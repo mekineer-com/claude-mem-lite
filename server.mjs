@@ -90,6 +90,14 @@ db.exec(`
   );
 `);
 
+// Schema migrations (idempotent)
+try {
+  db.exec(`ALTER TABLE observations ADD COLUMN importance INTEGER DEFAULT 1`);
+} catch {} // Column already exists
+try {
+  db.exec(`ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'`);
+} catch {} // Column already exists
+
 // Ensure FTS5 tables + triggers exist
 ensureFTS('observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
 ensureFTS('session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes']);
@@ -194,6 +202,7 @@ server.tool(
     project: z.string().optional().describe('Filter by project name'),
     date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
     date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
+    importance: z.number().int().min(1).max(3).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
     limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
     offset: z.number().int().min(0).optional().describe('Offset for pagination'),
   },
@@ -218,10 +227,11 @@ server.tool(
         // Project boost: current project gets 2x ranking boost (not filtered, just prioritized)
         const projectBoost = args.project ? null : currentProject;
         const rows = db.prepare(`
-          SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at,
+          SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
                  bm25(observations_fts, 10, 5, 5, 3, 3, 2)
                    * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
-                   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END) as score
+                   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
+                   * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
           FROM observations_fts
           JOIN observations o ON observations_fts.rowid = o.id
           WHERE observations_fts MATCH ?
@@ -229,6 +239,7 @@ server.tool(
             AND (? IS NULL OR o.type = ?)
             AND (? IS NULL OR o.created_at_epoch >= ?)
             AND (? IS NULL OR o.created_at_epoch <= ?)
+            AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
           ORDER BY score
           LIMIT ? OFFSET ?
         `).all(
@@ -239,6 +250,7 @@ server.tool(
           args.obs_type ?? null, args.obs_type ?? null,
           epochFrom, epochFrom,
           epochTo, epochTo,
+          args.importance ?? null, args.importance ?? null,
           limit, offset
         );
         for (const r of rows) {
@@ -252,6 +264,7 @@ server.tool(
         if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
         if (epochFrom) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
         if (epochTo) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+        if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
         params.push(limit, offset);
         const rows = db.prepare(`
@@ -501,7 +514,7 @@ server.tool(
       return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
     }
 
-    const allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
+    const allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids'];
     const fields = args.fields?.length ? args.fields.filter(f => allFields.includes(f)) : allFields;
 
     const parts = [];

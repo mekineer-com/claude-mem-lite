@@ -16,10 +16,23 @@ else
   exit 0
 fi
 
+# Read tool: track file path for episode context, then exit (no Node needed)
+if [[ "$tool" == "Read" ]]; then
+  if [[ "$input" =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
+    file_path="${BASH_REMATCH[1]}"
+    project="${CLAUDE_PROJECT_DIR##*/}"
+    project="${project:-unknown}"
+    runtime_dir="$HOME/claude-mem-lite/runtime"
+    mkdir -p "$runtime_dir" 2>/dev/null
+    echo "$file_path" >> "${runtime_dir}/reads-${project}.txt"
+  fi
+  exit 0
+fi
+
 # SYNC: Must match SKIP_TOOLS set and prefix filters in hook.mjs
 case "$tool" in
-  # Exact matches (SKIP_TOOLS set)
-  Read|Glob|TodoRead|TodoWrite|TaskList|TaskGet|TaskCreate|TaskUpdate|\
+  # Exact matches (SKIP_TOOLS set — Read handled above)
+  Glob|TodoRead|TodoWrite|TaskList|TaskGet|TaskCreate|TaskUpdate|\
   AskUserQuestion|EnterPlanMode|ExitPlanMode|\
   mcp__claude-in-chrome__screenshot|mcp__claude-in-chrome__read_page|\
   mcp__claude-in-chrome__tabs_context_mcp|mcp__claude-in-chrome__computer|\
