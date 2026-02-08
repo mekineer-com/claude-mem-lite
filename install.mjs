@@ -42,7 +42,7 @@ async function install() {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     const scriptsDir = join(DATA_DIR, 'scripts');
     if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
-    for (const f of ['server.mjs', 'hook.mjs', 'utils.mjs', 'package.json', 'skill.md', 'scripts/post-tool-use.sh']) {
+    for (const f of ['server.mjs', 'hook.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md', 'scripts/post-tool-use.sh']) {
       const src = join(PROJECT_DIR, f);
       if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
     }
@@ -374,11 +374,12 @@ async function doctor() {
 
 function isMemHook(cfg) {
   if (!cfg.hooks) return false;
-  return cfg.hooks.some(h =>
-    h.command?.includes('claude-mem-lite') ||
-    h.command?.includes('hook.mjs') ||
-    h.command?.includes('post-tool-use.sh')
-  );
+  return cfg.hooks.some(h => {
+    const cmd = h.command || '';
+    return cmd.includes('claude-mem-lite') ||
+      (cmd.includes('hook.mjs') && /\b(session-start|stop|user-prompt)\b/.test(cmd)) ||
+      cmd.includes('scripts/post-tool-use.sh');
+  });
 }
 
 function readSettings() {
