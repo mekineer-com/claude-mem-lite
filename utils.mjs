@@ -21,6 +21,39 @@ export function truncate(str, max = 80) {
   return str.length > max ? str.slice(0, max - 1) + '…' : str;
 }
 
+// ─── Secret Scrubbing ──────────────────────────────────────────────────────
+
+const SECRET_PATTERNS = [
+  // Key-value assignments: password=xxx, token=xxx, api_key=xxx, secret=xxx, etc.
+  [/(\b(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
+  // AWS access keys (AKIA...)
+  [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
+  // OpenAI / Anthropic keys (sk-...)
+  [/\bsk-[a-zA-Z0-9_-]{20,}\b/g, '***'],
+  // GitHub tokens (ghp_, gho_, github_pat_)
+  [/\b(?:ghp_|gho_|ghs_|ghr_)[a-zA-Z0-9_]{30,}\b/g, '***'],
+  [/\bgithub_pat_[a-zA-Z0-9_]{22,}\b/g, '***'],
+  // GitLab tokens (glpat-)
+  [/\bglpat-[a-zA-Z0-9_-]{20,}\b/g, '***'],
+  // Slack tokens (xox[bpas]-)
+  [/\bxox[bpas]-[a-zA-Z0-9-]{10,}\b/g, '***'],
+  // JWT tokens (eyJ...eyJ...)
+  [/\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+\b/g, '***'],
+  // PEM private key blocks
+  [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, '***PEM_KEY***'],
+  // Long hex strings in assignments (e.g. SECRET_KEY=abc123def456...)
+  [/(\b(?:key|secret|token|hash)\s*[=:]\s*)[0-9a-f]{32,}\b/gi, '$1***'],
+];
+
+export function scrubSecrets(text) {
+  if (!text || typeof text !== 'string') return text || '';
+  let result = text;
+  for (const [pattern, replacement] of SECRET_PATTERNS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+
 export function typeIcon(type) {
   const icons = { decision: '🟡', bugfix: '🔴', feature: '🟢', refactor: '🔵', discovery: '🔍', change: '📝' };
   return icons[type] || '⚪';
@@ -67,7 +100,10 @@ export function computeRuleImportance(episode) {
 // ─── Project Inference ───────────────────────────────────────────────────────
 
 export function inferProject() {
-  return basename(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
+  const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
+  const base = basename(p);
+  const parent = basename(dirname(p));
+  return parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;
 }
 
 // ─── Bash Analysis ───────────────────────────────────────────────────────────

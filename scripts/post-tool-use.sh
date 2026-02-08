@@ -20,7 +20,14 @@ fi
 if [[ "$tool" == "Read" ]]; then
   if [[ "$input" =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
     file_path="${BASH_REMATCH[1]}"
-    project="${CLAUDE_PROJECT_DIR##*/}"
+    _dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    _base="${_dir##*/}"
+    _parent="${_dir%/*}"; _parent="${_parent##*/}"
+    if [[ -n "$_parent" && "$_parent" != "." && "$_parent" != "/" ]]; then
+      project="${_parent}--${_base}"
+    else
+      project="${_base}"
+    fi
     project="${project:-unknown}"
     runtime_dir="$HOME/claude-mem-lite/runtime"
     mkdir -p "$runtime_dir" 2>/dev/null

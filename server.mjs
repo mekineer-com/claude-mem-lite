@@ -231,6 +231,11 @@ server.tool(
     const results = [];
     const currentProject = inferProject();
 
+    // Cross-source: over-fetch per source, apply global sort+pagination after merge
+    const isCrossSource = !searchType;
+    const perSourceLimit = isCrossSource ? limit * 3 : limit;
+    const perSourceOffset = isCrossSource ? 0 : offset;
+
     // Parse date bounds to epoch (with validation)
     const epochFrom = args.date_from ? new Date(args.date_from).getTime() : null;
     const epochTo = args.date_to ? new Date(args.date_to).getTime() : null;
@@ -268,7 +273,7 @@ server.tool(
           epochFrom, epochFrom,
           epochTo, epochTo,
           args.importance ?? null, args.importance ?? null,
-          limit, offset
+          perSourceLimit, perSourceOffset
         );
         for (const r of rows) {
           results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score });
@@ -283,15 +288,15 @@ server.tool(
         if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-        params.push(limit, offset);
+        params.push(perSourceLimit, perSourceOffset);
         const rows = db.prepare(`
-          SELECT id, type, title, subtitle, project, created_at
+          SELECT id, type, title, subtitle, project, created_at, created_at_epoch
           FROM observations ${where}
           ORDER BY created_at_epoch DESC
           LIMIT ? OFFSET ?
         `).all(...params);
         for (const r of rows) {
-          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at });
+          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
         }
       }
     }
@@ -321,7 +326,7 @@ server.tool(
           args.project ?? null, args.project ?? null,
           epochFrom, epochFrom,
           epochTo, epochTo,
-          limit, offset
+          perSourceLimit, perSourceOffset
         );
         for (const r of rows) {
           results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, score: r.score });
@@ -335,15 +340,15 @@ server.tool(
         if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
         if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-        params.push(limit, offset);
+        params.push(perSourceLimit, perSourceOffset);
         const rows = db.prepare(`
-          SELECT id, request, completed, project, created_at
+          SELECT id, request, completed, project, created_at, created_at_epoch
           FROM session_summaries ${where}
           ORDER BY created_at_epoch DESC
           LIMIT ? OFFSET ?
         `).all(...params);
         for (const r of rows) {
-          results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at });
+          results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
         }
       }
     }
@@ -365,7 +370,7 @@ server.tool(
           ftsQuery,
           epochFrom, epochFrom,
           epochTo, epochTo,
-          limit, offset
+          perSourceLimit, perSourceOffset
         );
         for (const r of rows) {
           results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: r.score });
@@ -376,28 +381,44 @@ server.tool(
         if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
         if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-        params.push(limit, offset);
+        params.push(perSourceLimit, perSourceOffset);
         const rows = db.prepare(`
-          SELECT id, prompt_text, content_session_id, created_at
+          SELECT id, prompt_text, content_session_id, created_at, created_at_epoch
           FROM user_prompts ${where}
           ORDER BY created_at_epoch DESC
           LIMIT ? OFFSET ?
         `).all(...params);
         for (const r of rows) {
-          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at });
+          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, dateEpoch: r.created_at_epoch });
         }
       }
     }
 
+    // Global sort and pagination (cross-source)
+    if (isCrossSource && results.length > 0) {
+      if (ftsQuery) {
+        // FTS mode: BM25 returns negative scores; more negative = better match
+        results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+      } else {
+        // Non-FTS mode: sort by date descending
+        results.sort((a, b) => (b.dateEpoch ?? 0) - (a.dateEpoch ?? 0));
+      }
+    }
+    const totalBeforePagination = results.length;
+    const paginatedResults = isCrossSource ? results.slice(offset, offset + limit) : results;
+
     // Format compact output
-    if (results.length === 0) {
+    if (paginatedResults.length === 0) {
       return { content: [{ type: 'text', text: 'No results found.' }] };
     }
 
     const lines = [];
-    lines.push(`Found ${results.length} result(s)${args.query ? ` for "${args.query}"` : ''}:\n`);
+    const countLabel = isCrossSource && totalBeforePagination > paginatedResults.length
+      ? `${paginatedResults.length} of ${totalBeforePagination}`
+      : `${paginatedResults.length}`;
+    lines.push(`Found ${countLabel} result(s)${args.query ? ` for "${args.query}"` : ''}:\n`);
 
-    for (const r of results) {
+    for (const r of paginatedResults) {
       if (r.source === 'obs') {
         lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}`);
       } else if (r.source === 'session') {

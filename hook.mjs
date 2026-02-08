@@ -13,7 +13,7 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSyn
 import {
   jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance,
   inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
-  parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc,
+  parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
 } from './utils.mjs';
 
 // Prevent recursive hooks from background claude -p calls
@@ -256,6 +256,47 @@ function addFileToEpisode(episode, files) {
   }
 }
 
+// ─── Pending Entry Recovery (concurrency safety) ────────────────────────────
+
+function writePendingEntry(entry, sessionId, project) {
+  const ts = Date.now();
+  const rand = Math.random().toString(36).slice(2, 6);
+  const pendingFile = join(RUNTIME_DIR, `pending-${ts}-${rand}.json`);
+  const tmp = pendingFile + '.tmp';
+  try {
+    writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts }));
+    renameSync(tmp, pendingFile);
+  } catch {
+    try { unlinkSync(tmp); } catch {}
+  }
+}
+
+function mergePendingEntries(episode) {
+  const oneHourAgo = Date.now() - 3600000;
+  let files;
+  try {
+    files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('pending-')).sort();
+  } catch { return; }
+
+  for (const f of files) {
+    const fp = join(RUNTIME_DIR, f);
+    try {
+      const raw = readFileSync(fp, 'utf8');
+      const pending = JSON.parse(raw);
+      unlinkSync(fp);
+      if (pending.ts < oneHourAgo) continue; // discard stale
+      if (pending.entry) {
+        episode.entries.push(pending.entry);
+        episode.lastAt = Math.max(episode.lastAt, pending.entry.ts || pending.ts);
+        addFileToEpisode(episode, pending.entry.files || []);
+      }
+    } catch {
+      // Corrupt pending file — remove
+      try { unlinkSync(fp); } catch {}
+    }
+  }
+}
+
 // isRelatedToEpisode imported from utils.mjs
 
 function episodeHasSignificantContent(episode) {
@@ -343,7 +384,7 @@ async function handlePostToolUse() {
   // Build episode entry
   const entry = {
     tool: tool_name,
-    desc: makeEntryDesc(tool_name, toolInput, resp),
+    desc: scrubSecrets(makeEntryDesc(tool_name, toolInput, resp)),
     files,
     ts: Date.now(),
     isError: bashSig?.isError || false,
@@ -356,9 +397,15 @@ async function handlePostToolUse() {
   const sessionId = getSessionId();
   const project = inferProject();
 
-  if (!acquireLock()) return; // Another hook is writing — skip this entry
+  if (!acquireLock()) {
+    writePendingEntry(entry, sessionId, project);
+    return;
+  }
   try {
     let episode = readEpisode();
+
+    // Merge any pending entries from previous lock failures
+    if (episode) mergePendingEntries(episode);
 
     if (episode) {
       const timeSinceLastEntry = Date.now() - episode.lastAt;
@@ -375,6 +422,7 @@ async function handlePostToolUse() {
 
     if (!episode) {
       episode = createEpisode(sessionId, project);
+      mergePendingEntries(episode);
     }
 
     episode.entries.push(entry);
@@ -643,7 +691,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function handleLLMSummary() {
   // Poll for llm-episode flush files to be processed (instead of fixed 20s wait)
   // llm-episode reads and deletes ep-flush-*.json files when done
-  for (let i = 0; i < 15; i++) {
+  const flushTimeout = parseInt(process.env.CLAUDE_MEM_FLUSH_TIMEOUT, 10) || 15;
+  for (let i = 0; i < flushTimeout; i++) {
     try {
       const files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('ep-flush-'));
       if (files.length === 0) break; // All episodes processed
@@ -660,13 +709,29 @@ async function handleLLMSummary() {
     const sessionId = process.argv[3] || getSessionId();
     const project = process.argv[4] || inferProject();
 
-    const recentObs = db.prepare(`
+    let recentObs = db.prepare(`
       SELECT id, type, title, narrative
       FROM observations
       WHERE memory_session_id = ?
       ORDER BY created_at_epoch DESC
       LIMIT 30
     `).all(sessionId);
+
+    // Grace period: wait 2s for late-arriving observations, then merge
+    if (recentObs.length > 0) {
+      const maxId = Math.max(...recentObs.map(o => o.id));
+      await sleep(2000);
+      const lateObs = db.prepare(`
+        SELECT id, type, title, narrative
+        FROM observations
+        WHERE memory_session_id = ? AND id > ?
+        ORDER BY created_at_epoch DESC
+        LIMIT 10
+      `).all(sessionId, maxId);
+      if (lateObs.length > 0) {
+        recentObs = [...lateObs, ...recentObs].slice(0, 30);
+      }
+    }
 
     if (recentObs.length < 1) return;
 
@@ -1035,7 +1100,7 @@ async function handleUserPrompt() {
       VALUES (?, ?, ?, ?, ?)
     `).run(
       sessionId,
-      promptText.slice(0, 10000),
+      scrubSecrets(promptText.slice(0, 10000)),
       counter?.prompt_counter || 1,
       now.toISOString(), now.getTime()
     );
