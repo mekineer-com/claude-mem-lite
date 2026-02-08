@@ -115,42 +115,43 @@ describe('sanitizeFtsQuery', () => {
     expect(sanitizeFtsQuery('')).toBeNull();
   });
 
-  it('wraps simple tokens in double quotes', () => {
-    expect(sanitizeFtsQuery('hello')).toBe('"hello"');
-    expect(sanitizeFtsQuery('hello world')).toBe('"hello" "world"');
+  it('returns bare tokens (single words unquoted)', () => {
+    expect(sanitizeFtsQuery('hello')).toBe('hello');
+    expect(sanitizeFtsQuery('hello world')).toBe('hello world');
   });
 
-  it('preserves hyphens within words', () => {
+  it('preserves hyphens within words (quoted)', () => {
     expect(sanitizeFtsQuery('webpack-dev-server')).toBe('"webpack-dev-server"');
     expect(sanitizeFtsQuery('vue-router next-auth')).toBe('"vue-router" "next-auth"');
   });
 
   it('strips leading minus (FTS5 NOT operator)', () => {
-    expect(sanitizeFtsQuery('-excluded term')).toBe('"excluded" "term"');
-    expect(sanitizeFtsQuery('term -other')).toBe('"term" "other"');
+    expect(sanitizeFtsQuery('-excluded term')).toBe('excluded term');
+    expect(sanitizeFtsQuery('term -other')).toBe('term other');
   });
 
   it('strips FTS5 special characters', () => {
-    expect(sanitizeFtsQuery('test{foo}')).toBe('"test" "foo"');
-    expect(sanitizeFtsQuery('test(bar)')).toBe('"test" "bar"');
-    expect(sanitizeFtsQuery('test[baz]')).toBe('"test" "baz"');
-    expect(sanitizeFtsQuery('a^b~c*d:e')).toBe('"a" "b" "c" "d" "e"');
+    expect(sanitizeFtsQuery('test{foo}')).toBe('test foo');
+    expect(sanitizeFtsQuery('test(bar)')).toBe('test bar');
+    expect(sanitizeFtsQuery('test[baz]')).toBe('test baz');
+    expect(sanitizeFtsQuery('a^b~c*d:e')).toBe('a b c d e');
   });
 
   it('filters out FTS5 boolean keywords', () => {
-    expect(sanitizeFtsQuery('hello AND world')).toBe('"hello" "world"');
-    expect(sanitizeFtsQuery('hello OR world')).toBe('"hello" "world"');
-    expect(sanitizeFtsQuery('NOT something')).toBe('"something"');
-    expect(sanitizeFtsQuery('hello NEAR world')).toBe('"hello" "world"');
+    expect(sanitizeFtsQuery('hello AND world')).toBe('hello world');
+    expect(sanitizeFtsQuery('hello OR world')).toBe('hello world');
+    expect(sanitizeFtsQuery('NOT something')).toBe('something');
+    expect(sanitizeFtsQuery('hello NEAR world')).toBe('hello world');
   });
 
   it('is case-insensitive for keywords', () => {
-    expect(sanitizeFtsQuery('hello and world')).toBe('"hello" "world"');
-    expect(sanitizeFtsQuery('hello or world')).toBe('"hello" "world"');
+    expect(sanitizeFtsQuery('hello and world')).toBe('hello world');
+    expect(sanitizeFtsQuery('hello or world')).toBe('hello world');
   });
 
-  it('escapes double quotes in tokens', () => {
-    expect(sanitizeFtsQuery('say "hello"')).toBe('"say" """hello"""');
+  it('quotes tokens with embedded special chars', () => {
+    // Token "hello" has embedded quotes (non-alphanumeric) → gets quoted+escaped
+    expect(sanitizeFtsQuery('say "hello"')).toBe('say """hello"""');
   });
 
   it('returns null when all tokens are keywords or special chars', () => {
@@ -160,7 +161,30 @@ describe('sanitizeFtsQuery', () => {
   });
 
   it('handles mixed hyphens and operators', () => {
-    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" "error"');
+    // "next-auth" stays quoted (has hyphen), "error" expands via synonym map
+    // Uses AND joiner because of parenthesized group
+    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err)');
+  });
+
+  it('expands abbreviation synonyms', () => {
+    expect(sanitizeFtsQuery('K8s')).toBe('(K8s OR kubernetes)');
+    expect(sanitizeFtsQuery('DB')).toBe('(DB OR database)');
+    // Multi-token with synonym uses AND joiner
+    expect(sanitizeFtsQuery('K8s deployment')).toBe('(K8s OR kubernetes) AND deployment');
+  });
+
+  it('expands full forms to abbreviations (bidirectional)', () => {
+    expect(sanitizeFtsQuery('database')).toBe('(database OR db)');
+    expect(sanitizeFtsQuery('kubernetes')).toBe('(kubernetes OR k8s)');
+  });
+
+  it('quotes multi-word synonyms', () => {
+    // "ci" expands to (ci OR "continuous integration")
+    expect(sanitizeFtsQuery('ci')).toBe('(ci OR "continuous integration")');
+  });
+
+  it('leaves tokens without synonyms unchanged', () => {
+    expect(sanitizeFtsQuery('foobar')).toBe('foobar');
   });
 });
 
