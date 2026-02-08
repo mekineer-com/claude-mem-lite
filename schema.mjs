@@ -86,19 +86,11 @@ const MIGRATIONS = [
 ];
 
 /**
- * Ensure DB directory, database file, and all tables exist.
- * Safe to call from any process (hook or server). Idempotent.
- * Returns an opened Database instance with WAL + busy_timeout configured.
+ * Apply full schema (tables, migrations, indexes, FTS5) to an opened DB instance.
+ * Single source of truth for all schema setup — used by ensureDb() and tests.
+ * The DB should have foreign_keys OFF before calling (enabled after dedup migration).
  */
-export function ensureDb() {
-  if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
-
-  const db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = OFF'); // Enabled after dedup migration
-
+export function initSchema(db) {
   // Create core tables
   db.exec(CORE_SCHEMA);
 
@@ -149,6 +141,23 @@ export function ensureDb() {
   ensureFTS(db, 'user_prompts_fts', 'user_prompts', ['prompt_text']);
 
   return db;
+}
+
+/**
+ * Ensure DB directory, database file, and all tables exist.
+ * Safe to call from any process (hook or server). Idempotent.
+ * Returns an opened Database instance with WAL + busy_timeout configured.
+ */
+export function ensureDb() {
+  if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
+
+  const db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 3000');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('foreign_keys = OFF'); // Enabled after dedup migration
+
+  return initSchema(db);
 }
 
 /**

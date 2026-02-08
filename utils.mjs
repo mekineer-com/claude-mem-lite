@@ -360,7 +360,7 @@ export function makeEntryDesc(toolName, input, resp) {
 
 export function debugCatch(e, context) {
   if (process.env.CLAUDE_MEM_DEBUG) {
-    console.error(`[claude-mem-lite] ${context}:`, e?.message || e);
+    console.error(`[claude-mem-lite] ${context}:`, e?.stack || e?.message || e);
   }
 }
 
