@@ -1,0 +1,300 @@
+[English](README.md) | [中文](README.zh-CN.md)
+
+# claude-mem-lite
+
+[Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的轻量级持久化记忆系统。自动捕获编码过程中的观察、决策和问题修复，通过全文搜索随时回溯。
+
+基于 [MCP 服务器](https://modelcontextprotocol.io/) + Claude Code 钩子构建。无需外部服务，单一 SQLite 数据库，开销极低。
+
+## 为什么选择 claude-mem-lite？
+
+对 [claude-mem](https://github.com/thedotmack/claude-mem) 的重新设计，用更智能、更精简的架构替代其重量级方案。
+
+### 架构对比
+
+| | claude-mem（原版） | claude-mem-lite |
+|---|---|---|
+| **LLM 调用** | 每次工具使用都触发 Sonnet 调用 | 仅在 episode 刷新时调用（5-10 次操作批处理） |
+| **LLM 输入** | 原始 `tool_input` + `tool_output` JSON | 预处理后的动作摘要 |
+| **对话模式** | 多轮对话，累积完整历史 | 无状态单轮提取 |
+| **噪声过滤** | LLM 通过 "WHEN TO SKIP" 提示词判断 | 确定性的代码级 Tier 1 过滤器 |
+| **运行方式** | 长驻后台 worker 进程（1.8MB .cjs） | 按需启动，立即退出 |
+| **依赖** | Bun + Python/uv + Chroma 向量数据库 | 仅 Node.js（3 个 npm 包） |
+| **源码大小** | ~2.3MB 编译后的打包文件 | ~50KB 可读源码 |
+| **数据目录** | `~/.claude-mem/` | `~/claude-mem-lite/`（自动迁移） |
+
+### Token 与成本效率
+
+以典型的 50 次工具调用的会话为例：
+
+| | claude-mem | claude-mem-lite | 比率 |
+|---|---|---|---|
+| LLM 调用次数 | ~50（每次工具使用） | ~5-8（按 episode） | **减少 7-10 倍** |
+| 每次调用 token | 1,000-5,000（原始 JSON + 历史） | 200-500（仅摘要） | **减少 5-10 倍** |
+| 总 token 量 | ~100K-250K | ~1K-4K | **减少 50-100 倍** |
+| 模型成本 | Sonnet ($3/$15 每百万) | Haiku ($0.25/$1.25 每百万) | **便宜 12 倍** |
+| 综合节省 | | | **成本降低 600 倍+** |
+
+### 质量对比
+
+| 维度 | 胜出方 | 原因 |
+|---|---|---|
+| **分类准确性** | 持平 | 两者都能正确生成 type/title/narrative |
+| **噪声过滤** | **lite** | 代码级过滤是确定性的；LLM 的 "WHEN TO SKIP" 不可靠 |
+| **观察连贯性** | **lite** | Episode 批处理将相关编辑组合为一条连贯的观察 |
+| **代码级细节** | 原版 | 能看到完整 diff，但在记忆搜索中很少用到 |
+| **搜索召回率** | 持平 | 用户搜索语义概念（"auth bug"），而非代码行 |
+| **Hook 延迟** | **lite** | 异步后台 worker；原版每次 hook 阻塞 2-5 秒 |
+
+### 设计理念
+
+原版把**所有数据扔给 LLM，期望它自行过滤**。claude-mem-lite **先用代码过滤，再把真正重要的内容**发送给更小的模型。这不是降级，而是更智能的架构——以极低的成本产出同等的搜索质量。
+
+## 功能特性
+
+- **自动捕获** -- 挂载到 Claude Code 生命周期（PostToolUse、SessionStart、Stop），无需手动操作即可记录观察
+- **FTS5 搜索** -- 基于 BM25 排名的全文搜索，覆盖观察、会话摘要和用户提示
+- **时间线浏览** -- 基于锚点的时间上下文窗口，按时间顺序浏览观察
+- **Episode 批处理** -- 将相关文件操作分组为连贯的 episode，再进行 LLM 编码
+- **错误触发回忆** -- Bash 出错时自动搜索记忆，浮现相关的历史修复方案
+- **会话摘要** -- 会话结束时通过后台 worker（使用 `claude -p`）生成 LLM 摘要
+- **项目作用域上下文** -- 将最近的记忆注入 `CLAUDE.md` 和会话启动上下文
+- **观察类型** -- 分类为 `decision`、`bugfix`、`feature`、`refactor`、`discovery` 或 `change`
+
+## 环境要求
+
+- **Node.js** >= 18
+- **Claude Code** CLI 已安装并配置（`claude` 命令可用）
+- **SQLite3** 支持（由 `better-sqlite3` 提供，安装时编译）
+
+## 安装
+
+### 方式一：插件市场（推荐）
+
+```bash
+/plugin marketplace add sdsrss/claude-mem-lite
+/plugin install claude-mem-lite
+```
+
+插件系统会处理一切：钩子、MCP 服务器和依赖安装（通过 Setup 钩子）。依赖会在首次运行时自动安装。
+
+### 方式二：npx（一行命令）
+
+```bash
+npx github:sdsrss/claude-mem-lite
+```
+
+源文件会自动复制到 `~/claude-mem-lite/` 以持久化保存。
+
+### 方式三：git clone
+
+```bash
+git clone https://github.com/sdsrss/claude-mem-lite.git
+cd claude-mem-lite
+node install.mjs install
+```
+
+源文件保留在克隆的仓库中。通过 `git pull && node install.mjs install` 更新。
+
+### 安装过程
+
+1. **安装依赖** -- `npm install --production`（编译原生 `better-sqlite3`）
+2. **注册 MCP 服务器** -- `mem` 服务器，包含 5 个工具（search、timeline、get、save、stats）
+3. **配置钩子** -- `PostToolUse`、`SessionStart`、`Stop` 生命周期钩子
+4. **创建数据目录** -- `~/claude-mem-lite/`，存放数据库和运行时文件
+5. **自动迁移** -- 如果 `~/.claude-mem/`（原版 claude-mem）存在，自动将数据库和运行时文件复制到 `~/claude-mem-lite/`，原目录保持不变
+6. **初始化数据库** -- SQLite WAL 模式，FTS5 索引在服务器首次启动时创建
+
+安装后重启 Claude Code 以激活。
+
+### 从 claude-mem（原版）迁移
+
+所有安装方式都会自动检测 `~/.claude-mem/` 并迁移：
+- 复制 `claude-mem.db` + WAL 文件到 `~/claude-mem-lite/`
+- 复制 `runtime/` 目录
+- **原 `~/.claude-mem/` 保持不变**（不删除、不覆盖）
+
+确认一切正常后手动删除旧目录：
+```bash
+rm -rf ~/.claude-mem/
+```
+
+### 目录结构
+
+```
+~/claude-mem-lite/
+  claude-mem.db          # SQLite 数据库（WAL 模式）
+  runtime/
+    session-<project>    # 活跃会话状态
+    ep-<project>.json    # Episode 缓冲区
+    ep-flush-*.json      # 已刷新的 episode，等待处理
+```
+
+## 使用方法
+
+### MCP 工具（由 Claude 自动使用）
+
+| 工具 | 描述 |
+|------|------|
+| `mem_search` | 基于 BM25 排名的 FTS5 全文搜索。支持按类型、项目、日期范围过滤。 |
+| `mem_timeline` | 围绕锚点按时间顺序浏览观察。 |
+| `mem_get` | 获取指定观察 ID 的完整详情。 |
+| `mem_save` | 手动保存记忆/观察。 |
+| `mem_stats` | 查看统计：计数、类型分布、热门项目、每日活动。 |
+
+### 技能命令（在 Claude Code 聊天中使用）
+
+```
+/mem search <query>        # 全文搜索所有记忆
+/mem recent [n]            # 显示最近 N 条观察（默认 10）
+/mem save <text>           # 保存手动记忆/笔记
+/mem stats                 # 显示记忆统计
+/mem timeline <query>      # 围绕匹配结果浏览时间线
+/mem <query>               # search 的简写
+```
+
+### 高效搜索工作流
+
+```
+1. mem_search(query="auth bug")     -> 紧凑的 ID 索引
+2. mem_timeline(anchor=12345)       -> 周边上下文
+3. mem_get(ids=[12345, 12346])      -> 完整详情
+```
+
+## 数据库结构
+
+四张核心表 + FTS5 虚拟表用于搜索：
+
+**observations** -- 单条编码观察（决策、bug修复、功能等）
+```
+id, memory_session_id, project, type, title, subtitle,
+text, narrative, concepts, facts, files_read, files_modified,
+created_at, created_at_epoch
+```
+
+**session_summaries** -- LLM 生成的会话摘要
+```
+id, memory_session_id, project, request, investigated,
+learned, completed, next_steps, files_read, files_edited, notes
+```
+
+**sdk_sessions** -- 会话追踪
+```
+id, content_session_id, memory_session_id, project,
+started_at, completed_at, status
+```
+
+**user_prompts** -- 用户输入记录
+```
+id, content_session_id, prompt_text, prompt_number
+```
+
+FTS5 索引：`observations_fts`、`session_summaries_fts`、`user_prompts_fts`
+
+## 工作原理
+
+### Hook 管线
+
+```
+SessionStart
+  -> 生成会话 ID
+  -> 查询最近观察（24 小时内）
+  -> 注入上下文到 CLAUDE.md + 标准输出
+
+PostToolUse（每次工具执行）
+  -> 过滤噪声（跳过 Read、Glob、截图等）
+  -> 检测 Bash 重要性（错误、测试、构建、git、部署）
+  -> 累积到 episode 缓冲区
+  -> 刷新条件：缓冲区满（10 条） | 5 分钟间隔 | 上下文切换
+  -> 为有意义的 episode 启动 LLM episode worker
+  -> 错误触发回忆：搜索记忆中相关的历史修复
+
+Stop
+  -> 刷新最终 episode 缓冲区
+  -> 标记会话为已完成
+  -> 启动 LLM 摘要 worker（延迟 20 秒）
+```
+
+### Episode 编码
+
+Episode 是一批相关操作（对同一组文件的编辑），由后台 LLM worker 处理：
+
+```
+Episode 缓冲区 -> 刷新为 JSON -> claude -p --model haiku -> 结构化观察 -> SQLite
+```
+
+每条观察都包含类型、标题、叙述、概念和事实。
+
+## 管理命令
+
+```bash
+# 插件安装：
+/plugin install claude-mem-lite       # 安装 / 更新
+/plugin uninstall claude-mem-lite     # 卸载
+
+# git clone 安装：
+node install.mjs install              # 安装并配置
+node install.mjs uninstall            # 移除（保留数据）
+node install.mjs uninstall --purge    # 移除并删除所有数据
+node install.mjs status               # 显示当前状态
+node install.mjs doctor               # 诊断问题
+
+# npx 安装：
+npx claude-mem-lite                   # 安装 / 重新安装
+npx claude-mem-lite uninstall         # 移除（保留数据）
+npx claude-mem-lite doctor            # 诊断问题
+```
+
+### doctor
+
+检查 Node.js 版本、依赖、服务器/钩子文件、数据库完整性、FTS5 索引和残留进程。
+
+### status
+
+显示 MCP 注册状态、钩子配置和数据库统计（观察/会话数量）。
+
+## 卸载
+
+```bash
+# 插件：
+/plugin uninstall claude-mem-lite
+
+# git clone：
+cd claude-mem-lite
+node install.mjs uninstall            # 保留 ~/claude-mem-lite/ 数据
+node install.mjs uninstall --purge    # 删除 ~/claude-mem-lite/ 及所有数据
+
+# npx：
+npx claude-mem-lite uninstall
+npx claude-mem-lite uninstall --purge
+```
+
+数据默认保留在 `~/claude-mem-lite/` 中。如需删除：
+```bash
+rm -rf ~/claude-mem-lite/
+```
+
+## 项目结构
+
+```
+claude-mem-lite/
+  .claude-plugin/
+    plugin.json      # 插件清单
+    marketplace.json # 市场目录
+  .mcp.json          # MCP 服务器定义（插件模式）
+  hooks/
+    hooks.json       # 钩子定义（插件模式）
+  commands/
+    mem.md           # /mem 命令定义
+  scripts/
+    setup.sh         # Setup 钩子：npm install + 迁移
+  server.mjs         # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
+  hook.mjs           # Claude Code 钩子：episode 捕获、错误回忆、会话管理
+  install.mjs        # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
+  skill.md           # MCP 技能定义（npx/git clone 模式）
+  package.json       # 依赖和元数据
+```
+
+## 许可证
+
+MIT

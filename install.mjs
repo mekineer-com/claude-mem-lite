@@ -2,15 +2,25 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 
 const PROJECT_DIR = resolve(import.meta.dirname || '.');
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
-const DB_PATH = join(homedir(), '.claude-mem', 'claude-mem.db');
-const SERVER_PATH = join(PROJECT_DIR, 'server.mjs');
-const HOOK_PATH = join(PROJECT_DIR, 'hook.mjs');
+const DATA_DIR = join(homedir(), 'claude-mem-lite');
+const DB_PATH = join(DATA_DIR, 'claude-mem.db');
+const OLD_DATA_DIR = join(homedir(), '.claude-mem');
+
+// Detect ephemeral context (npx) — files won't persist after exit
+const IS_NPX = process.env.npm_command === 'exec' ||
+  PROJECT_DIR.includes('_npx') || PROJECT_DIR.includes('.npm/_');
+
+// For npx: install runtime files to ~/claude-mem-lite/
+// For git clone: use files in-place from the cloned repo
+const INSTALL_DIR = IS_NPX ? DATA_DIR : PROJECT_DIR;
+const SERVER_PATH = join(INSTALL_DIR, 'server.mjs');
+const HOOK_PATH = join(INSTALL_DIR, 'hook.mjs');
 
 const cmd = process.argv[2];
 const flags = new Set(process.argv.slice(3));
@@ -25,11 +35,22 @@ function fail(msg) { console.log(`  ✗ ${msg}`); }
 async function install() {
   console.log('\nclaude-mem-lite installer\n');
 
-  // 1. npm install
-  if (!existsSync(join(PROJECT_DIR, 'node_modules'))) {
+  // 1. Copy source files to persistent location (npx mode)
+  if (IS_NPX) {
+    log('npx detected — installing to ~/claude-mem-lite/...');
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    for (const f of ['server.mjs', 'hook.mjs', 'package.json', 'skill.md']) {
+      const src = join(PROJECT_DIR, f);
+      if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
+    }
+    ok('Source files copied to ~/claude-mem-lite/');
+  }
+
+  // 2. npm install
+  if (!existsSync(join(INSTALL_DIR, 'node_modules'))) {
     log('Installing dependencies...');
     try {
-      execSync('npm install --production', { cwd: PROJECT_DIR, stdio: 'pipe' });
+      execSync('npm install --production', { cwd: INSTALL_DIR, stdio: 'pipe' });
       ok('Dependencies installed');
     } catch (e) {
       fail('npm install failed: ' + e.message);
@@ -39,7 +60,7 @@ async function install() {
     ok('Dependencies already installed');
   }
 
-  // 2. Register MCP server
+  // 3. Register MCP server
   log('Registering MCP server...');
   try {
     // Remove existing first (ignore errors)
@@ -51,7 +72,7 @@ async function install() {
     warn('Try manually: claude mcp add -s user -t stdio mem -- node ' + SERVER_PATH);
   }
 
-  // 3. Configure hooks
+  // 4. Configure hooks
   log('Configuring hooks...');
   const settings = readSettings();
   settings.hooks = settings.hooks || {};
@@ -85,7 +106,33 @@ async function install() {
   writeSettings(settings);
   ok('Hooks configured (PostToolUse, SessionStart, Stop)');
 
-  // 4. Verify database
+  // 5. Migrate from old ~/.claude-mem/ if needed
+  if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH)) {
+    log('Detected old ~/.claude-mem/ directory, migrating to ~/claude-mem-lite/...');
+    try {
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      // Migrate database and WAL/SHM files
+      for (const f of ['claude-mem.db', 'claude-mem.db-wal', 'claude-mem.db-shm']) {
+        const src = join(OLD_DATA_DIR, f);
+        if (existsSync(src)) {
+          execSync(`cp "${src}" "${join(DATA_DIR, f)}"`, { stdio: 'pipe' });
+        }
+      }
+      // Migrate runtime directory
+      const oldRuntime = join(OLD_DATA_DIR, 'runtime');
+      const newRuntime = join(DATA_DIR, 'runtime');
+      if (existsSync(oldRuntime) && !existsSync(newRuntime)) {
+        execSync(`cp -r "${oldRuntime}" "${newRuntime}"`, { stdio: 'pipe' });
+      }
+      ok('Data migrated from ~/.claude-mem/ → ~/claude-mem-lite/');
+      log('Old ~/.claude-mem/ preserved (remove manually when ready)');
+    } catch (e) {
+      warn('Migration failed: ' + e.message);
+      log('You can copy manually: cp ~/.claude-mem/claude-mem.db ~/claude-mem-lite/');
+    }
+  }
+
+  // 6. Verify database
   if (existsSync(DB_PATH)) {
     try {
       const Database = (await import('better-sqlite3')).default;
@@ -100,21 +147,21 @@ async function install() {
     log('No existing database — will be created on first use');
   }
 
-  // 5. Disable old claude-mem plugin
+  // 7. Disable old claude-mem plugin
   if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
     settings.enabledPlugins['claude-mem@thedotmack'] = false;
     writeSettings(settings);
     ok('Old claude-mem plugin disabled');
   }
 
-  // 6. Clean old processes
+  // 8. Clean old processes
   try {
     execSync('pkill -f chroma-mcp 2>/dev/null || true', { stdio: 'pipe' });
     execSync('pkill -f "claude-mem.*worker" 2>/dev/null || true', { stdio: 'pipe' });
   } catch {}
 
-  // 7. Offer to clean vector-db
-  const vectorDbPath = join(homedir(), '.claude-mem', 'vector-db');
+  // 9. Offer to clean old vector-db
+  const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
   if (existsSync(vectorDbPath)) {
     try {
       const size = execSync(`du -sh "${vectorDbPath}" 2>/dev/null`, { encoding: 'utf8' }).trim().split('\t')[0];
@@ -138,14 +185,15 @@ async function uninstall() {
     warn('MCP server not found or already removed');
   }
 
-  // 2. Remove hooks
+  // 2. Remove hooks (match both npx and git-clone install paths)
   const settings = readSettings();
   if (settings.hooks) {
-    const hookPath = HOOK_PATH;
     for (const [event, configs] of Object.entries(settings.hooks)) {
       settings.hooks[event] = configs.filter(cfg => {
         if (!cfg.hooks) return true;
-        return !cfg.hooks.some(h => h.command?.includes(hookPath) || h.command?.includes('hook.mjs'));
+        return !cfg.hooks.some(h =>
+          h.command?.includes('claude-mem-lite') && h.command?.includes('hook.mjs')
+        );
       });
       if (settings.hooks[event].length === 0) delete settings.hooks[event];
     }
@@ -156,13 +204,12 @@ async function uninstall() {
 
   // 3. Purge data if requested
   if (flags.has('--purge')) {
-    const memDir = join(homedir(), '.claude-mem');
-    if (existsSync(memDir)) {
-      rmSync(memDir, { recursive: true, force: true });
-      ok('Data purged (~/.claude-mem/)');
+    if (existsSync(DATA_DIR)) {
+      rmSync(DATA_DIR, { recursive: true, force: true });
+      ok('Data purged (~/claude-mem-lite/)');
     }
   } else {
-    log('Data preserved in ~/.claude-mem/ (use --purge to remove)');
+    log('Data preserved in ~/claude-mem-lite/ (use --purge to remove)');
   }
 
   console.log('\n  Done!\n');
@@ -213,7 +260,7 @@ async function status() {
   }
 
   // Old system
-  const vectorDb = join(homedir(), '.claude-mem', 'vector-db');
+  const vectorDb = join(OLD_DATA_DIR, 'vector-db');
   if (existsSync(vectorDb)) {
     warn('Old vector-db still exists (can be removed)');
   }
@@ -237,15 +284,15 @@ async function doctor() {
   }
 
   // Dependencies
-  const bsPath = join(PROJECT_DIR, 'node_modules', 'better-sqlite3');
+  const bsPath = join(INSTALL_DIR, 'node_modules', 'better-sqlite3');
   if (existsSync(bsPath)) {
     ok('better-sqlite3: installed');
   } else {
-    fail('better-sqlite3: not installed (run: npm install)');
+    fail('better-sqlite3: not installed (run install again)');
     issues++;
   }
 
-  const mcpPath = join(PROJECT_DIR, 'node_modules', '@modelcontextprotocol');
+  const mcpPath = join(INSTALL_DIR, 'node_modules', '@modelcontextprotocol');
   if (existsSync(mcpPath)) {
     ok('@modelcontextprotocol/sdk: installed');
   } else {
@@ -255,7 +302,7 @@ async function doctor() {
 
   // Server file
   if (existsSync(SERVER_PATH)) {
-    ok('server.mjs: exists');
+    ok(`server.mjs: ${SERVER_PATH}`);
   } else {
     fail('server.mjs: missing');
     issues++;
@@ -263,7 +310,7 @@ async function doctor() {
 
   // Hook file
   if (existsSync(HOOK_PATH)) {
-    ok('hook.mjs: exists');
+    ok(`hook.mjs: ${HOOK_PATH}`);
   } else {
     fail('hook.mjs: missing');
     issues++;
@@ -334,14 +381,21 @@ switch (cmd) {
     await doctor();
     break;
   default:
-    console.log(`
+    if (IS_NPX) {
+      // npx claude-mem-lite (no args) → auto install
+      await install();
+    } else {
+      console.log(`
 claude-mem-lite — Lightweight memory system for Claude Code
 
 Usage:
-  node install.mjs install          Install and configure
-  node install.mjs uninstall        Remove (keep data)
+  node install.mjs install            Install and configure
+  node install.mjs uninstall          Remove (keep data)
   node install.mjs uninstall --purge  Remove and delete all data
-  node install.mjs status           Show current status
-  node install.mjs doctor           Diagnose issues
+  node install.mjs status             Show current status
+  node install.mjs doctor             Diagnose issues
+
+  npx claude-mem-lite                 Install via npx (one-liner)
 `);
+    }
 }

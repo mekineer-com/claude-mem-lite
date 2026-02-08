@@ -12,7 +12,7 @@ import { z } from 'zod';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-const DB_DIR = join(homedir(), '.claude-mem');
+const DB_DIR = join(homedir(), 'claude-mem-lite');
 const DB_PATH = join(DB_DIR, 'claude-mem.db');
 
 if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
