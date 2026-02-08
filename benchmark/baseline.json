@@ -1,18 +1,21 @@
 {
-  "timestamp": "2026-02-08T16:12:20.432Z",
-  "queryCount": 25,
+  "timestamp": "2026-02-08T17:04:54.386Z",
+  "queryCount": 30,
   "metrics": {
-    "recall_at_10": 0.8929,
-    "ndcg_at_10": 1,
-    "mrr_at_10": 1,
-    "avg_tokens_injected": 484,
-    "p95_search_latency_ms": 0.1411
+    "recall_at_10": 0.8074,
+    "precision_at_10": 0.9333,
+    "ndcg_at_10": 0.9066,
+    "mrr_at_10": 0.9333,
+    "avg_tokens_injected": 427,
+    "p95_search_latency_ms": 0.1171
   },
   "perQuery": [
     {
       "id": "q2",
       "query": "Kafka",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -32,7 +35,9 @@
     {
       "id": "q3",
       "query": "Docker",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -50,7 +55,9 @@
     {
       "id": "q4",
       "query": "React",
+      "category": "standard",
       "recall_at_10": 0.5556,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -90,7 +97,9 @@
     {
       "id": "q5",
       "query": "Spark",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -118,7 +127,9 @@
     {
       "id": "q6",
       "query": "cache",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -140,7 +151,9 @@
     {
       "id": "q7",
       "query": "migration",
+      "category": "standard",
       "recall_at_10": 0.5,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -182,7 +195,9 @@
     {
       "id": "q8",
       "query": "validation",
+      "category": "standard",
       "recall_at_10": 0.6667,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -219,7 +234,9 @@
     {
       "id": "q9",
       "query": "performance",
+      "category": "standard",
       "recall_at_10": 0.5882,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -258,7 +275,9 @@
     {
       "id": "q10",
       "query": "memory",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -284,7 +303,9 @@
     {
       "id": "q11",
       "query": "notification",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -306,7 +327,9 @@
     {
       "id": "q12",
       "query": "deployment",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -328,7 +351,9 @@
     {
       "id": "q14",
       "query": "testing",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -358,7 +383,9 @@
     {
       "id": "q15",
       "query": "WebSocket",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -376,7 +403,9 @@
     {
       "id": "q16",
       "query": "Terraform",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -402,7 +431,9 @@
     {
       "id": "q18",
       "query": "API",
+      "category": "standard",
       "recall_at_10": 0.5556,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -442,7 +473,9 @@
     {
       "id": "q19",
       "query": "database",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -466,7 +499,9 @@
     {
       "id": "q20",
       "query": "security",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -488,7 +523,9 @@
     {
       "id": "q22",
       "query": "pipeline",
+      "category": "standard",
       "recall_at_10": 0.8333,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -522,7 +559,9 @@
     {
       "id": "q23",
       "query": "image",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -548,7 +587,9 @@
     {
       "id": "q24",
       "query": "navigation",
+      "category": "standard",
       "recall_at_10": 0.7143,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -584,7 +625,9 @@
     {
       "id": "q25",
       "query": "Kubernetes",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -612,7 +655,9 @@
     {
       "id": "q26",
       "query": "queue",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -642,7 +687,9 @@
     {
       "id": "q28",
       "query": "component",
+      "category": "standard",
       "recall_at_10": 0.9091,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -675,7 +722,9 @@
     {
       "id": "q29",
       "query": "Flink",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -695,7 +744,9 @@
     {
       "id": "q30",
       "query": "offline",
+      "category": "standard",
       "recall_at_10": 1,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
@@ -711,6 +762,146 @@
         121
       ],
       "tokens": 270
+    },
+    {
+      "id": "q31",
+      "query": "K8s",
+      "category": "hard_negative_abbreviation",
+      "recall_at_10": 0,
+      "precision_at_10": 0,
+      "ndcg_at_10": 0,
+      "mrr": 0,
+      "result_ids": [
+        36
+      ],
+      "relevant_ids": [
+        49,
+        67,
+        95,
+        161,
+        166,
+        171,
+        188,
+        191
+      ],
+      "tokens": 62
+    },
+    {
+      "id": "q32",
+      "query": "React hooks",
+      "category": "hard_negative_precision",
+      "recall_at_10": 0.4,
+      "precision_at_10": 1,
+      "ndcg_at_10": 0.5531,
+      "mrr": 1,
+      "result_ids": [
+        66,
+        186
+      ],
+      "relevant_ids": [
+        2,
+        11,
+        47,
+        66,
+        186
+      ],
+      "tokens": 125
+    },
+    {
+      "id": "q33",
+      "query": "error handling",
+      "category": "hard_negative_precision",
+      "recall_at_10": 1,
+      "precision_at_10": 1,
+      "ndcg_at_10": 1,
+      "mrr": 1,
+      "result_ids": [
+        42,
+        93,
+        87,
+        79,
+        150
+      ],
+      "relevant_ids": [
+        42,
+        79,
+        87,
+        93,
+        150
+      ],
+      "tokens": 340
+    },
+    {
+      "id": "q34",
+      "query": "auth",
+      "category": "hard_negative_cross_project",
+      "recall_at_10": 0.5,
+      "precision_at_10": 1,
+      "ndcg_at_10": 0.6448,
+      "mrr": 1,
+      "result_ids": [
+        60,
+        77,
+        169
+      ],
+      "relevant_ids": [
+        17,
+        60,
+        77,
+        81,
+        108,
+        169
+      ],
+      "tokens": 205
+    },
+    {
+      "id": "q35",
+      "query": "DB",
+      "category": "hard_negative_abbreviation",
+      "recall_at_10": 0,
+      "precision_at_10": 0,
+      "ndcg_at_10": 0,
+      "mrr": 0,
+      "result_ids": [],
+      "relevant_ids": [
+        72,
+        91,
+        120,
+        133,
+        169,
+        197
+      ],
+      "tokens": 0
     }
-  ]
+  ],
+  "byCategory": {
+    "standard": {
+      "count": 25,
+      "recall_at_10": 0.8929,
+      "precision_at_10": 1,
+      "ndcg_at_10": 1,
+      "mrr_at_10": 1
+    },
+    "hard_negative_abbreviation": {
+      "count": 2,
+      "recall_at_10": 0,
+      "precision_at_10": 0,
+      "ndcg_at_10": 0,
+      "mrr_at_10": 0
+    },
+    "hard_negative_precision": {
+      "count": 2,
+      "recall_at_10": 0.7,
+      "precision_at_10": 1,
+      "ndcg_at_10": 0.7766,
+      "mrr_at_10": 1
+    },
+    "hard_negative_cross_project": {
+      "count": 1,
+      "recall_at_10": 0.5,
+      "precision_at_10": 1,
+      "ndcg_at_10": 0.6448,
+      "mrr_at_10": 1
+    }
+  }
 }

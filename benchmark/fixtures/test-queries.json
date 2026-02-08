@@ -448,6 +448,86 @@
         113,
         121
       ]
+    },
+    {
+      "id": "q31",
+      "query": "K8s",
+      "desc": "Hard negative: abbreviation for Kubernetes — most K8s docs write 'Kubernetes' not 'K8s'",
+      "category": "hard_negative_abbreviation",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        49,
+        67,
+        95,
+        161,
+        166,
+        171,
+        188,
+        191
+      ]
+    },
+    {
+      "id": "q32",
+      "query": "React hooks",
+      "desc": "Hard negative: multi-word precision — should match only React+hooks docs, not all React docs",
+      "category": "hard_negative_precision",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        2,
+        11,
+        47,
+        66,
+        186
+      ]
+    },
+    {
+      "id": "q33",
+      "query": "error handling",
+      "desc": "Hard negative: semantic precision — should match error handling patterns, not docs that merely mention errors",
+      "category": "hard_negative_precision",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        42,
+        79,
+        87,
+        93,
+        150
+      ]
+    },
+    {
+      "id": "q34",
+      "query": "auth",
+      "desc": "Hard negative: cross-project filter — auth docs in api--backend only, should not return web/mobile auth",
+      "category": "hard_negative_cross_project",
+      "project": "api--backend",
+      "type": null,
+      "relevant_ids": [
+        17,
+        60,
+        77,
+        81,
+        108,
+        169
+      ]
+    },
+    {
+      "id": "q35",
+      "query": "DB",
+      "desc": "Hard negative: abbreviation for database — no docs contain literal 'DB' token",
+      "category": "hard_negative_abbreviation",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        72,
+        91,
+        120,
+        133,
+        169,
+        197
+      ]
     }
   ]
 }

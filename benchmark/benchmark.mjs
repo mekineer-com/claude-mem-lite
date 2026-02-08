@@ -229,6 +229,13 @@ export function computeRecallAtK(results, relevantIds, k = 10) {
   return hits / relevantIds.length;
 }
 
+export function computePrecisionAtK(results, relevantIds, k = 10) {
+  const topK = results.slice(0, k);
+  if (topK.length === 0) return 0;
+  const hits = topK.filter(r => relevantIds.includes(r.id)).length;
+  return hits / topK.length;
+}
+
 export function computeNDCG(results, relevantIds, k = 10) {
   if (!relevantIds || relevantIds.length === 0) return 0;
   const topK = results.slice(0, k);
@@ -284,18 +291,24 @@ export function runBenchmark(db, queries) {
     queryCount: queries.length,
     metrics: {
       recall_at_10: 0,
+      precision_at_10: 0,
       ndcg_at_10: 0,
       mrr_at_10: 0,
       avg_tokens_injected: 0,
       p95_search_latency_ms: 0,
     },
     perQuery: [],
+    byCategory: {},
   };
 
   let totalRecall = 0;
+  let totalPrecision = 0;
   let totalNDCG = 0;
   let totalMRR = 0;
   let totalTokens = 0;
+
+  // Category accumulators
+  const catAccum = {};
 
   for (const q of queries) {
     const searchResults = searchObservations(db, q.query, {
@@ -305,19 +318,32 @@ export function runBenchmark(db, queries) {
     });
 
     const recall = computeRecallAtK(searchResults, q.relevant_ids, 10);
+    const precision = computePrecisionAtK(searchResults, q.relevant_ids, 10);
     const ndcg = computeNDCG(searchResults, q.relevant_ids, 10);
     const mrr = computeMRR(searchResults, q.relevant_ids);
     const tokens = searchResults.reduce((sum, r) => sum + r.tokens, 0);
 
     totalRecall += recall;
+    totalPrecision += precision;
     totalNDCG += ndcg;
     totalMRR += mrr;
     totalTokens += tokens;
 
+    // Track per-category
+    const cat = q.category || 'standard';
+    if (!catAccum[cat]) catAccum[cat] = { recall: 0, precision: 0, ndcg: 0, mrr: 0, count: 0 };
+    catAccum[cat].recall += recall;
+    catAccum[cat].precision += precision;
+    catAccum[cat].ndcg += ndcg;
+    catAccum[cat].mrr += mrr;
+    catAccum[cat].count++;
+
     results.perQuery.push({
       id: q.id,
       query: q.query,
+      category: cat,
       recall_at_10: round(recall),
+      precision_at_10: round(precision),
       ndcg_at_10: round(ndcg),
       mrr: round(mrr),
       result_ids: searchResults.map(r => r.id),
@@ -328,10 +354,22 @@ export function runBenchmark(db, queries) {
 
   const n = queries.length;
   results.metrics.recall_at_10 = round(totalRecall / n);
+  results.metrics.precision_at_10 = round(totalPrecision / n);
   results.metrics.ndcg_at_10 = round(totalNDCG / n);
   results.metrics.mrr_at_10 = round(totalMRR / n);
   results.metrics.avg_tokens_injected = Math.round(totalTokens / n);
   results.metrics.p95_search_latency_ms = round(measureLatencyP95(db, queries));
+
+  // Per-category averages
+  for (const [cat, acc] of Object.entries(catAccum)) {
+    results.byCategory[cat] = {
+      count: acc.count,
+      recall_at_10: round(acc.recall / acc.count),
+      precision_at_10: round(acc.precision / acc.count),
+      ndcg_at_10: round(acc.ndcg / acc.count),
+      mrr_at_10: round(acc.mrr / acc.count),
+    };
+  }
 
   return results;
 }
@@ -365,10 +403,19 @@ function main() {
   // Summary to stderr
   console.error('\n─── Benchmark Results ───');
   console.error(`  Recall@10:       ${results.metrics.recall_at_10}`);
+  console.error(`  Precision@10:    ${results.metrics.precision_at_10}`);
   console.error(`  nDCG@10:         ${results.metrics.ndcg_at_10}`);
   console.error(`  MRR@10:          ${results.metrics.mrr_at_10}`);
   console.error(`  Avg tokens:      ${results.metrics.avg_tokens_injected}`);
   console.error(`  P95 latency:     ${results.metrics.p95_search_latency_ms}ms`);
+
+  // Per-category breakdown
+  if (Object.keys(results.byCategory).length > 1) {
+    console.error('\n─── By Category ───');
+    for (const [cat, m] of Object.entries(results.byCategory)) {
+      console.error(`  ${cat} (${m.count}q): R@10=${m.recall_at_10} P@10=${m.precision_at_10} nDCG=${m.ndcg_at_10} MRR=${m.mrr_at_10}`);
+    }
+  }
 
   // Queries with zero recall
   const zeroRecall = results.perQuery.filter(q => q.recall_at_10 === 0);
