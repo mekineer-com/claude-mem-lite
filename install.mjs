@@ -345,8 +345,10 @@ async function doctor() {
   // Check for stale processes
   try {
     const procs = execSync('pgrep -af "chroma|claude-mem.*worker" 2>/dev/null', { encoding: 'utf8' }).trim();
-    if (procs) {
-      warn('Old processes running:\n    ' + procs.split('\n').join('\n    '));
+    // Filter out the pgrep process itself (matches its own pattern)
+    const real = procs.split('\n').filter(l => !l.includes('pgrep'));
+    if (real.length > 0) {
+      warn('Old processes running:\n    ' + real.join('\n    '));
       issues++;
     }
   } catch {
