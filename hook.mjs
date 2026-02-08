@@ -220,6 +220,7 @@ function flushEpisode(episode) {
 // ─── PostToolUse Handler ────────────────────────────────────────────────────
 
 // Tier 1 D: Skip low-value tools entirely
+// SYNC: Skip list must match scripts/post-tool-use.sh
 const SKIP_TOOLS = new Set([
   'Read', 'Glob',  // noise — just opening/finding files
   'TodoRead', 'TodoWrite', 'TaskList', 'TaskGet', 'TaskCreate', 'TaskUpdate',
@@ -385,7 +386,7 @@ function detectBashSignificance(input, response) {
 
 // ─── Background: LLM Episode Extraction (Tier 2 F) ─────────────────────────
 
-function handleLLMEpisode() {
+async function handleLLMEpisode() {
   const tmpFile = process.argv[3];
   if (!tmpFile) return;
 
@@ -396,6 +397,14 @@ function handleLLMEpisode() {
   } catch { return; }
 
   if (!episode.entries || episode.entries.length === 0) return;
+
+  // Rate-limit background LLM calls to avoid competing with active sessions
+  const sessionActive = existsSync(sessionFile());
+  const delayMs = sessionActive
+    ? 2000 + Math.random() * 3000   // 2-5s when user session is active
+    : 500 + Math.random() * 1000;   // 0.5-1.5s after session ends
+  if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] llm-episode delay: ${Math.round(delayMs)}ms (session ${sessionActive ? 'active' : 'ended'})`);
+  await sleep(delayMs);
 
   const fileList = episode.files.map(f => basename(f)).join(', ') || '(multiple)';
 
@@ -636,19 +645,21 @@ function updateClaudeMd(contextBlock) {
 
   const startTag = '<claude-mem-context>';
   const endTag = '</claude-mem-context>';
+  const hintComment = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
   const newSection = `${startTag}\n${contextBlock}\n${endTag}`;
 
   const startIdx = content.indexOf(startTag);
   const endIdx = content.indexOf(endTag);
 
   if (startIdx !== -1 && endIdx !== -1) {
-    // Replace existing section in-place — preserves surrounding content
+    // Replace existing section in-place — preserves surrounding content (including hint if present)
     content = content.slice(0, startIdx) + newSection + content.slice(endIdx + endTag.length);
   } else if (content.length > 0) {
     // Append to end — never disturb existing CLAUDE.md structure
-    content = content.trimEnd() + '\n\n' + newSection + '\n';
+    const hint = content.includes(hintComment) ? '' : hintComment + '\n';
+    content = content.trimEnd() + '\n\n' + hint + newSection + '\n';
   } else {
-    content = newSection + '\n';
+    content = hintComment + '\n' + newSection + '\n';
   }
 
   try { writeFileSync(claudeMdPath, content); } catch (e) {
@@ -791,7 +802,7 @@ try {
     case 'post-tool-use':    await handlePostToolUse(); break;
     case 'session-start':    handleSessionStart(); break;
     case 'stop':             handleStop(); break;
-    case 'llm-episode':      handleLLMEpisode(); break;
+    case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
   }
 } catch (err) {

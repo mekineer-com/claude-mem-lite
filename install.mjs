@@ -39,10 +39,14 @@ async function install() {
   if (IS_NPX) {
     log('npx detected — installing to ~/claude-mem-lite/...');
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    for (const f of ['server.mjs', 'hook.mjs', 'package.json', 'skill.md']) {
+    const scriptsDir = join(DATA_DIR, 'scripts');
+    if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
+    for (const f of ['server.mjs', 'hook.mjs', 'package.json', 'skill.md', 'scripts/post-tool-use.sh']) {
       const src = join(PROJECT_DIR, f);
       if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
     }
+    // Ensure bash script is executable
+    try { execSync(`chmod +x "${join(scriptsDir, 'post-tool-use.sh')}"`, { stdio: 'pipe' }); } catch {}
     ok('Source files copied to ~/claude-mem-lite/');
   }
 
@@ -77,11 +81,12 @@ async function install() {
   const settings = readSettings();
   settings.hooks = settings.hooks || {};
 
+  const PREFILTER_PATH = join(INSTALL_DIR, 'scripts', 'post-tool-use.sh');
   settings.hooks.PostToolUse = [{
     matcher: '*',
     hooks: [{
       type: 'command',
-      command: `node ${HOOK_PATH} post-tool-use`,
+      command: `bash ${PREFILTER_PATH}`,
       timeout: 5
     }]
   }];
