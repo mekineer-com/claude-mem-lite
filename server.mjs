@@ -9,7 +9,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, estimateTokens } from './utils.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -97,6 +97,15 @@ try {
 } catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
 try {
   db.exec(`ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'`);
+} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
+try {
+  db.exec(`ALTER TABLE observations ADD COLUMN minhash_sig TEXT`);
+} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
+try {
+  db.exec(`ALTER TABLE observations ADD COLUMN access_count INTEGER DEFAULT 0`);
+} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
+try {
+  db.exec(`ALTER TABLE observations ADD COLUMN compressed_into INTEGER DEFAULT NULL`);
 } catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
 
 // Dedup migration: ensure memory_session_id is unique, then enable FK unconditionally
@@ -207,6 +216,69 @@ function safeHandler(fn) {
   };
 }
 
+// ─── Search Re-ranking Helpers ────────────────────────────────────────────
+
+function reRankWithContext(db, results, project) {
+  if (!results || results.length === 0) return;
+  // Get recently active files (last 2 hours, same project)
+  const twoHoursAgo = Date.now() - 2 * 3600000;
+  const recentObs = db.prepare(`
+    SELECT files_modified FROM observations
+    WHERE project = ? AND created_at_epoch > ?
+    ORDER BY created_at_epoch DESC LIMIT 10
+  `).all(project, twoHoursAgo);
+
+  const activeFiles = new Set();
+  for (const r of recentObs) {
+    try {
+      const files = JSON.parse(r.files_modified || '[]');
+      for (const f of files) activeFiles.add(f);
+    } catch {}
+  }
+  if (activeFiles.size === 0) return;
+
+  for (const result of results) {
+    if (result.source !== 'obs' || !result.files_modified) continue;
+    let resultFiles;
+    try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch { continue; }
+    if (resultFiles.length === 0) continue;
+    const commonFiles = resultFiles.filter(f => activeFiles.has(f));
+    const fileOverlap = commonFiles.length / resultFiles.length;
+    // BM25 scores are negative — multiply by >1 makes more negative = better rank
+    if (result.score != null) {
+      result.score *= (1.0 + 0.3 * fileOverlap);
+    }
+  }
+  // Re-sort by score (more negative = better)
+  results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+}
+
+function markSuperseded(results) {
+  if (!results || results.length === 0) return;
+  // Build map: file → [result objects], only for obs with files
+  const fileMap = new Map();
+  for (const r of results) {
+    if (r.source !== 'obs' || !r.files_modified) continue;
+    let files;
+    try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
+    for (const f of files) {
+      if (!fileMap.has(f)) fileMap.set(f, []);
+      fileMap.get(f).push(r);
+    }
+  }
+  // For each file with 2+ observations: mark older lower-importance as superseded
+  for (const [, obsForFile] of fileMap) {
+    if (obsForFile.length < 2) continue;
+    obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const newest = obsForFile[0];
+    for (let i = 1; i < obsForFile.length; i++) {
+      if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
+        obsForFile[i].superseded = true;
+      }
+    }
+  }
+}
+
 // ─── Tool: mem_search ───────────────────────────────────────────────────────
 
 server.tool(
@@ -250,13 +322,16 @@ server.tool(
         const projectBoost = args.project ? null : currentProject;
         const rows = db.prepare(`
           SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+                 o.files_modified,
                  bm25(observations_fts, 10, 5, 5, 3, 3, 2)
                    * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
                    * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-                   * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+                   * (0.5 + 0.5 * COALESCE(o.importance, 1))
+                   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
           FROM observations_fts
           JOIN observations o ON observations_fts.rowid = o.id
           WHERE observations_fts MATCH ?
+            AND COALESCE(o.compressed_into, 0) = 0
             AND (? IS NULL OR o.project = ?)
             AND (? IS NULL OR o.type = ?)
             AND (? IS NULL OR o.created_at_epoch >= ?)
@@ -276,21 +351,21 @@ server.tool(
           perSourceLimit, perSourceOffset
         );
         for (const r of rows) {
-          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score });
+          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance });
         }
       } else {
         // Structured filter (no FTS)
         const params = [];
-        const wheres = [];
+        const wheres = ['COALESCE(compressed_into, 0) = 0'];
         if (args.project) { wheres.push('project = ?'); params.push(args.project); }
         if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
         if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
         if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
-        const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+        const where = `WHERE ${wheres.join(' AND ')}`;
         params.push(perSourceLimit, perSourceOffset);
         const rows = db.prepare(`
-          SELECT id, type, title, subtitle, project, created_at, created_at_epoch
+          SELECT id, type, title, subtitle, project, created_at, created_at_epoch, files_modified, importance
           FROM observations ${where}
           ORDER BY created_at_epoch DESC
           LIMIT ? OFFSET ?
@@ -404,6 +479,13 @@ server.tool(
         results.sort((a, b) => (b.dateEpoch ?? 0) - (a.dateEpoch ?? 0));
       }
     }
+
+    // Re-rank observations by file context overlap and mark superseded
+    if (ftsQuery && results.some(r => r.source === 'obs')) {
+      reRankWithContext(db, results.filter(r => r.source === 'obs'), currentProject);
+      markSuperseded(results.filter(r => r.source === 'obs'));
+    }
+
     const totalBeforePagination = results.length;
     const paginatedResults = isCrossSource ? results.slice(offset, offset + limit) : results;
 
@@ -420,7 +502,8 @@ server.tool(
 
     for (const r of paginatedResults) {
       if (r.source === 'obs') {
-        lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}`);
+        const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
+        lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}`);
       } else if (r.source === 'session') {
         lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}`);
       } else if (r.source === 'prompt') {
@@ -462,6 +545,7 @@ server.tool(
           JOIN observations o ON observations_fts.rowid = o.id
           WHERE observations_fts MATCH ?
             AND (? IS NULL OR o.project = ?)
+            AND COALESCE(o.compressed_into, 0) = 0
           ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
             * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
           LIMIT 1
@@ -472,7 +556,8 @@ server.tool(
 
     // No anchor: return most recent
     if (!anchorId) {
-      const projectFilter = args.project ? 'WHERE project = ?' : '';
+      const compressedFilter = 'COALESCE(compressed_into, 0) = 0';
+      const projectFilter = args.project ? `WHERE ${compressedFilter} AND project = ?` : `WHERE ${compressedFilter}`;
       const params = args.project ? [args.project, before + after + 1] : [before + after + 1];
       const rows = db.prepare(`
         SELECT id, type, title, subtitle, project, created_at
@@ -505,7 +590,7 @@ server.tool(
     const beforeRows = db.prepare(`
       SELECT id, type, title, subtitle, project, created_at
       FROM observations
-      WHERE created_at_epoch < ? ${projectFilter}
+      WHERE created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
       ORDER BY created_at_epoch DESC
       LIMIT ?
     `).all(anchorRow.created_at_epoch, ...baseParams, before);
@@ -514,7 +599,7 @@ server.tool(
     const afterRows = db.prepare(`
       SELECT id, type, title, subtitle, project, created_at
       FROM observations
-      WHERE created_at_epoch > ? ${projectFilter}
+      WHERE created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
       ORDER BY created_at_epoch ASC
       LIMIT ?
     `).all(anchorRow.created_at_epoch, ...baseParams, after);
@@ -557,8 +642,13 @@ server.tool(
       allFields = ['id', 'prompt_text', 'content_session_id', 'prompt_number', 'created_at'];
       prefix = 'P#';
     } else {
+      // Increment access_count for retrieved observations
+      const updateStmt = db.prepare(
+        'UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id = ?'
+      );
+      db.transaction(() => { for (const id of args.ids) updateStmt.run(id); })();
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
-      allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids'];
+      allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count'];
       prefix = '#';
     }
 
@@ -730,6 +820,28 @@ server.tool(
       LIMIT 7
     `).all(Date.now() - 7 * 86400000, ...baseParams);
 
+    // Health metrics
+    const tokenEst = db.prepare(`
+      SELECT SUM(LENGTH(COALESCE(title,'')) + LENGTH(COALESCE(narrative,'')) + LENGTH(COALESCE(text,''))) / 4 as t
+      FROM observations WHERE 1=1 ${projectFilter}
+    `).get(...baseParams);
+
+    const avgImp = db.prepare(`
+      SELECT AVG(COALESCE(importance,1)) as v FROM observations WHERE 1=1 ${projectFilter}
+    `).get(...baseParams);
+
+    const thirtyDaysAgo = Date.now() - 30 * 86400000;
+    const lowVal = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? ${projectFilter}
+    `).get(thirtyDaysAgo, ...baseParams);
+
+    const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
+    const compressedCount = db.prepare(`
+      SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}
+    `).get(...baseParams);
+
     const lines = [
       `Memory Statistics${args.project ? ` (project: ${args.project})` : ''}:`,
       '',
@@ -744,9 +856,136 @@ server.tool(
       '',
       'Daily activity (last 7d):',
       ...daily.map(d => `  ${d.day}: ${d.c} observations`),
+      '',
+      'Data Health:',
+      `  Est. tokens: ${tokenEst.t ?? 0}`,
+      `  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`,
+      `  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`,
+      `  Compressed: ${compressedCount.c}`,
+      ...(noiseRatio > 0.6 ? ['  ⚠️ High noise ratio — consider running mem_compress'] : []),
     ];
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
+  })
+);
+
+// ─── Tool: mem_compress ──────────────────────────────────────────────────────
+
+server.tool(
+  'mem_compress',
+  'Compress old low-value observations into weekly summaries. Use preview=true to see candidates first.',
+  {
+    preview: z.boolean().optional().describe('true=count candidates, false=execute compression (default: true)'),
+    age_days: z.number().int().min(30).max(365).optional().describe('Min age in days (default: 60)'),
+    project: z.string().optional().describe('Filter by project'),
+  },
+  safeHandler(async (args) => {
+    const preview = args.preview !== false;
+    const ageDays = args.age_days ?? 60;
+    const cutoff = Date.now() - ageDays * 86400000;
+    const projectFilter = args.project ? 'AND project = ?' : '';
+    const baseParams = args.project ? [args.project] : [];
+
+    // Find low-value candidates: importance=1, never accessed, old, not already compressed
+    const candidates = db.prepare(`
+      SELECT id, project, type, title, created_at, created_at_epoch
+      FROM observations
+      WHERE COALESCE(importance, 1) = 1
+        AND COALESCE(access_count, 0) = 0
+        AND created_at_epoch < ?
+        AND compressed_into IS NULL
+        ${projectFilter}
+      ORDER BY project, created_at_epoch
+    `).all(cutoff, ...baseParams);
+
+    if (candidates.length === 0) {
+      return { content: [{ type: 'text', text: 'No candidates for compression.' }] };
+    }
+
+    // Group by project + ISO week
+    const groups = new Map();
+    for (const c of candidates) {
+      const d = new Date(c.created_at_epoch);
+      const year = d.getFullYear();
+      // ISO week calculation
+      const jan1 = new Date(year, 0, 1);
+      const weekNum = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+      const key = `${c.project}::${year}-W${String(weekNum).padStart(2, '0')}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+
+    // Filter groups with < 3 observations (not worth compressing)
+    const compressableGroups = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
+
+    if (preview) {
+      const totalCandidates = compressableGroups.reduce((s, [, obs]) => s + obs.length, 0);
+      const lines = [
+        `Compression preview:`,
+        `  Total candidates: ${candidates.length}`,
+        `  Compressable groups (≥3 obs): ${compressableGroups.length}`,
+        `  Observations to compress: ${totalCandidates}`,
+        '',
+        'Groups:',
+        ...compressableGroups.slice(0, 20).map(([key, obs]) => {
+          const [proj, week] = key.split('::');
+          const types = {};
+          for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
+          const typeStr = Object.entries(types).map(([t, c]) => `${c} ${t}`).join(', ');
+          return `  ${proj} ${week}: ${obs.length} obs (${typeStr})`;
+        }),
+        '',
+        `Call mem_compress(preview=false${args.age_days ? `, age_days=${args.age_days}` : ''}${args.project ? `, project="${args.project}"` : ''}) to execute.`,
+      ];
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    // Execute compression
+    let totalCompressed = 0;
+    const insertSummary = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, ?, 'change', ?, '', ?, '', '', '[]', '[]', 1, ?, ?)
+    `);
+    const markCompressed = db.prepare(
+      'UPDATE observations SET compressed_into = ? WHERE id = ?'
+    );
+
+    const compress = db.transaction(() => {
+      for (const [key, obs] of compressableGroups) {
+        const [proj] = key.split('::');
+        const types = {};
+        for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
+        const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
+        const title = `Weekly summary: ${obs.length} ${dominantType} observations`;
+        const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
+        const sessionId = obs[0].project ? `compress-${obs[0].project}` : 'compress-manual';
+
+        // Ensure session exists
+        const existing = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
+        if (!existing) {
+          const now = new Date();
+          db.prepare(`
+            INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+            VALUES (?, ?, ?, ?, ?, 'active')
+          `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
+        }
+
+        const now = new Date();
+        const summaryResult = insertSummary.run(
+          sessionId, proj, narrative, title, narrative,
+          now.toISOString(), now.getTime()
+        );
+        const summaryId = Number(summaryResult.lastInsertRowid);
+
+        for (const o of obs) {
+          markCompressed.run(summaryId, o.id);
+        }
+        totalCompressed += obs.length;
+      }
+    });
+    compress();
+
+    return { content: [{ type: 'text', text: `Compressed ${totalCompressed} observations into ${compressableGroups.length} weekly summaries.` }] };
   })
 );
 
