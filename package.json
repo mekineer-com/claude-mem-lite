@@ -18,6 +18,7 @@
     "commands/mem.md",
     "hooks/hooks.json",
     "scripts/setup.sh",
+    "scripts/post-tool-use.sh",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
     ".mcp.json",
