@@ -11,7 +11,9 @@
     "url": "https://github.com/sdsrss/claude-mem-lite.git"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "benchmark": "node benchmark/benchmark.mjs",
+    "benchmark:gate": "node benchmark/ci-gate.mjs"
   },
   "files": [
     "server.mjs",

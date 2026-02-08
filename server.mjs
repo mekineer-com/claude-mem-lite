@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, estimateTokens } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
@@ -146,19 +146,21 @@ function markSuperseded(results) {
 
 // ─── Tool: mem_search ───────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_search',
-  'FTS5 full-text search across observations, sessions, and prompts with BM25 ranking. Returns compact index (use mem_get for details).',
   {
-    query: z.string().optional().describe('Search query (FTS5 syntax supported)'),
-    type: z.enum(['observations', 'sessions', 'prompts']).optional().describe('Limit to one table'),
-    obs_type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Filter observation type'),
-    project: z.string().optional().describe('Filter by project name'),
-    date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
-    date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
-    importance: z.number().int().min(1).max(3).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
-    limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
-    offset: z.number().int().min(0).optional().describe('Offset for pagination'),
+    description: 'FTS5 full-text search across observations, sessions, and prompts with BM25 ranking. Returns compact index (use mem_get for details).',
+    inputSchema: {
+      query: z.string().optional().describe('Search query (FTS5 syntax supported)'),
+      type: z.enum(['observations', 'sessions', 'prompts']).optional().describe('Limit to one table'),
+      obs_type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Filter observation type'),
+      project: z.string().optional().describe('Filter by project name'),
+      date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
+      date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
+      importance: z.number().int().min(1).max(3).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
+      offset: z.number().int().min(0).optional().describe('Offset for pagination'),
+    },
   },
   safeHandler(async (args) => {
     const limit = args.limit ?? 20;
@@ -355,6 +357,8 @@ server.tool(
     if (ftsQuery && results.some(r => r.source === 'obs')) {
       reRankWithContext(db, results.filter(r => r.source === 'obs'), currentProject);
       markSuperseded(results.filter(r => r.source === 'obs'));
+      // Re-sort main array after score adjustments from re-ranking
+      results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 
     const totalBeforePagination = results.length;
@@ -390,15 +394,17 @@ server.tool(
 
 // ─── Tool: mem_timeline ─────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_timeline',
-  'Browse observations as a timeline around an anchor point. Use query to auto-find anchor, or specify anchor ID directly.',
   {
-    anchor: z.number().int().optional().describe('Observation ID as center point'),
-    query: z.string().optional().describe('FTS5 query to auto-find anchor'),
-    before: z.number().int().min(0).max(50).optional().describe('Items before anchor (default 5)'),
-    after: z.number().int().min(0).max(50).optional().describe('Items after anchor (default 5)'),
-    project: z.string().optional().describe('Filter by project'),
+    description: 'Browse observations as a timeline around an anchor point. Use query to auto-find anchor, or specify anchor ID directly.',
+    inputSchema: {
+      anchor: z.number().int().optional().describe('Observation ID as center point'),
+      query: z.string().optional().describe('FTS5 query to auto-find anchor'),
+      before: z.number().int().min(0).max(50).optional().describe('Items before anchor (default 5)'),
+      after: z.number().int().min(0).max(50).optional().describe('Items after anchor (default 5)'),
+      project: z.string().optional().describe('Filter by project'),
+    },
   },
   safeHandler(async (args) => {
     const before = args.before ?? 5;
@@ -491,13 +497,15 @@ server.tool(
 
 // ─── Tool: mem_get ──────────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_get',
-  'Get full details for one or more records by ID. Use after mem_search to drill into specific records.',
   {
-    ids: z.array(z.number().int()).min(1).max(20).describe('Observation IDs to retrieve'),
-    source: z.enum(['obs', 'session', 'prompt']).optional().describe('Record type: obs (default), session (S# from search), prompt (P# from search)'),
-    fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),
+    description: 'Get full details for one or more records by ID. Use after mem_search to drill into specific records.',
+    inputSchema: {
+      ids: z.array(z.number().int()).min(1).max(20).describe('Observation IDs to retrieve'),
+      source: z.enum(['obs', 'session', 'prompt']).optional().describe('Record type: obs (default), session (S# from search), prompt (P# from search)'),
+      fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),
+    },
   },
   safeHandler(async (args) => {
     const source = args.source || 'obs';
@@ -546,12 +554,14 @@ server.tool(
 
 // ─── Tool: mem_delete ────────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_delete',
-  'Delete observations by ID. Use confirm=false to preview, confirm=true to execute. FTS5 cleanup is automatic via triggers.',
   {
-    ids: z.array(z.number().int()).min(1).max(50).describe('Observation IDs to delete'),
-    confirm: z.boolean().describe('false=preview what will be deleted, true=execute deletion'),
+    description: 'Delete observations by ID. Use confirm=false to preview, confirm=true to execute. FTS5 cleanup is automatic via triggers.',
+    inputSchema: {
+      ids: z.array(z.number().int()).min(1).max(50).describe('Observation IDs to delete'),
+      confirm: z.boolean().describe('false=preview what will be deleted, true=execute deletion'),
+    },
   },
   safeHandler(async (args) => {
     const placeholders = args.ids.map(() => '?').join(',');
@@ -601,15 +611,17 @@ server.tool(
 
 // ─── Tool: mem_save ─────────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_save',
-  'Manually save a memory/observation. Use for important findings, decisions, or notes worth preserving.',
   {
-    content: z.string().min(1).describe('Memory content to save'),
-    title: z.string().optional().describe('Short title'),
-    type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Observation type (default: discovery)'),
-    project: z.string().optional().describe('Project name (default: inferred from CWD)'),
-    importance: z.number().int().min(1).max(3).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 1)'),
+    description: 'Manually save a memory/observation. Use for important findings, decisions, or notes worth preserving.',
+    inputSchema: {
+      content: z.string().min(1).describe('Memory content to save'),
+      title: z.string().optional().describe('Short title'),
+      type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Observation type (default: discovery)'),
+      project: z.string().optional().describe('Project name (default: inferred from CWD)'),
+      importance: z.number().int().min(1).max(3).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 1)'),
+    },
   },
   safeHandler(async (args) => {
     const now = new Date();
@@ -650,12 +662,14 @@ server.tool(
 
 // ─── Tool: mem_stats ────────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_stats',
-  'Get statistics about stored memories: counts, types, projects, recent activity.',
   {
-    project: z.string().optional().describe('Filter by project'),
-    days: z.number().int().min(1).max(365).optional().describe('Look back N days (default 30)'),
+    description: 'Get statistics about stored memories: counts, types, projects, recent activity.',
+    inputSchema: {
+      project: z.string().optional().describe('Filter by project'),
+      days: z.number().int().min(1).max(365).optional().describe('Look back N days (default 30)'),
+    },
   },
   safeHandler(async (args) => {
     const days = args.days ?? 30;
@@ -747,13 +761,15 @@ server.tool(
 
 // ─── Tool: mem_compress ──────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   'mem_compress',
-  'Compress old low-value observations into weekly summaries. Use preview=true to see candidates first.',
   {
-    preview: z.boolean().optional().describe('true=count candidates, false=execute compression (default: true)'),
-    age_days: z.number().int().min(30).max(365).optional().describe('Min age in days (default: 60)'),
-    project: z.string().optional().describe('Filter by project'),
+    description: 'Compress old low-value observations into weekly summaries. Use preview=true to see candidates first.',
+    inputSchema: {
+      preview: z.boolean().optional().describe('true=count candidates, false=execute compression (default: true)'),
+      age_days: z.number().int().min(30).max(365).optional().describe('Min age in days (default: 60)'),
+      project: z.string().optional().describe('Filter by project'),
+    },
   },
   safeHandler(async (args) => {
     const preview = args.preview !== false;

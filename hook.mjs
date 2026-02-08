@@ -538,18 +538,27 @@ async function handleLLMEpisode() {
   let episode;
   try {
     episode = JSON.parse(readFileSync(tmpFile, 'utf8'));
-    unlinkSync(tmpFile);
-  } catch { return; }
+  } catch {
+    // Can't read flush file — delete it to unblock handleLLMSummary polling
+    try { unlinkSync(tmpFile); } catch {}
+    return;
+  }
 
-  if (!episode.entries || episode.entries.length === 0) return;
+  if (!episode.entries || episode.entries.length === 0) {
+    try { unlinkSync(tmpFile); } catch {}
+    return;
+  }
 
   // Rate-limit background LLM calls to avoid competing with active sessions
-  const sessionActive = existsSync(sessionFile());
-  const delayMs = sessionActive
-    ? 2000 + Math.random() * 3000   // 2-5s when user session is active
-    : 500 + Math.random() * 1000;   // 0.5-1.5s after session ends
-  if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] llm-episode delay: ${Math.round(delayMs)}ms (session ${sessionActive ? 'active' : 'ended'})`);
-  await sleep(delayMs);
+  // Skip delay in test mode for deterministic timing
+  if (!process.env.CLAUDE_MEM_NO_DELAY) {
+    const sessionActive = existsSync(sessionFile());
+    const delayMs = sessionActive
+      ? 2000 + Math.random() * 3000   // 2-5s when user session is active
+      : 500 + Math.random() * 1000;   // 0.5-1.5s after session ends
+    if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] llm-episode delay: ${Math.round(delayMs)}ms (session ${sessionActive ? 'active' : 'ended'})`);
+    await sleep(delayMs);
+  }
 
   const fileList = episode.files.map(f => basename(f)).join(', ') || '(multiple)';
 
@@ -586,36 +595,38 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
   // Compute deterministic importance from rules before LLM call
   const ruleImportance = computeRuleImportance(episode);
 
-  // Acquire LLM semaphore to limit concurrent claude -p calls
-  if (!(await acquireLLMSlot())) {
-    if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] llm-episode: semaphore timeout, proceeding with degraded storage');
-  }
-
-  let raw, parsed;
-  try {
-    raw = callLLM(prompt);
-    parsed = parseJsonFromLLM(raw);
-  } finally {
-    releaseLLMSlot();
-  }
-
   let obs;
   const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
 
-  if (parsed && parsed.title) {
-    obs = {
-      type: validTypes.has(parsed.type) ? parsed.type : 'change',
-      title: truncate(parsed.title, 120),
-      subtitle: fileList,
-      narrative: truncate(parsed.narrative || '', 500),
-      concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
-      facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
-      files: episode.files,
-      filesRead: episode.filesRead || [],
-      importance: Math.max(ruleImportance, clampImportance(parsed.importance)),
-    };
-  } else {
-    // Degraded storage: LLM failed, but never lose data
+  // Acquire LLM semaphore to limit concurrent claude -p calls
+  const gotSlot = await acquireLLMSlot();
+  if (gotSlot) {
+    let raw, parsed;
+    try {
+      raw = callLLM(prompt);
+      parsed = parseJsonFromLLM(raw);
+    } finally {
+      releaseLLMSlot();
+    }
+
+    if (parsed && parsed.title) {
+      obs = {
+        type: validTypes.has(parsed.type) ? parsed.type : 'change',
+        title: truncate(parsed.title, 120),
+        subtitle: fileList,
+        narrative: truncate(parsed.narrative || '', 500),
+        concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
+        facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
+        files: episode.files,
+        filesRead: episode.filesRead || [],
+        importance: Math.max(ruleImportance, clampImportance(parsed.importance)),
+      };
+    }
+  }
+
+  if (!obs) {
+    // Degraded storage: LLM unavailable or failed, but never lose data
+    if (!gotSlot && process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] llm-episode: semaphore timeout, using degraded storage');
     const hasError = episode.entries.some(e => e.isError);
     const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
     const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
@@ -708,6 +719,9 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
       } catch {} finally { db.close(); }
     }
   }
+
+  // Delete flush file AFTER all DB writes — signals completion to handleLLMSummary
+  try { unlinkSync(tmpFile); } catch {}
 }
 
 // ─── Background: LLM Session Summary ────────────────────────────────────────
@@ -735,28 +749,14 @@ async function handleLLMSummary() {
     const sessionId = process.argv[3] || getSessionId();
     const project = process.argv[4] || inferProject();
 
-    let recentObs = db.prepare(`
+    // Flush file polling above guarantees all llm-episode DB writes are complete
+    const recentObs = db.prepare(`
       SELECT id, type, title, narrative
       FROM observations
       WHERE memory_session_id = ?
       ORDER BY created_at_epoch DESC
       LIMIT 30
     `).all(sessionId);
-
-    // Grace period: ALWAYS wait 2s for late-arriving observations (unconditional)
-    // Fixes race condition where llm-episode deletes flush file before writing obs to DB
-    const maxId = recentObs.length > 0 ? Math.max(...recentObs.map(o => o.id)) : 0;
-    await sleep(2000);
-    const lateObs = db.prepare(`
-      SELECT id, type, title, narrative
-      FROM observations
-      WHERE memory_session_id = ? AND id > ?
-      ORDER BY created_at_epoch DESC
-      LIMIT 10
-    `).all(sessionId, maxId);
-    if (lateObs.length > 0) {
-      recentObs = [...lateObs, ...recentObs].slice(0, 30);
-    }
 
     if (recentObs.length < 1) return;
 
@@ -819,6 +819,20 @@ function handleStop() {
       }
     } finally {
       releaseLock();
+    }
+  } else {
+    // Fallback: lock contended — read episode without lock and flush directly to file.
+    // Prevents data loss when PostToolUse holds the lock at session end.
+    const episode = readEpisodeRaw();
+    if (episode && episode.entries && episode.entries.length > 0) {
+      if (!episode.sessionId) episode.sessionId = sessionId;
+      if (!episode.project) episode.project = project;
+      const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
+      try {
+        writeFileSync(flushFile, JSON.stringify(episode));
+        spawnBackground('llm-episode', flushFile);
+      } catch {}
+      try { unlinkSync(episodeFile()); } catch {}
     }
   }
 
