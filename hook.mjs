@@ -9,7 +9,7 @@ import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, constants as fsConstants } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, constants as fsConstants } from 'fs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -129,14 +129,33 @@ function lockFile() {
 }
 
 function acquireLock(maxWaitMs = 500) {
+  const lf = lockFile();
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
     try {
-      const fd = openSync(lockFile(), fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+      const fd = openSync(lf, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+      const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
+      writeSync(fd, payload);
       closeSync(fd);
       return true;
     } catch {
-      // Lock held by another process — spin briefly
+      // Lock exists — check if stale or orphaned
+      try {
+        const raw = readFileSync(lf, 'utf8');
+        const info = JSON.parse(raw);
+        const age = Date.now() - (info.ts || 0);
+        let stale = age > 30000; // >30s = stale
+        if (!stale && info.pid) {
+          try { process.kill(info.pid, 0); } catch { stale = true; } // PID dead = orphan
+        }
+        if (stale) { try { unlinkSync(lf); } catch {} continue; }
+      } catch {
+        // Can't read lock — try removing if old by mtime
+        try {
+          const st = statSync(lf);
+          if (Date.now() - st.mtimeMs > 30000) { try { unlinkSync(lf); } catch {} continue; }
+        } catch {}
+      }
       const wait = Math.ceil(Math.random() * 20);
       const start = Date.now();
       while (Date.now() - start < wait) { /* spin */ }
@@ -169,6 +188,8 @@ function createEpisode(sessionId, project) {
     lastAt: Date.now(),
     files: [],
     entries: [],
+    filesRead: [],
+    fileHistoryShown: [],
   };
 }
 
@@ -201,6 +222,17 @@ function episodeHasSignificantContent(episode) {
 
 function flushEpisode(episode) {
   if (!episode || episode.entries.length === 0) return;
+
+  // Collect Read file paths tracked by post-tool-use.sh
+  const readsFile = join(RUNTIME_DIR, `reads-${episode.project || inferProject()}.txt`);
+  try {
+    const raw = readFileSync(readsFile, 'utf8');
+    const paths = [...new Set(raw.split('\n').filter(Boolean))];
+    episode.filesRead = paths;
+    writeFileSync(readsFile, ''); // Clear after collecting
+  } catch {
+    episode.filesRead = episode.filesRead || [];
+  }
 
   // Rename current buffer to prevent race conditions
   const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
@@ -299,6 +331,37 @@ async function handlePostToolUse() {
     episode.entries.push(entry);
     episode.lastAt = Date.now();
     addFileToEpisode(episode, files);
+
+    // Proactive file history: show past observations for files being edited
+    if (['Edit', 'Write', 'NotebookEdit'].includes(tool_name) && files.length > 0) {
+      for (const f of files) {
+        if (episode.fileHistoryShown?.includes(f)) continue;
+        try {
+          const db = openDb();
+          if (db) {
+            try {
+              const fname = basename(f);
+              const ftsQ = `"${fname.replace(/"/g, '""')}"`;
+              const rows = db.prepare(`
+                SELECT o.id, o.type, o.title
+                FROM observations_fts
+                JOIN observations o ON observations_fts.rowid = o.id
+                WHERE observations_fts MATCH ?
+                ORDER BY o.created_at_epoch DESC
+                LIMIT 3
+              `).all(ftsQ);
+              if (rows.length > 0) {
+                const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
+                process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
+              }
+            } finally { db.close(); }
+          }
+        } catch {}
+        if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
+        episode.fileHistoryShown.push(f);
+      }
+    }
+
     writeEpisode(episode);
   } finally {
     releaseLock();
@@ -422,7 +485,8 @@ File: ${episode.files.join(', ') || 'unknown'}
 Action: ${e.desc}
 Error: ${e.isError ? 'yes' : 'no'}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise description","narrative":"2-3 sentences on what and why","concepts":["kw1","kw2"],"facts":["fact1","fact2"]}`;
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise description","narrative":"2-3 sentences on what and why","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1}
+importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   } else {
     // Multiple entries: batch episode summary
     const actionList = episode.entries.map((e, i) =>
@@ -436,26 +500,89 @@ Files: ${fileList}
 Actions (${episode.entries.length} total):
 ${actionList}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent summary of the episode","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"]}`;
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent summary of the episode","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1}
+importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   }
 
   const raw = callLLM(prompt);
   const parsed = parseJsonFromLLM(raw);
-  if (!parsed || !parsed.title) return;
 
+  let obs;
   const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
-  const obs = {
-    type: validTypes.has(parsed.type) ? parsed.type : 'change',
-    title: truncate(parsed.title, 120),
-    subtitle: fileList,
-    narrative: truncate(parsed.narrative || '', 500),
-    concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
-    facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
-    files: episode.files,
-    filesRead: [],
-  };
+
+  if (parsed && parsed.title) {
+    obs = {
+      type: validTypes.has(parsed.type) ? parsed.type : 'change',
+      title: truncate(parsed.title, 120),
+      subtitle: fileList,
+      narrative: truncate(parsed.narrative || '', 500),
+      concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
+      facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
+      files: episode.files,
+      filesRead: episode.filesRead || [],
+      importance: parsed.importance ?? 1,
+    };
+  } else {
+    // Degraded storage: LLM failed, but never lose data
+    const hasError = episode.entries.some(e => e.isError);
+    const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
+    const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
+    const firstDesc = episode.entries[0]?.desc || '(no description)';
+    obs = {
+      type: inferredType,
+      title: truncate(firstDesc, 120),
+      subtitle: fileList,
+      narrative: episode.entries.map(e => e.desc).join('; '),
+      concepts: [],
+      facts: [],
+      files: episode.files,
+      filesRead: episode.filesRead || [],
+      importance: 1,
+    };
+  }
 
   saveObservation(obs, episode.project, episode.sessionId);
+
+  // Link related observations: find previous obs in same session with file overlap
+  if (episode.files.length > 0) {
+    const db = openDb();
+    if (db) {
+      try {
+        const newObs = db.prepare(`
+          SELECT id, files_modified, related_ids FROM observations
+          WHERE memory_session_id = ? ORDER BY created_at_epoch DESC LIMIT 1
+        `).get(episode.sessionId);
+
+        if (newObs) {
+          const prevObs = db.prepare(`
+            SELECT id, files_modified, related_ids FROM observations
+            WHERE memory_session_id = ? AND id < ? ORDER BY created_at_epoch DESC LIMIT 1
+          `).get(episode.sessionId, newObs.id);
+
+          if (prevObs) {
+            // Check file overlap
+            let prevFiles, newFiles;
+            try { prevFiles = JSON.parse(prevObs.files_modified || '[]'); } catch { prevFiles = []; }
+            try { newFiles = JSON.parse(newObs.files_modified || '[]'); } catch { newFiles = []; }
+            const overlap = prevFiles.some(f => newFiles.includes(f));
+
+            if (overlap) {
+              // Bidirectional link
+              let prevRelated, newRelated;
+              try { prevRelated = JSON.parse(prevObs.related_ids || '[]'); } catch { prevRelated = []; }
+              try { newRelated = JSON.parse(newObs.related_ids || '[]'); } catch { newRelated = []; }
+
+              if (!prevRelated.includes(newObs.id)) prevRelated.push(newObs.id);
+              if (!newRelated.includes(prevObs.id)) newRelated.push(prevObs.id);
+
+              db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(prevRelated), prevObs.id);
+              db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(newRelated), newObs.id);
+            }
+          }
+        }
+      } catch {} finally { db.close(); }
+    }
+  }
 }
 
 // ─── Background: LLM Session Summary ────────────────────────────────────────
@@ -584,7 +711,36 @@ function handleSessionStart() {
       `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
     }
 
+    // Stale session cleanup: mark 24h+ active sessions as abandoned
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    db.prepare(`
+      UPDATE sdk_sessions SET status = 'abandoned'
+      WHERE status = 'active' AND started_at_epoch < ?
+    `).run(oneDayAgo);
+
+    // Clean stale lock files in runtime dir
+    try {
+      for (const f of readdirSync(RUNTIME_DIR)) {
+        if (!f.endsWith('.lock')) continue;
+        const lp = join(RUNTIME_DIR, f);
+        try {
+          const raw = readFileSync(lp, 'utf8');
+          const info = JSON.parse(raw);
+          const age = Date.now() - (info.ts || 0);
+          let stale = age > 30000;
+          if (!stale && info.pid) {
+            try { process.kill(info.pid, 0); } catch { stale = true; }
+          }
+          if (stale) unlinkSync(lp);
+        } catch {
+          // Unreadable lock — check mtime
+          try {
+            const st = statSync(lp);
+            if (Date.now() - st.mtimeMs > 30000) unlinkSync(lp);
+          } catch {}
+        }
+      }
+    } catch {}
 
     // Recent observations for this project
     const observations = db.prepare(`
@@ -703,6 +859,18 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
       `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
     }
 
+    // Dedup: skip if a similar title was inserted in the last 5 minutes
+    const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
+    const recent = db.prepare(`
+      SELECT title FROM observations
+      WHERE project = ? AND created_at_epoch > ?
+      ORDER BY created_at_epoch DESC LIMIT 10
+    `).all(project, fiveMinAgo);
+
+    if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > 0.7)) {
+      return; // Duplicate — skip
+    }
+
     // text: expanded concepts+facts as plain text (distinct from narrative for better FTS coverage)
     // concepts/facts: space-separated plain text (not JSON arrays) for clean FTS matching
     const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
@@ -710,16 +878,17 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
     const textField = [conceptsText, factsText].filter(Boolean).join(' ');
 
     db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       sessionId, project,
       textField, obs.type, obs.title, obs.subtitle || '',
       obs.narrative || '',
       conceptsText,
       factsText,
-      JSON.stringify(obs.filesRead),
-      JSON.stringify(obs.files),
+      JSON.stringify(obs.filesRead || []),
+      JSON.stringify(obs.files || []),
+      obs.importance ?? 1,
       now.toISOString(), now.getTime()
     );
   } finally {
@@ -779,6 +948,18 @@ function extractFilePaths(input) {
   return [...new Set(paths)];
 }
 
+// ─── Jaccard Similarity ─────────────────────────────────────────────────────
+
+function jaccardSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const setA = new Set(a.toLowerCase().split(/\s+/));
+  const setB = new Set(b.toLowerCase().split(/\s+/));
+  let intersection = 0;
+  for (const w of setA) { if (setB.has(w)) intersection++; }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function readStdin() {
@@ -818,6 +999,53 @@ function truncate(str, max = 80) {
   return str.length > max ? str.slice(0, max - 1) + '…' : str;
 }
 
+// ─── UserPromptSubmit Handler ────────────────────────────────────────────────
+
+async function handleUserPrompt() {
+  let input = '';
+  try { input = await readStdin(); } catch { return; }
+
+  let hookData;
+  try { hookData = JSON.parse(input); } catch { return; }
+
+  const promptText = hookData.user_prompt;
+  if (!promptText || typeof promptText !== 'string') return;
+
+  const db = openDb();
+  if (!db) return;
+
+  try {
+    const sessionId = getSessionId();
+    const now = new Date();
+
+    // Ensure session exists
+    const existing = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
+    if (!existing) {
+      const project = inferProject();
+      db.prepare(`
+        INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+        VALUES (?, ?, ?, ?, ?, 'active')
+      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+    }
+
+    // Increment prompt counter
+    db.prepare('UPDATE sdk_sessions SET prompt_counter = COALESCE(prompt_counter, 0) + 1 WHERE content_session_id = ?').run(sessionId);
+    const counter = db.prepare('SELECT prompt_counter FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
+
+    db.prepare(`
+      INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      sessionId,
+      promptText.slice(0, 10000),
+      counter?.prompt_counter || 1,
+      now.toISOString(), now.getTime()
+    );
+  } finally {
+    db.close();
+  }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 try {
@@ -825,6 +1053,7 @@ try {
     case 'post-tool-use':    await handlePostToolUse(); break;
     case 'session-start':    handleSessionStart(); break;
     case 'stop':             handleStop(); break;
+    case 'user-prompt':      await handleUserPrompt(); break;
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
   }
