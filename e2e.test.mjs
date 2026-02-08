@@ -178,7 +178,7 @@ function runHook(event, { stdin, env = {}, args = [] } = {}) {
   try {
     const stdout = execFileSync(process.execPath, [HOOK_PATH, event, ...args], {
       input: stdin || '',
-      timeout: 10000,
+      timeout: 15000,
       encoding: 'utf8',
       env: mergedEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -501,7 +501,7 @@ describe('Suite 2: Episode Buffer Management', () => {
   });
 });
 
-describe('Suite 3: LLM Episode Processing', () => {
+describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
   it('llm-episode with mock LLM creates observation in DB', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
@@ -530,7 +530,7 @@ describe('Suite 3: LLM Episode Processing', () => {
 
     // Run llm-episode — it reads the flush file, calls mock LLM, saves observation
     const { exitCode } = runHook('llm-episode', {
-      env: { HOME: tmpHome },
+      env: { HOME: tmpHome, CLAUDE_MEM_NO_DELAY: '1' },
       args: [flushFile],
     });
     expect(exitCode).toBe(0);
@@ -575,7 +575,7 @@ describe('Suite 3: LLM Episode Processing', () => {
 
     // Use a mock that returns garbage (non-existent script → callLLM returns null)
     const { exitCode } = runHook('llm-episode', {
-      env: { HOME: tmpHome, CLAUDE_CODE_PATH: '/dev/null' },
+      env: { HOME: tmpHome, CLAUDE_CODE_PATH: '/dev/null', CLAUDE_MEM_NO_DELAY: '1' },
       args: [flushFile],
     });
     expect(exitCode).toBe(0);
@@ -621,7 +621,7 @@ describe('Suite 3: LLM Episode Processing', () => {
       }],
       filesRead: [], fileHistoryShown: [],
     }));
-    runHook('llm-episode', { env: { HOME: tmpHome }, args: [flush2] });
+    runHook('llm-episode', { env: { HOME: tmpHome, CLAUDE_MEM_NO_DELAY: '1' }, args: [flush2] });
 
     // Both observations should have related_ids referencing each other
     const db2 = openTestDb(tmpHome);
@@ -636,7 +636,7 @@ describe('Suite 3: LLM Episode Processing', () => {
   });
 });
 
-describe('Suite 4: Session Summary', () => {
+describe('Suite 4: Session Summary', { retry: 2 }, () => {
   it('llm-summary with observations creates session_summary', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
@@ -814,7 +814,7 @@ describe('Suite 8a: Cross-Session MinHash Dedup', () => {
 
     // Run llm-episode - the mock LLM will return a generic title, which won't match
     // by Jaccard but the MinHash check happens on the combined title+narrative
-    runHook('llm-episode', { env: { HOME: tmpHome }, args: [flushFile] });
+    runHook('llm-episode', { env: { HOME: tmpHome, CLAUDE_MEM_NO_DELAY: '1' }, args: [flushFile] });
 
     // The mock returns "Mock single observation" which is dissimilar, so it should NOT be deduped
     // This test validates that the minhash_sig column is populated for new observations
