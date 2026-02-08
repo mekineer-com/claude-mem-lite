@@ -4,150 +4,15 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import Database from 'better-sqlite3';
-import { homedir } from 'os';
-import { join } from 'path';
-import { existsSync, mkdirSync } from 'fs';
 import { z } from 'zod';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, estimateTokens } from './utils.mjs';
+import { ensureDb } from './schema.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-const DB_DIR = join(homedir(), 'claude-mem-lite');
-const DB_PATH = join(DB_DIR, 'claude-mem.db');
-
-if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
-
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+const db = ensureDb();
+// Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');
-db.pragma('synchronous = NORMAL');
-db.pragma('foreign_keys = OFF'); // Enabled below if safe
-
-// Ensure core tables exist (for fresh installs)
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sdk_sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_session_id TEXT NOT NULL UNIQUE,
-    memory_session_id TEXT,
-    project TEXT NOT NULL,
-    user_prompt TEXT,
-    started_at TEXT NOT NULL,
-    started_at_epoch INTEGER NOT NULL,
-    completed_at TEXT,
-    completed_at_epoch INTEGER,
-    status TEXT NOT NULL DEFAULT 'active',
-    worker_port INTEGER,
-    prompt_counter INTEGER DEFAULT 0
-  );
-
-  CREATE TABLE IF NOT EXISTS observations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    memory_session_id TEXT NOT NULL,
-    project TEXT NOT NULL,
-    text TEXT,
-    type TEXT NOT NULL CHECK(type IN ('decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change')),
-    title TEXT,
-    subtitle TEXT,
-    facts TEXT,
-    narrative TEXT,
-    concepts TEXT,
-    files_read TEXT,
-    files_modified TEXT,
-    prompt_number INTEGER,
-    discovery_tokens INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    created_at_epoch INTEGER NOT NULL,
-    FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS session_summaries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    memory_session_id TEXT NOT NULL,
-    project TEXT NOT NULL,
-    request TEXT,
-    investigated TEXT,
-    learned TEXT,
-    completed TEXT,
-    next_steps TEXT,
-    files_read TEXT,
-    files_edited TEXT,
-    notes TEXT,
-    prompt_number INTEGER,
-    discovery_tokens INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL,
-    created_at_epoch INTEGER NOT NULL,
-    FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS user_prompts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_session_id TEXT NOT NULL,
-    prompt_text TEXT,
-    prompt_number INTEGER,
-    created_at TEXT NOT NULL,
-    created_at_epoch INTEGER NOT NULL,
-    FOREIGN KEY(content_session_id) REFERENCES sdk_sessions(content_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-  );
-`);
-
-// Schema migrations (idempotent — only swallow "duplicate column" errors)
-try {
-  db.exec(`ALTER TABLE observations ADD COLUMN importance INTEGER DEFAULT 1`);
-} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
-try {
-  db.exec(`ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'`);
-} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
-try {
-  db.exec(`ALTER TABLE observations ADD COLUMN minhash_sig TEXT`);
-} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
-try {
-  db.exec(`ALTER TABLE observations ADD COLUMN access_count INTEGER DEFAULT 0`);
-} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
-try {
-  db.exec(`ALTER TABLE observations ADD COLUMN compressed_into INTEGER DEFAULT NULL`);
-} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
-
-// Dedup migration: ensure memory_session_id is unique, then enable FK unconditionally
-{
-  const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
-  if (!hasIdx) {
-    // Find and resolve duplicates before creating unique index
-    const dupes = db.prepare(`
-      SELECT memory_session_id, COUNT(*) as cnt
-      FROM sdk_sessions
-      WHERE memory_session_id IS NOT NULL
-      GROUP BY memory_session_id HAVING cnt > 1
-    `).all();
-
-    if (dupes.length > 0) {
-      const dedup = db.transaction(() => {
-        for (const { memory_session_id } of dupes) {
-          // All duplicates share the same memory_session_id, so observation counts
-          // are identical across them. Keep the oldest row (smallest id).
-          const rows = db.prepare(`
-            SELECT s.id FROM sdk_sessions s
-            WHERE s.memory_session_id = ?
-            ORDER BY s.id ASC
-          `).all(memory_session_id);
-
-          // Delete all but the keeper (first row)
-          for (let i = 1; i < rows.length; i++) {
-            db.prepare('DELETE FROM sdk_sessions WHERE id = ?').run(rows[i].id);
-          }
-        }
-      });
-      dedup();
-    }
-
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sess_memory_sid ON sdk_sessions(memory_session_id)`);
-  }
-  db.pragma('foreign_keys = ON');
-}
-
-// Performance indexes for timeline/filter queries
-db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_epoch_project ON observations(created_at_epoch DESC, project)`);
-db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`);
 
 // Ensure FTS5 tables + triggers exist
 ensureFTS('observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
@@ -436,13 +301,16 @@ server.tool(
                  bm25(user_prompts_fts, 1) as score
           FROM user_prompts_fts
           JOIN user_prompts p ON user_prompts_fts.rowid = p.id
+          JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
           WHERE user_prompts_fts MATCH ?
+            AND (? IS NULL OR s.project = ?)
             AND (? IS NULL OR p.created_at_epoch >= ?)
             AND (? IS NULL OR p.created_at_epoch <= ?)
           ORDER BY score
           LIMIT ? OFFSET ?
         `).all(
           ftsQuery,
+          args.project ?? null, args.project ?? null,
           epochFrom, epochFrom,
           epochTo, epochTo,
           perSourceLimit, perSourceOffset
@@ -453,14 +321,17 @@ server.tool(
       } else if (searchType === 'prompts') {
         const params = [];
         const wheres = [];
-        if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+        if (args.project) { wheres.push('s.project = ?'); params.push(args.project); }
+        if (epochFrom !== null) { wheres.push('p.created_at_epoch >= ?'); params.push(epochFrom); }
+        if (epochTo !== null) { wheres.push('p.created_at_epoch <= ?'); params.push(epochTo); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
         params.push(perSourceLimit, perSourceOffset);
         const rows = db.prepare(`
-          SELECT id, prompt_text, content_session_id, created_at, created_at_epoch
-          FROM user_prompts ${where}
-          ORDER BY created_at_epoch DESC
+          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
+          FROM user_prompts p
+          JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+          ${where}
+          ORDER BY p.created_at_epoch DESC
           LIMIT ? OFFSET ?
         `).all(...params);
         for (const r of rows) {
@@ -795,7 +666,9 @@ server.tool(
     // Total counts
     const obsTotal = db.prepare(`SELECT COUNT(*) as c FROM observations WHERE 1=1 ${projectFilter}`).get(...baseParams);
     const sessTotal = db.prepare(`SELECT COUNT(*) as c FROM session_summaries WHERE 1=1 ${projectFilter}`).get(...baseParams);
-    const promptTotal = db.prepare(`SELECT COUNT(*) as c FROM user_prompts`).get();
+    const promptTotal = args.project
+      ? db.prepare(`SELECT COUNT(*) as c FROM user_prompts p JOIN sdk_sessions s ON p.content_session_id = s.content_session_id WHERE s.project = ?`).get(args.project)
+      : db.prepare(`SELECT COUNT(*) as c FROM user_prompts`).get();
 
     // Recent counts
     const obsRecent = db.prepare(`SELECT COUNT(*) as c FROM observations WHERE created_at_epoch >= ? ${projectFilter}`).get(cutoff, ...baseParams);

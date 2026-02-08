@@ -4,7 +4,6 @@
 // Hooks (fast <100ms): post-tool-use, session-start, stop
 // Background workers (slow): llm-episode, llm-summary
 
-import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
@@ -16,6 +15,7 @@ import {
   parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
   estimateTokens, computeMinHash, estimateJaccardFromMinHash,
 } from './utils.mjs';
+import { ensureDb } from './schema.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -24,7 +24,6 @@ const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
 if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
 
 const DB_DIR = join(homedir(), 'claude-mem-lite');
-const DB_PATH = join(DB_DIR, 'claude-mem.db');
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 const SCRIPT_PATH = process.argv[1];
 
@@ -86,15 +85,11 @@ function createSessionId() {
 // ─── Database ───────────────────────────────────────────────────────────────
 
 function openDb() {
-  if (!existsSync(DB_PATH)) return null;
-  const db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
-  db.pragma('synchronous = NORMAL');
-  // Enable FK if server has completed dedup migration (unique index exists)
-  const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
-  db.pragma(hasIdx ? 'foreign_keys = ON' : 'foreign_keys = OFF');
-  return db;
+  try {
+    return ensureDb();
+  } catch {
+    return null;
+  }
 }
 
 // ─── LLM via claude CLI ────────────────────────────────────────────────────
@@ -748,20 +743,19 @@ async function handleLLMSummary() {
       LIMIT 30
     `).all(sessionId);
 
-    // Grace period: wait 2s for late-arriving observations, then merge
-    if (recentObs.length > 0) {
-      const maxId = Math.max(...recentObs.map(o => o.id));
-      await sleep(2000);
-      const lateObs = db.prepare(`
-        SELECT id, type, title, narrative
-        FROM observations
-        WHERE memory_session_id = ? AND id > ?
-        ORDER BY created_at_epoch DESC
-        LIMIT 10
-      `).all(sessionId, maxId);
-      if (lateObs.length > 0) {
-        recentObs = [...lateObs, ...recentObs].slice(0, 30);
-      }
+    // Grace period: ALWAYS wait 2s for late-arriving observations (unconditional)
+    // Fixes race condition where llm-episode deletes flush file before writing obs to DB
+    const maxId = recentObs.length > 0 ? Math.max(...recentObs.map(o => o.id)) : 0;
+    await sleep(2000);
+    const lateObs = db.prepare(`
+      SELECT id, type, title, narrative
+      FROM observations
+      WHERE memory_session_id = ? AND id > ?
+      ORDER BY created_at_epoch DESC
+      LIMIT 10
+    `).all(sessionId, maxId);
+    if (lateObs.length > 0) {
+      recentObs = [...lateObs, ...recentObs].slice(0, 30);
     }
 
     if (recentObs.length < 1) return;
