@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
@@ -14,19 +14,7 @@ const db = ensureDb();
 // Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-function fmtDate(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  const mon = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()];
-  const day = d.getDate();
-  const h = String(d.getHours()).padStart(2, '0');
-  const m = String(d.getMinutes()).padStart(2, '0');
-  return `${mon} ${day} ${h}:${m}`;
-}
-
-// inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate imported from utils.mjs
+// inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate, fmtDate imported from utils.mjs
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
@@ -317,9 +305,11 @@ server.registerTool(
     }
 
     // Re-rank observations by file context overlap and mark superseded
+    // Note: obsResults contains references to objects in results[]; score/flag mutations propagate
     if (ftsQuery && results.some(r => r.source === 'obs')) {
-      reRankWithContext(db, results.filter(r => r.source === 'obs'), currentProject);
-      markSuperseded(results.filter(r => r.source === 'obs'));
+      const obsResults = results.filter(r => r.source === 'obs');
+      reRankWithContext(db, obsResults, currentProject);
+      markSuperseded(obsResults);
       // Re-sort main array after score adjustments from re-ranking
       results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
@@ -579,7 +569,7 @@ server.registerTool(
   {
     description: 'Manually save a memory/observation. Use for important findings, decisions, or notes worth preserving.',
     inputSchema: {
-      content: z.string().min(1).describe('Memory content to save'),
+      content: z.string().min(1).max(50000).describe('Memory content to save'),
       title: z.string().optional().describe('Short title'),
       type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Observation type (default: discovery)'),
       project: z.string().optional().describe('Project name (default: inferred from CWD)'),
@@ -763,15 +753,7 @@ server.registerTool(
     // Group by project + ISO week
     const groups = new Map();
     for (const c of candidates) {
-      // Proper ISO 8601 week: week 1 contains Jan 4, weeks start on Monday
-      const d = new Date(c.created_at_epoch);
-      const tmp = new Date(d.getTime());
-      tmp.setHours(0, 0, 0, 0);
-      tmp.setDate(tmp.getDate() + 4 - (tmp.getDay() || 7));
-      const yearStart = new Date(tmp.getFullYear(), 0, 1);
-      const weekNum = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
-      const isoYear = tmp.getFullYear();
-      const key = `${c.project}::${isoYear}-W${String(weekNum).padStart(2, '0')}`;
+      const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(c);
     }

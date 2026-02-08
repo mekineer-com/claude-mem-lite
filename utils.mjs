@@ -49,6 +49,12 @@ const SECRET_PATTERNS = [
   [/(Authorization:\s*Bearer\s+)[^\s,;'"}\]]+/gi, '$1***'],
   // Supabase / generic long base64 keys (40+ chars, common in env vars)
   [/(\b(?:SUPABASE_KEY|SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL|REDIS_URL)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
+  // Database connection strings (postgres, mysql, mongodb, redis, amqp)
+  [/\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s,;'"}\]]+/gi, '$1://***'],
+  // npm tokens (npm_...)
+  [/\bnpm_[a-zA-Z0-9]{36,}\b/g, '***'],
+  // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_)
+  [/\b[srpk]{2}k?_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
 ];
 
 export function scrubSecrets(text) {
@@ -354,6 +360,39 @@ export function makeEntryDesc(toolName, input, resp) {
     default:
       return `${toolName}: ${truncate(resp, 50)}`;
   }
+}
+
+// ─── Date Formatting ─────────────────────────────────────────────────────────
+
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+export function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const mon = MONTHS[d.getMonth()];
+  const day = d.getDate();
+  const h = String(d.getHours()).padStart(2, '0');
+  const m = String(d.getMinutes()).padStart(2, '0');
+  return `${mon} ${day} ${h}:${m}`;
+}
+
+export function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// ─── ISO Week ────────────────────────────────────────────────────────────────
+
+export function isoWeekKey(epochMs) {
+  const d = new Date(epochMs);
+  const tmp = new Date(d.getTime());
+  tmp.setHours(0, 0, 0, 0);
+  tmp.setDate(tmp.getDate() + 4 - (tmp.getDay() || 7));
+  const yearStart = new Date(tmp.getFullYear(), 0, 1);
+  const weekNum = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
+  const isoYear = tmp.getFullYear();
+  return `${isoYear}-W${String(weekNum).padStart(2, '0')}`;
 }
 
 // ─── Debug Catch Helper ──────────────────────────────────────────────────────

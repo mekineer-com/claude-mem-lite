@@ -55,7 +55,7 @@ async function install() {
   if (!existsSync(join(INSTALL_DIR, 'node_modules'))) {
     log('Installing dependencies...');
     try {
-      execSync('npm install --production', { cwd: INSTALL_DIR, stdio: 'pipe' });
+      execSync('npm install --omit=dev', { cwd: INSTALL_DIR, stdio: 'pipe' });
       ok('Dependencies installed');
     } catch (e) {
       fail('npm install failed: ' + e.message);

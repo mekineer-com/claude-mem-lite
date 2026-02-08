@@ -13,6 +13,7 @@ import {
   inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
   parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
   estimateTokens, computeMinHash, estimateJaccardFromMinHash, debugCatch,
+  fmtTime,
 } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 
@@ -438,12 +439,14 @@ async function handlePostToolUse() {
   const sessionId = getSessionId();
   const project = inferProject();
 
-  // Single DB connection for both error recall and file history
-  const db = openDb();
+  // Lazy DB: only opened when needed (error recall or file history)
+  let db = null;
+  const getDb = () => { if (!db) db = openDb(); return db; };
 
   // Tier 2 G: Error-triggered recall
-  if (bashSig?.isError && db) {
-    triggerErrorRecall(db, toolInput, resp);
+  if (bashSig?.isError) {
+    const d = getDb();
+    if (d) triggerErrorRecall(d, toolInput, resp);
   }
 
   if (!acquireLock()) {
@@ -480,27 +483,30 @@ async function handlePostToolUse() {
     addFileToEpisode(episode, files);
 
     // Proactive file history: show past observations for files being edited
-    if (['Edit', 'Write', 'NotebookEdit'].includes(tool_name) && files.length > 0 && db) {
-      for (const f of files) {
-        if (episode.fileHistoryShown?.includes(f)) continue;
-        try {
-          const fname = basename(f);
-          const ftsQ = `"${fname.replace(/"/g, '""')}"`;
-          const rows = db.prepare(`
-            SELECT o.id, o.type, o.title
-            FROM observations_fts
-            JOIN observations o ON observations_fts.rowid = o.id
-            WHERE observations_fts MATCH ? AND o.project = ?
-            ORDER BY o.created_at_epoch DESC
-            LIMIT 3
-          `).all(ftsQ, project);
-          if (rows.length > 0) {
-            const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
-            process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
-          }
-        } catch (e) { debugCatch(e, 'fileHistory'); }
-        if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
-        episode.fileHistoryShown.push(f);
+    if (['Edit', 'Write', 'NotebookEdit'].includes(tool_name) && files.length > 0) {
+      const d = getDb();
+      if (d) {
+        for (const f of files) {
+          if (episode.fileHistoryShown?.includes(f)) continue;
+          try {
+            const fname = basename(f);
+            const ftsQ = `"${fname.replace(/"/g, '""')}"`;
+            const rows = d.prepare(`
+              SELECT o.id, o.type, o.title
+              FROM observations_fts
+              JOIN observations o ON observations_fts.rowid = o.id
+              WHERE observations_fts MATCH ? AND o.project = ?
+              ORDER BY o.created_at_epoch DESC
+              LIMIT 3
+            `).all(ftsQ, project);
+            if (rows.length > 0) {
+              const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
+              process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
+            }
+          } catch (e) { debugCatch(e, 'fileHistory'); }
+          if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
+          episode.fileHistoryShown.push(f);
+        }
       }
     }
 
@@ -1069,7 +1075,7 @@ function handleSessionStart() {
       obsLines.push('|----|------|---|-------|');
       for (const o of obsToShow) {
         const proj = o.project ? ` (${o.project})` : '';
-        obsLines.push(`| #${o.id} | ${fmtDate(o.created_at)} | ${typeIcon(o.type)} | ${truncate(o.title || '(untitled)', 60)}${proj} |`);
+        obsLines.push(`| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${truncate(o.title || '(untitled)', 60)}${proj} |`);
       }
     }
 
@@ -1111,7 +1117,11 @@ function updateClaudeMd(contextBlock) {
     content = hintComment + '\n' + newSection + '\n';
   }
 
-  try { writeFileSync(claudeMdPath, content); } catch (e) {
+  try {
+    const tmp = claudeMdPath + '.mem-tmp';
+    writeFileSync(tmp, content);
+    renameSync(tmp, claudeMdPath);
+  } catch (e) {
     if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] CLAUDE.md write failed: ${e.message}`);
   }
 }
@@ -1215,13 +1225,7 @@ function tryParseJson(str) {
   try { return JSON.parse(str); } catch { return {}; }
 }
 
-function fmtDate(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
-// typeIcon, truncate, etc. imported from utils.mjs
+// typeIcon, truncate, fmtTime, etc. imported from utils.mjs
 
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 

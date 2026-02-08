@@ -66,7 +66,12 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **User prompt capture** -- Records user prompts via UserPromptSubmit hook for intent tracking
 - **Read file tracking** -- Tracks files read during sessions for richer episode context
 - **Zero data loss** -- If LLM fails, observations are saved with degraded (inferred) metadata instead of being discarded
-- **Observation dedup** -- Jaccard similarity check prevents near-duplicate observations within 5 minutes
+- **Two-tier dedup** -- Jaccard similarity (5-minute window) + MinHash signatures (7-day cross-session window) prevent duplicates
+- **Synonym expansion** -- Abbreviations like `K8s`, `DB`, `auth` automatically expand to full forms in FTS5 search (48+ pairs)
+- **Token-budgeted context** -- Greedy knapsack algorithm selects session-start context within a 2,000-token budget, prioritizing by recency and importance
+- **Observation compression** -- Old low-value observations can be compressed into weekly summaries to reduce noise
+- **Secret scrubbing** -- Automatic redaction of API keys, tokens, PEM blocks, connection strings, and 15+ credential patterns
+- **Atomic writes** -- All file writes (episodes, CLAUDE.md) use write-to-tmp + rename to prevent corruption on crash
 - **Robust locking** -- PID-aware lock files with automatic stale/orphan cleanup (>30s timeout or dead PID)
 - **Stale session cleanup** -- Sessions active for >24h are automatically marked as abandoned on next start
 
@@ -107,7 +112,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 
 ### What happens during installation
 
-1. **Install dependencies** -- `npm install --production` (compiles native `better-sqlite3`)
+1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
 2. **Register MCP server** -- `mem` server with 7 tools (search, timeline, get, save, stats, delete, compress)
 3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/claude-mem-lite/` for database and runtime files
@@ -244,7 +249,7 @@ Episodes are batched related operations (edits to the same file group) that get 
 Episode buffer -> Flush to JSON -> claude -p --model haiku -> Structured observation -> SQLite
 ```
 
-Each observation includes type, title, narrative, concepts, facts, importance (1-3), and is automatically deduplicated (Jaccard similarity >70% within 5 minutes). If the LLM call fails, a degraded observation is saved with inferred metadata (zero data loss). Related observations in the same session are linked via `related_ids` based on file overlap.
+Each observation includes type, title, narrative, concepts, facts, importance (1-3), and is automatically deduplicated via two tiers: Jaccard similarity (>70% within 5 minutes) and MinHash signatures (>80% within 7 days across sessions). If the LLM call fails, a degraded observation is saved with inferred metadata (zero data loss). Related observations are linked via `related_ids` based on FTS5 title similarity and file overlap.
 
 ## Management Commands
 
@@ -311,9 +316,37 @@ claude-mem-lite/
     setup.sh         # Setup hook: npm install + migration
   server.mjs         # MCP server: tool definitions, FTS5 search, database init
   hook.mjs           # Claude Code hooks: episode capture, error recall, session management
+  schema.mjs         # Database schema: single source of truth for tables, migrations, FTS5
+  utils.mjs          # Shared utilities: FTS5 query building, MinHash dedup, secret scrubbing
   install.mjs        # CLI installer: setup, uninstall, status, doctor (npx/git clone mode)
   skill.md           # MCP skill definition (npx/git clone mode)
   package.json       # Dependencies and metadata
+  # Test & benchmark (dev only)
+  *.test.mjs         # Unit, integration, E2E tests (201 tests)
+  test-helpers.mjs   # Shared test utilities
+  benchmark/         # BM25 search quality benchmarks + CI gate
+```
+
+## Search Quality
+
+Benchmarked on 200 observations across 30 queries (standard + hard-negative categories):
+
+| Metric | Score |
+|--------|-------|
+| Recall@10 | 0.89 |
+| Precision@10 | 0.99 |
+| nDCG@10 | 0.97 |
+| MRR@10 | 0.97 |
+| P95 search latency | 0.14ms |
+
+The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent search quality regressions.
+
+## Development
+
+```bash
+npm test                  # Run all 201 tests (vitest)
+npm run benchmark         # Run full search quality benchmark
+npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% tolerance
 ```
 
 ## License
