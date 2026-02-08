@@ -10,10 +10,14 @@
     "type": "git",
     "url": "https://github.com/sdsrss/claude-mem-lite.git"
   },
+  "scripts": {
+    "test": "vitest run"
+  },
   "files": [
     "server.mjs",
     "hook.mjs",
     "install.mjs",
+    "utils.mjs",
     "skill.md",
     "commands/mem.md",
     "hooks/hooks.json",
@@ -28,5 +32,8 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "better-sqlite3": "^12.6.2",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
   }
 }

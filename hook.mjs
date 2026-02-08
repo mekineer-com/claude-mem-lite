@@ -10,6 +10,7 @@ import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, renameSync, constants as fsConstants } from 'fs';
+import { jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance } from './utils.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -65,7 +66,9 @@ function openDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 3000');
   db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = OFF'); // Schema has FK mismatch (memory_session_id lacks UNIQUE)
+  // Enable FK if server has completed dedup migration (unique index exists)
+  const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
+  db.pragma(hasIdx ? 'foreign_keys = ON' : 'foreign_keys = OFF');
   return db;
 }
 
@@ -104,6 +107,63 @@ function parseJsonFromLLM(text) {
   const obj = text.match(/\{[\s\S]*\}/);
   if (obj) try { return JSON.parse(obj[0]); } catch {}
   return null;
+}
+
+// ─── LLM Concurrency Semaphore (max 2 concurrent claude -p calls) ────────────
+
+const LLM_SEM_MAX = 2;
+const LLM_SEM_TIMEOUT = 30000; // 30s max wait
+const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function acquireLLMSlot() {
+  const deadline = Date.now() + LLM_SEM_TIMEOUT;
+  while (Date.now() < deadline) {
+    // Count active semaphore files
+    let active = 0;
+    try {
+      for (const f of readdirSync(RUNTIME_DIR)) {
+        if (!f.startsWith('llm-sem-')) continue;
+        try {
+          const raw = readFileSync(join(RUNTIME_DIR, f), 'utf8');
+          const info = JSON.parse(raw);
+          const age = Date.now() - (info.ts || 0);
+          if (age > 60000) {
+            // Stale (>60s) — clean up
+            try { unlinkSync(join(RUNTIME_DIR, f)); } catch {}
+            continue;
+          }
+          // Check if PID still alive
+          if (info.pid) {
+            try { process.kill(info.pid, 0); active++; } catch {
+              try { unlinkSync(join(RUNTIME_DIR, f)); } catch {}
+            }
+          } else {
+            active++;
+          }
+        } catch {
+          // Can't read — count as active to be safe
+          active++;
+        }
+      }
+    } catch {}
+
+    if (active < LLM_SEM_MAX) {
+      // Acquire slot
+      const slotFile = join(RUNTIME_DIR, `llm-sem-${process.pid}`);
+      try {
+        writeFileSync(slotFile, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+        return true;
+      } catch {}
+    }
+
+    // Async wait with jitter (no CPU burn)
+    await sleepMs(200 + Math.random() * 800);
+  }
+  return false; // Timed out
+}
+
+function releaseLLMSlot() {
+  try { unlinkSync(join(RUNTIME_DIR, `llm-sem-${process.pid}`)); } catch {}
 }
 
 // ─── Background Spawner ────────────────────────────────────────────────────
@@ -307,6 +367,7 @@ async function handlePostToolUse() {
     isError: bashSig?.isError || false,
     isSignificant: ['Edit', 'Write', 'NotebookEdit'].includes(tool_name) ||
                    bashSig?.isSignificant || false,
+    bashSig: bashSig || null,
   };
 
   // Episode buffer management (locked to prevent TOCTOU race)
@@ -456,6 +517,10 @@ function detectBashSignificance(input, response) {
   };
 }
 
+// ─── Rule-Engine Importance (deterministic, no LLM) ─────────────────────────
+
+// computeRuleImportance, clampImportance imported from utils.mjs
+
 // ─── Background: LLM Episode Extraction (Tier 2 F) ─────────────────────────
 
 async function handleLLMEpisode() {
@@ -510,8 +575,21 @@ JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coher
 importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   }
 
-  const raw = callLLM(prompt);
-  const parsed = parseJsonFromLLM(raw);
+  // Compute deterministic importance from rules before LLM call
+  const ruleImportance = computeRuleImportance(episode);
+
+  // Acquire LLM semaphore to limit concurrent claude -p calls
+  if (!(await acquireLLMSlot())) {
+    if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] llm-episode: semaphore timeout, proceeding with degraded storage');
+  }
+
+  let raw, parsed;
+  try {
+    raw = callLLM(prompt);
+    parsed = parseJsonFromLLM(raw);
+  } finally {
+    releaseLLMSlot();
+  }
 
   let obs;
   const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
@@ -526,7 +604,7 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
       facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
       files: episode.files,
       filesRead: episode.filesRead || [],
-      importance: parsed.importance ?? 1,
+      importance: Math.max(ruleImportance, clampImportance(parsed.importance)),
     };
   } else {
     // Degraded storage: LLM failed, but never lose data
@@ -543,48 +621,81 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
       facts: [],
       files: episode.files,
       filesRead: episode.filesRead || [],
-      importance: 1,
+      importance: ruleImportance,
     };
   }
 
-  saveObservation(obs, episode.project, episode.sessionId);
+  const savedId = saveObservation(obs, episode.project, episode.sessionId);
 
-  // Link related observations: find previous obs in same session with file overlap
-  if (episode.files.length > 0) {
+  // Link related observations via FTS5 semantic matching + file overlap (cross-session)
+  if (savedId) {
     const db = openDb();
     if (db) {
       try {
         const newObs = db.prepare(`
-          SELECT id, files_modified, related_ids FROM observations
-          WHERE memory_session_id = ? ORDER BY created_at_epoch DESC LIMIT 1
-        `).get(episode.sessionId);
+          SELECT id, title, files_modified, related_ids FROM observations WHERE id = ?
+        `).get(savedId);
+        if (!newObs) { db.close(); return; }
 
-        if (newObs) {
-          const prevObs = db.prepare(`
-            SELECT id, files_modified, related_ids FROM observations
-            WHERE memory_session_id = ? AND id < ? ORDER BY created_at_epoch DESC LIMIT 1
-          `).get(episode.sessionId, newObs.id);
+        const candidates = new Set();
 
-          if (prevObs) {
-            // Check file overlap
-            let prevFiles, newFiles;
-            try { prevFiles = JSON.parse(prevObs.files_modified || '[]'); } catch { prevFiles = []; }
-            try { newFiles = JSON.parse(newObs.files_modified || '[]'); } catch { newFiles = []; }
-            const overlap = prevFiles.some(f => newFiles.includes(f));
+        // Strategy 1: FTS5 title similarity (cross-session)
+        if (obs.title) {
+          const titleTokens = obs.title.replace(/[^a-zA-Z0-9_\s-]/g, ' ').split(/\s+/)
+            .filter(t => t.length > 2).slice(0, 5);
+          if (titleTokens.length > 0) {
+            const ftsQuery = titleTokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+            try {
+              const ftsMatches = db.prepare(`
+                SELECT o.id FROM observations_fts
+                JOIN observations o ON observations_fts.rowid = o.id
+                WHERE observations_fts MATCH ? AND o.id != ?
+                ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+                LIMIT 5
+              `).all(ftsQuery, newObs.id);
+              for (const m of ftsMatches) candidates.add(m.id);
+            } catch {}
+          }
+        }
 
-            if (overlap) {
-              // Bidirectional link
-              let prevRelated, newRelated;
-              try { prevRelated = JSON.parse(prevObs.related_ids || '[]'); } catch { prevRelated = []; }
-              try { newRelated = JSON.parse(newObs.related_ids || '[]'); } catch { newRelated = []; }
+        // Strategy 2: file overlap (any session, recent observations)
+        let newFiles;
+        try { newFiles = JSON.parse(newObs.files_modified || '[]'); } catch { newFiles = []; }
+        if (newFiles.length > 0) {
+          const recentObs = db.prepare(`
+            SELECT id, files_modified FROM observations
+            WHERE id != ? AND created_at_epoch > ?
+            ORDER BY created_at_epoch DESC LIMIT 50
+          `).all(newObs.id, Date.now() - 7 * 86400000);
+          for (const r of recentObs) {
+            let rFiles;
+            try { rFiles = JSON.parse(r.files_modified || '[]'); } catch { rFiles = []; }
+            if (rFiles.some(f => newFiles.includes(f))) candidates.add(r.id);
+          }
+        }
 
-              if (!prevRelated.includes(newObs.id)) prevRelated.push(newObs.id);
-              if (!newRelated.includes(prevObs.id)) newRelated.push(prevObs.id);
+        // Apply bidirectional links (max 5 related)
+        if (candidates.size > 0) {
+          let newRelated;
+          try { newRelated = JSON.parse(newObs.related_ids || '[]'); } catch { newRelated = []; }
 
-              db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(prevRelated), prevObs.id);
-              db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(newRelated), newObs.id);
+          for (const relId of [...candidates].slice(0, 5)) {
+            if (newRelated.includes(relId)) continue;
+            newRelated.push(relId);
+
+            // Add reverse link
+            const rel = db.prepare('SELECT related_ids FROM observations WHERE id = ?').get(relId);
+            if (rel) {
+              let relRelated;
+              try { relRelated = JSON.parse(rel.related_ids || '[]'); } catch { relRelated = []; }
+              if (!relRelated.includes(newObs.id)) {
+                relRelated.push(newObs.id);
+                db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(relRelated.slice(-10)), relId);
+              }
             }
           }
+
+          db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(newRelated.slice(-10)), newObs.id);
         }
       } catch {} finally { db.close(); }
     }
@@ -637,8 +748,19 @@ ${obsList}
 
 JSON: {"request":"what the user was working on","investigated":"what was explored/analyzed","learned":"key findings","completed":"what was accomplished","next_steps":"suggested follow-up"}`;
 
-    const raw = callLLM(prompt, 20000);
-    const parsed = parseJsonFromLLM(raw);
+    // Acquire LLM semaphore
+    if (!(await acquireLLMSlot())) {
+      if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] llm-summary: semaphore timeout, skipping summary');
+      return;
+    }
+
+    let raw, parsed;
+    try {
+      raw = callLLM(prompt, 20000);
+      parsed = parseJsonFromLLM(raw);
+    } finally {
+      releaseLLMSlot();
+    }
 
     if (parsed && parsed.request) {
       const now = new Date();
@@ -856,7 +978,7 @@ function updateClaudeMd(contextBlock) {
 
 function saveObservation(obs, projectOverride, sessionIdOverride) {
   const db = openDb();
-  if (!db) return;
+  if (!db) return null;
 
   try {
     const now = new Date();
@@ -880,7 +1002,7 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
     `).all(project, fiveMinAgo);
 
     if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > 0.7)) {
-      return; // Duplicate — skip
+      return null; // Duplicate — skip
     }
 
     // text: expanded concepts+facts as plain text (distinct from narrative for better FTS coverage)
@@ -889,7 +1011,7 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
     const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
     const textField = [conceptsText, factsText].filter(Boolean).join(' ');
 
-    db.prepare(`
+    const result = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
@@ -903,6 +1025,7 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
       obs.importance ?? 1,
       now.toISOString(), now.getTime()
     );
+    return Number(result.lastInsertRowid);
   } finally {
     db.close();
   }
@@ -960,17 +1083,7 @@ function extractFilePaths(input) {
   return [...new Set(paths)];
 }
 
-// ─── Jaccard Similarity ─────────────────────────────────────────────────────
-
-function jaccardSimilarity(a, b) {
-  if (!a || !b) return 0;
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
-  let intersection = 0;
-  for (const w of setA) { if (setB.has(w)) intersection++; }
-  const union = setA.size + setB.size - intersection;
-  return union === 0 ? 0 : intersection / union;
-}
+// jaccardSimilarity imported from utils.mjs
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
@@ -1000,16 +1113,7 @@ function fmtDate(iso) {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-function typeIcon(type) {
-  const icons = { decision: '🟡', bugfix: '🔴', feature: '🟢', refactor: '🔵', discovery: '🔍', change: '📝' };
-  return icons[type] || '⚪';
-}
-
-function truncate(str, max = 80) {
-  if (!str) return '';
-  str = str.replace(/\n/g, ' ').trim();
-  return str.length > max ? str.slice(0, max - 1) + '…' : str;
-}
+// typeIcon, truncate imported from utils.mjs
 
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 
