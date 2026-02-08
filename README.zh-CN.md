@@ -52,14 +52,23 @@
 
 ## 功能特性
 
-- **自动捕获** -- 挂载到 Claude Code 生命周期（PostToolUse、SessionStart、Stop），无需手动操作即可记录观察
-- **FTS5 搜索** -- 基于 BM25 排名的全文搜索，覆盖观察、会话摘要和用户提示
+- **自动捕获** -- 挂载到 Claude Code 生命周期（PostToolUse、SessionStart、Stop、UserPromptSubmit），无需手动操作即可记录观察
+- **FTS5 搜索** -- 基于 BM25 排名的全文搜索，覆盖观察、会话摘要和用户提示，支持重要度加权
 - **时间线浏览** -- 基于锚点的时间上下文窗口，按时间顺序浏览观察
 - **Episode 批处理** -- 将相关文件操作分组为连贯的 episode，再进行 LLM 编码
 - **错误触发回忆** -- Bash 出错时自动搜索记忆，浮现相关的历史修复方案
+- **主动文件历史** -- 编辑文件时，自动显示该文件相关的历史观察记录
 - **会话摘要** -- 会话结束时通过后台 worker（使用 `claude -p`）生成 LLM 摘要
 - **项目作用域上下文** -- 将最近的记忆注入 `CLAUDE.md` 和会话启动上下文
 - **观察类型** -- 分类为 `decision`、`bugfix`、`feature`、`refactor`、`discovery` 或 `change`
+- **重要度分级** -- LLM 为每条观察分配 1-3 级重要度（日常/关注/关键）
+- **观察关联** -- 基于文件重叠自动建立观察之间的双向链接
+- **用户提示捕获** -- 通过 UserPromptSubmit 钩子记录用户提示，追踪用户意图
+- **Read 文件追踪** -- 追踪会话中读取的文件，丰富 episode 上下文
+- **零数据丢失** -- LLM 失败时，使用推断的元数据保存降级记录，而非丢弃
+- **观察去重** -- Jaccard 相似度检查防止 5 分钟内出现近似重复的观察
+- **健壮锁机制** -- PID 感知的锁文件，自动清理过期（>30s）或孤儿（PID 已死）锁
+- **过期会话清理** -- 活跃超过 24 小时的会话在下次启动时自动标记为 abandoned
 
 ## 环境要求
 
@@ -128,6 +137,7 @@ rm -rf ~/.claude-mem/
     session-<project>    # 活跃会话状态
     ep-<project>.json    # Episode 缓冲区
     ep-flush-*.json      # 已刷新的 episode，等待处理
+    reads-<project>.txt  # Read 文件路径（刷新时收集）
 ```
 
 ## 使用方法
@@ -136,9 +146,9 @@ rm -rf ~/.claude-mem/
 
 | 工具 | 描述 |
 |------|------|
-| `mem_search` | 基于 BM25 排名的 FTS5 全文搜索。支持按类型、项目、日期范围过滤。 |
+| `mem_search` | 基于 BM25 排名的 FTS5 全文搜索。支持按类型、项目、日期范围、重要度过滤。 |
 | `mem_timeline` | 围绕锚点按时间顺序浏览观察。 |
-| `mem_get` | 获取指定观察 ID 的完整详情。 |
+| `mem_get` | 获取指定观察 ID 的完整详情（包含重要度和关联 ID）。 |
 | `mem_save` | 手动保存记忆/观察。 |
 | `mem_stats` | 查看统计：计数、类型分布、热门项目、每日活动。 |
 
@@ -169,7 +179,7 @@ rm -rf ~/.claude-mem/
 ```
 id, memory_session_id, project, type, title, subtitle,
 text, narrative, concepts, facts, files_read, files_modified,
-created_at, created_at_epoch
+importance, related_ids, created_at, created_at_epoch
 ```
 
 **session_summaries** -- LLM 生成的会话摘要
@@ -181,10 +191,10 @@ learned, completed, next_steps, files_read, files_edited, notes
 **sdk_sessions** -- 会话追踪
 ```
 id, content_session_id, memory_session_id, project,
-started_at, completed_at, status
+started_at, completed_at, status, prompt_counter
 ```
 
-**user_prompts** -- 用户输入记录
+**user_prompts** -- 通过 UserPromptSubmit 钩子捕获的用户提示
 ```
 id, content_session_id, prompt_text, prompt_number
 ```
@@ -198,21 +208,30 @@ FTS5 索引：`observations_fts`、`session_summaries_fts`、`user_prompts_fts`
 ```
 SessionStart
   -> 生成会话 ID
+  -> 标记过期会话（活跃 >24h）为 abandoned
+  -> 清理孤儿/过期锁文件
   -> 查询最近观察（24 小时内）
   -> 注入上下文到 CLAUDE.md + 标准输出
 
 PostToolUse（每次工具执行）
-  -> 过滤噪声（跳过 Read、Glob、截图等）
+  -> Bash 预过滤器 ~5ms 跳过噪声（Read 路径追踪到 reads 文件）
   -> 检测 Bash 重要性（错误、测试、构建、git、部署）
   -> 累积到 episode 缓冲区
+  -> 主动文件历史：为编辑的文件显示过往观察
   -> 刷新条件：缓冲区满（10 条） | 5 分钟间隔 | 上下文切换
+  -> 刷新时收集 Read 文件路径到 episode
   -> 为有意义的 episode 启动 LLM episode worker
   -> 错误触发回忆：搜索记忆中相关的历史修复
+
+UserPromptSubmit
+  -> 捕获用户提示文本到 user_prompts 表
+  -> 递增会话提示计数器
+  -> 纯数据库操作，<100ms
 
 Stop
   -> 刷新最终 episode 缓冲区
   -> 标记会话为已完成
-  -> 启动 LLM 摘要 worker（延迟 20 秒）
+  -> 启动 LLM 摘要 worker（轮询等待）
 ```
 
 ### Episode 编码
@@ -223,7 +242,7 @@ Episode 是一批相关操作（对同一组文件的编辑），由后台 LLM w
 Episode 缓冲区 -> 刷新为 JSON -> claude -p --model haiku -> 结构化观察 -> SQLite
 ```
 
-每条观察都包含类型、标题、叙述、概念和事实。
+每条观察包含类型、标题、叙述、概念、事实和重要度（1-3），并自动去重（5 分钟内 Jaccard 相似度 >70%）。LLM 调用失败时，使用推断的元数据保存降级记录（零数据丢失）。同一会话中的相关观察通过文件重叠自动建立 `related_ids` 链接。
 
 ## 管理命令
 
