@@ -4,6 +4,7 @@ import { resolve } from 'path';
 import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, truncate, estimateTokens } from './utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { initSchema } from './schema.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 
@@ -13,58 +14,71 @@ describe('dedup migration', () => {
   afterEach(() => { db.close(); });
 
   it('creates unique index when no duplicates exist', () => {
-    insertSession(db, { id: 'a', memoryId: 'mem-a' });
-    insertSession(db, { id: 'b', memoryId: 'mem-b' });
-
-    // Simulate migration logic
+    // initSchema (called by createTestDb) already applies the dedup migration
     const hasIdx = db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'").get();
-    expect(hasIdx).toBeUndefined();
+    expect(hasIdx).toBeDefined();
 
-    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sess_memory_sid ON sdk_sessions(memory_session_id)");
-    db.pragma('foreign_keys = ON');
-
+    // FK should be enabled after migration
     const fk = db.pragma('foreign_keys')[0];
     expect(fk.foreign_keys).toBe(1);
+
+    // Can insert sessions with unique memory_session_ids
+    insertSession(db, { id: 'a', memoryId: 'mem-a' });
+    insertSession(db, { id: 'b', memoryId: 'mem-b' });
+    const count = db.prepare("SELECT COUNT(*) as cnt FROM sdk_sessions").get();
+    expect(count.cnt).toBe(2);
   });
 
   it('deduplicates sessions keeping oldest row', () => {
-    // Create duplicate memory_session_id
-    insertSession(db, { id: 'a', memoryId: 'dup-mem' });
-    insertSession(db, { id: 'b', memoryId: 'dup-mem' });
-    insertSession(db, { id: 'c', memoryId: 'dup-mem' });
-    insertSession(db, { id: 'unique', memoryId: 'unique-mem' });
+    // Create a pre-migration DB to test the dedup path
+    const rawDb = new Database(':memory:');
+    rawDb.pragma('journal_mode = WAL');
+    rawDb.pragma('foreign_keys = OFF');
+
+    // Create only sdk_sessions without unique index (simulating legacy DB)
+    rawDb.exec(`CREATE TABLE IF NOT EXISTS sdk_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      content_session_id TEXT NOT NULL UNIQUE,
+      memory_session_id TEXT,
+      project TEXT NOT NULL,
+      user_prompt TEXT,
+      started_at TEXT NOT NULL,
+      started_at_epoch INTEGER NOT NULL,
+      completed_at TEXT,
+      completed_at_epoch INTEGER,
+      status TEXT NOT NULL DEFAULT 'active',
+      worker_port INTEGER,
+      prompt_counter INTEGER DEFAULT 0
+    )`);
+
+    // Insert duplicate memory_session_ids (allowed without unique index)
+    insertSession(rawDb, { id: 'a', memoryId: 'dup-mem' });
+    insertSession(rawDb, { id: 'b', memoryId: 'dup-mem' });
+    insertSession(rawDb, { id: 'c', memoryId: 'dup-mem' });
+    insertSession(rawDb, { id: 'unique', memoryId: 'unique-mem' });
 
     // Verify duplicates exist
-    const dupes = db.prepare(`
+    const dupes = rawDb.prepare(`
       SELECT memory_session_id, COUNT(*) as cnt FROM sdk_sessions
       WHERE memory_session_id IS NOT NULL GROUP BY memory_session_id HAVING cnt > 1
     `).all();
     expect(dupes.length).toBe(1);
     expect(dupes[0].cnt).toBe(3);
 
-    // Run dedup (same logic as server.mjs)
-    const dedupFn = db.transaction(() => {
-      for (const { memory_session_id } of dupes) {
-        const rows = db.prepare(`
-          SELECT s.id FROM sdk_sessions s WHERE s.memory_session_id = ? ORDER BY s.id ASC
-        `).all(memory_session_id);
-        for (let i = 1; i < rows.length; i++) {
-          db.prepare('DELETE FROM sdk_sessions WHERE id = ?').run(rows[i].id);
-        }
-      }
-    });
-    dedupFn();
+    // Run initSchema — should detect dupes, dedup, then create unique index
+    initSchema(rawDb);
 
     // Verify: only 1 row per memory_session_id
-    const remaining = db.prepare("SELECT id, memory_session_id FROM sdk_sessions ORDER BY id").all();
+    const remaining = rawDb.prepare("SELECT id, memory_session_id FROM sdk_sessions ORDER BY id").all();
     expect(remaining.length).toBe(2);
     expect(remaining[0].memory_session_id).toBe('dup-mem');
     expect(remaining[1].memory_session_id).toBe('unique-mem');
 
-    // Now unique index should succeed
-    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sess_memory_sid ON sdk_sessions(memory_session_id)");
-    db.pragma('foreign_keys = ON');
-    expect(db.pragma('foreign_keys')[0].foreign_keys).toBe(1);
+    // Unique index should now exist
+    const hasIdx = rawDb.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'").get();
+    expect(hasIdx).toBeDefined();
+
+    rawDb.close();
   });
 });
 

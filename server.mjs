@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
@@ -78,8 +78,7 @@ function reRankWithContext(db, results, project) {
       result.score *= (1.0 + 0.3 * fileOverlap);
     }
   }
-  // Re-sort by score (more negative = better)
-  results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+  // Note: caller re-sorts the main results array after this — no sort needed here
 }
 
 function markSuperseded(results) {
@@ -615,10 +614,12 @@ server.registerTool(
       return { content: [{ type: 'text', text: `Skipped: a similar observation already exists in project "${project}".` }] };
     }
 
+    const minhashSig = computeMinHash(title + ' ' + args.content);
+
     const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?)
-    `).run(sessionId, project, args.content, type, title, args.content, args.importance ?? 1, now.toISOString(), now.getTime());
+      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?)
+    `).run(sessionId, project, args.content, type, title, args.content, args.importance ?? 1, minhashSig, now.toISOString(), now.getTime());
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
   })

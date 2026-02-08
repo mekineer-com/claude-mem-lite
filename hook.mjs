@@ -6,7 +6,6 @@
 
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
-import { homedir } from 'os';
 import { join, basename } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, renameSync, constants as fsConstants } from 'fs';
 import {
@@ -15,7 +14,7 @@ import {
   parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
   estimateTokens, computeMinHash, estimateJaccardFromMinHash, debugCatch,
 } from './utils.mjs';
-import { ensureDb } from './schema.mjs';
+import { ensureDb, DB_DIR } from './schema.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -23,7 +22,6 @@ const event = process.argv[2];
 const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
 if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
 
-const DB_DIR = join(homedir(), 'claude-mem-lite');
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 const SCRIPT_PATH = process.argv[1];
 
@@ -663,17 +661,20 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
     };
   }
 
-  const savedId = saveObservation(obs, episode.project, episode.sessionId);
+  // Single DB connection for save + related linking (avoids double open/close)
+  const db = openDb();
+  if (!db) { try { unlinkSync(tmpFile); } catch {} return; }
 
-  // Link related observations via FTS5 semantic matching + file overlap (cross-session)
-  if (savedId) {
-    const db = openDb();
-    if (db) {
+  try {
+    const savedId = saveObservation(obs, episode.project, episode.sessionId, db);
+
+    // Link related observations via FTS5 semantic matching + file overlap (cross-session)
+    if (savedId) {
       try {
         const newObs = db.prepare(`
           SELECT id, title, files_modified, related_ids FROM observations WHERE id = ?
         `).get(savedId);
-        if (!newObs) { db.close(); return; }
+        if (!newObs) return;
 
         const candidates = new Set();
 
@@ -735,8 +736,10 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
 
           db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(newRelated.slice(-10)), newObs.id);
         }
-      } catch (e) { debugCatch(e, 'relatedObsLinking'); } finally { db.close(); }
+      } catch (e) { debugCatch(e, 'relatedObsLinking'); }
     }
+  } finally {
+    db.close();
   }
 
   // Delete flush file AFTER all DB writes — signals completion to handleLLMSummary
@@ -750,7 +753,8 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function handleLLMSummary() {
   // Poll for llm-episode flush files to be processed (instead of fixed 20s wait)
   // llm-episode reads and deletes ep-flush-*.json files when done
-  const flushTimeout = parseInt(process.env.CLAUDE_MEM_FLUSH_TIMEOUT, 10) || 15;
+  const parsed = parseInt(process.env.CLAUDE_MEM_FLUSH_TIMEOUT, 10);
+  const flushTimeout = Number.isNaN(parsed) ? 15 : parsed;
   for (let i = 0; i < flushTimeout; i++) {
     try {
       const files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('ep-flush-'));
@@ -843,7 +847,7 @@ function handleStop() {
     // Fallback: lock contended — atomically rename episode file to claim ownership.
     // Prevents data loss from concurrent PostToolUse writes between read and delete.
     const epFile = episodeFile();
-    const claimFile = epFile + `.claim-${Date.now()}`;
+    const claimFile = epFile + `.claim-${process.pid}-${Date.now()}`;
     try {
       renameSync(epFile, claimFile);
       const episode = JSON.parse(readFileSync(claimFile, 'utf8'));
@@ -1114,8 +1118,8 @@ function updateClaudeMd(contextBlock) {
 
 // ─── Save Observation to DB ─────────────────────────────────────────────────
 
-function saveObservation(obs, projectOverride, sessionIdOverride) {
-  const db = openDb();
+function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
+  const db = externalDb || openDb();
   if (!db) return null;
 
   try {
@@ -1180,7 +1184,7 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
     );
     return Number(result.lastInsertRowid);
   } finally {
-    db.close();
+    if (!externalDb) db.close();
   }
 }
 
