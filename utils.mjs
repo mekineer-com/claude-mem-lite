@@ -44,6 +44,12 @@ const SECRET_PATTERNS = [
   [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, '***PEM_KEY***'],
   // Long hex strings in assignments (e.g. SECRET_KEY=abc123def456...)
   [/(\b(?:key|secret|token|hash)\s*[=:]\s*)[0-9a-f]{32,}\b/gi, '$1***'],
+  // Google Cloud API keys (AIza...)
+  [/\bAIza[A-Za-z0-9_-]{35}\b/g, '***'],
+  // Generic Bearer tokens in Authorization headers
+  [/(Authorization:\s*Bearer\s+)[^\s,;'"}\]]+/gi, '$1***'],
+  // Supabase / generic long base64 keys (40+ chars, common in env vars)
+  [/(\b(?:SUPABASE_KEY|SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL|REDIS_URL)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
 ];
 
 export function scrubSecrets(text) {
@@ -67,7 +73,8 @@ export function computeMinHash(text, numHashes = 64) {
   if (!text || typeof text !== 'string') return null;
   const tokens = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
     .filter(t => t.length > 2);
-  if (tokens.length === 0) return null;
+  // Require at least 3 tokens for meaningful signature (avoids high collision on short texts)
+  if (tokens.length < 3) return null;
 
   const mins = new Array(numHashes).fill(0xFFFFFFFF);
   for (const token of tokens) {

@@ -31,6 +31,28 @@ const SCRIPT_PATH = process.argv[1];
 // Ensure runtime directory exists
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
+// Crash-safe: flush episode buffer on unexpected termination to prevent data loss
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    try {
+      const ep = readEpisodeRaw();
+      if (ep && ep.entries && ep.entries.length > 0) {
+        const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
+        writeFileSync(flushFile, JSON.stringify(ep));
+        try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
+      }
+    } catch {}
+    process.exit(0);
+  });
+}
+
+// Raw episode read (no lock needed, for signal handlers only)
+function readEpisodeRaw() {
+  try {
+    return JSON.parse(readFileSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`), 'utf8'));
+  } catch { return null; }
+}
+
 if (!event) process.exit(0);
 
 // ─── Session ID Management (Tier 1 A) ──────────────────────────────────────
@@ -170,6 +192,8 @@ function spawnBackground(bgEvent, ...extraArgs) {
     stdio: 'ignore',
     env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
   });
+  // Reap child on exit to prevent zombie processes
+  child.on('exit', () => {});
   child.unref();
 }
 
@@ -188,10 +212,14 @@ function acquireLock(maxWaitMs = 500) {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
     try {
-      const fd = openSync(lf, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
-      const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
-      writeSync(fd, payload);
-      closeSync(fd);
+      let fd;
+      try {
+        fd = openSync(lf, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+        const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
+        writeSync(fd, payload);
+      } finally {
+        if (fd !== undefined) closeSync(fd);
+      }
       return true;
     } catch {
       // Lock exists — check if stale or orphaned
@@ -324,11 +352,10 @@ function flushEpisode(episode) {
     episode.filesRead = episode.filesRead || [];
   }
 
-  // Rename current buffer to prevent race conditions
+  // Write episode to flush file, then remove buffer AFTER spawn to prevent race
   const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
   try {
     writeFileSync(flushFile, JSON.stringify(episode));
-    try { unlinkSync(episodeFile()); } catch {}
   } catch {
     return;
   }
@@ -338,6 +365,9 @@ function flushEpisode(episode) {
   } else {
     try { unlinkSync(flushFile); } catch {}
   }
+
+  // Remove episode buffer AFTER spawning background worker to prevent concurrent overwrites
+  try { unlinkSync(episodeFile()); } catch {}
 }
 
 // ─── PostToolUse Handler ────────────────────────────────────────────────────
@@ -915,15 +945,12 @@ function handleSessionStart() {
   if (!db) return;
 
   try {
-    // Ensure session exists in DB
+    // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
     const now = new Date();
-    const existing = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
-    if (!existing) {
-      db.prepare(`
-        INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-        VALUES (?, ?, ?, ?, ?, 'active')
-      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-    }
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
     // Stale session cleanup: mark 24h+ active sessions as abandoned
     const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
@@ -1060,13 +1087,11 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
     const project = projectOverride || inferProject();
     const sessionId = sessionIdOverride || getSessionId();
 
-    const existing = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
-    if (!existing) {
-      db.prepare(`
-        INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-        VALUES (?, ?, ?, ?, ?, 'active')
-      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-    }
+    // INSERT OR IGNORE avoids race condition on concurrent calls
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
     // Two-tier dedup
     // Tier 1 (fast): 5-min Jaccard on titles (existing logic)
@@ -1174,15 +1199,12 @@ async function handleUserPrompt() {
     const sessionId = getSessionId();
     const now = new Date();
 
-    // Ensure session exists
-    const existing = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
-    if (!existing) {
-      const project = inferProject();
-      db.prepare(`
-        INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-        VALUES (?, ?, ?, ?, ?, 'active')
-      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-    }
+    // Ensure session exists (INSERT OR IGNORE avoids race condition)
+    const project = inferProject();
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
     // Increment prompt counter
     db.prepare('UPDATE sdk_sessions SET prompt_counter = COALESCE(prompt_counter, 0) + 1 WHERE content_session_id = ?').run(sessionId);

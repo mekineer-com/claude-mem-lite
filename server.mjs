@@ -303,9 +303,9 @@ server.tool(
     const results = [];
     const currentProject = inferProject();
 
-    // Cross-source: over-fetch per source, apply global sort+pagination after merge
+    // Cross-source: over-fetch per source to ensure enough results after merge+sort
     const isCrossSource = !searchType;
-    const perSourceLimit = isCrossSource ? limit * 3 : limit;
+    const perSourceLimit = isCrossSource ? Math.max(limit * 3, offset + limit + 10) : limit;
     const perSourceOffset = isCrossSource ? 0 : offset;
 
     // Parse date bounds to epoch (with validation)
@@ -702,24 +702,27 @@ server.tool(
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // Clean up stale references in other observations' related_ids
+    // Wrap cleanup + deletion in a transaction for consistency
     const deletedIds = new Set(args.ids);
-    const referencing = db.prepare(`
-      SELECT id, related_ids FROM observations
-      WHERE related_ids IS NOT NULL AND related_ids != '[]'
-    `).all();
-    for (const r of referencing) {
-      let ids;
-      try { ids = JSON.parse(r.related_ids); } catch { continue; }
-      if (!Array.isArray(ids)) continue;
-      const filtered = ids.filter(id => !deletedIds.has(id));
-      if (filtered.length !== ids.length) {
-        db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
+    const deleteTx = db.transaction(() => {
+      // Clean up stale references in other observations' related_ids
+      const referencing = db.prepare(`
+        SELECT id, related_ids FROM observations
+        WHERE related_ids IS NOT NULL AND related_ids != '[]'
+      `).all();
+      for (const r of referencing) {
+        let ids;
+        try { ids = JSON.parse(r.related_ids); } catch { continue; }
+        if (!Array.isArray(ids)) continue;
+        const filtered = ids.filter(id => !deletedIds.has(id));
+        if (filtered.length !== ids.length) {
+          db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
+        }
       }
-    }
-
-    // Execute deletion (FTS5 cleanup handled by observations_ad trigger)
-    const result = db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...args.ids);
+      // Execute deletion (FTS5 cleanup handled by observations_ad trigger)
+      return db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...args.ids);
+    });
+    const result = deleteTx();
 
     return { content: [{ type: 'text', text: `Deleted ${result.changes} observation(s).` }] };
   })
@@ -744,24 +747,24 @@ server.tool(
     const title = args.title || args.content.slice(0, 100);
     const sessionId = `manual-${project}`;
 
-    // Ensure session exists
-    const existingSession = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
-    if (!existingSession) {
-      db.prepare(`
-        INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-        VALUES (?, ?, ?, ?, ?, 'active')
-      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-    }
+    // Ensure session exists (INSERT OR IGNORE avoids race condition on concurrent calls)
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
-    // Dedup: skip if a similar title was saved recently (5 min window)
+    // Dedup: skip if a similar title or content was saved recently (5 min window)
     const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
     const recent = db.prepare(`
-      SELECT title FROM observations
+      SELECT title, text FROM observations
       WHERE project = ? AND created_at_epoch > ?
-      ORDER BY created_at_epoch DESC LIMIT 10
+      ORDER BY created_at_epoch DESC LIMIT 50
     `).all(project, fiveMinAgo);
 
-    if (title && recent.some(r => jaccardSimilarity(r.title, title) > 0.7)) {
+    if (title && recent.some(r =>
+      jaccardSimilarity(r.title, title) > 0.7 ||
+      jaccardSimilarity(r.text || '', args.content) > 0.7
+    )) {
       return { content: [{ type: 'text', text: `Skipped: a similar observation already exists in project "${project}".` }] };
     }
 
@@ -905,12 +908,15 @@ server.tool(
     // Group by project + ISO week
     const groups = new Map();
     for (const c of candidates) {
+      // Proper ISO 8601 week: week 1 contains Jan 4, weeks start on Monday
       const d = new Date(c.created_at_epoch);
-      const year = d.getFullYear();
-      // ISO week calculation
-      const jan1 = new Date(year, 0, 1);
-      const weekNum = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
-      const key = `${c.project}::${year}-W${String(weekNum).padStart(2, '0')}`;
+      const tmp = new Date(d.getTime());
+      tmp.setHours(0, 0, 0, 0);
+      tmp.setDate(tmp.getDate() + 4 - (tmp.getDay() || 7));
+      const yearStart = new Date(tmp.getFullYear(), 0, 1);
+      const weekNum = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
+      const isoYear = tmp.getFullYear();
+      const key = `${c.project}::${isoYear}-W${String(weekNum).padStart(2, '0')}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(c);
     }
@@ -960,17 +966,13 @@ server.tool(
         const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
         const sessionId = obs[0].project ? `compress-${obs[0].project}` : 'compress-manual';
 
-        // Ensure session exists
-        const existing = db.prepare('SELECT 1 FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
-        if (!existing) {
-          const now = new Date();
-          db.prepare(`
-            INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-            VALUES (?, ?, ?, ?, ?, 'active')
-          `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
-        }
-
+        // Ensure session exists (INSERT OR IGNORE avoids race condition)
         const now = new Date();
+        db.prepare(`
+          INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+          VALUES (?, ?, ?, ?, ?, 'active')
+        `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
+
         const summaryResult = insertSummary.run(
           sessionId, proj, narrative, title, narrative,
           now.toISOString(), now.getTime()

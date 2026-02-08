@@ -31,7 +31,8 @@ if [[ "$tool" == "Read" ]]; then
     project="${project:-unknown}"
     runtime_dir="$HOME/claude-mem-lite/runtime"
     mkdir -p "$runtime_dir" 2>/dev/null
-    echo "$file_path" >> "${runtime_dir}/reads-${project}.txt"
+    # Use printf to avoid shell interpretation of special characters in file paths
+    printf '%s\n' "$file_path" >> "${runtime_dir}/reads-${project}.txt"
   fi
   exit 0
 fi

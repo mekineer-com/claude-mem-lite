@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { homedir } from 'os';
@@ -69,8 +69,8 @@ async function install() {
   log('Registering MCP server...');
   try {
     // Remove existing first (ignore errors)
-    try { execSync('claude mcp remove -s user mem', { stdio: 'pipe' }); } catch {}
-    execSync(`claude mcp add -s user -t stdio mem -- node "${SERVER_PATH}"`, { stdio: 'pipe' });
+    try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); } catch {}
+    execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
     ok('MCP server registered: mem');
   } catch (e) {
     fail('MCP registration failed: ' + e.message);
@@ -184,7 +184,7 @@ async function install() {
   const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
   if (existsSync(vectorDbPath)) {
     try {
-      const size = execSync(`du -sh "${vectorDbPath}" 2>/dev/null`, { encoding: 'utf8' }).trim().split('\t')[0];
+      const size = execFileSync('du', ['-sh', vectorDbPath], { encoding: 'utf8' }).trim().split('\t')[0];
       warn(`Old vector-db exists (${size}). Run: rm -rf ~/.claude-mem/vector-db/`);
     } catch {}
   }
@@ -199,7 +199,7 @@ async function uninstall() {
 
   // 1. Remove MCP
   try {
-    execSync('claude mcp remove -s user mem', { stdio: 'pipe' });
+    execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' });
     ok('MCP server removed');
   } catch {
     warn('MCP server not found or already removed');
@@ -219,9 +219,11 @@ async function uninstall() {
 
   // 3. Purge data if requested
   if (flags.has('--purge')) {
-    if (existsSync(DATA_DIR)) {
+    if (existsSync(DATA_DIR) && DATA_DIR.includes('claude-mem-lite')) {
       rmSync(DATA_DIR, { recursive: true, force: true });
       ok('Data purged (~/claude-mem-lite/)');
+    } else if (existsSync(DATA_DIR)) {
+      fail('Unexpected DATA_DIR path, refusing to purge: ' + DATA_DIR);
     }
   } else {
     log('Data preserved in ~/claude-mem-lite/ (use --purge to remove)');
@@ -237,7 +239,7 @@ async function status() {
 
   // MCP
   try {
-    const list = execSync('claude mcp list 2>/dev/null', { encoding: 'utf8' });
+    const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8' });
     if (list.includes('mem:') || list.includes('mem ')) {
       ok('MCP server: registered');
     } else {
@@ -388,6 +390,8 @@ function readSettings() {
 }
 
 function writeSettings(settings) {
+  const settingsDir = dirname(SETTINGS_PATH);
+  if (!existsSync(settingsDir)) mkdirSync(settingsDir, { recursive: true });
   const tmp = SETTINGS_PATH + '.tmp';
   writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
   renameSync(tmp, SETTINGS_PATH);
