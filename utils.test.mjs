@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   jaccardSimilarity,
   truncate,
@@ -6,6 +6,13 @@ import {
   sanitizeFtsQuery,
   clampImportance,
   computeRuleImportance,
+  inferProject,
+  detectBashSignificance,
+  extractErrorKeywords,
+  extractFilePaths,
+  parseJsonFromLLM,
+  isRelatedToEpisode,
+  makeEntryDesc,
 } from './utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
@@ -280,5 +287,421 @@ describe('computeRuleImportance', () => {
   it('handles entries with no bashSig or files', () => {
     const ep = mkEpisode([mkEntry()]);
     expect(computeRuleImportance(ep)).toBe(1);
+  });
+});
+
+// ─── inferProject ────────────────────────────────────────────────────────────
+
+describe('inferProject', () => {
+  const origEnv = { ...process.env };
+  afterEach(() => {
+    // Restore only the keys we modify
+    if (origEnv.CLAUDE_PROJECT_DIR !== undefined) process.env.CLAUDE_PROJECT_DIR = origEnv.CLAUDE_PROJECT_DIR;
+    else delete process.env.CLAUDE_PROJECT_DIR;
+    if (origEnv.PWD !== undefined) process.env.PWD = origEnv.PWD;
+    else delete process.env.PWD;
+  });
+
+  it('returns basename of CLAUDE_PROJECT_DIR if set', () => {
+    process.env.CLAUDE_PROJECT_DIR = '/home/user/my-project';
+    expect(inferProject()).toBe('my-project');
+  });
+
+  it('falls back to PWD if CLAUDE_PROJECT_DIR not set', () => {
+    delete process.env.CLAUDE_PROJECT_DIR;
+    process.env.PWD = '/workspace/other-project';
+    expect(inferProject()).toBe('other-project');
+  });
+
+  it('falls back to cwd if neither env var set', () => {
+    delete process.env.CLAUDE_PROJECT_DIR;
+    delete process.env.PWD;
+    const result = inferProject();
+    expect(typeof result).toBe('string');
+    expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+// ─── detectBashSignificance ──────────────────────────────────────────────────
+
+describe('detectBashSignificance', () => {
+  it('detects errors in response (requires length > 30)', () => {
+    const result = detectBashSignificance(
+      { command: 'npm test' },
+      'Error: Cannot find module xyz at require (node:internal/modules/cjs:1234:56)'
+    );
+    expect(result.isError).toBe(true);
+    expect(result.isSignificant).toBe(true);
+  });
+
+  it('ignores short error-like responses', () => {
+    const result = detectBashSignificance({ command: 'ls' }, 'error');
+    expect(result.isError).toBe(false);
+  });
+
+  it('detects test commands', () => {
+    expect(detectBashSignificance({ command: 'npm test' }, 'ok').isTest).toBe(true);
+    expect(detectBashSignificance({ command: 'npx vitest run' }, 'ok').isTest).toBe(true);
+    expect(detectBashSignificance({ command: 'pytest tests/' }, 'ok').isTest).toBe(true);
+    expect(detectBashSignificance({ command: 'jest --coverage' }, 'ok').isTest).toBe(true);
+    expect(detectBashSignificance({ command: 'npx cypress run' }, 'ok').isTest).toBe(true);
+    expect(detectBashSignificance({ command: 'npx playwright test' }, 'ok').isTest).toBe(true);
+  });
+
+  it('detects build commands', () => {
+    expect(detectBashSignificance({ command: 'npm run build' }, 'ok').isBuild).toBe(true);
+    expect(detectBashSignificance({ command: 'tsc --noEmit' }, 'ok').isBuild).toBe(true);
+    expect(detectBashSignificance({ command: 'npx webpack' }, 'ok').isBuild).toBe(true);
+    expect(detectBashSignificance({ command: 'cargo build' }, 'ok').isBuild).toBe(true);
+    expect(detectBashSignificance({ command: 'make all' }, 'ok').isBuild).toBe(true);
+  });
+
+  it('detects git operations', () => {
+    expect(detectBashSignificance({ command: 'git commit -m "msg"' }, 'ok').isGit).toBe(true);
+    expect(detectBashSignificance({ command: 'git push origin main' }, 'ok').isGit).toBe(true);
+    expect(detectBashSignificance({ command: 'git merge feat' }, 'ok').isGit).toBe(true);
+    expect(detectBashSignificance({ command: 'git rebase main' }, 'ok').isGit).toBe(true);
+  });
+
+  it('does NOT detect non-mutation git commands', () => {
+    expect(detectBashSignificance({ command: 'git status' }, 'ok').isGit).toBe(false);
+    expect(detectBashSignificance({ command: 'git log' }, 'ok').isGit).toBe(false);
+    expect(detectBashSignificance({ command: 'git diff' }, 'ok').isGit).toBe(false);
+  });
+
+  it('detects deploy commands', () => {
+    expect(detectBashSignificance({ command: 'docker build .' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'kubectl apply -f k8s/' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'terraform plan' }, 'ok').isDeploy).toBe(true);
+  });
+
+  it('returns all false for ordinary commands', () => {
+    const result = detectBashSignificance({ command: 'ls -la' }, 'file1 file2');
+    expect(result.isError).toBe(false);
+    expect(result.isTest).toBe(false);
+    expect(result.isBuild).toBe(false);
+    expect(result.isGit).toBe(false);
+    expect(result.isDeploy).toBe(false);
+    expect(result.isSignificant).toBe(false);
+  });
+
+  it('isSignificant is true when any flag is true', () => {
+    expect(detectBashSignificance({ command: 'npm test' }, 'ok').isSignificant).toBe(true);
+    expect(detectBashSignificance({ command: 'npm run build' }, 'ok').isSignificant).toBe(true);
+  });
+
+  it('handles missing command gracefully', () => {
+    const result = detectBashSignificance({}, 'some output');
+    expect(result.isTest).toBe(false);
+    expect(result.isBuild).toBe(false);
+  });
+
+  it('detects multiple error patterns', () => {
+    expect(detectBashSignificance({ command: 'x' }, 'ENOENT: no such file or directory, open').isError).toBe(true);
+    expect(detectBashSignificance({ command: 'x' }, 'panic: runtime error: index out of range').isError).toBe(true);
+    expect(detectBashSignificance({ command: 'x' }, 'Traceback (most recent call last): in foo.py').isError).toBe(true);
+    expect(detectBashSignificance({ command: 'x' }, 'bash: command not found: nonexistent_tool').isError).toBe(true);
+  });
+});
+
+// ─── extractErrorKeywords ────────────────────────────────────────────────────
+
+describe('extractErrorKeywords', () => {
+  it('extracts keywords from command', () => {
+    const result = extractErrorKeywords('npm install express', 'Error: EACCES permission denied');
+    expect(result).toContain('npm');
+    expect(result).toContain('install');
+    expect(result).toContain('express');
+  });
+
+  it('filters stop words from command', () => {
+    const result = extractErrorKeywords('node require test', 'Error: module not found for express');
+    // 'node' and 'require' are stop words
+    expect(result).not.toContain('node');
+    expect(result).not.toContain('require');
+  });
+
+  it('extracts keywords from error lines in response', () => {
+    const response = 'Loading config...\nError: ModuleNotFoundError for package xyz\nDone.';
+    const result = extractErrorKeywords('npm start', response);
+    expect(result).toContain('modulenotfounderror');
+  });
+
+  it('filters short words from response (<=3 chars)', () => {
+    const result = extractErrorKeywords('cmd', 'Error: a bc def ghij in module');
+    // 'a' and 'bc' are <=3 chars, should be filtered from response tokens
+    expect(result).not.toContain('a');
+    expect(result).not.toContain('bc');
+  });
+
+  it('returns null for empty/trivial input', () => {
+    expect(extractErrorKeywords('', 'ok')).toBeNull();
+    // 'ls' is <= 2 chars so filtered from command
+    expect(extractErrorKeywords('ls', 'file1 file2')).toBeNull();
+  });
+
+  it('limits to 6 keywords', () => {
+    const response = 'Error: alpha bravo charlie delta echo foxtrot golf hotel india juliet';
+    const result = extractErrorKeywords('aaa bbb ccc', response);
+    expect(result.length).toBeLessThanOrEqual(6);
+  });
+
+  it('handles multi-line error responses', () => {
+    const response = [
+      'npm warn deprecated package@1.0',
+      'Error: Cannot find module express',
+      'at Function.Module._resolveFilename',
+      'TypeError: undefined is not a function',
+    ].join('\n');
+    const result = extractErrorKeywords('npm start', response);
+    expect(result).not.toBeNull();
+    expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('excludes numeric-only tokens from response', () => {
+    const result = extractErrorKeywords('cmd', 'Error at line 1234 in module.js');
+    expect(result).not.toContain('1234');
+  });
+});
+
+// ─── extractFilePaths ────────────────────────────────────────────────────────
+
+describe('extractFilePaths', () => {
+  it('extracts file_path from input', () => {
+    expect(extractFilePaths({ file_path: '/src/foo.js' })).toEqual(['/src/foo.js']);
+  });
+
+  it('extracts path from input', () => {
+    expect(extractFilePaths({ path: '/src/bar.ts' })).toEqual(['/src/bar.ts']);
+  });
+
+  it('extracts filePath from input', () => {
+    expect(extractFilePaths({ filePath: '/src/baz.py' })).toEqual(['/src/baz.py']);
+  });
+
+  it('extracts paths from Bash commands', () => {
+    const result = extractFilePaths({ command: 'cat /etc/hosts && ls /home/user/project' });
+    expect(result).toContain('/etc/hosts');
+    expect(result).toContain('/home/user/project');
+  });
+
+  it('extracts paths with extensions from commands', () => {
+    const result = extractFilePaths({ command: 'node /app/server.mjs' });
+    expect(result).toContain('/app/server.mjs');
+  });
+
+  it('extracts extensionless paths (Makefile, Dockerfile)', () => {
+    const result = extractFilePaths({ command: 'cat /project/Makefile' });
+    expect(result).toContain('/project/Makefile');
+  });
+
+  it('filters /dev/, /proc/, /tmp/ paths', () => {
+    const result = extractFilePaths({ command: 'cat /dev/null /proc/1/status /tmp/test /src/app.js' });
+    expect(result).not.toContain('/dev/null');
+    expect(result).not.toContain('/proc/1/status');
+    expect(result).not.toContain('/tmp/test');
+    expect(result).toContain('/src/app.js');
+  });
+
+  it('deduplicates paths', () => {
+    const result = extractFilePaths({
+      file_path: '/src/foo.js',
+      command: 'cat /src/foo.js',
+    });
+    expect(result).toEqual(['/src/foo.js']);
+  });
+
+  it('returns empty array for no paths', () => {
+    expect(extractFilePaths({})).toEqual([]);
+    expect(extractFilePaths({ command: 'echo hello' })).toEqual([]);
+  });
+
+  it('combines all path sources', () => {
+    const result = extractFilePaths({
+      file_path: '/a/one.js',
+      path: '/b/two.ts',
+      filePath: '/c/three.py',
+    });
+    expect(result).toContain('/a/one.js');
+    expect(result).toContain('/b/two.ts');
+    expect(result).toContain('/c/three.py');
+  });
+});
+
+// ─── parseJsonFromLLM ────────────────────────────────────────────────────────
+
+describe('parseJsonFromLLM', () => {
+  it('returns null for null/undefined/empty', () => {
+    expect(parseJsonFromLLM(null)).toBeNull();
+    expect(parseJsonFromLLM(undefined)).toBeNull();
+    expect(parseJsonFromLLM('')).toBeNull();
+  });
+
+  it('parses valid JSON directly', () => {
+    const obj = { type: 'bugfix', title: 'Fix login' };
+    expect(parseJsonFromLLM(JSON.stringify(obj))).toEqual(obj);
+  });
+
+  it('parses JSON in fenced code block', () => {
+    const text = 'Here is the result:\n```json\n{"type":"feature","title":"Add search"}\n```\nDone.';
+    expect(parseJsonFromLLM(text)).toEqual({ type: 'feature', title: 'Add search' });
+  });
+
+  it('parses JSON in unfenced code block', () => {
+    const text = 'Result:\n```\n{"type":"refactor","title":"Clean up"}\n```';
+    expect(parseJsonFromLLM(text)).toEqual({ type: 'refactor', title: 'Clean up' });
+  });
+
+  it('extracts JSON object from mixed text', () => {
+    const text = 'The observation is: {"type":"discovery","title":"Found pattern"} as shown above.';
+    expect(parseJsonFromLLM(text)).toEqual({ type: 'discovery', title: 'Found pattern' });
+  });
+
+  it('returns null for unparseable text', () => {
+    expect(parseJsonFromLLM('just plain text')).toBeNull();
+    expect(parseJsonFromLLM('no json here {{')).toBeNull();
+  });
+
+  it('handles nested JSON objects', () => {
+    const obj = { type: 'bugfix', meta: { severity: 'high' } };
+    expect(parseJsonFromLLM(JSON.stringify(obj))).toEqual(obj);
+  });
+
+  it('handles JSON with arrays', () => {
+    const obj = { concepts: ['auth', 'jwt'], facts: ['uses bcrypt'] };
+    expect(parseJsonFromLLM(JSON.stringify(obj))).toEqual(obj);
+  });
+});
+
+// ─── isRelatedToEpisode ──────────────────────────────────────────────────────
+
+describe('isRelatedToEpisode', () => {
+  const mkEpisode = (files) => ({ files });
+
+  it('returns true when newFiles is empty', () => {
+    expect(isRelatedToEpisode(mkEpisode(['/a/foo.js']), [])).toBe(true);
+  });
+
+  it('returns true when episode.files is empty', () => {
+    expect(isRelatedToEpisode(mkEpisode([]), ['/b/bar.js'])).toBe(true);
+  });
+
+  it('returns true for same file', () => {
+    expect(isRelatedToEpisode(mkEpisode(['/src/app.js']), ['/src/app.js'])).toBe(true);
+  });
+
+  it('returns true for same directory', () => {
+    expect(isRelatedToEpisode(mkEpisode(['/src/foo.js']), ['/src/bar.js'])).toBe(true);
+  });
+
+  it('returns false for unrelated files in different directories', () => {
+    expect(isRelatedToEpisode(mkEpisode(['/src/foo.js']), ['/test/bar.js'])).toBe(false);
+  });
+
+  it('returns true if any file pair overlaps', () => {
+    expect(isRelatedToEpisode(
+      mkEpisode(['/src/a.js', '/lib/b.js']),
+      ['/test/c.js', '/src/d.js']  // /src/ overlaps
+    )).toBe(true);
+  });
+
+  it('handles deeply nested paths', () => {
+    expect(isRelatedToEpisode(
+      mkEpisode(['/a/b/c/foo.js']),
+      ['/a/b/c/bar.js']
+    )).toBe(true);
+    expect(isRelatedToEpisode(
+      mkEpisode(['/a/b/c/foo.js']),
+      ['/a/b/d/bar.js']
+    )).toBe(false);
+  });
+});
+
+// ─── makeEntryDesc ───────────────────────────────────────────────────────────
+
+describe('makeEntryDesc', () => {
+  it('describes Edit tool', () => {
+    const desc = makeEntryDesc('Edit', {
+      file_path: '/src/app.js',
+      old_string: 'const x = 1',
+      new_string: 'const x = 2',
+    }, '');
+    expect(desc).toContain('app.js');
+    expect(desc).toContain('const x = 1');
+    expect(desc).toContain('const x = 2');
+    expect(desc).toContain('→');
+  });
+
+  it('describes Write tool', () => {
+    const desc = makeEntryDesc('Write', {
+      file_path: '/src/new.js',
+      content: 'hello world',
+    }, '');
+    expect(desc).toContain('Created');
+    expect(desc).toContain('new.js');
+    expect(desc).toContain('11 chars');
+  });
+
+  it('describes NotebookEdit tool', () => {
+    const desc = makeEntryDesc('NotebookEdit', {
+      new_source: 'import pandas as pd',
+    }, '');
+    expect(desc).toContain('Notebook cell');
+    expect(desc).toContain('import pandas');
+  });
+
+  it('describes Bash tool without error', () => {
+    const desc = makeEntryDesc('Bash', { command: 'ls -la' }, 'file1 file2');
+    expect(desc).toContain('ls -la');
+    expect(desc).toContain('file1 file2');
+    expect(desc).not.toContain('ERROR');
+  });
+
+  it('describes Bash tool with error', () => {
+    const longErr = 'Error: something went wrong in the module loader';
+    const desc = makeEntryDesc('Bash', { command: 'npm start' }, longErr);
+    expect(desc).toContain('npm start');
+    expect(desc).toContain('ERROR');
+  });
+
+  it('describes Grep tool', () => {
+    const desc = makeEntryDesc('Grep', { pattern: 'TODO' }, 'src/foo.js:10: TODO fix');
+    expect(desc).toContain('Search');
+    expect(desc).toContain('TODO');
+  });
+
+  it('describes LSP tool', () => {
+    const desc = makeEntryDesc('LSP', { operation: 'goToDefinition', filePath: '/src/types.ts' }, '');
+    expect(desc).toContain('goToDefinition');
+    expect(desc).toContain('types.ts');
+  });
+
+  it('describes Task tool', () => {
+    const desc = makeEntryDesc('Task', { description: 'Explore auth module' }, '');
+    expect(desc).toContain('Explore auth module');
+  });
+
+  it('describes WebSearch tool', () => {
+    const desc = makeEntryDesc('WebSearch', { query: 'react hooks' }, '');
+    expect(desc).toContain('Web:');
+    expect(desc).toContain('react hooks');
+  });
+
+  it('describes WebFetch tool', () => {
+    const desc = makeEntryDesc('WebFetch', { url: 'https://example.com' }, '');
+    expect(desc).toContain('Fetch:');
+    expect(desc).toContain('example.com');
+  });
+
+  it('handles unknown tools', () => {
+    const desc = makeEntryDesc('CustomTool', {}, 'some result');
+    expect(desc).toContain('CustomTool:');
+    expect(desc).toContain('some result');
+  });
+
+  it('handles missing input fields gracefully', () => {
+    expect(() => makeEntryDesc('Edit', {}, '')).not.toThrow();
+    expect(() => makeEntryDesc('Bash', {}, '')).not.toThrow();
+    expect(() => makeEntryDesc('Write', {}, '')).not.toThrow();
   });
 });

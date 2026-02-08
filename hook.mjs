@@ -8,9 +8,13 @@ import Database from 'better-sqlite3';
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
-import { join, basename, dirname } from 'path';
+import { join, basename } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, renameSync, constants as fsConstants } from 'fs';
-import { jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance } from './utils.mjs';
+import {
+  jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance,
+  inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
+  parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc,
+} from './utils.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -34,9 +38,7 @@ function inferProjectDir() {
   return process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
 }
 
-function inferProject() {
-  return basename(inferProjectDir());
-}
+// inferProject imported from utils.mjs
 
 function sessionFile() {
   return join(RUNTIME_DIR, `session-${inferProject()}`);
@@ -99,15 +101,7 @@ function callLLM(prompt, timeoutMs = 15000) {
   }
 }
 
-function parseJsonFromLLM(text) {
-  if (!text) return null;
-  try { return JSON.parse(text); } catch {}
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (fenced) try { return JSON.parse(fenced[1]); } catch {}
-  const obj = text.match(/\{[\s\S]*\}/);
-  if (obj) try { return JSON.parse(obj[0]); } catch {}
-  return null;
-}
+// parseJsonFromLLM imported from utils.mjs
 
 // ─── LLM Concurrency Semaphore (max 2 concurrent claude -p calls) ────────────
 
@@ -262,19 +256,7 @@ function addFileToEpisode(episode, files) {
   }
 }
 
-function isRelatedToEpisode(episode, newFiles) {
-  // No files (Bash, Grep without file context) → always related
-  if (newFiles.length === 0) return true;
-  if (episode.files.length === 0) return true;
-  // Check file or directory overlap
-  for (const nf of newFiles) {
-    for (const ef of episode.files) {
-      if (nf === ef) return true;
-      if (dirname(nf) === dirname(ef)) return true;
-    }
-  }
-  return false;
-}
+// isRelatedToEpisode imported from utils.mjs
 
 function episodeHasSignificantContent(episode) {
   return episode.entries.some(e =>
@@ -471,55 +453,7 @@ function triggerErrorRecall(toolInput, response) {
   }
 }
 
-function extractErrorKeywords(cmd, response) {
-  const STOP_WORDS = new Set([
-    'error', 'failed', 'cannot', 'could', 'with', 'from', 'that', 'this',
-    'have', 'been', 'were', 'does', 'will', 'would', 'should', 'must',
-    'true', 'false', 'null', 'undefined', 'function', 'return', 'const',
-    'node', 'require', 'stack', 'trace',
-  ]);
-  const words = new Set();
-  // Extract meaningful tokens from command
-  const cmdParts = cmd.split(/[\s/\\|&;]+/).filter(w => w.length > 2 && !/^-/.test(w));
-  for (const w of cmdParts.slice(0, 3)) {
-    const lw = w.toLowerCase();
-    if (!STOP_WORDS.has(lw)) words.add(lw);
-  }
-  // Extract error-specific tokens from response
-  const errLines = response.split('\n').filter(l =>
-    /error|fail|exception|cannot|not found|undefined|null/i.test(l)
-  ).slice(0, 3);
-  for (const line of errLines) {
-    const tokens = line.replace(/[^a-zA-Z0-9_.-]/g, ' ').split(/\s+/)
-      .filter(w => w.length > 3 && !/^\d+$/.test(w));
-    for (const t of tokens.slice(0, 5)) {
-      const lt = t.toLowerCase();
-      if (!STOP_WORDS.has(lt)) words.add(lt);
-    }
-  }
-  const result = [...words].slice(0, 6);
-  return result.length >= 1 ? result : null;
-}
-
-// ─── Bash Significance Detection (Tier 1 B) ────────────────────────────────
-
-function detectBashSignificance(input, response) {
-  const cmd = (input.command || '').toLowerCase();
-  const isError = /\berror\b|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
-    && response.length > 30;
-  const isTest = /\b(test|jest|pytest|vitest|mocha|spec|cypress|playwright)\b/i.test(cmd);
-  const isBuild = /\b(build|compile|tsc|webpack|vite|rollup|esbuild|make|cargo)\b/i.test(cmd);
-  const isGit = /\bgit\s+(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);
-  const isDeploy = /\b(deploy|docker|kubectl|terraform)\b/i.test(cmd);
-  return {
-    isError, isTest, isBuild, isGit, isDeploy,
-    isSignificant: isError || isTest || isBuild || isGit || isDeploy,
-  };
-}
-
-// ─── Rule-Engine Importance (deterministic, no LLM) ─────────────────────────
-
-// computeRuleImportance, clampImportance imported from utils.mjs
+// extractErrorKeywords, detectBashSignificance, computeRuleImportance, clampImportance imported from utils.mjs
 
 // ─── Background: LLM Episode Extraction (Tier 2 F) ─────────────────────────
 
@@ -1031,59 +965,7 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
   }
 }
 
-// ─── Entry Description Generators ───────────────────────────────────────────
-
-function makeEntryDesc(toolName, input, resp) {
-  switch (toolName) {
-    case 'Edit':
-      return `${basename(input.file_path || '')}: "${truncate(input.old_string || '', 40)}" → "${truncate(input.new_string || '', 40)}"`;
-    case 'Write':
-      return `Created ${basename(input.file_path || '')} (${(input.content || '').length} chars)`;
-    case 'NotebookEdit':
-      return `Notebook cell: ${truncate(input.new_source || '', 60)}`;
-    case 'Bash': {
-      const cmd = truncate(input.command || '', 50);
-      const isErr = /error|fail|exception|panic/i.test(resp) && resp.length > 30;
-      const snippet = truncate(resp, 60);
-      return isErr ? `${cmd} → ERROR: ${snippet}` : `${cmd} → ${snippet}`;
-    }
-    case 'Grep':
-      return `Search "${truncate(input.pattern || '', 20)}" → ${truncate(resp, 60)}`;
-    case 'LSP':
-      return `${input.operation || ''} ${basename(input.filePath || '')}`;
-    case 'Task':
-      return truncate(input.description || '', 60);
-    case 'WebSearch':
-      return `Web: ${truncate(input.query || '', 50)}`;
-    case 'WebFetch':
-      return `Fetch: ${truncate(input.url || '', 50)}`;
-    default:
-      return `${toolName}: ${truncate(resp, 50)}`;
-  }
-}
-
-// ─── File Path Extraction ───────────────────────────────────────────────────
-
-function extractFilePaths(input) {
-  const paths = [];
-  if (input.file_path) paths.push(input.file_path);
-  if (input.path) paths.push(input.path);
-  if (input.filePath) paths.push(input.filePath);
-  if (input.command) {
-    const match = input.command.match(/(?:^|\s)(\/[\w./-]+(?:\.\w+))/g);
-    if (match) {
-      for (const m of match) {
-        const p = m.trim();
-        if (!p.startsWith('/dev/') && !p.startsWith('/proc/') && !p.startsWith('/tmp/')) {
-          paths.push(p);
-        }
-      }
-    }
-  }
-  return [...new Set(paths)];
-}
-
-// jaccardSimilarity imported from utils.mjs
+// makeEntryDesc, extractFilePaths, jaccardSimilarity imported from utils.mjs
 
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
@@ -1113,7 +995,7 @@ function fmtDate(iso) {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-// typeIcon, truncate imported from utils.mjs
+// typeIcon, truncate, etc. imported from utils.mjs
 
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 
