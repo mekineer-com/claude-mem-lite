@@ -13,6 +13,7 @@ import {
   parseJsonFromLLM,
   isRelatedToEpisode,
   makeEntryDesc,
+  scrubSecrets,
 } from './utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
@@ -302,15 +303,15 @@ describe('inferProject', () => {
     else delete process.env.PWD;
   });
 
-  it('returns basename of CLAUDE_PROJECT_DIR if set', () => {
+  it('returns parent--basename of CLAUDE_PROJECT_DIR if set', () => {
     process.env.CLAUDE_PROJECT_DIR = '/home/user/my-project';
-    expect(inferProject()).toBe('my-project');
+    expect(inferProject()).toBe('user--my-project');
   });
 
   it('falls back to PWD if CLAUDE_PROJECT_DIR not set', () => {
     delete process.env.CLAUDE_PROJECT_DIR;
     process.env.PWD = '/workspace/other-project';
-    expect(inferProject()).toBe('other-project');
+    expect(inferProject()).toBe('workspace--other-project');
   });
 
   it('falls back to cwd if neither env var set', () => {
@@ -319,6 +320,24 @@ describe('inferProject', () => {
     const result = inferProject();
     expect(typeof result).toBe('string');
     expect(result.length).toBeGreaterThan(0);
+  });
+
+  it('disambiguates same-name dirs under different parents', () => {
+    process.env.CLAUDE_PROJECT_DIR = '/work/app';
+    const a = inferProject();
+    process.env.CLAUDE_PROJECT_DIR = '/personal/app';
+    const b = inferProject();
+    expect(a).toBe('work--app');
+    expect(b).toBe('personal--app');
+    expect(a).not.toBe(b);
+  });
+
+  it('returns basename only for root-level directories', () => {
+    process.env.CLAUDE_PROJECT_DIR = '/project';
+    // dirname('/project') is '/', basename('/') is ''
+    // When parent is empty or '/', should return just base
+    const result = inferProject();
+    expect(result).toBe('project');
   });
 });
 
@@ -703,5 +722,83 @@ describe('makeEntryDesc', () => {
     expect(() => makeEntryDesc('Edit', {}, '')).not.toThrow();
     expect(() => makeEntryDesc('Bash', {}, '')).not.toThrow();
     expect(() => makeEntryDesc('Write', {}, '')).not.toThrow();
+  });
+});
+
+// ─── scrubSecrets ────────────────────────────────────────────────────────────
+
+describe('scrubSecrets', () => {
+  it('returns empty string for null/undefined/empty', () => {
+    expect(scrubSecrets(null)).toBe('');
+    expect(scrubSecrets(undefined)).toBe('');
+    expect(scrubSecrets('')).toBe('');
+  });
+
+  it('passes through text with no secrets', () => {
+    const text = 'normal log output with no secrets';
+    expect(scrubSecrets(text)).toBe(text);
+  });
+
+  it('scrubs key=value password assignments', () => {
+    expect(scrubSecrets('password=hunter2')).toBe('password=***');
+    expect(scrubSecrets('token=abc123xyz')).toBe('token=***');
+    expect(scrubSecrets('api_key=sk-mykey123')).toBe('api_key=***');
+    expect(scrubSecrets('API_SECRET=mysecretvalue')).toBe('API_SECRET=***');
+  });
+
+  it('scrubs key: value style assignments', () => {
+    expect(scrubSecrets('password: hunter2')).toBe('password: ***');
+    expect(scrubSecrets('auth_token: bearer123')).toBe('auth_token: ***');
+  });
+
+  it('scrubs AWS access keys', () => {
+    expect(scrubSecrets('key is AKIAIOSFODNN7EXAMPLE')).toBe('key is ***');
+  });
+
+  it('scrubs OpenAI/Anthropic keys (sk-...)', () => {
+    expect(scrubSecrets('using sk-proj-abc123def456ghi789jkl')).toBe('using ***');
+  });
+
+  it('scrubs GitHub tokens', () => {
+    expect(scrubSecrets('token: ghp_' + 'a'.repeat(36))).toBe('token: ***');
+    expect(scrubSecrets('github_pat_' + 'b'.repeat(40))).toBe('***');
+  });
+
+  it('scrubs GitLab tokens', () => {
+    expect(scrubSecrets('glpat-' + 'x'.repeat(20))).toBe('***');
+  });
+
+  it('scrubs Slack tokens', () => {
+    expect(scrubSecrets('xoxb-123456789-abcdefghij')).toBe('***');
+    expect(scrubSecrets('xoxp-token-value-here')).toBe('***');
+  });
+
+  it('scrubs JWT tokens', () => {
+    const jwt = 'eyJhbGciOiJIUzI.eyJzdWIiOiIxMjM.SflKxwRJSMeKKF';
+    expect(scrubSecrets(`bearer ${jwt}`)).toBe('bearer ***');
+  });
+
+  it('scrubs PEM private key blocks', () => {
+    const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----';
+    expect(scrubSecrets(`config: ${pem} done`)).toBe('config: ***PEM_KEY*** done');
+  });
+
+  it('scrubs long hex strings in key assignments', () => {
+    const hex = 'a'.repeat(40);
+    expect(scrubSecrets(`secret=${hex}`)).toBe('secret=***');
+  });
+
+  it('preserves key names while scrubbing values', () => {
+    const result = scrubSecrets('password=secret123 token=abc user=john');
+    expect(result).toContain('password=***');
+    expect(result).toContain('token=***');
+    expect(result).toContain('user=john'); // not a secret key
+  });
+
+  it('handles multiple secrets in one string', () => {
+    const text = 'password=hunter2 and api_key=sk-secret123key456val';
+    const result = scrubSecrets(text);
+    expect(result).not.toContain('hunter2');
+    expect(result).not.toContain('sk-secret123key456val');
   });
 });

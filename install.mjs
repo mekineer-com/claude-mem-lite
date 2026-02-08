@@ -110,14 +110,23 @@ async function install() {
     }]
   };
 
+  const memUserPrompt = {
+    matcher: '*',
+    hooks: [{
+      type: 'command',
+      command: `node "${HOOK_PATH}" user-prompt`,
+      timeout: 5
+    }]
+  };
+
   // Filter out existing mem hooks, then append fresh ones
-  for (const [event, config] of [['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop]]) {
+  for (const [event, config] of [['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
     const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
     settings.hooks[event] = [...existing, config];
   }
 
   writeSettings(settings);
-  ok('Hooks configured (PostToolUse, SessionStart, Stop)');
+  ok('Hooks configured (PostToolUse, SessionStart, Stop, UserPromptSubmit)');
 
   // 5. Migrate from old ~/.claude-mem/ if needed
   if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH)) {
