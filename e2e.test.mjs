@@ -10,6 +10,7 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { computeMinHash } from './utils.mjs';
+import { ensureFTS } from './schema.mjs';
 
 const HOOK_PATH = resolve('hook.mjs');
 const MOCK_CLAUDE = resolve('scripts/mock-claude.mjs');
@@ -108,44 +109,10 @@ function initTestDb(tmpHome) {
     CREATE INDEX idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project);
   `);
 
-  // FTS5 tables + triggers
-  db.exec(`
-    CREATE VIRTUAL TABLE observations_fts USING fts5(title, subtitle, narrative, text, facts, concepts, content='observations', content_rowid='id');
-    CREATE TRIGGER observations_ai AFTER INSERT ON observations BEGIN
-      INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts) VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-    END;
-    CREATE TRIGGER observations_ad AFTER DELETE ON observations BEGIN
-      INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts) VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-    END;
-    CREATE TRIGGER observations_au AFTER UPDATE ON observations BEGIN
-      INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts) VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-      INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts) VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-    END;
-
-    CREATE VIRTUAL TABLE session_summaries_fts USING fts5(request, investigated, learned, completed, next_steps, notes, content='session_summaries', content_rowid='id');
-    CREATE TRIGGER session_summaries_ai AFTER INSERT ON session_summaries BEGIN
-      INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes) VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-    END;
-    CREATE TRIGGER session_summaries_ad AFTER DELETE ON session_summaries BEGIN
-      INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes) VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-    END;
-    CREATE TRIGGER session_summaries_au AFTER UPDATE ON session_summaries BEGIN
-      INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes) VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-      INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes) VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-    END;
-
-    CREATE VIRTUAL TABLE user_prompts_fts USING fts5(prompt_text, content='user_prompts', content_rowid='id');
-    CREATE TRIGGER user_prompts_ai AFTER INSERT ON user_prompts BEGIN
-      INSERT INTO user_prompts_fts(rowid, prompt_text) VALUES (new.id, new.prompt_text);
-    END;
-    CREATE TRIGGER user_prompts_ad AFTER DELETE ON user_prompts BEGIN
-      INSERT INTO user_prompts_fts(user_prompts_fts, rowid, prompt_text) VALUES('delete', old.id, old.prompt_text);
-    END;
-    CREATE TRIGGER user_prompts_au AFTER UPDATE ON user_prompts BEGIN
-      INSERT INTO user_prompts_fts(user_prompts_fts, rowid, prompt_text) VALUES('delete', old.id, old.prompt_text);
-      INSERT INTO user_prompts_fts(rowid, prompt_text) VALUES (new.id, new.prompt_text);
-    END;
-  `);
+  // FTS5 tables + triggers (shared with schema.mjs)
+  ensureFTS(db, 'observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
+  ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes']);
+  ensureFTS(db, 'user_prompts_fts', 'user_prompts', ['prompt_text']);
 
   db.close();
   return dbPath;

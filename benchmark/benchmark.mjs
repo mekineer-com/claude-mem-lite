@@ -2,111 +2,13 @@
 // Benchmark runner for claude-mem-lite search quality
 // Uses the exact same BM25 scoring formula from server.mjs
 
-import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
+import { createTestDb } from '../test-helpers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-// ─── Database Setup ─────────────────────────────────────────────────────────
-
-function createBenchmarkDb() {
-  const db = new Database(':memory:');
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = OFF');
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS sdk_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      content_session_id TEXT NOT NULL UNIQUE,
-      memory_session_id TEXT UNIQUE,
-      project TEXT NOT NULL,
-      user_prompt TEXT,
-      started_at TEXT NOT NULL,
-      started_at_epoch INTEGER NOT NULL,
-      completed_at TEXT,
-      completed_at_epoch INTEGER,
-      status TEXT NOT NULL DEFAULT 'active',
-      worker_port INTEGER,
-      prompt_counter INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS observations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      memory_session_id TEXT NOT NULL,
-      project TEXT NOT NULL,
-      text TEXT,
-      type TEXT NOT NULL CHECK(type IN ('decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change')),
-      title TEXT,
-      subtitle TEXT,
-      facts TEXT,
-      narrative TEXT,
-      concepts TEXT,
-      files_read TEXT,
-      files_modified TEXT,
-      prompt_number INTEGER,
-      discovery_tokens INTEGER DEFAULT 0,
-      created_at TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL,
-      importance INTEGER DEFAULT 1,
-      related_ids TEXT DEFAULT '[]',
-      minhash_sig TEXT,
-      access_count INTEGER DEFAULT 0,
-      compressed_into INTEGER DEFAULT NULL,
-      FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS session_summaries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      memory_session_id TEXT NOT NULL,
-      project TEXT NOT NULL,
-      request TEXT,
-      investigated TEXT,
-      learned TEXT,
-      completed TEXT,
-      next_steps TEXT,
-      files_read TEXT,
-      files_edited TEXT,
-      notes TEXT,
-      prompt_number INTEGER,
-      discovery_tokens INTEGER DEFAULT 0,
-      created_at TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL,
-      FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-    );
-  `);
-
-  // FTS5 tables
-  ensureFTS(db, 'observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
-  ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes']);
-
-  // Performance indexes
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_epoch_project ON observations(created_at_epoch DESC, project)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`);
-
-  return db;
-}
-
-function ensureFTS(db, ftsName, tableName, columns) {
-  const colList = columns.join(', ');
-  const newVals = columns.map(c => `new.${c}`).join(', ');
-  const oldVals = columns.map(c => `old.${c}`).join(', ');
-  db.exec(`
-    CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id');
-    CREATE TRIGGER ${tableName}_ai AFTER INSERT ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
-    END;
-    CREATE TRIGGER ${tableName}_ad AFTER DELETE ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
-    END;
-    CREATE TRIGGER ${tableName}_au AFTER UPDATE ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
-      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
-    END;
-  `);
-}
 
 // ─── Seed Database ──────────────────────────────────────────────────────────
 
@@ -388,7 +290,7 @@ function main() {
   const queryData = JSON.parse(readFileSync(queriesPath, 'utf-8'));
 
   console.error('Creating benchmark database...');
-  const db = createBenchmarkDb();
+  const db = createTestDb();
 
   console.error('Seeding database...');
   const counts = seedDatabase(db, seedData);
