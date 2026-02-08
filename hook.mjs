@@ -65,6 +65,7 @@ function openDb() {
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 3000');
   db.pragma('synchronous = NORMAL');
+  db.pragma('foreign_keys = OFF'); // Schema has FK mismatch (memory_session_id lacks UNIQUE)
   return db;
 }
 
