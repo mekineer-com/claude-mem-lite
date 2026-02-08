@@ -9,7 +9,7 @@ import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, constants as fsConstants } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, constants as fsConstants } from 'fs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -19,7 +19,11 @@ if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0
 
 const DB_DIR = join(homedir(), '.claude-mem');
 const DB_PATH = join(DB_DIR, 'claude-mem.db');
+const RUNTIME_DIR = join(DB_DIR, 'runtime');
 const SCRIPT_PATH = process.argv[1];
+
+// Ensure runtime directory exists
+try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
 if (!event) process.exit(0);
 
@@ -34,7 +38,7 @@ function inferProject() {
 }
 
 function sessionFile() {
-  return `/tmp/claude-mem-session-${process.getuid()}-${inferProject()}`;
+  return join(RUNTIME_DIR, `session-${inferProject()}`);
 }
 
 function getSessionId() {
@@ -116,7 +120,7 @@ function spawnBackground(bgEvent, ...extraArgs) {
 // ─── Episode Buffer (Tier 2 F) ─────────────────────────────────────────────
 
 function episodeFile() {
-  return `/tmp/claude-mem-ep-${process.getuid()}-${inferProject()}.json`;
+  return join(RUNTIME_DIR, `ep-${inferProject()}.json`);
 }
 
 function lockFile() {
@@ -198,7 +202,7 @@ function flushEpisode(episode) {
   if (!episode || episode.entries.length === 0) return;
 
   // Rename current buffer to prevent race conditions
-  const flushFile = `/tmp/claude-mem-ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
+  const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
   try {
     writeFileSync(flushFile, JSON.stringify(episode));
     try { unlinkSync(episodeFile()); } catch {}
