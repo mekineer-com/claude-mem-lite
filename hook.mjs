@@ -17,7 +17,7 @@ const event = process.argv[2];
 const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
 if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
 
-const DB_DIR = join(homedir(), '.claude-mem');
+const DB_DIR = join(homedir(), 'claude-mem-lite');
 const DB_PATH = join(DB_DIR, 'claude-mem.db');
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 const SCRIPT_PATH = process.argv[1];

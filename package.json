@@ -1,10 +1,28 @@
 {
   "name": "claude-mem-lite",
   "version": "2.0.0",
+  "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "bin": {
     "claude-mem-lite": "./install.mjs"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sdsrss/claude-mem-lite.git"
+  },
+  "files": [
+    "server.mjs",
+    "hook.mjs",
+    "install.mjs",
+    "skill.md",
+    "commands/mem.md",
+    "hooks/hooks.json",
+    "scripts/setup.sh",
+    ".claude-plugin/plugin.json",
+    ".claude-plugin/marketplace.json",
+    ".mcp.json",
+    "README.md"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "better-sqlite3": "^12.6.2",
