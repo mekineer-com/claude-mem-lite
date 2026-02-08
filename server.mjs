@@ -98,21 +98,29 @@ function ensureFTS(ftsName, tableName, columns) {
   const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
   if (exists) return;
 
+  // Validate identifiers to prevent SQL injection
+  const idRe = /^[a-z_]+$/;
+  if (!idRe.test(ftsName) || !idRe.test(tableName) || !columns.every(c => idRe.test(c))) {
+    throw new Error(`Invalid identifier in ensureFTS: ${ftsName}, ${tableName}`);
+  }
+
   const colList = columns.join(', ');
+  const newVals = columns.map(c => `new.${c}`).join(', ');
+  const oldVals = columns.map(c => `old.${c}`).join(', ');
   db.exec(`
     CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id');
 
     CREATE TRIGGER ${tableName}_ai AFTER INSERT ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (${columns.map(c => `new.${c}`).join(', ')});
+      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
     END;
 
     CREATE TRIGGER ${tableName}_ad AFTER DELETE ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', ${columns.map(c => `old.${c}`).join(', ')});
+      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
     END;
 
     CREATE TRIGGER ${tableName}_au AFTER UPDATE ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', ${columns.map(c => `old.${c}`).join(', ')});
-      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (${columns.map(c => `new.${c}`).join(', ')});
+      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
+      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
     END;
   `);
 }
@@ -156,8 +164,18 @@ function sanitizeFtsQuery(query) {
 
 const server = new McpServer({
   name: 'claude-mem-lite',
-  version: '1.0.0',
+  version: '2.0.0',
 });
+
+function safeHandler(fn) {
+  return async (args, extra) => {
+    try {
+      return await fn(args, extra);
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+    }
+  };
+}
 
 // ─── Tool: mem_search ───────────────────────────────────────────────────────
 
@@ -174,16 +192,18 @@ server.tool(
     limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
     offset: z.number().int().min(0).optional().describe('Offset for pagination'),
   },
-  async (args) => {
+  safeHandler(async (args) => {
     const limit = args.limit ?? 20;
     const offset = args.offset ?? 0;
     const ftsQuery = sanitizeFtsQuery(args.query);
     const searchType = args.type;
     const results = [];
 
-    // Parse date bounds to epoch
+    // Parse date bounds to epoch (with validation)
     const epochFrom = args.date_from ? new Date(args.date_from).getTime() : null;
     const epochTo = args.date_to ? new Date(args.date_to).getTime() : null;
+    if (epochFrom !== null && isNaN(epochFrom)) throw new Error(`Invalid date_from: ${args.date_from}`);
+    if (epochTo !== null && isNaN(epochTo)) throw new Error(`Invalid date_to: ${args.date_to}`);
 
     // Search observations
     if (!searchType || searchType === 'observations') {
@@ -341,7 +361,7 @@ server.tool(
     lines.push(`\nUse mem_get(ids=[...]) for full details.`);
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
+  })
 );
 
 // ─── Tool: mem_timeline ─────────────────────────────────────────────────────
@@ -356,7 +376,7 @@ server.tool(
     after: z.number().int().min(0).max(50).optional().describe('Items after anchor (default 5)'),
     project: z.string().optional().describe('Filter by project'),
   },
-  async (args) => {
+  safeHandler(async (args) => {
     const before = args.before ?? 5;
     const after = args.after ?? 5;
     let anchorId = args.anchor;
@@ -438,7 +458,7 @@ server.tool(
     }
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
+  })
 );
 
 // ─── Tool: mem_get ──────────────────────────────────────────────────────────
@@ -450,7 +470,7 @@ server.tool(
     ids: z.array(z.number().int()).min(1).max(20).describe('Observation IDs to retrieve'),
     fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),
   },
-  async (args) => {
+  safeHandler(async (args) => {
     const placeholders = args.ids.map(() => '?').join(',');
     const rows = db.prepare(`
       SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC
@@ -475,7 +495,7 @@ server.tool(
     }
 
     return { content: [{ type: 'text', text: parts.join('\n\n') }] };
-  }
+  })
 );
 
 // ─── Tool: mem_save ─────────────────────────────────────────────────────────
@@ -489,7 +509,7 @@ server.tool(
     type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Observation type (default: discovery)'),
     project: z.string().optional().describe('Project name (default: inferred from CWD)'),
   },
-  async (args) => {
+  safeHandler(async (args) => {
     const now = new Date();
     const project = args.project || 'manual';
     const type = args.type || 'discovery';
@@ -511,7 +531,7 @@ server.tool(
     `).run(sessionId, project, args.content, type, title, args.content, now.toISOString(), now.getTime());
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
-  }
+  })
 );
 
 // ─── Tool: mem_stats ────────────────────────────────────────────────────────
@@ -523,7 +543,7 @@ server.tool(
     project: z.string().optional().describe('Filter by project'),
     days: z.number().int().min(1).max(365).optional().describe('Look back N days (default 30)'),
   },
-  async (args) => {
+  safeHandler(async (args) => {
     const days = args.days ?? 30;
     const cutoff = Date.now() - days * 86400000;
     const projectFilter = args.project ? 'AND project = ?' : '';
@@ -577,8 +597,17 @@ server.tool(
     ];
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
-  }
+  })
 );
+
+// ─── Shutdown Cleanup ────────────────────────────────────────────────────────
+
+function shutdown() {
+  try { db.close(); } catch {}
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 // ─── Start Server ───────────────────────────────────────────────────────────
 

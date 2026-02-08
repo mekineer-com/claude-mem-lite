@@ -5,20 +5,22 @@
 // Background workers (slow): llm-episode, llm-summary
 
 import Database from 'better-sqlite3';
-import { execSync, spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, openSync, closeSync, constants as fsConstants } from 'fs';
 
 // Prevent recursive hooks from background claude -p calls
-if (process.env.CLAUDE_MEM_HOOK_RUNNING) process.exit(0);
+// Background workers (llm-episode, llm-summary) are exempt — they're ours
+const event = process.argv[2];
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
+if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
 
 const DB_DIR = join(homedir(), '.claude-mem');
 const DB_PATH = join(DB_DIR, 'claude-mem.db');
 const SCRIPT_PATH = process.argv[1];
 
-const event = process.argv[2];
 if (!event) process.exit(0);
 
 // ─── Session ID Management (Tier 1 A) ──────────────────────────────────────
@@ -32,7 +34,7 @@ function inferProject() {
 }
 
 function sessionFile() {
-  return `/tmp/claude-mem-session-${inferProject()}`;
+  return `/tmp/claude-mem-session-${process.getuid()}-${inferProject()}`;
 }
 
 function getSessionId() {
@@ -74,16 +76,13 @@ function getClaudePath() {
 
 function callLLM(prompt, timeoutMs = 15000) {
   try {
-    const result = execSync(
-      `"${getClaudePath()}" -p --model haiku`,
-      {
-        input: prompt,
-        timeout: timeoutMs,
-        encoding: 'utf8',
-        env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }
-    );
+    const result = execFileSync(getClaudePath(), ['-p', '--model', 'haiku'], {
+      input: prompt,
+      timeout: timeoutMs,
+      encoding: 'utf8',
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     return result.trim();
   } catch (e) {
     const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
@@ -109,7 +108,7 @@ function spawnBackground(bgEvent, ...extraArgs) {
   const child = spawn(process.execPath, args, {
     detached: true,
     stdio: 'ignore',
-    env: process.env,
+    env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
   });
   child.unref();
 }
@@ -117,7 +116,32 @@ function spawnBackground(bgEvent, ...extraArgs) {
 // ─── Episode Buffer (Tier 2 F) ─────────────────────────────────────────────
 
 function episodeFile() {
-  return `/tmp/claude-mem-ep-${inferProject()}.json`;
+  return `/tmp/claude-mem-ep-${process.getuid()}-${inferProject()}.json`;
+}
+
+function lockFile() {
+  return episodeFile() + '.lock';
+}
+
+function acquireLock(maxWaitMs = 500) {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      const fd = openSync(lockFile(), fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+      closeSync(fd);
+      return true;
+    } catch {
+      // Lock held by another process — spin briefly
+      const wait = Math.ceil(Math.random() * 20);
+      const start = Date.now();
+      while (Date.now() - start < wait) { /* spin */ }
+    }
+  }
+  return false;
+}
+
+function releaseLock() {
+  try { unlinkSync(lockFile()); } catch {}
 }
 
 function readEpisode() {
@@ -182,14 +206,9 @@ function flushEpisode(episode) {
     return;
   }
 
-  if (episode.entries.length === 1 && episodeHasSignificantContent(episode)) {
-    // Single significant entry → individual LLM extraction
-    spawnBackground('llm-episode', flushFile);
-  } else if (episode.entries.length >= 2 && episodeHasSignificantContent(episode)) {
-    // Multiple entries with significant content → batch LLM extraction
+  if (episodeHasSignificantContent(episode)) {
     spawnBackground('llm-episode', flushFile);
   } else {
-    // No significant content → clean up, don't record
     try { unlinkSync(flushFile); } catch {}
   }
 }
@@ -246,32 +265,38 @@ async function handlePostToolUse() {
                    bashSig?.isSignificant || false,
   };
 
-  // Episode buffer management
+  // Episode buffer management (locked to prevent TOCTOU race)
   const sessionId = getSessionId();
   const project = inferProject();
-  let episode = readEpisode();
 
-  if (episode) {
-    const timeSinceLastEntry = Date.now() - episode.lastAt;
-    const fileRelated = isRelatedToEpisode(episode, files);
-    const bufferFull = episode.entries.length >= 10;
-    const timeGap = timeSinceLastEntry > 5 * 60 * 1000;
+  if (!acquireLock()) return; // Another hook is writing — skip this entry
+  try {
+    let episode = readEpisode();
 
-    // Phase transition → flush current episode, start new
-    if (bufferFull || timeGap || (!fileRelated && episode.entries.length >= 2)) {
-      flushEpisode(episode);
-      episode = null;
+    if (episode) {
+      const timeSinceLastEntry = Date.now() - episode.lastAt;
+      const fileRelated = isRelatedToEpisode(episode, files);
+      const bufferFull = episode.entries.length >= 10;
+      const timeGap = timeSinceLastEntry > 5 * 60 * 1000;
+
+      // Phase transition → flush current episode, start new
+      if (bufferFull || timeGap || (!fileRelated && episode.entries.length >= 2)) {
+        flushEpisode(episode);
+        episode = null;
+      }
     }
-  }
 
-  if (!episode) {
-    episode = createEpisode(sessionId, project);
-  }
+    if (!episode) {
+      episode = createEpisode(sessionId, project);
+    }
 
-  episode.entries.push(entry);
-  episode.lastAt = Date.now();
-  addFileToEpisode(episode, files);
-  writeEpisode(episode);
+    episode.entries.push(entry);
+    episode.lastAt = Date.now();
+    addFileToEpisode(episode, files);
+    writeEpisode(episode);
+  } finally {
+    releaseLock();
+  }
 }
 
 // ─── Error-Triggered Recall (Tier 2 G) ─────────────────────────────────────
@@ -622,7 +647,9 @@ function updateClaudeMd(contextBlock) {
     content = newSection + '\n';
   }
 
-  try { writeFileSync(claudeMdPath, content); } catch {}
+  try { writeFileSync(claudeMdPath, content); } catch (e) {
+    if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] CLAUDE.md write failed: ${e.message}`);
+  }
 }
 
 // ─── Save Observation to DB ─────────────────────────────────────────────────
@@ -717,11 +744,15 @@ function extractFilePaths(input) {
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function readStdin() {
+  const MAX_STDIN = 256 * 1024; // 256KB — large tool responses are truncated
   return new Promise((resolve, reject) => {
     let data = '';
     const timeout = setTimeout(() => { process.stdin.destroy(); reject(new Error('timeout')); }, 3000);
     process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('data', chunk => {
+      data += chunk;
+      if (data.length > MAX_STDIN) { process.stdin.destroy(); clearTimeout(timeout); resolve(data.slice(0, MAX_STDIN)); }
+    });
     process.stdin.on('end', () => { clearTimeout(timeout); resolve(data); });
     process.stdin.on('error', err => { clearTimeout(timeout); reject(err); });
     process.stdin.resume();
