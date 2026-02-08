@@ -803,7 +803,7 @@ server.registerTool(
     let totalCompressed = 0;
     const insertSummary = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, ?, ?, 'change', ?, '', ?, '', '', '[]', '[]', 1, ?, ?)
+      VALUES (?, ?, ?, 'change', ?, '', ?, '', '', '[]', '[]', 2, ?, ?)
     `);
     const markCompressed = db.prepare(
       'UPDATE observations SET compressed_into = ? WHERE id = ?'
