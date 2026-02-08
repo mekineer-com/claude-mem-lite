@@ -393,11 +393,19 @@ const SKIP_TOOLS = new Set([
 ]);
 
 async function handlePostToolUse() {
-  let input = '';
-  try { input = await readStdin(); } catch { return; }
+  let raw;
+  try { raw = await readStdin(); } catch { return; }
 
   let hookData;
-  try { hookData = JSON.parse(input); } catch { return; }
+  try { hookData = JSON.parse(raw.text); } catch {
+    // Truncated JSON — try to salvage tool_name from the prefix
+    if (raw.truncated) {
+      if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] stdin truncated at 256KB, attempting salvage`);
+      const m = raw.text.match(/"tool_name"\s*:\s*"([^"]+)"/);
+      if (m) hookData = { tool_name: m[1], tool_input: {}, tool_response: '(truncated)' };
+    }
+    if (!hookData) return;
+  }
 
   const { tool_name, tool_input, tool_response } = hookData;
   if (!tool_name) return;
@@ -839,7 +847,7 @@ function handleStop() {
     try {
       renameSync(epFile, claimFile);
       const episode = JSON.parse(readFileSync(claimFile, 'utf8'));
-      if (episode && episode.entries && episode.entries.length > 0) {
+      if (episode && episode.entries && episode.entries.length > 0 && episodeHasSignificantContent(episode)) {
         if (!episode.sessionId) episode.sessionId = sessionId;
         if (!episode.project) episode.project = project;
         const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
@@ -1188,9 +1196,12 @@ function readStdin() {
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', chunk => {
       data += chunk;
-      if (data.length > MAX_STDIN) { process.stdin.destroy(); clearTimeout(timeout); resolve(data.slice(0, MAX_STDIN)); }
+      if (data.length > MAX_STDIN) {
+        process.stdin.destroy(); clearTimeout(timeout);
+        resolve({ text: data.slice(0, MAX_STDIN), truncated: true });
+      }
     });
-    process.stdin.on('end', () => { clearTimeout(timeout); resolve(data); });
+    process.stdin.on('end', () => { clearTimeout(timeout); resolve({ text: data, truncated: false }); });
     process.stdin.on('error', err => { clearTimeout(timeout); reject(err); });
     process.stdin.resume();
   });
@@ -1211,11 +1222,11 @@ function fmtDate(iso) {
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 
 async function handleUserPrompt() {
-  let input = '';
-  try { input = await readStdin(); } catch { return; }
+  let raw;
+  try { raw = await readStdin(); } catch { return; }
 
   let hookData;
-  try { hookData = JSON.parse(input); } catch { return; }
+  try { hookData = JSON.parse(raw.text); } catch { return; }
 
   const promptText = hookData.user_prompt;
   if (!promptText || typeof promptText !== 'string') return;
