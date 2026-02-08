@@ -21,6 +21,7 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
 db.pragma('synchronous = NORMAL');
+db.pragma('foreign_keys = OFF'); // Schema has FK mismatch (memory_session_id lacks UNIQUE)
 
 // Ensure core tables exist (for fresh installs)
 db.exec(`
