@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
@@ -614,12 +614,14 @@ server.registerTool(
       return { content: [{ type: 'text', text: `Skipped: a similar observation already exists in project "${project}".` }] };
     }
 
-    const minhashSig = computeMinHash(title + ' ' + args.content);
+    const safeContent = scrubSecrets(args.content);
+    const safeTitle = scrubSecrets(title);
+    const minhashSig = computeMinHash(safeTitle + ' ' + safeContent);
 
     const result = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?)
-    `).run(sessionId, project, args.content, type, title, args.content, args.importance ?? 1, minhashSig, now.toISOString(), now.getTime());
+    `).run(sessionId, project, safeContent, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, now.toISOString(), now.getTime());
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
   })
@@ -660,8 +662,8 @@ server.registerTool(
       GROUP BY type ORDER BY c DESC
     `).all(cutoff, ...baseParams);
 
-    // Projects
-    const projects = db.prepare(`
+    // Projects (global view — skipped when filtering by single project)
+    const projects = args.project ? [] : db.prepare(`
       SELECT project, COUNT(*) as c FROM observations
       GROUP BY project ORDER BY c DESC
       LIMIT 20
@@ -706,8 +708,7 @@ server.registerTool(
       'Type distribution (recent):',
       ...types.map(t => `  ${typeIcon(t.type)} ${t.type}: ${t.c}`),
       '',
-      'Top projects:',
-      ...projects.map(p => `  ${p.project}: ${p.c}`),
+      ...(projects.length ? ['Top projects:', ...projects.map(p => `  ${p.project}: ${p.c}`)] : []),
       '',
       'Daily activity (last 7d):',
       ...daily.map(d => `  ${d.day}: ${d.c} observations`),
