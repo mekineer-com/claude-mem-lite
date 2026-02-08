@@ -66,7 +66,12 @@
 - **用户提示捕获** -- 通过 UserPromptSubmit 钩子记录用户提示，追踪用户意图
 - **Read 文件追踪** -- 追踪会话中读取的文件，丰富 episode 上下文
 - **零数据丢失** -- LLM 失败时，使用推断的元数据保存降级记录，而非丢弃
-- **观察去重** -- Jaccard 相似度检查防止 5 分钟内出现近似重复的观察
+- **两级去重** -- Jaccard 相似度（5 分钟窗口）+ MinHash 签名（7 天跨会话窗口）双重防重
+- **同义词扩展** -- 缩写如 `K8s`、`DB`、`auth` 在 FTS5 搜索时自动扩展为全称（48+ 对）
+- **Token 预算上下文** -- 贪心背包算法在 2,000 token 预算内选择会话启动上下文，按时效性和重要度优先
+- **观察压缩** -- 可将旧的低价值观察压缩为每周摘要，减少噪声
+- **秘密擦除** -- 自动编辑 API 密钥、token、PEM 块、数据库连接字符串等 15+ 种凭证模式
+- **原子写入** -- 所有文件写入（episode、CLAUDE.md）使用 write-to-tmp + rename 防止崩溃时损坏
 - **健壮锁机制** -- PID 感知的锁文件，自动清理过期（>30s）或孤儿（PID 已死）锁
 - **过期会话清理** -- 活跃超过 24 小时的会话在下次启动时自动标记为 abandoned
 
@@ -107,7 +112,7 @@ node install.mjs install
 
 ### 安装过程
 
-1. **安装依赖** -- `npm install --production`（编译原生 `better-sqlite3`）
+1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
 2. **注册 MCP 服务器** -- `mem` 服务器，包含 7 个工具（search、timeline、get、save、stats、delete、compress）
 3. **配置钩子** -- `PostToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/claude-mem-lite/`，存放数据库和运行时文件
@@ -244,7 +249,7 @@ Episode 是一批相关操作（对同一组文件的编辑），由后台 LLM w
 Episode 缓冲区 -> 刷新为 JSON -> claude -p --model haiku -> 结构化观察 -> SQLite
 ```
 
-每条观察包含类型、标题、叙述、概念、事实和重要度（1-3），并自动去重（5 分钟内 Jaccard 相似度 >70%）。LLM 调用失败时，使用推断的元数据保存降级记录（零数据丢失）。同一会话中的相关观察通过文件重叠自动建立 `related_ids` 链接。
+每条观察包含类型、标题、叙述、概念、事实和重要度（1-3），并通过两级机制自动去重：Jaccard 相似度（5 分钟内 >70%）和 MinHash 签名（7 天跨会话 >80%）。LLM 调用失败时，使用推断的元数据保存降级记录（零数据丢失）。相关观察通过 FTS5 标题相似度和文件重叠自动建立 `related_ids` 链接。
 
 ## 管理命令
 
@@ -311,9 +316,37 @@ claude-mem-lite/
     setup.sh         # Setup 钩子：npm install + 迁移
   server.mjs         # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
   hook.mjs           # Claude Code 钩子：episode 捕获、错误回忆、会话管理
+  schema.mjs         # 数据库 schema：表、迁移、FTS5 的单一事实来源
+  utils.mjs          # 共享工具：FTS5 查询构建、MinHash 去重、秘密擦除
   install.mjs        # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
   skill.md           # MCP 技能定义（npx/git clone 模式）
   package.json       # 依赖和元数据
+  # 测试和基准（仅开发）
+  *.test.mjs         # 单元、集成、E2E 测试（201 个）
+  test-helpers.mjs   # 共享测试工具
+  benchmark/         # BM25 搜索质量基准 + CI 门控
+```
+
+## 搜索质量
+
+基于 200 条观察和 30 个查询（标准 + 困难负样本类别）的基准测试结果：
+
+| 指标 | 得分 |
+|------|------|
+| Recall@10 | 0.89 |
+| Precision@10 | 0.99 |
+| nDCG@10 | 0.97 |
+| MRR@10 | 0.97 |
+| P95 搜索延迟 | 0.14ms |
+
+基准测试作为 CI 门控运行（`npm run benchmark:gate`），防止搜索质量回退。
+
+## 开发
+
+```bash
+npm test                  # 运行全部 201 个测试（vitest）
+npm run benchmark         # 运行完整搜索质量基准测试
+npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 ```
 
 ## 许可证

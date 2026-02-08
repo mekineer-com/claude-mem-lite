@@ -17,6 +17,9 @@ import {
   estimateTokens,
   computeMinHash,
   estimateJaccardFromMinHash,
+  fmtDate,
+  fmtTime,
+  isoWeekKey,
 } from './utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
@@ -828,6 +831,22 @@ describe('scrubSecrets', () => {
     expect(result).not.toContain('hunter2');
     expect(result).not.toContain('sk-secret123key456val');
   });
+
+  it('scrubs database connection strings', () => {
+    expect(scrubSecrets('postgresql://admin:secret@db.host:5432/mydb')).toBe('postgresql://***');
+    expect(scrubSecrets('mongodb+srv://user:pass@cluster.net/db')).toBe('mongodb+srv://***');
+    expect(scrubSecrets('mysql://root:password@localhost/app')).toBe('mysql://***');
+    expect(scrubSecrets('redis://default:token@redis.cloud:6379')).toBe('redis://***');
+  });
+
+  it('scrubs npm tokens', () => {
+    expect(scrubSecrets('npm_abcdefghijklmnopqrstuvwxyz0123456789AB')).toBe('***');
+  });
+
+  it('scrubs Stripe keys', () => {
+    expect(scrubSecrets('sk_live_abcdefghijklmnopqrstuv')).toBe('***');
+    expect(scrubSecrets('pk_test_abcdefghijklmnopqrstuv')).toBe('***');
+  });
 });
 
 // ─── estimateTokens ──────────────────────────────────────────────────────────
@@ -913,5 +932,68 @@ describe('estimateJaccardFromMinHash', () => {
 
   it('returns 0 for empty strings', () => {
     expect(estimateJaccardFromMinHash('', '')).toBe(0);
+  });
+});
+
+// ─── fmtDate ────────────────────────────────────────────────────────────────
+
+describe('fmtDate', () => {
+  it('returns empty string for falsy input', () => {
+    expect(fmtDate('')).toBe('');
+    expect(fmtDate(null)).toBe('');
+    expect(fmtDate(undefined)).toBe('');
+  });
+
+  it('formats ISO date to "Mon DD HH:MM"', () => {
+    // Jan 15, 2026, 14:30 UTC
+    const result = fmtDate(new Date(2026, 0, 15, 14, 30).toISOString());
+    expect(result).toMatch(/Jan 15 14:30/);
+  });
+});
+
+// ─── fmtTime ────────────────────────────────────────────────────────────────
+
+describe('fmtTime', () => {
+  it('returns empty string for falsy input', () => {
+    expect(fmtTime('')).toBe('');
+    expect(fmtTime(null)).toBe('');
+  });
+
+  it('formats ISO date to "HH:MM"', () => {
+    const result = fmtTime(new Date(2026, 0, 15, 9, 5).toISOString());
+    expect(result).toBe('09:05');
+  });
+});
+
+// ─── isoWeekKey ─────────────────────────────────────────────────────────────
+
+describe('isoWeekKey', () => {
+  it('returns correct week for mid-year date', () => {
+    // 2026-06-15 is a Monday, ISO week 25
+    const epoch = new Date(2026, 5, 15).getTime();
+    expect(isoWeekKey(epoch)).toBe('2026-W25');
+  });
+
+  it('handles Dec 31 that falls in week 1 of next year', () => {
+    // 2025-12-31 is a Wednesday → ISO week 1 of 2026
+    const epoch = new Date(2025, 11, 31).getTime();
+    expect(isoWeekKey(epoch)).toBe('2026-W01');
+  });
+
+  it('handles Jan 1 that falls in last week of prev year', () => {
+    // 2027-01-01 is a Friday → still ISO week 53 of 2026
+    const epoch = new Date(2027, 0, 1).getTime();
+    expect(isoWeekKey(epoch)).toBe('2026-W53');
+  });
+
+  it('handles Jan 4 (always in week 1)', () => {
+    // Jan 4 is always in ISO week 1 by definition
+    const epoch = new Date(2026, 0, 4).getTime();
+    expect(isoWeekKey(epoch)).toBe('2026-W01');
+  });
+
+  it('pads week number to 2 digits', () => {
+    const epoch = new Date(2026, 0, 5).getTime(); // W02
+    expect(isoWeekKey(epoch)).toMatch(/W\d{2}$/);
   });
 });
