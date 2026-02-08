@@ -108,6 +108,84 @@ export function typeIcon(type) {
 // ─── FTS5 ────────────────────────────────────────────────────────────────────
 
 const FTS5_KEYWORDS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
+
+// Synonym/abbreviation map: query abbreviation → expanded full forms
+// Bidirectional: both directions are registered so "K8s" finds "Kubernetes" and vice versa
+const SYNONYM_MAP = new Map();
+const SYNONYM_PAIRS = [
+  ['k8s', 'kubernetes'],
+  ['db', 'database'],
+  ['js', 'javascript'],
+  ['ts', 'typescript'],
+  ['py', 'python'],
+  ['ci', 'continuous integration'],
+  ['cd', 'continuous deployment'],
+  ['ws', 'websocket'],
+  ['auth', 'authentication'],
+  ['authn', 'authentication'],
+  ['authz', 'authorization'],
+  ['config', 'configuration'],
+  ['deps', 'dependencies'],
+  ['env', 'environment'],
+  ['infra', 'infrastructure'],
+  ['msg', 'message'],
+  ['pkg', 'package'],
+  ['repo', 'repository'],
+  ['req', 'request'],
+  ['res', 'response'],
+  ['ml', 'machine learning'],
+  ['ai', 'artificial intelligence'],
+  ['api', 'application programming interface'],
+  ['ui', 'user interface'],
+  ['ux', 'user experience'],
+  ['fe', 'frontend'],
+  ['be', 'backend'],
+  ['gql', 'graphql'],
+  ['tf', 'terraform'],
+  ['cdk', 'cloud development kit'],
+  ['iac', 'infrastructure as code'],
+  ['e2e', 'end to end'],
+  ['perf', 'performance'],
+  ['impl', 'implementation'],
+  ['fn', 'function'],
+  ['util', 'utility'],
+  ['utils', 'utilities'],
+  ['err', 'error'],
+  ['src', 'source'],
+  ['lib', 'library'],
+  ['dev', 'development'],
+  ['prod', 'production'],
+  ['async', 'asynchronous'],
+  ['sync', 'synchronous'],
+];
+// Build bidirectional lookup (case-insensitive)
+for (const [abbr, full] of SYNONYM_PAIRS) {
+  const aLow = abbr.toLowerCase();
+  const fLow = full.toLowerCase();
+  if (!SYNONYM_MAP.has(aLow)) SYNONYM_MAP.set(aLow, new Set());
+  SYNONYM_MAP.get(aLow).add(fLow);
+  if (!SYNONYM_MAP.has(fLow)) SYNONYM_MAP.set(fLow, new Set());
+  SYNONYM_MAP.get(fLow).add(aLow);
+}
+
+// Format a term for FTS5: quote if it contains spaces, hyphens, or special chars
+function ftsToken(term) {
+  // Bare tokens are safe only if purely alphanumeric
+  if (/^[a-zA-Z0-9]+$/.test(term)) return term;
+  return `"${term.replace(/"/g, '""')}"`;
+}
+
+function expandToken(token) {
+  const synonyms = SYNONYM_MAP.get(token.toLowerCase());
+  if (!synonyms || synonyms.size === 0) return ftsToken(token);
+  // FTS5 OR group: (original OR synonym1 OR "multi word synonym")
+  const parts = [ftsToken(token)];
+  for (const syn of synonyms) {
+    parts.push(ftsToken(syn));
+  }
+  return `(${parts.join(' OR ')})`;
+}
+
 export function sanitizeFtsQuery(query) {
   if (!query) return null;
   const cleaned = query
@@ -117,7 +195,10 @@ export function sanitizeFtsQuery(query) {
   if (!cleaned) return null;
   const tokens = cleaned.split(/\s+/).filter(t => t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()));
   if (tokens.length === 0) return null;
-  return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' ');
+  const expanded = tokens.map(t => expandToken(t));
+  // FTS5 requires explicit AND after parenthesized OR groups
+  const hasGroup = expanded.some(e => e.startsWith('('));
+  return expanded.join(hasGroup ? ' AND ' : ' ');
 }
 
 // ─── Importance ──────────────────────────────────────────────────────────────
