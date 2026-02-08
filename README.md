@@ -108,8 +108,8 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --production` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem` server with 5 tools (search, timeline, get, save, stats)
-3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop` lifecycle hooks
+2. **Register MCP server** -- `mem` server with 7 tools (search, timeline, get, save, stats, delete, compress)
+3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/claude-mem-lite/` for database and runtime files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) exists, copies database and runtime files to `~/claude-mem-lite/`, preserving the original untouched
 6. **Initialize database** -- SQLite with WAL mode, FTS5 indexes created on first server start
@@ -151,6 +151,8 @@ rm -rf ~/.claude-mem/
 | `mem_get` | Retrieve full details for specific observation IDs (includes importance and related_ids). |
 | `mem_save` | Manually save a memory/observation. |
 | `mem_stats` | View statistics: counts, type distribution, top projects, daily activity. |
+| `mem_delete` | Delete observations by ID with preview/confirm workflow. FTS5 cleanup is automatic. |
+| `mem_compress` | Compress old low-value observations into weekly summaries to reduce noise. |
 
 ### Skill Commands (in Claude Code chat)
 

@@ -108,8 +108,8 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --production`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem` 服务器，包含 5 个工具（search、timeline、get、save、stats）
-3. **配置钩子** -- `PostToolUse`、`SessionStart`、`Stop` 生命周期钩子
+2. **注册 MCP 服务器** -- `mem` 服务器，包含 7 个工具（search、timeline、get、save、stats、delete、compress）
+3. **配置钩子** -- `PostToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/claude-mem-lite/`，存放数据库和运行时文件
 5. **自动迁移** -- 如果 `~/.claude-mem/`（原版 claude-mem）存在，自动将数据库和运行时文件复制到 `~/claude-mem-lite/`，原目录保持不变
 6. **初始化数据库** -- SQLite WAL 模式，FTS5 索引在服务器首次启动时创建
@@ -151,6 +151,8 @@ rm -rf ~/.claude-mem/
 | `mem_get` | 获取指定观察 ID 的完整详情（包含重要度和关联 ID）。 |
 | `mem_save` | 手动保存记忆/观察。 |
 | `mem_stats` | 查看统计：计数、类型分布、热门项目、每日活动。 |
+| `mem_delete` | 按 ID 删除观察，支持预览/确认工作流。FTS5 自动清理。 |
+| `mem_compress` | 压缩旧的低价值观察为每周摘要，减少噪声。 |
 
 ### 技能命令（在 Claude Code 聊天中使用）
 
