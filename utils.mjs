@@ -2,6 +2,7 @@
 // Used by server.mjs, hook.mjs, and tests
 
 import { basename, dirname } from 'path';
+import { createHash } from 'crypto';
 
 // ─── String Utilities ────────────────────────────────────────────────────────
 
@@ -52,6 +53,44 @@ export function scrubSecrets(text) {
     result = result.replace(pattern, replacement);
   }
   return result;
+}
+
+// ─── Token Estimation ─────────────────────────────────────────────────────
+
+export function estimateTokens(text) {
+  return Math.ceil(((text || '').length || 1) / 4);
+}
+
+// ─── MinHash Signatures ──────────────────────────────────────────────────
+
+export function computeMinHash(text, numHashes = 64) {
+  if (!text || typeof text !== 'string') return null;
+  const tokens = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+    .filter(t => t.length > 2);
+  if (tokens.length === 0) return null;
+
+  const mins = new Array(numHashes).fill(0xFFFFFFFF);
+  for (const token of tokens) {
+    for (let i = 0; i < numHashes; i++) {
+      const h = createHash('sha256').update(`${i}-${token}`).digest();
+      const val = h.readUInt32BE(0);
+      if (val < mins[i]) mins[i] = val;
+    }
+  }
+  return mins.map(v => v.toString(16).padStart(8, '0')).join('');
+}
+
+export function estimateJaccardFromMinHash(sig1, sig2) {
+  if (!sig1 || !sig2) return 0;
+  if (sig1.length !== sig2.length) return 0;
+  const numHashes = sig1.length / 8;
+  if (numHashes === 0) return 0;
+  let matches = 0;
+  for (let i = 0; i < numHashes; i++) {
+    const offset = i * 8;
+    if (sig1.slice(offset, offset + 8) === sig2.slice(offset, offset + 8)) matches++;
+  }
+  return matches / numHashes;
 }
 
 export function typeIcon(type) {

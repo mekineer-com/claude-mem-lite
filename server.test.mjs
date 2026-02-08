@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
-import { sanitizeFtsQuery, jaccardSimilarity, truncate } from './utils.mjs';
+import { sanitizeFtsQuery, jaccardSimilarity, truncate, estimateTokens } from './utils.mjs';
 
 // ─── In-memory DB setup (mirrors server.mjs schema) ────────────────────────
 
@@ -42,6 +42,9 @@ function createTestDb() {
       discovery_tokens INTEGER DEFAULT 0,
       importance INTEGER DEFAULT 1,
       related_ids TEXT DEFAULT '[]',
+      minhash_sig TEXT,
+      access_count INTEGER DEFAULT 0,
+      compressed_into INTEGER DEFAULT NULL,
       created_at TEXT NOT NULL,
       created_at_epoch INTEGER NOT NULL,
       FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id)
@@ -103,12 +106,12 @@ function insertSession(db, { id, project = 'test', memoryId = null }) {
   `).run(id, memoryId ?? id, project, now.toISOString(), now.getTime());
 }
 
-function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, text = '', importance = 1, relatedIds = '[]', epochOffset = 0 }) {
+function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, text = '', narrative = '', importance = 1, relatedIds = '[]', epochOffset = 0, filesModified = '[]', accessCount = 0, compressedInto = null }) {
   const now = Date.now() + epochOffset;
   return db.prepare(`
-    INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, related_ids, created_at, created_at_epoch)
-    VALUES (?, ?, ?, ?, ?, '', '', '', '', '[]', '[]', ?, ?, ?, ?)
-  `).run(sessionId, project, text, type, title, importance, relatedIds, new Date(now).toISOString(), now);
+    INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, related_ids, access_count, compressed_into, created_at, created_at_epoch)
+    VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?)
+  `).run(sessionId, project, text, type, title, narrative, filesModified, importance, relatedIds, accessCount, compressedInto, new Date(now).toISOString(), now);
 }
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
@@ -411,5 +414,372 @@ describe('mem_get multi-source', () => {
     const rows = db.prepare("SELECT * FROM user_prompts WHERE id = 1").all();
     expect(rows.length).toBe(1);
     expect(rows[0].prompt_text).toBe('Help me build feature X');
+  });
+});
+
+// ─── Phase 1c: access_count ─────────────────────────────────────────────────
+
+describe('access_count tracking', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('mem_get increments access_count', () => {
+    insertObs(db, { title: 'test obs' });
+    const id = db.prepare("SELECT id FROM observations WHERE title = 'test obs'").get().id;
+
+    // Simulate mem_get: increment access_count
+    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count,0) + 1 WHERE id = ?');
+    updateStmt.run(id);
+    updateStmt.run(id);
+
+    const obs = db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id);
+    expect(obs.access_count).toBe(2);
+  });
+
+  it('missing access_count defaults to 0', () => {
+    insertObs(db, { title: 'old data' });
+    const obs = db.prepare("SELECT access_count FROM observations WHERE title = 'old data'").get();
+    expect(obs.access_count).toBe(0);
+  });
+
+  it('access_count boosts search ranking', () => {
+    // Two observations with same text — one with high access_count
+    insertObs(db, { title: 'database query optimization', text: 'database query optimization', accessCount: 50 });
+    insertObs(db, { title: 'database query slow fix', text: 'database query slow fix', accessCount: 0 });
+
+    const ftsQuery = '"database" "query"';
+    const now = Date.now();
+    const rows = db.prepare(`
+      SELECT o.id, o.title, o.access_count,
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+               * (0.5 + 0.5 * COALESCE(o.importance, 1))
+               * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ?
+      ORDER BY score
+    `).all(now, ftsQuery);
+
+    expect(rows.length).toBe(2);
+    // The one with access_count=50 should have a better (more negative) score
+    const highAccess = rows.find(r => r.access_count === 50);
+    const lowAccess = rows.find(r => r.access_count === 0);
+    expect(highAccess.score).toBeLessThan(lowAccess.score);
+  });
+});
+
+// ─── Phase 2a: reRankWithContext ─────────────────────────────────────────────
+
+describe('reRankWithContext', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('boosts file-overlapping results', () => {
+    // Insert a recent observation editing auth.js
+    insertObs(db, { title: 'recent auth edit', filesModified: '["auth.js"]', epochOffset: -1000 });
+    // Insert two search results
+    const results = [
+      { source: 'obs', id: 100, title: 'bug in auth', score: -5.0, files_modified: '["auth.js"]', importance: 1 },
+      { source: 'obs', id: 101, title: 'unrelated fix', score: -5.0, files_modified: '["utils.js"]', importance: 1 },
+    ];
+
+    // Simulate reRankWithContext logic
+    const twoHoursAgo = Date.now() - 2 * 3600000;
+    const recentObs = db.prepare(`
+      SELECT files_modified FROM observations WHERE project = 'test' AND created_at_epoch > ?
+    `).all(twoHoursAgo);
+
+    const activeFiles = new Set();
+    for (const r of recentObs) {
+      try { for (const f of JSON.parse(r.files_modified || '[]')) activeFiles.add(f); } catch {}
+    }
+
+    for (const result of results) {
+      let resultFiles;
+      try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch { continue; }
+      const common = resultFiles.filter(f => activeFiles.has(f));
+      const overlap = common.length / resultFiles.length;
+      result.score *= (1.0 + 0.3 * overlap);
+    }
+    results.sort((a, b) => a.score - b.score);
+
+    // auth.js result should be boosted (more negative)
+    expect(results[0].id).toBe(100);
+    expect(results[0].score).toBeLessThan(results[1].score);
+  });
+
+  it('handles no active files gracefully', () => {
+    const results = [
+      { source: 'obs', id: 100, title: 'test', score: -5.0, files_modified: '["foo.js"]', importance: 1 },
+    ];
+    // No recent observations → activeFiles is empty → no boost applied
+    const twoHoursAgo = Date.now() - 2 * 3600000;
+    const recentObs = db.prepare(`
+      SELECT files_modified FROM observations WHERE project = 'test' AND created_at_epoch > ?
+    `).all(twoHoursAgo);
+    expect(recentObs.length).toBe(0);
+    // Score unchanged
+    expect(results[0].score).toBe(-5.0);
+  });
+
+  it('handles empty files_modified', () => {
+    const results = [
+      { source: 'obs', id: 100, title: 'test', score: -5.0, files_modified: '[]', importance: 1 },
+    ];
+    let files;
+    try { files = JSON.parse(results[0].files_modified); } catch { files = []; }
+    expect(files.length).toBe(0);
+    // No crash, score unchanged
+    expect(results[0].score).toBe(-5.0);
+  });
+});
+
+// ─── Phase 2b: markSuperseded ────────────────────────────────────────────────
+
+describe('markSuperseded', () => {
+  it('marks older lower-importance obs as superseded', () => {
+    const results = [
+      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 1 },
+      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 2 },
+    ];
+
+    // Simulate markSuperseded
+    const fileMap = new Map();
+    for (const r of results) {
+      let files;
+      try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
+      for (const f of files) {
+        if (!fileMap.has(f)) fileMap.set(f, []);
+        fileMap.get(f).push(r);
+      }
+    }
+    for (const [, obsForFile] of fileMap) {
+      if (obsForFile.length < 2) continue;
+      obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+      const newest = obsForFile[0];
+      for (let i = 1; i < obsForFile.length; i++) {
+        if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
+          obsForFile[i].superseded = true;
+        }
+      }
+    }
+
+    expect(results[0].superseded).toBe(true);  // old, imp=1 <= newest imp=2
+    expect(results[1].superseded).toBeUndefined();  // newest
+  });
+
+  it('preserves high-importance old obs', () => {
+    const results = [
+      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 3 },
+      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 1 },
+    ];
+
+    const fileMap = new Map();
+    for (const r of results) {
+      let files;
+      try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
+      for (const f of files) {
+        if (!fileMap.has(f)) fileMap.set(f, []);
+        fileMap.get(f).push(r);
+      }
+    }
+    for (const [, obsForFile] of fileMap) {
+      if (obsForFile.length < 2) continue;
+      obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+      const newest = obsForFile[0];
+      for (let i = 1; i < obsForFile.length; i++) {
+        if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
+          obsForFile[i].superseded = true;
+        }
+      }
+    }
+
+    expect(results[0].superseded).toBeUndefined();  // imp=3 > newest imp=1
+    expect(results[1].superseded).toBeUndefined();  // newest
+  });
+
+  it('handles obs without files', () => {
+    const results = [
+      { source: 'obs', id: 1, date: '2026-01-01', importance: 1 },
+      { source: 'session', id: 2, date: '2026-02-01' },
+    ];
+    // No files_modified → no crash
+    expect(() => {
+      for (const r of results) {
+        try { JSON.parse(r.files_modified || '[]'); } catch { /* skip */ }
+      }
+    }).not.toThrow();
+  });
+});
+
+// ─── Phase 3a: Health metrics in mem_stats ──────────────────────────────────
+
+describe('mem_stats health metrics', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('computes token estimate', () => {
+    insertObs(db, { title: 'test observation', narrative: 'some narrative text here', text: 'extra text' });
+    const result = db.prepare(`
+      SELECT SUM(LENGTH(COALESCE(title,'')) + LENGTH(COALESCE(narrative,'')) + LENGTH(COALESCE(text,''))) / 4 as t
+      FROM observations
+    `).get();
+    expect(result.t).toBeGreaterThan(0);
+  });
+
+  it('computes noise ratio', () => {
+    // Insert old, low-value, never-accessed observation
+    insertObs(db, { title: 'old noise', importance: 1, accessCount: 0, epochOffset: -32 * 86400000 });
+    // Insert recent observation
+    insertObs(db, { title: 'recent obs', importance: 2, epochOffset: 0 });
+
+    const obsTotal = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+    const lowVal = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0 AND created_at_epoch < ?
+    `).get(Date.now() - 30 * 86400000);
+
+    const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
+    expect(noiseRatio).toBeCloseTo(0.5, 1);  // 1 of 2 is noise
+  });
+
+  it('triggers warning at > 60% noise', () => {
+    // Insert 7 old low-value + 3 recent = 70% noise
+    for (let i = 0; i < 7; i++) {
+      insertObs(db, { title: `old noise ${i}`, importance: 1, accessCount: 0, epochOffset: -(31 + i) * 86400000 });
+    }
+    for (let i = 0; i < 3; i++) {
+      insertObs(db, { title: `recent ${i}`, importance: 2, epochOffset: 0 });
+    }
+
+    const obsTotal = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+    const lowVal = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0 AND created_at_epoch < ?
+    `).get(Date.now() - 30 * 86400000);
+
+    const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
+    expect(noiseRatio).toBeGreaterThan(0.6);
+  });
+});
+
+// ─── Phase 3b: mem_compress ─────────────────────────────────────────────────
+
+describe('mem_compress', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('preview shows candidates', () => {
+    // Seed 5 old low-value obs in same project/week
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `old obs ${i}`, importance: 1, accessCount: 0, epochOffset: -(90 - i) * 86400000 });
+    }
+
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL
+    `).all(cutoff);
+
+    expect(candidates.length).toBe(5);
+  });
+
+  it('creates weekly summaries', () => {
+    // Seed 5 old low-value obs with same week
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `old obs ${i}`, type: 'change', importance: 1, accessCount: 0, epochOffset: -(90 + i) * 86400000 });
+    }
+
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id, project, type, title, created_at, created_at_epoch FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL ORDER BY project, created_at_epoch
+    `).all(cutoff);
+
+    // Group by project + ISO week
+    const groups = new Map();
+    for (const c of candidates) {
+      const d = new Date(c.created_at_epoch);
+      const year = d.getFullYear();
+      const jan1 = new Date(year, 0, 1);
+      const weekNum = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+      const key = `${c.project}::${year}-W${String(weekNum).padStart(2, '0')}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+
+    const compressable = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
+    expect(compressable.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('marks originals with compressed_into', () => {
+    insertObs(db, { title: 'will compress A', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+    insertObs(db, { title: 'will compress B', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+
+    // Simulate marking
+    db.prepare('UPDATE observations SET compressed_into = 999 WHERE id = 1').run();
+    const obs = db.prepare('SELECT compressed_into FROM observations WHERE id = 1').get();
+    expect(obs.compressed_into).toBe(999);
+  });
+
+  it('compressed obs excluded from search', () => {
+    insertObs(db, { title: 'visible searchable term', text: 'visible searchable term' });
+    insertObs(db, { title: 'hidden searchable term', text: 'hidden searchable term', compressedInto: 99 });
+
+    const rows = db.prepare(`
+      SELECT o.id FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"searchable"'
+        AND COALESCE(o.compressed_into, 0) = 0
+    `).all();
+
+    expect(rows.length).toBe(1);
+    expect(rows[0].id).toBe(1);
+  });
+
+  it('skips small groups (< 3 obs)', () => {
+    // Only 2 obs → should not be compressed
+    insertObs(db, { title: 'small group A', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+    insertObs(db, { title: 'small group B', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id, project, type, title, created_at, created_at_epoch FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL ORDER BY project, created_at_epoch
+    `).all(cutoff);
+
+    const groups = new Map();
+    for (const c of candidates) {
+      const d = new Date(c.created_at_epoch);
+      const year = d.getFullYear();
+      const jan1 = new Date(year, 0, 1);
+      const weekNum = Math.ceil(((d - jan1) / 86400000 + jan1.getDay() + 1) / 7);
+      const key = `${c.project}::${year}-W${String(weekNum).padStart(2, '0')}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+
+    const compressable = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
+    expect(compressable.length).toBe(0);
   });
 });

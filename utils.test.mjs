@@ -14,6 +14,9 @@ import {
   isRelatedToEpisode,
   makeEntryDesc,
   scrubSecrets,
+  estimateTokens,
+  computeMinHash,
+  estimateJaccardFromMinHash,
 } from './utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
@@ -800,5 +803,91 @@ describe('scrubSecrets', () => {
     const result = scrubSecrets(text);
     expect(result).not.toContain('hunter2');
     expect(result).not.toContain('sk-secret123key456val');
+  });
+});
+
+// ─── estimateTokens ──────────────────────────────────────────────────────────
+
+describe('estimateTokens', () => {
+  it('returns ceil(length/4) for normal text', () => {
+    expect(estimateTokens('hello world')).toBe(3); // 11 chars / 4 = 2.75 → 3
+  });
+
+  it('returns 1 for empty string', () => {
+    expect(estimateTokens('')).toBe(1); // ceil(0 || 1 / 4) = 1
+  });
+
+  it('returns 1 for null/undefined', () => {
+    expect(estimateTokens(null)).toBe(1);
+    expect(estimateTokens(undefined)).toBe(1);
+  });
+
+  it('handles long strings', () => {
+    const text = 'a'.repeat(1000);
+    expect(estimateTokens(text)).toBe(250);
+  });
+});
+
+// ─── computeMinHash ──────────────────────────────────────────────────────────
+
+describe('computeMinHash', () => {
+  it('returns consistent signatures for same text', () => {
+    const sig1 = computeMinHash('fixed authentication bug in login flow');
+    const sig2 = computeMinHash('fixed authentication bug in login flow');
+    expect(sig1).toBe(sig2);
+  });
+
+  it('detects similar text (high estimated Jaccard)', () => {
+    const sig1 = computeMinHash('fixed authentication bug in login flow');
+    const sig2 = computeMinHash('fixed authentication bug in the login flow');
+    const similarity = estimateJaccardFromMinHash(sig1, sig2);
+    expect(similarity).toBeGreaterThan(0.5);
+  });
+
+  it('rejects dissimilar text (low estimated Jaccard)', () => {
+    const sig1 = computeMinHash('fixed authentication bug in login flow');
+    const sig2 = computeMinHash('database migration schema update for users table');
+    const similarity = estimateJaccardFromMinHash(sig1, sig2);
+    expect(similarity).toBeLessThan(0.3);
+  });
+
+  it('returns null for null/empty/undefined', () => {
+    expect(computeMinHash(null)).toBeNull();
+    expect(computeMinHash('')).toBeNull();
+    expect(computeMinHash(undefined)).toBeNull();
+  });
+
+  it('returns null for text with only short words', () => {
+    expect(computeMinHash('a b c')).toBeNull();
+  });
+
+  it('returns hex string of correct length', () => {
+    const sig = computeMinHash('this is a test string with some words');
+    expect(sig).not.toBeNull();
+    expect(sig.length).toBe(64 * 8); // 64 hashes × 8 hex chars each
+    expect(/^[0-9a-f]+$/.test(sig)).toBe(true);
+  });
+});
+
+// ─── estimateJaccardFromMinHash ─────────────────────────────────────────────
+
+describe('estimateJaccardFromMinHash', () => {
+  it('returns 1 for identical signatures', () => {
+    const sig = computeMinHash('the quick brown fox jumps over lazy dog');
+    expect(estimateJaccardFromMinHash(sig, sig)).toBe(1);
+  });
+
+  it('returns 0 for null inputs', () => {
+    expect(estimateJaccardFromMinHash(null, 'abc')).toBe(0);
+    expect(estimateJaccardFromMinHash('abc', null)).toBe(0);
+    expect(estimateJaccardFromMinHash(null, null)).toBe(0);
+  });
+
+  it('returns 0 for mismatched lengths', () => {
+    expect(estimateJaccardFromMinHash('abcd', 'abcdef')).toBe(0);
+  });
+
+  it('returns 0 for empty strings', () => {
+    expect(estimateJaccardFromMinHash('', '')).toBe(0);
   });
 });

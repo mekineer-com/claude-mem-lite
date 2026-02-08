@@ -14,6 +14,7 @@ import {
   jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance,
   inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
   parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
+  estimateTokens, computeMinHash, estimateJaccardFromMinHash,
 } from './utils.mjs';
 
 // Prevent recursive hooks from background claude -p calls
@@ -817,6 +818,86 @@ function handleStop() {
   try { unlinkSync(sessionFile()); } catch {}
 }
 
+// ─── Token Budget Optimizer ──────────────────────────────────────────────────
+
+function selectWithTokenBudget(db, project, budget = 2000) {
+  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+  // Candidate pool: up to 50 recent observations + 10 session summaries
+  const obsPool = db.prepare(`
+    SELECT id, type, title, narrative, importance, created_at_epoch, files_modified
+    FROM observations
+    WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+    ORDER BY created_at_epoch DESC
+    LIMIT 50
+  `).all(project, oneDayAgo);
+
+  const sessPool = db.prepare(`
+    SELECT id, request, completed, next_steps, created_at_epoch
+    FROM session_summaries
+    WHERE project = ? AND created_at_epoch > ?
+    ORDER BY created_at_epoch DESC
+    LIMIT 10
+  `).all(project, oneDayAgo);
+
+  const now = Date.now();
+  const selectedObs = [];
+  const selectedSess = [];
+  let totalTokens = 0;
+
+  // Score each candidate: value = recency * importance, cost = tokens
+  const scoredObs = obsPool.map(o => {
+    const ageDays = (now - o.created_at_epoch) / 86400000;
+    const recency = 1 / (1 + ageDays);
+    const impBoost = 0.5 + 0.5 * (o.importance || 1);
+    const value = recency * impBoost;
+    const cost = estimateTokens((o.title || '') + (o.narrative || ''));
+    return { ...o, value, cost, valueDensity: cost > 0 ? value / cost : 0 };
+  });
+
+  const scoredSess = sessPool.map(s => {
+    const ageDays = (now - s.created_at_epoch) / 86400000;
+    const recency = 1 / (1 + ageDays);
+    const value = recency * 1.5; // Session summaries slightly boosted
+    const cost = estimateTokens((s.request || '') + (s.completed || '') + (s.next_steps || ''));
+    return { ...s, value, cost, valueDensity: cost > 0 ? value / cost : 0 };
+  });
+
+  // Combine and sort by value density (greedy knapsack)
+  const allCandidates = [
+    ...scoredObs.map(o => ({ ...o, _kind: 'obs' })),
+    ...scoredSess.map(s => ({ ...s, _kind: 'sess' })),
+  ].sort((a, b) => b.valueDensity - a.valueDensity);
+
+  const selectedFiles = new Set();
+
+  for (const c of allCandidates) {
+    if (totalTokens + c.cost > budget) continue;
+
+    // Diversity penalty: reduce value for file overlap with already-selected
+    if (c._kind === 'obs' && c.files_modified) {
+      let cFiles;
+      try { cFiles = JSON.parse(c.files_modified || '[]'); } catch { cFiles = []; }
+      if (cFiles.length > 0 && selectedFiles.size > 0) {
+        const overlap = cFiles.filter(f => selectedFiles.has(f)).length;
+        const overlapRatio = overlap / cFiles.length;
+        const penalizedValue = c.valueDensity * (1 - 0.3 * overlapRatio);
+        if (penalizedValue < 0.001) continue; // Skip if too redundant
+      }
+      for (const f of cFiles) selectedFiles.add(f);
+    }
+
+    totalTokens += c.cost;
+    if (c._kind === 'obs') {
+      selectedObs.push({ id: c.id, type: c.type, title: c.title, created_at: new Date(c.created_at_epoch).toISOString() });
+    } else {
+      selectedSess.push({ id: c.id, request: c.request, completed: c.completed, next_steps: c.next_steps, created_at: new Date(c.created_at_epoch).toISOString() });
+    }
+  }
+
+  return { observations: selectedObs, summaries: selectedSess, totalTokens };
+}
+
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
 function handleSessionStart() {
@@ -875,14 +956,9 @@ function handleSessionStart() {
       }
     } catch {}
 
-    // Recent observations for this project
-    const observations = db.prepare(`
-      SELECT id, type, title, created_at
-      FROM observations
-      WHERE project = ? AND created_at_epoch > ?
-      ORDER BY created_at_epoch DESC
-      LIMIT 15
-    `).all(project, oneDayAgo);
+    // Token-budgeted observation selection (replaces flat LIMIT 15)
+    const selected = selectWithTokenBudget(db, project, 2000);
+    const observations = selected.observations;
 
     // Fallback: recent across all projects (small — avoid context bloat)
     let fallbackObs = [];
@@ -890,7 +966,7 @@ function handleSessionStart() {
       fallbackObs = db.prepare(`
         SELECT id, type, title, project, created_at
         FROM observations
-        WHERE created_at_epoch > ?
+        WHERE created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
         ORDER BY created_at_epoch DESC
         LIMIT 5
       `).all(oneDayAgo);
@@ -992,7 +1068,8 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
       `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
     }
 
-    // Dedup: skip if a similar title was inserted in the last 5 minutes
+    // Two-tier dedup
+    // Tier 1 (fast): 5-min Jaccard on titles (existing logic)
     const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
     const recent = db.prepare(`
       SELECT title FROM observations
@@ -1004,6 +1081,21 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
       return null; // Duplicate — skip
     }
 
+    // Tier 2 (slow): MinHash cross-session dedup (7-day window)
+    const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
+    if (minhashSig) {
+      const sevenDaysAgo = now.getTime() - 7 * 86400000;
+      const recentSigs = db.prepare(`
+        SELECT minhash_sig FROM observations
+        WHERE project = ? AND created_at_epoch > ? AND minhash_sig IS NOT NULL
+        ORDER BY created_at_epoch DESC LIMIT 100
+      `).all(project, sevenDaysAgo);
+
+      if (recentSigs.some(r => estimateJaccardFromMinHash(minhashSig, r.minhash_sig) > 0.8)) {
+        return null; // Cross-session duplicate — skip
+      }
+    }
+
     // text: expanded concepts+facts as plain text (distinct from narrative for better FTS coverage)
     // concepts/facts: space-separated plain text (not JSON arrays) for clean FTS matching
     const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
@@ -1011,8 +1103,8 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
     const textField = [conceptsText, factsText].filter(Boolean).join(' ');
 
     const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       sessionId, project,
       textField, obs.type, obs.title, obs.subtitle || '',
@@ -1022,6 +1114,7 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
       JSON.stringify(obs.filesRead || []),
       JSON.stringify(obs.files || []),
       obs.importance ?? 1,
+      minhashSig,
       now.toISOString(), now.getTime()
     );
     return Number(result.lastInsertRowid);

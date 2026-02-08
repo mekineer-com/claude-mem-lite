@@ -1,0 +1,453 @@
+{
+  "queries": [
+    {
+      "id": "q2",
+      "query": "Kafka",
+      "desc": "Kafka-related observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        15,
+        37,
+        63,
+        75
+      ]
+    },
+    {
+      "id": "q3",
+      "query": "Docker",
+      "desc": "Docker observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        18,
+        36,
+        95
+      ]
+    },
+    {
+      "id": "q4",
+      "query": "React",
+      "desc": "React frontend observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        2,
+        4,
+        11,
+        47,
+        48,
+        52,
+        58,
+        66,
+        106,
+        107,
+        124,
+        135,
+        138,
+        174,
+        177,
+        186,
+        190,
+        193
+      ]
+    },
+    {
+      "id": "q5",
+      "query": "Spark",
+      "desc": "Spark data processing",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        23,
+        25,
+        28,
+        43,
+        56,
+        65,
+        109,
+        116
+      ]
+    },
+    {
+      "id": "q6",
+      "query": "cache",
+      "desc": "Caching observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        18,
+        51,
+        77,
+        138,
+        141
+      ]
+    },
+    {
+      "id": "q7",
+      "query": "migration",
+      "desc": "Migration observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        16,
+        17,
+        40,
+        41,
+        42,
+        46,
+        52,
+        58,
+        64,
+        66,
+        74,
+        75,
+        79,
+        83,
+        90,
+        95,
+        115,
+        117,
+        124,
+        129
+      ]
+    },
+    {
+      "id": "q8",
+      "query": "validation",
+      "desc": "Validation observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        11,
+        21,
+        28,
+        40,
+        60,
+        90,
+        98,
+        100,
+        104,
+        122,
+        126,
+        130,
+        153,
+        175,
+        182
+      ]
+    },
+    {
+      "id": "q9",
+      "query": "performance",
+      "desc": "Performance observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        2,
+        13,
+        19,
+        52,
+        65,
+        71,
+        90,
+        105,
+        107,
+        124,
+        135,
+        151,
+        163,
+        171,
+        174,
+        183,
+        193
+      ]
+    },
+    {
+      "id": "q10",
+      "query": "memory",
+      "desc": "Memory-related observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        17,
+        20,
+        49,
+        51,
+        124,
+        181,
+        185
+      ]
+    },
+    {
+      "id": "q11",
+      "query": "notification",
+      "desc": "Notification features",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        7,
+        39,
+        48,
+        149,
+        169
+      ]
+    },
+    {
+      "id": "q12",
+      "query": "deployment",
+      "desc": "Deployment observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        24,
+        73,
+        88,
+        99,
+        171
+      ]
+    },
+    {
+      "id": "q14",
+      "query": "testing",
+      "desc": "Testing observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        27,
+        28,
+        76,
+        102,
+        126,
+        133,
+        157,
+        199,
+        200
+      ]
+    },
+    {
+      "id": "q15",
+      "query": "WebSocket",
+      "desc": "WebSocket observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        20,
+        108,
+        152
+      ]
+    },
+    {
+      "id": "q16",
+      "query": "Terraform",
+      "desc": "Terraform/IaC observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        21,
+        74,
+        112,
+        130,
+        165,
+        192,
+        199
+      ]
+    },
+    {
+      "id": "q18",
+      "query": "API",
+      "desc": "API observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        34,
+        52,
+        57,
+        65,
+        71,
+        84,
+        92,
+        98,
+        114,
+        123,
+        129,
+        150,
+        166,
+        168,
+        171,
+        175,
+        176,
+        196
+      ]
+    },
+    {
+      "id": "q19",
+      "query": "database",
+      "desc": "Database observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        72,
+        91,
+        120,
+        133,
+        169,
+        197
+      ]
+    },
+    {
+      "id": "q20",
+      "query": "security",
+      "desc": "Security observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        1,
+        17,
+        89,
+        104,
+        166
+      ]
+    },
+    {
+      "id": "q22",
+      "query": "pipeline",
+      "desc": "Pipeline observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        5,
+        27,
+        35,
+        37,
+        46,
+        55,
+        79,
+        94,
+        109,
+        146,
+        154,
+        200
+      ]
+    },
+    {
+      "id": "q23",
+      "query": "image",
+      "desc": "Image handling observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        3,
+        35,
+        44,
+        51,
+        95,
+        142,
+        158
+      ]
+    },
+    {
+      "id": "q24",
+      "query": "navigation",
+      "desc": "Navigation observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        3,
+        4,
+        10,
+        11,
+        20,
+        45,
+        52,
+        70,
+        76,
+        96,
+        97,
+        122,
+        137,
+        193
+      ]
+    },
+    {
+      "id": "q25",
+      "query": "Kubernetes",
+      "desc": "K8s observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        49,
+        67,
+        95,
+        161,
+        166,
+        171,
+        188,
+        191
+      ]
+    },
+    {
+      "id": "q26",
+      "query": "queue",
+      "desc": "Queue-related observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        5,
+        10,
+        39,
+        94,
+        113,
+        159,
+        184,
+        195,
+        198
+      ]
+    },
+    {
+      "id": "q28",
+      "query": "component",
+      "desc": "Component observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        4,
+        12,
+        20,
+        45,
+        48,
+        51,
+        69,
+        70,
+        87,
+        127,
+        147
+      ]
+    },
+    {
+      "id": "q29",
+      "query": "Flink",
+      "desc": "Flink streaming observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        9,
+        22,
+        56,
+        75
+      ]
+    },
+    {
+      "id": "q30",
+      "query": "offline",
+      "desc": "Offline-first observations",
+      "project": null,
+      "type": null,
+      "relevant_ids": [
+        33,
+        109,
+        113,
+        121
+      ]
+    }
+  ]
+}
