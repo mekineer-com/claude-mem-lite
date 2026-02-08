@@ -76,37 +76,44 @@ async function install() {
     warn('Try manually: claude mcp add -s user -t stdio mem -- node ' + SERVER_PATH);
   }
 
-  // 4. Configure hooks
+  // 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
   log('Configuring hooks...');
   const settings = readSettings();
   settings.hooks = settings.hooks || {};
 
   const PREFILTER_PATH = join(INSTALL_DIR, 'scripts', 'post-tool-use.sh');
-  settings.hooks.PostToolUse = [{
+
+  const memPostToolUse = {
     matcher: '*',
     hooks: [{
       type: 'command',
       command: `bash ${PREFILTER_PATH}`,
       timeout: 5
     }]
-  }];
+  };
 
-  settings.hooks.SessionStart = [{
+  const memSessionStart = {
     matcher: 'startup|clear|compact',
     hooks: [{
       type: 'command',
       command: `node ${HOOK_PATH} session-start`,
       timeout: 10
     }]
-  }];
+  };
 
-  settings.hooks.Stop = [{
+  const memStop = {
     hooks: [{
       type: 'command',
       command: `node ${HOOK_PATH} stop`,
       timeout: 5
     }]
-  }];
+  };
+
+  // Filter out existing mem hooks, then append fresh ones
+  for (const [event, config] of [['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop]]) {
+    const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
+    settings.hooks[event] = [...existing, config];
+  }
 
   writeSettings(settings);
   ok('Hooks configured (PostToolUse, SessionStart, Stop)');
@@ -192,12 +199,7 @@ async function uninstall() {
   const settings = readSettings();
   if (settings.hooks) {
     for (const [event, configs] of Object.entries(settings.hooks)) {
-      settings.hooks[event] = configs.filter(cfg => {
-        if (!cfg.hooks) return true;
-        return !cfg.hooks.some(h =>
-          h.command?.includes('claude-mem-lite') && h.command?.includes('hook.mjs')
-        );
-      });
+      settings.hooks[event] = configs.filter(cfg => !isMemHook(cfg));
       if (settings.hooks[event].length === 0) delete settings.hooks[event];
     }
     if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
@@ -355,6 +357,15 @@ async function doctor() {
 }
 
 // ─── Settings helpers ───────────────────────────────────────────────────────
+
+function isMemHook(cfg) {
+  if (!cfg.hooks) return false;
+  return cfg.hooks.some(h =>
+    h.command?.includes('claude-mem-lite') ||
+    h.command?.includes('hook.mjs') ||
+    h.command?.includes('post-tool-use.sh')
+  );
+}
 
 function readSettings() {
   try {

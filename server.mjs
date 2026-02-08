@@ -21,7 +21,7 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
 db.pragma('synchronous = NORMAL');
-db.pragma('foreign_keys = OFF'); // Schema has FK mismatch (memory_session_id lacks UNIQUE)
+db.pragma('foreign_keys = OFF'); // Enabled below if safe
 
 // Ensure core tables exist (for fresh installs)
 db.exec(`
@@ -90,13 +90,32 @@ db.exec(`
   );
 `);
 
-// Schema migrations (idempotent)
+// Schema migrations (idempotent — only swallow "duplicate column" errors)
 try {
   db.exec(`ALTER TABLE observations ADD COLUMN importance INTEGER DEFAULT 1`);
-} catch {} // Column already exists
+} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
 try {
   db.exec(`ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'`);
-} catch {} // Column already exists
+} catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
+
+// Enable foreign keys if memory_session_id has unique index (safe for cascades)
+{
+  const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
+  if (hasIdx) {
+    db.pragma('foreign_keys = ON');
+  } else {
+    try {
+      db.exec(`CREATE UNIQUE INDEX idx_sess_memory_sid ON sdk_sessions(memory_session_id)`);
+      db.pragma('foreign_keys = ON');
+    } catch {
+      // Duplicates exist in memory_session_id — leave FK off
+    }
+  }
+}
+
+// Performance indexes for timeline/filter queries
+db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_epoch_project ON observations(created_at_epoch DESC, project)`);
+db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`);
 
 // Ensure FTS5 tables + triggers exist
 ensureFTS('observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
@@ -161,14 +180,25 @@ function inferProject() {
   return basename(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
 }
 
+function jaccardSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const setA = new Set(a.toLowerCase().split(/\s+/));
+  const setB = new Set(b.toLowerCase().split(/\s+/));
+  let intersection = 0;
+  for (const w of setA) { if (setB.has(w)) intersection++; }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
 // Sanitize FTS5 query: escape special chars, wrap tokens in double quotes
+const FTS5_KEYWORDS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
 function sanitizeFtsQuery(query) {
   if (!query) return null;
-  // Remove FTS5 operators that could cause syntax errors
-  const cleaned = query.replace(/[{}()\[\]^~*:]/g, ' ').trim();
+  // Remove FTS5 operators that could cause syntax errors (including - for NOT)
+  const cleaned = query.replace(/[{}()\[\]^~*:\-]/g, ' ').trim();
   if (!cleaned) return null;
-  // Split into tokens, quote each, join with space (implicit AND)
-  const tokens = cleaned.split(/\s+/).filter(Boolean);
+  // Split into tokens, filter out FTS5 boolean keywords, quote each
+  const tokens = cleaned.split(/\s+/).filter(t => t && !FTS5_KEYWORDS.has(t.toUpperCase()));
   if (tokens.length === 0) return null;
   return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' ');
 }
@@ -229,7 +259,7 @@ server.tool(
         const rows = db.prepare(`
           SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
                  bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                   * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
+                   * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
                    * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
                    * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
           FROM observations_fts
@@ -287,7 +317,7 @@ server.tool(
         const rows = db.prepare(`
           SELECT s.id, s.request, s.completed, s.project, s.created_at,
                  bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1)
-                   * (1.0 + 0.5 / (1.0 + (? - s.created_at_epoch) / 604800000.0))
+                   * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / 1209600000.0))
                    * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
           FROM session_summaries_fts
           JOIN session_summaries s ON session_summaries_fts.rowid = s.id
@@ -425,7 +455,7 @@ server.tool(
           WHERE observations_fts MATCH ?
             AND (? IS NULL OR o.project = ?)
           ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-            * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
+            * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
           LIMIT 1
         `).get(ftsQuery, args.project ?? null, args.project ?? null, nowT);
         if (row) anchorId = row.id;
@@ -557,6 +587,18 @@ server.tool(
         INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
         VALUES (?, ?, ?, ?, ?, 'active')
       `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+    }
+
+    // Dedup: skip if a similar title was saved recently (5 min window)
+    const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
+    const recent = db.prepare(`
+      SELECT title FROM observations
+      WHERE project = ? AND created_at_epoch > ?
+      ORDER BY created_at_epoch DESC LIMIT 10
+    `).all(project, fiveMinAgo);
+
+    if (title && recent.some(r => jaccardSimilarity(r.title, title) > 0.7)) {
+      return { content: [{ type: 'text', text: `Skipped: a similar observation already exists in project "${project}".` }] };
     }
 
     const result = db.prepare(`
