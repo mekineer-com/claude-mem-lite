@@ -2,7 +2,7 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir } from 'os';
 
@@ -119,15 +119,13 @@ async function install() {
       // Migrate database and WAL/SHM files
       for (const f of ['claude-mem.db', 'claude-mem.db-wal', 'claude-mem.db-shm']) {
         const src = join(OLD_DATA_DIR, f);
-        if (existsSync(src)) {
-          execSync(`cp "${src}" "${join(DATA_DIR, f)}"`, { stdio: 'pipe' });
-        }
+        if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
       }
       // Migrate runtime directory
       const oldRuntime = join(OLD_DATA_DIR, 'runtime');
       const newRuntime = join(DATA_DIR, 'runtime');
       if (existsSync(oldRuntime) && !existsSync(newRuntime)) {
-        execSync(`cp -r "${oldRuntime}" "${newRuntime}"`, { stdio: 'pipe' });
+        cpSync(oldRuntime, newRuntime, { recursive: true });
       }
       ok('Data migrated from ~/.claude-mem/ → ~/claude-mem-lite/');
       log('Old ~/.claude-mem/ preserved (remove manually when ready)');
