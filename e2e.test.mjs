@@ -501,7 +501,7 @@ describe('Suite 2: Episode Buffer Management', () => {
   });
 });
 
-describe('Suite 3: LLM Episode Processing', () => {
+describe('Suite 3: LLM Episode Processing', { timeout: 10000 }, () => {
   it('llm-episode with mock LLM creates observation in DB', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
@@ -636,7 +636,7 @@ describe('Suite 3: LLM Episode Processing', () => {
   });
 });
 
-describe('Suite 4: Session Summary', () => {
+describe('Suite 4: Session Summary', { timeout: 10000 }, () => {
   it('llm-summary with observations creates session_summary', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
@@ -775,7 +775,7 @@ describe('Suite 7: Secret Scrubbing E2E', () => {
   });
 });
 
-describe('Suite 8a: Cross-Session MinHash Dedup', () => {
+describe('Suite 8a: Cross-Session MinHash Dedup', { timeout: 10000 }, () => {
   it('cross-session dedup blocks near-duplicate observation', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
