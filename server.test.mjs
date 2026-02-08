@@ -1,118 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'fs';
+import { resolve } from 'path';
 import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, truncate, estimateTokens } from './utils.mjs';
-
-// ─── In-memory DB setup (mirrors server.mjs schema) ────────────────────────
-
-function createTestDb() {
-  const db = new Database(':memory:');
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = OFF');
-
-  db.exec(`
-    CREATE TABLE sdk_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      content_session_id TEXT NOT NULL UNIQUE,
-      memory_session_id TEXT,
-      project TEXT NOT NULL,
-      user_prompt TEXT,
-      started_at TEXT NOT NULL,
-      started_at_epoch INTEGER NOT NULL,
-      completed_at TEXT,
-      completed_at_epoch INTEGER,
-      status TEXT NOT NULL DEFAULT 'active',
-      worker_port INTEGER,
-      prompt_counter INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE observations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      memory_session_id TEXT NOT NULL,
-      project TEXT NOT NULL,
-      text TEXT,
-      type TEXT NOT NULL CHECK(type IN ('decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change')),
-      title TEXT,
-      subtitle TEXT,
-      facts TEXT,
-      narrative TEXT,
-      concepts TEXT,
-      files_read TEXT,
-      files_modified TEXT,
-      prompt_number INTEGER,
-      discovery_tokens INTEGER DEFAULT 0,
-      importance INTEGER DEFAULT 1,
-      related_ids TEXT DEFAULT '[]',
-      minhash_sig TEXT,
-      access_count INTEGER DEFAULT 0,
-      compressed_into INTEGER DEFAULT NULL,
-      created_at TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL,
-      FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id)
-    );
-
-    CREATE TABLE session_summaries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      memory_session_id TEXT NOT NULL,
-      project TEXT NOT NULL,
-      request TEXT,
-      investigated TEXT,
-      learned TEXT,
-      completed TEXT,
-      next_steps TEXT,
-      files_read TEXT,
-      files_edited TEXT,
-      notes TEXT,
-      prompt_number INTEGER,
-      discovery_tokens INTEGER DEFAULT 0,
-      created_at TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL,
-      FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id)
-    );
-
-    CREATE TABLE user_prompts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      content_session_id TEXT NOT NULL,
-      prompt_text TEXT,
-      prompt_number INTEGER,
-      created_at TEXT NOT NULL,
-      created_at_epoch INTEGER NOT NULL,
-      FOREIGN KEY(content_session_id) REFERENCES sdk_sessions(content_session_id)
-    );
-  `);
-
-  // FTS5 tables + triggers (same as server.mjs ensureFTS)
-  db.exec(`
-    CREATE VIRTUAL TABLE observations_fts USING fts5(title, subtitle, narrative, text, facts, concepts, content='observations', content_rowid='id');
-    CREATE TRIGGER observations_ai AFTER INSERT ON observations BEGIN
-      INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts) VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-    END;
-    CREATE TRIGGER observations_ad AFTER DELETE ON observations BEGIN
-      INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts) VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-    END;
-    CREATE TRIGGER observations_au AFTER UPDATE ON observations BEGIN
-      INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts) VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-      INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts) VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-    END;
-  `);
-
-  return db;
-}
-
-function insertSession(db, { id, project = 'test', memoryId = null }) {
-  const now = new Date();
-  db.prepare(`
-    INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-    VALUES (?, ?, ?, ?, ?, 'active')
-  `).run(id, memoryId ?? id, project, now.toISOString(), now.getTime());
-}
-
-function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, text = '', narrative = '', importance = 1, relatedIds = '[]', epochOffset = 0, filesModified = '[]', accessCount = 0, compressedInto = null }) {
-  const now = Date.now() + epochOffset;
-  return db.prepare(`
-    INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, related_ids, access_count, compressed_into, created_at, created_at_epoch)
-    VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?)
-  `).run(sessionId, project, text, type, title, narrative, filesModified, importance, relatedIds, accessCount, compressedInto, new Date(now).toISOString(), now);
-}
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 
@@ -781,5 +672,69 @@ describe('mem_compress', () => {
 
     const compressable = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
     expect(compressable.length).toBe(0);
+  });
+});
+
+// ─── SKIP_TOOLS sync: hook.mjs ↔ post-tool-use.sh ──────────────────────────
+
+describe('SKIP_TOOLS sync between hook.mjs and post-tool-use.sh', () => {
+  it('bash skip list matches hook.mjs SKIP_TOOLS + prefix filters', () => {
+    // Extract SKIP_TOOLS from hook.mjs
+    const hookSrc = readFileSync(resolve('hook.mjs'), 'utf8');
+    const skipMatch = hookSrc.match(/const SKIP_TOOLS\s*=\s*new Set\(\[([\s\S]*?)\]\)/);
+    expect(skipMatch, 'Could not find SKIP_TOOLS in hook.mjs').toBeTruthy();
+    const hookTools = skipMatch[1]
+      .split(',')
+      .map(s => s.replace(/\/\/.*$/gm, '').trim().replace(/^['"]|['"]$/g, ''))
+      .filter(Boolean);
+
+    // Extract prefix filters from hook.mjs (tool_name.startsWith checks)
+    const prefixMatches = hookSrc.matchAll(/tool_name\.startsWith\(['"]([^'"]+)['"]\)/g);
+    const hookPrefixes = [...prefixMatches].map(m => m[1]);
+
+    // Extract from post-tool-use.sh
+    const bashSrc = readFileSync(resolve('scripts/post-tool-use.sh'), 'utf8');
+
+    // Extract exact-match tools from the case statement
+    const caseMatch = bashSrc.match(/# Exact matches[\s\S]*?exit 0\s*;;/);
+    expect(caseMatch, 'Could not find exact matches in post-tool-use.sh').toBeTruthy();
+    const bashTools = caseMatch[0]
+      .replace(/# .*$/gm, '')
+      .replace(/exit 0\s*;;/, '')
+      .replace(/\\\n/g, '')
+      .split('|')
+      .map(s => s.trim().replace(/[)]/g, ''))
+      .filter(s => s && s !== 'Read'); // Read is handled separately in bash
+
+    // Extract prefix filters from bash
+    const prefixMatch = bashSrc.match(/# Prefix filters\s*\n\s*(.*?)exit 0/s);
+    expect(prefixMatch, 'Could not find prefix filters in post-tool-use.sh').toBeTruthy();
+    const bashPrefixes = prefixMatch[1]
+      .replace(/\)/, '')
+      .split('|')
+      .map(s => s.trim().replace(/\*$/, ''))
+      .filter(Boolean);
+
+    // Compare: hook SKIP_TOOLS should be a superset of bash exact tools (bash includes Read separately)
+    const hookSet = new Set(hookTools);
+    for (const tool of bashTools) {
+      expect(hookSet.has(tool), `Tool "${tool}" in post-tool-use.sh but not in hook.mjs SKIP_TOOLS`).toBe(true);
+    }
+
+    // Compare: all non-Read hook tools should be in bash
+    const bashSet = new Set([...bashTools, 'Read']); // Read is handled separately
+    for (const tool of hookTools) {
+      expect(bashSet.has(tool), `Tool "${tool}" in hook.mjs SKIP_TOOLS but not in post-tool-use.sh`).toBe(true);
+    }
+
+    // Compare prefixes
+    const hookPrefixSet = new Set(hookPrefixes);
+    const bashPrefixSet = new Set(bashPrefixes);
+    for (const p of bashPrefixes) {
+      expect(hookPrefixSet.has(p), `Prefix "${p}" in post-tool-use.sh but not in hook.mjs`).toBe(true);
+    }
+    for (const p of hookPrefixes) {
+      expect(bashPrefixSet.has(p), `Prefix "${p}" in hook.mjs but not in post-tool-use.sh`).toBe(true);
+    }
   });
 });

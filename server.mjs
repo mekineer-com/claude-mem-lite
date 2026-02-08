@@ -14,42 +14,6 @@ const db = ensureDb();
 // Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');
 
-// Ensure FTS5 tables + triggers exist
-ensureFTS('observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
-ensureFTS('session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes']);
-ensureFTS('user_prompts_fts', 'user_prompts', ['prompt_text']);
-
-function ensureFTS(ftsName, tableName, columns) {
-  const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
-  if (exists) return;
-
-  // Validate identifiers to prevent SQL injection
-  const idRe = /^[a-z_]+$/;
-  if (!idRe.test(ftsName) || !idRe.test(tableName) || !columns.every(c => idRe.test(c))) {
-    throw new Error(`Invalid identifier in ensureFTS: ${ftsName}, ${tableName}`);
-  }
-
-  const colList = columns.join(', ');
-  const newVals = columns.map(c => `new.${c}`).join(', ');
-  const oldVals = columns.map(c => `old.${c}`).join(', ');
-  db.exec(`
-    CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id');
-
-    CREATE TRIGGER ${tableName}_ai AFTER INSERT ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
-    END;
-
-    CREATE TRIGGER ${tableName}_ad AFTER DELETE ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
-    END;
-
-    CREATE TRIGGER ${tableName}_au AFTER UPDATE ON ${tableName} BEGIN
-      INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
-      INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
-    END;
-  `);
-}
-
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function fmtDate(iso) {

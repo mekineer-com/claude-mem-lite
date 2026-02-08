@@ -174,13 +174,7 @@ async function install() {
     ok('Old claude-mem plugin disabled');
   }
 
-  // 8. Clean old processes
-  try {
-    execSync('pkill -f chroma-mcp 2>/dev/null || true', { stdio: 'pipe' });
-    execSync('pkill -f "claude-mem.*worker" 2>/dev/null || true', { stdio: 'pipe' });
-  } catch {}
-
-  // 9. Offer to clean old vector-db
+  // 8. Offer to clean old vector-db
   const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
   if (existsSync(vectorDbPath)) {
     try {

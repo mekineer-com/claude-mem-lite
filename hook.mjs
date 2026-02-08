@@ -13,7 +13,7 @@ import {
   jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance,
   inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
   parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
-  estimateTokens, computeMinHash, estimateJaccardFromMinHash,
+  estimateTokens, computeMinHash, estimateJaccardFromMinHash, debugCatch,
 } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 
@@ -248,8 +248,7 @@ function acquireLock(maxWaitMs = 500) {
         } catch {}
       }
       const wait = Math.ceil(Math.random() * 20);
-      const start = Date.now();
-      while (Date.now() - start < wait) { /* spin */ }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
     }
   }
   return false;
@@ -417,11 +416,6 @@ async function handlePostToolUse() {
   // Tier 1 B: Detect significant Bash commands
   const bashSig = (tool_name === 'Bash') ? detectBashSignificance(toolInput, resp) : null;
 
-  // Tier 2 G: Error-triggered recall
-  if (bashSig?.isError) {
-    triggerErrorRecall(toolInput, resp);
-  }
-
   // Build episode entry
   const entry = {
     tool: tool_name,
@@ -438,7 +432,16 @@ async function handlePostToolUse() {
   const sessionId = getSessionId();
   const project = inferProject();
 
+  // Single DB connection for both error recall and file history
+  const db = openDb();
+
+  // Tier 2 G: Error-triggered recall
+  if (bashSig?.isError && db) {
+    triggerErrorRecall(db, toolInput, resp);
+  }
+
   if (!acquireLock()) {
+    if (db) try { db.close(); } catch {}
     writePendingEntry(entry, sessionId, project);
     return;
   }
@@ -471,30 +474,25 @@ async function handlePostToolUse() {
     addFileToEpisode(episode, files);
 
     // Proactive file history: show past observations for files being edited
-    if (['Edit', 'Write', 'NotebookEdit'].includes(tool_name) && files.length > 0) {
+    if (['Edit', 'Write', 'NotebookEdit'].includes(tool_name) && files.length > 0 && db) {
       for (const f of files) {
         if (episode.fileHistoryShown?.includes(f)) continue;
         try {
-          const db = openDb();
-          if (db) {
-            try {
-              const fname = basename(f);
-              const ftsQ = `"${fname.replace(/"/g, '""')}"`;
-              const rows = db.prepare(`
-                SELECT o.id, o.type, o.title
-                FROM observations_fts
-                JOIN observations o ON observations_fts.rowid = o.id
-                WHERE observations_fts MATCH ? AND o.project = ?
-                ORDER BY o.created_at_epoch DESC
-                LIMIT 3
-              `).all(ftsQ, project);
-              if (rows.length > 0) {
-                const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
-                process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
-              }
-            } finally { db.close(); }
+          const fname = basename(f);
+          const ftsQ = `"${fname.replace(/"/g, '""')}"`;
+          const rows = db.prepare(`
+            SELECT o.id, o.type, o.title
+            FROM observations_fts
+            JOIN observations o ON observations_fts.rowid = o.id
+            WHERE observations_fts MATCH ? AND o.project = ?
+            ORDER BY o.created_at_epoch DESC
+            LIMIT 3
+          `).all(ftsQ, project);
+          if (rows.length > 0) {
+            const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
+            process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
           }
-        } catch {}
+        } catch (e) { debugCatch(e, 'fileHistory'); }
         if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
         episode.fileHistoryShown.push(f);
       }
@@ -503,15 +501,13 @@ async function handlePostToolUse() {
     writeEpisode(episode);
   } finally {
     releaseLock();
+    if (db) try { db.close(); } catch {}
   }
 }
 
 // ─── Error-Triggered Recall (Tier 2 G) ─────────────────────────────────────
 
-function triggerErrorRecall(toolInput, response) {
-  const db = openDb();
-  if (!db) return;
-
+function triggerErrorRecall(db, toolInput, response) {
   try {
     const project = inferProject();
 
@@ -539,9 +535,7 @@ function triggerErrorRecall(toolInput, response) {
       const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
       process.stdout.write(`[claude-mem] Related memories found for this error:\n${hints}\n  → Use mem_get(ids=[${rows.map(r => r.id).join(',')}]) for details.\n`);
     }
-  } catch {} finally {
-    db.close();
-  }
+  } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }
 
 // extractErrorKeywords, detectBashSignificance, computeRuleImportance, clampImportance imported from utils.mjs
@@ -733,7 +727,7 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
 
           db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(newRelated.slice(-10)), newObs.id);
         }
-      } catch {} finally { db.close(); }
+      } catch (e) { debugCatch(e, 'relatedObsLinking'); } finally { db.close(); }
     }
   }
 
@@ -838,19 +832,22 @@ function handleStop() {
       releaseLock();
     }
   } else {
-    // Fallback: lock contended — read episode without lock and flush directly to file.
-    // Prevents data loss when PostToolUse holds the lock at session end.
-    const episode = readEpisodeRaw();
-    if (episode && episode.entries && episode.entries.length > 0) {
-      if (!episode.sessionId) episode.sessionId = sessionId;
-      if (!episode.project) episode.project = project;
-      const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
-      try {
+    // Fallback: lock contended — atomically rename episode file to claim ownership.
+    // Prevents data loss from concurrent PostToolUse writes between read and delete.
+    const epFile = episodeFile();
+    const claimFile = epFile + `.claim-${Date.now()}`;
+    try {
+      renameSync(epFile, claimFile);
+      const episode = JSON.parse(readFileSync(claimFile, 'utf8'));
+      if (episode && episode.entries && episode.entries.length > 0) {
+        if (!episode.sessionId) episode.sessionId = sessionId;
+        if (!episode.project) episode.project = project;
+        const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
         writeFileSync(flushFile, JSON.stringify(episode));
         spawnBackground('llm-episode', flushFile);
-      } catch {}
-      try { unlinkSync(episodeFile()); } catch {}
-    }
+      }
+      try { unlinkSync(claimFile); } catch {}
+    } catch (e) { debugCatch(e, 'handleStop-fallback'); }
   }
 
   // Mark session completed (sync, instant)
@@ -957,9 +954,15 @@ function selectWithTokenBudget(db, project, budget = 2000) {
 
 function handleSessionStart() {
   // Flush any leftover episode buffer from previous session (e.g. after /clear)
-  const prevEpisode = readEpisode();
-  if (prevEpisode && prevEpisode.entries && prevEpisode.entries.length > 0) {
-    flushEpisode(prevEpisode);
+  if (acquireLock()) {
+    try {
+      const prevEpisode = readEpisode();
+      if (prevEpisode && prevEpisode.entries && prevEpisode.entries.length > 0) {
+        flushEpisode(prevEpisode);
+      }
+    } finally {
+      releaseLock();
+    }
   }
 
   // Tier 1 A: Create unique session ID

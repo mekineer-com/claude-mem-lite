@@ -2,7 +2,6 @@
 // Used by server.mjs, hook.mjs, and tests
 
 import { basename, dirname } from 'path';
-import { createHash } from 'crypto';
 
 // ─── String Utilities ────────────────────────────────────────────────────────
 
@@ -69,6 +68,17 @@ export function estimateTokens(text) {
 
 // ─── MinHash Signatures ──────────────────────────────────────────────────
 
+// FNV-1a hash: fast, non-cryptographic, ~10x faster than SHA-256 for MinHash
+function fnv1a(str) {
+  let hash = 0x811c9dc5; // FNV offset basis (32-bit)
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193); // FNV prime
+    hash >>>= 0; // Keep as uint32
+  }
+  return hash;
+}
+
 export function computeMinHash(text, numHashes = 64) {
   if (!text || typeof text !== 'string') return null;
   const tokens = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
@@ -79,8 +89,7 @@ export function computeMinHash(text, numHashes = 64) {
   const mins = new Array(numHashes).fill(0xFFFFFFFF);
   for (const token of tokens) {
     for (let i = 0; i < numHashes; i++) {
-      const h = createHash('sha256').update(`${i}-${token}`).digest();
-      const val = h.readUInt32BE(0);
+      const val = fnv1a(`${i}-${token}`);
       if (val < mins[i]) mins[i] = val;
     }
   }
@@ -344,6 +353,14 @@ export function makeEntryDesc(toolName, input, resp) {
       return `Fetch: ${truncate(input.url || '', 50)}`;
     default:
       return `${toolName}: ${truncate(resp, 50)}`;
+  }
+}
+
+// ─── Debug Catch Helper ──────────────────────────────────────────────────────
+
+export function debugCatch(e, context) {
+  if (process.env.CLAUDE_MEM_DEBUG) {
+    console.error(`[claude-mem-lite] ${context}:`, e?.message || e);
   }
 }
 
