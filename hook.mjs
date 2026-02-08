@@ -9,7 +9,7 @@ import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, constants as fsConstants } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, renameSync, constants as fsConstants } from 'fs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -177,7 +177,10 @@ function readEpisode() {
 }
 
 function writeEpisode(episode) {
-  writeFileSync(episodeFile(), JSON.stringify(episode));
+  const target = episodeFile();
+  const tmp = target + '.tmp';
+  writeFileSync(tmp, JSON.stringify(episode));
+  renameSync(tmp, target);
 }
 
 function createEpisode(sessionId, project) {
@@ -224,12 +227,15 @@ function flushEpisode(episode) {
   if (!episode || episode.entries.length === 0) return;
 
   // Collect Read file paths tracked by post-tool-use.sh
+  // Use rename to atomically collect — prevents losing concurrent appends
   const readsFile = join(RUNTIME_DIR, `reads-${episode.project || inferProject()}.txt`);
+  const readsCollect = readsFile + `.collect-${Date.now()}`;
   try {
-    const raw = readFileSync(readsFile, 'utf8');
+    renameSync(readsFile, readsCollect);
+    const raw = readFileSync(readsCollect, 'utf8');
     const paths = [...new Set(raw.split('\n').filter(Boolean))];
     episode.filesRead = paths;
-    writeFileSync(readsFile, ''); // Clear after collecting
+    try { unlinkSync(readsCollect); } catch {}
   } catch {
     episode.filesRead = episode.filesRead || [];
   }
@@ -391,7 +397,7 @@ function triggerErrorRecall(toolInput, response) {
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ?
       ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-        * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
+        * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
       LIMIT 3
     `).all(ftsQuery, nowR);
 
@@ -658,10 +664,16 @@ function handleStop() {
   const sessionId = getSessionId();
   const project = inferProject();
 
-  // Flush remaining episode buffer
-  const episode = readEpisode();
-  if (episode) {
-    flushEpisode(episode);
+  // Flush remaining episode buffer (locked to prevent race with handlePostToolUse)
+  if (acquireLock(1000)) {
+    try {
+      const episode = readEpisode();
+      if (episode) {
+        flushEpisode(episode);
+      }
+    } finally {
+      releaseLock();
+    }
   }
 
   // Mark session completed (sync, instant)

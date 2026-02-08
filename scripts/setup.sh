@@ -40,8 +40,8 @@ else
   log_ok "Dependencies up to date"
 fi
 
-# 2. Ensure data directory exists
-mkdir -p "$DATA_DIR/runtime"
+# 2. Ensure data directory exists (runtime created after migration check)
+mkdir -p "$DATA_DIR"
 log_ok "Data directory: $DATA_DIR"
 
 # 3. Migrate from old ~/.claude-mem/ if needed
@@ -56,6 +56,9 @@ if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem.db" ]]; then
   fi
   log_ok "Data migrated (old ~/.claude-mem/ preserved)"
 fi
+
+# 4. Ensure runtime directory exists (after migration to not mask migration check)
+mkdir -p "$DATA_DIR/runtime"
 
 log_ok "claude-mem-lite ready"
 exit 0
