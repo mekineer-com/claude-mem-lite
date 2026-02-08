@@ -9,6 +9,7 @@ import { homedir } from 'os';
 import { join, basename } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { z } from 'zod';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery } from './utils.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -98,19 +99,41 @@ try {
   db.exec(`ALTER TABLE observations ADD COLUMN related_ids TEXT DEFAULT '[]'`);
 } catch (e) { if (!e.message?.includes('duplicate column name')) throw e; }
 
-// Enable foreign keys if memory_session_id has unique index (safe for cascades)
+// Dedup migration: ensure memory_session_id is unique, then enable FK unconditionally
 {
   const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
-  if (hasIdx) {
-    db.pragma('foreign_keys = ON');
-  } else {
-    try {
-      db.exec(`CREATE UNIQUE INDEX idx_sess_memory_sid ON sdk_sessions(memory_session_id)`);
-      db.pragma('foreign_keys = ON');
-    } catch {
-      // Duplicates exist in memory_session_id — leave FK off
+  if (!hasIdx) {
+    // Find and resolve duplicates before creating unique index
+    const dupes = db.prepare(`
+      SELECT memory_session_id, COUNT(*) as cnt
+      FROM sdk_sessions
+      WHERE memory_session_id IS NOT NULL
+      GROUP BY memory_session_id HAVING cnt > 1
+    `).all();
+
+    if (dupes.length > 0) {
+      const dedup = db.transaction(() => {
+        for (const { memory_session_id } of dupes) {
+          // All duplicates share the same memory_session_id, so observation counts
+          // are identical across them. Keep the oldest row (smallest id).
+          const rows = db.prepare(`
+            SELECT s.id FROM sdk_sessions s
+            WHERE s.memory_session_id = ?
+            ORDER BY s.id ASC
+          `).all(memory_session_id);
+
+          // Delete all but the keeper (first row)
+          for (let i = 1; i < rows.length; i++) {
+            db.prepare('DELETE FROM sdk_sessions WHERE id = ?').run(rows[i].id);
+          }
+        }
+      });
+      dedup();
     }
+
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sess_memory_sid ON sdk_sessions(memory_session_id)`);
   }
+  db.pragma('foreign_keys = ON');
 }
 
 // Performance indexes for timeline/filter queries
@@ -165,43 +188,15 @@ function fmtDate(iso) {
   return `${mon} ${day} ${h}:${m}`;
 }
 
-function typeIcon(type) {
-  const icons = { decision: '🟡', bugfix: '🔴', feature: '🟢', refactor: '🔵', discovery: '🔍', change: '📝' };
-  return icons[type] || '⚪';
-}
-
-function truncate(str, max = 80) {
-  if (!str) return '';
-  str = str.replace(/\n/g, ' ').trim();
-  return str.length > max ? str.slice(0, max - 1) + '…' : str;
-}
+// typeIcon, truncate imported from utils.mjs
 
 function inferProject() {
   return basename(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
 }
 
-function jaccardSimilarity(a, b) {
-  if (!a || !b) return 0;
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
-  let intersection = 0;
-  for (const w of setA) { if (setB.has(w)) intersection++; }
-  const union = setA.size + setB.size - intersection;
-  return union === 0 ? 0 : intersection / union;
-}
+// jaccardSimilarity imported from utils.mjs
 
-// Sanitize FTS5 query: escape special chars, wrap tokens in double quotes
-const FTS5_KEYWORDS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
-function sanitizeFtsQuery(query) {
-  if (!query) return null;
-  // Remove FTS5 operators that could cause syntax errors (including - for NOT)
-  const cleaned = query.replace(/[{}()\[\]^~*:\-]/g, ' ').trim();
-  if (!cleaned) return null;
-  // Split into tokens, filter out FTS5 boolean keywords, quote each
-  const tokens = cleaned.split(/\s+/).filter(t => t && !FTS5_KEYWORDS.has(t.toUpperCase()));
-  if (tokens.length === 0) return null;
-  return tokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' ');
-}
+// sanitizeFtsQuery imported from utils.mjs
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
@@ -529,27 +524,40 @@ server.tool(
 
 server.tool(
   'mem_get',
-  'Get full details for one or more observations by ID. Use after mem_search to drill into specific records.',
+  'Get full details for one or more records by ID. Use after mem_search to drill into specific records.',
   {
     ids: z.array(z.number().int()).min(1).max(20).describe('Observation IDs to retrieve'),
+    source: z.enum(['obs', 'session', 'prompt']).optional().describe('Record type: obs (default), session (S# from search), prompt (P# from search)'),
     fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),
   },
   safeHandler(async (args) => {
+    const source = args.source || 'obs';
     const placeholders = args.ids.map(() => '?').join(',');
-    const rows = db.prepare(`
-      SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC
-    `).all(...args.ids);
 
-    if (rows.length === 0) {
-      return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
+    let rows, allFields, prefix;
+    if (source === 'session') {
+      rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
+      allFields = ['id', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'files_read', 'files_edited', 'notes', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
+      prefix = 'S#';
+    } else if (source === 'prompt') {
+      rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
+      allFields = ['id', 'prompt_text', 'content_session_id', 'prompt_number', 'created_at'];
+      prefix = 'P#';
+    } else {
+      rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
+      allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids'];
+      prefix = '#';
     }
 
-    const allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids'];
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: `No ${source === 'session' ? 'sessions' : source === 'prompt' ? 'prompts' : 'observations'} found for given IDs.` }] };
+    }
+
     const fields = args.fields?.length ? args.fields.filter(f => allFields.includes(f)) : allFields;
 
     const parts = [];
     for (const row of rows) {
-      const lines = [`── #${row.id} ──`];
+      const lines = [`── ${prefix}${row.id} ──`];
       for (const f of fields) {
         const val = row[f];
         if (val === null || val === undefined || val === '') continue;
@@ -559,6 +567,58 @@ server.tool(
     }
 
     return { content: [{ type: 'text', text: parts.join('\n\n') }] };
+  })
+);
+
+// ─── Tool: mem_delete ────────────────────────────────────────────────────────
+
+server.tool(
+  'mem_delete',
+  'Delete observations by ID. Use confirm=false to preview, confirm=true to execute. FTS5 cleanup is automatic via triggers.',
+  {
+    ids: z.array(z.number().int()).min(1).max(50).describe('Observation IDs to delete'),
+    confirm: z.boolean().describe('false=preview what will be deleted, true=execute deletion'),
+  },
+  safeHandler(async (args) => {
+    const placeholders = args.ids.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT id, type, title, project FROM observations WHERE id IN (${placeholders})
+    `).all(...args.ids);
+
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
+    }
+
+    if (!args.confirm) {
+      // Preview mode
+      const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`];
+      for (const r of rows) {
+        lines.push(`  #${r.id} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${r.project}`);
+      }
+      lines.push(`\nCall mem_delete(ids=[...], confirm=true) to execute.`);
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    // Clean up stale references in other observations' related_ids
+    const deletedIds = new Set(args.ids);
+    const referencing = db.prepare(`
+      SELECT id, related_ids FROM observations
+      WHERE related_ids IS NOT NULL AND related_ids != '[]'
+    `).all();
+    for (const r of referencing) {
+      let ids;
+      try { ids = JSON.parse(r.related_ids); } catch { continue; }
+      if (!Array.isArray(ids)) continue;
+      const filtered = ids.filter(id => !deletedIds.has(id));
+      if (filtered.length !== ids.length) {
+        db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
+      }
+    }
+
+    // Execute deletion (FTS5 cleanup handled by observations_ad trigger)
+    const result = db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...args.ids);
+
+    return { content: [{ type: 'text', text: `Deleted ${result.changes} observation(s).` }] };
   })
 );
 
@@ -572,10 +632,11 @@ server.tool(
     title: z.string().optional().describe('Short title'),
     type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Observation type (default: discovery)'),
     project: z.string().optional().describe('Project name (default: inferred from CWD)'),
+    importance: z.number().int().min(1).max(3).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 1)'),
   },
   safeHandler(async (args) => {
     const now = new Date();
-    const project = args.project || 'manual';
+    const project = args.project || inferProject();
     const type = args.type || 'discovery';
     const title = args.title || args.content.slice(0, 100);
     const sessionId = `manual-${project}`;
@@ -602,9 +663,9 @@ server.tool(
     }
 
     const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?)
-    `).run(sessionId, project, args.content, type, title, args.content, now.toISOString(), now.getTime());
+      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?)
+    `).run(sessionId, project, args.content, type, title, args.content, args.importance ?? 1, now.toISOString(), now.getTime());
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
   })
@@ -676,9 +737,20 @@ server.tool(
   })
 );
 
+// ─── WAL Checkpoint (periodic) ───────────────────────────────────────────────
+
+// Checkpoint WAL every 5 minutes to prevent unbounded growth
+const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000;
+const walTimer = setInterval(() => {
+  try { db.pragma('wal_checkpoint(PASSIVE)'); } catch {}
+}, WAL_CHECKPOINT_INTERVAL);
+walTimer.unref(); // Don't keep process alive just for checkpoints
+
 // ─── Shutdown Cleanup ────────────────────────────────────────────────────────
 
 function shutdown() {
+  clearInterval(walTimer);
+  try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
   try { db.close(); } catch {}
   process.exit(0);
 }

@@ -3,10 +3,11 @@
 
 import { execSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync } from 'fs';
-import { join, resolve } from 'path';
+import { join, resolve, dirname } from 'path';
 import { homedir } from 'os';
+import { fileURLToPath } from 'url';
 
-const PROJECT_DIR = resolve(import.meta.dirname || '.');
+const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
 const DATA_DIR = join(homedir(), 'claude-mem-lite');
 const DB_PATH = join(DATA_DIR, 'claude-mem.db');
@@ -41,7 +42,7 @@ async function install() {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     const scriptsDir = join(DATA_DIR, 'scripts');
     if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
-    for (const f of ['server.mjs', 'hook.mjs', 'package.json', 'skill.md', 'scripts/post-tool-use.sh']) {
+    for (const f of ['server.mjs', 'hook.mjs', 'utils.mjs', 'package.json', 'skill.md', 'scripts/post-tool-use.sh']) {
       const src = join(PROJECT_DIR, f);
       if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
     }
