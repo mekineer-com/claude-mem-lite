@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import Database from 'better-sqlite3';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, basename } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { z } from 'zod';
 
@@ -149,6 +149,10 @@ function truncate(str, max = 80) {
   return str.length > max ? str.slice(0, max - 1) + '…' : str;
 }
 
+function inferProject() {
+  return basename(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
+}
+
 // Sanitize FTS5 query: escape special chars, wrap tokens in double quotes
 function sanitizeFtsQuery(query) {
   if (!query) return null;
@@ -199,6 +203,7 @@ server.tool(
     const ftsQuery = sanitizeFtsQuery(args.query);
     const searchType = args.type;
     const results = [];
+    const currentProject = inferProject();
 
     // Parse date bounds to epoch (with validation)
     const epochFrom = args.date_from ? new Date(args.date_from).getTime() : null;
@@ -210,10 +215,13 @@ server.tool(
     if (!searchType || searchType === 'observations') {
       if (ftsQuery) {
         const now = Date.now();
+        // Project boost: current project gets 2x ranking boost (not filtered, just prioritized)
+        const projectBoost = args.project ? null : currentProject;
         const rows = db.prepare(`
           SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at,
                  bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                   * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0)) as score
+                   * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
+                   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END) as score
           FROM observations_fts
           JOIN observations o ON observations_fts.rowid = o.id
           WHERE observations_fts MATCH ?
@@ -225,6 +233,7 @@ server.tool(
           LIMIT ? OFFSET ?
         `).all(
           now,
+          projectBoost, projectBoost,
           ftsQuery,
           args.project ?? null, args.project ?? null,
           args.obs_type ?? null, args.obs_type ?? null,
@@ -261,10 +270,12 @@ server.tool(
     if (!searchType || searchType === 'sessions') {
       if (ftsQuery) {
         const nowS = Date.now();
+        const sessionProjectBoost = args.project ? null : currentProject;
         const rows = db.prepare(`
           SELECT s.id, s.request, s.completed, s.project, s.created_at,
                  bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1)
-                   * (1.0 + 0.5 / (1.0 + (? - s.created_at_epoch) / 604800000.0)) as score
+                   * (1.0 + 0.5 / (1.0 + (? - s.created_at_epoch) / 604800000.0))
+                   * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
           FROM session_summaries_fts
           JOIN session_summaries s ON session_summaries_fts.rowid = s.id
           WHERE session_summaries_fts MATCH ?
@@ -275,6 +286,7 @@ server.tool(
           LIMIT ? OFFSET ?
         `).all(
           nowS,
+          sessionProjectBoost, sessionProjectBoost,
           ftsQuery,
           args.project ?? null, args.project ?? null,
           epochFrom, epochFrom,
