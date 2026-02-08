@@ -321,14 +321,16 @@ function triggerErrorRecall(toolInput, response) {
     const ftsQuery = keywords.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
     if (!ftsQuery) return;
 
+    const nowR = Date.now();
     const rows = db.prepare(`
       SELECT o.id, o.type, o.title
       FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ?
       ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+        * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
       LIMIT 3
-    `).all(ftsQuery);
+    `).all(ftsQuery, nowR);
 
     if (rows.length > 0) {
       const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
@@ -701,15 +703,21 @@ function saveObservation(obs, projectOverride, sessionIdOverride) {
       `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
     }
 
+    // text: expanded concepts+facts as plain text (distinct from narrative for better FTS coverage)
+    // concepts/facts: space-separated plain text (not JSON arrays) for clean FTS matching
+    const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
+    const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
+    const textField = [conceptsText, factsText].filter(Boolean).join(' ');
+
     db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       sessionId, project,
-      obs.narrative || '', obs.type, obs.title, obs.subtitle || '',
+      textField, obs.type, obs.title, obs.subtitle || '',
       obs.narrative || '',
-      JSON.stringify(obs.concepts),
-      JSON.stringify(obs.facts),
+      conceptsText,
+      factsText,
       JSON.stringify(obs.filesRead),
       JSON.stringify(obs.files),
       now.toISOString(), now.getTime()

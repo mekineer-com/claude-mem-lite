@@ -209,9 +209,11 @@ server.tool(
     // Search observations
     if (!searchType || searchType === 'observations') {
       if (ftsQuery) {
+        const now = Date.now();
         const rows = db.prepare(`
           SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at,
-                 bm25(observations_fts, 10, 5, 5, 3, 3, 2) as score
+                 bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+                   * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0)) as score
           FROM observations_fts
           JOIN observations o ON observations_fts.rowid = o.id
           WHERE observations_fts MATCH ?
@@ -222,6 +224,7 @@ server.tool(
           ORDER BY score
           LIMIT ? OFFSET ?
         `).all(
+          now,
           ftsQuery,
           args.project ?? null, args.project ?? null,
           args.obs_type ?? null, args.obs_type ?? null,
@@ -257,9 +260,11 @@ server.tool(
     // Search session summaries
     if (!searchType || searchType === 'sessions') {
       if (ftsQuery) {
+        const nowS = Date.now();
         const rows = db.prepare(`
           SELECT s.id, s.request, s.completed, s.project, s.created_at,
-                 bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1) as score
+                 bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1)
+                   * (1.0 + 0.5 / (1.0 + (? - s.created_at_epoch) / 604800000.0)) as score
           FROM session_summaries_fts
           JOIN session_summaries s ON session_summaries_fts.rowid = s.id
           WHERE session_summaries_fts MATCH ?
@@ -269,6 +274,7 @@ server.tool(
           ORDER BY score
           LIMIT ? OFFSET ?
         `).all(
+          nowS,
           ftsQuery,
           args.project ?? null, args.project ?? null,
           epochFrom, epochFrom,
@@ -382,10 +388,11 @@ server.tool(
     const after = args.after ?? 5;
     let anchorId = args.anchor;
 
-    // Auto-find anchor via FTS
+    // Auto-find anchor via FTS (with recency decay)
     if (!anchorId && args.query) {
       const ftsQuery = sanitizeFtsQuery(args.query);
       if (ftsQuery) {
+        const nowT = Date.now();
         const row = db.prepare(`
           SELECT o.id
           FROM observations_fts
@@ -393,8 +400,9 @@ server.tool(
           WHERE observations_fts MATCH ?
             AND (? IS NULL OR o.project = ?)
           ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+            * (1.0 + 0.5 / (1.0 + (? - o.created_at_epoch) / 604800000.0))
           LIMIT 1
-        `).get(ftsQuery, args.project ?? null, args.project ?? null);
+        `).get(ftsQuery, args.project ?? null, args.project ?? null, nowT);
         if (row) anchorId = row.id;
       }
     }
@@ -528,7 +536,7 @@ server.tool(
 
     const result = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, '[]', '[]', '[]', '[]', ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?)
     `).run(sessionId, project, args.content, type, title, args.content, now.toISOString(), now.getTime());
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
