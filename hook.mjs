@@ -129,46 +129,59 @@ const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function acquireLLMSlot() {
   const deadline = Date.now() + LLM_SEM_TIMEOUT;
+  const slotFile = join(RUNTIME_DIR, `llm-sem-${process.pid}`);
+
   while (Date.now() < deadline) {
-    // Count active semaphore files
+    // Acquire-then-verify: atomically create our slot first, then check total count
+    let created = false;
+    try {
+      let fd;
+      try {
+        fd = openSync(slotFile, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
+        const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
+        writeSync(fd, payload);
+        created = true;
+      } finally {
+        if (fd !== undefined) closeSync(fd);
+      }
+    } catch {
+      // Slot file already exists for this PID — update timestamp
+      try { writeFileSync(slotFile, JSON.stringify({ pid: process.pid, ts: Date.now() })); created = true; } catch {}
+    }
+
+    if (!created) { await sleepMs(200 + Math.random() * 800); continue; }
+
+    // Count all active semaphore files (including ours) and clean stale ones
     let active = 0;
     try {
       for (const f of readdirSync(RUNTIME_DIR)) {
         if (!f.startsWith('llm-sem-')) continue;
+        const fp = join(RUNTIME_DIR, f);
         try {
-          const raw = readFileSync(join(RUNTIME_DIR, f), 'utf8');
+          const raw = readFileSync(fp, 'utf8');
           const info = JSON.parse(raw);
           const age = Date.now() - (info.ts || 0);
           if (age > 60000) {
-            // Stale (>60s) — clean up
-            try { unlinkSync(join(RUNTIME_DIR, f)); } catch {}
+            try { unlinkSync(fp); } catch {}
             continue;
           }
-          // Check if PID still alive
           if (info.pid) {
             try { process.kill(info.pid, 0); active++; } catch {
-              try { unlinkSync(join(RUNTIME_DIR, f)); } catch {}
+              try { unlinkSync(fp); } catch {}
             }
           } else {
             active++;
           }
         } catch {
-          // Can't read — count as active to be safe
           active++;
         }
       }
     } catch {}
 
-    if (active < LLM_SEM_MAX) {
-      // Acquire slot
-      const slotFile = join(RUNTIME_DIR, `llm-sem-${process.pid}`);
-      try {
-        writeFileSync(slotFile, JSON.stringify({ pid: process.pid, ts: Date.now() }));
-        return true;
-      } catch {}
-    }
+    if (active <= LLM_SEM_MAX) return true; // Slot acquired
 
-    // Async wait with jitter (no CPU burn)
+    // Too many concurrent — release our slot and back off
+    try { unlinkSync(slotFile); } catch {}
     await sleepMs(200 + Math.random() * 800);
   }
   return false; // Timed out
@@ -307,8 +320,10 @@ function mergePendingEntries(episode) {
     try {
       const raw = readFileSync(fp, 'utf8');
       const pending = JSON.parse(raw);
+      if (pending.ts < oneHourAgo) { try { unlinkSync(fp); } catch {} continue; }
+      // Only merge entries belonging to the same project
+      if (pending.project && episode.project && pending.project !== episode.project) continue;
       unlinkSync(fp);
-      if (pending.ts < oneHourAgo) continue; // discard stale
       if (pending.entry) {
         episode.entries.push(pending.entry);
         episode.lastAt = Math.max(episode.lastAt, pending.entry.ts || pending.ts);
@@ -469,10 +484,10 @@ async function handlePostToolUse() {
                 SELECT o.id, o.type, o.title
                 FROM observations_fts
                 JOIN observations o ON observations_fts.rowid = o.id
-                WHERE observations_fts MATCH ?
+                WHERE observations_fts MATCH ? AND o.project = ?
                 ORDER BY o.created_at_epoch DESC
                 LIMIT 3
-              `).all(ftsQ);
+              `).all(ftsQ, project);
               if (rows.length > 0) {
                 const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
                 process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
@@ -498,6 +513,8 @@ function triggerErrorRecall(toolInput, response) {
   if (!db) return;
 
   try {
+    const project = inferProject();
+
     // Extract error keywords
     const cmd = toolInput.command || '';
     const keywords = extractErrorKeywords(cmd, response);
@@ -512,11 +529,11 @@ function triggerErrorRecall(toolInput, response) {
       SELECT o.id, o.type, o.title
       FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ?
+      WHERE observations_fts MATCH ? AND o.project = ?
       ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
       LIMIT 3
-    `).all(ftsQuery, nowR);
+    `).all(ftsQuery, project, nowR);
 
     if (rows.length > 0) {
       const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
@@ -668,10 +685,10 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
               const ftsMatches = db.prepare(`
                 SELECT o.id FROM observations_fts
                 JOIN observations o ON observations_fts.rowid = o.id
-                WHERE observations_fts MATCH ? AND o.id != ?
+                WHERE observations_fts MATCH ? AND o.id != ? AND o.project = ?
                 ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
                 LIMIT 5
-              `).all(ftsQuery, newObs.id);
+              `).all(ftsQuery, newObs.id, episode.project);
               for (const m of ftsMatches) candidates.add(m.id);
             } catch {}
           }
@@ -683,9 +700,9 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
         if (newFiles.length > 0) {
           const recentObs = db.prepare(`
             SELECT id, files_modified FROM observations
-            WHERE id != ? AND created_at_epoch > ?
+            WHERE id != ? AND created_at_epoch > ? AND project = ?
             ORDER BY created_at_epoch DESC LIMIT 50
-          `).all(newObs.id, Date.now() - 7 * 86400000);
+          `).all(newObs.id, Date.now() - 7 * 86400000, episode.project);
           for (const r of recentObs) {
             let rFiles;
             try { rFiles = JSON.parse(r.files_modified || '[]'); } catch { rFiles = []; }

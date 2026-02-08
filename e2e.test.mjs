@@ -13,7 +13,7 @@ import { computeMinHash } from './utils.mjs';
 
 const HOOK_PATH = resolve('hook.mjs');
 const MOCK_CLAUDE = resolve('scripts/mock-claude.mjs');
-const PROJECT_DIR = '/tmp/e2e-test-project/parent--testproj';
+const PROJECT_DIR = '/tmp/parent/testproj';
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
