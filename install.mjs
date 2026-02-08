@@ -2,7 +2,7 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -70,7 +70,7 @@ async function install() {
   try {
     // Remove existing first (ignore errors)
     try { execSync('claude mcp remove -s user mem', { stdio: 'pipe' }); } catch {}
-    execSync(`claude mcp add -s user -t stdio mem -- node ${SERVER_PATH}`, { stdio: 'pipe' });
+    execSync(`claude mcp add -s user -t stdio mem -- node "${SERVER_PATH}"`, { stdio: 'pipe' });
     ok('MCP server registered: mem');
   } catch (e) {
     fail('MCP registration failed: ' + e.message);
@@ -88,7 +88,7 @@ async function install() {
     matcher: '*',
     hooks: [{
       type: 'command',
-      command: `bash ${PREFILTER_PATH}`,
+      command: `bash "${PREFILTER_PATH}"`,
       timeout: 5
     }]
   };
@@ -97,7 +97,7 @@ async function install() {
     matcher: 'startup|clear|compact',
     hooks: [{
       type: 'command',
-      command: `node ${HOOK_PATH} session-start`,
+      command: `node "${HOOK_PATH}" session-start`,
       timeout: 10
     }]
   };
@@ -105,7 +105,7 @@ async function install() {
   const memStop = {
     hooks: [{
       type: 'command',
-      command: `node ${HOOK_PATH} stop`,
+      command: `node "${HOOK_PATH}" stop`,
       timeout: 5
     }]
   };
@@ -379,7 +379,9 @@ function readSettings() {
 }
 
 function writeSettings(settings) {
-  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n');
+  const tmp = SETTINGS_PATH + '.tmp';
+  writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
+  renameSync(tmp, SETTINGS_PATH);
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────

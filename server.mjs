@@ -6,10 +6,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import Database from 'better-sqlite3';
 import { homedir } from 'os';
-import { join, basename } from 'path';
+import { join } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject } from './utils.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -188,15 +188,7 @@ function fmtDate(iso) {
   return `${mon} ${day} ${h}:${m}`;
 }
 
-// typeIcon, truncate imported from utils.mjs
-
-function inferProject() {
-  return basename(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
-}
-
-// jaccardSimilarity imported from utils.mjs
-
-// sanitizeFtsQuery imported from utils.mjs
+// inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate imported from utils.mjs
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
@@ -287,8 +279,8 @@ server.tool(
         const wheres = [];
         if (args.project) { wheres.push('project = ?'); params.push(args.project); }
         if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
-        if (epochFrom) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+        if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
+        if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
         params.push(limit, offset);
@@ -340,8 +332,8 @@ server.tool(
         const params = [];
         const wheres = [];
         if (args.project) { wheres.push('project = ?'); params.push(args.project); }
-        if (epochFrom) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+        if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
+        if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
         params.push(limit, offset);
         const rows = db.prepare(`
@@ -381,8 +373,8 @@ server.tool(
       } else if (searchType === 'prompts') {
         const params = [];
         const wheres = [];
-        if (epochFrom) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+        if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
+        if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
         const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
         params.push(limit, offset);
         const rows = db.prepare(`
