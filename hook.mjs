@@ -9,7 +9,7 @@ import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, basename, dirname } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, constants as fsConstants } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, constants as fsConstants } from 'fs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -461,8 +461,16 @@ JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coher
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function handleLLMSummary() {
-  // Wait for concurrent llm-episode processes to finish writing
-  await sleep(20000);
+  // Poll for llm-episode flush files to be processed (instead of fixed 20s wait)
+  // llm-episode reads and deletes ep-flush-*.json files when done
+  for (let i = 0; i < 15; i++) {
+    try {
+      const files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('ep-flush-'));
+      if (files.length === 0) break; // All episodes processed
+    } catch { break; }
+    if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] llm-summary waiting for flush files (${i + 1}/15)`);
+    await sleep(1000);
+  }
 
   const db = openDb();
   if (!db) return;
@@ -550,6 +558,12 @@ function handleStop() {
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
 function handleSessionStart() {
+  // Flush any leftover episode buffer from previous session (e.g. after /clear)
+  const prevEpisode = readEpisode();
+  if (prevEpisode && prevEpisode.entries && prevEpisode.entries.length > 0) {
+    flushEpisode(prevEpisode);
+  }
+
   // Tier 1 A: Create unique session ID
   const sessionId = createSessionId();
   const project = inferProject();
