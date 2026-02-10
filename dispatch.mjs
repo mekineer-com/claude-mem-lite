@@ -241,8 +241,8 @@ function isRecentlyRecommended(db, resourceId, sessionId) {
 
   // Check 2: Recommended within cooldown window (cross-session cooldown)
   const cooldownHit = db.prepare(
-    `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', '-${COOLDOWN_MINUTES} minutes') LIMIT 1`
-  ).get(resourceId);
+    `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', ?) LIMIT 1`
+  ).get(resourceId, `-${COOLDOWN_MINUTES} minutes`);
   return !!cooldownHit;
 }
 

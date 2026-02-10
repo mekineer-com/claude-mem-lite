@@ -5,8 +5,13 @@ export default defineConfig({
     testTimeout: 20000,
     coverage: {
       provider: 'v8',
-      include: ['utils.mjs', 'schema.mjs', 'server-internals.mjs'],
-      exclude: ['install.mjs', 'server.mjs', 'benchmark/**', 'scripts/**'],
+      include: [
+        'utils.mjs', 'schema.mjs', 'server-internals.mjs',
+        'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
+        'registry.mjs', 'registry-retriever.mjs',
+        'hook-episode.mjs', 'hook-context.mjs', 'hook-semaphore.mjs',
+      ],
+      exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'benchmark/**', 'scripts/**'],
       thresholds: {
         lines: 70,
         functions: 70,

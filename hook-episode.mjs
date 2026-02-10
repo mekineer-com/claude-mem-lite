@@ -74,7 +74,9 @@ export function acquireLock(maxWaitMs = 500) {
           if (Date.now() - st.mtimeMs > 30000) { try { unlinkSync(lf); } catch {} continue; }
         } catch {}
       }
-      // Synchronous sleep for lock retry (hook runs as short-lived subprocess, not event-driven)
+      // WARNING: Atomics.wait blocks the main thread. This is intentional and safe here
+      // because hook.mjs runs as a short-lived subprocess (not the MCP server).
+      // Do NOT use this pattern in server.mjs or any long-lived event-driven process.
       const wait = Math.ceil(Math.random() * 20);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
     }
