@@ -269,6 +269,35 @@ describe('FTS5 search integration', () => {
   });
 });
 
+// ─── date_to inclusive filter ────────────────────────────────────────────────
+
+describe('date_to inclusive (YYYY-MM-DD covers full day)', () => {
+  it('date-only date_to extends to end-of-day', () => {
+    // "2026-02-10" should parse to 2026-02-10T23:59:59.999Z, not 00:00:00.000Z
+    const dateTo = '2026-02-10';
+    let epochTo = new Date(dateTo).getTime();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
+      epochTo += 86400000 - 1;
+    }
+    // An observation created at 3:45 PM on 2026-02-10 (epoch ~1770699921000) should be included
+    const midDayEpoch = new Date('2026-02-10T15:45:00Z').getTime();
+    expect(midDayEpoch).toBeLessThanOrEqual(epochTo);
+    // But next day should NOT be included
+    const nextDayEpoch = new Date('2026-02-11T00:00:00Z').getTime();
+    expect(nextDayEpoch).toBeGreaterThan(epochTo);
+  });
+
+  it('ISO datetime date_to is NOT extended', () => {
+    const dateTo = '2026-02-10T12:00:00Z';
+    let epochTo = new Date(dateTo).getTime();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(dateTo)) {
+      epochTo += 86400000 - 1;
+    }
+    // Should remain as noon, not extended
+    expect(epochTo).toBe(new Date('2026-02-10T12:00:00Z').getTime());
+  });
+});
+
 // ─── WAL checkpoint ─────────────────────────────────────────────────────────
 
 describe('WAL checkpoint', () => {

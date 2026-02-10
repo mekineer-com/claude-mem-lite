@@ -11,7 +11,7 @@ export const memSearchSchema = {
   obs_type: OBS_TYPE_ENUM.optional().describe('Filter observation type'),
   project: z.string().optional().describe('Filter by project name'),
   date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
-  date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
+  date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD). Date-only format is inclusive (covers full day)'),
   importance: z.number().int().min(1).max(3).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
   limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
   offset: z.number().int().min(0).optional().describe('Offset for pagination'),
