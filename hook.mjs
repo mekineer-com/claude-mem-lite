@@ -4,19 +4,14 @@
 // Hooks (fast <100ms): post-tool-use, session-start, stop
 // Background workers (slow): llm-episode, llm-summary
 
-import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join, basename } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, renameSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statSync } from 'fs';
 import {
-  jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance,
-  inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
-  parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
-  computeMinHash, estimateJaccardFromMinHash, debugCatch, debugLog,
-  fmtTime,
+  truncate, typeIcon, inferProject, detectBashSignificance,
+  extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
+  makeEntryDesc, scrubSecrets, debugCatch, debugLog, fmtTime,
 } from './utils.mjs';
-import { ensureDb, DB_DIR } from './schema.mjs';
-import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import {
   readEpisodeRaw, episodeFile,
   acquireLock, releaseLock, readEpisode, writeEpisode,
@@ -24,22 +19,21 @@ import {
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { selectWithTokenBudget, updateClaudeMd } from './hook-context.mjs';
-import { ensureRegistryDb } from './registry.mjs';
 import { dispatchOnSessionStart, dispatchOnPreToolUse } from './dispatch.mjs';
 import { collectFeedback } from './dispatch-feedback.mjs';
-import { getClaudePath as getClaudePathShared } from './haiku-client.mjs';
+import {
+  RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
+  STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
+  sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
+  closeRegistryDb, spawnBackground,
+} from './hook-shared.mjs';
+import { handleLLMEpisode, handleLLMSummary } from './hook-llm.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
 const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
 if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
-
-const RUNTIME_DIR = join(DB_DIR, 'runtime');
-const SCRIPT_PATH = process.argv[1];
-
-// Ensure runtime directory exists
-try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
 // Crash-safe: flush episode buffer on unexpected termination to prevent data loss
 // Uses flag-based approach to avoid calling file I/O inside signal handlers,
@@ -65,89 +59,6 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 }
 
 if (!event) process.exit(0);
-
-// ─── Session ID Management (Tier 1 A) ──────────────────────────────────────
-
-function sessionFile() {
-  return join(RUNTIME_DIR, `session-${inferProject()}`);
-}
-
-function getSessionId() {
-  try {
-    const data = JSON.parse(readFileSync(sessionFile(), 'utf8'));
-    if (Date.now() - data.startedAt < 12 * 60 * 60 * 1000) return data.id;
-  } catch {}
-  // Fallback: create a new one (shouldn't happen if SessionStart ran)
-  return createSessionId();
-}
-
-function createSessionId() {
-  const project = inferProject();
-  const id = `hook-${project}-${randomUUID().slice(0, 8)}`;
-  writeFileSync(sessionFile(), JSON.stringify({ id, startedAt: Date.now(), project }));
-  return id;
-}
-
-// ─── Database ───────────────────────────────────────────────────────────────
-
-function openDb() {
-  try {
-    return ensureDb();
-  } catch {
-    return null;
-  }
-}
-
-// ─── Registry Database (dispatch system) ──────────────────────────────────
-
-const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
-let _registryDb = null;
-
-function getRegistryDb() {
-  if (_registryDb) return _registryDb;
-  try { _registryDb = ensureRegistryDb(REGISTRY_DB_PATH); } catch (e) { debugCatch(e, 'getRegistryDb'); }
-  return _registryDb;
-}
-
-// ─── LLM via claude CLI ────────────────────────────────────────────────────
-
-function callLLM(prompt, timeoutMs = 15000) {
-  try {
-    const result = execFileSync(getClaudePathShared(), ['-p', '--model', 'haiku'], {
-      input: prompt,
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return result.trim();
-  } catch (e) {
-    const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
-    // Only return partial output if it looks like complete JSON (starts with { and ends with })
-    // Truncated output from timeouts can produce garbled JSON that parseJsonFromLLM may misparse
-    if (out && out.startsWith('{') && out.endsWith('}')) return out;
-    return null;
-  }
-}
-
-// ─── Background Spawner ────────────────────────────────────────────────────
-
-function spawnBackground(bgEvent, ...extraArgs) {
-  const args = [SCRIPT_PATH, bgEvent, ...extraArgs];
-  try {
-    const child = spawn(process.execPath, args, {
-      detached: true,
-      stdio: 'ignore',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
-    });
-    child.on('error', (err) => { debugCatch(err, 'spawnBackground'); });
-    // Reap child on exit to prevent zombie processes
-    child.on('exit', () => {});
-    child.unref();
-  } catch (err) {
-    debugCatch(err, 'spawnBackground');
-  }
-}
 
 // ─── Episode Flush ──────────────────────────────────────────────────────────
 
@@ -271,8 +182,8 @@ async function handlePostToolUse() {
     if (episode) {
       const timeSinceLastEntry = Date.now() - episode.lastAt;
       const fileRelated = isRelatedToEpisode(episode, files);
-      const bufferFull = episode.entries.length >= 10;
-      const timeGap = timeSinceLastEntry > 5 * 60 * 1000;
+      const bufferFull = episode.entries.length >= EPISODE_BUFFER_SIZE;
+      const timeGap = timeSinceLastEntry > EPISODE_TIME_GAP_MS;
 
       // Phase transition → flush current episode, start new
       if (bufferFull || timeGap || (!fileRelated && episode.entries.length >= 2)) {
@@ -358,288 +269,6 @@ function triggerErrorRecall(db, toolInput, response) {
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }
 
-// ─── Background: LLM Episode Extraction (Tier 2 F) ─────────────────────────
-
-async function handleLLMEpisode() {
-  const tmpFile = process.argv[3];
-  if (!tmpFile) return;
-
-  let episode;
-  try {
-    episode = JSON.parse(readFileSync(tmpFile, 'utf8'));
-  } catch {
-    // Can't read flush file — delete it to unblock handleLLMSummary polling
-    try { unlinkSync(tmpFile); } catch {}
-    return;
-  }
-
-  if (!episode.entries || episode.entries.length === 0) {
-    try { unlinkSync(tmpFile); } catch {}
-    return;
-  }
-
-  // Rate-limit background LLM calls to avoid competing with active sessions
-  // Skip delay in test mode for deterministic timing
-  if (!process.env.CLAUDE_MEM_NO_DELAY) {
-    const sessionActive = existsSync(sessionFile());
-    const delayMs = sessionActive
-      ? 2000 + Math.random() * 3000   // 2-5s when user session is active
-      : 500 + Math.random() * 1000;   // 0.5-1.5s after session ends
-    debugLog('DEBUG', 'llm-episode', `delay: ${Math.round(delayMs)}ms (session ${sessionActive ? 'active' : 'ended'})`);
-    await sleep(delayMs);
-  }
-
-  const fileList = episode.files.map(f => basename(f)).join(', ') || '(multiple)';
-
-  let prompt;
-  if (episode.entries.length === 1) {
-    // Single entry: extract as individual observation
-    const e = episode.entries[0];
-    prompt = `Extract a structured observation from this code change. Return ONLY valid JSON, no markdown fences.
-
-Tool: ${e.tool}
-File: ${episode.files.join(', ') || 'unknown'}
-Action: ${e.desc}
-Error: ${e.isError ? 'yes' : 'no'}
-
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1}
-Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
-  } else {
-    // Multiple entries: batch episode summary
-    const actionList = episode.entries.map((e, i) =>
-      `${i + 1}. [${e.tool}] ${e.desc}${e.isError ? ' (ERROR)' : ''}`
-    ).join('\n');
-
-    prompt = `Summarize this coding episode as ONE coherent observation. Return ONLY valid JSON, no markdown fences.
-
-Project: ${episode.project}
-Files: ${fileList}
-Actions (${episode.entries.length} total):
-${actionList}
-
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1}
-Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
-  }
-
-  // Compute deterministic importance from rules before LLM call
-  const ruleImportance = computeRuleImportance(episode);
-
-  let obs;
-  const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
-
-  // Acquire LLM semaphore to limit concurrent claude -p calls
-  const gotSlot = await acquireLLMSlot();
-  if (gotSlot) {
-    let raw, parsed;
-    try {
-      raw = callLLM(prompt);
-      parsed = parseJsonFromLLM(raw);
-    } finally {
-      releaseLLMSlot();
-    }
-
-    if (parsed && parsed.title) {
-      obs = {
-        type: validTypes.has(parsed.type) ? parsed.type : 'change',
-        title: truncate(parsed.title, 120),
-        subtitle: fileList,
-        narrative: truncate(parsed.narrative || '', 500),
-        concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
-        facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
-        files: episode.files,
-        filesRead: episode.filesRead || [],
-        importance: Math.max(ruleImportance, clampImportance(parsed.importance)),
-      };
-    }
-  }
-
-  if (!obs) {
-    // Degraded storage: LLM unavailable or failed, but never lose data
-    if (!gotSlot) debugLog('WARN', 'llm-episode', 'semaphore timeout, using degraded storage');
-    const hasError = episode.entries.some(e => e.isError);
-    const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
-    const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
-    const firstDesc = episode.entries[0]?.desc || '(no description)';
-    obs = {
-      type: inferredType,
-      title: truncate(firstDesc, 120),
-      subtitle: fileList,
-      narrative: episode.entries.map(e => e.desc).join('; '),
-      concepts: [],
-      facts: [],
-      files: episode.files,
-      filesRead: episode.filesRead || [],
-      importance: ruleImportance,
-    };
-  }
-
-  // Single DB connection for save + related linking (avoids double open/close)
-  const db = openDb();
-  if (!db) { try { unlinkSync(tmpFile); } catch {} return; }
-
-  try {
-    const savedId = saveObservation(obs, episode.project, episode.sessionId, db);
-
-    // Link related observations via FTS5 semantic matching + file overlap (cross-session)
-    if (savedId) {
-      try {
-        const newObs = db.prepare(`
-          SELECT id, title, files_modified, related_ids FROM observations WHERE id = ?
-        `).get(savedId);
-        if (!newObs) return;
-
-        const candidates = new Set();
-
-        // Strategy 1: FTS5 title similarity (cross-session)
-        if (obs.title) {
-          const titleTokens = obs.title.replace(/[^a-zA-Z0-9_\s-]/g, ' ').split(/\s+/)
-            .filter(t => t.length > 2).slice(0, 5);
-          if (titleTokens.length > 0) {
-            const ftsQuery = titleTokens.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
-            try {
-              const ftsMatches = db.prepare(`
-                SELECT o.id FROM observations_fts
-                JOIN observations o ON observations_fts.rowid = o.id
-                WHERE observations_fts MATCH ? AND o.id != ? AND o.project = ?
-                ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                LIMIT 5
-              `).all(ftsQuery, newObs.id, episode.project);
-              for (const m of ftsMatches) candidates.add(m.id);
-            } catch {}
-          }
-        }
-
-        // Strategy 2: file overlap (any session, recent observations)
-        let newFiles;
-        try { newFiles = JSON.parse(newObs.files_modified || '[]'); } catch { newFiles = []; }
-        if (newFiles.length > 0) {
-          const recentObs = db.prepare(`
-            SELECT id, files_modified FROM observations
-            WHERE id != ? AND created_at_epoch > ? AND project = ?
-            ORDER BY created_at_epoch DESC LIMIT 50
-          `).all(newObs.id, Date.now() - 7 * 86400000, episode.project);
-          for (const r of recentObs) {
-            let rFiles;
-            try { rFiles = JSON.parse(r.files_modified || '[]'); } catch { rFiles = []; }
-            if (rFiles.some(f => newFiles.includes(f))) candidates.add(r.id);
-          }
-        }
-
-        // Apply bidirectional links (max 5 related)
-        if (candidates.size > 0) {
-          let newRelated;
-          try { newRelated = JSON.parse(newObs.related_ids || '[]'); } catch { newRelated = []; }
-
-          for (const relId of [...candidates].slice(0, 5)) {
-            if (newRelated.includes(relId)) continue;
-            newRelated.push(relId);
-
-            // Add reverse link
-            const rel = db.prepare('SELECT related_ids FROM observations WHERE id = ?').get(relId);
-            if (rel) {
-              let relRelated;
-              try { relRelated = JSON.parse(rel.related_ids || '[]'); } catch { relRelated = []; }
-              if (!relRelated.includes(newObs.id)) {
-                relRelated.push(newObs.id);
-                db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(relRelated.slice(-10)), relId);
-              }
-            }
-          }
-
-          db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(newRelated.slice(-10)), newObs.id);
-        }
-      } catch (e) { debugCatch(e, 'relatedObsLinking'); }
-    }
-  } finally {
-    db.close();
-  }
-
-  // Delete flush file AFTER all DB writes — signals completion to handleLLMSummary
-  try { unlinkSync(tmpFile); } catch {}
-}
-
-// ─── Background: LLM Session Summary ────────────────────────────────────────
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function handleLLMSummary() {
-  // Poll for llm-episode flush files to be processed (instead of fixed 20s wait)
-  // llm-episode reads and deletes ep-flush-*.json files when done
-  const parsed = parseInt(process.env.CLAUDE_MEM_FLUSH_TIMEOUT, 10);
-  const flushTimeout = Number.isNaN(parsed) ? 15 : parsed;
-  for (let i = 0; i < flushTimeout; i++) {
-    try {
-      const files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('ep-flush-'));
-      if (files.length === 0) break; // All episodes processed
-    } catch { break; }
-    debugLog('DEBUG', 'llm-summary', `waiting for flush files (${i + 1}/15)`);
-    await sleep(1000);
-  }
-
-  const db = openDb();
-  if (!db) return;
-
-  try {
-    // Session ID and project passed as args from handleStop
-    const sessionId = process.argv[3] || getSessionId();
-    const project = process.argv[4] || inferProject();
-
-    // Flush file polling above guarantees all llm-episode DB writes are complete
-    const recentObs = db.prepare(`
-      SELECT id, type, title, narrative
-      FROM observations
-      WHERE memory_session_id = ?
-      ORDER BY created_at_epoch DESC
-      LIMIT 30
-    `).all(sessionId);
-
-    if (recentObs.length < 1) return;
-
-    const obsList = recentObs.map((o, i) =>
-      `${i + 1}. [${o.type}] ${o.title}${o.narrative ? ': ' + truncate(o.narrative, 80) : ''}`
-    ).join('\n');
-
-    const prompt = `Summarize this coding session. Return ONLY valid JSON, no markdown fences.
-
-Project: ${project}
-Observations (${recentObs.length} total):
-${obsList}
-
-JSON: {"request":"what the user was working on","investigated":"what was explored/analyzed","learned":"key findings","completed":"what was accomplished","next_steps":"suggested follow-up"}`;
-
-    // Acquire LLM semaphore
-    if (!(await acquireLLMSlot())) {
-      debugLog('WARN', 'llm-summary', 'semaphore timeout, skipping summary');
-      return;
-    }
-
-    let raw, parsed;
-    try {
-      raw = callLLM(prompt, 20000);
-      parsed = parseJsonFromLLM(raw);
-    } finally {
-      releaseLLMSlot();
-    }
-
-    if (parsed && parsed.request) {
-      const now = new Date();
-      db.prepare(`
-        INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?)
-      `).run(
-        sessionId, project,
-        parsed.request || '', parsed.investigated || '', parsed.learned || '',
-        parsed.completed || '', parsed.next_steps || '',
-        now.toISOString(), now.getTime()
-      );
-    }
-  } finally {
-    db.close();
-  }
-}
-
 // ─── Stop Handler ───────────────────────────────────────────────────────────
 
 async function handleStop() {
@@ -693,11 +322,9 @@ async function handleStop() {
   }
 
   // Dispatch: collect feedback on recommendations
-  // Reconstruct session tool events from invocations + DB for adoption detection
   try {
     const rdb = getRegistryDb();
     if (rdb) {
-      // Query user_prompts and session data for session events
       const memDb = openDb();
       const sessionEvents = [];
       if (memDb) {
@@ -705,7 +332,6 @@ async function handleStop() {
           const prompts = memDb.prepare(
             'SELECT prompt_text FROM user_prompts WHERE content_session_id = ? ORDER BY created_at_epoch'
           ).all(sessionId);
-          // Provide prompts as pseudo-events for adoption detection
           for (const p of prompts) {
             if (p.prompt_text) {
               sessionEvents.push({ tool_name: '_user_prompt', tool_input: { text: p.prompt_text }, tool_response: '' });
@@ -755,7 +381,7 @@ async function handleSessionStart() {
     `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
     // Stale session cleanup: mark 24h+ active sessions as abandoned
-    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const oneDayAgo = Date.now() - STALE_SESSION_MS;
     db.prepare(`
       UPDATE sdk_sessions SET status = 'abandoned'
       WHERE status = 'active' AND started_at_epoch < ?
@@ -770,18 +396,17 @@ async function handleSessionStart() {
           const raw = readFileSync(lp, 'utf8');
           const info = JSON.parse(raw);
           const age = Date.now() - (info.ts || 0);
-          let stale = age > 30000;
+          let stale = age > STALE_LOCK_MS;
           if (!stale && info.pid) {
             try { process.kill(info.pid, 0); } catch (killErr) {
-              stale = killErr.code === 'ESRCH'; // Only stale if process truly gone
+              stale = killErr.code === 'ESRCH';
             }
           }
           if (stale) unlinkSync(lp);
         } catch {
-          // Unreadable lock — check mtime
           try {
             const st = statSync(lp);
-            if (Date.now() - st.mtimeMs > 30000) unlinkSync(lp);
+            if (Date.now() - st.mtimeMs > STALE_LOCK_MS) unlinkSync(lp);
           } catch {}
         }
       }
@@ -794,7 +419,7 @@ async function handleSessionStart() {
     // Fallback: recent across all projects with tiered windows
     let fallbackObs = [];
     if (observations.length < 3) {
-      const fbSevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+      const fbSevenDaysAgo = Date.now() - FALLBACK_OBS_WINDOW_MS;
       fallbackObs = db.prepare(`
         SELECT id, type, title, project, created_at
         FROM observations
@@ -864,103 +489,6 @@ async function handleSessionStart() {
   } finally {
     db.close();
   }
-}
-
-// ─── Save Observation to DB ─────────────────────────────────────────────────
-
-function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
-  const db = externalDb || openDb();
-  if (!db) return null;
-
-  try {
-    const now = new Date();
-    const project = projectOverride || inferProject();
-    const sessionId = sessionIdOverride || getSessionId();
-
-    // INSERT OR IGNORE avoids race condition on concurrent calls
-    db.prepare(`
-      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-      VALUES (?, ?, ?, ?, ?, 'active')
-    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-
-    // Two-tier dedup
-    // Tier 1 (fast): 5-min Jaccard on titles (existing logic)
-    const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
-    const recent = db.prepare(`
-      SELECT title FROM observations
-      WHERE project = ? AND created_at_epoch > ?
-      ORDER BY created_at_epoch DESC LIMIT 10
-    `).all(project, fiveMinAgo);
-
-    if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > 0.7)) {
-      return null; // Duplicate — skip
-    }
-
-    // Tier 2 (slow): MinHash cross-session dedup (7-day window)
-    const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
-    if (minhashSig) {
-      const sevenDaysAgo = now.getTime() - 7 * 86400000;
-      const recentSigs = db.prepare(`
-        SELECT minhash_sig FROM observations
-        WHERE project = ? AND created_at_epoch > ? AND minhash_sig IS NOT NULL
-        ORDER BY created_at_epoch DESC LIMIT 100
-      `).all(project, sevenDaysAgo);
-
-      if (recentSigs.some(r => estimateJaccardFromMinHash(minhashSig, r.minhash_sig) > 0.8)) {
-        return null; // Cross-session duplicate — skip
-      }
-    }
-
-    // text: expanded concepts+facts as plain text (distinct from narrative for better FTS coverage)
-    // concepts/facts: space-separated plain text (not JSON arrays) for clean FTS matching
-    const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
-    const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
-    const textField = [conceptsText, factsText].filter(Boolean).join(' ');
-
-    const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      sessionId, project,
-      textField, obs.type, obs.title, obs.subtitle || '',
-      obs.narrative || '',
-      conceptsText,
-      factsText,
-      JSON.stringify(obs.filesRead || []),
-      JSON.stringify(obs.files || []),
-      obs.importance ?? 1,
-      minhashSig,
-      now.toISOString(), now.getTime()
-    );
-    return Number(result.lastInsertRowid);
-  } finally {
-    if (!externalDb) db.close();
-  }
-}
-
-// ─── Utilities ──────────────────────────────────────────────────────────────
-
-function readStdin() {
-  const MAX_STDIN = 256 * 1024; // 256KB — large tool responses are truncated
-  return new Promise((resolve, reject) => {
-    let data = '';
-    const timeout = setTimeout(() => { process.stdin.destroy(); reject(new Error('timeout')); }, 3000);
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => {
-      data += chunk;
-      if (data.length > MAX_STDIN) {
-        process.stdin.destroy(); clearTimeout(timeout);
-        resolve({ text: data.slice(0, MAX_STDIN), truncated: true });
-      }
-    });
-    process.stdin.on('end', () => { clearTimeout(timeout); resolve({ text: data, truncated: false }); });
-    process.stdin.on('error', err => { clearTimeout(timeout); reject(err); });
-    process.stdin.resume();
-  });
-}
-
-function tryParseJson(str) {
-  try { return JSON.parse(str); } catch { return {}; }
 }
 
 // ─── PreToolUse Handler (Dispatch) ──────────────────────────────────────────
@@ -1038,6 +566,31 @@ async function handleUserPrompt() {
   }
 }
 
+// ─── Utilities ──────────────────────────────────────────────────────────────
+
+function readStdin() {
+  const MAX_STDIN = 256 * 1024; // 256KB — large tool responses are truncated
+  return new Promise((resolve, reject) => {
+    let data = '';
+    const timeout = setTimeout(() => { process.stdin.destroy(); reject(new Error('timeout')); }, 3000);
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => {
+      data += chunk;
+      if (data.length > MAX_STDIN) {
+        process.stdin.destroy(); clearTimeout(timeout);
+        resolve({ text: data.slice(0, MAX_STDIN), truncated: true });
+      }
+    });
+    process.stdin.on('end', () => { clearTimeout(timeout); resolve({ text: data, truncated: false }); });
+    process.stdin.on('error', err => { clearTimeout(timeout); reject(err); });
+    process.stdin.resume();
+  });
+}
+
+function tryParseJson(str) {
+  try { return JSON.parse(str); } catch { return {}; }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 try {
@@ -1055,5 +608,8 @@ try {
   const ts = new Date().toISOString();
   console.error(`[claude-mem-lite] [${ts}] [ERROR] ${event}: ${err.message}`);
 }
+
+// Close singleton registry DB to prevent WAL residue
+closeRegistryDb();
 
 process.exit(0);

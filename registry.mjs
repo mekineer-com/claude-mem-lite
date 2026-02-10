@@ -180,18 +180,19 @@ const UPSERT_SQL = `
  * @returns {number} Resource ID
  */
 export function upsertResource(db, r) {
-  const result = db.prepare(UPSERT_SQL).run(
-    r.name, r.type, r.status || 'active', r.source || 'preinstalled',
-    r.repo_url || null, r.repo_stars || 0, r.local_path,
-    r.file_hash || null, r.intent_tags || '', r.domain_tags || '',
-    r.action_type || '', r.trigger_patterns || '', r.capability_summary || '',
-    r.input_type || '', r.output_type || '', r.prerequisites || '{}',
-    r.indexed_at || null
-  );
-  // Return the id (lastInsertRowid for insert, or query for update)
-  if (result.changes > 0 && result.lastInsertRowid) return Number(result.lastInsertRowid);
-  const row = db.prepare('SELECT id FROM resources WHERE type = ? AND name = ?').get(r.type, r.name);
-  return row?.id || 0;
+  return db.transaction(() => {
+    const result = db.prepare(UPSERT_SQL).run(
+      r.name, r.type, r.status || 'active', r.source || 'preinstalled',
+      r.repo_url || null, r.repo_stars || 0, r.local_path,
+      r.file_hash || null, r.intent_tags || '', r.domain_tags || '',
+      r.action_type || '', r.trigger_patterns || '', r.capability_summary || '',
+      r.input_type || '', r.output_type || '', r.prerequisites || '{}',
+      r.indexed_at || null
+    );
+    if (result.changes > 0 && result.lastInsertRowid) return Number(result.lastInsertRowid);
+    const row = db.prepare('SELECT id FROM resources WHERE type = ? AND name = ?').get(r.type, r.name);
+    return row?.id || 0;
+  })();
 }
 
 /**
