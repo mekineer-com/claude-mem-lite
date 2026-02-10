@@ -7,15 +7,23 @@
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join, basename } from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, openSync, closeSync, readdirSync, writeSync, statSync, renameSync, constants as fsConstants } from 'fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, renameSync, statSync } from 'fs';
 import {
   jaccardSimilarity, truncate, typeIcon, clampImportance, computeRuleImportance,
   inferProject, detectBashSignificance, extractErrorKeywords, extractFilePaths,
   parseJsonFromLLM, isRelatedToEpisode, makeEntryDesc, scrubSecrets,
-  estimateTokens, computeMinHash, estimateJaccardFromMinHash, debugCatch,
+  computeMinHash, estimateJaccardFromMinHash, debugCatch, debugLog,
   fmtTime,
 } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
+import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
+import {
+  readEpisodeRaw, episodeFile,
+  acquireLock, releaseLock, readEpisode, writeEpisode,
+  createEpisode, addFileToEpisode,
+  writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
+} from './hook-episode.mjs';
+import { selectWithTokenBudget, updateClaudeMd } from './hook-context.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -52,22 +60,9 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
   });
 }
 
-// Raw episode read (no lock needed, for signal handlers only)
-function readEpisodeRaw() {
-  try {
-    return JSON.parse(readFileSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`), 'utf8'));
-  } catch { return null; }
-}
-
 if (!event) process.exit(0);
 
 // ─── Session ID Management (Tier 1 A) ──────────────────────────────────────
-
-function inferProjectDir() {
-  return process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-}
-
-// inferProject imported from utils.mjs
 
 function sessionFile() {
   return join(RUNTIME_DIR, `session-${inferProject()}`);
@@ -128,79 +123,6 @@ function callLLM(prompt, timeoutMs = 15000) {
   }
 }
 
-// parseJsonFromLLM imported from utils.mjs
-
-// ─── LLM Concurrency Semaphore (max 2 concurrent claude -p calls) ────────────
-
-const LLM_SEM_MAX = 2;
-const LLM_SEM_TIMEOUT = 30000; // 30s max wait
-const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function acquireLLMSlot() {
-  const deadline = Date.now() + LLM_SEM_TIMEOUT;
-  const slotFile = join(RUNTIME_DIR, `llm-sem-${process.pid}`);
-
-  while (Date.now() < deadline) {
-    // Acquire-then-verify: atomically create our slot first, then check total count
-    let created = false;
-    try {
-      let fd;
-      try {
-        fd = openSync(slotFile, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
-        const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
-        writeSync(fd, payload);
-        created = true;
-      } finally {
-        if (fd !== undefined) closeSync(fd);
-      }
-    } catch {
-      // Slot file already exists for this PID — update timestamp
-      try { writeFileSync(slotFile, JSON.stringify({ pid: process.pid, ts: Date.now() })); created = true; } catch {}
-    }
-
-    if (!created) { await sleepMs(200 + Math.random() * 800); continue; }
-
-    // Count all active semaphore files (including ours) and clean stale ones
-    let active = 0;
-    try {
-      for (const f of readdirSync(RUNTIME_DIR)) {
-        if (!f.startsWith('llm-sem-')) continue;
-        const fp = join(RUNTIME_DIR, f);
-        try {
-          const raw = readFileSync(fp, 'utf8');
-          const info = JSON.parse(raw);
-          const age = Date.now() - (info.ts || 0);
-          if (age > 60000) {
-            try { unlinkSync(fp); } catch {}
-            continue;
-          }
-          if (info.pid) {
-            try { process.kill(info.pid, 0); active++; } catch (killErr) {
-              if (killErr.code === 'ESRCH') { try { unlinkSync(fp); } catch {} }
-              else { active++; } // EPERM = process exists but different user
-            }
-          } else {
-            active++;
-          }
-        } catch {
-          active++;
-        }
-      }
-    } catch {}
-
-    if (active <= LLM_SEM_MAX) return true; // Slot acquired
-
-    // Too many concurrent — release our slot and back off
-    try { unlinkSync(slotFile); } catch {}
-    await sleepMs(200 + Math.random() * 800);
-  }
-  return false; // Timed out
-}
-
-function releaseLLMSlot() {
-  try { unlinkSync(join(RUNTIME_DIR, `llm-sem-${process.pid}`)); } catch {}
-}
-
 // ─── Background Spawner ────────────────────────────────────────────────────
 
 function spawnBackground(bgEvent, ...extraArgs) {
@@ -220,156 +142,7 @@ function spawnBackground(bgEvent, ...extraArgs) {
   }
 }
 
-// ─── Episode Buffer (Tier 2 F) ─────────────────────────────────────────────
-
-function episodeFile() {
-  return join(RUNTIME_DIR, `ep-${inferProject()}.json`);
-}
-
-function lockFile() {
-  return episodeFile() + '.lock';
-}
-
-function acquireLock(maxWaitMs = 500) {
-  const lf = lockFile();
-  const deadline = Date.now() + maxWaitMs;
-  while (Date.now() < deadline) {
-    try {
-      let fd;
-      try {
-        fd = openSync(lf, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY);
-        const payload = JSON.stringify({ pid: process.pid, ts: Date.now() });
-        writeSync(fd, payload);
-      } finally {
-        if (fd !== undefined) closeSync(fd);
-      }
-      return true;
-    } catch {
-      // Lock exists — check if stale or orphaned
-      try {
-        const raw = readFileSync(lf, 'utf8');
-        const info = JSON.parse(raw);
-        const age = Date.now() - (info.ts || 0);
-        let stale = age > 30000; // >30s = stale
-        if (!stale && info.pid) {
-          try { process.kill(info.pid, 0); } catch (killErr) {
-            stale = killErr.code === 'ESRCH'; // Only stale if process truly gone
-          }
-        }
-        if (stale) { try { unlinkSync(lf); } catch {} continue; }
-      } catch {
-        // Can't read lock — try removing if old by mtime
-        try {
-          const st = statSync(lf);
-          if (Date.now() - st.mtimeMs > 30000) { try { unlinkSync(lf); } catch {} continue; }
-        } catch {}
-      }
-      // Synchronous sleep for lock retry (hook runs as short-lived subprocess, not event-driven)
-      const wait = Math.ceil(Math.random() * 20);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
-    }
-  }
-  return false;
-}
-
-function releaseLock() {
-  try { unlinkSync(lockFile()); } catch {}
-}
-
-function readEpisode() {
-  try {
-    return JSON.parse(readFileSync(episodeFile(), 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function writeEpisode(episode) {
-  const target = episodeFile();
-  const tmp = target + '.tmp';
-  writeFileSync(tmp, JSON.stringify(episode));
-  try {
-    renameSync(tmp, target);
-  } catch (err) {
-    try { unlinkSync(tmp); } catch {}
-    throw err;
-  }
-}
-
-function createEpisode(sessionId, project) {
-  return {
-    sessionId,
-    project,
-    startedAt: Date.now(),
-    lastAt: Date.now(),
-    files: [],
-    entries: [],
-    filesRead: [],
-    fileHistoryShown: [],
-  };
-}
-
-function addFileToEpisode(episode, files) {
-  for (const f of files) {
-    if (!episode.files.includes(f)) episode.files.push(f);
-  }
-}
-
-// ─── Pending Entry Recovery (concurrency safety) ────────────────────────────
-
-function writePendingEntry(entry, sessionId, project) {
-  const ts = Date.now();
-  const rand = Math.random().toString(36).slice(2, 6);
-  const pendingFile = join(RUNTIME_DIR, `pending-${ts}-${rand}.json`);
-  const tmp = pendingFile + '.tmp';
-  try {
-    writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts }));
-    renameSync(tmp, pendingFile);
-  } catch {
-    try { unlinkSync(tmp); } catch {}
-  }
-}
-
-function mergePendingEntries(episode) {
-  const oneHourAgo = Date.now() - 3600000;
-  const MAX_PENDING_MERGE = 50;
-  let files;
-  try {
-    files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('pending-')).sort();
-  } catch { return; }
-
-  let merged = 0;
-  for (const f of files) {
-    if (merged >= MAX_PENDING_MERGE) break;
-    const fp = join(RUNTIME_DIR, f);
-    try {
-      const raw = readFileSync(fp, 'utf8');
-      const pending = JSON.parse(raw);
-      if (pending.ts < oneHourAgo) { try { unlinkSync(fp); } catch {} continue; }
-      // Only merge entries belonging to the same project
-      if (pending.project && episode.project && pending.project !== episode.project) continue;
-      unlinkSync(fp);
-      if (pending.entry) {
-        episode.entries.push(pending.entry);
-        episode.lastAt = Math.max(episode.lastAt, pending.entry.ts || pending.ts);
-        addFileToEpisode(episode, pending.entry.files || []);
-        merged++;
-      }
-    } catch {
-      // Corrupt pending file — remove
-      try { unlinkSync(fp); } catch {}
-    }
-  }
-}
-
-// isRelatedToEpisode imported from utils.mjs
-
-function episodeHasSignificantContent(episode) {
-  return episode.entries.some(e =>
-    ['Edit', 'Write', 'NotebookEdit'].includes(e.tool) ||
-    (e.tool === 'Bash' && e.isError)
-  );
-}
+// ─── Episode Flush ──────────────────────────────────────────────────────────
 
 function flushEpisode(episode) {
   if (!episode || episode.entries.length === 0) return;
@@ -427,7 +200,7 @@ async function handlePostToolUse() {
   try { hookData = JSON.parse(raw.text); } catch {
     // Truncated JSON — try to salvage tool_name from the prefix
     if (raw.truncated) {
-      if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] stdin truncated at 256KB, attempting salvage`);
+      debugLog('WARN', 'postToolUse', 'stdin truncated at 256KB, attempting salvage');
       const m = raw.text.match(/"tool_name"\s*:\s*"([^"]+)"/);
       if (m) hookData = { tool_name: m[1], tool_input: {}, tool_response: '(truncated)' };
     }
@@ -578,8 +351,6 @@ function triggerErrorRecall(db, toolInput, response) {
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }
 
-// extractErrorKeywords, detectBashSignificance, computeRuleImportance, clampImportance imported from utils.mjs
-
 // ─── Background: LLM Episode Extraction (Tier 2 F) ─────────────────────────
 
 async function handleLLMEpisode() {
@@ -607,7 +378,7 @@ async function handleLLMEpisode() {
     const delayMs = sessionActive
       ? 2000 + Math.random() * 3000   // 2-5s when user session is active
       : 500 + Math.random() * 1000;   // 0.5-1.5s after session ends
-    if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] llm-episode delay: ${Math.round(delayMs)}ms (session ${sessionActive ? 'active' : 'ended'})`);
+    debugLog('DEBUG', 'llm-episode', `delay: ${Math.round(delayMs)}ms (session ${sessionActive ? 'active' : 'ended'})`);
     await sleep(delayMs);
   }
 
@@ -679,7 +450,7 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
 
   if (!obs) {
     // Degraded storage: LLM unavailable or failed, but never lose data
-    if (!gotSlot && process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] llm-episode: semaphore timeout, using degraded storage');
+    if (!gotSlot) debugLog('WARN', 'llm-episode', 'semaphore timeout, using degraded storage');
     const hasError = episode.entries.some(e => e.isError);
     const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
     const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
@@ -796,7 +567,7 @@ async function handleLLMSummary() {
       const files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('ep-flush-'));
       if (files.length === 0) break; // All episodes processed
     } catch { break; }
-    if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] llm-summary waiting for flush files (${i + 1}/15)`);
+    debugLog('DEBUG', 'llm-summary', `waiting for flush files (${i + 1}/15)`);
     await sleep(1000);
   }
 
@@ -833,7 +604,7 @@ JSON: {"request":"what the user was working on","investigated":"what was explore
 
     // Acquire LLM semaphore
     if (!(await acquireLLMSlot())) {
-      if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] llm-summary: semaphore timeout, skipping summary');
+      debugLog('WARN', 'llm-summary', 'semaphore timeout, skipping summary');
       return;
     }
 
@@ -919,120 +690,6 @@ function handleStop() {
 
   // Clean session file AFTER spawning background
   try { unlinkSync(sessionFile()); } catch {}
-}
-
-// ─── Adaptive Time Windows ───────────────────────────────────────────────────
-// Adjusts recall windows based on project activity velocity:
-// High activity → shorter windows (recent data more relevant)
-// Low activity → longer windows (older data stays relevant)
-
-function computeAdaptiveWindows(db, project) {
-  const sevenDaysAgo = Date.now() - 7 * 86400000;
-  const row = db.prepare(`
-    SELECT COUNT(*) as c FROM observations
-    WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
-  `).get(project, sevenDaysAgo);
-  const velocity = (row?.c || 0) / 7; // observations per day
-
-  if (velocity > 10) {
-    // High velocity: tighter windows, focus on very recent
-    return { tier1: 12 * 3600000, tier2: 3 * 86400000, tier3: 14 * 86400000, sessWindow: 3 * 86400000 };
-  } else if (velocity >= 3) {
-    // Medium velocity: default windows
-    return { tier1: 24 * 3600000, tier2: 7 * 86400000, tier3: 30 * 86400000, sessWindow: 7 * 86400000 };
-  } else {
-    // Low velocity: wider windows, older data still relevant
-    return { tier1: 48 * 3600000, tier2: 14 * 86400000, tier3: 60 * 86400000, sessWindow: 14 * 86400000 };
-  }
-}
-
-// ─── Token Budget Optimizer ──────────────────────────────────────────────────
-
-function selectWithTokenBudget(db, project, budget = 2000) {
-  const now_ms = Date.now();
-  const windows = computeAdaptiveWindows(db, project);
-  const tier1Ago = now_ms - windows.tier1;
-  const tier2Ago = now_ms - windows.tier2;
-  const tier3Ago = now_ms - windows.tier3;
-
-  // Candidate pool: tiered time windows by importance (adaptive)
-  const obsPool = db.prepare(`
-    SELECT id, type, title, narrative, importance, created_at_epoch, files_modified
-    FROM observations
-    WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-      AND (
-        (created_at_epoch > ? AND importance >= 1)
-        OR (created_at_epoch > ? AND importance >= 2)
-        OR (created_at_epoch > ? AND importance >= 3)
-      )
-    ORDER BY created_at_epoch DESC
-    LIMIT 50
-  `).all(project, tier1Ago, tier2Ago, tier3Ago);
-
-  const sessPool = db.prepare(`
-    SELECT id, request, completed, next_steps, created_at_epoch
-    FROM session_summaries
-    WHERE project = ? AND created_at_epoch > ?
-    ORDER BY created_at_epoch DESC
-    LIMIT 10
-  `).all(project, now_ms - windows.sessWindow);
-
-  const now = Date.now();
-  const selectedObs = [];
-  const selectedSess = [];
-  let totalTokens = 0;
-
-  // Score each candidate: value = recency * importance, cost = tokens
-  const scoredObs = obsPool.map(o => {
-    const ageDays = (now - o.created_at_epoch) / 86400000;
-    const recency = 1 / (1 + ageDays);
-    const impBoost = 0.5 + 0.5 * (o.importance || 1);
-    const value = recency * impBoost;
-    const cost = estimateTokens((o.title || '') + (o.narrative || ''));
-    return { ...o, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
-  });
-
-  const scoredSess = sessPool.map(s => {
-    const ageDays = (now - s.created_at_epoch) / 86400000;
-    const recency = 1 / (1 + ageDays);
-    const value = recency * 1.5; // Session summaries slightly boosted
-    const cost = estimateTokens((s.request || '') + (s.completed || '') + (s.next_steps || ''));
-    return { ...s, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
-  });
-
-  // Combine and sort by value density (greedy knapsack)
-  const allCandidates = [
-    ...scoredObs.map(o => ({ ...o, _kind: 'obs' })),
-    ...scoredSess.map(s => ({ ...s, _kind: 'sess' })),
-  ].sort((a, b) => b.valueDensity - a.valueDensity);
-
-  const selectedFiles = new Set();
-
-  for (const c of allCandidates) {
-    if (totalTokens + c.cost > budget) continue;
-
-    // Diversity penalty: reduce value for file overlap with already-selected
-    if (c._kind === 'obs' && c.files_modified) {
-      let cFiles;
-      try { cFiles = JSON.parse(c.files_modified || '[]'); } catch { cFiles = []; }
-      if (cFiles.length > 0 && selectedFiles.size > 0) {
-        const overlap = cFiles.filter(f => selectedFiles.has(f)).length;
-        const overlapRatio = overlap / cFiles.length;
-        const penalizedValue = c.valueDensity * (1 - 0.3 * overlapRatio);
-        if (penalizedValue < 0.001) continue; // Skip if too redundant
-      }
-      for (const f of cFiles) selectedFiles.add(f);
-    }
-
-    totalTokens += c.cost;
-    if (c._kind === 'obs') {
-      selectedObs.push({ id: c.id, type: c.type, title: c.title, created_at: new Date(c.created_at_epoch).toISOString() });
-    } else {
-      selectedSess.push({ id: c.id, request: c.request, completed: c.completed, next_steps: c.next_steps, created_at: new Date(c.created_at_epoch).toISOString() });
-    }
-  }
-
-  return { observations: selectedObs, summaries: selectedSess, totalTokens };
 }
 
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
@@ -1165,41 +822,6 @@ function handleSessionStart() {
   }
 }
 
-// ─── CLAUDE.md Persistence (Tier 1 E) ──────────────────────────────────────
-
-function updateClaudeMd(contextBlock) {
-  const claudeMdPath = join(inferProjectDir(), 'CLAUDE.md');
-  let content = '';
-  try { content = readFileSync(claudeMdPath, 'utf8'); } catch {}
-
-  const startTag = '<claude-mem-context>';
-  const endTag = '</claude-mem-context>';
-  const hintComment = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
-  const newSection = `${startTag}\n${contextBlock}\n${endTag}`;
-
-  const startIdx = content.indexOf(startTag);
-  const endIdx = content.indexOf(endTag);
-
-  if (startIdx !== -1 && endIdx !== -1) {
-    // Replace existing section in-place — preserves surrounding content (including hint if present)
-    content = content.slice(0, startIdx) + newSection + content.slice(endIdx + endTag.length);
-  } else if (content.length > 0) {
-    // Append to end — never disturb existing CLAUDE.md structure
-    const hint = content.includes(hintComment) ? '' : hintComment + '\n';
-    content = content.trimEnd() + '\n\n' + hint + newSection + '\n';
-  } else {
-    content = hintComment + '\n' + newSection + '\n';
-  }
-
-  try {
-    const tmp = claudeMdPath + '.mem-tmp';
-    writeFileSync(tmp, content);
-    renameSync(tmp, claudeMdPath);
-  } catch (e) {
-    if (process.env.CLAUDE_MEM_DEBUG) console.error(`[claude-mem-lite] CLAUDE.md write failed: ${e.message}`);
-  }
-}
-
 // ─── Save Observation to DB ─────────────────────────────────────────────────
 
 function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
@@ -1272,8 +894,6 @@ function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
   }
 }
 
-// makeEntryDesc, extractFilePaths, jaccardSimilarity imported from utils.mjs
-
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function readStdin() {
@@ -1298,8 +918,6 @@ function readStdin() {
 function tryParseJson(str) {
   try { return JSON.parse(str); } catch { return {}; }
 }
-
-// typeIcon, truncate, fmtTime, etc. imported from utils.mjs
 
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 
@@ -1357,9 +975,9 @@ try {
     case 'llm-summary':      await handleLLMSummary(); break;
   }
 } catch (err) {
-  if (process.env.CLAUDE_MEM_DEBUG) {
-    console.error(`[claude-mem-lite] ${event} error:`, err.message);
-  }
+  // Always log fatal errors (ungated) with structured format
+  const ts = new Date().toISOString();
+  console.error(`[claude-mem-lite] [${ts}] [ERROR] ${event}: ${err.message}`);
 }
 
 process.exit(0);

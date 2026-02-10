@@ -3,6 +3,13 @@
 
 // ─── Search Re-ranking Helpers ────────────────────────────────────────────
 
+/**
+ * Re-rank search results by boosting scores for observations touching recently active files.
+ * Mutates score fields on result objects in-place (BM25 negative scores).
+ * @param {object} db better-sqlite3 database handle
+ * @param {object[]} results Array of search result objects with source, score, files_modified
+ * @param {string} project Current project name for scoping recent activity
+ */
 export function reRankWithContext(db, results, project) {
   if (!results || results.length === 0) return;
   // Get recently active files (last 2 hours, same project)
@@ -50,6 +57,11 @@ export function reRankWithContext(db, results, project) {
   // Note: caller re-sorts the main results array after this — no sort needed here
 }
 
+/**
+ * Mark older, lower-importance observations as superseded when multiple touch the same file.
+ * Mutates result objects in-place by adding superseded=true flag.
+ * @param {object[]} results Array of search result objects with source, files_modified, date, importance
+ */
 export function markSuperseded(results) {
   if (!results || results.length === 0) return;
   // Build map: file → [result objects], only for obs with files
@@ -81,6 +93,7 @@ export function markSuperseded(results) {
 // results' full text (title + narrative), filter out query terms + stop words,
 // use TF-IDF-style scoring to find terms that appear in many top results.
 
+/** @type {Set<string>} Common words excluded from PRF term extraction */
 export const PRF_STOP_WORDS = new Set([
   'the', 'and', 'for', 'with', 'from', 'that', 'this', 'was', 'were', 'been',
   'have', 'has', 'had', 'are', 'but', 'not', 'all', 'can', 'into', 'when',
@@ -89,6 +102,14 @@ export const PRF_STOP_WORDS = new Set([
   'file', 'files', 'code', 'change', 'changed', 'changes',
 ]);
 
+/**
+ * Extract discriminative terms from top search results for pseudo-relevance feedback.
+ * Selects terms that appear in 2+ top documents but aren't already in the query.
+ * @param {object[]} results Top search result objects with title and narrative fields
+ * @param {string} ftsQuery The original FTS5 query (terms are excluded from output)
+ * @param {number} [limit=3] Maximum number of expansion terms to return
+ * @returns {string[]} Array of discriminative terms for query expansion
+ */
 export function extractPRFTerms(results, ftsQuery, limit = 3) {
   // Extract query tokens for exclusion
   const queryTokens = new Set(
@@ -125,6 +146,14 @@ export function extractPRFTerms(results, ftsQuery, limit = 3) {
 // "Poor man's word2vec": find concepts that frequently co-occur with query
 // terms in existing observations, then use them to supplement sparse results.
 
+/**
+ * Expand a search query by finding co-occurring concepts in matching observations.
+ * Acts as a "poor man's word2vec" for concept-based query expansion.
+ * @param {object} db better-sqlite3 database handle
+ * @param {string} ftsQuery The FTS5 query to find concept neighbors for
+ * @param {string} [project] Optional project filter
+ * @returns {string[]} Array of concept terms for query expansion (max 3)
+ */
 export function expandQueryByConcepts(db, ftsQuery, project) {
   let rows;
   try {
