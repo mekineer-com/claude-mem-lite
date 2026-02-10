@@ -225,11 +225,12 @@ async function uninstall() {
 
   // 3. Purge data if requested
   if (flags.has('--purge')) {
-    if (existsSync(DATA_DIR) && DATA_DIR.includes('claude-mem-lite')) {
+    const expectedPurgePath = join(homedir(), 'claude-mem-lite');
+    if (existsSync(DATA_DIR) && DATA_DIR === expectedPurgePath) {
       rmSync(DATA_DIR, { recursive: true, force: true });
       ok('Data purged (~/claude-mem-lite/)');
     } else if (existsSync(DATA_DIR)) {
-      fail('Unexpected DATA_DIR path, refusing to purge: ' + DATA_DIR);
+      fail('DATA_DIR path mismatch, refusing to purge for safety: ' + DATA_DIR);
     }
   } else {
     log('Data preserved in ~/claude-mem-lite/ (use --purge to remove)');

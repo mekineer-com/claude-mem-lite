@@ -269,7 +269,9 @@ export function inferProject() {
   const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
   const base = basename(p);
   const parent = basename(dirname(p));
-  return parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;
+  const raw = parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;
+  // Sanitize to prevent path traversal when used in filenames (ep-<project>.json)
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-');
 }
 
 // ─── Bash Analysis ───────────────────────────────────────────────────────────

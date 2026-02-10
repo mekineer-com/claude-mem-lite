@@ -30,17 +30,25 @@ const SCRIPT_PATH = process.argv[1];
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
 // Crash-safe: flush episode buffer on unexpected termination to prevent data loss
+// Uses flag-based approach to avoid calling file I/O inside signal handlers,
+// which can deadlock if the signal fires during a main-thread file operation.
+let _shutdownRequested = false;
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
-    try {
-      const ep = readEpisodeRaw();
-      if (ep && ep.entries && ep.entries.length > 0) {
-        const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
-        writeFileSync(flushFile, JSON.stringify(ep));
-        try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
-      }
-    } catch {}
-    process.exit(0);
+    if (_shutdownRequested) process.exit(0); // Double-signal = force exit
+    _shutdownRequested = true;
+    // Schedule flush on next tick to avoid re-entering file I/O
+    setTimeout(() => {
+      try {
+        const ep = readEpisodeRaw();
+        if (ep && ep.entries && ep.entries.length > 0) {
+          const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+          writeFileSync(flushFile, JSON.stringify(ep));
+          try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
+        }
+      } catch {}
+      process.exit(0);
+    });
   });
 }
 
@@ -113,7 +121,9 @@ function callLLM(prompt, timeoutMs = 15000) {
     return result.trim();
   } catch (e) {
     const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
-    if (out) return out;
+    // Only return partial output if it looks like complete JSON (starts with { and ends with })
+    // Truncated output from timeouts can produce garbled JSON that parseJsonFromLLM may misparse
+    if (out && out.startsWith('{') && out.endsWith('}')) return out;
     return null;
   }
 }
@@ -165,8 +175,9 @@ async function acquireLLMSlot() {
             continue;
           }
           if (info.pid) {
-            try { process.kill(info.pid, 0); active++; } catch {
-              try { unlinkSync(fp); } catch {}
+            try { process.kill(info.pid, 0); active++; } catch (killErr) {
+              if (killErr.code === 'ESRCH') { try { unlinkSync(fp); } catch {} }
+              else { active++; } // EPERM = process exists but different user
             }
           } else {
             active++;
@@ -194,14 +205,19 @@ function releaseLLMSlot() {
 
 function spawnBackground(bgEvent, ...extraArgs) {
   const args = [SCRIPT_PATH, bgEvent, ...extraArgs];
-  const child = spawn(process.execPath, args, {
-    detached: true,
-    stdio: 'ignore',
-    env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
-  });
-  // Reap child on exit to prevent zombie processes
-  child.on('exit', () => {});
-  child.unref();
+  try {
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+    });
+    child.on('error', (err) => { debugCatch(err, 'spawnBackground'); });
+    // Reap child on exit to prevent zombie processes
+    child.on('exit', () => {});
+    child.unref();
+  } catch (err) {
+    debugCatch(err, 'spawnBackground');
+  }
 }
 
 // ─── Episode Buffer (Tier 2 F) ─────────────────────────────────────────────
@@ -236,7 +252,9 @@ function acquireLock(maxWaitMs = 500) {
         const age = Date.now() - (info.ts || 0);
         let stale = age > 30000; // >30s = stale
         if (!stale && info.pid) {
-          try { process.kill(info.pid, 0); } catch { stale = true; } // PID dead = orphan
+          try { process.kill(info.pid, 0); } catch (killErr) {
+            stale = killErr.code === 'ESRCH'; // Only stale if process truly gone
+          }
         }
         if (stale) { try { unlinkSync(lf); } catch {} continue; }
       } catch {
@@ -246,6 +264,7 @@ function acquireLock(maxWaitMs = 500) {
           if (Date.now() - st.mtimeMs > 30000) { try { unlinkSync(lf); } catch {} continue; }
         } catch {}
       }
+      // Synchronous sleep for lock retry (hook runs as short-lived subprocess, not event-driven)
       const wait = Math.ceil(Math.random() * 20);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
     }
@@ -269,7 +288,12 @@ function writeEpisode(episode) {
   const target = episodeFile();
   const tmp = target + '.tmp';
   writeFileSync(tmp, JSON.stringify(episode));
-  renameSync(tmp, target);
+  try {
+    renameSync(tmp, target);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch {}
+    throw err;
+  }
 }
 
 function createEpisode(sessionId, project) {
@@ -308,12 +332,15 @@ function writePendingEntry(entry, sessionId, project) {
 
 function mergePendingEntries(episode) {
   const oneHourAgo = Date.now() - 3600000;
+  const MAX_PENDING_MERGE = 50;
   let files;
   try {
     files = readdirSync(RUNTIME_DIR).filter(f => f.startsWith('pending-')).sort();
   } catch { return; }
 
+  let merged = 0;
   for (const f of files) {
+    if (merged >= MAX_PENDING_MERGE) break;
     const fp = join(RUNTIME_DIR, f);
     try {
       const raw = readFileSync(fp, 'utf8');
@@ -326,6 +353,7 @@ function mergePendingEntries(episode) {
         episode.entries.push(pending.entry);
         episode.lastAt = Math.max(episode.lastAt, pending.entry.ts || pending.ts);
         addFileToEpisode(episode, pending.entry.files || []);
+        merged++;
       }
     } catch {
       // Corrupt pending file — remove
@@ -361,7 +389,7 @@ function flushEpisode(episode) {
   }
 
   // Write episode to flush file, then remove buffer AFTER spawn to prevent race
-  const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
+  const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
   try {
     writeFileSync(flushFile, JSON.stringify(episode));
   } catch {
@@ -858,15 +886,18 @@ function handleStop() {
     const claimFile = epFile + `.claim-${process.pid}-${Date.now()}`;
     try {
       renameSync(epFile, claimFile);
-      const episode = JSON.parse(readFileSync(claimFile, 'utf8'));
-      if (episode && episode.entries && episode.entries.length > 0 && episodeHasSignificantContent(episode)) {
-        if (!episode.sessionId) episode.sessionId = sessionId;
-        if (!episode.project) episode.project = project;
-        const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`);
-        writeFileSync(flushFile, JSON.stringify(episode));
-        spawnBackground('llm-episode', flushFile);
+      try {
+        const episode = JSON.parse(readFileSync(claimFile, 'utf8'));
+        if (episode && episode.entries && episode.entries.length > 0 && episodeHasSignificantContent(episode)) {
+          if (!episode.sessionId) episode.sessionId = sessionId;
+          if (!episode.project) episode.project = project;
+          const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+          writeFileSync(flushFile, JSON.stringify(episode));
+          spawnBackground('llm-episode', flushFile);
+        }
+      } finally {
+        try { unlinkSync(claimFile); } catch {}
       }
-      try { unlinkSync(claimFile); } catch {}
     } catch (e) { debugCatch(e, 'handleStop-fallback'); }
   }
 
@@ -1052,7 +1083,9 @@ function handleSessionStart() {
           const age = Date.now() - (info.ts || 0);
           let stale = age > 30000;
           if (!stale && info.pid) {
-            try { process.kill(info.pid, 0); } catch { stale = true; }
+            try { process.kill(info.pid, 0); } catch (killErr) {
+              stale = killErr.code === 'ESRCH'; // Only stale if process truly gone
+            }
           }
           if (stale) unlinkSync(lp);
         } catch {

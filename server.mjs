@@ -167,7 +167,7 @@ server.registerTool(
                     results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
                   }
                 }
-              } catch { /* expansion is best-effort */ }
+              } catch (e) { if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] concept expansion error:', e.message); }
             }
           }
 
@@ -217,7 +217,7 @@ server.registerTool(
                     results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.6, files_modified: r.files_modified, importance: r.importance, snippet: '' });
                   }
                 }
-              } catch { /* PRF is best-effort */ }
+              } catch (e) { if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] PRF expansion error:', e.message); }
             }
           }
         }
@@ -601,14 +601,18 @@ server.registerTool(
     const deletedIds = new Set(args.ids);
     const deleteTx = db.transaction(() => {
       // Clean up stale references in other observations' related_ids
+      // Use LIKE filter to avoid O(N) full-table scan — only fetch rows that may reference deleted IDs
+      const likeConditions = args.ids.map(() => `related_ids LIKE ?`).join(' OR ');
+      const likeParams = args.ids.map(id => `%${id}%`);
       const referencing = db.prepare(`
         SELECT id, related_ids FROM observations
         WHERE related_ids IS NOT NULL AND related_ids != '[]'
-      `).all();
+          AND (${likeConditions})
+      `).all(...likeParams);
       for (const r of referencing) {
         let ids;
         try { ids = JSON.parse(r.related_ids); } catch { continue; }
-        if (!Array.isArray(ids)) continue;
+        if (!Array.isArray(ids) || !ids.every(id => Number.isInteger(id))) continue;
         const filtered = ids.filter(id => !deletedIds.has(id));
         if (filtered.length !== ids.length) {
           db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
@@ -848,7 +852,7 @@ server.registerTool(
     let totalCompressed = 0;
     const insertSummary = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, ?, ?, 'change', ?, '', ?, '', '', '[]', '[]', 2, ?, ?)
+      VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', '[]', 2, ?, ?)
     `);
     const markCompressed = db.prepare(
       'UPDATE observations SET compressed_into = ? WHERE id = ?'
@@ -872,7 +876,7 @@ server.registerTool(
         `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
 
         const summaryResult = insertSummary.run(
-          sessionId, proj, narrative, title, narrative,
+          sessionId, proj, narrative, dominantType, title, narrative,
           now.toISOString(), now.getTime()
         );
         const summaryId = Number(summaryResult.lastInsertRowid);
