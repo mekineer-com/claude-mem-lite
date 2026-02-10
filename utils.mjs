@@ -5,6 +5,12 @@ import { basename, dirname } from 'path';
 
 // ─── String Utilities ────────────────────────────────────────────────────────
 
+/**
+ * Compute word-level Jaccard similarity between two strings.
+ * @param {string} a First string
+ * @param {string} b Second string
+ * @returns {number} Similarity score between 0 and 1
+ */
 export function jaccardSimilarity(a, b) {
   if (!a || !b) return 0;
   const setA = new Set(a.toLowerCase().split(/\s+/));
@@ -15,6 +21,12 @@ export function jaccardSimilarity(a, b) {
   return union === 0 ? 0 : intersection / union;
 }
 
+/**
+ * Truncate a string to a maximum length, replacing newlines with spaces.
+ * @param {string} str Input string
+ * @param {number} [max=80] Maximum character length
+ * @returns {string} Truncated string with ellipsis if needed
+ */
 export function truncate(str, max = 80) {
   if (!str) return '';
   str = str.replace(/\n/g, ' ').trim();
@@ -57,6 +69,11 @@ const SECRET_PATTERNS = [
   [/\b[srpk]{2}k?_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
 ];
 
+/**
+ * Scrub known secret patterns (API keys, tokens, credentials) from text.
+ * @param {string} text Input text potentially containing secrets
+ * @returns {string} Text with secrets replaced by '***'
+ */
 export function scrubSecrets(text) {
   if (!text || typeof text !== 'string') return text || '';
   let result = text;
@@ -68,6 +85,11 @@ export function scrubSecrets(text) {
 
 // ─── Token Estimation ─────────────────────────────────────────────────────
 
+/**
+ * Estimate token count for a string using the ~4 chars/token heuristic.
+ * @param {string} text Input text
+ * @returns {number} Estimated token count (minimum 1)
+ */
 export function estimateTokens(text) {
   return Math.ceil(((text || '').length || 1) / 4);
 }
@@ -85,6 +107,13 @@ function fnv1a(str) {
   return hash;
 }
 
+/**
+ * Compute a MinHash signature for approximate set similarity.
+ * Returns null for texts with fewer than 3 tokens.
+ * @param {string} text Input text to hash
+ * @param {number} [numHashes=64] Number of hash functions
+ * @returns {string|null} Hex-encoded MinHash signature or null
+ */
 export function computeMinHash(text, numHashes = 64) {
   if (!text || typeof text !== 'string') return null;
   const tokens = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
@@ -102,6 +131,12 @@ export function computeMinHash(text, numHashes = 64) {
   return mins.map(v => v.toString(16).padStart(8, '0')).join('');
 }
 
+/**
+ * Estimate Jaccard similarity from two MinHash signatures.
+ * @param {string} sig1 First hex-encoded MinHash signature
+ * @param {string} sig2 Second hex-encoded MinHash signature
+ * @returns {number} Estimated Jaccard similarity between 0 and 1
+ */
 export function estimateJaccardFromMinHash(sig1, sig2) {
   if (!sig1 || !sig2) return 0;
   if (sig1.length !== sig2.length) return 0;
@@ -115,6 +150,11 @@ export function estimateJaccardFromMinHash(sig1, sig2) {
   return matches / numHashes;
 }
 
+/**
+ * Map observation type to its display emoji icon.
+ * @param {string} type Observation type (decision, bugfix, feature, etc.)
+ * @returns {string} Emoji icon for the type
+ */
 export function typeIcon(type) {
   const icons = { decision: '🟡', bugfix: '🔴', feature: '🟢', refactor: '🔵', discovery: '🔍', change: '📝' };
   return icons[type] || '⚪';
@@ -225,6 +265,12 @@ function expandToken(token) {
   return `(${parts.join(' OR ')})`;
 }
 
+/**
+ * Sanitize and expand a user query into a valid FTS5 query string.
+ * Strips special characters, expands synonyms, and joins with AND/space.
+ * @param {string} query Raw user search query
+ * @returns {string|null} FTS5-safe query or null if empty
+ */
 export function sanitizeFtsQuery(query) {
   if (!query) return null;
   const cleaned = query
@@ -242,11 +288,22 @@ export function sanitizeFtsQuery(query) {
 
 // ─── Importance ──────────────────────────────────────────────────────────────
 
+/**
+ * Clamp an importance value to the valid range [1, 3].
+ * @param {*} val Raw importance value (may be non-numeric)
+ * @returns {number} Clamped integer importance (1, 2, or 3)
+ */
 export function clampImportance(val) {
   if (typeof val !== 'number' || isNaN(val)) return 1;
   return Math.max(1, Math.min(3, Math.round(val)));
 }
 
+/**
+ * Compute deterministic importance from episode entries using rule-based heuristics.
+ * Checks file patterns (env, migrations, config) and bash significance signals.
+ * @param {object} episode Episode with entries array
+ * @returns {number} Rule-based importance (1, 2, or 3)
+ */
 export function computeRuleImportance(episode) {
   let importance = 1;
   for (const entry of episode.entries) {
@@ -265,6 +322,11 @@ export function computeRuleImportance(episode) {
 
 // ─── Project Inference ───────────────────────────────────────────────────────
 
+/**
+ * Infer a sanitized project name from CLAUDE_PROJECT_DIR, PWD, or cwd.
+ * Format: "parent--basename" with non-alphanumeric chars replaced by hyphens.
+ * @returns {string} Sanitized project identifier safe for use in filenames
+ */
 export function inferProject() {
   const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
   const base = basename(p);
@@ -276,6 +338,13 @@ export function inferProject() {
 
 // ─── Bash Analysis ───────────────────────────────────────────────────────────
 
+/**
+ * Detect significance signals in a Bash command and its response.
+ * Checks for errors, test runs, builds, git operations, and deployments.
+ * @param {object} input Tool input with command field
+ * @param {string} response Command output text
+ * @returns {{isError: boolean, isTest: boolean, isBuild: boolean, isGit: boolean, isDeploy: boolean, isSignificant: boolean}}
+ */
 export function detectBashSignificance(input, response) {
   const cmd = (input.command || '').toLowerCase();
   const isError = /\berror\b|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
@@ -297,6 +366,13 @@ const ERROR_STOP_WORDS = new Set([
   'node', 'require', 'stack', 'trace',
 ]);
 
+/**
+ * Extract discriminative keywords from a failed command and its error output.
+ * Filters out common stop words to produce useful FTS5 search terms.
+ * @param {string} cmd The command that was executed
+ * @param {string} response The error output text
+ * @returns {string[]|null} Array of 1-6 keywords or null if none found
+ */
 export function extractErrorKeywords(cmd, response) {
   const words = new Set();
   const cmdParts = cmd.split(/[\s/\\|&;]+/).filter(w => w.length > 2 && !/^-/.test(w));
@@ -321,6 +397,12 @@ export function extractErrorKeywords(cmd, response) {
 
 // ─── File Paths ──────────────────────────────────────────────────────────────
 
+/**
+ * Extract file paths from tool input (file_path, path, filePath, or command args).
+ * Deduplicates and excludes /dev/, /proc/, and /tmp/ paths.
+ * @param {object} input Tool input object
+ * @returns {string[]} Unique array of file paths
+ */
 export function extractFilePaths(input) {
   const paths = [];
   if (input.file_path) paths.push(input.file_path);
@@ -343,12 +425,23 @@ export function extractFilePaths(input) {
 
 // ─── Episode Logic ───────────────────────────────────────────────────────────
 
-// Strip test/spec suffixes to match source ↔ test file siblings
-// auth.test.ts → auth.ts, auth.spec.js → auth.js, auth.e2e.ts → auth.ts
+/**
+ * Strip test/spec/e2e suffixes from a filename for sibling matching.
+ * Example: auth.test.ts → auth.ts, auth.spec.js → auth.js
+ * @param {string} filePath File path to strip
+ * @returns {string} Basename with test suffix removed
+ */
 export function stripTestSuffix(filePath) {
   return basename(filePath).replace(/\.(test|spec|e2e)\./i, '.');
 }
 
+/**
+ * Check if new files are related to an existing episode's file set.
+ * Considers exact match, directory overlap, and test-sibling relationships.
+ * @param {object} episode Episode with files array
+ * @param {string[]} newFiles Array of file paths to check
+ * @returns {boolean} true if any file is related to the episode
+ */
 export function isRelatedToEpisode(episode, newFiles) {
   // No files (Bash, Grep without file context) → always related
   if (newFiles.length === 0) return true;
@@ -367,6 +460,13 @@ export function isRelatedToEpisode(episode, newFiles) {
 
 // ─── Entry Description ──────────────────────────────────────────────────────
 
+/**
+ * Generate a human-readable description of a tool invocation for episode entries.
+ * @param {string} toolName Name of the tool (Edit, Write, Bash, etc.)
+ * @param {object} input Tool input parameters
+ * @param {string} resp Tool response text
+ * @returns {string} Concise description of the action
+ */
 export function makeEntryDesc(toolName, input, resp) {
   switch (toolName) {
     case 'Edit':
@@ -400,6 +500,11 @@ export function makeEntryDesc(toolName, input, resp) {
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
+/**
+ * Format an ISO date string as "Mon DD HH:MM" for compact display.
+ * @param {string} iso ISO 8601 date string
+ * @returns {string} Formatted date or empty string
+ */
 export function fmtDate(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -410,6 +515,11 @@ export function fmtDate(iso) {
   return `${mon} ${day} ${h}:${m}`;
 }
 
+/**
+ * Format an ISO date string as "HH:MM" for time-only display.
+ * @param {string} iso ISO 8601 date string
+ * @returns {string} Formatted time or empty string
+ */
 export function fmtTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -418,6 +528,11 @@ export function fmtTime(iso) {
 
 // ─── ISO Week ────────────────────────────────────────────────────────────────
 
+/**
+ * Convert an epoch timestamp to an ISO week key string (e.g. "2026-W06").
+ * @param {number} epochMs Epoch timestamp in milliseconds
+ * @returns {string} ISO week key in format "YYYY-Wnn"
+ */
 export function isoWeekKey(epochMs) {
   const d = new Date(epochMs);
   const tmp = new Date(d.getTime());
@@ -429,16 +544,42 @@ export function isoWeekKey(epochMs) {
   return `${isoYear}-W${String(weekNum).padStart(2, '0')}`;
 }
 
-// ─── Debug Catch Helper ──────────────────────────────────────────────────────
+// ─── Structured Logging ──────────────────────────────────────────────────────
 
+/**
+ * Emit a structured log line gated by CLAUDE_MEM_DEBUG.
+ * Format: [claude-mem-lite] [ISO timestamp] [LEVEL] context: message
+ * @param {'DEBUG'|'WARN'|'ERROR'} level Log severity
+ * @param {string} context Module or function name
+ * @param {string} msg Human-readable message
+ */
+export function debugLog(level, context, msg) {
+  if (!process.env.CLAUDE_MEM_DEBUG) return;
+  const ts = new Date().toISOString();
+  console.error(`[claude-mem-lite] [${ts}] [${level}] ${context}: ${msg}`);
+}
+
+/**
+ * Log a caught error at ERROR level (includes stack trace when available).
+ * Gated by CLAUDE_MEM_DEBUG. Use in catch blocks for non-fatal errors.
+ * @param {Error|unknown} e The caught error
+ * @param {string} context Module or function name for attribution
+ */
 export function debugCatch(e, context) {
   if (process.env.CLAUDE_MEM_DEBUG) {
-    console.error(`[claude-mem-lite] ${context}:`, e?.stack || e?.message || e);
+    const ts = new Date().toISOString();
+    console.error(`[claude-mem-lite] [${ts}] [ERROR] ${context}:`, e?.stack || e?.message || e);
   }
 }
 
 // ─── JSON Parsing ────────────────────────────────────────────────────────────
 
+/**
+ * Parse JSON from LLM output, handling markdown fences and embedded objects.
+ * Tries: direct parse → fenced code block → regex object extraction.
+ * @param {string} text Raw LLM output text
+ * @returns {object|null} Parsed JSON object or null on failure
+ */
 export function parseJsonFromLLM(text) {
   if (!text) return null;
   try { return JSON.parse(text); } catch {}

@@ -4,10 +4,10 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { z } from 'zod';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
+import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema } from './tool-schemas.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -50,17 +50,7 @@ server.registerTool(
   'mem_search',
   {
     description: 'FTS5 full-text search across observations, sessions, and prompts with BM25 ranking. Returns compact index (use mem_get for details).',
-    inputSchema: {
-      query: z.string().optional().describe('Search query (FTS5 syntax supported)'),
-      type: z.enum(['observations', 'sessions', 'prompts']).optional().describe('Limit to one table'),
-      obs_type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Filter observation type'),
-      project: z.string().optional().describe('Filter by project name'),
-      date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
-      date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
-      importance: z.number().int().min(1).max(3).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
-      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
-      offset: z.number().int().min(0).optional().describe('Offset for pagination'),
-    },
+    inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
     const limit = args.limit ?? 20;
@@ -167,7 +157,7 @@ server.registerTool(
                     results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
                   }
                 }
-              } catch (e) { if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] concept expansion error:', e.message); }
+              } catch (e) { debugLog('WARN', 'mem_search', `concept expansion error: ${e.message}`); }
             }
           }
 
@@ -217,7 +207,7 @@ server.registerTool(
                     results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.6, files_modified: r.files_modified, importance: r.importance, snippet: '' });
                   }
                 }
-              } catch (e) { if (process.env.CLAUDE_MEM_DEBUG) console.error('[claude-mem-lite] PRF expansion error:', e.message); }
+              } catch (e) { debugLog('WARN', 'mem_search', `PRF expansion error: ${e.message}`); }
             }
           }
         }
@@ -412,13 +402,7 @@ server.registerTool(
   'mem_timeline',
   {
     description: 'Browse observations as a timeline around an anchor point. Use query to auto-find anchor, or specify anchor ID directly.',
-    inputSchema: {
-      anchor: z.number().int().optional().describe('Observation ID as center point'),
-      query: z.string().optional().describe('FTS5 query to auto-find anchor'),
-      before: z.number().int().min(0).max(50).optional().describe('Items before anchor (default 5)'),
-      after: z.number().int().min(0).max(50).optional().describe('Items after anchor (default 5)'),
-      project: z.string().optional().describe('Filter by project'),
-    },
+    inputSchema: memTimelineSchema,
   },
   safeHandler(async (args) => {
     const before = args.before ?? 5;
@@ -515,11 +499,7 @@ server.registerTool(
   'mem_get',
   {
     description: 'Get full details for one or more records by ID. Use after mem_search to drill into specific records.',
-    inputSchema: {
-      ids: z.array(z.number().int()).min(1).max(20).describe('Observation IDs to retrieve'),
-      source: z.enum(['obs', 'session', 'prompt']).optional().describe('Record type: obs (default), session (S# from search), prompt (P# from search)'),
-      fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),
-    },
+    inputSchema: memGetSchema,
   },
   safeHandler(async (args) => {
     const source = args.source || 'obs';
@@ -572,10 +552,7 @@ server.registerTool(
   'mem_delete',
   {
     description: 'Delete observations by ID. Use confirm=false to preview, confirm=true to execute. FTS5 cleanup is automatic via triggers.',
-    inputSchema: {
-      ids: z.array(z.number().int()).min(1).max(50).describe('Observation IDs to delete'),
-      confirm: z.boolean().describe('false=preview what will be deleted, true=execute deletion'),
-    },
+    inputSchema: memDeleteSchema,
   },
   safeHandler(async (args) => {
     const placeholders = args.ids.map(() => '?').join(',');
@@ -633,13 +610,7 @@ server.registerTool(
   'mem_save',
   {
     description: 'Manually save a memory/observation. Use for important findings, decisions, or notes worth preserving.',
-    inputSchema: {
-      content: z.string().min(1).max(50000).describe('Memory content to save'),
-      title: z.string().optional().describe('Short title'),
-      type: z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']).optional().describe('Observation type (default: discovery)'),
-      project: z.string().optional().describe('Project name (default: inferred from CWD)'),
-      importance: z.number().int().min(1).max(3).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 1)'),
-    },
+    inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
     const now = new Date();
@@ -688,10 +659,7 @@ server.registerTool(
   'mem_stats',
   {
     description: 'Get statistics about stored memories: counts, types, projects, recent activity.',
-    inputSchema: {
-      project: z.string().optional().describe('Filter by project'),
-      days: z.number().int().min(1).max(365).optional().describe('Look back N days (default 30)'),
-    },
+    inputSchema: memStatsSchema,
   },
   safeHandler(async (args) => {
     const days = args.days ?? 30;
@@ -786,11 +754,7 @@ server.registerTool(
   'mem_compress',
   {
     description: 'Compress old low-value observations into weekly summaries. Use preview=true to see candidates first.',
-    inputSchema: {
-      preview: z.boolean().optional().describe('true=count candidates, false=execute compression (default: true)'),
-      age_days: z.number().int().min(30).max(365).optional().describe('Min age in days (default: 60)'),
-      project: z.string().optional().describe('Filter by project'),
-    },
+    inputSchema: memCompressSchema,
   },
   safeHandler(async (args) => {
     const preview = args.preview !== false;
