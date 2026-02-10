@@ -18,10 +18,20 @@ db.pragma('busy_timeout = 5000');
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: 'claude-mem-lite',
-  version: '2.0.0',
-});
+const server = new McpServer(
+  { name: 'claude-mem-lite', version: '2.0.0' },
+  {
+    instructions: [
+      'Proactively use mem_search when:',
+      '- Errors occur: search for related past fixes (obs_type="bugfix")',
+      '- Before significant file changes: search for file history',
+      '- Architecture decisions: check past decisions (obs_type="decision")',
+      '- Stuck/blocked: search for similar past work',
+      '',
+      'Workflow: mem_search → mem_timeline(anchor=ID) → mem_get(ids=[...]) for full context.',
+    ].join('\n'),
+  },
+);
 
 function safeHandler(fn) {
   return async (args, extra) => {
