@@ -28,6 +28,8 @@ if [[ "$tool" == "Read" ]]; then
     else
       project="${_base}"
     fi
+    # Sanitize project name to match utils.mjs inferProject()
+    project="${project//[^a-zA-Z0-9_.-]/-}"
     project="${project:-unknown}"
     runtime_dir="$HOME/claude-mem-lite/runtime"
     mkdir -p "$runtime_dir" 2>/dev/null
@@ -54,5 +56,5 @@ case "$tool" in
 esac
 
 # Tool not skipped — hand off to Node for full processing
-SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
 printf '%s' "$input" | node "${SCRIPT_DIR}/hook.mjs" post-tool-use
