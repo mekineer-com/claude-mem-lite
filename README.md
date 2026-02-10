@@ -68,6 +68,11 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Zero data loss** -- If LLM fails, observations are saved with degraded (inferred) metadata instead of being discarded
 - **Two-tier dedup** -- Jaccard similarity (5-minute window) + MinHash signatures (7-day cross-session window) prevent duplicates
 - **Synonym expansion** -- Abbreviations like `K8s`, `DB`, `auth` automatically expand to full forms in FTS5 search (48+ pairs)
+- **Pseudo-relevance feedback (PRF)** -- Top results seed expansion queries for broader recall
+- **Concept co-occurrence** -- Shared concepts across observations expand search to related topics
+- **Context-aware re-ranking** -- Active file overlap boosts relevance (exact match + directory-level half-weight)
+- **Superseded detection** -- Marks older observations as outdated when newer ones cover the same files with higher importance
+- **Adaptive time windows** -- Session startup recall uses velocity-based time windows (high/medium/low activity tiers)
 - **Token-budgeted context** -- Greedy knapsack algorithm selects session-start context within a 2,000-token budget, prioritizing by recency and importance
 - **Observation compression** -- Old low-value observations can be compressed into weekly summaries to reduce noise
 - **Secret scrubbing** -- Automatic redaction of API keys, tokens, PEM blocks, connection strings, and 15+ credential patterns
@@ -124,9 +129,10 @@ Restart Claude Code after installation to activate.
 ### Migration from claude-mem (original)
 
 All installation methods auto-detect `~/.claude-mem/` and migrate:
-- Copy `claude-mem.db` + WAL files to `~/claude-mem-lite/`
+- Copy `claude-mem.db` → `~/claude-mem-lite/claude-mem-lite.db` (renamed)
 - Copy the `runtime/` directory
 - **Original `~/.claude-mem/` is preserved** (no deletion, no overwrite)
+- Existing `claude-mem.db` in `~/claude-mem-lite/` is automatically renamed to `claude-mem-lite.db` on first run
 
 Remove the old directory manually after confirming:
 ```bash
@@ -137,7 +143,7 @@ rm -rf ~/.claude-mem/
 
 ```
 ~/claude-mem-lite/
-  claude-mem.db          # SQLite database (WAL mode)
+  claude-mem-lite.db       # SQLite database (WAL mode)
   runtime/
     session-<project>    # Active session state
     ep-<project>.json    # Episode buffer
@@ -314,17 +320,19 @@ claude-mem-lite/
     mem.md           # /mem command definition
   scripts/
     setup.sh         # Setup hook: npm install + migration
-  server.mjs         # MCP server: tool definitions, FTS5 search, database init
-  hook.mjs           # Claude Code hooks: episode capture, error recall, session management
-  schema.mjs         # Database schema: single source of truth for tables, migrations, FTS5
-  utils.mjs          # Shared utilities: FTS5 query building, MinHash dedup, secret scrubbing
-  install.mjs        # CLI installer: setup, uninstall, status, doctor (npx/git clone mode)
-  skill.md           # MCP skill definition (npx/git clone mode)
-  package.json       # Dependencies and metadata
+  server.mjs           # MCP server: tool definitions, FTS5 search, database init
+  server-internals.mjs # Extracted search helpers: re-ranking, PRF, concept expansion
+  hook.mjs             # Claude Code hooks: episode capture, error recall, session management
+  schema.mjs           # Database schema: single source of truth for tables, migrations, FTS5
+  tool-schemas.mjs     # Shared Zod schemas for MCP tool validation
+  utils.mjs            # Shared utilities: FTS5 query building, MinHash dedup, secret scrubbing
+  install.mjs          # CLI installer: setup, uninstall, status, doctor (npx/git clone mode)
+  skill.md             # MCP skill definition (npx/git clone mode)
+  package.json         # Dependencies and metadata
   # Test & benchmark (dev only)
-  *.test.mjs         # Unit, integration, E2E tests (201 tests)
-  test-helpers.mjs   # Shared test utilities
-  benchmark/         # BM25 search quality benchmarks + CI gate
+  *.test.mjs           # Unit, property, integration, contract, E2E tests (323 tests)
+  test-helpers.mjs     # Shared test utilities
+  benchmark/           # BM25 search quality benchmarks + CI gate
 ```
 
 ## Search Quality
@@ -333,18 +341,21 @@ Benchmarked on 200 observations across 30 queries (standard + hard-negative cate
 
 | Metric | Score |
 |--------|-------|
-| Recall@10 | 0.89 |
-| Precision@10 | 0.99 |
-| nDCG@10 | 0.97 |
-| MRR@10 | 0.97 |
-| P95 search latency | 0.14ms |
+| Recall@10 | 0.88 |
+| Precision@10 | 0.96 |
+| nDCG@10 | 0.95 |
+| MRR@10 | 0.95 |
+| P95 search latency | 0.15ms |
 
 The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent search quality regressions.
 
 ## Development
 
 ```bash
-npm test                  # Run all 201 tests (vitest)
+npm run lint              # ESLint static analysis
+npm test                  # Run all 323 tests (vitest)
+npm run test:smoke        # Run 5 core smoke tests
+npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
 npm run benchmark         # Run full search quality benchmark
 npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% tolerance
 ```

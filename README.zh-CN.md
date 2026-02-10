@@ -68,6 +68,11 @@
 - **零数据丢失** -- LLM 失败时，使用推断的元数据保存降级记录，而非丢弃
 - **两级去重** -- Jaccard 相似度（5 分钟窗口）+ MinHash 签名（7 天跨会话窗口）双重防重
 - **同义词扩展** -- 缩写如 `K8s`、`DB`、`auth` 在 FTS5 搜索时自动扩展为全称（48+ 对）
+- **伪相关反馈（PRF）** -- 首轮结果作为种子扩展查询，提升召回率
+- **概念共现** -- 观察间的共享概念自动扩展搜索到相关主题
+- **上下文感知重排** -- 活跃文件重叠提升相关性（精确匹配 + 目录级半权重）
+- **过时检测** -- 当更新的观察覆盖相同文件且重要度更高时，标记旧观察为已取代
+- **自适应时间窗口** -- 会话启动回忆使用基于速率的时间窗口（高/中/低活跃度分级）
 - **Token 预算上下文** -- 贪心背包算法在 2,000 token 预算内选择会话启动上下文，按时效性和重要度优先
 - **观察压缩** -- 可将旧的低价值观察压缩为每周摘要，减少噪声
 - **秘密擦除** -- 自动编辑 API 密钥、token、PEM 块、数据库连接字符串等 15+ 种凭证模式
@@ -124,9 +129,10 @@ node install.mjs install
 ### 从 claude-mem（原版）迁移
 
 所有安装方式都会自动检测 `~/.claude-mem/` 并迁移：
-- 复制 `claude-mem.db` + WAL 文件到 `~/claude-mem-lite/`
+- 复制 `claude-mem.db` → `~/claude-mem-lite/claude-mem-lite.db`（重命名）
 - 复制 `runtime/` 目录
 - **原 `~/.claude-mem/` 保持不变**（不删除、不覆盖）
+- 已有的 `~/claude-mem-lite/claude-mem.db` 会在首次运行时自动重命名为 `claude-mem-lite.db`
 
 确认一切正常后手动删除旧目录：
 ```bash
@@ -137,7 +143,7 @@ rm -rf ~/.claude-mem/
 
 ```
 ~/claude-mem-lite/
-  claude-mem.db          # SQLite 数据库（WAL 模式）
+  claude-mem-lite.db       # SQLite 数据库（WAL 模式）
   runtime/
     session-<project>    # 活跃会话状态
     ep-<project>.json    # Episode 缓冲区
@@ -314,17 +320,19 @@ claude-mem-lite/
     mem.md           # /mem 命令定义
   scripts/
     setup.sh         # Setup 钩子：npm install + 迁移
-  server.mjs         # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
-  hook.mjs           # Claude Code 钩子：episode 捕获、错误回忆、会话管理
-  schema.mjs         # 数据库 schema：表、迁移、FTS5 的单一事实来源
-  utils.mjs          # 共享工具：FTS5 查询构建、MinHash 去重、秘密擦除
-  install.mjs        # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
-  skill.md           # MCP 技能定义（npx/git clone 模式）
-  package.json       # 依赖和元数据
+  server.mjs           # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
+  server-internals.mjs # 搜索辅助模块：重排序、PRF、概念扩展
+  hook.mjs             # Claude Code 钩子：episode 捕获、错误回忆、会话管理
+  schema.mjs           # 数据库 schema：表、迁移、FTS5 的单一事实来源
+  tool-schemas.mjs     # 共享 Zod schema，用于 MCP 工具校验
+  utils.mjs            # 共享工具：FTS5 查询构建、MinHash 去重、秘密擦除
+  install.mjs          # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
+  skill.md             # MCP 技能定义（npx/git clone 模式）
+  package.json         # 依赖和元数据
   # 测试和基准（仅开发）
-  *.test.mjs         # 单元、集成、E2E 测试（201 个）
-  test-helpers.mjs   # 共享测试工具
-  benchmark/         # BM25 搜索质量基准 + CI 门控
+  *.test.mjs           # 单元、属性、集成、契约、E2E 测试（323 个）
+  test-helpers.mjs     # 共享测试工具
+  benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
 
 ## 搜索质量
@@ -333,18 +341,21 @@ claude-mem-lite/
 
 | 指标 | 得分 |
 |------|------|
-| Recall@10 | 0.89 |
-| Precision@10 | 0.99 |
-| nDCG@10 | 0.97 |
-| MRR@10 | 0.97 |
-| P95 搜索延迟 | 0.14ms |
+| Recall@10 | 0.88 |
+| Precision@10 | 0.96 |
+| nDCG@10 | 0.95 |
+| MRR@10 | 0.95 |
+| P95 搜索延迟 | 0.15ms |
 
 基准测试作为 CI 门控运行（`npm run benchmark:gate`），防止搜索质量回退。
 
 ## 开发
 
 ```bash
-npm test                  # 运行全部 201 个测试（vitest）
+npm run lint              # ESLint 静态分析
+npm test                  # 运行全部 323 个测试（vitest）
+npm run test:smoke        # 运行 5 个核心冒烟测试
+npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试
 npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 ```

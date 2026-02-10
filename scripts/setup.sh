@@ -46,12 +46,12 @@ log_ok "Data directory: $DATA_DIR"
 
 # 3. Migrate from old ~/.claude-mem/ if needed
 OLD_DIR="$HOME/.claude-mem"
-if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem.db" ]]; then
+if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" && ! -f "$DATA_DIR/claude-mem.db" ]]; then
   log_info "Migrating data from ~/.claude-mem/ → ~/claude-mem-lite/..."
-  if cp "$OLD_DIR/claude-mem.db" "$DATA_DIR/claude-mem.db" 2>/dev/null; then
+  if cp "$OLD_DIR/claude-mem.db" "$DATA_DIR/claude-mem-lite.db" 2>/dev/null; then
     # Main DB copied successfully, WAL/SHM are optional
-    cp "$OLD_DIR/claude-mem.db-wal" "$DATA_DIR/claude-mem.db-wal" 2>/dev/null || true
-    cp "$OLD_DIR/claude-mem.db-shm" "$DATA_DIR/claude-mem.db-shm" 2>/dev/null || true
+    cp "$OLD_DIR/claude-mem.db-wal" "$DATA_DIR/claude-mem-lite.db-wal" 2>/dev/null || true
+    cp "$OLD_DIR/claude-mem.db-shm" "$DATA_DIR/claude-mem-lite.db-shm" 2>/dev/null || true
     if [[ -d "$OLD_DIR/runtime" && ! -d "$DATA_DIR/runtime" ]]; then
       cp -r "$OLD_DIR/runtime" "$DATA_DIR/runtime" 2>/dev/null || true
     fi
@@ -59,6 +59,14 @@ if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem.db" ]]; then
   else
     log_warn "Migration failed — using fresh database"
   fi
+fi
+
+# 3b. Rename claude-mem.db → claude-mem-lite.db in same directory
+if [[ -f "$DATA_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" ]]; then
+  mv "$DATA_DIR/claude-mem.db" "$DATA_DIR/claude-mem-lite.db"
+  mv "$DATA_DIR/claude-mem.db-wal" "$DATA_DIR/claude-mem-lite.db-wal" 2>/dev/null || true
+  mv "$DATA_DIR/claude-mem.db-shm" "$DATA_DIR/claude-mem-lite.db-shm" 2>/dev/null || true
+  log_ok "Database renamed: claude-mem.db → claude-mem-lite.db"
 fi
 
 # 4. Ensure runtime directory exists (after migration to not mask migration check)
