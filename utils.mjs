@@ -128,6 +128,7 @@ const FTS5_KEYWORDS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
 // Bidirectional: both directions are registered so "K8s" finds "Kubernetes" and vice versa
 const SYNONYM_MAP = new Map();
 const SYNONYM_PAIRS = [
+  // Abbreviation ↔ full form
   ['k8s', 'kubernetes'],
   ['db', 'database'],
   ['js', 'javascript'],
@@ -172,6 +173,29 @@ const SYNONYM_PAIRS = [
   ['prod', 'production'],
   ['async', 'asynchronous'],
   ['sync', 'synchronous'],
+  // Semantic equivalents — bridges terms users type interchangeably
+  ['login', 'signin'],
+  ['login', 'auth'],
+  ['signin', 'auth'],
+  ['bug', 'error'],
+  ['bug', 'issue'],
+  ['bug', 'defect'],
+  ['crash', 'panic'],
+  ['crash', 'segfault'],
+  ['slow', 'latency'],
+  ['slow', 'perf'],
+  ['remove', 'delete'],
+  ['setup', 'install'],
+  ['setup', 'config'],
+  ['deploy', 'release'],
+  ['deploy', 'publish'],
+  ['refactor', 'restructure'],
+  ['refactor', 'cleanup'],
+  ['test', 'spec'],
+  ['api', 'endpoint'],
+  ['api', 'route'],
+  ['cache', 'caching'],
+  ['migrate', 'migration'],
 ];
 // Build bidirectional lookup (case-insensitive)
 for (const [abbr, full] of SYNONYM_PAIRS) {

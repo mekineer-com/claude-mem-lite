@@ -151,6 +151,7 @@ server.registerTool(
         const rows = db.prepare(`
           SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
                  o.files_modified,
+                 snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
                  bm25(observations_fts, 10, 5, 5, 3, 3, 2)
                    * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
                    * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
@@ -179,7 +180,7 @@ server.registerTool(
           perSourceLimit, perSourceOffset
         );
         for (const r of rows) {
-          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance });
+          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
         }
       } else {
         // Structured filter (no FTS)
@@ -329,7 +330,14 @@ server.registerTool(
 
     // Format compact output
     if (paginatedResults.length === 0) {
-      return { content: [{ type: 'text', text: 'No results found.' }] };
+      const hint = [];
+      hint.push('No results found.');
+      if (args.query) {
+        const expanded = ftsQuery || args.query;
+        if (expanded !== args.query) hint.push(`Searched as: ${expanded}`);
+        hint.push('Tip: check spelling, try broader terms, or use mem_stats to see available data.');
+      }
+      return { content: [{ type: 'text', text: hint.join('\n') }] };
     }
 
     const lines = [];
@@ -342,6 +350,10 @@ server.registerTool(
       if (r.source === 'obs') {
         const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
         lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}`);
+        // Show FTS5 snippet when available and adds info beyond the title
+        if (r.snippet && r.snippet.length > 10 && r.snippet !== r.title) {
+          lines.push(`     ${truncate(r.snippet, 100)}`);
+        }
       } else if (r.source === 'session') {
         lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}`);
       } else if (r.source === 'prompt') {
@@ -349,7 +361,7 @@ server.registerTool(
       }
     }
 
-    lines.push(`\nUse mem_get(ids=[...]) for full details.`);
+    lines.push(`\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details`);
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   })

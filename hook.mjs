@@ -596,7 +596,8 @@ File: ${episode.files.join(', ') || 'unknown'}
 Action: ${e.desc}
 Error: ${e.isError ? 'yes' : 'no'}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise description","narrative":"2-3 sentences on what and why","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1}
+Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   } else {
     // Multiple entries: batch episode summary
@@ -611,7 +612,8 @@ Files: ${fileList}
 Actions (${episode.entries.length} total):
 ${actionList}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent summary of the episode","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1}
+Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   }
 
@@ -931,7 +933,7 @@ function selectWithTokenBudget(db, project, budget = 2000) {
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const value = recency * impBoost;
     const cost = estimateTokens((o.title || '') + (o.narrative || ''));
-    return { ...o, value, cost, valueDensity: cost > 0 ? value / cost : 0 };
+    return { ...o, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
   });
 
   const scoredSess = sessPool.map(s => {
@@ -939,7 +941,7 @@ function selectWithTokenBudget(db, project, budget = 2000) {
     const recency = 1 / (1 + ageDays);
     const value = recency * 1.5; // Session summaries slightly boosted
     const cost = estimateTokens((s.request || '') + (s.completed || '') + (s.next_steps || ''));
-    return { ...s, value, cost, valueDensity: cost > 0 ? value / cost : 0 };
+    return { ...s, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
   });
 
   // Combine and sort by value density (greedy knapsack)
