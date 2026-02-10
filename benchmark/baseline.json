@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-02-08T18:30:52.948Z",
+  "timestamp": "2026-02-10T19:48:14.111Z",
   "queryCount": 30,
   "metrics": {
-    "recall_at_10": 0.8852,
-    "precision_at_10": 0.9926,
-    "ndcg_at_10": 0.9697,
-    "mrr_at_10": 0.9667,
-    "avg_tokens_injected": 466,
-    "p95_search_latency_ms": 0.1358
+    "recall_at_10": 0.8796,
+    "precision_at_10": 0.9631,
+    "ndcg_at_10": 0.9509,
+    "mrr_at_10": 0.95,
+    "avg_tokens_injected": 472,
+    "p95_search_latency_ms": 0.1462
   },
   "perQuery": [
     {
@@ -129,15 +129,17 @@
       "query": "cache",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 1,
-      "ndcg_at_10": 1,
+      "precision_at_10": 0.7143,
+      "ndcg_at_10": 0.9896,
       "mrr": 1,
       "result_ids": [
         18,
-        138,
-        51,
         77,
-        141
+        141,
+        138,
+        35,
+        51,
+        78
       ],
       "relevant_ids": [
         18,
@@ -146,7 +148,7 @@
         138,
         141
       ],
-      "tokens": 327
+      "tokens": 468
     },
     {
       "id": "q7",
@@ -432,21 +434,21 @@
       "id": "q18",
       "query": "API",
       "category": "standard",
-      "recall_at_10": 0.5556,
-      "precision_at_10": 1,
-      "ndcg_at_10": 1,
-      "mrr": 1,
+      "recall_at_10": 0.2222,
+      "precision_at_10": 0.4,
+      "ndcg_at_10": 0.3382,
+      "mrr": 0.5,
       "result_ids": [
+        60,
+        175,
+        4,
+        58,
+        193,
+        67,
+        122,
         114,
         129,
-        71,
-        52,
-        92,
-        34,
-        176,
-        175,
-        168,
-        84
+        71
       ],
       "relevant_ids": [
         34,
@@ -468,7 +470,7 @@
         176,
         196
       ],
-      "tokens": 664
+      "tokens": 659
     },
     {
       "id": "q19",
@@ -844,13 +846,14 @@
       "id": "q34",
       "query": "auth",
       "category": "hard_negative_cross_project",
-      "recall_at_10": 0.8333,
+      "recall_at_10": 1,
       "precision_at_10": 1,
-      "ndcg_at_10": 0.8922,
+      "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        60,
         17,
+        60,
+        81,
         77,
         108,
         169
@@ -863,7 +866,7 @@
         108,
         169
       ],
-      "tokens": 339
+      "tokens": 406
     },
     {
       "id": "q35",
@@ -895,10 +898,10 @@
   "byCategory": {
     "standard": {
       "count": 25,
-      "recall_at_10": 0.8929,
-      "precision_at_10": 0.9956,
-      "ndcg_at_10": 0.9929,
-      "mrr_at_10": 0.98
+      "recall_at_10": 0.8796,
+      "precision_at_10": 0.9601,
+      "ndcg_at_10": 0.966,
+      "mrr_at_10": 0.96
     },
     "hard_negative_abbreviation": {
       "count": 2,
@@ -916,9 +919,9 @@
     },
     "hard_negative_cross_project": {
       "count": 1,
-      "recall_at_10": 0.8333,
+      "recall_at_10": 1,
       "precision_at_10": 1,
-      "ndcg_at_10": 0.8922,
+      "ndcg_at_10": 1,
       "mrr_at_10": 1
     }
   }
