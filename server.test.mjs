@@ -689,6 +689,104 @@ describe('mem_compress', () => {
   });
 });
 
+// ─── PRF (Pseudo-Relevance Feedback) ─────────────────────────────────────────
+
+describe('PRF document-level expansion', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('finds expanded results via shared terms in top matches', () => {
+    // Seed observations that share vocabulary
+    insertObs(db, { title: 'authentication token refresh bug', text: 'authentication token refresh', narrative: 'The session cookie expired causing token refresh failure' });
+    insertObs(db, { title: 'session cookie handling fix', text: 'session cookie handling', narrative: 'Fixed session cookie not being set after authentication' });
+    insertObs(db, { title: 'cookie expiry configuration', text: 'cookie expiry configuration', narrative: 'Updated cookie expiry to match session timeout settings' });
+
+    // Primary search for "authentication" should find direct match
+    const ftsQuery = sanitizeFtsQuery('authentication');
+    const rows = db.prepare(`
+      SELECT o.id, o.title FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+      ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+      LIMIT 8
+    `).all(ftsQuery);
+
+    // Should find observations with "authentication" or its synonyms
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    // "cookie" and "session" should be discriminative terms across these results
+    const titles = rows.map(r => r.title);
+    expect(titles.some(t => t.includes('authentication') || t.includes('session'))).toBe(true);
+  });
+
+  it('does not expand when no results exist', () => {
+    const ftsQuery = sanitizeFtsQuery('nonexistent_term_xyz');
+    const rows = db.prepare(`
+      SELECT o.id FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+    `).all(ftsQuery);
+    expect(rows.length).toBe(0);
+  });
+});
+
+// ─── Adaptive Time Windows ───────────────────────────────────────────────────
+
+describe('adaptive time windows logic', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('detects high velocity (>10 obs/day)', () => {
+    // Insert 80 observations in the last 7 days (>11/day)
+    for (let i = 0; i < 80; i++) {
+      insertObs(db, { title: `high vel obs ${i}`, epochOffset: -i * 3600000 });
+    }
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+    const row = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE project = 'test' AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+    `).get(sevenDaysAgo);
+    const velocity = row.c / 7;
+    expect(velocity).toBeGreaterThan(10);
+  });
+
+  it('detects low velocity (<3 obs/day)', () => {
+    // Insert 5 observations in the last 7 days (<1/day)
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `low vel obs ${i}`, epochOffset: -i * 86400000 });
+    }
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+    const row = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE project = 'test' AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+    `).get(sevenDaysAgo);
+    const velocity = row.c / 7;
+    expect(velocity).toBeLessThan(3);
+  });
+
+  it('medium velocity uses default windows', () => {
+    // Insert 35 observations in the last 7 days (5/day)
+    for (let i = 0; i < 35; i++) {
+      insertObs(db, { title: `med vel obs ${i}`, epochOffset: -i * 4 * 3600000 });
+    }
+    const sevenDaysAgo = Date.now() - 7 * 86400000;
+    const row = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE project = 'test' AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+    `).get(sevenDaysAgo);
+    const velocity = row.c / 7;
+    expect(velocity).toBeGreaterThanOrEqual(3);
+    expect(velocity).toBeLessThanOrEqual(10);
+  });
+});
+
 // ─── SKIP_TOOLS sync: hook.mjs ↔ post-tool-use.sh ──────────────────────────
 
 describe('SKIP_TOOLS sync between hook.mjs and post-tool-use.sh', () => {

@@ -890,16 +890,41 @@ function handleStop() {
   try { unlinkSync(sessionFile()); } catch {}
 }
 
+// ─── Adaptive Time Windows ───────────────────────────────────────────────────
+// Adjusts recall windows based on project activity velocity:
+// High activity → shorter windows (recent data more relevant)
+// Low activity → longer windows (older data stays relevant)
+
+function computeAdaptiveWindows(db, project) {
+  const sevenDaysAgo = Date.now() - 7 * 86400000;
+  const row = db.prepare(`
+    SELECT COUNT(*) as c FROM observations
+    WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+  `).get(project, sevenDaysAgo);
+  const velocity = (row?.c || 0) / 7; // observations per day
+
+  if (velocity > 10) {
+    // High velocity: tighter windows, focus on very recent
+    return { tier1: 12 * 3600000, tier2: 3 * 86400000, tier3: 14 * 86400000, sessWindow: 3 * 86400000 };
+  } else if (velocity >= 3) {
+    // Medium velocity: default windows
+    return { tier1: 24 * 3600000, tier2: 7 * 86400000, tier3: 30 * 86400000, sessWindow: 7 * 86400000 };
+  } else {
+    // Low velocity: wider windows, older data still relevant
+    return { tier1: 48 * 3600000, tier2: 14 * 86400000, tier3: 60 * 86400000, sessWindow: 14 * 86400000 };
+  }
+}
+
 // ─── Token Budget Optimizer ──────────────────────────────────────────────────
 
 function selectWithTokenBudget(db, project, budget = 2000) {
   const now_ms = Date.now();
-  const oneDayAgo = now_ms - 24 * 60 * 60 * 1000;
-  const sevenDaysAgo = now_ms - 7 * 24 * 60 * 60 * 1000;
-  const thirtyDaysAgo = now_ms - 30 * 24 * 60 * 60 * 1000;
+  const windows = computeAdaptiveWindows(db, project);
+  const tier1Ago = now_ms - windows.tier1;
+  const tier2Ago = now_ms - windows.tier2;
+  const tier3Ago = now_ms - windows.tier3;
 
-  // Candidate pool: tiered time windows by importance
-  // 24h: all records | 7d: importance>=2 | 30d: importance=3
+  // Candidate pool: tiered time windows by importance (adaptive)
   const obsPool = db.prepare(`
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified
     FROM observations
@@ -911,7 +936,7 @@ function selectWithTokenBudget(db, project, budget = 2000) {
       )
     ORDER BY created_at_epoch DESC
     LIMIT 50
-  `).all(project, oneDayAgo, sevenDaysAgo, thirtyDaysAgo);
+  `).all(project, tier1Ago, tier2Ago, tier3Ago);
 
   const sessPool = db.prepare(`
     SELECT id, request, completed, next_steps, created_at_epoch
@@ -919,7 +944,7 @@ function selectWithTokenBudget(db, project, budget = 2000) {
     WHERE project = ? AND created_at_epoch > ?
     ORDER BY created_at_epoch DESC
     LIMIT 10
-  `).all(project, sevenDaysAgo);
+  `).all(project, now_ms - windows.sessWindow);
 
   const now = Date.now();
   const selectedObs = [];

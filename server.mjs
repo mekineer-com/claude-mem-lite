@@ -118,6 +118,51 @@ function markSuperseded(results) {
   }
 }
 
+// ─── Pseudo-Relevance Feedback (PRF) ────────────────────────────────────────
+// Two-phase document-level expansion: extract discriminative terms from top
+// results' full text (title + narrative), filter out query terms + stop words,
+// use TF-IDF-style scoring to find terms that appear in many top results.
+
+const PRF_STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'was', 'were', 'been',
+  'have', 'has', 'had', 'are', 'but', 'not', 'all', 'can', 'into', 'when',
+  'which', 'their', 'will', 'would', 'could', 'should', 'also', 'than',
+  'then', 'its', 'use', 'used', 'using', 'some', 'new', 'added', 'updated',
+  'file', 'files', 'code', 'change', 'changed', 'changes',
+]);
+
+function extractPRFTerms(results, ftsQuery, limit = 3) {
+  // Extract query tokens for exclusion
+  const queryTokens = new Set(
+    ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
+      .map(t => t.toLowerCase())
+      .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
+  );
+
+  // Count term frequencies across top results' full text
+  const termFreq = {};
+  const docCount = Math.min(results.length, 8);
+  for (let i = 0; i < docCount; i++) {
+    const r = results[i];
+    const text = ((r.title || '') + ' ' + (r.narrative || '')).toLowerCase();
+    const tokens = text.replace(/[^a-z0-9_-]/g, ' ').split(/\s+/)
+      .filter(t => t.length > 3 && !PRF_STOP_WORDS.has(t) && !queryTokens.has(t));
+    const seen = new Set();
+    for (const t of tokens) {
+      if (seen.has(t)) continue;
+      seen.add(t);
+      termFreq[t] = (termFreq[t] || 0) + 1;
+    }
+  }
+
+  // Select terms appearing in >= 2 top docs (discriminative, not noise)
+  return Object.entries(termFreq)
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([term]) => term);
+}
+
 // ─── Concept Co-occurrence Query Expansion ─────────────────────────────────
 // "Poor man's word2vec": find concepts that frequently co-occur with query
 // terms in existing observations, then use them to supplement sparse results.
@@ -237,35 +282,78 @@ server.registerTool(
           results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
         }
 
-        // Concept co-occurrence expansion: when primary results are sparse,
-        // find related observations via co-occurring concepts (pseudo-relevance feedback)
-        if (rows.length > 0 && rows.length < Math.ceil(limit / 2)) {
-          const expanded = expandQueryByConcepts(db, ftsQuery);
-          if (expanded.length > 0) {
-            const existingIds = new Set(results.filter(r => r.source === 'obs').map(r => r.id));
-            const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
-            try {
-              const expRows = db.prepare(`
-                SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-                       o.files_modified,
-                       bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
-                         * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
-                FROM observations_fts
-                JOIN observations o ON observations_fts.rowid = o.id
-                WHERE observations_fts MATCH ?
-                  AND COALESCE(o.compressed_into, 0) = 0
-                  AND (? IS NULL OR o.project = ?)
-                ORDER BY score
-                LIMIT ?
-              `).all(now, expansionFts, args.project ?? null, args.project ?? null, limit);
-              for (const r of expRows) {
-                if (!existingIds.has(r.id)) {
-                  existingIds.add(r.id);
-                  results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+        // Two-phase query expansion for sparse results:
+        // Phase 1: Concept co-occurrence (uses concepts column from top matches)
+        // Phase 2: PRF document-level (uses title+narrative terms from top matches)
+        const obsCount = results.filter(r => r.source === 'obs').length;
+        if (rows.length > 0 && obsCount < limit) {
+          const existingIds = new Set(results.filter(r => r.source === 'obs').map(r => r.id));
+
+          // Phase 1: Concept co-occurrence expansion
+          if (obsCount < Math.ceil(limit / 2)) {
+            const expanded = expandQueryByConcepts(db, ftsQuery);
+            if (expanded.length > 0) {
+              const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
+              try {
+                const expRows = db.prepare(`
+                  SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+                         o.files_modified,
+                         bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+                           * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+                  FROM observations_fts
+                  JOIN observations o ON observations_fts.rowid = o.id
+                  WHERE observations_fts MATCH ?
+                    AND COALESCE(o.compressed_into, 0) = 0
+                    AND (? IS NULL OR o.project = ?)
+                  ORDER BY score
+                  LIMIT ?
+                `).all(now, expansionFts, args.project ?? null, args.project ?? null, limit);
+                for (const r of expRows) {
+                  if (!existingIds.has(r.id)) {
+                    existingIds.add(r.id);
+                    results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+                  }
                 }
-              }
-            } catch { /* expansion is best-effort */ }
+              } catch { /* expansion is best-effort */ }
+            }
+          }
+
+          // Phase 2: PRF document-level expansion (extracts terms from top result text)
+          if (rows.length >= 3) {
+            const topResults = db.prepare(`
+              SELECT o.title, o.narrative FROM observations_fts
+              JOIN observations o ON observations_fts.rowid = o.id
+              WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+              ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+              LIMIT 8
+            `).all(ftsQuery);
+            const prfTerms = extractPRFTerms(topResults, ftsQuery);
+            if (prfTerms.length > 0) {
+              const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+              try {
+                const prfRows = db.prepare(`
+                  SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+                         o.files_modified,
+                         bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+                           * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+                  FROM observations_fts
+                  JOIN observations o ON observations_fts.rowid = o.id
+                  WHERE observations_fts MATCH ?
+                    AND COALESCE(o.compressed_into, 0) = 0
+                    AND (? IS NULL OR o.project = ?)
+                  ORDER BY score
+                  LIMIT ?
+                `).all(now, prfFts, args.project ?? null, args.project ?? null, limit);
+                for (const r of prfRows) {
+                  if (!existingIds.has(r.id)) {
+                    existingIds.add(r.id);
+                    results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.6, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+                  }
+                }
+              } catch { /* PRF is best-effort */ }
+            }
           }
         }
       } else {
