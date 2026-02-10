@@ -412,6 +412,22 @@ async function handleSessionStart() {
       }
     } catch {}
 
+    // Auto-compress: mark old low-importance observations as compressed (90+ days, importance=1)
+    // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
+    try {
+      const autoCompressAge = Date.now() - 90 * 86400000; // 90 days
+      const compressed = db.prepare(`
+        UPDATE observations SET compressed_into = -1
+        WHERE COALESCE(compressed_into, 0) = 0
+          AND importance = 1
+          AND created_at_epoch < ?
+          AND project = ?
+      `).run(autoCompressAge, project);
+      if (compressed.changes > 0) {
+        debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
+      }
+    } catch {}
+
     // Token-budgeted observation selection (replaces flat LIMIT 15)
     const selected = selectWithTokenBudget(db, project, 2000);
     const observations = selected.observations;

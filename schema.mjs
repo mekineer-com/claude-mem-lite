@@ -7,7 +7,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, mkdirSync, renameSync } from 'fs';
 
-export const DB_DIR = join(homedir(), 'claude-mem-lite');
+export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), 'claude-mem-lite');
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 
 const CORE_SCHEMA = `

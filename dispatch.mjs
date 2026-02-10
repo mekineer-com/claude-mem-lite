@@ -54,7 +54,11 @@ export function shouldSkipDispatch(event) {
   return { skip: false, reason: '' };
 }
 
-/** Check if a bash command is a simple read-only query. */
+/**
+ * Check if a bash command is a simple read-only query.
+ * @param {string} cmd Bash command string
+ * @returns {boolean} true if the command is a simple read-only query
+ */
 function isSimpleBashQuery(cmd) {
   if (!cmd) return true;
   const lower = cmd.toLowerCase().trim();
@@ -110,7 +114,11 @@ export function extractContextSignals(event, sessionCtx = {}) {
   return signals;
 }
 
-/** Extract intent keywords from user prompt. */
+/**
+ * Extract intent keywords from user prompt.
+ * @param {string} prompt User's natural language prompt
+ * @returns {string} Comma-separated intent tags (e.g. "test,fix")
+ */
 function extractIntent(prompt) {
   if (!prompt) return '';
   const intentPatterns = [
@@ -144,7 +152,11 @@ function extractIntent(prompt) {
   return found.join(',');
 }
 
-/** Infer tech stack from file extensions. */
+/**
+ * Infer tech stack from file extensions.
+ * @param {string[]} files Array of file paths
+ * @returns {string} Comma-separated tech/language tags
+ */
 function inferTechStack(files) {
   const extMap = {
     '.js': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript',
@@ -172,7 +184,12 @@ function inferTechStack(files) {
   return [...tags].join(',');
 }
 
-/** Infer action type from tool name and input. */
+/**
+ * Infer action type from tool name and input.
+ * @param {string} toolName Claude Code tool name (e.g. "Bash", "Edit")
+ * @param {object} [toolInput] Tool input parameters
+ * @returns {string} Action category (e.g. "edit", "test", "build")
+ */
 function inferAction(toolName, toolInput) {
   switch (toolName) {
     case 'Edit': case 'Write': case 'NotebookEdit': return 'edit';
@@ -190,7 +207,12 @@ function inferAction(toolName, toolInput) {
   }
 }
 
-/** Extract error domain from command + error output. */
+/**
+ * Extract error domain from command and error output.
+ * @param {string} cmd Bash command that produced the error
+ * @param {string} response Command output containing the error
+ * @returns {string} Error domain category (e.g. "type-error", "test-fail")
+ */
 function extractErrorDomain(cmd, response) {
   const combined = (cmd + ' ' + response).toLowerCase();
   if (/type\s*error|typescript|tsc/.test(combined)) return 'type-error';
@@ -218,6 +240,12 @@ export function needsHaikuDispatch(results) {
   return false;
 }
 
+/**
+ * Call Haiku LLM to semantically resolve the best resource query.
+ * @param {string} userPrompt User's prompt text
+ * @param {string} toolContext Current tool action context
+ * @returns {Promise<{query: string, type: string, confidence: number}|null>} Haiku result or null
+ */
 async function haikuDispatch(userPrompt, toolContext) {
   const prompt = `Given this coding context, which resource (skill or agent) would be most helpful?
 Return ONLY valid JSON.

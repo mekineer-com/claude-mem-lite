@@ -21,6 +21,11 @@ import { DB_DIR } from './schema.mjs';
 
 // ─── Scan Sources ────────────────────────────────────────────────────────────
 
+/**
+ * Build the list of directories to scan for skill and agent resources.
+ * @param {string} dataDir Base data directory for managed resources
+ * @returns {{path: string, type: string, source: string}[]} Scan source descriptors
+ */
 function getScanSources(dataDir) {
   const home = homedir();
   return [
@@ -35,7 +40,12 @@ function getScanSources(dataDir) {
 
 // ─── Content Reading ─────────────────────────────────────────────────────────
 
-/** Read the primary markdown content file from a resource directory. */
+/**
+ * Read the primary markdown content file from a resource directory.
+ * Searches skill.md, agent.md, README.md, then any .md or .yaml file.
+ * @param {string} dirPath Absolute path to the resource directory
+ * @returns {string} File content or empty string if not found
+ */
 function readResourceContent(dirPath) {
   // Priority: skill.md / agent.md > README.md > first .md file
   const candidates = ['skill.md', 'agent.md', 'SKILL.md', 'AGENT.md', 'README.md'];
@@ -66,7 +76,11 @@ function readResourceContent(dirPath) {
   return '';
 }
 
-/** Compute SHA-256 hash of content for change detection. */
+/**
+ * Compute SHA-256 hash of content for change detection.
+ * @param {string} content File content to hash
+ * @returns {string|null} Hex-encoded SHA-256 hash, or null if content is empty
+ */
 function computeHash(content) {
   if (!content) return null;
   return createHash('sha256').update(content).digest('hex');

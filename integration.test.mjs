@@ -324,3 +324,117 @@ describe('tool flow: save → search → get roundtrip', () => {
     expect(after.length).toBe(0);
   });
 });
+
+// ─── WAL Concurrent Stress Test ─────────────────────────────────────────────
+
+describe('WAL concurrent stress test', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'stress-sess', memoryId: 'stress-sess' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('parallel inserts all succeed without corruption', async () => {
+    const workerCount = 10;
+    const insertsPerWorker = 5;
+
+    await Promise.all(
+      Array.from({ length: workerCount }, (_, w) => (async () => {
+        for (let i = 0; i < insertsPerWorker; i++) {
+          insertObs(db, {
+            sessionId: 'stress-sess',
+            title: `worker-${w}-obs-${i}`,
+            text: `stress test observation from worker ${w} iteration ${i}`,
+            importance: (i % 3) + 1,
+            epochOffset: -(w * insertsPerWorker + i) * 1000,
+          });
+        }
+      })()),
+    );
+
+    const total = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+    expect(total.c).toBe(workerCount * insertsPerWorker);
+
+    // Verify every row exists with correct title pattern
+    for (let w = 0; w < workerCount; w++) {
+      for (let i = 0; i < insertsPerWorker; i++) {
+        const row = db.prepare('SELECT title FROM observations WHERE title = ?').get(`worker-${w}-obs-${i}`);
+        expect(row).toBeTruthy();
+      }
+    }
+  });
+
+  it('concurrent reads during writes return consistent data', async () => {
+    // Pre-seed some observations
+    for (let i = 0; i < 10; i++) {
+      insertObs(db, {
+        sessionId: 'stress-sess',
+        title: `seed-obs-${i}`,
+        text: `seed observation ${i}`,
+        epochOffset: -i * 1000,
+      });
+    }
+
+    const readResults = [];
+    const writeCount = 10;
+
+    await Promise.all([
+      // Writer: insert more rows concurrently
+      (async () => {
+        for (let i = 0; i < writeCount; i++) {
+          insertObs(db, {
+            sessionId: 'stress-sess',
+            title: `concurrent-write-${i}`,
+            text: `concurrent write observation ${i}`,
+            epochOffset: -(100 + i) * 1000,
+          });
+        }
+      })(),
+      // Reader: repeatedly count rows while writes happen
+      (async () => {
+        for (let i = 0; i < 20; i++) {
+          const count = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+          readResults.push(count.c);
+        }
+      })(),
+    ]);
+
+    // Reads should always return a valid count (>= seed count, monotonically non-decreasing or stable)
+    for (const count of readResults) {
+      expect(count).toBeGreaterThanOrEqual(10);
+      expect(count).toBeLessThanOrEqual(10 + writeCount);
+    }
+
+    // Final state: all rows present
+    const finalCount = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+    expect(finalCount.c).toBe(10 + writeCount);
+  });
+
+  it('FTS index remains consistent after concurrent inserts', async () => {
+    const workerCount = 5;
+    const insertsPerWorker = 4;
+
+    await Promise.all(
+      Array.from({ length: workerCount }, (_, w) => (async () => {
+        for (let i = 0; i < insertsPerWorker; i++) {
+          insertObs(db, {
+            sessionId: 'stress-sess',
+            title: `ftsworker ${w} iteration ${i}`,
+            text: `ftsworker stress fts consistency check worker ${w}`,
+            epochOffset: -(w * insertsPerWorker + i) * 1000,
+          });
+        }
+      })()),
+    );
+
+    // FTS should find all rows matching "ftsworker"
+    const ftsRows = db.prepare(`
+      SELECT o.id FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"ftsworker"'
+    `).all();
+
+    expect(ftsRows.length).toBe(workerCount * insertsPerWorker);
+  });
+});

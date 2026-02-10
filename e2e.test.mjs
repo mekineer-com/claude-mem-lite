@@ -880,6 +880,47 @@ describe('Suite 8a: Additional E2E', () => {
     expect(claudeMd2).toContain('# Existing');
   });
 
+  it('auto-compress marks old low-importance observations during session-start', () => {
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    const sessId = `hook-parent--testproj-${randomUUID().slice(0, 8)}`;
+    const hundredDaysAgo = Date.now() - 100 * 86400000;
+
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'parent--testproj', ?, ?, 'completed')
+    `).run(sessId, sessId, now.toISOString(), now.getTime());
+
+    // Old, low-importance observation (should be auto-compressed)
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'old routine note', 'discovery', 'Old routine observation', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
+
+    // Old, higher-importance observation (should NOT be auto-compressed)
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'old notable note', 'decision', 'Old notable observation', '', '', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
+
+    db.close();
+
+    // Session-start triggers auto-compression
+    runHook('session-start', { env: { HOME: tmpHome } });
+
+    const db2 = openTestDb(tmpHome);
+    const obs = db2.prepare('SELECT id, importance, compressed_into FROM observations ORDER BY id').all();
+    db2.close();
+
+    expect(obs.length).toBe(2);
+    // importance=1 should be marked as auto-compressed
+    const lowImportance = obs.find(o => o.importance === 1);
+    expect(lowImportance.compressed_into).toBe(-1);
+    // importance=2 should be untouched
+    const highImportance = obs.find(o => o.importance === 2);
+    expect(highImportance.compressed_into).toBeNull();
+  });
+
   it('CLAUDE.md created from scratch when none exists', () => {
     const projDir3 = join(tmpHome, 'parent', 'noclaudemd');
     mkdirSync(projDir3, { recursive: true });

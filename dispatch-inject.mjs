@@ -22,8 +22,10 @@ function isNativeSkill(name) {
 // ─── Injection Templates ─────────────────────────────────────────────────────
 
 /**
- * Native skill template — shortest, just tells Claude to use the skill command.
- * Used when skill exists in ~/.claude/skills/
+ * Native skill template -- tells Claude to use the skill command.
+ * Used when skill exists in ~/.claude/skills/.
+ * @param {object} resource Resource object from DB
+ * @returns {string} Injection text referencing the native skill command
  */
 function injectSkillNative(resource) {
   return `[Auto-suggestion] A relevant skill "${resource.name}" is available for this task. ` +
@@ -32,8 +34,10 @@ function injectSkillNative(resource) {
 }
 
 /**
- * Managed skill template — includes content for Claude to use directly.
+ * Managed skill template -- includes content for Claude to use directly.
  * Used when skill is in managed/ directory (not installed natively).
+ * @param {object} resource Resource object from DB
+ * @returns {string} Injection text with embedded skill content
  */
 function injectSkillManaged(resource) {
   let content = '';
@@ -60,7 +64,9 @@ ${truncatedContent}
 }
 
 /**
- * Agent template — guides Claude to use Task tool with the agent.
+ * Agent template -- guides Claude to use Task tool with the agent definition.
+ * @param {object} resource Resource object from DB
+ * @returns {string} Injection text with agent definition for Task tool delegation
  */
 function injectAgent(resource) {
   let agentDef = '';
