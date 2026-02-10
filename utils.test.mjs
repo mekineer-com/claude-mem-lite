@@ -890,6 +890,29 @@ describe('scrubSecrets', () => {
     expect(scrubSecrets('sk_live_abcdefghijklmnopqrstuv')).toBe('***');
     expect(scrubSecrets('pk_test_abcdefghijklmnopqrstuv')).toBe('***');
   });
+
+  it('scrubs Google Cloud API keys (AIza...)', () => {
+    expect(scrubSecrets('key is AIza' + 'A'.repeat(35))).toBe('key is ***');
+    expect(scrubSecrets('AIza' + 'Bc1De'.repeat(7))).toBe('***');
+  });
+
+  it('scrubs Authorization Bearer headers', () => {
+    expect(scrubSecrets('Authorization: Bearer eyJhbGciOiJ.token.sig')).toBe('Authorization: Bearer ***');
+    expect(scrubSecrets('Authorization:Bearer some-opaque-token')).toBe('Authorization:Bearer ***');
+  });
+
+  it('scrubs Supabase/DATABASE_URL/REDIS_URL env vars', () => {
+    expect(scrubSecrets('SUPABASE_KEY=eyJhbGciOiJIUzI1NiJ9.longbase64value')).toBe('SUPABASE_KEY=***');
+    expect(scrubSecrets('SUPABASE_ANON_KEY: sb-anon-abc123def456')).toBe('SUPABASE_ANON_KEY: ***');
+    expect(scrubSecrets('SUPABASE_SERVICE_ROLE_KEY=sb-role-xyz789')).toBe('SUPABASE_SERVICE_ROLE_KEY=***');
+    expect(scrubSecrets('DATABASE_URL=postgres://user:pass@host/db')).toBe('DATABASE_URL=***');
+    expect(scrubSecrets('REDIS_URL: redis://default:tok@redis.io:6379')).toBe('REDIS_URL: ***');
+  });
+
+  it('scrubs AMQP connection strings', () => {
+    expect(scrubSecrets('amqp://user:pass@rabbit.host:5672/vhost')).toBe('amqp://***');
+    expect(scrubSecrets('connect to amqp://guest:guest@localhost')).toBe('connect to amqp://***');
+  });
 });
 
 // ─── estimateTokens ──────────────────────────────────────────────────────────

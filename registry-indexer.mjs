@@ -7,6 +7,11 @@ import { debugLog, debugCatch, truncate } from './utils.mjs';
 
 // ─── Index Prompt ────────────────────────────────────────────────────────────
 
+/**
+ * Build the LLM prompt for extracting structured metadata from a resource.
+ * @param {object} resource Scanned resource with name, type, and content
+ * @returns {string} Prompt string for Haiku JSON extraction
+ */
 function buildIndexPrompt(resource) {
   const content = truncate(resource.content, 3000);
   return `Analyze this Claude Code ${resource.type} definition and extract structured metadata.
