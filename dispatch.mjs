@@ -20,7 +20,7 @@ const READ_ONLY_TOOLS = new Set([
 ]);
 
 const CONFIDENCE_THRESHOLD = 3.0; // BM25 relevance threshold (negative values, lower = better)
-const COOLDOWN_MINUTES = 5;
+export const COOLDOWN_MINUTES = 5;
 
 // ─── Tier 0: Local Fast Filter ───────────────────────────────────────────────
 
@@ -232,7 +232,7 @@ JSON: {"query":"search keywords for finding the right skill or agent","type":"sk
 
 // ─── Cooldown & Dedup (DB-persisted, survives process restarts) ─────────────
 
-function isRecentlyRecommended(db, resourceId, sessionId) {
+export function isRecentlyRecommended(db, resourceId, sessionId) {
   // Check 1: Already recommended in this session (session dedup)
   const sessionHit = db.prepare(
     'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? LIMIT 1'

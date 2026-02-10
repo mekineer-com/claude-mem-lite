@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch } from './utils.mjs';
 import { ensureDb } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema } from './tool-schemas.mjs';
@@ -537,11 +537,10 @@ server.registerTool(
       allFields = ['id', 'prompt_text', 'content_session_id', 'prompt_number', 'created_at'];
       prefix = 'P#';
     } else {
-      // Increment access_count for retrieved observations
-      const updateStmt = db.prepare(
-        'UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id = ?'
-      );
-      db.transaction(() => { for (const id of args.ids) updateStmt.run(id); })();
+      // Increment access_count for retrieved observations (batch UPDATE)
+      db.prepare(
+        `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id IN (${placeholders})`
+      ).run(...args.ids);
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
       allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count'];
       prefix = '#';
@@ -610,7 +609,7 @@ server.registerTool(
       `).all(...likeParams);
       for (const r of referencing) {
         let ids;
-        try { ids = JSON.parse(r.related_ids); } catch { continue; }
+        try { ids = JSON.parse(r.related_ids); } catch (e) { debugCatch(e, 'deleteRelatedIds'); continue; }
         if (!Array.isArray(ids) || !ids.every(id => Number.isInteger(id))) continue;
         const filtered = ids.filter(id => !deletedIds.has(id));
         if (filtered.length !== ids.length) {
@@ -840,10 +839,6 @@ server.registerTool(
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', '[]', 2, ?, ?)
     `);
-    const markCompressed = db.prepare(
-      'UPDATE observations SET compressed_into = ? WHERE id = ?'
-    );
-
     const compress = db.transaction(() => {
       for (const [key, obs] of compressableGroups) {
         const [proj] = key.split('::');
@@ -867,9 +862,10 @@ server.registerTool(
         );
         const summaryId = Number(summaryResult.lastInsertRowid);
 
-        for (const o of obs) {
-          markCompressed.run(summaryId, o.id);
-        }
+        // Batch UPDATE instead of per-row loop
+        const obsIds = obs.map(o => o.id);
+        const obsPh = obsIds.map(() => '?').join(',');
+        db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsPh})`).run(summaryId, ...obsIds);
         totalCompressed += obs.length;
       }
     });
@@ -884,7 +880,7 @@ server.registerTool(
 // Checkpoint WAL every 5 minutes to prevent unbounded growth
 const WAL_CHECKPOINT_INTERVAL = 5 * 60 * 1000;
 const walTimer = setInterval(() => {
-  try { db.pragma('wal_checkpoint(PASSIVE)'); } catch {}
+  try { db.pragma('wal_checkpoint(PASSIVE)'); } catch (e) { debugCatch(e, 'walCheckpoint'); }
 }, WAL_CHECKPOINT_INTERVAL);
 walTimer.unref(); // Don't keep process alive just for checkpoints
 

@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { ensureRegistryDb } from './registry.mjs';
@@ -45,7 +45,10 @@ export function getSessionId() {
 export function createSessionId() {
   const project = inferProject();
   const id = `hook-${project}-${randomUUID().slice(0, 8)}`;
-  writeFileSync(sessionFile(), JSON.stringify({ id, startedAt: Date.now(), project }));
+  const file = sessionFile();
+  const tmp = file + `.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify({ id, startedAt: Date.now(), project }));
+  renameSync(tmp, file);
   return id;
 }
 
@@ -88,8 +91,8 @@ export function callLLM(prompt, timeoutMs = 15000) {
     });
     return result.trim();
   } catch (e) {
-    const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
-    if (out && out.startsWith('{') && out.endsWith('}')) return out;
+    const out = _extractResponseFromError(e);
+    if (out) return out;
     return null;
   }
 }
@@ -115,3 +118,13 @@ export function spawnBackground(bgEvent, ...extraArgs) {
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * Extract partial response from CLI error output (timeout/error recovery).
+ * @param {Error} error The caught error from execFileSync
+ * @returns {string|null} Extracted JSON string or null
+ */
+export function _extractResponseFromError(error) {
+  const out = error.stdout?.toString?.()?.trim() || error.output?.[1]?.toString?.()?.trim() || '';
+  return out && out.startsWith('{') && out.endsWith('}') ? out : null;
+}

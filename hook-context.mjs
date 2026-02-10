@@ -3,7 +3,7 @@
 
 import { join } from 'path';
 import { readFileSync, writeFileSync, renameSync } from 'fs';
-import { estimateTokens, debugLog } from './utils.mjs';
+import { estimateTokens, debugLog, debugCatch } from './utils.mjs';
 
 /**
  * Infer the project directory from environment variables or cwd.
@@ -115,7 +115,7 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
     // Diversity penalty: reduce value for file overlap with already-selected
     if (c._kind === 'obs' && c.files_modified) {
       let cFiles;
-      try { cFiles = JSON.parse(c.files_modified || '[]'); } catch { cFiles = []; }
+      try { cFiles = JSON.parse(c.files_modified || '[]'); } catch (e) { debugCatch(e, 'budgetSelect-parseFiles'); cFiles = []; }
       if (cFiles.length > 0 && selectedFiles.size > 0) {
         const overlap = cFiles.filter(f => selectedFiles.has(f)).length;
         const overlapRatio = overlap / cFiles.length;

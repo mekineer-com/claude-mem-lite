@@ -52,7 +52,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 
 ## Features
 
-- **Automatic capture** -- Hooks into Claude Code lifecycle (PostToolUse, SessionStart, Stop, UserPromptSubmit) to record observations without manual effort
+- **Automatic capture** -- Hooks into Claude Code lifecycle (PostToolUse, PreToolUse, SessionStart, Stop, UserPromptSubmit) to record observations without manual effort
 - **FTS5 search** -- BM25-ranked full-text search across observations, session summaries, and user prompts with importance weighting
 - **Timeline browsing** -- Navigate observations chronologically with anchor-based context windows
 - **Episode batching** -- Groups related file operations into coherent episodes before LLM encoding
@@ -79,6 +79,12 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Atomic writes** -- All file writes (episodes, CLAUDE.md) use write-to-tmp + rename to prevent corruption on crash
 - **Robust locking** -- PID-aware lock files with automatic stale/orphan cleanup (>30s timeout or dead PID)
 - **Stale session cleanup** -- Sessions active for >24h are automatically marked as abandoned on next start
+- **Intelligent dispatch** -- 3-tier progressive dispatch system automatically recommends the right skill or agent for the current task
+- **Resource registry** -- Indexes installed skills and agents with FTS5 search, composite scoring, and invocation tracking
+- **Closed-loop feedback** -- Tracks whether recommendations were adopted and whether sessions succeeded, improving future dispatch quality
+- **Bilingual intent recognition** -- Understands user intent in both English and Chinese (15+ EN + 12+ CN intent categories)
+- **Domain synonym expansion** -- Dispatch queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
+- **DB-persisted cooldown** -- 5-minute cross-session cooldown and per-session dedup prevent repeated recommendations
 
 ## Requirements
 
@@ -119,7 +125,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
 2. **Register MCP server** -- `mem` server with 7 tools (search, timeline, get, save, stats, delete, compress)
-3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
+3. **Configure hooks** -- `PostToolUse`, `PreToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/claude-mem-lite/` for database and runtime files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) exists, copies database and runtime files to `~/claude-mem-lite/`, preserving the original untouched
 6. **Initialize database** -- SQLite with WAL mode, FTS5 indexes created on first server start
@@ -143,7 +149,8 @@ rm -rf ~/.claude-mem/
 
 ```
 ~/claude-mem-lite/
-  claude-mem-lite.db       # SQLite database (WAL mode)
+  claude-mem-lite.db       # SQLite database — memory (WAL mode)
+  resource-registry.db     # SQLite database — skill/agent registry
   runtime/
     session-<project>    # Active session state
     ep-<project>.json    # Episode buffer
@@ -225,6 +232,7 @@ SessionStart
   -> Clean orphaned/stale lock files
   -> Query recent observations (24h)
   -> Inject context into CLAUDE.md + stdout
+  -> Dispatch: recommend skill/agent based on user prompt (Tier 0→1→2→3)
 
 PostToolUse (every tool execution)
   -> Bash pre-filter skips noise in ~5ms (Read paths tracked to reads file)
@@ -236,6 +244,9 @@ PostToolUse (every tool execution)
   -> Spawn LLM episode worker for significant episodes
   -> Error-triggered recall: search memory for related past fixes
 
+PreToolUse (before tool execution)
+  -> Dispatch: recommend skill/agent based on current action context (Tier 0→1→2)
+
 UserPromptSubmit
   -> Capture user prompt text to user_prompts table
   -> Increment session prompt counter
@@ -243,9 +254,61 @@ UserPromptSubmit
 
 Stop
   -> Flush final episode buffer
+  -> Collect dispatch feedback: adoption detection + outcome scoring
   -> Mark session completed
   -> Spawn LLM summary worker (poll-based wait)
 ```
+
+### Intelligent Dispatch
+
+The dispatch system proactively recommends skills and agents during coding sessions via a 3-tier progressive architecture:
+
+```
+Tier 0: Fast Filter (<1ms)
+  -> Skip read-only tools (Read, Glob, Grep, LSP...)
+  -> Skip simple Bash queries (ls, cat, git status...)
+  -> Skip when Claude already chose a Skill or Task agent
+  -> Skip MCP-internal tools
+
+Tier 1: Context Signal Extraction (<1ms)
+  -> Intent: extract from user prompt (test, fix, deploy, review...)
+  -> Tech stack: infer from recent file extensions (.ts → typescript)
+  -> Action: infer from tool name (Edit → edit, Bash+jest → test)
+  -> Error domain: classify errors (type-error, test-fail, build-fail...)
+
+Tier 2: FTS5 Retrieval (<5ms)
+  -> Expand signals with domain synonyms (15+ EN, 12+ CN categories)
+  -> BM25-ranked search over resource registry
+  -> Composite scoring: BM25 (40%) + repo stars (15%) + success rate (15%) + adoption rate (10%)
+
+Tier 3: Haiku Semantic Dispatch (~500ms, SessionStart only)
+  -> Activated when FTS5 confidence is low or top results are ambiguous
+  -> LLM generates semantic search query for refined retrieval
+  -> Disabled for PreToolUse (2s hook timeout insufficient)
+```
+
+**Dispatch triggers:**
+
+| Hook | Budget | Tiers | Use case |
+|------|--------|-------|----------|
+| SessionStart | 10s | 0→1→2→3 | Analyze user prompt, suggest best skill/agent upfront |
+| PreToolUse | 2s | 0→1→2 | React to current action context in real-time |
+
+**Feedback loop (Stop hook):**
+
+At session end, the system reviews all recommendations made during the session:
+- **Adoption detection** -- Did Claude actually use the recommended skill (`Skill` tool) or agent (`Task` tool)?
+- **Outcome detection** -- Was the session successful (edits without errors), partial (errors then fixes), or failed?
+- **Score calculation** -- Adopted + success = 1.0, adopted + partial = 0.5, adopted + failure = 0.2
+- Stats feed back into composite scoring, improving future dispatch quality over time
+
+**Injection templates:**
+
+| Resource type | Location | Template |
+|---------------|----------|----------|
+| Skill | `~/.claude/skills/` (native) | Short hint: use `/skill <name>` |
+| Skill | managed directory | Full skill content injected (up to 3KB) |
+| Agent | any | Agent definition injected for `Task` tool delegation |
 
 ### Episode Encoding
 
@@ -323,14 +386,27 @@ claude-mem-lite/
   server.mjs           # MCP server: tool definitions, FTS5 search, database init
   server-internals.mjs # Extracted search helpers: re-ranking, PRF, concept expansion
   hook.mjs             # Claude Code hooks: episode capture, error recall, session management
+  hook-llm.mjs         # Background LLM workers: episode extraction, session summaries
+  hook-shared.mjs      # Shared hook infrastructure: session management, DB access, LLM calls
+  hook-context.mjs     # CLAUDE.md context injection and token budgeting
+  hook-episode.mjs     # Episode buffer management: atomic writes, pending entry merging
+  hook-semaphore.mjs   # LLM concurrency control: file-based semaphore for background workers
   schema.mjs           # Database schema: single source of truth for tables, migrations, FTS5
   tool-schemas.mjs     # Shared Zod schemas for MCP tool validation
   utils.mjs            # Shared utilities: FTS5 query building, MinHash dedup, secret scrubbing
+  # Intelligent dispatch
+  dispatch.mjs         # 3-tier dispatch orchestration: fast filter, context signals, FTS5, Haiku
+  dispatch-inject.mjs  # Injection template rendering for skill/agent recommendations
+  dispatch-feedback.mjs # Closed-loop feedback: adoption detection, outcome tracking
+  registry.mjs         # Resource registry DB: schema, CRUD, FTS5, invocation tracking
+  registry-retriever.mjs # FTS5 retrieval with synonym expansion and composite scoring
+  haiku-client.mjs     # Unified Haiku LLM wrapper: direct API or CLI fallback
+  # Install & config
   install.mjs          # CLI installer: setup, uninstall, status, doctor (npx/git clone mode)
   skill.md             # MCP skill definition (npx/git clone mode)
   package.json         # Dependencies and metadata
   # Test & benchmark (dev only)
-  *.test.mjs           # Unit, property, integration, contract, E2E tests (323 tests)
+  *.test.mjs           # Unit, property, integration, contract, E2E tests (470 tests)
   test-helpers.mjs     # Shared test utilities
   benchmark/           # BM25 search quality benchmarks + CI gate
 ```
@@ -353,7 +429,7 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 
 ```bash
 npm run lint              # ESLint static analysis
-npm test                  # Run all 323 tests (vitest)
+npm test                  # Run all 470 tests (vitest)
 npm run test:smoke        # Run 5 core smoke tests
 npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
 npm run benchmark         # Run full search quality benchmark
