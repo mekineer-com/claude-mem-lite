@@ -891,16 +891,25 @@ function handleStop() {
 // ─── Token Budget Optimizer ──────────────────────────────────────────────────
 
 function selectWithTokenBudget(db, project, budget = 2000) {
-  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const now_ms = Date.now();
+  const oneDayAgo = now_ms - 24 * 60 * 60 * 1000;
+  const sevenDaysAgo = now_ms - 7 * 24 * 60 * 60 * 1000;
+  const thirtyDaysAgo = now_ms - 30 * 24 * 60 * 60 * 1000;
 
-  // Candidate pool: up to 50 recent observations + 10 session summaries
+  // Candidate pool: tiered time windows by importance
+  // 24h: all records | 7d: importance>=2 | 30d: importance=3
   const obsPool = db.prepare(`
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified
     FROM observations
-    WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+    WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+      AND (
+        (created_at_epoch > ? AND importance >= 1)
+        OR (created_at_epoch > ? AND importance >= 2)
+        OR (created_at_epoch > ? AND importance >= 3)
+      )
     ORDER BY created_at_epoch DESC
     LIMIT 50
-  `).all(project, oneDayAgo);
+  `).all(project, oneDayAgo, sevenDaysAgo, thirtyDaysAgo);
 
   const sessPool = db.prepare(`
     SELECT id, request, completed, next_steps, created_at_epoch
@@ -908,7 +917,7 @@ function selectWithTokenBudget(db, project, budget = 2000) {
     WHERE project = ? AND created_at_epoch > ?
     ORDER BY created_at_epoch DESC
     LIMIT 10
-  `).all(project, oneDayAgo);
+  `).all(project, sevenDaysAgo);
 
   const now = Date.now();
   const selectedObs = [];
@@ -1033,16 +1042,21 @@ function handleSessionStart() {
     const selected = selectWithTokenBudget(db, project, 2000);
     const observations = selected.observations;
 
-    // Fallback: recent across all projects (small — avoid context bloat)
+    // Fallback: recent across all projects with tiered windows
     let fallbackObs = [];
     if (observations.length < 3) {
+      const fbSevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
       fallbackObs = db.prepare(`
         SELECT id, type, title, project, created_at
         FROM observations
-        WHERE created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
+        WHERE COALESCE(compressed_into, 0) = 0
+          AND (
+            (created_at_epoch > ? AND importance >= 1)
+            OR (created_at_epoch > ? AND importance >= 2)
+          )
         ORDER BY created_at_epoch DESC
         LIMIT 5
-      `).all(oneDayAgo);
+      `).all(oneDayAgo, fbSevenDaysAgo);
     }
 
     // Latest session summary
