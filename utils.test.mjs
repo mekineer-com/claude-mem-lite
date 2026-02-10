@@ -134,9 +134,10 @@ describe('sanitizeFtsQuery', () => {
   });
 
   it('strips FTS5 special characters', () => {
-    expect(sanitizeFtsQuery('test{foo}')).toBe('test foo');
-    expect(sanitizeFtsQuery('test(bar)')).toBe('test bar');
-    expect(sanitizeFtsQuery('test[baz]')).toBe('test baz');
+    // "test" now has synonym "spec", so any query containing "test" gets OR-expanded
+    expect(sanitizeFtsQuery('test{foo}')).toBe('(test OR spec) AND foo');
+    expect(sanitizeFtsQuery('test(bar)')).toBe('(test OR spec) AND bar');
+    expect(sanitizeFtsQuery('test[baz]')).toBe('(test OR spec) AND baz');
     expect(sanitizeFtsQuery('a^b~c*d:e')).toBe('a b c d e');
   });
 
@@ -166,7 +167,8 @@ describe('sanitizeFtsQuery', () => {
   it('handles mixed hyphens and operators', () => {
     // "next-auth" stays quoted (has hyphen), "error" expands via synonym map
     // Uses AND joiner because of parenthesized group
-    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err)');
+    // "error" now also has semantic synonym "bug" in addition to abbreviation "err"
+    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug)');
   });
 
   it('expands abbreviation synonyms', () => {
