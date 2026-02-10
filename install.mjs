@@ -203,7 +203,7 @@ async function install() {
       const resources = manifest.resources || [];
 
       if (resources.length > 0) {
-        const managedDir = join(INSTALL_DIR, 'managed');
+        const managedDir = join(DATA_DIR, 'managed');
 
         // 6a. Git shallow clone unique repos
         const repos = new Map();
@@ -244,7 +244,7 @@ async function install() {
 
         // 6b. Init registry DB and record preinstalled entries
         const { ensureRegistryDb } = await import('./registry.mjs');
-        const regDbPath = join(INSTALL_DIR, 'resource-registry.db');
+        const regDbPath = join(DATA_DIR, 'resource-registry.db');
         const rdb = ensureRegistryDb(regDbPath);
 
         const insertPre = rdb.prepare(`
@@ -277,7 +277,7 @@ async function install() {
         // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
         log('  Scanning resources...');
         const { scanAllResources, diffResources } = await import('./registry-scanner.mjs');
-        const scanned = scanAllResources({ dataDir: INSTALL_DIR });
+        const scanned = scanAllResources({ dataDir: DATA_DIR });
 
         // Attach star counts and repo URLs
         for (const s of scanned) {
