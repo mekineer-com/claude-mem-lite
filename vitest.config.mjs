@@ -10,6 +10,7 @@ export default defineConfig({
         'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
         'registry.mjs', 'registry-retriever.mjs',
         'hook-episode.mjs', 'hook-context.mjs', 'hook-semaphore.mjs',
+        'hook-shared.mjs', 'hook-llm.mjs', 'haiku-client.mjs',
       ],
       exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'benchmark/**', 'scripts/**'],
       thresholds: {
