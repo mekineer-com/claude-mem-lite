@@ -24,6 +24,10 @@ import {
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { selectWithTokenBudget, updateClaudeMd } from './hook-context.mjs';
+import { ensureRegistryDb } from './registry.mjs';
+import { dispatchOnSessionStart, dispatchOnPreToolUse } from './dispatch.mjs';
+import { collectFeedback } from './dispatch-feedback.mjs';
+import { getClaudePath as getClaudePathShared } from './haiku-client.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -94,19 +98,22 @@ function openDb() {
   }
 }
 
-// ─── LLM via claude CLI ────────────────────────────────────────────────────
+// ─── Registry Database (dispatch system) ──────────────────────────────────
 
-function getClaudePath() {
-  try {
-    const s = JSON.parse(readFileSync(join(DB_DIR, 'settings.json'), 'utf8'));
-    if (s.CLAUDE_CODE_PATH) return s.CLAUDE_CODE_PATH;
-  } catch {}
-  return process.env.CLAUDE_CODE_PATH || 'claude';
+const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
+let _registryDb = null;
+
+function getRegistryDb() {
+  if (_registryDb) return _registryDb;
+  try { _registryDb = ensureRegistryDb(REGISTRY_DB_PATH); } catch {}
+  return _registryDb;
 }
+
+// ─── LLM via claude CLI ────────────────────────────────────────────────────
 
 function callLLM(prompt, timeoutMs = 15000) {
   try {
-    const result = execFileSync(getClaudePath(), ['-p', '--model', 'haiku'], {
+    const result = execFileSync(getClaudePathShared(), ['-p', '--model', 'haiku'], {
       input: prompt,
       timeout: timeoutMs,
       encoding: 'utf8',
@@ -635,7 +642,7 @@ JSON: {"request":"what the user was working on","investigated":"what was explore
 
 // ─── Stop Handler ───────────────────────────────────────────────────────────
 
-function handleStop() {
+async function handleStop() {
   // Capture session info BEFORE cleanup
   const sessionId = getSessionId();
   const project = inferProject();
@@ -685,6 +692,31 @@ function handleStop() {
     }
   }
 
+  // Dispatch: collect feedback on recommendations
+  // Reconstruct session tool events from invocations + DB for adoption detection
+  try {
+    const rdb = getRegistryDb();
+    if (rdb) {
+      // Query user_prompts and session data for session events
+      const memDb = openDb();
+      const sessionEvents = [];
+      if (memDb) {
+        try {
+          const prompts = memDb.prepare(
+            'SELECT prompt_text FROM user_prompts WHERE content_session_id = ? ORDER BY created_at_epoch'
+          ).all(sessionId);
+          // Provide prompts as pseudo-events for adoption detection
+          for (const p of prompts) {
+            if (p.prompt_text) {
+              sessionEvents.push({ tool_name: '_user_prompt', tool_input: { text: p.prompt_text }, tool_response: '' });
+            }
+          }
+        } catch {} finally { memDb.close(); }
+      }
+      await collectFeedback(rdb, sessionId, sessionEvents);
+    }
+  } catch (e) { debugCatch(e, 'handleStop-feedback'); }
+
   // Spawn background for session summary (pass sessionId and project)
   spawnBackground('llm-summary', sessionId, project);
 
@@ -694,7 +726,7 @@ function handleStop() {
 
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
-function handleSessionStart() {
+async function handleSessionStart() {
   // Flush any leftover episode buffer from previous session (e.g. after /clear)
   if (acquireLock()) {
     try {
@@ -817,6 +849,18 @@ function handleSessionStart() {
     // CLAUDE.md: slim (summary only — observations already in stdout)
     updateClaudeMd(summaryLines.join('\n'));
 
+    // Dispatch: recommend skill/agent based on session context
+    try {
+      const rdb = getRegistryDb();
+      if (rdb) {
+        const promptCtx = latestSummary?.next_steps || '';
+        const dispatchResult = await dispatchOnSessionStart(rdb, promptCtx, sessionId);
+        if (dispatchResult) {
+          process.stdout.write(dispatchResult + '\n');
+        }
+      }
+    } catch (e) { debugCatch(e, 'handleSessionStart-dispatch'); }
+
   } finally {
     db.close();
   }
@@ -919,6 +963,37 @@ function tryParseJson(str) {
   try { return JSON.parse(str); } catch { return {}; }
 }
 
+// ─── PreToolUse Handler (Dispatch) ──────────────────────────────────────────
+
+async function handlePreToolUse() {
+  let raw;
+  try { raw = await readStdin(); } catch { return; }
+
+  let hookData;
+  try { hookData = JSON.parse(raw.text); } catch { return; }
+
+  const rdb = getRegistryDb();
+  if (!rdb) return;
+
+  // Quick session context from user prompts DB
+  const sessionId = getSessionId();
+  const sessionCtx = { sessionId };
+  const db = openDb();
+  if (db) {
+    try {
+      const latest = db.prepare(
+        'SELECT prompt_text FROM user_prompts WHERE content_session_id = ? ORDER BY created_at_epoch DESC LIMIT 1'
+      ).get(sessionId);
+      if (latest) sessionCtx.userPrompt = latest.prompt_text;
+    } catch {} finally { db.close(); }
+  }
+
+  const injection = await dispatchOnPreToolUse(rdb, hookData, sessionCtx);
+  if (injection) {
+    process.stdout.write(injection + '\n');
+  }
+}
+
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 
 async function handleUserPrompt() {
@@ -967,9 +1042,10 @@ async function handleUserPrompt() {
 
 try {
   switch (event) {
+    case 'pre-tool-use':     await handlePreToolUse(); break;
     case 'post-tool-use':    await handlePostToolUse(); break;
-    case 'session-start':    handleSessionStart(); break;
-    case 'stop':             handleStop(); break;
+    case 'session-start':    await handleSessionStart(); break;
+    case 'stop':             await handleStop(); break;
     case 'user-prompt':      await handleUserPrompt(); break;
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;

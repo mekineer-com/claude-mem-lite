@@ -42,12 +42,23 @@ async function install() {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     const scriptsDir = join(DATA_DIR, 'scripts');
     if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
-    for (const f of ['server.mjs', 'hook.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md', 'scripts/post-tool-use.sh']) {
+    for (const f of [
+      'server.mjs', 'hook.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
+      'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs',
+      'haiku-client.mjs', 'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
+      'registry-retriever.mjs', 'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
+      'scripts/post-tool-use.sh',
+    ]) {
       const src = join(PROJECT_DIR, f);
       if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
     }
     // Ensure bash script is executable
     try { execSync(`chmod +x "${join(scriptsDir, 'post-tool-use.sh')}"`, { stdio: 'pipe' }); } catch {}
+    // Copy registry manifest
+    const registryDir = join(DATA_DIR, 'registry');
+    if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
+    const manifestSrc = join(PROJECT_DIR, 'registry', 'preinstalled.json');
+    if (existsSync(manifestSrc)) copyFileSync(manifestSrc, join(registryDir, 'preinstalled.json'));
     ok('Source files copied to ~/claude-mem-lite/');
   }
 
@@ -110,6 +121,15 @@ async function install() {
     }]
   };
 
+  const memPreToolUse = {
+    matcher: '*',
+    hooks: [{
+      type: 'command',
+      command: `node "${HOOK_PATH}" pre-tool-use`,
+      timeout: 2
+    }]
+  };
+
   const memUserPrompt = {
     matcher: '*',
     hooks: [{
@@ -120,13 +140,13 @@ async function install() {
   };
 
   // Filter out existing mem hooks, then append fresh ones
-  for (const [event, config] of [['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
+  for (const [event, config] of [['PostToolUse', memPostToolUse], ['PreToolUse', memPreToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
     const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
     settings.hooks[event] = [...existing, config];
   }
 
   writeSettings(settings);
-  ok('Hooks configured (PostToolUse, SessionStart, Stop, UserPromptSubmit)');
+  ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
 
   // 5. Migrate from old ~/.claude-mem/ if needed
   if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH) && !existsSync(join(DATA_DIR, 'claude-mem.db'))) {
@@ -164,7 +184,147 @@ async function install() {
     ok('Database renamed: claude-mem.db → claude-mem-lite.db');
   }
 
-  // 6. Verify database
+  // 6. Install pre-installed resources (skills + agents)
+  log('Setting up skill/agent registry...');
+  try {
+    const manifestPath = join(INSTALL_DIR, 'registry', 'preinstalled.json');
+    if (!existsSync(manifestPath)) {
+      // For git-clone mode, check PROJECT_DIR
+      const altPath = join(PROJECT_DIR, 'registry', 'preinstalled.json');
+      if (existsSync(altPath)) {
+        const registryDir = join(INSTALL_DIR, 'registry');
+        if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
+        copyFileSync(altPath, manifestPath);
+      }
+    }
+
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+      const resources = manifest.resources || [];
+
+      if (resources.length > 0) {
+        const managedDir = join(INSTALL_DIR, 'managed');
+
+        // 6a. Git shallow clone unique repos
+        const repos = new Map();
+        for (const r of resources) {
+          if (!repos.has(r.repo)) repos.set(r.repo, []);
+          repos.get(r.repo).push(r);
+        }
+
+        let cloned = 0;
+        for (const [repoUrl, entries] of repos) {
+          const repoName = repoUrl.split('/').slice(-2).join('-');
+          const clonePath = join(managedDir, 'repos', repoName);
+          if (!existsSync(clonePath)) {
+            try {
+              mkdirSync(join(managedDir, 'repos'), { recursive: true });
+              execSync(`git clone --depth 1 "${repoUrl}.git" "${clonePath}"`, { stdio: 'pipe', timeout: 30000 });
+              cloned++;
+            } catch {
+              warn(`  Clone failed: ${repoUrl}`);
+              continue;
+            }
+          }
+
+          // Copy resources to managed/skills/ or managed/agents/
+          for (const entry of entries) {
+            const srcPath = entry.path === '.' ? clonePath : join(clonePath, entry.path);
+            const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
+            const destPath = join(destDir, entry.name);
+            if (!existsSync(destPath) && existsSync(srcPath)) {
+              mkdirSync(destDir, { recursive: true });
+              try {
+                cpSync(srcPath, destPath, { recursive: true });
+              } catch {}
+            }
+          }
+        }
+        ok(`Repos cloned (${cloned} new / ${repos.size} total)`);
+
+        // 6b. Init registry DB and record preinstalled entries
+        const { ensureRegistryDb } = await import('./registry.mjs');
+        const regDbPath = join(INSTALL_DIR, 'resource-registry.db');
+        const rdb = ensureRegistryDb(regDbPath);
+
+        const insertPre = rdb.prepare(`
+          INSERT OR REPLACE INTO preinstalled (name, type, repo_url, repo_path, tags, enabled)
+          VALUES (?, ?, ?, ?, ?, 1)
+        `);
+        for (const r of resources) {
+          insertPre.run(r.name, r.type, r.repo, r.path, JSON.stringify(r.tags || []));
+        }
+        ok(`Registry DB initialized (${resources.length} preinstalled entries)`);
+
+        // 6c. Fetch GitHub stars (best-effort, unauthenticated)
+        log('  Fetching GitHub stars...');
+        const starCache = new Map();
+        for (const [repoUrl] of repos) {
+          const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+          if (match) {
+            try {
+              const apiUrl = `https://api.github.com/repos/${match[1]}/${match[2]}`;
+              const res = execSync(`curl -sf "${apiUrl}" 2>/dev/null`, { encoding: 'utf8', timeout: 10000 });
+              const data = JSON.parse(res);
+              if (typeof data.stargazers_count === 'number') {
+                starCache.set(repoUrl, data.stargazers_count);
+              }
+            } catch {}
+          }
+        }
+        if (starCache.size > 0) ok(`Stars fetched (${starCache.size}/${repos.size} repos)`);
+
+        // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
+        log('  Scanning resources...');
+        const { scanAllResources, diffResources } = await import('./registry-scanner.mjs');
+        const scanned = scanAllResources({ dataDir: INSTALL_DIR });
+
+        // Attach star counts and repo URLs
+        for (const s of scanned) {
+          const entry = resources.find(r => r.name === s.name && r.type === s.type);
+          if (entry) {
+            s.repoUrl = entry.repo;
+            s.repoStars = starCache.get(entry.repo) || 0;
+          }
+        }
+
+        const { toIndex } = diffResources(rdb, scanned);
+        if (toIndex.length > 0) {
+          // Use fallback indexing at install time (no Haiku calls)
+          // Full Haiku indexing happens on first SessionStart
+          const { upsertResource } = await import('./registry.mjs');
+          for (const res of toIndex) {
+            try {
+              upsertResource(rdb, {
+                name: res.name,
+                type: res.type,
+                status: 'active',
+                source: res.source,
+                repo_url: res.repoUrl || null,
+                repo_stars: res.repoStars || 0,
+                local_path: res.localPath,
+                file_hash: res.fileHash,
+                intent_tags: (res.name.replace(/-/g, ' ')),
+                domain_tags: '',
+                trigger_patterns: `when user needs ${res.name.replace(/-/g, ' ')}`,
+                capability_summary: `${res.type}: ${res.name.replace(/-/g, ' ')}`,
+              });
+            } catch {}
+          }
+          ok(`Resources registered: ${toIndex.length} indexed`);
+        }
+
+        rdb.close();
+      }
+    } else {
+      log('  No preinstalled manifest found, skipping');
+    }
+  } catch (e) {
+    warn('Resource setup: ' + e.message);
+    log('  Skills/agents will be indexed on first use');
+  }
+
+  // 7. Verify database
   if (existsSync(DB_PATH)) {
     try {
       const Database = (await import('better-sqlite3')).default;
@@ -384,7 +544,7 @@ function isMemHook(cfg) {
   return cfg.hooks.some(h => {
     const cmd = h.command || '';
     return cmd.includes('claude-mem-lite') ||
-      (cmd.includes('hook.mjs') && /\b(session-start|stop|user-prompt)\b/.test(cmd)) ||
+      (cmd.includes('hook.mjs') && /\b(session-start|stop|user-prompt|pre-tool-use)\b/.test(cmd)) ||
       cmd.includes('scripts/post-tool-use.sh');
   });
 }

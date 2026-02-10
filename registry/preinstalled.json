@@ -1,0 +1,286 @@
+{
+  "version": 1,
+  "updated_at": "2026-02-11",
+  "resources": [
+    {
+      "name": "skill-creator",
+      "type": "skill",
+      "repo": "https://github.com/anthropics/skills",
+      "path": "skills/skill-creator",
+      "tags": ["skill", "create", "develop", "extend", "meta"]
+    },
+    {
+      "name": "frontend-design",
+      "type": "skill",
+      "repo": "https://github.com/anthropics/skills",
+      "path": "skills/frontend-design",
+      "tags": ["frontend", "ui", "design", "css", "react", "component"]
+    },
+    {
+      "name": "webapp-testing",
+      "type": "skill",
+      "repo": "https://github.com/anthropics/skills",
+      "path": "skills/webapp-testing",
+      "tags": ["test", "webapp", "e2e", "browser", "qa"]
+    },
+    {
+      "name": "mcp-builder",
+      "type": "skill",
+      "repo": "https://github.com/anthropics/skills",
+      "path": "skills/mcp-builder",
+      "tags": ["mcp", "server", "tool", "integration", "build"]
+    },
+    {
+      "name": "pdf",
+      "type": "skill",
+      "repo": "https://github.com/anthropics/skills",
+      "path": "skills/pdf",
+      "tags": ["pdf", "document", "generate", "export"]
+    },
+    {
+      "name": "doc-coauthoring",
+      "type": "skill",
+      "repo": "https://github.com/anthropics/skills",
+      "path": "skills/doc-coauthoring",
+      "tags": ["documentation", "writing", "collaborate", "docs"]
+    },
+    {
+      "name": "superpowers-brainstorming",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/brainstorming",
+      "tags": ["brainstorm", "design", "planning", "creative", "ideas"]
+    },
+    {
+      "name": "superpowers-tdd",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/test-driven-development",
+      "tags": ["test", "tdd", "development", "testing", "quality"]
+    },
+    {
+      "name": "superpowers-debugging",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/systematic-debugging",
+      "tags": ["debug", "troubleshoot", "fix", "error", "systematic"]
+    },
+    {
+      "name": "superpowers-code-review",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/requesting-code-review",
+      "tags": ["review", "code-review", "quality", "audit", "feedback"]
+    },
+    {
+      "name": "superpowers-writing-plans",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/writing-plans",
+      "tags": ["plan", "architecture", "design", "spec", "implementation"]
+    },
+    {
+      "name": "superpowers-git-worktrees",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/using-git-worktrees",
+      "tags": ["git", "worktree", "branch", "isolation", "parallel"]
+    },
+    {
+      "name": "superpowers-verification",
+      "type": "skill",
+      "repo": "https://github.com/obra/superpowers",
+      "path": "skills/verification-before-completion",
+      "tags": ["verify", "check", "test", "complete", "quality"]
+    },
+    {
+      "name": "playwright-skill",
+      "type": "skill",
+      "repo": "https://github.com/lackeyjb/playwright-skill",
+      "path": ".",
+      "tags": ["playwright", "browser", "automation", "test", "e2e"]
+    },
+    {
+      "name": "planning-with-files",
+      "type": "skill",
+      "repo": "https://github.com/OthmanAdi/planning-with-files",
+      "path": ".",
+      "tags": ["plan", "files", "organize", "structure", "project"]
+    },
+    {
+      "name": "code-review-master",
+      "type": "skill",
+      "repo": "https://github.com/awesome-claude-skills/code-review-master",
+      "path": ".",
+      "tags": ["review", "code-review", "quality", "best-practices"]
+    },
+    {
+      "name": "code-review-expert",
+      "type": "skill",
+      "repo": "https://github.com/sanyuan0704/code-review-expert",
+      "path": ".",
+      "tags": ["review", "code-review", "expert", "quality"]
+    },
+    {
+      "name": "ui-ux-pro-max",
+      "type": "skill",
+      "repo": "https://github.com/nextlevelbuilder/ui-ux-pro-max-skill",
+      "path": ".",
+      "tags": ["ui", "ux", "design", "frontend", "pro"]
+    },
+    {
+      "name": "code-review-ai",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/code-review-ai",
+      "tags": ["review", "code-review", "ai", "quality", "audit"]
+    },
+    {
+      "name": "tdd-workflows",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/tdd-workflows",
+      "tags": ["test", "tdd", "workflow", "testing", "quality"]
+    },
+    {
+      "name": "debugging-toolkit",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/debugging-toolkit",
+      "tags": ["debug", "toolkit", "error", "troubleshoot", "fix"]
+    },
+    {
+      "name": "code-refactoring",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/code-refactoring",
+      "tags": ["refactor", "clean", "simplify", "restructure"]
+    },
+    {
+      "name": "code-documentation",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/code-documentation",
+      "tags": ["documentation", "docs", "readme", "jsdoc", "comment"]
+    },
+    {
+      "name": "security-scanning",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/security-scanning",
+      "tags": ["security", "scan", "vulnerability", "audit"]
+    },
+    {
+      "name": "application-performance",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/application-performance",
+      "tags": ["performance", "optimize", "profile", "benchmark"]
+    },
+    {
+      "name": "api-scaffolding",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/api-scaffolding",
+      "tags": ["api", "scaffold", "rest", "endpoint", "backend"]
+    },
+    {
+      "name": "database-design",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/database-design",
+      "tags": ["database", "schema", "sql", "design", "model"]
+    },
+    {
+      "name": "database-migrations",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/database-migrations",
+      "tags": ["database", "migration", "schema", "alter", "sql"]
+    },
+    {
+      "name": "cicd-automation",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/cicd-automation",
+      "tags": ["ci", "cd", "automation", "pipeline", "deploy"]
+    },
+    {
+      "name": "git-pr-workflows",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/git-pr-workflows",
+      "tags": ["git", "pr", "pull-request", "merge", "workflow"]
+    },
+    {
+      "name": "unit-testing",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/unit-testing",
+      "tags": ["test", "unit", "jest", "vitest", "mocha"]
+    },
+    {
+      "name": "dependency-management",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/dependency-management",
+      "tags": ["dependency", "npm", "package", "update", "manage"]
+    },
+    {
+      "name": "error-debugging",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/error-debugging",
+      "tags": ["error", "debug", "diagnose", "stack-trace", "fix"]
+    },
+    {
+      "name": "python-development",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/python-development",
+      "tags": ["python", "pip", "poetry", "django", "flask"]
+    },
+    {
+      "name": "javascript-typescript",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/javascript-typescript",
+      "tags": ["javascript", "typescript", "node", "npm", "web"]
+    },
+    {
+      "name": "cloud-infrastructure",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/cloud-infrastructure",
+      "tags": ["cloud", "aws", "gcp", "azure", "infrastructure"]
+    },
+    {
+      "name": "ui-design",
+      "type": "agent",
+      "repo": "https://github.com/wshobson/agents",
+      "path": "plugins/ui-design",
+      "tags": ["ui", "design", "frontend", "css", "component"]
+    },
+    {
+      "name": "frontend-developer",
+      "type": "agent",
+      "repo": "https://github.com/davila7/claude-code-templates",
+      "path": ".claude/agents/frontend-developer.md",
+      "tags": ["frontend", "react", "vue", "web", "component"]
+    },
+    {
+      "name": "mcp-expert",
+      "type": "agent",
+      "repo": "https://github.com/davila7/claude-code-templates",
+      "path": ".claude/agents/mcp-expert.md",
+      "tags": ["mcp", "server", "tool", "integration", "protocol"]
+    },
+    {
+      "name": "component-reviewer",
+      "type": "agent",
+      "repo": "https://github.com/davila7/claude-code-templates",
+      "path": ".claude/agents/component-reviewer.md",
+      "tags": ["component", "review", "quality", "frontend"]
+    }
+  ]
+}
