@@ -88,8 +88,13 @@ server.registerTool(
     const perSourceOffset = isCrossSource ? 0 : offset;
 
     // Parse date bounds to epoch (with validation)
+    // date_to with date-only format (YYYY-MM-DD) extends to end-of-day (23:59:59.999Z)
+    // so that "date_to=2026-02-10" includes all events on that day
     const epochFrom = args.date_from ? new Date(args.date_from).getTime() : null;
-    const epochTo = args.date_to ? new Date(args.date_to).getTime() : null;
+    let epochTo = args.date_to ? new Date(args.date_to).getTime() : null;
+    if (epochTo !== null && args.date_to && /^\d{4}-\d{2}-\d{2}$/.test(args.date_to)) {
+      epochTo += 86400000 - 1; // extend to 23:59:59.999
+    }
     if (epochFrom !== null && isNaN(epochFrom)) throw new Error(`Invalid date_from: ${args.date_from}`);
     if (epochTo !== null && isNaN(epochTo)) throw new Error(`Invalid date_to: ${args.date_to}`);
 
