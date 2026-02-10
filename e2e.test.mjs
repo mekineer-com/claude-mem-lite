@@ -719,6 +719,150 @@ describe('Suite 8a: Cross-Session MinHash Dedup', () => {
   });
 });
 
+describe('Suite 8a: Additional E2E', () => {
+  it('session-start with no existing DB creates DB', () => {
+    // Use a fresh tmpHome with no DB
+    const freshHome = makeTmpDir();
+    const freshProjDir = join(freshHome, 'parent', 'freshproj');
+    mkdirSync(freshProjDir, { recursive: true });
+
+    const { exitCode, stdout } = runHook('session-start', {
+      env: { HOME: freshHome, CLAUDE_PROJECT_DIR: freshProjDir },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('<claude-mem-context>');
+
+    // DB should have been created
+    const dbPath = join(freshHome, 'claude-mem-lite', 'claude-mem.db');
+    expect(existsSync(dbPath)).toBe(true);
+
+    try { rmSync(freshHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('expired sessions get cleaned up on session-start', () => {
+    // Seed an old active session (>24h ago)
+    const db = openTestDb(tmpHome);
+    const oldEpoch = Date.now() - 25 * 3600000;
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'parent--testproj', ?, ?, 'active')
+    `).run('old-sess', 'old-sess', new Date(oldEpoch).toISOString(), oldEpoch);
+    db.close();
+
+    // Start a new session — should mark old one as expired
+    runHook('session-start', { env: { HOME: tmpHome } });
+
+    const db2 = openTestDb(tmpHome);
+    const oldSess = db2.prepare("SELECT status FROM sdk_sessions WHERE content_session_id = 'old-sess'").get();
+    db2.close();
+    // Old active sessions should be marked as expired/completed
+    if (oldSess) {
+      expect(oldSess.status).not.toBe('active');
+    }
+  });
+
+  it('user-prompt with API key gets scrubbed', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+
+    const { exitCode } = runHook('user-prompt', {
+      stdin: JSON.stringify({ user_prompt: 'Deploy with token=sk-abc123def456ghi789jklmnopqrstuvwxyz to production' }),
+      env: { HOME: tmpHome },
+    });
+    expect(exitCode).toBe(0);
+
+    const db = openTestDb(tmpHome);
+    const prompts = db.prepare('SELECT prompt_text FROM user_prompts WHERE content_session_id = ?').all(sessionId);
+    db.close();
+    expect(prompts.length).toBe(1);
+    // The sk- token should be scrubbed
+    expect(prompts[0].prompt_text).not.toContain('sk-abc123def456ghi789jklmnopqrstuvwxyz');
+    expect(prompts[0].prompt_text).toContain('***');
+  });
+
+  it('long prompt is truncated to 10000 chars', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+
+    const longPrompt = 'A'.repeat(15000);
+    runHook('user-prompt', {
+      stdin: JSON.stringify({ user_prompt: longPrompt }),
+      env: { HOME: tmpHome },
+    });
+
+    const db = openTestDb(tmpHome);
+    const prompts = db.prepare('SELECT prompt_text FROM user_prompts WHERE content_session_id = ?').all(sessionId);
+    db.close();
+    expect(prompts.length).toBe(1);
+    expect(prompts[0].prompt_text.length).toBeLessThanOrEqual(10000);
+  });
+
+  it('CLAUDE.md idempotent: two session-starts do not duplicate context', () => {
+    const projDir2 = join(tmpHome, 'parent', 'idempotent');
+    mkdirSync(projDir2, { recursive: true });
+    writeFileSync(join(projDir2, 'CLAUDE.md'), '# Existing\n\nContent here.\n');
+
+    // Seed a summary
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    const sessId = `hook-parent--idempotent-${randomUUID().slice(0, 8)}`;
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'parent--idempotent', ?, ?, 'completed')
+    `).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'parent--idempotent', 'Test request', 'Test completed', 'Test next', ?, ?)
+    `).run(sessId, now.toISOString(), now.getTime());
+    db.close();
+
+    // First session-start
+    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
+    const claudeMd1 = readFileSync(join(projDir2, 'CLAUDE.md'), 'utf8');
+
+    // Second session-start
+    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
+    const claudeMd2 = readFileSync(join(projDir2, 'CLAUDE.md'), 'utf8');
+
+    // Count context blocks — should be exactly 1
+    const count1 = (claudeMd1.match(/<claude-mem-context>/g) || []).length;
+    const count2 = (claudeMd2.match(/<claude-mem-context>/g) || []).length;
+    expect(count1).toBe(1);
+    expect(count2).toBe(1);
+    // Original content preserved
+    expect(claudeMd2).toContain('# Existing');
+  });
+
+  it('CLAUDE.md created from scratch when none exists', () => {
+    const projDir3 = join(tmpHome, 'parent', 'noclaudemd');
+    mkdirSync(projDir3, { recursive: true });
+    // No CLAUDE.md file exists
+
+    // Seed a summary
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    const sessId = `hook-parent--noclaudemd-${randomUUID().slice(0, 8)}`;
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'parent--noclaudemd', ?, ?, 'completed')
+    `).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'parent--noclaudemd', 'Build API', 'API built', 'Add tests', ?, ?)
+    `).run(sessId, now.toISOString(), now.getTime());
+    db.close();
+
+    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3 } });
+
+    // CLAUDE.md should be created with context block
+    const claudeMdPath = join(projDir3, 'CLAUDE.md');
+    expect(existsSync(claudeMdPath)).toBe(true);
+    const content = readFileSync(claudeMdPath, 'utf8');
+    expect(content).toContain('<claude-mem-context>');
+    expect(content).toContain('Build API');
+  });
+});
+
 describe('Suite 8: CLAUDE.md Persistence', () => {
   it('session-start with summary writes CLAUDE.md context block', () => {
     // Create a project dir whose path produces project name 'parent--testproj'

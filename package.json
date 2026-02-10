@@ -11,7 +11,10 @@
     "url": "https://github.com/sdsrss/claude-mem-lite.git"
   },
   "scripts": {
+    "lint": "eslint .",
     "test": "vitest run",
+    "test:smoke": "vitest run smoke.test.mjs",
+    "test:coverage": "vitest run --coverage",
     "benchmark": "node benchmark/benchmark.mjs",
     "benchmark:gate": "node benchmark/ci-gate.mjs"
   },
@@ -37,6 +40,10 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@vitest/coverage-v8": "^4.0.18",
+    "eslint": "^10.0.0",
+    "fast-check": "^4.5.3",
     "vitest": "^4.0.18"
   }
 }

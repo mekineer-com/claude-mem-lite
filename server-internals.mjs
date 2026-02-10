@@ -1,0 +1,164 @@
+// claude-mem-lite server internal functions
+// Extracted from server.mjs for testability (server.mjs has top-level side effects)
+
+// ─── Search Re-ranking Helpers ────────────────────────────────────────────
+
+export function reRankWithContext(db, results, project) {
+  if (!results || results.length === 0) return;
+  // Get recently active files (last 2 hours, same project)
+  const twoHoursAgo = Date.now() - 2 * 3600000;
+  const recentObs = db.prepare(`
+    SELECT files_modified FROM observations
+    WHERE project = ? AND created_at_epoch > ?
+    ORDER BY created_at_epoch DESC LIMIT 10
+  `).all(project, twoHoursAgo);
+
+  const activeFiles = new Set();
+  for (const r of recentObs) {
+    try {
+      const files = JSON.parse(r.files_modified || '[]');
+      for (const f of files) activeFiles.add(f);
+    } catch {}
+  }
+  if (activeFiles.size === 0) return;
+
+  // Pre-compute active directories for directory-level matching
+  const activeDirs = new Set();
+  for (const f of activeFiles) {
+    const lastSlash = f.lastIndexOf('/');
+    if (lastSlash > 0) activeDirs.add(f.substring(0, lastSlash));
+  }
+
+  for (const result of results) {
+    if (result.source !== 'obs' || !result.files_modified) continue;
+    let resultFiles;
+    try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch { continue; }
+    if (resultFiles.length === 0) continue;
+    const exactMatches = resultFiles.filter(f => activeFiles.has(f)).length;
+    // Directory-level: same parent dir but different file (half weight)
+    const dirMatches = resultFiles.filter(f => {
+      if (activeFiles.has(f)) return false; // already counted as exact
+      const lastSlash = f.lastIndexOf('/');
+      return lastSlash > 0 && activeDirs.has(f.substring(0, lastSlash));
+    }).length;
+    const fileOverlap = (exactMatches + 0.5 * dirMatches) / resultFiles.length;
+    // BM25 scores are negative — multiply by >1 makes more negative = better rank
+    if (result.score !== null && result.score !== undefined && fileOverlap > 0) {
+      result.score *= (1.0 + 0.3 * fileOverlap);
+    }
+  }
+  // Note: caller re-sorts the main results array after this — no sort needed here
+}
+
+export function markSuperseded(results) {
+  if (!results || results.length === 0) return;
+  // Build map: file → [result objects], only for obs with files
+  const fileMap = new Map();
+  for (const r of results) {
+    if (r.source !== 'obs' || !r.files_modified) continue;
+    let files;
+    try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
+    for (const f of files) {
+      if (!fileMap.has(f)) fileMap.set(f, []);
+      fileMap.get(f).push(r);
+    }
+  }
+  // For each file with 2+ observations: mark older lower-importance as superseded
+  for (const [, obsForFile] of fileMap) {
+    if (obsForFile.length < 2) continue;
+    obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    const newest = obsForFile[0];
+    for (let i = 1; i < obsForFile.length; i++) {
+      if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
+        obsForFile[i].superseded = true;
+      }
+    }
+  }
+}
+
+// ─── Pseudo-Relevance Feedback (PRF) ────────────────────────────────────────
+// Two-phase document-level expansion: extract discriminative terms from top
+// results' full text (title + narrative), filter out query terms + stop words,
+// use TF-IDF-style scoring to find terms that appear in many top results.
+
+export const PRF_STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'was', 'were', 'been',
+  'have', 'has', 'had', 'are', 'but', 'not', 'all', 'can', 'into', 'when',
+  'which', 'their', 'will', 'would', 'could', 'should', 'also', 'than',
+  'then', 'its', 'use', 'used', 'using', 'some', 'new', 'added', 'updated',
+  'file', 'files', 'code', 'change', 'changed', 'changes',
+]);
+
+export function extractPRFTerms(results, ftsQuery, limit = 3) {
+  // Extract query tokens for exclusion
+  const queryTokens = new Set(
+    ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
+      .map(t => t.toLowerCase())
+      .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
+  );
+
+  // Count term frequencies across top results' full text
+  const termFreq = {};
+  const docCount = Math.min(results.length, 8);
+  for (let i = 0; i < docCount; i++) {
+    const r = results[i];
+    const text = ((r.title || '') + ' ' + (r.narrative || '')).toLowerCase();
+    const tokens = text.replace(/[^a-z0-9_-]/g, ' ').split(/\s+/)
+      .filter(t => t.length > 3 && !PRF_STOP_WORDS.has(t) && !queryTokens.has(t));
+    const seen = new Set();
+    for (const t of tokens) {
+      if (seen.has(t)) continue;
+      seen.add(t);
+      termFreq[t] = (termFreq[t] || 0) + 1;
+    }
+  }
+
+  // Select terms appearing in >= 2 top docs (discriminative, not noise)
+  return Object.entries(termFreq)
+    .filter(([, count]) => count >= 2)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([term]) => term);
+}
+
+// ─── Concept Co-occurrence Query Expansion ─────────────────────────────────
+// "Poor man's word2vec": find concepts that frequently co-occur with query
+// terms in existing observations, then use them to supplement sparse results.
+
+export function expandQueryByConcepts(db, ftsQuery, project) {
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT o.concepts FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+        AND (? IS NULL OR o.project = ?)
+      ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+      LIMIT 20
+    `).all(ftsQuery, project ?? null, project ?? null);
+  } catch { return []; }
+
+  if (rows.length === 0) return [];
+
+  // Count concept frequencies across matched observations
+  const freq = {};
+  for (const row of rows) {
+    for (const c of (row.concepts || '').split(/\s+/).filter(Boolean)) {
+      const cl = c.toLowerCase();
+      freq[cl] = (freq[cl] || 0) + 1;
+    }
+  }
+
+  // Filter out terms already present in the query
+  const queryTokens = new Set(
+    ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
+      .map(t => t.toLowerCase())
+      .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
+  );
+
+  return Object.entries(freq)
+    .filter(([c, count]) => count >= 2 && !queryTokens.has(c))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([concept]) => concept);
+}
