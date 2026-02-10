@@ -52,7 +52,7 @@
 
 ## 功能特性
 
-- **自动捕获** -- 挂载到 Claude Code 生命周期（PostToolUse、SessionStart、Stop、UserPromptSubmit），无需手动操作即可记录观察
+- **自动捕获** -- 挂载到 Claude Code 生命周期（PostToolUse、PreToolUse、SessionStart、Stop、UserPromptSubmit），无需手动操作即可记录观察
 - **FTS5 搜索** -- 基于 BM25 排名的全文搜索，覆盖观察、会话摘要和用户提示，支持重要度加权
 - **时间线浏览** -- 基于锚点的时间上下文窗口，按时间顺序浏览观察
 - **Episode 批处理** -- 将相关文件操作分组为连贯的 episode，再进行 LLM 编码
@@ -79,6 +79,12 @@
 - **原子写入** -- 所有文件写入（episode、CLAUDE.md）使用 write-to-tmp + rename 防止崩溃时损坏
 - **健壮锁机制** -- PID 感知的锁文件，自动清理过期（>30s）或孤儿（PID 已死）锁
 - **过期会话清理** -- 活跃超过 24 小时的会话在下次启动时自动标记为 abandoned
+- **智能调度** -- 三级渐进式调度系统，自动为当前任务推荐最合适的 skill 或 agent
+- **资源注册表** -- 对已安装的 skill 和 agent 建立 FTS5 索引，支持复合评分和调用追踪
+- **闭环反馈** -- 追踪推荐是否被采纳、会话是否成功，持续改进调度质量
+- **双语意图识别** -- 同时理解中文和英文用户意图（15+ 英文 + 12+ 中文意图类别）
+- **领域同义词扩展** -- 调度查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
+- **持久化冷却机制** -- 5 分钟跨会话冷却 + 同会话去重，避免重复推荐
 
 ## 环境要求
 
@@ -119,7 +125,7 @@ node install.mjs install
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
 2. **注册 MCP 服务器** -- `mem` 服务器，包含 7 个工具（search、timeline、get、save、stats、delete、compress）
-3. **配置钩子** -- `PostToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
+3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/claude-mem-lite/`，存放数据库和运行时文件
 5. **自动迁移** -- 如果 `~/.claude-mem/`（原版 claude-mem）存在，自动将数据库和运行时文件复制到 `~/claude-mem-lite/`，原目录保持不变
 6. **初始化数据库** -- SQLite WAL 模式，FTS5 索引在服务器首次启动时创建
@@ -143,7 +149,8 @@ rm -rf ~/.claude-mem/
 
 ```
 ~/claude-mem-lite/
-  claude-mem-lite.db       # SQLite 数据库（WAL 模式）
+  claude-mem-lite.db       # SQLite 数据库 — 记忆（WAL 模式）
+  resource-registry.db     # SQLite 数据库 — skill/agent 注册表
   runtime/
     session-<project>    # 活跃会话状态
     ep-<project>.json    # Episode 缓冲区
@@ -225,6 +232,7 @@ SessionStart
   -> 清理孤儿/过期锁文件
   -> 查询最近观察（24 小时内）
   -> 注入上下文到 CLAUDE.md + 标准输出
+  -> 调度：根据用户提示推荐 skill/agent（Tier 0→1→2→3）
 
 PostToolUse（每次工具执行）
   -> Bash 预过滤器 ~5ms 跳过噪声（Read 路径追踪到 reads 文件）
@@ -236,6 +244,9 @@ PostToolUse（每次工具执行）
   -> 为有意义的 episode 启动 LLM episode worker
   -> 错误触发回忆：搜索记忆中相关的历史修复
 
+PreToolUse（工具执行前）
+  -> 调度：根据当前操作上下文推荐 skill/agent（Tier 0→1→2）
+
 UserPromptSubmit
   -> 捕获用户提示文本到 user_prompts 表
   -> 递增会话提示计数器
@@ -243,9 +254,61 @@ UserPromptSubmit
 
 Stop
   -> 刷新最终 episode 缓冲区
+  -> 收集调度反馈：采纳检测 + 结果评分
   -> 标记会话为已完成
   -> 启动 LLM 摘要 worker（轮询等待）
 ```
+
+### 智能调度系统
+
+调度系统在编码会话中主动推荐合适的 skill 和 agent，采用三级渐进式架构：
+
+```
+Tier 0：快速过滤（<1ms）
+  -> 跳过只读工具（Read、Glob、Grep、LSP...）
+  -> 跳过简单 Bash 查询（ls、cat、git status...）
+  -> 跳过 Claude 已选择 Skill 或 Task agent 的情况
+  -> 跳过 MCP 内部工具
+
+Tier 1：上下文信号提取（<1ms）
+  -> 意图：从用户提示提取（测试、修复、部署、审查...）
+  -> 技术栈：从最近文件扩展名推断（.ts → typescript）
+  -> 动作：从工具名推断（Edit → edit, Bash+jest → test）
+  -> 错误领域：分类错误（type-error, test-fail, build-fail...）
+
+Tier 2：FTS5 检索（<5ms）
+  -> 用领域同义词扩展信号（15+ 英文、12+ 中文类别）
+  -> BM25 排名搜索资源注册表
+  -> 复合评分：BM25（40%）+ 仓库星标（15%）+ 成功率（15%）+ 采纳率（10%）
+
+Tier 3：Haiku 语义调度（~500ms，仅 SessionStart）
+  -> 当 FTS5 置信度低或前几名结果分数接近时激活
+  -> LLM 生成语义搜索查询以精细化检索
+  -> PreToolUse 禁用（2 秒 hook 超时不够）
+```
+
+**调度触发点：**
+
+| Hook | 时间预算 | 层级 | 用途 |
+|------|---------|------|------|
+| SessionStart | 10s | 0→1→2→3 | 分析用户提示，提前推荐最佳 skill/agent |
+| PreToolUse | 2s | 0→1→2 | 根据当前操作上下文实时推荐 |
+
+**反馈闭环（Stop hook）：**
+
+会话结束时，系统回顾本次会话中所有推荐：
+- **采纳检测** -- Claude 是否实际使用了推荐的 skill（`Skill` 工具）或 agent（`Task` 工具）？
+- **结果检测** -- 会话是否成功（有编辑无报错）、部分成功（报错后修复）、还是失败？
+- **评分计算** -- 采纳 + 成功 = 1.0，采纳 + 部分 = 0.5，采纳 + 失败 = 0.2
+- 统计数据回流到复合评分，持续改进调度质量
+
+**注入模板：**
+
+| 资源类型 | 位置 | 模板 |
+|---------|------|------|
+| Skill | `~/.claude/skills/`（原生） | 简短提示：使用 `/skill <name>` |
+| Skill | 托管目录 | 注入完整 skill 内容（最大 3KB） |
+| Agent | 任意 | 注入 agent 定义，用于 `Task` 工具委托 |
 
 ### Episode 编码
 
@@ -323,14 +386,27 @@ claude-mem-lite/
   server.mjs           # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
   server-internals.mjs # 搜索辅助模块：重排序、PRF、概念扩展
   hook.mjs             # Claude Code 钩子：episode 捕获、错误回忆、会话管理
+  hook-llm.mjs         # 后台 LLM worker：episode 提取、会话摘要
+  hook-shared.mjs      # 共享钩子基础设施：会话管理、数据库访问、LLM 调用
+  hook-context.mjs     # CLAUDE.md 上下文注入与 token 预算
+  hook-episode.mjs     # Episode 缓冲区管理：原子写入、待处理条目合并
+  hook-semaphore.mjs   # LLM 并发控制：基于文件的信号量
   schema.mjs           # 数据库 schema：表、迁移、FTS5 的单一事实来源
   tool-schemas.mjs     # 共享 Zod schema，用于 MCP 工具校验
   utils.mjs            # 共享工具：FTS5 查询构建、MinHash 去重、秘密擦除
+  # 智能调度
+  dispatch.mjs         # 三级调度编排：快速过滤、上下文信号、FTS5、Haiku
+  dispatch-inject.mjs  # 注入模板渲染：skill/agent 推荐
+  dispatch-feedback.mjs # 闭环反馈：采纳检测、结果追踪
+  registry.mjs         # 资源注册表 DB：schema、CRUD、FTS5、调用追踪
+  registry-retriever.mjs # FTS5 检索：同义词扩展与复合评分
+  haiku-client.mjs     # 统一 Haiku LLM 封装：直连 API 或 CLI 回退
+  # 安装与配置
   install.mjs          # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
   skill.md             # MCP 技能定义（npx/git clone 模式）
   package.json         # 依赖和元数据
   # 测试和基准（仅开发）
-  *.test.mjs           # 单元、属性、集成、契约、E2E 测试（323 个）
+  *.test.mjs           # 单元、属性、集成、契约、E2E 测试（470 个）
   test-helpers.mjs     # 共享测试工具
   benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
@@ -353,7 +429,7 @@ claude-mem-lite/
 
 ```bash
 npm run lint              # ESLint 静态分析
-npm test                  # 运行全部 323 个测试（vitest）
+npm test                  # 运行全部 470 个测试（vitest）
 npm run test:smoke        # 运行 5 个核心冒烟测试
 npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试

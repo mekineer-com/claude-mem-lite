@@ -234,6 +234,8 @@ export function getResourceById(db, id) {
 export function updateResourceStats(db, id, field) {
   const allowed = new Set(['recommend_count', 'adopt_count', 'success_count']);
   if (!allowed.has(field)) throw new Error(`Invalid stats field: ${field}`);
+  // String interpolation required: SQLite cannot parameterize column names.
+  // Safety: field is validated against allowlist above.
   db.prepare(`UPDATE resources SET ${field} = ${field} + 1, updated_at = datetime('now') WHERE id = ?`).run(id);
 }
 

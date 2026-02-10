@@ -108,13 +108,13 @@ function linkRelatedObservations(db, savedId, obs, episode) {
           LIMIT 5
         `).all(ftsQuery, newObs.id, episode.project);
         for (const m of ftsMatches) candidates.add(m.id);
-      } catch {}
+      } catch (e) { debugCatch(e, 'linkRelated-fts'); }
     }
   }
 
   // Strategy 2: file overlap (any session, recent observations)
   let newFiles;
-  try { newFiles = JSON.parse(newObs.files_modified || '[]'); } catch { newFiles = []; }
+  try { newFiles = JSON.parse(newObs.files_modified || '[]'); } catch (e) { debugCatch(e, 'linkRelated-newFiles'); newFiles = []; }
   if (!Array.isArray(newFiles) || !newFiles.every(f => typeof f === 'string')) newFiles = [];
   if (newFiles.length > 0) {
     const recentObs = db.prepare(`
@@ -124,7 +124,7 @@ function linkRelatedObservations(db, savedId, obs, episode) {
     `).all(newObs.id, Date.now() - RELATED_OBS_WINDOW_MS, episode.project);
     for (const r of recentObs) {
       let rFiles;
-      try { rFiles = JSON.parse(r.files_modified || '[]'); } catch { rFiles = []; }
+      try { rFiles = JSON.parse(r.files_modified || '[]'); } catch (e) { debugCatch(e, 'linkRelated-rFiles'); rFiles = []; }
       if (!Array.isArray(rFiles) || !rFiles.every(f => typeof f === 'string')) rFiles = [];
       if (rFiles.some(f => newFiles.includes(f))) candidates.add(r.id);
     }
@@ -133,7 +133,7 @@ function linkRelatedObservations(db, savedId, obs, episode) {
   // Apply bidirectional links (max 5 related)
   if (candidates.size > 0) {
     let newRelated;
-    try { newRelated = JSON.parse(newObs.related_ids || '[]'); } catch { newRelated = []; }
+    try { newRelated = JSON.parse(newObs.related_ids || '[]'); } catch (e) { debugCatch(e, 'linkRelated-newRelated'); newRelated = []; }
     if (!Array.isArray(newRelated) || !newRelated.every(id => Number.isInteger(id))) newRelated = [];
 
     for (const relId of [...candidates].slice(0, 5)) {
@@ -143,7 +143,7 @@ function linkRelatedObservations(db, savedId, obs, episode) {
       const rel = db.prepare('SELECT related_ids FROM observations WHERE id = ?').get(relId);
       if (rel) {
         let relRelated;
-        try { relRelated = JSON.parse(rel.related_ids || '[]'); } catch { relRelated = []; }
+        try { relRelated = JSON.parse(rel.related_ids || '[]'); } catch (e) { debugCatch(e, 'linkRelated-relRelated'); relRelated = []; }
         if (!Array.isArray(relRelated) || !relRelated.every(id => Number.isInteger(id))) relRelated = [];
         if (!relRelated.includes(newObs.id)) {
           relRelated.push(newObs.id);

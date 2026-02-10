@@ -1,6 +1,8 @@
 // claude-mem-lite server internal functions
 // Extracted from server.mjs for testability (server.mjs has top-level side effects)
 
+import { debugCatch } from './utils.mjs';
+
 // ─── Search Re-ranking Helpers ────────────────────────────────────────────
 
 /**
@@ -25,7 +27,7 @@ export function reRankWithContext(db, results, project) {
     try {
       const files = JSON.parse(r.files_modified || '[]');
       for (const f of files) activeFiles.add(f);
-    } catch {}
+    } catch (e) { debugCatch(e, 'reRankWithContext-parse'); }
   }
   if (activeFiles.size === 0) return;
 
@@ -39,7 +41,7 @@ export function reRankWithContext(db, results, project) {
   for (const result of results) {
     if (result.source !== 'obs' || !result.files_modified) continue;
     let resultFiles;
-    try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch { continue; }
+    try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch (e) { debugCatch(e, 'reRankWithContext-resultFiles'); continue; }
     if (resultFiles.length === 0) continue;
     const exactMatches = resultFiles.filter(f => activeFiles.has(f)).length;
     // Directory-level: same parent dir but different file (half weight)
@@ -69,7 +71,7 @@ export function markSuperseded(results) {
   for (const r of results) {
     if (r.source !== 'obs' || !r.files_modified) continue;
     let files;
-    try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
+    try { files = JSON.parse(r.files_modified || '[]'); } catch (e) { debugCatch(e, 'markSuperseded-parse'); continue; }
     for (const f of files) {
       if (!fileMap.has(f)) fileMap.set(f, []);
       fileMap.get(f).push(r);
@@ -165,7 +167,7 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
       ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
       LIMIT 20
     `).all(ftsQuery, project ?? null, project ?? null);
-  } catch { return []; }
+  } catch (e) { debugCatch(e, 'expandQueryByConcepts-fts'); return []; }
 
   if (rows.length === 0) return [];
 

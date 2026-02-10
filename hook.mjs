@@ -337,7 +337,7 @@ async function handleStop() {
               sessionEvents.push({ tool_name: '_user_prompt', tool_input: { text: p.prompt_text }, tool_response: '' });
             }
           }
-        } catch {} finally { memDb.close(); }
+        } catch (e) { debugCatch(e, 'handleStop-queryPrompts'); } finally { memDb.close(); }
       }
       await collectFeedback(rdb, sessionId, sessionEvents);
     }
@@ -513,7 +513,7 @@ async function handlePreToolUse() {
         'SELECT prompt_text FROM user_prompts WHERE content_session_id = ? ORDER BY created_at_epoch DESC LIMIT 1'
       ).get(sessionId);
       if (latest) sessionCtx.userPrompt = latest.prompt_text;
-    } catch {} finally { db.close(); }
+    } catch (e) { debugCatch(e, 'handlePreToolUse-queryPrompt'); } finally { db.close(); }
   }
 
   const injection = await dispatchOnPreToolUse(rdb, hookData, sessionCtx);
