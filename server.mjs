@@ -167,16 +167,17 @@ function extractPRFTerms(results, ftsQuery, limit = 3) {
 // "Poor man's word2vec": find concepts that frequently co-occur with query
 // terms in existing observations, then use them to supplement sparse results.
 
-function expandQueryByConcepts(db, ftsQuery) {
+function expandQueryByConcepts(db, ftsQuery, project) {
   let rows;
   try {
     rows = db.prepare(`
       SELECT o.concepts FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+        AND (? IS NULL OR o.project = ?)
       ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
       LIMIT 20
-    `).all(ftsQuery);
+    `).all(ftsQuery, project ?? null, project ?? null);
   } catch { return []; }
 
   if (rows.length === 0) return [];
@@ -291,7 +292,7 @@ server.registerTool(
 
           // Phase 1: Concept co-occurrence expansion
           if (obsCount < Math.ceil(limit / 2)) {
-            const expanded = expandQueryByConcepts(db, ftsQuery);
+            const expanded = expandQueryByConcepts(db, ftsQuery, args.project);
             if (expanded.length > 0) {
               const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
               try {
@@ -306,9 +307,21 @@ server.registerTool(
                   WHERE observations_fts MATCH ?
                     AND COALESCE(o.compressed_into, 0) = 0
                     AND (? IS NULL OR o.project = ?)
+                    AND (? IS NULL OR o.type = ?)
+                    AND (? IS NULL OR o.created_at_epoch >= ?)
+                    AND (? IS NULL OR o.created_at_epoch <= ?)
+                    AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
                   ORDER BY score
                   LIMIT ?
-                `).all(now, expansionFts, args.project ?? null, args.project ?? null, limit);
+                `).all(
+                  now, expansionFts,
+                  args.project ?? null, args.project ?? null,
+                  args.obs_type ?? null, args.obs_type ?? null,
+                  epochFrom, epochFrom,
+                  epochTo, epochTo,
+                  args.importance ?? null, args.importance ?? null,
+                  limit
+                );
                 for (const r of expRows) {
                   if (!existingIds.has(r.id)) {
                     existingIds.add(r.id);
@@ -325,9 +338,10 @@ server.registerTool(
               SELECT o.title, o.narrative FROM observations_fts
               JOIN observations o ON observations_fts.rowid = o.id
               WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+                AND (? IS NULL OR o.project = ?)
               ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
               LIMIT 8
-            `).all(ftsQuery);
+            `).all(ftsQuery, args.project ?? null, args.project ?? null);
             const prfTerms = extractPRFTerms(topResults, ftsQuery);
             if (prfTerms.length > 0) {
               const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
@@ -343,9 +357,21 @@ server.registerTool(
                   WHERE observations_fts MATCH ?
                     AND COALESCE(o.compressed_into, 0) = 0
                     AND (? IS NULL OR o.project = ?)
+                    AND (? IS NULL OR o.type = ?)
+                    AND (? IS NULL OR o.created_at_epoch >= ?)
+                    AND (? IS NULL OR o.created_at_epoch <= ?)
+                    AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
                   ORDER BY score
                   LIMIT ?
-                `).all(now, prfFts, args.project ?? null, args.project ?? null, limit);
+                `).all(
+                  now, prfFts,
+                  args.project ?? null, args.project ?? null,
+                  args.obs_type ?? null, args.obs_type ?? null,
+                  epochFrom, epochFrom,
+                  epochTo, epochTo,
+                  args.importance ?? null, args.importance ?? null,
+                  limit
+                );
                 for (const r of prfRows) {
                   if (!existingIds.has(r.id)) {
                     existingIds.add(r.id);
