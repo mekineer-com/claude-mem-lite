@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import Database from 'better-sqlite3';
-import { sanitizeFtsQuery, jaccardSimilarity, truncate, estimateTokens } from './utils.mjs';
+import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from './utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema } from './schema.mjs';
 
@@ -847,6 +847,370 @@ describe('SKIP_TOOLS sync between hook.mjs and post-tool-use.sh', () => {
     }
     for (const p of hookPrefixes) {
       expect(bashPrefixSet.has(p), `Prefix "${p}" in hook.mjs but not in post-tool-use.sh`).toBe(true);
+    }
+  });
+});
+
+// ─── BM25 Scoring Formula ────────────────────────────────────────────────────
+
+describe('BM25 scoring formula', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('recency decay: newer obs scores better', () => {
+    insertObs(db, { title: 'recency test subject alpha', text: 'recency test subject alpha', epochOffset: -30 * 86400000 });
+    insertObs(db, { title: 'recency test subject alpha', text: 'recency test subject alpha', epochOffset: -1000 });
+
+    const now = Date.now();
+    const rows = db.prepare(`
+      SELECT o.id, o.created_at_epoch,
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+               * (0.5 + 0.5 * COALESCE(o.importance, 1))
+               * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"recency"'
+      ORDER BY score
+    `).all(now);
+    expect(rows.length).toBe(2);
+    // More recent should have better (more negative) score
+    const newer = rows.find(r => r.created_at_epoch > now - 86400000);
+    const older = rows.find(r => r.created_at_epoch < now - 86400000);
+    expect(newer.score).toBeLessThan(older.score);
+  });
+
+  it('project boost: current project gets 2x', () => {
+    insertObs(db, { title: 'projboost alpha test term', text: 'projboost alpha test term', project: 'myproject' });
+    insertObs(db, { title: 'projboost alpha test term', text: 'projboost alpha test term', project: 'other' });
+
+    const now = Date.now();
+    const rows = db.prepare(`
+      SELECT o.id, o.project,
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+               * (CASE WHEN o.project = 'myproject' THEN 2.0 ELSE 1.0 END)
+               * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"projboost"'
+      ORDER BY score
+    `).all(now);
+    expect(rows.length).toBe(2);
+    const boosted = rows.find(r => r.project === 'myproject');
+    const notBoosted = rows.find(r => r.project === 'other');
+    expect(boosted.score).toBeLessThan(notBoosted.score);
+  });
+
+  it('importance weight: higher importance scores better', () => {
+    insertObs(db, { title: 'impweight unique test term', text: 'impweight unique test term', importance: 1 });
+    insertObs(db, { title: 'impweight unique test term', text: 'impweight unique test term', importance: 3 });
+
+    const now = Date.now();
+    const rows = db.prepare(`
+      SELECT o.id, o.importance,
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+               * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"impweight"'
+      ORDER BY score
+    `).all(now);
+    expect(rows.length).toBe(2);
+    const highImp = rows.find(r => r.importance === 3);
+    const lowImp = rows.find(r => r.importance === 1);
+    expect(highImp.score).toBeLessThan(lowImp.score);
+  });
+
+  it('access_count boost: frequently accessed scores better', () => {
+    insertObs(db, { title: 'accboost unique test term', text: 'accboost unique test term', accessCount: 0 });
+    insertObs(db, { title: 'accboost unique test term', text: 'accboost unique test term', accessCount: 100 });
+
+    const now = Date.now();
+    const rows = db.prepare(`
+      SELECT o.id, o.access_count,
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+               * (0.5 + 0.5 * COALESCE(o.importance, 1))
+               * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"accboost"'
+      ORDER BY score
+    `).all(now);
+    expect(rows.length).toBe(2);
+    const highAcc = rows.find(r => r.access_count === 100);
+    const lowAcc = rows.find(r => r.access_count === 0);
+    expect(highAcc.score).toBeLessThan(lowAcc.score);
+  });
+
+  it('BM25 base score is negative', () => {
+    insertObs(db, { title: 'bm25base unique test term', text: 'bm25base unique test term' });
+
+    const rows = db.prepare(`
+      SELECT bm25(observations_fts, 10, 5, 5, 3, 3, 2) as raw_score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"bm25base"'
+    `).all();
+    expect(rows.length).toBe(1);
+    expect(rows[0].raw_score).toBeLessThan(0);
+  });
+});
+
+// ─── mem_timeline ────────────────────────────────────────────────────────────
+
+describe('mem_timeline', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('FTS auto-anchor finds matching observation', () => {
+    insertObs(db, { title: 'timeline anchor target observation', text: 'timeline anchor target observation' });
+
+    const ftsQuery = '"timeline" AND "anchor"';
+    const now = Date.now();
+    const row = db.prepare(`
+      SELECT o.id FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ?
+        AND COALESCE(o.compressed_into, 0) = 0
+      ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+        * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+      LIMIT 1
+    `).get(ftsQuery, now);
+    expect(row).toBeDefined();
+    expect(row.id).toBeGreaterThan(0);
+  });
+
+  it('returns most recent when no anchor specified', () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `timeline obs ${i}`, epochOffset: -i * 86400000 });
+    }
+    const rows = db.prepare(`
+      SELECT id, title FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0
+      ORDER BY created_at_epoch DESC LIMIT 11
+    `).all();
+    expect(rows.length).toBe(5);
+    expect(rows[0].title).toBe('timeline obs 0');
+  });
+
+  it('filters by project', () => {
+    insertObs(db, { title: 'proj a obs', project: 'proj-a' });
+    insertObs(db, { title: 'proj b obs', project: 'proj-b' });
+
+    const rows = db.prepare(`
+      SELECT id, title FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0 AND project = ?
+      ORDER BY created_at_epoch DESC LIMIT 11
+    `).all('proj-a');
+    expect(rows.length).toBe(1);
+    expect(rows[0].title).toBe('proj a obs');
+  });
+
+  it('handles non-existent anchor gracefully', () => {
+    const row = db.prepare('SELECT created_at_epoch FROM observations WHERE id = ?').get(99999);
+    expect(row).toBeUndefined();
+  });
+});
+
+// ─── mem_compress full flow ─────────────────────────────────────────────────
+
+describe('mem_compress full flow', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('preview returns correct count', () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `compress preview ${i}`, importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+    }
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL
+    `).all(cutoff);
+    expect(candidates.length).toBe(5);
+  });
+
+  it('creates summary observation with correct type', () => {
+    // Create 4 old obs in same week
+    for (let i = 0; i < 4; i++) {
+      insertObs(db, { title: `compress target ${i}`, type: 'change', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 + i * 1000 });
+    }
+
+    // Execute compression manually
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id, project, type, title, created_at, created_at_epoch FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL ORDER BY project, created_at_epoch
+    `).all(cutoff);
+
+    const groups = new Map();
+    for (const c of candidates) {
+      const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+
+    const compressable = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
+    expect(compressable.length).toBeGreaterThanOrEqual(1);
+
+    // Create summary
+    const [, obs] = compressable[0];
+    const narrative = obs.map(o => `- ${o.title}`).join('\n');
+    const now = new Date();
+
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run('compress-test', 'compress-test', 'test', now.toISOString(), now.getTime());
+
+    const result = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, ?, 'change', ?, '', ?, '', '', '[]', '[]', 2, ?, ?)
+    `).run('compress-test', 'test', narrative, `Weekly summary: ${obs.length} change observations`, narrative, now.toISOString(), now.getTime());
+
+    const summaryId = Number(result.lastInsertRowid);
+    for (const o of obs) {
+      db.prepare('UPDATE observations SET compressed_into = ? WHERE id = ?').run(summaryId, o.id);
+    }
+
+    // Verify summary exists
+    const summary = db.prepare('SELECT * FROM observations WHERE id = ?').get(summaryId);
+    expect(summary.type).toBe('change');
+    expect(summary.importance).toBe(2);
+    expect(summary.title).toContain('Weekly summary');
+  });
+
+  it('marks originals with compressed_into', () => {
+    for (let i = 0; i < 3; i++) {
+      insertObs(db, { title: `mark target ${i}`, importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+    }
+    // Simulate marking
+    db.prepare('UPDATE observations SET compressed_into = 999 WHERE id = 1').run();
+    const obs = db.prepare('SELECT compressed_into FROM observations WHERE id = 1').get();
+    expect(obs.compressed_into).toBe(999);
+  });
+
+  it('compressed obs are invisible to FTS search', () => {
+    insertObs(db, { title: 'compressible searchable unique', text: 'compressible searchable unique' });
+    db.prepare('UPDATE observations SET compressed_into = 100 WHERE id = 1').run();
+
+    const rows = db.prepare(`
+      SELECT o.id FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH '"compressible"'
+        AND COALESCE(o.compressed_into, 0) = 0
+    `).all();
+    expect(rows.length).toBe(0);
+  });
+
+  it('skips groups with fewer than 3 observations', () => {
+    insertObs(db, { title: 'small A', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+    insertObs(db, { title: 'small B', importance: 1, accessCount: 0, epochOffset: -90 * 86400000 });
+
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id, project, type, title, created_at, created_at_epoch FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL ORDER BY project, created_at_epoch
+    `).all(cutoff);
+
+    const groups = new Map();
+    for (const c of candidates) {
+      const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+    const compressable = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
+    expect(compressable.length).toBe(0);
+  });
+
+  it('preserves high-importance observations', () => {
+    // High-importance obs should not be candidates
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: `important ${i}`, importance: 3, accessCount: 0, epochOffset: -90 * 86400000 });
+    }
+    const cutoff = Date.now() - 60 * 86400000;
+    const candidates = db.prepare(`
+      SELECT id FROM observations
+      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND created_at_epoch < ? AND compressed_into IS NULL
+    `).all(cutoff);
+    expect(candidates.length).toBe(0);
+  });
+});
+
+// ─── Cross-source merge ─────────────────────────────────────────────────────
+
+describe('cross-source merge', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', memoryId: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('FTS results sorted by score (more negative = better)', () => {
+    const results = [
+      { source: 'obs', id: 1, score: -3.0 },
+      { source: 'session', id: 2, score: -8.0 },
+      { source: 'obs', id: 3, score: -5.0 },
+    ];
+    results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+    expect(results[0].score).toBe(-8.0);
+    expect(results[2].score).toBe(-3.0);
+  });
+
+  it('non-FTS results sorted by date descending', () => {
+    const results = [
+      { source: 'obs', id: 1, dateEpoch: 1000 },
+      { source: 'obs', id: 2, dateEpoch: 3000 },
+      { source: 'obs', id: 3, dateEpoch: 2000 },
+    ];
+    results.sort((a, b) => (b.dateEpoch ?? 0) - (a.dateEpoch ?? 0));
+    expect(results[0].dateEpoch).toBe(3000);
+    expect(results[2].dateEpoch).toBe(1000);
+  });
+
+  it('cross-source interleaving by score', () => {
+    const results = [
+      { source: 'obs', id: 1, score: -2.0 },
+      { source: 'session', id: 2, score: -5.0 },
+      { source: 'prompt', id: 3, score: -3.0 },
+    ];
+    results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+    expect(results.map(r => r.source)).toEqual(['session', 'prompt', 'obs']);
+  });
+
+  it('pagination: offset+limit slices correctly', () => {
+    const results = Array.from({ length: 30 }, (_, i) => ({ id: i, score: -(30 - i) }));
+    results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+
+    const page1 = results.slice(0, 10);
+    const page2 = results.slice(10, 20);
+
+    expect(page1.length).toBe(10);
+    expect(page2.length).toBe(10);
+    // No overlap
+    const page1Ids = new Set(page1.map(r => r.id));
+    for (const r of page2) {
+      expect(page1Ids.has(r.id)).toBe(false);
     }
   });
 });

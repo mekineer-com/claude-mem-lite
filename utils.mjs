@@ -228,7 +228,7 @@ function expandToken(token) {
 export function sanitizeFtsQuery(query) {
   if (!query) return null;
   const cleaned = query
-    .replace(/[{}()\[\]^~*:]/g, ' ')
+    .replace(/[{}()[\]^~*:]/g, ' ')
     .replace(/(^|\s)-/g, '$1')
     .trim();
   if (!cleaned) return null;
