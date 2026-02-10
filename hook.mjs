@@ -547,7 +547,7 @@ async function handleUserPrompt() {
   let hookData;
   try { hookData = JSON.parse(raw.text); } catch { return; }
 
-  const promptText = hookData.user_prompt;
+  const promptText = hookData.prompt || hookData.user_prompt;
   if (!promptText || typeof promptText !== 'string') return;
 
   const db = openDb();
