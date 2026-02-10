@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
 const DATA_DIR = join(homedir(), 'claude-mem-lite');
-const DB_PATH = join(DATA_DIR, 'claude-mem.db');
+const DB_PATH = join(DATA_DIR, 'claude-mem-lite.db');
 const OLD_DATA_DIR = join(homedir(), '.claude-mem');
 
 // Detect ephemeral context (npx) — files won't persist after exit
@@ -129,14 +129,16 @@ async function install() {
   ok('Hooks configured (PostToolUse, SessionStart, Stop, UserPromptSubmit)');
 
   // 5. Migrate from old ~/.claude-mem/ if needed
-  if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH)) {
+  if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH) && !existsSync(join(DATA_DIR, 'claude-mem.db'))) {
     log('Detected old ~/.claude-mem/ directory, migrating to ~/claude-mem-lite/...');
     try {
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      // Migrate database and WAL/SHM files
-      for (const f of ['claude-mem.db', 'claude-mem.db-wal', 'claude-mem.db-shm']) {
-        const src = join(OLD_DATA_DIR, f);
-        if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
+      // Migrate database and WAL/SHM files (copy as claude-mem-lite.db)
+      const srcDb = join(OLD_DATA_DIR, 'claude-mem.db');
+      if (existsSync(srcDb)) copyFileSync(srcDb, DB_PATH);
+      for (const ext of ['-wal', '-shm']) {
+        const src = join(OLD_DATA_DIR, 'claude-mem.db' + ext);
+        if (existsSync(src)) copyFileSync(src, DB_PATH + ext);
       }
       // Migrate runtime directory
       const oldRuntime = join(OLD_DATA_DIR, 'runtime');
@@ -148,8 +150,18 @@ async function install() {
       log('Old ~/.claude-mem/ preserved (remove manually when ready)');
     } catch (e) {
       warn('Migration failed: ' + e.message);
-      log('You can copy manually: cp ~/.claude-mem/claude-mem.db ~/claude-mem-lite/');
+      log('You can copy manually: cp ~/.claude-mem/claude-mem.db ~/claude-mem-lite/claude-mem-lite.db');
     }
+  }
+
+  // 5b. Rename claude-mem.db → claude-mem-lite.db in same directory
+  const oldDbInDir = join(DATA_DIR, 'claude-mem.db');
+  if (existsSync(oldDbInDir) && !existsSync(DB_PATH)) {
+    renameSync(oldDbInDir, DB_PATH);
+    for (const ext of ['-wal', '-shm']) {
+      if (existsSync(oldDbInDir + ext)) try { renameSync(oldDbInDir + ext, DB_PATH + ext); } catch {}
+    }
+    ok('Database renamed: claude-mem.db → claude-mem-lite.db');
   }
 
   // 6. Verify database

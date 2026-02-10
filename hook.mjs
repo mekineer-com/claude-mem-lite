@@ -501,7 +501,7 @@ async function handlePostToolUse() {
             `).all(ftsQ, project);
             if (rows.length > 0) {
               const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
-              process.stdout.write(`[claude-mem] File history for ${fname}:\n${hints}\n`);
+              process.stdout.write(`[claude-mem-lite] File history for ${fname}:\n${hints}\n`);
             }
           } catch (e) { debugCatch(e, 'fileHistory'); }
           if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
@@ -545,7 +545,7 @@ function triggerErrorRecall(db, toolInput, response) {
 
     if (rows.length > 0) {
       const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
-      process.stdout.write(`[claude-mem] Related memories found for this error:\n${hints}\n  → Use mem_get(ids=[${rows.map(r => r.id).join(',')}]) for details.\n`);
+      process.stdout.write(`[claude-mem-lite] Related memories found for this error:\n${hints}\n  → Use mem_get(ids=[${rows.map(r => r.id).join(',')}]) for details.\n`);
     }
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }

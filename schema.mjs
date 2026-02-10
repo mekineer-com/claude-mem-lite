@@ -5,10 +5,10 @@
 import Database from 'better-sqlite3';
 import { homedir } from 'os';
 import { join } from 'path';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, renameSync } from 'fs';
 
 export const DB_DIR = join(homedir(), 'claude-mem-lite');
-export const DB_PATH = join(DB_DIR, 'claude-mem.db');
+export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -150,6 +150,15 @@ export function initSchema(db) {
  */
 export function ensureDb() {
   if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
+
+  // Auto-migrate old filename in same directory (claude-mem.db → claude-mem-lite.db)
+  const oldPath = join(DB_DIR, 'claude-mem.db');
+  if (!existsSync(DB_PATH) && existsSync(oldPath)) {
+    renameSync(oldPath, DB_PATH);
+    for (const ext of ['-wal', '-shm']) {
+      if (existsSync(oldPath + ext)) try { renameSync(oldPath + ext, DB_PATH + ext); } catch {}
+    }
+  }
 
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');

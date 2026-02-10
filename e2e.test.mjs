@@ -28,7 +28,7 @@ function initTestDb(tmpHome) {
   mkdirSync(dbDir, { recursive: true });
   mkdirSync(join(dbDir, 'runtime'), { recursive: true });
 
-  const dbPath = join(dbDir, 'claude-mem.db');
+  const dbPath = join(dbDir, 'claude-mem-lite.db');
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = OFF');
@@ -41,7 +41,7 @@ function initTestDb(tmpHome) {
 }
 
 function openTestDb(tmpHome) {
-  const dbPath = join(tmpHome, 'claude-mem-lite', 'claude-mem.db');
+  const dbPath = join(tmpHome, 'claude-mem-lite', 'claude-mem-lite.db');
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 3000');
@@ -641,7 +641,7 @@ describe('Suite 6: Error Recall', () => {
       env: { HOME: tmpHome },
     });
 
-    expect(stdout).toContain('[claude-mem] Related memories found for this error');
+    expect(stdout).toContain('[claude-mem-lite] Related memories found for this error');
     expect(stdout).toContain('ECONNREFUSED');
   });
 });
@@ -733,10 +733,57 @@ describe('Suite 8a: Additional E2E', () => {
     expect(stdout).toContain('<claude-mem-context>');
 
     // DB should have been created
-    const dbPath = join(freshHome, 'claude-mem-lite', 'claude-mem.db');
+    const dbPath = join(freshHome, 'claude-mem-lite', 'claude-mem-lite.db');
     expect(existsSync(dbPath)).toBe(true);
 
     try { rmSync(freshHome, { recursive: true, force: true }); } catch {}
+  });
+
+  it('auto-migrates claude-mem.db → claude-mem-lite.db on session-start', () => {
+    // Create a fresh home with old DB filename
+    const migrateHome = makeTmpDir();
+    const migrateDbDir = join(migrateHome, 'claude-mem-lite');
+    mkdirSync(migrateDbDir, { recursive: true });
+    mkdirSync(join(migrateDbDir, 'runtime'), { recursive: true });
+
+    // Create DB with old filename
+    const oldDbPath = join(migrateDbDir, 'claude-mem.db');
+    const db = new Database(oldDbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+    // Insert a marker observation
+    const now = new Date();
+    const sessId = 'migrate-test-sess';
+    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'marker', 'discovery', 'Migration marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run(sessId, now.toISOString(), now.getTime());
+    db.close();
+
+    // Old file should exist, new should not
+    expect(existsSync(oldDbPath)).toBe(true);
+    const newDbPath = join(migrateDbDir, 'claude-mem-lite.db');
+    expect(existsSync(newDbPath)).toBe(false);
+
+    // Session-start triggers ensureDb() which auto-migrates
+    const migrateProjDir = join(migrateHome, 'parent', 'migrateproj');
+    mkdirSync(migrateProjDir, { recursive: true });
+    const { exitCode } = runHook('session-start', {
+      env: { HOME: migrateHome, CLAUDE_PROJECT_DIR: migrateProjDir },
+    });
+    expect(exitCode).toBe(0);
+
+    // Old file should be gone, new file should exist
+    expect(existsSync(oldDbPath)).toBe(false);
+    expect(existsSync(newDbPath)).toBe(true);
+
+    // Verify data survived migration
+    const db2 = new Database(newDbPath, { readonly: true });
+    const obs = db2.prepare("SELECT title FROM observations WHERE title = 'Migration marker'").get();
+    db2.close();
+    expect(obs).not.toBeUndefined();
+    expect(obs.title).toBe('Migration marker');
+
+    try { rmSync(migrateHome, { recursive: true, force: true }); } catch {}
   });
 
   it('expired sessions get cleaned up on session-start', () => {

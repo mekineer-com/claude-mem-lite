@@ -20,6 +20,7 @@
   },
   "files": [
     "server.mjs",
+    "server-internals.mjs",
     "hook.mjs",
     "install.mjs",
     "utils.mjs",
