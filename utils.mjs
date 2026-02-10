@@ -341,15 +341,23 @@ export function extractFilePaths(input) {
 
 // ─── Episode Logic ───────────────────────────────────────────────────────────
 
+// Strip test/spec suffixes to match source ↔ test file siblings
+// auth.test.ts → auth.ts, auth.spec.js → auth.js, auth.e2e.ts → auth.ts
+export function stripTestSuffix(filePath) {
+  return basename(filePath).replace(/\.(test|spec|e2e)\./i, '.');
+}
+
 export function isRelatedToEpisode(episode, newFiles) {
   // No files (Bash, Grep without file context) → always related
   if (newFiles.length === 0) return true;
   if (episode.files.length === 0) return true;
-  // Check file or directory overlap
+  // Check file, directory, or test-sibling overlap
   for (const nf of newFiles) {
     for (const ef of episode.files) {
       if (nf === ef) return true;
       if (dirname(nf) === dirname(ef)) return true;
+      // Test file ↔ source file (auth.ts ↔ auth.test.ts across directories)
+      if (stripTestSuffix(nf) === stripTestSuffix(ef)) return true;
     }
   }
   return false;
