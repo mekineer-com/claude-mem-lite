@@ -64,15 +64,28 @@ function reRankWithContext(db, results, project) {
   }
   if (activeFiles.size === 0) return;
 
+  // Pre-compute active directories for directory-level matching
+  const activeDirs = new Set();
+  for (const f of activeFiles) {
+    const lastSlash = f.lastIndexOf('/');
+    if (lastSlash > 0) activeDirs.add(f.substring(0, lastSlash));
+  }
+
   for (const result of results) {
     if (result.source !== 'obs' || !result.files_modified) continue;
     let resultFiles;
     try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch { continue; }
     if (resultFiles.length === 0) continue;
-    const commonFiles = resultFiles.filter(f => activeFiles.has(f));
-    const fileOverlap = commonFiles.length / resultFiles.length;
+    const exactMatches = resultFiles.filter(f => activeFiles.has(f)).length;
+    // Directory-level: same parent dir but different file (half weight)
+    const dirMatches = resultFiles.filter(f => {
+      if (activeFiles.has(f)) return false; // already counted as exact
+      const lastSlash = f.lastIndexOf('/');
+      return lastSlash > 0 && activeDirs.has(f.substring(0, lastSlash));
+    }).length;
+    const fileOverlap = (exactMatches + 0.5 * dirMatches) / resultFiles.length;
     // BM25 scores are negative — multiply by >1 makes more negative = better rank
-    if (result.score != null) {
+    if (result.score != null && fileOverlap > 0) {
       result.score *= (1.0 + 0.3 * fileOverlap);
     }
   }
@@ -103,6 +116,47 @@ function markSuperseded(results) {
       }
     }
   }
+}
+
+// ─── Concept Co-occurrence Query Expansion ─────────────────────────────────
+// "Poor man's word2vec": find concepts that frequently co-occur with query
+// terms in existing observations, then use them to supplement sparse results.
+
+function expandQueryByConcepts(db, ftsQuery) {
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT o.concepts FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+      ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+      LIMIT 20
+    `).all(ftsQuery);
+  } catch { return []; }
+
+  if (rows.length === 0) return [];
+
+  // Count concept frequencies across matched observations
+  const freq = {};
+  for (const row of rows) {
+    for (const c of (row.concepts || '').split(/\s+/).filter(Boolean)) {
+      const cl = c.toLowerCase();
+      freq[cl] = (freq[cl] || 0) + 1;
+    }
+  }
+
+  // Filter out terms already present in the query
+  const queryTokens = new Set(
+    ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
+      .map(t => t.toLowerCase())
+      .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
+  );
+
+  return Object.entries(freq)
+    .filter(([c, count]) => count >= 2 && !queryTokens.has(c))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([concept]) => concept);
 }
 
 // ─── Tool: mem_search ───────────────────────────────────────────────────────
@@ -181,6 +235,38 @@ server.registerTool(
         );
         for (const r of rows) {
           results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
+        }
+
+        // Concept co-occurrence expansion: when primary results are sparse,
+        // find related observations via co-occurring concepts (pseudo-relevance feedback)
+        if (rows.length > 0 && rows.length < Math.ceil(limit / 2)) {
+          const expanded = expandQueryByConcepts(db, ftsQuery);
+          if (expanded.length > 0) {
+            const existingIds = new Set(results.filter(r => r.source === 'obs').map(r => r.id));
+            const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
+            try {
+              const expRows = db.prepare(`
+                SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+                       o.files_modified,
+                       bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+                         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+                         * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+                FROM observations_fts
+                JOIN observations o ON observations_fts.rowid = o.id
+                WHERE observations_fts MATCH ?
+                  AND COALESCE(o.compressed_into, 0) = 0
+                  AND (? IS NULL OR o.project = ?)
+                ORDER BY score
+                LIMIT ?
+              `).all(now, expansionFts, args.project ?? null, args.project ?? null, limit);
+              for (const r of expRows) {
+                if (!existingIds.has(r.id)) {
+                  existingIds.add(r.id);
+                  results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+                }
+              }
+            } catch { /* expansion is best-effort */ }
+          }
         }
       } else {
         // Structured filter (no FTS)

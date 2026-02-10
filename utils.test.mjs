@@ -12,6 +12,7 @@ import {
   extractFilePaths,
   parseJsonFromLLM,
   isRelatedToEpisode,
+  stripTestSuffix,
   makeEntryDesc,
   scrubSecrets,
   estimateTokens,
@@ -624,6 +625,32 @@ describe('parseJsonFromLLM', () => {
   });
 });
 
+// ─── stripTestSuffix ─────────────────────────────────────────────────────────
+
+describe('stripTestSuffix', () => {
+  it('strips .test. suffix', () => {
+    expect(stripTestSuffix('/src/auth.test.ts')).toBe('auth.ts');
+  });
+
+  it('strips .spec. suffix', () => {
+    expect(stripTestSuffix('/tests/auth.spec.js')).toBe('auth.js');
+  });
+
+  it('strips .e2e. suffix', () => {
+    expect(stripTestSuffix('/e2e/auth.e2e.ts')).toBe('auth.ts');
+  });
+
+  it('leaves non-test files unchanged', () => {
+    expect(stripTestSuffix('/src/auth.ts')).toBe('auth.ts');
+    expect(stripTestSuffix('/src/test-utils.js')).toBe('test-utils.js');
+  });
+
+  it('is case insensitive', () => {
+    expect(stripTestSuffix('/src/auth.Test.ts')).toBe('auth.ts');
+    expect(stripTestSuffix('/src/auth.SPEC.js')).toBe('auth.js');
+  });
+});
+
 // ─── isRelatedToEpisode ──────────────────────────────────────────────────────
 
 describe('isRelatedToEpisode', () => {
@@ -647,6 +674,20 @@ describe('isRelatedToEpisode', () => {
 
   it('returns false for unrelated files in different directories', () => {
     expect(isRelatedToEpisode(mkEpisode(['/src/foo.js']), ['/test/bar.js'])).toBe(false);
+  });
+
+  it('returns true for test file ↔ source file siblings', () => {
+    // auth.ts ↔ auth.test.ts (different directories)
+    expect(isRelatedToEpisode(mkEpisode(['/src/auth.ts']), ['/tests/auth.test.ts'])).toBe(true);
+    // auth.js ↔ auth.spec.js
+    expect(isRelatedToEpisode(mkEpisode(['/src/auth.js']), ['/tests/auth.spec.js'])).toBe(true);
+    // auth.ts ↔ auth.e2e.ts
+    expect(isRelatedToEpisode(mkEpisode(['/src/auth.ts']), ['/e2e/auth.e2e.ts'])).toBe(true);
+  });
+
+  it('does not false-positive on unrelated test files', () => {
+    // auth.ts ↔ login.test.ts (different base name)
+    expect(isRelatedToEpisode(mkEpisode(['/src/auth.ts']), ['/tests/login.test.ts'])).toBe(false);
   });
 
   it('returns true if any file pair overlaps', () => {
