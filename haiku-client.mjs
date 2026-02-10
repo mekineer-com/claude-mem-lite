@@ -1,4 +1,3 @@
-/* global fetch, AbortController */
 // claude-mem-lite: Unified Haiku LLM call wrapper
 // Shared by memory (hook.mjs) and dispatch modules
 // Auto-detects API key for direct calls, falls back to claude CLI
