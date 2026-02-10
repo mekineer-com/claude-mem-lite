@@ -17,6 +17,28 @@ db.pragma('busy_timeout = 5000');
 
 // inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate, fmtDate imported from utils.mjs
 
+// ─── Scoring Model Constants ────────────────────────────────────────────────
+//
+// Composite scoring: BM25(weights) × recency_decay × [project_boost] × [importance] × [access_bonus]
+//
+// BM25 column weights — higher weight = matches in that column score higher:
+//   observations_fts:        title=10, subtitle=5, narrative=5, text=3, facts=3, concepts=2
+//   session_summaries_fts:   request=5, investigated=3, learned=3, completed=3, next_steps=2, notes=1
+//
+// Recency decay — exponential half-life:
+//   factor = 1 + e^(-ln2 × age_ms / half_life_ms)
+//   At age=0: 2.0 (full boost) → at half_life: 1.5 → at ∞: 1.0
+//   0.693 = ln(2), ensures exact halving at each half-life interval
+//
+// Optional per-query modifiers:
+//   Project boost: 2× for current project matches
+//   Importance:    0.5 + 0.5 × importance (range 0.5–2.0)
+//   Access bonus:  1 + 0.1 × ln(1 + access_count)
+
+const OBS_BM25 = 'bm25(observations_fts, 10, 5, 5, 3, 3, 2)';
+const SESS_BM25 = 'bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1)';
+const RECENCY_HALF_LIFE_MS = 1209600000; // 14 days in milliseconds
+
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer(
@@ -81,8 +103,8 @@ server.registerTool(
           SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
                  o.files_modified,
                  snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
-                 bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                   * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+                 ${OBS_BM25}
+                   * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
                    * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
                    * (0.5 + 0.5 * COALESCE(o.importance, 1))
                    * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
@@ -128,8 +150,8 @@ server.registerTool(
                 const expRows = db.prepare(`
                   SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
                          o.files_modified,
-                         bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+                         ${OBS_BM25}
+                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
                            * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
                   FROM observations_fts
                   JOIN observations o ON observations_fts.rowid = o.id
@@ -168,7 +190,7 @@ server.registerTool(
               JOIN observations o ON observations_fts.rowid = o.id
               WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
                 AND (? IS NULL OR o.project = ?)
-              ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+              ORDER BY ${OBS_BM25}
               LIMIT 8
             `).all(ftsQuery, args.project ?? null, args.project ?? null);
             const prfTerms = extractPRFTerms(topResults, ftsQuery);
@@ -178,8 +200,8 @@ server.registerTool(
                 const prfRows = db.prepare(`
                   SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
                          o.files_modified,
-                         bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+                         ${OBS_BM25}
+                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
                            * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
                   FROM observations_fts
                   JOIN observations o ON observations_fts.rowid = o.id
@@ -241,8 +263,8 @@ server.registerTool(
         const sessionProjectBoost = args.project ? null : currentProject;
         const rows = db.prepare(`
           SELECT s.id, s.request, s.completed, s.project, s.created_at,
-                 bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1)
-                   * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / 1209600000.0))
+                 ${SESS_BM25}
+                   * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
                    * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
           FROM session_summaries_fts
           JOIN session_summaries s ON session_summaries_fts.rowid = s.id
@@ -421,8 +443,8 @@ server.registerTool(
           WHERE observations_fts MATCH ?
             AND (? IS NULL OR o.project = ?)
             AND COALESCE(o.compressed_into, 0) = 0
-          ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
-            * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+          ORDER BY ${OBS_BM25}
+            * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
           LIMIT 1
         `).get(ftsQuery, args.project ?? null, args.project ?? null, nowT);
         if (row) anchorId = row.id;

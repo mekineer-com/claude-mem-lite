@@ -105,7 +105,7 @@ let _registryDb = null;
 
 function getRegistryDb() {
   if (_registryDb) return _registryDb;
-  try { _registryDb = ensureRegistryDb(REGISTRY_DB_PATH); } catch {}
+  try { _registryDb = ensureRegistryDb(REGISTRY_DB_PATH); } catch (e) { debugCatch(e, 'getRegistryDb'); }
   return _registryDb;
 }
 
