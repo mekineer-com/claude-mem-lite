@@ -40,7 +40,8 @@ const SECRET_PATTERNS = [
   [/(\b(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
   // AWS access keys (AKIA...)
   [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
-  // OpenAI / Anthropic keys (sk-...)
+  // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold
+  [/\bsk-(?:proj|ant|ant-api\d{2})-[a-zA-Z0-9_-]{8,}\b/g, '***'],
   [/\bsk-[a-zA-Z0-9_-]{20,}\b/g, '***'],
   // GitHub tokens (ghp_, gho_, github_pat_)
   [/\b(?:ghp_|gho_|ghs_|ghr_)[a-zA-Z0-9_]{30,}\b/g, '***'],
