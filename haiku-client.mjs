@@ -1,6 +1,7 @@
-// claude-mem-lite: Unified Haiku LLM call wrapper
+// claude-mem-lite: Unified LLM call wrapper
 // Shared by memory (hook.mjs) and dispatch modules
 // Auto-detects API key for direct calls, falls back to claude CLI
+// Model configurable via CLAUDE_MEM_MODEL env var (default: haiku)
 
 import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
@@ -8,19 +9,40 @@ import { join } from 'path';
 import { debugLog, debugCatch, parseJsonFromLLM } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
 
+// ─── Model Resolution ────────────────────────────────────────────────────────
+
+// CLI name → API model ID mapping
+const MODEL_MAP = {
+  haiku: 'claude-haiku-4-5-20251001',
+  sonnet: 'claude-sonnet-4-5-20250929',
+};
+
+/**
+ * Resolve the LLM model to use for background calls.
+ * Reads CLAUDE_MEM_MODEL env var, defaults to 'haiku'.
+ * @returns {{ cli: string, api: string }} CLI name and API model ID
+ */
+export function resolveModel() {
+  const raw = (process.env.CLAUDE_MEM_MODEL || 'haiku').toLowerCase().trim();
+  const cli = MODEL_MAP[raw] ? raw : 'haiku';
+  const api = MODEL_MAP[cli];
+  return { cli, api };
+}
+
 // ─── Mode Detection ──────────────────────────────────────────────────────────
 
 let _mode = null;
 
 /**
- * Detect whether to use direct API or CLI for Haiku calls.
+ * Detect whether to use direct API or CLI for LLM calls.
  * Cached after first call.
  * @returns {'api'|'cli'} The detected mode
  */
 export function detectMode() {
   if (_mode) return _mode;
   _mode = process.env.ANTHROPIC_API_KEY ? 'api' : 'cli';
-  debugLog('DEBUG', 'haiku-client', `mode: ${_mode}`);
+  const { cli } = resolveModel();
+  debugLog('DEBUG', 'haiku-client', `mode: ${_mode}, model: ${cli}`);
   return _mode;
 }
 
@@ -84,6 +106,7 @@ async function callHaikuAPI(prompt, { timeout, maxTokens }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
 
+  const { api: modelId } = resolveModel();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
@@ -96,7 +119,7 @@ async function callHaikuAPI(prompt, { timeout, maxTokens }) {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
+        model: modelId,
         max_tokens: maxTokens,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -119,8 +142,9 @@ async function callHaikuAPI(prompt, { timeout, maxTokens }) {
 // ─── CLI Mode ────────────────────────────────────────────────────────────────
 
 function callHaikuCLI(prompt, { timeout }) {
+  const { cli: modelName } = resolveModel();
   try {
-    const result = execFileSync(getClaudePath(), ['-p', '--model', 'haiku'], {
+    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName], {
       input: prompt,
       timeout,
       encoding: 'utf8',

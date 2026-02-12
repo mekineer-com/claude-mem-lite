@@ -8,7 +8,7 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, ren
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { ensureRegistryDb } from './registry.mjs';
-import { getClaudePath as getClaudePathShared } from './haiku-client.mjs';
+import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared } from './haiku-client.mjs';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -82,8 +82,9 @@ export function closeRegistryDb() {
 // ─── LLM via claude CLI ─────────────────────────────────────────────────────
 
 export function callLLM(prompt, timeoutMs = 15000) {
+  const { cli: modelName } = resolveModelShared();
   try {
-    const result = execFileSync(getClaudePathShared(), ['-p', '--model', 'haiku'], {
+    const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName], {
       input: prompt,
       timeout: timeoutMs,
       encoding: 'utf8',
