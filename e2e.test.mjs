@@ -1,6 +1,6 @@
 // E2E test suite for claude-mem-lite hook lifecycle
 // Tests the actual CLI entry point (node hook.mjs <event>) as a subprocess
-// Isolation via HOME env var → redirects ~/claude-mem-lite/ to temp dir
+// Isolation via HOME env var → redirects ~/.claude-mem-lite/ to temp dir
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
@@ -24,7 +24,7 @@ function makeTmpDir() {
 }
 
 function initTestDb(tmpHome) {
-  const dbDir = join(tmpHome, 'claude-mem-lite');
+  const dbDir = join(tmpHome, '.claude-mem-lite');
   mkdirSync(dbDir, { recursive: true });
   mkdirSync(join(dbDir, 'runtime'), { recursive: true });
 
@@ -41,7 +41,7 @@ function initTestDb(tmpHome) {
 }
 
 function openTestDb(tmpHome) {
-  const dbPath = join(tmpHome, 'claude-mem-lite', 'claude-mem-lite.db');
+  const dbPath = join(tmpHome, '.claude-mem-lite', 'claude-mem-lite.db');
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 3000');
@@ -87,7 +87,7 @@ function makeToolPayload(toolName, input, response) {
 }
 
 function getSessionFile(tmpHome) {
-  const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+  const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
   const files = readdirSync(runtimeDir).filter(f => f.startsWith('session-'));
   return files.length > 0 ? join(runtimeDir, files[0]) : null;
 }
@@ -101,13 +101,13 @@ function getSessionIdFromFile(tmpHome) {
 }
 
 function getEpisodeFile(tmpHome) {
-  const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+  const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
   const files = readdirSync(runtimeDir).filter(f => f.startsWith('ep-') && f.endsWith('.json') && !f.startsWith('ep-flush-'));
   return files.length > 0 ? join(runtimeDir, files[0]) : null;
 }
 
 function getFlushFiles(tmpHome) {
-  const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+  const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
   return readdirSync(runtimeDir).filter(f => f.startsWith('ep-flush-'));
 }
 
@@ -320,7 +320,7 @@ describe('Suite 2: Episode Buffer Management', () => {
     });
 
     // Manually create a pending file (simulates what writePendingEntry does on lock failure)
-    const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const pendingFile = join(runtimeDir, `pending-${Date.now()}-test.json`);
     writeFileSync(pendingFile, JSON.stringify({
       entry: {
@@ -399,7 +399,7 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
     const sessionId = getSessionIdFromFile(tmpHome);
 
     // Create a flush file manually (simulating what flushEpisode does)
-    const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-test.json`);
     writeFileSync(flushFile, JSON.stringify({
       sessionId,
@@ -444,7 +444,7 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
 
-    const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-bad.json`);
     writeFileSync(flushFile, JSON.stringify({
       sessionId,
@@ -496,7 +496,7 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
     db.close();
 
     // Second observation via llm-episode — overlapping file (shared.js)
-    const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flush2 = join(runtimeDir, `ep-flush-${Date.now()}-r2.json`);
     writeFileSync(flush2, JSON.stringify({
       sessionId,
@@ -703,7 +703,7 @@ describe('Suite 8a: Cross-Session MinHash Dedup', () => {
     db.close();
 
     // Try to save a near-duplicate observation via llm-episode
-    const runtimeDir = join(tmpHome, 'claude-mem-lite', 'runtime');
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-dedup.json`);
     writeFileSync(flushFile, JSON.stringify({
       sessionId: `hook-parent--testproj-different-session`,
@@ -750,21 +750,21 @@ describe('Suite 8a: Additional E2E', () => {
     expect(stdout).toContain('<claude-mem-context>');
 
     // DB should have been created
-    const dbPath = join(freshHome, 'claude-mem-lite', 'claude-mem-lite.db');
+    const dbPath = join(freshHome, '.claude-mem-lite', 'claude-mem-lite.db');
     expect(existsSync(dbPath)).toBe(true);
 
     try { rmSync(freshHome, { recursive: true, force: true }); } catch {}
   });
 
-  it('auto-migrates claude-mem.db → claude-mem-lite.db on session-start', () => {
-    // Create a fresh home with old DB filename
+  it('auto-migrates ~/claude-mem-lite/claude-mem.db → ~/.claude-mem-lite/claude-mem-lite.db on session-start', () => {
+    // Create a fresh home with old unhidden dir + old DB filename
     const migrateHome = makeTmpDir();
-    const migrateDbDir = join(migrateHome, 'claude-mem-lite');
-    mkdirSync(migrateDbDir, { recursive: true });
-    mkdirSync(join(migrateDbDir, 'runtime'), { recursive: true });
+    const oldUnhiddenDir = join(migrateHome, 'claude-mem-lite');
+    mkdirSync(oldUnhiddenDir, { recursive: true });
+    mkdirSync(join(oldUnhiddenDir, 'runtime'), { recursive: true });
 
-    // Create DB with old filename
-    const oldDbPath = join(migrateDbDir, 'claude-mem.db');
+    // Create DB with old filename in old dir
+    const oldDbPath = join(oldUnhiddenDir, 'claude-mem.db');
     const db = new Database(oldDbPath);
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = OFF');
@@ -776,12 +776,14 @@ describe('Suite 8a: Additional E2E', () => {
     db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'marker', 'discovery', 'Migration marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
-    // Old file should exist, new should not
+    // Old file should exist, new hidden dir should not
     expect(existsSync(oldDbPath)).toBe(true);
-    const newDbPath = join(migrateDbDir, 'claude-mem-lite.db');
-    expect(existsSync(newDbPath)).toBe(false);
+    const newHiddenDir = join(migrateHome, '.claude-mem-lite');
+    expect(existsSync(newHiddenDir)).toBe(false);
 
-    // Session-start triggers ensureDb() which auto-migrates
+    // Session-start triggers ensureDb() which:
+    //   1. Renames ~/claude-mem-lite/ → ~/.claude-mem-lite/
+    //   2. Renames claude-mem.db → claude-mem-lite.db
     const migrateProjDir = join(migrateHome, 'parent', 'migrateproj');
     mkdirSync(migrateProjDir, { recursive: true });
     const { exitCode } = runHook('session-start', {
@@ -789,11 +791,13 @@ describe('Suite 8a: Additional E2E', () => {
     });
     expect(exitCode).toBe(0);
 
-    // Old file should be gone, new file should exist
-    expect(existsSync(oldDbPath)).toBe(false);
+    // Old unhidden dir should be gone
+    expect(existsSync(oldUnhiddenDir)).toBe(false);
+    // New hidden dir should exist with renamed DB
+    const newDbPath = join(newHiddenDir, 'claude-mem-lite.db');
     expect(existsSync(newDbPath)).toBe(true);
 
-    // Verify data survived migration
+    // Verify data survived both migrations
     const db2 = new Database(newDbPath, { readonly: true });
     const obs = db2.prepare("SELECT title FROM observations WHERE title = 'Migration marker'").get();
     db2.close();

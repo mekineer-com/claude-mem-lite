@@ -13,7 +13,8 @@ else
   ROOT="$CLAUDE_PLUGIN_ROOT"
 fi
 
-DATA_DIR="$HOME/claude-mem-lite"
+DATA_DIR="$HOME/.claude-mem-lite"
+OLD_UNHIDDEN_DIR="$HOME/claude-mem-lite"
 
 # Colors
 if [[ -t 2 ]]; then
@@ -40,14 +41,20 @@ else
   log_ok "Dependencies up to date"
 fi
 
-# 2. Ensure data directory exists (runtime created after migration check)
+# 2. Migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
+if [[ -d "$OLD_UNHIDDEN_DIR" && ! -d "$DATA_DIR" ]]; then
+  mv "$OLD_UNHIDDEN_DIR" "$DATA_DIR"
+  log_ok "Migrated ~/claude-mem-lite/ → ~/.claude-mem-lite/"
+fi
+
+# 2b. Ensure data directory exists (runtime created after migration check)
 mkdir -p "$DATA_DIR"
 log_ok "Data directory: $DATA_DIR"
 
 # 3. Migrate from old ~/.claude-mem/ if needed
 OLD_DIR="$HOME/.claude-mem"
 if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" && ! -f "$DATA_DIR/claude-mem.db" ]]; then
-  log_info "Migrating data from ~/.claude-mem/ → ~/claude-mem-lite/..."
+  log_info "Migrating data from ~/.claude-mem/ → ~/.claude-mem-lite/..."
   if cp "$OLD_DIR/claude-mem.db" "$DATA_DIR/claude-mem-lite.db" 2>/dev/null; then
     # Main DB copied successfully, WAL/SHM are optional
     cp "$OLD_DIR/claude-mem.db-wal" "$DATA_DIR/claude-mem-lite.db-wal" 2>/dev/null || true

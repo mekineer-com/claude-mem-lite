@@ -5,9 +5,9 @@
 import Database from 'better-sqlite3';
 import { homedir } from 'os';
 import { join } from 'path';
-import { existsSync, mkdirSync, renameSync } from 'fs';
+import { existsSync, mkdirSync, renameSync, rmSync } from 'fs';
 
-export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), 'claude-mem-lite');
+export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 
 const CORE_SCHEMA = `
@@ -151,6 +151,15 @@ export function initSchema(db) {
  * Returns an opened Database instance with WAL + busy_timeout configured.
  */
 export function ensureDb() {
+  // Auto-migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
+  // Check DB_PATH (not DB_DIR) because hook-shared.mjs module-level init may create DB_DIR early
+  const oldUnhidden = join(homedir(), 'claude-mem-lite');
+  if (existsSync(oldUnhidden) && !existsSync(DB_PATH)) {
+    // Remove empty DB_DIR if pre-created by module-level mkdir
+    if (existsSync(DB_DIR)) try { rmSync(DB_DIR, { recursive: true, force: true }); } catch {}
+    renameSync(oldUnhidden, DB_DIR);
+  }
+
   if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
 
   // Auto-migrate old filename in same directory (claude-mem.db → claude-mem-lite.db)

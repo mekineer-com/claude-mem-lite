@@ -6,7 +6,7 @@ import { readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync
 import { join, basename } from 'path';
 import { homedir } from 'os';
 
-const MANAGED_DIR = join(homedir(), 'claude-mem-lite', 'managed');
+const MANAGED_DIR = join(homedir(), '.claude-mem-lite', 'managed');
 const AGENTS_DIR = join(MANAGED_DIR, 'agents');
 
 const DRY_RUN = process.argv.includes('--dry-run');

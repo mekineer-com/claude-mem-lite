@@ -9,7 +9,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { discoverAllManaged, withRelativePaths } from '../resource-discovery.mjs';
 
-const BASE_DIR = join(homedir(), 'claude-mem-lite');
+const BASE_DIR = join(homedir(), '.claude-mem-lite');
 const MANAGED_DIR = join(BASE_DIR, 'managed');
 const DB_PATH = join(BASE_DIR, 'resource-registry.db');
 

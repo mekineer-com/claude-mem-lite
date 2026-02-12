@@ -2,14 +2,14 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, lstatSync, unlinkSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
-const DATA_DIR = join(homedir(), 'claude-mem-lite');
+const DATA_DIR = join(homedir(), '.claude-mem-lite');
 const DB_PATH = join(DATA_DIR, 'claude-mem-lite.db');
 const OLD_DATA_DIR = join(homedir(), '.claude-mem');
 
@@ -17,9 +17,8 @@ const OLD_DATA_DIR = join(homedir(), '.claude-mem');
 const IS_NPX = process.env.npm_command === 'exec' ||
   PROJECT_DIR.includes('_npx') || PROJECT_DIR.includes('.npm/_');
 
-// For npx: install runtime files to ~/claude-mem-lite/
-// For git clone: use files in-place from the cloned repo
-const INSTALL_DIR = IS_NPX ? DATA_DIR : PROJECT_DIR;
+// Both modes install to ~/.claude-mem-lite/ (copies or symlinks)
+const INSTALL_DIR = DATA_DIR;
 const SERVER_PATH = join(INSTALL_DIR, 'server.mjs');
 const HOOK_PATH = join(INSTALL_DIR, 'hook.mjs');
 
@@ -311,22 +310,64 @@ function fail(msg) { console.log(`  ✗ ${msg}`); }
 async function install() {
   console.log('\nclaude-mem-lite installer\n');
 
-  // 1. Copy source files to persistent location (npx mode)
-  if (IS_NPX) {
-    log('npx detected — installing to ~/claude-mem-lite/...');
-    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  // 1. Install source files to ~/.claude-mem-lite/
+  const IS_DEV = flags.has('--dev');
+
+  // Auto-migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
+  const oldUnhidden = join(homedir(), 'claude-mem-lite');
+  if (!existsSync(DATA_DIR) && existsSync(oldUnhidden)) {
+    log('Migrating ~/claude-mem-lite/ → ~/.claude-mem-lite/...');
+    renameSync(oldUnhidden, DATA_DIR);
+    ok('Directory migrated');
+  }
+
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+
+  const SOURCE_FILES = [
+    'server.mjs', 'hook.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
+    'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs',
+    'haiku-client.mjs', 'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
+    'registry-retriever.mjs', 'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
+  ];
+
+  if (IS_DEV) {
+    log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
+    // Symlink individual source files
+    for (const f of SOURCE_FILES) {
+      const target = join(PROJECT_DIR, f);
+      const link = join(DATA_DIR, f);
+      if (existsSync(target)) {
+        // Remove existing file/symlink before creating
+        if (existsSync(link)) try { unlinkSync(link); } catch {}
+        symlinkSync(target, link);
+      }
+    }
+    // Symlink scripts/ directory
+    const scriptsLink = join(DATA_DIR, 'scripts');
+    if (existsSync(scriptsLink)) try { rmSync(scriptsLink, { recursive: true, force: true }); } catch {}
+    symlinkSync(join(PROJECT_DIR, 'scripts'), scriptsLink);
+    // Symlink node_modules/
+    const nmLink = join(DATA_DIR, 'node_modules');
+    if (existsSync(nmLink)) try { rmSync(nmLink, { recursive: true, force: true }); } catch {}
+    symlinkSync(join(PROJECT_DIR, 'node_modules'), nmLink);
+    // Symlink registry/ directory
+    const regLink = join(DATA_DIR, 'registry');
+    if (existsSync(regLink)) try { rmSync(regLink, { recursive: true, force: true }); } catch {}
+    if (existsSync(join(PROJECT_DIR, 'registry'))) {
+      symlinkSync(join(PROJECT_DIR, 'registry'), regLink);
+    }
+    ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
+  } else {
+    log('Installing to ~/.claude-mem-lite/...');
     const scriptsDir = join(DATA_DIR, 'scripts');
     if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
-    for (const f of [
-      'server.mjs', 'hook.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
-      'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs',
-      'haiku-client.mjs', 'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
-      'registry-retriever.mjs', 'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
-      'scripts/post-tool-use.sh',
-    ]) {
+    for (const f of SOURCE_FILES) {
       const src = join(PROJECT_DIR, f);
       if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
     }
+    // Copy scripts
+    const postToolSrc = join(PROJECT_DIR, 'scripts', 'post-tool-use.sh');
+    if (existsSync(postToolSrc)) copyFileSync(postToolSrc, join(scriptsDir, 'post-tool-use.sh'));
     // Ensure bash script is executable
     try { execSync(`chmod +x "${join(scriptsDir, 'post-tool-use.sh')}"`, { stdio: 'pipe' }); } catch {}
     // Copy registry manifest
@@ -334,11 +375,13 @@ async function install() {
     if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
     const manifestSrc = join(PROJECT_DIR, 'registry', 'preinstalled.json');
     if (existsSync(manifestSrc)) copyFileSync(manifestSrc, join(registryDir, 'preinstalled.json'));
-    ok('Source files copied to ~/claude-mem-lite/');
+    ok('Source files copied to ~/.claude-mem-lite/');
   }
 
-  // 2. npm install
-  if (!existsSync(join(INSTALL_DIR, 'node_modules'))) {
+  // 2. npm install (skip for --dev: node_modules is symlinked)
+  if (IS_DEV) {
+    ok('Dependencies: using dev dir (symlinked)');
+  } else if (!existsSync(join(INSTALL_DIR, 'node_modules'))) {
     log('Installing dependencies...');
     try {
       execSync('npm install --omit=dev', { cwd: INSTALL_DIR, stdio: 'pipe' });
@@ -425,7 +468,7 @@ async function install() {
 
   // 5. Migrate from old ~/.claude-mem/ if needed
   if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH) && !existsSync(join(DATA_DIR, 'claude-mem.db'))) {
-    log('Detected old ~/.claude-mem/ directory, migrating to ~/claude-mem-lite/...');
+    log('Detected old ~/.claude-mem/ directory, migrating to ~/.claude-mem-lite/...');
     try {
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
       // Migrate database and WAL/SHM files (copy as claude-mem-lite.db)
@@ -441,11 +484,11 @@ async function install() {
       if (existsSync(oldRuntime) && !existsSync(newRuntime)) {
         cpSync(oldRuntime, newRuntime, { recursive: true });
       }
-      ok('Data migrated from ~/.claude-mem/ → ~/claude-mem-lite/');
+      ok('Data migrated from ~/.claude-mem/ → ~/.claude-mem-lite/');
       log('Old ~/.claude-mem/ preserved (remove manually when ready)');
     } catch (e) {
       warn('Migration failed: ' + e.message);
-      log('You can copy manually: cp ~/.claude-mem/claude-mem.db ~/claude-mem-lite/claude-mem-lite.db');
+      log('You can copy manually: cp ~/.claude-mem/claude-mem.db ~/.claude-mem-lite/claude-mem-lite.db');
     }
   }
 
@@ -666,15 +709,15 @@ async function uninstall() {
 
   // 3. Purge data if requested
   if (flags.has('--purge')) {
-    const expectedPurgePath = join(homedir(), 'claude-mem-lite');
+    const expectedPurgePath = join(homedir(), '.claude-mem-lite');
     if (existsSync(DATA_DIR) && DATA_DIR === expectedPurgePath) {
       rmSync(DATA_DIR, { recursive: true, force: true });
-      ok('Data purged (~/claude-mem-lite/)');
+      ok('Data purged (~/.claude-mem-lite/)');
     } else if (existsSync(DATA_DIR)) {
       fail('DATA_DIR path mismatch, refusing to purge for safety: ' + DATA_DIR);
     }
   } else {
-    log('Data preserved in ~/claude-mem-lite/ (use --purge to remove)');
+    log('Data preserved in ~/.claude-mem-lite/ (use --purge to remove)');
   }
 
   console.log('\n  Done!\n');
@@ -870,7 +913,8 @@ switch (cmd) {
 claude-mem-lite — Lightweight memory system for Claude Code
 
 Usage:
-  node install.mjs install            Install and configure
+  node install.mjs install            Install (copy files to ~/.claude-mem-lite/)
+  node install.mjs install --dev      Install dev mode (symlinks to dev dir)
   node install.mjs uninstall          Remove (keep data)
   node install.mjs uninstall --purge  Remove and delete all data
   node install.mjs status             Show current status
