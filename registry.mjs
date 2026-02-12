@@ -99,7 +99,7 @@ const INVOCATIONS_SCHEMA = `
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     resource_id   INTEGER NOT NULL REFERENCES resources(id),
     session_id    TEXT,
-    trigger       TEXT CHECK(trigger IN ('session_start','pre_tool_use','user_explicit')),
+    trigger       TEXT CHECK(trigger IN ('session_start','pre_tool_use','user_explicit','user_prompt')),
     tier          INTEGER CHECK(tier IN (1,2,3)),
     recommended   INTEGER DEFAULT 1,
     adopted       INTEGER DEFAULT 0,
@@ -162,6 +162,21 @@ export function ensureRegistryDb(dbPath) {
   }
 
   db.exec(INVOCATIONS_SCHEMA);
+
+  // Migrate invocations CHECK constraint: add 'user_prompt' trigger value
+  // SQLite cannot ALTER CHECK constraints, so recreate table if needed
+  try {
+    const schema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='invocations'`).get();
+    if (schema?.sql && !schema.sql.includes('user_prompt')) {
+      db.exec(`
+        ALTER TABLE invocations RENAME TO invocations_old;
+        ${INVOCATIONS_SCHEMA}
+        INSERT INTO invocations SELECT * FROM invocations_old;
+        DROP TABLE invocations_old;
+      `);
+    }
+  } catch {}
+
   db.exec(PREINSTALLED_SCHEMA);
 
   return db;

@@ -4,12 +4,17 @@
 // Tier 2: Enhanced FTS5 retrieval (<5ms)
 // Tier 3: Haiku semantic dispatch (~500ms, only when needed)
 
-import { basename } from 'path';
+import { basename, join } from 'path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { retrieveResources, buildEnhancedQuery, buildQueryFromText } from './registry-retriever.mjs';
 import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { callHaikuJSON } from './haiku-client.mjs';
 import { debugCatch, truncate } from './utils.mjs';
+import { DB_DIR } from './schema.mjs';
+
+const RUNTIME_DIR = join(DB_DIR, 'runtime');
+try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -27,36 +32,45 @@ export const COOLDOWN_MINUTES = 5;
 
 const BREAKER_THRESHOLD = 3;
 const BREAKER_RESET_MS = 5 * 60 * 1000; // 5 minutes
+const BREAKER_FILE = join(RUNTIME_DIR, 'haiku-breaker.json');
 
-let _breakerFailures = 0;
-let _breakerOpenUntil = 0;
+function _readBreakerState() {
+  try {
+    if (!existsSync(BREAKER_FILE)) return { failures: 0, openUntil: 0 };
+    return JSON.parse(readFileSync(BREAKER_FILE, 'utf8'));
+  } catch { return { failures: 0, openUntil: 0 }; }
+}
+
+function _writeBreakerState(state) {
+  try { writeFileSync(BREAKER_FILE, JSON.stringify(state)); } catch {}
+}
 
 function isHaikuCircuitOpen() {
-  if (_breakerOpenUntil > 0 && Date.now() < _breakerOpenUntil) return true;
-  if (_breakerOpenUntil > 0 && Date.now() >= _breakerOpenUntil) {
+  const state = _readBreakerState();
+  if (state.openUntil > 0 && Date.now() < state.openUntil) return true;
+  if (state.openUntil > 0 && Date.now() >= state.openUntil) {
     // Reset: half-open → allow one attempt
-    _breakerFailures = 0;
-    _breakerOpenUntil = 0;
+    _writeBreakerState({ failures: 0, openUntil: 0 });
   }
   return false;
 }
 
 function recordHaikuSuccess() {
-  _breakerFailures = 0;
-  _breakerOpenUntil = 0;
+  _writeBreakerState({ failures: 0, openUntil: 0 });
 }
 
 function recordHaikuFailure() {
-  _breakerFailures++;
-  if (_breakerFailures >= BREAKER_THRESHOLD) {
-    _breakerOpenUntil = Date.now() + BREAKER_RESET_MS;
+  const state = _readBreakerState();
+  state.failures++;
+  if (state.failures >= BREAKER_THRESHOLD) {
+    state.openUntil = Date.now() + BREAKER_RESET_MS;
   }
+  _writeBreakerState(state);
 }
 
 /** Reset circuit breaker state (for testing). */
 export function _resetCircuitBreaker() {
-  _breakerFailures = 0;
-  _breakerOpenUntil = 0;
+  _writeBreakerState({ failures: 0, openUntil: 0 });
 }
 
 /** Simulate Haiku failure (for testing). */
@@ -607,7 +621,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     recordInvocation(db, {
       resource_id: best.id,
       session_id: sessionId || null,
-      trigger: 'session_start', // Same trigger type — they serve the same purpose
+      trigger: 'user_prompt',
       tier: 2,
       recommended: 1,
     });

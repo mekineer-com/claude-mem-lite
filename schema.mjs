@@ -5,7 +5,7 @@
 import Database from 'better-sqlite3';
 import { homedir } from 'os';
 import { join } from 'path';
-import { existsSync, mkdirSync, renameSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
 
 export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
@@ -155,9 +155,14 @@ export function ensureDb() {
   // Check DB_PATH (not DB_DIR) because hook-shared.mjs module-level init may create DB_DIR early
   const oldUnhidden = join(homedir(), 'claude-mem-lite');
   if (existsSync(oldUnhidden) && !existsSync(DB_PATH)) {
-    // Remove empty DB_DIR if pre-created by module-level mkdir
-    if (existsSync(DB_DIR)) try { rmSync(DB_DIR, { recursive: true, force: true }); } catch {}
-    renameSync(oldUnhidden, DB_DIR);
+    // Remove DB_DIR only if it has no user data (no .db files)
+    if (existsSync(DB_DIR)) {
+      try {
+        const hasDbFiles = readdirSync(DB_DIR).some(f => f.endsWith('.db'));
+        if (!hasDbFiles) rmSync(DB_DIR, { recursive: true, force: true });
+      } catch {}
+    }
+    if (!existsSync(DB_DIR)) renameSync(oldUnhidden, DB_DIR);
   }
 
   if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });

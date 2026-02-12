@@ -100,7 +100,7 @@ function createRegistryDb() {
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       resource_id   INTEGER NOT NULL REFERENCES resources(id),
       session_id    TEXT,
-      trigger       TEXT CHECK(trigger IN ('session_start','pre_tool_use','user_explicit')),
+      trigger       TEXT CHECK(trigger IN ('session_start','pre_tool_use','user_explicit','user_prompt')),
       tier          INTEGER CHECK(tier IN (1,2,3)),
       recommended   INTEGER DEFAULT 1,
       adopted       INTEGER DEFAULT 0,

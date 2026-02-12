@@ -154,9 +154,9 @@ describe('sanitizeFtsQuery', () => {
     expect(sanitizeFtsQuery('hello or world')).toBe('hello world');
   });
 
-  it('quotes tokens with embedded special chars', () => {
-    // Token "hello" has embedded quotes (non-alphanumeric) → gets quoted+escaped
-    expect(sanitizeFtsQuery('say "hello"')).toBe('say """hello"""');
+  it('strips quotes and treats as plain tokens', () => {
+    // Quotes are stripped to prevent unexpected FTS5 phrase semantics
+    expect(sanitizeFtsQuery('say "hello"')).toBe('say hello');
   });
 
   it('returns null when all tokens are keywords or special chars', () => {

@@ -108,7 +108,8 @@ export function readEpisode() {
 export function writeEpisode(episode) {
   const target = episodeFile();
   const tmp = target + '.tmp';
-  writeFileSync(tmp, JSON.stringify(episode));
+  const { _fileSet, ...serializable } = episode;
+  writeFileSync(tmp, JSON.stringify(serializable));
   try {
     renameSync(tmp, target);
   } catch (err) {
@@ -142,8 +143,12 @@ export function createEpisode(sessionId, project) {
  * @param {string[]} files Array of file paths to add
  */
 export function addFileToEpisode(episode, files) {
+  if (!episode._fileSet) episode._fileSet = new Set(episode.files);
   for (const f of files) {
-    if (!episode.files.includes(f)) episode.files.push(f);
+    if (!episode._fileSet.has(f)) {
+      episode._fileSet.add(f);
+      episode.files.push(f);
+    }
   }
 }
 

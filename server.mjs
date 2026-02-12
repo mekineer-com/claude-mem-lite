@@ -910,6 +910,8 @@ function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+process.on('uncaughtException', (err) => { debugCatch(err, 'uncaughtException'); shutdown(); });
+process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'); shutdown(); });
 
 // ─── Start Server ───────────────────────────────────────────────────────────
 

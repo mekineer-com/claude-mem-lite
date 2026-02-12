@@ -130,9 +130,11 @@ function callHaikuCLI(prompt, { timeout }) {
     const text = result.trim();
     return text ? { text } : null;
   } catch (e) {
-    // Try to extract partial output on timeout
+    // Try to extract partial output on timeout — validate JSON before returning
     const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
-    if (out && out.startsWith('{') && out.endsWith('}')) return { text: out };
+    if (out && out.startsWith('{') && out.endsWith('}')) {
+      try { JSON.parse(out); return { text: out }; } catch {}
+    }
     debugCatch(e, 'haiku-cli');
     return null;
   }

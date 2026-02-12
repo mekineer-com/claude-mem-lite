@@ -67,7 +67,7 @@ const SECRET_PATTERNS = [
   // npm tokens (npm_...)
   [/\bnpm_[a-zA-Z0-9]{36,}\b/g, '***'],
   // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_)
-  [/\b[srpk]{2}k?_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
+  [/\b[srp]k_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
 ];
 
 /**
@@ -275,7 +275,7 @@ function expandToken(token) {
 export function sanitizeFtsQuery(query) {
   if (!query) return null;
   const cleaned = query
-    .replace(/[{}()[\]^~*:]/g, ' ')
+    .replace(/[{}()[\]^~*:"]/g, ' ')
     .replace(/(^|\s)-/g, '$1')
     .trim();
   if (!cleaned) return null;

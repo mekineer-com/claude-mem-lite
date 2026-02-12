@@ -324,10 +324,13 @@ async function install() {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
   const SOURCE_FILES = [
-    'server.mjs', 'hook.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
+    'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
+    'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs',
     'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs',
-    'haiku-client.mjs', 'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
-    'registry-retriever.mjs', 'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
+    'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
+    'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
+    'registry-retriever.mjs', 'resource-discovery.mjs',
+    'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
   ];
 
   if (IS_DEV) {
@@ -432,6 +435,7 @@ async function install() {
   };
 
   const memStop = {
+    matcher: '*',
     hooks: [{
       type: 'command',
       command: `node "${HOOK_PATH}" stop`,
@@ -537,7 +541,7 @@ async function install() {
           if (!existsSync(clonePath)) {
             try {
               mkdirSync(join(managedDir, 'repos'), { recursive: true });
-              execFileSync('git', ['clone', '--depth', '1', `${repoUrl}.git`, clonePath], { stdio: 'pipe', timeout: 30000 });
+              execFileSync('git', ['clone', '--depth', '1', `${repoUrl.replace(/\.git$/, '')}.git`, clonePath], { stdio: 'pipe', timeout: 30000 });
               cloned++;
             } catch {
               warn(`  Clone failed: ${repoUrl}`);
