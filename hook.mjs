@@ -24,15 +24,16 @@ import { collectFeedback } from './dispatch-feedback.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
+  RESOURCE_RESCAN_INTERVAL_MS,
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary } from './hook-llm.mjs';
 
 // Prevent recursive hooks from background claude -p calls
-// Background workers (llm-episode, llm-summary) are exempt — they're ours
+// Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
 const event = process.argv[2];
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'resource-scan']);
 if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
 
 // Crash-safe: flush episode buffer on unexpected termination to prevent data loss
@@ -504,6 +505,13 @@ async function handleSessionStart() {
       }
     } catch (e) { debugCatch(e, 'handleSessionStart-dispatch'); }
 
+    // Background rescan: detect changed/new managed resources since last scan.
+    // TTL-based (1h) — avoids redundant filesystem scans on every session.
+    // Non-blocking: spawns detached worker, results available before first user prompt.
+    if (needsResourceRescan()) {
+      spawnBackground('resource-scan');
+    }
+
   } finally {
     db.close();
   }
@@ -610,6 +618,76 @@ async function handleUserPrompt() {
   } catch (e) { debugCatch(e, 'handleUserPrompt-dispatch'); }
 }
 
+// ─── Resource Rescan (Background Worker) ─────────────────────────────────────
+
+const RESCAN_MARKER = join(RUNTIME_DIR, 'last-resource-scan');
+
+/**
+ * Check if resource rescan is needed (marker older than RESOURCE_RESCAN_INTERVAL_MS).
+ * @returns {boolean}
+ */
+function needsResourceRescan() {
+  try {
+    const marker = statSync(RESCAN_MARKER);
+    return (Date.now() - marker.mtimeMs) > RESOURCE_RESCAN_INTERVAL_MS;
+  } catch {
+    return true; // No marker = never scanned
+  }
+}
+
+/**
+ * Background worker: scan filesystem for changed resources, upsert any diffs.
+ * Spawned by SessionStart when marker is stale. Non-blocking to the hook caller.
+ */
+async function handleResourceScan() {
+  const rdb = getRegistryDb();
+  if (!rdb) return;
+
+  try {
+    const { scanAllResources, diffResources } = await import('./registry-scanner.mjs');
+    const { upsertResource } = await import('./registry.mjs');
+
+    const scanned = scanAllResources();
+    const { toIndex, toDisable } = diffResources(rdb, scanned);
+
+    if (toIndex.length === 0 && toDisable.length === 0) {
+      // Touch marker even if nothing changed — avoids rescanning every session
+      writeFileSync(RESCAN_MARKER, String(Date.now()));
+      return;
+    }
+
+    // Upsert changed resources with fallback metadata (no Haiku)
+    for (const res of toIndex) {
+      try {
+        upsertResource(rdb, {
+          name: res.name,
+          type: res.type,
+          status: 'active',
+          source: res.source,
+          repo_url: res.repoUrl || null,
+          local_path: res.localPath,
+          file_hash: res.fileHash,
+          intent_tags: res.name.replace(/-/g, ' ').replace(/\//g, ' '),
+          trigger_patterns: `when user needs ${res.name.replace(/-/g, ' ').replace(/\//g, ' ')}`,
+          capability_summary: `${res.type}: ${res.name.replace(/-/g, ' ')}`,
+        });
+      } catch {}
+    }
+
+    // Disable resources no longer on filesystem
+    for (const row of toDisable) {
+      try {
+        rdb.prepare("UPDATE resources SET status = 'disabled', updated_at = datetime('now') WHERE id = ?").run(row.id);
+      } catch {}
+    }
+
+    debugLog('DEBUG', 'resource-scan', `indexed ${toIndex.length}, disabled ${toDisable.length}`);
+    writeFileSync(RESCAN_MARKER, String(Date.now()));
+  } catch (e) {
+    debugCatch(e, 'handleResourceScan');
+  }
+}
+
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function readStdin() {
@@ -646,6 +724,7 @@ try {
     case 'user-prompt':      await handleUserPrompt(); break;
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
+    case 'resource-scan':    await handleResourceScan(); break;
   }
 } catch (err) {
   // Always log fatal errors (ungated) with structured format

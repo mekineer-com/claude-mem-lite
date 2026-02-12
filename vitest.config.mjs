@@ -8,7 +8,8 @@ export default defineConfig({
       include: [
         'utils.mjs', 'schema.mjs', 'server-internals.mjs',
         'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
-        'registry.mjs', 'registry-retriever.mjs',
+        'registry.mjs', 'registry-retriever.mjs', 'registry-scanner.mjs',
+        'resource-discovery.mjs',
         'hook-episode.mjs', 'hook-context.mjs', 'hook-semaphore.mjs',
         'hook-shared.mjs', 'hook-llm.mjs', 'haiku-client.mjs',
       ],

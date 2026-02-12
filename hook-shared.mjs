@@ -24,6 +24,7 @@ export const STALE_LOCK_MS = 30000;                       // 30s
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
 export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+export const RESOURCE_RESCAN_INTERVAL_MS = 60 * 60 * 1000;    // 1 hour
 
 // Ensure runtime directory exists
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
