@@ -20,7 +20,7 @@ const DISPATCH_SYNONYMS = {
   'infra':    ['infrastructure', 'devops', 'docker', 'kubernetes', 'terraform'],
   'db':       ['database', 'sql', 'postgres', 'mysql', 'mongodb', 'schema'],
   'api':      ['endpoint', 'rest', 'graphql', 'route', 'backend'],
-  'plan':     ['planning', 'architecture', 'design', 'spec', 'blueprint'],
+  'plan':     ['planning', 'architecture', 'spec', 'blueprint'],
   'build':    ['compile', 'bundle', 'webpack', 'vite', 'typescript', 'tsc'],
   // Chinese intent mappings
   '清理':     ['refactor', 'clean', 'lint', 'format', 'simplify'],
@@ -63,33 +63,48 @@ function expandToken(token) {
  * @returns {string|null} FTS5 query string or null
  */
 export function buildEnhancedQuery(signals) {
-  const tokens = new Set();
+  const parts = [];
 
-  if (signals.intent) {
-    for (const t of signals.intent.split(/[\s,]+/).filter(Boolean)) {
-      tokens.add(t.toLowerCase());
-    }
+  // Column-targeted: route primary intent to intent_tags column (highest signal)
+  if (signals.primaryIntent) {
+    const expanded = expandToken(signals.primaryIntent.toLowerCase());
+    parts.push(`intent_tags:${expanded}`);
   }
-  if (signals.techStack) {
-    for (const t of signals.techStack.split(/[\s,]+/).filter(Boolean)) {
-      tokens.add(t.toLowerCase());
+
+  // Secondary intents and action → general query (matches trigger_patterns via BM25 weight 5.0)
+  const generalTokens = new Set();
+  if (signals.intent) {
+    const intents = signals.intent.split(/[\s,]+/).filter(Boolean);
+    // Skip primary (already column-targeted), add rest as general
+    for (const t of intents.slice(signals.primaryIntent ? 1 : 0)) {
+      generalTokens.add(t.toLowerCase());
     }
   }
   if (signals.action) {
     for (const t of signals.action.split(/[\s,]+/).filter(Boolean)) {
-      tokens.add(t.toLowerCase());
+      generalTokens.add(t.toLowerCase());
     }
   }
   if (signals.errorDomain) {
     for (const t of signals.errorDomain.split(/[\s,]+/).filter(Boolean)) {
-      tokens.add(t.toLowerCase());
+      generalTokens.add(t.toLowerCase());
     }
   }
 
-  if (tokens.size === 0) return null;
+  // Column-targeted: route tech stack to domain_tags column
+  if (signals.techStack) {
+    for (const t of signals.techStack.split(/[\s,]+/).filter(Boolean)) {
+      parts.push(`domain_tags:${expandToken(t.toLowerCase())}`);
+    }
+  }
 
-  const expanded = [...tokens].map(t => expandToken(t));
-  return expanded.join(' OR ');
+  // Add general tokens (expanded with synonyms)
+  for (const t of generalTokens) {
+    parts.push(expandToken(t));
+  }
+
+  if (parts.length === 0) return null;
+  return parts.join(' OR ');
 }
 
 /**
@@ -132,6 +147,55 @@ export function buildQueryFromText(text) {
 // ─── FTS5 Retrieval ──────────────────────────────────────────────────────────
 
 // BM25 weights: trigger_patterns(5), capability_summary(3), intent_tags(2), domain_tags(1), name(1)
+//
+// Composite ranking formula:
+//   40% BM25 text relevance
+//   15% Star popularity (saturation normalization — diminishing returns after ~500 stars)
+//   15% Success rate (Laplace smoothing — Beta prior α=1, β=1 for small-sample robustness)
+//   10% Adoption rate (Laplace smoothing)
+//   10% Cold start exploration bonus (UCB1-inspired — decays as recommend_count grows)
+//   -10% Negative feedback penalty (zombie recommendations: high recommend, near-zero adopt)
+
+// Time-windowed behavioral signals: blend all-time rates (stability) with recent 30-day rates (freshness)
+// recent_* subqueries return NULL when no recent invocations → COALESCE falls back to all-time only
+//
+// Sign convention: bm25() returns NEGATIVE (more negative = more relevant).
+// We keep the negative direction and SUBTRACT positive behavioral signals to make
+// better resources more negative. ORDER BY ... ASC puts most negative (best) first.
+const COMPOSITE_ORDER = `
+  ORDER BY (
+    bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) * 0.4
+    - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
+    - (
+        (r.success_count + 1.0) / (r.recommend_count + 2.0) * 0.5
+        + COALESCE(
+            (SELECT (SUM(CASE WHEN i.outcome='success' THEN 1 ELSE 0 END) + 1.0)
+                  / (COUNT(*) + 2.0)
+             FROM invocations i WHERE i.resource_id = r.id
+               AND i.created_at > datetime('now', '-30 days')),
+            (r.success_count + 1.0) / (r.recommend_count + 2.0)
+          ) * 0.5
+      ) * 0.15
+    - (
+        (r.adopt_count + 1.0) / (r.recommend_count + 2.0) * 0.5
+        + COALESCE(
+            (SELECT (SUM(CASE WHEN i.adopted=1 THEN 1 ELSE 0 END) + 1.0)
+                  / (COUNT(*) + 2.0)
+             FROM invocations i WHERE i.resource_id = r.id
+               AND i.created_at > datetime('now', '-30 days')),
+            (r.adopt_count + 1.0) / (r.recommend_count + 2.0)
+          ) * 0.5
+      ) * 0.10
+    - CASE WHEN r.recommend_count < 10
+        THEN 0.10 * (1.0 - r.recommend_count * 1.0 / 10.0)
+        ELSE 0 END
+    + CASE WHEN r.recommend_count > 5
+           AND (r.adopt_count * 1.0) / r.recommend_count < 0.1
+        THEN 0.10
+        ELSE 0 END
+  ) ASC
+`;
+
 const SEARCH_SQL = `
   SELECT r.*,
     bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) AS relevance
@@ -139,16 +203,7 @@ const SEARCH_SQL = `
   JOIN resources r ON r.id = resources_fts.rowid
   WHERE resources_fts MATCH ?
     AND r.status = 'active'
-  ORDER BY (
-    bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) * -0.4
-    + COALESCE(CAST(r.repo_stars AS REAL) / NULLIF((SELECT MAX(repo_stars) FROM resources WHERE repo_stars > 0), 0), 0) * 0.15
-    + CASE WHEN r.recommend_count > 0
-        THEN CAST(r.success_count AS REAL) / r.recommend_count * 0.15
-        ELSE 0.05 END
-    + CASE WHEN r.recommend_count > 0
-        THEN CAST(r.adopt_count AS REAL) / r.recommend_count * 0.10
-        ELSE 0.05 END
-  ) ASC
+  ${COMPOSITE_ORDER}
   LIMIT ?
 `;
 
@@ -160,16 +215,7 @@ const SEARCH_BY_TYPE_SQL = `
   WHERE resources_fts MATCH ?
     AND r.status = 'active'
     AND r.type = ?
-  ORDER BY (
-    bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) * -0.4
-    + COALESCE(CAST(r.repo_stars AS REAL) / NULLIF((SELECT MAX(repo_stars) FROM resources WHERE repo_stars > 0), 0), 0) * 0.15
-    + CASE WHEN r.recommend_count > 0
-        THEN CAST(r.success_count AS REAL) / r.recommend_count * 0.15
-        ELSE 0.05 END
-    + CASE WHEN r.recommend_count > 0
-        THEN CAST(r.adopt_count AS REAL) / r.recommend_count * 0.10
-        ELSE 0.05 END
-  ) ASC
+  ${COMPOSITE_ORDER}
   LIMIT ?
 `;
 
