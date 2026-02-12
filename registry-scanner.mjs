@@ -3,11 +3,11 @@
 
 import { createHash } from 'crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
-import { join, basename } from 'path';
+import { join } from 'path';
 import { homedir } from 'os';
 import { debugCatch } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
-import { discoverPlugin, discoverPlugins } from './resource-discovery.mjs';
+import { discoverFlat, discoverPlugin, discoverPlugins } from './resource-discovery.mjs';
 
 /**
  * @typedef {object} ScannedResource
@@ -95,80 +95,24 @@ function computeHash(content) {
   return createHash('sha256').update(content).digest('hex');
 }
 
-// ─── Single Resource Parsing ─────────────────────────────────────────────────
-
-/**
- * Parse a single resource directory into a ScannedResource.
- * @param {string} dirPath Path to resource directory
- * @param {'skill'|'agent'} type Resource type
- * @param {'preinstalled'|'user'} source Source origin
- * @returns {ScannedResource|null} Parsed resource or null if invalid
- */
-export function parseResource(dirPath, type, source) {
-  try {
-    const stat = statSync(dirPath);
-    if (!stat.isDirectory()) {
-      // Single .md file (not in a subdirectory)
-      if (dirPath.endsWith('.md')) {
-        const content = readFileSync(dirPath, 'utf8');
-        if (!content || content.length < 10) return null;
-        return {
-          name: basename(dirPath, '.md'),
-          type,
-          source,
-          localPath: dirPath,
-          content,
-          fileHash: computeHash(content),
-          repoUrl: null,
-        };
-      }
-      return null;
-    }
-
-    const content = readResourceContent(dirPath);
-    if (!content || content.length < 10) return null;
-
-    return {
-      name: basename(dirPath),
-      type,
-      source,
-      localPath: dirPath,
-      content,
-      fileHash: computeHash(content),
-      repoUrl: null,
-    };
-  } catch (e) {
-    debugCatch(e, `parseResource(${dirPath})`);
-    return null;
-  }
-}
-
 // ─── Directory Scanning ──────────────────────────────────────────────────────
 
 /**
  * Scan a single directory for resources.
  * Each subdirectory (or .md file) is treated as one resource.
+ * Delegates path discovery to discoverFlat(), then reads content via buildScannedResource().
  * @param {string} dirPath Directory to scan
  * @param {'skill'|'agent'} type Resource type
  * @param {'preinstalled'|'user'} source Source origin
  * @returns {ScannedResource[]} Array of discovered resources
  */
 export function scanDirectory(dirPath, type, source) {
-  if (!existsSync(dirPath)) return [];
-
+  const discovered = discoverFlat(dirPath, type, { strict: false, includeFiles: true });
   const resources = [];
-  try {
-    const entries = readdirSync(dirPath);
-    for (const entry of entries) {
-      if (entry.startsWith('.') || entry === 'node_modules') continue;
-      const fullPath = join(dirPath, entry);
-      const res = parseResource(fullPath, type, source);
-      if (res) resources.push(res);
-    }
-  } catch (e) {
-    debugCatch(e, `scanDirectory(${dirPath})`);
+  for (const d of discovered) {
+    const res = buildScannedResource(d, source);
+    if (res) resources.push(res);
   }
-
   return resources;
 }
 

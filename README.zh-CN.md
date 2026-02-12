@@ -21,7 +21,7 @@
 | **运行方式** | 长驻后台 worker 进程（1.8MB .cjs） | 按需启动，立即退出 |
 | **依赖** | Bun + Python/uv + Chroma 向量数据库 | 仅 Node.js（3 个 npm 包） |
 | **源码大小** | ~2.3MB 编译后的打包文件 | ~50KB 可读源码 |
-| **数据目录** | `~/.claude-mem/` | `~/claude-mem-lite/`（自动迁移） |
+| **数据目录** | `~/.claude-mem/` | `~/.claude-mem-lite/`（隐藏目录，自动迁移） |
 
 ### Token 与成本效率
 
@@ -79,8 +79,9 @@
 - **原子写入** -- 所有文件写入（episode、CLAUDE.md）使用 write-to-tmp + rename 防止崩溃时损坏
 - **健壮锁机制** -- PID 感知的锁文件，自动清理过期（>30s）或孤儿（PID 已死）锁
 - **过期会话清理** -- 活跃超过 24 小时的会话在下次启动时自动标记为 abandoned
-- **智能调度** -- 三级渐进式调度系统，自动为当前任务推荐最合适的 skill 或 agent
+- **智能调度** -- 三级渐进式调度系统，在 SessionStart、UserPromptSubmit、PreToolUse 三个时机自动推荐最合适的 skill 或 agent
 - **资源注册表** -- 对已安装的 skill 和 agent 建立 FTS5 索引，支持复合评分和调用追踪
+- **统一资源发现** -- 共享文件系统遍历层（`resource-discovery.mjs`），运行时扫描器和离线索引器共用，支持扁平目录、插件嵌套和松散 `.md` 文件
 - **闭环反馈** -- 追踪推荐是否被采纳、会话是否成功，持续改进调度质量
 - **双语意图识别** -- 同时理解中文和英文用户意图（15+ 英文 + 12+ 中文意图类别）
 - **领域同义词扩展** -- 调度查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
@@ -109,7 +110,7 @@
 npx github:sdsrss/claude-mem-lite
 ```
 
-源文件会自动复制到 `~/claude-mem-lite/` 以持久化保存。
+源文件会自动复制到 `~/.claude-mem-lite/` 以持久化保存。
 
 ### 方式三：git clone
 
@@ -126,29 +127,37 @@ node install.mjs install
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
 2. **注册 MCP 服务器** -- `mem` 服务器，包含 7 个工具（search、timeline、get、save、stats、delete、compress）
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
-4. **创建数据目录** -- `~/claude-mem-lite/`，存放数据库和运行时文件
-5. **自动迁移** -- 如果 `~/.claude-mem/`（原版 claude-mem）存在，自动将数据库和运行时文件复制到 `~/claude-mem-lite/`，原目录保持不变
+4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
+5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
 6. **初始化数据库** -- SQLite WAL 模式，FTS5 索引在服务器首次启动时创建
 
 安装后重启 Claude Code 以激活。
 
-### 从 claude-mem（原版）迁移
+### 迁移
 
-所有安装方式都会自动检测 `~/.claude-mem/` 并迁移：
-- 复制 `claude-mem.db` → `~/claude-mem-lite/claude-mem-lite.db`（重命名）
+所有安装方式自动检测并从旧版本迁移：
+
+**从 claude-mem 原版（`~/.claude-mem/`）：**
+- 复制 `claude-mem.db` → `~/.claude-mem-lite/claude-mem-lite.db`（重命名）
 - 复制 `runtime/` 目录
 - **原 `~/.claude-mem/` 保持不变**（不删除、不覆盖）
-- 已有的 `~/claude-mem-lite/claude-mem.db` 会在首次运行时自动重命名为 `claude-mem-lite.db`
+
+**从 v0.5 前的非隐藏目录（`~/claude-mem-lite/`）：**
+- 整个目录移动到 `~/.claude-mem-lite/`（隐藏目录）
+
+**就地重命名：**
+- 已有的 `~/.claude-mem-lite/claude-mem.db` 会自动重命名为 `claude-mem-lite.db`
 
 确认一切正常后手动删除旧目录：
 ```bash
-rm -rf ~/.claude-mem/
+rm -rf ~/.claude-mem/       # 原版 claude-mem
+rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 ```
 
 ### 目录结构
 
 ```
-~/claude-mem-lite/
+~/.claude-mem-lite/
   claude-mem-lite.db       # SQLite 数据库 — 记忆（WAL 模式）
   resource-registry.db     # SQLite 数据库 — skill/agent 注册表
   runtime/
@@ -156,6 +165,10 @@ rm -rf ~/.claude-mem/
     ep-<project>.json    # Episode 缓冲区
     ep-flush-*.json      # 已刷新的 episode，等待处理
     reads-<project>.txt  # Read 文件路径（刷新时收集）
+  managed/
+    skills/              # 独立 skill（扁平布局）
+    agents/              # Agent 插件（嵌套：agents/*.md + skills/*/SKILL.md）
+    repos/               # 浅克隆的源代码仓库
 ```
 
 ## 使用方法
@@ -250,7 +263,8 @@ PreToolUse（工具执行前）
 UserPromptSubmit
   -> 捕获用户提示文本到 user_prompts 表
   -> 递增会话提示计数器
-  -> 纯数据库操作，<100ms
+  -> 调度：根据用户实际提示推荐 skill/agent（Tier 0→1→2）
+  -> 主要调度触发点 — 用户意图在此最为明确
 
 Stop
   -> 刷新最终 episode 缓冲区
@@ -291,7 +305,8 @@ Tier 3：Haiku 语义调度（~500ms，仅 SessionStart）
 
 | Hook | 时间预算 | 层级 | 用途 |
 |------|---------|------|------|
-| SessionStart | 10s | 0→1→2→3 | 分析用户提示，提前推荐最佳 skill/agent |
+| SessionStart | 10s | 0→1→2→3 | 分析上次会话的 next_steps，提前推荐 skill/agent |
+| UserPromptSubmit | 2s | 0→1→2 | 主要调度触发点 — 用户实际提示意图最明确 |
 | PreToolUse | 2s | 0→1→2 | 根据当前操作上下文实时推荐 |
 
 **反馈闭环（Stop hook）：**
@@ -356,17 +371,17 @@ npx claude-mem-lite doctor            # 诊断问题
 
 # git clone：
 cd claude-mem-lite
-node install.mjs uninstall            # 保留 ~/claude-mem-lite/ 数据
-node install.mjs uninstall --purge    # 删除 ~/claude-mem-lite/ 及所有数据
+node install.mjs uninstall            # 保留 ~/.claude-mem-lite/ 数据
+node install.mjs uninstall --purge    # 删除 ~/.claude-mem-lite/ 及所有数据
 
 # npx：
 npx claude-mem-lite uninstall
 npx claude-mem-lite uninstall --purge
 ```
 
-数据默认保留在 `~/claude-mem-lite/` 中。如需删除：
+数据默认保留在 `~/.claude-mem-lite/` 中。如需删除：
 ```bash
-rm -rf ~/claude-mem-lite/
+rm -rf ~/.claude-mem-lite/
 ```
 
 ## 项目结构
@@ -381,8 +396,6 @@ claude-mem-lite/
     hooks.json       # 钩子定义（插件模式）
   commands/
     mem.md           # /mem 命令定义
-  scripts/
-    setup.sh         # Setup 钩子：npm install + 迁移
   server.mjs           # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
   server-internals.mjs # 搜索辅助模块：重排序、PRF、概念扩展
   hook.mjs             # Claude Code 钩子：episode 捕获、错误回忆、会话管理
@@ -400,13 +413,20 @@ claude-mem-lite/
   dispatch-feedback.mjs # 闭环反馈：采纳检测、结果追踪
   registry.mjs         # 资源注册表 DB：schema、CRUD、FTS5、调用追踪
   registry-retriever.mjs # FTS5 检索：同义词扩展与复合评分
+  registry-scanner.mjs # 文件系统扫描器：读取内容 + 哈希，委托发现层
+  resource-discovery.mjs # 共享发现层：扁平目录、插件嵌套、松散 .md 文件
   haiku-client.mjs     # 统一 Haiku LLM 封装：直连 API 或 CLI 回退
   # 安装与配置
   install.mjs          # CLI 安装器：设置、卸载、状态、诊断（npx/git clone 模式）
   skill.md             # MCP 技能定义（npx/git clone 模式）
   package.json         # 依赖和元数据
+  scripts/
+    setup.sh           # Setup 钩子：npm install + 迁移（隐藏目录 + 旧目录）
+    post-tool-use.sh   # Bash 预过滤器：~5ms 跳过噪声，追踪 Read 路径
+    convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
+    index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）
-  *.test.mjs           # 单元、属性、集成、契约、E2E 测试（470 个）
+  *.test.mjs           # 单元、属性、集成、契约、E2E、管线测试（569 个）
   test-helpers.mjs     # 共享测试工具
   benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
@@ -429,7 +449,7 @@ claude-mem-lite/
 
 ```bash
 npm run lint              # ESLint 静态分析
-npm test                  # 运行全部 470 个测试（vitest）
+npm test                  # 运行全部 569 个测试（vitest）
 npm run test:smoke        # 运行 5 个核心冒烟测试
 npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试

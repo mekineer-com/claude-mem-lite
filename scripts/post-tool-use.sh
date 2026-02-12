@@ -31,7 +31,7 @@ if [[ "$tool" == "Read" ]]; then
     # Sanitize project name to match utils.mjs inferProject()
     project="${project//[^a-zA-Z0-9_.-]/-}"
     project="${project:-unknown}"
-    runtime_dir="$HOME/claude-mem-lite/runtime"
+    runtime_dir="$HOME/.claude-mem-lite/runtime"
     mkdir -p "$runtime_dir" 2>/dev/null
     # Use printf to avoid shell interpretation of special characters in file paths
     printf '%s\n' "$file_path" >> "${runtime_dir}/reads-${project}.txt"

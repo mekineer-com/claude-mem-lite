@@ -2,7 +2,7 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, lstatSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';

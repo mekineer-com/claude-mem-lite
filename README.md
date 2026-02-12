@@ -21,7 +21,7 @@ A ground-up redesign of [claude-mem](https://github.com/thedotmack/claude-mem), 
 | **Runtime** | Long-running worker process (1.8MB .cjs) | On-demand spawn, exits immediately |
 | **Dependencies** | Bun + Python/uv + Chroma vector DB | Node.js only (3 npm packages) |
 | **Source size** | ~2.3MB compiled bundles | ~50KB readable source |
-| **Data directory** | `~/.claude-mem/` | `~/claude-mem-lite/` (auto-migrates) |
+| **Data directory** | `~/.claude-mem/` | `~/.claude-mem-lite/` (hidden, auto-migrates) |
 
 ### Token & cost efficiency
 
@@ -79,8 +79,9 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Atomic writes** -- All file writes (episodes, CLAUDE.md) use write-to-tmp + rename to prevent corruption on crash
 - **Robust locking** -- PID-aware lock files with automatic stale/orphan cleanup (>30s timeout or dead PID)
 - **Stale session cleanup** -- Sessions active for >24h are automatically marked as abandoned on next start
-- **Intelligent dispatch** -- 3-tier progressive dispatch system automatically recommends the right skill or agent for the current task
+- **Intelligent dispatch** -- 3-tier progressive dispatch system automatically recommends the right skill or agent for the current task, triggered on SessionStart, UserPromptSubmit, and PreToolUse
 - **Resource registry** -- Indexes installed skills and agents with FTS5 search, composite scoring, and invocation tracking
+- **Unified resource discovery** -- Shared filesystem traversal layer (`resource-discovery.mjs`) used by both runtime scanner and offline indexer, supporting flat directories, plugin nesting, and loose `.md` files
 - **Closed-loop feedback** -- Tracks whether recommendations were adopted and whether sessions succeeded, improving future dispatch quality
 - **Bilingual intent recognition** -- Understands user intent in both English and Chinese (15+ EN + 12+ CN intent categories)
 - **Domain synonym expansion** -- Dispatch queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
@@ -109,7 +110,7 @@ The plugin system handles everything: hooks, MCP server, and dependency installa
 npx github:sdsrss/claude-mem-lite
 ```
 
-Source files are automatically copied to `~/claude-mem-lite/` for persistence.
+Source files are automatically copied to `~/.claude-mem-lite/` for persistence.
 
 ### Method 3: git clone
 
@@ -126,29 +127,37 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
 2. **Register MCP server** -- `mem` server with 7 tools (search, timeline, get, save, stats, delete, compress)
 3. **Configure hooks** -- `PostToolUse`, `PreToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
-4. **Create data directory** -- `~/claude-mem-lite/` for database and runtime files
-5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) exists, copies database and runtime files to `~/claude-mem-lite/`, preserving the original untouched
+4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
+5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
 6. **Initialize database** -- SQLite with WAL mode, FTS5 indexes created on first server start
 
 Restart Claude Code after installation to activate.
 
-### Migration from claude-mem (original)
+### Migration
 
-All installation methods auto-detect `~/.claude-mem/` and migrate:
-- Copy `claude-mem.db` → `~/claude-mem-lite/claude-mem-lite.db` (renamed)
+All installation methods auto-detect and migrate from previous versions:
+
+**From claude-mem (original `~/.claude-mem/`):**
+- Copy `claude-mem.db` → `~/.claude-mem-lite/claude-mem-lite.db` (renamed)
 - Copy the `runtime/` directory
 - **Original `~/.claude-mem/` is preserved** (no deletion, no overwrite)
-- Existing `claude-mem.db` in `~/claude-mem-lite/` is automatically renamed to `claude-mem-lite.db` on first run
 
-Remove the old directory manually after confirming:
+**From pre-v0.5 unhidden directory (`~/claude-mem-lite/`):**
+- Entire directory is moved to `~/.claude-mem-lite/` (hidden)
+
+**In-place rename:**
+- Existing `claude-mem.db` in `~/.claude-mem-lite/` is automatically renamed to `claude-mem-lite.db`
+
+Remove old directories manually after confirming:
 ```bash
-rm -rf ~/.claude-mem/
+rm -rf ~/.claude-mem/       # original claude-mem
+rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 ```
 
 ### Directory Structure
 
 ```
-~/claude-mem-lite/
+~/.claude-mem-lite/
   claude-mem-lite.db       # SQLite database — memory (WAL mode)
   resource-registry.db     # SQLite database — skill/agent registry
   runtime/
@@ -156,6 +165,10 @@ rm -rf ~/.claude-mem/
     ep-<project>.json    # Episode buffer
     ep-flush-*.json      # Flushed episodes awaiting processing
     reads-<project>.txt  # Read file paths (collected on flush)
+  managed/
+    skills/              # Standalone skills (flat layout)
+    agents/              # Agent plugins (nested: agents/*.md + skills/*/SKILL.md)
+    repos/               # Shallow-cloned source repos
 ```
 
 ## Usage
@@ -250,7 +263,8 @@ PreToolUse (before tool execution)
 UserPromptSubmit
   -> Capture user prompt text to user_prompts table
   -> Increment session prompt counter
-  -> Pure DB operation, <100ms
+  -> Dispatch: recommend skill/agent based on user's actual prompt (Tier 0→1→2)
+  -> Primary dispatch point — user intent is clearest here
 
 Stop
   -> Flush final episode buffer
@@ -291,7 +305,8 @@ Tier 3: Haiku Semantic Dispatch (~500ms, SessionStart only)
 
 | Hook | Budget | Tiers | Use case |
 |------|--------|-------|----------|
-| SessionStart | 10s | 0→1→2→3 | Analyze user prompt, suggest best skill/agent upfront |
+| SessionStart | 10s | 0→1→2→3 | Analyze previous session's next_steps, suggest skill/agent upfront |
+| UserPromptSubmit | 2s | 0→1→2 | Primary dispatch point — user's actual prompt has clearest intent |
 | PreToolUse | 2s | 0→1→2 | React to current action context in real-time |
 
 **Feedback loop (Stop hook):**
@@ -356,17 +371,17 @@ Shows MCP registration, hook configuration, and database stats (observation/sess
 
 # git clone:
 cd claude-mem-lite
-node install.mjs uninstall            # Keeps ~/claude-mem-lite/ data
-node install.mjs uninstall --purge    # Deletes ~/claude-mem-lite/ and all data
+node install.mjs uninstall            # Keeps ~/.claude-mem-lite/ data
+node install.mjs uninstall --purge    # Deletes ~/.claude-mem-lite/ and all data
 
 # npx:
 npx claude-mem-lite uninstall
 npx claude-mem-lite uninstall --purge
 ```
 
-Data in `~/claude-mem-lite/` is preserved by default. Delete manually if needed:
+Data in `~/.claude-mem-lite/` is preserved by default. Delete manually if needed:
 ```bash
-rm -rf ~/claude-mem-lite/
+rm -rf ~/.claude-mem-lite/
 ```
 
 ## Project Structure
@@ -381,8 +396,6 @@ claude-mem-lite/
     hooks.json       # Hook definitions (plugin mode)
   commands/
     mem.md           # /mem command definition
-  scripts/
-    setup.sh         # Setup hook: npm install + migration
   server.mjs           # MCP server: tool definitions, FTS5 search, database init
   server-internals.mjs # Extracted search helpers: re-ranking, PRF, concept expansion
   hook.mjs             # Claude Code hooks: episode capture, error recall, session management
@@ -400,13 +413,20 @@ claude-mem-lite/
   dispatch-feedback.mjs # Closed-loop feedback: adoption detection, outcome tracking
   registry.mjs         # Resource registry DB: schema, CRUD, FTS5, invocation tracking
   registry-retriever.mjs # FTS5 retrieval with synonym expansion and composite scoring
+  registry-scanner.mjs # Filesystem scanner: reads content + hashes, delegates discovery
+  resource-discovery.mjs # Shared discovery layer: flat dirs, plugin nesting, loose .md files
   haiku-client.mjs     # Unified Haiku LLM wrapper: direct API or CLI fallback
   # Install & config
   install.mjs          # CLI installer: setup, uninstall, status, doctor (npx/git clone mode)
   skill.md             # MCP skill definition (npx/git clone mode)
   package.json         # Dependencies and metadata
+  scripts/
+    setup.sh           # Setup hook: npm install + migration (hidden dir + old dir)
+    post-tool-use.sh   # Bash pre-filter: skips noise in ~5ms, tracks Read paths
+    convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
+    index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
-  *.test.mjs           # Unit, property, integration, contract, E2E tests (470 tests)
+  *.test.mjs           # Unit, property, integration, contract, E2E, pipeline tests (569 tests)
   test-helpers.mjs     # Shared test utilities
   benchmark/           # BM25 search quality benchmarks + CI gate
 ```
@@ -429,7 +449,7 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 
 ```bash
 npm run lint              # ESLint static analysis
-npm test                  # Run all 470 tests (vitest)
+npm test                  # Run all 569 tests (vitest)
 npm run test:smoke        # Run 5 core smoke tests
 npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
 npm run benchmark         # Run full search quality benchmark
@@ -440,7 +460,7 @@ npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% toleranc
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_DIR` | Custom data directory. All databases, runtime files, and managed resources are stored here. | `~/claude-mem-lite/` |
+| `CLAUDE_MEM_DIR` | Custom data directory. All databases, runtime files, and managed resources are stored here. | `~/.claude-mem-lite/` |
 | `CLAUDE_MEM_DEBUG` | Enable debug logging (`1` to enable). | _(disabled)_ |
 
 ## License
