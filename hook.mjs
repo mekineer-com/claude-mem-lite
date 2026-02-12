@@ -23,7 +23,7 @@ import { dispatchOnSessionStart, dispatchOnPreToolUse, dispatchOnUserPrompt } fr
 import { collectFeedback } from './dispatch-feedback.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
-  STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
+  SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
   RESOURCE_RESCAN_INTERVAL_MS,
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
@@ -368,6 +368,20 @@ async function handleSessionStart() {
     }
   }
 
+  // Detect mid-session restart (/clear or /compact): if a recent session file exists,
+  // the previous session ended without Stop hook firing. Read BEFORE createSessionId()
+  // overwrites the session file. Normal /exit deletes the file, so this only triggers
+  // for /clear, /compact, or crash recovery.
+  let prevSessionId = null;
+  let prevProject = null;
+  try {
+    const data = JSON.parse(readFileSync(sessionFile(), 'utf8'));
+    if (Date.now() - data.startedAt < SESSION_EXPIRY_MS) {
+      prevSessionId = data.id;
+      prevProject = data.project;
+    }
+  } catch {} // No session file = fresh startup, nothing to recover
+
   // Tier 1 A: Create unique session ID
   const sessionId = createSessionId();
   const project = inferProject();
@@ -382,6 +396,56 @@ async function handleSessionStart() {
       INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, ?, ?, ?, 'active')
     `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+
+    // Complete previous session if this is a mid-session restart (/clear, /compact, crash)
+    if (prevSessionId) {
+      try {
+        db.prepare(`
+          UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?
+          WHERE content_session_id = ? AND status = 'active'
+        `).run(now.toISOString(), now.getTime(), prevSessionId);
+      } catch (e) { debugCatch(e, 'session-start-complete-prev'); }
+
+      // Collect dispatch feedback for previous session
+      try {
+        const rdb = getRegistryDb();
+        if (rdb) {
+          const sessionEvents = readAndClearToolEvents();
+          await collectFeedback(rdb, prevSessionId, sessionEvents);
+        }
+      } catch (e) { debugCatch(e, 'session-start-prev-feedback'); }
+
+      // Generate session summary for previous session (background Haiku — richer version)
+      spawnBackground('llm-summary', prevSessionId, prevProject || project);
+
+      // Build fast synchronous summary for immediate context availability.
+      // Background llm-summary will produce a richer Haiku version later;
+      // context injection query (ORDER BY created_at_epoch DESC) auto-prefers latest.
+      try {
+        const firstPrompt = db.prepare(`
+          SELECT prompt_text FROM user_prompts
+          WHERE content_session_id = ?
+          ORDER BY prompt_number ASC LIMIT 1
+        `).get(prevSessionId);
+
+        const prevObs = db.prepare(`
+          SELECT title FROM observations
+          WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+          ORDER BY created_at_epoch DESC LIMIT 5
+        `).all(prevSessionId);
+
+        const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
+        const fastCompleted = prevObs.map(o => o.title).filter(Boolean).join('; ');
+
+        if (fastRequest || fastCompleted) {
+          db.prepare(`
+            INSERT INTO session_summaries
+            (memory_session_id, project, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch)
+            VALUES (?, ?, ?, '', '', ?, '', '[]', '[]', 'fast', ?, ?)
+          `).run(prevSessionId, prevProject || project, fastRequest, truncate(fastCompleted, 300), now.toISOString(), now.getTime());
+        }
+      } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
+    }
 
     // Stale session cleanup: mark 24h+ active sessions as abandoned
     const oneDayAgo = Date.now() - STALE_SESSION_MS;
@@ -450,6 +514,47 @@ async function handleSessionStart() {
         ORDER BY created_at_epoch DESC
         LIMIT 5
       `).all(oneDayAgo, fbSevenDaysAgo);
+    }
+
+    // Fallback fast summary: if a recently completed session has no summary yet
+    // (e.g. /exit → fast restart before Haiku finishes), build one synchronously.
+    // Skipped when prevSessionId is set (already handled above).
+    if (!prevSessionId) {
+      try {
+        const recentSession = db.prepare(`
+          SELECT content_session_id, project FROM sdk_sessions
+          WHERE project = ? AND status = 'completed' AND completed_at_epoch > ?
+          ORDER BY completed_at_epoch DESC LIMIT 1
+        `).get(project, Date.now() - 120000); // within last 2 minutes
+
+        if (recentSession) {
+          const hasSummary = db.prepare(`
+            SELECT 1 FROM session_summaries WHERE memory_session_id = ? LIMIT 1
+          `).get(recentSession.content_session_id);
+
+          if (!hasSummary) {
+            const fp = db.prepare(`
+              SELECT prompt_text FROM user_prompts
+              WHERE content_session_id = ? ORDER BY prompt_number ASC LIMIT 1
+            `).get(recentSession.content_session_id);
+            const po = db.prepare(`
+              SELECT title FROM observations
+              WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+              ORDER BY created_at_epoch DESC LIMIT 5
+            `).all(recentSession.content_session_id);
+
+            const fr = truncate(fp?.prompt_text || '', 200);
+            const fc = po.map(o => o.title).filter(Boolean).join('; ');
+            if (fr || fc) {
+              db.prepare(`
+                INSERT INTO session_summaries
+                (memory_session_id, project, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch)
+                VALUES (?, ?, ?, '', '', ?, '', '[]', '[]', 'fast', ?, ?)
+              `).run(recentSession.content_session_id, project, fr, truncate(fc, 300), now.toISOString(), now.getTime());
+            }
+          }
+        }
+      } catch (e) { debugCatch(e, 'session-start-exit-fast-summary'); }
     }
 
     // Latest session summary
