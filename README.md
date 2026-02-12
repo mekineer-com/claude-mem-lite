@@ -461,6 +461,7 @@ npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% toleranc
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CLAUDE_MEM_DIR` | Custom data directory. All databases, runtime files, and managed resources are stored here. | `~/.claude-mem-lite/` |
+| `CLAUDE_MEM_MODEL` | LLM model for background calls (episode extraction, session summaries, dispatch). Accepts `haiku` or `sonnet`. | `haiku` |
 | `CLAUDE_MEM_DEBUG` | Enable debug logging (`1` to enable). | _(disabled)_ |
 
 ## License
