@@ -7,6 +7,7 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { debugCatch } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
+import { discoverPlugin, discoverPlugins } from './resource-discovery.mjs';
 
 /**
  * @typedef {object} ScannedResource
@@ -19,22 +20,30 @@ import { DB_DIR } from './schema.mjs';
  * @property {string|null} repoUrl GitHub repo URL if preinstalled
  */
 
+// ─── Resource Location Convention ─────────────────────────────────────────────
+// Two resource locations, differentiated by naming convention:
+//   managed/skills/{skill}/          → standalone skills, name: "{skill}"
+//   managed/agents/{plugin}/skills/  → plugin-attached skills, name: "{plugin}/{skill}"
+//   managed/agents/{plugin}/agents/  → plugin agents, name: "{plugin}/{agent}"
+// Both scanned by same scanner; deduplication by "type:name" key.
+
 // ─── Scan Sources ────────────────────────────────────────────────────────────
 
 /**
  * Build the list of directories to scan for skill and agent resources.
  * @param {string} dataDir Base data directory for managed resources
- * @returns {{path: string, type: string, source: string}[]} Scan source descriptors
+ * @returns {{path: string, type: string, source: string, layout: string}[]}
  */
 function getScanSources(dataDir) {
   const home = homedir();
   return [
-    // User local resources (highest priority)
-    { path: join(home, '.claude', 'skills'), type: 'skill', source: 'user' },
-    { path: join(home, '.claude', 'agents'), type: 'agent', source: 'user' },
+    // User local resources (highest priority) — flat layout
+    { path: join(home, '.claude', 'skills'), type: 'skill', source: 'user', layout: 'flat' },
+    { path: join(home, '.claude', 'agents'), type: 'agent', source: 'user', layout: 'flat' },
     // Pre-installed managed resources
-    { path: join(dataDir, 'managed', 'skills'), type: 'skill', source: 'preinstalled' },
-    { path: join(dataDir, 'managed', 'agents'), type: 'agent', source: 'preinstalled' },
+    { path: join(dataDir, 'managed', 'skills'), type: 'skill', source: 'preinstalled', layout: 'flat' },
+    // Agent plugins contain both agents and skills in nested structure
+    { path: join(dataDir, 'managed', 'agents'), type: null, source: 'preinstalled', layout: 'plugins' },
   ];
 }
 
@@ -163,6 +172,72 @@ export function scanDirectory(dirPath, type, source) {
   return resources;
 }
 
+// ─── Plugin Scanning ──────────────────────────────────────────────────────
+
+/**
+ * Build a ScannedResource from a DiscoveredResource by reading content.
+ * @param {{type: string, name: string, absPath: string}} discovered
+ * @param {'preinstalled'|'user'} source
+ * @returns {ScannedResource|null}
+ */
+function buildScannedResource(discovered, source) {
+  try {
+    const stat = statSync(discovered.absPath);
+    let content;
+    if (stat.isDirectory()) {
+      content = readResourceContent(discovered.absPath);
+    } else {
+      content = readFileSync(discovered.absPath, 'utf8');
+    }
+    if (!content || content.length < 10) return null;
+    return {
+      name: discovered.name,
+      type: discovered.type,
+      source,
+      localPath: discovered.absPath,
+      content,
+      fileHash: computeHash(content),
+      repoUrl: null,
+    };
+  } catch (e) {
+    debugCatch(e, `buildScannedResource(${discovered.absPath})`);
+    return null;
+  }
+}
+
+/**
+ * Scan a single agent plugin directory for nested agents and skills.
+ * @param {string} pluginDir Absolute path to plugin directory
+ * @param {string} pluginName Plugin directory name
+ * @param {'preinstalled'|'user'} source Source origin
+ * @returns {ScannedResource[]} Discovered agents and skills
+ */
+export function scanPluginResources(pluginDir, pluginName, source) {
+  const discovered = discoverPlugin(pluginDir, pluginName);
+  const resources = [];
+  for (const d of discovered) {
+    const res = buildScannedResource(d, source);
+    if (res) resources.push(res);
+  }
+  return resources;
+}
+
+/**
+ * Scan a plugins directory (e.g. managed/agents/) for all plugin subdirs.
+ * @param {string} dirPath Directory containing plugin directories
+ * @param {'preinstalled'|'user'} source Source origin
+ * @returns {ScannedResource[]} All discovered plugin resources
+ */
+export function scanPluginsDirectory(dirPath, source) {
+  const discovered = discoverPlugins(dirPath);
+  const resources = [];
+  for (const d of discovered) {
+    const res = buildScannedResource(d, source);
+    if (res) resources.push(res);
+  }
+  return resources;
+}
+
 // ─── Main Scan ───────────────────────────────────────────────────────────────
 
 /**
@@ -178,7 +253,9 @@ export function scanAllResources(config = {}) {
   const seen = new Map(); // key: "type:name" -> resource
 
   for (const src of sources) {
-    const resources = scanDirectory(src.path, src.type, src.source);
+    const resources = src.layout === 'plugins'
+      ? scanPluginsDirectory(src.path, src.source)
+      : scanDirectory(src.path, src.type, src.source);
     for (const res of resources) {
       const key = `${res.type}:${res.name}`;
       // User resources override preinstalled (scanned first due to source order)

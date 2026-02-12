@@ -4,9 +4,10 @@
 // Advantage over Claude Code native: weighted scoring, usage learning, zero startup tokens
 
 import Database from 'better-sqlite3';
-import { readdirSync, readFileSync, statSync, existsSync } from 'fs';
-import { join, relative } from 'path';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { homedir } from 'os';
+import { discoverAllManaged, withRelativePaths } from '../resource-discovery.mjs';
 
 const BASE_DIR = join(homedir(), 'claude-mem-lite');
 const MANAGED_DIR = join(BASE_DIR, 'managed');
@@ -320,89 +321,10 @@ function extractFeatures(frontmatter, body) {
   };
 }
 
-// ─── File Discovery ──────────────────────────────────────────────────────────
-
-function findSkillMd(dir) {
-  const direct = join(dir, 'SKILL.md');
-  if (existsSync(direct)) return direct;
-
-  // .claude/skills/*/SKILL.md
-  const dotClaude = join(dir, '.claude', 'skills');
-  if (existsSync(dotClaude)) {
-    try {
-      for (const sub of readdirSync(dotClaude)) {
-        const nested = join(dotClaude, sub, 'SKILL.md');
-        if (existsSync(nested)) return nested;
-      }
-    } catch {}
-  }
-
-  // skills/*/SKILL.md (repos cloned as-is)
-  const skillsDir = join(dir, 'skills');
-  if (existsSync(skillsDir)) {
-    try {
-      for (const sub of readdirSync(skillsDir)) {
-        const nested = join(skillsDir, sub, 'SKILL.md');
-        if (existsSync(nested)) return nested;
-      }
-    } catch {}
-  }
-  return null;
-}
+// ─── File Discovery (delegated to resource-discovery.mjs) ────────────────────
 
 function discoverAll() {
-  const items = [];
-
-  // 1. Standalone skills: managed/skills/*/
-  const skillsDir = join(MANAGED_DIR, 'skills');
-  if (existsSync(skillsDir)) {
-    for (const name of readdirSync(skillsDir)) {
-      const dir = join(skillsDir, name);
-      if (!statSync(dir).isDirectory() || name === 'learned') continue;
-      const skillMd = findSkillMd(dir);
-      if (skillMd) {
-        items.push({ type: 'skill', name, filePath: relative(MANAGED_DIR, skillMd), absPath: skillMd, parentPlugin: null });
-      }
-    }
-  }
-
-  // 2. Agent plugins: managed/agents/*/
-  const agentsDir = join(MANAGED_DIR, 'agents');
-  if (existsSync(agentsDir)) {
-    for (const pluginName of readdirSync(agentsDir)) {
-      const pluginDir = join(agentsDir, pluginName);
-      if (!statSync(pluginDir).isDirectory()) continue;
-
-      // 2a. agents/*.md
-      const agentSubDir = join(pluginDir, 'agents');
-      if (existsSync(agentSubDir)) {
-        for (const file of readdirSync(agentSubDir)) {
-          if (!file.endsWith('.md')) continue;
-          const absPath = join(agentSubDir, file);
-          if (statSync(absPath).size === 0) continue; // skip empty files
-          items.push({
-            type: 'agent', name: `${pluginName}/${file.replace('.md', '')}`,
-            filePath: relative(MANAGED_DIR, absPath), absPath, parentPlugin: pluginName,
-          });
-        }
-      }
-
-      // 2b. skills/*/SKILL.md
-      const skillSubDir = join(pluginDir, 'skills');
-      if (existsSync(skillSubDir)) {
-        for (const skillName of readdirSync(skillSubDir)) {
-          const skillPath = join(skillSubDir, skillName, 'SKILL.md');
-          if (existsSync(skillPath)) {
-            items.push({
-              type: 'skill', name: `${pluginName}/${skillName}`,
-              filePath: relative(MANAGED_DIR, skillPath), absPath: skillPath, parentPlugin: pluginName,
-            });
-          }
-        }
-      }
-    }
-  }
-  return items;
+  return withRelativePaths(discoverAllManaged(MANAGED_DIR), MANAGED_DIR);
 }
 
 // ─── Repo URL Lookup ─────────────────────────────────────────────────────────

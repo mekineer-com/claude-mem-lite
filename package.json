@@ -35,6 +35,7 @@
     "registry-retriever.mjs",
     "registry-indexer.mjs",
     "registry-scanner.mjs",
+    "resource-discovery.mjs",
     "install.mjs",
     "tool-schemas.mjs",
     "utils.mjs",
