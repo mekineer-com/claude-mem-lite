@@ -56,24 +56,36 @@ export function findSkillMd(dir) {
  * @param {'skill'|'agent'} type Resource type
  * @param {object} [opts]
  * @param {string[]} [opts.skipNames] Directory names to skip
+ * @param {boolean} [opts.strict=true] When false, skill dirs without SKILL.md are still discovered
+ * @param {boolean} [opts.includeFiles=false] When true, loose .md files are also returned
  * @returns {DiscoveredResource[]}
  */
 export function discoverFlat(dirPath, type, opts = {}) {
   if (!existsSync(dirPath)) return [];
   const skipNames = new Set(opts.skipNames || []);
+  const strict = opts.strict !== false;
+  const includeFiles = opts.includeFiles || false;
 
   const items = [];
   for (const name of readdirSync(dirPath)) {
     if (name.startsWith('.') || name === 'node_modules' || skipNames.has(name)) continue;
-    const dir = join(dirPath, name);
-    try { if (!statSync(dir).isDirectory()) continue; } catch { continue; }
+    const fullPath = join(dirPath, name);
+    let stat;
+    try { stat = statSync(fullPath); } catch { continue; }
 
-    if (type === 'skill') {
-      const skillMd = findSkillMd(dir);
-      if (skillMd) items.push({ type: 'skill', name, absPath: skillMd, parentPlugin: null });
-    } else {
-      // For agents, look for .md files or readable content
-      items.push({ type: 'agent', name, absPath: dir, parentPlugin: null });
+    if (stat.isDirectory()) {
+      if (type === 'skill') {
+        const skillMd = findSkillMd(fullPath);
+        if (skillMd) {
+          items.push({ type: 'skill', name, absPath: skillMd, parentPlugin: null });
+        } else if (!strict) {
+          items.push({ type: 'skill', name, absPath: fullPath, parentPlugin: null });
+        }
+      } else {
+        items.push({ type: 'agent', name, absPath: fullPath, parentPlugin: null });
+      }
+    } else if (includeFiles && name.endsWith('.md')) {
+      items.push({ type, name: basename(name, '.md'), absPath: fullPath, parentPlugin: null });
     }
   }
   return items;
