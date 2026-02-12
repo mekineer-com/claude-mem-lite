@@ -166,5 +166,8 @@ export function readAndClearToolEvents() {
  */
 export function _extractResponseFromError(error) {
   const out = error.stdout?.toString?.()?.trim() || error.output?.[1]?.toString?.()?.trim() || '';
-  return out && out.startsWith('{') && out.endsWith('}') ? out : null;
+  if (out && out.startsWith('{') && out.endsWith('}')) {
+    try { JSON.parse(out); return out; } catch { return null; }
+  }
+  return null;
 }

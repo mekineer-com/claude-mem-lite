@@ -49,8 +49,8 @@ function isHaikuCircuitOpen() {
   const state = _readBreakerState();
   if (state.openUntil > 0 && Date.now() < state.openUntil) return true;
   if (state.openUntil > 0 && Date.now() >= state.openUntil) {
-    // Reset: half-open → allow one attempt
-    _writeBreakerState({ failures: 0, openUntil: 0 });
+    // Half-open: single probe failure re-trips immediately
+    _writeBreakerState({ failures: BREAKER_THRESHOLD - 1, openUntil: 0 });
   }
   return false;
 }
@@ -663,11 +663,13 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     // Low-confidence results: skip recommendation rather than suggest unreliable match
     if (needsHaikuDispatch(results)) return null;
 
-    const best = results[0];
-
-    // Apply DB-persisted cooldown and session dedup
+    // Apply DB-persisted cooldown and session dedup (filter all, not just top)
     const sid = sessionCtx.sessionId || null;
-    if (sid && isRecentlyRecommended(db, best.id, sid)) return null;
+    const viable = sid
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sid))
+      : results;
+    if (viable.length === 0) return null;
+    const best = viable[0];
 
     // Record invocation (also serves as cooldown/dedup marker)
     recordInvocation(db, {

@@ -661,14 +661,14 @@ async function install() {
     log('No existing database — will be created on first use');
   }
 
-  // 7. Disable old claude-mem plugin
+  // 8. Disable old claude-mem plugin
   if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
     settings.enabledPlugins['claude-mem@thedotmack'] = false;
     writeSettings(settings);
     ok('Old claude-mem plugin disabled');
   }
 
-  // 8. Offer to clean old vector-db
+  // 9. Offer to clean old vector-db
   const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
   if (existsSync(vectorDbPath)) {
     try {
@@ -697,6 +697,7 @@ async function uninstall() {
   const settings = readSettings();
   if (settings.hooks) {
     for (const [event, configs] of Object.entries(settings.hooks)) {
+      if (!Array.isArray(configs)) continue;
       settings.hooks[event] = configs.filter(cfg => !isMemHook(cfg));
       if (settings.hooks[event].length === 0) delete settings.hooks[event];
     }

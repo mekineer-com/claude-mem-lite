@@ -168,12 +168,15 @@ export function ensureRegistryDb(dbPath) {
   try {
     const schema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='invocations'`).get();
     if (schema?.sql && !schema.sql.includes('user_prompt')) {
-      db.exec(`
-        ALTER TABLE invocations RENAME TO invocations_old;
-        ${INVOCATIONS_SCHEMA}
-        INSERT INTO invocations SELECT * FROM invocations_old;
-        DROP TABLE invocations_old;
-      `);
+      db.transaction(() => {
+        db.exec(`ALTER TABLE invocations RENAME TO invocations_old`);
+        db.exec(INVOCATIONS_SCHEMA);
+        db.exec(`INSERT INTO invocations
+          (id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+          SELECT id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at
+          FROM invocations_old`);
+        db.exec(`DROP TABLE invocations_old`);
+      })();
     }
   } catch {}
 
@@ -187,8 +190,9 @@ export function ensureRegistryDb(dbPath) {
 const UPSERT_SQL = `
   INSERT INTO resources (name, type, status, source, repo_url, repo_stars, local_path, file_hash,
     intent_tags, domain_tags, action_type, trigger_patterns, capability_summary,
-    input_type, output_type, prerequisites, indexed_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    input_type, output_type, prerequisites, keywords, tech_stack, use_cases, complexity,
+    indexed_at, updated_at)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(type, name) DO UPDATE SET
     status=excluded.status, source=excluded.source, repo_url=excluded.repo_url,
     repo_stars=excluded.repo_stars, local_path=excluded.local_path, file_hash=excluded.file_hash,
@@ -196,6 +200,8 @@ const UPSERT_SQL = `
     action_type=excluded.action_type, trigger_patterns=excluded.trigger_patterns,
     capability_summary=excluded.capability_summary, input_type=excluded.input_type,
     output_type=excluded.output_type, prerequisites=excluded.prerequisites,
+    keywords=excluded.keywords, tech_stack=excluded.tech_stack,
+    use_cases=excluded.use_cases, complexity=excluded.complexity,
     indexed_at=excluded.indexed_at, updated_at=datetime('now')
 `;
 
@@ -213,6 +219,7 @@ export function upsertResource(db, r) {
       r.file_hash || null, r.intent_tags || '', r.domain_tags || '',
       r.action_type || '', r.trigger_patterns || '', r.capability_summary || '',
       r.input_type || '', r.output_type || '', r.prerequisites || '{}',
+      r.keywords || '', r.tech_stack || '', r.use_cases || '', r.complexity || 'intermediate',
       r.indexed_at || null
     );
     if (result.changes > 0 && result.lastInsertRowid) return Number(result.lastInsertRowid);

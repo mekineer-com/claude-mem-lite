@@ -902,16 +902,16 @@ walTimer.unref(); // Don't keep process alive just for checkpoints
 
 // ─── Shutdown Cleanup ────────────────────────────────────────────────────────
 
-function shutdown() {
+function shutdown(exitCode = 0) {
   clearInterval(walTimer);
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
   try { db.close(); } catch {}
-  process.exit(0);
+  process.exit(exitCode);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
-process.on('uncaughtException', (err) => { debugCatch(err, 'uncaughtException'); shutdown(); });
-process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'); shutdown(); });
+process.on('SIGINT', () => shutdown(0));
+process.on('SIGTERM', () => shutdown(0));
+process.on('uncaughtException', (err) => { debugCatch(err, 'uncaughtException'); shutdown(1); });
+process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'); shutdown(1); });
 
 // ─── Start Server ───────────────────────────────────────────────────────────
 

@@ -48,7 +48,8 @@
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
     ".mcp.json",
-    "README.md"
+    "README.md",
+    "registry/preinstalled.json"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

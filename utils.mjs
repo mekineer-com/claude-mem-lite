@@ -62,6 +62,8 @@ const SECRET_PATTERNS = [
   [/(Authorization:\s*Bearer\s+)[^\s,;'"}\]]+/gi, '$1***'],
   // Supabase / generic long base64 keys (40+ chars, common in env vars)
   [/(\b(?:SUPABASE_KEY|SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL|REDIS_URL)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
+  // Basic auth in URLs (https://user:password@host)
+  [/https?:\/\/[^@/\s]+:[^@/\s]+@/gi, 'https://***:***@'],
   // Database connection strings (postgres, mysql, mongodb, redis, amqp)
   [/\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s,;'"}\]]+/gi, '$1://***'],
   // npm tokens (npm_...)

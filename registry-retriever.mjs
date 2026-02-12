@@ -295,8 +295,8 @@ const COMPOSITE_ORDER = `
     - CASE WHEN r.recommend_count < 10
         THEN 0.10 * (1.0 - r.recommend_count * 1.0 / 10.0)
         ELSE 0 END
-    + CASE WHEN r.recommend_count > 5
-           AND (r.adopt_count * 1.0) / r.recommend_count < 0.1
+    + CASE WHEN r.recommend_count > 15
+           AND (r.adopt_count + 1.0) / (r.recommend_count + 2.0) < 0.1
         THEN 0.10
         ELSE 0 END
   ) ASC

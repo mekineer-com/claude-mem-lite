@@ -31,7 +31,7 @@ log_err()  { echo -e "${RED}✗${NC} $*" >&2; }
 # 1. Install npm dependencies if needed
 if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   log_info "Installing dependencies..."
-  if npm install --production --prefix "$ROOT" 2>&1; then
+  if npm install --omit=dev --prefix "$ROOT" 2>&1; then
     log_ok "Dependencies installed"
   else
     log_err "npm install failed"
