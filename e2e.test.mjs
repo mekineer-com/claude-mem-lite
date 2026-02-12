@@ -1012,3 +1012,189 @@ describe('Suite 8: CLAUDE.md Persistence', () => {
     expect(claudeMd).toContain('Existing content.');
   });
 });
+
+describe('Suite 9: Hidden Data Dir Migration', () => {
+  it('migrates ~/claude-mem-lite/ with runtime dir pre-created by module init', () => {
+    // Simulates the race: hook-shared.mjs creates ~/.claude-mem-lite/runtime/
+    // at module load time BEFORE ensureDb() runs. Migration must still work.
+    const home = makeTmpDir();
+    const oldDir = join(home, 'claude-mem-lite');
+    const newDir = join(home, '.claude-mem-lite');
+
+    // Old dir with DB
+    mkdirSync(oldDir, { recursive: true });
+    mkdirSync(join(oldDir, 'runtime'), { recursive: true });
+    const oldDbPath = join(oldDir, 'claude-mem-lite.db');
+    const db = new Database(oldDbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+    const now = new Date();
+    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('race-sess', 'race-sess', now.toISOString(), now.getTime());
+    db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'race marker', 'discovery', 'Race condition marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('race-sess', now.toISOString(), now.getTime());
+    db.close();
+
+    // Pre-create new hidden dir with runtime/ (simulates module-level mkdir)
+    mkdirSync(join(newDir, 'runtime'), { recursive: true });
+    // But NO DB file in new dir
+    expect(existsSync(join(newDir, 'claude-mem-lite.db'))).toBe(false);
+
+    const projDir = join(home, 'parent', 'raceproj');
+    mkdirSync(projDir, { recursive: true });
+    const { exitCode } = runHook('session-start', {
+      env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
+    });
+    expect(exitCode).toBe(0);
+
+    // Old dir should be gone, data should be in new hidden dir
+    expect(existsSync(oldDir)).toBe(false);
+    const newDbPath = join(newDir, 'claude-mem-lite.db');
+    expect(existsSync(newDbPath)).toBe(true);
+
+    const db2 = new Database(newDbPath, { readonly: true });
+    const obs = db2.prepare("SELECT title FROM observations WHERE title = 'Race condition marker'").get();
+    db2.close();
+    expect(obs).not.toBeUndefined();
+
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+
+  it('skips migration when hidden dir already has DB', () => {
+    // Both dirs exist with DBs — new dir data must NOT be overwritten
+    const home = makeTmpDir();
+    const oldDir = join(home, 'claude-mem-lite');
+    const newDir = join(home, '.claude-mem-lite');
+
+    // Old dir with old marker
+    mkdirSync(oldDir, { recursive: true });
+    mkdirSync(join(oldDir, 'runtime'), { recursive: true });
+    const oldDb = new Database(join(oldDir, 'claude-mem-lite.db'));
+    oldDb.pragma('journal_mode = WAL');
+    oldDb.pragma('foreign_keys = OFF');
+    initSchema(oldDb);
+    const now = new Date();
+    oldDb.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('old-sess', 'old-sess', now.toISOString(), now.getTime());
+    oldDb.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'old data', 'discovery', 'Old marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('old-sess', now.toISOString(), now.getTime());
+    oldDb.close();
+
+    // New hidden dir with different marker
+    mkdirSync(newDir, { recursive: true });
+    mkdirSync(join(newDir, 'runtime'), { recursive: true });
+    const newDb = new Database(join(newDir, 'claude-mem-lite.db'));
+    newDb.pragma('journal_mode = WAL');
+    newDb.pragma('foreign_keys = OFF');
+    initSchema(newDb);
+    newDb.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('new-sess', 'new-sess', now.toISOString(), now.getTime());
+    newDb.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'new data', 'discovery', 'New marker', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('new-sess', now.toISOString(), now.getTime());
+    newDb.close();
+
+    const projDir = join(home, 'parent', 'skipproj');
+    mkdirSync(projDir, { recursive: true });
+    const { exitCode } = runHook('session-start', {
+      env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
+    });
+    expect(exitCode).toBe(0);
+
+    // Old dir should still exist (not consumed)
+    expect(existsSync(oldDir)).toBe(true);
+
+    // New hidden dir should have its own data preserved (not overwritten)
+    const db2 = new Database(join(newDir, 'claude-mem-lite.db'), { readonly: true });
+    const newMarker = db2.prepare("SELECT title FROM observations WHERE title = 'New marker'").get();
+    const oldMarker = db2.prepare("SELECT title FROM observations WHERE title = 'Old marker'").get();
+    db2.close();
+    expect(newMarker).not.toBeUndefined();
+    expect(oldMarker).toBeUndefined(); // old data NOT merged in
+
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+
+  it('migrates dir with already-renamed DB (no file rename needed)', () => {
+    // ~/claude-mem-lite/claude-mem-lite.db → ~/.claude-mem-lite/claude-mem-lite.db
+    // Only dir migration, DB filename already correct
+    const home = makeTmpDir();
+    const oldDir = join(home, 'claude-mem-lite');
+    mkdirSync(oldDir, { recursive: true });
+    mkdirSync(join(oldDir, 'runtime'), { recursive: true });
+
+    const dbPath = join(oldDir, 'claude-mem-lite.db');
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+    const now = new Date();
+    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, 'test', ?, ?, 'completed')`).run('renamed-sess', 'renamed-sess', now.toISOString(), now.getTime());
+    db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?, 'test', 'already renamed', 'discovery', 'Already renamed DB', '', '', '', '', '[]', '[]', 1, ?, ?)`).run('renamed-sess', now.toISOString(), now.getTime());
+    db.close();
+
+    const projDir = join(home, 'parent', 'renameproj');
+    mkdirSync(projDir, { recursive: true });
+    const { exitCode } = runHook('session-start', {
+      env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
+    });
+    expect(exitCode).toBe(0);
+
+    // Old dir gone, new hidden dir has the DB
+    expect(existsSync(oldDir)).toBe(false);
+    const newDir = join(home, '.claude-mem-lite');
+    const newDbPath = join(newDir, 'claude-mem-lite.db');
+    expect(existsSync(newDbPath)).toBe(true);
+
+    // No claude-mem.db should exist (wasn't there to begin with)
+    expect(existsSync(join(newDir, 'claude-mem.db'))).toBe(false);
+
+    const db2 = new Database(newDbPath, { readonly: true });
+    const obs = db2.prepare("SELECT title FROM observations WHERE title = 'Already renamed DB'").get();
+    db2.close();
+    expect(obs).not.toBeUndefined();
+
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+
+  it('full lifecycle uses hidden dir for all runtime files', () => {
+    // Verify session file, episode file, flush file all under ~/.claude-mem-lite/
+    const home = makeTmpDir();
+    const projDir = join(home, 'parent', 'hiddenproj');
+    mkdirSync(projDir, { recursive: true });
+
+    // Session start — creates DB + session file
+    const { exitCode: e1 } = runHook('session-start', {
+      env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
+    });
+    expect(e1).toBe(0);
+
+    const hiddenDir = join(home, '.claude-mem-lite');
+    const runtimeDir = join(hiddenDir, 'runtime');
+
+    // DB created under hidden dir
+    expect(existsSync(join(hiddenDir, 'claude-mem-lite.db'))).toBe(true);
+
+    // Session file created under hidden dir
+    const sessionFiles = readdirSync(runtimeDir).filter(f => f.startsWith('session-'));
+    expect(sessionFiles.length).toBe(1);
+
+    // Post-tool-use → episode buffer under hidden dir
+    runHook('post-tool-use', {
+      stdin: makeToolPayload('Edit', {
+        file_path: '/tmp/src/hidden.js',
+        old_string: 'old',
+        new_string: 'new',
+      }, 'OK — edited file'),
+      env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
+    });
+
+    const epFiles = readdirSync(runtimeDir).filter(f => f.startsWith('ep-') && !f.startsWith('ep-flush-'));
+    expect(epFiles.length).toBe(1);
+
+    // Stop → session completed, flush file created
+    runHook('stop', { env: { HOME: home, CLAUDE_PROJECT_DIR: projDir } });
+
+    const flushFiles = readdirSync(runtimeDir).filter(f => f.startsWith('ep-flush-'));
+    expect(flushFiles.length).toBeGreaterThanOrEqual(1);
+
+    // No unhidden dir should have been created
+    expect(existsSync(join(home, 'claude-mem-lite'))).toBe(false);
+
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+});
