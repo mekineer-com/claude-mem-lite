@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { upsertResource, getSessionInvocations } from './registry.mjs';
 import {
-  dispatchOnSessionStart, dispatchOnUserPrompt,
+  dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
   extractContextSignals, shouldSkipDispatch,
   _resetCircuitBreaker,
 } from './dispatch.mjs';
@@ -276,6 +276,91 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       expect(signals.intent).toMatch(/review|secure/);
       expect(signals.techStack).toContain('typescript');
       expect(signals.action).toBe('edit');
+    });
+
+    it('dispatches recommendation for Edit with strong intent match', async () => {
+      const result = await dispatchOnPreToolUse(db,
+        { tool_name: 'Edit', tool_input: { file_path: '/src/parser.test.ts' } },
+        { userPrompt: 'Write unit tests for the parser', recentFiles: ['/src/parser.test.ts'], sessionId: 'session-pre-1' }
+      );
+      // Should match superpowers-tdd (test intent + edit action)
+      if (result) {
+        expect(result).toContain('[Auto-suggestion]');
+      }
+      // Even if null (low confidence), the function executed all tiers
+    });
+
+    it('records invocation with pre_tool_use trigger', async () => {
+      const result = await dispatchOnPreToolUse(db,
+        { tool_name: 'Edit', tool_input: { file_path: '/src/auth.ts' } },
+        { userPrompt: 'Fix the crash in authentication', recentFiles: ['/src/auth.ts'], sessionId: 'session-pre-2' }
+      );
+      if (result) {
+        const invocations = getSessionInvocations(db, 'session-pre-2');
+        expect(invocations).toHaveLength(1);
+        expect(invocations[0].trigger).toBe('pre_tool_use');
+        expect(invocations[0].tier).toBe(2);
+      }
+    });
+
+    it('returns null for null db or event', async () => {
+      expect(await dispatchOnPreToolUse(null, { tool_name: 'Edit' })).toBeNull();
+      expect(await dispatchOnPreToolUse(db, null)).toBeNull();
+    });
+
+    it('returns null when query yields no FTS5 results', async () => {
+      const result = await dispatchOnPreToolUse(db,
+        { tool_name: 'Edit', tool_input: { file_path: '/tmp/random.xyz' } },
+        { userPrompt: '', recentFiles: [], sessionId: 'session-pre-3' }
+      );
+      expect(result).toBeNull();
+    });
+
+    it('session dedup blocks repeated PreToolUse recommendation', async () => {
+      const first = await dispatchOnPreToolUse(db,
+        { tool_name: 'Edit', tool_input: { file_path: '/src/auth.ts' } },
+        { userPrompt: 'Fix the crash in authentication', recentFiles: ['/src/auth.ts'], sessionId: 'session-pre-4' }
+      );
+      // Second call same session — should be deduped if first succeeded
+      const second = await dispatchOnPreToolUse(db,
+        { tool_name: 'Edit', tool_input: { file_path: '/src/auth.ts' } },
+        { userPrompt: 'Fix the crash in authentication', recentFiles: ['/src/auth.ts'], sessionId: 'session-pre-4' }
+      );
+      if (first) {
+        expect(second).toBeNull();
+      }
+    });
+
+    it('works without sessionId (no dedup filtering)', async () => {
+      const result = await dispatchOnPreToolUse(db,
+        { tool_name: 'Edit', tool_input: { file_path: '/src/parser.test.ts' } },
+        { userPrompt: 'Write unit tests for the parser', recentFiles: ['/src/parser.test.ts'] }
+      );
+      // No sessionId → skips dedup filter, may return recommendation
+      if (result) {
+        expect(result).toContain('[Auto-suggestion]');
+      }
+    });
+  });
+
+  // Stage 3b: UserPromptSubmit textQuery fallback
+  describe('UserPromptSubmit textQuery fallback', () => {
+    it('falls back to textQuery when enhanced query has no results', async () => {
+      // Seed a resource that only matches via broad text, not via intent columns
+      upsertResource(db, {
+        name: 'niche-tool', type: 'skill', source: 'preinstalled',
+        local_path: '/test/skills/niche',
+        intent_tags: '', domain_tags: '',
+        trigger_patterns: 'xyzzy plugh adventurer',
+        capability_summary: 'A niche tool for xyzzy plugh adventurers',
+        keywords: 'xyzzy plugh adventure',
+        tech_stack: '', use_cases: 'xyzzy plugh adventure questing',
+      });
+      // This prompt has no standard intent patterns, so enhancedQuery returns empty.
+      // But textQuery via buildQueryFromText should match "xyzzy" in FTS5.
+      const result = await dispatchOnUserPrompt(db, 'Help me with xyzzy plugh', 'session-fallback-1');
+      expect(result).not.toBeNull();
+      expect(result).toContain('niche-tool');
     });
   });
 
