@@ -509,10 +509,10 @@ const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov
 export function fmtDate(iso) {
   if (!iso) return '';
   const d = new Date(iso);
-  const mon = MONTHS[d.getMonth()];
-  const day = d.getDate();
-  const h = String(d.getHours()).padStart(2, '0');
-  const m = String(d.getMinutes()).padStart(2, '0');
+  const mon = MONTHS[d.getUTCMonth()];
+  const day = d.getUTCDate();
+  const h = String(d.getUTCHours()).padStart(2, '0');
+  const m = String(d.getUTCMinutes()).padStart(2, '0');
   return `${mon} ${day} ${h}:${m}`;
 }
 

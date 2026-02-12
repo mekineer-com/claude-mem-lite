@@ -93,9 +93,11 @@ export function extractContextSignals(event, sessionCtx = {}) {
     signals.intent = extractIntent(sessionCtx.userPrompt);
   }
 
-  // Infer tech stack from recent files
+  // Infer tech stack from recent files or current tool_input.file_path
   if (sessionCtx.recentFiles?.length > 0) {
     signals.techStack = inferTechStack(sessionCtx.recentFiles);
+  } else if (event.tool_input?.file_path) {
+    signals.techStack = inferTechStack([event.tool_input.file_path]);
   }
 
   // Infer action from tool name and input
@@ -121,28 +123,39 @@ export function extractContextSignals(event, sessionCtx = {}) {
  */
 function extractIntent(prompt) {
   if (!prompt) return '';
+  // English patterns use \b word boundaries
   const intentPatterns = [
     [/\b(tests?|testing|tdd|spec|coverage)\b/i, 'test'],
     [/\b(debug|fix(es)?|bugs?|errors?|troubleshoot)\b/i, 'fix'],
     [/\b(commits?|push|pr|pull request|merge)\b/i, 'commit'],
     [/\b(deploy|release|publish|ship)\b/i, 'deploy'],
-    [/\b(reviews?|code review|审查)\b/i, 'review'],
-    [/\b(refactor|clean|simplify|重构)\b/i, 'clean'],
-    [/\b(perf|performance|optimi|快|慢)\b/i, 'fast'],
-    [/\b(security|secure|vulnerability|安全)\b/i, 'secure'],
+    [/\b(reviews?|code review)\b/i, 'review'],
+    [/\b(refactor|clean|simplify)\b/i, 'clean'],
+    [/\b(perf|performance|optimi)\b/i, 'fast'],
+    [/\b(security|secure|vulnerability)\b/i, 'secure'],
     [/\b(lint|format|style|prettier|eslint)\b/i, 'lint'],
-    [/\b(design|ui|ux|frontend|css|界面|设计)\b/i, 'design'],
-    [/\b(build|compile|bundle|构建)\b/i, 'build'],
-    [/\b(docs?|documentation|readme|文档)\b/i, 'doc'],
-    [/\b(infra|docker|k8s|terraform|部署)\b/i, 'infra'],
-    [/\b(db|database|sql|数据库)\b/i, 'db'],
-    [/\b(api|endpoints?|routes?|接口)\b/i, 'api'],
-    [/\b(plan|architect|设计|规划)\b/i, 'plan'],
-    [/(测试|写测试)/i, 'test'],
-    [/(修复|修bug)/i, 'fix'],
-    [/(提交|推送)/i, 'commit'],
-    [/(优化)/i, 'fast'],
-    [/(清理|整理)/i, 'clean'],
+    [/\b(design|ui|ux|frontend|css)\b/i, 'design'],
+    [/\b(build|compile|bundle)\b/i, 'build'],
+    [/\b(docs?|documentation|readme)\b/i, 'doc'],
+    [/\b(infra|docker|k8s|terraform)\b/i, 'infra'],
+    [/\b(db|database|sql)\b/i, 'db'],
+    [/\b(api|endpoints?|routes?)\b/i, 'api'],
+    [/\b(plan|architect)\b/i, 'plan'],
+    // Chinese patterns — \b doesn't work with CJK characters, so match without boundaries
+    [/(测试|写测试)/, 'test'],
+    [/(修复|修bug)/, 'fix'],
+    [/(提交|推送)/, 'commit'],
+    [/(部署|上线|发布)/, 'deploy'],
+    [/(审查|代码审查|评审)/, 'review'],
+    [/(重构|清理|整理)/, 'clean'],
+    [/(优化|快|慢)/, 'fast'],
+    [/(安全|漏洞)/, 'secure'],
+    [/(界面|设计|前端|UI)/, 'design'],
+    [/(构建|编译|打包)/, 'build'],
+    [/(文档|说明)/, 'doc'],
+    [/(数据库|建表)/, 'db'],
+    [/(接口|路由)/, 'api'],
+    [/(规划|架构)/, 'plan'],
   ];
 
   const found = [];
