@@ -13,6 +13,7 @@ import { callHaikuJSON } from './haiku-client.mjs';
 import { debugCatch, truncate } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
 
+// Duplicated from hook-shared.mjs to avoid circular import (dispatch ← hook ← hook-shared)
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
@@ -59,6 +60,8 @@ function recordHaikuSuccess() {
   _writeBreakerState({ failures: 0, openUntil: 0 });
 }
 
+// NOTE: read-modify-write without file locking — concurrent hook processes may lose
+// one increment. Acceptable: threshold is 3, worst case trips on 4th failure instead.
 function recordHaikuFailure() {
   const state = _readBreakerState();
   state.failures++;

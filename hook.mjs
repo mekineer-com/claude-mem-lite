@@ -390,22 +390,50 @@ async function handleSessionStart() {
   if (!db) return;
 
   try {
-    // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
     const now = new Date();
-    db.prepare(`
-      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-      VALUES (?, ?, ?, ?, ?, 'active')
-    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
-    // Complete previous session if this is a mid-session restart (/clear, /compact, crash)
-    if (prevSessionId) {
-      try {
+    // ── DB mutations in a transaction (crash-safe consistency) ──
+    const staleSessionCutoff = Date.now() - STALE_SESSION_MS;
+    const autoCompressAge = Date.now() - 90 * 86400000; // 90 days
+
+    db.transaction(() => {
+      // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
+      db.prepare(`
+        INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+        VALUES (?, ?, ?, ?, ?, 'active')
+      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+
+      // Complete previous session if this is a mid-session restart (/clear, /compact, crash)
+      if (prevSessionId) {
         db.prepare(`
           UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?
           WHERE content_session_id = ? AND status = 'active'
         `).run(now.toISOString(), now.getTime(), prevSessionId);
-      } catch (e) { debugCatch(e, 'session-start-complete-prev'); }
+      }
 
+      // Stale session cleanup: mark 24h+ active sessions as abandoned
+      db.prepare(`
+        UPDATE sdk_sessions SET status = 'abandoned'
+        WHERE status = 'active' AND started_at_epoch < ?
+      `).run(staleSessionCutoff);
+
+      // Auto-compress: mark old low-importance observations as compressed (90+ days, importance=1)
+      // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
+      const compressed = db.prepare(`
+        UPDATE observations SET compressed_into = -1
+        WHERE COALESCE(compressed_into, 0) = 0
+          AND importance = 1
+          AND created_at_epoch < ?
+          AND project = ?
+      `).run(autoCompressAge, project);
+      if (compressed.changes > 0) {
+        debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
+      }
+    })();
+
+    // ── Non-transactional operations (side effects, background work) ──
+
+    if (prevSessionId) {
       // Collect dispatch feedback for previous session
       try {
         const rdb = getRegistryDb();
@@ -447,13 +475,6 @@ async function handleSessionStart() {
       } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
     }
 
-    // Stale session cleanup: mark 24h+ active sessions as abandoned
-    const oneDayAgo = Date.now() - STALE_SESSION_MS;
-    db.prepare(`
-      UPDATE sdk_sessions SET status = 'abandoned'
-      WHERE status = 'active' AND started_at_epoch < ?
-    `).run(oneDayAgo);
-
     // Clean stale lock files in runtime dir
     try {
       for (const f of readdirSync(RUNTIME_DIR)) {
@@ -479,29 +500,14 @@ async function handleSessionStart() {
       }
     } catch {}
 
-    // Auto-compress: mark old low-importance observations as compressed (90+ days, importance=1)
-    // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
-    try {
-      const autoCompressAge = Date.now() - 90 * 86400000; // 90 days
-      const compressed = db.prepare(`
-        UPDATE observations SET compressed_into = -1
-        WHERE COALESCE(compressed_into, 0) = 0
-          AND importance = 1
-          AND created_at_epoch < ?
-          AND project = ?
-      `).run(autoCompressAge, project);
-      if (compressed.changes > 0) {
-        debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
-      }
-    } catch {}
-
     // Token-budgeted observation selection (replaces flat LIMIT 15)
     const selected = selectWithTokenBudget(db, project, 2000);
     const observations = selected.observations;
 
-    // Fallback: recent across all projects with tiered windows
+    // Fallback: recent across all projects with tiered windows (M7: local variable for clarity)
     let fallbackObs = [];
     if (observations.length < 3) {
+      const fbOneDayAgo = Date.now() - STALE_SESSION_MS;
       const fbSevenDaysAgo = Date.now() - FALLBACK_OBS_WINDOW_MS;
       fallbackObs = db.prepare(`
         SELECT id, type, title, project, created_at
@@ -513,7 +519,7 @@ async function handleSessionStart() {
           )
         ORDER BY created_at_epoch DESC
         LIMIT 5
-      `).all(oneDayAgo, fbSevenDaysAgo);
+      `).all(fbOneDayAgo, fbSevenDaysAgo);
     }
 
     // Fallback fast summary: if a recently completed session has no summary yet

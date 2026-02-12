@@ -5,8 +5,20 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { truncate } from './utils.mjs';
+import { DB_DIR } from './schema.mjs';
 
 const MAX_INJECTION_CHARS = 3000;
+
+// Allowed base directories for resource file reads (defense-in-depth)
+const ALLOWED_BASES = [
+  join(homedir(), '.claude'),
+  join(DB_DIR, 'managed'),
+];
+
+function isAllowedPath(filePath) {
+  if (!filePath) return false;
+  return ALLOWED_BASES.some(base => filePath.startsWith(base));
+}
 
 // ─── Template Detection ──────────────────────────────────────────────────────
 
@@ -40,6 +52,7 @@ function injectSkillNative(resource) {
  * @returns {string} Injection text with embedded skill content
  */
 function injectSkillManaged(resource) {
+  if (!isAllowedPath(resource.local_path)) return injectSkillNative(resource);
   let content = '';
   try {
     content = readFileSync(resource.local_path, 'utf8');
@@ -69,6 +82,11 @@ ${truncatedContent}
  * @returns {string} Injection text with agent definition for Task tool delegation
  */
 function injectAgent(resource) {
+  if (!isAllowedPath(resource.local_path)) {
+    return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task. ` +
+      `Capability: ${truncate(resource.capability_summary, 100)}. ` +
+      `Use the Task tool to delegate this work.`;
+  }
   let agentDef = '';
   try {
     agentDef = readFileSync(resource.local_path, 'utf8');

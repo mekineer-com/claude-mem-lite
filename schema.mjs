@@ -189,6 +189,52 @@ export function ensureDb() {
  * Create FTS5 virtual table + sync triggers for a content table.
  * Idempotent: skips if already exists. Exported for test helpers.
  */
+/**
+ * Rebuild all FTS5 indexes. Use after suspected index corruption (e.g. crash mid-trigger).
+ * Safe to call at any time — rebuilds are idempotent.
+ * @param {Database} db Opened database instance
+ * @returns {{rebuilt: string[], errors: string[]}} Results per FTS table
+ */
+export function rebuildFTS(db) {
+  const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts'];
+  const rebuilt = [];
+  const errors = [];
+  for (const fts of FTS_TABLES) {
+    try {
+      const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(fts);
+      if (!exists) { errors.push(`${fts}: not found`); continue; }
+      db.exec(`INSERT INTO ${fts}(${fts}) VALUES('rebuild')`);
+      rebuilt.push(fts);
+    } catch (e) {
+      errors.push(`${fts}: ${e.message}`);
+    }
+  }
+  return { rebuilt, errors };
+}
+
+/**
+ * Check FTS5 index integrity. Returns true if all indexes are healthy.
+ * @param {Database} db Opened database instance
+ * @returns {{healthy: boolean, details: string[]}}
+ */
+export function checkFTSIntegrity(db) {
+  const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts'];
+  const details = [];
+  let healthy = true;
+  for (const fts of FTS_TABLES) {
+    try {
+      const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(fts);
+      if (!exists) { details.push(`${fts}: missing`); healthy = false; continue; }
+      db.exec(`INSERT INTO ${fts}(${fts}) VALUES('integrity-check')`);
+      details.push(`${fts}: ok`);
+    } catch (e) {
+      details.push(`${fts}: CORRUPT (${e.message})`);
+      healthy = false;
+    }
+  }
+  return { healthy, details };
+}
+
 export function ensureFTS(db, ftsName, tableName, columns) {
   const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
   if (exists) return;

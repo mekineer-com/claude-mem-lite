@@ -5,13 +5,32 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch } from './utils.mjs';
-import { ensureDb } from './schema.mjs';
+import { ensureDb, DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema } from './tool-schemas.mjs';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-const db = ensureDb();
+import { rmSync } from 'fs';
+
+let db;
+try {
+  db = ensureDb();
+} catch (firstErr) {
+  // Recovery: remove WAL/SHM files (corrupt WAL is the most common cause) and retry
+  debugLog('WARN', 'server', `DB open failed, attempting WAL recovery: ${firstErr.message}`);
+  try { rmSync(DB_PATH + '-wal', { force: true }); } catch {}
+  try { rmSync(DB_PATH + '-shm', { force: true }); } catch {}
+  try {
+    db = ensureDb();
+    debugLog('INFO', 'server', 'DB recovered after WAL cleanup');
+  } catch (retryErr) {
+    // Fatal: log and exit with descriptive message (Claude Code shows stderr)
+    console.error(`[claude-mem-lite] FATAL: Database cannot be opened: ${retryErr.message}`);
+    console.error(`[claude-mem-lite] Try: rm "${DB_PATH}-wal" "${DB_PATH}-shm" or reinstall with: node install.mjs install`);
+    process.exit(1);
+  }
+}
 // Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');
 
