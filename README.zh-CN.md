@@ -86,12 +86,30 @@
 - **双语意图识别** -- 同时理解中文和英文用户意图（15+ 英文 + 12+ 中文意图类别）
 - **领域同义词扩展** -- 调度查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
 - **持久化冷却机制** -- 5 分钟跨会话冷却 + 同会话去重，避免重复推荐
+- **双模式 LLM 调用** -- 自动检测 `ANTHROPIC_API_KEY` 直连 API；无 key 时回退到 `claude -p` CLI
+- **Haiku 熔断器** -- 连续 3 次 LLM 失败后，禁用 Haiku 调度 5 分钟，防止级联延迟
+- **否定意图感知** -- 正确处理 "不要测试了，先修 bug" 等复杂提示，排除被否定的意图，支持中英文混合输入
+- **可配置 LLM 模型** -- 通过 `CLAUDE_MEM_MODEL` 环境变量在 Haiku（快速/低成本）和 Sonnet（深度分析）之间切换
+- **数据库自动恢复** -- 启动时检测并清理损坏的 WAL/SHM 文件；定期 WAL checkpoint 防止无限增长
+- **Schema 自动迁移** -- 每次启动运行幂等的 `ALTER TABLE` 迁移，安全地添加新列和索引，不丢失数据
+- **探索奖励** -- 注册表中的新资源在复合排名中获得公平机会；高推荐零采纳的"僵尸"资源被惩罚
+- **LLM 并发控制** -- 基于文件的信号量将后台 worker 限制为 2 个并发 LLM 调用，防止资源争用
+- **stdin 溢出保护** -- Hook 输入在 256KB 处截断，对超大工具输出使用正则挽救关键信息
+
+## 平台支持
+
+| 平台 | 状态 | 说明 |
+|------|------|------|
+| **Linux** | 支持 | 主要开发和测试平台 |
+| **macOS** | 支持 | 完全兼容（Intel 和 Apple Silicon） |
+| **Windows** | 暂不支持 | 使用 POSIX shell 脚本（`post-tool-use.sh`、`setup.sh`）和 Unix 文件锁；WSL2 可能可用但未经测试 |
 
 ## 环境要求
 
 - **Node.js** >= 18
 - **Claude Code** CLI 已安装并配置（`claude` 命令可用）
 - **SQLite3** 支持（由 `better-sqlite3` 提供，安装时编译）
+- **平台**：Linux 或 macOS（参见[平台支持](#平台支持)）
 
 ## 安装
 
@@ -426,7 +444,7 @@ claude-mem-lite/
     convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
     index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）
-  *.test.mjs           # 单元、属性、集成、契约、E2E、管线测试（569 个）
+  *.test.mjs           # 单元、属性、集成、契约、E2E、管线测试（581 个）
   test-helpers.mjs     # 共享测试工具
   benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
@@ -449,7 +467,7 @@ claude-mem-lite/
 
 ```bash
 npm run lint              # ESLint 静态分析
-npm test                  # 运行全部 569 个测试（vitest）
+npm test                  # 运行全部 581 个测试（vitest）
 npm run test:smoke        # 运行 5 个核心冒烟测试
 npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试

@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "bin": {
     "claude-mem-lite": "./install.mjs"
   },

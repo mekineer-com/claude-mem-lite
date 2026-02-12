@@ -86,12 +86,30 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Bilingual intent recognition** -- Understands user intent in both English and Chinese (15+ EN + 12+ CN intent categories)
 - **Domain synonym expansion** -- Dispatch queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
 - **DB-persisted cooldown** -- 5-minute cross-session cooldown and per-session dedup prevent repeated recommendations
+- **Dual LLM mode** -- Auto-detects `ANTHROPIC_API_KEY` for direct API calls; falls back to `claude -p` CLI when no key is available
+- **Haiku circuit breaker** -- After 3 consecutive LLM failures, disables Haiku dispatch for 5 minutes to prevent cascading latency
+- **Negation-aware intent** -- Handles complex prompts like "don't test, just fix the bug" — correctly excludes negated intents even in mixed English/Chinese input
+- **Configurable LLM model** -- Switch between Haiku (fast/cheap) and Sonnet (deeper analysis) via `CLAUDE_MEM_MODEL` env var
+- **DB auto-recovery** -- Detects and cleans corrupted WAL/SHM files on startup; periodic WAL checkpoints prevent unbounded growth
+- **Schema auto-migration** -- Idempotent `ALTER TABLE` migrations run on every startup, safely adding new columns and indexes without data loss
+- **Exploration bonus** -- New resources in the registry get a fair chance in composite ranking; zombie resources (high recommend, zero adopt) are penalized
+- **LLM concurrency control** -- File-based semaphore limits background workers to 2 concurrent LLM calls, preventing resource contention
+- **stdin overflow protection** -- Hook input truncated at 256KB with regex-based action salvage for oversized tool outputs
+
+## Platform Support
+
+| Platform | Status | Notes |
+|----------|--------|-------|
+| **Linux** | Supported | Primary development and testing platform |
+| **macOS** | Supported | Fully compatible (Intel and Apple Silicon) |
+| **Windows** | Not supported | Uses POSIX shell scripts (`post-tool-use.sh`, `setup.sh`) and Unix file locking; WSL2 may work but is untested |
 
 ## Requirements
 
 - **Node.js** >= 18
 - **Claude Code** CLI installed and configured (`claude` command available)
 - **SQLite3** support (provided by `better-sqlite3`, compiled on install)
+- **Platform**: Linux or macOS (see [Platform Support](#platform-support))
 
 ## Installation
 
@@ -426,7 +444,7 @@ claude-mem-lite/
     convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
     index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
-  *.test.mjs           # Unit, property, integration, contract, E2E, pipeline tests (569 tests)
+  *.test.mjs           # Unit, property, integration, contract, E2E, pipeline tests (581 tests)
   test-helpers.mjs     # Shared test utilities
   benchmark/           # BM25 search quality benchmarks + CI gate
 ```
@@ -449,7 +467,7 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 
 ```bash
 npm run lint              # ESLint static analysis
-npm test                  # Run all 569 tests (vitest)
+npm test                  # Run all 581 tests (vitest)
 npm run test:smoke        # Run 5 core smoke tests
 npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
 npm run benchmark         # Run full search quality benchmark
