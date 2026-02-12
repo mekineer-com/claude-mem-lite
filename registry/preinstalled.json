@@ -108,13 +108,6 @@
       "tags": ["plan", "files", "organize", "structure", "project"]
     },
     {
-      "name": "code-review-master",
-      "type": "skill",
-      "repo": "https://github.com/awesome-claude-skills/code-review-master",
-      "path": ".",
-      "tags": ["review", "code-review", "quality", "best-practices"]
-    },
-    {
       "name": "code-review-expert",
       "type": "skill",
       "repo": "https://github.com/sanyuan0704/code-review-expert",

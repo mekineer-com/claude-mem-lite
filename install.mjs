@@ -118,12 +118,6 @@ const RESOURCE_METADATA = {
     capability_summary: 'Plan project structure and organize files before implementation',
     trigger_patterns: 'when user needs to plan file structure or organize project layout before building',
   },
-  'skill:code-review-master': {
-    intent_tags: 'review,code-review,quality,best-practices,inspect,audit',
-    domain_tags: 'quality,review',
-    capability_summary: 'Comprehensive code review following best practices and quality standards',
-    trigger_patterns: 'when user wants a thorough code review checking for best practices and quality issues',
-  },
   'skill:code-review-expert': {
     intent_tags: 'review,code-review,expert,quality,SOLID,security,architecture',
     domain_tags: 'quality,review,security',
