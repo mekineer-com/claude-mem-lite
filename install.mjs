@@ -23,6 +23,281 @@ const INSTALL_DIR = IS_NPX ? DATA_DIR : PROJECT_DIR;
 const SERVER_PATH = join(INSTALL_DIR, 'server.mjs');
 const HOOK_PATH = join(INSTALL_DIR, 'hook.mjs');
 
+// ─── Curated Resource Metadata ───────────────────────────────────────────────
+// Replaces generic name-echo fallback with FTS5-optimized metadata per resource.
+// Keys: intent_tags, domain_tags, capability_summary, trigger_patterns
+
+const RESOURCE_METADATA = {
+  // ─── Skills ──────────────────────────────────────────────────────────────
+  'skill:skill-creator': {
+    intent_tags: 'skill,create,extend,meta,develop,author',
+    domain_tags: 'claude,skill,markdown',
+    capability_summary: 'Guide for creating and authoring new Claude Code skills with proper structure and metadata',
+    trigger_patterns: 'when user wants to create a new skill or extend Claude capabilities with custom workflows',
+  },
+  'skill:frontend-design': {
+    intent_tags: 'design,ui,ux,frontend,css,component,layout,styling,interface',
+    domain_tags: 'css,react,html,tailwind,frontend',
+    capability_summary: 'Create distinctive production-grade frontend interfaces with high design quality',
+    trigger_patterns: 'when user needs to build or design UI components pages or web interfaces',
+  },
+  'skill:webapp-testing': {
+    intent_tags: 'test,webapp,e2e,browser,qa,selenium,cypress,integration',
+    domain_tags: 'browser,web,testing',
+    capability_summary: 'Web application testing with browser automation and E2E test suites',
+    trigger_patterns: 'when user needs to test web applications in a browser or write E2E tests',
+  },
+  'skill:mcp-builder': {
+    intent_tags: 'mcp,server,tool,integration,build,protocol,plugin',
+    domain_tags: 'mcp,node,typescript',
+    capability_summary: 'Build MCP servers and tool integrations for Claude Code',
+    trigger_patterns: 'when user wants to build an MCP server or create tool integrations',
+  },
+  'skill:pdf': {
+    intent_tags: 'pdf,document,generate,export,report,print',
+    domain_tags: 'pdf,document',
+    capability_summary: 'Generate and export PDF documents from content',
+    trigger_patterns: 'when user needs to create generate or export PDF documents',
+  },
+  'skill:doc-coauthoring': {
+    intent_tags: 'documentation,writing,collaborate,docs,readme,technical-writing',
+    domain_tags: 'markdown,docs,documentation',
+    capability_summary: 'Collaborative documentation writing and technical content authoring',
+    trigger_patterns: 'when user needs help writing documentation README or technical content',
+  },
+  'skill:superpowers-brainstorming': {
+    intent_tags: 'brainstorm,design,planning,creative,ideas,explore,requirements',
+    domain_tags: 'planning,design',
+    capability_summary: 'Explore user intent requirements and design before implementation through structured brainstorming',
+    trigger_patterns: 'when user needs to brainstorm ideas explore requirements or plan creative solutions before coding',
+  },
+  'skill:superpowers-tdd': {
+    intent_tags: 'test,tdd,testing,unittest,spec,coverage,quality,red-green-refactor',
+    domain_tags: 'testing,javascript,typescript,python',
+    capability_summary: 'Test-driven development workflow with red-green-refactor cycle and quality checks',
+    trigger_patterns: 'when user wants to write tests first or follow TDD methodology for feature development',
+  },
+  'skill:superpowers-debugging': {
+    intent_tags: 'debug,troubleshoot,fix,error,systematic,diagnose,bug,crash,failure',
+    domain_tags: 'debugging,error-handling',
+    capability_summary: 'Systematic debugging approach for complex bugs using hypothesis-driven investigation',
+    trigger_patterns: 'when user encounters bugs errors crashes or unexpected behavior that needs systematic debugging',
+  },
+  'skill:superpowers-code-review': {
+    intent_tags: 'review,code-review,quality,audit,feedback,inspect,pr-review',
+    domain_tags: 'quality,review',
+    capability_summary: 'Structured code review requesting with quality checklists and feedback gathering',
+    trigger_patterns: 'when user wants to request or perform a thorough code review of their changes',
+  },
+  'skill:superpowers-writing-plans': {
+    intent_tags: 'plan,architecture,spec,implementation,blueprint,roadmap,strategy',
+    domain_tags: 'planning,architecture',
+    capability_summary: 'Write structured implementation plans from specs before touching code',
+    trigger_patterns: 'when user has requirements or specs and needs a multi-step implementation plan before coding',
+  },
+  'skill:superpowers-git-worktrees': {
+    intent_tags: 'git,worktree,branch,isolation,parallel,workspace',
+    domain_tags: 'git,workflow',
+    capability_summary: 'Create isolated git worktrees for parallel feature development',
+    trigger_patterns: 'when user needs to work on multiple branches simultaneously or isolate feature work',
+  },
+  'skill:superpowers-verification': {
+    intent_tags: 'verify,check,test,complete,quality,validation,evidence',
+    domain_tags: 'quality,verification',
+    capability_summary: 'Verify work is complete by running checks and gathering evidence before claiming done',
+    trigger_patterns: 'when user is about to claim work is complete and needs verification before committing',
+  },
+  'skill:playwright-skill': {
+    intent_tags: 'playwright,browser,automation,test,e2e,screenshot,scrape',
+    domain_tags: 'playwright,browser,testing',
+    capability_summary: 'Browser automation with Playwright for testing forms screenshots and web interactions',
+    trigger_patterns: 'when user needs to automate browser interactions test web pages or take screenshots with Playwright',
+  },
+  'skill:planning-with-files': {
+    intent_tags: 'plan,files,organize,structure,project,scope',
+    domain_tags: 'planning,project',
+    capability_summary: 'Plan project structure and organize files before implementation',
+    trigger_patterns: 'when user needs to plan file structure or organize project layout before building',
+  },
+  'skill:code-review-master': {
+    intent_tags: 'review,code-review,quality,best-practices,inspect,audit',
+    domain_tags: 'quality,review',
+    capability_summary: 'Comprehensive code review following best practices and quality standards',
+    trigger_patterns: 'when user wants a thorough code review checking for best practices and quality issues',
+  },
+  'skill:code-review-expert': {
+    intent_tags: 'review,code-review,expert,quality,SOLID,security,architecture',
+    domain_tags: 'quality,review,security',
+    capability_summary: 'Expert code review detecting SOLID violations security risks and architectural issues',
+    trigger_patterns: 'when user needs expert-level code review with SOLID analysis and security scanning',
+  },
+  'skill:ui-ux-pro-max': {
+    intent_tags: 'ui,ux,design,frontend,pro,interface,visual,styling',
+    domain_tags: 'ui,ux,frontend,css',
+    capability_summary: 'Professional UI/UX design with polished visual styling and user experience focus',
+    trigger_patterns: 'when user needs professional-grade UI/UX design with strong visual polish',
+  },
+  // ─── Agents ──────────────────────────────────────────────────────────────
+  'agent:code-review-ai': {
+    intent_tags: 'review,code-review,ai,quality,audit,automated',
+    domain_tags: 'quality,review',
+    capability_summary: 'AI-powered automated code review with quality analysis and improvement suggestions',
+    trigger_patterns: 'when user wants AI-automated code review or quality analysis of their codebase',
+  },
+  'agent:tdd-workflows': {
+    intent_tags: 'test,tdd,workflow,testing,quality,unittest,spec',
+    domain_tags: 'testing,tdd',
+    capability_summary: 'Automated TDD workflow agent for test-first development cycles',
+    trigger_patterns: 'when user wants automated TDD workflow support with test generation and execution',
+  },
+  'agent:debugging-toolkit': {
+    intent_tags: 'debug,toolkit,error,troubleshoot,fix,diagnose,trace,crash',
+    domain_tags: 'debugging,error-handling',
+    capability_summary: 'Debugging toolkit agent with error analysis stack trace investigation and fix suggestions',
+    trigger_patterns: 'when user has errors or crashes and needs automated debugging assistance and fix suggestions',
+  },
+  'agent:code-refactoring': {
+    intent_tags: 'refactor,clean,simplify,restructure,organize,improve,technical-debt',
+    domain_tags: 'refactoring,quality',
+    capability_summary: 'Automated code refactoring for cleaner structure reduced complexity and technical debt',
+    trigger_patterns: 'when user wants to refactor code simplify complex logic or reduce technical debt',
+  },
+  'agent:code-documentation': {
+    intent_tags: 'documentation,docs,readme,jsdoc,comment,docstring,api-docs',
+    domain_tags: 'documentation,docs',
+    capability_summary: 'Automated code documentation generation including JSDoc README and API docs',
+    trigger_patterns: 'when user needs to generate documentation add JSDoc comments or create README files',
+  },
+  'agent:security-scanning': {
+    intent_tags: 'security,scan,vulnerability,audit,owasp,secrets,xss,injection',
+    domain_tags: 'security,audit',
+    capability_summary: 'Security vulnerability scanning for OWASP issues secrets leaks and injection flaws',
+    trigger_patterns: 'when user needs security scanning for vulnerabilities secrets or OWASP compliance',
+  },
+  'agent:application-performance': {
+    intent_tags: 'performance,optimize,profile,benchmark,speed,latency,memory',
+    domain_tags: 'performance,optimization',
+    capability_summary: 'Application performance profiling optimization and benchmark analysis',
+    trigger_patterns: 'when user needs to profile optimize or benchmark application performance',
+  },
+  'agent:api-scaffolding': {
+    intent_tags: 'api,scaffold,rest,endpoint,backend,route,express,fastify',
+    domain_tags: 'api,backend,rest',
+    capability_summary: 'Scaffold REST API endpoints with routes controllers and validation boilerplate',
+    trigger_patterns: 'when user needs to scaffold new API endpoints or build REST backend structure',
+  },
+  'agent:database-design': {
+    intent_tags: 'database,schema,sql,design,model,erd,table,relation',
+    domain_tags: 'database,sql,schema',
+    capability_summary: 'Database schema design with table relationships indexes and normalization',
+    trigger_patterns: 'when user needs to design database schema create tables or model data relationships',
+  },
+  'agent:database-migrations': {
+    intent_tags: 'database,migration,schema,alter,sql,upgrade,rollback',
+    domain_tags: 'database,sql,migration',
+    capability_summary: 'Database migration generation with schema alterations upgrade and rollback support',
+    trigger_patterns: 'when user needs to create database migrations alter schemas or manage schema versions',
+  },
+  'agent:cicd-automation': {
+    intent_tags: 'ci,cd,automation,pipeline,deploy,github-actions,workflow',
+    domain_tags: 'cicd,devops,deploy',
+    capability_summary: 'CI/CD pipeline automation with GitHub Actions workflow configuration and deploy setup',
+    trigger_patterns: 'when user needs to set up CI/CD pipelines configure GitHub Actions or automate deployments',
+  },
+  'agent:git-pr-workflows': {
+    intent_tags: 'git,pr,pull-request,merge,workflow,branch,commit',
+    domain_tags: 'git,workflow',
+    capability_summary: 'Git PR workflow automation with branch management commit strategy and merge handling',
+    trigger_patterns: 'when user needs help with git PR workflows branch management or merge strategies',
+  },
+  'agent:unit-testing': {
+    intent_tags: 'test,unit,jest,vitest,mocha,pytest,unittest,spec',
+    domain_tags: 'testing,unittest',
+    capability_summary: 'Unit test generation and execution with jest vitest mocha or pytest',
+    trigger_patterns: 'when user needs to write or generate unit tests using jest vitest mocha or pytest',
+  },
+  'agent:dependency-management': {
+    intent_tags: 'dependency,npm,package,update,manage,upgrade,audit,outdated',
+    domain_tags: 'dependencies,npm,package',
+    capability_summary: 'Dependency management with version updates audit and compatibility checking',
+    trigger_patterns: 'when user needs to manage update audit or resolve dependency conflicts',
+  },
+  'agent:error-debugging': {
+    intent_tags: 'error,debug,diagnose,stack-trace,fix,exception,crash,runtime',
+    domain_tags: 'debugging,error-handling',
+    capability_summary: 'Error diagnosis from stack traces with root cause analysis and fix suggestions',
+    trigger_patterns: 'when user has runtime errors exceptions or stack traces that need diagnosis and fixing',
+  },
+  'agent:python-development': {
+    intent_tags: 'python,pip,poetry,django,flask,fastapi,virtualenv',
+    domain_tags: 'python,backend',
+    capability_summary: 'Python development agent for Django Flask FastAPI and general Python projects',
+    trigger_patterns: 'when user is working on Python projects with pip poetry Django Flask or FastAPI',
+  },
+  'agent:javascript-typescript': {
+    intent_tags: 'javascript,typescript,node,npm,web,react,express,fullstack',
+    domain_tags: 'javascript,typescript,node,web',
+    capability_summary: 'JavaScript and TypeScript development agent for Node.js React and web projects',
+    trigger_patterns: 'when user is working on JavaScript TypeScript Node.js or web development projects',
+  },
+  'agent:cloud-infrastructure': {
+    intent_tags: 'cloud,aws,gcp,azure,infrastructure,terraform,iac,devops',
+    domain_tags: 'cloud,infrastructure,devops',
+    capability_summary: 'Cloud infrastructure management with AWS GCP Azure and Terraform IaC',
+    trigger_patterns: 'when user needs to manage cloud infrastructure with AWS GCP Azure or Terraform',
+  },
+  'agent:ui-design': {
+    intent_tags: 'ui,design,frontend,css,component,layout,responsive',
+    domain_tags: 'ui,frontend,css',
+    capability_summary: 'UI design agent for frontend component layout and responsive design implementation',
+    trigger_patterns: 'when user needs to design and implement UI components layouts or responsive interfaces',
+  },
+  'agent:frontend-developer': {
+    intent_tags: 'frontend,react,vue,web,component,spa,interface',
+    domain_tags: 'frontend,react,vue,web',
+    capability_summary: 'Frontend development agent for React Vue and modern web application building',
+    trigger_patterns: 'when user needs to build frontend applications with React Vue or modern web frameworks',
+  },
+  'agent:mcp-expert': {
+    intent_tags: 'mcp,server,tool,integration,protocol,sdk,plugin',
+    domain_tags: 'mcp,protocol,integration',
+    capability_summary: 'MCP protocol expert for building servers tools and integrations with the MCP SDK',
+    trigger_patterns: 'when user needs expert help with MCP protocol server development or tool integration',
+  },
+  'agent:component-reviewer': {
+    intent_tags: 'component,review,quality,frontend,react,vue,audit',
+    domain_tags: 'frontend,review,component',
+    capability_summary: 'Frontend component reviewer for quality accessibility and best-practice auditing',
+    trigger_patterns: 'when user wants to review frontend components for quality accessibility and best practices',
+  },
+};
+
+/**
+ * Apply curated metadata to existing resource DB entries.
+ * Fixes existing installs that have generic name-echo metadata.
+ * @param {Database} rdb Registry database handle
+ */
+function reindexKnownResources(rdb) {
+  const update = rdb.prepare(`
+    UPDATE resources SET
+      intent_tags = ?, domain_tags = ?,
+      capability_summary = ?, trigger_patterns = ?,
+      updated_at = datetime('now')
+    WHERE type = ? AND name = ?
+  `);
+
+  rdb.transaction(() => {
+    for (const [key, meta] of Object.entries(RESOURCE_METADATA)) {
+      const [type, name] = key.split(':');
+      update.run(
+        meta.intent_tags, meta.domain_tags,
+        meta.capability_summary, meta.trigger_patterns,
+        type, name
+      );
+    }
+  })();
+}
+
 const cmd = process.argv[2];
 const flags = new Set(process.argv.slice(3));
 
@@ -295,6 +570,8 @@ async function install() {
           const { upsertResource } = await import('./registry.mjs');
           for (const res of toIndex) {
             try {
+              const metaKey = `${res.type}:${res.name}`;
+              const meta = RESOURCE_METADATA[metaKey];
               upsertResource(rdb, {
                 name: res.name,
                 type: res.type,
@@ -304,15 +581,19 @@ async function install() {
                 repo_stars: res.repoStars || 0,
                 local_path: res.localPath,
                 file_hash: res.fileHash,
-                intent_tags: (res.name.replace(/-/g, ' ')),
-                domain_tags: '',
-                trigger_patterns: `when user needs ${res.name.replace(/-/g, ' ')}`,
-                capability_summary: `${res.type}: ${res.name.replace(/-/g, ' ')}`,
+                intent_tags: meta?.intent_tags || res.name.replace(/-/g, ' '),
+                domain_tags: meta?.domain_tags || '',
+                trigger_patterns: meta?.trigger_patterns || `when user needs ${res.name.replace(/-/g, ' ')}`,
+                capability_summary: meta?.capability_summary || `${res.type}: ${res.name.replace(/-/g, ' ')}`,
               });
             } catch {}
           }
           ok(`Resources registered: ${toIndex.length} indexed`);
         }
+
+        // Apply curated metadata to all known resources (fixes existing installs)
+        reindexKnownResources(rdb);
+        ok('Resource metadata curated (FTS5 reindexed)');
 
         rdb.close();
       }

@@ -19,8 +19,45 @@ const READ_ONLY_TOOLS = new Set([
   'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode',
 ]);
 
-const CONFIDENCE_THRESHOLD = 3.0; // BM25 relevance threshold (negative values, lower = better)
 export const COOLDOWN_MINUTES = 5;
+
+// ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
+// Prevents cascading latency when Haiku API is down or slow.
+// After BREAKER_THRESHOLD consecutive failures, disable for BREAKER_RESET_MS.
+
+const BREAKER_THRESHOLD = 3;
+const BREAKER_RESET_MS = 5 * 60 * 1000; // 5 minutes
+
+let _breakerFailures = 0;
+let _breakerOpenUntil = 0;
+
+function isHaikuCircuitOpen() {
+  if (_breakerOpenUntil > 0 && Date.now() < _breakerOpenUntil) return true;
+  if (_breakerOpenUntil > 0 && Date.now() >= _breakerOpenUntil) {
+    // Reset: half-open → allow one attempt
+    _breakerFailures = 0;
+    _breakerOpenUntil = 0;
+  }
+  return false;
+}
+
+function recordHaikuSuccess() {
+  _breakerFailures = 0;
+  _breakerOpenUntil = 0;
+}
+
+function recordHaikuFailure() {
+  _breakerFailures++;
+  if (_breakerFailures >= BREAKER_THRESHOLD) {
+    _breakerOpenUntil = Date.now() + BREAKER_RESET_MS;
+  }
+}
+
+/** Reset circuit breaker state (for testing). */
+export function _resetCircuitBreaker() {
+  _breakerFailures = 0;
+  _breakerOpenUntil = 0;
+}
 
 // ─── Tier 0: Local Fast Filter ───────────────────────────────────────────────
 
@@ -65,7 +102,7 @@ function isSimpleBashQuery(cmd) {
   // Simple commands that don't need skill suggestions
   const simplePatterns = [
     /^(ls|cat|head|tail|echo|pwd|whoami|which|type|file|wc)\b/,
-    /^git\s+(status|log|diff|show|branch|remote|stash\s+list)\b/,
+    /^git\s+(status|log|show|branch|remote|stash\s+list)\b/,
     /^(node|python|ruby|go)\s+--?v/,
     /^(npm|yarn|pnpm)\s+(list|ls|outdated|info|view)\b/,
   ];
@@ -82,15 +119,17 @@ function isSimpleBashQuery(cmd) {
  */
 export function extractContextSignals(event, sessionCtx = {}) {
   const signals = {
-    intent: '',
+    intent: '',          // comma-separated intent tags, primary first
+    primaryIntent: '',   // first/strongest intent (for column-targeted queries)
     techStack: '',
     action: '',
     errorDomain: '',
   };
 
-  // Extract intent from user prompt
+  // Extract weighted intent from user prompt (primary intent is first element)
   if (sessionCtx.userPrompt) {
     signals.intent = extractIntent(sessionCtx.userPrompt);
+    signals.primaryIntent = signals.intent.split(',')[0] || '';
   }
 
   // Infer tech stack from recent files or current tool_input.file_path
@@ -116,10 +155,17 @@ export function extractContextSignals(event, sessionCtx = {}) {
   return signals;
 }
 
+// Negation patterns: "don't test", "not deploy", "别测试", "不要部署"
+const NEGATION_EN = /\b(?:don'?t|do\s+not|no\s+need\s+to|skip|without|avoid|not)\s+/i;
+const NEGATION_CJK = /(?:不要|别|不用|先别|暂时不|不需要|跳过)/;
+
 /**
- * Extract intent keywords from user prompt.
+ * Extract weighted intent keywords from user prompt.
+ * Returns primary (first match, strongest signal) and secondary intents.
+ * Negated intents (e.g. "don't test") are excluded.
+ *
  * @param {string} prompt User's natural language prompt
- * @returns {string} Comma-separated intent tags (e.g. "test,fix")
+ * @returns {string} Comma-separated intent tags, primary intent listed first (e.g. "test,fix")
  */
 function extractIntent(prompt) {
   if (!prompt) return '';
@@ -141,29 +187,56 @@ function extractIntent(prompt) {
     [/\b(db|database|sql)\b/i, 'db'],
     [/\b(api|endpoints?|routes?)\b/i, 'api'],
     [/\b(plan|architect)\b/i, 'plan'],
-    // Chinese patterns — \b doesn't work with CJK characters, so match without boundaries
-    [/(测试|写测试)/, 'test'],
-    [/(修复|修bug)/, 'fix'],
+    // Chinese patterns — \b doesn't work with CJK characters, so match without boundaries.
+    // Use 2+ char compounds to avoid false positives from polysemous single chars.
+    [/(测试|写测试|单测|单元测试|用例|覆盖率)/, 'test'],
+    [/(修复|修bug|调试|排错|报错|出错|有问题|不工作)/, 'fix'],
     [/(提交|推送)/, 'commit'],
     [/(部署|上线|发布)/, 'deploy'],
     [/(审查|代码审查|评审)/, 'review'],
-    [/(重构|清理|整理)/, 'clean'],
-    [/(优化|快|慢)/, 'fast'],
-    [/(安全|漏洞)/, 'secure'],
-    [/(界面|设计|前端|UI)/, 'design'],
+    [/(重构|清理|整理|简化)/, 'clean'],
+    [/(优化|性能|卡顿|耗时|太慢)/, 'fast'],
+    [/(安全|漏洞|鉴权|认证|授权|权限)/, 'secure'],
+    [/(格式化|代码风格|代码规范)/, 'lint'],
+    [/(界面|前端|样式|页面|组件|布局)/, 'design'],
     [/(构建|编译|打包)/, 'build'],
-    [/(文档|说明)/, 'doc'],
-    [/(数据库|建表)/, 'db'],
+    [/(写文档|文档化|文档|注释)/, 'doc'],
+    [/(容器|服务器|运维|集群)/, 'infra'],
+    [/(数据库|建表|索引|迁移)/, 'db'],
     [/(接口|路由)/, 'api'],
-    [/(规划|架构)/, 'plan'],
+    [/(规划|架构|方案)/, 'plan'],
   ];
+
+  // Build negated intent set: detect "don't X", "not X", "别X", "不要X"
+  // Uses clause-aware proximity: negation must be in the same clause and close to the keyword
+  const CLAUSE_BOUNDARY = /[,，。；;、.!?！？]/;
+  const negated = new Set();
+  for (const [pattern, tag] of intentPatterns) {
+    const match = pattern.exec(prompt);
+    if (!match) continue;
+    const matchStart = match.index;
+    // EN: 20-char window, CJK: 8-char window — check both
+    const enPrefix = prompt.slice(Math.max(0, matchStart - 20), matchStart);
+    const cjkPrefix = prompt.slice(Math.max(0, matchStart - 8), matchStart);
+    // Clause boundary check: if a comma/period separates negation from keyword, skip
+    const hasEnNeg = NEGATION_EN.test(enPrefix) && !CLAUSE_BOUNDARY.test(enPrefix);
+    const hasCjkNeg = NEGATION_CJK.test(cjkPrefix) && !CLAUSE_BOUNDARY.test(cjkPrefix);
+    if (hasEnNeg || hasCjkNeg) {
+      negated.add(tag);
+    }
+  }
 
   const found = [];
   for (const [pattern, tag] of intentPatterns) {
-    if (pattern.test(prompt)) found.push(tag);
+    if (pattern.test(prompt) && !negated.has(tag) && !found.includes(tag)) {
+      found.push(tag);
+    }
   }
   return found.join(',');
 }
+
+/** Exported for testing. */
+export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK };
 
 /**
  * Infer tech stack from file extensions.
@@ -241,15 +314,39 @@ function extractErrorDomain(cmd, response) {
 
 /**
  * Check if Haiku dispatch is needed based on FTS5 results.
+ * Uses relative confidence: top result must be strong enough relative to result set,
+ * and gap between top two must be decisive.
  * @param {object[]} results FTS5 results with relevance scores
  * @returns {boolean} true if Haiku should be called
  */
 export function needsHaikuDispatch(results) {
   if (results.length === 0) return true;
-  // BM25 returns negative values (more negative = more relevant)
-  if (Math.abs(results[0].relevance) < CONFIDENCE_THRESHOLD) return true;
-  if (results.length > 1 &&
-      Math.abs(Math.abs(results[0].relevance) - Math.abs(results[1].relevance)) < 0.5) return true;
+
+  // Circuit breaker: if Haiku is tripped, never escalate
+  if (isHaikuCircuitOpen()) return false;
+
+  const topScore = Math.abs(results[0].relevance);
+
+  // Relative threshold: if only one result or few results, use absolute minimum
+  // For larger result sets, use mean-relative threshold
+  if (results.length === 1) {
+    // Single result: needs at least moderate relevance
+    return topScore < 2.0;
+  }
+
+  // Compute mean relevance across results
+  const meanScore = results.reduce((sum, r) => sum + Math.abs(r.relevance), 0) / results.length;
+
+  // Top result should be significantly above mean (at least 1.5x)
+  if (topScore < meanScore * 1.5 && topScore < 3.0) return true;
+
+  // Top two results too close → ambiguous, need Haiku to disambiguate
+  if (results.length > 1) {
+    const gap = topScore - Math.abs(results[1].relevance);
+    // Gap should be at least 10% of top score, or at least 0.5 absolute
+    if (gap < Math.max(topScore * 0.1, 0.5)) return true;
+  }
+
   return false;
 }
 
@@ -260,6 +357,9 @@ export function needsHaikuDispatch(results) {
  * @returns {Promise<{query: string, type: string, confidence: number}|null>} Haiku result or null
  */
 async function haikuDispatch(userPrompt, toolContext) {
+  // Circuit breaker: skip if Haiku is tripped
+  if (isHaikuCircuitOpen()) return null;
+
   const prompt = `Given this coding context, which resource (skill or agent) would be most helpful?
 Return ONLY valid JSON.
 
@@ -268,7 +368,13 @@ Current action: ${truncate(toolContext || '', 200)}
 
 JSON: {"query":"search keywords for finding the right skill or agent","type":"skill|agent|either","confidence":0.0-1.0}`;
 
-  return callHaikuJSON(prompt, { timeout: 3000, maxTokens: 100 });
+  const result = await callHaikuJSON(prompt, { timeout: 3000, maxTokens: 100 });
+  if (result) {
+    recordHaikuSuccess();
+  } else {
+    recordHaikuFailure();
+  }
+  return result;
 }
 
 // ─── Cooldown & Dedup (DB-persisted, survives process restarts) ─────────────
