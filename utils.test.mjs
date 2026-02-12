@@ -1010,10 +1010,10 @@ describe('fmtDate', () => {
     expect(fmtDate(undefined)).toBe('');
   });
 
-  it('formats ISO date to "Mon DD HH:MM"', () => {
+  it('formats ISO date to "Mon DD HH:MM" in UTC', () => {
     // Jan 15, 2026, 14:30 UTC
-    const result = fmtDate(new Date(2026, 0, 15, 14, 30).toISOString());
-    expect(result).toMatch(/Jan 15 14:30/);
+    const result = fmtDate('2026-01-15T14:30:00.000Z');
+    expect(result).toBe('Jan 15 14:30');
   });
 });
 
