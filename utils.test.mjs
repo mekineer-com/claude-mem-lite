@@ -889,6 +889,15 @@ describe('scrubSecrets', () => {
   it('scrubs Stripe keys', () => {
     expect(scrubSecrets('sk_live_abcdefghijklmnopqrstuv')).toBe('***');
     expect(scrubSecrets('pk_test_abcdefghijklmnopqrstuv')).toBe('***');
+    expect(scrubSecrets('rk_live_abcdefghijklmnopqrstuv')).toBe('***');
+  });
+
+  it('does not false-positive on non-Stripe prefixes', () => {
+    // Old regex [srpk]{2}k?_ matched 'ss_live_', 'pp_live_', 'kk_live_' etc.
+    // Tightened to [srp]k_ — only real Stripe prefixes
+    expect(scrubSecrets('ss_live_abcdefghijklmnopqrstuv')).toBe('ss_live_abcdefghijklmnopqrstuv');
+    expect(scrubSecrets('pp_test_abcdefghijklmnopqrstuv')).toBe('pp_test_abcdefghijklmnopqrstuv');
+    expect(scrubSecrets('kk_live_abcdefghijklmnopqrstuv')).toBe('kk_live_abcdefghijklmnopqrstuv');
   });
 
   it('scrubs Google Cloud API keys (AIza...)', () => {

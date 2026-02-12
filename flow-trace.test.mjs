@@ -235,6 +235,14 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       const cross = await dispatchOnUserPrompt(db, '帮我写单元测试', 'session-2b');
       expect(cross).toBeNull();
     });
+
+    it('records invocation with user_prompt trigger (not session_start)', async () => {
+      await dispatchOnUserPrompt(db, '帮我写单元测试', 'session-2c');
+      const invocations = getSessionInvocations(db, 'session-2c');
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0].trigger).toBe('user_prompt');
+      expect(invocations[0].recommended).toBe(1);
+    });
   });
 
   // Stage 2b: Cross-hook dedup (SessionStart → UserPrompt)

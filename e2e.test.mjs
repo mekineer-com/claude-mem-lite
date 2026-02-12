@@ -1198,3 +1198,70 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
     try { rmSync(home, { recursive: true, force: true }); } catch {}
   });
 });
+
+// ─── Suite 10: Code Review Fix Validations ──────────────────────────────────
+
+describe('Suite 10: Code Review Fix Validations', () => {
+  it('SOURCE_FILES covers all static imports in server.mjs and hook.mjs', () => {
+    // Validate that install.mjs SOURCE_FILES includes every local .mjs import
+    const installSrc = readFileSync(resolve('install.mjs'), 'utf8');
+    const match = installSrc.match(/const SOURCE_FILES = \[([\s\S]*?)\];/);
+    expect(match).not.toBeNull();
+    const sourceFiles = match[1].match(/'([^']+\.mjs)'/g).map(s => s.replace(/'/g, ''));
+
+    // Collect all local .mjs imports from server.mjs and hook.mjs
+    const entryFiles = ['server.mjs', 'hook.mjs'];
+    const visited = new Set();
+    const queue = [...entryFiles];
+
+    while (queue.length > 0) {
+      const file = queue.shift();
+      if (visited.has(file)) continue;
+      visited.add(file);
+      const src = readFileSync(resolve(file), 'utf8');
+      const imports = [...src.matchAll(/from\s+'\.\/([^']+\.mjs)'/g)].map(m => m[1]);
+      for (const imp of imports) {
+        if (!visited.has(imp)) queue.push(imp);
+      }
+    }
+
+    // Every visited .mjs file (except the entry points themselves if not in SOURCE_FILES) must be in SOURCE_FILES
+    for (const file of visited) {
+      expect(sourceFiles).toContain(file);
+    }
+  });
+
+  it('migration preserves DB_DIR when it contains .db files', () => {
+    const home = makeTmpDir();
+    const oldDir = join(home, 'claude-mem-lite');
+    const newDir = join(home, '.claude-mem-lite');
+
+    // Old dir with DB
+    mkdirSync(oldDir, { recursive: true });
+    const oldDbPath = join(oldDir, 'claude-mem-lite.db');
+    const db = new Database(oldDbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+    db.close();
+
+    // New dir already has a .db file (user data — must NOT be deleted)
+    mkdirSync(newDir, { recursive: true });
+    writeFileSync(join(newDir, 'some-data.db'), 'important data');
+
+    const projDir = join(home, 'parent', 'safetyproj');
+    mkdirSync(projDir, { recursive: true });
+    const { exitCode } = runHook('session-start', {
+      env: { HOME: home, CLAUDE_PROJECT_DIR: projDir },
+    });
+    expect(exitCode).toBe(0);
+
+    // Both dirs should still exist — migration should NOT have deleted newDir
+    expect(existsSync(newDir)).toBe(true);
+    expect(existsSync(join(newDir, 'some-data.db'))).toBe(true);
+    // Old dir should still exist (migration couldn't proceed)
+    expect(existsSync(oldDir)).toBe(true);
+
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+});

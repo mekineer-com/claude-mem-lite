@@ -1056,6 +1056,21 @@ describe('Haiku circuit breaker', () => {
     _recordHaikuSuccess();
     expect(_isHaikuCircuitOpen()).toBe(false);
   });
+
+  it('persists state to file across separate read/write cycles', () => {
+    // Simulate cross-process: write failures, then read in separate calls
+    _resetCircuitBreaker();
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    // State should survive — each call reads from disk
+    expect(_isHaikuCircuitOpen()).toBe(false); // 2 failures: still closed
+    _recordHaikuFailure();
+    // Now at threshold — breaker opens (persisted to file)
+    expect(_isHaikuCircuitOpen()).toBe(true);
+    // Reset and verify persisted reset
+    _resetCircuitBreaker();
+    expect(_isHaikuCircuitOpen()).toBe(false);
+  });
 });
 
 // ─── Cooldown & Dedup Tests ─────────────────────────────────────────────────
