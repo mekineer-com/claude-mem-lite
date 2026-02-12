@@ -830,21 +830,28 @@ async function doctor() {
       const db = new Database(DB_PATH, { readonly: true });
       // Check FTS
       const fts = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations_fts'").get();
+      db.close();
       if (fts) {
         ok('FTS5 index: present');
-        // FTS5 integrity check
+        // FTS5 integrity check (requires read-write access for INSERT INTO fts VALUES('integrity-check'))
         try {
           const { checkFTSIntegrity, rebuildFTS } = await import('./schema.mjs');
-          const { healthy, details } = checkFTSIntegrity(db);
-          if (healthy) {
-            ok('FTS5 integrity: all indexes healthy');
-          } else {
-            warn('FTS5 integrity issues detected:');
-            for (const d of details) log(`    ${d}`);
-            log('  Attempting FTS5 rebuild...');
-            const { rebuilt, errors } = rebuildFTS(db);
-            if (rebuilt.length > 0) ok(`FTS5 rebuilt: ${rebuilt.join(', ')}`);
-            if (errors.length > 0) { fail(`FTS5 rebuild errors: ${errors.join(', ')}`); issues++; }
+          const rwDb = new Database(DB_PATH);
+          rwDb.pragma('busy_timeout = 3000');
+          try {
+            const { healthy, details } = checkFTSIntegrity(rwDb);
+            if (healthy) {
+              ok('FTS5 integrity: all indexes healthy');
+            } else {
+              warn('FTS5 integrity issues detected:');
+              for (const d of details) log(`    ${d}`);
+              log('  Attempting FTS5 rebuild...');
+              const { rebuilt, errors } = rebuildFTS(rwDb);
+              if (rebuilt.length > 0) ok(`FTS5 rebuilt: ${rebuilt.join(', ')}`);
+              if (errors.length > 0) { fail(`FTS5 rebuild errors: ${errors.join(', ')}`); issues++; }
+            }
+          } finally {
+            rwDb.close();
           }
         } catch (e) {
           warn('FTS5 integrity check failed: ' + e.message);
@@ -852,7 +859,6 @@ async function doctor() {
       } else {
         warn('FTS5 index: missing (will be created on server start)');
       }
-      db.close();
     } catch (e) {
       fail('Database: ' + e.message);
       issues++;
