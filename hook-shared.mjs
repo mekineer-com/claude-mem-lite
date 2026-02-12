@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, unlinkSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { ensureRegistryDb } from './registry.mjs';
@@ -118,6 +118,45 @@ export function spawnBackground(bgEvent, ...extraArgs) {
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ─── Tool Event Tracking (for dispatch feedback) ────────────────────────────
+// PostToolUse appends feedback-relevant tool events (Skill, Task, Edit, Write, Bash errors).
+// Stop handler reads them and passes to collectFeedback for adoption/outcome detection.
+
+export function toolEventsFile() {
+  return join(RUNTIME_DIR, `tool-events-${inferProject()}.jsonl`);
+}
+
+/**
+ * Append a tool event for feedback tracking.
+ * Only call for feedback-relevant events (Skill, Task, Edit, Write, Bash).
+ * @param {object} event { tool_name, tool_input, tool_response }
+ */
+export function appendToolEvent(event) {
+  try {
+    appendFileSync(toolEventsFile(), JSON.stringify(event) + '\n');
+  } catch {}
+}
+
+/**
+ * Read all tracked tool events and remove the file.
+ * Uses rename→read→delete for atomicity.
+ * @returns {object[]} Array of tool event objects
+ */
+export function readAndClearToolEvents() {
+  const file = toolEventsFile();
+  const claimFile = file + `.claim-${process.pid}-${Date.now()}`;
+  try {
+    renameSync(file, claimFile);
+    const raw = readFileSync(claimFile, 'utf8');
+    try { unlinkSync(claimFile); } catch {}
+    return raw.trim().split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
 
 /**
  * Extract partial response from CLI error output (timeout/error recovery).

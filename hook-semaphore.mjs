@@ -3,9 +3,7 @@
 
 import { join } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, readdirSync, openSync, closeSync, writeSync, constants as fsConstants } from 'fs';
-import { DB_DIR } from './schema.mjs';
-
-const RUNTIME_DIR = join(DB_DIR, 'runtime');
+import { RUNTIME_DIR } from './hook-shared.mjs';
 
 export const LLM_SEM_MAX = 2;
 export const LLM_SEM_TIMEOUT = 30000; // 30s max wait

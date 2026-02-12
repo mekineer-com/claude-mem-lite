@@ -20,6 +20,7 @@ const RESOURCES_SCHEMA = `
     repo_stars    INTEGER DEFAULT 0,
     local_path    TEXT NOT NULL,
     file_hash     TEXT,
+    parent_plugin TEXT,
     intent_tags       TEXT DEFAULT '',
     domain_tags       TEXT DEFAULT '',
     action_type       TEXT DEFAULT '',
@@ -28,6 +29,10 @@ const RESOURCES_SCHEMA = `
     input_type    TEXT DEFAULT '',
     output_type   TEXT DEFAULT '',
     prerequisites TEXT DEFAULT '{}',
+    keywords      TEXT DEFAULT '',
+    tech_stack    TEXT DEFAULT '',
+    use_cases     TEXT DEFAULT '',
+    complexity    TEXT DEFAULT 'intermediate',
     recommend_count   INTEGER DEFAULT 0,
     adopt_count       INTEGER DEFAULT 0,
     success_count     INTEGER DEFAULT 0,
@@ -43,12 +48,18 @@ const RESOURCES_SCHEMA = `
     ON resources(status) WHERE status = 'active';
 `;
 
+// Canonical FTS5 column order — all consumers must use this order.
+// BM25 weights (positional): trigger_patterns(5), keywords(3), capability_summary(3),
+//   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
 const FTS5_SCHEMA = `
   CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(
     trigger_patterns,
+    keywords,
     capability_summary,
     intent_tags,
+    use_cases,
     domain_tags,
+    tech_stack,
     name,
     content=resources,
     content_rowid=id,
@@ -58,28 +69,28 @@ const FTS5_SCHEMA = `
 
 const TRIGGERS_SCHEMA = `
   CREATE TRIGGER IF NOT EXISTS res_fts_insert AFTER INSERT ON resources BEGIN
-    INSERT INTO resources_fts(rowid, trigger_patterns, capability_summary,
-      intent_tags, domain_tags, name)
-    VALUES (NEW.id, NEW.trigger_patterns, NEW.capability_summary,
-      NEW.intent_tags, NEW.domain_tags, NEW.name);
+    INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+      intent_tags, use_cases, domain_tags, tech_stack, name)
+    VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
+      NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
   END;
 
   CREATE TRIGGER IF NOT EXISTS res_fts_update AFTER UPDATE ON resources BEGIN
-    INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns,
-      capability_summary, intent_tags, domain_tags, name)
-    VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.capability_summary,
-      OLD.intent_tags, OLD.domain_tags, OLD.name);
-    INSERT INTO resources_fts(rowid, trigger_patterns, capability_summary,
-      intent_tags, domain_tags, name)
-    VALUES (NEW.id, NEW.trigger_patterns, NEW.capability_summary,
-      NEW.intent_tags, NEW.domain_tags, NEW.name);
+    INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
+      capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
+    VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
+      OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
+    INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+      intent_tags, use_cases, domain_tags, tech_stack, name)
+    VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
+      NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
   END;
 
   CREATE TRIGGER IF NOT EXISTS res_fts_delete AFTER DELETE ON resources BEGIN
-    INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns,
-      capability_summary, intent_tags, domain_tags, name)
-    VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.capability_summary,
-      OLD.intent_tags, OLD.domain_tags, OLD.name);
+    INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
+      capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
+    VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
+      OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
   END;
 `;
 
@@ -300,12 +311,18 @@ export function getSessionInvocations(db, sessionId) {
  * @param {object} update Fields to update
  */
 export function updateInvocation(db, id, update) {
+  const allowed = new Set(['adopted', 'outcome', 'score']);
   const sets = [];
   const vals = [];
-  if (update.adopted !== undefined) { sets.push('adopted = ?'); vals.push(update.adopted); }
-  if (update.outcome !== undefined) { sets.push('outcome = ?'); vals.push(update.outcome); }
-  if (update.score !== undefined) { sets.push('score = ?'); vals.push(update.score); }
+  for (const [key, val] of Object.entries(update)) {
+    if (val === undefined) continue;
+    if (!allowed.has(key)) throw new Error(`Invalid invocation field: ${key}`);
+    sets.push(`${key} = ?`);
+    vals.push(val);
+  }
   if (sets.length === 0) return;
   vals.push(id);
+  // String interpolation required: SQLite cannot parameterize column names.
+  // Safety: column names are validated against allowlist above.
   db.prepare(`UPDATE invocations SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
 }

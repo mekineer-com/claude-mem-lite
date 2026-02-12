@@ -1025,8 +1025,8 @@ describe('fmtTime', () => {
     expect(fmtTime(null)).toBe('');
   });
 
-  it('formats ISO date to "HH:MM"', () => {
-    const result = fmtTime(new Date(2026, 0, 15, 9, 5).toISOString());
+  it('formats ISO date to "HH:MM" in UTC', () => {
+    const result = fmtTime('2026-01-15T09:05:00.000Z');
     expect(result).toBe('09:05');
   });
 });

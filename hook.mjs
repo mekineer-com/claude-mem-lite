@@ -19,13 +19,13 @@ import {
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { selectWithTokenBudget, updateClaudeMd } from './hook-context.mjs';
-import { dispatchOnSessionStart, dispatchOnPreToolUse } from './dispatch.mjs';
+import { dispatchOnSessionStart, dispatchOnPreToolUse, dispatchOnUserPrompt } from './dispatch.mjs';
 import { collectFeedback } from './dispatch-feedback.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
-  closeRegistryDb, spawnBackground,
+  closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary } from './hook-llm.mjs';
 
@@ -230,6 +230,19 @@ async function handlePostToolUse() {
     }
 
     writeEpisode(episode);
+
+    // Track feedback-relevant tool events for dispatch adoption detection.
+    // Skill/Task: adoption detection checks these tool names.
+    // Edit/Write/NotebookEdit: outcome detection checks for edits.
+    // Bash errors: outcome detection checks for error signals.
+    if (['Skill', 'Task', 'Edit', 'Write', 'NotebookEdit'].includes(tool_name) ||
+        (tool_name === 'Bash' && bashSig?.isError)) {
+      appendToolEvent({
+        tool_name,
+        tool_input: toolInput,
+        tool_response: (tool_name === 'Bash' && bashSig?.isError) ? resp.slice(0, 500) : '',
+      });
+    }
   } finally {
     releaseLock();
     if (db) try { db.close(); } catch {}
@@ -321,24 +334,13 @@ async function handleStop() {
     }
   }
 
-  // Dispatch: collect feedback on recommendations
+  // Dispatch: collect feedback on recommendations using actual tool events
+  // PostToolUse tracks Skill/Task/Edit/Write/Bash events in a JSONL file.
+  // These events drive adoption detection (Skill/Task) and outcome detection (Edit/Bash errors).
   try {
     const rdb = getRegistryDb();
     if (rdb) {
-      const memDb = openDb();
-      const sessionEvents = [];
-      if (memDb) {
-        try {
-          const prompts = memDb.prepare(
-            'SELECT prompt_text FROM user_prompts WHERE content_session_id = ? ORDER BY created_at_epoch'
-          ).all(sessionId);
-          for (const p of prompts) {
-            if (p.prompt_text) {
-              sessionEvents.push({ tool_name: '_user_prompt', tool_input: { text: p.prompt_text }, tool_response: '' });
-            }
-          }
-        } catch (e) { debugCatch(e, 'handleStop-queryPrompts'); } finally { memDb.close(); }
-      }
+      const sessionEvents = readAndClearToolEvents();
       await collectFeedback(rdb, sessionId, sessionEvents);
     }
   } catch (e) { debugCatch(e, 'handleStop-feedback'); }
@@ -519,7 +521,7 @@ async function handlePreToolUse() {
   const rdb = getRegistryDb();
   if (!rdb) return;
 
-  // Quick session context from user prompts DB
+  // Quick session context from user prompts DB + episode buffer
   const sessionId = getSessionId();
   const sessionCtx = { sessionId };
   const db = openDb();
@@ -531,6 +533,17 @@ async function handlePreToolUse() {
       if (latest) sessionCtx.userPrompt = latest.prompt_text;
     } catch (e) { debugCatch(e, 'handlePreToolUse-queryPrompt'); } finally { db.close(); }
   }
+  // Collect recent file paths from episode buffer for tech stack inference
+  try {
+    const episode = readEpisodeRaw();
+    if (episode?.entries) {
+      const files = new Set();
+      for (const e of episode.entries) {
+        if (e.files) for (const f of e.files) files.add(f);
+      }
+      if (files.size > 0) sessionCtx.recentFiles = [...files].slice(-10);
+    }
+  } catch {}
 
   const injection = await dispatchOnPreToolUse(rdb, hookData, sessionCtx);
   if (injection) {
@@ -550,11 +563,11 @@ async function handleUserPrompt() {
   const promptText = hookData.prompt || hookData.user_prompt;
   if (!promptText || typeof promptText !== 'string') return;
 
+  const sessionId = getSessionId();
   const db = openDb();
   if (!db) return;
 
   try {
-    const sessionId = getSessionId();
     const now = new Date();
 
     // Ensure session exists (INSERT OR IGNORE avoids race condition)
@@ -580,6 +593,21 @@ async function handleUserPrompt() {
   } finally {
     db.close();
   }
+
+  // Dispatch: recommend skill/agent based on user's actual prompt.
+  // This is the ideal dispatch point — fires when the user submits their prompt,
+  // before Claude starts working. SessionStart uses stale next_steps from previous session;
+  // PreToolUse fires too late (after Claude committed to an approach via read-only tools).
+  // Cooldown + session dedup (invocations table) prevents double-recommending with SessionStart.
+  try {
+    const rdb = getRegistryDb();
+    if (rdb) {
+      const result = await dispatchOnUserPrompt(rdb, promptText, sessionId);
+      if (result) {
+        process.stdout.write(result + '\n');
+      }
+    }
+  } catch (e) { debugCatch(e, 'handleUserPrompt-dispatch'); }
 }
 
 // ─── Utilities ──────────────────────────────────────────────────────────────

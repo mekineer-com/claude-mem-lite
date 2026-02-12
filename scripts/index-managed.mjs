@@ -13,6 +13,10 @@ const MANAGED_DIR = join(BASE_DIR, 'managed');
 const DB_PATH = join(BASE_DIR, 'resource-registry.db');
 
 // ─── YAML Frontmatter Parser ─────────────────────────────────────────────────
+// Lightweight YAML subset parser for skill/agent frontmatter.
+// Known limitations: does not handle YAML arrays (- item), nested objects,
+// or unquoted values containing colons (e.g. bare URLs). For such fields,
+// wrap the value in quotes in the frontmatter: url: "https://..."
 
 function parseFrontmatter(content) {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -137,8 +141,10 @@ function extractFeatures(frontmatter, body) {
     const total = descScore + bodyScore;
     if (total > 0) intentScores[intent] = total;
   }
+  // Cap to top 5 intents — over-tagging dilutes FTS matching accuracy
   const sortedIntents = Object.entries(intentScores)
     .sort(([, a], [, b]) => b - a)
+    .slice(0, 5)
     .map(([k]) => k);
 
   // ── 2. Domain tags (scored, weighted) ─────────────────────────────────
@@ -149,8 +155,10 @@ function extractFeatures(frontmatter, body) {
     const total = descScore + bodyScore;
     if (total > 0) domainScores[domain] = total;
   }
+  // Cap to top 5 domains
   const sortedDomains = Object.entries(domainScores)
     .sort(([, a], [, b]) => b - a)
+    .slice(0, 5)
     .map(([k]) => k);
 
   // ── 3. Action type — primary verb ─────────────────────────────────────
@@ -287,11 +295,19 @@ function extractFeatures(frontmatter, body) {
   const descWords = desc.toLowerCase().match(/\b[a-z]{3,}\b/g) || [];
   const keywords = [...new Set(descWords.filter(w => !stopWords.has(w)))].slice(0, 20);
 
+  // Fallback: if no trigger_patterns extracted, derive from description + intent
+  let triggerStr = [...triggers].slice(0, 15).join('|');
+  if (!triggerStr && desc) {
+    // Use first sentence of description + intent tags as fallback trigger
+    const firstSentence = desc.replace(/\.\s.*/, '').trim();
+    if (firstSentence) triggerStr = firstSentence.replace(/\s+/g, '\\s+').slice(0, 200);
+  }
+
   return {
     intent_tags: sortedIntents.join(','),
     domain_tags: sortedDomains.join(','),
     action_type: bestAction,
-    trigger_patterns: [...triggers].slice(0, 15).join('|'),
+    trigger_patterns: triggerStr,
     capability_summary: summary.slice(0, 600),
     input_type: [...inputTypes].join(','),
     output_type: [...outputTypes].join(','),
@@ -418,91 +434,73 @@ function main() {
   const db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 5000');
-  db.pragma('foreign_keys = OFF');
+  db.pragma('foreign_keys = ON');
 
   // Add new v2 columns if missing
   const newCols = ['tech_stack', 'use_cases', 'complexity', 'keywords', 'parent_plugin'];
   for (const col of newCols) {
+    if (!/^[a-z_]+$/.test(col)) throw new Error(`Invalid column name: ${col}`);
     try { db.exec(`ALTER TABLE resources ADD COLUMN ${col} TEXT DEFAULT ''`); } catch {}
   }
 
-  // Preserve usage stats before rebuilding
-  const usageStats = {};
-  try {
-    const rows = db.prepare(
-      'SELECT name, type, recommend_count, adopt_count, success_count FROM resources'
-    ).all();
-    for (const r of rows) usageStats[`${r.type}:${r.name}`] = r;
-  } catch {}
-
-  // Drop corrupted FTS first, then clear resources
-  try { db.exec('DROP TABLE IF EXISTS resources_fts'); } catch {}
-  // Drop ALL FTS triggers before deleting (they reference the FTS table)
+  // Drop old FTS + triggers (may have wrong column order), rebuild with canonical order
   const triggers = db.prepare(
     "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='resources'"
   ).all();
   for (const t of triggers) {
     try { db.exec(`DROP TRIGGER IF EXISTS "${t.name}"`); } catch {}
   }
-  db.exec('DELETE FROM resources');
+  try { db.exec('DROP TABLE IF EXISTS resources_fts'); } catch {}
 
-  // Rebuild FTS with new fields
+  // Rebuild FTS with canonical column order (must match registry.mjs)
+  // BM25 weights: trigger_patterns(5), keywords(3), capability_summary(3),
+  //   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
   db.exec(`
     CREATE VIRTUAL TABLE resources_fts USING fts5(
-      name,
-      keywords,
       trigger_patterns,
+      keywords,
       capability_summary,
       intent_tags,
+      use_cases,
       domain_tags,
       tech_stack,
-      use_cases,
+      name,
       content=resources,
       content_rowid=id,
       tokenize='unicode61 remove_diacritics 2'
     );
   `);
 
-  // Recreate FTS sync triggers
-  db.exec('DROP TRIGGER IF EXISTS res_fts_insert');
-  db.exec('DROP TRIGGER IF EXISTS res_fts_update');
-  db.exec('DROP TRIGGER IF EXISTS res_fts_delete');
-  db.exec(`
-    CREATE TRIGGER res_fts_insert AFTER INSERT ON resources BEGIN
-      INSERT INTO resources_fts(rowid, name, keywords, trigger_patterns, capability_summary, intent_tags, domain_tags, tech_stack, use_cases)
-      VALUES (NEW.id, NEW.name, NEW.keywords, NEW.trigger_patterns, NEW.capability_summary, NEW.intent_tags, NEW.domain_tags, NEW.tech_stack, NEW.use_cases);
-    END;
-    CREATE TRIGGER res_fts_update AFTER UPDATE ON resources BEGIN
-      INSERT INTO resources_fts(resources_fts, rowid, name, keywords, trigger_patterns, capability_summary, intent_tags, domain_tags, tech_stack, use_cases)
-      VALUES ('delete', OLD.id, OLD.name, OLD.keywords, OLD.trigger_patterns, OLD.capability_summary, OLD.intent_tags, OLD.domain_tags, OLD.tech_stack, OLD.use_cases);
-      INSERT INTO resources_fts(rowid, name, keywords, trigger_patterns, capability_summary, intent_tags, domain_tags, tech_stack, use_cases)
-      VALUES (NEW.id, NEW.name, NEW.keywords, NEW.trigger_patterns, NEW.capability_summary, NEW.intent_tags, NEW.domain_tags, NEW.tech_stack, NEW.use_cases);
-    END;
-    CREATE TRIGGER res_fts_delete AFTER DELETE ON resources BEGIN
-      INSERT INTO resources_fts(resources_fts, rowid, name, keywords, trigger_patterns, capability_summary, intent_tags, domain_tags, tech_stack, use_cases)
-      VALUES ('delete', OLD.id, OLD.name, OLD.keywords, OLD.trigger_patterns, OLD.capability_summary, OLD.intent_tags, OLD.domain_tags, OLD.tech_stack, OLD.use_cases);
-    END;
-  `);
-
-  const insert = db.prepare(`
+  // UPSERT: preserve resource IDs so invocations.resource_id stays valid
+  const upsert = db.prepare(`
     INSERT INTO resources (
       name, type, status, source, repo_url, local_path, parent_plugin, file_hash,
       intent_tags, domain_tags, action_type, trigger_patterns,
       capability_summary, input_type, output_type, prerequisites,
-      tech_stack, use_cases, complexity, keywords,
-      recommend_count, adopt_count, success_count, indexed_at
+      tech_stack, use_cases, complexity, keywords, indexed_at
     ) VALUES (
       @name, @type, 'active', 'preinstalled', @repo_url, @local_path, @parent_plugin, @file_hash,
       @intent_tags, @domain_tags, @action_type, @trigger_patterns,
       @capability_summary, @input_type, @output_type, @prerequisites,
-      @tech_stack, @use_cases, @complexity, @keywords,
-      @recommend_count, @adopt_count, @success_count, datetime('now')
+      @tech_stack, @use_cases, @complexity, @keywords, datetime('now')
     )
+    ON CONFLICT(type, name) DO UPDATE SET
+      status='active', source='preinstalled',
+      repo_url=excluded.repo_url, local_path=excluded.local_path,
+      parent_plugin=excluded.parent_plugin, file_hash=excluded.file_hash,
+      intent_tags=excluded.intent_tags, domain_tags=excluded.domain_tags,
+      action_type=excluded.action_type, trigger_patterns=excluded.trigger_patterns,
+      capability_summary=excluded.capability_summary, input_type=excluded.input_type,
+      output_type=excluded.output_type, prerequisites=excluded.prerequisites,
+      tech_stack=excluded.tech_stack, use_cases=excluded.use_cases,
+      complexity=excluded.complexity, keywords=excluded.keywords,
+      indexed_at=datetime('now'), updated_at=datetime('now')
   `);
 
   let indexed = 0, errors = 0;
+  const indexedNames = new Set();
 
-  const insertAll = db.transaction(() => {
+  const upsertAll = db.transaction(() => {
     for (const item of items) {
       try {
         const content = readFileSync(item.absPath, 'utf8');
@@ -513,10 +511,7 @@ function main() {
         const repoUrl = lookupRepoUrl(db, item.name, item.type);
         const hash = simpleHash(content);
 
-        // Restore usage stats if they existed
-        const prev = usageStats[`${item.type}:${item.name}`];
-
-        insert.run({
+        upsert.run({
           name: item.name,
           type: item.type,
           repo_url: repoUrl,
@@ -524,19 +519,60 @@ function main() {
           parent_plugin: item.parentPlugin || null,
           file_hash: hash,
           ...features,
-          recommend_count: prev?.recommend_count || 0,
-          adopt_count: prev?.adopt_count || 0,
-          success_count: prev?.success_count || 0,
         });
+        indexedNames.add(`${item.type}:${item.name}`);
         indexed++;
       } catch (e) {
         console.error(`   ✗ ${item.type} ${item.name}: ${e.message}`);
         errors++;
       }
     }
+
+    // Soft-disable resources no longer in the scan (preserves invocations history)
+    const allResources = db.prepare('SELECT id, type, name FROM resources WHERE status = ?').all('active');
+    for (const r of allResources) {
+      if (!indexedNames.has(`${r.type}:${r.name}`)) {
+        db.prepare("UPDATE resources SET status = 'disabled', updated_at = datetime('now') WHERE id = ?").run(r.id);
+      }
+    }
   });
 
-  insertAll();
+  upsertAll();
+
+  // Populate FTS from resources table (triggers not yet active during UPSERT)
+  db.exec(`
+    INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+      intent_tags, use_cases, domain_tags, tech_stack, name)
+    SELECT id, trigger_patterns, keywords, capability_summary,
+      intent_tags, use_cases, domain_tags, tech_stack, name
+    FROM resources WHERE status = 'active'
+  `);
+
+  // Recreate FTS sync triggers for future changes
+  db.exec(`
+    CREATE TRIGGER res_fts_insert AFTER INSERT ON resources BEGIN
+      INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+        intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
+        NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
+    END;
+    CREATE TRIGGER res_fts_update AFTER UPDATE ON resources BEGIN
+      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
+        capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
+        OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
+      INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+        intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
+        NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
+    END;
+    CREATE TRIGGER res_fts_delete AFTER DELETE ON resources BEGIN
+      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
+        capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
+        OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
+    END;
+  `);
 
   // Stats
   const stats = db.prepare('SELECT type, COUNT(*) as cnt FROM resources GROUP BY type').all();

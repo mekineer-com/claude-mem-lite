@@ -6,7 +6,9 @@ import { upsertResource, getActiveResources, getResourceByName,
   updateInvocation, getResourceSuccessRates } from './registry.mjs';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from './registry-retriever.mjs';
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
-  _resetCircuitBreaker, _NEGATION_EN, _NEGATION_CJK } from './dispatch.mjs';
+  isRecentlyRecommended,
+  _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
+  _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from './dispatch.mjs';
 import { renderInjection } from './dispatch-inject.mjs';
 import { collectFeedback } from './dispatch-feedback.mjs';
 
@@ -40,6 +42,11 @@ function createRegistryDb() {
       input_type    TEXT DEFAULT '',
       output_type   TEXT DEFAULT '',
       prerequisites TEXT DEFAULT '{}',
+      keywords      TEXT DEFAULT '',
+      tech_stack    TEXT DEFAULT '',
+      use_cases     TEXT DEFAULT '',
+      complexity    TEXT DEFAULT 'intermediate',
+      parent_plugin TEXT,
       recommend_count   INTEGER DEFAULT 0,
       adopt_count       INTEGER DEFAULT 0,
       success_count     INTEGER DEFAULT 0,
@@ -51,9 +58,13 @@ function createRegistryDb() {
     CREATE INDEX IF NOT EXISTS idx_res_status ON resources(status) WHERE status = 'active';
   `);
 
+  // Canonical 8-column FTS5 schema — must match registry.mjs column order
+  // BM25 weights: trigger_patterns(5), keywords(3), capability_summary(3),
+  //   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
   db.exec(`
     CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(
-      trigger_patterns, capability_summary, intent_tags, domain_tags, name,
+      trigger_patterns, keywords, capability_summary, intent_tags, use_cases,
+      domain_tags, tech_stack, name,
       content=resources, content_rowid=id,
       tokenize='unicode61 remove_diacritics 2'
     );
@@ -61,18 +72,26 @@ function createRegistryDb() {
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS res_fts_insert AFTER INSERT ON resources BEGIN
-      INSERT INTO resources_fts(rowid, trigger_patterns, capability_summary, intent_tags, domain_tags, name)
-      VALUES (NEW.id, NEW.trigger_patterns, NEW.capability_summary, NEW.intent_tags, NEW.domain_tags, NEW.name);
+      INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+        intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
+        NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
     END;
     CREATE TRIGGER IF NOT EXISTS res_fts_update AFTER UPDATE ON resources BEGIN
-      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, capability_summary, intent_tags, domain_tags, name)
-      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.capability_summary, OLD.intent_tags, OLD.domain_tags, OLD.name);
-      INSERT INTO resources_fts(rowid, trigger_patterns, capability_summary, intent_tags, domain_tags, name)
-      VALUES (NEW.id, NEW.trigger_patterns, NEW.capability_summary, NEW.intent_tags, NEW.domain_tags, NEW.name);
+      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
+        capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
+        OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
+      INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
+        intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
+        NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
     END;
     CREATE TRIGGER IF NOT EXISTS res_fts_delete AFTER DELETE ON resources BEGIN
-      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, capability_summary, intent_tags, domain_tags, name)
-      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.capability_summary, OLD.intent_tags, OLD.domain_tags, OLD.name);
+      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
+        capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
+      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
+        OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
     END;
   `);
 
@@ -330,6 +349,18 @@ describe('registry-retriever.mjs', () => {
       expect(q).toContain('domain_tags:');
     });
 
+    it('excludes action (tool type) from FTS query — prevents noise', () => {
+      const q = buildEnhancedQuery({
+        intent: 'test',
+        primaryIntent: 'test',
+        techStack: '',
+        action: 'edit',
+        errorDomain: '',
+      });
+      // 'edit' should NOT appear in query — it's tool metadata, not user intent
+      expect(q).not.toMatch(/\bedit\b/);
+    });
+
     it('secondary intents go as general tokens (not column-targeted)', () => {
       const q = buildEnhancedQuery({
         intent: 'test,fix',
@@ -539,6 +570,24 @@ describe('dispatch.mjs', () => {
       );
       expect(signals.intent).not.toContain('test');
       expect(signals.intent).toContain('commit');
+    });
+
+    it('extracts review intent from "审核" (Chinese review synonym)', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Bash', tool_input: { command: 'git diff' } },
+        { userPrompt: '审核一下新开发功能的代码' }
+      );
+      expect(signals.intent).toContain('review');
+      expect(signals.primaryIntent).toBe('review');
+    });
+
+    it('cross-variant: CJK negated but EN affirmative keeps the tag', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: '不要测试了，but write the tests for auth' }
+      );
+      // Chinese variant negated, English variant affirmed → tag should survive
+      expect(signals.intent).toContain('test');
     });
   });
 
@@ -969,12 +1018,74 @@ describe('Composite ranking formula', () => {
 describe('Haiku circuit breaker', () => {
   beforeEach(() => { _resetCircuitBreaker(); });
 
-  it('needsHaikuDispatch returns false when circuit is open', () => {
-    // Simulate 3 failures by calling needsHaikuDispatch with empty results
-    // then checking behavior — we test via the exported _resetCircuitBreaker
-    // The circuit breaker is internal, so we test its effect indirectly
-    _resetCircuitBreaker();
-    // With fresh breaker, empty results should need Haiku
+  it('fresh breaker allows Haiku dispatch', () => {
+    expect(_isHaikuCircuitOpen()).toBe(false);
     expect(needsHaikuDispatch([])).toBe(true);
+  });
+
+  it('opens after 3 consecutive failures', () => {
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    expect(_isHaikuCircuitOpen()).toBe(false); // 2 failures: still closed
+    _recordHaikuFailure();
+    expect(_isHaikuCircuitOpen()).toBe(true); // 3 failures: open
+  });
+
+  it('blocks Haiku dispatch when circuit is open', () => {
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    // Circuit open → needsHaikuDispatch should return false (don't escalate)
+    expect(needsHaikuDispatch([])).toBe(false);
+    expect(needsHaikuDispatch([{ relevance: -0.5 }])).toBe(false);
+  });
+
+  it('resets on success', () => {
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    _recordHaikuSuccess(); // reset
+    _recordHaikuFailure(); // only 1 failure now
+    expect(_isHaikuCircuitOpen()).toBe(false);
+  });
+
+  it('success after open resets breaker', () => {
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    _recordHaikuFailure();
+    expect(_isHaikuCircuitOpen()).toBe(true);
+    _recordHaikuSuccess();
+    expect(_isHaikuCircuitOpen()).toBe(false);
+  });
+});
+
+// ─── Cooldown & Dedup Tests ─────────────────────────────────────────────────
+
+describe('isRecentlyRecommended', () => {
+  let db;
+  beforeEach(() => { db = createRegistryDb(); });
+
+  it('returns false when no invocations exist', () => {
+    const id = seedResource(db);
+    expect(isRecentlyRecommended(db, id, 'sess-1')).toBe(false);
+  });
+
+  it('returns true for same session (session dedup)', () => {
+    const id = seedResource(db);
+    recordInvocation(db, { resource_id: id, session_id: 'sess-dup', trigger: 'session_start', tier: 2 });
+    expect(isRecentlyRecommended(db, id, 'sess-dup')).toBe(true);
+  });
+
+  it('returns true within cooldown window (cross-session)', () => {
+    const id = seedResource(db);
+    recordInvocation(db, { resource_id: id, session_id: 'sess-old', trigger: 'session_start', tier: 2 });
+    // Different session, but within cooldown
+    expect(isRecentlyRecommended(db, id, 'sess-new')).toBe(true);
+  });
+
+  it('returns false for different resource in same session', () => {
+    const id1 = seedResource(db, { name: 'skill-a' });
+    const id2 = seedResource(db, { name: 'skill-b' });
+    recordInvocation(db, { resource_id: id1, session_id: 'sess-1', trigger: 'session_start', tier: 2 });
+    expect(isRecentlyRecommended(db, id2, 'sess-1')).toBe(false);
   });
 });
