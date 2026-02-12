@@ -66,6 +66,314 @@ function safeHandler(fn) {
   };
 }
 
+// ─── Tool: mem_search — helper functions ────────────────────────────────────
+
+function searchObservations(ctx) {
+  const { ftsQuery, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit } = ctx;
+  const results = [];
+
+  if (ftsQuery) {
+    const now = Date.now();
+    const projectBoost = args.project ? null : currentProject;
+    const rows = db.prepare(`
+      SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+             o.files_modified,
+             snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
+             ${OBS_BM25}
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+               * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
+               * (0.5 + 0.5 * COALESCE(o.importance, 1))
+               * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ?
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND (? IS NULL OR o.project = ?)
+        AND (? IS NULL OR o.type = ?)
+        AND (? IS NULL OR o.created_at_epoch >= ?)
+        AND (? IS NULL OR o.created_at_epoch <= ?)
+        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+      ORDER BY score
+      LIMIT ? OFFSET ?
+    `).all(
+      now,
+      projectBoost, projectBoost,
+      ftsQuery,
+      args.project ?? null, args.project ?? null,
+      args.obs_type ?? null, args.obs_type ?? null,
+      epochFrom, epochFrom,
+      epochTo, epochTo,
+      args.importance ?? null, args.importance ?? null,
+      perSourceLimit, perSourceOffset
+    );
+    for (const r of rows) {
+      results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
+    }
+
+    // Two-phase query expansion for sparse results
+    if (rows.length > 0 && results.length < limit) {
+      const existingIds = new Set(results.map(r => r.id));
+      expandObsByConceptCo(ctx, now, existingIds, results);
+      expandObsByPRF(ctx, now, rows.length, existingIds, results);
+    }
+  } else {
+    const params = [];
+    const wheres = ['COALESCE(compressed_into, 0) = 0'];
+    if (args.project) { wheres.push('project = ?'); params.push(args.project); }
+    if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
+    if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
+    if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+    if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
+    const where = `WHERE ${wheres.join(' AND ')}`;
+    params.push(perSourceLimit, perSourceOffset);
+    const rows = db.prepare(`
+      SELECT id, type, title, subtitle, project, created_at, created_at_epoch, files_modified, importance
+      FROM observations ${where}
+      ORDER BY created_at_epoch DESC
+      LIMIT ? OFFSET ?
+    `).all(...params);
+    for (const r of rows) {
+      results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
+    }
+  }
+
+  return results;
+}
+
+function expandObsByConceptCo(ctx, now, existingIds, results) {
+  const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
+  if (results.length >= Math.ceil(limit / 2)) return;
+  const expanded = expandQueryByConcepts(db, ftsQuery, args.project);
+  if (expanded.length === 0) return;
+  const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
+  try {
+    const expRows = db.prepare(`
+      SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+             o.files_modified,
+             ${OBS_BM25}
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+               * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ?
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND (? IS NULL OR o.project = ?)
+        AND (? IS NULL OR o.type = ?)
+        AND (? IS NULL OR o.created_at_epoch >= ?)
+        AND (? IS NULL OR o.created_at_epoch <= ?)
+        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+      ORDER BY score
+      LIMIT ?
+    `).all(
+      now, expansionFts,
+      args.project ?? null, args.project ?? null,
+      args.obs_type ?? null, args.obs_type ?? null,
+      epochFrom, epochFrom,
+      epochTo, epochTo,
+      args.importance ?? null, args.importance ?? null,
+      limit
+    );
+    for (const r of expRows) {
+      if (!existingIds.has(r.id)) {
+        existingIds.add(r.id);
+        results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+      }
+    }
+  } catch (e) { debugLog('WARN', 'mem_search', `concept expansion error: ${e.message}`); }
+}
+
+function expandObsByPRF(ctx, now, primaryCount, existingIds, results) {
+  const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
+  if (primaryCount < 3) return;
+  const topResults = db.prepare(`
+    SELECT o.title, o.narrative FROM observations_fts
+    JOIN observations o ON observations_fts.rowid = o.id
+    WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+      AND (? IS NULL OR o.project = ?)
+    ORDER BY ${OBS_BM25}
+    LIMIT 8
+  `).all(ftsQuery, args.project ?? null, args.project ?? null);
+  const prfTerms = extractPRFTerms(topResults, ftsQuery);
+  if (prfTerms.length === 0) return;
+  const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+  try {
+    const prfRows = db.prepare(`
+      SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+             o.files_modified,
+             ${OBS_BM25}
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+               * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ?
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND (? IS NULL OR o.project = ?)
+        AND (? IS NULL OR o.type = ?)
+        AND (? IS NULL OR o.created_at_epoch >= ?)
+        AND (? IS NULL OR o.created_at_epoch <= ?)
+        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+      ORDER BY score
+      LIMIT ?
+    `).all(
+      now, prfFts,
+      args.project ?? null, args.project ?? null,
+      args.obs_type ?? null, args.obs_type ?? null,
+      epochFrom, epochFrom,
+      epochTo, epochTo,
+      args.importance ?? null, args.importance ?? null,
+      limit
+    );
+    for (const r of prfRows) {
+      if (!existingIds.has(r.id)) {
+        existingIds.add(r.id);
+        results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.6, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+      }
+    }
+  } catch (e) { debugLog('WARN', 'mem_search', `PRF expansion error: ${e.message}`); }
+}
+
+function searchSessions(ctx) {
+  const { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject } = ctx;
+  const results = [];
+
+  if (ftsQuery) {
+    const now = Date.now();
+    const sessionProjectBoost = args.project ? null : currentProject;
+    const rows = db.prepare(`
+      SELECT s.id, s.request, s.completed, s.project, s.created_at,
+             ${SESS_BM25}
+               * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+               * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
+      FROM session_summaries_fts
+      JOIN session_summaries s ON session_summaries_fts.rowid = s.id
+      WHERE session_summaries_fts MATCH ?
+        AND (? IS NULL OR s.project = ?)
+        AND (? IS NULL OR s.created_at_epoch >= ?)
+        AND (? IS NULL OR s.created_at_epoch <= ?)
+      ORDER BY score
+      LIMIT ? OFFSET ?
+    `).all(
+      now,
+      sessionProjectBoost, sessionProjectBoost,
+      ftsQuery,
+      args.project ?? null, args.project ?? null,
+      epochFrom, epochFrom,
+      epochTo, epochTo,
+      perSourceLimit, perSourceOffset
+    );
+    for (const r of rows) {
+      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, score: r.score });
+    }
+  } else if (!searchType) {
+    // Skip sessions in unfiltered no-query mode (too noisy)
+  } else {
+    const params = [];
+    const wheres = [];
+    if (args.project) { wheres.push('project = ?'); params.push(args.project); }
+    if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
+    if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
+    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    params.push(perSourceLimit, perSourceOffset);
+    const rows = db.prepare(`
+      SELECT id, request, completed, project, created_at, created_at_epoch
+      FROM session_summaries ${where}
+      ORDER BY created_at_epoch DESC
+      LIMIT ? OFFSET ?
+    `).all(...params);
+    for (const r of rows) {
+      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
+    }
+  }
+
+  return results;
+}
+
+function searchPrompts(ctx) {
+  const { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset } = ctx;
+  const results = [];
+
+  if (ftsQuery) {
+    const rows = db.prepare(`
+      SELECT p.id, p.prompt_text, p.content_session_id, p.created_at,
+             bm25(user_prompts_fts, 1) as score
+      FROM user_prompts_fts
+      JOIN user_prompts p ON user_prompts_fts.rowid = p.id
+      JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+      WHERE user_prompts_fts MATCH ?
+        AND (? IS NULL OR s.project = ?)
+        AND (? IS NULL OR p.created_at_epoch >= ?)
+        AND (? IS NULL OR p.created_at_epoch <= ?)
+      ORDER BY score
+      LIMIT ? OFFSET ?
+    `).all(
+      ftsQuery,
+      args.project ?? null, args.project ?? null,
+      epochFrom, epochFrom,
+      epochTo, epochTo,
+      perSourceLimit, perSourceOffset
+    );
+    for (const r of rows) {
+      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: r.score });
+    }
+  } else if (searchType === 'prompts') {
+    const params = [];
+    const wheres = [];
+    if (args.project) { wheres.push('s.project = ?'); params.push(args.project); }
+    if (epochFrom !== null) { wheres.push('p.created_at_epoch >= ?'); params.push(epochFrom); }
+    if (epochTo !== null) { wheres.push('p.created_at_epoch <= ?'); params.push(epochTo); }
+    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
+    params.push(perSourceLimit, perSourceOffset);
+    const rows = db.prepare(`
+      SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
+      FROM user_prompts p
+      JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+      ${where}
+      ORDER BY p.created_at_epoch DESC
+      LIMIT ? OFFSET ?
+    `).all(...params);
+    for (const r of rows) {
+      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, dateEpoch: r.created_at_epoch });
+    }
+  }
+
+  return results;
+}
+
+function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCrossSource) {
+  if (paginatedResults.length === 0) {
+    const hint = ['No results found.'];
+    if (args.query) {
+      const expanded = ftsQuery || args.query;
+      if (expanded !== args.query) hint.push(`Searched as: ${expanded}`);
+      hint.push('Tip: check spelling, try broader terms, or use mem_stats to see available data.');
+    }
+    return { content: [{ type: 'text', text: hint.join('\n') }] };
+  }
+
+  const lines = [];
+  const countLabel = isCrossSource && totalCount > paginatedResults.length
+    ? `${paginatedResults.length} of ${totalCount}`
+    : `${paginatedResults.length}`;
+  lines.push(`Found ${countLabel} result(s)${args.query ? ` for "${args.query}"` : ''}:\n`);
+
+  for (const r of paginatedResults) {
+    if (r.source === 'obs') {
+      const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
+      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}`);
+      if (r.snippet && r.snippet.length > 10 && r.snippet !== r.title) {
+        lines.push(`     ${truncate(r.snippet, 100)}`);
+      }
+    } else if (r.source === 'session') {
+      lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}`);
+    } else if (r.source === 'prompt') {
+      lines.push(`P#${r.id} 💬 ${truncate(r.text)} | ${fmtDate(r.date)}`);
+    }
+  }
+
+  lines.push(`\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details`);
+  return { content: [{ type: 'text', text: lines.join('\n') }] };
+}
+
 // ─── Tool: mem_search ───────────────────────────────────────────────────────
 
 server.registerTool(
@@ -79,17 +387,14 @@ server.registerTool(
     const offset = args.offset ?? 0;
     const ftsQuery = sanitizeFtsQuery(args.query);
     const searchType = args.type;
-    const results = [];
     const currentProject = inferProject();
 
-    // Cross-source: over-fetch per source to ensure enough results after merge+sort
     const isCrossSource = !searchType;
     const perSourceLimit = isCrossSource ? Math.max(limit * 3, offset + limit + 10) : limit;
     const perSourceOffset = isCrossSource ? 0 : offset;
 
     // Parse date bounds to epoch (with validation)
     // date_to with date-only format (YYYY-MM-DD) extends to end-of-day (23:59:59.999Z)
-    // so that "date_to=2026-02-10" includes all events on that day
     const epochFrom = args.date_from ? new Date(args.date_from).getTime() : null;
     let epochTo = args.date_to ? new Date(args.date_to).getTime() : null;
     if (epochTo !== null && args.date_to && /^\d{4}-\d{2}-\d{2}$/.test(args.date_to)) {
@@ -98,328 +403,34 @@ server.registerTool(
     if (epochFrom !== null && isNaN(epochFrom)) throw new Error(`Invalid date_from: ${args.date_from}`);
     if (epochTo !== null && isNaN(epochTo)) throw new Error(`Invalid date_to: ${args.date_to}`);
 
-    // Search observations
-    if (!searchType || searchType === 'observations') {
-      if (ftsQuery) {
-        const now = Date.now();
-        // Project boost: current project gets 2x ranking boost (not filtered, just prioritized)
-        const projectBoost = args.project ? null : currentProject;
-        const rows = db.prepare(`
-          SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-                 o.files_modified,
-                 snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
-                 ${OBS_BM25}
-                   * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-                   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-                   * (0.5 + 0.5 * COALESCE(o.importance, 1))
-                   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
-          FROM observations_fts
-          JOIN observations o ON observations_fts.rowid = o.id
-          WHERE observations_fts MATCH ?
-            AND COALESCE(o.compressed_into, 0) = 0
-            AND (? IS NULL OR o.project = ?)
-            AND (? IS NULL OR o.type = ?)
-            AND (? IS NULL OR o.created_at_epoch >= ?)
-            AND (? IS NULL OR o.created_at_epoch <= ?)
-            AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-          ORDER BY score
-          LIMIT ? OFFSET ?
-        `).all(
-          now,
-          projectBoost, projectBoost,
-          ftsQuery,
-          args.project ?? null, args.project ?? null,
-          args.obs_type ?? null, args.obs_type ?? null,
-          epochFrom, epochFrom,
-          epochTo, epochTo,
-          args.importance ?? null, args.importance ?? null,
-          perSourceLimit, perSourceOffset
-        );
-        for (const r of rows) {
-          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
-        }
+    const ctx = { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
+    const results = [];
 
-        // Two-phase query expansion for sparse results:
-        // Phase 1: Concept co-occurrence (uses concepts column from top matches)
-        // Phase 2: PRF document-level (uses title+narrative terms from top matches)
-        const obsCount = results.filter(r => r.source === 'obs').length;
-        if (rows.length > 0 && obsCount < limit) {
-          const existingIds = new Set(results.filter(r => r.source === 'obs').map(r => r.id));
+    if (!searchType || searchType === 'observations') results.push(...searchObservations(ctx));
+    if (!searchType || searchType === 'sessions')     results.push(...searchSessions(ctx));
+    if (!searchType || searchType === 'prompts')       results.push(...searchPrompts(ctx));
 
-          // Phase 1: Concept co-occurrence expansion
-          if (obsCount < Math.ceil(limit / 2)) {
-            const expanded = expandQueryByConcepts(db, ftsQuery, args.project);
-            if (expanded.length > 0) {
-              const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
-              try {
-                const expRows = db.prepare(`
-                  SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-                         o.files_modified,
-                         ${OBS_BM25}
-                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-                           * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
-                  FROM observations_fts
-                  JOIN observations o ON observations_fts.rowid = o.id
-                  WHERE observations_fts MATCH ?
-                    AND COALESCE(o.compressed_into, 0) = 0
-                    AND (? IS NULL OR o.project = ?)
-                    AND (? IS NULL OR o.type = ?)
-                    AND (? IS NULL OR o.created_at_epoch >= ?)
-                    AND (? IS NULL OR o.created_at_epoch <= ?)
-                    AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-                  ORDER BY score
-                  LIMIT ?
-                `).all(
-                  now, expansionFts,
-                  args.project ?? null, args.project ?? null,
-                  args.obs_type ?? null, args.obs_type ?? null,
-                  epochFrom, epochFrom,
-                  epochTo, epochTo,
-                  args.importance ?? null, args.importance ?? null,
-                  limit
-                );
-                for (const r of expRows) {
-                  if (!existingIds.has(r.id)) {
-                    existingIds.add(r.id);
-                    results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
-                  }
-                }
-              } catch (e) { debugLog('WARN', 'mem_search', `concept expansion error: ${e.message}`); }
-            }
-          }
-
-          // Phase 2: PRF document-level expansion (extracts terms from top result text)
-          if (rows.length >= 3) {
-            const topResults = db.prepare(`
-              SELECT o.title, o.narrative FROM observations_fts
-              JOIN observations o ON observations_fts.rowid = o.id
-              WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
-                AND (? IS NULL OR o.project = ?)
-              ORDER BY ${OBS_BM25}
-              LIMIT 8
-            `).all(ftsQuery, args.project ?? null, args.project ?? null);
-            const prfTerms = extractPRFTerms(topResults, ftsQuery);
-            if (prfTerms.length > 0) {
-              const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
-              try {
-                const prfRows = db.prepare(`
-                  SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-                         o.files_modified,
-                         ${OBS_BM25}
-                           * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-                           * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
-                  FROM observations_fts
-                  JOIN observations o ON observations_fts.rowid = o.id
-                  WHERE observations_fts MATCH ?
-                    AND COALESCE(o.compressed_into, 0) = 0
-                    AND (? IS NULL OR o.project = ?)
-                    AND (? IS NULL OR o.type = ?)
-                    AND (? IS NULL OR o.created_at_epoch >= ?)
-                    AND (? IS NULL OR o.created_at_epoch <= ?)
-                    AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-                  ORDER BY score
-                  LIMIT ?
-                `).all(
-                  now, prfFts,
-                  args.project ?? null, args.project ?? null,
-                  args.obs_type ?? null, args.obs_type ?? null,
-                  epochFrom, epochFrom,
-                  epochTo, epochTo,
-                  args.importance ?? null, args.importance ?? null,
-                  limit
-                );
-                for (const r of prfRows) {
-                  if (!existingIds.has(r.id)) {
-                    existingIds.add(r.id);
-                    results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.6, files_modified: r.files_modified, importance: r.importance, snippet: '' });
-                  }
-                }
-              } catch (e) { debugLog('WARN', 'mem_search', `PRF expansion error: ${e.message}`); }
-            }
-          }
-        }
-      } else {
-        // Structured filter (no FTS)
-        const params = [];
-        const wheres = ['COALESCE(compressed_into, 0) = 0'];
-        if (args.project) { wheres.push('project = ?'); params.push(args.project); }
-        if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
-        if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
-        if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
-        const where = `WHERE ${wheres.join(' AND ')}`;
-        params.push(perSourceLimit, perSourceOffset);
-        const rows = db.prepare(`
-          SELECT id, type, title, subtitle, project, created_at, created_at_epoch, files_modified, importance
-          FROM observations ${where}
-          ORDER BY created_at_epoch DESC
-          LIMIT ? OFFSET ?
-        `).all(...params);
-        for (const r of rows) {
-          results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
-        }
-      }
-    }
-
-    // Search session summaries
-    if (!searchType || searchType === 'sessions') {
-      if (ftsQuery) {
-        const nowS = Date.now();
-        const sessionProjectBoost = args.project ? null : currentProject;
-        const rows = db.prepare(`
-          SELECT s.id, s.request, s.completed, s.project, s.created_at,
-                 ${SESS_BM25}
-                   * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-                   * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
-          FROM session_summaries_fts
-          JOIN session_summaries s ON session_summaries_fts.rowid = s.id
-          WHERE session_summaries_fts MATCH ?
-            AND (? IS NULL OR s.project = ?)
-            AND (? IS NULL OR s.created_at_epoch >= ?)
-            AND (? IS NULL OR s.created_at_epoch <= ?)
-          ORDER BY score
-          LIMIT ? OFFSET ?
-        `).all(
-          nowS,
-          sessionProjectBoost, sessionProjectBoost,
-          ftsQuery,
-          args.project ?? null, args.project ?? null,
-          epochFrom, epochFrom,
-          epochTo, epochTo,
-          perSourceLimit, perSourceOffset
-        );
-        for (const r of rows) {
-          results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, score: r.score });
-        }
-      } else if (!searchType) {
-        // Skip sessions in unfiltered no-query mode (too noisy)
-      } else {
-        const params = [];
-        const wheres = [];
-        if (args.project) { wheres.push('project = ?'); params.push(args.project); }
-        if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
-        const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-        params.push(perSourceLimit, perSourceOffset);
-        const rows = db.prepare(`
-          SELECT id, request, completed, project, created_at, created_at_epoch
-          FROM session_summaries ${where}
-          ORDER BY created_at_epoch DESC
-          LIMIT ? OFFSET ?
-        `).all(...params);
-        for (const r of rows) {
-          results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
-        }
-      }
-    }
-
-    // Search user prompts
-    if (!searchType || searchType === 'prompts') {
-      if (ftsQuery) {
-        const rows = db.prepare(`
-          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at,
-                 bm25(user_prompts_fts, 1) as score
-          FROM user_prompts_fts
-          JOIN user_prompts p ON user_prompts_fts.rowid = p.id
-          JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
-          WHERE user_prompts_fts MATCH ?
-            AND (? IS NULL OR s.project = ?)
-            AND (? IS NULL OR p.created_at_epoch >= ?)
-            AND (? IS NULL OR p.created_at_epoch <= ?)
-          ORDER BY score
-          LIMIT ? OFFSET ?
-        `).all(
-          ftsQuery,
-          args.project ?? null, args.project ?? null,
-          epochFrom, epochFrom,
-          epochTo, epochTo,
-          perSourceLimit, perSourceOffset
-        );
-        for (const r of rows) {
-          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: r.score });
-        }
-      } else if (searchType === 'prompts') {
-        const params = [];
-        const wheres = [];
-        if (args.project) { wheres.push('s.project = ?'); params.push(args.project); }
-        if (epochFrom !== null) { wheres.push('p.created_at_epoch >= ?'); params.push(epochFrom); }
-        if (epochTo !== null) { wheres.push('p.created_at_epoch <= ?'); params.push(epochTo); }
-        const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-        params.push(perSourceLimit, perSourceOffset);
-        const rows = db.prepare(`
-          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
-          FROM user_prompts p
-          JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
-          ${where}
-          ORDER BY p.created_at_epoch DESC
-          LIMIT ? OFFSET ?
-        `).all(...params);
-        for (const r of rows) {
-          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, dateEpoch: r.created_at_epoch });
-        }
-      }
-    }
-
-    // Global sort and pagination (cross-source)
+    // Global sort (cross-source)
     if (isCrossSource && results.length > 0) {
       if (ftsQuery) {
-        // FTS mode: BM25 returns negative scores; more negative = better match
         results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
       } else {
-        // Non-FTS mode: sort by date descending
         results.sort((a, b) => (b.dateEpoch ?? 0) - (a.dateEpoch ?? 0));
       }
     }
 
     // Re-rank observations by file context overlap and mark superseded
-    // Note: obsResults contains references to objects in results[]; score/flag mutations propagate
     if (ftsQuery && results.some(r => r.source === 'obs')) {
       const obsResults = results.filter(r => r.source === 'obs');
       reRankWithContext(db, obsResults, currentProject);
       markSuperseded(obsResults);
-      // Re-sort main array after score adjustments from re-ranking
       results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 
     const totalBeforePagination = results.length;
     const paginatedResults = isCrossSource ? results.slice(offset, offset + limit) : results;
 
-    // Format compact output
-    if (paginatedResults.length === 0) {
-      const hint = [];
-      hint.push('No results found.');
-      if (args.query) {
-        const expanded = ftsQuery || args.query;
-        if (expanded !== args.query) hint.push(`Searched as: ${expanded}`);
-        hint.push('Tip: check spelling, try broader terms, or use mem_stats to see available data.');
-      }
-      return { content: [{ type: 'text', text: hint.join('\n') }] };
-    }
-
-    const lines = [];
-    const countLabel = isCrossSource && totalBeforePagination > paginatedResults.length
-      ? `${paginatedResults.length} of ${totalBeforePagination}`
-      : `${paginatedResults.length}`;
-    lines.push(`Found ${countLabel} result(s)${args.query ? ` for "${args.query}"` : ''}:\n`);
-
-    for (const r of paginatedResults) {
-      if (r.source === 'obs') {
-        const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
-        lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}`);
-        // Show FTS5 snippet when available and adds info beyond the title
-        if (r.snippet && r.snippet.length > 10 && r.snippet !== r.title) {
-          lines.push(`     ${truncate(r.snippet, 100)}`);
-        }
-      } else if (r.source === 'session') {
-        lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}`);
-      } else if (r.source === 'prompt') {
-        lines.push(`P#${r.id} 💬 ${truncate(r.text)} | ${fmtDate(r.date)}`);
-      }
-    }
-
-    lines.push(`\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details`);
-
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
+    return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, isCrossSource);
   })
 );
 

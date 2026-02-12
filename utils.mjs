@@ -524,7 +524,7 @@ export function fmtDate(iso) {
 export function fmtTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
 // ─── ISO Week ────────────────────────────────────────────────────────────────

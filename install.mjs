@@ -494,7 +494,7 @@ async function install() {
           if (!existsSync(clonePath)) {
             try {
               mkdirSync(join(managedDir, 'repos'), { recursive: true });
-              execSync(`git clone --depth 1 "${repoUrl}.git" "${clonePath}"`, { stdio: 'pipe', timeout: 30000 });
+              execFileSync('git', ['clone', '--depth', '1', `${repoUrl}.git`, clonePath], { stdio: 'pipe', timeout: 30000 });
               cloned++;
             } catch {
               warn(`  Clone failed: ${repoUrl}`);
@@ -539,7 +539,7 @@ async function install() {
           if (match) {
             try {
               const apiUrl = `https://api.github.com/repos/${match[1]}/${match[2]}`;
-              const res = execSync(`curl -sf "${apiUrl}" 2>/dev/null`, { encoding: 'utf8', timeout: 10000 });
+              const res = execFileSync('curl', ['-sf', apiUrl], { encoding: 'utf8', timeout: 10000 });
               const data = JSON.parse(res);
               if (typeof data.stargazers_count === 'number') {
                 starCache.set(repoUrl, data.stargazers_count);

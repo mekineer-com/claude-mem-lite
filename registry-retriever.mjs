@@ -7,35 +7,118 @@ import { debugCatch } from './utils.mjs';
 
 const DISPATCH_SYNONYMS = {
   // English intent synonyms
-  'clean':    ['refactor', 'lint', 'format', 'organize', 'tidy', 'simplify'],
-  'test':     ['testing', 'unittest', 'e2e', 'coverage', 'tdd', 'qa', 'spec'],
-  'fix':      ['debug', 'bugfix', 'troubleshoot', 'diagnose', 'repair', 'error'],
-  'fast':     ['performance', 'optimize', 'profile', 'benchmark', 'speed'],
-  'deploy':   ['release', 'publish', 'ci', 'cd', 'build', 'ship'],
-  'commit':   ['git', 'push', 'merge', 'pr', 'branch', 'version'],
-  'secure':   ['security', 'vulnerability', 'audit', 'secrets', 'auth'],
-  'review':   ['code-review', 'pr-review', 'quality', 'inspect', 'check'],
-  'doc':      ['documentation', 'readme', 'docs', 'comment', 'jsdoc'],
-  'design':   ['ui', 'ux', 'frontend', 'layout', 'css', 'component'],
-  'infra':    ['infrastructure', 'devops', 'docker', 'kubernetes', 'terraform'],
-  'db':       ['database', 'sql', 'postgres', 'mysql', 'mongodb', 'schema'],
-  'api':      ['endpoint', 'rest', 'graphql', 'route', 'backend'],
-  'plan':     ['planning', 'architecture', 'spec', 'blueprint'],
-  'build':    ['compile', 'bundle', 'webpack', 'vite', 'typescript', 'tsc'],
+  'clean':    ['refactor', 'lint', 'format', 'organize', 'tidy', 'simplify', 'restructure', 'rewrite', 'smell', 'debt'],
+  'test':     ['testing', 'unittest', 'e2e', 'coverage', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest', 'mocha', 'cypress', 'playwright'],
+  'fix':      ['debug', 'bugfix', 'troubleshoot', 'diagnose', 'repair', 'error', 'crash', 'broken', 'issue', 'problem'],
+  'fast':     ['performance', 'optimize', 'profile', 'benchmark', 'speed', 'latency', 'bottleneck', 'slow', 'cache'],
+  'deploy':   ['release', 'publish', 'ci', 'cd', 'ship', 'rollout', 'staging', 'production'],
+  'commit':   ['git', 'push', 'merge', 'pr', 'branch', 'version', 'rebase', 'stash', 'tag'],
+  'secure':   ['security', 'vulnerability', 'audit', 'secrets', 'auth', 'xss', 'csrf', 'injection', 'encrypt', 'ssl', 'tls', 'cors', 'oauth', 'jwt', 'cve'],
+  'review':   ['code-review', 'pr-review', 'quality', 'inspect', 'check', 'audit'],
+  'doc':      ['documentation', 'readme', 'docs', 'comment', 'jsdoc', 'typedoc', 'changelog', 'wiki', 'guide'],
+  'design':   ['ui', 'ux', 'frontend', 'layout', 'css', 'component', 'tailwind', 'responsive', 'theme'],
+  'infra':    ['infrastructure', 'devops', 'docker', 'kubernetes', 'terraform', 'ansible', 'helm', 'aws', 'gcp', 'azure', 'nginx', 'pipeline', 'cloud'],
+  'db':       ['database', 'sql', 'postgres', 'mysql', 'mongodb', 'schema', 'migration', 'orm', 'prisma', 'redis', 'sqlite', 'drizzle', 'sequelize'],
+  'api':      ['endpoint', 'rest', 'graphql', 'route', 'backend', 'grpc', 'websocket', 'middleware', 'swagger', 'openapi'],
+  'plan':     ['planning', 'architecture', 'spec', 'blueprint', 'rfc', 'proposal', 'roadmap'],
+  'build':    ['compile', 'bundle', 'webpack', 'vite', 'typescript', 'tsc', 'esbuild', 'rollup', 'parcel', 'babel', 'swc', 'transpile'],
+  'lint':     ['eslint', 'prettier', 'biome', 'stylelint', 'format', 'style'],
   // Chinese intent mappings
   '清理':     ['refactor', 'clean', 'lint', 'format', 'simplify'],
-  '测试':     ['test', 'testing', 'tdd', 'qa', 'spec'],
+  '测试':     ['test', 'testing', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest'],
   '提交':     ['commit', 'git', 'push', 'pr'],
   '部署':     ['deploy', 'release', 'ci', 'ship'],
-  '优化':     ['optimize', 'performance', 'fast', 'speed'],
-  '安全':     ['security', 'audit', 'vulnerability'],
+  '优化':     ['optimize', 'performance', 'fast', 'speed', 'cache'],
+  '安全':     ['security', 'audit', 'vulnerability', 'auth', 'xss', 'csrf'],
   '审查':     ['review', 'code-review', 'pr-review', 'quality'],
-  '修复':     ['fix', 'debug', 'bugfix', 'repair', 'error'],
+  '修复':     ['fix', 'debug', 'bugfix', 'repair', 'error', 'crash'],
   '文档':     ['documentation', 'readme', 'docs'],
-  '设计':     ['design', 'ui', 'ux', 'frontend'],
-  '构建':     ['build', 'compile', 'bundle'],
+  '设计':     ['design', 'ui', 'ux', 'frontend', 'layout', 'component'],
+  '构建':     ['build', 'compile', 'bundle', 'webpack', 'vite'],
   '重构':     ['refactor', 'restructure', 'simplify', 'clean'],
+  '数据库':   ['database', 'sql', 'schema', 'migration', 'orm'],
+  '接口':     ['api', 'endpoint', 'rest', 'route', 'backend'],
+  '规划':     ['planning', 'architecture', 'spec', 'blueprint'],
+  '格式化':   ['lint', 'format', 'eslint', 'prettier', 'style'],
+  '编译':     ['compile', 'build', 'bundle', 'transpile'],
+  '打包':     ['bundle', 'build', 'webpack', 'vite'],
+  '容器':     ['docker', 'container', 'kubernetes', 'infrastructure'],
+  '运维':     ['devops', 'infrastructure', 'deploy', 'docker'],
 };
+
+// ─── CJK Tokenization ───────────────────────────────────────────────────────
+// Chinese text has no word boundaries (no spaces between words).
+// Two-layer extraction:
+//   1. DISPATCH_SYNONYMS CJK keys → synonym-expanded via expandToken()
+//   2. CJK_INTENT_MAP → inject English equivalents for FTS5 matching
+
+const CJK_INTENT_MAP = {
+  // test
+  '测试': 'test', '写测试': 'test', '单测': 'test', '单元测试': 'test',
+  '用例': 'test', '覆盖率': 'coverage',
+  // fix/debug — synced with extractIntent CJK patterns
+  '修复': 'fix', '调试': 'debug', '排错': 'debug', '报错': 'error',
+  '出错': 'error', '修bug': 'fix', '改bug': 'fix', '找bug': 'debug',
+  '有bug': 'fix', '有问题': 'fix', '不工作': 'fix', '跑不起来': 'fix',
+  '不能用': 'fix', '挂了': 'crash', '崩溃': 'crash',
+  // commit
+  '提交': 'commit', '推送': 'push', '上传': 'push',
+  // deploy
+  '部署': 'deploy', '上线': 'deploy', '发布': 'release', '回滚': 'rollback',
+  // review
+  '审查': 'review', '审核': 'review', '评审': 'review', '代码审查': 'review',
+  '代码审核': 'review', '看看代码': 'review',
+  // clean
+  '重构': 'refactor', '清理': 'clean', '整理': 'clean', '简化': 'simplify',
+  '太烂': 'refactor', '乱七八糟': 'refactor', '看不懂': 'refactor',
+  // performance
+  '优化': 'optimize', '性能': 'performance', '卡顿': 'performance', '太慢': 'performance',
+  '耗时': 'performance', '慢死了': 'performance', '好慢': 'performance', '缓存': 'cache',
+  // security
+  '安全': 'security', '漏洞': 'vulnerability', '鉴权': 'auth', '认证': 'auth',
+  '授权': 'auth', '权限': 'auth', '泄露': 'security', '暴露': 'security',
+  '不安全': 'vulnerability',
+  // lint
+  '格式化': 'format', '代码风格': 'lint', '代码规范': 'lint', '类型检查': 'typecheck',
+  // design
+  '设计': 'design', '界面': 'ui', '前端': 'frontend', '样式': 'css',
+  '页面': 'frontend', '组件': 'component', '布局': 'layout',
+  // build
+  '构建': 'build', '编译': 'compile', '打包': 'bundle', '依赖': 'dependency',
+  // doc
+  '文档': 'documentation', '写文档': 'documentation', '文档化': 'documentation',
+  '注释': 'comment',
+  // infra
+  '容器': 'docker', '服务器': 'server', '运维': 'devops', '集群': 'cluster',
+  '监控': 'monitoring', '配置': 'config', '日志': 'logging',
+  // db
+  '数据库': 'database', '建表': 'database', '索引': 'database', '迁移': 'migration',
+  '查询慢': 'performance',
+  // api
+  '接口': 'api', '路由': 'route',
+  // plan
+  '规划': 'planning', '架构': 'architecture', '方案': 'plan', '设计方案': 'architecture',
+};
+
+// Merge all CJK keys from both maps, longest-first to avoid partial matches
+const ALL_CJK_KEYS = [...new Set([
+  ...Object.keys(DISPATCH_SYNONYMS).filter(k => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(k)),
+  ...Object.keys(CJK_INTENT_MAP),
+])].sort((a, b) => b.length - a.length);
+
+function extractCJKTokens(text) {
+  const found = [];
+  const seen = new Set();
+  for (const key of ALL_CJK_KEYS) {
+    if (text.includes(key)) {
+      if (!seen.has(key)) { seen.add(key); found.push(key); }
+      // Also inject English equivalent for direct FTS5 matching
+      const en = CJK_INTENT_MAP[key];
+      if (en && !seen.has(en)) { seen.add(en); found.push(en); }
+    }
+  }
+  return found;
+}
 
 // ─── Query Building ──────────────────────────────────────────────────────────
 
@@ -44,14 +127,21 @@ const DISPATCH_SYNONYMS = {
  * @param {string} token Input token
  * @returns {string} FTS5 OR group or bare token
  */
+const MAX_SYNONYM_EXPANSION = 8;
+
 function expandToken(token) {
   const lower = token.toLowerCase();
   const synonyms = DISPATCH_SYNONYMS[lower];
+  // CJK characters: pass through unquoted — FTS5 unicode61 tokenizer handles them natively.
+  // Quoting CJK tokens can interfere with tokenization.
+  const isSafe = t => /^[a-zA-Z0-9]+$/.test(t) || /[\u4e00-\u9fff\u3400-\u4dbf]/.test(t);
   if (!synonyms || synonyms.length === 0) {
-    return /^[a-zA-Z0-9]+$/.test(token) ? token : `"${token.replace(/"/g, '""')}"`;
+    return isSafe(token) ? token : `"${token.replace(/"/g, '""')}"`;
   }
-  const parts = [token, ...synonyms].map(t =>
-    /^[a-zA-Z0-9]+$/.test(t) ? t : `"${t.replace(/"/g, '""')}"`
+  // Cap synonym expansion to prevent BM25 precision dilution from overly broad OR groups
+  const capped = synonyms.slice(0, MAX_SYNONYM_EXPANSION);
+  const parts = [token, ...capped].map(t =>
+    isSafe(t) ? t : `"${t.replace(/"/g, '""')}"`
   );
   return `(${parts.join(' OR ')})`;
 }
@@ -71,18 +161,20 @@ export function buildEnhancedQuery(signals) {
     parts.push(`intent_tags:${expanded}`);
   }
 
-  // Secondary intents and action → general query (matches trigger_patterns via BM25 weight 5.0)
+  // Secondary intents → also column-targeted to intent_tags (not general query).
+  // Previously these were general tokens that matched trigger_patterns (BM25 weight 5.0),
+  // causing secondary domain words (e.g. "api" in "Write documentation for the API module")
+  // to overpower the primary intent. Column-targeting keeps intent signal in the right lane.
+  //
+  // Note: signals.action (tool type: edit/bash/write) is NOT included — it's metadata
+  // about the tool being used, not what the user needs help with.
   const generalTokens = new Set();
   if (signals.intent) {
     const intents = signals.intent.split(/[\s,]+/).filter(Boolean);
-    // Skip primary (already column-targeted), add rest as general
+    // Secondary intents: column-targeted but WITHOUT synonym expansion.
+    // This gives primary intent (expanded) higher BM25 weight than secondary intents (single token).
     for (const t of intents.slice(signals.primaryIntent ? 1 : 0)) {
-      generalTokens.add(t.toLowerCase());
-    }
-  }
-  if (signals.action) {
-    for (const t of signals.action.split(/[\s,]+/).filter(Boolean)) {
-      generalTokens.add(t.toLowerCase());
+      parts.push(`intent_tags:${t.toLowerCase()}`);
     }
   }
   if (signals.errorDomain) {
@@ -134,9 +226,20 @@ export function buildQueryFromText(text) {
   ]);
 
   const cleaned = text.replace(/[{}()[\]^~*:@#$%&]/g, ' ').trim();
-  const tokens = cleaned.split(/\s+/)
-    .filter(t => t.length > 1 && !STOP_WORDS.has(t.toLowerCase()) && !/^\d+$/.test(t))
-    .slice(0, 8); // Limit to 8 most relevant tokens
+
+  // Extract CJK compound words before whitespace split (Chinese has no spaces)
+  const cjkTokens = extractCJKTokens(cleaned);
+
+  const wsTokens = cleaned.split(/\s+/)
+    .filter(t => t.length > 1 && !STOP_WORDS.has(t.toLowerCase()) && !/^\d+$/.test(t));
+
+  // Merge: CJK tokens first (high signal), then whitespace tokens, deduplicated
+  const seen = new Set();
+  const tokens = [];
+  for (const t of [...cjkTokens, ...wsTokens]) {
+    if (!seen.has(t)) { seen.add(t); tokens.push(t); }
+  }
+  tokens.splice(8); // Limit to 8 most relevant tokens
 
   if (tokens.length === 0) return null;
 
@@ -146,7 +249,9 @@ export function buildQueryFromText(text) {
 
 // ─── FTS5 Retrieval ──────────────────────────────────────────────────────────
 
-// BM25 weights: trigger_patterns(5), capability_summary(3), intent_tags(2), domain_tags(1), name(1)
+// BM25 weights (8 columns, positional — must match FTS5 column order in registry.mjs):
+//   trigger_patterns(5), keywords(3), capability_summary(3),
+//   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
 //
 // Composite ranking formula:
 //   40% BM25 text relevance
@@ -156,15 +261,16 @@ export function buildQueryFromText(text) {
 //   10% Cold start exploration bonus (UCB1-inspired — decays as recommend_count grows)
 //   -10% Negative feedback penalty (zombie recommendations: high recommend, near-zero adopt)
 
-// Time-windowed behavioral signals: blend all-time rates (stability) with recent 30-day rates (freshness)
-// recent_* subqueries return NULL when no recent invocations → COALESCE falls back to all-time only
+// Time-windowed behavioral signals: blend all-time rates (stability) with recent 30-day rates (freshness).
+// recent_* subqueries return NULL when no recent invocations:
+//   COUNT(*)=0 → SUM(...)=NULL → (NULL+1.0)/(0+2.0) = NULL → COALESCE falls back to all-time only.
 //
 // Sign convention: bm25() returns NEGATIVE (more negative = more relevant).
 // We keep the negative direction and SUBTRACT positive behavioral signals to make
 // better resources more negative. ORDER BY ... ASC puts most negative (best) first.
 const COMPOSITE_ORDER = `
   ORDER BY (
-    bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) * 0.4
+    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
     - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
     - (
         (r.success_count + 1.0) / (r.recommend_count + 2.0) * 0.5
@@ -198,7 +304,7 @@ const COMPOSITE_ORDER = `
 
 const SEARCH_SQL = `
   SELECT r.*,
-    bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) AS relevance
+    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance
   FROM resources_fts
   JOIN resources r ON r.id = resources_fts.rowid
   WHERE resources_fts MATCH ?
@@ -209,7 +315,7 @@ const SEARCH_SQL = `
 
 const SEARCH_BY_TYPE_SQL = `
   SELECT r.*,
-    bm25(resources_fts, 5.0, 3.0, 2.0, 1.0, 1.0) AS relevance
+    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance
   FROM resources_fts
   JOIN resources r ON r.id = resources_fts.rowid
   WHERE resources_fts MATCH ?

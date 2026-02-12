@@ -19,19 +19,35 @@ function detectAdoption(invocation, sessionEvents) {
 
   for (const event of sessionEvents) {
     // Skill adoption: Claude used the Skill tool with matching name
+    // Case-insensitive matching with plugin-prefix support (e.g. "superpowers:tdd")
     if (resource_type === 'skill' && event.tool_name === 'Skill') {
-      const skillName = event.tool_input?.skill || '';
-      if (skillName === resource_name || skillName.endsWith(`:${resource_name}`)) {
+      const skillName = (event.tool_input?.skill || '').toLowerCase();
+      const resLower = resource_name.toLowerCase();
+      if (skillName === resLower ||
+          skillName.endsWith(`:${resLower}`) ||
+          resLower.endsWith(`:${skillName}`) ||
+          skillName.replace(/[-:]/g, '') === resLower.replace(/[-:]/g, '')) {
         return true;
       }
     }
 
     // Agent adoption: Claude used Task tool with matching agent type/description
+    // Normalizes hyphens/colons to spaces for comparison (e.g. "code-review-ai" ↔ "code review ai")
     if (resource_type === 'agent' && event.tool_name === 'Task') {
       const desc = (event.tool_input?.description || '').toLowerCase();
       const prompt = (event.tool_input?.prompt || '').toLowerCase();
-      const nameLower = resource_name.toLowerCase().replace(/-/g, ' ');
-      if (desc.includes(nameLower) || prompt.includes(nameLower)) {
+      const subType = (event.tool_input?.subagent_type || '').toLowerCase();
+      const nameLower = resource_name.toLowerCase();
+      const nameNorm = nameLower.replace(/[-:]/g, ' ');
+      const nameCompact = nameLower.replace(/[-:]/g, '');
+      const subTypeNorm = subType.replace(/[-:]/g, ' ');
+      const subTypeCompact = subType.replace(/[-:]/g, '');
+      if (desc.includes(nameNorm) || desc.includes(nameLower) ||
+          prompt.includes(nameNorm) || prompt.includes(nameLower) ||
+          subType === nameLower || subTypeNorm === nameNorm ||
+          subTypeCompact === nameCompact ||
+          subType.includes(nameNorm) || subType.includes(nameCompact) ||
+          subTypeNorm.includes(nameNorm)) {
         return true;
       }
     }

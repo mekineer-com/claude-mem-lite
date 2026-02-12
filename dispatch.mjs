@@ -59,6 +59,15 @@ export function _resetCircuitBreaker() {
   _breakerOpenUntil = 0;
 }
 
+/** Simulate Haiku failure (for testing). */
+export function _recordHaikuFailure() { recordHaikuFailure(); }
+
+/** Simulate Haiku success (for testing). */
+export function _recordHaikuSuccess() { recordHaikuSuccess(); }
+
+/** Check if circuit is open (for testing). */
+export function _isHaikuCircuitOpen() { return isHaikuCircuitOpen(); }
+
 // ─── Tier 0: Local Fast Filter ───────────────────────────────────────────────
 
 /**
@@ -132,11 +141,20 @@ export function extractContextSignals(event, sessionCtx = {}) {
     signals.primaryIntent = signals.intent.split(',')[0] || '';
   }
 
-  // Infer tech stack from recent files or current tool_input.file_path
+  // Infer tech stack from recent files, current tool_input, or prompt text
   if (sessionCtx.recentFiles?.length > 0) {
     signals.techStack = inferTechStack(sessionCtx.recentFiles);
   } else if (event.tool_input?.file_path) {
     signals.techStack = inferTechStack([event.tool_input.file_path]);
+  }
+  // Supplement with prompt-based tech detection (catches "React app", "Django API", etc.)
+  if (sessionCtx.userPrompt) {
+    const promptTech = inferTechFromPrompt(sessionCtx.userPrompt);
+    if (promptTech) {
+      signals.techStack = signals.techStack
+        ? signals.techStack + ',' + promptTech
+        : promptTech;
+    }
   }
 
   // Infer action from tool name and input
@@ -156,8 +174,8 @@ export function extractContextSignals(event, sessionCtx = {}) {
 }
 
 // Negation patterns: "don't test", "not deploy", "别测试", "不要部署"
-const NEGATION_EN = /\b(?:don'?t|do\s+not|no\s+need\s+to|skip|without|avoid|not)\s+/i;
-const NEGATION_CJK = /(?:不要|别|不用|先别|暂时不|不需要|跳过)/;
+const NEGATION_EN = /\b(?:don'?t|do\s+not|no\s+need\s+to|skip|without|avoid|not|never|stop|cancel|ignore|hold\s+off)\s+/i;
+const NEGATION_CJK = /(?:不要|别|不用|先别|暂时不|不需要|跳过|停止|取消|算了|不做|不搞)/;
 
 /**
  * Extract weighted intent keywords from user prompt.
@@ -169,66 +187,78 @@ const NEGATION_CJK = /(?:不要|别|不用|先别|暂时不|不需要|跳过)/;
  */
 function extractIntent(prompt) {
   if (!prompt) return '';
-  // English patterns use \b word boundaries
+  // English patterns — use trailing-optional boundaries for verb conjugations:
+  //   \b prefix ensures word start, but many suffixed forms (debugging, refactoring, deployed)
+  //   fail with trailing \b. Use \b...\w* for words that commonly have suffixes.
   const intentPatterns = [
-    [/\b(tests?|testing|tdd|spec|coverage)\b/i, 'test'],
-    [/\b(debug|fix(es)?|bugs?|errors?|troubleshoot)\b/i, 'fix'],
-    [/\b(commits?|push|pr|pull request|merge)\b/i, 'commit'],
-    [/\b(deploy|release|publish|ship)\b/i, 'deploy'],
-    [/\b(reviews?|code review)\b/i, 'review'],
-    [/\b(refactor|clean|simplify)\b/i, 'clean'],
-    [/\b(perf|performance|optimi)\b/i, 'fast'],
-    [/\b(security|secure|vulnerability)\b/i, 'secure'],
-    [/\b(lint|format|style|prettier|eslint)\b/i, 'lint'],
-    [/\b(design|ui|ux|frontend|css)\b/i, 'design'],
-    [/\b(build|compile|bundle)\b/i, 'build'],
-    [/\b(docs?|documentation|readme)\b/i, 'doc'],
-    [/\b(infra|docker|k8s|terraform)\b/i, 'infra'],
-    [/\b(db|database|sql)\b/i, 'db'],
-    [/\b(api|endpoints?|routes?)\b/i, 'api'],
-    [/\b(plan|architect)\b/i, 'plan'],
+    [/\b(tests?|testing|tested|tdd|spec|coverage|jest|vitest|pytest|mocha|cypress)\b/i, 'test'],
+    [/\b(debug\w*|fix\w*|bugs?|errors?|troubleshoot\w*|broken|crash\w*|issue|problem|fail\w*|not working|doesn'?t work)\b/i, 'fix'],
+    [/\b(commits?|committing|committed|push\w*|pr|pull request|merg\w*|rebas\w*|cherry.?pick|stash|tag)\b/i, 'commit'],
+    [/\b(deploy\w*|release\w*|publish\w*|ship\w*|rollout|staging|production)\b/i, 'deploy'],
+    [/\b(reviews?|reviewing|reviewed|reviewer|code review|audit\w*|inspect\w*|look over|check over)\b/i, 'review'],
+    [/\b(refactor\w*|clean\w*|simplif\w*|tidy|organiz\w*|restructur\w*|rewrit\w*|messy|ugly|smell|technical.?debt)\b/i, 'clean'],
+    [/\b(perf|performance|optimiz\w*|fast\w*|slow\w*|speed\w*|latency|bottleneck|laggy)\b/i, 'fast'],
+    [/\b(secur\w*|vulnerabilit\w*|xss|csrf|injection|encrypt\w*|ssl|tls|cors|oauth|jwt|cve|insecure|unsafe)\b/i, 'secure'],
+    [/\b(lint\w*|format\w*|style|prettier|eslint|biome|stylelint)\b/i, 'lint'],
+    [/\b(design\w*|ui|ux|frontend|css|tailwind|responsive|layout|theme|component)\b/i, 'design'],
+    [/\b(build\w*|compil\w*|bundl\w*|transpil\w*|esbuild|vite|rollup|webpack|parcel|babel|swc)\b/i, 'build'],
+    [/\b(docs?|documentation|readme|changelog|wiki|guide|tutorial|jsdoc|typedoc)\b/i, 'doc'],
+    [/\b(infra\w*|docker\w*|k8s|kubernetes|terraform|ansible|helm|aws|gcp|azure|cloud|nginx|ci\b|cd\b|pipeline)\b/i, 'infra'],
+    [/\b(db|database|sql|migrat\w*|schema|orm|prisma|redis|mongo\w*|postgres\w*|mysql|sqlite)\b/i, 'db'],
+    [/\b(api|endpoints?|routes?|rest|graphql|grpc|websocket|middleware|swagger|openapi)\b/i, 'api'],
+    [/\b(plan\w*|architect\w*|rfc|proposal|roadmap|blueprint|spec\b)\b/i, 'plan'],
     // Chinese patterns — \b doesn't work with CJK characters, so match without boundaries.
     // Use 2+ char compounds to avoid false positives from polysemous single chars.
     [/(测试|写测试|单测|单元测试|用例|覆盖率)/, 'test'],
-    [/(修复|修bug|调试|排错|报错|出错|有问题|不工作)/, 'fix'],
-    [/(提交|推送)/, 'commit'],
-    [/(部署|上线|发布)/, 'deploy'],
-    [/(审查|代码审查|评审)/, 'review'],
-    [/(重构|清理|整理|简化)/, 'clean'],
-    [/(优化|性能|卡顿|耗时|太慢)/, 'fast'],
-    [/(安全|漏洞|鉴权|认证|授权|权限)/, 'secure'],
-    [/(格式化|代码风格|代码规范)/, 'lint'],
+    [/(修复|修bug|改bug|找bug|有bug|调试|排错|报错|出错|有问题|不工作|跑不起来|不能用|挂了|崩溃)/, 'fix'],
+    [/(提交|推送|上传)/, 'commit'],
+    [/(部署|上线|发布|回滚)/, 'deploy'],
+    [/(审查|审核|代码审查|评审|代码审核|看看代码|review)/, 'review'],
+    [/(重构|清理|整理|简化|太烂|乱七八糟|看不懂)/, 'clean'],
+    [/(优化|性能|卡顿|耗时|太慢|慢死了|好慢|缓存)/, 'fast'],
+    [/(安全|漏洞|鉴权|认证|授权|权限|泄露|暴露|不安全)/, 'secure'],
+    [/(格式化|代码风格|代码规范|类型检查)/, 'lint'],
     [/(界面|前端|样式|页面|组件|布局)/, 'design'],
-    [/(构建|编译|打包)/, 'build'],
+    [/(构建|编译|打包|依赖)/, 'build'],
     [/(写文档|文档化|文档|注释)/, 'doc'],
-    [/(容器|服务器|运维|集群)/, 'infra'],
-    [/(数据库|建表|索引|迁移)/, 'db'],
+    [/(容器|服务器|运维|集群|监控|配置|日志)/, 'infra'],
+    [/(数据库|建表|索引|迁移|查询慢)/, 'db'],
     [/(接口|路由)/, 'api'],
-    [/(规划|架构|方案)/, 'plan'],
+    [/(规划|架构|方案|设计方案)/, 'plan'],
   ];
 
-  // Build negated intent set: detect "don't X", "not X", "别X", "不要X"
-  // Uses clause-aware proximity: negation must be in the same clause and close to the keyword
+  // Build per-tag negation/affirmation tracking.
+  // A tag is only excluded if ALL its matching instances are negated.
+  // This handles mixed-language inputs like "不要测试了，但 write the tests for auth"
+  // where the Chinese variant is negated but the English variant is not.
   const CLAUSE_BOUNDARY = /[,，。；;、.!?！？]/;
-  const negated = new Set();
+  const tagHasAffirmative = new Map(); // tag → true if any non-negated match exists
+  const tagMatched = new Set();        // tags that matched at least once
+
   for (const [pattern, tag] of intentPatterns) {
-    const match = pattern.exec(prompt);
-    if (!match) continue;
-    const matchStart = match.index;
-    // EN: 20-char window, CJK: 8-char window — check both
-    const enPrefix = prompt.slice(Math.max(0, matchStart - 20), matchStart);
-    const cjkPrefix = prompt.slice(Math.max(0, matchStart - 8), matchStart);
-    // Clause boundary check: if a comma/period separates negation from keyword, skip
-    const hasEnNeg = NEGATION_EN.test(enPrefix) && !CLAUSE_BOUNDARY.test(enPrefix);
-    const hasCjkNeg = NEGATION_CJK.test(cjkPrefix) && !CLAUSE_BOUNDARY.test(cjkPrefix);
-    if (hasEnNeg || hasCjkNeg) {
-      negated.add(tag);
+    // Use global flag + matchAll to find ALL matches (not just the first).
+    // This handles "don't test auth, but test UI" where the first match is negated
+    // but the second is affirmative — the tag should still be included.
+    const globalPattern = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
+    const matches = prompt.matchAll(globalPattern);
+    for (const match of matches) {
+      tagMatched.add(tag);
+      const matchStart = match.index;
+      // EN: 20-char window, CJK: 8-char window — check both
+      const enPrefix = prompt.slice(Math.max(0, matchStart - 20), matchStart);
+      const cjkPrefix = prompt.slice(Math.max(0, matchStart - 8), matchStart);
+      // Clause boundary check: if a comma/period separates negation from keyword, skip
+      const hasEnNeg = NEGATION_EN.test(enPrefix) && !CLAUSE_BOUNDARY.test(enPrefix);
+      const hasCjkNeg = NEGATION_CJK.test(cjkPrefix) && !CLAUSE_BOUNDARY.test(cjkPrefix);
+      if (!hasEnNeg && !hasCjkNeg) {
+        tagHasAffirmative.set(tag, true);
+      }
     }
   }
 
   const found = [];
-  for (const [pattern, tag] of intentPatterns) {
-    if (pattern.test(prompt) && !negated.has(tag) && !found.includes(tag)) {
+  for (const tag of tagMatched) {
+    if (tagHasAffirmative.get(tag) && !found.includes(tag)) {
       found.push(tag);
     }
   }
@@ -250,21 +280,85 @@ function inferTechStack(files) {
     '.jsx': 'javascript,react',
     '.py': 'python', '.pyw': 'python',
     '.rs': 'rust', '.go': 'go',
-    '.rb': 'ruby', '.java': 'java',
+    '.rb': 'ruby', '.java': 'java', '.kt': 'kotlin', '.kts': 'kotlin',
+    '.swift': 'swift', '.dart': 'dart,flutter',
+    '.c': 'c', '.h': 'c', '.cpp': 'cpp', '.hpp': 'cpp',
+    '.cs': 'csharp,dotnet', '.php': 'php',
+    '.ex': 'elixir', '.exs': 'elixir', '.erl': 'erlang',
+    '.lua': 'lua', '.zig': 'zig', '.sol': 'solidity',
     '.vue': 'vue,javascript', '.svelte': 'svelte,javascript',
-    '.css': 'css,frontend', '.scss': 'scss,frontend',
+    '.css': 'css,frontend', '.scss': 'scss,frontend', '.less': 'less,frontend',
     '.html': 'html,frontend',
     '.sql': 'database,sql',
+    '.prisma': 'prisma,database',
+    '.graphql': 'graphql', '.gql': 'graphql',
+    '.proto': 'protobuf,grpc',
     '.yml': 'yaml,config', '.yaml': 'yaml,config',
+    '.toml': 'toml,config', '.json': 'json',
+    '.sh': 'bash,shell', '.bash': 'bash,shell', '.zsh': 'zsh,shell',
     '.docker': 'docker,infrastructure',
     '.tf': 'terraform,infrastructure',
   };
 
+  // Filename-based detection (no extension matching)
+  const nameMap = {
+    'Dockerfile': 'docker,infrastructure',
+    'docker-compose.yml': 'docker,infrastructure',
+    'docker-compose.yaml': 'docker,infrastructure',
+    'Makefile': 'make,build',
+    'Cargo.toml': 'rust', 'go.mod': 'go',
+    'Gemfile': 'ruby', 'requirements.txt': 'python',
+    'pyproject.toml': 'python', 'Pipfile': 'python',
+  };
+
   const tags = new Set();
   for (const f of files) {
-    const ext = '.' + basename(f).split('.').pop();
+    const name = basename(f);
+    if (nameMap[name]) {
+      for (const t of nameMap[name].split(',')) tags.add(t);
+    }
+    const ext = '.' + name.split('.').pop();
     if (extMap[ext]) {
       for (const t of extMap[ext].split(',')) tags.add(t);
+    }
+  }
+  return [...tags].join(',');
+}
+
+/**
+ * Extract tech stack keywords from prompt text.
+ * Supplements file-based detection when no recent files are available.
+ * @param {string} prompt User prompt text
+ * @returns {string} Comma-separated tech/language tags
+ */
+function inferTechFromPrompt(prompt) {
+  if (!prompt) return '';
+  const techPatterns = [
+    [/\b(react|nextjs|next\.js|gatsby)\b/i, 'react,frontend'],
+    [/\b(vue|nuxt|vuex)\b/i, 'vue,frontend'],
+    [/\b(svelte|sveltekit)\b/i, 'svelte,frontend'],
+    [/\b(angular)\b/i, 'angular,frontend'],
+    [/\b(node\.?js|express|fastify|nestjs|koa)\b/i, 'node,javascript'],
+    [/\b(typescript|ts)\b/i, 'typescript'],
+    [/\b(python|django|flask|fastapi)\b/i, 'python'],
+    [/\b(rust|cargo)\b/i, 'rust'],
+    [/\b(golang|go\s+\w+)\b/i, 'go'],
+    [/\b(java|spring|maven|gradle)\b/i, 'java'],
+    [/\b(ruby|rails)\b/i, 'ruby'],
+    [/\b(php|laravel|symfony)\b/i, 'php'],
+    [/\b(swift|swiftui)\b/i, 'swift'],
+    [/\b(kotlin|android)\b/i, 'kotlin'],
+    [/\b(docker|kubernetes|k8s|helm)\b/i, 'docker,infrastructure'],
+    [/\b(terraform|ansible|aws|gcp|azure)\b/i, 'infrastructure,cloud'],
+    [/\b(postgres\w*|mysql|sqlite|mongodb|redis)\b/i, 'database'],
+    [/\b(tailwind|css|sass|scss)\b/i, 'css,frontend'],
+    [/\b(graphql)\b/i, 'graphql'],
+    [/\b(prisma|drizzle|sequelize)\b/i, 'database,orm'],
+  ];
+  const tags = new Set();
+  for (const [pattern, techTags] of techPatterns) {
+    if (pattern.test(prompt)) {
+      for (const t of techTags.split(',')) tags.add(t);
     }
   }
   return [...tags].join(',');
@@ -281,11 +375,13 @@ function inferAction(toolName, toolInput) {
     case 'Edit': case 'Write': case 'NotebookEdit': return 'edit';
     case 'Bash': {
       const cmd = (toolInput?.command || '').toLowerCase();
-      if (/\b(test|jest|pytest|vitest)\b/.test(cmd)) return 'test';
-      if (/\b(build|compile|tsc|webpack)\b/.test(cmd)) return 'build';
-      if (/\b(lint|eslint|prettier)\b/.test(cmd)) return 'lint';
-      if (/\b(deploy|docker|kubectl)\b/.test(cmd)) return 'deploy';
-      if (/\bgit\s+(commit|push|merge)\b/.test(cmd)) return 'commit';
+      if (/\b(test|jest|pytest|vitest|mocha|cypress|playwright|phpunit|rspec|cargo\s+test|go\s+test)\b/.test(cmd)) return 'test';
+      if (/\b(build|compile|tsc|webpack|esbuild|vite|rollup|parcel|make|cmake|cargo\s+build|go\s+build|mvn|gradle)\b/.test(cmd)) return 'build';
+      if (/\b(lint|eslint|prettier|biome|stylelint|rubocop|flake8|pylint|clippy)\b/.test(cmd)) return 'lint';
+      if (/\b(deploy|docker|kubectl|helm|terraform|ansible|pulumi)\b/.test(cmd)) return 'deploy';
+      if (/\bgit\s+(commit|push|merge|rebase|tag)\b/.test(cmd)) return 'commit';
+      if (/\b(npm\s+install|yarn\s+add|pnpm\s+add|pip\s+install|cargo\s+add|go\s+get|bundle\s+install)\b/.test(cmd)) return 'deps';
+      if (/\b(psql|mysql|sqlite3|mongosh|redis-cli)\b/.test(cmd)) return 'db';
       return 'bash';
     }
     case 'Task': return 'delegate';
@@ -302,11 +398,16 @@ function inferAction(toolName, toolInput) {
 function extractErrorDomain(cmd, response) {
   const combined = (cmd + ' ' + response).toLowerCase();
   if (/type\s*error|typescript|tsc/.test(combined)) return 'type-error';
-  if (/test.*fail|jest|vitest|pytest/.test(combined)) return 'test-fail';
-  if (/build.*fail|compile|webpack|esbuild/.test(combined)) return 'build-fail';
-  if (/syntax\s*error|parse/.test(combined)) return 'syntax-error';
-  if (/module.*not found|cannot find|enoent/.test(combined)) return 'module-not-found';
-  if (/permission|eacces/.test(combined)) return 'permission-error';
+  if (/test.*fail|jest|vitest|pytest|mocha|cypress/.test(combined)) return 'test-fail';
+  if (/build.*fail|compile|webpack|esbuild|vite|rollup/.test(combined)) return 'build-fail';
+  if (/syntax\s*error|parse\s*error|unexpected\s+token/.test(combined)) return 'syntax-error';
+  if (/module.*not found|cannot find|enoent|no such file/.test(combined)) return 'module-not-found';
+  if (/permission|eacces|eperm|forbidden/.test(combined)) return 'permission-error';
+  if (/econnrefused|econnreset|etimedout|fetch.*fail|network|socket hang up/.test(combined)) return 'network-error';
+  if (/out of memory|heap|oom|enomem|allocation/.test(combined)) return 'memory-error';
+  if (/lint|eslint|prettier|stylelint/.test(combined)) return 'lint-error';
+  if (/npm\s+err|yarn\s+error|pnpm\s+err|dependency|peer\s+dep|resolution/.test(combined)) return 'dependency-error';
+  if (/git\s+(conflict|merge|rebase|cherry)/.test(combined)) return 'git-error';
   return 'error';
 }
 
@@ -320,10 +421,10 @@ function extractErrorDomain(cmd, response) {
  * @returns {boolean} true if Haiku should be called
  */
 export function needsHaikuDispatch(results) {
-  if (results.length === 0) return true;
-
-  // Circuit breaker: if Haiku is tripped, never escalate
+  // Circuit breaker: if Haiku is tripped, never escalate (regardless of result quality)
   if (isHaikuCircuitOpen()) return false;
+
+  if (results.length === 0) return true;
 
   const topScore = Math.abs(results[0].relevance);
 
@@ -406,11 +507,19 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
   if (!userPrompt || !db) return null;
 
   try {
-    // Build query from user prompt
-    const query = buildQueryFromText(userPrompt);
-    if (!query) return null;
+    // Primary: intent-aware enhanced query (column-targeted, better for mixed-domain prompts)
+    const signals = extractContextSignals({ tool_name: '_session_start' }, { userPrompt });
+    const enhancedQuery = buildEnhancedQuery(signals);
 
-    let results = retrieveResources(db, query, { limit: 3 });
+    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3 }) : [];
+
+    // Fallback: broad text query (catches prompts without clear intent patterns)
+    if (results.length === 0) {
+      const textQuery = buildQueryFromText(userPrompt);
+      if (!textQuery) return null;
+      results = retrieveResources(db, textQuery, { limit: 3 });
+    }
+
     let tier = 2;
 
     // Tier 3: Haiku semantic fallback (SessionStart has 10s budget)
@@ -457,6 +566,61 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
 }
 
 /**
+ * Dispatch on UserPromptSubmit: analyze user's actual prompt, return best resource suggestion.
+ * Tier 1+2 only (no Haiku fallback) for fast response within hook timeout.
+ * Cooldown + session dedup prevents double-recommending with SessionStart.
+ * @param {Database} db Registry database
+ * @param {string} userPrompt User's prompt text
+ * @param {string} [sessionId] Session identifier for dedup
+ * @returns {Promise<string|null>} Injection text or null
+ */
+export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
+  if (!userPrompt || !db) return null;
+
+  try {
+    // Intent-aware enhanced query (column-targeted)
+    const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt });
+    const enhancedQuery = buildEnhancedQuery(signals);
+
+    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3 }) : [];
+
+    // Fallback: broad text query
+    if (results.length === 0) {
+      const textQuery = buildQueryFromText(userPrompt);
+      if (!textQuery) return null;
+      results = retrieveResources(db, textQuery, { limit: 3 });
+    }
+
+    if (results.length === 0) return null;
+
+    // Skip if low confidence (no Haiku fallback — stay fast)
+    if (needsHaikuDispatch(results)) return null;
+
+    // Filter by cooldown + session dedup (prevents double-recommend with SessionStart)
+    const viable = sessionId
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId))
+      : results;
+    if (viable.length === 0) return null;
+
+    const best = viable[0];
+
+    recordInvocation(db, {
+      resource_id: best.id,
+      session_id: sessionId || null,
+      trigger: 'session_start', // Same trigger type — they serve the same purpose
+      tier: 2,
+      recommended: 1,
+    });
+    updateResourceStats(db, best.id, 'recommend_count');
+
+    return renderInjection(best);
+  } catch (e) {
+    debugCatch(e, 'dispatchOnUserPrompt');
+    return null;
+  }
+}
+
+/**
  * Dispatch on PreToolUse: filter, analyze, and optionally recommend.
  * @param {Database} db Registry database
  * @param {object} event Hook event data
@@ -478,18 +642,14 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
 
     // Tier 2: FTS5 retrieval
     const results = retrieveResources(db, query, { limit: 3 });
+    if (results.length === 0) return null;
 
-    let best = null;
     const tier = 2; // Tier 3 disabled for PreToolUse — 2s hook timeout insufficient
 
-    if (results.length > 0 && !needsHaikuDispatch(results)) {
-      best = results[0];
-    }
+    // Low-confidence results: skip recommendation rather than suggest unreliable match
+    if (needsHaikuDispatch(results)) return null;
 
-    // Fallback to best Tier 2 result
-    if (!best && results.length > 0) best = results[0];
-
-    if (!best) return null;
+    const best = results[0];
 
     // Apply DB-persisted cooldown and session dedup
     const sid = sessionCtx.sessionId || null;

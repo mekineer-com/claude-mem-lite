@@ -3,10 +3,8 @@
 
 import { join } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, readdirSync, openSync, closeSync, writeSync, renameSync, statSync, constants as fsConstants } from 'fs';
-import { DB_DIR } from './schema.mjs';
 import { inferProject } from './utils.mjs';
-
-const RUNTIME_DIR = join(DB_DIR, 'runtime');
+import { RUNTIME_DIR } from './hook-shared.mjs';
 
 /**
  * Read episode file without locking (for signal handlers only).
