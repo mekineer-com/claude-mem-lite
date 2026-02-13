@@ -9,8 +9,8 @@ import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
-import { computeMinHash } from './utils.mjs';
-import { initSchema } from './schema.mjs';
+import { computeMinHash } from '../utils.mjs';
+import { initSchema } from '../schema.mjs';
 
 const HOOK_PATH = resolve('hook.mjs');
 const MOCK_CLAUDE = resolve('scripts/mock-claude.mjs');

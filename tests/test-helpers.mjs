@@ -2,7 +2,7 @@
 // Single source of truth: uses initSchema from schema.mjs — no DDL duplication
 
 import Database from 'better-sqlite3';
-import { initSchema } from './schema.mjs';
+import { initSchema } from '../schema.mjs';
 
 /**
  * Create an in-memory test database with full production schema + FTS5.

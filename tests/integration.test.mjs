@@ -1,8 +1,8 @@
 // Integration tests: verify complete pipelines across DB layers
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { sanitizeFtsQuery, jaccardSimilarity, computeMinHash, scrubSecrets, isoWeekKey } from './utils.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
+import { sanitizeFtsQuery, jaccardSimilarity, computeMinHash, scrubSecrets, isoWeekKey } from '../utils.mjs';
+import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from '../server-internals.mjs';
 
 // ─── Search Pipeline Integration ─────────────────────────────────────────────
 

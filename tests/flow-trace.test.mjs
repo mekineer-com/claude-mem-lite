@@ -5,15 +5,15 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
-import { upsertResource, getSessionInvocations } from './registry.mjs';
+import { upsertResource, getSessionInvocations } from '../registry.mjs';
 import {
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
   extractContextSignals, shouldSkipDispatch,
   _resetCircuitBreaker,
-} from './dispatch.mjs';
-import { buildEnhancedQuery, retrieveResources } from './registry-retriever.mjs';
-import { renderInjection } from './dispatch-inject.mjs';
-import { collectFeedback } from './dispatch-feedback.mjs';
+} from '../dispatch.mjs';
+import { buildEnhancedQuery, retrieveResources } from '../registry-retriever.mjs';
+import { renderInjection } from '../dispatch-inject.mjs';
+import { collectFeedback } from '../dispatch-feedback.mjs';
 
 // ─── DB Setup (mirrors dispatch.test.mjs) ────────────────────────────────────
 

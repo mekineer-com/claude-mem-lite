@@ -8,7 +8,7 @@ import {
   scanDirectory,
   scanPluginResources, scanPluginsDirectory,
   scanAllResources, diffResources,
-} from './registry-scanner.mjs';
+} from '../registry-scanner.mjs';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

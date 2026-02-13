@@ -21,8 +21,8 @@ import {
   writePendingEntry,
   mergePendingEntries,
   episodeHasSignificantContent,
-} from './hook-episode.mjs';
-import { DB_DIR } from './schema.mjs';
+} from '../hook-episode.mjs';
+import { DB_DIR } from '../schema.mjs';
 
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 

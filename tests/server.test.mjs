@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import Database from 'better-sqlite3';
-import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from './utils.mjs';
+import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { initSchema } from './schema.mjs';
+import { initSchema } from '../schema.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 

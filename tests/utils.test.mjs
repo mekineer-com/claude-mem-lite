@@ -21,7 +21,7 @@ import {
   fmtDate,
   fmtTime,
   isoWeekKey,
-} from './utils.mjs';
+} from '../utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
 

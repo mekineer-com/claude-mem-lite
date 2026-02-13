@@ -7,12 +7,12 @@ vi.mock('child_process', () => ({
 }));
 
 // Mock schema.mjs to avoid DB_DIR dependency issues
-vi.mock('./schema.mjs', () => ({
+vi.mock('../schema.mjs', () => ({
   DB_DIR: '/tmp/haiku-test',
 }));
 
 // Mock utils.mjs — only the functions haiku-client uses
-vi.mock('./utils.mjs', () => ({
+vi.mock('../utils.mjs', () => ({
   debugLog: vi.fn(),
   debugCatch: vi.fn(),
   parseJsonFromLLM: vi.fn((raw) => {
@@ -22,7 +22,7 @@ vi.mock('./utils.mjs', () => ({
 }));
 
 import { execFileSync } from 'child_process';
-import { detectMode, _resetMode, getClaudePath, callHaiku, callHaikuJSON } from './haiku-client.mjs';
+import { detectMode, _resetMode, getClaudePath, callHaiku, callHaikuJSON } from '../haiku-client.mjs';
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 

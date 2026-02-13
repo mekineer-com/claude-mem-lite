@@ -9,7 +9,7 @@ import {
   memSaveSchema,
   memStatsSchema,
   memCompressSchema,
-} from './tool-schemas.mjs';
+} from '../tool-schemas.mjs';
 
 // Helper: parse object against schema (Zod object from flat dict)
 function parseSchema(schemaDef, data) {

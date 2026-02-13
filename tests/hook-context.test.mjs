@@ -3,7 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { computeAdaptiveWindows, selectWithTokenBudget, updateClaudeMd } from './hook-context.mjs';
+import { computeAdaptiveWindows, selectWithTokenBudget, updateClaudeMd } from '../hook-context.mjs';
 
 // ─── computeAdaptiveWindows ──────────────────────────────────────────────────
 

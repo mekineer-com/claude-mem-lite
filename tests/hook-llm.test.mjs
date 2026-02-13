@@ -4,17 +4,17 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTestDb, insertSession } from './test-helpers.mjs';
-import { computeMinHash } from './utils.mjs';
+import { computeMinHash } from '../utils.mjs';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
-vi.mock('./hook-semaphore.mjs', () => ({
+vi.mock('../hook-semaphore.mjs', () => ({
   acquireLLMSlot: vi.fn(async () => true),
   releaseLLMSlot: vi.fn(),
 }));
 
-vi.mock('./hook-shared.mjs', async () => {
-  const actual = await vi.importActual('./hook-shared.mjs');
+vi.mock('../hook-shared.mjs', async () => {
+  const actual = await vi.importActual('../hook-shared.mjs');
   return {
     ...actual,
     openDb: vi.fn(),
@@ -23,9 +23,9 @@ vi.mock('./hook-shared.mjs', async () => {
   };
 });
 
-import { saveObservation, handleLLMEpisode, handleLLMSummary } from './hook-llm.mjs';
-import { openDb, callLLM } from './hook-shared.mjs';
-import { acquireLLMSlot } from './hook-semaphore.mjs';
+import { saveObservation, handleLLMEpisode, handleLLMSummary } from '../hook-llm.mjs';
+import { openDb, callLLM } from '../hook-shared.mjs';
+import { acquireLLMSlot } from '../hook-semaphore.mjs';
 
 // ─── saveObservation ─────────────────────────────────────────────────────────
 

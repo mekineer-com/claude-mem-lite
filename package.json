@@ -16,7 +16,7 @@
   "scripts": {
     "lint": "eslint .",
     "test": "vitest run",
-    "test:smoke": "vitest run smoke.test.mjs",
+    "test:smoke": "vitest run tests/smoke.test.mjs",
     "test:coverage": "vitest run --coverage",
     "benchmark": "node benchmark/benchmark.mjs",
     "benchmark:gate": "node benchmark/ci-gate.mjs"

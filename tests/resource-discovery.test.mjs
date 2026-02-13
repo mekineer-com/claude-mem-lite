@@ -10,7 +10,7 @@ import {
   discoverPlugins,
   discoverAllManaged,
   withRelativePaths,
-} from './resource-discovery.mjs';
+} from '../resource-discovery.mjs';
 
 const TEST_ROOT = join(tmpdir(), `discovery-test-${process.pid}`);
 

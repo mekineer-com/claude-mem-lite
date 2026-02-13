@@ -3,14 +3,14 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { upsertResource, getActiveResources, getResourceByName,
   updateResourceStats, recordInvocation, getSessionInvocations,
-  updateInvocation, getResourceSuccessRates } from './registry.mjs';
-import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from './registry-retriever.mjs';
+  updateInvocation, getResourceSuccessRates } from '../registry.mjs';
+import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   isRecentlyRecommended,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
-  _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from './dispatch.mjs';
-import { renderInjection } from './dispatch-inject.mjs';
-import { collectFeedback } from './dispatch-feedback.mjs';
+  _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from '../dispatch.mjs';
+import { renderInjection } from '../dispatch-inject.mjs';
+import { collectFeedback } from '../dispatch-feedback.mjs';
 
 // ─── Registry DB Helper ─────────────────────────────────────────────────────
 

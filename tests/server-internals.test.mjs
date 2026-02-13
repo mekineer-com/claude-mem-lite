@@ -1,7 +1,7 @@
 // Unit tests for server-internals.mjs (extracted from server.mjs for testability)
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, PRF_STOP_WORDS } from './server-internals.mjs';
+import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, PRF_STOP_WORDS } from '../server-internals.mjs';
 
 // ─── reRankWithContext ──────────────────────────────────────────────────────
 

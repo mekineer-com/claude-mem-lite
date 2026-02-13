@@ -8,8 +8,8 @@ import {
   LLM_SEM_MAX,
   LLM_SEM_TIMEOUT,
   sleepMs,
-} from './hook-semaphore.mjs';
-import { DB_DIR } from './schema.mjs';
+} from '../hook-semaphore.mjs';
+import { DB_DIR } from '../schema.mjs';
 
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 const slotFile = () => join(RUNTIME_DIR, `llm-sem-${process.pid}`);

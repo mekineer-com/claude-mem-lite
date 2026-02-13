@@ -2,7 +2,7 @@
 import { describe, it } from 'vitest';
 import fc from 'fast-check';
 import Database from 'better-sqlite3';
-import { initSchema } from './schema.mjs';
+import { initSchema } from '../schema.mjs';
 import {
   sanitizeFtsQuery,
   scrubSecrets,
@@ -11,7 +11,7 @@ import {
   jaccardSimilarity,
   estimateTokens,
   clampImportance,
-} from './utils.mjs';
+} from '../utils.mjs';
 
 // ─── sanitizeFtsQuery ───────────────────────────────────────────────────────
 
