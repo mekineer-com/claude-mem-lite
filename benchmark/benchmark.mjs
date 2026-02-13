@@ -6,7 +6,7 @@ import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
-import { createTestDb } from '../test-helpers.mjs';
+import { createTestDb } from '../tests/test-helpers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
