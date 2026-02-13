@@ -7,7 +7,7 @@
     "node": ">=18"
   },
   "bin": {
-    "claude-mem-lite": "./install.mjs"
+    "claude-mem-lite": "./cli.mjs"
   },
   "repository": {
     "type": "git",
@@ -22,6 +22,7 @@
     "benchmark:gate": "node benchmark/ci-gate.mjs"
   },
   "files": [
+    "cli.mjs",
     "server.mjs",
     "server-internals.mjs",
     "hook.mjs",
