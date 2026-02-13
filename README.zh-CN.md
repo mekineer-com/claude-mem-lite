@@ -444,8 +444,7 @@ claude-mem-lite/
     convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
     index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）
-  *.test.mjs           # 单元、属性、集成、契约、E2E、管线测试（581 个）
-  test-helpers.mjs     # 共享测试工具
+  tests/               # 单元、属性、集成、契约、E2E、管线测试（581 个）
   benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
 

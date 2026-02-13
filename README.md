@@ -444,8 +444,7 @@ claude-mem-lite/
     convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
     index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
-  *.test.mjs           # Unit, property, integration, contract, E2E, pipeline tests (581 tests)
-  test-helpers.mjs     # Shared test utilities
+  tests/               # Unit, property, integration, contract, E2E, pipeline tests (581 tests)
   benchmark/           # BM25 search quality benchmarks + CI gate
 ```
 
