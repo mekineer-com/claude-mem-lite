@@ -9,7 +9,6 @@ import { upsertResource, getSessionInvocations } from '../registry.mjs';
 import {
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
   extractContextSignals, shouldSkipDispatch,
-  _resetCircuitBreaker,
 } from '../dispatch.mjs';
 import { buildEnhancedQuery, retrieveResources } from '../registry-retriever.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
@@ -186,7 +185,6 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
   beforeEach(() => {
     db = createRegistryDb();
     for (const r of SEED_RESOURCES) upsertResource(db, r);
-    _resetCircuitBreaker();
   });
 
   // Stage 1: SessionStart dispatches on previous session's next_steps
