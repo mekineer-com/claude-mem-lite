@@ -1290,6 +1290,8 @@ async function install() {
     // Remove existing first (ignore errors)
     try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); } catch {}
     execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
+    // Remove project-level registration that shadows global (from .mcp.json)
+    try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', 'mem'], { stdio: 'pipe' }); } catch {}
     ok('MCP server registered: mem');
   } catch (e) {
     fail('MCP registration failed: ' + e.message);

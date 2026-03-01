@@ -238,6 +238,15 @@ const SYNONYM_PAIRS = [
   ['api', 'endpoint'],
   ['api', 'route'],
   ['cache', 'caching'],
+  ['cache', 'memoize'],
+  ['optimize', 'optimization'],
+  ['optimize', 'performance'],
+  ['speed', 'performance'],
+  ['fix', 'bugfix'],
+  ['fix', 'patch'],
+  ['debug', 'debugging'],
+  ['debug', 'troubleshoot'],
+  ['error', 'failure'],
   ['migrate', 'migration'],
 ];
 // Build bidirectional lookup (case-insensitive)
@@ -287,6 +296,26 @@ export function sanitizeFtsQuery(query) {
   // FTS5 requires explicit AND after parenthesized OR groups
   const hasGroup = expanded.some(e => e.startsWith('('));
   return expanded.join(hasGroup ? ' AND ' : ' ');
+}
+
+/**
+ * Relax an AND-joined FTS5 query to OR-joined for fallback search.
+ * Only useful when the original query has multiple tokens (single-token queries
+ * are already as relaxed as possible).
+ * @param {string} ftsQuery Original AND-joined FTS5 query from sanitizeFtsQuery
+ * @returns {string|null} OR-joined query, or null if relaxation wouldn't help
+ */
+export function relaxFtsQueryToOr(ftsQuery) {
+  if (!ftsQuery) return null;
+  // Replace AND joins with OR — handles both explicit " AND " and implicit space joins
+  const orQuery = ftsQuery.replace(/ AND /g, ' OR ');
+  // If no AND was present, tokens are space-joined (implicit AND); convert to OR
+  if (orQuery === ftsQuery && !ftsQuery.includes(' OR ')) {
+    const parts = ftsQuery.split(/\s+/);
+    if (parts.length < 2) return null; // single token — OR won't help
+    return parts.join(' OR ');
+  }
+  return orQuery !== ftsQuery ? orQuery : null;
 }
 
 // ─── Importance ──────────────────────────────────────────────────────────────

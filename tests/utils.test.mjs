@@ -168,8 +168,8 @@ describe('sanitizeFtsQuery', () => {
   it('handles mixed hyphens and operators', () => {
     // "next-auth" stays quoted (has hyphen), "error" expands via synonym map
     // Uses AND joiner because of parenthesized group
-    // "error" now also has semantic synonym "bug" in addition to abbreviation "err"
-    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug)');
+    // "error" has abbreviation "err", semantic synonyms "bug" and "failure"
+    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug OR failure)');
   });
 
   it('expands abbreviation synonyms', () => {

@@ -582,6 +582,31 @@ async function handleSessionStart() {
       summaryLines.push('');
     }
 
+    // Key context: top high-importance observations for CLAUDE.md persistence
+    const keyObs = db.prepare(`
+      SELECT id, type, title FROM observations
+      WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+        AND COALESCE(importance, 1) >= 2
+      ORDER BY created_at_epoch DESC LIMIT 5
+    `).all(project);
+    if (keyObs.length > 0) {
+      summaryLines.push('### Key Context');
+      for (const o of keyObs) {
+        summaryLines.push(`- [${o.type || 'discovery'}] ${truncate(o.title || '(untitled)', 80)} (#${o.id})`);
+      }
+      summaryLines.push('');
+    } else if (!latestSummary) {
+      // Fallback: no summary AND no key observations — show recent activity
+      const recentObs = (observations.length >= 3 ? observations : fallbackObs).slice(0, 3);
+      if (recentObs.length > 0) {
+        summaryLines.push('### Recent Activity');
+        for (const o of recentObs) {
+          summaryLines.push(`- ${truncate(o.title || '(untitled)', 80)}`);
+        }
+        summaryLines.push('');
+      }
+    }
+
     // Build observations table (stdout only — not persisted to CLAUDE.md)
     const obsLines = [];
     const obsToShow = observations.length >= 3 ? observations : fallbackObs;

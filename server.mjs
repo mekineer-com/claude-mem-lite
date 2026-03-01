@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch } from './utils.mjs';
 import { ensureDb, DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema } from './tool-schemas.mjs';
@@ -64,13 +64,21 @@ const server = new McpServer(
   { name: 'claude-mem-lite', version: '2.0.0' },
   {
     instructions: [
-      'Proactively use mem_search when:',
-      '- Errors occur: search for related past fixes (obs_type="bugfix")',
-      '- Before significant file changes: search for file history',
-      '- Architecture decisions: check past decisions (obs_type="decision")',
-      '- Stuck/blocked: search for similar past work',
+      'Proactively search memory to leverage past experience. This is your long-term memory across sessions.',
       '',
-      'Workflow: mem_search → mem_timeline(anchor=ID) → mem_get(ids=[...]) for full context.',
+      'WHEN TO SEARCH (mem_search):',
+      '- Error/bug encountered → mem_search(query="<error keyword>", obs_type="bugfix")',
+      '- Before modifying important files → mem_search(query="<filename>")',
+      '- Architecture/design decisions → mem_search(query="<topic>", obs_type="decision")',
+      '- Stuck or blocked → mem_search(query="<problem description>")',
+      '- Starting work on a feature → mem_search(query="<feature name>")',
+      '',
+      'WHEN TO SAVE (mem_save):',
+      '- Non-obvious debugging discovery → mem_save with type="bugfix"',
+      '- Key architecture decision → mem_save with type="decision"',
+      '- Important pattern or convention found → mem_save with type="discovery"',
+      '',
+      'WORKFLOW: mem_search → mem_timeline(anchor=ID) → mem_get(ids=[...]) for full context.',
     ].join('\n'),
   },
 );
@@ -127,6 +135,50 @@ function searchObservations(ctx) {
     );
     for (const r of rows) {
       results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
+    }
+
+    // OR fallback: when AND query returns 0 results, retry with OR semantics
+    if (rows.length === 0) {
+      const orQuery = relaxFtsQueryToOr(ftsQuery);
+      if (orQuery) {
+        try {
+          const orRows = db.prepare(`
+            SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+                   o.files_modified,
+                   snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
+                   ${OBS_BM25}
+                     * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+                     * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
+                     * (0.5 + 0.5 * COALESCE(o.importance, 1))
+                     * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
+                     * 0.8 as score
+            FROM observations_fts
+            JOIN observations o ON observations_fts.rowid = o.id
+            WHERE observations_fts MATCH ?
+              AND COALESCE(o.compressed_into, 0) = 0
+              AND (? IS NULL OR o.project = ?)
+              AND (? IS NULL OR o.type = ?)
+              AND (? IS NULL OR o.created_at_epoch >= ?)
+              AND (? IS NULL OR o.created_at_epoch <= ?)
+              AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+            ORDER BY score
+            LIMIT ? OFFSET ?
+          `).all(
+            now,
+            projectBoost, projectBoost,
+            orQuery,
+            args.project ?? null, args.project ?? null,
+            args.obs_type ?? null, args.obs_type ?? null,
+            epochFrom, epochFrom,
+            epochTo, epochTo,
+            args.importance ?? null, args.importance ?? null,
+            perSourceLimit, perSourceOffset
+          );
+          for (const r of orRows) {
+            results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
+          }
+        } catch (e) { debugCatch(e, 'searchObservations-or-fallback'); }
+      }
     }
 
     // Two-phase query expansion for sparse results
