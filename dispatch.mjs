@@ -85,6 +85,38 @@ export function _recordHaikuSuccess() { recordHaikuSuccess(); }
 /** Check if circuit is open (for testing). */
 export function _isHaikuCircuitOpen() { return isHaikuCircuitOpen(); }
 
+// ─── Project Domain Detection ─────────────────────────────────────────────────
+
+/**
+ * Detect project tech domains from marker files in the project directory.
+ * Used to post-filter FTS5 results — exclude resources whose domain_tags
+ * don't overlap with the project's detected domains.
+ * @returns {string[]} Array of domain tags (e.g. ['javascript', 'node', 'typescript'])
+ */
+export function detectProjectDomains() {
+  const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const techs = new Set();
+  const checks = [
+    ['package.json', ['javascript', 'node']],
+    ['tsconfig.json', ['typescript', 'javascript']],
+    ['Cargo.toml', ['rust']],
+    ['go.mod', ['go']],
+    ['requirements.txt', ['python']],
+    ['pyproject.toml', ['python']],
+    ['Gemfile', ['ruby']],
+    ['build.gradle', ['java']],
+    ['pom.xml', ['java']],
+    ['Package.swift', ['swift', 'ios']],
+    ['pubspec.yaml', ['dart', 'flutter']],
+    ['Podfile', ['ios', 'swift']],
+    ['CMakeLists.txt', ['cpp']],
+  ];
+  for (const [file, tags] of checks) {
+    if (existsSync(join(dir, file))) tags.forEach(t => techs.add(t));
+  }
+  return [...techs];
+}
+
 // ─── Tier 0: Local Fast Filter ───────────────────────────────────────────────
 
 /**
@@ -98,8 +130,8 @@ export function shouldSkipDispatch(event) {
   // Claude already chose a skill
   if (tool_name === 'Skill') return { skip: true, reason: 'claude_chose_skill' };
 
-  // Claude already chose an agent via Task tool
-  if (tool_name === 'Task' && tool_input?.subagent_type) {
+  // Claude already chose an agent via Agent tool
+  if (tool_name === 'Agent' && tool_input?.subagent_type) {
     return { skip: true, reason: 'claude_chose_agent' };
   }
 
@@ -401,7 +433,7 @@ function inferAction(toolName, toolInput) {
       if (/\b(psql|mysql|sqlite3|mongosh|redis-cli)\b/.test(cmd)) return 'db';
       return 'bash';
     }
-    case 'Task': return 'delegate';
+    case 'Agent': return 'delegate';
     default: return '';
   }
 }
@@ -524,17 +556,19 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
   if (!userPrompt || !db) return null;
 
   try {
+    const projectDomains = detectProjectDomains();
+
     // Primary: intent-aware enhanced query (column-targeted, better for mixed-domain prompts)
     const signals = extractContextSignals({ tool_name: '_session_start' }, { userPrompt });
     const enhancedQuery = buildEnhancedQuery(signals);
 
-    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3 }) : [];
+    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3, projectDomains }) : [];
 
     // Fallback: broad text query (catches prompts without clear intent patterns)
     if (results.length === 0) {
       const textQuery = buildQueryFromText(userPrompt);
       if (!textQuery) return null;
-      results = retrieveResources(db, textQuery, { limit: 3 });
+      results = retrieveResources(db, textQuery, { limit: 3, projectDomains });
     }
 
     let tier = 2;
@@ -549,6 +583,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
           const haikuResults = retrieveResources(db, haikuQuery, {
             type: haikuResult.type === 'either' ? undefined : haikuResult.type,
             limit: 3,
+            projectDomains,
           });
           if (haikuResults.length > 0) results = haikuResults;
         }
@@ -595,17 +630,19 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
   if (!userPrompt || !db) return null;
 
   try {
+    const projectDomains = detectProjectDomains();
+
     // Intent-aware enhanced query (column-targeted)
     const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt });
     const enhancedQuery = buildEnhancedQuery(signals);
 
-    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3 }) : [];
+    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3, projectDomains }) : [];
 
     // Fallback: broad text query
     if (results.length === 0) {
       const textQuery = buildQueryFromText(userPrompt);
       if (!textQuery) return null;
-      results = retrieveResources(db, textQuery, { limit: 3 });
+      results = retrieveResources(db, textQuery, { limit: 3, projectDomains });
     }
 
     if (results.length === 0) return null;
@@ -657,8 +694,10 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const query = buildEnhancedQuery(signals);
     if (!query) return null;
 
+    const projectDomains = detectProjectDomains();
+
     // Tier 2: FTS5 retrieval
-    const results = retrieveResources(db, query, { limit: 3 });
+    const results = retrieveResources(db, query, { limit: 3, projectDomains });
     if (results.length === 0) return null;
 
     const tier = 2; // Tier 3 disabled for PreToolUse — 2s hook timeout insufficient

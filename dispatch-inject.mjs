@@ -77,15 +77,15 @@ ${truncatedContent}
 }
 
 /**
- * Agent template -- guides Claude to use Task tool with the agent definition.
+ * Agent template -- guides Claude to use Agent tool with the agent definition.
  * @param {object} resource Resource object from DB
- * @returns {string} Injection text with agent definition for Task tool delegation
+ * @returns {string} Injection text with agent definition for Agent tool delegation
  */
 function injectAgent(resource) {
   if (!isAllowedPath(resource.local_path)) {
     return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task. ` +
       `Capability: ${truncate(resource.capability_summary, 100)}. ` +
-      `Use the Task tool to delegate this work.`;
+      `Use the Agent tool to delegate this work.`;
   }
   let agentDef = '';
   try {
@@ -104,7 +104,7 @@ function injectAgent(resource) {
     const truncatedDef = truncate(agentDef, MAX_INJECTION_CHARS - 300);
     return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task.
 Capability: ${truncate(resource.capability_summary, 100)}
-Use the Task tool with this agent definition:
+Use the Agent tool with this agent definition:
 <agent-definition>
 ${truncatedDef}
 </agent-definition>`;
@@ -112,7 +112,7 @@ ${truncatedDef}
 
   return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task. ` +
     `Capability: ${truncate(resource.capability_summary, 100)}. ` +
-    `Use the Task tool to delegate this work.`;
+    `Use the Agent tool to delegate this work.`;
 }
 
 // ─── Main Render ─────────────────────────────────────────────────────────────

@@ -247,6 +247,56 @@ export function buildQueryFromText(text) {
   return expanded.join(' OR ');
 }
 
+// ─── Project Domain Filtering ─────────────────────────────────────────────────
+
+// Platform/language tags that indicate a resource is technology-specific.
+// Only resources with these tags AND no overlap with project domains get filtered out.
+// Resources with only functional tags (testing, quality, review) always pass.
+const TECHNOLOGY_TAGS = new Set([
+  'javascript', 'typescript', 'node', 'react', 'vue', 'svelte', 'angular',
+  'python', 'django', 'flask', 'fastapi',
+  'rust', 'go', 'java', 'kotlin', 'ruby', 'php', 'swift', 'dart', 'flutter',
+  'ios', 'macos', 'android',
+  'cpp', 'c', 'csharp', 'dotnet', 'aspnet',
+  'elixir', 'erlang', 'lua', 'zig', 'solidity',
+  'html', 'css', 'frontend', 'backend',
+]);
+
+/**
+ * Post-filter FTS5 results by project domain overlap.
+ * - Resources with empty domain_tags (universal) always pass.
+ * - Resources with only functional tags (no technology-specific tags) always pass.
+ * - Resources with technology tags must overlap with project domains or tech_stack.
+ * @param {object[]} results FTS5 results
+ * @param {string[]} projectDomains Detected project domains
+ * @returns {object[]} Filtered results
+ */
+export function filterByProjectDomain(results, projectDomains) {
+  if (!projectDomains || projectDomains.length === 0) return results;
+  const domainSet = new Set(projectDomains.map(d => d.toLowerCase()));
+  return results.filter(r => {
+    // Universal: no domain_tags
+    if (!r.domain_tags || r.domain_tags.trim() === '') return true;
+
+    const tags = r.domain_tags.split(/[\s,]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+
+    // Check if any tag is a technology tag
+    const hasTechTag = tags.some(t => TECHNOLOGY_TAGS.has(t));
+    if (!hasTechTag) return true; // Only functional tags — always pass
+
+    // Has tech tags — check overlap with project domains
+    if (tags.some(t => domainSet.has(t))) return true;
+
+    // Also check tech_stack column (broader tech info)
+    if (r.tech_stack) {
+      const techTags = r.tech_stack.split(/[\s,]+/).map(t => t.trim().toLowerCase()).filter(Boolean);
+      if (techTags.some(t => domainSet.has(t))) return true;
+    }
+
+    return false;
+  });
+}
+
 // ─── FTS5 Retrieval ──────────────────────────────────────────────────────────
 
 // BM25 weights (8 columns, positional — must match FTS5 column order in registry.mjs):
@@ -327,30 +377,48 @@ const SEARCH_BY_TYPE_SQL = `
 
 /**
  * Search for resources using FTS5 with composite scoring.
+ * When projectDomains is provided, fetches extra results internally to allow
+ * headroom after domain filtering, then slices to requested limit.
  * @param {Database} db Registry database
  * @param {string} query FTS5 query string (already expanded)
  * @param {object} [opts] Options
  * @param {'skill'|'agent'} [opts.type] Filter by type
  * @param {number} [opts.limit=3] Max results
+ * @param {string[]} [opts.projectDomains] Project domains for post-filtering
  * @returns {object[]} Array of matching resources with relevance scores
  */
-export function retrieveResources(db, query, { type, limit = 3 } = {}) {
+export function retrieveResources(db, query, { type, limit = 3, projectDomains } = {}) {
   if (!query) return [];
 
+  // Fetch extra when domain filtering is active to ensure enough results after filtering
+  const fetchLimit = (projectDomains && projectDomains.length > 0) ? Math.max(limit * 3, 10) : limit;
+
   try {
+    let results;
     if (type) {
-      return db.prepare(SEARCH_BY_TYPE_SQL).all(query, type, limit);
+      results = db.prepare(SEARCH_BY_TYPE_SQL).all(query, type, fetchLimit);
+    } else {
+      results = db.prepare(SEARCH_SQL).all(query, fetchLimit);
     }
-    return db.prepare(SEARCH_SQL).all(query, limit);
+    if (projectDomains && projectDomains.length > 0) {
+      results = filterByProjectDomain(results, projectDomains);
+    }
+    return results.slice(0, limit);
   } catch (e) {
     // FTS5 query syntax error — try simpler query
     debugCatch(e, 'retrieveResources');
     try {
       const simpleQuery = query.replace(/[()]/g, '').split(/\s+OR\s+/).slice(0, 3).join(' OR ');
+      let results;
       if (type) {
-        return db.prepare(SEARCH_BY_TYPE_SQL).all(simpleQuery, type, limit);
+        results = db.prepare(SEARCH_BY_TYPE_SQL).all(simpleQuery, type, fetchLimit);
+      } else {
+        results = db.prepare(SEARCH_SQL).all(simpleQuery, fetchLimit);
       }
-      return db.prepare(SEARCH_SQL).all(simpleQuery, limit);
+      if (projectDomains && projectDomains.length > 0) {
+        results = filterByProjectDomain(results, projectDomains);
+      }
+      return results.slice(0, limit);
     } catch {
       return [];
     }

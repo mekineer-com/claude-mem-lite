@@ -21,6 +21,7 @@ const RESOURCES_SCHEMA = `
     local_path    TEXT NOT NULL,
     file_hash     TEXT,
     parent_plugin TEXT,
+    invocation_name   TEXT DEFAULT '',
     intent_tags       TEXT DEFAULT '',
     domain_tags       TEXT DEFAULT '',
     action_type       TEXT DEFAULT '',
@@ -154,6 +155,14 @@ export function ensureRegistryDb(dbPath) {
 
   db.exec(RESOURCES_SCHEMA);
 
+  // Migrate: add invocation_name column if missing (safe for existing DBs)
+  try {
+    const cols = db.prepare("PRAGMA table_info(resources)").all();
+    if (!cols.some(c => c.name === 'invocation_name')) {
+      db.exec("ALTER TABLE resources ADD COLUMN invocation_name TEXT DEFAULT ''");
+    }
+  } catch {}
+
   // FTS5 + triggers: only create if not exists
   const hasFts = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_fts'`).get();
   if (!hasFts) {
@@ -189,13 +198,14 @@ export function ensureRegistryDb(dbPath) {
 
 const UPSERT_SQL = `
   INSERT INTO resources (name, type, status, source, repo_url, repo_stars, local_path, file_hash,
-    intent_tags, domain_tags, action_type, trigger_patterns, capability_summary,
+    invocation_name, intent_tags, domain_tags, action_type, trigger_patterns, capability_summary,
     input_type, output_type, prerequisites, keywords, tech_stack, use_cases, complexity,
     indexed_at, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(type, name) DO UPDATE SET
     status=excluded.status, source=excluded.source, repo_url=excluded.repo_url,
     repo_stars=excluded.repo_stars, local_path=excluded.local_path, file_hash=excluded.file_hash,
+    invocation_name=CASE WHEN excluded.invocation_name != '' THEN excluded.invocation_name ELSE invocation_name END,
     intent_tags=excluded.intent_tags, domain_tags=excluded.domain_tags,
     action_type=excluded.action_type, trigger_patterns=excluded.trigger_patterns,
     capability_summary=excluded.capability_summary, input_type=excluded.input_type,
@@ -216,7 +226,8 @@ export function upsertResource(db, r) {
     const result = db.prepare(UPSERT_SQL).run(
       r.name, r.type, r.status || 'active', r.source || 'preinstalled',
       r.repo_url || null, r.repo_stars || 0, r.local_path,
-      r.file_hash || null, r.intent_tags || '', r.domain_tags || '',
+      r.file_hash || null, r.invocation_name || '',
+      r.intent_tags || '', r.domain_tags || '',
       r.action_type || '', r.trigger_patterns || '', r.capability_summary || '',
       r.input_type || '', r.output_type || '', r.prerequisites || '{}',
       r.keywords || '', r.tech_stack || '', r.use_cases || '', r.complexity || 'intermediate',
@@ -318,7 +329,8 @@ export function getResourceSuccessRates(db, days = 30) {
  */
 export function getSessionInvocations(db, sessionId) {
   return db.prepare(`
-    SELECT i.*, r.name as resource_name, r.type as resource_type
+    SELECT i.*, r.name as resource_name, r.type as resource_type,
+           r.invocation_name as invocation_name
     FROM invocations i
     JOIN resources r ON r.id = i.resource_id
     WHERE i.session_id = ?

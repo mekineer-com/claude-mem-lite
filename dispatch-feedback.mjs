@@ -6,6 +6,59 @@ import { debugCatch } from './utils.mjs';
 
 // ─── Adoption Detection ──────────────────────────────────────────────────────
 
+// Abbreviation map for common short-form registry names → full invocation names
+const SKILL_ABBREVS = {
+  'tdd': 'test driven development',
+  'debugging': 'systematic debugging',
+  'code-review': 'requesting code review',
+  'verification': 'verification before completion',
+  'git-worktrees': 'using git worktrees',
+};
+
+/**
+ * Check if a skill invocation matches a registry resource name.
+ * Tries multiple matching strategies: exact, plugin-prefix, normalized,
+ * invocation_name, and token-overlap with abbreviation expansion.
+ * @param {string} resourceName Registry resource name (e.g. "superpowers-tdd")
+ * @param {string} invocationName Stored invocation_name from DB (e.g. "superpowers:test-driven-development")
+ * @param {string} skillInput Invoked skill name from Skill tool (e.g. "superpowers:test-driven-development")
+ * @returns {boolean}
+ */
+function detectSkillAdoption(resourceName, invocationName, skillInput) {
+  const invoked = (skillInput || '').toLowerCase();
+  const resLower = resourceName.toLowerCase();
+  if (!invoked) return false;
+
+  // Exact match
+  if (invoked === resLower) return true;
+
+  // Stored invocation_name match (most reliable)
+  if (invocationName) {
+    const invNameLower = invocationName.toLowerCase();
+    if (invoked === invNameLower) return true;
+  }
+
+  // Plugin prefix match: "superpowers:test-driven-development" for "test-driven-development"
+  if (invoked.endsWith(':' + resLower) || resLower.endsWith(':' + invoked)) return true;
+
+  // Normalized match (strip hyphens/colons)
+  const norm = s => s.replace(/[-:_]/g, '');
+  if (norm(invoked) === norm(resLower)) return true;
+
+  // Token overlap with abbreviation expansion
+  const rTokens = resLower.split(/[-:_]+/);
+  const iTokens = invoked.split(/[-:_]+/);
+  // Plugin name match (first token): "superpowers" === "superpowers"
+  if (rTokens[0] === iTokens[0] && rTokens.length > 1 && iTokens.length > 1) {
+    const rRest = rTokens.slice(1).join(' ');
+    const iRest = iTokens.slice(1).join(' ');
+    const expanded = SKILL_ABBREVS[rRest] || rRest;
+    if (iRest.includes(expanded) || expanded.includes(iRest)) return true;
+  }
+
+  return false;
+}
+
 /**
  * Check if a recommended resource was adopted in the session events.
  * @param {object} invocation Invocation record with resource info
@@ -15,25 +68,19 @@ import { debugCatch } from './utils.mjs';
 function detectAdoption(invocation, sessionEvents) {
   if (!sessionEvents || sessionEvents.length === 0) return false;
 
-  const { resource_name, resource_type } = invocation;
+  const { resource_name, resource_type, invocation_name } = invocation;
 
   for (const event of sessionEvents) {
     // Skill adoption: Claude used the Skill tool with matching name
-    // Case-insensitive matching with plugin-prefix support (e.g. "superpowers:tdd")
     if (resource_type === 'skill' && event.tool_name === 'Skill') {
-      const skillName = (event.tool_input?.skill || '').toLowerCase();
-      const resLower = resource_name.toLowerCase();
-      if (skillName === resLower ||
-          skillName.endsWith(`:${resLower}`) ||
-          resLower.endsWith(`:${skillName}`) ||
-          skillName.replace(/[-:]/g, '') === resLower.replace(/[-:]/g, '')) {
+      if (detectSkillAdoption(resource_name, invocation_name || '', event.tool_input?.skill)) {
         return true;
       }
     }
 
-    // Agent adoption: Claude used Task tool with matching agent type/description
+    // Agent adoption: Claude used Agent tool with matching agent type/description
     // Normalizes hyphens/colons to spaces for comparison (e.g. "code-review-ai" ↔ "code review ai")
-    if (resource_type === 'agent' && event.tool_name === 'Task') {
+    if (resource_type === 'agent' && event.tool_name === 'Agent') {
       const desc = (event.tool_input?.description || '').toLowerCase();
       const prompt = (event.tool_input?.prompt || '').toLowerCase();
       const subType = (event.tool_input?.subagent_type || '').toLowerCase();

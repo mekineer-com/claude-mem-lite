@@ -46,6 +46,7 @@ function createRegistryDb() {
       use_cases     TEXT DEFAULT '',
       complexity    TEXT DEFAULT 'intermediate',
       parent_plugin TEXT,
+      invocation_name TEXT DEFAULT '',
       recommend_count   INTEGER DEFAULT 0,
       adopt_count       INTEGER DEFAULT 0,
       success_count     INTEGER DEFAULT 0,
@@ -383,11 +384,11 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       expect(updated.score).toBe(1.0);
     });
 
-    it('adopted agent via Task tool → success', async () => {
+    it('adopted agent via Agent tool → success', async () => {
       await dispatchOnUserPrompt(db, 'Review this codebase for quality issues', 'session-6');
 
       const toolEvents = [
-        { tool_name: 'Task', tool_input: { subagent_type: 'code-review-ai', description: 'review', prompt: 'review' }, tool_response: '' },
+        { tool_name: 'Agent', tool_input: { subagent_type: 'code-review-ai', description: 'review', prompt: 'review' }, tool_response: '' },
         { tool_name: 'Edit', tool_input: { file_path: '/src/app.ts' }, tool_response: 'ok' },
       ];
       await collectFeedback(db, 'session-6', toolEvents);
@@ -486,12 +487,12 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       expect(injection.length).toBeLessThanOrEqual(3000);
     });
 
-    it('agent injection mentions Task tool', () => {
+    it('agent injection mentions Agent tool', () => {
       const agent = db.prepare('SELECT * FROM resources WHERE name = ?').get('code-review-ai');
       const injection = renderInjection(agent);
       expect(injection).toContain('[Auto-suggestion]');
       expect(injection).toContain('code-review-ai');
-      expect(injection).toContain('Task tool');
+      expect(injection).toContain('Agent tool');
       expect(injection.length).toBeLessThanOrEqual(3000);
     });
   });

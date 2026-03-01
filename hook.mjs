@@ -233,10 +233,10 @@ async function handlePostToolUse() {
     writeEpisode(episode);
 
     // Track feedback-relevant tool events for dispatch adoption detection.
-    // Skill/Task: adoption detection checks these tool names.
+    // Skill/Agent: adoption detection checks these tool names.
     // Edit/Write/NotebookEdit: outcome detection checks for edits.
     // Bash errors: outcome detection checks for error signals.
-    if (['Skill', 'Task', 'Edit', 'Write', 'NotebookEdit'].includes(tool_name) ||
+    if (['Skill', 'Agent', 'Edit', 'Write', 'NotebookEdit'].includes(tool_name) ||
         (tool_name === 'Bash' && bashSig?.isError)) {
       appendToolEvent({
         tool_name,

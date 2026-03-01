@@ -47,6 +47,7 @@ function createRegistryDb() {
       use_cases     TEXT DEFAULT '',
       complexity    TEXT DEFAULT 'intermediate',
       parent_plugin TEXT,
+      invocation_name TEXT DEFAULT '',
       recommend_count   INTEGER DEFAULT 0,
       adopt_count       INTEGER DEFAULT 0,
       success_count     INTEGER DEFAULT 0,
@@ -428,8 +429,8 @@ describe('dispatch.mjs', () => {
       expect(result.reason).toBe('claude_chose_skill');
     });
 
-    it('skips Task with subagent_type', () => {
-      const result = shouldSkipDispatch({ tool_name: 'Task', tool_input: { subagent_type: 'Bash' } });
+    it('skips Agent with subagent_type', () => {
+      const result = shouldSkipDispatch({ tool_name: 'Agent', tool_input: { subagent_type: 'Bash' } });
       expect(result.skip).toBe(true);
       expect(result.reason).toBe('claude_chose_agent');
     });
@@ -647,7 +648,7 @@ describe('dispatch-inject.mjs', () => {
       expect(text).toContain('[Auto-suggestion]');
     });
 
-    it('renders agent injection with Task tool guidance', () => {
+    it('renders agent injection with Agent tool guidance', () => {
       const text = renderInjection({
         name: 'code-review-ai',
         type: 'agent',
@@ -655,7 +656,7 @@ describe('dispatch-inject.mjs', () => {
         local_path: '/tmp/nonexistent-agent',
       });
       expect(text).toContain('code-review-ai');
-      expect(text).toContain('Task tool');
+      expect(text).toContain('Agent tool');
     });
 
     it('enforces max length', () => {
@@ -715,7 +716,7 @@ describe('dispatch-feedback.mjs', () => {
     expect(inv.score).toBe(1.0);
   });
 
-  it('detects agent adoption from Task tool usage', async () => {
+  it('detects agent adoption from Agent tool usage', async () => {
     const id = seedResource(db, { name: 'code-review', type: 'agent' });
     recordInvocation(db, {
       resource_id: id,
@@ -726,7 +727,7 @@ describe('dispatch-feedback.mjs', () => {
     });
 
     const events = [
-      { tool_name: 'Task', tool_input: { description: 'code review analysis', prompt: 'review this code' } },
+      { tool_name: 'Agent', tool_input: { description: 'code review analysis', prompt: 'review this code' } },
     ];
 
     await collectFeedback(db, 'sess-agent', events);

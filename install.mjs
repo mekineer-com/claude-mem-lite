@@ -39,6 +39,7 @@ const RESOURCE_METADATA = {
     domain_tags: 'css,react,html,tailwind,frontend',
     capability_summary: 'Create distinctive production-grade frontend interfaces with high design quality',
     trigger_patterns: 'when user needs to build or design UI components pages or web interfaces',
+    invocation_name: 'frontend-design:frontend-design',
   },
   'skill:webapp-testing': {
     intent_tags: 'test,webapp,e2e,browser,qa,selenium,cypress,integration',
@@ -69,42 +70,49 @@ const RESOURCE_METADATA = {
     domain_tags: 'planning,design',
     capability_summary: 'Explore user intent requirements and design before implementation through structured brainstorming',
     trigger_patterns: 'when user needs to brainstorm ideas explore requirements or plan creative solutions before coding',
+    invocation_name: 'superpowers:brainstorming',
   },
   'skill:superpowers-tdd': {
     intent_tags: 'test,tdd,testing,unittest,spec,coverage,quality,red-green-refactor',
     domain_tags: 'testing,javascript,typescript,python',
     capability_summary: 'Test-driven development workflow with red-green-refactor cycle and quality checks',
     trigger_patterns: 'when user wants to write tests first or follow TDD methodology for feature development',
+    invocation_name: 'superpowers:test-driven-development',
   },
   'skill:superpowers-debugging': {
     intent_tags: 'debug,troubleshoot,fix,error,systematic,diagnose,bug,crash,failure',
     domain_tags: 'debugging,error-handling',
     capability_summary: 'Systematic debugging approach for complex bugs using hypothesis-driven investigation',
     trigger_patterns: 'when user encounters bugs errors crashes or unexpected behavior that needs systematic debugging',
+    invocation_name: 'superpowers:systematic-debugging',
   },
   'skill:superpowers-code-review': {
     intent_tags: 'review,code-review,quality,audit,feedback,inspect,pr-review',
     domain_tags: 'quality,review',
     capability_summary: 'Structured code review requesting with quality checklists and feedback gathering',
     trigger_patterns: 'when user wants to request or perform a thorough code review of their changes',
+    invocation_name: 'superpowers:requesting-code-review',
   },
   'skill:superpowers-writing-plans': {
     intent_tags: 'plan,architecture,spec,implementation,blueprint,roadmap,strategy',
     domain_tags: 'planning,architecture',
     capability_summary: 'Write structured implementation plans from specs before touching code',
     trigger_patterns: 'when user has requirements or specs and needs a multi-step implementation plan before coding',
+    invocation_name: 'superpowers:writing-plans',
   },
   'skill:superpowers-git-worktrees': {
     intent_tags: 'git,worktree,branch,isolation,parallel,workspace',
     domain_tags: 'git,workflow',
     capability_summary: 'Create isolated git worktrees for parallel feature development',
     trigger_patterns: 'when user needs to work on multiple branches simultaneously or isolate feature work',
+    invocation_name: 'superpowers:using-git-worktrees',
   },
   'skill:superpowers-verification': {
     intent_tags: 'verify,check,test,complete,quality,validation,evidence',
     domain_tags: 'quality,verification',
     capability_summary: 'Verify work is complete by running checks and gathering evidence before claiming done',
     trigger_patterns: 'when user is about to claim work is complete and needs verification before committing',
+    invocation_name: 'superpowers:verification-before-completion',
   },
   'skill:playwright-skill': {
     intent_tags: 'playwright,browser,automation,test,e2e,screenshot,scrape',
@@ -1157,6 +1165,7 @@ function reindexKnownResources(rdb) {
     UPDATE resources SET
       intent_tags = ?, domain_tags = ?,
       capability_summary = ?, trigger_patterns = ?,
+      invocation_name = CASE WHEN ? != '' THEN ? ELSE invocation_name END,
       updated_at = datetime('now')
     WHERE type = ? AND name = ?
   `);
@@ -1164,9 +1173,11 @@ function reindexKnownResources(rdb) {
   rdb.transaction(() => {
     for (const [key, meta] of Object.entries(RESOURCE_METADATA)) {
       const [type, name] = key.split(':');
+      const invName = meta.invocation_name || '';
       update.run(
         meta.intent_tags, meta.domain_tags,
         meta.capability_summary, meta.trigger_patterns,
+        invName, invName,
         type, name
       );
     }
@@ -1504,6 +1515,7 @@ async function install() {
                 repo_stars: res.repoStars || 0,
                 local_path: res.localPath,
                 file_hash: res.fileHash,
+                invocation_name: meta?.invocation_name || '',
                 intent_tags: meta?.intent_tags || res.name.replace(/-/g, ' '),
                 domain_tags: meta?.domain_tags || '',
                 trigger_patterns: meta?.trigger_patterns || `when user needs ${res.name.replace(/-/g, ' ')}`,
