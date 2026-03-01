@@ -34,8 +34,20 @@ function isNativeSkill(name) {
 // ─── Injection Templates ─────────────────────────────────────────────────────
 
 /**
+ * Invocable skill template -- tells Claude to invoke via Skill tool.
+ * Used when the resource has an invocation_name (registered as a Claude Code skill/plugin).
+ * @param {object} resource Resource object from DB
+ * @returns {string} Injection text instructing Skill tool invocation
+ */
+function injectSkillInvocable(resource) {
+  return `[Auto-suggestion] A relevant skill is available for this task. ` +
+    `Invoke it now: use the Skill tool with skill="${resource.invocation_name}". ` +
+    `Capability: ${truncate(resource.capability_summary, 100)}`;
+}
+
+/**
  * Native skill template -- tells Claude to use the skill command.
- * Used when skill exists in ~/.claude/skills/.
+ * Used when skill exists in ~/.claude/skills/ but has no invocation_name.
  * @param {object} resource Resource object from DB
  * @returns {string} Injection text referencing the native skill command
  */
@@ -129,7 +141,11 @@ export function renderInjection(resource) {
   let injection;
 
   if (resource.type === 'skill') {
-    if (isNativeSkill(resource.name)) {
+    // Priority: if invocation_name is set, the skill is a registered Claude Code skill/plugin
+    // → instruct Claude to invoke via Skill tool (enables adoption tracking)
+    if (resource.invocation_name) {
+      injection = injectSkillInvocable(resource);
+    } else if (isNativeSkill(resource.name)) {
       injection = injectSkillNative(resource);
     } else {
       injection = injectSkillManaged(resource);
