@@ -623,6 +623,22 @@ describe('dispatch.mjs', () => {
       expect(signals.intent).not.toContain('test');
     });
 
+    it('excludes test intent for CJK "跑单测"', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: '跑单测看看通过没' }
+      );
+      expect(signals.intent).not.toContain('test');
+    });
+
+    it('excludes test intent for "execute the tests"', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'execute the tests before deploying' }
+      );
+      expect(signals.intent).not.toContain('test');
+    });
+
     it('keeps test intent for test-writing prompts', () => {
       const signals = extractContextSignals(
         { tool_name: '_session_start' },

@@ -124,9 +124,9 @@ export function detectProjectDomains() {
     ['nuxt.config.ts', ['web', 'browser', 'vue']],
     ['angular.json', ['web', 'browser', 'angular']],
     ['.browserslistrc', ['web', 'browser']],
-    ['vite.config.ts', ['web', 'frontend']],
-    ['vite.config.js', ['web', 'frontend']],
-    ['webpack.config.js', ['web', 'frontend']],
+    ['vite.config.ts', ['web', 'browser', 'frontend']],
+    ['vite.config.js', ['web', 'browser', 'frontend']],
+    ['webpack.config.js', ['web', 'browser', 'frontend']],
   ];
   for (const [file, tags] of checks) {
     if (existsSync(join(dir, file))) tags.forEach(t => techs.add(t));
@@ -245,6 +245,12 @@ export function extractContextSignals(event, sessionCtx = {}) {
 const NEGATION_EN = /\b(?:don'?t|do\s+not|no\s+need\s+to|skip|without|avoid|not|never|stop|cancel|ignore|hold\s+off)\s+/i;
 const NEGATION_CJK = /(?:不要|别|不用|先别|暂时不|不需要|跳过|停止|取消|算了|不做|不搞)/;
 
+// Test-run vs test-write disambiguation (module-scoped for performance)
+const _RUN_TEST = /\b(run\w*\s+(?:the\s+)?tests?|npm\s+test|npx\s+(?:vitest|jest|mocha|pytest)|yarn\s+test|pnpm\s+test|make\s+test|cargo\s+test|go\s+test|check\s+(?:if\s+)?tests?\s+pass|execute\s+(?:the\s+)?tests?)\b/i;
+const _RUN_TEST_CJK = /(?:运行测试|跑测试|跑一下测试|跑单测|执行测试|测试跑|看测试)/;
+const _WRITE_TEST = /\b(write\s+tests?|add\s+tests?|create\s+tests?|need\s+tests?|missing\s+tests?|tdd|test.?driven|red.?green|increase\s+coverage|improve\s+coverage)\b/i;
+const _WRITE_TEST_CJK = /(?:写测试|加测试|补测试|补单测|缺测试|测试覆盖)/;
+
 /**
  * Extract weighted intent keywords from user prompt.
  * Returns primary (first match, strongest signal) and secondary intents.
@@ -334,12 +340,8 @@ function extractIntent(prompt) {
   // Distinguish test-running from test-writing: "run tests" / "npm test" / "运行测试" should NOT
   // trigger TDD recommendations. Only keep 'test' intent when the prompt implies *writing* tests.
   if (found.includes('test')) {
-    const RUN_TEST = /\b(run\w*\s+(?:the\s+)?tests?|npm\s+test|npx\s+(?:vitest|jest|mocha|pytest)|yarn\s+test|pnpm\s+test|make\s+test|cargo\s+test|go\s+test|check\s+(?:if\s+)?tests?\s+pass|execute\s+tests?)\b/i;
-    const RUN_TEST_CJK = /(?:运行测试|跑测试|跑一下测试|执行测试|测试跑|看测试)/;
-    const WRITE_TEST = /\b(write\s+tests?|add\s+tests?|create\s+tests?|need\s+tests?|missing\s+tests?|tdd|test.?driven|red.?green|increase\s+coverage|improve\s+coverage)\b/i;
-    const WRITE_TEST_CJK = /(?:写测试|加测试|补测试|缺测试|测试覆盖|单测)/;
-    const isRunning = RUN_TEST.test(prompt) || RUN_TEST_CJK.test(prompt);
-    const isWriting = WRITE_TEST.test(prompt) || WRITE_TEST_CJK.test(prompt);
+    const isRunning = _RUN_TEST.test(prompt) || _RUN_TEST_CJK.test(prompt);
+    const isWriting = _WRITE_TEST.test(prompt) || _WRITE_TEST_CJK.test(prompt);
     if (isRunning && !isWriting) {
       found.splice(found.indexOf('test'), 1);
     }
