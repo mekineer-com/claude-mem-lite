@@ -592,7 +592,11 @@ async function handleSessionStart() {
     if (keyObs.length > 0) {
       summaryLines.push('### Key Context');
       for (const o of keyObs) {
-        summaryLines.push(`- [${o.type || 'discovery'}] ${truncate(o.title || '(untitled)', 80)} (#${o.id})`);
+        // Strip raw JSON output from degraded Bash-style titles
+        const clean = (o.title || '(untitled)')
+          .replace(/ → (?:ERROR: )?\{".*$/, '')
+          .replace(/ → (?:ERROR: )?\{[^}]*\.{3}$/, '');
+        summaryLines.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})`);
       }
       summaryLines.push('');
     } else if (!latestSummary) {

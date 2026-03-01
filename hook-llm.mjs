@@ -156,6 +156,27 @@ function linkRelatedObservations(db, savedId, obs, episode) {
   }
 }
 
+// ─── Degraded Title Builder ──────────────────────────────────────────────────
+// When LLM is unavailable, build a readable title from episode metadata
+// instead of using raw makeEntryDesc output (which contains JSON stdout).
+
+function buildDegradedTitle(episode) {
+  const files = (episode.files || []).filter(Boolean);
+  const hasError = episode.entries.some(e => e.isError);
+  const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
+
+  if (files.length > 0) {
+    const names = files.map(f => basename(f)).slice(0, 3).join(', ');
+    const suffix = files.length > 3 ? ` +${files.length - 3} more` : '';
+    if (hasError) return `Error while working on ${names}${suffix}`;
+    if (hasEdit) return `Modified ${names}${suffix}`;
+    return `Worked on ${names}${suffix}`;
+  }
+  // No files: strip raw JSON output from Bash descriptions
+  const desc = episode.entries[0]?.desc || '(no description)';
+  return desc.replace(/ → (?:ERROR: )?\{.*$/, hasError ? ' (error)' : '');
+}
+
 // ─── Background: LLM Episode Extraction (Tier 2 F) ──────────────────────────
 
 export async function handleLLMEpisode() {
@@ -252,10 +273,9 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
     const hasError = episode.entries.some(e => e.isError);
     const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
     const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
-    const firstDesc = episode.entries[0]?.desc || '(no description)';
     obs = {
       type: inferredType,
-      title: truncate(firstDesc, 120),
+      title: truncate(buildDegradedTitle(episode), 120),
       subtitle: fileList,
       narrative: episode.entries.map(e => e.desc).join('; '),
       concepts: [],

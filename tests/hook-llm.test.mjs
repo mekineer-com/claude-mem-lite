@@ -251,7 +251,8 @@ describe('handleLLMEpisode', () => {
 
     const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
     expect(obs.length).toBe(1);
-    expect(obs[0].title).toBe('Update configuration');
+    // buildDegradedTitle uses file-centric summary: "Modified app.mjs"
+    expect(obs[0].title).toBe('Modified app.mjs');
     expect(obs[0].type).toBe('change');
   });
 
@@ -269,6 +270,8 @@ describe('handleLLMEpisode', () => {
 
     const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
     expect(obs[0].type).toBe('bugfix');
+    // buildDegradedTitle: file + error → "Error while working on app.mjs"
+    expect(obs[0].title).toBe('Error while working on app.mjs');
   });
 
   it('returns early when no tmpFile specified', async () => {
