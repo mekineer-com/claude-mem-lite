@@ -511,8 +511,8 @@ const RESOURCE_METADATA = {
     trigger_patterns: 'when user needs XML sitemap generation optimization or crawl management',
   },
   'skill:seo-technical': {
-    intent_tags: 'seo,technical,performance,core-web-vitals,speed,crawl,indexing',
-    domain_tags: 'seo,technical,performance',
+    intent_tags: 'seo,technical,core-web-vitals,crawl,indexing',
+    domain_tags: 'seo,technical',
     capability_summary: 'Technical SEO audit covering core web vitals site speed crawlability and indexing',
     trigger_patterns: 'when user needs technical SEO improvements core web vitals or site speed optimization',
   },
@@ -997,8 +997,8 @@ const RESOURCE_METADATA = {
     trigger_patterns: 'when user needs SEO-optimized content creation keyword articles or blog writing',
   },
   'agent:seo-technical-optimization': {
-    intent_tags: 'seo,technical,optimization,speed,crawl,indexing,performance',
-    domain_tags: 'seo,technical,optimization',
+    intent_tags: 'seo,technical,optimization,crawl,indexing',
+    domain_tags: 'seo,technical',
     capability_summary: 'Technical SEO optimization agent for site speed crawl efficiency and indexing',
     trigger_patterns: 'when user needs technical SEO optimization site speed or crawl improvements',
   },

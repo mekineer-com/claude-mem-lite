@@ -267,41 +267,48 @@ function extractIntent(prompt) {
   // English patterns — use trailing-optional boundaries for verb conjugations:
   //   \b prefix ensures word start, but many suffixed forms (debugging, refactoring, deployed)
   //   fail with trailing \b. Use \b...\w* for words that commonly have suffixes.
+  // Pattern ordering determines PRIMARY intent (first match).
+  // Priority: action verbs → domain-specific → quality/style → generic/overloaded.
+  // This ensures "review code before push" → review (not commit),
+  // "design database schema" → db (not design), "I have a spec" → plan (not test).
   const intentPatterns = [
-    [/\b(tests?|testing|tested|tdd|spec|coverage|jest|vitest|pytest|mocha|cypress)\b/i, 'test'],
+    // ── Action verbs (what the user wants to DO) ──
+    [/\b(tests?|testing|tested|tdd|coverage|jest|vitest|pytest|mocha|cypress)\b/i, 'test'],
     [/\b(debug\w*|fix\w*|bugs?|errors?|troubleshoot\w*|broken|crash\w*|issue|problem|fail\w*|not working|doesn'?t work)\b/i, 'fix'],
+    [/\b(reviews?|reviewing|reviewed|reviewer|code review|audit\w*|inspect\w*|look over|check over)\b/i, 'review'],
     [/\b(commits?|committing|committed|push\w*|pr|pull request|merg\w*|rebas\w*|cherry.?pick|stash|tag)\b/i, 'commit'],
     [/\b(deploy\w*|release\w*|publish\w*|ship\w*|rollout|staging|production)\b/i, 'deploy'],
-    [/\b(reviews?|reviewing|reviewed|reviewer|code review|audit\w*|inspect\w*|look over|check over)\b/i, 'review'],
+    [/\b(plan\w*|architect\w*|rfc|proposal|roadmap|blueprint|spec)\b/i, 'plan'],
     [/\b(refactor\w*|clean\w*|simplif\w*|tidy|organiz\w*|restructur\w*|rewrit\w*|messy|ugly|smell|technical.?debt)\b/i, 'clean'],
-    [/\b(perf|performance|optimiz\w*|fast\w*|slow\w*|speed\w*|latency|bottleneck|laggy)\b/i, 'fast'],
-    [/\b(secur\w*|vulnerabilit\w*|xss|csrf|injection|encrypt\w*|ssl|tls|cors|oauth|jwt|cve|insecure|unsafe)\b/i, 'secure'],
-    [/\b(lint\w*|format\w*|style|prettier|eslint|biome|stylelint)\b/i, 'lint'],
-    [/\b(design\w*|ui|ux|frontend|css|tailwind|responsive|layout|theme|component)\b/i, 'design'],
-    [/\b(build\w*|compil\w*|bundl\w*|transpil\w*|esbuild|vite|rollup|webpack|parcel|babel|swc)\b/i, 'build'],
     [/\b(docs?|documentation|readme|changelog|wiki|guide|tutorial|jsdoc|typedoc)\b/i, 'doc'],
-    [/\b(infra\w*|docker\w*|k8s|kubernetes|terraform|ansible|helm|aws|gcp|azure|cloud|nginx|ci\b|cd\b|pipeline)\b/i, 'infra'],
+    // ── Domain-specific (what area the work is in) ──
     [/\b(db|database|sql|migrat\w*|schema|orm|prisma|redis|mongo\w*|postgres\w*|mysql|sqlite)\b/i, 'db'],
     [/\b(api|endpoints?|routes?|rest|graphql|grpc|websocket|middleware|swagger|openapi)\b/i, 'api'],
-    [/\b(plan\w*|architect\w*|rfc|proposal|roadmap|blueprint|spec\b)\b/i, 'plan'],
-    // Chinese patterns — \b doesn't work with CJK characters, so match without boundaries.
-    // Use 2+ char compounds to avoid false positives from polysemous single chars.
+    [/\b(secur\w*|vulnerabilit\w*|xss|csrf|injection|encrypt\w*|ssl|tls|cors|oauth|jwt|cve|insecure|unsafe)\b/i, 'secure'],
+    [/\b(infra\w*|docker\w*|k8s|kubernetes|terraform|ansible|helm|aws|gcp|azure|cloud|nginx|ci\b|cd\b|pipeline)\b/i, 'infra'],
+    [/\b(build\w*|compil\w*|bundl\w*|transpil\w*|esbuild|vite|rollup|webpack|parcel|babel|swc)\b/i, 'build'],
+    // ── Quality / style ──
+    [/\b(perf|performance|optimiz\w*|fast\w*|slow\w*|speed\w*|latency|bottleneck|laggy)\b/i, 'fast'],
+    [/\b(lint\w*|format\w*|style|prettier|eslint|biome|stylelint)\b/i, 'lint'],
+    // ── Generic / overloaded (easily confused with domain terms) ──
+    [/\b(ui|ux|frontend|css|tailwind|responsive|layout|theme|component)\b/i, 'design'],
+    // ── Chinese patterns ──
     [/(测试|写测试|单测|单元测试|用例|覆盖率)/, 'test'],
     [/(修复|修bug|改bug|找bug|有bug|调试|排错|报错|出错|有问题|不工作|跑不起来|不能用|挂了|崩溃)/, 'fix'],
+    [/(审查|审核|代码审查|评审|代码审核|看看代码|review)/, 'review'],
     [/(提交|推送|上传)/, 'commit'],
     [/(部署|上线|发布|回滚)/, 'deploy'],
-    [/(审查|审核|代码审查|评审|代码审核|看看代码|review)/, 'review'],
+    [/(规划|架构|方案|设计方案)/, 'plan'],
     [/(重构|清理|整理|简化|太烂|乱七八糟|看不懂)/, 'clean'],
-    [/(优化|性能|卡顿|耗时|太慢|慢死了|好慢|缓存)/, 'fast'],
-    [/(安全|漏洞|鉴权|认证|授权|权限|泄露|暴露|不安全)/, 'secure'],
-    [/(格式化|代码风格|代码规范|类型检查)/, 'lint'],
-    [/(界面|前端|样式|页面|组件|布局)/, 'design'],
-    [/(构建|编译|打包|依赖)/, 'build'],
     [/(写文档|文档化|文档|注释)/, 'doc'],
-    [/(容器|服务器|运维|集群|监控|配置|日志)/, 'infra'],
     [/(数据库|建表|索引|迁移|查询慢)/, 'db'],
     [/(接口|路由)/, 'api'],
-    [/(规划|架构|方案|设计方案)/, 'plan'],
+    [/(安全|漏洞|鉴权|认证|授权|权限|泄露|暴露|不安全)/, 'secure'],
+    [/(容器|服务器|运维|集群|监控|配置|日志)/, 'infra'],
+    [/(构建|编译|打包|依赖)/, 'build'],
+    [/(优化|性能|卡顿|耗时|太慢|慢死了|好慢|缓存)/, 'fast'],
+    [/(格式化|代码风格|代码规范|类型检查)/, 'lint'],
+    [/(界面|前端|样式|页面|组件|布局)/, 'design'],
   ];
 
   // Build per-tag negation/affirmation tracking.
