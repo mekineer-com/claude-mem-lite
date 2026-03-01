@@ -1,9 +1,3 @@
 {
-  "mcpServers": {
-    "mem": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["./server.mjs"]
-    }
-  }
+  "mcpServers": {}
 }
