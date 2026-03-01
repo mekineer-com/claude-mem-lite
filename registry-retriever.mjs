@@ -260,6 +260,7 @@ const TECHNOLOGY_TAGS = new Set([
   'cpp', 'c', 'csharp', 'dotnet', 'aspnet',
   'elixir', 'erlang', 'lua', 'zig', 'solidity',
   'html', 'css', 'frontend', 'backend',
+  'browser', 'web', 'playwright',
 ]);
 
 /**

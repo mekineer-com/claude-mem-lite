@@ -6,7 +6,7 @@ import { upsertResource, getActiveResources, getResourceByName,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
-  isRecentlyRecommended,
+  isRecentlyRecommended, SESSION_RECOMMEND_CAP,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
   _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
@@ -590,6 +590,62 @@ describe('dispatch.mjs', () => {
       // Chinese variant negated, English variant affirmed → tag should survive
       expect(signals.intent).toContain('test');
     });
+
+    it('excludes test intent for test-running prompts (run tests)', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'run the tests' }
+      );
+      expect(signals.intent).not.toContain('test');
+    });
+
+    it('excludes test intent for test-running prompts (npm test)', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'npm test' }
+      );
+      expect(signals.intent).not.toContain('test');
+    });
+
+    it('excludes test intent for test-running prompts (npx vitest)', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'npx vitest' }
+      );
+      expect(signals.intent).not.toContain('test');
+    });
+
+    it('excludes test intent for CJK test-running prompts', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: '运行测试看看结果' }
+      );
+      expect(signals.intent).not.toContain('test');
+    });
+
+    it('keeps test intent for test-writing prompts', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'write tests for the auth module' }
+      );
+      expect(signals.intent).toContain('test');
+    });
+
+    it('keeps test intent for TDD prompts', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'use TDD to implement the new feature' }
+      );
+      expect(signals.intent).toContain('test');
+    });
+
+    it('keeps test intent when both running and writing are mentioned', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'run the tests and write tests for the missing cases' }
+      );
+      expect(signals.intent).toContain('test');
+    });
   });
 
   describe('needsHaikuDispatch', () => {
@@ -1103,5 +1159,27 @@ describe('isRecentlyRecommended', () => {
     const id2 = seedResource(db, { name: 'skill-b' });
     recordInvocation(db, { resource_id: id1, session_id: 'sess-1', trigger: 'session_start', tier: 2 });
     expect(isRecentlyRecommended(db, id2, 'sess-1')).toBe(false);
+  });
+
+  it('returns true when session reaches recommendation cap', () => {
+    const ids = [];
+    for (let i = 0; i < SESSION_RECOMMEND_CAP; i++) {
+      ids.push(seedResource(db, { name: `skill-cap-${i}` }));
+    }
+    const newId = seedResource(db, { name: 'skill-over-cap' });
+    // Fill up to cap with recommended invocations
+    for (const id of ids) {
+      recordInvocation(db, { resource_id: id, session_id: 'sess-cap', trigger: 'session_start', tier: 2, recommended: 1 });
+    }
+    // New resource should be blocked by session cap
+    expect(isRecentlyRecommended(db, newId, 'sess-cap')).toBe(true);
+  });
+
+  it('allows recommendations below session cap', () => {
+    const id1 = seedResource(db, { name: 'skill-under-1' });
+    const id2 = seedResource(db, { name: 'skill-under-2' });
+    recordInvocation(db, { resource_id: id1, session_id: 'sess-under', trigger: 'session_start', tier: 2, recommended: 1 });
+    // Only 1 recommendation, cap is 3 — should be allowed
+    expect(isRecentlyRecommended(db, id2, 'sess-under')).toBe(false);
   });
 });

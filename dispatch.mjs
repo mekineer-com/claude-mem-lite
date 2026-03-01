@@ -25,7 +25,8 @@ const READ_ONLY_TOOLS = new Set([
   'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode',
 ]);
 
-export const COOLDOWN_MINUTES = 5;
+export const COOLDOWN_MINUTES = 60;
+export const SESSION_RECOMMEND_CAP = 3;
 
 // ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
 // Prevents cascading latency when Haiku API is down or slow.
@@ -116,6 +117,16 @@ export function detectProjectDomains() {
     ['pubspec.yaml', ['dart', 'flutter']],
     ['Podfile', ['ios', 'swift']],
     ['CMakeLists.txt', ['cpp']],
+    // Web/browser context — enables domain filtering for browser-specific resources
+    ['next.config.js', ['web', 'browser', 'react']],
+    ['next.config.mjs', ['web', 'browser', 'react']],
+    ['next.config.ts', ['web', 'browser', 'react']],
+    ['nuxt.config.ts', ['web', 'browser', 'vue']],
+    ['angular.json', ['web', 'browser', 'angular']],
+    ['.browserslistrc', ['web', 'browser']],
+    ['vite.config.ts', ['web', 'frontend']],
+    ['vite.config.js', ['web', 'frontend']],
+    ['webpack.config.js', ['web', 'frontend']],
   ];
   for (const [file, tags] of checks) {
     if (existsSync(join(dir, file))) tags.forEach(t => techs.add(t));
@@ -319,6 +330,21 @@ function extractIntent(prompt) {
       found.push(tag);
     }
   }
+
+  // Distinguish test-running from test-writing: "run tests" / "npm test" / "运行测试" should NOT
+  // trigger TDD recommendations. Only keep 'test' intent when the prompt implies *writing* tests.
+  if (found.includes('test')) {
+    const RUN_TEST = /\b(run\w*\s+(?:the\s+)?tests?|npm\s+test|npx\s+(?:vitest|jest|mocha|pytest)|yarn\s+test|pnpm\s+test|make\s+test|cargo\s+test|go\s+test|check\s+(?:if\s+)?tests?\s+pass|execute\s+tests?)\b/i;
+    const RUN_TEST_CJK = /(?:运行测试|跑测试|跑一下测试|执行测试|测试跑|看测试)/;
+    const WRITE_TEST = /\b(write\s+tests?|add\s+tests?|create\s+tests?|need\s+tests?|missing\s+tests?|tdd|test.?driven|red.?green|increase\s+coverage|improve\s+coverage)\b/i;
+    const WRITE_TEST_CJK = /(?:写测试|加测试|补测试|缺测试|测试覆盖|单测)/;
+    const isRunning = RUN_TEST.test(prompt) || RUN_TEST_CJK.test(prompt);
+    const isWriting = WRITE_TEST.test(prompt) || WRITE_TEST_CJK.test(prompt);
+    if (isRunning && !isWriting) {
+      found.splice(found.indexOf('test'), 1);
+    }
+  }
+
   return found.join(',');
 }
 
@@ -538,13 +564,21 @@ JSON: {"query":"search keywords for finding the right skill or agent","type":"sk
 // ─── Cooldown & Dedup (DB-persisted, survives process restarts) ─────────────
 
 export function isRecentlyRecommended(db, resourceId, sessionId) {
-  // Check 1: Already recommended in this session (session dedup)
+  // Check 1: Per-session recommendation cap (avoid overwhelming user with suggestions)
+  if (sessionId) {
+    const sessionCount = db.prepare(
+      'SELECT COUNT(*) as cnt FROM invocations WHERE session_id = ? AND recommended = 1'
+    ).get(sessionId);
+    if (sessionCount.cnt >= SESSION_RECOMMEND_CAP) return true;
+  }
+
+  // Check 2: Already recommended in this session (session dedup)
   const sessionHit = db.prepare(
     'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? LIMIT 1'
   ).get(resourceId, sessionId);
   if (sessionHit) return true;
 
-  // Check 2: Recommended within cooldown window (cross-session cooldown)
+  // Check 3: Recommended within cooldown window (cross-session cooldown)
   const cooldownHit = db.prepare(
     `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', ?) LIMIT 1`
   ).get(resourceId, `-${COOLDOWN_MINUTES} minutes`);
