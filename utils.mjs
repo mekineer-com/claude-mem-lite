@@ -488,7 +488,7 @@ export function makeEntryDesc(toolName, input, resp) {
       return `Search "${truncate(input.pattern || '', 20)}" → ${truncate(resp, 60)}`;
     case 'LSP':
       return `${input.operation || ''} ${basename(input.filePath || '')}`;
-    case 'Task':
+    case 'Task': case 'Agent':
       return truncate(input.description || '', 60);
     case 'WebSearch':
       return `Web: ${truncate(input.query || '', 50)}`;

@@ -87,14 +87,20 @@ export function _isHaikuCircuitOpen() { return isHaikuCircuitOpen(); }
 
 // ─── Project Domain Detection ─────────────────────────────────────────────────
 
+// Module-level cache — project dir doesn't change during a session
+let _domainCache = null;
+let _domainCacheDir = null;
+
 /**
  * Detect project tech domains from marker files in the project directory.
  * Used to post-filter FTS5 results — exclude resources whose domain_tags
  * don't overlap with the project's detected domains.
+ * Results are cached per directory (project dir doesn't change within a session).
  * @returns {string[]} Array of domain tags (e.g. ['javascript', 'node', 'typescript'])
  */
 export function detectProjectDomains() {
   const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  if (_domainCache && _domainCacheDir === dir) return _domainCache;
   const techs = new Set();
   const checks = [
     ['package.json', ['javascript', 'node']],
@@ -114,7 +120,9 @@ export function detectProjectDomains() {
   for (const [file, tags] of checks) {
     if (existsSync(join(dir, file))) tags.forEach(t => techs.add(t));
   }
-  return [...techs];
+  _domainCache = [...techs];
+  _domainCacheDir = dir;
+  return _domainCache;
 }
 
 // ─── Tier 0: Local Fast Filter ───────────────────────────────────────────────
