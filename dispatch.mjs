@@ -291,6 +291,9 @@ function extractIntent(prompt) {
     [/\b(perf|performance|optimiz\w*|fast\w*|slow\w*|speed\w*|latency|bottleneck|laggy)\b/i, 'fast'],
     [/\b(lint\w*|format\w*|style|prettier|eslint|biome|stylelint)\b/i, 'lint'],
     // ── Generic / overloaded (easily confused with domain terms) ──
+    // Note: bare "design" intentionally excluded — too ambiguous ("design database" vs "design UI").
+    // Only UI-specific keywords trigger design intent. Prompts like "design the homepage" without
+    // UI terms will rely on text-based FTS5 fallback rather than intent matching.
     [/\b(ui|ux|frontend|css|tailwind|responsive|layout|theme|component)\b/i, 'design'],
     // ── Chinese patterns ──
     [/(测试|写测试|单测|单元测试|用例|覆盖率)/, 'test'],

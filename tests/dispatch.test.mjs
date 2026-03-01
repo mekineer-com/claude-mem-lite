@@ -680,6 +680,53 @@ describe('dispatch.mjs', () => {
       expect(signals.intent).toContain('test');
       expect(signals.suppressedIntents).toEqual([]);
     });
+
+    // ── Intent priority ordering tests (v2.0.12) ──
+    // These verify that pattern array ordering produces correct primary intent.
+
+    it('prioritizes review over commit: "review code before push"', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: 'review code before I push' }
+      );
+      expect(signals.primaryIntent).toBe('review');
+      expect(signals.intent).toContain('commit');
+    });
+
+    it('prioritizes db over design: "design database schema"', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: 'design database schema' }
+      );
+      expect(signals.primaryIntent).toBe('db');
+      expect(signals.intent).not.toContain('design');
+    });
+
+    it('maps spec to plan (not test)', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: 'I have a spec for the new module' }
+      );
+      expect(signals.primaryIntent).toBe('plan');
+      expect(signals.intent).not.toContain('test');
+    });
+
+    it('bare "design" does not trigger design intent (ambiguous)', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: 'design the homepage' }
+      );
+      // "design" alone is too ambiguous — only UI-specific keywords trigger design
+      expect(signals.intent).not.toContain('design');
+    });
+
+    it('UI keywords trigger design intent', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: 'create a responsive layout with tailwind' }
+      );
+      expect(signals.primaryIntent).toBe('design');
+    });
   });
 
   describe('needsHaikuDispatch', () => {
@@ -892,6 +939,35 @@ describe('dispatch-feedback.mjs', () => {
 
   it('handles null sessionId gracefully', async () => {
     await collectFeedback(db, null, []);
+  });
+
+  it('double collectFeedback does not overwrite previous outcome', async () => {
+    const id = seedResource(db, { name: 'double-skill', type: 'skill' });
+    recordInvocation(db, {
+      resource_id: id,
+      session_id: 'sess-double',
+      trigger: 'session_start',
+      tier: 2,
+      recommended: 1,
+    });
+
+    // First collection: skill adopted, edits made → success
+    const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'double-skill' } },
+      { tool_name: 'Edit', tool_input: { file_path: '/test.js' } },
+    ];
+    await collectFeedback(db, 'sess-double', events);
+    const first = db.prepare('SELECT * FROM invocations WHERE session_id = ?').get('sess-double');
+    expect(first.outcome).toBe('success');
+    expect(first.adopted).toBe(1);
+    expect(first.score).toBe(1.0);
+
+    // Second collection with empty events should NOT overwrite
+    await collectFeedback(db, 'sess-double', []);
+    const second = db.prepare('SELECT * FROM invocations WHERE session_id = ?').get('sess-double');
+    expect(second.outcome).toBe('success');
+    expect(second.adopted).toBe(1);
+    expect(second.score).toBe(1.0);
   });
 });
 

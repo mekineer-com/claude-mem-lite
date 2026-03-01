@@ -445,7 +445,7 @@ const RESOURCE_METADATA = {
     trigger_patterns: 'when user needs social media content posts or engagement strategies',
   },
   'skill:seo-audit': {
-    intent_tags: 'seo,audit,technical,analysis,crawl,performance,indexing',
+    intent_tags: 'seo,audit,technical,analysis,crawl,indexing',
     domain_tags: 'seo,audit,web',
     capability_summary: 'Comprehensive SEO audit with technical analysis crawl errors and performance checks',
     trigger_patterns: 'when user needs a comprehensive SEO audit or technical site analysis',
@@ -523,8 +523,8 @@ const RESOURCE_METADATA = {
     trigger_patterns: 'when user wants automated SEO content writing or optimization assistance',
   },
   'agent:seo-performance-agent': {
-    intent_tags: 'seo,performance,agent,speed,core-web-vitals,pagespeed',
-    domain_tags: 'seo,performance,agent',
+    intent_tags: 'seo,agent,core-web-vitals,pagespeed',
+    domain_tags: 'seo,agent',
     capability_summary: 'SEO performance monitoring agent for core web vitals and page speed analysis',
     trigger_patterns: 'when user needs automated SEO performance monitoring or speed optimization',
   },
