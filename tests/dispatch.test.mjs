@@ -662,6 +662,24 @@ describe('dispatch.mjs', () => {
       );
       expect(signals.intent).toContain('test');
     });
+
+    it('populates suppressedIntents when test-run suppresses test', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'npm test' }
+      );
+      expect(signals.intent).not.toContain('test');
+      expect(signals.suppressedIntents).toContain('test');
+    });
+
+    it('suppressedIntents is empty when test intent is kept', () => {
+      const signals = extractContextSignals(
+        { tool_name: '_session_start' },
+        { userPrompt: 'write tests for auth' }
+      );
+      expect(signals.intent).toContain('test');
+      expect(signals.suppressedIntents).toEqual([]);
+    });
   });
 
   describe('needsHaikuDispatch', () => {

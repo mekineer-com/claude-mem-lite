@@ -198,6 +198,7 @@ export function extractContextSignals(event, sessionCtx = {}) {
   const signals = {
     intent: '',          // comma-separated intent tags, primary first
     primaryIntent: '',   // first/strongest intent (for column-targeted queries)
+    suppressedIntents: [], // intents detected but actively suppressed (e.g. test-run)
     techStack: '',
     action: '',
     errorDomain: '',
@@ -205,7 +206,9 @@ export function extractContextSignals(event, sessionCtx = {}) {
 
   // Extract weighted intent from user prompt (primary intent is first element)
   if (sessionCtx.userPrompt) {
-    signals.intent = extractIntent(sessionCtx.userPrompt);
+    const { intent, suppressed } = extractIntent(sessionCtx.userPrompt);
+    signals.intent = intent;
+    signals.suppressedIntents = suppressed;
     signals.primaryIntent = signals.intent.split(',')[0] || '';
   }
 
@@ -339,15 +342,17 @@ function extractIntent(prompt) {
 
   // Distinguish test-running from test-writing: "run tests" / "npm test" / "运行测试" should NOT
   // trigger TDD recommendations. Only keep 'test' intent when the prompt implies *writing* tests.
+  const suppressed = [];
   if (found.includes('test')) {
     const isRunning = _RUN_TEST.test(prompt) || _RUN_TEST_CJK.test(prompt);
     const isWriting = _WRITE_TEST.test(prompt) || _WRITE_TEST_CJK.test(prompt);
     if (isRunning && !isWriting) {
       found.splice(found.indexOf('test'), 1);
+      suppressed.push('test');
     }
   }
 
-  return found.join(',');
+  return { intent: found.join(','), suppressed };
 }
 
 /** Exported for testing. */
@@ -613,6 +618,13 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
       const textQuery = buildQueryFromText(userPrompt);
       if (!textQuery) return null;
       results = retrieveResources(db, textQuery, { limit: 3, projectDomains });
+      // Filter out resources matching suppressed intents (e.g. TDD for test-running prompts)
+      if (signals.suppressedIntents.length > 0) {
+        results = results.filter(r => {
+          const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/);
+          return !signals.suppressedIntents.some(s => tags.includes(s));
+        });
+      }
     }
 
     let tier = 2;
@@ -687,6 +699,12 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
       const textQuery = buildQueryFromText(userPrompt);
       if (!textQuery) return null;
       results = retrieveResources(db, textQuery, { limit: 3, projectDomains });
+      if (signals.suppressedIntents.length > 0) {
+        results = results.filter(r => {
+          const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/);
+          return !signals.suppressedIntents.some(s => tags.includes(s));
+        });
+      }
     }
 
     if (results.length === 0) return null;
