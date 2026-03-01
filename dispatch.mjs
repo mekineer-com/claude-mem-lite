@@ -263,7 +263,7 @@ const _WRITE_TEST_CJK = /(?:写测试|加测试|补测试|补单测|缺测试|�
  * @returns {string} Comma-separated intent tags, primary intent listed first (e.g. "test,fix")
  */
 function extractIntent(prompt) {
-  if (!prompt) return '';
+  if (!prompt) return { intent: '', suppressed: [] };
   // English patterns — use trailing-optional boundaries for verb conjugations:
   //   \b prefix ensures word start, but many suffixed forms (debugging, refactoring, deployed)
   //   fail with trailing \b. Use \b...\w* for words that commonly have suffixes.

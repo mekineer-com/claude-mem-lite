@@ -477,6 +477,24 @@ describe('dispatch.mjs', () => {
   });
 
   describe('extractContextSignals', () => {
+    it('handles empty userPrompt without crash (I-1 regression guard)', () => {
+      // extractIntent must return {intent, suppressed} even for empty input
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: '' }
+      );
+      expect(signals.intent).toBe('');
+      expect(signals.suppressedIntents).toEqual([]);
+    });
+
+    it('handles null userPrompt without crash', () => {
+      const signals = extractContextSignals(
+        { tool_name: 'Edit', tool_input: {} },
+        { userPrompt: null }
+      );
+      expect(signals.intent).toBe('');
+    });
+
     it('extracts intent from user prompt', () => {
       const signals = extractContextSignals(
         { tool_name: 'Edit', tool_input: {} },

@@ -9,6 +9,13 @@ import { DB_DIR } from './schema.mjs';
 
 const MAX_INJECTION_CHARS = 3000;
 
+/** Truncate multi-line content preserving newlines (unlike utils.truncate which flattens). */
+function truncateContent(str, max) {
+  if (!str) return '';
+  const trimmed = str.trim();
+  return trimmed.length > max ? trimmed.slice(0, max - 1) + '…' : trimmed;
+}
+
 // Allowed base directories for resource file reads (defense-in-depth)
 const ALLOWED_BASES = [
   join(homedir(), '.claude'),
@@ -79,7 +86,7 @@ function injectSkillManaged(resource) {
     } catch {}
   }
 
-  const truncatedContent = truncate(content, MAX_INJECTION_CHARS - 300);
+  const truncatedContent = truncateContent(content, MAX_INJECTION_CHARS - 300);
 
   return `[Auto-suggestion] Recommended skill for this task: "${resource.name}"
 Capability: ${truncate(resource.capability_summary, 100)}
@@ -113,7 +120,7 @@ function injectAgent(resource) {
   }
 
   if (agentDef) {
-    const truncatedDef = truncate(agentDef, MAX_INJECTION_CHARS - 300);
+    const truncatedDef = truncateContent(agentDef, MAX_INJECTION_CHARS - 300);
     return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task.
 Capability: ${truncate(resource.capability_summary, 100)}
 Use the Agent tool with this agent definition:

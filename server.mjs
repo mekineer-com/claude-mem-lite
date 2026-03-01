@@ -686,7 +686,10 @@ server.registerTool(
     const deletedIds = new Set(args.ids);
     const deleteTx = db.transaction(() => {
       // Clean up stale references in other observations' related_ids
-      // Use LIKE filter to avoid O(N) full-table scan — only fetch rows that may reference deleted IDs
+      // Use LIKE filter to avoid O(N) full-table scan — only fetch rows that may reference deleted IDs.
+      // NOTE: LIKE %id% has false positives (e.g. %1% matches [10], [21]). This is intentional —
+      // the LIKE is a coarse pre-filter; the JSON parse + Set.has below is the precise filter.
+      // Acceptable because observation count per user is typically <10K.
       const likeConditions = args.ids.map(() => `related_ids LIKE ?`).join(' OR ');
       const likeParams = args.ids.map(id => `%${id}%`);
       const referencing = db.prepare(`
