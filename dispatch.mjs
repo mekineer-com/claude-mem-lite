@@ -372,7 +372,7 @@ function extractIntent(prompt) {
 }
 
 /** Exported for testing. */
-export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords };
+export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate };
 
 // Stop words for raw keyword extraction.
 // Includes common English stop words + action verbs already covered by intent patterns.
@@ -681,6 +681,52 @@ function reRankByKeywords(results, rawKeywords) {
   return [...matching, ...rest];
 }
 
+/**
+ * Apply adoption-rate-based score decay to penalize zombie resources.
+ * Uses Laplace-smoothed adoption rate with tiered multipliers.
+ * Cold start protection: no penalty for recommend_count < 10.
+ * @param {object[]} results FTS5 results with recommend_count/adopt_count
+ * @returns {object[]} Filtered results with decayed scores
+ */
+function applyAdoptionDecay(results) {
+  return results.map(r => {
+    const recs = r.recommend_count || 0;
+    const adopts = r.adopt_count || 0;
+    if (recs < 10) return r; // Cold start protection
+
+    const rate = (adopts + 1) / (recs + 2); // Laplace smoothing
+    let multiplier = 1.0;
+    if (recs > 100 && rate < 0.01) multiplier = 0;       // Block entirely
+    else if (recs > 50 && rate < 0.02) multiplier = 0.1;  // Heavy penalty
+    else if (recs > 20 && rate < 0.05) multiplier = 0.3;  // Light penalty
+
+    if (multiplier === 0) return null;
+    if (multiplier < 1) {
+      return { ...r, relevance: r.relevance * multiplier, _decayed: true };
+    }
+    return r;
+  }).filter(Boolean);
+}
+
+/**
+ * Gate results by confidence: require at least one intent signal
+ * to directly match the resource's intent_tags.
+ * Prevents recommendations based solely on incidental text overlap.
+ * @param {object[]} results FTS5 results
+ * @param {object} signals Context signals with intent and rawKeywords arrays
+ * @returns {object[]} Filtered results that pass the gate
+ */
+function passesConfidenceGate(results, signals) {
+  if (!signals?.intent?.length && !signals?.rawKeywords?.length) return [];
+  const intentSet = new Set([...(signals.intent || []), ...(signals.rawKeywords || [])]);
+  if (intentSet.size === 0) return [];
+
+  return results.filter(r => {
+    const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/).filter(Boolean);
+    return tags.some(t => intentSet.has(t));
+  });
+}
+
 // ─── Main Dispatch Functions ─────────────────────────────────────────────────
 
 /**
@@ -720,6 +766,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
     }
 
     results = reRankByKeywords(results, signals.rawKeywords);
+    results = applyAdoptionDecay(results);
     results = results.slice(0, 3);
 
     let tier = 2;
@@ -811,6 +858,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     // match those keywords. "帮我做一下SEO审查" → rawKeywords=["seo"] → SEO audit
     // resources should rank above generic code-review resources.
     results = reRankByKeywords(results, signals.rawKeywords);
+    results = applyAdoptionDecay(results);
     results = results.slice(0, 3);
 
     if (results.length === 0) return null;
@@ -872,7 +920,8 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const projectDomains = detectProjectDomains();
 
     // Tier 2: FTS5 retrieval
-    const results = retrieveResources(db, query, { limit: 3, projectDomains });
+    let results = retrieveResources(db, query, { limit: 3, projectDomains });
+    results = applyAdoptionDecay(results);
     if (results.length === 0) return null;
 
     const tier = 2; // Tier 3 disabled for PreToolUse — 2s hook timeout insufficient

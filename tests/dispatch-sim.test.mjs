@@ -8,7 +8,7 @@ import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../re
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP,
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
-  _resetCircuitBreaker, _reRankByKeywords } from '../dispatch.mjs';
+  _resetCircuitBreaker, _reRankByKeywords, _applyAdoptionDecay, _passesConfidenceGate } from '../dispatch.mjs';
 import { upsertResource, recordInvocation } from '../registry.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 
@@ -425,6 +425,7 @@ function fullPipeline(db, userPrompt, { sessionId = 'sim-sess-1' } = {}) {
     }
   }
   results = _reRankByKeywords(results, signals.rawKeywords);
+  results = _applyAdoptionDecay(results);
   results = results.slice(0, 3);
   return { signals, results, topName: results[0]?.name || null };
 }
@@ -1153,6 +1154,112 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       const results = retrieveResources(db, 'intent_tags:"zombie-test-tag"', { limit: 2 });
       expect(results.length).toBe(2);
       expect(results[0].name).toBe('healthy-res');
+    });
+  });
+
+  describe('Confidence gate — direct intent-tag match required', () => {
+    it('passes resource when intent directly matches intent_tags', () => {
+      const signals = { intent: ['test'], rawKeywords: [], suppressedIntents: [] };
+      const results = [
+        { name: 'superpowers-tdd', intent_tags: 'test,tdd,testing', relevance: -5.0 },
+      ];
+      const passed = _passesConfidenceGate(results, signals);
+      expect(passed.length).toBe(1);
+      expect(passed[0].name).toBe('superpowers-tdd');
+    });
+
+    it('rejects resource when no intent matches intent_tags', () => {
+      const signals = { intent: ['fast'], rawKeywords: [], suppressedIntents: [] };
+      const results = [
+        { name: 'superpowers-tdd', intent_tags: 'test,tdd,testing', relevance: -5.0 },
+      ];
+      const passed = _passesConfidenceGate(results, signals);
+      expect(passed.length).toBe(0);
+    });
+
+    it('passes resource when rawKeywords match intent_tags', () => {
+      const signals = { intent: ['fast'], rawKeywords: ['seo'], suppressedIntents: [] };
+      const results = [
+        { name: 'seo-audit', intent_tags: 'seo,audit,technical', relevance: -5.0 },
+        { name: 'application-performance', intent_tags: 'performance,optimize', relevance: -4.0 },
+      ];
+      const passed = _passesConfidenceGate(results, signals);
+      // seo-audit passes via rawKeywords, performance does not match 'fast' or 'seo'
+      expect(passed.length).toBe(1);
+      expect(passed[0].name).toBe('seo-audit');
+    });
+
+    it('returns empty when signals have no intent and no rawKeywords', () => {
+      const signals = { intent: [], rawKeywords: [], suppressedIntents: [] };
+      const results = [
+        { name: 'anything', intent_tags: 'test,fix', relevance: -5.0 },
+      ];
+      const passed = _passesConfidenceGate(results, signals);
+      expect(passed.length).toBe(0);
+    });
+
+    it('handles null/undefined signals gracefully', () => {
+      const passed = _passesConfidenceGate([{ name: 'x', intent_tags: 'test' }], null);
+      expect(passed.length).toBe(0);
+    });
+  });
+
+  // ─── Scenario 18: Zombie decay — adoption-rate score multiplier ───────────
+
+  describe('Zombie decay — adoption-rate score multiplier', () => {
+    it('zombie resource (176 recs, 1 adopt) is heavily penalized vs healthy resource', () => {
+      // Seed zombie
+      seed(db, {
+        name: 'zombie-tdd', type: 'skill',
+        intent_tags: 'zombieunique,test', keywords: 'zombieunique test',
+        trigger_patterns: 'zombie tdd trigger',
+        capability_summary: 'Zombie TDD',
+        recommend_count: 176, adopt_count: 1, success_count: 1,
+      });
+      // Seed healthy resource with same tags
+      seed(db, {
+        name: 'healthy-test', type: 'skill',
+        intent_tags: 'zombieunique,test', keywords: 'zombieunique test',
+        trigger_patterns: 'healthy test trigger',
+        capability_summary: 'Healthy test',
+        recommend_count: 20, adopt_count: 5, success_count: 3,
+      });
+      const { results } = fullPipeline(db, 'zombieunique');
+      const zombieIdx = results.findIndex(r => r.name === 'zombie-tdd');
+      const healthyIdx = results.findIndex(r => r.name === 'healthy-test');
+      // Healthy should rank above zombie (or zombie filtered out)
+      if (zombieIdx >= 0 && healthyIdx >= 0) {
+        expect(healthyIdx).toBeLessThan(zombieIdx);
+      } else {
+        // Zombie might be completely filtered
+        expect(healthyIdx).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('cold start resource (<10 recs) gets no penalty', () => {
+      seed(db, {
+        name: 'coldstart-res', type: 'skill',
+        intent_tags: 'coldstartunique', keywords: 'coldstartunique',
+        trigger_patterns: 'cold start trigger',
+        capability_summary: 'Cold start resource',
+        recommend_count: 5, adopt_count: 0,
+      });
+      const { results } = fullPipeline(db, 'coldstartunique');
+      const found = results.find(r => r.name === 'coldstart-res');
+      expect(found).toBeTruthy();
+    });
+
+    it('mega-zombie (>100 recs, 0 adopts) is completely blocked', () => {
+      seed(db, {
+        name: 'mega-zombie', type: 'skill',
+        intent_tags: 'megazombieunique', keywords: 'megazombieunique',
+        trigger_patterns: 'mega zombie trigger',
+        capability_summary: 'Mega zombie resource',
+        recommend_count: 150, adopt_count: 0,
+      });
+      const { results } = fullPipeline(db, 'megazombieunique');
+      const found = results.find(r => r.name === 'mega-zombie');
+      expect(found).toBeUndefined();
     });
   });
 });
