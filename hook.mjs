@@ -749,11 +749,12 @@ async function handleUserPrompt() {
   const db = openDb();
   if (!db) return;
 
+  const project = inferProject();
+
   try {
     const now = new Date();
 
     // Ensure session exists (INSERT OR IGNORE avoids race condition)
-    const project = inferProject();
     db.prepare(`
       INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, ?, ?, ?, 'active')
@@ -772,41 +773,32 @@ async function handleUserPrompt() {
       counter?.prompt_counter || 1,
       now.toISOString(), now.getTime()
     );
+
+    // Semantic memory injection: search past observations for the user's prompt
+    if (hasInjectionBudget()) {
+      try {
+        const keyObs = db.prepare(`
+          SELECT id FROM observations
+          WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+            AND COALESCE(importance, 1) >= 2
+          ORDER BY created_at_epoch DESC LIMIT 5
+        `).all(project);
+        const keyContextIds = keyObs.map(o => o.id);
+
+        const memories = searchRelevantMemories(db, promptText, project, keyContextIds);
+        if (memories.length > 0) {
+          const lines = ['<memory-context relevance="high">'];
+          for (const m of memories) {
+            lines.push(`- [${m.type}] ${truncate(m.title, 80)} (#${m.id})`);
+          }
+          lines.push('</memory-context>');
+          process.stdout.write(lines.join('\n') + '\n');
+          incrementInjection();
+        }
+      } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
+    }
   } finally {
     db.close();
-  }
-
-  // Semantic memory injection: search past observations for the user's prompt
-  if (hasInjectionBudget()) {
-    try {
-      const memDb = openDb();
-      if (memDb) {
-        try {
-          const project = inferProject();
-          // Get Key Context IDs to exclude (same query as session-start)
-          const keyObs = memDb.prepare(`
-            SELECT id FROM observations
-            WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-              AND COALESCE(importance, 1) >= 2
-            ORDER BY created_at_epoch DESC LIMIT 5
-          `).all(project);
-          const keyContextIds = keyObs.map(o => o.id);
-
-          const memories = searchRelevantMemories(memDb, promptText, project, keyContextIds);
-          if (memories.length > 0) {
-            const lines = ['<memory-context relevance="high">'];
-            for (const m of memories) {
-              lines.push(`- [${m.type}] ${truncate(m.title, 80)} (#${m.id})`);
-            }
-            lines.push('</memory-context>');
-            process.stdout.write(lines.join('\n') + '\n');
-            incrementInjection();
-          }
-        } finally {
-          memDb.close();
-        }
-      }
-    } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
   }
 
   // Dispatch: recommend skill/agent based on user's actual prompt.
