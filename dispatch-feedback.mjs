@@ -100,6 +100,30 @@ function detectAdoption(invocation, sessionEvents) {
     }
   }
 
+  // Behavioral adoption: detect usage patterns matching the recommended resource
+  const resourceLower = resource_name.toLowerCase();
+
+  // Debugging pattern: Read→Bash(error)→Read→Edit cycle
+  if (resourceLower.includes('debug') || resourceLower.includes('troubleshoot')) {
+    let hasRead = false, hasBashError = false, hasEditAfterError = false;
+    for (const e of sessionEvents) {
+      if (e.tool_name === 'Read') hasRead = true;
+      if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) hasBashError = true;
+      if (hasBashError && EDIT_TOOLS.has(e.tool_name)) hasEditAfterError = true;
+    }
+    if (hasRead && hasBashError && hasEditAfterError) return true;
+  }
+
+  // Code review pattern: Agent with 'review' in prompt/description
+  if (resourceLower.includes('review')) {
+    for (const e of sessionEvents) {
+      if (e.tool_name === 'Agent') {
+        const text = ((e.tool_input?.prompt || '') + (e.tool_input?.description || '')).toLowerCase();
+        if (text.includes('review')) return true;
+      }
+    }
+  }
+
   return false;
 }
 
@@ -187,3 +211,6 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
     debugCatch(e, 'collectFeedback');
   }
 }
+
+// Test exports
+export { detectAdoption as _detectAdoption };

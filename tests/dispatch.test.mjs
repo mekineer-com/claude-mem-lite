@@ -10,7 +10,7 @@ import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
   _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
-import { collectFeedback } from '../dispatch-feedback.mjs';
+import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
 
 // ─── Registry DB Helper ─────────────────────────────────────────────────────
 
@@ -986,6 +986,38 @@ describe('dispatch-feedback.mjs', () => {
     expect(second.outcome).toBe('success');
     expect(second.adopted).toBe(1);
     expect(second.score).toBe(1.0);
+  });
+
+  describe('behavioral adoption detection', () => {
+    it('detects debugging pattern (Read→Bash→Edit cycle) after debugging recommendation', () => {
+      const inv = { resource_name: 'superpowers-debugging', resource_type: 'skill', invocation_name: 'superpowers:systematic-debugging' };
+      const events = [
+        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL: expected 1, got 2' },
+        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'PASS' },
+      ];
+      expect(detectAdoption(inv, events)).toBe(true);
+    });
+
+    it('detects code-review pattern (Agent with review in prompt) after review recommendation', () => {
+      const inv = { resource_name: 'superpowers-code-review', resource_type: 'skill', invocation_name: 'superpowers:requesting-code-review' };
+      const events = [
+        { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code changes for quality issues', description: 'Code quality review' } },
+      ];
+      expect(detectAdoption(inv, events)).toBe(true);
+    });
+
+    it('does NOT detect debugging pattern for unrelated resources', () => {
+      const inv = { resource_name: 'frontend-design', resource_type: 'skill', invocation_name: 'frontend-design:frontend-design' };
+      const events = [
+        { tool_name: 'Read', tool_input: {} },
+        { tool_name: 'Bash', tool_input: { command: 'test' }, tool_response: 'FAIL' },
+        { tool_name: 'Edit', tool_input: {} },
+      ];
+      expect(detectAdoption(inv, events)).toBe(false);
+    });
   });
 });
 
