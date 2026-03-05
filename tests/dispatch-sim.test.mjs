@@ -8,7 +8,7 @@ import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../re
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP,
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
-  _resetCircuitBreaker } from '../dispatch.mjs';
+  _resetCircuitBreaker, _reRankByKeywords } from '../dispatch.mjs';
 import { upsertResource, recordInvocation } from '../registry.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 
@@ -379,6 +379,24 @@ function seedProductionCatalog(db) {
       keywords: 'python django flask fastapi pip poetry',
       repo_stars: 280,
     },
+    {
+      name: 'seo-audit', type: 'skill',
+      intent_tags: 'seo,audit,technical,analysis,crawl,indexing',
+      domain_tags: 'seo,audit,web',
+      trigger_patterns: 'when user needs a comprehensive SEO audit or technical site analysis',
+      capability_summary: 'Comprehensive SEO audit with technical analysis crawl errors and performance checks',
+      keywords: 'seo audit crawl indexing technical',
+      repo_stars: 280,
+    },
+    {
+      name: 'seo-content-agent', type: 'agent',
+      intent_tags: 'seo,content,agent,writing,optimization,automated',
+      domain_tags: 'seo,content,agent',
+      trigger_patterns: 'when user wants automated SEO content writing or optimization assistance',
+      capability_summary: 'Automated SEO content agent for writing and optimizing search-friendly content',
+      keywords: 'seo content optimization writing',
+      repo_stars: 250,
+    },
   ];
 
   for (const r of catalog) {
@@ -392,11 +410,12 @@ function seedProductionCatalog(db) {
 function fullPipeline(db, userPrompt, { sessionId = 'sim-sess-1' } = {}) {
   const signals = extractContextSignals({ tool_name: '_session_start' }, { userPrompt });
   const enhancedQuery = buildEnhancedQuery(signals);
-  let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3 }) : [];
+  const fetchLimit = signals.rawKeywords.length > 0 ? 8 : 3;
+  let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: fetchLimit }) : [];
   if (results.length === 0) {
     const textQuery = buildQueryFromText(userPrompt);
     if (textQuery) {
-      results = retrieveResources(db, textQuery, { limit: 3 });
+      results = retrieveResources(db, textQuery, { limit: fetchLimit });
       if (signals.suppressedIntents.length > 0) {
         results = results.filter(r => {
           const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/);
@@ -405,6 +424,8 @@ function fullPipeline(db, userPrompt, { sessionId = 'sim-sess-1' } = {}) {
       }
     }
   }
+  results = _reRankByKeywords(results, signals.rawKeywords);
+  results = results.slice(0, 3);
   return { signals, results, topName: results[0]?.name || null };
 }
 
@@ -546,6 +567,12 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       const { topName, signals } = fullPipeline(db, '设计数据库表结构');
       expect(signals.intent).toContain('db');
       expect(['database-design', 'postgres-patterns']).toContain(topName);
+    });
+
+    it('"用seo技能检查下网站的seo优化问题" → SEO skill', () => {
+      const { topName, signals } = fullPipeline(db, '用seo技能检查下网站的seo优化问题');
+      expect(signals.rawKeywords).toContain('seo');
+      expect(['seo-audit', 'seo-content-agent']).toContain(topName);
     });
   });
 

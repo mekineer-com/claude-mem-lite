@@ -199,6 +199,7 @@ export function extractContextSignals(event, sessionCtx = {}) {
     intent: '',          // comma-separated intent tags, primary first
     primaryIntent: '',   // first/strongest intent (for column-targeted queries)
     suppressedIntents: [], // intents detected but actively suppressed (e.g. test-run)
+    rawKeywords: [],     // domain-specific keywords not captured by intent patterns (e.g. "seo")
     techStack: '',
     action: '',
     errorDomain: '',
@@ -210,6 +211,11 @@ export function extractContextSignals(event, sessionCtx = {}) {
     signals.intent = intent;
     signals.suppressedIntents = suppressed;
     signals.primaryIntent = signals.intent.split(',')[0] || '';
+    // Extract raw domain keywords not captured by intent patterns.
+    // Intent patterns cover generic actions (test, fix, review) but miss domain
+    // topics (seo, kubernetes, oauth). These raw keywords supplement the enhanced
+    // query to ensure domain-specific resources are found.
+    signals.rawKeywords = extractRawKeywords(sessionCtx.userPrompt, signals.intent);
   }
 
   // Infer tech stack from recent files, current tool_input, or prompt text
@@ -366,7 +372,53 @@ function extractIntent(prompt) {
 }
 
 /** Exported for testing. */
-export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK };
+export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords };
+
+// Stop words for raw keyword extraction.
+// Includes common English stop words + action verbs already covered by intent patterns.
+// Domain-specific technical terms (seo, kubernetes, react, etc.) pass through.
+const RAW_KW_STOP = new Set([
+  // Standard English stop words
+  'the', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had',
+  'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+  'can', 'shall', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by',
+  'from', 'as', 'into', 'about', 'and', 'or', 'but', 'not', 'no', 'this',
+  'that', 'it', 'its', 'my', 'your', 'me', 'us', 'you', 'he', 'she', 'we', 'they',
+  'if', 'so', 'just', 'also', 'then', 'how', 'what', 'when', 'where', 'who',
+  'use', 'using', 'need', 'want', 'check', 'look', 'help', 'please', 'let',
+  'some', 'all', 'any', 'each', 'every', 'new', 'like', 'before', 'after',
+  // Action verbs — captured by intent patterns, not domain keywords
+  'design', 'build', 'create', 'make', 'add', 'remove', 'delete', 'update',
+  'write', 'read', 'run', 'test', 'tests', 'testing', 'fix', 'debug',
+  'review', 'deploy', 'commit', 'push', 'plan', 'clean', 'refactor',
+  'find', 'get', 'set', 'show', 'list', 'change', 'move', 'copy', 'send',
+  'start', 'stop', 'open', 'close', 'save', 'load', 'install', 'setup',
+  'implement', 'configure', 'code', 'file', 'function', 'module', 'app',
+]);
+
+/**
+ * Extract raw domain keywords from prompt text that aren't captured by intent patterns.
+ * Handles embedded English words in CJK text (e.g. "seo" from "用seo技能检查下").
+ * Filters out words already covered by extracted intents to avoid duplication.
+ * @param {string} prompt User prompt text
+ * @param {string} intentStr Comma-separated intents already extracted
+ * @returns {string[]} Array of raw keywords (max 5)
+ */
+function extractRawKeywords(prompt, intentStr) {
+  if (!prompt) return [];
+  // Extract all English words (2+ chars) from the prompt
+  const words = prompt.match(/[a-zA-Z]{2,}/gi) || [];
+  const intentSet = new Set((intentStr || '').split(',').filter(Boolean));
+  const seen = new Set();
+  const result = [];
+  for (const w of words) {
+    const lower = w.toLowerCase();
+    if (lower.length < 2 || RAW_KW_STOP.has(lower) || intentSet.has(lower) || seen.has(lower)) continue;
+    seen.add(lower);
+    result.push(lower);
+  }
+  return result.slice(0, 5);
+}
 
 /**
  * Infer tech stack from file extensions.
@@ -602,6 +654,33 @@ export function isRecentlyRecommended(db, resourceId, sessionId) {
   return !!cooldownHit;
 }
 
+// ─── Keyword Re-ranking ──────────────────────────────────────────────────────
+
+/**
+ * Re-rank results to prefer resources matching rawKeywords in their intent_tags.
+ * When a user mentions domain-specific terms (e.g. "seo"), resources in that domain
+ * should rank above generic resources that only match the action intent (e.g. "review").
+ * Within each group (matching vs non-matching), original BM25 order is preserved.
+ * No-op when rawKeywords is empty.
+ * @param {object[]} results FTS5 results
+ * @param {string[]} rawKeywords Domain keywords from prompt
+ * @returns {object[]} Re-ranked results
+ */
+function reRankByKeywords(results, rawKeywords) {
+  if (!rawKeywords?.length || results.length <= 1) return results;
+  const matching = [];
+  const rest = [];
+  for (const r of results) {
+    const tags = (r.intent_tags || '').toLowerCase();
+    if (rawKeywords.some(kw => tags.includes(kw))) {
+      matching.push(r);
+    } else {
+      rest.push(r);
+    }
+  }
+  return [...matching, ...rest];
+}
+
 // ─── Main Dispatch Functions ─────────────────────────────────────────────────
 
 /**
@@ -621,7 +700,10 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
     const signals = extractContextSignals({ tool_name: '_session_start' }, { userPrompt });
     const enhancedQuery = buildEnhancedQuery(signals);
 
-    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3, projectDomains }) : [];
+    // Fetch extra results when rawKeywords present — BM25 may rank intent-matching
+    // resources above domain-specific ones; extra headroom lets reRankByKeywords promote them.
+    const fetchLimit = signals.rawKeywords.length > 0 ? 8 : 3;
+    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: fetchLimit, projectDomains }) : [];
 
     // Fallback: broad text query (catches prompts without clear intent patterns)
     if (results.length === 0) {
@@ -636,6 +718,9 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
         });
       }
     }
+
+    results = reRankByKeywords(results, signals.rawKeywords);
+    results = results.slice(0, 3);
 
     let tier = 2;
 
@@ -702,7 +787,12 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt });
     const enhancedQuery = buildEnhancedQuery(signals);
 
-    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: 3, projectDomains }) : [];
+    // Fetch extra results when rawKeywords are present — the top-3 by BM25 may be
+    // dominated by intent synonyms (e.g. "review" expands to many code-review terms),
+    // pushing domain-specific resources (e.g. SEO) below the limit. Extra headroom
+    // lets reRankByKeywords() promote domain-matched resources to the top.
+    const fetchLimit = signals.rawKeywords.length > 0 ? 8 : 3;
+    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: fetchLimit, projectDomains }) : [];
 
     // Fallback: broad text query
     if (results.length === 0) {
@@ -717,10 +807,23 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
       }
     }
 
+    // Re-rank: when rawKeywords are present, prefer resources whose intent_tags
+    // match those keywords. "帮我做一下SEO审查" → rawKeywords=["seo"] → SEO audit
+    // resources should rank above generic code-review resources.
+    results = reRankByKeywords(results, signals.rawKeywords);
+    results = results.slice(0, 3);
+
     if (results.length === 0) return null;
 
-    // Skip if low confidence (no Haiku fallback — stay fast)
-    if (needsHaikuDispatch(results)) return null;
+    // Skip if low confidence (no Haiku fallback — stay fast).
+    // Exception: when results match the user's raw domain keywords (e.g. "seo"),
+    // close BM25 scores indicate "multiple equally good options in the right domain"
+    // rather than "ambiguous/wrong match". Trust the domain match.
+    if (needsHaikuDispatch(results)) {
+      const hasKeywordMatch = signals.rawKeywords?.length > 0 && results.some(r =>
+        signals.rawKeywords.some(kw => (r.intent_tags || '').toLowerCase().includes(kw)));
+      if (!hasKeywordMatch) return null;
+    }
 
     // Filter by cooldown + session dedup (prevents double-recommend with SessionStart)
     const viable = sessionId

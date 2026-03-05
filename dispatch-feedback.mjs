@@ -2,7 +2,7 @@
 // Runs at Stop hook to track adoption and outcomes of recommendations
 
 import { getSessionInvocations, updateInvocation, updateResourceStats } from './registry.mjs';
-import { debugCatch } from './utils.mjs';
+import { debugCatch, EDIT_TOOLS } from './utils.mjs';
 
 // ─── Adoption Detection ──────────────────────────────────────────────────────
 
@@ -127,7 +127,7 @@ function detectOutcome(sessionEvents) {
       lastErrorIndex = i;
     }
 
-    if (['Edit', 'Write', 'NotebookEdit'].includes(e.tool_name)) {
+    if (EDIT_TOOLS.has(e.tool_name)) {
       hasEdit = true;
       if (lastErrorIndex >= 0 && i > lastErrorIndex) {
         errorThenFix = true;

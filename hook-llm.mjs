@@ -6,7 +6,7 @@ import { existsSync, readFileSync, unlinkSync, readdirSync } from 'fs';
 import {
   jaccardSimilarity, truncate, clampImportance, computeRuleImportance,
   inferProject, parseJsonFromLLM,
-  computeMinHash, estimateJaccardFromMinHash, debugCatch, debugLog,
+  computeMinHash, estimateJaccardFromMinHash, cjkBigrams, EDIT_TOOLS, debugCatch, debugLog,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import {
@@ -15,6 +15,14 @@ import {
 } from './hook-shared.mjs';
 
 // ─── Save Observation to DB ─────────────────────────────────────────────────
+
+/** Build the FTS5 text field from observation data (concepts + facts + CJK bigrams). */
+function buildFtsTextField(obs) {
+  const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
+  const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
+  const bigramText = cjkBigrams((obs.title || '') + ' ' + (obs.narrative || ''));
+  return { conceptsText, factsText, textField: [conceptsText, factsText, bigramText].filter(Boolean).join(' ') };
+}
 
 export function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
   const db = externalDb || openDb();
@@ -58,9 +66,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       }
     }
 
-    const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
-    const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
-    const textField = [conceptsText, factsText].filter(Boolean).join(' ');
+    const { conceptsText, factsText, textField } = buildFtsTextField(obs);
 
     const result = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
@@ -160,10 +166,10 @@ function linkRelatedObservations(db, savedId, obs, episode) {
 // When LLM is unavailable, build a readable title from episode metadata
 // instead of using raw makeEntryDesc output (which contains JSON stdout).
 
-function buildDegradedTitle(episode) {
+export function buildDegradedTitle(episode) {
   const files = (episode.files || []).filter(Boolean);
   const hasError = episode.entries.some(e => e.isError);
-  const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
+  const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
 
   if (files.length > 0) {
     const names = files.map(f => basename(f)).slice(0, 3).join(', ');
@@ -270,8 +276,14 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
 
   if (!obs) {
     if (!gotSlot) debugLog('WARN', 'llm-episode', 'semaphore timeout, using degraded storage');
+    // If pre-saved observation exists, LLM degraded mode doesn't need to overwrite — keep pre-saved data
+    if (episode.savedId) {
+      debugLog('DEBUG', 'llm-episode', `LLM failed but pre-saved obs #${episode.savedId} exists, keeping`);
+      try { unlinkSync(tmpFile); } catch {}
+      return;
+    }
     const hasError = episode.entries.some(e => e.isError);
-    const hasEdit = episode.entries.some(e => ['Edit', 'Write', 'NotebookEdit'].includes(e.tool));
+    const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
     const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
     obs = {
       type: inferredType,
@@ -290,7 +302,30 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
   if (!db) { try { unlinkSync(tmpFile); } catch {} return; }
 
   try {
-    const savedId = saveObservation(obs, episode.project, episode.sessionId, db);
+    let savedId;
+
+    if (episode.savedId && obs) {
+      // Upgrade pre-saved observation with LLM-enriched data
+      const { conceptsText, factsText, textField } = buildFtsTextField(obs);
+      const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
+      db.prepare(`
+        UPDATE observations SET type=?, title=?, subtitle=?, narrative=?, concepts=?, facts=?,
+          text=?, importance=?, files_read=?, minhash_sig=?
+        WHERE id = ?
+      `).run(
+        obs.type, truncate(obs.title, 120), obs.subtitle || '',
+        truncate(obs.narrative || '', 500),
+        conceptsText, factsText, textField,
+        obs.importance,
+        JSON.stringify(obs.filesRead || []),
+        minhashSig,
+        episode.savedId
+      );
+      savedId = episode.savedId;
+      debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+    } else {
+      savedId = saveObservation(obs, episode.project, episode.sessionId, db);
+    }
 
     if (savedId) {
       try {

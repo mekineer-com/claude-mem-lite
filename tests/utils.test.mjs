@@ -6,6 +6,7 @@ import {
   sanitizeFtsQuery,
   clampImportance,
   computeRuleImportance,
+  cjkBigrams,
   inferProject,
   detectBashSignificance,
   extractErrorKeywords,
@@ -192,6 +193,63 @@ describe('sanitizeFtsQuery', () => {
   it('leaves tokens without synonyms unchanged', () => {
     expect(sanitizeFtsQuery('foobar')).toBe('foobar');
   });
+
+  it('appends CJK bigrams for Chinese phrase matching', () => {
+    // "系统崩溃" → individual chars skipped, bigrams "系统 统崩 崩溃" used
+    const result = sanitizeFtsQuery('系统崩溃');
+    expect(result).toContain('系统');
+    expect(result).toContain('崩溃');
+  });
+
+  it('handles mixed CJK and Latin tokens with bigrams', () => {
+    const result = sanitizeFtsQuery('修复 server');
+    expect(result).not.toBeNull();
+    // Should contain both the bigram for CJK and expanded server token
+    expect(result).toContain('server');
+  });
+
+  it('skips single CJK chars when bigrams available', () => {
+    const result = sanitizeFtsQuery('系统');
+    // Should use bigram "系统" not individual chars "系" and "统"
+    expect(result).toBe('系统');
+  });
+
+  it('preserves single CJK chars when no bigrams possible', () => {
+    // Single CJK character — no bigram possible, should keep it
+    const result = sanitizeFtsQuery('猫');
+    expect(result).toBe('猫');
+  });
+});
+
+// ─── cjkBigrams ─────────────────────────────────────────────────────────────
+
+describe('cjkBigrams', () => {
+  it('returns empty for null/empty/non-CJK', () => {
+    expect(cjkBigrams(null)).toBe('');
+    expect(cjkBigrams('')).toBe('');
+    expect(cjkBigrams('hello world')).toBe('');
+  });
+
+  it('generates bigrams from CJK runs', () => {
+    expect(cjkBigrams('系统崩溃')).toBe('系统 统崩 崩溃');
+    expect(cjkBigrams('修复')).toBe('修复');
+  });
+
+  it('handles multiple CJK runs separated by non-CJK', () => {
+    expect(cjkBigrams('系统修复 服务器崩溃')).toBe('系统 统修 修复 服务 务器 器崩 崩溃');
+  });
+
+  it('skips single CJK characters (no bigram from length 1)', () => {
+    expect(cjkBigrams('猫')).toBe('');
+    expect(cjkBigrams('猫 狗')).toBe('');
+  });
+
+  it('handles mixed CJK and Latin text', () => {
+    const result = cjkBigrams('用seo技能检查');
+    expect(result).toContain('技能');
+    expect(result).toContain('能检');
+    expect(result).toContain('检查');
+  });
 });
 
 // ─── clampImportance ────────────────────────────────────────────────────────
@@ -320,6 +378,40 @@ describe('computeRuleImportance', () => {
 
   it('handles entries with no bashSig or files', () => {
     const ep = mkEpisode([mkEntry()]);
+    expect(computeRuleImportance(ep)).toBe(1);
+  });
+
+  it('returns 2 for tool diversity (Edit + Bash + Read)', () => {
+    const ep = mkEpisode([
+      mkEntry({ tool: 'Edit', files: ['/src/a.js'] }),
+      mkEntry({ tool: 'Bash', files: [] }),
+      mkEntry({ tool: 'Grep', files: [] }),
+    ]);
+    expect(computeRuleImportance(ep)).toBe(2);
+  });
+
+  it('returns 2 for error→edit debug cycle', () => {
+    const ep = mkEpisode([
+      mkEntry({ tool: 'Bash', isError: true, bashSig: null }),
+      mkEntry({ tool: 'Edit', files: ['/src/fix.js'] }),
+    ]);
+    expect(computeRuleImportance(ep)).toBe(2);
+  });
+
+  it('returns 2 for broad changes (5+ files)', () => {
+    const ep = {
+      entries: [mkEntry({ tool: 'Edit', files: ['/a.js'] })],
+      files: ['/a.js', '/b.js', '/c.js', '/d.js', '/e.js'],
+    };
+    expect(computeRuleImportance(ep)).toBe(2);
+  });
+
+  it('does not upgrade to 2 for tool diversity without Edit', () => {
+    const ep = mkEpisode([
+      mkEntry({ tool: 'Bash', files: [] }),
+      mkEntry({ tool: 'Grep', files: [] }),
+      mkEntry({ tool: 'Read', files: [] }),
+    ]);
     expect(computeRuleImportance(ep)).toBe(1);
   });
 });

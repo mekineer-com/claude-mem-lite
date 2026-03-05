@@ -190,6 +190,18 @@ export function buildEnhancedQuery(signals) {
     }
   }
 
+  // Raw keywords from prompt: domain-specific terms not captured by intent patterns.
+  // Added as column-targeted intent_tags + literal general match (no synonym expansion).
+  // Synonym expansion is harmful for rawKeywords: "database" expanding to ORM/SQL terms
+  // would dilute BM25 precision. Literal matching is sufficient — "seo" matches "seo"
+  // directly across name, intent_tags, capability_summary, trigger_patterns.
+  if (signals.rawKeywords?.length > 0) {
+    for (const kw of signals.rawKeywords) {
+      parts.push(`intent_tags:${kw}`);
+      parts.push(kw); // literal, no synonym expansion
+    }
+  }
+
   // Add general tokens (expanded with synonyms)
   for (const t of generalTokens) {
     parts.push(expandToken(t));
@@ -205,39 +217,46 @@ export function buildEnhancedQuery(signals) {
  * @param {string} text Raw text input
  * @returns {string|null} FTS5 query string or null
  */
+const TEXT_QUERY_STOP_WORDS = new Set([
+  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+  'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for',
+  'on', 'with', 'at', 'by', 'from', 'as', 'into', 'about', 'between',
+  'after', 'before', 'above', 'below', 'and', 'or', 'but', 'not', 'no',
+  'this', 'that', 'these', 'those', 'it', 'its', 'my', 'your', 'his',
+  'her', 'our', 'their', 'me', 'him', 'us', 'them', 'i', 'you', 'he',
+  'she', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'how',
+  'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some',
+  'such', 'than', 'too', 'very', 'just', 'also', 'then', 'so', 'if',
+  '的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都',
+  '一', '一个', '上', '也', '这', '那', '你', '他', '她', '它', '们',
+  '把', '让', '给', '用', '来', '去', '做', '说', '要', '会', '能',
+  '帮', '帮我', '请', '下', '吧',
+]);
+
 export function buildQueryFromText(text) {
   if (!text || typeof text !== 'string') return null;
-
-  const STOP_WORDS = new Set([
-    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-    'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for',
-    'on', 'with', 'at', 'by', 'from', 'as', 'into', 'about', 'between',
-    'after', 'before', 'above', 'below', 'and', 'or', 'but', 'not', 'no',
-    'this', 'that', 'these', 'those', 'it', 'its', 'my', 'your', 'his',
-    'her', 'our', 'their', 'me', 'him', 'us', 'them', 'i', 'you', 'he',
-    'she', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'how',
-    'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some',
-    'such', 'than', 'too', 'very', 'just', 'also', 'then', 'so', 'if',
-    '的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都',
-    '一', '一个', '上', '也', '这', '那', '你', '他', '她', '它', '们',
-    '把', '让', '给', '用', '来', '去', '做', '说', '要', '会', '能',
-    '帮', '帮我', '请', '下', '吧',
-  ]);
 
   const cleaned = text.replace(/[{}()[\]^~*:@#$%&]/g, ' ').trim();
 
   // Extract CJK compound words before whitespace split (Chinese has no spaces)
   const cjkTokens = extractCJKTokens(cleaned);
 
-  const wsTokens = cleaned.split(/\s+/)
-    .filter(t => t.length > 1 && !STOP_WORDS.has(t.toLowerCase()) && !/^\d+$/.test(t));
+  // Extract embedded English words from mixed CJK/Latin text.
+  // Handles "用seo技能检查下网站的seo优化问题" → extracts "seo".
+  // Whitespace split fails here because CJK text has no spaces.
+  const embeddedEnTokens = (cleaned.match(/[a-zA-Z]{2,}/g) || [])
+    .map(w => w.toLowerCase());
 
-  // Merge: CJK tokens first (high signal), then whitespace tokens, deduplicated
+  const wsTokens = cleaned.split(/\s+/)
+    .filter(t => t.length > 1 && !TEXT_QUERY_STOP_WORDS.has(t.toLowerCase()) && !/^\d+$/.test(t));
+
+  // Merge: CJK tokens first (high signal), then embedded English, then whitespace tokens, deduplicated
   const seen = new Set();
   const tokens = [];
-  for (const t of [...cjkTokens, ...wsTokens]) {
-    if (!seen.has(t)) { seen.add(t); tokens.push(t); }
+  for (const t of [...cjkTokens, ...embeddedEnTokens, ...wsTokens]) {
+    const key = t.toLowerCase();
+    if (!seen.has(key) && !TEXT_QUERY_STOP_WORDS.has(key)) { seen.add(key); tokens.push(t); }
   }
   tokens.splice(8); // Limit to 8 most relevant tokens
 

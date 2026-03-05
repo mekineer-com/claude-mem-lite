@@ -261,8 +261,8 @@ for (const [abbr, full] of SYNONYM_PAIRS) {
 
 // Format a term for FTS5: quote if it contains spaces, hyphens, or special chars
 function ftsToken(term) {
-  // Bare tokens are safe only if purely alphanumeric
-  if (/^[a-zA-Z0-9]+$/.test(term)) return term;
+  // Bare tokens are safe if purely alphanumeric or CJK characters
+  if (/^[a-zA-Z0-9\u4e00-\u9fff\u3400-\u4dbf]+$/.test(term)) return term;
   return `"${term.replace(/"/g, '""')}"`;
 }
 
@@ -292,10 +292,26 @@ export function sanitizeFtsQuery(query) {
   if (!cleaned) return null;
   const tokens = cleaned.split(/\s+/).filter(t => t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()));
   if (tokens.length === 0) return null;
-  const expanded = tokens.map(t => expandToken(t));
+  // Replace single CJK character tokens with bigrams for better phrase matching.
+  // Individual CJK chars ("系","统") are too noisy; bigrams ("系统") capture compound words.
+  const bigrams = cjkBigrams(cleaned);
+  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(Boolean) : []);
+  const hasBigrams = bigramSet.size > 0;
+  const finalTokens = [];
+  const seen = new Set();
+  for (const t of tokens) {
+    // Skip single CJK characters when we have bigrams — they're subsumed by bigram tokens
+    if (hasBigrams && /^[\u4e00-\u9fff\u3400-\u4dbf]$/.test(t)) continue;
+    const expanded = expandToken(t);
+    if (!seen.has(expanded)) { seen.add(expanded); finalTokens.push(expanded); }
+  }
+  for (const bg of bigramSet) {
+    if (!seen.has(bg)) { seen.add(bg); finalTokens.push(bg); }
+  }
+  if (finalTokens.length === 0) return null;
   // FTS5 requires explicit AND after parenthesized OR groups
-  const hasGroup = expanded.some(e => e.startsWith('('));
-  return expanded.join(hasGroup ? ' AND ' : ' ');
+  const hasGroup = finalTokens.some(e => e.startsWith('('));
+  return finalTokens.join(hasGroup ? ' AND ' : ' ');
 }
 
 /**
@@ -336,11 +352,24 @@ export function clampImportance(val) {
  * @param {object} episode Episode with entries array
  * @returns {number} Rule-based importance (1, 2, or 3)
  */
+// Tools that produce file edits (used for significance detection, feedback, importance)
+export const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
+
 export function computeRuleImportance(episode) {
   let importance = 1;
+  const toolTypes = new Set();
+  let hasErrorThenEdit = false;
+  let lastWasError = false;
+
   for (const entry of episode.entries) {
     const sig = entry.bashSig;
     const files = entry.files || [];
+    toolTypes.add(entry.tool);
+
+    // Track error→edit debug cycle pattern
+    if (lastWasError && EDIT_TOOLS.has(entry.tool)) hasErrorThenEdit = true;
+    lastWasError = entry.isError || sig?.isError;
+
     if (sig?.isError && (sig?.isTest || sig?.isBuild)) { importance = 3; break; }
     if (files.some(f => /\.(env|pem|key)$|\/auth\.|\/credential|\/password/i.test(f))) { importance = 3; break; }
     if (files.some(f => /migration|schema\.|prisma|alembic/i.test(f))) { importance = 3; break; }
@@ -349,7 +378,33 @@ export function computeRuleImportance(episode) {
     if (sig?.isDeploy && importance < 2) importance = 2;
     if (files.some(f => /\.config\.|tsconfig|Dockerfile|docker-compose|package\.json|\.yml$|\.yaml$/i.test(basename(f))) && importance < 2) importance = 2;
   }
+
+  // Tool diversity: Edit + Bash + another tool = complete dev cycle
+  if (toolTypes.size >= 3 && toolTypes.has('Edit') && importance < 2) importance = 2;
+  // Debug cycle: error followed by edit = active debugging
+  if (hasErrorThenEdit && importance < 2) importance = 2;
+  // Broad change: many files touched
+  if ((episode.files || []).length >= 5 && importance < 2) importance = 2;
+
   return importance;
+}
+
+/**
+ * Generate CJK bigrams from text for improved Chinese phrase matching in FTS5.
+ * "修复了系统崩溃" → "修复 系统 统崩 崩溃"
+ * @param {string} text Input text containing CJK characters
+ * @returns {string} Space-separated bigrams
+ */
+export function cjkBigrams(text) {
+  if (!text) return '';
+  const runs = text.match(/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/g) || [];
+  const bigrams = [];
+  for (const run of runs) {
+    for (let i = 0; i < run.length - 1; i++) {
+      bigrams.push(run[i] + run[i + 1]);
+    }
+  }
+  return bigrams.join(' ');
 }
 
 // ─── Project Inference ───────────────────────────────────────────────────────

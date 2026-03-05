@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statS
 import {
   truncate, typeIcon, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
-  makeEntryDesc, scrubSecrets, debugCatch, debugLog, fmtTime,
+  makeEntryDesc, scrubSecrets, computeRuleImportance, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -28,7 +28,7 @@ import {
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
 } from './hook-shared.mjs';
-import { handleLLMEpisode, handleLLMSummary } from './hook-llm.mjs';
+import { handleLLMEpisode, handleLLMSummary, saveObservation, buildDegradedTitle } from './hook-llm.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
@@ -80,6 +80,32 @@ function flushEpisode(episode) {
     episode.filesRead = episode.filesRead || [];
   }
 
+  const isSignificant = episodeHasSignificantContent(episode);
+
+  // Immediate save: create rule-based observation for instant visibility.
+  // LLM background worker will upgrade title/narrative/importance later.
+  if (isSignificant) {
+    try {
+      const hasError = episode.entries.some(e => e.isError);
+      const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
+      const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
+      const fileList = (episode.files || []).map(f => basename(f)).join(', ') || '(multiple)';
+      const obs = {
+        type: inferredType,
+        title: truncate(buildDegradedTitle(episode), 120),
+        subtitle: fileList,
+        narrative: episode.entries.map(e => e.desc).join('; '),
+        concepts: [],
+        facts: [],
+        files: episode.files,
+        filesRead: episode.filesRead || [],
+        importance: computeRuleImportance(episode),
+      };
+      const id = saveObservation(obs, episode.project, episode.sessionId);
+      if (id) episode.savedId = id;
+    } catch (e) { debugCatch(e, 'flushEpisode-immediateSave'); }
+  }
+
   // Write episode to flush file, then remove buffer AFTER spawn to prevent race
   const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
   try {
@@ -88,7 +114,7 @@ function flushEpisode(episode) {
     return;
   }
 
-  if (episodeHasSignificantContent(episode)) {
+  if (isSignificant) {
     spawnBackground('llm-episode', flushFile);
   } else {
     try { unlinkSync(flushFile); } catch {}
@@ -150,7 +176,7 @@ async function handlePostToolUse() {
     files,
     ts: Date.now(),
     isError: bashSig?.isError || false,
-    isSignificant: ['Edit', 'Write', 'NotebookEdit'].includes(tool_name) ||
+    isSignificant: EDIT_TOOLS.has(tool_name) ||
                    bashSig?.isSignificant || false,
     bashSig: bashSig || null,
   };
@@ -203,7 +229,7 @@ async function handlePostToolUse() {
     addFileToEpisode(episode, files);
 
     // Proactive file history: show past observations for files being edited
-    if (['Edit', 'Write', 'NotebookEdit'].includes(tool_name) && files.length > 0) {
+    if (EDIT_TOOLS.has(tool_name) && files.length > 0) {
       const d = getDb();
       if (d) {
         for (const f of files) {

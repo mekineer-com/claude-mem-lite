@@ -164,6 +164,28 @@ describe('saveObservation', () => {
     const id = saveObservation({ type: 'discovery', title: 'Test' }, 'test', 'sess-1');
     expect(id).toBeNull();
   });
+
+  it('includes CJK bigrams in text field for Chinese titles', () => {
+    const id = saveObservation(
+      { type: 'bugfix', title: '修复系统崩溃的问题', narrative: '通过重启服务解决' },
+      'test', 'sess-1', db
+    );
+    expect(id).toBeGreaterThan(0);
+    const row = db.prepare('SELECT text FROM observations WHERE id = ?').get(id);
+    // text field should contain bigrams from title+narrative
+    expect(row.text).toContain('修复');
+    expect(row.text).toContain('系统');
+    expect(row.text).toContain('崩溃');
+  });
+
+  it('does not add empty bigrams for English-only content', () => {
+    const id = saveObservation(
+      { type: 'feature', title: 'Add caching', concepts: ['cache'], facts: ['TTL 1h'] },
+      'test', 'sess-1', db
+    );
+    const row = db.prepare('SELECT text FROM observations WHERE id = ?').get(id);
+    expect(row.text).toBe('cache TTL 1h');
+  });
 });
 
 // ─── handleLLMEpisode ────────────────────────────────────────────────────────
@@ -387,6 +409,63 @@ describe('handleLLMEpisode', () => {
     const newObs = db.prepare('SELECT related_ids FROM observations ORDER BY id DESC LIMIT 1').get();
     const relatedIds = JSON.parse(newObs.related_ids || '[]');
     expect(relatedIds.length).toBeLessThanOrEqual(5);
+  });
+
+  it('upgrades pre-saved observation when savedId is present', async () => {
+    // Pre-save a rule-based observation (simulating what flushEpisode does)
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+    const preSavedId = saveObservation(
+      { type: 'change', title: 'Modified auth.mjs', narrative: 'Edit auth.mjs', importance: 1 },
+      'test-proj', 'ep-sess', db
+    );
+    expect(preSavedId).toBeGreaterThan(0);
+
+    // Episode includes savedId — LLM should UPDATE, not INSERT
+    writeFileSync(tmpFile, JSON.stringify({
+      sessionId: 'ep-sess', project: 'test-proj',
+      savedId: preSavedId,
+      files: ['auth.mjs'], filesRead: ['config.mjs'],
+      entries: [{ tool: 'Edit', desc: 'Add JWT middleware', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    // Should have exactly 1 observation (upgraded, not duplicated)
+    const allObs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
+    expect(allObs.length).toBe(1);
+    expect(allObs[0].id).toBe(preSavedId);
+    // LLM-upgraded fields
+    expect(allObs[0].title).toBe('Add user authentication');
+    expect(allObs[0].type).toBe('feature');
+    expect(allObs[0].importance).toBe(2);
+  });
+
+  it('keeps pre-saved observation when LLM fails and savedId present', async () => {
+    acquireLLMSlot.mockResolvedValueOnce(false);
+
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+    const preSavedId = saveObservation(
+      { type: 'change', title: 'Modified app.mjs', narrative: 'Quick edit', importance: 1 },
+      'test-proj', 'ep-sess', db
+    );
+
+    writeFileSync(tmpFile, JSON.stringify({
+      sessionId: 'ep-sess', project: 'test-proj',
+      savedId: preSavedId,
+      files: ['app.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Update app', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    // Pre-saved observation should remain unchanged
+    const obs = db.prepare('SELECT * FROM observations WHERE id = ?').get(preSavedId);
+    expect(obs.title).toBe('Modified app.mjs');
+    expect(obs.importance).toBe(1);
+
+    // No duplicate observations
+    const allObs = db.prepare('SELECT COUNT(*) as c FROM observations WHERE memory_session_id = ?').get('ep-sess');
+    expect(allObs.c).toBe(1);
   });
 });
 

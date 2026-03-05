@@ -3,7 +3,7 @@
 
 import { join } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, readdirSync, openSync, closeSync, writeSync, renameSync, statSync, constants as fsConstants } from 'fs';
-import { inferProject } from './utils.mjs';
+import { inferProject, EDIT_TOOLS } from './utils.mjs';
 import { RUNTIME_DIR } from './hook-shared.mjs';
 
 /**
@@ -216,7 +216,7 @@ export function mergePendingEntries(episode) {
  */
 export function episodeHasSignificantContent(episode) {
   return episode.entries.some(e =>
-    ['Edit', 'Write', 'NotebookEdit'].includes(e.tool) ||
+    EDIT_TOOLS.has(e.tool) ||
     (e.tool === 'Bash' && e.isError)
   );
 }
