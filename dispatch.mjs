@@ -6,7 +6,7 @@
 
 import { basename, join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
-import { retrieveResources, buildEnhancedQuery, buildQueryFromText } from './registry-retriever.mjs';
+import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
 import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { callHaikuJSON } from './haiku-client.mjs';
@@ -717,9 +717,21 @@ function applyAdoptionDecay(results) {
  * @returns {object[]} Filtered results that pass the gate
  */
 function passesConfidenceGate(results, signals) {
-  if (!signals?.intent?.length && !signals?.rawKeywords?.length) return [];
-  const intentSet = new Set([...(signals.intent || []), ...(signals.rawKeywords || [])]);
-  if (intentSet.size === 0) return [];
+  // signals.intent is a comma-separated string (e.g. "test,fix"), not an array
+  const intentTokens = typeof signals?.intent === 'string'
+    ? signals.intent.split(',').filter(Boolean)
+    : Array.isArray(signals?.intent) ? signals.intent : [];
+
+  // No structured intent → skip gate (rawKeywords match FTS5 text columns, not intent_tags)
+  if (intentTokens.length === 0) return results;
+
+  // Expand intent tokens through DISPATCH_SYNONYMS so "fast" also matches "performance", etc.
+  const rawKw = signals?.rawKeywords || [];
+  const intentSet = new Set([...intentTokens, ...rawKw]);
+  for (const token of intentTokens) {
+    const syns = DISPATCH_SYNONYMS[token];
+    if (syns) for (const s of syns) intentSet.add(s);
+  }
 
   return results.filter(r => {
     const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/).filter(Boolean);
@@ -767,6 +779,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
 
     results = reRankByKeywords(results, signals.rawKeywords);
     results = applyAdoptionDecay(results);
+    results = passesConfidenceGate(results, signals);
     results = results.slice(0, 3);
 
     let tier = 2;
@@ -859,6 +872,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     // resources should rank above generic code-review resources.
     results = reRankByKeywords(results, signals.rawKeywords);
     results = applyAdoptionDecay(results);
+    results = passesConfidenceGate(results, signals);
     results = results.slice(0, 3);
 
     if (results.length === 0) return null;
@@ -922,6 +936,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     // Tier 2: FTS5 retrieval
     let results = retrieveResources(db, query, { limit: 3, projectDomains });
     results = applyAdoptionDecay(results);
+    results = passesConfidenceGate(results, signals);
     if (results.length === 0) return null;
 
     const tier = 2; // Tier 3 disabled for PreToolUse — 2s hook timeout insufficient

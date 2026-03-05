@@ -426,6 +426,7 @@ function fullPipeline(db, userPrompt, { sessionId = 'sim-sess-1' } = {}) {
   }
   results = _reRankByKeywords(results, signals.rawKeywords);
   results = _applyAdoptionDecay(results);
+  results = _passesConfidenceGate(results, signals);
   results = results.slice(0, 3);
   return { signals, results, topName: results[0]?.name || null };
 }
@@ -1159,7 +1160,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
   describe('Confidence gate — direct intent-tag match required', () => {
     it('passes resource when intent directly matches intent_tags', () => {
-      const signals = { intent: ['test'], rawKeywords: [], suppressedIntents: [] };
+      const signals = { intent: 'test', rawKeywords: [], suppressedIntents: [] };
       const results = [
         { name: 'superpowers-tdd', intent_tags: 'test,tdd,testing', relevance: -5.0 },
       ];
@@ -1169,7 +1170,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
     });
 
     it('rejects resource when no intent matches intent_tags', () => {
-      const signals = { intent: ['fast'], rawKeywords: [], suppressedIntents: [] };
+      const signals = { intent: 'fast', rawKeywords: [], suppressedIntents: [] };
       const results = [
         { name: 'superpowers-tdd', intent_tags: 'test,tdd,testing', relevance: -5.0 },
       ];
@@ -1177,30 +1178,34 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       expect(passed.length).toBe(0);
     });
 
-    it('passes resource when rawKeywords match intent_tags', () => {
-      const signals = { intent: ['fast'], rawKeywords: ['seo'], suppressedIntents: [] };
+    it('passes resources matching rawKeywords or synonym-expanded intents', () => {
+      const signals = { intent: 'fast', rawKeywords: ['seo'], suppressedIntents: [] };
       const results = [
         { name: 'seo-audit', intent_tags: 'seo,audit,technical', relevance: -5.0 },
         { name: 'application-performance', intent_tags: 'performance,optimize', relevance: -4.0 },
+        { name: 'unrelated-skill', intent_tags: 'frontend,css,design', relevance: -3.0 },
       ];
       const passed = _passesConfidenceGate(results, signals);
-      // seo-audit passes via rawKeywords, performance does not match 'fast' or 'seo'
-      expect(passed.length).toBe(1);
-      expect(passed[0].name).toBe('seo-audit');
+      // seo-audit passes via rawKeywords, performance passes via 'fast'→'performance' synonym
+      expect(passed.length).toBe(2);
+      expect(passed.map(r => r.name)).toContain('seo-audit');
+      expect(passed.map(r => r.name)).toContain('application-performance');
+      // unrelated-skill filtered out
+      expect(passed.map(r => r.name)).not.toContain('unrelated-skill');
     });
 
-    it('returns empty when signals have no intent and no rawKeywords', () => {
-      const signals = { intent: [], rawKeywords: [], suppressedIntents: [] };
+    it('passes all results when signals have no intent (no gate applied)', () => {
+      const signals = { intent: '', rawKeywords: [], suppressedIntents: [] };
       const results = [
         { name: 'anything', intent_tags: 'test,fix', relevance: -5.0 },
       ];
       const passed = _passesConfidenceGate(results, signals);
-      expect(passed.length).toBe(0);
+      expect(passed.length).toBe(1);
     });
 
-    it('handles null/undefined signals gracefully', () => {
+    it('handles null/undefined signals gracefully (passes all, no gate)', () => {
       const passed = _passesConfidenceGate([{ name: 'x', intent_tags: 'test' }], null);
-      expect(passed.length).toBe(0);
+      expect(passed.length).toBe(1);
     });
   });
 

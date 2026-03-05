@@ -5,7 +5,7 @@ import { debugCatch } from './utils.mjs';
 
 // ─── Domain Synonyms ─────────────────────────────────────────────────────────
 
-const DISPATCH_SYNONYMS = {
+export const DISPATCH_SYNONYMS = {
   // English intent synonyms
   'clean':    ['refactor', 'lint', 'format', 'organize', 'tidy', 'simplify', 'restructure', 'rewrite', 'smell', 'debt'],
   'test':     ['testing', 'unittest', 'e2e', 'coverage', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest', 'mocha', 'cypress', 'playwright'],
