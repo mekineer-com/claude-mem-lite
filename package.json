@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -28,6 +28,7 @@
     "hook.mjs",
     "hook-shared.mjs",
     "hook-llm.mjs",
+    "hook-memory.mjs",
     "hook-semaphore.mjs",
     "hook-episode.mjs",
     "hook-context.mjs",
