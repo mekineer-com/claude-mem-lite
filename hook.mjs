@@ -27,6 +27,7 @@ import {
   RESOURCE_RESCAN_INTERVAL_MS,
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
+  resetInjectionBudget, hasInjectionBudget, incrementInjection,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildDegradedTitle } from './hook-llm.mjs';
 
@@ -382,6 +383,8 @@ async function handleStop() {
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
 async function handleSessionStart() {
+  resetInjectionBudget();
+
   // Flush any leftover episode buffer from previous session (e.g. after /clear)
   if (acquireLock()) {
     try {
@@ -662,11 +665,12 @@ async function handleSessionStart() {
     // Dispatch: recommend skill/agent based on session context
     try {
       const rdb = getRegistryDb();
-      if (rdb) {
+      if (rdb && hasInjectionBudget()) {
         const promptCtx = latestSummary?.next_steps || '';
         const dispatchResult = await dispatchOnSessionStart(rdb, promptCtx, sessionId);
         if (dispatchResult) {
           process.stdout.write(dispatchResult + '\n');
+          incrementInjection();
         }
       }
     } catch (e) { debugCatch(e, 'handleSessionStart-dispatch'); }
@@ -719,9 +723,12 @@ async function handlePreToolUse() {
     }
   } catch {}
 
-  const injection = await dispatchOnPreToolUse(rdb, hookData, sessionCtx);
-  if (injection) {
-    process.stdout.write(injection + '\n');
+  if (hasInjectionBudget()) {
+    const injection = await dispatchOnPreToolUse(rdb, hookData, sessionCtx);
+    if (injection) {
+      process.stdout.write(injection + '\n');
+      incrementInjection();
+    }
   }
 }
 
@@ -775,10 +782,11 @@ async function handleUserPrompt() {
   // Cooldown + session dedup (invocations table) prevents double-recommending with SessionStart.
   try {
     const rdb = getRegistryDb();
-    if (rdb) {
+    if (rdb && hasInjectionBudget()) {
       const result = await dispatchOnUserPrompt(rdb, promptText, sessionId);
       if (result) {
         process.stdout.write(result + '\n');
+        incrementInjection();
       }
     }
   } catch (e) { debugCatch(e, 'handleUserPrompt-dispatch'); }

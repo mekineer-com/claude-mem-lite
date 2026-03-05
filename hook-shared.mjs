@@ -121,6 +121,18 @@ export function spawnBackground(bgEvent, ...extraArgs) {
 
 export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ─── Injection Budget (per-session, in-memory) ──────────────────────────────
+// Limits total context injections across all hooks to prevent context bloat.
+// Reset at session-start. Each hook checks before injecting.
+
+export const MAX_INJECTIONS_PER_SESSION = 3;
+let _injectionCount = 0;
+
+export function getInjectionCount() { return _injectionCount; }
+export function incrementInjection() { _injectionCount++; }
+export function resetInjectionBudget() { _injectionCount = 0; }
+export function hasInjectionBudget() { return _injectionCount < MAX_INJECTIONS_PER_SESSION; }
+
 // ─── Tool Event Tracking (for dispatch feedback) ────────────────────────────
 // PostToolUse appends feedback-relevant tool events (Skill, Task, Edit, Write, Bash errors).
 // Stop handler reads them and passes to collectFeedback for adoption/outcome detection.
