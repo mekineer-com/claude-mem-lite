@@ -1212,7 +1212,7 @@ async function install() {
 
   const SOURCE_FILES = [
     'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
-    'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs',
+    'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs',
     'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs',
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',

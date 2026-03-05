@@ -30,6 +30,7 @@ import {
   resetInjectionBudget, hasInjectionBudget, incrementInjection,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildDegradedTitle } from './hook-llm.mjs';
+import { searchRelevantMemories } from './hook-memory.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
@@ -773,6 +774,39 @@ async function handleUserPrompt() {
     );
   } finally {
     db.close();
+  }
+
+  // Semantic memory injection: search past observations for the user's prompt
+  if (hasInjectionBudget()) {
+    try {
+      const memDb = openDb();
+      if (memDb) {
+        try {
+          const project = inferProject();
+          // Get Key Context IDs to exclude (same query as session-start)
+          const keyObs = memDb.prepare(`
+            SELECT id FROM observations
+            WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+              AND COALESCE(importance, 1) >= 2
+            ORDER BY created_at_epoch DESC LIMIT 5
+          `).all(project);
+          const keyContextIds = keyObs.map(o => o.id);
+
+          const memories = searchRelevantMemories(memDb, promptText, project, keyContextIds);
+          if (memories.length > 0) {
+            const lines = ['<memory-context relevance="high">'];
+            for (const m of memories) {
+              lines.push(`- [${m.type}] ${truncate(m.title, 80)} (#${m.id})`);
+            }
+            lines.push('</memory-context>');
+            process.stdout.write(lines.join('\n') + '\n');
+            incrementInjection();
+          }
+        } finally {
+          memDb.close();
+        }
+      }
+    } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
   }
 
   // Dispatch: recommend skill/agent based on user's actual prompt.
