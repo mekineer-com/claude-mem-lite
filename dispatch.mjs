@@ -693,7 +693,7 @@ function reRankByKeywords(results, rawKeywords) {
  * @returns {object[]} Filtered results with decayed scores
  */
 function applyAdoptionDecay(results, db) {
-  return results.map(r => {
+  const decayed = results.map(r => {
     const recs = r.recommend_count || 0;
     const adopts = r.adopt_count || 0;
     if (recs < 10) return r; // Cold start protection
@@ -721,6 +721,12 @@ function applyAdoptionDecay(results, db) {
     }
     return r;
   }).filter(Boolean);
+  // Re-sort after decay: decayed zombies must drop in ranking.
+  // BM25 scores are negative (more negative = better match), sort ascending.
+  if (decayed.some(r => r._decayed)) {
+    decayed.sort((a, b) => (a.composite_score ?? a.relevance) - (b.composite_score ?? b.relevance));
+  }
+  return decayed;
 }
 
 /**
@@ -761,6 +767,24 @@ function passesConfidenceGate(results, signals) {
     const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/).filter(Boolean);
     return tags.some(t => intentSet.has(t));
   });
+}
+
+// ─── Shared Post-Processing Pipeline ────────────────────────────────────────
+
+/**
+ * Standard post-processing pipeline for dispatch results.
+ * Applies keyword re-ranking, adoption decay, confidence gating, and limit.
+ * @param {object[]} results FTS5 results
+ * @param {object} signals Context signals
+ * @param {object} db Registry database
+ * @param {number} [limit=3] Maximum results to return
+ * @returns {object[]} Post-processed results
+ */
+function postProcessResults(results, signals, db, limit = 3) {
+  results = reRankByKeywords(results, signals.rawKeywords);
+  results = applyAdoptionDecay(results, db);
+  results = passesConfidenceGate(results, signals);
+  return results.slice(0, limit);
 }
 
 // ─── Main Dispatch Functions ─────────────────────────────────────────────────
@@ -807,10 +831,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
       }
     }
 
-    results = reRankByKeywords(results, signals.rawKeywords);
-    results = applyAdoptionDecay(results, db);
-    results = passesConfidenceGate(results, signals);
-    results = results.slice(0, 3);
+    results = postProcessResults(results, signals, db);
 
     let tier = 2;
 
@@ -827,10 +848,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
             projectDomains,
           });
           if (haikuResults.length > 0) {
-            // Apply same post-processing as Tier2 to prevent zombie/low-confidence bypass
-            haikuResults = reRankByKeywords(haikuResults, signals.rawKeywords);
-            haikuResults = applyAdoptionDecay(haikuResults, db);
-            haikuResults = passesConfidenceGate(haikuResults, signals);
+            haikuResults = postProcessResults(haikuResults, signals, db);
             if (haikuResults.length > 0) results = haikuResults;
           }
         }
@@ -935,13 +953,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
       }
     }
 
-    // Re-rank: when rawKeywords are present, prefer resources whose intent_tags
-    // match those keywords. "帮我做一下SEO审查" → rawKeywords=["seo"] → SEO audit
-    // resources should rank above generic code-review resources.
-    results = reRankByKeywords(results, signals.rawKeywords);
-    results = applyAdoptionDecay(results, db);
-    results = passesConfidenceGate(results, signals);
-    results = results.slice(0, 3);
+    results = postProcessResults(results, signals, db);
 
     if (results.length === 0) return null;
 
@@ -1008,8 +1020,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
 
     // Tier 2: FTS5 retrieval
     let results = retrieveResources(db, query, { limit: 3, projectDomains });
-    results = applyAdoptionDecay(results, db);
-    results = passesConfidenceGate(results, signals);
+    results = postProcessResults(results, signals, db);
     if (results.length === 0) return null;
 
     const tier = 2; // Tier 3 disabled for PreToolUse — 2s hook timeout insufficient

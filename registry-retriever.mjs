@@ -196,8 +196,9 @@ export function buildEnhancedQuery(signals) {
   // would dilute BM25 precision. Literal matching is sufficient — "seo" matches "seo"
   // directly across name, intent_tags, capability_summary, trigger_patterns.
   if (signals.rawKeywords?.length > 0) {
+    const isSafe = t => /^[a-zA-Z0-9]+$/.test(t) || /[\u4e00-\u9fff\u3400-\u4dbf]/.test(t);
     for (const kw of signals.rawKeywords) {
-      const safeKw = expandToken(kw);
+      const safeKw = isSafe(kw) ? kw : `"${kw.replace(/"/g, '""')}"`;
       parts.push(`intent_tags:${safeKw}`);
       parts.push(safeKw);
     }

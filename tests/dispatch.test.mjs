@@ -1,6 +1,5 @@
 // Tests for v3 dispatch system: registry, retriever, dispatch, inject, feedback
 import { describe, it, expect, beforeEach } from 'vitest';
-import Database from 'better-sqlite3';
 import { upsertResource, getActiveResources, getResourceByName,
   updateResourceStats, recordInvocation, getSessionInvocations,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
@@ -12,127 +11,11 @@ import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   _applyAdoptionDecay } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
+import { createRegistryTestDb } from './test-helpers.mjs';
 
 // ─── Registry DB Helper ─────────────────────────────────────────────────────
 
-function createRegistryDb() {
-  // Use ensureRegistryDb with an in-memory path workaround
-  // ensureRegistryDb expects a file path, so we create one inline
-  const db = new Database(':memory:');
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
-  db.pragma('foreign_keys = ON');
-
-  // Apply schemas directly (same as ensureRegistryDb)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS resources (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      name          TEXT NOT NULL,
-      type          TEXT NOT NULL CHECK(type IN ('skill','agent')),
-      status        TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','error','indexing')),
-      source        TEXT NOT NULL CHECK(source IN ('preinstalled','user')),
-      repo_url      TEXT,
-      repo_stars    INTEGER DEFAULT 0,
-      local_path    TEXT NOT NULL,
-      file_hash     TEXT,
-      intent_tags       TEXT DEFAULT '',
-      domain_tags       TEXT DEFAULT '',
-      action_type       TEXT DEFAULT '',
-      trigger_patterns  TEXT DEFAULT '',
-      capability_summary TEXT DEFAULT '',
-      input_type    TEXT DEFAULT '',
-      output_type   TEXT DEFAULT '',
-      prerequisites TEXT DEFAULT '{}',
-      keywords      TEXT DEFAULT '',
-      tech_stack    TEXT DEFAULT '',
-      use_cases     TEXT DEFAULT '',
-      complexity    TEXT DEFAULT 'intermediate',
-      parent_plugin TEXT,
-      invocation_name TEXT DEFAULT '',
-      recommend_count   INTEGER DEFAULT 0,
-      adopt_count       INTEGER DEFAULT 0,
-      success_count     INTEGER DEFAULT 0,
-      indexed_at    TEXT,
-      created_at    TEXT DEFAULT (datetime('now')),
-      updated_at    TEXT DEFAULT (datetime('now'))
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_res_type_name ON resources(type, name);
-    CREATE INDEX IF NOT EXISTS idx_res_status ON resources(status) WHERE status = 'active';
-  `);
-
-  // Canonical 8-column FTS5 schema — must match registry.mjs column order
-  // BM25 weights: trigger_patterns(5), keywords(3), capability_summary(3),
-  //   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
-  db.exec(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(
-      trigger_patterns, keywords, capability_summary, intent_tags, use_cases,
-      domain_tags, tech_stack, name,
-      content=resources, content_rowid=id,
-      tokenize='unicode61 remove_diacritics 2'
-    );
-  `);
-
-  db.exec(`
-    CREATE TRIGGER IF NOT EXISTS res_fts_insert AFTER INSERT ON resources BEGIN
-      INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
-        intent_tags, use_cases, domain_tags, tech_stack, name)
-      VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
-        NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
-    END;
-    CREATE TRIGGER IF NOT EXISTS res_fts_update AFTER UPDATE ON resources BEGIN
-      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
-        capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
-      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
-        OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
-      INSERT INTO resources_fts(rowid, trigger_patterns, keywords, capability_summary,
-        intent_tags, use_cases, domain_tags, tech_stack, name)
-      VALUES (NEW.id, NEW.trigger_patterns, NEW.keywords, NEW.capability_summary,
-        NEW.intent_tags, NEW.use_cases, NEW.domain_tags, NEW.tech_stack, NEW.name);
-    END;
-    CREATE TRIGGER IF NOT EXISTS res_fts_delete AFTER DELETE ON resources BEGIN
-      INSERT INTO resources_fts(resources_fts, rowid, trigger_patterns, keywords,
-        capability_summary, intent_tags, use_cases, domain_tags, tech_stack, name)
-      VALUES ('delete', OLD.id, OLD.trigger_patterns, OLD.keywords, OLD.capability_summary,
-        OLD.intent_tags, OLD.use_cases, OLD.domain_tags, OLD.tech_stack, OLD.name);
-    END;
-  `);
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS invocations (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      resource_id   INTEGER NOT NULL REFERENCES resources(id),
-      session_id    TEXT,
-      trigger       TEXT CHECK(trigger IN ('session_start','pre_tool_use','user_explicit','user_prompt')),
-      tier          INTEGER CHECK(tier IN (1,2,3)),
-      recommended   INTEGER DEFAULT 1,
-      adopted       INTEGER DEFAULT 0,
-      outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored',NULL)),
-      score         REAL,
-      created_at    TEXT DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_inv_resource ON invocations(resource_id, created_at);
-    CREATE INDEX IF NOT EXISTS idx_inv_session ON invocations(session_id);
-  `);
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS preinstalled (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      name          TEXT NOT NULL,
-      type          TEXT NOT NULL CHECK(type IN ('skill','agent')),
-      repo_url      TEXT NOT NULL,
-      repo_path     TEXT DEFAULT '',
-      stars         INTEGER DEFAULT 0,
-      tags          TEXT DEFAULT '[]',
-      enabled       INTEGER DEFAULT 1,
-      cloned_at     TEXT,
-      clone_hash    TEXT,
-      created_at    TEXT DEFAULT (datetime('now'))
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_type_name ON preinstalled(type, name);
-  `);
-
-  return db;
-}
+const createRegistryDb = createRegistryTestDb;
 
 function seedResource(db, overrides = {}) {
   const { recommend_count, adopt_count, success_count, ...rest } = overrides;

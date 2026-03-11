@@ -104,7 +104,7 @@ const INVOCATIONS_SCHEMA = `
     tier          INTEGER CHECK(tier IN (1,2,3)),
     recommended   INTEGER DEFAULT 1,
     adopted       INTEGER DEFAULT 0,
-    outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored',NULL)),
+    outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored') OR outcome IS NULL),
     score         REAL,
     created_at    TEXT DEFAULT (datetime('now'))
   );
@@ -161,7 +161,7 @@ export function ensureRegistryDb(dbPath) {
     if (!cols.some(c => c.name === 'invocation_name')) {
       db.exec("ALTER TABLE resources ADD COLUMN invocation_name TEXT DEFAULT ''");
     }
-  } catch {}
+  } catch (e) { debugCatch(e, 'invocation_name-migration'); }
 
   // FTS5 + triggers: only create if not exists
   const hasFts = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_fts'`).get();
@@ -214,6 +214,10 @@ export function ensureRegistryDb(dbPath) {
 
   return db;
 }
+
+// ─── Exported Schema (for test-helpers.mjs) ─────────────────────────────────
+
+export { RESOURCES_SCHEMA, FTS5_SCHEMA, TRIGGERS_SCHEMA, INVOCATIONS_SCHEMA, PREINSTALLED_SCHEMA };
 
 // ─── Resource CRUD ───────────────────────────────────────────────────────────
 

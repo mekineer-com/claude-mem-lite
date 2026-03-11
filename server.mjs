@@ -1001,7 +1001,9 @@ const idleTimer = setInterval(() => {
     const thirtyDaysAgo = Date.now() - 30 * 86400000;
 
     db.transaction(() => {
-      // Delete old low-quality observations (importance<=1, never accessed, 30+ days)
+      // Delete old low-quality observations (importance<=1, never accessed, 30+ days).
+      // NOTE: no project filter — MCP server is global, operates across all projects.
+      // This is intentionally broader than hook.mjs auto-compress (which scopes to current project).
       const deleted = db.prepare(`
         DELETE FROM observations
         WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
