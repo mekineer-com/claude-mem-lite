@@ -31,6 +31,7 @@ import {
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildDegradedTitle } from './hook-llm.mjs';
 import { searchRelevantMemories } from './hook-memory.mjs';
+import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from './hook-handoff.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
@@ -318,6 +319,9 @@ async function handleStop() {
   const sessionId = getSessionId();
   const project = inferProject();
 
+  // Snapshot episode BEFORE flush for handoff extraction
+  const episodeSnapshot = readEpisodeRaw();
+
   // Flush remaining episode buffer (locked to prevent race with handlePostToolUse)
   if (acquireLock(1000)) {
     try {
@@ -350,7 +354,7 @@ async function handleStop() {
     } catch (e) { debugCatch(e, 'handleStop-fallback'); }
   }
 
-  // Mark session completed (sync, instant)
+  // Mark session completed + save handoff (sync, instant)
   const db = openDb();
   if (db) {
     try {
@@ -358,6 +362,9 @@ async function handleStop() {
         UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?
         WHERE content_session_id = ? AND status = 'active'
       `).run(new Date().toISOString(), Date.now(), sessionId);
+      // Save handoff snapshot for cross-session continuity
+      try { buildAndSaveHandoff(db, sessionId, project, 'exit', episodeSnapshot); }
+      catch (e) { debugCatch(e, 'handleStop-handoff'); }
     } finally {
       db.close();
     }
@@ -385,6 +392,9 @@ async function handleStop() {
 
 async function handleSessionStart() {
   resetInjectionBudget();
+
+  // Snapshot episode BEFORE flush for handoff extraction
+  const episodeSnapshot = readEpisodeRaw();
 
   // Flush any leftover episode buffer from previous session (e.g. after /clear)
   if (acquireLock()) {
@@ -464,6 +474,10 @@ async function handleSessionStart() {
     // ── Non-transactional operations (side effects, background work) ──
 
     if (prevSessionId) {
+      // Save handoff for cross-session continuity (/clear or /compact)
+      try { buildAndSaveHandoff(db, prevSessionId, prevProject || project, 'clear', episodeSnapshot); }
+      catch (e) { debugCatch(e, 'session-start-handoff'); }
+
       // Collect dispatch feedback for previous session
       try {
         const rdb = getRegistryDb();
@@ -773,6 +787,19 @@ async function handleUserPrompt() {
       counter?.prompt_counter || 1,
       now.toISOString(), now.getTime()
     );
+
+    // Cross-session handoff injection (first prompt only, before semantic memory)
+    if (counter?.prompt_counter === 1 && hasInjectionBudget()) {
+      try {
+        if (detectContinuationIntent(db, promptText, project)) {
+          const injection = renderHandoffInjection(db, project);
+          if (injection) {
+            process.stdout.write(injection + '\n');
+            incrementInjection();
+          }
+        }
+      } catch (e) { debugCatch(e, 'handleUserPrompt-handoff'); }
+    }
 
     // Semantic memory injection: search past observations for the user's prompt
     if (hasInjectionBudget()) {

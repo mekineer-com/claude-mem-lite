@@ -74,6 +74,20 @@ const CORE_SCHEMA = `
     created_at_epoch INTEGER NOT NULL,
     FOREIGN KEY(content_session_id) REFERENCES sdk_sessions(content_session_id) ON DELETE CASCADE ON UPDATE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS session_handoffs (
+    project TEXT NOT NULL,
+    type TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    working_on TEXT,
+    completed TEXT,
+    unfinished TEXT,
+    key_files TEXT,
+    key_decisions TEXT,
+    match_keywords TEXT,
+    created_at_epoch INTEGER,
+    PRIMARY KEY (project, type)
+  );
 `;
 
 // Column migrations (idempotent — only swallow "duplicate column" errors)

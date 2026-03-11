@@ -676,3 +676,63 @@ export function parseJsonFromLLM(text) {
   if (obj) try { return JSON.parse(obj[0]); } catch {}
   return null;
 }
+
+// ─── Handoff Utilities ──────────────────────────────────────────────────────
+
+/** Stop words for handoff keyword extraction (broader than ERROR_STOP_WORDS). */
+export const HANDOFF_STOP_WORDS = new Set([
+  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'are', 'was', 'were',
+  'been', 'have', 'has', 'had', 'does', 'did', 'will', 'would', 'should', 'could',
+  'can', 'may', 'must', 'not', 'but', 'its', 'all', 'any', 'each', 'some',
+  'into', 'over', 'after', 'before', 'between', 'about', 'also', 'just', 'then',
+  'than', 'when', 'where', 'how', 'what', 'which', 'who', 'why', 'here', 'there',
+  'more', 'very', 'only', 'still', 'now', 'new', 'old', 'get', 'got', 'set',
+  'true', 'false', 'null', 'undefined', 'function', 'return', 'const', 'let', 'var',
+  'import', 'export', 'default', 'class', 'async', 'await', 'try', 'catch',
+]);
+
+/**
+ * Tokenize text for handoff keyword matching.
+ * Splits on whitespace/punctuation, lowercases, filters short tokens.
+ * @param {string} text Input text
+ * @returns {string[]} Array of lowercase tokens (length >= 3)
+ */
+export function tokenizeHandoff(text) {
+  if (!text) return [];
+  return text
+    .split(/[\s,;:.()[\]{}'"`<>→|/\\#@!?=+*&^%$~]+/)
+    .map(w => w.toLowerCase().replace(/^[.\-]+|[.\-]+$/g, ''))
+    .filter(w => w.length >= 3);
+}
+
+/**
+ * Check if a token is a "specific" term (file name, identifier, etc.)
+ * that should get double weight in intent matching.
+ * @param {string} token Lowercase token
+ * @returns {boolean}
+ */
+export function isSpecificTerm(token) {
+  if (!token || token.length < 3) return false;
+  if (token.includes('_') || token.includes('-')) return true;
+  if (HANDOFF_STOP_WORDS.has(token)) return false;
+  return token.length >= 4 && !/^\d+$/.test(token);
+}
+
+/**
+ * Extract match keywords from text and file paths for handoff intent matching.
+ * @param {string} text Combined text from prompts, observations, etc.
+ * @param {string[]} files Array of file paths
+ * @returns {string} Space-separated keywords
+ */
+export function extractMatchKeywords(text, files) {
+  const terms = new Set();
+  for (const f of files) {
+    const base = basename(f).replace(/\.[^.]+$/, '');
+    if (base.length >= 3) terms.add(base.toLowerCase());
+  }
+  const words = tokenizeHandoff(text);
+  for (const w of words) {
+    if (!HANDOFF_STOP_WORDS.has(w)) terms.add(w);
+  }
+  return [...terms].join(' ');
+}

@@ -26,6 +26,12 @@ export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const RESOURCE_RESCAN_INTERVAL_MS = 60 * 60 * 1000;    // 1 hour
 
+// Handoff system constants
+export const HANDOFF_EXPIRY_CLEAR = 3600000;                   // 1 hour
+export const HANDOFF_EXPIRY_EXIT = 7 * 24 * 60 * 60 * 1000;   // 7 days
+export const HANDOFF_MATCH_THRESHOLD = 3;                       // min weighted score
+export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚才|continue|resume|where.we.left|pick.up|carry.on/i;
+
 // Ensure runtime directory exists
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
