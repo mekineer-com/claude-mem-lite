@@ -5,18 +5,14 @@
 // Tier 3: Haiku semantic dispatch (~500ms, only when needed)
 
 import { basename, join } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
 import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { callHaikuJSON } from './haiku-client.mjs';
-import { debugCatch, truncate, inferProject } from './utils.mjs';
-import { DB_DIR } from './schema.mjs';
+import { debugCatch, truncate } from './utils.mjs';
+import { peekToolEvents, RUNTIME_DIR } from './hook-shared.mjs';
 import { detectActiveSuite, shouldRecommendForStage, detectExplicitRequest, inferCurrentStage } from './dispatch-workflow.mjs';
-
-// Duplicated from hook-shared.mjs to avoid circular import (dispatch ← hook ← hook-shared)
-const RUNTIME_DIR = join(DB_DIR, 'runtime');
-try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -32,17 +28,6 @@ export const SESSION_RECOMMEND_CAP = 3;
 // Minimum absolute BM25 composite score to recommend. Typical good matches score 5-50;
 // this filters only near-zero noise matches from incidental text overlap.
 export const BM25_MIN_THRESHOLD = 1.5;
-
-// Read tool events without clearing (duplicated from hook-shared.mjs to avoid circular import)
-function peekToolEvents() {
-  try {
-    const file = join(RUNTIME_DIR, `tool-events-${inferProject()}.jsonl`);
-    const raw = readFileSync(file, 'utf8');
-    return raw.trim().split('\n').filter(Boolean).map(line => {
-      try { return JSON.parse(line); } catch { return null; }
-    }).filter(Boolean);
-  } catch { return []; }
-}
 
 // ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
 // Prevents cascading latency when Haiku API is down or slow.
@@ -727,7 +712,7 @@ function applyAdoptionDecay(results, db) {
         ).get(r.id)?.cnt || 0;
         if (recentRejects >= 10) multiplier *= 0.3;
         else if (recentRejects >= 5) multiplier *= 0.5;
-      } catch {}
+      } catch (e) { debugCatch(e, 'applyAdoptionDecay-recentRejects'); }
     }
 
     if (multiplier < 0.01) return null;
@@ -1002,21 +987,20 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const { skip } = shouldSkipDispatch(event);
     if (skip) return null;
 
+    // Tier 1: Extract context signals
+    const signals = extractContextSignals(event, sessionCtx);
+
     // Suite protection: if a suite auto-flow is active, suppress recommendations
     // for stages the suite already covers
     const events = peekToolEvents();
     const activeSuite = detectActiveSuite(events);
     if (activeSuite) {
-      const signals0 = extractContextSignals(event, sessionCtx);
-      const stage = inferCurrentStage(signals0.primaryIntent, activeSuite);
+      const stage = inferCurrentStage(signals.primaryIntent, activeSuite);
       if (stage) {
         const { shouldRecommend } = shouldRecommendForStage(activeSuite, stage);
         if (!shouldRecommend) return null;
       }
     }
-
-    // Tier 1: Extract context signals
-    const signals = extractContextSignals(event, sessionCtx);
     const query = buildEnhancedQuery(signals);
     if (!query) return null;
 

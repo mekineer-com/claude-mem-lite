@@ -61,7 +61,7 @@ const RECENCY_HALF_LIFE_MS = 1209600000; // 14 days in milliseconds
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer(
-  { name: 'claude-mem-lite', version: '2.2.1' },
+  { name: 'claude-mem-lite', version: '2.2.2' },
   {
     instructions: [
       'Proactively search memory to leverage past experience. This is your long-term memory across sessions.',
@@ -1000,29 +1000,31 @@ const idleTimer = setInterval(() => {
   try {
     const thirtyDaysAgo = Date.now() - 30 * 86400000;
 
-    // Delete old low-quality observations (importance=1, never accessed, 30+ days)
-    const deleted = db.prepare(`
-      DELETE FROM observations
-      WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
-        AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
-    `).run(thirtyDaysAgo);
-    if (deleted.changes > 0) {
-      debugLog('INFO', 'idle-cleanup', `Deleted ${deleted.changes} stale low-quality observations`);
-    }
+    db.transaction(() => {
+      // Delete old low-quality observations (importance<=1, never accessed, 30+ days)
+      const deleted = db.prepare(`
+        DELETE FROM observations
+        WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
+          AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
+      `).run(thirtyDaysAgo);
+      if (deleted.changes > 0) {
+        debugLog('INFO', 'idle-cleanup', `Deleted ${deleted.changes} stale low-quality observations`);
+      }
 
-    // Mark old importance=1 as compressed (30+ days)
-    // NOTE: compressed_into = -1 is an established sentinel meaning "auto-compressed without merge target"
-    // (same pattern used in hook.mjs:456 for time-based compression)
-    const compressed = db.prepare(`
-      UPDATE observations SET compressed_into = -1
-      WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
-        AND created_at_epoch < ?
-    `).run(thirtyDaysAgo);
-    if (compressed.changes > 0) {
-      debugLog('INFO', 'idle-cleanup', `Compressed ${compressed.changes} old observations`);
-    }
+      // Mark old importance=1 as compressed (30+ days)
+      // NOTE: compressed_into = -1 is an established sentinel meaning "auto-compressed without merge target"
+      // (same pattern used in hook.mjs:456 for time-based compression)
+      const compressed = db.prepare(`
+        UPDATE observations SET compressed_into = -1
+        WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
+          AND created_at_epoch < ?
+      `).run(thirtyDaysAgo);
+      if (compressed.changes > 0) {
+        debugLog('INFO', 'idle-cleanup', `Compressed ${compressed.changes} old observations`);
+      }
+    })();
 
-    // FTS5 index optimization
+    // FTS5 index optimization (outside transaction — WAL-friendly)
     db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");
     debugLog('DEBUG', 'idle-cleanup', 'FTS5 optimize complete');
   } catch (e) {
