@@ -83,9 +83,15 @@ const server = new McpServer(
   },
 );
 
+// Track MCP request activity for idle-time cleanup (see idle timer below)
+let lastMcpRequestTime = Date.now();
+let idleCleanupRan = false;
+
 function safeHandler(fn) {
   return async (args, extra) => {
     try {
+      lastMcpRequestTime = Date.now();
+      idleCleanupRan = false;
       return await fn(args, extra);
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -980,10 +986,56 @@ const walTimer = setInterval(() => {
 }, WAL_CHECKPOINT_INTERVAL);
 walTimer.unref(); // Don't keep process alive just for checkpoints
 
+// ─── Idle-Time Memory Optimization ──────────────────────────────────────────
+// When no MCP requests for 5 minutes, run lightweight DB maintenance.
+// lastMcpRequestTime and idleCleanupRan are declared near safeHandler (which updates them).
+
+const IDLE_THRESHOLD_MS = 5 * 60 * 1000;
+
+const idleTimer = setInterval(() => {
+  if (idleCleanupRan) return;
+  if (Date.now() - lastMcpRequestTime < IDLE_THRESHOLD_MS) return;
+  idleCleanupRan = true;
+
+  try {
+    const thirtyDaysAgo = Date.now() - 30 * 86400000;
+
+    // Delete old low-quality observations (importance=1, never accessed, 30+ days)
+    const deleted = db.prepare(`
+      DELETE FROM observations
+      WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
+        AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
+    `).run(thirtyDaysAgo);
+    if (deleted.changes > 0) {
+      debugLog('INFO', 'idle-cleanup', `Deleted ${deleted.changes} stale low-quality observations`);
+    }
+
+    // Mark old importance=1 as compressed (30+ days)
+    // NOTE: compressed_into = -1 is an established sentinel meaning "auto-compressed without merge target"
+    // (same pattern used in hook.mjs:456 for time-based compression)
+    const compressed = db.prepare(`
+      UPDATE observations SET compressed_into = -1
+      WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
+        AND created_at_epoch < ?
+    `).run(thirtyDaysAgo);
+    if (compressed.changes > 0) {
+      debugLog('INFO', 'idle-cleanup', `Compressed ${compressed.changes} old observations`);
+    }
+
+    // FTS5 index optimization
+    db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");
+    debugLog('DEBUG', 'idle-cleanup', 'FTS5 optimize complete');
+  } catch (e) {
+    debugCatch(e, 'idle-cleanup');
+  }
+}, 60000); // Check every minute
+idleTimer.unref();
+
 // ─── Shutdown Cleanup ────────────────────────────────────────────────────────
 
 function shutdown(exitCode = 0) {
   clearInterval(walTimer);
+  clearInterval(idleTimer);
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
   try { db.close(); } catch {}
   process.exit(exitCode);
