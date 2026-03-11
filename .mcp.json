@@ -1,6 +1,8 @@
 {
-  "mem": {
-    "command": "node",
-    "args": ["${CLAUDE_PLUGIN_ROOT}/server.mjs"]
+  "mcpServers": {
+    "mem": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server.mjs"]
+    }
   }
 }
