@@ -24,15 +24,17 @@ function seedPrompt(db, sessionId, text, num) {
   db.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch) VALUES (?, ?, ?, datetime('now'), ?)`).run(sessionId, text, num, Date.now());
 }
 
+let _seedObsEpochOffset = 0;
 function seedObservation(db, sessionId, project, title, type, importance, filesModified, narrative) {
-  db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, importance, files_modified, narrative, created_at, created_at_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`).run(sessionId, project, type, title, importance, filesModified, narrative || null, Date.now());
+  const epoch = Date.now() + (_seedObsEpochOffset++);
+  db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, importance, files_modified, narrative, created_at, created_at_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`).run(sessionId, project, type, title, importance, filesModified, narrative || null, epoch);
 }
 
 // ─── Schema Tests ───────────────────────────────────────────────────────────
 
 describe('session_handoffs schema', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); });
+  beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
 
   it('creates session_handoffs table with correct columns', () => {
     const cols = db.prepare(`PRAGMA table_info(session_handoffs)`).all();
@@ -158,7 +160,7 @@ describe('handoff utility functions', () => {
 
 describe('buildAndSaveHandoff', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); });
+  beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
 
   it('saves handoff with working_on from prompts', () => {
     seedSession(db, 's1', 'test-proj');
@@ -272,8 +274,8 @@ describe('buildAndSaveHandoff', () => {
   it('falls back to most recent bugfix for unfinished when no episode snapshot', () => {
     seedSession(db, 's1', 'test-proj');
     seedPrompt(db, 's1', 'fix bugs', 1);
-    seedObservation(db, 's1', 'test-proj', 'TypeError in dispatch', 'bugfix', 2, null);
     seedObservation(db, 's1', 'test-proj', 'Fixed null pointer earlier', 'bugfix', 1, null);
+    seedObservation(db, 's1', 'test-proj', 'TypeError in dispatch', 'bugfix', 2, null);
 
     buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
 
@@ -393,7 +395,7 @@ describe('detectContinuationIntent', () => {
 
 describe('renderHandoffInjection', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); });
+  beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
 
   it('renders handoff with all sections', () => {
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch)

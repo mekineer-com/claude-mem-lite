@@ -172,10 +172,8 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
         { userPrompt: 'Write unit tests for the parser', recentFiles: ['/src/parser.test.ts'], sessionId: 'session-pre-1' }
       );
       // Should match superpowers-tdd (test intent + edit action)
-      if (result) {
-        expect(result).toContain('[Auto-suggestion]');
-      }
-      // Even if null (low confidence), the function executed all tiers
+      // Result can be null if BM25 confidence gate rejects — both outcomes are valid
+      expect(result === null || result.includes('[Auto-suggestion]')).toBe(true);
     });
 
     it('records invocation with pre_tool_use trigger', async () => {
@@ -184,10 +182,15 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
         { userPrompt: 'Fix the crash in authentication', recentFiles: ['/src/auth.ts'], sessionId: 'session-pre-2' }
       );
       if (result) {
+        // When dispatch produces a recommendation, verify invocation was recorded
         const invocations = getSessionInvocations(db, 'session-pre-2');
         expect(invocations).toHaveLength(1);
         expect(invocations[0].trigger).toBe('pre_tool_use');
         expect(invocations[0].tier).toBe(2);
+      } else {
+        // When dispatch returns null, no invocation should be recorded
+        const invocations = getSessionInvocations(db, 'session-pre-2');
+        expect(invocations).toHaveLength(0);
       }
     });
 

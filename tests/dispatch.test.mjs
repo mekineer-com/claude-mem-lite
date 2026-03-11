@@ -1,5 +1,8 @@
 // Tests for v3 dispatch system: registry, retriever, dispatch, inject, feedback
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest';
+import os from 'os';
+import { join } from 'path';
+import { unlinkSync } from 'fs';
 import { upsertResource, getActiveResources, getResourceByName,
   updateResourceStats, recordInvocation, getSessionInvocations,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
@@ -7,11 +10,12 @@ import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../re
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP, dispatchOnSessionStart,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
-  _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK,
+  _isHaikuCircuitOpen, _setBreakerFile, _NEGATION_EN, _NEGATION_CJK,
   _applyAdoptionDecay } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
+import { RUNTIME_DIR } from '../hook-shared.mjs';
 
 // ─── Registry DB Helper ─────────────────────────────────────────────────────
 
@@ -1134,6 +1138,12 @@ describe('Composite ranking formula', () => {
 // ─── Circuit Breaker Tests ──────────────────────────────────────────────────
 
 describe('Haiku circuit breaker', () => {
+  const tmpBreakerFile = join(os.tmpdir(), `breaker-test-${process.pid}.json`);
+  beforeAll(() => { _setBreakerFile(tmpBreakerFile); });
+  afterAll(() => {
+    _setBreakerFile(join(RUNTIME_DIR, 'haiku-breaker.json'));
+    try { unlinkSync(tmpBreakerFile); } catch {}
+  });
   beforeEach(() => { _resetCircuitBreaker(); });
 
   it('fresh breaker allows Haiku dispatch', () => {

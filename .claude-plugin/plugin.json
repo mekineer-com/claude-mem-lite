@@ -15,5 +15,6 @@
     "mcp",
     "sqlite",
     "fts5"
-  ]
+  ],
+  "commands": "./commands"
 }

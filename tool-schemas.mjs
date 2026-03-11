@@ -57,10 +57,12 @@ export const memCompressSchema = {
 
 export const memMaintainSchema = {
   action: z.enum(['scan', 'execute']).describe('scan=analyze candidates, execute=apply changes'),
-  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost'])).optional()
-    .describe('Operations to execute (for action=execute)'),
+  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'purge_stale'])).optional()
+    .describe('Operations to execute (for action=execute). purge_stale deletes idle-marked observations after user confirmation.'),
   merge_ids: z.array(z.array(z.number().int()).min(2)).optional()
     .describe('For dedup: [[keepId, removeId1, removeId2], ...] — first ID in each group is kept'),
+  retain_days: z.number().int().min(7).max(365).optional()
+    .describe('For purge_stale: keep observations newer than N days (default 30)'),
   project: z.string().optional().describe('Filter by project'),
 };
 

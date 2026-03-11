@@ -35,18 +35,21 @@ export const BM25_MIN_THRESHOLD = 1.5;
 
 const BREAKER_THRESHOLD = 3;
 const BREAKER_RESET_MS = 5 * 60 * 1000; // 5 minutes
-const BREAKER_FILE = join(RUNTIME_DIR, 'haiku-breaker.json');
+let breakerFile = join(RUNTIME_DIR, 'haiku-breaker.json');
 
 function _readBreakerState() {
   try {
-    if (!existsSync(BREAKER_FILE)) return { failures: 0, openUntil: 0 };
-    return JSON.parse(readFileSync(BREAKER_FILE, 'utf8'));
+    if (!existsSync(breakerFile)) return { failures: 0, openUntil: 0 };
+    return JSON.parse(readFileSync(breakerFile, 'utf8'));
   } catch { return { failures: 0, openUntil: 0 }; }
 }
 
 function _writeBreakerState(state) {
-  try { writeFileSync(BREAKER_FILE, JSON.stringify(state)); } catch {}
+  try { writeFileSync(breakerFile, JSON.stringify(state)); } catch {}
 }
+
+/** Override breaker file path (for testing isolation). */
+export function _setBreakerFile(path) { breakerFile = path; }
 
 function isHaikuCircuitOpen() {
   const state = _readBreakerState();

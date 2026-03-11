@@ -119,6 +119,69 @@ function safeHandler(fn) {
 
 // ─── Tool: mem_search — helper functions ────────────────────────────────────
 
+// Score expression variants for FTS5 queries (see Scoring Model Constants above)
+const FULL_SCORE = `${OBS_BM25}
+  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+  * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
+  * (0.5 + 0.5 * COALESCE(o.importance, 1))
+  * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))`;
+
+const SIMPLE_SCORE = `${OBS_BM25}
+  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+  * (0.5 + 0.5 * COALESCE(o.importance, 1))`;
+
+/**
+ * Build an FTS5 observation search query.
+ * @param {'full'|'simple'} scoring - full includes project boost + access bonus
+ * @param {object} opts - { multiplier, withSnippet, withOffset }
+ */
+function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset } = {}) {
+  const scoreExpr = scoring === 'full' ? FULL_SCORE : SIMPLE_SCORE;
+  const mult = multiplier ? ` * ${multiplier}` : '';
+  return `
+    SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+           o.files_modified,
+           ${withSnippet ? "snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet," : ''}
+           ${scoreExpr}${mult} as score
+    FROM observations_fts
+    JOIN observations o ON observations_fts.rowid = o.id
+    WHERE observations_fts MATCH ?
+      AND COALESCE(o.compressed_into, 0) = 0
+      AND (? IS NULL OR o.project = ?)
+      AND (? IS NULL OR o.type = ?)
+      AND (? IS NULL OR o.created_at_epoch >= ?)
+      AND (? IS NULL OR o.created_at_epoch <= ?)
+      AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+    ORDER BY score
+    LIMIT ?${withOffset ? ' OFFSET ?' : ''}`;
+}
+
+/** Build params array for an FTS5 observation query. */
+function buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epochTo, limit, offset }) {
+  const params = [now];
+  if (projectBoost !== undefined) params.push(projectBoost, projectBoost); // full scoring only
+  params.push(
+    ftsQuery,
+    args.project ?? null, args.project ?? null,
+    args.obs_type ?? null, args.obs_type ?? null,
+    epochFrom, epochFrom,
+    epochTo, epochTo,
+    args.importance ?? null, args.importance ?? null,
+    limit,
+  );
+  if (offset !== undefined) params.push(offset);
+  return params;
+}
+
+/** Map a raw FTS5 row to a result object. */
+function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
+  return {
+    source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle,
+    project: r.project, date: r.created_at, score: scoreMultiplier ? r.score * scoreMultiplier : r.score,
+    files_modified: r.files_modified, importance: r.importance, snippet: snippet ? (r.match_snippet || '') : '',
+  };
+}
+
 function searchObservations(ctx) {
   const { ftsQuery, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit } = ctx;
   const results = [];
@@ -126,81 +189,19 @@ function searchObservations(ctx) {
   if (ftsQuery) {
     const now = Date.now();
     const projectBoost = args.project ? null : currentProject;
-    const rows = db.prepare(`
-      SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-             o.files_modified,
-             snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
-             ${OBS_BM25}
-               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-               * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-               * (0.5 + 0.5 * COALESCE(o.importance, 1))
-               * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
-      FROM observations_fts
-      JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ?
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND (? IS NULL OR o.project = ?)
-        AND (? IS NULL OR o.type = ?)
-        AND (? IS NULL OR o.created_at_epoch >= ?)
-        AND (? IS NULL OR o.created_at_epoch <= ?)
-        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-      ORDER BY score
-      LIMIT ? OFFSET ?
-    `).all(
-      now,
-      projectBoost, projectBoost,
-      ftsQuery,
-      args.project ?? null, args.project ?? null,
-      args.obs_type ?? null, args.obs_type ?? null,
-      epochFrom, epochFrom,
-      epochTo, epochTo,
-      args.importance ?? null, args.importance ?? null,
-      perSourceLimit, perSourceOffset
-    );
-    for (const r of rows) {
-      results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
-    }
+
+    const rows = db.prepare(buildObsFtsQuery('full', { withSnippet: true, withOffset: true }))
+      .all(...buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
+    for (const r of rows) results.push(ftsRowToResult(r, { snippet: true }));
 
     // OR fallback: when AND query returns 0 results, retry with OR semantics
     if (rows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery) {
         try {
-          const orRows = db.prepare(`
-            SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-                   o.files_modified,
-                   snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet,
-                   ${OBS_BM25}
-                     * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-                     * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-                     * (0.5 + 0.5 * COALESCE(o.importance, 1))
-                     * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
-                     * 0.8 as score
-            FROM observations_fts
-            JOIN observations o ON observations_fts.rowid = o.id
-            WHERE observations_fts MATCH ?
-              AND COALESCE(o.compressed_into, 0) = 0
-              AND (? IS NULL OR o.project = ?)
-              AND (? IS NULL OR o.type = ?)
-              AND (? IS NULL OR o.created_at_epoch >= ?)
-              AND (? IS NULL OR o.created_at_epoch <= ?)
-              AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-            ORDER BY score
-            LIMIT ? OFFSET ?
-          `).all(
-            now,
-            projectBoost, projectBoost,
-            orQuery,
-            args.project ?? null, args.project ?? null,
-            args.obs_type ?? null, args.obs_type ?? null,
-            epochFrom, epochFrom,
-            epochTo, epochTo,
-            args.importance ?? null, args.importance ?? null,
-            perSourceLimit, perSourceOffset
-          );
-          for (const r of orRows) {
-            results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score, files_modified: r.files_modified, importance: r.importance, snippet: r.match_snippet || '' });
-          }
+          const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.8, withSnippet: true, withOffset: true }))
+            .all(...buildObsFtsParams({ now, projectBoost, ftsQuery: orQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
+          for (const r of orRows) results.push(ftsRowToResult(r, { snippet: true }));
         } catch (e) { debugCatch(e, 'searchObservations-or-fallback'); }
       }
     }
@@ -242,36 +243,12 @@ function expandObsByConceptCo(ctx, now, existingIds, results) {
   if (expanded.length === 0) return;
   const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
   try {
-    const expRows = db.prepare(`
-      SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-             o.files_modified,
-             ${OBS_BM25}
-               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-               * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
-      FROM observations_fts
-      JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ?
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND (? IS NULL OR o.project = ?)
-        AND (? IS NULL OR o.type = ?)
-        AND (? IS NULL OR o.created_at_epoch >= ?)
-        AND (? IS NULL OR o.created_at_epoch <= ?)
-        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-      ORDER BY score
-      LIMIT ?
-    `).all(
-      now, expansionFts,
-      args.project ?? null, args.project ?? null,
-      args.obs_type ?? null, args.obs_type ?? null,
-      epochFrom, epochFrom,
-      epochTo, epochTo,
-      args.importance ?? null, args.importance ?? null,
-      limit
-    );
+    const expRows = db.prepare(buildObsFtsQuery('simple'))
+      .all(...buildObsFtsParams({ now, ftsQuery: expansionFts, args, epochFrom, epochTo, limit }));
     for (const r of expRows) {
       if (!existingIds.has(r.id)) {
         existingIds.add(r.id);
-        results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.7, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+        results.push(ftsRowToResult(r, { scoreMultiplier: 0.7 }));
       }
     }
   } catch (e) { debugLog('WARN', 'mem_search', `concept expansion error: ${e.message}`); }
@@ -292,36 +269,12 @@ function expandObsByPRF(ctx, now, primaryCount, existingIds, results) {
   if (prfTerms.length === 0) return;
   const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
   try {
-    const prfRows = db.prepare(`
-      SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
-             o.files_modified,
-             ${OBS_BM25}
-               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-               * (0.5 + 0.5 * COALESCE(o.importance, 1)) as score
-      FROM observations_fts
-      JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ?
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND (? IS NULL OR o.project = ?)
-        AND (? IS NULL OR o.type = ?)
-        AND (? IS NULL OR o.created_at_epoch >= ?)
-        AND (? IS NULL OR o.created_at_epoch <= ?)
-        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-      ORDER BY score
-      LIMIT ?
-    `).all(
-      now, prfFts,
-      args.project ?? null, args.project ?? null,
-      args.obs_type ?? null, args.obs_type ?? null,
-      epochFrom, epochFrom,
-      epochTo, epochTo,
-      args.importance ?? null, args.importance ?? null,
-      limit
-    );
+    const prfRows = db.prepare(buildObsFtsQuery('simple'))
+      .all(...buildObsFtsParams({ now, ftsQuery: prfFts, args, epochFrom, epochTo, limit }));
     for (const r of prfRows) {
       if (!existingIds.has(r.id)) {
         existingIds.add(r.id);
-        results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, score: r.score * 0.6, files_modified: r.files_modified, importance: r.importance, snippet: '' });
+        results.push(ftsRowToResult(r, { scoreMultiplier: 0.6 }));
       }
     }
   } catch (e) { debugLog('WARN', 'mem_search', `PRF expansion error: ${e.message}`); }
@@ -1025,13 +978,13 @@ server.registerTool(
         LIMIT ${SCAN_LIMIT}
       `).all(...baseParams);
 
-      const wordSets = recent.map(r => new Set((r.title || '').toLowerCase().split(/\s+/).filter(w => w.length > 2)));
+      const titles = recent.map(r => (r.title || '').trim());
       const duplicates = [];
       for (let i = 0; i < recent.length && duplicates.length < DUPLICATE_LIMIT; i++) {
-        if (wordSets[i].size === 0) continue;
+        if (!titles[i]) continue;
         for (let j = i + 1; j < recent.length; j++) {
-          if (wordSets[j].size === 0) continue;
-          const sim = jaccardSimilarity(wordSets[i], wordSets[j]);
+          if (!titles[j]) continue;
+          const sim = jaccardSimilarity(titles[i], titles[j]);
           if (sim > SIMILARITY_THRESHOLD) {
             duplicates.push({
               a: { id: recent[i].id, title: recent[i].title, importance: recent[i].importance },
@@ -1058,6 +1011,11 @@ server.registerTool(
         WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
       `).get(staleAge, ...baseParams);
 
+      // Count pending-purge items (compressed_into = -2, marked by idle cleanup)
+      const pendingPurge = db.prepare(`
+        SELECT COUNT(*) as count FROM observations WHERE compressed_into = -2 ${projectFilter}
+      `).get(...baseParams);
+
       const lines = [
         `Memory maintenance scan:`,
         `  Total active observations: ${stats.total}`,
@@ -1065,6 +1023,7 @@ server.registerTool(
         `  Stale (>30d, imp=1, no access): ${stats.stale}`,
         `  Broken (no title/narrative): ${stats.broken}`,
         `  Boostable (accessed>3, imp<3): ${stats.boostable}`,
+        `  Pending purge (idle-marked): ${pendingPurge.count}`,
       ];
       if (duplicates.length > 0) {
         lines.push('', 'Top duplicates:');
@@ -1125,6 +1084,18 @@ server.registerTool(
             totalMerged += removeIds.length;
           }
           results.push(`Merged ${totalMerged} duplicate observations`);
+        }
+
+        if (ops.includes('purge_stale')) {
+          // Delete observations previously marked as pending-purge (compressed_into = -2)
+          // by idle cleanup. Requires user confirmation via /mem:update or /mem:mem.
+          const retainDays = args.retain_days || 30;
+          const retainCutoff = Date.now() - retainDays * 86400000;
+          const purged = db.prepare(`
+            DELETE FROM observations
+            WHERE compressed_into = -2 AND created_at_epoch < ? ${projectFilter}
+          `).run(retainCutoff, ...baseParams);
+          results.push(`Purged ${purged.changes} stale observations (retained last ${retainDays} days)`);
         }
       })();
 
@@ -1258,21 +1229,21 @@ const idleTimer = setInterval(() => {
     const thirtyDaysAgo = Date.now() - 30 * 86400000;
 
     db.transaction(() => {
-      // Delete old low-quality observations (importance<=1, never accessed, 30+ days).
+      // Mark old low-quality observations as pending-purge (importance<=1, never accessed, 30+ days).
+      // compressed_into = -2 is a sentinel meaning "pending user-confirmed purge".
+      // Actual deletion only happens when user confirms via mem_maintain execute purge_stale.
       // NOTE: no project filter — MCP server is global, operates across all projects.
-      // This is intentionally broader than hook.mjs auto-compress (which scopes to current project).
-      const deleted = db.prepare(`
-        DELETE FROM observations
+      const marked = db.prepare(`
+        UPDATE observations SET compressed_into = -2
         WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
           AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
       `).run(thirtyDaysAgo);
-      if (deleted.changes > 0) {
-        debugLog('INFO', 'idle-cleanup', `Deleted ${deleted.changes} stale low-quality observations`);
+      if (marked.changes > 0) {
+        debugLog('INFO', 'idle-cleanup', `Marked ${marked.changes} stale observations as pending-purge`);
       }
 
       // Mark old importance=1 as compressed (30+ days)
-      // NOTE: compressed_into = -1 is an established sentinel meaning "auto-compressed without merge target"
-      // (same pattern used in hook.mjs:456 for time-based compression)
+      // compressed_into = -1 is an established sentinel meaning "auto-compressed without merge target"
       const compressed = db.prepare(`
         UPDATE observations SET compressed_into = -1
         WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1

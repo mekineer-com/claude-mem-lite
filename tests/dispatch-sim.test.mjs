@@ -660,9 +660,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       // Then: user_prompt for same intent — should not recommend same resource
       const result = await dispatchOnUserPrompt(db, 'add tests for the login', 'sim-double');
       // Either null (same resource deduped) or a different resource
-      if (result) {
-        expect(result).not.toContain('superpowers-tdd');
-      }
+      expect(result === null || !result.includes('superpowers-tdd')).toBe(true);
     });
   });
 
@@ -722,10 +720,8 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       expect(r1).toBeTruthy();
       // Same session, same prompt → blocked
       const r2 = await dispatchOnSessionStart(db, 'write tests', 'same-sess', { hasHandoff: true });
-      // r2 should be different resource or null
-      if (r2) {
-        expect(r2).not.toBe(r1);
-      }
+      // r2 is either null (dedup blocked) or a different resource
+      expect(r2 === null || r2 !== r1).toBe(true);
     });
 
     it('same resource blocked across sessions within cooldown', async () => {
@@ -734,10 +730,8 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       // Session 2 (different session, but within 60min cooldown)
       const r2 = await dispatchOnSessionStart(db, 'write tests', 'sess-b', { hasHandoff: true });
       // Should either return different resource or null (cooldown blocks same resource)
-      if (r2) {
-        // The top result might be different if cooldown blocks the first choice
-        expect(r2).toBeTruthy();
-      }
+      // r2 is either null (cooldown blocked) or a different resource
+      expect(r2 === null || typeof r2 === 'string').toBe(true);
     });
 
     it('session cap enforced across different intents', async () => {
@@ -835,7 +829,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       // Turn 1: User starts with planning
       const r1 = await dispatchOnSessionStart(db, 'I need to plan the new auth system architecture', session, { hasHandoff: true });
       turns.push({ prompt: 'plan auth architecture', result: r1 });
-      if (r1) expect(r1).toContain('[Auto-suggestion]');
+      expect(r1 === null || r1.includes('[Auto-suggestion]')).toBe(true);
 
       // Turn 2: User starts coding — triggers pre-tool-use
       const r2 = await dispatchOnPreToolUse(db,
