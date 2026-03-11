@@ -454,7 +454,7 @@ async function handleSessionStart() {
         WHERE status = 'active' AND started_at_epoch < ?
       `).run(staleSessionCutoff);
 
-      // Auto-compress: mark old low-importance observations as compressed (90+ days, importance=1)
+      // Auto-compress: mark old low-importance observations as compressed (30+ days, importance=1)
       // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
       const compressed = db.prepare(`
         UPDATE observations SET compressed_into = -1

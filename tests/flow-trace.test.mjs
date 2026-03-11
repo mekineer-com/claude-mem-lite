@@ -409,7 +409,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
 
       const inv = getSessionInvocations(db, 'session-7')[0];
       expect(inv.adopted).toBe(0);
-      expect(inv.outcome).toBe('success');
+      expect(inv.outcome).toBe('ignored');
       expect(inv.score).toBe(0);
     });
 
@@ -423,7 +423,9 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       await collectFeedback(db, 'session-8', toolEvents);
 
       const inv = getSessionInvocations(db, 'session-8')[0];
-      expect(inv.outcome).toBe('failure');
+      // Non-adopted resource → outcome is 'ignored' (not 'failure'), since outcome
+      // detection is only meaningful for adopted resources
+      expect(inv.outcome).toBe('ignored');
     });
 
     it('partial outcome when error then fix attempt', async () => {

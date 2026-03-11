@@ -1217,7 +1217,7 @@ async function install() {
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
-    'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
+    'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-workflow.mjs',
   ];
 
   if (IS_DEV) {
