@@ -180,6 +180,20 @@ export function readAndClearToolEvents() {
 }
 
 /**
+ * Read tracked tool events WITHOUT clearing the file.
+ * Used by dispatch to detect active suites mid-session.
+ * @returns {object[]} Array of tool event objects
+ */
+export function peekToolEvents() {
+  try {
+    const raw = readFileSync(toolEventsFile(), 'utf8');
+    return raw.trim().split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+  } catch { return []; }
+}
+
+/**
  * Extract partial response from CLI error output (timeout/error recovery).
  * @param {Error} error The caught error from execFileSync
  * @returns {string|null} Extracted JSON string or null
