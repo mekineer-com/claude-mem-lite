@@ -5,9 +5,11 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch } from './utils.mjs';
-import { ensureDb, DB_PATH } from './schema.mjs';
+import { ensureDb, DB_PATH, DB_DIR } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
-import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema } from './tool-schemas.mjs';
+import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
+import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { join } from 'path';
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -33,6 +35,22 @@ try {
 }
 // Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');
+
+// ─── Registry Database (lazy-loaded on first mem_registry call) ─────────────
+
+const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
+let registryDb = null;
+
+function getRegistryDb() {
+  if (registryDb) return registryDb;
+  try {
+    registryDb = ensureRegistryDb(REGISTRY_DB_PATH);
+    registryDb.pragma('busy_timeout = 3000');
+  } catch (e) {
+    debugLog('WARN', 'server', `Registry DB not available: ${e.message}`);
+  }
+  return registryDb;
+}
 
 // inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate, fmtDate imported from utils.mjs
 
@@ -977,6 +995,245 @@ server.registerTool(
   })
 );
 
+// ─── Tool: mem_maintain ──────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_maintain',
+  {
+    description: 'Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/decay/boost/dedup operations.',
+    inputSchema: memMaintainSchema,
+  },
+  safeHandler(async (args) => {
+    const STALE_AGE_MS = 30 * 86400000;
+    const SIMILARITY_THRESHOLD = 0.7;
+    const SCAN_LIMIT = 500;
+    const DUPLICATE_LIMIT = 50;
+    const DUPLICATE_DISPLAY = 15;
+
+    const action = args.action;
+    const project = args.project;
+    const projectFilter = project ? 'AND project = ?' : '';
+    const baseParams = project ? [project] : [];
+
+    if (action === 'scan') {
+      // 1. Find near-duplicate titles (pre-compute word sets, then O(n²) Jaccard)
+      const recent = db.prepare(`
+        SELECT id, title, project, importance, access_count, created_at_epoch
+        FROM observations
+        WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
+        ORDER BY created_at_epoch DESC
+        LIMIT ${SCAN_LIMIT}
+      `).all(...baseParams);
+
+      const wordSets = recent.map(r => new Set((r.title || '').toLowerCase().split(/\s+/).filter(w => w.length > 2)));
+      const duplicates = [];
+      for (let i = 0; i < recent.length && duplicates.length < DUPLICATE_LIMIT; i++) {
+        if (wordSets[i].size === 0) continue;
+        for (let j = i + 1; j < recent.length; j++) {
+          if (wordSets[j].size === 0) continue;
+          const sim = jaccardSimilarity(wordSets[i], wordSets[j]);
+          if (sim > SIMILARITY_THRESHOLD) {
+            duplicates.push({
+              a: { id: recent[i].id, title: recent[i].title, importance: recent[i].importance },
+              b: { id: recent[j].id, title: recent[j].title, importance: recent[j].importance },
+              similarity: sim.toFixed(2),
+            });
+          }
+          if (duplicates.length >= DUPLICATE_LIMIT) break;
+        }
+      }
+
+      // 2. Consolidated stats query (single table scan instead of 4 separate COUNTs)
+      const staleAge = Date.now() - STALE_AGE_MS;
+      const stats = db.prepare(`
+        SELECT
+          COUNT(*) as total,
+          SUM(CASE WHEN COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
+                        AND created_at_epoch < ? THEN 1 ELSE 0 END) as stale,
+          SUM(CASE WHEN (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
+                   THEN 1 ELSE 0 END) as broken,
+          SUM(CASE WHEN COALESCE(access_count, 0) > 3 AND COALESCE(importance, 1) < 3
+                   THEN 1 ELSE 0 END) as boostable
+        FROM observations
+        WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
+      `).get(staleAge, ...baseParams);
+
+      const lines = [
+        `Memory maintenance scan:`,
+        `  Total active observations: ${stats.total}`,
+        `  Near-duplicate pairs: ${duplicates.length}`,
+        `  Stale (>30d, imp=1, no access): ${stats.stale}`,
+        `  Broken (no title/narrative): ${stats.broken}`,
+        `  Boostable (accessed>3, imp<3): ${stats.boostable}`,
+      ];
+      if (duplicates.length > 0) {
+        lines.push('', 'Top duplicates:');
+        for (const d of duplicates.slice(0, DUPLICATE_DISPLAY)) {
+          lines.push(`  [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`);
+        }
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    if (action === 'execute') {
+      const ops = args.operations || [];
+      const results = [];
+      const staleAge = Date.now() - STALE_AGE_MS;
+
+      db.transaction(() => {
+        if (ops.includes('cleanup')) {
+          const deleted = db.prepare(`
+            DELETE FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND (title IS NULL OR title = '')
+              AND (narrative IS NULL OR narrative = '')
+              ${projectFilter}
+          `).run(...baseParams);
+          results.push(`Cleaned up ${deleted.changes} broken observations`);
+        }
+
+        if (ops.includes('decay')) {
+          const decayed = db.prepare(`
+            UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND COALESCE(importance, 1) > 1
+              AND COALESCE(access_count, 0) = 0
+              AND created_at_epoch < ?
+              ${projectFilter}
+          `).run(staleAge, ...baseParams);
+          results.push(`Decayed ${decayed.changes} stale observations`);
+        }
+
+        if (ops.includes('boost')) {
+          const boosted = db.prepare(`
+            UPDATE observations SET importance = MIN(3, COALESCE(importance, 1) + 1)
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND COALESCE(access_count, 0) > 3
+              AND COALESCE(importance, 1) < 3
+              ${projectFilter}
+          `).run(...baseParams);
+          results.push(`Boosted ${boosted.changes} frequently-accessed observations`);
+        }
+
+        if (ops.includes('dedup') && args.merge_ids) {
+          let totalMerged = 0;
+          const mergeStmt = db.prepare('UPDATE observations SET compressed_into = ? WHERE id = ? AND COALESCE(compressed_into, 0) = 0');
+          for (const group of args.merge_ids) {
+            if (group.length < 2) continue;
+            const [keepId, ...removeIds] = group;
+            for (const removeId of removeIds) mergeStmt.run(keepId, removeId);
+            totalMerged += removeIds.length;
+          }
+          results.push(`Merged ${totalMerged} duplicate observations`);
+        }
+      })();
+
+      // FTS5 optimize (outside transaction)
+      db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");
+      results.push('FTS5 index optimized');
+
+      return { content: [{ type: 'text', text: results.join('\n') }] };
+    }
+
+    return { content: [{ type: 'text', text: `Unknown action: ${action}. Use "scan" or "execute".` }], isError: true };
+  })
+);
+
+// ─── Tool: mem_registry ─────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_registry',
+  {
+    description: 'Manage tool resource registry: list resources, view stats, import/remove tools, reindex FTS5.',
+    inputSchema: memRegistrySchema,
+  },
+  safeHandler(async (args) => {
+    const rdb = getRegistryDb();
+    if (!rdb) {
+      return { content: [{ type: 'text', text: 'Registry DB not available. Run install first.' }], isError: true };
+    }
+
+    const action = args.action;
+
+    if (action === 'list') {
+      const typeFilter = args.type;
+      const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
+      const params = typeFilter ? [typeFilter, 'active'] : ['active'];
+      const resources = rdb.prepare(`
+        SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
+        FROM resources ${where} ORDER BY type, name
+      `).all(...params);
+
+      if (resources.length === 0) return { content: [{ type: 'text', text: 'No resources found.' }] };
+
+      const lines = resources.map(r =>
+        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 60)}`
+      );
+      return { content: [{ type: 'text', text: `Resources (${resources.length}):\n${lines.join('\n')}` }] };
+    }
+
+    if (action === 'stats') {
+      const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
+      const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
+      const topAdopted = rdb.prepare(`
+        SELECT name, type, adopt_count, recommend_count
+        FROM resources WHERE status = ? AND adopt_count > 0
+        ORDER BY adopt_count DESC LIMIT 10
+      `).all('active');
+      const zeroAdopt = rdb.prepare(`
+        SELECT COUNT(*) as c FROM resources
+        WHERE status = ? AND recommend_count > 0 AND adopt_count = 0
+      `).get('active');
+      const userAdded = rdb.prepare(`
+        SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'
+      `).get('active');
+
+      const lines = [
+        `Registry Stats:`,
+        `  Total active: ${total.c}`,
+        ...byType.map(t => `  ${t.type}: ${t.c}`),
+        `  User-added: ${userAdded.c}`,
+        `  Zero adoption (recommended but never adopted): ${zeroAdopt.c}`,
+      ];
+      if (topAdopted.length > 0) {
+        lines.push('', 'Top adopted:');
+        for (const r of topAdopted) {
+          lines.push(`  ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
+        }
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    if (action === 'import') {
+      if (!args.name || !args.resource_type) {
+        return { content: [{ type: 'text', text: 'import requires name and resource_type' }], isError: true };
+      }
+      const IMPORT_STRING_FIELDS = ['repo_url', 'local_path', 'invocation_name', 'intent_tags',
+        'domain_tags', 'trigger_patterns', 'capability_summary', 'keywords', 'tech_stack', 'use_cases'];
+      const fields = { name: args.name, type: args.resource_type, status: 'active', source: args.source || 'user' };
+      for (const f of IMPORT_STRING_FIELDS) fields[f] = args[f] || '';
+      const id = upsertResource(rdb, fields);
+      return { content: [{ type: 'text', text: `Imported: ${args.resource_type}:${args.name} (id=${id})` }] };
+    }
+
+    if (action === 'remove') {
+      if (!args.name || !args.resource_type) {
+        return { content: [{ type: 'text', text: 'remove requires name and resource_type' }], isError: true };
+      }
+      const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(args.resource_type, args.name);
+      return { content: [{ type: 'text', text: result.changes > 0 ? `Removed: ${args.resource_type}:${args.name}` : 'Not found.' }] };
+    }
+
+    if (action === 'reindex') {
+      rdb.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
+      const count = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
+      return { content: [{ type: 'text', text: `FTS5 reindexed. ${count.c} active resources.` }] };
+    }
+
+    return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: list, stats, import, remove, reindex` }], isError: true };
+  })
+);
+
 // ─── WAL Checkpoint (periodic) ───────────────────────────────────────────────
 
 // Checkpoint WAL every 5 minutes to prevent unbounded growth
@@ -1042,6 +1299,7 @@ function shutdown(exitCode = 0) {
   clearInterval(idleTimer);
   try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch {}
   try { db.close(); } catch {}
+  try { if (registryDb) registryDb.close(); } catch {}
   process.exit(exitCode);
 }
 process.on('SIGINT', () => shutdown(0));

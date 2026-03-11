@@ -54,3 +54,30 @@ export const memCompressSchema = {
   age_days: z.number().int().min(30).max(365).optional().describe('Min age in days (default: 60)'),
   project: z.string().optional().describe('Filter by project'),
 };
+
+export const memMaintainSchema = {
+  action: z.enum(['scan', 'execute']).describe('scan=analyze candidates, execute=apply changes'),
+  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost'])).optional()
+    .describe('Operations to execute (for action=execute)'),
+  merge_ids: z.array(z.array(z.number().int()).min(2)).optional()
+    .describe('For dedup: [[keepId, removeId1, removeId2], ...] — first ID in each group is kept'),
+  project: z.string().optional().describe('Filter by project'),
+};
+
+export const memRegistrySchema = {
+  action: z.enum(['list', 'stats', 'import', 'remove', 'reindex']).describe('Registry operation'),
+  type: z.enum(['skill', 'agent']).optional().describe('Filter by resource type (for list)'),
+  name: z.string().optional().describe('Resource name (for import/remove)'),
+  resource_type: z.enum(['skill', 'agent']).optional().describe('Resource type (for import/remove)'),
+  source: z.enum(['preinstalled', 'user']).optional().describe('Source (for import, default: user)'),
+  repo_url: z.string().optional().describe('GitHub repository URL (for import)'),
+  local_path: z.string().optional().describe('Local file path (for import)'),
+  invocation_name: z.string().optional().describe('Invocation name like "plugin:skill" (for import)'),
+  intent_tags: z.string().optional().describe('Comma-separated intent tags (for import)'),
+  domain_tags: z.string().optional().describe('Comma-separated domain/tech tags (for import)'),
+  trigger_patterns: z.string().optional().describe('When to recommend this tool (for import)'),
+  capability_summary: z.string().optional().describe('What this tool does (for import)'),
+  keywords: z.string().optional().describe('Search keywords (for import)'),
+  tech_stack: z.string().optional().describe('Technology stack tags (for import)'),
+  use_cases: z.string().optional().describe('Usage scenarios (for import)'),
+};

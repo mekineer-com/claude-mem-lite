@@ -564,6 +564,27 @@ const RESOURCE_METADATA = {
     capability_summary: 'Autonomous skill extraction and continuous learning from Claude Code work sessions',
     trigger_patterns: 'when user wants to extract reusable skills from work sessions or enable continuous learning',
   },
+  'skill:mem-memory': {
+    intent_tags: 'memory,save,store,remember,note,record,persist,auto-save',
+    domain_tags: 'memory,ai,claude',
+    capability_summary: 'Save content to memory — with explicit content, instructions, or auto-summarize current session',
+    trigger_patterns: 'when user wants to save something to memory or auto-save session highlights',
+    invocation_name: 'claude-mem-lite:memory',
+  },
+  'skill:mem-update': {
+    intent_tags: 'maintenance,cleanup,deduplicate,decay,optimize,reindex,health',
+    domain_tags: 'memory,registry,maintenance',
+    capability_summary: 'Auto-maintain memory and resource registry — deduplicate, merge, decay, cleanup, reindex',
+    trigger_patterns: 'when user wants to clean up memory database or maintain the tool registry',
+    invocation_name: 'claude-mem-lite:update',
+  },
+  'skill:mem-tools': {
+    intent_tags: 'import,tools,github,skills,agents,registry,add,discover',
+    domain_tags: 'memory,registry,github,tools',
+    capability_summary: 'Import skills and agents from GitHub repositories into the tool resource registry',
+    trigger_patterns: 'when user wants to import or add new skills and agents from GitHub to the tool registry',
+    invocation_name: 'claude-mem-lite:tools',
+  },
   'skill:anthropic-architect': {
     intent_tags: 'anthropic,architecture,system-design,claude,patterns,best-practices',
     domain_tags: 'anthropic,architecture,ai',

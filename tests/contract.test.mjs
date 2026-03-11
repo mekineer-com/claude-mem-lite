@@ -9,6 +9,8 @@ import {
   memSaveSchema,
   memStatsSchema,
   memCompressSchema,
+  memMaintainSchema,
+  memRegistrySchema,
 } from '../tool-schemas.mjs';
 
 // Helper: parse object against schema (Zod object from flat dict)
@@ -221,6 +223,83 @@ describe('mem_compress schema', () => {
 
   it('rejects age_days above maximum', () => {
     expect(parseSchema(memCompressSchema, { age_days: 366 }).success).toBe(false);
+  });
+});
+
+// ─── mem_maintain schema ─────────────────────────────────────────────────────
+
+describe('mem_maintain schema', () => {
+  it('accepts scan action', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'scan' }).success).toBe(true);
+  });
+
+  it('accepts scan with project filter', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'scan', project: 'my-project' }).success).toBe(true);
+  });
+
+  it('accepts execute with operations', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'execute', operations: ['cleanup', 'decay', 'boost'] }).success).toBe(true);
+  });
+
+  it('accepts execute with dedup and merge_ids', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'execute', operations: ['dedup'], merge_ids: [[1, 2, 3], [4, 5]] }).success).toBe(true);
+  });
+
+  it('rejects invalid action', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'invalid' }).success).toBe(false);
+  });
+
+  it('rejects invalid operation', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'execute', operations: ['invalid'] }).success).toBe(false);
+  });
+
+  it('rejects merge_ids with single element group', () => {
+    expect(parseSchema(memMaintainSchema, { action: 'execute', operations: ['dedup'], merge_ids: [[1]] }).success).toBe(false);
+  });
+});
+
+// ─── mem_registry schema ────────────────────────────────────────────────────
+
+describe('mem_registry schema', () => {
+  it('accepts list action', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'list' }).success).toBe(true);
+  });
+
+  it('accepts list with type filter', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'list', type: 'skill' }).success).toBe(true);
+  });
+
+  it('accepts stats action', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'stats' }).success).toBe(true);
+  });
+
+  it('accepts import with full metadata', () => {
+    expect(parseSchema(memRegistrySchema, {
+      action: 'import',
+      name: 'my-tool',
+      resource_type: 'skill',
+      repo_url: 'https://github.com/user/repo',
+      intent_tags: 'test,debug',
+      domain_tags: 'javascript',
+      capability_summary: 'A testing tool',
+      trigger_patterns: 'when user wants to test',
+    }).success).toBe(true);
+  });
+
+  it('accepts remove action', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'remove', name: 'old-tool', resource_type: 'agent' }).success).toBe(true);
+  });
+
+  it('accepts reindex action', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'reindex' }).success).toBe(true);
+  });
+
+  it('rejects invalid action', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'invalid' }).success).toBe(false);
+  });
+
+  it('rejects invalid resource_type', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'import', name: 'x', resource_type: 'invalid' }).success).toBe(false);
   });
 });
 
