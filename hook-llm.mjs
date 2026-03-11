@@ -267,7 +267,7 @@ Error: ${e.isError ? 'yes' : 'no'}
 
 JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1}
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
+importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   } else {
     const actionList = episode.entries.map((e, i) =>
       `${i + 1}. [${e.tool}] ${e.desc}${e.isError ? ' (ERROR)' : ''}`
@@ -282,7 +282,7 @@ ${actionList}
 
 JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1}
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
+importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
   }
 
   const ruleImportance = computeRuleImportance(episode);
@@ -301,6 +301,21 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
     }
 
     if (parsed && parsed.title) {
+      // Discard if LLM judges observation has no learning value
+      if (parsed.importance === 0 || parsed.importance === '0') {
+        debugLog('DEBUG', 'llm-episode', `Discarded low-value observation: ${parsed.title}`);
+        // If pre-saved, delete it too
+        if (episode.savedId) {
+          const ddb = openDb();
+          if (ddb) {
+            try { ddb.prepare('DELETE FROM observations WHERE id = ?').run(episode.savedId); }
+            finally { ddb.close(); }
+          }
+        }
+        try { unlinkSync(tmpFile); } catch {}
+        return;
+      }
+
       obs = {
         type: validTypes.has(parsed.type) ? parsed.type : 'change',
         title: truncate(parsed.title, 120),

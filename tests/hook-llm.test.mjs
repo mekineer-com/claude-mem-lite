@@ -467,6 +467,67 @@ describe('handleLLMEpisode', () => {
     const allObs = db.prepare('SELECT COUNT(*) as c FROM observations WHERE memory_session_id = ?').get('ep-sess');
     expect(allObs.c).toBe(1);
   });
+
+  it('discards observation when LLM returns importance=0', async () => {
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'discovery',
+      title: 'Browsed some files',
+      narrative: 'Just looking around',
+      concepts: [],
+      facts: [],
+      importance: 0,
+    }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['readme.md'], filesRead: ['readme.md'],
+      entries: [{ tool: 'Read', desc: 'Read readme.md', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
+    expect(obs.length).toBe(0);
+  });
+
+  it('discards and deletes pre-saved observation when LLM returns importance=0', async () => {
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+    const preSavedId = saveObservation(
+      { type: 'discovery', title: 'Read readme.md', narrative: 'Browsing', importance: 1 },
+      'test-proj', 'ep-sess', db
+    );
+    expect(preSavedId).toBeGreaterThan(0);
+
+    // The discard path calls openDb() to get a DB handle for deleting the pre-saved obs.
+    // We return a wrapper around our test db that tracks close() but doesn't actually close.
+    const deleteDbProxy = { ...db, close: vi.fn(), prepare: (...a) => db.prepare(...a) };
+    openDb.mockReturnValueOnce(deleteDbProxy);
+
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'discovery',
+      title: 'Read readme.md',
+      narrative: 'Browsing',
+      concepts: [],
+      facts: [],
+      importance: 0,
+    }));
+
+    writeFileSync(tmpFile, JSON.stringify({
+      sessionId: 'ep-sess', project: 'test-proj',
+      savedId: preSavedId,
+      files: ['readme.md'], filesRead: ['readme.md'],
+      entries: [{ tool: 'Read', desc: 'Read readme.md', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    // The pre-saved observation should be deleted
+    const deleted = db.prepare('SELECT * FROM observations WHERE id = ?').get(preSavedId);
+    expect(deleted).toBeUndefined();
+    // The delete DB handle should have been closed
+    expect(deleteDbProxy.close).toHaveBeenCalled();
+  });
 });
 
 // ─── handleLLMSummary ────────────────────────────────────────────────────────
