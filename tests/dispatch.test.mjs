@@ -105,7 +105,7 @@ function createRegistryDb() {
       tier          INTEGER CHECK(tier IN (1,2,3)),
       recommended   INTEGER DEFAULT 1,
       adopted       INTEGER DEFAULT 0,
-      outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped',NULL)),
+      outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored',NULL)),
       score         REAL,
       created_at    TEXT DEFAULT (datetime('now'))
     );
@@ -842,10 +842,10 @@ describe('dispatch-feedback.mjs', () => {
       recommended: 1,
     });
 
-    // No session events → outcome = skipped
+    // No session events → not adopted → outcome = ignored
     await collectFeedback(db, 'sess-test', []);
     const inv = db.prepare('SELECT * FROM invocations WHERE session_id = ?').get('sess-test');
-    expect(inv.outcome).toBe('skipped');
+    expect(inv.outcome).toBe('ignored');
     expect(inv.adopted).toBe(0);
   });
 
@@ -891,7 +891,7 @@ describe('dispatch-feedback.mjs', () => {
   });
 
   it('detects failure outcome from error events', async () => {
-    const id = seedResource(db);
+    const id = seedResource(db, { name: 'fail-skill', type: 'skill' });
     recordInvocation(db, {
       resource_id: id,
       session_id: 'sess-fail',
@@ -901,6 +901,7 @@ describe('dispatch-feedback.mjs', () => {
     });
 
     const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'fail-skill' } },
       { tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_response: 'Error: test failed with exception' },
     ];
 
@@ -910,7 +911,7 @@ describe('dispatch-feedback.mjs', () => {
   });
 
   it('handles partial outcome (error then fix)', async () => {
-    const id = seedResource(db);
+    const id = seedResource(db, { name: 'partial-skill', type: 'skill' });
     recordInvocation(db, {
       resource_id: id,
       session_id: 'sess-partial',
@@ -920,6 +921,7 @@ describe('dispatch-feedback.mjs', () => {
     });
 
     const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'partial-skill' } },
       { tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_response: 'Error: test failed with exception blah' },
       { tool_name: 'Edit', tool_input: { file_path: '/fix.js' } },
     ];
@@ -986,6 +988,21 @@ describe('dispatch-feedback.mjs', () => {
     expect(second.outcome).toBe('success');
     expect(second.adopted).toBe(1);
     expect(second.score).toBe(1.0);
+  });
+
+  it('non-adopted recommendations get outcome=ignored and score=0', async () => {
+    const resId = seedResource(db, { name: 'unused-skill', intent_tags: 'deploy' });
+    recordInvocation(db, { resource_id: resId, session_id: 'sess-ignored', trigger: 'user_prompt', tier: 2 });
+
+    const events = [
+      { tool_name: 'Edit', tool_input: { file_path: 'foo.js' }, tool_response: '' },
+    ];
+    await collectFeedback(db, 'sess-ignored', events);
+
+    const inv = db.prepare('SELECT * FROM invocations WHERE session_id = ?').get('sess-ignored');
+    expect(inv.adopted).toBe(0);
+    expect(inv.outcome).toBe('ignored');
+    expect(inv.score).toBe(0);
   });
 
   describe('behavioral adoption detection', () => {

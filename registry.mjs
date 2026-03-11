@@ -104,7 +104,7 @@ const INVOCATIONS_SCHEMA = `
     tier          INTEGER CHECK(tier IN (1,2,3)),
     recommended   INTEGER DEFAULT 1,
     adopted       INTEGER DEFAULT 0,
-    outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped',NULL)),
+    outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored',NULL)),
     score         REAL,
     created_at    TEXT DEFAULT (datetime('now'))
   );
@@ -191,6 +191,24 @@ export function ensureRegistryDb(dbPath) {
       })();
     }
   } catch (e) { debugCatch(e, 'ensureRegistryDb-migration'); }
+
+  // Migrate invocations CHECK constraint: add 'ignored' outcome value
+  try {
+    const schema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='invocations'`).get();
+    if (schema?.sql && !schema.sql.includes("'ignored'")) {
+      db.transaction(() => {
+        const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='invocations_old'`).get();
+        if (hasOld) db.exec(`DROP TABLE invocations_old`);
+        db.exec(`ALTER TABLE invocations RENAME TO invocations_old`);
+        db.exec(INVOCATIONS_SCHEMA);
+        db.exec(`INSERT INTO invocations
+          (id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+          SELECT id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at
+          FROM invocations_old`);
+        db.exec(`DROP TABLE invocations_old`);
+      })();
+    }
+  } catch (e) { debugCatch(e, 'ensureRegistryDb-ignored-migration'); }
 
   db.exec(PREINSTALLED_SCHEMA);
 

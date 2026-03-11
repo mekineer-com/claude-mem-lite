@@ -183,13 +183,12 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
     const invocations = getSessionInvocations(db, sessionId);
     if (invocations.length === 0) return;
 
-    const outcome = detectOutcome(sessionEvents);
-
     for (const inv of invocations) {
       // Skip if already collected (prevents double-collection from stop + session-start)
       if (inv.outcome) continue;
 
       const adopted = detectAdoption(inv, sessionEvents);
+      const outcome = adopted ? detectOutcome(sessionEvents) : 'ignored';
       const score = adopted ? (outcome === 'success' ? 1.0 : outcome === 'partial' ? 0.5 : 0.2) : 0;
 
       // Update invocation record
