@@ -95,6 +95,7 @@
 - **探索奖励** -- 注册表中的新资源在复合排名中获得公平机会；高推荐零采纳的"僵尸"资源被惩罚
 - **LLM 并发控制** -- 基于文件的信号量将后台 worker 限制为 2 个并发 LLM 调用，防止资源争用
 - **stdin 溢出保护** -- Hook 输入在 256KB 处截断，对超大工具输出使用正则挽救关键信息
+- **跨会话交接** -- 在 `/clear` 或 `/exit` 时捕获会话状态（请求、已完成工作、后续步骤、关键文件），下次会话检测到继续意图时自动注入上下文（支持显式关键词和 FTS5 术语重叠匹配）
 
 ## 平台支持
 
@@ -224,7 +225,7 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 
 ## 数据库结构
 
-四张核心表 + FTS5 虚拟表用于搜索：
+五张核心表 + FTS5 虚拟表用于搜索：
 
 **observations** -- 单条编码观察（决策、bug修复、功能等）
 ```
@@ -250,6 +251,12 @@ started_at, completed_at, status, prompt_counter
 id, content_session_id, prompt_text, prompt_number
 ```
 
+**session_handoffs** -- 跨会话交接快照（UPSERT，每个项目最多 2 行）
+```
+project, type, session_id, working_on, completed, unfinished,
+key_files, key_decisions, match_keywords, created_at_epoch
+```
+
 FTS5 索引：`observations_fts`、`session_summaries_fts`、`user_prompts_fts`
 
 ## 工作原理
@@ -258,7 +265,7 @@ FTS5 索引：`observations_fts`、`session_summaries_fts`、`user_prompts_fts`
 
 ```
 SessionStart
-  -> 生成会话 ID
+  -> 生成会话 ID（/clear 时保存交接快照）
   -> 标记过期会话（活跃 >24h）为 abandoned
   -> 清理孤儿/过期锁文件
   -> 查询最近观察（24 小时内）
@@ -281,11 +288,13 @@ PreToolUse（工具执行前）
 UserPromptSubmit
   -> 捕获用户提示文本到 user_prompts 表
   -> 递增会话提示计数器
+  -> 交接：检测继续意图 → 注入上一次会话上下文
   -> 调度：根据用户实际提示推荐 skill/agent（Tier 0→1→2）
   -> 主要调度触发点 — 用户意图在此最为明确
 
 Stop
   -> 刷新最终 episode 缓冲区
+  -> 保存交接快照（/exit 时）
   -> 收集调度反馈：采纳检测 + 结果评分
   -> 标记会话为已完成
   -> 启动 LLM 摘要 worker（轮询等待）
@@ -419,6 +428,7 @@ claude-mem-lite/
   hook.mjs             # Claude Code 钩子：episode 捕获、错误回忆、会话管理
   hook-llm.mjs         # 后台 LLM worker：episode 提取、会话摘要
   hook-shared.mjs      # 共享钩子基础设施：会话管理、数据库访问、LLM 调用
+  hook-handoff.mjs     # 跨会话交接：状态提取、意图检测、上下文注入
   hook-context.mjs     # CLAUDE.md 上下文注入与 token 预算
   hook-episode.mjs     # Episode 缓冲区管理：原子写入、待处理条目合并
   hook-semaphore.mjs   # LLM 并发控制：基于文件的信号量
@@ -444,7 +454,7 @@ claude-mem-lite/
     convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
     index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）
-  tests/               # 单元、属性、集成、契约、E2E、管线测试（581 个）
+  tests/               # 单元、属性、集成、契约、E2E、管线测试（789 个）
   benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
 
@@ -466,7 +476,7 @@ claude-mem-lite/
 
 ```bash
 npm run lint              # ESLint 静态分析
-npm test                  # 运行全部 581 个测试（vitest）
+npm test                  # 运行全部 789 个测试（vitest）
 npm run test:smoke        # 运行 5 个核心冒烟测试
 npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试

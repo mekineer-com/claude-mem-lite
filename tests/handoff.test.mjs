@@ -269,15 +269,18 @@ describe('buildAndSaveHandoff', () => {
     expect(row.match_keywords).toContain('hook');
   });
 
-  it('falls back to bugfix titles for unfinished when no episode snapshot', () => {
+  it('falls back to most recent bugfix for unfinished when no episode snapshot', () => {
     seedSession(db, 's1', 'test-proj');
     seedPrompt(db, 's1', 'fix bugs', 1);
     seedObservation(db, 's1', 'test-proj', 'TypeError in dispatch', 'bugfix', 2, null);
+    seedObservation(db, 's1', 'test-proj', 'Fixed null pointer earlier', 'bugfix', 1, null);
 
     buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
 
     const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj'`).get();
+    // Only the most recent bugfix (first in DESC order) is used
     expect(row.unfinished).toContain('TypeError in dispatch');
+    expect(row.unfinished).not.toContain('Fixed null pointer');
   });
 });
 
@@ -314,6 +317,11 @@ describe('detectContinuationIntent', () => {
   it('rejects prompts with insufficient overlap (score < 3)', () => {
     // Only "handoff" matches = score 2 (specific term) → below threshold
     expect(detectContinuationIntent(db, 'what is a handoff?', 'test-proj')).toBe(false);
+  });
+
+  it('does not match "continue" as substring (e.g. "discontinued")', () => {
+    expect(detectContinuationIntent(db, 'the feature was discontinued', 'test-proj')).toBe(false);
+    expect(detectContinuationIntent(db, 'presumed to be working', 'test-proj')).toBe(false);
   });
 
   it('returns true for keyword match even without handoff in DB', () => {
@@ -394,5 +402,25 @@ describe('renderHandoffInjection', () => {
 
     const result = renderHandoffInjection(db, 'p');
     expect(result).toContain('age="2m"');
+  });
+
+  it('returns null for expired handoff', () => {
+    // clear handoff expired (> 1 hour)
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'clear', 's1', 'old work', ?)`).run(Date.now() - 4000000);
+    expect(renderHandoffInjection(db, 'p')).toBeNull();
+  });
+
+  it('returns null for expired exit handoff (> 7 days)', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 's1', 'old work', ?)`).run(Date.now() - 8 * 86400000);
+    expect(renderHandoffInjection(db, 'p')).toBeNull();
+  });
+
+  it('renders non-expired exit handoff', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 's1', 'recent work', ?)`).run(Date.now() - 3 * 86400000);
+    const result = renderHandoffInjection(db, 'p');
+    expect(result).toContain('recent work');
   });
 });

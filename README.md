@@ -95,6 +95,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Exploration bonus** -- New resources in the registry get a fair chance in composite ranking; zombie resources (high recommend, zero adopt) are penalized
 - **LLM concurrency control** -- File-based semaphore limits background workers to 2 concurrent LLM calls, preventing resource contention
 - **stdin overflow protection** -- Hook input truncated at 256KB with regex-based action salvage for oversized tool outputs
+- **Cross-session handoff** -- Captures session state (request, completed work, next steps, key files) on `/clear` or `/exit`, then injects context when the next session detects continuation intent via explicit keywords or FTS5 term overlap
 
 ## Platform Support
 
@@ -224,7 +225,7 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 
 ## Database Schema
 
-Four core tables with FTS5 virtual tables for search:
+Five core tables with FTS5 virtual tables for search:
 
 **observations** -- Individual coding observations (decisions, bugfixes, features, etc.)
 ```
@@ -250,6 +251,12 @@ started_at, completed_at, status, prompt_counter
 id, content_session_id, prompt_text, prompt_number
 ```
 
+**session_handoffs** -- Cross-session handoff snapshots (UPSERT, max 2 per project)
+```
+project, type, session_id, working_on, completed, unfinished,
+key_files, key_decisions, match_keywords, created_at_epoch
+```
+
 FTS5 indexes: `observations_fts`, `session_summaries_fts`, `user_prompts_fts`
 
 ## How It Works
@@ -258,7 +265,7 @@ FTS5 indexes: `observations_fts`, `session_summaries_fts`, `user_prompts_fts`
 
 ```
 SessionStart
-  -> Generate session ID
+  -> Generate session ID (or save handoff snapshot on /clear)
   -> Mark stale sessions (>24h active) as abandoned
   -> Clean orphaned/stale lock files
   -> Query recent observations (24h)
@@ -281,11 +288,13 @@ PreToolUse (before tool execution)
 UserPromptSubmit
   -> Capture user prompt text to user_prompts table
   -> Increment session prompt counter
+  -> Handoff: detect continuation intent → inject previous session context
   -> Dispatch: recommend skill/agent based on user's actual prompt (Tier 0→1→2)
   -> Primary dispatch point — user intent is clearest here
 
 Stop
   -> Flush final episode buffer
+  -> Save handoff snapshot (on /exit)
   -> Collect dispatch feedback: adoption detection + outcome scoring
   -> Mark session completed
   -> Spawn LLM summary worker (poll-based wait)
@@ -419,6 +428,7 @@ claude-mem-lite/
   hook.mjs             # Claude Code hooks: episode capture, error recall, session management
   hook-llm.mjs         # Background LLM workers: episode extraction, session summaries
   hook-shared.mjs      # Shared hook infrastructure: session management, DB access, LLM calls
+  hook-handoff.mjs     # Cross-session handoff: state extraction, intent detection, injection
   hook-context.mjs     # CLAUDE.md context injection and token budgeting
   hook-episode.mjs     # Episode buffer management: atomic writes, pending entry merging
   hook-semaphore.mjs   # LLM concurrency control: file-based semaphore for background workers
@@ -444,7 +454,7 @@ claude-mem-lite/
     convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
     index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
-  tests/               # Unit, property, integration, contract, E2E, pipeline tests (581 tests)
+  tests/               # Unit, property, integration, contract, E2E, pipeline tests (789 tests)
   benchmark/           # BM25 search quality benchmarks + CI gate
 ```
 
@@ -466,7 +476,7 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 
 ```bash
 npm run lint              # ESLint static analysis
-npm test                  # Run all 581 tests (vitest)
+npm test                  # Run all 789 tests (vitest)
 npm run test:smoke        # Run 5 core smoke tests
 npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
 npm run benchmark         # Run full search quality benchmark

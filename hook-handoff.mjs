@@ -42,10 +42,10 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       .map(e => e.desc);
     if (pendingDescs.length > 0) unfinished = pendingDescs.join('; ');
   }
-  // Also include recent errors as unfinished signals
-  const errors = completed.filter(o => o.type === 'bugfix');
-  if (errors.length > 0 && !unfinished) {
-    unfinished = errors.map(e => e.title).join('; ');
+  // Only the most recent bugfix is an "unfinished" signal (earlier ones are likely resolved)
+  if (!unfinished) {
+    const lastBugfix = completed.find(o => o.type === 'bugfix');
+    if (lastBugfix) unfinished = lastBugfix.title;
   }
 
   // 4. Key files — from episode snapshot + observations
@@ -154,6 +154,11 @@ export function renderHandoffInjection(db, project) {
     WHERE project = ? ORDER BY created_at_epoch DESC LIMIT 1
   `).get(project);
   if (!handoff) return null;
+
+  // Check expiry — don't render stale handoffs
+  const age = Date.now() - handoff.created_at_epoch;
+  const maxAge = handoff.type === 'clear' ? HANDOFF_EXPIRY_CLEAR : HANDOFF_EXPIRY_EXIT;
+  if (age > maxAge) return null;
 
   const ageSec = Math.round((Date.now() - handoff.created_at_epoch) / 1000);
   const ageStr = ageSec < 60 ? `${ageSec}s` :
