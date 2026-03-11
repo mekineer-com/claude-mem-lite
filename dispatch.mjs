@@ -10,8 +10,9 @@ import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYN
 import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { callHaikuJSON } from './haiku-client.mjs';
-import { debugCatch, truncate } from './utils.mjs';
+import { debugCatch, truncate, inferProject } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
+import { detectActiveSuite, shouldRecommendForStage, detectExplicitRequest, inferCurrentStage } from './dispatch-workflow.mjs';
 
 // Duplicated from hook-shared.mjs to avoid circular import (dispatch ← hook ← hook-shared)
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
@@ -27,6 +28,21 @@ const READ_ONLY_TOOLS = new Set([
 
 export const COOLDOWN_MINUTES = 60;
 export const SESSION_RECOMMEND_CAP = 3;
+
+// Minimum absolute BM25 composite score to recommend. Typical good matches score 5-50;
+// this filters only near-zero noise matches from incidental text overlap.
+export const BM25_MIN_THRESHOLD = 1.5;
+
+// Read tool events without clearing (duplicated from hook-shared.mjs to avoid circular import)
+function peekToolEvents() {
+  try {
+    const file = join(RUNTIME_DIR, `tool-events-${inferProject()}.jsonl`);
+    const raw = readFileSync(file, 'utf8');
+    return raw.trim().split('\n').filter(Boolean).map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean);
+  } catch { return []; }
+}
 
 // ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
 // Prevents cascading latency when Haiku API is down or slow.
@@ -691,7 +707,7 @@ function reRankByKeywords(results, rawKeywords) {
  * @param {object[]} results FTS5 results with recommend_count/adopt_count
  * @returns {object[]} Filtered results with decayed scores
  */
-function applyAdoptionDecay(results) {
+function applyAdoptionDecay(results, db) {
   return results.map(r => {
     const recs = r.recommend_count || 0;
     const adopts = r.adopt_count || 0;
@@ -699,14 +715,23 @@ function applyAdoptionDecay(results) {
 
     const rate = (adopts + 1) / (recs + 2); // Laplace smoothing
     let multiplier = 1.0;
-    if (recs > 100 && rate < 0.01) multiplier = 0;       // Block entirely
-    else if (recs > 50 && rate < 0.02) multiplier = 0.1;  // Heavy penalty
-    else if (recs > 20 && rate < 0.05) multiplier = 0.3;  // Light penalty
+    if (recs > 100 && rate < 0.01) multiplier = 0.05;   // Near-block but not permanent
+    else if (recs > 50 && rate < 0.02) multiplier = 0.15;
+    else if (recs > 20 && rate < 0.05) multiplier = 0.4;
 
-    if (multiplier === 0) return null;
+    // Recent rejection boost: extra penalty for resources rejected many times recently
+    if (db && multiplier < 1) {
+      try {
+        const recentRejects = db.prepare(
+          `SELECT COUNT(*) as cnt FROM invocations WHERE resource_id = ? AND adopted = 0 AND created_at > datetime('now', '-7 days')`
+        ).get(r.id)?.cnt || 0;
+        if (recentRejects >= 10) multiplier *= 0.3;
+        else if (recentRejects >= 5) multiplier *= 0.5;
+      } catch {}
+    }
+
+    if (multiplier < 0.01) return null;
     if (multiplier < 1) {
-      // Composite scores are negative (more negative = more relevant).
-      // To penalize: multiply by multiplier (<1) to make less negative (worse rank).
       return { ...r, composite_score: (r.composite_score ?? r.relevance) * multiplier, _decayed: true };
     }
     return r;
@@ -722,6 +747,15 @@ function applyAdoptionDecay(results) {
  * @returns {object[]} Filtered results that pass the gate
  */
 function passesConfidenceGate(results, signals) {
+  // BM25 absolute minimum: filter out weak text matches regardless of intent.
+  // Only apply when enough results exist (BM25 IDF is unreliable with < 3 matches).
+  if (results.length >= 3) {
+    results = results.filter(r => {
+      const score = Math.abs(r.composite_score ?? r.relevance);
+      return score >= BM25_MIN_THRESHOLD;
+    });
+  }
+
   // signals.intent is a comma-separated string (e.g. "test,fix"), not an array
   const intentTokens = typeof signals?.intent === 'string'
     ? signals.intent.split(',').filter(Boolean)
@@ -789,7 +823,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
     }
 
     results = reRankByKeywords(results, signals.rawKeywords);
-    results = applyAdoptionDecay(results);
+    results = applyAdoptionDecay(results, db);
     results = passesConfidenceGate(results, signals);
     results = results.slice(0, 3);
 
@@ -810,7 +844,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
           if (haikuResults.length > 0) {
             // Apply same post-processing as Tier2 to prevent zombie/low-confidence bypass
             haikuResults = reRankByKeywords(haikuResults, signals.rawKeywords);
-            haikuResults = applyAdoptionDecay(haikuResults);
+            haikuResults = applyAdoptionDecay(haikuResults, db);
             haikuResults = passesConfidenceGate(haikuResults, signals);
             if (haikuResults.length > 0) results = haikuResults;
           }
@@ -854,14 +888,46 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
  * @param {string} [sessionId] Session identifier for dedup
  * @returns {Promise<string|null>} Injection text or null
  */
-export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
+export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionEvents } = {}) {
   if (!userPrompt || !db) return null;
 
   try {
+    // 1. Explicit request → highest priority, bypass all restrictions
+    const explicit = detectExplicitRequest(userPrompt);
+    if (explicit.isExplicit) {
+      const textQuery = buildQueryFromText(explicit.searchTerm);
+      if (textQuery) {
+        const explicitResults = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
+        if (explicitResults.length > 0) {
+          const best = explicitResults[0];
+          if (!sessionId || !isRecentlyRecommended(db, best.id, sessionId)) {
+            recordInvocation(db, { resource_id: best.id, session_id: sessionId, trigger: 'user_prompt', tier: 1, recommended: 1 });
+            updateResourceStats(db, best.id, 'recommend_count');
+            return renderInjection(best);
+          }
+        }
+      }
+    }
+
+    // 2. Suite auto-flow protection
+    const events = sessionEvents || peekToolEvents();
+    const activeSuite = detectActiveSuite(events);
+
     const projectDomains = detectProjectDomains();
 
     // Intent-aware enhanced query (column-targeted)
     const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt });
+
+    // Check if active suite covers the current stage
+    if (activeSuite) {
+      const currentStage = inferCurrentStage(signals.primaryIntent, activeSuite);
+      if (currentStage) {
+        const { shouldRecommend } = shouldRecommendForStage(activeSuite, currentStage);
+        if (!shouldRecommend) return null;
+      }
+    }
+
+    // 3. Normal FTS flow
     const enhancedQuery = buildEnhancedQuery(signals);
 
     // Fetch extra results when rawKeywords are present — the top-3 by BM25 may be
@@ -888,21 +954,14 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     // match those keywords. "帮我做一下SEO审查" → rawKeywords=["seo"] → SEO audit
     // resources should rank above generic code-review resources.
     results = reRankByKeywords(results, signals.rawKeywords);
-    results = applyAdoptionDecay(results);
+    results = applyAdoptionDecay(results, db);
     results = passesConfidenceGate(results, signals);
     results = results.slice(0, 3);
 
     if (results.length === 0) return null;
 
-    // Skip if low confidence (no Haiku fallback — stay fast).
-    // Exception: when results match the user's raw domain keywords (e.g. "seo"),
-    // close BM25 scores indicate "multiple equally good options in the right domain"
-    // rather than "ambiguous/wrong match". Trust the domain match.
-    if (needsHaikuDispatch(results)) {
-      const hasKeywordMatch = signals.rawKeywords?.length > 0 && results.some(r =>
-        signals.rawKeywords.some(kw => (r.intent_tags || '').toLowerCase().includes(kw)));
-      if (!hasKeywordMatch) return null;
-    }
+    // Low confidence → skip (no Haiku in user_prompt path — stay fast)
+    if (needsHaikuDispatch(results)) return null;
 
     // Filter by cooldown + session dedup (prevents double-recommend with SessionStart)
     const viable = sessionId
@@ -943,6 +1002,19 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const { skip } = shouldSkipDispatch(event);
     if (skip) return null;
 
+    // Suite protection: if a suite auto-flow is active, suppress recommendations
+    // for stages the suite already covers
+    const events = peekToolEvents();
+    const activeSuite = detectActiveSuite(events);
+    if (activeSuite) {
+      const signals0 = extractContextSignals(event, sessionCtx);
+      const stage = inferCurrentStage(signals0.primaryIntent, activeSuite);
+      if (stage) {
+        const { shouldRecommend } = shouldRecommendForStage(activeSuite, stage);
+        if (!shouldRecommend) return null;
+      }
+    }
+
     // Tier 1: Extract context signals
     const signals = extractContextSignals(event, sessionCtx);
     const query = buildEnhancedQuery(signals);
@@ -952,7 +1024,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
 
     // Tier 2: FTS5 retrieval
     let results = retrieveResources(db, query, { limit: 3, projectDomains });
-    results = applyAdoptionDecay(results);
+    results = applyAdoptionDecay(results, db);
     results = passesConfidenceGate(results, signals);
     if (results.length === 0) return null;
 

@@ -8,7 +8,8 @@ import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../re
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP, dispatchOnSessionStart,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
-  _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from '../dispatch.mjs';
+  _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK,
+  _applyAdoptionDecay } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
 
@@ -1388,5 +1389,37 @@ describe('dispatchOnSessionStart handoff gate', () => {
     });
     const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-2', { hasHandoff: true });
     expect(result).toBeTruthy();
+  });
+});
+
+// ─── applyAdoptionDecay with db rejection dampening ──────────────────────────
+
+describe('applyAdoptionDecay with db rejection dampening', () => {
+  let db;
+  beforeEach(() => { db = createRegistryDb(); });
+
+  it('applies extra dampening for resources with many recent rejections', () => {
+    const resId = seedResource(db, { name: 'over-recommended', recommend_count: 60, adopt_count: 1 });
+    // Seed 10 recent rejections
+    for (let i = 0; i < 10; i++) {
+      recordInvocation(db, { resource_id: resId, session_id: `sess-${i}`, adopted: 0, outcome: 'ignored' });
+    }
+
+    const results = [{ id: resId, recommend_count: 60, adopt_count: 1, composite_score: -10.0, name: 'over-recommended' }];
+    const decayed = _applyAdoptionDecay(results, db);
+    expect(decayed.length).toBeGreaterThan(0);
+    // Base multiplier: rate=(1+1)/(60+2)≈0.032 < 0.05 at 60 recs → 0.4
+    // Recent rejection: 10 rejects → 0.4 * 0.3 = 0.12
+    // composite_score: -10.0 * 0.12 = -1.2
+    expect(Math.abs(decayed[0].composite_score)).toBeLessThan(2.0);
+    expect(decayed[0]._decayed).toBe(true);
+  });
+
+  it('no extra dampening without db', () => {
+    const results = [{ id: 1, recommend_count: 60, adopt_count: 1, composite_score: -10.0 }];
+    const decayed = _applyAdoptionDecay(results, null);
+    expect(decayed.length).toBe(1);
+    // Only base multiplier 0.4 applies → -10 * 0.4 = -4
+    expect(Math.abs(decayed[0].composite_score)).toBeCloseTo(4.0, 0);
   });
 });

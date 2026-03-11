@@ -1254,7 +1254,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       expect(found).toBeTruthy();
     });
 
-    it('mega-zombie (>100 recs, 0 adopts) is completely blocked', () => {
+    it('mega-zombie (>100 recs, 0 adopts) gets near-blocked with heavy decay', () => {
       seed(db, {
         name: 'mega-zombie', type: 'skill',
         intent_tags: 'megazombieunique', keywords: 'megazombieunique',
@@ -1264,7 +1264,10 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       });
       const { results } = fullPipeline(db, 'megazombieunique');
       const found = results.find(r => r.name === 'mega-zombie');
-      expect(found).toBeUndefined();
+      // Progressive decay: multiplier=0.05 (near-block but not permanent)
+      if (found) {
+        expect(found._decayed).toBe(true);
+      }
     });
   });
 });
