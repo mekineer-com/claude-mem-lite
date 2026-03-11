@@ -700,32 +700,32 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
   describe('dispatchOnSessionStart — full E2E', () => {
     it('returns injection text for "write tests" prompt', async () => {
-      const result = await dispatchOnSessionStart(db, 'write tests for the auth module', 'sim-sess');
+      const result = await dispatchOnSessionStart(db, 'write tests for the auth module', 'sim-sess', { hasHandoff: true });
       expect(result).toBeTruthy();
       expect(result).toContain('[Auto-suggestion]');
       expect(result).toContain('test-driven') // invocation_name reference
     });
 
     it('returns injection text for Chinese prompt "帮我修复bug"', async () => {
-      const result = await dispatchOnSessionStart(db, '帮我修复bug', 'sim-sess-cn');
+      const result = await dispatchOnSessionStart(db, '帮我修复bug', 'sim-sess-cn', { hasHandoff: true });
       expect(result).toBeTruthy();
       expect(result).toContain('[Auto-suggestion]');
     });
 
     it('returns null for empty prompt', async () => {
-      const result = await dispatchOnSessionStart(db, '', 'sim-sess-empty');
+      const result = await dispatchOnSessionStart(db, '', 'sim-sess-empty', { hasHandoff: true });
       expect(result).toBeNull();
     });
 
     it('returns null for pure stop-word prompt', async () => {
-      const result = await dispatchOnSessionStart(db, 'the a is are for', 'sim-sess-stop');
+      const result = await dispatchOnSessionStart(db, 'the a is are for', 'sim-sess-stop', { hasHandoff: true });
       expect(result).toBeNull();
     });
 
     it('session dedup: second call for same session returns null', async () => {
-      const r1 = await dispatchOnSessionStart(db, 'write tests', 'sim-dedup');
+      const r1 = await dispatchOnSessionStart(db, 'write tests', 'sim-dedup', { hasHandoff: true });
       expect(r1).toBeTruthy();
-      const r2 = await dispatchOnSessionStart(db, 'write more tests', 'sim-dedup');
+      const r2 = await dispatchOnSessionStart(db, 'write more tests', 'sim-dedup', { hasHandoff: true });
       // Same resource can't be recommended twice in same session
       // But a DIFFERENT resource could still be recommended
       // r2 is null only if the same resource is top result again (session dedup)
@@ -741,7 +741,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
         'refactor the code',  // 4th — should be blocked by SESSION_RECOMMEND_CAP=3
       ];
       for (const p of prompts) {
-        results.push(await dispatchOnSessionStart(db, p, 'sim-cap'));
+        results.push(await dispatchOnSessionStart(db, p, 'sim-cap', { hasHandoff: true }));
       }
       // First 3 should succeed, 4th should be null (cap reached)
       const nonNull = results.filter(r => r !== null);
@@ -767,7 +767,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
     it('does not double-recommend with session_start', async () => {
       // First: session_start recommends TDD
-      await dispatchOnSessionStart(db, 'write tests for auth', 'sim-double');
+      await dispatchOnSessionStart(db, 'write tests for auth', 'sim-double', { hasHandoff: true });
       // Then: user_prompt for same intent — should not recommend same resource
       const result = await dispatchOnUserPrompt(db, 'add tests for the login', 'sim-double');
       // Either null (same resource deduped) or a different resource
@@ -829,10 +829,10 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
   describe('cooldown and dedup', () => {
     it('same resource blocked in same session', async () => {
-      const r1 = await dispatchOnSessionStart(db, 'write tests', 'same-sess');
+      const r1 = await dispatchOnSessionStart(db, 'write tests', 'same-sess', { hasHandoff: true });
       expect(r1).toBeTruthy();
       // Same session, same prompt → blocked
-      const r2 = await dispatchOnSessionStart(db, 'write tests', 'same-sess');
+      const r2 = await dispatchOnSessionStart(db, 'write tests', 'same-sess', { hasHandoff: true });
       // r2 should be different resource or null
       if (r2) {
         expect(r2).not.toBe(r1);
@@ -841,9 +841,9 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
     it('same resource blocked across sessions within cooldown', async () => {
       // Session 1
-      await dispatchOnSessionStart(db, 'write tests', 'sess-a');
+      await dispatchOnSessionStart(db, 'write tests', 'sess-a', { hasHandoff: true });
       // Session 2 (different session, but within 60min cooldown)
-      const r2 = await dispatchOnSessionStart(db, 'write tests', 'sess-b');
+      const r2 = await dispatchOnSessionStart(db, 'write tests', 'sess-b', { hasHandoff: true });
       // Should either return different resource or null (cooldown blocks same resource)
       if (r2) {
         // The top result might be different if cooldown blocks the first choice
@@ -862,7 +862,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       ];
       let recommendCount = 0;
       for (const p of prompts) {
-        const r = await dispatchOnSessionStart(db, p, session);
+        const r = await dispatchOnSessionStart(db, p, session, { hasHandoff: true });
         if (r) recommendCount++;
       }
       expect(recommendCount).toBeLessThanOrEqual(SESSION_RECOMMEND_CAP);
@@ -944,7 +944,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       const turns = [];
 
       // Turn 1: User starts with planning
-      const r1 = await dispatchOnSessionStart(db, 'I need to plan the new auth system architecture', session);
+      const r1 = await dispatchOnSessionStart(db, 'I need to plan the new auth system architecture', session, { hasHandoff: true });
       turns.push({ prompt: 'plan auth architecture', result: r1 });
       if (r1) expect(r1).toContain('[Auto-suggestion]');
 

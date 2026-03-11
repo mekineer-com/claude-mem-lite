@@ -748,13 +748,19 @@ function passesConfidenceGate(results, signals) {
 
 /**
  * Dispatch on SessionStart: analyze user prompt, return best resource suggestion.
+ * Only dispatches when continuing from a previous session (handoff).
+ * Cold starts (no previous session) showed 0% adoption — skip dispatch entirely.
  * @param {Database} db Registry database
  * @param {string} userPrompt User's prompt text
  * @param {string} [sessionId] Session identifier for dedup
+ * @param {Object} [options]
+ * @param {boolean} [options.hasHandoff=false] Whether a previous session handoff exists
  * @returns {Promise<string|null>} Injection text or null
  */
-export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
-  if (!userPrompt || !db) return null;
+export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHandoff = false } = {}) {
+  if (!db) return null;
+  if (!hasHandoff) return null;  // Only dispatch when continuing from a previous session
+  if (!userPrompt) return null;  // Prompt still required for FTS query
 
   try {
     const projectDomains = detectProjectDomains();

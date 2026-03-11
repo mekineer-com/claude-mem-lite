@@ -6,7 +6,7 @@ import { upsertResource, getActiveResources, getResourceByName,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
 import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
-  isRecentlyRecommended, SESSION_RECOMMEND_CAP,
+  isRecentlyRecommended, SESSION_RECOMMEND_CAP, dispatchOnSessionStart,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
   _isHaikuCircuitOpen, _NEGATION_EN, _NEGATION_CJK } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
@@ -1358,5 +1358,35 @@ describe('isRecentlyRecommended', () => {
     recordInvocation(db, { resource_id: id1, session_id: 'sess-under', trigger: 'session_start', tier: 2, recommended: 1 });
     // Only 1 recommendation, cap is 3 — should be allowed
     expect(isRecentlyRecommended(db, id2, 'sess-under')).toBe(false);
+  });
+});
+
+// ─── dispatchOnSessionStart handoff gate ─────────────────────────────────────
+
+describe('dispatchOnSessionStart handoff gate', () => {
+  let db;
+  beforeEach(() => { db = createRegistryDb(); });
+
+  it('returns null when hasHandoff=false', async () => {
+    seedResource(db, { name: 'some-skill', intent_tags: 'plan' });
+    const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-1', { hasHandoff: false });
+    expect(result).toBeNull();
+  });
+
+  it('returns null when hasHandoff is omitted (default false)', async () => {
+    seedResource(db, { name: 'some-skill', intent_tags: 'plan' });
+    const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-1');
+    expect(result).toBeNull();
+  });
+
+  it('returns injection when hasHandoff=true', async () => {
+    seedResource(db, {
+      name: 'planning-skill', type: 'skill', intent_tags: 'plan',
+      trigger_patterns: 'plan feature architecture',
+      capability_summary: 'Feature planning',
+      invocation_name: 'superpowers:writing-plans',
+    });
+    const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-2', { hasHandoff: true });
+    expect(result).toBeTruthy();
   });
 });

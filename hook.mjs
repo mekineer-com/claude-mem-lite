@@ -675,8 +675,10 @@ async function handleSessionStart() {
     try {
       const rdb = getRegistryDb();
       if (rdb && hasInjectionBudget()) {
-        const promptCtx = latestSummary?.next_steps || '';
-        const dispatchResult = await dispatchOnSessionStart(rdb, promptCtx, sessionId);
+        // Build prompt context with fallbacks: next_steps → request → completed (empty = no dispatch)
+        const promptCtx = latestSummary?.next_steps || latestSummary?.request || latestSummary?.completed || '';
+        const hasHandoff = !!prevSessionId;  // prevSessionId set when /clear or rapid restart detected
+        const dispatchResult = await dispatchOnSessionStart(rdb, promptCtx, sessionId, { hasHandoff });
         if (dispatchResult) {
           process.stdout.write(dispatchResult + '\n');
           incrementInjection();

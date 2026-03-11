@@ -192,7 +192,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
   describe('SessionStart trigger', () => {
     it('dispatches injection for relevant next_steps', async () => {
       const result = await dispatchOnSessionStart(
-        db, 'Debug remaining indexing script errors', 'session-1'
+        db, 'Debug remaining indexing script errors', 'session-1', { hasHandoff: true }
       );
       expect(result).not.toBeNull();
       expect(result).toContain('[Auto-suggestion]');
@@ -200,7 +200,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
 
     it('records invocation with session_start trigger', async () => {
       await dispatchOnSessionStart(
-        db, 'Debug remaining indexing script errors', 'session-1'
+        db, 'Debug remaining indexing script errors', 'session-1', { hasHandoff: true }
       );
       const invocations = getSessionInvocations(db, 'session-1');
       expect(invocations).toHaveLength(1);
@@ -210,7 +210,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
     });
 
     it('returns null for empty next_steps', async () => {
-      const result = await dispatchOnSessionStart(db, '', 'session-empty');
+      const result = await dispatchOnSessionStart(db, '', 'session-empty', { hasHandoff: true });
       expect(result).toBeNull();
     });
   });
@@ -248,7 +248,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
   describe('SessionStart→UserPrompt dedup', () => {
     it('UserPrompt deduped against preceding SessionStart', async () => {
       const startResult = await dispatchOnSessionStart(
-        db, 'Write unit tests for the auth module', 'session-3'
+        db, 'Write unit tests for the auth module', 'session-3', { hasHandoff: true }
       );
       expect(startResult).not.toBeNull();
 
