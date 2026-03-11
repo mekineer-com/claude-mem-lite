@@ -216,13 +216,23 @@ export function mergePendingEntries(episode) {
  * @returns {boolean} true if the episode has significant content
  */
 export function episodeHasSignificantContent(episode) {
+  // 1. File edits or Bash errors → always significant
   const hasEditsOrErrors = episode.entries.some(e =>
     EDIT_TOOLS.has(e.tool) ||
     (e.tool === 'Bash' && e.isError)
   );
   if (hasEditsOrErrors) return true;
 
-  // Review/research pattern: reading many files indicates investigation
+  // 2. Important files touched (config, schema, security, migration)
+  // Checks episode.files (all touched files, including reads) — catches important-file investigation
+  const allFiles = episode.files || [];
+  const hasImportantFile = allFiles.some(f =>
+    /\.(env|yml|yaml|toml|lock|sql|prisma|proto)$/.test(f) ||
+    /(config|schema|migration|auth|security)/i.test(f)
+  );
+  if (hasImportantFile) return true;
+
+  // 3. Research pattern: reading many files indicates investigation
   const readCount = episode.entries.filter(e =>
     e.tool === 'Read' || e.tool === 'Grep'
   ).length;

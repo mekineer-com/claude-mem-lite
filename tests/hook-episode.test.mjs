@@ -161,6 +161,26 @@ describe('hook-episode.mjs', () => {
       const ep = createEpisode('s', 'p');
       expect(episodeHasSignificantContent(ep)).toBe(false);
     });
+
+    it('returns true when important files are READ (not edited)', () => {
+      // No EDIT_TOOLS entries — tests condition 2 (important files) without triggering condition 1 (edits)
+      const ep = {
+        files: ['schema.prisma', 'app.js'],
+        entries: [
+          { tool: 'Read', files: ['schema.prisma'] },
+          { tool: 'Read', files: ['app.js'] },
+        ],
+      };
+      expect(episodeHasSignificantContent(ep)).toBe(true);
+    });
+
+    it('returns false for 4 reads of non-important files (below threshold)', () => {
+      const ep = {
+        files: ['a.js', 'b.js', 'c.js', 'd.js'],
+        entries: Array.from({ length: 4 }, (_, i) => ({ tool: 'Read', files: [`${String.fromCharCode(97+i)}.js`] })),
+      };
+      expect(episodeHasSignificantContent(ep)).toBe(false);
+    });
   });
 
   // ─── acquireLock / releaseLock ──────────────────────────────────────────
