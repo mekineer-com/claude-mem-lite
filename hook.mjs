@@ -344,6 +344,27 @@ async function handleStop() {
         if (episode && episode.entries && episode.entries.length > 0 && episodeHasSignificantContent(episode)) {
           if (!episode.sessionId) episode.sessionId = sessionId;
           if (!episode.project) episode.project = project;
+          // Immediate save: persist rule-based observation to DB before spawning background worker.
+          // Without this, data is lost if the background worker fails.
+          try {
+            const hasError = episode.entries.some(e => e.isError);
+            const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
+            const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
+            const fileList = (episode.files || []).map(f => basename(f)).join(', ') || '(multiple)';
+            const obs = {
+              type: inferredType,
+              title: truncate(buildDegradedTitle(episode), 120),
+              subtitle: fileList,
+              narrative: episode.entries.map(e => e.desc).join('; '),
+              concepts: [],
+              facts: [],
+              files: episode.files,
+              filesRead: episode.filesRead || [],
+              importance: computeRuleImportance(episode),
+            };
+            const id = saveObservation(obs, episode.project, episode.sessionId);
+            if (id) episode.savedId = id;
+          } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
           const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
           writeFileSync(flushFile, JSON.stringify(episode));
           spawnBackground('llm-episode', flushFile);
@@ -373,10 +394,11 @@ async function handleStop() {
   // Dispatch: collect feedback on recommendations using actual tool events
   // PostToolUse tracks Skill/Task/Edit/Write/Bash events in a JSONL file.
   // These events drive adoption detection (Skill/Task) and outcome detection (Edit/Bash errors).
+  // Always clear event file to prevent stale events accumulating if registry DB is unavailable.
   try {
+    const sessionEvents = readAndClearToolEvents();
     const rdb = getRegistryDb();
     if (rdb) {
-      const sessionEvents = readAndClearToolEvents();
       await collectFeedback(rdb, sessionId, sessionEvents);
     }
   } catch (e) { debugCatch(e, 'handleStop-feedback'); }

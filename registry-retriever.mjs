@@ -338,8 +338,9 @@ export function filterByProjectDomain(results, projectDomains) {
 // Sign convention: bm25() returns NEGATIVE (more negative = more relevant).
 // We keep the negative direction and SUBTRACT positive behavioral signals to make
 // better resources more negative. ORDER BY ... ASC puts most negative (best) first.
-const COMPOSITE_ORDER = `
-  ORDER BY (
+// Composite score expression (shared between SELECT and ORDER BY)
+// Sign convention: more negative = better. BM25 is negative, behavioral signals are subtracted.
+const COMPOSITE_EXPR = `(
     bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
     - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
     - (
@@ -369,23 +370,27 @@ const COMPOSITE_ORDER = `
            AND (r.adopt_count + 1.0) / (r.recommend_count + 2.0) < 0.1
         THEN 0.10
         ELSE 0 END
-  ) ASC
-`;
+  )`;
+
+// COMPOSITE_ORDER kept for SEARCH_BY_TYPE_SQL and other queries
+const COMPOSITE_ORDER = `ORDER BY ${COMPOSITE_EXPR} ASC`;
 
 const SEARCH_SQL = `
   SELECT r.*,
-    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance
+    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
+    ${COMPOSITE_EXPR} AS composite_score
   FROM resources_fts
   JOIN resources r ON r.id = resources_fts.rowid
   WHERE resources_fts MATCH ?
     AND r.status = 'active'
-  ${COMPOSITE_ORDER}
+  ORDER BY ${COMPOSITE_EXPR} ASC
   LIMIT ?
 `;
 
 const SEARCH_BY_TYPE_SQL = `
   SELECT r.*,
-    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance
+    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
+    ${COMPOSITE_EXPR} AS composite_score
   FROM resources_fts
   JOIN resources r ON r.id = resources_fts.rowid
   WHERE resources_fts MATCH ?

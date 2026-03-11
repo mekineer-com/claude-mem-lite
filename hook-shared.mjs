@@ -30,7 +30,7 @@ export const RESOURCE_RESCAN_INTERVAL_MS = 60 * 60 * 1000;    // 1 hour
 export const HANDOFF_EXPIRY_CLEAR = 3600000;                   // 1 hour
 export const HANDOFF_EXPIRY_EXIT = 7 * 24 * 60 * 60 * 1000;   // 7 days
 export const HANDOFF_MATCH_THRESHOLD = 3;                       // min weighted score
-export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚才|\bcontinue\b|\bresume\b|\bwhere.we.left\b|\bpick.up\b|\bcarry.on\b/i;
+export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚才|\bcontinue\b|\bresume\b|\bwhere[\s\-]+we[\s\-]+left\b|\bpick[\s\-]+up\b|\bcarry[\s\-]+on\b/i;
 
 // Ensure runtime directory exists
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
@@ -127,9 +127,10 @@ export function spawnBackground(bgEvent, ...extraArgs) {
 
 export function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── Injection Budget (per-session, in-memory) ──────────────────────────────
-// Limits total context injections across all hooks to prevent context bloat.
-// Reset at session-start. Each hook checks before injecting.
+// ─── Injection Budget (per hook invocation, in-memory) ───────────────────────
+// Limits context injections within a single hook process to prevent context bloat.
+// Note: each hook event runs in a separate process, so this is per-invocation,
+// not per-session. Session-level dedup is handled by cooldown/sessionId checks.
 
 export const MAX_INJECTIONS_PER_SESSION = 3;
 let _injectionCount = 0;

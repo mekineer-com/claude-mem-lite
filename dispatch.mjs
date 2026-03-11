@@ -578,7 +578,10 @@ export function needsHaikuDispatch(results) {
 
   if (results.length === 0) return true;
 
-  const topScore = Math.abs(results[0].relevance);
+  // Prefer composite_score (includes behavioral signals) over raw BM25 relevance.
+  // Both are negative (more negative = better). Use absolute values for comparison.
+  const scoreOf = r => Math.abs(r.composite_score ?? r.relevance);
+  const topScore = scoreOf(results[0]);
 
   // Relative threshold: if only one result or few results, use absolute minimum
   // For larger result sets, use mean-relative threshold
@@ -588,14 +591,14 @@ export function needsHaikuDispatch(results) {
   }
 
   // Compute mean relevance across results
-  const meanScore = results.reduce((sum, r) => sum + Math.abs(r.relevance), 0) / results.length;
+  const meanScore = results.reduce((sum, r) => sum + scoreOf(r), 0) / results.length;
 
   // Top result should be significantly above mean (at least 1.5x)
   if (topScore < meanScore * 1.5 && topScore < 3.0) return true;
 
   // Top two results too close → ambiguous, need Haiku to disambiguate
   if (results.length > 1) {
-    const gap = topScore - Math.abs(results[1].relevance);
+    const gap = topScore - scoreOf(results[1]);
     // Gap should be at least 10% of top score, or at least 0.5 absolute
     if (gap < Math.max(topScore * 0.1, 0.5)) return true;
   }
@@ -633,19 +636,19 @@ JSON: {"query":"search keywords for finding the right skill or agent","type":"sk
 // ─── Cooldown & Dedup (DB-persisted, survives process restarts) ─────────────
 
 export function isRecentlyRecommended(db, resourceId, sessionId) {
-  // Check 1: Per-session recommendation cap (avoid overwhelming user with suggestions)
+  // Check 1 & 2: Session-scoped checks (cap + dedup) — only when sessionId is available
   if (sessionId) {
     const sessionCount = db.prepare(
       'SELECT COUNT(*) as cnt FROM invocations WHERE session_id = ? AND recommended = 1'
     ).get(sessionId);
     if (sessionCount.cnt >= SESSION_RECOMMEND_CAP) return true;
-  }
 
-  // Check 2: Already recommended in this session (session dedup)
-  const sessionHit = db.prepare(
-    'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? LIMIT 1'
-  ).get(resourceId, sessionId);
-  if (sessionHit) return true;
+    // Already recommended in this session (session dedup)
+    const sessionHit = db.prepare(
+      'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? LIMIT 1'
+    ).get(resourceId, sessionId);
+    if (sessionHit) return true;
+  }
 
   // Check 3: Recommended within cooldown window (cross-session cooldown)
   const cooldownHit = db.prepare(
@@ -702,7 +705,9 @@ function applyAdoptionDecay(results) {
 
     if (multiplier === 0) return null;
     if (multiplier < 1) {
-      return { ...r, relevance: r.relevance * multiplier, _decayed: true };
+      // BM25 scores are negative (more negative = more relevant).
+      // To penalize: divide by multiplier to make less negative (worse rank).
+      return { ...r, relevance: r.relevance / multiplier, _decayed: true };
     }
     return r;
   }).filter(Boolean);
@@ -796,7 +801,13 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
             limit: 3,
             projectDomains,
           });
-          if (haikuResults.length > 0) results = haikuResults;
+          if (haikuResults.length > 0) {
+            // Apply same post-processing as Tier2 to prevent zombie/low-confidence bypass
+            haikuResults = reRankByKeywords(haikuResults, signals.rawKeywords);
+            haikuResults = applyAdoptionDecay(haikuResults);
+            haikuResults = passesConfidenceGate(haikuResults, signals);
+            if (haikuResults.length > 0) results = haikuResults;
+          }
         }
       }
     }

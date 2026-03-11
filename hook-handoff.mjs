@@ -149,16 +149,19 @@ export function detectContinuationIntent(db, promptText, project) {
  * @returns {string|null} Injection text or null if no handoff
  */
 export function renderHandoffInjection(db, project) {
-  const handoff = db.prepare(`
+  const now = Date.now();
+  // Fetch recent handoffs and find the most recent non-expired one.
+  // A newer but expired 'clear' handoff (1h) must not shadow a still-valid 'exit' handoff (7d).
+  const handoffs = db.prepare(`
     SELECT * FROM session_handoffs
-    WHERE project = ? ORDER BY created_at_epoch DESC LIMIT 1
-  `).get(project);
+    WHERE project = ? ORDER BY created_at_epoch DESC LIMIT 5
+  `).all(project);
+  const handoff = handoffs.find(h => {
+    const age = now - h.created_at_epoch;
+    const maxAge = h.type === 'clear' ? HANDOFF_EXPIRY_CLEAR : HANDOFF_EXPIRY_EXIT;
+    return age <= maxAge;
+  });
   if (!handoff) return null;
-
-  // Check expiry — don't render stale handoffs
-  const age = Date.now() - handoff.created_at_epoch;
-  const maxAge = handoff.type === 'clear' ? HANDOFF_EXPIRY_CLEAR : HANDOFF_EXPIRY_EXIT;
-  if (age > maxAge) return null;
 
   const ageSec = Math.round((Date.now() - handoff.created_at_epoch) / 1000);
   const ageStr = ageSec < 60 ? `${ageSec}s` :

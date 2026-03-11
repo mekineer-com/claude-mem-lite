@@ -939,6 +939,12 @@ server.registerTool(
         const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
         const sessionId = obs[0].project ? `compress-${obs[0].project}` : 'compress-manual';
 
+        // Use median timestamp of compressed observations instead of now,
+        // so the summary appears at the correct position in timeline/recency scoring.
+        const sortedEpochs = obs.map(o => o.created_at_epoch).sort((a, b) => a - b);
+        const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
+        const medianDate = new Date(medianEpoch);
+
         // Ensure session exists (INSERT OR IGNORE avoids race condition)
         const now = new Date();
         db.prepare(`
@@ -948,7 +954,7 @@ server.registerTool(
 
         const summaryResult = insertSummary.run(
           sessionId, proj, narrative, dominantType, title, narrative,
-          now.toISOString(), now.getTime()
+          medianDate.toISOString(), medianEpoch
         );
         const summaryId = Number(summaryResult.lastInsertRowid);
 

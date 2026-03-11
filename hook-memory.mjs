@@ -28,7 +28,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
 
     const selectStmt = db.prepare(`
       SELECT o.id, o.type, o.title, o.importance,
-             bm25(observations_fts) as relevance
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2) as relevance
       FROM observations_fts
       JOIN observations o ON o.id = observations_fts.rowid
       WHERE observations_fts MATCH ?
@@ -36,7 +36,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         AND o.importance >= 2
         AND o.created_at_epoch > ?
         AND COALESCE(o.compressed_into, 0) = 0
-      ORDER BY bm25(observations_fts)
+      ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
       LIMIT 10
     `);
     const rows = selectStmt.all(ftsQuery, project, cutoff);

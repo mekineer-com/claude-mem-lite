@@ -78,14 +78,13 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
     LIMIT 10
   `).all(project, now_ms - windows.sessWindow);
 
-  const now = Date.now();
   const selectedObs = [];
   const selectedSess = [];
   let totalTokens = 0;
 
   // Score each candidate: value = recency * importance, cost = tokens
   const scoredObs = obsPool.map(o => {
-    const ageDays = (now - o.created_at_epoch) / 86400000;
+    const ageDays = (now_ms - o.created_at_epoch) / 86400000;
     const recency = 1 / (1 + ageDays);
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const value = recency * impBoost;
@@ -94,7 +93,7 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   });
 
   const scoredSess = sessPool.map(s => {
-    const ageDays = (now - s.created_at_epoch) / 86400000;
+    const ageDays = (now_ms - s.created_at_epoch) / 86400000;
     const recency = 1 / (1 + ageDays);
     const value = recency * 1.5; // Session summaries slightly boosted
     const cost = estimateTokens((s.request || '') + (s.completed || '') + (s.next_steps || ''));
