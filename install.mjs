@@ -1581,7 +1581,7 @@ async function install() {
 async function uninstall() {
   console.log('\nclaude-mem-lite uninstaller\n');
 
-  // 1. Remove MCP
+  // 1. Remove MCP (legacy hook-based install)
   try {
     execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' });
     ok('MCP server removed');
@@ -1589,7 +1589,7 @@ async function uninstall() {
     warn('MCP server not found or already removed');
   }
 
-  // 2. Remove hooks (match both npx and git-clone install paths)
+  // 2. Remove hooks from settings.json (match both npx and git-clone install paths)
   const settings = readSettings();
   if (settings.hooks) {
     for (const [event, configs] of Object.entries(settings.hooks)) {
@@ -1598,11 +1598,67 @@ async function uninstall() {
       if (settings.hooks[event].length === 0) delete settings.hooks[event];
     }
     if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-    writeSettings(settings);
-    ok('Hooks removed');
   }
 
-  // 3. Purge data if requested
+  // 3. Clean plugin system entries from settings.json
+  const pluginKey = 'claude-mem-lite@sdsrss';
+  const marketplaceKey = 'sdsrss';
+  if (settings.enabledPlugins) {
+    delete settings.enabledPlugins[pluginKey];
+  }
+  if (settings.extraKnownMarketplaces) {
+    delete settings.extraKnownMarketplaces[marketplaceKey];
+  }
+  writeSettings(settings);
+  ok('Hooks and plugin settings cleaned');
+
+  // 4. Clean plugin system registry files
+  const pluginsDir = join(homedir(), '.claude', 'plugins');
+
+  // 4a. Remove marketplace directory
+  const marketplaceDir = join(pluginsDir, 'marketplaces', marketplaceKey);
+  if (existsSync(marketplaceDir)) {
+    rmSync(marketplaceDir, { recursive: true, force: true });
+    ok('Marketplace directory removed');
+  }
+
+  // 4b. Remove cache directory
+  const cacheDir = join(pluginsDir, 'cache', marketplaceKey);
+  if (existsSync(cacheDir)) {
+    rmSync(cacheDir, { recursive: true, force: true });
+    ok('Plugin cache removed');
+  }
+
+  // 4c. Clean known_marketplaces.json
+  const knownPath = join(pluginsDir, 'known_marketplaces.json');
+  try {
+    const known = JSON.parse(readFileSync(knownPath, 'utf8'));
+    if (marketplaceKey in known) {
+      delete known[marketplaceKey];
+      writeFileSync(knownPath, JSON.stringify(known, null, 2) + '\n');
+      ok('Removed from known_marketplaces.json');
+    }
+  } catch { /* file may not exist */ }
+
+  // 4d. Clean installed_plugins.json
+  const installedPath = join(pluginsDir, 'installed_plugins.json');
+  try {
+    const installed = JSON.parse(readFileSync(installedPath, 'utf8'));
+    const plugins = installed.plugins || installed;
+    let cleaned = false;
+    for (const key of Object.keys(plugins)) {
+      if (key.includes('claude-mem-lite') || key.includes('sdsrss')) {
+        delete plugins[key];
+        cleaned = true;
+      }
+    }
+    if (cleaned) {
+      writeFileSync(installedPath, JSON.stringify(installed, null, 2) + '\n');
+      ok('Removed from installed_plugins.json');
+    }
+  } catch { /* file may not exist */ }
+
+  // 5. Purge data if requested
   if (flags.has('--purge')) {
     const expectedPurgePath = join(homedir(), '.claude-mem-lite');
     if (existsSync(DATA_DIR) && DATA_DIR === expectedPurgePath) {
