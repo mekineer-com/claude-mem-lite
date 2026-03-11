@@ -369,9 +369,12 @@ async function handleStop() {
   // Always clear event file to prevent stale events accumulating if registry DB is unavailable.
   try {
     const sessionEvents = readAndClearToolEvents();
-    const rdb = getRegistryDb();
-    if (rdb) {
-      await collectFeedback(rdb, sessionId, sessionEvents);
+    // Skip feedback for zero-interaction sessions (no tool events = no meaningful signal)
+    if (sessionEvents.length > 0) {
+      const rdb = getRegistryDb();
+      if (rdb) {
+        await collectFeedback(rdb, sessionId, sessionEvents);
+      }
     }
   } catch (e) { debugCatch(e, 'handleStop-feedback'); }
 
@@ -428,7 +431,7 @@ async function handleSessionStart() {
 
     // ── DB mutations in a transaction (crash-safe consistency) ──
     const staleSessionCutoff = Date.now() - STALE_SESSION_MS;
-    const autoCompressAge = Date.now() - 90 * 86400000; // 90 days
+    const autoCompressAge = Date.now() - 30 * 86400000; // 30 days (accelerated from 90)
 
     db.transaction(() => {
       // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
