@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# claude-mem-lite Setup Hook
-# Installs native dependencies (better-sqlite3) on first run
+# claude-mem-lite SessionStart pre-hook
+# Data directory setup and migrations (deps handled by launch.mjs)
 #
 
 set -euo pipefail
@@ -28,26 +28,13 @@ log_info() { echo -e "${BLUE}ℹ${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}⚠${NC} $*" >&2; }
 log_err()  { echo -e "${RED}✗${NC} $*" >&2; }
 
-# 1. Install npm dependencies if needed
-if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
-  log_info "Installing dependencies..."
-  if npm install --omit=dev --prefix "$ROOT" 2>&1; then
-    log_ok "Dependencies installed"
-  else
-    log_err "npm install failed"
-    exit 1
-  fi
-else
-  log_ok "Dependencies up to date"
-fi
-
-# 2. Migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
+# 1. Migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
 if [[ -d "$OLD_UNHIDDEN_DIR" && ! -d "$DATA_DIR" ]]; then
   mv "$OLD_UNHIDDEN_DIR" "$DATA_DIR"
   log_ok "Migrated ~/claude-mem-lite/ → ~/.claude-mem-lite/"
 fi
 
-# 2b. Ensure data directory exists (runtime created after migration check)
+# 2. Ensure data directory exists (runtime created after migration check)
 mkdir -p "$DATA_DIR"
 log_ok "Data directory: $DATA_DIR"
 
@@ -68,7 +55,7 @@ if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" && ! -f
   fi
 fi
 
-# 3b. Rename claude-mem.db → claude-mem-lite.db in same directory
+# 4. Rename claude-mem.db → claude-mem-lite.db in same directory
 if [[ -f "$DATA_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" ]]; then
   mv "$DATA_DIR/claude-mem.db" "$DATA_DIR/claude-mem-lite.db"
   mv "$DATA_DIR/claude-mem.db-wal" "$DATA_DIR/claude-mem-lite.db-wal" 2>/dev/null || true
@@ -76,7 +63,7 @@ if [[ -f "$DATA_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" ]]; th
   log_ok "Database renamed: claude-mem.db → claude-mem-lite.db"
 fi
 
-# 4. Ensure runtime directory exists (after migration to not mask migration check)
+# 5. Ensure runtime directory exists (after migration to not mask migration check)
 mkdir -p "$DATA_DIR/runtime"
 
 log_ok "claude-mem-lite ready"
