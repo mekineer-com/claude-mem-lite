@@ -622,12 +622,11 @@ export function fmtTime(iso) {
  */
 export function isoWeekKey(epochMs) {
   const d = new Date(epochMs);
-  const tmp = new Date(d.getTime());
-  tmp.setHours(0, 0, 0, 0);
-  tmp.setDate(tmp.getDate() + 4 - (tmp.getDay() || 7));
-  const yearStart = new Date(tmp.getFullYear(), 0, 1);
+  const tmp = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  tmp.setUTCDate(tmp.getUTCDate() + 4 - (tmp.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
   const weekNum = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
-  const isoYear = tmp.getFullYear();
+  const isoYear = tmp.getUTCFullYear();
   return `${isoYear}-W${String(weekNum).padStart(2, '0')}`;
 }
 

@@ -24,7 +24,7 @@ const ALLOWED_BASES = [
 
 function isAllowedPath(filePath) {
   if (!filePath) return false;
-  return ALLOWED_BASES.some(base => filePath.startsWith(base));
+  return ALLOWED_BASES.some(base => filePath === base || filePath.startsWith(base + '/'));
 }
 
 // ─── Template Detection ──────────────────────────────────────────────────────

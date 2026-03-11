@@ -494,7 +494,7 @@ function inferTechFromPrompt(prompt) {
     [/\b(typescript|ts)\b/i, 'typescript'],
     [/\b(python|django|flask|fastapi)\b/i, 'python'],
     [/\b(rust|cargo)\b/i, 'rust'],
-    [/\b(golang|go\s+\w+)\b/i, 'go'],
+    [/\b(golang|go\s+(?:build|test|run|get|mod|install|fmt|vet|generate|clean|work|tool))\b/i, 'go'],
     [/\b(java|spring|maven|gradle)\b/i, 'java'],
     [/\b(ruby|rails)\b/i, 'ruby'],
     [/\b(php|laravel|symfony)\b/i, 'php'],
@@ -645,7 +645,7 @@ export function isRecentlyRecommended(db, resourceId, sessionId) {
 
     // Already recommended in this session (session dedup)
     const sessionHit = db.prepare(
-      'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? LIMIT 1'
+      'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? AND recommended = 1 LIMIT 1'
     ).get(resourceId, sessionId);
     if (sessionHit) return true;
   }
@@ -705,9 +705,9 @@ function applyAdoptionDecay(results) {
 
     if (multiplier === 0) return null;
     if (multiplier < 1) {
-      // BM25 scores are negative (more negative = more relevant).
-      // To penalize: divide by multiplier to make less negative (worse rank).
-      return { ...r, relevance: r.relevance / multiplier, _decayed: true };
+      // Composite scores are negative (more negative = more relevant).
+      // To penalize: multiply by multiplier (<1) to make less negative (worse rank).
+      return { ...r, composite_score: (r.composite_score ?? r.relevance) * multiplier, _decayed: true };
     }
     return r;
   }).filter(Boolean);
@@ -796,7 +796,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId) {
       if (haikuResult?.query) {
         const haikuQuery = buildQueryFromText(haikuResult.query);
         if (haikuQuery) {
-          const haikuResults = retrieveResources(db, haikuQuery, {
+          let haikuResults = retrieveResources(db, haikuQuery, {
             type: haikuResult.type === 'either' ? undefined : haikuResult.type,
             limit: 3,
             projectDomains,

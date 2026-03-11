@@ -1136,14 +1136,14 @@ describe('fmtTime', () => {
 
 describe('isoWeekKey', () => {
   it('returns correct week for mid-year date', () => {
-    // 2026-06-15 is a Monday, ISO week 25
-    const epoch = new Date(2026, 5, 15).getTime();
+    // 2026-06-15 is a Monday in UTC, ISO week 25
+    const epoch = Date.UTC(2026, 5, 15);
     expect(isoWeekKey(epoch)).toBe('2026-W25');
   });
 
   it('handles Dec 31 that falls in week 1 of next year', () => {
     // 2025-12-31 is a Wednesday → ISO week 1 of 2026
-    const epoch = new Date(2025, 11, 31).getTime();
+    const epoch = Date.UTC(2025, 11, 31);
     expect(isoWeekKey(epoch)).toBe('2026-W01');
   });
 

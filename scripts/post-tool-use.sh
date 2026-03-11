@@ -50,7 +50,7 @@ case "$tool" in
     exit 0
     ;;
   # Prefix filters
-  mem_*|mcp__mem__*|mcp__sequential*|mcp__plugin_context7*)
+  mem_*|mcp__mem__*|mcp__plugin_claude-mem-lite*|mcp__sequential*|mcp__plugin_context7*)
     exit 0
     ;;
 esac

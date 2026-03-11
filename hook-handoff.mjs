@@ -27,14 +27,14 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
 
   const workingOn = prompts.map(p => truncate(p.prompt_text, 200)).join(' → ');
 
-  // 2. Completed — from observations
+  // 2. Completed — from observations (include narrative for richer handoff)
   const completed = db.prepare(`
-    SELECT title, type FROM observations
+    SELECT title, type, narrative FROM observations
     WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-    ORDER BY created_at_epoch DESC LIMIT 10
+    ORDER BY created_at_epoch DESC LIMIT 15
   `).all(sessionId);
 
-  // 3. Unfinished — from episode snapshot (passed in, not re-read)
+  // 3. Unfinished — episode snapshot + full session edit history from narratives
   let unfinished = '';
   if (episodeSnapshot?.entries) {
     const pendingDescs = episodeSnapshot.entries
@@ -46,6 +46,15 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   if (!unfinished) {
     const lastBugfix = completed.find(o => o.type === 'bugfix');
     if (lastBugfix) unfinished = lastBugfix.title;
+  }
+  // Enrich unfinished with full session edit history from observation narratives.
+  // Since handoff is UPSERT (max 2 rows per project), storing more data is free.
+  const narratives = completed
+    .filter(c => c.narrative)
+    .map(c => c.narrative);
+  if (narratives.length > 0) {
+    const editHistory = narratives.join('\n');
+    unfinished = [unfinished, editHistory].filter(Boolean).join('\n---\n');
   }
 
   // 4. Key files — from episode snapshot + observations
@@ -87,9 +96,9 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       created_at_epoch = excluded.created_at_epoch
   `).run(
     project, type, sessionId,
-    truncate(workingOn, 500),
+    truncate(workingOn, 1000),
     completed.map(c => `[${c.type}] ${c.title}`).join('\n'),
-    truncate(unfinished, 300),
+    truncate(unfinished, 3000),
     JSON.stringify([...fileSet].slice(0, 20)),
     decisions.map(d => d.title).join('\n'),
     keywords,
@@ -195,14 +204,15 @@ export function renderHandoffInjection(db, project) {
   // Append session summary if available (long-gap enrichment)
   try {
     const summary = db.prepare(`
-      SELECT completed, next_steps FROM session_summaries
+      SELECT completed, next_steps, remaining_items FROM session_summaries
       WHERE memory_session_id = ? AND project = ?
       ORDER BY created_at_epoch DESC LIMIT 1
     `).get(handoff.session_id, project);
-    if (summary && (summary.completed || summary.next_steps)) {
+    if (summary && (summary.completed || summary.next_steps || summary.remaining_items)) {
       lines.push('');
       lines.push('<session-summary source="haiku">');
       if (summary.completed) lines.push(summary.completed);
+      if (summary.remaining_items) lines.push(`Remaining: ${summary.remaining_items}`);
       if (summary.next_steps) lines.push(`Next steps: ${summary.next_steps}`);
       lines.push('</session-summary>');
     }

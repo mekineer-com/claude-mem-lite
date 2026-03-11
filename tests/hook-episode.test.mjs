@@ -123,6 +123,33 @@ describe('hook-episode.mjs', () => {
       expect(episodeHasSignificantContent(ep)).toBe(true);
     });
 
+    it('returns true for review pattern (5+ Read/Grep entries)', () => {
+      const ep = createEpisode('s', 'p');
+      for (let i = 0; i < 5; i++) {
+        ep.entries.push({ tool: 'Read', desc: `read file ${i}`, isError: false });
+      }
+      expect(episodeHasSignificantContent(ep)).toBe(true);
+    });
+
+    it('returns true for mixed Read/Grep review pattern', () => {
+      const ep = createEpisode('s', 'p');
+      ep.entries.push({ tool: 'Read', desc: 'read file 1', isError: false });
+      ep.entries.push({ tool: 'Read', desc: 'read file 2', isError: false });
+      ep.entries.push({ tool: 'Grep', desc: 'search pattern', isError: false });
+      ep.entries.push({ tool: 'Read', desc: 'read file 3', isError: false });
+      ep.entries.push({ tool: 'Grep', desc: 'search another', isError: false });
+      expect(episodeHasSignificantContent(ep)).toBe(true);
+    });
+
+    it('returns false for fewer than 5 Read/Grep entries without edits', () => {
+      const ep = createEpisode('s', 'p');
+      ep.entries.push({ tool: 'Read', desc: 'read file 1', isError: false });
+      ep.entries.push({ tool: 'Read', desc: 'read file 2', isError: false });
+      ep.entries.push({ tool: 'Grep', desc: 'search', isError: false });
+      ep.entries.push({ tool: 'Bash', desc: 'git status', isError: false });
+      expect(episodeHasSignificantContent(ep)).toBe(false);
+    });
+
     it('returns false for episodes with only non-significant entries', () => {
       const ep = createEpisode('s', 'p');
       ep.entries.push({ tool: 'Bash', desc: 'git status', isError: false });

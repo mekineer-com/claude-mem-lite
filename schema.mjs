@@ -97,6 +97,7 @@ const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN minhash_sig TEXT',
   'ALTER TABLE observations ADD COLUMN access_count INTEGER DEFAULT 0',
   'ALTER TABLE observations ADD COLUMN compressed_into INTEGER DEFAULT NULL',
+  'ALTER TABLE session_summaries ADD COLUMN remaining_items TEXT',
 ];
 
 /**
@@ -153,7 +154,7 @@ export function initSchema(db) {
 
   // FTS5 full-text search tables + triggers (idempotent)
   ensureFTS(db, 'observations_fts', 'observations', ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts']);
-  ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes']);
+  ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes', 'remaining_items']);
   ensureFTS(db, 'user_prompts_fts', 'user_prompts', ['prompt_text']);
 
   return db;
@@ -196,7 +197,12 @@ export function ensureDb() {
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = OFF'); // Enabled after dedup migration
 
-  return initSchema(db);
+  try {
+    return initSchema(db);
+  } catch (e) {
+    try { db.close(); } catch {}
+    throw e;
+  }
 }
 
 /**
@@ -211,10 +217,12 @@ export function ensureDb() {
  */
 export function rebuildFTS(db) {
   const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts'];
+  const idRe = /^[a-z][a-z0-9_]*$/;
   const rebuilt = [];
   const errors = [];
   for (const fts of FTS_TABLES) {
     try {
+      if (!idRe.test(fts)) { errors.push(`${fts}: invalid identifier`); continue; }
       const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(fts);
       if (!exists) { errors.push(`${fts}: not found`); continue; }
       db.exec(`INSERT INTO ${fts}(${fts}) VALUES('rebuild')`);
@@ -233,10 +241,12 @@ export function rebuildFTS(db) {
  */
 export function checkFTSIntegrity(db) {
   const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts'];
+  const idRe = /^[a-z][a-z0-9_]*$/;
   const details = [];
   let healthy = true;
   for (const fts of FTS_TABLES) {
     try {
+      if (!idRe.test(fts)) { details.push(`${fts}: invalid identifier`); healthy = false; continue; }
       const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(fts);
       if (!exists) { details.push(`${fts}: missing`); healthy = false; continue; }
       db.exec(`INSERT INTO ${fts}(${fts}) VALUES('integrity-check')`);
@@ -254,7 +264,7 @@ export function ensureFTS(db, ftsName, tableName, columns) {
   if (exists) return;
 
   // Validate identifiers to prevent SQL injection
-  const idRe = /^[a-z_]+$/;
+  const idRe = /^[a-z][a-z0-9_]*$/;
   if (!idRe.test(ftsName) || !idRe.test(tableName) || !columns.every(c => idRe.test(c))) {
     throw new Error(`Invalid identifier in ensureFTS: ${ftsName}, ${tableName}`);
   }

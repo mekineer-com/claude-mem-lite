@@ -210,13 +210,21 @@ export function mergePendingEntries(episode) {
 
 /**
  * Check if an episode has significant content worth processing with LLM.
- * Significant = contains file edits or Bash errors.
+ * Significant = contains file edits, Bash errors, or a review/research pattern
+ * (5+ Read/Grep entries indicate investigation worth recording).
  * @param {object} episode The episode to check
  * @returns {boolean} true if the episode has significant content
  */
 export function episodeHasSignificantContent(episode) {
-  return episode.entries.some(e =>
+  const hasEditsOrErrors = episode.entries.some(e =>
     EDIT_TOOLS.has(e.tool) ||
     (e.tool === 'Bash' && e.isError)
   );
+  if (hasEditsOrErrors) return true;
+
+  // Review/research pattern: reading many files indicates investigation
+  const readCount = episode.entries.filter(e =>
+    e.tool === 'Read' || e.tool === 'Grep'
+  ).length;
+  return readCount >= 5;
 }

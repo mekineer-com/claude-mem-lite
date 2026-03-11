@@ -24,8 +24,8 @@ function seedPrompt(db, sessionId, text, num) {
   db.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch) VALUES (?, ?, ?, datetime('now'), ?)`).run(sessionId, text, num, Date.now());
 }
 
-function seedObservation(db, sessionId, project, title, type, importance, filesModified) {
-  db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, importance, files_modified, created_at, created_at_epoch) VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?)`).run(sessionId, project, type, title, importance, filesModified, Date.now());
+function seedObservation(db, sessionId, project, title, type, importance, filesModified, narrative) {
+  db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, importance, files_modified, narrative, created_at, created_at_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`).run(sessionId, project, type, title, importance, filesModified, narrative || null, Date.now());
 }
 
 // ─── Schema Tests ───────────────────────────────────────────────────────────
@@ -282,6 +282,38 @@ describe('buildAndSaveHandoff', () => {
     expect(row.unfinished).toContain('TypeError in dispatch');
     expect(row.unfinished).not.toContain('Fixed null pointer');
   });
+
+  it('enriches unfinished with observation narratives (full edit history)', () => {
+    seedSession(db, 's1', 'test-proj');
+    seedPrompt(db, 's1', 'code review and fix issues', 1);
+    seedObservation(db, 's1', 'test-proj', 'Modified hook.mjs', 'change', 1, null,
+      'hook.mjs: "scrubSecrets" → "scrubSecrets, EDIT_TOOLS"');
+    seedObservation(db, 's1', 'test-proj', 'Modified dispatch.mjs', 'change', 1, null,
+      'dispatch.mjs: "score * decay" → "score * -decay"');
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'clear', null);
+
+    const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj'`).get();
+    // Unfinished should contain the full narrative details
+    expect(row.unfinished).toContain('scrubSecrets');
+    expect(row.unfinished).toContain('EDIT_TOOLS');
+    expect(row.unfinished).toContain('score * -decay');
+  });
+
+  it('unfinished preserves up to 3000 chars of narrative detail', () => {
+    seedSession(db, 's1', 'test-proj');
+    seedPrompt(db, 's1', 'fix everything', 1);
+    // Create observations with long narratives that together exceed old 300 limit
+    seedObservation(db, 's1', 'test-proj', 'Change 1', 'change', 1, null, 'detail-'.repeat(100));
+    seedObservation(db, 's1', 'test-proj', 'Change 2', 'change', 1, null, 'info-'.repeat(100));
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'clear', null);
+
+    const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj'`).get();
+    // unfinished should exceed old 300 limit, capped at 3000
+    expect(row.unfinished.length).toBeGreaterThan(300);
+    expect(row.unfinished.length).toBeLessThanOrEqual(3000);
+  });
 });
 
 // ─── detectContinuationIntent Tests ─────────────────────────────────────────
@@ -390,6 +422,18 @@ describe('renderHandoffInjection', () => {
     expect(result).toContain('finished stuff');
     expect(result).toContain('do next thing');
     expect(result).toContain('</session-summary>');
+  });
+
+  it('renders remaining_items from session summary', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 's1', 'code review', ?)`).run(Date.now());
+    seedSession(db, 's1', 'p');
+    db.prepare(`INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, remaining_items, created_at, created_at_epoch)
+      VALUES ('s1', 'p', 'full code review', 'fixed dispatch scoring', 'run tests', 'hook.mjs: missing EDIT_TOOLS import; schema.mjs: remaining_items column needed', datetime('now'), ?)`).run(Date.now());
+
+    const result = renderHandoffInjection(db, 'p');
+    expect(result).toContain('Remaining: hook.mjs: missing EDIT_TOOLS import');
+    expect(result).toContain('schema.mjs: remaining_items column needed');
   });
 
   it('returns null when no handoff exists', () => {

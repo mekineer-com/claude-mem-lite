@@ -9,17 +9,19 @@ describe('searchRelevantMemories', () => {
     db = new Database(':memory:');
     db.exec(`
       CREATE TABLE observations (
-        id INTEGER PRIMARY KEY, type TEXT, title TEXT, narrative TEXT,
+        id INTEGER PRIMARY KEY, type TEXT, title TEXT, subtitle TEXT,
+        narrative TEXT, facts TEXT, concepts TEXT,
         importance INTEGER DEFAULT 1, project TEXT, created_at TEXT,
         created_at_epoch INTEGER, compressed_into INTEGER, access_count INTEGER DEFAULT 0,
         text TEXT
       );
       CREATE VIRTUAL TABLE observations_fts USING fts5(
-        title, narrative, text, content=observations, content_rowid=id
+        title, subtitle, narrative, text, facts, concepts,
+        content=observations, content_rowid=id
       );
       CREATE TRIGGER obs_fts_ai AFTER INSERT ON observations BEGIN
-        INSERT INTO observations_fts(rowid, title, narrative, text)
-        VALUES (new.id, new.title, new.narrative, new.text);
+        INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
+        VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
       END;
     `);
 

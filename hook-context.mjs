@@ -154,7 +154,7 @@ export function updateClaudeMd(contextBlock) {
   const startIdx = content.indexOf(startTag);
   const endIdx = content.indexOf(endTag);
 
-  if (startIdx !== -1 && endIdx !== -1) {
+  if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {
     // Replace existing section in-place — preserves surrounding content (including hint if present)
     content = content.slice(0, startIdx) + newSection + content.slice(endIdx + endTag.length);
   } else if (content.length > 0) {

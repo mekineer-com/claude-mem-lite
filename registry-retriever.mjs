@@ -197,8 +197,9 @@ export function buildEnhancedQuery(signals) {
   // directly across name, intent_tags, capability_summary, trigger_patterns.
   if (signals.rawKeywords?.length > 0) {
     for (const kw of signals.rawKeywords) {
-      parts.push(`intent_tags:${kw}`);
-      parts.push(kw); // literal, no synonym expansion
+      const safeKw = expandToken(kw);
+      parts.push(`intent_tags:${safeKw}`);
+      parts.push(safeKw);
     }
   }
 
@@ -376,27 +377,31 @@ const COMPOSITE_EXPR = `(
 const COMPOSITE_ORDER = `ORDER BY ${COMPOSITE_EXPR} ASC`;
 
 const SEARCH_SQL = `
-  SELECT r.*,
-    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
-    ${COMPOSITE_EXPR} AS composite_score
-  FROM resources_fts
-  JOIN resources r ON r.id = resources_fts.rowid
-  WHERE resources_fts MATCH ?
-    AND r.status = 'active'
-  ORDER BY ${COMPOSITE_EXPR} ASC
+  SELECT *, composite_score FROM (
+    SELECT r.*,
+      bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
+      ${COMPOSITE_EXPR} AS composite_score
+    FROM resources_fts
+    JOIN resources r ON r.id = resources_fts.rowid
+    WHERE resources_fts MATCH ?
+      AND r.status = 'active'
+  ) sub
+  ORDER BY composite_score ASC
   LIMIT ?
 `;
 
 const SEARCH_BY_TYPE_SQL = `
-  SELECT r.*,
-    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
-    ${COMPOSITE_EXPR} AS composite_score
-  FROM resources_fts
-  JOIN resources r ON r.id = resources_fts.rowid
-  WHERE resources_fts MATCH ?
-    AND r.status = 'active'
-    AND r.type = ?
-  ${COMPOSITE_ORDER}
+  SELECT *, composite_score FROM (
+    SELECT r.*,
+      bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
+      ${COMPOSITE_EXPR} AS composite_score
+    FROM resources_fts
+    JOIN resources r ON r.id = resources_fts.rowid
+    WHERE resources_fts MATCH ?
+      AND r.status = 'active'
+      AND r.type = ?
+  ) sub
+  ORDER BY composite_score ASC
   LIMIT ?
 `;
 

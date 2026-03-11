@@ -4,7 +4,7 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-// debugLog, debugCatch available from utils.mjs if needed
+import { debugCatch } from './utils.mjs';
 
 // ─── Schema ──────────────────────────────────────────────────────────────────
 
@@ -178,6 +178,9 @@ export function ensureRegistryDb(dbPath) {
     const schema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='invocations'`).get();
     if (schema?.sql && !schema.sql.includes('user_prompt')) {
       db.transaction(() => {
+        // Clean up leftover from previous failed migration attempt
+        const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='invocations_old'`).get();
+        if (hasOld) db.exec(`DROP TABLE invocations_old`);
         db.exec(`ALTER TABLE invocations RENAME TO invocations_old`);
         db.exec(INVOCATIONS_SCHEMA);
         db.exec(`INSERT INTO invocations
@@ -187,7 +190,7 @@ export function ensureRegistryDb(dbPath) {
         db.exec(`DROP TABLE invocations_old`);
       })();
     }
-  } catch {}
+  } catch (e) { debugCatch(e, 'ensureRegistryDb-migration'); }
 
   db.exec(PREINSTALLED_SCHEMA);
 
@@ -223,7 +226,7 @@ const UPSERT_SQL = `
  */
 export function upsertResource(db, r) {
   return db.transaction(() => {
-    const result = db.prepare(UPSERT_SQL).run(
+    db.prepare(UPSERT_SQL).run(
       r.name, r.type, r.status || 'active', r.source || 'preinstalled',
       r.repo_url || null, r.repo_stars || 0, r.local_path,
       r.file_hash || null, r.invocation_name || '',
@@ -233,7 +236,6 @@ export function upsertResource(db, r) {
       r.keywords || '', r.tech_stack || '', r.use_cases || '', r.complexity || 'intermediate',
       r.indexed_at || null
     );
-    if (result.changes > 0 && result.lastInsertRowid) return Number(result.lastInsertRowid);
     const row = db.prepare('SELECT id FROM resources WHERE type = ? AND name = ?').get(r.type, r.name);
     return row?.id || 0;
   })();

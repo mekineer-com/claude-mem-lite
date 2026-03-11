@@ -54,13 +54,13 @@ function fallbackExtract(resource) {
     infra: 'infrastructure,devops,cloud',
   };
 
-  let intentTags = '';
+  const intentTagSet = new Set();
   for (const [key, tags] of Object.entries(intentMap)) {
     if (name.includes(key) || content.includes(key)) {
-      intentTags = tags;
-      break;
+      for (const t of tags.split(',')) intentTagSet.add(t);
     }
   }
+  const intentTags = [...intentTagSet].join(',');
 
   // Infer domain tags from content
   const domainPatterns = [

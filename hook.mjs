@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statS
 import {
   truncate, typeIcon, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
-  makeEntryDesc, scrubSecrets, computeRuleImportance, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
+  makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -29,7 +29,7 @@ import {
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
   resetInjectionBudget, hasInjectionBudget, incrementInjection,
 } from './hook-shared.mjs';
-import { handleLLMEpisode, handleLLMSummary, saveObservation, buildDegradedTitle } from './hook-llm.mjs';
+import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from './hook-handoff.mjs';
 
@@ -89,21 +89,7 @@ function flushEpisode(episode) {
   // LLM background worker will upgrade title/narrative/importance later.
   if (isSignificant) {
     try {
-      const hasError = episode.entries.some(e => e.isError);
-      const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
-      const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
-      const fileList = (episode.files || []).map(f => basename(f)).join(', ') || '(multiple)';
-      const obs = {
-        type: inferredType,
-        title: truncate(buildDegradedTitle(episode), 120),
-        subtitle: fileList,
-        narrative: episode.entries.map(e => e.desc).join('; '),
-        concepts: [],
-        facts: [],
-        files: episode.files,
-        filesRead: episode.filesRead || [],
-        importance: computeRuleImportance(episode),
-      };
+      const obs = buildImmediateObservation(episode);
       const id = saveObservation(obs, episode.project, episode.sessionId);
       if (id) episode.savedId = id;
     } catch (e) { debugCatch(e, 'flushEpisode-immediateSave'); }
@@ -160,7 +146,7 @@ async function handlePostToolUse() {
 
   // Skip noise
   if (SKIP_TOOLS.has(tool_name)) return;
-  if (tool_name.startsWith('mem_') || tool_name.startsWith('mcp__mem__')) return;
+  if (tool_name.startsWith('mem_') || tool_name.startsWith('mcp__mem__') || tool_name.startsWith('mcp__plugin_claude-mem-lite')) return;
   if (tool_name.startsWith('mcp__sequential') || tool_name.startsWith('mcp__plugin_context7')) return;
 
   const resp = typeof tool_response === 'string' ? tool_response : JSON.stringify(tool_response || '');
@@ -347,21 +333,7 @@ async function handleStop() {
           // Immediate save: persist rule-based observation to DB before spawning background worker.
           // Without this, data is lost if the background worker fails.
           try {
-            const hasError = episode.entries.some(e => e.isError);
-            const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
-            const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
-            const fileList = (episode.files || []).map(f => basename(f)).join(', ') || '(multiple)';
-            const obs = {
-              type: inferredType,
-              title: truncate(buildDegradedTitle(episode), 120),
-              subtitle: fileList,
-              narrative: episode.entries.map(e => e.desc).join('; '),
-              concepts: [],
-              facts: [],
-              files: episode.files,
-              filesRead: episode.filesRead || [],
-              importance: computeRuleImportance(episode),
-            };
+            const obs = buildImmediateObservation(episode);
             const id = saveObservation(obs, episode.project, episode.sessionId);
             if (id) episode.savedId = id;
           } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
@@ -906,6 +878,7 @@ async function handleResourceScan() {
     }
 
     // Upsert changed resources with fallback metadata (no Haiku)
+    let firstErr = true;
     for (const res of toIndex) {
       try {
         upsertResource(rdb, {
@@ -920,7 +893,7 @@ async function handleResourceScan() {
           trigger_patterns: `when user needs ${res.name.replace(/-/g, ' ').replace(/\//g, ' ')}`,
           capability_summary: `${res.type}: ${res.name.replace(/-/g, ' ')}`,
         });
-      } catch {}
+      } catch (e) { if (firstErr) { debugCatch(e, 'handleResourceScan-upsert'); firstErr = false; } }
     }
 
     // Disable resources no longer on filesystem

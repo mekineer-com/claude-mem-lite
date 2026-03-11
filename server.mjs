@@ -61,7 +61,7 @@ const RECENCY_HALF_LIFE_MS = 1209600000; // 14 days in milliseconds
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer(
-  { name: 'claude-mem-lite', version: '2.0.0' },
+  { name: 'claude-mem-lite', version: '2.1.6' },
   {
     instructions: [
       'Proactively search memory to leverage past experience. This is your long-term memory across sessions.',

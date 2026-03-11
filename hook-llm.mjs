@@ -183,6 +183,47 @@ export function buildDegradedTitle(episode) {
   return desc.replace(/ → (?:ERROR: )?\{.*$/, hasError ? ' (error)' : '');
 }
 
+/**
+ * Build a rule-based observation from episode metadata for immediate DB persistence.
+ * Used as pre-save (before LLM) and as fallback when LLM is unavailable.
+ * @param {object} episode Episode with entries, files, filesRead arrays
+ * @returns {object} Observation object ready for saveObservation()
+ */
+export function buildImmediateObservation(episode) {
+  const hasError = episode.entries.some(e => e.isError);
+  const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
+  const readCount = episode.entries.filter(e => e.tool === 'Read' || e.tool === 'Grep').length;
+  const isReviewPattern = !hasEdit && !hasError && readCount >= 5;
+  const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
+  const fileList = (episode.files || []).map(f => basename(f)).join(', ') || '(multiple)';
+
+  // Review/research episodes: use a descriptive title with file count
+  let title;
+  if (isReviewPattern) {
+    const allFiles = [...new Set([
+      ...(episode.files || []),
+      ...(episode.filesRead || []),
+    ])].map(f => basename(f));
+    const names = allFiles.slice(0, 4).join(', ');
+    const suffix = allFiles.length > 4 ? ` +${allFiles.length - 4} more` : '';
+    title = truncate(`Reviewed ${allFiles.length} files: ${names}${suffix}`, 120);
+  } else {
+    title = truncate(buildDegradedTitle(episode), 120);
+  }
+
+  return {
+    type: inferredType,
+    title,
+    subtitle: fileList,
+    narrative: episode.entries.map(e => e.desc).join('; '),
+    concepts: [],
+    facts: [],
+    files: episode.files,
+    filesRead: episode.filesRead || [],
+    importance: isReviewPattern ? Math.max(2, computeRuleImportance(episode)) : computeRuleImportance(episode),
+  };
+}
+
 // ─── Background: LLM Episode Extraction (Tier 2 F) ──────────────────────────
 
 export async function handleLLMEpisode() {
@@ -282,20 +323,7 @@ importance: 1=routine, 2=notable (error fix, arch decision, config change), 3=cr
       try { unlinkSync(tmpFile); } catch {}
       return;
     }
-    const hasError = episode.entries.some(e => e.isError);
-    const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
-    const inferredType = hasError ? 'bugfix' : hasEdit ? 'change' : 'discovery';
-    obs = {
-      type: inferredType,
-      title: truncate(buildDegradedTitle(episode), 120),
-      subtitle: fileList,
-      narrative: episode.entries.map(e => e.desc).join('; '),
-      concepts: [],
-      facts: [],
-      files: episode.files,
-      filesRead: episode.filesRead || [],
-      importance: ruleImportance,
-    };
+    obs = buildImmediateObservation(episode);
   }
 
   const db = openDb();
@@ -371,16 +399,25 @@ export async function handleLLMSummary() {
     if (recentObs.length < 1) return;
 
     const obsList = recentObs.map((o, i) =>
-      `${i + 1}. [${o.type}] ${o.title}${o.narrative ? ': ' + truncate(o.narrative, 80) : ''}`
+      `${i + 1}. [${o.type}] ${o.title}${o.narrative ? ': ' + truncate(o.narrative, 200) : ''}`
     ).join('\n');
+
+    // Include user prompts for richer context
+    const userPrompts = db.prepare(`
+      SELECT prompt_text FROM user_prompts
+      WHERE content_session_id = ? ORDER BY prompt_number ASC LIMIT 10
+    `).all(sessionId).map(p => truncate(p.prompt_text, 300));
+    const promptCtx = userPrompts.length > 0
+      ? `\nUser requests: ${userPrompts.join(' → ')}\n`
+      : '';
 
     const prompt = `Summarize this coding session. Return ONLY valid JSON, no markdown fences.
 
-Project: ${project}
+Project: ${project}${promptCtx}
 Observations (${recentObs.length} total):
 ${obsList}
 
-JSON: {"request":"what the user was working on","investigated":"what was explored/analyzed","learned":"key findings","completed":"what was accomplished","next_steps":"suggested follow-up"}`;
+JSON: {"request":"what the user was working on","completed":"specific items accomplished with file names","remaining_items":"specific unfinished items from the original request — compare investigation scope with actual changes to infer what was NOT yet done; be precise with file:issue format, or empty string if all done","next_steps":"suggested follow-up"}`;
 
     if (!(await acquireLLMSlot())) {
       debugLog('WARN', 'llm-summary', 'semaphore timeout, skipping summary');
@@ -398,12 +435,13 @@ JSON: {"request":"what the user was working on","investigated":"what was explore
     if (llmParsed && llmParsed.request) {
       const now = new Date();
       db.prepare(`
-        INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?)
+        INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?)
       `).run(
         sessionId, project,
         llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
         llmParsed.completed || '', llmParsed.next_steps || '',
+        llmParsed.remaining_items || '',
         now.toISOString(), now.getTime()
       );
     }
