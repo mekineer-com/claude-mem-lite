@@ -707,7 +707,7 @@ export function tokenizeHandoff(text) {
   if (!text) return [];
   return text
     .split(/[\s,;:.()[\]{}'"`<>→|/\\#@!?=+*&^%$~]+/)
-    .map(w => w.toLowerCase().replace(/^[.\-]+|[.\-]+$/g, ''))
+    .map(w => w.toLowerCase().replace(/^[.-]+|[.-]+$/g, ''))
     .filter(w => w.length >= 3);
 }
 

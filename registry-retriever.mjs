@@ -374,9 +374,6 @@ const COMPOSITE_EXPR = `(
         ELSE 0 END
   )`;
 
-// COMPOSITE_ORDER kept for SEARCH_BY_TYPE_SQL and other queries
-const COMPOSITE_ORDER = `ORDER BY ${COMPOSITE_EXPR} ASC`;
-
 const SEARCH_SQL = `
   SELECT *, composite_score FROM (
     SELECT r.*,

@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { extractMatchKeywords, tokenizeHandoff, isSpecificTerm, HANDOFF_STOP_WORDS } from '../utils.mjs';
+import { extractMatchKeywords, tokenizeHandoff, isSpecificTerm } from '../utils.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from '../hook-handoff.mjs';
 
 // ─── DB Helper ──────────────────────────────────────────────────────────────

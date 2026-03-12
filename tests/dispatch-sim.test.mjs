@@ -4,11 +4,11 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
-import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
-  isRecentlyRecommended, SESSION_RECOMMEND_CAP,
+import { shouldSkipDispatch, extractContextSignals,
+  SESSION_RECOMMEND_CAP,
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
   _resetCircuitBreaker, _reRankByKeywords, _applyAdoptionDecay, _passesConfidenceGate } from '../dispatch.mjs';
-import { upsertResource, recordInvocation } from '../registry.mjs';
+import { upsertResource } from '../registry.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
 
@@ -296,7 +296,7 @@ function seedProductionCatalog(db) {
 
 // ─── Helper: run full dispatch pipeline for a user prompt ────────────────────
 
-function fullPipeline(db, userPrompt, { sessionId = 'sim-sess-1' } = {}) {
+function fullPipeline(db, userPrompt, { sessionId: _sessionId = 'sim-sess-1' } = {}) {
   const signals = extractContextSignals({ tool_name: '_session_start' }, { userPrompt });
   const enhancedQuery = buildEnhancedQuery(signals);
   const fetchLimit = signals.rawKeywords.length > 0 ? 8 : 3;
@@ -614,11 +614,8 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
     it('session dedup: second call for same session returns null', async () => {
       const r1 = await dispatchOnSessionStart(db, 'write tests', 'sim-dedup', { hasHandoff: true });
       expect(r1).toBeTruthy();
-      const r2 = await dispatchOnSessionStart(db, 'write more tests', 'sim-dedup', { hasHandoff: true });
-      // Same resource can't be recommended twice in same session
-      // But a DIFFERENT resource could still be recommended
-      // r2 is null only if the same resource is top result again (session dedup)
-      // or if session cap is hit
+      const _r2 = await dispatchOnSessionStart(db, 'write more tests', 'sim-dedup', { hasHandoff: true });
+      // r2 is null if same resource is top result again (session dedup) or session cap hit
     });
 
     it('respects session recommendation cap', async () => {
