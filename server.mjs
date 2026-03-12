@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
@@ -1011,9 +1011,9 @@ server.registerTool(
         WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
       `).get(staleAge, ...baseParams);
 
-      // Count pending-purge items (compressed_into = -2, marked by idle cleanup)
+      // Count pending-purge items (marked by idle cleanup)
       const pendingPurge = db.prepare(`
-        SELECT COUNT(*) as count FROM observations WHERE compressed_into = -2 ${projectFilter}
+        SELECT COUNT(*) as count FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} ${projectFilter}
       `).get(...baseParams);
 
       const lines = [
@@ -1087,13 +1087,13 @@ server.registerTool(
         }
 
         if (ops.includes('purge_stale')) {
-          // Delete observations previously marked as pending-purge (compressed_into = -2)
-          // by idle cleanup. Requires user confirmation via /mem:update or /mem:mem.
-          const retainDays = args.retain_days || 30;
+          // Delete observations previously marked as pending-purge by idle cleanup.
+          // Requires user confirmation via /mem:update or /mem:mem.
+          const retainDays = args.retain_days ?? 30;
           const retainCutoff = Date.now() - retainDays * 86400000;
           const purged = db.prepare(`
             DELETE FROM observations
-            WHERE compressed_into = -2 AND created_at_epoch < ? ${projectFilter}
+            WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
           `).run(retainCutoff, ...baseParams);
           results.push(`Purged ${purged.changes} stale observations (retained last ${retainDays} days)`);
         }
@@ -1230,11 +1230,10 @@ const idleTimer = setInterval(() => {
 
     db.transaction(() => {
       // Mark old low-quality observations as pending-purge (importance<=1, never accessed, 30+ days).
-      // compressed_into = -2 is a sentinel meaning "pending user-confirmed purge".
       // Actual deletion only happens when user confirms via mem_maintain execute purge_stale.
       // NOTE: no project filter — MCP server is global, operates across all projects.
       const marked = db.prepare(`
-        UPDATE observations SET compressed_into = -2
+        UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
         WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
           AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
       `).run(thirtyDaysAgo);
@@ -1243,9 +1242,8 @@ const idleTimer = setInterval(() => {
       }
 
       // Mark old importance=1 as compressed (30+ days)
-      // compressed_into = -1 is an established sentinel meaning "auto-compressed without merge target"
       const compressed = db.prepare(`
-        UPDATE observations SET compressed_into = -1
+        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
         WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
           AND created_at_epoch < ?
       `).run(thirtyDaysAgo);

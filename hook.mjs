@@ -11,6 +11,7 @@ import {
   truncate, typeIcon, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
+  COMPRESSED_AUTO,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -457,7 +458,7 @@ async function handleSessionStart() {
       // Auto-compress: mark old low-importance observations as compressed (30+ days, importance=1)
       // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
       const compressed = db.prepare(`
-        UPDATE observations SET compressed_into = -1
+        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
         WHERE COALESCE(compressed_into, 0) = 0
           AND importance = 1
           AND created_at_epoch < ?

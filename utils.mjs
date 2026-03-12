@@ -3,6 +3,13 @@
 
 import { basename, dirname } from 'path';
 
+// ─── Sentinel Values ────────────────────────────────────────────────────────
+
+/** compressed_into sentinel: auto-compressed without merge target */
+export const COMPRESSED_AUTO = -1;
+/** compressed_into sentinel: pending user-confirmed purge (marked by idle cleanup) */
+export const COMPRESSED_PENDING_PURGE = -2;
+
 // ─── String Utilities ────────────────────────────────────────────────────────
 
 /**

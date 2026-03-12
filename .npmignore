@@ -1,0 +1,24 @@
+# From .gitignore
+/docs
+/CLAUDE.md
+/node_modules
+/coverage
+/managed
+/resource-registry.db*
+.tmp/
+.claude-mem-lite/
+*.db
+*.db-wal
+*.db-shm
+.env*
+.worktrees/
+
+# Dev/CI only
+tests/
+benchmark/
+.github/
+.gsd/
+.eslint*
+vitest.config.*
+project_memory.md
+memory_archive.md
