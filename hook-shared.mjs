@@ -94,6 +94,7 @@ export function callLLM(prompt, timeoutMs = 15000) {
       encoding: 'utf8',
       env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: '/tmp', // Prevent ghost sessions in user's /resume list
     });
     return result.trim();
   } catch (e) {
