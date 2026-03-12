@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # claude-mem-lite SessionStart pre-hook
-# Data directory setup and migrations (deps handled by launch.mjs)
+# Data directory setup, migrations, and dependency resolution
 #
 
 set -euo pipefail
@@ -65,6 +65,25 @@ fi
 
 # 5. Ensure runtime directory exists (after migration to not mask migration check)
 mkdir -p "$DATA_DIR/runtime"
+
+# 6. Ensure native dependencies available for hooks (ESM import needs node_modules in resolution chain)
+#    Plugin cache doesn't include node_modules — symlink from data dir or npm install on first run
+if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
+  # Fast path: symlink from data dir (instant, no network needed)
+  if [[ -d "$DATA_DIR/node_modules/better-sqlite3" ]]; then
+    ln -sfn "$DATA_DIR/node_modules" "$ROOT/node_modules" 2>/dev/null && \
+      log_ok "Dependencies linked from $DATA_DIR" || true
+  fi
+  # Slow path: npm install (first-time only, ~10-20s for native addon)
+  if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
+    log_info "Installing dependencies (first-time setup)..."
+    if (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund 2>&1) >&2; then
+      log_ok "Dependencies installed"
+    else
+      log_warn "Dependency install failed — hooks may have limited functionality"
+    fi
+  fi
+fi
 
 log_ok "claude-mem-lite ready"
 exit 0
