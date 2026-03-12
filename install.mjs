@@ -21,6 +21,7 @@ const IS_NPX = process.env.npm_command === 'exec' ||
 const INSTALL_DIR = DATA_DIR;
 const SERVER_PATH = join(INSTALL_DIR, 'server.mjs');
 const HOOK_PATH = join(INSTALL_DIR, 'hook.mjs');
+const MARKETPLACE_KEY = 'sdsrss';
 
 // ─── Curated Resource Metadata ───────────────────────────────────────────────
 // Replaces generic name-echo fallback with FTS5-optimized metadata per resource.
@@ -1174,6 +1175,292 @@ const RESOURCE_METADATA = {
     trigger_patterns: 'when user needs data visualization charts dashboards or interactive graph creation',
   },
 
+  // ─── Plugin Skills (locally installed, no git repo) ────────────────────────
+  'skill:superpowers-executing-plans': {
+    intent_tags: 'execute,plan,implementation,session,review,checkpoint,step-by-step',
+    domain_tags: 'planning,execution,workflow',
+    capability_summary: 'Execute written implementation plans in separate sessions with review checkpoints',
+    trigger_patterns: 'when user has a written implementation plan to execute with review checkpoints',
+    invocation_name: 'superpowers:executing-plans',
+  },
+  'skill:superpowers-receiving-code-review': {
+    intent_tags: 'code-review,feedback,receiving,review-response,technical-rigor,verification',
+    domain_tags: 'quality,review,workflow',
+    capability_summary: 'Handle received code review feedback with technical rigor and verification before implementing',
+    trigger_patterns: 'when receiving code review feedback especially if unclear or technically questionable',
+    invocation_name: 'superpowers:receiving-code-review',
+  },
+  'skill:superpowers-subagent-development': {
+    intent_tags: 'subagent,parallel,development,independent,tasks,concurrent,delegation',
+    domain_tags: 'workflow,parallel,automation',
+    capability_summary: 'Execute implementation plans with independent tasks via parallel subagents',
+    trigger_patterns: 'when executing plans with independent tasks that can be parallelized via subagents',
+    invocation_name: 'superpowers:subagent-driven-development',
+  },
+  'skill:superpowers-finishing-branch': {
+    intent_tags: 'finish,branch,merge,pr,cleanup,integrate,complete,development',
+    domain_tags: 'git,workflow,integration',
+    capability_summary: 'Guide completion of development branches with merge PR or cleanup options',
+    trigger_patterns: 'when implementation is complete tests pass and need to decide how to integrate the work',
+    invocation_name: 'superpowers:finishing-a-development-branch',
+  },
+  'skill:superpowers-writing-skills': {
+    intent_tags: 'skill,write,create,edit,deploy,verify,author,markdown',
+    domain_tags: 'skills,meta,authoring',
+    capability_summary: 'Create edit and verify Claude Code skills before deployment',
+    trigger_patterns: 'when creating new skills editing existing skills or verifying skills work before deployment',
+    invocation_name: 'superpowers:writing-skills',
+  },
+  'skill:superpowers-parallel-agents': {
+    intent_tags: 'parallel,agents,dispatch,concurrent,independent,tasks,multi-agent',
+    domain_tags: 'workflow,parallel,agents',
+    capability_summary: 'Dispatch parallel agents for 2+ independent tasks without shared state',
+    trigger_patterns: 'when facing 2 or more independent tasks that can be worked on without shared state',
+    invocation_name: 'superpowers:dispatching-parallel-agents',
+  },
+  'skill:claude-api': {
+    intent_tags: 'claude,api,anthropic,sdk,build,integration,tool-use,agent-sdk',
+    domain_tags: 'anthropic,api,sdk,ai',
+    capability_summary: 'Build apps with the Claude API or Anthropic SDK including Agent SDK',
+    trigger_patterns: 'when code imports anthropic sdk or user asks to use Claude API Anthropic SDK or Agent SDK',
+    invocation_name: 'claude-api',
+  },
+  'skill:postgres-patterns': {
+    intent_tags: 'postgresql,postgres,database,query,optimization,schema,indexing,security,supabase',
+    domain_tags: 'postgresql,database,sql,supabase',
+    capability_summary: 'PostgreSQL patterns for query optimization schema design indexing and security',
+    trigger_patterns: 'when user needs PostgreSQL query optimization schema design indexing or security patterns',
+    invocation_name: 'postgres-patterns',
+  },
+  'skill:multi-model-reviewer': {
+    intent_tags: 'multi-model,review,openrouter,gpt,qwen,claude,code-review,architecture',
+    domain_tags: 'ai,review,quality',
+    capability_summary: 'Multi-model code review via OpenRouter calling Claude GPT Qwen for joint assessment',
+    trigger_patterns: 'when user requests code review architecture review or multi-model multi-angle analysis',
+    invocation_name: 'multi-model-reviewer',
+  },
+  'skill:build-error-resolver': {
+    intent_tags: 'build,error,typescript,type-error,fix,compile,resolution,minimal',
+    domain_tags: 'build,typescript,debugging',
+    capability_summary: 'Fix build and TypeScript errors with minimal diffs focusing on getting build green',
+    trigger_patterns: 'when build fails or type errors occur needing quick resolution with minimal changes',
+    invocation_name: 'build-error-resolver',
+  },
+  'skill:perplexity-search': {
+    intent_tags: 'search,web,perplexity,latest,best-practice,documentation,solution',
+    domain_tags: 'search,web,ai',
+    capability_summary: 'Web search via Perplexity AI for latest programming resources and solutions',
+    trigger_patterns: 'when needing latest API docs best practices tool recommendations or searching solutions online',
+    invocation_name: 'perplexity-search',
+  },
+  'skill:claude-code-plugin-dev': {
+    intent_tags: 'plugin,claude-code,marketplace,mcp,hooks,commands,develop,publish',
+    domain_tags: 'claude,plugin,mcp,development',
+    capability_summary: 'Create and publish Claude Code plugins with correct metadata format and marketplace support',
+    trigger_patterns: 'when building Claude Code plugins getting plugin install errors or packaging MCP servers as plugins',
+    invocation_name: 'claude-code-plugin-dev',
+  },
+  'skill:npm-cross-platform-release': {
+    intent_tags: 'npm,publish,release,cross-platform,binary,github-actions,npx',
+    domain_tags: 'npm,release,cicd',
+    capability_summary: 'Cross-platform binary build and npm publish via GitHub Actions with npx support',
+    trigger_patterns: 'when user needs to publish npm packages set up cross-platform binary distribution or CI/CD release',
+    invocation_name: 'npm-cross-platform-release',
+  },
+  'skill:fullstack-qa': {
+    intent_tags: 'qa,fullstack,automation,test,browser,api,ui,e2e,visual,curl',
+    domain_tags: 'testing,qa,browser,web',
+    capability_summary: 'Fullstack automated testing: test suite curl API browser function UI visual review',
+    trigger_patterns: 'when user needs fullstack testing QA automation browser testing API testing or UI visual review',
+    invocation_name: 'fullstack-qa',
+  },
+  'skill:strategic-compact': {
+    intent_tags: 'compact,context,memory,compression,preserve,manual,window',
+    domain_tags: 'context,workflow,memory',
+    capability_summary: 'Manual context compaction at logical intervals to preserve context through task phases',
+    trigger_patterns: 'when context window is getting full and need strategic compaction to preserve important context',
+    invocation_name: 'strategic-compact',
+  },
+  'skill:keybindings-help': {
+    intent_tags: 'keybindings,keyboard,shortcuts,rebind,customize,chord,keys',
+    domain_tags: 'claude,config,keyboard',
+    capability_summary: 'Customize Claude Code keyboard shortcuts rebind keys and add chord bindings',
+    trigger_patterns: 'when user wants to customize keyboard shortcuts rebind keys or modify keybindings',
+    invocation_name: 'keybindings-help',
+  },
+  'skill:simplify': {
+    intent_tags: 'simplify,refactor,reuse,quality,efficiency,review,clean,code',
+    domain_tags: 'quality,refactoring,code',
+    capability_summary: 'Review changed code for reuse quality and efficiency then fix any issues found',
+    trigger_patterns: 'when user wants to review and simplify recently changed code for quality and efficiency',
+    invocation_name: 'simplify',
+  },
+  'skill:loop': {
+    intent_tags: 'loop,recurring,interval,poll,schedule,repeat,monitor,cron',
+    domain_tags: 'automation,workflow,scheduling',
+    capability_summary: 'Run a prompt or slash command on a recurring interval for monitoring or polling',
+    trigger_patterns: 'when user wants to set up a recurring task poll for status or run something repeatedly',
+    invocation_name: 'loop',
+  },
+  'skill:feature-dev': {
+    intent_tags: 'feature,development,guided,architecture,codebase,implementation,design',
+    domain_tags: 'development,architecture,workflow',
+    capability_summary: 'Guided feature development with codebase understanding and architecture focus',
+    trigger_patterns: 'when user needs guided feature development with architecture analysis and codebase understanding',
+    invocation_name: 'feature-dev:feature-dev',
+  },
+  'skill:mem-search': {
+    intent_tags: 'memory,search,manage,recall,observations,sessions,prompts,history',
+    domain_tags: 'memory,ai,claude,search',
+    capability_summary: 'Search and manage project memory including observations sessions and prompts',
+    trigger_patterns: 'when user wants to search memory recall past work manage observations or browse session history',
+    invocation_name: 'claude-mem-lite:mem',
+  },
+
+  // ─── Plugin Commands as Skills ─────────────────────────────────────────────
+  'skill:commit-clean-gone': {
+    intent_tags: 'git,clean,branch,gone,remote,prune,worktree,cleanup',
+    domain_tags: 'git,cleanup,branch',
+    capability_summary: 'Clean up git branches marked as gone with associated worktree removal',
+    trigger_patterns: 'when user needs to clean up deleted remote branches or prune gone branches',
+    invocation_name: 'commit-commands:clean_gone',
+  },
+  'skill:commit': {
+    intent_tags: 'git,commit,save,stage,message,changes',
+    domain_tags: 'git,workflow',
+    capability_summary: 'Create a git commit with staged changes',
+    trigger_patterns: 'when user wants to create a git commit',
+    invocation_name: 'commit-commands:commit',
+  },
+  'skill:commit-push-pr': {
+    intent_tags: 'git,commit,push,pr,pull-request,merge,publish',
+    domain_tags: 'git,workflow,github',
+    capability_summary: 'Commit push and open a pull request in one workflow',
+    trigger_patterns: 'when user wants to commit push and create a PR in one step',
+    invocation_name: 'commit-commands:commit-push-pr',
+  },
+  'skill:ralph-cancel': {
+    intent_tags: 'ralph,cancel,stop,loop,session,abort',
+    domain_tags: 'ralph,workflow,automation',
+    capability_summary: 'Cancel an active Ralph Loop session',
+    trigger_patterns: 'when user wants to cancel or stop an active Ralph Loop',
+    invocation_name: 'ralph-loop:cancel-ralph',
+  },
+  'skill:ralph-help': {
+    intent_tags: 'ralph,help,explain,commands,usage,documentation',
+    domain_tags: 'ralph,workflow,help',
+    capability_summary: 'Explain Ralph Loop plugin and list available commands',
+    trigger_patterns: 'when user asks about Ralph Loop what it does or how to use it',
+    invocation_name: 'ralph-loop:help',
+  },
+  'skill:ralph-loop-start': {
+    intent_tags: 'ralph,loop,start,autonomous,session,continuous',
+    domain_tags: 'ralph,workflow,automation',
+    capability_summary: 'Start Ralph Loop for autonomous continuous session execution',
+    trigger_patterns: 'when user wants to start Ralph Loop for continuous autonomous work',
+    invocation_name: 'ralph-loop:ralph-loop',
+  },
+  'skill:gsd-resume': {
+    intent_tags: 'gsd,resume,continue,restore,state,project,workspace',
+    domain_tags: 'gsd,project,workflow',
+    capability_summary: 'Resume project execution from saved state with workspace validation',
+    trigger_patterns: 'when user wants to resume a paused GSD project from saved state',
+    invocation_name: 'gsd:resume',
+  },
+  'skill:gsd-start': {
+    intent_tags: 'gsd,start,project,requirements,plan,discuss,execute',
+    domain_tags: 'gsd,project,workflow',
+    capability_summary: 'Interactive project start — discuss requirements research plan then auto-execute',
+    trigger_patterns: 'when user wants to start a new GSD project with discussion planning and execution',
+    invocation_name: 'gsd:start',
+  },
+  'skill:gsd-stop': {
+    intent_tags: 'gsd,stop,pause,save,state,checkpoint',
+    domain_tags: 'gsd,project,workflow',
+    capability_summary: 'Save current GSD project state and pause execution',
+    trigger_patterns: 'when user wants to pause or stop a GSD project and save progress',
+    invocation_name: 'gsd:stop',
+  },
+  'skill:gsd-prd': {
+    intent_tags: 'gsd,prd,requirements,document,description,spec,start',
+    domain_tags: 'gsd,project,requirements',
+    capability_summary: 'Start GSD project from a requirements document or description text',
+    trigger_patterns: 'when user has a PRD or requirements document and wants to start a GSD project from it',
+    invocation_name: 'gsd:prd',
+  },
+  'skill:gsd-status': {
+    intent_tags: 'gsd,status,progress,overview,dashboard,state',
+    domain_tags: 'gsd,project,monitoring',
+    capability_summary: 'Display GSD project progress overview from canonical state fields',
+    trigger_patterns: 'when user wants to see GSD project status progress or current state',
+    invocation_name: 'gsd:status',
+  },
+
+  // ─── Plugin Agent Types ────────────────────────────────────────────────────
+  'agent:feature-dev-code-architect': {
+    intent_tags: 'architecture,design,feature,blueprint,codebase,patterns,conventions,plan',
+    domain_tags: 'architecture,development,design',
+    capability_summary: 'Design feature architectures by analyzing codebase patterns with implementation blueprints',
+    trigger_patterns: 'when user needs feature architecture design with codebase analysis and implementation blueprints',
+    invocation_name: 'feature-dev:code-architect',
+  },
+  'agent:feature-dev-code-reviewer': {
+    intent_tags: 'review,bugs,logic,security,quality,conventions,confidence,priority',
+    domain_tags: 'quality,review,security',
+    capability_summary: 'Review code for bugs security vulnerabilities and quality with confidence-based filtering',
+    trigger_patterns: 'when user needs focused code review for bugs security issues and high-priority quality problems',
+    invocation_name: 'feature-dev:code-reviewer',
+  },
+  'agent:feature-dev-code-explorer': {
+    intent_tags: 'explore,analyze,trace,execution,architecture,dependencies,understand,codebase',
+    domain_tags: 'architecture,analysis,exploration',
+    capability_summary: 'Deep codebase analysis by tracing execution paths mapping architecture and understanding patterns',
+    trigger_patterns: 'when user needs deep codebase analysis execution path tracing or architecture understanding',
+    invocation_name: 'feature-dev:code-explorer',
+  },
+  'agent:code-simplifier-agent': {
+    intent_tags: 'simplify,refine,clarity,consistency,maintainability,clean,refactor',
+    domain_tags: 'quality,refactoring,code',
+    capability_summary: 'Simplify and refine code for clarity consistency and maintainability preserving functionality',
+    trigger_patterns: 'when user wants to simplify code improve clarity or refine for consistency and maintainability',
+    invocation_name: 'code-simplifier:code-simplifier',
+  },
+  'agent:superpowers-code-reviewer-agent': {
+    intent_tags: 'review,plan,standards,major-step,validate,milestone,code-review',
+    domain_tags: 'quality,review,workflow',
+    capability_summary: 'Review completed project steps against original plan and coding standards',
+    trigger_patterns: 'when a major project step is completed and needs review against plan and coding standards',
+    invocation_name: 'superpowers:code-reviewer',
+  },
+  'agent:gsd-debugger': {
+    intent_tags: 'debug,systematic,root-cause,analysis,fix,diagnose,gsd',
+    domain_tags: 'debugging,gsd,analysis',
+    capability_summary: 'Systematic GSD debugging with root cause analysis and targeted fixes',
+    trigger_patterns: 'when GSD project encounters bugs needing systematic debugging and root cause analysis',
+    invocation_name: 'gsd:debugger',
+  },
+  'agent:gsd-executor': {
+    intent_tags: 'execute,task,tdd,self-review,structured,result,gsd',
+    domain_tags: 'gsd,execution,tdd',
+    capability_summary: 'Execute one GSD task with TDD self-review and return structured result',
+    trigger_patterns: 'when GSD project needs to execute a single task with TDD and structured output',
+    invocation_name: 'gsd:executor',
+  },
+  'agent:gsd-reviewer': {
+    intent_tags: 'review,two-stage,quality,post-execution,gsd,verify',
+    domain_tags: 'gsd,review,quality',
+    capability_summary: 'Two-stage code review after GSD executor completes a task',
+    trigger_patterns: 'when GSD executor completes a task and needs two-stage quality review',
+    invocation_name: 'gsd:reviewer',
+  },
+  'agent:gsd-researcher': {
+    intent_tags: 'research,domain,ecosystem,planning,investigate,gsd,discovery',
+    domain_tags: 'gsd,research,planning',
+    capability_summary: 'Research domain ecosystem and gather information before GSD project planning',
+    trigger_patterns: 'when GSD project needs domain research ecosystem investigation before planning',
+    invocation_name: 'gsd:researcher',
+  },
+
 };
 
 /**
@@ -1206,6 +1493,42 @@ function reindexKnownResources(rdb) {
       );
     }
   })();
+}
+
+/**
+ * Register plugin resources that have no local files (virtual resources).
+ * These are skills/agents from other installed plugins that the dispatch
+ * system should know about for intelligent recommendation.
+ * Only inserts entries that don't already exist in the resources table.
+ * @param {Database} rdb Registry database handle
+ */
+function registerVirtualResources(rdb) {
+  const insert = rdb.prepare(`
+    INSERT OR IGNORE INTO resources (name, type, status, source, local_path, invocation_name,
+      intent_tags, domain_tags, capability_summary, trigger_patterns,
+      created_at, updated_at)
+    VALUES (?, ?, 'active', 'preinstalled', '', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+  `);
+
+  let count = 0;
+  rdb.transaction(() => {
+    for (const [key, meta] of Object.entries(RESOURCE_METADATA)) {
+      const sep = key.indexOf(':');
+      if (sep < 0) continue;
+      const type = key.slice(0, sep);
+      const name = key.slice(sep + 1);
+      const { changes } = insert.run(
+        name, type,
+        meta.invocation_name || '',
+        meta.intent_tags || name.replace(/-/g, ' '),
+        meta.domain_tags || '',
+        meta.capability_summary || `${type}: ${name.replace(/-/g, ' ')}`,
+        meta.trigger_patterns || `when user needs ${name.replace(/-/g, ' ')}`,
+      );
+      count += changes;
+    }
+  })();
+  return count;
 }
 
 const cmd = process.argv[2];
@@ -1320,6 +1643,43 @@ async function install() {
   } catch (e) {
     fail('MCP registration failed: ' + e.message);
     warn('Try manually: claude mcp add -s user -t stdio mem -- node ' + SERVER_PATH);
+  }
+
+  // 3b. Deduplicate: if marketplace plugin also registers MCP + hooks,
+  // clear them to prevent double execution. install.mjs hooks (in settings.json)
+  // point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
+  // while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
+  const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
+  const pluginMcpPath = join(pluginDir, '.mcp.json');
+  const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
+
+  if (existsSync(pluginDir)) {
+    // Clear plugin MCP to prevent duplicate "mem" server
+    try {
+      if (existsSync(pluginMcpPath)) {
+        const pluginMcp = JSON.parse(readFileSync(pluginMcpPath, 'utf8'));
+        if (pluginMcp.mcpServers?.mem) {
+          delete pluginMcp.mcpServers.mem;
+          writeFileSync(pluginMcpPath, JSON.stringify(pluginMcp, null, 2) + '\n');
+          ok('Marketplace plugin: MCP cleared (prevents duplicate)');
+        }
+      }
+    } catch (e) { warn(`Marketplace MCP dedup: ${e.message}`); }
+
+    // Clear plugin hooks to prevent double hook execution
+    try {
+      if (existsSync(pluginHooksPath)) {
+        const pluginHooks = JSON.parse(readFileSync(pluginHooksPath, 'utf8'));
+        if (pluginHooks.hooks && Object.keys(pluginHooks.hooks).length > 0) {
+          writeFileSync(pluginHooksPath, JSON.stringify({
+            description: pluginHooks.description || 'claude-mem-lite hooks',
+            _note: 'Hooks managed by install.mjs in settings.json — this file cleared to prevent duplicates',
+            hooks: {}
+          }, null, 2) + '\n');
+          ok('Marketplace plugin: hooks cleared (prevents duplicate)');
+        }
+      }
+    } catch (e) { warn(`Marketplace hooks dedup: ${e.message}`); }
   }
 
   // 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
@@ -1447,35 +1807,56 @@ async function install() {
           repos.get(r.repo).push(r);
         }
 
-        let cloned = 0;
+        let cloned = 0, updated = 0;
         for (const [repoUrl, entries] of repos) {
           const repoName = repoUrl.split('/').slice(-2).join('-');
           const clonePath = join(managedDir, 'repos', repoName);
+          let repoReady = false;
+
           if (!existsSync(clonePath)) {
+            // Fresh clone
             try {
               mkdirSync(join(managedDir, 'repos'), { recursive: true });
               execFileSync('git', ['clone', '--depth', '1', `${repoUrl.replace(/\.git$/, '')}.git`, clonePath], { stdio: 'pipe', timeout: 30000 });
               cloned++;
+              repoReady = true;
             } catch {
               warn(`  Clone failed: ${repoUrl}`);
               continue;
             }
+          } else {
+            // Update existing: fetch latest and fast-forward
+            try {
+              const localHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
+              execFileSync('git', ['-C', clonePath, 'fetch', '--depth', '1', 'origin'], { stdio: 'pipe', timeout: 30000 });
+              const remoteHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
+              if (localHash !== remoteHash) {
+                execFileSync('git', ['-C', clonePath, 'reset', '--hard', 'FETCH_HEAD'], { stdio: 'pipe' });
+                updated++;
+                repoReady = true; // needs re-copy
+              }
+            } catch {
+              // Fetch/update failed — use existing clone as-is
+            }
           }
 
           // Copy resources to managed/skills/ or managed/agents/
+          // Re-copy if repo was freshly cloned or updated
+          mkdirSync(join(managedDir, 'skills'), { recursive: true });
+          mkdirSync(join(managedDir, 'agents'), { recursive: true });
           for (const entry of entries) {
             const srcPath = entry.path === '.' ? clonePath : join(clonePath, entry.path);
             const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
             const destPath = join(destDir, entry.name);
-            if (!existsSync(destPath) && existsSync(srcPath)) {
-              mkdirSync(destDir, { recursive: true });
+            if (existsSync(srcPath) && (repoReady || !existsSync(destPath))) {
               try {
+                if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true });
                 cpSync(srcPath, destPath, { recursive: true });
               } catch {}
             }
           }
         }
-        ok(`Repos cloned (${cloned} new / ${repos.size} total)`);
+        ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size} total`);
 
         // 6b. Init registry DB and record preinstalled entries
         const { ensureRegistryDb } = await import('./registry.mjs');
@@ -1556,6 +1937,10 @@ async function install() {
         reindexKnownResources(rdb);
         ok('Resource metadata curated (FTS5 reindexed)');
 
+        // Register plugin resources (skills/agents from other plugins, no local files)
+        const virtualCount = registerVirtualResources(rdb);
+        if (virtualCount > 0) ok(`Plugin resources registered: ${virtualCount} virtual entries`);
+
         rdb.close();
       }
     } else {
@@ -1625,8 +2010,8 @@ async function uninstall() {
   }
 
   // 3. Clean plugin system entries from settings.json
-  const pluginKey = 'claude-mem-lite@sdsrss';
-  const marketplaceKey = 'sdsrss';
+  const pluginKey = `claude-mem-lite@${MARKETPLACE_KEY}`;
+  const marketplaceKey = MARKETPLACE_KEY;
   if (settings.enabledPlugins) {
     delete settings.enabledPlugins[pluginKey];
   }
