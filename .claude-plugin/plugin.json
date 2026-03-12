@@ -15,6 +15,5 @@
     "mcp",
     "sqlite",
     "fts5"
-  ],
-  "commands": ".claude-plugin/commands"
+  ]
 }
