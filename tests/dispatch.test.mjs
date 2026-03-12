@@ -1469,3 +1469,56 @@ describe('adaptive cooldown', () => {
     db.close();
   });
 });
+
+// ─── Consecutive Rejection Silencing ────────────────────────────────────────
+
+describe('consecutive rejection silencing', () => {
+  it('silences resource after 5 consecutive rejections', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // 5 consecutive rejections
+    for (let i = 0; i < 5; i++) {
+      const invId = recordInvocation(db, {
+        resource_id: id, session_id: `sess-${i}`, trigger: 'user_prompt', tier: 2, recommended: 1,
+      });
+      updateInvocation(db, invId, { adopted: 0, outcome: 'ignored', score: 0 });
+    }
+
+    const result = isRecentlyRecommended(db, id, 'new-session');
+    expect(result).toBe(true); // Silenced = treated as recently recommended
+    db.close();
+  });
+
+  it('does not silence if one recent recommendation was adopted', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // 4 rejections then 1 adoption — all 2 days ago to avoid cooldown interference
+    for (let i = 0; i < 4; i++) {
+      db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+        VALUES (?, ?, 'user_prompt', 2, 1, 0, 'ignored', 0, datetime('now', '-2 days'))`).run(id, `sess-${i}`);
+    }
+    db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+      VALUES (?, 'sess-4', 'user_prompt', 2, 1, 1, 'success', 1.0, datetime('now', '-2 days'))`).run(id);
+
+    const result = isRecentlyRecommended(db, id, null);
+    expect(result).toBe(false); // Not silenced, and no cooldown hit
+    db.close();
+  });
+
+  it('does not silence with fewer than 5 rejections', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // Only 3 rejections — 2 days ago to avoid cooldown interference
+    for (let i = 0; i < 3; i++) {
+      db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+        VALUES (?, ?, 'user_prompt', 2, 1, 0, 'ignored', 0, datetime('now', '-2 days'))`).run(id, `sess-${i}`);
+    }
+
+    const result = isRecentlyRecommended(db, id, null);
+    expect(result).toBe(false); // Not enough rejections to silence
+    db.close();
+  });
+});

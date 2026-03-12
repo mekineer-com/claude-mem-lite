@@ -685,6 +685,30 @@ function getAdaptiveCooldown(db) {
   } catch { return COOLDOWN_MINUTES; }
 }
 
+const CONSECUTIVE_REJECT_THRESHOLD = 5;
+const CONSECUTIVE_REJECT_WINDOW_DAYS = 7;
+
+/**
+ * Check if a resource has been consecutively rejected (not adopted) in recent history.
+ * @param {Database} db Registry database
+ * @param {number} resourceId Resource ID
+ * @returns {boolean} true if resource should be silenced
+ */
+function isConsecutivelyRejected(db, resourceId) {
+  try {
+    const recent = db.prepare(`
+      SELECT adopted FROM invocations
+      WHERE resource_id = ? AND recommended = 1 AND outcome IS NOT NULL
+        AND created_at > datetime('now', '-${CONSECUTIVE_REJECT_WINDOW_DAYS} days')
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(resourceId, CONSECUTIVE_REJECT_THRESHOLD);
+
+    if (recent.length < CONSECUTIVE_REJECT_THRESHOLD) return false;
+    return recent.every(r => r.adopted === 0);
+  } catch { return false; }
+}
+
 export function isRecentlyRecommended(db, resourceId, sessionId) {
   // Check 1: Session cap (loop-invariant — callers should prefer isSessionCapped for filter loops)
   if (sessionId) {
@@ -697,7 +721,10 @@ export function isRecentlyRecommended(db, resourceId, sessionId) {
     if (sessionHit) return true;
   }
 
-  // Check 3: Recommended within adaptive cooldown window (cross-session cooldown)
+  // Check 3: Consecutive rejection silencing
+  if (isConsecutivelyRejected(db, resourceId)) return true;
+
+  // Check 4: Recommended within adaptive cooldown window (cross-session cooldown)
   const cooldown = getAdaptiveCooldown(db);
   const cooldownHit = db.prepare(
     `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', ?) LIMIT 1`
