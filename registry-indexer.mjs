@@ -24,7 +24,7 @@ ${content}
 </content>
 
 JSON format:
-{"intent_tags":"comma-separated intent keywords (e.g. test,debug,deploy,review)","domain_tags":"comma-separated tech/language tags (e.g. javascript,react,python)","action_type":"analyze|generate|transform|validate|deploy|configure|review","trigger_patterns":"natural language describing when to use this (e.g. when user needs to write tests; when debugging errors)","capability_summary":"50-100 char description of what it does","input_type":"code|file|directory|url|text","output_type":"report|file|diff|terminal_output|analysis"}`;
+{"intent_tags":"comma-separated intent keywords (e.g. test,debug,deploy,review)","domain_tags":"comma-separated tech/language tags (e.g. javascript,react,python)","action_type":"analyze|generate|transform|validate|deploy|configure|review","trigger_patterns":"natural language describing when to use this (e.g. when user needs to write tests; when debugging errors)","capability_summary":"50-100 char description of what it does","keywords":"specific technical terms, framework names, method names not duplicating intent_tags (e.g. jest,vitest,red-green-refactor,pytest)","tech_stack":"specific frameworks and tools this works with (e.g. jest,vitest,mocha,pytest)","use_cases":"3-5 specific usage scenarios separated by semicolons","input_type":"code|file|directory|url|text","output_type":"report|file|diff|terminal_output|analysis"}`;
 }
 
 // ─── Fallback Extraction ─────────────────────────────────────────────────────
@@ -127,6 +127,9 @@ export async function indexResource(db, resource) {
     capability_summary: metadata.capability_summary || '',
     input_type: metadata.input_type || '',
     output_type: metadata.output_type || '',
+    keywords: metadata.keywords || '',
+    tech_stack: metadata.tech_stack || '',
+    use_cases: metadata.use_cases || '',
     prerequisites: typeof metadata.prerequisites === 'object'
       ? JSON.stringify(metadata.prerequisites) : '{}',
     indexed_at: now,
