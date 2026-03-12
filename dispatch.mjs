@@ -29,6 +29,10 @@ export const SESSION_RECOMMEND_CAP = 3;
 // this filters only near-zero noise matches from incidental text overlap.
 export const BM25_MIN_THRESHOLD = 1.5;
 
+// Minimum confidence from Haiku semantic dispatch to replace FTS5 results.
+// Prevents low-confidence Haiku queries (e.g. 0.2) from overriding good FTS5 matches.
+export const HAIKU_CONFIDENCE_THRESHOLD = 0.6;
+
 // ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
 // Prevents cascading latency when Haiku API is down or slow.
 // After BREAKER_THRESHOLD consecutive failures, disable for BREAKER_RESET_MS.
@@ -756,14 +760,13 @@ function applyAdoptionDecay(results, db) {
  * @returns {object[]} Filtered results that pass the gate
  */
 function passesConfidenceGate(results, signals) {
-  // BM25 absolute minimum: filter out weak text matches regardless of intent.
-  // Only apply when enough results exist (BM25 IDF is unreliable with < 3 matches).
-  if (results.length >= 3) {
-    results = results.filter(r => {
-      const score = Math.abs(r.composite_score ?? r.relevance);
-      return score >= BM25_MIN_THRESHOLD;
-    });
-  }
+  // BM25 absolute minimum: filter weak text matches.
+  // Stricter threshold for 3+ results (reliable IDF); gentler floor for 1-2 results.
+  const minThreshold = results.length >= 3 ? BM25_MIN_THRESHOLD : 1.0;
+  results = results.filter(r => {
+    const score = Math.abs(r.composite_score ?? r.relevance);
+    return score >= minThreshold;
+  });
 
   // signals.intent is a comma-separated string (e.g. "test,fix"), not an array
   const intentTokens = typeof signals?.intent === 'string'
@@ -857,7 +860,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
     if (needsHaikuDispatch(results)) {
       tier = 3;
       const haikuResult = await haikuDispatch(userPrompt, '');
-      if (haikuResult?.query) {
+      if (haikuResult?.query && (haikuResult.confidence ?? 0) >= HAIKU_CONFIDENCE_THRESHOLD) {
         const haikuQuery = buildQueryFromText(haikuResult.query);
         if (haikuQuery) {
           let haikuResults = retrieveResources(db, haikuQuery, {
@@ -1034,7 +1037,11 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
         if (!shouldRecommend) return null;
       }
     }
-    const query = buildEnhancedQuery(signals);
+    let query = buildEnhancedQuery(signals);
+    if (!query && sessionCtx?.userPrompt) {
+      query = buildQueryFromText(sessionCtx.userPrompt);
+      if (!query) return null;
+    }
     if (!query) return null;
 
     const projectDomains = detectProjectDomains();

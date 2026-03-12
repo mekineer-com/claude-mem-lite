@@ -11,7 +11,8 @@ import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP, dispatchOnSessionStart,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
   _isHaikuCircuitOpen, _setBreakerFile, _NEGATION_EN, _NEGATION_CJK,
-  _applyAdoptionDecay } from '../dispatch.mjs';
+  _applyAdoptionDecay, _passesConfidenceGate as passesConfidenceGate,
+  HAIKU_CONFIDENCE_THRESHOLD } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
@@ -1280,11 +1281,23 @@ describe('dispatchOnSessionStart handoff gate', () => {
   });
 
   it('returns injection when hasHandoff=true', async () => {
+    // Seed multiple resources so BM25 IDF is meaningful (single-doc corpora score ~0)
     seedResource(db, {
-      name: 'planning-skill', type: 'skill', intent_tags: 'plan',
-      trigger_patterns: 'plan feature architecture',
-      capability_summary: 'Feature planning',
+      name: 'planning-skill', type: 'skill', intent_tags: 'plan,design,architecture',
+      trigger_patterns: 'when user needs to plan features, design architecture, create implementation plans',
+      capability_summary: 'Feature planning and architecture design workflow',
+      keywords: 'plan,feature,architecture,design,roadmap',
       invocation_name: 'superpowers:writing-plans',
+    });
+    seedResource(db, {
+      name: 'test-runner', type: 'skill', intent_tags: 'test,tdd',
+      trigger_patterns: 'when running unit tests',
+      capability_summary: 'Test runner',
+    });
+    seedResource(db, {
+      name: 'debug-helper', type: 'skill', intent_tags: 'debug,fix',
+      trigger_patterns: 'when debugging issues',
+      capability_summary: 'Debug helper',
     });
     const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-2', { hasHandoff: true });
     expect(result).toBeTruthy();
@@ -1321,5 +1334,36 @@ describe('applyAdoptionDecay with db rejection dampening', () => {
     expect(decayed.length).toBe(1);
     // Only base multiplier 0.4 applies → -10 * 0.4 = -4
     expect(Math.abs(decayed[0].composite_score)).toBeCloseTo(4.0, 0);
+  });
+});
+
+// ─── Haiku Confidence Threshold ─────────────────────────────────────────────
+
+describe('haikuDispatch confidence', () => {
+  it('HAIKU_CONFIDENCE_THRESHOLD is exported and >= 0.5', () => {
+    expect(HAIKU_CONFIDENCE_THRESHOLD).toBeGreaterThanOrEqual(0.5);
+    expect(HAIKU_CONFIDENCE_THRESHOLD).toBeLessThanOrEqual(1.0);
+  });
+});
+
+// ─── passesConfidenceGate BM25 floor ────────────────────────────────────────
+
+describe('passesConfidenceGate BM25 floor', () => {
+  it('filters weak single result below floor', () => {
+    const results = [
+      { composite_score: -0.3, intent_tags: 'test,tdd' },
+    ];
+    const signals = { intent: 'test', rawKeywords: [] };
+    const filtered = passesConfidenceGate(results, signals);
+    expect(filtered.length).toBe(0);
+  });
+
+  it('keeps strong single result above floor', () => {
+    const results = [
+      { composite_score: -2.5, intent_tags: 'test,tdd' },
+    ];
+    const signals = { intent: 'test', rawKeywords: [] };
+    const filtered = passesConfidenceGate(results, signals);
+    expect(filtered.length).toBe(1);
   });
 });
