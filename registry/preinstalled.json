@@ -1128,19 +1128,6 @@
       ]
     },
     {
-      "name": "claudeception",
-      "type": "skill",
-      "repo": "https://github.com/blader/Claudeception",
-      "path": ".",
-      "tags": [
-        "meta",
-        "skill-extraction",
-        "learning",
-        "continuous",
-        "autonomous"
-      ]
-    },
-    {
       "name": "anthropic-architect",
       "type": "skill",
       "repo": "https://github.com/jamesrochabrun/skills",

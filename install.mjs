@@ -1808,6 +1808,13 @@ async function install() {
         }
 
         let cloned = 0, updated = 0;
+        const deadRepos = new Set(); // repos that no longer exist (404)
+
+        const isRepoNotFound = (err) => {
+          const msg = (err?.stderr ? err.stderr.toString() : '') + (err?.message || '');
+          return /repository.*not found|404/i.test(msg);
+        };
+
         for (const [repoUrl, entries] of repos) {
           const repoName = repoUrl.split('/').slice(-2).join('-');
           const clonePath = join(managedDir, 'repos', repoName);
@@ -1820,8 +1827,13 @@ async function install() {
               execFileSync('git', ['clone', '--depth', '1', `${repoUrl.replace(/\.git$/, '')}.git`, clonePath], { stdio: 'pipe', timeout: 30000 });
               cloned++;
               repoReady = true;
-            } catch {
-              warn(`  Clone failed: ${repoUrl}`);
+            } catch (err) {
+              if (isRepoNotFound(err)) {
+                deadRepos.add(repoUrl);
+                warn(`  Repo not found (removed?): ${repoUrl}`);
+              } else {
+                warn(`  Clone failed: ${repoUrl}`);
+              }
               continue;
             }
           } else {
@@ -1835,8 +1847,21 @@ async function install() {
                 updated++;
                 repoReady = true; // needs re-copy
               }
-            } catch {
-              // Fetch/update failed — use existing clone as-is
+            } catch (err) {
+              if (isRepoNotFound(err)) {
+                deadRepos.add(repoUrl);
+                warn(`  Repo not found (removed?): ${repoUrl} — cleaning up`);
+                // Remove local clone
+                try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
+                // Remove extracted resources
+                for (const entry of entries) {
+                  const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
+                  const destPath = join(destDir, entry.name);
+                  try { if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true }); } catch {}
+                }
+                continue;
+              }
+              // Transient failure — use existing clone as-is
             }
           }
 
@@ -1856,7 +1881,8 @@ async function install() {
             }
           }
         }
-        ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size} total`);
+        ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size - deadRepos.size} active` +
+           (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : ''));
 
         // 6b. Init registry DB and record preinstalled entries
         const { ensureRegistryDb } = await import('./registry.mjs');
@@ -1867,15 +1893,30 @@ async function install() {
           INSERT OR REPLACE INTO preinstalled (name, type, repo_url, repo_path, tags, enabled)
           VALUES (?, ?, ?, ?, ?, 1)
         `);
-        for (const r of resources) {
+        const activeResources = deadRepos.size > 0
+          ? resources.filter(r => !deadRepos.has(r.repo))
+          : resources;
+        for (const r of activeResources) {
           insertPre.run(r.name, r.type, r.repo, r.path, JSON.stringify(r.tags || []));
         }
-        ok(`Registry DB initialized (${resources.length} preinstalled entries)`);
+
+        // Clean up DB entries for dead repos
+        if (deadRepos.size > 0) {
+          const delPre = rdb.prepare('DELETE FROM preinstalled WHERE repo_url = ?');
+          const delRes = rdb.prepare('DELETE FROM resources WHERE repo_url = ?');
+          for (const deadUrl of deadRepos) {
+            try { delPre.run(deadUrl); } catch {}
+            try { delRes.run(deadUrl); } catch {}
+          }
+        }
+        ok(`Registry DB initialized (${activeResources.length} preinstalled entries` +
+           (deadRepos.size > 0 ? `, ${deadRepos.size} dead repos purged` : '') + ')');
 
         // 6c. Fetch GitHub stars (best-effort, unauthenticated)
         log('  Fetching GitHub stars...');
         const starCache = new Map();
         for (const [repoUrl] of repos) {
+          if (deadRepos.has(repoUrl)) continue;
           const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
           if (match) {
             try {
