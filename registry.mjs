@@ -106,6 +106,7 @@ const INVOCATIONS_SCHEMA = `
     adopted       INTEGER DEFAULT 0,
     outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored') OR outcome IS NULL),
     score         REAL,
+    rejection_reason TEXT CHECK(rejection_reason IN ('alternative','manual','context_switch','session_end','unknown') OR rejection_reason IS NULL),
     created_at    TEXT DEFAULT (datetime('now'))
   );
 
@@ -209,6 +210,14 @@ export function ensureRegistryDb(dbPath) {
       })();
     }
   } catch (e) { debugCatch(e, 'ensureRegistryDb-ignored-migration'); }
+
+  // Migrate: add rejection_reason column if missing
+  try {
+    const cols = db.prepare("PRAGMA table_info(invocations)").all();
+    if (!cols.some(c => c.name === 'rejection_reason')) {
+      db.exec("ALTER TABLE invocations ADD COLUMN rejection_reason TEXT");
+    }
+  } catch (e) { debugCatch(e, 'rejection_reason-migration'); }
 
   db.exec(PREINSTALLED_SCHEMA);
 
@@ -370,7 +379,7 @@ export function getSessionInvocations(db, sessionId) {
  * @param {object} update Fields to update
  */
 export function updateInvocation(db, id, update) {
-  const allowed = new Set(['adopted', 'outcome', 'score']);
+  const allowed = new Set(['adopted', 'outcome', 'score', 'rejection_reason']);
   const sets = [];
   const vals = [];
   for (const [key, val] of Object.entries(update)) {

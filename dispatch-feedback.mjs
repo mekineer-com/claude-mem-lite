@@ -165,6 +165,49 @@ function detectOutcome(sessionEvents) {
   return 'success'; // No errors, no edits = informational session, ok
 }
 
+// ─── Rejection Classification ────────────────────────────────────────────────
+
+/**
+ * Classify why a recommendation was not adopted.
+ * Analyzes post-recommendation events to determine the reason.
+ * @param {object} invocation Invocation record with created_at
+ * @param {object[]} sessionEvents All session tool events
+ * @returns {string} Rejection reason
+ */
+function classifyRejection(invocation, sessionEvents) {
+  if (!sessionEvents || sessionEvents.length === 0) return 'session_end';
+
+  const recTime = new Date(invocation.created_at).getTime();
+  const afterEvents = sessionEvents.filter(e =>
+    (e.timestamp || 0) > recTime || !e.timestamp
+  );
+
+  if (afterEvents.length <= 2) return 'session_end';
+
+  // Alternative: Claude used a different skill/agent instead
+  const { resource_type, invocation_name, resource_name } = invocation;
+  for (const e of afterEvents) {
+    if (resource_type === 'skill' && e.tool_name === 'Skill') {
+      const used = (e.tool_input?.skill || '').toLowerCase();
+      const expected = (invocation_name || resource_name || '').toLowerCase();
+      if (used && used !== expected && !used.includes(expected)) return 'alternative';
+    }
+    if (resource_type === 'agent' && e.tool_name === 'Agent') {
+      return 'alternative';
+    }
+  }
+
+  // Manual: Claude completed work without any skill/agent
+  const hasEdits = afterEvents.some(e => EDIT_TOOLS.has(e.tool_name));
+  const noSkillAgent = !afterEvents.some(e => e.tool_name === 'Skill' || e.tool_name === 'Agent');
+  if (hasEdits && noSkillAgent) return 'manual';
+
+  // Context switch: lots of activity but unrelated
+  if (afterEvents.length > 5) return 'context_switch';
+
+  return 'unknown';
+}
+
 // ─── Main Feedback Collection ────────────────────────────────────────────────
 
 /**
@@ -190,12 +233,14 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
       const adopted = detectAdoption(inv, sessionEvents);
       const outcome = adopted ? detectOutcome(sessionEvents) : 'ignored';
       const score = adopted ? (outcome === 'success' ? 1.0 : outcome === 'partial' ? 0.5 : 0.2) : 0;
+      const rejection_reason = adopted ? null : classifyRejection(inv, sessionEvents);
 
       // Update invocation record
       updateInvocation(db, inv.id, {
         adopted: adopted ? 1 : 0,
         outcome,
         score,
+        rejection_reason,
       });
 
       // Update resource stats
