@@ -115,6 +115,14 @@ describe('inferCurrentStage', () => {
     expect(inferCurrentStage('commit', null)).toBe('COMMIT');
   });
 
+  it('infers stage from suppressed intent when primary is empty', () => {
+    expect(inferCurrentStage(null, null, ['test'])).toBe('TEST');
+  });
+
+  it('primary intent takes precedence over suppressed', () => {
+    expect(inferCurrentStage('commit', null, ['test'])).toBe('COMMIT');
+  });
+
   it('returns null for unknown intent', () => {
     expect(inferCurrentStage('unknown', null)).toBeNull();
   });

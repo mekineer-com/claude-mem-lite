@@ -123,11 +123,16 @@ export function shouldRecommendForStage(activeSuite, currentStage) {
  * @param {{lastSkill: string}|null} activeSuite Active suite info
  * @returns {string|null} Stage name or null
  */
-export function inferCurrentStage(primaryIntent, activeSuite) {
+export function inferCurrentStage(primaryIntent, activeSuite, suppressedIntents = []) {
   if (activeSuite?.lastSkill && SKILL_STAGE_MAP[activeSuite.lastSkill]) {
     return SKILL_STAGE_MAP[activeSuite.lastSkill];
   }
-  return INTENT_STAGE_MAP[primaryIntent] || null;
+  if (INTENT_STAGE_MAP[primaryIntent]) return INTENT_STAGE_MAP[primaryIntent];
+  // Check suppressed intents — still the user's actual intent, just not used for FTS search
+  for (const si of suppressedIntents) {
+    if (INTENT_STAGE_MAP[si]) return INTENT_STAGE_MAP[si];
+  }
+  return null;
 }
 
 // ─── Explicit Request Detection ──────────────────────────────────────────────

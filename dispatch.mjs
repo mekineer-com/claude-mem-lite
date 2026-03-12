@@ -947,7 +947,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
 
     // Check if active suite covers the current stage
     if (activeSuite) {
-      const currentStage = inferCurrentStage(signals.primaryIntent, activeSuite);
+      const currentStage = inferCurrentStage(signals.primaryIntent, activeSuite, signals.suppressedIntents);
       if (currentStage) {
         const { shouldRecommend } = shouldRecommendForStage(activeSuite, currentStage);
         if (!shouldRecommend) return null;
@@ -1032,7 +1032,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const events = peekToolEvents();
     const activeSuite = detectActiveSuite(events);
     if (activeSuite) {
-      const stage = inferCurrentStage(signals.primaryIntent, activeSuite);
+      const stage = inferCurrentStage(signals.primaryIntent, activeSuite, signals.suppressedIntents);
       if (stage) {
         const { shouldRecommend } = shouldRecommendForStage(activeSuite, stage);
         if (!shouldRecommend) return null;
