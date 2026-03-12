@@ -229,7 +229,8 @@ const UPSERT_SQL = `
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(type, name) DO UPDATE SET
     status=excluded.status, source=excluded.source, repo_url=excluded.repo_url,
-    repo_stars=excluded.repo_stars, local_path=excluded.local_path, file_hash=excluded.file_hash,
+    repo_stars=CASE WHEN excluded.repo_stars > 0 THEN excluded.repo_stars ELSE repo_stars END,
+    local_path=excluded.local_path, file_hash=excluded.file_hash,
     invocation_name=CASE WHEN excluded.invocation_name != '' THEN excluded.invocation_name ELSE invocation_name END,
     intent_tags=excluded.intent_tags, domain_tags=excluded.domain_tags,
     action_type=excluded.action_type, trigger_patterns=excluded.trigger_patterns,

@@ -1367,3 +1367,45 @@ describe('passesConfidenceGate BM25 floor', () => {
     expect(filtered.length).toBe(1);
   });
 });
+
+// ─── upsertResource repo_stars protection ───────────────────────────────────
+
+describe('upsertResource repo_stars protection', () => {
+  it('preserves existing repo_stars when new value is 0', () => {
+    const db = createRegistryDb();
+    upsertResource(db, {
+      name: 'starred-skill', type: 'skill', source: 'preinstalled',
+      local_path: '/tmp/s', repo_stars: 500,
+      intent_tags: 'test', trigger_patterns: 'when testing',
+      capability_summary: 'test skill',
+    });
+    upsertResource(db, {
+      name: 'starred-skill', type: 'skill', source: 'preinstalled',
+      local_path: '/tmp/s', repo_stars: 0,
+      intent_tags: 'test', trigger_patterns: 'when testing',
+      capability_summary: 'test skill',
+    });
+    const row = db.prepare('SELECT repo_stars FROM resources WHERE name = ?').get('starred-skill');
+    expect(row.repo_stars).toBe(500);
+    db.close();
+  });
+
+  it('updates repo_stars when new value is positive', () => {
+    const db = createRegistryDb();
+    upsertResource(db, {
+      name: 'starred-skill', type: 'skill', source: 'preinstalled',
+      local_path: '/tmp/s', repo_stars: 500,
+      intent_tags: 'test', trigger_patterns: 'when testing',
+      capability_summary: 'test skill',
+    });
+    upsertResource(db, {
+      name: 'starred-skill', type: 'skill', source: 'preinstalled',
+      local_path: '/tmp/s', repo_stars: 800,
+      intent_tags: 'test', trigger_patterns: 'when testing',
+      capability_summary: 'test skill',
+    });
+    const row = db.prepare('SELECT repo_stars FROM resources WHERE name = ?').get('starred-skill');
+    expect(row.repo_stars).toBe(800);
+    db.close();
+  });
+});
