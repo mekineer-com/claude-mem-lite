@@ -16,5 +16,5 @@
     "sqlite",
     "fts5"
   ],
-  "commands": "./commands"
+  "commands": ".claude-plugin/commands"
 }
