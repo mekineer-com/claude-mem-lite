@@ -279,16 +279,11 @@ const _WRITE_TEST_CJK = /(?:写测试|加测试|补测试|补单测|缺测试|�
  * @param {string} prompt User's natural language prompt
  * @returns {string} Comma-separated intent tags, primary intent listed first (e.g. "test,fix")
  */
-function extractIntent(prompt) {
-  if (!prompt) return { intent: '', suppressed: [] };
-  // English patterns — use trailing-optional boundaries for verb conjugations:
-  //   \b prefix ensures word start, but many suffixed forms (debugging, refactoring, deployed)
-  //   fail with trailing \b. Use \b...\w* for words that commonly have suffixes.
-  // Pattern ordering determines PRIMARY intent (first match).
-  // Priority: action verbs → domain-specific → quality/style → generic/overloaded.
-  // This ensures "review code before push" → review (not commit),
-  // "design database schema" → db (not design), "I have a spec" → plan (not test).
-  const intentPatterns = [
+// Intent patterns — pre-compiled at module scope to avoid re-creating RegExp on every call.
+// Each entry: [pattern, globalPattern, tag]. Pattern ordering determines PRIMARY intent (first match).
+// Priority: action verbs → domain-specific → quality/style → generic/overloaded.
+const _INTENT_PATTERNS = (() => {
+  const raw = [
     // ── Action verbs (what the user wants to DO) ──
     [/\b(tests?|testing|tested|tdd|coverage|jest|vitest|pytest|mocha|cypress)\b/i, 'test'],
     [/\b(debug\w*|fix\w*|bugs?|errors?|troubleshoot\w*|broken|crash\w*|issue|problem|fail\w*|not working|doesn'?t work)\b/i, 'fix'],
@@ -330,20 +325,26 @@ function extractIntent(prompt) {
     [/(格式化|代码风格|代码规范|类型检查)/, 'lint'],
     [/(界面|前端|样式|页面|组件|布局)/, 'design'],
   ];
+  // Pre-compile global variants for matchAll — avoids creating new RegExp on every extractIntent call
+  return raw.map(([p, tag]) => [p, new RegExp(p.source, p.flags.includes('g') ? p.flags : p.flags + 'g'), tag]);
+})();
+
+const _CLAUSE_BOUNDARY = /[,，。；;、.!?！？]/;
+
+function extractIntent(prompt) {
+  if (!prompt) return { intent: '', suppressed: [] };
 
   // Build per-tag negation/affirmation tracking.
   // A tag is only excluded if ALL its matching instances are negated.
   // This handles mixed-language inputs like "不要测试了，但 write the tests for auth"
   // where the Chinese variant is negated but the English variant is not.
-  const CLAUSE_BOUNDARY = /[,，。；;、.!?！？]/;
   const tagHasAffirmative = new Map(); // tag → true if any non-negated match exists
   const tagMatched = new Set();        // tags that matched at least once
 
-  for (const [pattern, tag] of intentPatterns) {
-    // Use global flag + matchAll to find ALL matches (not just the first).
+  for (const [, globalPattern, tag] of _INTENT_PATTERNS) {
+    // matchAll finds ALL matches (not just the first).
     // This handles "don't test auth, but test UI" where the first match is negated
     // but the second is affirmative — the tag should still be included.
-    const globalPattern = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
     const matches = prompt.matchAll(globalPattern);
     for (const match of matches) {
       tagMatched.add(tag);
@@ -352,8 +353,8 @@ function extractIntent(prompt) {
       const enPrefix = prompt.slice(Math.max(0, matchStart - 20), matchStart);
       const cjkPrefix = prompt.slice(Math.max(0, matchStart - 8), matchStart);
       // Clause boundary check: if a comma/period separates negation from keyword, skip
-      const hasEnNeg = NEGATION_EN.test(enPrefix) && !CLAUSE_BOUNDARY.test(enPrefix);
-      const hasCjkNeg = NEGATION_CJK.test(cjkPrefix) && !CLAUSE_BOUNDARY.test(cjkPrefix);
+      const hasEnNeg = NEGATION_EN.test(enPrefix) && !_CLAUSE_BOUNDARY.test(enPrefix);
+      const hasCjkNeg = NEGATION_CJK.test(cjkPrefix) && !_CLAUSE_BOUNDARY.test(cjkPrefix);
       if (!hasEnNeg && !hasCjkNeg) {
         tagHasAffirmative.set(tag, true);
       }
@@ -699,19 +700,19 @@ function isConsecutivelyRejected(db, resourceId) {
     const recent = db.prepare(`
       SELECT adopted FROM invocations
       WHERE resource_id = ? AND recommended = 1 AND outcome IS NOT NULL
-        AND created_at > datetime('now', '-${CONSECUTIVE_REJECT_WINDOW_DAYS} days')
+        AND created_at > datetime('now', ?)
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(resourceId, CONSECUTIVE_REJECT_THRESHOLD);
+    `).all(resourceId, `-${CONSECUTIVE_REJECT_WINDOW_DAYS} days`, CONSECUTIVE_REJECT_THRESHOLD);
 
     if (recent.length < CONSECUTIVE_REJECT_THRESHOLD) return false;
     return recent.every(r => r.adopted === 0);
   } catch { return false; }
 }
 
-export function isRecentlyRecommended(db, resourceId, sessionId) {
-  // Check 1: Session cap (loop-invariant — callers should prefer isSessionCapped for filter loops)
-  if (sessionId) {
+export function isRecentlyRecommended(db, resourceId, sessionId, { skipCapCheck = false } = {}) {
+  // Check 1: Session cap (loop-invariant — callers should hoist isSessionCapped and pass skipCapCheck: true)
+  if (sessionId && !skipCapCheck) {
     if (isSessionCapped(db, sessionId)) return true;
 
     // Check 2: Already recommended in this session (session dedup)
@@ -964,7 +965,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
     // Filter by DB-persisted cooldown + session dedup (hoisted cap check avoids N queries)
     if (sessionId && isSessionCapped(db, sessionId)) return null;
     const viable = sessionId
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId))
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true }))
       : results;
     if (viable.length === 0) return null;
 
@@ -1069,7 +1070,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
     // Filter by cooldown + session dedup (hoisted cap check avoids N queries)
     if (sessionId && isSessionCapped(db, sessionId)) return null;
     const viable = sessionId
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId))
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true }))
       : results;
     if (viable.length === 0) return null;
 
@@ -1143,7 +1144,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const sid = sessionCtx.sessionId || null;
     if (sid && isSessionCapped(db, sid)) return null;
     const viable = sid
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sid))
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sid, { skipCapCheck: true }))
       : results;
     if (viable.length === 0) return null;
     const best = viable[0];

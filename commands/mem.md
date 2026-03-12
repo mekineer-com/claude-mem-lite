@@ -1,5 +1,4 @@
 ---
-name: mem
 description: Search and manage project memory (observations, sessions, prompts)
 ---
 

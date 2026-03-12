@@ -1,5 +1,4 @@
 ---
-name: memory
 description: Save content to memory — with explicit content, instructions, or auto-summarize current session
 ---
 

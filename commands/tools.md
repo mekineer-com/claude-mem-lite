@@ -1,5 +1,4 @@
 ---
-name: tools
 description: Import skills and agents from GitHub repositories into the tool resource registry
 ---
 

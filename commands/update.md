@@ -1,5 +1,4 @@
 ---
-name: update
 description: Auto-maintain memory and resource registry — deduplicate, merge, decay, cleanup, reindex
 ---
 

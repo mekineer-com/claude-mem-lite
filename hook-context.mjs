@@ -2,7 +2,7 @@
 // Handles adaptive time windows, token-budgeted selection, and CLAUDE.md persistence
 
 import { join } from 'path';
-import { readFileSync, writeFileSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { estimateTokens, truncate, debugLog, debugCatch } from './utils.mjs';
 
 /**
@@ -165,11 +165,12 @@ export function updateClaudeMd(contextBlock) {
     content = hintComment + '\n' + newSection + '\n';
   }
 
+  const tmp = claudeMdPath + '.mem-tmp';
   try {
-    const tmp = claudeMdPath + '.mem-tmp';
     writeFileSync(tmp, content);
     renameSync(tmp, claudeMdPath);
   } catch (e) {
+    try { unlinkSync(tmp); } catch {}
     debugLog('ERROR', 'updateClaudeMd', `CLAUDE.md write failed: ${e.message}`);
   }
 }
