@@ -33,6 +33,7 @@
     "hook-episode.mjs",
     "hook-context.mjs",
     "hook-handoff.mjs",
+    "hook-update.mjs",
     "haiku-client.mjs",
     "dispatch.mjs",
     "dispatch-inject.mjs",

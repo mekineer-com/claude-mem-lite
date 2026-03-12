@@ -33,6 +33,7 @@ import {
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
+import { checkForUpdate } from './hook-update.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
@@ -722,6 +723,16 @@ async function handleSessionStart() {
     if (needsResourceRescan()) {
       spawnBackground('resource-scan');
     }
+
+    // Auto-update check (24h throttle, 3s timeout, silent on failure)
+    try {
+      const updateResult = await checkForUpdate();
+      if (updateResult?.updated) {
+        process.stdout.write(`\n🔄 claude-mem-lite: v${updateResult.from} → v${updateResult.to} updated\n`);
+      } else if (updateResult?.updateAvailable) {
+        process.stdout.write(`\n📦 claude-mem-lite: v${updateResult.to} available (current: v${updateResult.from})\n`);
+      }
+    } catch (e) { debugCatch(e, 'session-start-update'); }
 
   } finally {
     db.close();

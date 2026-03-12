@@ -1989,7 +1989,7 @@ async function install() {
   const SOURCE_FILES = [
     'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
     'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs',
-    'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs',
+    'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
@@ -2742,6 +2742,70 @@ function writeSettings(settings) {
   renameSync(tmp, SETTINGS_PATH);
 }
 
+// ─── Manual Update ───────────────────────────────────────────────────────────
+
+async function manualUpdate() {
+  console.log('\nclaude-mem-lite update\n');
+
+  // Force check by importing hook-update (bypasses throttle for manual use)
+  const { checkForUpdate, getCurrentVersion } = await import('./hook-update.mjs');
+  log('Checking for updates...');
+  const result = await checkForUpdate();
+
+  if (result?.updated) {
+    ok(`Updated: v${result.from} → v${result.to}`);
+  } else if (result?.updateAvailable) {
+    warn(`v${result.to} available but install failed — try: node install.mjs install`);
+  } else {
+    const ver = getCurrentVersion();
+    ok(`Already up to date (v${ver})`);
+  }
+  console.log('');
+}
+
+// ─── Release: Sync Versions ─────────────────────────────────────────────────
+
+function syncVersions() {
+  console.log('\nclaude-mem-lite release — sync versions\n');
+
+  const pkg = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8'));
+  const version = pkg.version;
+  log(`package.json version: ${version}`);
+
+  // Sync plugin.json
+  const pluginJsonPath = join(PROJECT_DIR, '.claude-plugin', 'plugin.json');
+  if (existsSync(pluginJsonPath)) {
+    const pluginJson = JSON.parse(readFileSync(pluginJsonPath, 'utf8'));
+    if (pluginJson.version !== version) {
+      pluginJson.version = version;
+      writeFileSync(pluginJsonPath, JSON.stringify(pluginJson, null, 2) + '\n');
+      ok(`plugin.json: ${pluginJson.version} → ${version}`);
+    } else {
+      ok(`plugin.json: already ${version}`);
+    }
+  } else {
+    warn('plugin.json not found');
+  }
+
+  // Sync marketplace.json
+  const marketJsonPath = join(PROJECT_DIR, '.claude-plugin', 'marketplace.json');
+  if (existsSync(marketJsonPath)) {
+    const marketJson = JSON.parse(readFileSync(marketJsonPath, 'utf8'));
+    const plugin = marketJson.plugins?.[0];
+    if (plugin && plugin.version !== version) {
+      plugin.version = version;
+      writeFileSync(marketJsonPath, JSON.stringify(marketJson, null, 2) + '\n');
+      ok(`marketplace.json: ${plugin.version} → ${version}`);
+    } else if (plugin) {
+      ok(`marketplace.json: already ${version}`);
+    }
+  } else {
+    warn('marketplace.json not found');
+  }
+
+  console.log('');
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 switch (cmd) {
@@ -2756,6 +2820,12 @@ switch (cmd) {
     break;
   case 'doctor':
     await doctor();
+    break;
+  case 'update':
+    await manualUpdate();
+    break;
+  case 'release':
+    syncVersions();
     break;
   default:
     if (IS_NPX) {
@@ -2772,6 +2842,8 @@ Usage:
   node install.mjs uninstall --purge  Remove and delete all data
   node install.mjs status             Show current status
   node install.mjs doctor             Diagnose issues
+  node install.mjs update             Check for and install updates
+  node install.mjs release            Sync version to plugin.json + marketplace.json
 
   npx claude-mem-lite                 Install via npx (one-liner)
 `);
