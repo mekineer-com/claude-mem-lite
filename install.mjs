@@ -1527,6 +1527,26 @@ function registerVirtualResources(rdb) {
       );
       count += changes;
     }
+
+    // Backfill keywords from preinstalled tags for resources missing keywords.
+    // preinstalled.tags (JSON array) provides FTS5 coverage when RESOURCE_METADATA
+    // doesn't supply keywords for a resource.
+    try {
+      const backfill = rdb.prepare(`
+        UPDATE resources SET keywords = (
+          SELECT GROUP_CONCAT(json_each.value, ',')
+          FROM preinstalled p, json_each(p.tags)
+          WHERE p.type = resources.type AND p.name = resources.name
+        )
+        WHERE (keywords IS NULL OR keywords = '')
+          AND EXISTS (
+            SELECT 1 FROM preinstalled p
+            WHERE p.type = resources.type AND p.name = resources.name
+              AND p.tags != '[]' AND p.tags IS NOT NULL
+          )
+      `);
+      backfill.run();
+    } catch {}
   })();
   return count;
 }

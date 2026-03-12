@@ -762,10 +762,11 @@ function applyAdoptionDecay(results, db) {
 function passesConfidenceGate(results, signals) {
   // BM25 absolute minimum: filter weak text matches.
   // Stricter threshold for 3+ results (reliable IDF); gentler floor for 1-2 results.
-  const minThreshold = results.length >= 3 ? BM25_MIN_THRESHOLD : 1.0;
+  const minThreshold = results.length >= 3 ? BM25_MIN_THRESHOLD : 0.5;
   results = results.filter(r => {
-    const score = Math.abs(r.composite_score ?? r.relevance);
-    return score >= minThreshold;
+    const raw = r.composite_score ?? r.relevance;
+    if (raw == null) return true; // no score → pass (pre-scored or synthetic result)
+    return Math.abs(raw) >= minThreshold;
   });
 
   // signals.intent is a comma-separated string (e.g. "test,fix"), not an array
