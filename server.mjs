@@ -79,7 +79,7 @@ const RECENCY_HALF_LIFE_MS = 1209600000; // 14 days in milliseconds
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer(
-  { name: 'claude-mem-lite', version: '2.2.2' },
+  { name: 'claude-mem-lite', version: '2.3.1' },
   {
     instructions: [
       'Proactively search memory to leverage past experience. This is your long-term memory across sessions.',
@@ -1241,7 +1241,9 @@ const idleTimer = setInterval(() => {
         debugLog('INFO', 'idle-cleanup', `Marked ${marked.changes} stale observations as pending-purge`);
       }
 
-      // Mark old importance=1 as compressed (30+ days)
+      // Mark old importance=1 with access_count>0 as compressed (30+ days).
+      // Note: importance=1, access_count=0 rows were already marked pending-purge above,
+      // so this only catches importance=1 rows that HAVE been accessed.
       const compressed = db.prepare(`
         UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
         WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1

@@ -20,7 +20,7 @@ const RESOURCES_SCHEMA = `
     repo_stars    INTEGER DEFAULT 0,
     local_path    TEXT NOT NULL,
     file_hash     TEXT,
-    parent_plugin TEXT,
+    parent_plugin TEXT,          -- unused, kept for schema compat
     invocation_name   TEXT DEFAULT '',
     intent_tags       TEXT DEFAULT '',
     domain_tags       TEXT DEFAULT '',

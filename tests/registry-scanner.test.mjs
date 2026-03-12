@@ -3,12 +3,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import Database from 'better-sqlite3';
 import {
   scanDirectory,
   scanPluginResources, scanPluginsDirectory,
   scanAllResources, diffResources,
 } from '../registry-scanner.mjs';
+import { createRegistryTestDb } from './test-helpers.mjs';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -20,20 +20,7 @@ function mkDir(...segments) {
   return p;
 }
 
-function createRegistryDb() {
-  const db = new Database(':memory:');
-  db.exec(`
-    CREATE TABLE resources (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL, type TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active',
-      source TEXT NOT NULL, file_hash TEXT,
-      local_path TEXT NOT NULL DEFAULT ''
-    );
-    CREATE UNIQUE INDEX idx_res_type_name ON resources(type, name);
-  `);
-  return db;
-}
+const createRegistryDb = createRegistryTestDb;
 
 // ─── Setup / Teardown ─────────────────────────────────────────────────────────
 

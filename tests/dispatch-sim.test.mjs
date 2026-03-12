@@ -2,7 +2,7 @@
 // Tests the full dispatch pipeline: user prompt → intent → FTS5 → ranking → injection
 // Simulates production-level skill/agent recommendation accuracy from a user's perspective
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
 import { shouldSkipDispatch, extractContextSignals,
   SESSION_RECOMMEND_CAP,
@@ -331,6 +331,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
     seedProductionCatalog(db);
     _resetCircuitBreaker();
   });
+  afterEach(() => { db.close(); });
 
   // ─── Scenario 1: English user prompts → correct skill/agent ───────────────
 

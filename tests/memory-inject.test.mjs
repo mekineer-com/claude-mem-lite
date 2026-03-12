@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { searchRelevantMemories } from '../hook-memory.mjs';
 
@@ -34,6 +34,7 @@ describe('searchRelevantMemories', () => {
       insert.run(i, `Updated config file ${i}`, `Minor config changes ${i}`, now, `config yaml settings update number ${i}`);
     }
   });
+  afterEach(() => { db.close(); });
 
   it('returns matching bugfix memories for relevant prompt', () => {
     db.prepare(`INSERT INTO observations (id, type, title, narrative, importance, project, created_at, created_at_epoch, text)

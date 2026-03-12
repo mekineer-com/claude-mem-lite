@@ -2,7 +2,7 @@
 // Formats resource recommendations for Claude Code's additionalContext
 
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { truncate } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
@@ -18,13 +18,14 @@ function truncateContent(str, max) {
 
 // Allowed base directories for resource file reads (defense-in-depth)
 const ALLOWED_BASES = [
-  join(homedir(), '.claude'),
-  join(DB_DIR, 'managed'),
+  resolve(join(homedir(), '.claude')),
+  resolve(join(DB_DIR, 'managed')),
 ];
 
 function isAllowedPath(filePath) {
   if (!filePath) return false;
-  return ALLOWED_BASES.some(base => filePath === base || filePath.startsWith(base + '/'));
+  const resolved = resolve(filePath);
+  return ALLOWED_BASES.some(base => resolved === base || resolved.startsWith(base + '/'));
 }
 
 // ─── Template Detection ──────────────────────────────────────────────────────

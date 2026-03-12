@@ -1,5 +1,5 @@
 // Tests for cross-session handoff: schema, utils, extraction, intent detection, injection
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { extractMatchKeywords, tokenizeHandoff, isSpecificTerm } from '../utils.mjs';
@@ -35,6 +35,7 @@ function seedObservation(db, sessionId, project, title, type, importance, filesM
 describe('session_handoffs schema', () => {
   let db;
   beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
+  afterEach(() => { db.close(); });
 
   it('creates session_handoffs table with correct columns', () => {
     const cols = db.prepare(`PRAGMA table_info(session_handoffs)`).all();
@@ -161,6 +162,7 @@ describe('handoff utility functions', () => {
 describe('buildAndSaveHandoff', () => {
   let db;
   beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
+  afterEach(() => { db.close(); });
 
   it('saves handoff with working_on from prompts', () => {
     seedSession(db, 's1', 'test-proj');
@@ -396,6 +398,7 @@ describe('detectContinuationIntent', () => {
 describe('renderHandoffInjection', () => {
   let db;
   beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
+  afterEach(() => { db.close(); });
 
   it('renders handoff with all sections', () => {
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch)

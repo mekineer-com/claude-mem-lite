@@ -1193,7 +1193,10 @@ function reindexKnownResources(rdb) {
 
   rdb.transaction(() => {
     for (const [key, meta] of Object.entries(RESOURCE_METADATA)) {
-      const [type, name] = key.split(':');
+      const sep = key.indexOf(':');
+      if (sep < 0) continue; // skip malformed keys without type:name separator
+      const type = key.slice(0, sep);
+      const name = key.slice(sep + 1);
       const invName = meta.invocation_name || '';
       update.run(
         meta.intent_tags, meta.domain_tags,

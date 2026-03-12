@@ -1,5 +1,5 @@
 // Tests for v3 dispatch system: registry, retriever, dispatch, inject, feedback
-import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import os from 'os';
 import { join } from 'path';
 import { unlinkSync } from 'fs';
@@ -52,6 +52,7 @@ function seedResource(db, overrides = {}) {
 describe('registry.mjs', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   describe('upsertResource', () => {
     it('inserts new resource and returns id', () => {
@@ -167,6 +168,7 @@ describe('registry.mjs', () => {
 describe('registry-retriever.mjs', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   describe('buildQueryFromText', () => {
     it('builds FTS5 query from text', () => {
@@ -719,6 +721,7 @@ describe('dispatch-inject.mjs', () => {
 describe('dispatch-feedback.mjs', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   it('collects feedback for session invocations', async () => {
     const id = seedResource(db);
@@ -1021,6 +1024,7 @@ describe('FTS5 end-to-end dispatch', () => {
 describe('Composite ranking formula', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   it('new resource with 0 history is not buried (exploration bonus)', () => {
     // Established resource with moderate stats
@@ -1206,6 +1210,7 @@ describe('Haiku circuit breaker', () => {
 describe('isRecentlyRecommended', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   it('returns false when no invocations exist', () => {
     const id = seedResource(db);
@@ -1260,6 +1265,7 @@ describe('isRecentlyRecommended', () => {
 describe('dispatchOnSessionStart handoff gate', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   it('returns null when hasHandoff=false', async () => {
     seedResource(db, { name: 'some-skill', intent_tags: 'plan' });
@@ -1290,6 +1296,7 @@ describe('dispatchOnSessionStart handoff gate', () => {
 describe('applyAdoptionDecay with db rejection dampening', () => {
   let db;
   beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
 
   it('applies extra dampening for resources with many recent rejections', () => {
     const resId = seedResource(db, { name: 'over-recommended', recommend_count: 60, adopt_count: 1 });

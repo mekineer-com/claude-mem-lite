@@ -427,7 +427,8 @@ export function inferProject() {
   const parent = basename(dirname(p));
   const raw = parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;
   // Sanitize to prevent path traversal when used in filenames (ep-<project>.json)
-  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-');
+  // Truncate to 100 chars to avoid exceeding filesystem name limits (255 bytes)
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
 }
 
 // ─── Bash Analysis ───────────────────────────────────────────────────────────

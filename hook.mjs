@@ -257,7 +257,7 @@ async function handlePostToolUse() {
       appendToolEvent({
         tool_name,
         tool_input: toolInput,
-        tool_response: (tool_name === 'Bash' && bashSig?.isError) ? resp.slice(0, 500) : '',
+        tool_response: (tool_name === 'Bash' && bashSig?.isError) ? scrubSecrets(resp.slice(0, 500)) : '',
       });
     }
   } finally {
@@ -884,7 +884,7 @@ async function handleResourceScan() {
     }
 
     // Upsert changed resources with fallback metadata (no Haiku)
-    let firstErr = true;
+    let upsertErrors = 0;
     for (const res of toIndex) {
       try {
         upsertResource(rdb, {
@@ -899,7 +899,7 @@ async function handleResourceScan() {
           trigger_patterns: `when user needs ${res.name.replace(/-/g, ' ').replace(/\//g, ' ')}`,
           capability_summary: `${res.type}: ${res.name.replace(/-/g, ' ')}`,
         });
-      } catch (e) { if (firstErr) { debugCatch(e, 'handleResourceScan-upsert'); firstErr = false; } }
+      } catch (e) { upsertErrors++; if (upsertErrors <= 3) debugCatch(e, `handleResourceScan-upsert[${upsertErrors}]`); }
     }
 
     // Disable resources no longer on filesystem
@@ -922,7 +922,7 @@ function readStdin() {
   const MAX_STDIN = 256 * 1024; // 256KB — large tool responses are truncated
   return new Promise((resolve, reject) => {
     let data = '';
-    const timeout = setTimeout(() => { process.stdin.destroy(); reject(new Error('timeout')); }, 3000);
+    const timeout = setTimeout(() => { debugLog('WARN', 'readStdin', 'stdin timeout after 3s — event dropped'); process.stdin.destroy(); reject(new Error('timeout')); }, 3000);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', chunk => {
       data += chunk;

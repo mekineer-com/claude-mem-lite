@@ -3,7 +3,7 @@
 //   SessionStart → UserPromptSubmit → PreToolUse → Feedback collection
 // These tests exercise cross-module integration that unit tests don't cover.
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { upsertResource, getSessionInvocations } from '../registry.mjs';
 import {
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
@@ -76,6 +76,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
     db = createRegistryDb();
     for (const r of SEED_RESOURCES) upsertResource(db, r);
   });
+  afterEach(() => { db.close(); });
 
   // Stage 1: SessionStart dispatches on previous session's next_steps
   describe('SessionStart trigger', () => {

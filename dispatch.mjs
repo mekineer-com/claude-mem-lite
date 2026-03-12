@@ -639,15 +639,27 @@ JSON: {"query":"search keywords for finding the right skill or agent","type":"sk
 
 // ─── Cooldown & Dedup (DB-persisted, survives process restarts) ─────────────
 
-export function isRecentlyRecommended(db, resourceId, sessionId) {
-  // Check 1 & 2: Session-scoped checks (cap + dedup) — only when sessionId is available
-  if (sessionId) {
-    const sessionCount = db.prepare(
-      'SELECT COUNT(*) as cnt FROM invocations WHERE session_id = ? AND recommended = 1'
-    ).get(sessionId);
-    if (sessionCount.cnt >= SESSION_RECOMMEND_CAP) return true;
+/**
+ * Check if session has hit the recommendation cap.
+ * Separated from per-resource check so callers in filter loops can hoist this.
+ * @param {Database} db Registry database
+ * @param {string} sessionId Session identifier
+ * @returns {boolean} true if session cap is reached
+ */
+export function isSessionCapped(db, sessionId) {
+  if (!sessionId) return false;
+  const sessionCount = db.prepare(
+    'SELECT COUNT(*) as cnt FROM invocations WHERE session_id = ? AND recommended = 1'
+  ).get(sessionId);
+  return sessionCount.cnt >= SESSION_RECOMMEND_CAP;
+}
 
-    // Already recommended in this session (session dedup)
+export function isRecentlyRecommended(db, resourceId, sessionId) {
+  // Check 1: Session cap (loop-invariant — callers should prefer isSessionCapped for filter loops)
+  if (sessionId) {
+    if (isSessionCapped(db, sessionId)) return true;
+
+    // Check 2: Already recommended in this session (session dedup)
     const sessionHit = db.prepare(
       'SELECT 1 FROM invocations WHERE resource_id = ? AND session_id = ? AND recommended = 1 LIMIT 1'
     ).get(resourceId, sessionId);
@@ -860,7 +872,8 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
 
     if (results.length === 0) return null;
 
-    // Filter by DB-persisted cooldown + session dedup
+    // Filter by DB-persisted cooldown + session dedup (hoisted cap check avoids N queries)
+    if (sessionId && isSessionCapped(db, sessionId)) return null;
     const viable = sessionId
       ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId))
       : results;
@@ -898,12 +911,13 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
   if (!userPrompt || !db) return null;
 
   try {
-    // 1. Explicit request → highest priority, bypass all restrictions
+    // 1. Explicit request → highest priority, bypass cooldown but apply adoption decay
     const explicit = detectExplicitRequest(userPrompt);
     if (explicit.isExplicit) {
       const textQuery = buildQueryFromText(explicit.searchTerm);
       if (textQuery) {
-        const explicitResults = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
+        let explicitResults = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
+        explicitResults = applyAdoptionDecay(explicitResults, db);
         if (explicitResults.length > 0) {
           const best = explicitResults[0];
           if (!sessionId || !isRecentlyRecommended(db, best.id, sessionId)) {
@@ -963,7 +977,8 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
     // Low confidence → skip (no Haiku in user_prompt path — stay fast)
     if (needsHaikuDispatch(results)) return null;
 
-    // Filter by cooldown + session dedup (prevents double-recommend with SessionStart)
+    // Filter by cooldown + session dedup (hoisted cap check avoids N queries)
+    if (sessionId && isSessionCapped(db, sessionId)) return null;
     const viable = sessionId
       ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId))
       : results;
@@ -1031,8 +1046,9 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     // Low-confidence results: skip recommendation rather than suggest unreliable match
     if (needsHaikuDispatch(results)) return null;
 
-    // Apply DB-persisted cooldown and session dedup (filter all, not just top)
+    // Apply DB-persisted cooldown and session dedup (hoisted cap check avoids N queries)
     const sid = sessionCtx.sessionId || null;
+    if (sid && isSessionCapped(db, sid)) return null;
     const viable = sid
       ? results.filter(r => !isRecentlyRecommended(db, r.id, sid))
       : results;

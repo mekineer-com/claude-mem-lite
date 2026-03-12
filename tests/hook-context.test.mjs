@@ -1,5 +1,5 @@
 // Tests for hook-context.mjs — adaptive time windows, token budgeting, CLAUDE.md updates
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
@@ -242,12 +242,12 @@ describe('updateClaudeMd', () => {
   beforeEach(() => {
     try { mkdirSync(testDir, { recursive: true }); } catch {}
     // Mock inferProjectDir by setting env var
-    process.env.CLAUDE_PROJECT_DIR = testDir;
+    vi.stubEnv('CLAUDE_PROJECT_DIR', testDir);
     try { unlinkSync(testClaudeMd); } catch {}
   });
 
   afterEach(() => {
-    delete process.env.CLAUDE_PROJECT_DIR;
+    vi.unstubAllEnvs();
     try { unlinkSync(testClaudeMd); } catch {}
   });
 
