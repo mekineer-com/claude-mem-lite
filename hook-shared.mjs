@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, unlinkSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
-import { ensureDb, DB_DIR } from './schema.mjs';
+import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { ensureRegistryDb } from './registry.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared } from './haiku-client.mjs';
 
@@ -23,7 +23,7 @@ export const STALE_SESSION_MS = 24 * 60 * 60 * 1000;     // 24h
 export const STALE_LOCK_MS = 30000;                       // 30s
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
 export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
-export const FALLBACK_OBS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
 export const RESOURCE_RESCAN_INTERVAL_MS = 60 * 60 * 1000;    // 1 hour
 
 // Handoff system constants
@@ -70,8 +70,6 @@ export function openDb() {
 }
 
 // ─── Registry Database (dispatch system) ─────────────────────────────────────
-
-const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 let _registryDb = null;
 
 export function getRegistryDb() {
@@ -101,6 +99,7 @@ export function callLLM(prompt, timeoutMs = 15000) {
   } catch (e) {
     const out = _extractResponseFromError(e);
     if (out) return out;
+    debugCatch(e, 'callLLM');
     return null;
   }
 }
@@ -201,7 +200,12 @@ export function peekToolEvents() {
 export function _extractResponseFromError(error) {
   const out = error.stdout?.toString?.()?.trim() || error.output?.[1]?.toString?.()?.trim() || '';
   if (out && out.startsWith('{') && out.endsWith('}')) {
-    try { JSON.parse(out); return out; } catch { return null; }
+    try {
+      const parsed = JSON.parse(out);
+      // Reject structurally incomplete responses (e.g. truncated mid-output)
+      if (typeof parsed !== 'object' || parsed === null || Object.keys(parsed).length === 0) return null;
+      return out;
+    } catch { return null; }
   }
   return null;
 }

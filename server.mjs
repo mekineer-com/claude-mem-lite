@@ -4,12 +4,15 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
-import { ensureDb, DB_PATH, DB_DIR } from './schema.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
+import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
-import { join } from 'path';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const { version: PKG_VERSION } = require('./package.json');
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
@@ -38,7 +41,6 @@ db.pragma('busy_timeout = 5000');
 
 // ─── Registry Database (lazy-loaded on first mem_registry call) ─────────────
 
-const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 let registryDb = null;
 
 function getRegistryDb() {
@@ -79,7 +81,7 @@ const RECENCY_HALF_LIFE_MS = 1209600000; // 14 days in milliseconds
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
 const server = new McpServer(
-  { name: 'claude-mem-lite', version: '2.3.1' },
+  { name: 'claude-mem-lite', version: PKG_VERSION },
   {
     instructions: [
       'Proactively search memory to leverage past experience. This is your long-term memory across sessions.',
@@ -969,7 +971,7 @@ server.registerTool(
     const baseParams = project ? [project] : [];
 
     if (action === 'scan') {
-      // 1. Find near-duplicate titles (pre-compute word sets, then O(n²) Jaccard)
+      // 1. Find near-duplicate titles (MinHash pre-filter → exact Jaccard on candidates)
       const recent = db.prepare(`
         SELECT id, title, project, importance, access_count, created_at_epoch
         FROM observations
@@ -979,11 +981,15 @@ server.registerTool(
       `).all(...baseParams);
 
       const titles = recent.map(r => (r.title || '').trim());
+      const minhashes = titles.map(t => t ? computeMinHash(t) : null);
+      const MINHASH_PRE_THRESHOLD = 0.5; // loose pre-filter to catch candidates
       const duplicates = [];
       for (let i = 0; i < recent.length && duplicates.length < DUPLICATE_LIMIT; i++) {
-        if (!titles[i]) continue;
+        if (!titles[i] || !minhashes[i]) continue;
         for (let j = i + 1; j < recent.length; j++) {
-          if (!titles[j]) continue;
+          if (!titles[j] || !minhashes[j]) continue;
+          // Fast MinHash estimate to skip obvious non-matches
+          if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PRE_THRESHOLD) continue;
           const sim = jaccardSimilarity(titles[i], titles[j]);
           if (sim > SIMILARITY_THRESHOLD) {
             duplicates.push({
@@ -1038,40 +1044,53 @@ server.registerTool(
       const ops = args.operations || [];
       const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;
+      const OP_ROW_CAP = 1000; // safety cap per operation
 
       db.transaction(() => {
         if (ops.includes('cleanup')) {
           const deleted = db.prepare(`
             DELETE FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND (title IS NULL OR title = '')
-              AND (narrative IS NULL OR narrative = '')
-              ${projectFilter}
+            WHERE id IN (
+              SELECT id FROM observations
+              WHERE COALESCE(compressed_into, 0) = 0
+                AND (title IS NULL OR title = '')
+                AND (narrative IS NULL OR narrative = '')
+                ${projectFilter}
+              LIMIT ${OP_ROW_CAP}
+            )
           `).run(...baseParams);
-          results.push(`Cleaned up ${deleted.changes} broken observations`);
+          results.push(`Cleaned up ${deleted.changes} broken observations` + (deleted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('decay')) {
           const decayed = db.prepare(`
             UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND COALESCE(importance, 1) > 1
-              AND COALESCE(access_count, 0) = 0
-              AND created_at_epoch < ?
-              ${projectFilter}
+            WHERE id IN (
+              SELECT id FROM observations
+              WHERE COALESCE(compressed_into, 0) = 0
+                AND COALESCE(importance, 1) > 1
+                AND COALESCE(access_count, 0) = 0
+                AND created_at_epoch < ?
+                ${projectFilter}
+              LIMIT ${OP_ROW_CAP}
+            )
           `).run(staleAge, ...baseParams);
-          results.push(`Decayed ${decayed.changes} stale observations`);
+          results.push(`Decayed ${decayed.changes} stale observations` + (decayed.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('boost')) {
           const boosted = db.prepare(`
             UPDATE observations SET importance = MIN(3, COALESCE(importance, 1) + 1)
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND COALESCE(access_count, 0) > 3
-              AND COALESCE(importance, 1) < 3
-              ${projectFilter}
+            WHERE id IN (
+              SELECT id FROM observations
+              WHERE COALESCE(compressed_into, 0) = 0
+                AND COALESCE(access_count, 0) > 3
+                AND COALESCE(importance, 1) < 3
+                ${projectFilter}
+              LIMIT ${OP_ROW_CAP}
+            )
           `).run(...baseParams);
-          results.push(`Boosted ${boosted.changes} frequently-accessed observations`);
+          results.push(`Boosted ${boosted.changes} frequently-accessed observations` + (boosted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('dedup') && args.merge_ids) {
@@ -1093,9 +1112,13 @@ server.registerTool(
           const retainCutoff = Date.now() - retainDays * 86400000;
           const purged = db.prepare(`
             DELETE FROM observations
-            WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
+            WHERE id IN (
+              SELECT id FROM observations
+              WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
+              LIMIT ${OP_ROW_CAP}
+            )
           `).run(retainCutoff, ...baseParams);
-          results.push(`Purged ${purged.changes} stale observations (retained last ${retainDays} days)`);
+          results.push(`Purged ${purged.changes} stale observations (retained last ${retainDays} days)` + (purged.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
         }
       })();
 

@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
 
 export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
+export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (

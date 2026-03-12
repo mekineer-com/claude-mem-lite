@@ -32,6 +32,9 @@ export const BM25_MIN_THRESHOLD = 1.5;
 // ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
 // Prevents cascading latency when Haiku API is down or slow.
 // After BREAKER_THRESHOLD consecutive failures, disable for BREAKER_RESET_MS.
+// KNOWN LIMITATION: File-based state has a TOCTOU race under concurrent hook
+// processes. Worst case: breaker trips on failure N+1 instead of N. This is
+// acceptable — the breaker is a latency guard, not a correctness mechanism.
 
 const BREAKER_THRESHOLD = 3;
 const BREAKER_RESET_MS = 5 * 60 * 1000; // 5 minutes
