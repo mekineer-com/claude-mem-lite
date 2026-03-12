@@ -861,6 +861,36 @@ function postProcessResults(results, signals, db, limit = 3) {
   return results.slice(0, limit);
 }
 
+// ─── Recommendation Reason ──────────────────────────────────────────────────
+
+const INTENT_LABELS = {
+  test: 'testing', fix: 'debugging', review: 'code review', commit: 'git workflow',
+  deploy: 'deployment', plan: 'planning', clean: 'refactoring', doc: 'documentation',
+  db: 'database', api: 'API', secure: 'security', infra: 'infrastructure',
+  build: 'build tooling', fast: 'performance', lint: 'code style', design: 'UI/frontend',
+};
+
+/**
+ * Build a brief human-readable reason for why a resource was recommended.
+ * @param {object} signals Context signals from extractContextSignals
+ * @param {object} [options]
+ * @param {boolean} [options.explicit] Whether this was an explicit user request
+ * @returns {string} Brief reason string
+ */
+function buildRecommendReason(signals, { explicit = false } = {}) {
+  if (explicit) return 'Matched your explicit request';
+
+  const parts = [];
+  if (signals?.primaryIntent) {
+    const label = INTENT_LABELS[signals.primaryIntent] || signals.primaryIntent;
+    parts.push(`${label} intent detected`);
+  }
+  if (signals?.rawKeywords?.length > 0) {
+    parts.push(`keywords: ${signals.rawKeywords.slice(0, 3).join(', ')}`);
+  }
+  return parts.join('; ') || '';
+}
+
 // ─── Main Dispatch Functions ─────────────────────────────────────────────────
 
 /**
@@ -950,7 +980,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
     });
     updateResourceStats(db, best.id, 'recommend_count');
 
-    return renderInjection(best);
+    return renderInjection(best, buildRecommendReason(signals));
   } catch (e) {
     debugCatch(e, 'dispatchOnSessionStart');
     return null;
@@ -982,7 +1012,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
           if (!sessionId || !isRecentlyRecommended(db, best.id, sessionId)) {
             recordInvocation(db, { resource_id: best.id, session_id: sessionId, trigger: 'user_prompt', tier: 1, recommended: 1 });
             updateResourceStats(db, best.id, 'recommend_count');
-            return renderInjection(best);
+            return renderInjection(best, buildRecommendReason(null, { explicit: true }));
           }
         }
       }
@@ -1054,7 +1084,7 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
     });
     updateResourceStats(db, best.id, 'recommend_count');
 
-    return renderInjection(best);
+    return renderInjection(best, buildRecommendReason(signals));
   } catch (e) {
     debugCatch(e, 'dispatchOnUserPrompt');
     return null;
@@ -1128,7 +1158,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     });
     updateResourceStats(db, best.id, 'recommend_count');
 
-    return renderInjection(best);
+    return renderInjection(best, buildRecommendReason(signals));
   } catch (e) {
     debugCatch(e, 'dispatchOnPreToolUse');
     return null;

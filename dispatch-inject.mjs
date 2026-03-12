@@ -143,9 +143,10 @@ ${truncatedDef}
  * Enforces MAX_INJECTION_CHARS hard limit.
  *
  * @param {object} resource Resource object from DB
+ * @param {string} [reason] Brief reason why this resource was recommended
  * @returns {string} Injection text for additionalContext
  */
-export function renderInjection(resource) {
+export function renderInjection(resource, reason) {
   let injection;
 
   if (resource.type === 'skill') {
@@ -161,6 +162,8 @@ export function renderInjection(resource) {
   } else {
     injection = injectAgent(resource);
   }
+
+  if (reason) injection += `\nReason: ${reason}`;
 
   // Hard limit enforcement
   if (injection.length > MAX_INJECTION_CHARS) {
