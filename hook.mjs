@@ -32,7 +32,7 @@ import {
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { searchRelevantMemories } from './hook-memory.mjs';
-import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from './hook-handoff.mjs';
+import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
@@ -471,10 +471,20 @@ async function handleSessionStart() {
 
     // ── Non-transactional operations (side effects, background work) ──
 
+    // Shared clear handoff reference — queried once, used by fast summary + working state
+    let prevClearHandoff = null;
+
     if (prevSessionId) {
       // Save handoff for cross-session continuity (/clear or /compact)
       try { buildAndSaveHandoff(db, prevSessionId, prevProject || project, 'clear', episodeSnapshot); }
       catch (e) { debugCatch(e, 'session-start-handoff'); }
+
+      // Read the just-saved handoff for downstream consumers (fast summary remaining, working state)
+      try {
+        prevClearHandoff = db.prepare(
+          'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ?'
+        ).get(prevProject || project, 'clear');
+      } catch {}
 
       // Collect dispatch feedback for previous session
       try {
@@ -507,12 +517,23 @@ async function handleSessionStart() {
         const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
         const fastCompleted = prevObs.map(o => o.title).filter(Boolean).join('; ');
 
+        // Infer remaining_items from handoff unfinished (already built above at line 476)
+        let fastRemaining = '';
+        if (prevClearHandoff?.unfinished) {
+          fastRemaining = truncate(extractUnfinishedSummary(prevClearHandoff.unfinished, 0), 200);
+        }
+        // Fallback: episode errors
+        if (!fastRemaining && episodeSnapshot?.entries) {
+          const errors = episodeSnapshot.entries.filter(e => e.isError).map(e => e.desc).filter(Boolean);
+          if (errors.length > 0) fastRemaining = truncate(errors.join('; '), 200);
+        }
+
         if (fastRequest || fastCompleted) {
           db.prepare(`
             INSERT INTO session_summaries
-            (memory_session_id, project, request, investigated, learned, completed, next_steps, files_read, files_edited, notes, created_at, created_at_epoch)
-            VALUES (?, ?, ?, '', '', ?, '', '[]', '[]', 'fast', ?, ?)
-          `).run(prevSessionId, prevProject || project, fastRequest, truncate(fastCompleted, 300), now.toISOString(), now.getTime());
+            (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+            VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', 'fast', ?, ?)
+          `).run(prevSessionId, prevProject || project, fastRequest, truncate(fastCompleted, 300), fastRemaining, now.toISOString(), now.getTime());
         }
       } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
     }
@@ -607,7 +628,7 @@ async function handleSessionStart() {
 
     // Latest session summary
     const latestSummary = db.prepare(`
-      SELECT request, completed, next_steps, created_at
+      SELECT request, completed, next_steps, remaining_items, created_at
       FROM session_summaries
       WHERE project = ?
       ORDER BY created_at_epoch DESC
@@ -620,6 +641,7 @@ async function handleSessionStart() {
       summaryLines.push('### Last Session');
       if (latestSummary.request) summaryLines.push(`Request: ${truncate(latestSummary.request, 120)}`);
       if (latestSummary.completed) summaryLines.push(`Completed: ${truncate(latestSummary.completed, 120)}`);
+      if (latestSummary.remaining_items) summaryLines.push(`Remaining: ${truncate(latestSummary.remaining_items, 120)}`);
       if (latestSummary.next_steps) summaryLines.push(`Next: ${truncate(latestSummary.next_steps, 120)}`);
       summaryLines.push('');
     }
@@ -653,6 +675,23 @@ async function handleSessionStart() {
       }
     }
 
+    // Working state from /clear handoff (persisted to both stdout and CLAUDE.md)
+    const handoffLines = [];
+    if (prevClearHandoff) {
+      handoffLines.push('### Working State (from /clear)');
+      if (prevClearHandoff.working_on) handoffLines.push(`- Working on: ${truncate(prevClearHandoff.working_on, 200)}`);
+      if (prevClearHandoff.unfinished) {
+        handoffLines.push(`- Unfinished: ${truncate(extractUnfinishedSummary(prevClearHandoff.unfinished), 200)}`);
+      }
+      if (prevClearHandoff.key_files) {
+        try {
+          const files = JSON.parse(prevClearHandoff.key_files);
+          if (files.length > 0) handoffLines.push(`- Key files: ${files.map(f => basename(f)).join(', ')}`);
+        } catch {}
+      }
+      handoffLines.push('');
+    }
+
     // Build observations table (stdout only — not persisted to CLAUDE.md)
     const obsLines = [];
     const obsToShow = observations.length >= 3 ? observations : fallbackObs;
@@ -668,12 +707,12 @@ async function handleSessionStart() {
       }
     }
 
-    // Stdout: full context (summary + observations table)
-    const fullContext = [...summaryLines, ...obsLines].join('\n');
+    // Stdout: full context (summary + handoff state + observations table)
+    const fullContext = [...summaryLines, ...handoffLines, ...obsLines].join('\n');
     process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
 
-    // CLAUDE.md: slim (summary only — observations already in stdout)
-    updateClaudeMd(summaryLines.join('\n'));
+    // CLAUDE.md: slim (summary + handoff state — observations already in stdout)
+    updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
 
     // Dispatch: recommend skill/agent based on session context
     try {
@@ -788,14 +827,17 @@ async function handleUserPrompt() {
       now.toISOString(), now.getTime()
     );
 
-    // Cross-session handoff injection (first prompt only, before semantic memory)
-    if (counter?.prompt_counter === 1 && hasInjectionBudget()) {
+    // Cross-session handoff injection (first 3 prompts window, before semantic memory)
+    if (counter?.prompt_counter <= 3 && hasInjectionBudget()) {
       try {
         if (detectContinuationIntent(db, promptText, project)) {
           const injection = renderHandoffInjection(db, project);
           if (injection) {
             process.stdout.write(injection + '\n');
             incrementInjection();
+            // Consume clear handoff after injection to prevent duplicate injection on prompts 2-3.
+            // Exit handoffs are kept (7d TTL, content-dependent keyword/FTS matching won't re-trigger).
+            try { db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear'").run(project); } catch {}
           }
         }
       } catch (e) { debugCatch(e, 'handleUserPrompt-handoff'); }

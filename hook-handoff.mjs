@@ -116,6 +116,14 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
  * @returns {boolean}
  */
 export function detectContinuationIntent(db, promptText, project) {
+  // Stage 0: Non-expired 'clear' handoff = always continue (/clear means user is resuming)
+  const clearHandoff = db.prepare(`
+    SELECT created_at_epoch FROM session_handoffs WHERE project = ? AND type = 'clear'
+  `).get(project);
+  if (clearHandoff && (Date.now() - clearHandoff.created_at_epoch <= HANDOFF_EXPIRY_CLEAR)) {
+    return true;
+  }
+
   // Stage 1: Explicit keyword match — always works, even without handoff
   if (CONTINUE_KEYWORDS.test(promptText)) return true;
 
@@ -219,4 +227,23 @@ export function renderHandoffInjection(db, project) {
   } catch {}
 
   return lines.join('\n');
+}
+
+// Separator used by buildAndSaveHandoff to join pending entries with narrative history.
+const UNFINISHED_NARRATIVE_SEP = '\n---\n';
+const UNFINISHED_ENTRY_SEP = '; ';
+
+/**
+ * Extract the pending-work portion of the unfinished field (before narrative history).
+ * @param {string} unfinished Raw unfinished text from session_handoffs
+ * @param {number} [maxItems=3] Max number of pending entries to return
+ * @returns {string} Pending work summary (empty string if none)
+ */
+export function extractUnfinishedSummary(unfinished, maxItems = 3) {
+  if (!unfinished) return '';
+  const pending = unfinished.split(UNFINISHED_NARRATIVE_SEP)[0];
+  if (maxItems > 0) {
+    return pending.split(UNFINISHED_ENTRY_SEP).slice(0, maxItems).join(UNFINISHED_ENTRY_SEP);
+  }
+  return pending;
 }

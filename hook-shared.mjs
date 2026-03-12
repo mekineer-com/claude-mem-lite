@@ -27,7 +27,7 @@ export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
 export const RESOURCE_RESCAN_INTERVAL_MS = 60 * 60 * 1000;    // 1 hour
 
 // Handoff system constants
-export const HANDOFF_EXPIRY_CLEAR = 3600000;                   // 1 hour
+export const HANDOFF_EXPIRY_CLEAR = 6 * 3600000;                // 6 hours (covers lunch/meeting breaks)
 export const HANDOFF_EXPIRY_EXIT = 7 * 24 * 60 * 60 * 1000;   // 7 days
 export const HANDOFF_MATCH_THRESHOLD = 3;                       // min weighted score
 export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚才|\bcontinue\b|\bresume\b|\bwhere[\s-]+we[\s-]+left\b|\bpick[\s-]+up\b|\bcarry[\s-]+on\b/i;

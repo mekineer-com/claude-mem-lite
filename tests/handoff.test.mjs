@@ -326,8 +326,22 @@ describe('detectContinuationIntent', () => {
   let db;
   beforeEach(() => {
     db = createTestDb();
+    // Use 'exit' type for FTS/keyword tests — Stage 0 auto-match only applies to 'clear'
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, match_keywords, created_at_epoch)
-      VALUES ('test-proj', 'clear', 's1', 'implement handoff', 'handoff dispatch hook schema intent detection', ?)`).run(Date.now());
+      VALUES ('test-proj', 'exit', 's1', 'implement handoff', 'handoff dispatch hook schema intent detection', ?)`).run(Date.now());
+  });
+
+  it('Stage 0: always returns true for non-expired clear handoff regardless of prompt', () => {
+    db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+      VALUES ('test-proj', 'clear', 's2', 'handoff work', ?)`).run(Date.now());
+    expect(detectContinuationIntent(db, 'hello how are you', 'test-proj')).toBe(true);
+    expect(detectContinuationIntent(db, 'build a new REST API', 'test-proj')).toBe(true);
+  });
+
+  it('Stage 0: expired clear handoff does not auto-match', () => {
+    db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+      VALUES ('test-proj', 'clear', 's2', 'handoff work', ?)`).run(Date.now() - 25000000); // > 6h
+    expect(detectContinuationIntent(db, 'build a new REST API', 'test-proj')).toBe(false);
   });
 
   it('detects explicit Chinese keywords', () => {
@@ -370,10 +384,10 @@ describe('detectContinuationIntent', () => {
     expect(detectContinuationIntent(emptyDb, 'handoff dispatch hook', 'no-such-proj')).toBe(false);
   });
 
-  it('respects expiry — expired clear handoff is skipped for FTS', () => {
+  it('respects expiry — expired clear handoff is skipped for FTS and Stage 0', () => {
     const oldDb = createTestDb();
     oldDb.prepare(`INSERT INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
-      VALUES ('p', 'clear', 's', 'handoff dispatch hook schema', ?)`).run(Date.now() - 4000000); // > 1 hour ago
+      VALUES ('p', 'clear', 's', 'handoff dispatch hook schema', ?)`).run(Date.now() - 25000000); // > 6 hours ago
     expect(detectContinuationIntent(oldDb, 'handoff dispatch hook schema', 'p')).toBe(false);
     expect(detectContinuationIntent(oldDb, '继续', 'p')).toBe(true); // keyword always works
   });
@@ -454,9 +468,9 @@ describe('renderHandoffInjection', () => {
   });
 
   it('returns null for expired handoff', () => {
-    // clear handoff expired (> 1 hour)
+    // clear handoff expired (> 6 hours)
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
-      VALUES ('p', 'clear', 's1', 'old work', ?)`).run(Date.now() - 4000000);
+      VALUES ('p', 'clear', 's1', 'old work', ?)`).run(Date.now() - 25000000);
     expect(renderHandoffInjection(db, 'p')).toBeNull();
   });
 
