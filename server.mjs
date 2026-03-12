@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
+import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { createRequire } from 'module';
@@ -121,15 +121,28 @@ function safeHandler(fn) {
 
 // ─── Tool: mem_search — helper functions ────────────────────────────────────
 
+// Type-differentiated recency decay: decisions persist longer, routine changes fade fast
+const TYPE_DECAY_CASE = `(
+  CASE o.type
+    WHEN 'decision'  THEN 7776000000.0
+    WHEN 'discovery' THEN 5184000000.0
+    WHEN 'feature'   THEN 2592000000.0
+    WHEN 'bugfix'    THEN 1209600000.0
+    WHEN 'refactor'  THEN 1209600000.0
+    WHEN 'change'    THEN  604800000.0
+    ELSE 1209600000.0
+  END
+)`;
+
 // Score expression variants for FTS5 queries (see Scoring Model Constants above)
 const FULL_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
+  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
   * (0.5 + 0.5 * COALESCE(o.importance, 1))`;
 
 /**
@@ -607,6 +620,8 @@ server.registerTool(
       db.prepare(
         `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id IN (${placeholders})`
       ).run(...args.ids);
+      // Auto-boost importance for frequently accessed observations
+      autoBoostIfNeeded(db, args.ids);
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
       allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count'];
       prefix = '#';
@@ -1249,33 +1264,10 @@ const idleTimer = setInterval(() => {
   idleCleanupRan = true;
 
   try {
-    const thirtyDaysAgo = Date.now() - 30 * 86400000;
-
-    db.transaction(() => {
-      // Mark old low-quality observations as pending-purge (importance<=1, never accessed, 30+ days).
-      // Actual deletion only happens when user confirms via mem_maintain execute purge_stale.
-      // NOTE: no project filter — MCP server is global, operates across all projects.
-      const marked = db.prepare(`
-        UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
-        WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
-          AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
-      `).run(thirtyDaysAgo);
-      if (marked.changes > 0) {
-        debugLog('INFO', 'idle-cleanup', `Marked ${marked.changes} stale observations as pending-purge`);
-      }
-
-      // Mark old importance=1 with access_count>0 as compressed (30+ days).
-      // Note: importance=1, access_count=0 rows were already marked pending-purge above,
-      // so this only catches importance=1 rows that HAVE been accessed.
-      const compressed = db.prepare(`
-        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
-        WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
-          AND created_at_epoch < ?
-      `).run(thirtyDaysAgo);
-      if (compressed.changes > 0) {
-        debugLog('INFO', 'idle-cleanup', `Compressed ${compressed.changes} old observations`);
-      }
-    })();
+    // Type-differentiated cleanup: higher-value types survive longer
+    const { marked, compressed } = runIdleCleanup(db);
+    if (marked > 0) debugLog('INFO', 'idle-cleanup', `Marked ${marked} stale observations as pending-purge`);
+    if (compressed > 0) debugLog('INFO', 'idle-cleanup', `Compressed ${compressed} old observations`);
 
     // FTS5 index optimization (outside transaction — WAL-friendly)
     db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");

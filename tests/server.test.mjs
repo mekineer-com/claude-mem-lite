@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
+import { autoBoostIfNeeded, runIdleCleanup } from '../server-internals.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 
@@ -1241,5 +1242,237 @@ describe('cross-source merge', () => {
     for (const r of page2) {
       expect(page1Ids.has(r.id)).toBe(false);
     }
+  });
+});
+
+// ─── Schema: lesson_learned and search_aliases ──────────────────────────────
+
+describe('schema: lesson_learned and search_aliases', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('observations table has lesson_learned and search_aliases columns', () => {
+    const cols = db.pragma('table_info(observations)').map(c => c.name);
+    expect(cols).toContain('lesson_learned');
+    expect(cols).toContain('search_aliases');
+  });
+
+  it('session_summaries table has lessons and key_decisions columns', () => {
+    const cols = db.pragma('table_info(session_summaries)').map(c => c.name);
+    expect(cols).toContain('lessons');
+    expect(cols).toContain('key_decisions');
+  });
+
+  it('new columns default to null', () => {
+    insertSession(db, { id: 'sess-schema', project: 'test' });
+    insertObs(db, { sessionId: 'sess-schema', title: 'test defaults' });
+    const row = db.prepare('SELECT lesson_learned, search_aliases FROM observations ORDER BY id DESC LIMIT 1').get();
+    expect(row.lesson_learned).toBeNull();
+    expect(row.search_aliases).toBeNull();
+  });
+
+  it('insertObs can store lesson_learned and search_aliases', () => {
+    insertSession(db, { id: 'sess-lesson', project: 'test' });
+    insertObs(db, {
+      sessionId: 'sess-lesson', title: 'test lesson',
+      lessonLearned: 'Always use atomic writes',
+      searchAliases: 'atomic rename TOCTOU'
+    });
+    const row = db.prepare('SELECT lesson_learned, search_aliases FROM observations ORDER BY id DESC LIMIT 1').get();
+    expect(row.lesson_learned).toBe('Always use atomic writes');
+    expect(row.search_aliases).toBe('atomic rename TOCTOU');
+  });
+});
+
+// ─── Auto-boost on access ────────────────────────────────────────────────────
+
+describe('auto-boost on access', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('boosts importance to 2 when access_count reaches 2 and importance is 1', () => {
+    insertSession(db, { id: 'sess-boost', project: 'test' });
+    const result = insertObs(db, { sessionId: 'sess-boost', title: 'test boost', importance: 1, accessCount: 1 });
+    const id = Number(result.lastInsertRowid);
+    db.prepare('UPDATE observations SET access_count = access_count + 1 WHERE id = ?').run(id);
+    autoBoostIfNeeded(db, [id]);
+    const row = db.prepare('SELECT importance, access_count FROM observations WHERE id = ?').get(id);
+    expect(row.access_count).toBe(2);
+    expect(row.importance).toBe(2);
+  });
+
+  it('does not boost importance=2+ observations', () => {
+    insertSession(db, { id: 'sess-boost2', project: 'test' });
+    const result = insertObs(db, { sessionId: 'sess-boost2', title: 'already important', importance: 2, accessCount: 1 });
+    const id = Number(result.lastInsertRowid);
+    db.prepare('UPDATE observations SET access_count = access_count + 1 WHERE id = ?').run(id);
+    autoBoostIfNeeded(db, [id]);
+    const row = db.prepare('SELECT importance FROM observations WHERE id = ?').get(id);
+    expect(row.importance).toBe(2);
+  });
+});
+
+// ─── Type-differentiated decay ──────────────────────────────────────────────
+
+describe('type-differentiated decay', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('decisions rank higher than changes at same age when both are 30 days old', () => {
+    insertSession(db, { id: 'sess-decay', project: 'test' });
+    insertObs(db, { sessionId: 'sess-decay', type: 'decision', title: 'auth architecture design choice', text: 'auth architecture design choice', importance: 2, epochOffset: -30 * 86400000 });
+    insertObs(db, { sessionId: 'sess-decay', type: 'change', title: 'auth config update change', text: 'auth config update change', importance: 2, epochOffset: -30 * 86400000 });
+
+    const now = Date.now();
+    const rows = db.prepare(`
+      SELECT o.id, o.type, o.title,
+             bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+               * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / (
+                 CASE o.type
+                   WHEN 'decision'  THEN 7776000000.0
+                   WHEN 'discovery' THEN 5184000000.0
+                   WHEN 'feature'   THEN 2592000000.0
+                   WHEN 'bugfix'    THEN 1209600000.0
+                   WHEN 'refactor'  THEN 1209600000.0
+                   WHEN 'change'    THEN  604800000.0
+                   ELSE 1209600000.0
+                 END
+               ))) as score
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH 'auth'
+        AND COALESCE(o.compressed_into, 0) = 0
+      ORDER BY score
+    `).all(now);
+
+    const decisionIdx = rows.findIndex(r => r.type === 'decision');
+    const changeIdx = rows.findIndex(r => r.type === 'change');
+    expect(decisionIdx).toBeLessThan(changeIdx);
+  });
+});
+
+// ─── Type-aware idle cleanup ────────────────────────────────────────────────
+
+describe('type-aware idle cleanup', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('does not mark decision observations as pending-purge at 30 days', () => {
+    insertSession(db, { id: 'sess-idle', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle', type: 'decision',
+      title: 'chose FTS5 over elasticsearch',
+      importance: 1, accessCount: 0,
+      epochOffset: -31 * 86400000
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBeNull();
+  });
+
+  it('marks decision observations as pending-purge at 90+ days', () => {
+    insertSession(db, { id: 'sess-idle-dec90', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-dec90', type: 'decision',
+      title: 'old architecture decision',
+      importance: 1, accessCount: 0,
+      epochOffset: -91 * 86400000
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBe(-2);
+  });
+
+  it('marks change observations as pending-purge at 14+ days', () => {
+    insertSession(db, { id: 'sess-idle2', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle2', type: 'change',
+      title: 'updated readme',
+      importance: 1, accessCount: 0,
+      epochOffset: -15 * 86400000
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBe(-2);
+  });
+
+  it('does not mark change observations before 14 days', () => {
+    insertSession(db, { id: 'sess-idle-recent', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-recent', type: 'change',
+      title: 'recent change',
+      importance: 1, accessCount: 0,
+      epochOffset: -10 * 86400000
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBeNull();
+  });
+
+  it('marks feature observations as pending-purge at 60+ days', () => {
+    insertSession(db, { id: 'sess-idle-feat', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-feat', type: 'feature',
+      title: 'old feature obs',
+      importance: 1, accessCount: 0,
+      epochOffset: -61 * 86400000
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBe(-2);
+  });
+
+  it('marks bugfix observations as pending-purge at 30+ days', () => {
+    insertSession(db, { id: 'sess-idle-bug', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-bug', type: 'bugfix',
+      title: 'old bugfix',
+      importance: 1, accessCount: 0,
+      epochOffset: -31 * 86400000
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBe(-2);
+  });
+
+  it('does not mark accessed or high-importance observations', () => {
+    insertSession(db, { id: 'sess-idle3', project: 'test' });
+    const r1 = insertObs(db, {
+      sessionId: 'sess-idle3', type: 'change', title: 'accessed change',
+      importance: 1, accessCount: 5, epochOffset: -30 * 86400000
+    });
+    const r2 = insertObs(db, {
+      sessionId: 'sess-idle3', type: 'change', title: 'important change',
+      importance: 2, accessCount: 0, epochOffset: -30 * 86400000
+    });
+    runIdleCleanup(db);
+    const row1 = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(Number(r1.lastInsertRowid));
+    const row2 = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(Number(r2.lastInsertRowid));
+    // accessed change: importance=1, access_count=5 → not pending-purge, but auto-compressed
+    expect(row1.compressed_into).toBe(-1);
+    // important change: importance=2 → untouched
+    expect(row2.compressed_into).toBeNull();
+  });
+
+  it('returns counts of marked and compressed observations', () => {
+    insertSession(db, { id: 'sess-idle-count', project: 'test' });
+    // Two old changes with no access → pending-purge
+    insertObs(db, { sessionId: 'sess-idle-count', type: 'change', title: 'stale1', importance: 1, accessCount: 0, epochOffset: -20 * 86400000 });
+    insertObs(db, { sessionId: 'sess-idle-count', type: 'change', title: 'stale2', importance: 1, accessCount: 0, epochOffset: -20 * 86400000 });
+    // One old change with access → compressed
+    insertObs(db, { sessionId: 'sess-idle-count', type: 'change', title: 'accessed', importance: 1, accessCount: 3, epochOffset: -20 * 86400000 });
+    const result = runIdleCleanup(db);
+    expect(result.marked).toBe(2);
+    expect(result.compressed).toBe(1);
   });
 });

@@ -19,7 +19,7 @@ import {
   createEpisode, addFileToEpisode,
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
-import { selectWithTokenBudget, updateClaudeMd } from './hook-context.mjs';
+import { selectWithTokenBudget, updateClaudeMd, buildSummaryLines } from './hook-context.mjs';
 import { dispatchOnSessionStart, dispatchOnPreToolUse, dispatchOnUserPrompt } from './dispatch.mjs';
 import { collectFeedback } from './dispatch-feedback.mjs';
 import {
@@ -31,7 +31,7 @@ import {
   resetInjectionBudget, hasInjectionBudget, incrementInjection,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
-import { searchRelevantMemories } from './hook-memory.mjs';
+import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 
 // Prevent recursive hooks from background claude -p calls
@@ -219,25 +219,20 @@ async function handlePostToolUse() {
     addFileToEpisode(episode, files);
 
     // Proactive file history: show past observations for files being edited
+    // Uses recallForFile for importance>=2 with lesson context
     if (EDIT_TOOLS.has(tool_name) && files.length > 0) {
       const d = getDb();
       if (d) {
         for (const f of files) {
           if (episode.fileHistoryShown?.includes(f)) continue;
           try {
-            const fname = basename(f);
-            const ftsQ = `"${fname.replace(/"/g, '""')}"`;
-            const rows = d.prepare(`
-              SELECT o.id, o.type, o.title
-              FROM observations_fts
-              JOIN observations o ON observations_fts.rowid = o.id
-              WHERE observations_fts MATCH ? AND o.project = ?
-              ORDER BY o.created_at_epoch DESC
-              LIMIT 3
-            `).all(ftsQ, project);
-            if (rows.length > 0) {
-              const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
-              process.stdout.write(`[claude-mem-lite] File history for ${fname}:\n${hints}\n`);
+            const recalled = recallForFile(d, f, project);
+            if (recalled.length > 0) {
+              const hints = recalled.map(r => {
+                const lesson = r.lesson_learned ? ` | ${r.lesson_learned}` : '';
+                return `  #${r.id} [${r.type}] ${truncate(r.title, 60)}${lesson}`;
+              }).join('\n');
+              process.stdout.write(`[claude-mem-lite] History for ${basename(f)}:\n${hints}\n`);
             }
           } catch (e) { debugCatch(e, 'fileHistory'); }
           if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
@@ -628,7 +623,7 @@ async function handleSessionStart() {
 
     // Latest session summary
     const latestSummary = db.prepare(`
-      SELECT request, completed, next_steps, remaining_items, created_at
+      SELECT request, completed, next_steps, remaining_items, lessons, key_decisions, created_at
       FROM session_summaries
       WHERE project = ?
       ORDER BY created_at_epoch DESC
@@ -636,15 +631,7 @@ async function handleSessionStart() {
     `).get(project);
 
     // Build summary lines (shared by stdout and CLAUDE.md)
-    const summaryLines = [];
-    if (latestSummary) {
-      summaryLines.push('### Last Session');
-      if (latestSummary.request) summaryLines.push(`Request: ${truncate(latestSummary.request, 120)}`);
-      if (latestSummary.completed) summaryLines.push(`Completed: ${truncate(latestSummary.completed, 120)}`);
-      if (latestSummary.remaining_items) summaryLines.push(`Remaining: ${truncate(latestSummary.remaining_items, 120)}`);
-      if (latestSummary.next_steps) summaryLines.push(`Next: ${truncate(latestSummary.next_steps, 120)}`);
-      summaryLines.push('');
-    }
+    const summaryLines = buildSummaryLines(latestSummary);
 
     // Key context: top high-importance observations for CLAUDE.md persistence
     const keyObs = db.prepare(`
@@ -858,7 +845,8 @@ async function handleUserPrompt() {
         if (memories.length > 0) {
           const lines = ['<memory-context relevance="high">'];
           for (const m of memories) {
-            lines.push(`- [${m.type}] ${truncate(m.title, 80)} (#${m.id})`);
+            const lessonTag = m.lesson_learned ? ` | Lesson: ${m.lesson_learned}` : '';
+            lines.push(`- [${m.type}] ${truncate(m.title, 80)}${lessonTag} (#${m.id})`);
           }
           lines.push('</memory-context>');
           process.stdout.write(lines.join('\n') + '\n');

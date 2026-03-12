@@ -16,12 +16,13 @@ import {
 
 // ─── Save Observation to DB ─────────────────────────────────────────────────
 
-/** Build the FTS5 text field from observation data (concepts + facts + CJK bigrams). */
+/** Build the FTS5 text field from observation data (concepts + facts + searchAliases + CJK bigrams). */
 function buildFtsTextField(obs) {
   const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '';
   const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
+  const aliasesText = obs.searchAliases || '';
   const bigramText = cjkBigrams((obs.title || '') + ' ' + (obs.narrative || ''));
-  return { conceptsText, factsText, textField: [conceptsText, factsText, bigramText].filter(Boolean).join(' ') };
+  return { conceptsText, factsText, textField: [conceptsText, factsText, aliasesText, bigramText].filter(Boolean).join(' ') };
 }
 
 export function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
@@ -69,8 +70,8 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     const { conceptsText, factsText, textField } = buildFtsTextField(obs);
 
     const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       sessionId, project,
       textField, obs.type, obs.title, obs.subtitle || '',
@@ -81,6 +82,8 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       JSON.stringify(obs.files || []),
       obs.importance ?? 1,
       minhashSig,
+      obs.lessonLearned || null,
+      obs.searchAliases || null,
       now.toISOString(), now.getTime()
     );
     return Number(result.lastInsertRowid);
@@ -265,9 +268,11 @@ File: ${episode.files.join(', ') || 'unknown'}
 Action: ${e.desc}
 Error: ${e.isError ? 'yes' : 'no'}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight or null if routine","search_aliases":["alt query 1","alt query 2"]}
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
+importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)
+lesson_learned: If this episode revealed something NON-OBVIOUS (a debugging insight, a gotcha, a design reason), capture it as a reusable lesson. null if routine.
+search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
   } else {
     const actionList = episode.entries.map((e, i) =>
       `${i + 1}. [${e.tool}] ${e.desc}${e.isError ? ' (ERROR)' : ''}`
@@ -280,9 +285,11 @@ Files: ${fileList}
 Actions (${episode.entries.length} total):
 ${actionList}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or null if routine","search_aliases":["alt query 1","alt query 2"]}
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)`;
+importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)
+lesson_learned: If this episode revealed something NON-OBVIOUS (a debugging insight, a gotcha, a design reason), capture it as a reusable lesson. null if routine.
+search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
   }
 
   const ruleImportance = computeRuleImportance(episode);
@@ -316,6 +323,11 @@ importance: 0=not worth saving (pure browsing, trivial query, no learning value)
         return;
       }
 
+      const lessonLearned = typeof parsed.lesson_learned === 'string' ? parsed.lesson_learned.slice(0, 500) : null;
+      const searchAliases = Array.isArray(parsed.search_aliases)
+        ? parsed.search_aliases.slice(0, 6).join(' ')
+        : null;
+
       obs = {
         type: validTypes.has(parsed.type) ? parsed.type : 'change',
         title: truncate(parsed.title, 120),
@@ -326,6 +338,8 @@ importance: 0=not worth saving (pure browsing, trivial query, no learning value)
         files: episode.files,
         filesRead: episode.filesRead || [],
         importance: Math.max(ruleImportance, clampImportance(parsed.importance)),
+        lessonLearned,
+        searchAliases,
       };
     }
   }
@@ -353,7 +367,7 @@ importance: 0=not worth saving (pure browsing, trivial query, no learning value)
       const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
       db.prepare(`
         UPDATE observations SET type=?, title=?, subtitle=?, narrative=?, concepts=?, facts=?,
-          text=?, importance=?, files_read=?, minhash_sig=?
+          text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?
         WHERE id = ?
       `).run(
         obs.type, truncate(obs.title, 120), obs.subtitle || '',
@@ -362,6 +376,8 @@ importance: 0=not worth saving (pure browsing, trivial query, no learning value)
         obs.importance,
         JSON.stringify(obs.filesRead || []),
         minhashSig,
+        obs.lessonLearned || null,
+        obs.searchAliases || null,
         episode.savedId
       );
       savedId = episode.savedId;
@@ -432,7 +448,9 @@ Project: ${project}${promptCtx}
 Observations (${recentObs.length} total):
 ${obsList}
 
-JSON: {"request":"what the user was working on","completed":"specific items accomplished with file names","remaining_items":"specific unfinished items from the original request — compare investigation scope with actual changes to infer what was NOT yet done; be precise with file:issue format, or empty string if all done","next_steps":"suggested follow-up"}`;
+JSON: {"request":"what the user was working on","completed":"specific items accomplished with file names","remaining_items":"specific unfinished items from the original request — compare investigation scope with actual changes to infer what was NOT yet done; be precise with file:issue format, or empty string if all done","next_steps":"suggested follow-up","lessons":["non-obvious insights discovered during this session"],"key_decisions":["important design choices made and WHY"]}
+lessons: Only genuinely non-obvious insights (debugging discoveries, gotchas, architectural reasons). Empty array if routine.
+key_decisions: Only decisions with lasting impact (library choices, architecture, data model). Include reasoning. Empty array if none.`;
 
     if (!(await acquireLLMSlot())) {
       debugLog('WARN', 'llm-summary', 'semaphore timeout, skipping summary');
@@ -449,14 +467,19 @@ JSON: {"request":"what the user was working on","completed":"specific items acco
 
     if (llmParsed && llmParsed.request) {
       const now = new Date();
+      const lessonsJson = Array.isArray(llmParsed.lessons) && llmParsed.lessons.length > 0
+        ? JSON.stringify(llmParsed.lessons) : null;
+      const decisionsJson = Array.isArray(llmParsed.key_decisions) && llmParsed.key_decisions.length > 0
+        ? JSON.stringify(llmParsed.key_decisions) : null;
       db.prepare(`
-        INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?)
+        INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, lessons, key_decisions, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?, ?, ?)
       `).run(
         sessionId, project,
         llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
         llmParsed.completed || '', llmParsed.next_steps || '',
         llmParsed.remaining_items || '',
+        lessonsJson, decisionsJson,
         now.toISOString(), now.getTime()
       );
     }

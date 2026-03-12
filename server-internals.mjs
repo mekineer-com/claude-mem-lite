@@ -1,7 +1,7 @@
 // claude-mem-lite server internal functions
 // Extracted from server.mjs for testability (server.mjs has top-level side effects)
 
-import { debugCatch } from './utils.mjs';
+import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 
 // ─── Search Re-ranking Helpers ────────────────────────────────────────────
 
@@ -192,4 +192,71 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, 3)
     .map(([concept]) => concept);
+}
+
+// ─── Auto-boost ─────────────────────────────────────────────────────────────
+
+/**
+ * Boost importance to 2 for observations that have been accessed multiple times
+ * (access_count >= 2) but still have default importance (1).
+ * Called after incrementing access_count in mem_get.
+ * @param {object} db better-sqlite3 database handle
+ * @param {number[]} ids Array of observation IDs to check
+ */
+export function autoBoostIfNeeded(db, ids) {
+  if (!ids || ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(`
+    UPDATE observations SET importance = 2
+    WHERE id IN (${placeholders})
+      AND COALESCE(importance, 1) = 1
+      AND COALESCE(access_count, 0) >= 2
+  `).run(...ids);
+}
+
+// ─── Idle Cleanup ────────────────────────────────────────────────────────────
+
+/**
+ * Run type-differentiated idle cleanup on stale observations.
+ * Higher-value types (decision, discovery) survive longer than ephemeral types (change).
+ * - Marks low-quality (importance<=1, never accessed) as pending-purge (COMPRESSED_PENDING_PURGE).
+ * - Marks importance=1 accessed observations as auto-compressed (COMPRESSED_AUTO).
+ * @param {object} db better-sqlite3 database handle
+ * @returns {{ marked: number, compressed: number }}
+ */
+export function runIdleCleanup(db) {
+  // SAFETY: type values are hardcoded constants, not user input
+  const staleThresholds = [
+    { types: "'decision','discovery'", days: 90 },
+    { types: "'feature'", days: 60 },
+    { types: "'bugfix','refactor'", days: 30 },
+    { types: "'change'", days: 14 },
+  ];
+
+  let totalMarked = 0;
+  let totalCompressed = 0;
+
+  db.transaction(() => {
+    for (const { types, days } of staleThresholds) {
+      const cutoff = Date.now() - days * 86400000;
+
+      const marked = db.prepare(`
+        UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
+        WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
+          AND type IN (${types})
+          AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
+      `).run(cutoff);
+      totalMarked += marked.changes;
+
+      const compressed = db.prepare(`
+        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
+        WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
+          AND type IN (${types})
+          AND created_at_epoch < ?
+      `).run(cutoff);
+      totalCompressed += compressed.changes;
+    }
+  })();
+
+  return { marked: totalMarked, compressed: totalCompressed };
 }

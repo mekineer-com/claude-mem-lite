@@ -3,7 +3,7 @@
 
 import { join } from 'path';
 import { readFileSync, writeFileSync, renameSync } from 'fs';
-import { estimateTokens, debugLog, debugCatch } from './utils.mjs';
+import { estimateTokens, truncate, debugLog, debugCatch } from './utils.mjs';
 
 /**
  * Infer the project directory from environment variables or cwd.
@@ -172,4 +172,35 @@ export function updateClaudeMd(contextBlock) {
   } catch (e) {
     debugLog('ERROR', 'updateClaudeMd', `CLAUDE.md write failed: ${e.message}`);
   }
+}
+
+/**
+ * Build summary lines from a latestSummary row.
+ * Extracted for testability — used by handleSessionStart.
+ * @param {object} latestSummary Row from session_summaries with request, completed, etc.
+ * @returns {string[]} Lines to include in context output
+ */
+export function buildSummaryLines(latestSummary) {
+  const lines = [];
+  if (!latestSummary) return lines;
+
+  lines.push('### Last Session');
+  if (latestSummary.request) lines.push(`Request: ${truncate(latestSummary.request, 120)}`);
+  if (latestSummary.completed) lines.push(`Completed: ${truncate(latestSummary.completed, 120)}`);
+  if (latestSummary.remaining_items) lines.push(`Remaining: ${truncate(latestSummary.remaining_items, 120)}`);
+  if (latestSummary.next_steps) lines.push(`Next: ${truncate(latestSummary.next_steps, 120)}`);
+  if (latestSummary.lessons) {
+    try {
+      const lessons = JSON.parse(latestSummary.lessons);
+      if (lessons.length > 0) lines.push(`Lessons: ${lessons.slice(0, 3).join('; ')}`);
+    } catch {}
+  }
+  if (latestSummary.key_decisions) {
+    try {
+      const decisions = JSON.parse(latestSummary.key_decisions);
+      if (decisions.length > 0) lines.push(`Decisions: ${decisions.slice(0, 3).join('; ')}`);
+    } catch {}
+  }
+  lines.push('');
+  return lines;
 }

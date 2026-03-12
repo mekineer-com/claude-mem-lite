@@ -99,6 +99,10 @@ const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN access_count INTEGER DEFAULT 0',
   'ALTER TABLE observations ADD COLUMN compressed_into INTEGER DEFAULT NULL',
   'ALTER TABLE session_summaries ADD COLUMN remaining_items TEXT',
+  'ALTER TABLE observations ADD COLUMN lesson_learned TEXT DEFAULT NULL',
+  'ALTER TABLE observations ADD COLUMN search_aliases TEXT DEFAULT NULL',
+  'ALTER TABLE session_summaries ADD COLUMN lessons TEXT DEFAULT NULL',
+  'ALTER TABLE session_summaries ADD COLUMN key_decisions TEXT DEFAULT NULL',
 ];
 
 /**

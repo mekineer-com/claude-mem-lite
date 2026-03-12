@@ -4,7 +4,7 @@ import { writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTestDb, insertSession } from './test-helpers.mjs';
-import { computeMinHash } from '../utils.mjs';
+import { computeMinHash, parseJsonFromLLM } from '../utils.mjs';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
@@ -605,5 +605,141 @@ describe('handleLLMSummary', () => {
 
     const count = db.prepare('SELECT COUNT(*) as cnt FROM session_summaries').get();
     expect(count.cnt).toBe(0);
+  });
+});
+
+// ─── session summary structured knowledge ────────────────────────────────────
+
+describe('session summary structured knowledge', () => {
+  it('parses lessons array from summary', () => {
+    const raw = JSON.stringify({
+      request: 'Fix authentication flow',
+      completed: 'Fixed token refresh in auth.ts',
+      remaining_items: '',
+      next_steps: 'Add integration tests',
+      lessons: ['Token refresh needs exponential backoff', 'OAuth state must be crypto random'],
+      key_decisions: ['Chose jose over jsonwebtoken for ESM compatibility']
+    });
+    const parsed = parseJsonFromLLM(raw);
+    expect(parsed.lessons).toHaveLength(2);
+    expect(parsed.key_decisions).toHaveLength(1);
+  });
+
+  it('handles missing lessons gracefully', () => {
+    const raw = JSON.stringify({
+      request: 'Update readme', completed: 'Done', remaining_items: '', next_steps: ''
+    });
+    const parsed = parseJsonFromLLM(raw);
+    expect(parsed.lessons).toBeUndefined();
+    expect(parsed.key_decisions).toBeUndefined();
+  });
+
+  it('persists lessons and key_decisions in session_summaries table', async () => {
+    const db = createTestDb();
+    db._realClose = db.close;
+    db.close = () => {};
+
+    const origArgv3 = process.argv[3];
+    const origArgv4 = process.argv[4];
+    process.argv[3] = 'lessons-sess';
+    process.argv[4] = 'test-proj';
+    process.env.CLAUDE_MEM_FLUSH_TIMEOUT = '0';
+
+    openDb.mockReturnValue(db);
+    callLLM.mockReturnValue(JSON.stringify({
+      request: 'Fix auth flow',
+      completed: 'Fixed token refresh',
+      remaining_items: '',
+      next_steps: 'Add tests',
+      lessons: ['Exponential backoff needed for token refresh'],
+      key_decisions: ['Chose jose for ESM compat']
+    }));
+
+    insertSession(db, { id: 'lessons-sess', project: 'test-proj' });
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'feature', 'Auth fix', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('lessons-sess', 'test-proj', new Date().toISOString(), Date.now());
+
+    await handleLLMSummary();
+
+    const summary = db.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').get('lessons-sess');
+    expect(summary).toBeDefined();
+    expect(summary.lessons).toBe(JSON.stringify(['Exponential backoff needed for token refresh']));
+    expect(summary.key_decisions).toBe(JSON.stringify(['Chose jose for ESM compat']));
+
+    process.argv[3] = origArgv3;
+    process.argv[4] = origArgv4;
+    delete process.env.CLAUDE_MEM_FLUSH_TIMEOUT;
+    db._realClose();
+  });
+
+  it('stores null for empty lessons and key_decisions arrays', async () => {
+    const db = createTestDb();
+    db._realClose = db.close;
+    db.close = () => {};
+
+    const origArgv3 = process.argv[3];
+    const origArgv4 = process.argv[4];
+    process.argv[3] = 'no-lessons-sess';
+    process.argv[4] = 'test-proj';
+    process.env.CLAUDE_MEM_FLUSH_TIMEOUT = '0';
+
+    openDb.mockReturnValue(db);
+    callLLM.mockReturnValue(JSON.stringify({
+      request: 'Update readme',
+      completed: 'Done',
+      remaining_items: '',
+      next_steps: '',
+      lessons: [],
+      key_decisions: []
+    }));
+
+    insertSession(db, { id: 'no-lessons-sess', project: 'test-proj' });
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'change', 'Update readme', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('no-lessons-sess', 'test-proj', new Date().toISOString(), Date.now());
+
+    await handleLLMSummary();
+
+    const summary = db.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').get('no-lessons-sess');
+    expect(summary).toBeDefined();
+    expect(summary.lessons).toBeNull();
+    expect(summary.key_decisions).toBeNull();
+
+    process.argv[3] = origArgv3;
+    process.argv[4] = origArgv4;
+    delete process.env.CLAUDE_MEM_FLUSH_TIMEOUT;
+    db._realClose();
+  });
+});
+
+// ─── lesson_learned and search_aliases extraction ────────────────────────────
+
+describe('lesson_learned and search_aliases extraction', () => {
+  it('parses lesson_learned from LLM response', () => {
+    const raw = JSON.stringify({
+      type: 'bugfix', title: 'Fix race condition in session init',
+      narrative: 'Session file was created without atomic rename',
+      concepts: ['race-condition', 'atomicity'],
+      facts: ['session file write needs atomic rename to prevent TOCTOU'],
+      importance: 2,
+      lesson_learned: 'Always use atomic write (tmp+rename) for concurrent file access',
+      search_aliases: ['TOCTOU', 'file race', 'concurrent write', '原子写入'],
+    });
+    const parsed = parseJsonFromLLM(raw);
+    expect(parsed.lesson_learned).toBe('Always use atomic write (tmp+rename) for concurrent file access');
+    expect(parsed.search_aliases).toEqual(['TOCTOU', 'file race', 'concurrent write', '原子写入']);
+  });
+
+  it('lesson_learned is null for routine observations', () => {
+    const raw = JSON.stringify({
+      type: 'change', title: 'Updated config', narrative: 'Changed port',
+      concepts: ['config'], facts: ['port changed to 3001'],
+      importance: 1, lesson_learned: null, search_aliases: ['config change'],
+    });
+    const parsed = parseJsonFromLLM(raw);
+    expect(parsed.lesson_learned).toBeNull();
   });
 });

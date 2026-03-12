@@ -136,10 +136,10 @@ describe('sanitizeFtsQuery', () => {
   });
 
   it('strips FTS5 special characters', () => {
-    // "test" now has synonym "spec", so any query containing "test" gets OR-expanded
-    expect(sanitizeFtsQuery('test{foo}')).toBe('(test OR spec) AND foo');
-    expect(sanitizeFtsQuery('test(bar)')).toBe('(test OR spec) AND bar');
-    expect(sanitizeFtsQuery('test[baz]')).toBe('(test OR spec) AND baz');
+    // "test" now has synonyms "spec" and "测试" (CJK), so any query containing "test" gets OR-expanded
+    expect(sanitizeFtsQuery('test{foo}')).toBe('(test OR spec OR 测试) AND foo');
+    expect(sanitizeFtsQuery('test(bar)')).toBe('(test OR spec OR 测试) AND bar');
+    expect(sanitizeFtsQuery('test[baz]')).toBe('(test OR spec OR 测试) AND baz');
     expect(sanitizeFtsQuery('a^b~c*d:e')).toBe('a b c d e');
   });
 
@@ -169,20 +169,22 @@ describe('sanitizeFtsQuery', () => {
   it('handles mixed hyphens and operators', () => {
     // "next-auth" stays quoted (has hyphen), "error" expands via synonym map
     // Uses AND joiner because of parenthesized group
-    // "error" has abbreviation "err", semantic synonyms "bug" and "failure"
-    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug OR failure)');
+    // "error" has abbreviation "err", semantic synonyms "bug", "failure", and CJK "错误"
+    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug OR failure OR 错误)');
   });
 
   it('expands abbreviation synonyms', () => {
+    // K8s links to kubernetes directly; 集群 links to kubernetes but not transitively to K8s
     expect(sanitizeFtsQuery('K8s')).toBe('(K8s OR kubernetes)');
-    expect(sanitizeFtsQuery('DB')).toBe('(DB OR database)');
-    // Multi-token with synonym uses AND joiner
-    expect(sanitizeFtsQuery('K8s deployment')).toBe('(K8s OR kubernetes) AND deployment');
+    // DB links to database directly; 数据库 links to db bidirectionally
+    expect(sanitizeFtsQuery('DB')).toBe('(DB OR database OR 数据库)');
+    // Multi-token with synonym uses AND joiner; deployment links to 部署
+    expect(sanitizeFtsQuery('K8s deployment')).toBe('(K8s OR kubernetes) AND (deployment OR 部署)');
   });
 
   it('expands full forms to abbreviations (bidirectional)', () => {
-    expect(sanitizeFtsQuery('database')).toBe('(database OR db)');
-    expect(sanitizeFtsQuery('kubernetes')).toBe('(kubernetes OR k8s)');
+    expect(sanitizeFtsQuery('database')).toBe('(database OR db OR 数据库)');
+    expect(sanitizeFtsQuery('kubernetes')).toBe('(kubernetes OR k8s OR 集群)');
   });
 
   it('quotes multi-word synonyms', () => {
@@ -218,6 +220,43 @@ describe('sanitizeFtsQuery', () => {
     // Single CJK character — no bigram possible, should keep it
     const result = sanitizeFtsQuery('猫');
     expect(result).toBe('猫');
+  });
+});
+
+// ─── CJK↔EN synonym expansion ───────────────────────────────────────────────
+
+describe('CJK↔EN synonym expansion', () => {
+  it('expands 认证 to auth', () => {
+    const result = sanitizeFtsQuery('认证');
+    expect(result).toMatch(/auth/i);
+  });
+  it('expands auth to include 认证', () => {
+    const result = sanitizeFtsQuery('auth problem');
+    expect(result).toMatch(/认证/);
+  });
+  it('expands 部署 to deploy', () => {
+    const result = sanitizeFtsQuery('部署');
+    expect(result).toMatch(/deploy/i);
+  });
+  it('expands 缓存 to cache', () => {
+    const result = sanitizeFtsQuery('缓存');
+    expect(result).toMatch(/cache/i);
+  });
+  it('expands 数据库 to database', () => {
+    const result = sanitizeFtsQuery('数据库');
+    expect(result).toMatch(/database|db/i);
+  });
+  it('expands 测试 to test', () => {
+    const result = sanitizeFtsQuery('测试');
+    expect(result).toMatch(/test/i);
+  });
+  it('expands 修复 to fix', () => {
+    const result = sanitizeFtsQuery('修复');
+    expect(result).toMatch(/fix/i);
+  });
+  it('expands 性能 to performance', () => {
+    const result = sanitizeFtsQuery('性能');
+    expect(result).toMatch(/performance|perf/i);
   });
 });
 

@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { computeAdaptiveWindows, selectWithTokenBudget, updateClaudeMd } from '../hook-context.mjs';
+import { computeAdaptiveWindows, selectWithTokenBudget, updateClaudeMd, buildSummaryLines } from '../hook-context.mjs';
 
 // ─── computeAdaptiveWindows ──────────────────────────────────────────────────
 
@@ -290,5 +290,44 @@ describe('updateClaudeMd', () => {
     expect(content).toContain('# Other Section');
     expect(content).toContain('updated');
     expect(content).not.toContain('old');
+  });
+});
+
+// ─── buildSummaryLines ──────────────────────────────────────────────────────
+
+describe('buildSummaryLines', () => {
+  it('includes lessons and decisions in summary lines', () => {
+    const summary = {
+      request: 'Fix auth flow',
+      completed: 'Fixed token refresh',
+      next_steps: 'Add tests',
+      remaining_items: '',
+      lessons: JSON.stringify(['Always use exponential backoff for retries']),
+      key_decisions: JSON.stringify(['Chose jose over jsonwebtoken for ESM']),
+    };
+    const lines = buildSummaryLines(summary);
+    const text = lines.join('\n');
+    expect(text).toMatch(/Lessons:.*exponential backoff/);
+    expect(text).toMatch(/Decisions:.*jose/);
+  });
+
+  it('handles null lessons gracefully', () => {
+    const summary = { request: 'Simple task', completed: 'Done', next_steps: '', remaining_items: '' };
+    const lines = buildSummaryLines(summary);
+    const text = lines.join('\n');
+    expect(text).not.toMatch(/Lessons:/);
+    expect(text).not.toMatch(/Decisions:/);
+  });
+
+  it('returns empty array for null summary', () => {
+    const lines = buildSummaryLines(null);
+    expect(lines).toEqual([]);
+  });
+
+  it('truncates long fields', () => {
+    const summary = { request: 'x'.repeat(200), completed: '', next_steps: '', remaining_items: '' };
+    const lines = buildSummaryLines(summary);
+    const requestLine = lines.find(l => l.startsWith('Request:'));
+    expect(requestLine.length).toBeLessThan(200);
   });
 });

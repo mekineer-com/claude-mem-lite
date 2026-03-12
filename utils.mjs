@@ -10,6 +10,19 @@ export const COMPRESSED_AUTO = -1;
 /** compressed_into sentinel: pending user-confirmed purge (marked by idle cleanup) */
 export const COMPRESSED_PENDING_PURGE = -2;
 
+// ─── Type-Differentiated Recency Decay ──────────────────────────────────────
+
+/** Recency half-life per observation type (in milliseconds) */
+export const DECAY_HALF_LIFE_BY_TYPE = {
+  decision:  90 * 86400000,  // 90 days — architectural decisions persist
+  discovery: 60 * 86400000,  // 60 days — learned patterns last
+  feature:   30 * 86400000,  // 30 days — feature work is mid-range
+  bugfix:    14 * 86400000,  // 14 days — bugs are usually one-off
+  refactor:  14 * 86400000,  // 14 days — code cleanup
+  change:     7 * 86400000,  //  7 days — routine changes decay fast
+};
+export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * 86400000;
+
 // ─── String Utilities ────────────────────────────────────────────────────────
 
 /**
@@ -255,6 +268,57 @@ const SYNONYM_PAIRS = [
   ['debug', 'troubleshoot'],
   ['error', 'failure'],
   ['migrate', 'migration'],
+  // ─── CJK ↔ EN cross-language synonyms ───
+  // Authentication & Authorization
+  ['认证', 'auth'], ['认证', 'authentication'], ['登录', 'login'], ['登录', 'auth'],
+  ['授权', 'authorization'], ['权限', 'permission'],
+  // Deployment & Operations
+  ['部署', 'deploy'], ['部署', 'deployment'], ['发布', 'release'], ['发布', 'publish'],
+  // Data & Storage
+  ['缓存', 'cache'], ['缓存', 'caching'],
+  ['数据库', 'database'], ['数据库', 'db'],
+  // Testing & Debugging
+  ['测试', 'test'], ['测试', 'testing'],
+  ['调试', 'debug'], ['调试', 'debugging'],
+  ['修复', 'fix'], ['修复', 'bugfix'],
+  // Code Quality
+  ['重构', 'refactor'], ['重构', 'refactoring'],
+  ['配置', 'config'], ['配置', 'configuration'],
+  // API & Networking
+  ['接口', 'api'], ['接口', 'endpoint'],
+  ['路由', 'route'], ['路由', 'routing'],
+  ['中间件', 'middleware'],
+  // UI & Components
+  ['组件', 'component'], ['模板', 'template'],
+  // Database Operations
+  ['迁移', 'migration'], ['迁移', 'migrate'],
+  ['索引', 'index'], ['查询', 'query'], ['查询', 'search'],
+  ['排序', 'sort'], ['分页', 'pagination'],
+  // Validation & Security
+  ['验证', 'validate'], ['验证', 'validation'],
+  ['加密', 'encrypt'], ['加密', 'encryption'],
+  ['会话', 'session'], ['令牌', 'token'],
+  // Patterns & Architecture
+  ['钩子', 'hook'], ['回调', 'callback'],
+  ['异步', 'async'], ['同步', 'sync'],
+  ['并发', 'concurrent'], ['线程', 'thread'],
+  // Performance
+  ['性能', 'performance'], ['性能', 'perf'],
+  ['内存', 'memory'], ['泄漏', 'leak'],
+  ['超时', 'timeout'], ['重试', 'retry'],
+  // Observability
+  ['日志', 'log'], ['日志', 'logging'],
+  ['监控', 'monitor'], ['告警', 'alert'],
+  // Build & Dependencies
+  ['依赖', 'dependency'], ['构建', 'build'], ['构建', 'compile'],
+  ['打包', 'bundle'], ['类型', 'type'], ['类型', 'typescript'],
+  // Errors
+  ['错误', 'error'], ['异常', 'exception'],
+  // Infrastructure
+  ['容器', 'container'], ['容器', 'docker'],
+  ['集群', 'cluster'], ['集群', 'kubernetes'],
+  ['网关', 'gateway'], ['负载', 'load balancing'],
+  ['队列', 'queue'], ['序列化', 'serialize'],
 ];
 // Build bidirectional lookup (case-insensitive)
 for (const [abbr, full] of SYNONYM_PAIRS) {
