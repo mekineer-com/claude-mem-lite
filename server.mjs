@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
@@ -748,11 +748,14 @@ server.registerTool(
     const safeContent = scrubSecrets(args.content);
     const safeTitle = scrubSecrets(title);
     const minhashSig = computeMinHash(safeTitle + ' ' + safeContent);
+    // Append CJK bigrams to text field for FTS5 indexing of Chinese content
+    const bigramText = cjkBigrams(safeTitle + ' ' + safeContent);
+    const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
 
     const result = db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?)
-    `).run(sessionId, project, safeContent, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, now.toISOString(), now.getTime());
+    `).run(sessionId, project, textField, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, now.toISOString(), now.getTime());
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
   })
