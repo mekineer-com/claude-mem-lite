@@ -12,6 +12,7 @@ import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
   _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
   _isHaikuCircuitOpen, _setBreakerFile, _NEGATION_EN, _NEGATION_CJK,
   _applyAdoptionDecay, _passesConfidenceGate as passesConfidenceGate,
+  _filterAutoLoadedSkills, _filterGarbageMetadata,
   HAIKU_CONFIDENCE_THRESHOLD } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
@@ -1282,22 +1283,23 @@ describe('dispatchOnSessionStart handoff gate', () => {
 
   it('returns injection when hasHandoff=true', async () => {
     // Seed multiple resources so BM25 IDF is meaningful (single-doc corpora score ~0)
+    // Use non-plugin invocation_name and genuine capability_summary to pass new filters
     seedResource(db, {
       name: 'planning-skill', type: 'skill', intent_tags: 'plan,design,architecture',
       trigger_patterns: 'when user needs to plan features, design architecture, create implementation plans',
-      capability_summary: 'Feature planning and architecture design workflow',
+      capability_summary: 'Feature planning and architecture design workflow with structured output',
       keywords: 'plan,feature,architecture,design,roadmap',
-      invocation_name: 'superpowers:writing-plans',
+      invocation_name: 'planning-skill',
     });
     seedResource(db, {
       name: 'test-runner', type: 'skill', intent_tags: 'test,tdd',
-      trigger_patterns: 'when running unit tests',
-      capability_summary: 'Test runner',
+      trigger_patterns: 'when running unit tests and validating coverage',
+      capability_summary: 'Automated test execution with coverage reporting and failure analysis',
     });
     seedResource(db, {
       name: 'debug-helper', type: 'skill', intent_tags: 'debug,fix',
-      trigger_patterns: 'when debugging issues',
-      capability_summary: 'Debug helper',
+      trigger_patterns: 'when debugging issues and analyzing stack traces',
+      capability_summary: 'Interactive debugging workflow with root cause analysis and fix suggestions',
     });
     const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-2', { hasHandoff: true });
     expect(result).toBeTruthy();
@@ -1473,20 +1475,23 @@ describe('adaptive cooldown', () => {
 // ─── Consecutive Rejection Silencing ────────────────────────────────────────
 
 describe('consecutive rejection silencing', () => {
-  it('silences resource after 5 consecutive rejections', () => {
+  it('silences resource after 8 consecutive rejections and sets silenced_until', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // 5 consecutive rejections
-    for (let i = 0; i < 5; i++) {
-      const invId = recordInvocation(db, {
+    // 8 consecutive rejections (no outcome required — uses adopted=0 default)
+    for (let i = 0; i < 8; i++) {
+      recordInvocation(db, {
         resource_id: id, session_id: `sess-${i}`, trigger: 'user_prompt', tier: 2, recommended: 1,
       });
-      updateInvocation(db, invId, { adopted: 0, outcome: 'ignored', score: 0 });
     }
 
     const result = isRecentlyRecommended(db, id, 'new-session');
     expect(result).toBe(true); // Silenced = treated as recently recommended
+
+    // Verify silenced_until was set on the resource
+    const row = db.prepare('SELECT silenced_until FROM resources WHERE id = ?').get(id);
+    expect(row.silenced_until).toBeTruthy();
     db.close();
   });
 
@@ -1494,25 +1499,25 @@ describe('consecutive rejection silencing', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // 4 rejections then 1 adoption — all 2 days ago to avoid cooldown interference
-    for (let i = 0; i < 4; i++) {
+    // 7 rejections then 1 adoption — all 2 days ago to avoid cooldown interference
+    for (let i = 0; i < 7; i++) {
       db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
         VALUES (?, ?, 'user_prompt', 2, 1, 0, 'ignored', 0, datetime('now', '-2 days'))`).run(id, `sess-${i}`);
     }
     db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
-      VALUES (?, 'sess-4', 'user_prompt', 2, 1, 1, 'success', 1.0, datetime('now', '-2 days'))`).run(id);
+      VALUES (?, 'sess-7', 'user_prompt', 2, 1, 1, 'success', 1.0, datetime('now', '-2 days'))`).run(id);
 
     const result = isRecentlyRecommended(db, id, null);
     expect(result).toBe(false); // Not silenced, and no cooldown hit
     db.close();
   });
 
-  it('does not silence with fewer than 5 rejections', () => {
+  it('does not silence with fewer than 8 rejections', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // Only 3 rejections — 2 days ago to avoid cooldown interference
-    for (let i = 0; i < 3; i++) {
+    // Only 5 rejections — 2 days ago to avoid cooldown interference
+    for (let i = 0; i < 5; i++) {
       db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
         VALUES (?, ?, 'user_prompt', 2, 1, 0, 'ignored', 0, datetime('now', '-2 days'))`).run(id, `sess-${i}`);
     }
@@ -1520,5 +1525,100 @@ describe('consecutive rejection silencing', () => {
     const result = isRecentlyRecommended(db, id, null);
     expect(result).toBe(false); // Not enough rejections to silence
     db.close();
+  });
+
+  it('respects hard-silence even without invocation history', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // Manually set silenced_until in the future
+    db.prepare("UPDATE resources SET silenced_until = datetime('now', '+7 days') WHERE id = ?").run(id);
+
+    const result = isRecentlyRecommended(db, id, 'any-session');
+    expect(result).toBe(true); // Hard-silenced
+    db.close();
+  });
+
+  it('silences without outcome — uses adopted=0 default', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // 8 invocations with NO outcome set (simulates feedback collection delay)
+    for (let i = 0; i < 8; i++) {
+      db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
+        VALUES (?, ?, 'user_prompt', 2, 1, datetime('now', '-${i} hours'))`).run(id, `sess-${i}`);
+    }
+
+    const result = isRecentlyRecommended(db, id, 'new-session');
+    expect(result).toBe(true); // Should silence even without outcomes
+    db.close();
+  });
+});
+
+// ─── filterAutoLoadedSkills ─────────────────────────────────────────────────
+
+describe('filterAutoLoadedSkills', () => {
+  it('filters skills with plugin-namespaced invocation_name', () => {
+    const results = [
+      { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development' },
+      { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging' },
+      { name: 'code-review-expert', type: 'skill', invocation_name: 'code-review-expert' },
+      { name: 'frontend-design', type: 'skill', invocation_name: 'frontend-design:frontend-design' },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].name).toBe('code-review-expert');
+  });
+
+  it('keeps agents regardless of invocation_name', () => {
+    const results = [
+      { name: 'gsd-executor', type: 'agent', invocation_name: 'gsd:executor' },
+      { name: 'code-review-ai/reviewer', type: 'agent', invocation_name: '' },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(2);
+  });
+
+  it('keeps skills without invocation_name', () => {
+    const results = [
+      { name: 'standalone-skill', type: 'skill', invocation_name: '' },
+      { name: 'another', type: 'skill' },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(2);
+  });
+});
+
+// ─── filterGarbageMetadata ──────────────────────────────────────────────────
+
+describe('filterGarbageMetadata', () => {
+  it('filters resources where capability_summary restates the name', () => {
+    const results = [
+      { name: 'error-diagnostics/error-detective', capability_summary: 'agent: error diagnostics/error detective' },
+      { name: 'error-debugging/error-detective', capability_summary: 'agent: error debugging/error detective' },
+      { name: 'code-review-expert', capability_summary: 'Comprehensive code review with quality metrics and best practices' },
+    ];
+    const filtered = _filterGarbageMetadata(results);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].name).toBe('code-review-expert');
+  });
+
+  it('filters resources with empty capability_summary', () => {
+    const results = [
+      { name: 'no-metadata', capability_summary: '' },
+      { name: 'has-metadata', capability_summary: 'Real useful description of what this does' },
+    ];
+    const filtered = _filterGarbageMetadata(results);
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].name).toBe('has-metadata');
+  });
+
+  it('keeps resources with genuine descriptions', () => {
+    const results = [
+      { name: 'mcp-builder', capability_summary: 'Create and configure MCP servers with proper schema, tool registration, and error handling' },
+      { name: 'postgres-patterns', capability_summary: 'PostgreSQL query optimization, schema design, indexing strategies, and security best practices' },
+    ];
+    const filtered = _filterGarbageMetadata(results);
+    expect(filtered).toHaveLength(2);
   });
 });

@@ -303,6 +303,107 @@ describe('mem_registry schema', () => {
   });
 });
 
+// ─── LLM string coercion ─────────────────────────────────────────────────────
+
+describe('LLM string coercion (preprocess)', () => {
+  it('coerces string integers to numbers', () => {
+    const r = parseSchema(memSearchSchema, { importance: '2', limit: '50', offset: '0' });
+    expect(r.success).toBe(true);
+    expect(r.data.importance).toBe(2);
+    expect(r.data.limit).toBe(50);
+    expect(r.data.offset).toBe(0);
+  });
+
+  it('rejects non-numeric strings', () => {
+    expect(parseSchema(memSearchSchema, { importance: 'abc' }).success).toBe(false);
+    expect(parseSchema(memSearchSchema, { limit: '3.5' }).success).toBe(false);
+  });
+
+  it('coerces string anchor and before/after', () => {
+    const r = parseSchema(memTimelineSchema, { anchor: '42', before: '3', after: '7' });
+    expect(r.success).toBe(true);
+    expect(r.data.anchor).toBe(42);
+    expect(r.data.before).toBe(3);
+    expect(r.data.after).toBe(7);
+  });
+
+  it('coerces comma-separated string ids to int array', () => {
+    const r = parseSchema(memGetSchema, { ids: '1,2,3' });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual([1, 2, 3]);
+  });
+
+  it('coerces single string id to array', () => {
+    const r = parseSchema(memGetSchema, { ids: '42' });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual([42]);
+  });
+
+  it('coerces single number id to array', () => {
+    const r = parseSchema(memGetSchema, { ids: 7 });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual([7]);
+  });
+
+  it('coerces array of string ids', () => {
+    const r = parseSchema(memGetSchema, { ids: ['1', '2'] });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual([1, 2]);
+  });
+
+  it('coerces "true"/"false" strings to boolean', () => {
+    const r = parseSchema(memDeleteSchema, { ids: [1], confirm: 'true' });
+    expect(r.success).toBe(true);
+    expect(r.data.confirm).toBe(true);
+
+    const r2 = parseSchema(memDeleteSchema, { ids: [1], confirm: 'false' });
+    expect(r2.success).toBe(true);
+    expect(r2.data.confirm).toBe(false);
+  });
+
+  it('coerces "True"/"FALSE" (case-insensitive)', () => {
+    expect(parseSchema(memDeleteSchema, { ids: [1], confirm: 'True' }).success).toBe(true);
+    expect(parseSchema(memDeleteSchema, { ids: [1], confirm: 'FALSE' }).success).toBe(true);
+  });
+
+  it('coerces string importance in mem_save', () => {
+    const r = parseSchema(memSaveSchema, { content: 'test', importance: '3' });
+    expect(r.success).toBe(true);
+    expect(r.data.importance).toBe(3);
+  });
+
+  it('coerces string days in mem_stats', () => {
+    const r = parseSchema(memStatsSchema, { days: '90' });
+    expect(r.success).toBe(true);
+    expect(r.data.days).toBe(90);
+  });
+
+  it('coerces string age_days and preview in mem_compress', () => {
+    const r = parseSchema(memCompressSchema, { preview: 'false', age_days: '60' });
+    expect(r.success).toBe(true);
+    expect(r.data.preview).toBe(false);
+    expect(r.data.age_days).toBe(60);
+  });
+
+  it('coerces string retain_days in mem_maintain', () => {
+    const r = parseSchema(memMaintainSchema, { action: 'execute', operations: ['purge_stale'], retain_days: '30' });
+    expect(r.success).toBe(true);
+    expect(r.data.retain_days).toBe(30);
+  });
+
+  it('coerces string ids inside merge_ids groups', () => {
+    const r = parseSchema(memMaintainSchema, { action: 'execute', operations: ['dedup'], merge_ids: [['1', '2', '3']] });
+    expect(r.success).toBe(true);
+    expect(r.data.merge_ids).toEqual([[1, 2, 3]]);
+  });
+
+  it('still rejects invalid coerced values (range check)', () => {
+    expect(parseSchema(memSearchSchema, { importance: '5' }).success).toBe(false);
+    expect(parseSchema(memSearchSchema, { limit: '0' }).success).toBe(false);
+    expect(parseSchema(memCompressSchema, { age_days: '10' }).success).toBe(false);
+  });
+});
+
 // ─── Output format validation ───────────────────────────────────────────────
 
 describe('output format contracts', () => {

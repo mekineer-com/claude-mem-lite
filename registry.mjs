@@ -37,6 +37,7 @@ const RESOURCES_SCHEMA = `
     recommend_count   INTEGER DEFAULT 0,
     adopt_count       INTEGER DEFAULT 0,
     success_count     INTEGER DEFAULT 0,
+    silenced_until TEXT,
     indexed_at    TEXT,
     created_at    TEXT DEFAULT (datetime('now')),
     updated_at    TEXT DEFAULT (datetime('now'))
@@ -156,13 +157,12 @@ export function ensureRegistryDb(dbPath) {
 
   db.exec(RESOURCES_SCHEMA);
 
-  // Migrate: add invocation_name column if missing (safe for existing DBs)
+  // Migrate: add missing columns to resources (single PRAGMA call for all)
   try {
-    const cols = db.prepare("PRAGMA table_info(resources)").all();
-    if (!cols.some(c => c.name === 'invocation_name')) {
-      db.exec("ALTER TABLE resources ADD COLUMN invocation_name TEXT DEFAULT ''");
-    }
-  } catch (e) { debugCatch(e, 'invocation_name-migration'); }
+    const resCols = new Set(db.prepare("PRAGMA table_info(resources)").all().map(c => c.name));
+    if (!resCols.has('invocation_name')) db.exec("ALTER TABLE resources ADD COLUMN invocation_name TEXT DEFAULT ''");
+    if (!resCols.has('silenced_until')) db.exec("ALTER TABLE resources ADD COLUMN silenced_until TEXT");
+  } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
   // FTS5 + triggers: only create if not exists
   const hasFts = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_fts'`).get();

@@ -593,7 +593,9 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       const result = await dispatchOnSessionStart(db, 'write tests for the auth module', 'sim-sess', { hasHandoff: true });
       expect(result).toBeTruthy();
       expect(result).toContain('[Auto-suggestion]');
-      expect(result).toContain('test-driven') // invocation_name reference
+      // After filterAutoLoadedSkills, plugin-namespaced skills (superpowers:*) are excluded;
+      // the unit-testing agent (non-plugin) should surface instead
+      expect(result).toContain('unit-testing');
     });
 
     it('returns injection text for Chinese prompt "帮我修复bug"', async () => {

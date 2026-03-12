@@ -384,7 +384,7 @@ function extractIntent(prompt) {
 }
 
 /** Exported for testing. */
-export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate };
+export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate, filterAutoLoadedSkills as _filterAutoLoadedSkills, filterGarbageMetadata as _filterGarbageMetadata };
 
 // Stop words for raw keyword extraction.
 // Includes common English stop words + action verbs already covered by intent patterns.
@@ -686,31 +686,52 @@ function getAdaptiveCooldown(db) {
   } catch { return COOLDOWN_MINUTES; }
 }
 
-const CONSECUTIVE_REJECT_THRESHOLD = 5;
+const CONSECUTIVE_REJECT_THRESHOLD = 8;
 const CONSECUTIVE_REJECT_WINDOW_DAYS = 7;
+const SILENCE_DAYS = 30;
 
 /**
  * Check if a resource has been consecutively rejected (not adopted) in recent history.
+ * Uses adopted=0 (default) instead of outcome IS NOT NULL to avoid feedback timing issues.
+ *
+ * Side-effect: when threshold is met, sets silenced_until on the resource row
+ * to hard-silence it for SILENCE_DAYS. This write is intentional — the check
+ * and silence are an atomic decision to avoid re-evaluating on every call.
+ *
  * @param {Database} db Registry database
  * @param {number} resourceId Resource ID
  * @returns {boolean} true if resource should be silenced
  */
 function isConsecutivelyRejected(db, resourceId) {
   try {
+    // Check hard-silence first (most efficient)
+    const silenced = db.prepare(
+      `SELECT 1 FROM resources WHERE id = ? AND silenced_until > datetime('now')`
+    ).get(resourceId);
+    if (silenced) return true;
+
     const recent = db.prepare(`
       SELECT adopted FROM invocations
-      WHERE resource_id = ? AND recommended = 1 AND outcome IS NOT NULL
+      WHERE resource_id = ? AND recommended = 1
         AND created_at > datetime('now', ?)
       ORDER BY created_at DESC
       LIMIT ?
     `).all(resourceId, `-${CONSECUTIVE_REJECT_WINDOW_DAYS} days`, CONSECUTIVE_REJECT_THRESHOLD);
 
     if (recent.length < CONSECUTIVE_REJECT_THRESHOLD) return false;
-    return recent.every(r => r.adopted === 0);
+    if (!recent.every(r => r.adopted === 0)) return false;
+
+    // Hard-silence: set silenced_until on the resource
+    try {
+      db.prepare(
+        `UPDATE resources SET silenced_until = datetime('now', ?) WHERE id = ?`
+      ).run(`+${SILENCE_DAYS} days`, resourceId);
+    } catch { /* best-effort */ }
+    return true;
   } catch { return false; }
 }
 
-export function isRecentlyRecommended(db, resourceId, sessionId, { skipCapCheck = false } = {}) {
+export function isRecentlyRecommended(db, resourceId, sessionId, { skipCapCheck = false, cooldown } = {}) {
   // Check 1: Session cap (loop-invariant — callers should hoist isSessionCapped and pass skipCapCheck: true)
   if (sessionId && !skipCapCheck) {
     if (isSessionCapped(db, sessionId)) return true;
@@ -726,10 +747,11 @@ export function isRecentlyRecommended(db, resourceId, sessionId, { skipCapCheck 
   if (isConsecutivelyRejected(db, resourceId)) return true;
 
   // Check 4: Recommended within adaptive cooldown window (cross-session cooldown)
-  const cooldown = getAdaptiveCooldown(db);
+  // cooldown is loop-invariant — callers should hoist getAdaptiveCooldown and pass it in
+  const cd = cooldown ?? getAdaptiveCooldown(db);
   const cooldownHit = db.prepare(
     `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', ?) LIMIT 1`
-  ).get(resourceId, `-${cooldown} minutes`);
+  ).get(resourceId, `-${cd} minutes`);
   return !!cooldownHit;
 }
 
@@ -844,11 +866,56 @@ function passesConfidenceGate(results, signals) {
   });
 }
 
+// ─── Auto-loaded Skill Filter ────────────────────────────────────────────────
+
+/**
+ * Filter out skills that are already auto-loaded by Claude Code plugins.
+ * Plugin-namespaced skills (invocation_name contains ':') are always present
+ * in the system-reminder, making dispatch recommendations structurally redundant.
+ * @param {object[]} results FTS5 results
+ * @returns {object[]} Filtered results
+ */
+function filterAutoLoadedSkills(results) {
+  return results.filter(r => {
+    if (r.type !== 'skill') return true;
+    const inv = r.invocation_name || '';
+    return !inv.includes(':');
+  });
+}
+
+// ─── Metadata Quality Gate ──────────────────────────────────────────────────
+
+const GARBAGE_METADATA_OVERLAP_THRESHOLD = 0.8;
+const MIN_TOKEN_LENGTH = 2;
+
+/**
+ * Filter out resources with auto-generated garbage metadata.
+ * Auto-generated metadata restates the resource name as capability_summary
+ * (e.g., "agent: error debugging/error detective"), causing overly broad FTS5 matches.
+ * @param {object[]} results FTS5 results
+ * @returns {object[]} Filtered results (garbage metadata removed)
+ */
+function filterGarbageMetadata(results) {
+  return results.filter(r => {
+    const cap = (r.capability_summary || '').toLowerCase().trim();
+    if (!cap) return false; // No metadata at all — filter
+    const name = (r.name || '').toLowerCase();
+    // Garbage pattern: capability_summary is just "type: name" (restated name)
+    const nameTokens = name.replace(/[/-]/g, ' ').split(/\s+/).filter(t => t.length >= MIN_TOKEN_LENGTH);
+    if (nameTokens.length === 0) return true;
+    const capTokens = cap.replace(/[/-:]/g, ' ').split(/\s+/).filter(t => t.length >= MIN_TOKEN_LENGTH);
+    if (capTokens.length === 0) return true;
+    const overlap = capTokens.filter(t => nameTokens.includes(t)).length;
+    return overlap / capTokens.length < GARBAGE_METADATA_OVERLAP_THRESHOLD;
+  });
+}
+
 // ─── Shared Post-Processing Pipeline ────────────────────────────────────────
 
 /**
  * Standard post-processing pipeline for dispatch results.
- * Applies keyword re-ranking, adoption decay, confidence gating, and limit.
+ * Applies auto-loaded filter, metadata quality gate, keyword re-ranking,
+ * adoption decay, confidence gating, and limit.
  * @param {object[]} results FTS5 results
  * @param {object} signals Context signals
  * @param {object} db Registry database
@@ -856,6 +923,8 @@ function passesConfidenceGate(results, signals) {
  * @returns {object[]} Post-processed results
  */
 function postProcessResults(results, signals, db, limit = 3) {
+  results = filterAutoLoadedSkills(results);
+  results = filterGarbageMetadata(results);
   results = reRankByKeywords(results, signals.rawKeywords);
   results = applyAdoptionDecay(results, db);
   results = passesConfidenceGate(results, signals);
@@ -962,10 +1031,11 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
 
     if (results.length === 0) return null;
 
-    // Filter by DB-persisted cooldown + session dedup (hoisted cap check avoids N queries)
+    // Filter by DB-persisted cooldown + session dedup (hoisted cap + cooldown avoids N queries)
     if (sessionId && isSessionCapped(db, sessionId)) return null;
+    const cooldown = getAdaptiveCooldown(db);
     const viable = sessionId
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true }))
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true, cooldown }))
       : results;
     if (viable.length === 0) return null;
 
@@ -1067,10 +1137,11 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
     // Low confidence → skip (no Haiku in user_prompt path — stay fast)
     if (needsHaikuDispatch(results)) return null;
 
-    // Filter by cooldown + session dedup (hoisted cap check avoids N queries)
+    // Filter by cooldown + session dedup (hoisted cap + cooldown avoids N queries)
     if (sessionId && isSessionCapped(db, sessionId)) return null;
+    const cooldown = getAdaptiveCooldown(db);
     const viable = sessionId
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true }))
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true, cooldown }))
       : results;
     if (viable.length === 0) return null;
 
@@ -1140,11 +1211,12 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     // Low-confidence results: skip recommendation rather than suggest unreliable match
     if (needsHaikuDispatch(results)) return null;
 
-    // Apply DB-persisted cooldown and session dedup (hoisted cap check avoids N queries)
+    // Apply DB-persisted cooldown and session dedup (hoisted cap + cooldown avoids N queries)
     const sid = sessionCtx.sessionId || null;
     if (sid && isSessionCapped(db, sid)) return null;
+    const cooldown = getAdaptiveCooldown(db);
     const viable = sid
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sid, { skipCapCheck: true }))
+      ? results.filter(r => !isRecentlyRecommended(db, r.id, sid, { skipCapCheck: true, cooldown }))
       : results;
     if (viable.length === 0) return null;
     const best = viable[0];
