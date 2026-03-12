@@ -47,6 +47,32 @@ describe('detectActiveSuite', () => {
     ];
     expect(detectActiveSuite(events)).toBeNull();
   });
+
+  it('returns null when suite skill is too far back (> 20 events)', () => {
+    const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'superpowers:brainstorming' }, timestamp: Date.now() - 300000 },
+      ...Array.from({ length: 21 }, () => ({ tool_name: 'Edit', tool_input: {}, timestamp: Date.now() })),
+    ];
+    expect(detectActiveSuite(events)).toBeNull();
+  });
+
+  it('detects suite when skill is recent (< 20 events)', () => {
+    const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'superpowers:brainstorming' }, timestamp: Date.now() },
+      ...Array.from({ length: 5 }, () => ({ tool_name: 'Edit', tool_input: {}, timestamp: Date.now() })),
+    ];
+    const result = detectActiveSuite(events);
+    expect(result).not.toBeNull();
+    expect(result.suite).toBe('superpowers');
+  });
+
+  it('returns null when suite skill is too old (> 15 min)', () => {
+    const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'superpowers:brainstorming' }, timestamp: Date.now() - 16 * 60 * 1000 },
+      { tool_name: 'Edit', tool_input: {}, timestamp: Date.now() },
+    ];
+    expect(detectActiveSuite(events)).toBeNull();
+  });
 });
 
 describe('shouldRecommendForStage', () => {

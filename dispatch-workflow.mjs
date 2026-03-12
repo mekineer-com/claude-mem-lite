@@ -66,22 +66,32 @@ export const SUITE_AUTO_FLOWS = {
   },
 };
 
+const SUITE_MOMENTUM_MAX_DISTANCE = 20;
+const SUITE_MOMENTUM_MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
+
 /**
  * Detect if a suite auto-flow is active based on recent Skill tool events.
- * Scans backwards to find the most recent Skill invocation from a known suite.
+ * Scans backwards with momentum decay: suite influence fades after 20 tool calls or 15 minutes.
  * @param {object[]} sessionEvents Array of tool events
- * @returns {{suite: string, flow: object, lastSkill: string}|null}
+ * @returns {{suite: string, flow: object, lastSkill: string, distance: number}|null}
  */
 export function detectActiveSuite(sessionEvents) {
   if (!sessionEvents || sessionEvents.length === 0) return null;
 
   for (let i = sessionEvents.length - 1; i >= 0; i--) {
+    const distance = sessionEvents.length - 1 - i;
+
+    // Momentum decay: suite influence fades after 20 tool calls
+    if (distance > SUITE_MOMENTUM_MAX_DISTANCE) return null;
+
     const e = sessionEvents[i];
     if (e.tool_name === 'Skill' && e.tool_input?.skill) {
       const skill = e.tool_input.skill;
       const suite = skill.split(':')[0];
       if (SUITE_AUTO_FLOWS[suite]) {
-        return { suite, flow: SUITE_AUTO_FLOWS[suite], lastSkill: skill };
+        // Time decay: suite influence expires after 15 minutes
+        if (e.timestamp && (Date.now() - e.timestamp) > SUITE_MOMENTUM_MAX_AGE_MS) return null;
+        return { suite, flow: SUITE_AUTO_FLOWS[suite], lastSkill: skill, distance };
       }
     }
   }
