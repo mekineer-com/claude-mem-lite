@@ -817,7 +817,7 @@ function passesConfidenceGate(results, signals) {
   const minThreshold = results.length >= 3 ? BM25_MIN_THRESHOLD : 0.5;
   results = results.filter(r => {
     const raw = r.composite_score ?? r.relevance;
-    if (raw == null) return true; // no score → pass (pre-scored or synthetic result)
+    if (raw === null || raw === undefined) return true; // no score → pass (pre-scored or synthetic result)
     return Math.abs(raw) >= minThreshold;
   });
 
