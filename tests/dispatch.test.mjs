@@ -1409,3 +1409,63 @@ describe('upsertResource repo_stars protection', () => {
     db.close();
   });
 });
+
+// ─── Adaptive Cooldown ──────────────────────────────────────────────────────
+
+describe('adaptive cooldown', () => {
+  // Helper: seed feedback invocations in the past (2 days ago) so they
+  // contribute to adoption stats but don't interfere with cooldown checks.
+  function seedFeedback(db, id, total, adoptedCount) {
+    for (let i = 0; i < total; i++) {
+      db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+        VALUES (?, ?, 'user_prompt', 2, 1, ?, ?, ?, datetime('now', '-2 days'))`).run(
+        id, `feedback-${i}`,
+        i < adoptedCount ? 1 : 0,
+        i < adoptedCount ? 'success' : 'ignored',
+        i < adoptedCount ? 1.0 : 0,
+      );
+    }
+  }
+
+  it('uses shorter cooldown when recent adoption rate is high', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+    seedFeedback(db, id, 10, 8); // 80% adoption rate
+
+    // Recommend 35 minutes ago (inside 60-min default, outside 30-min high-adoption cooldown)
+    db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
+      VALUES (?, 'past-sess', 'user_prompt', 2, 1, datetime('now', '-35 minutes'))`).run(id);
+
+    const result = isRecentlyRecommended(db, id, 'new-session');
+    expect(result).toBe(false); // 35 min > 30 min adaptive cooldown
+    db.close();
+  });
+
+  it('uses longer cooldown when recent adoption rate is low', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+    seedFeedback(db, id, 10, 1); // 10% adoption rate
+
+    // Recommend 90 minutes ago (outside 60-min default, inside 120-min low-adoption cooldown)
+    db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
+      VALUES (?, 'past-sess', 'user_prompt', 2, 1, datetime('now', '-90 minutes'))`).run(id);
+
+    const result = isRecentlyRecommended(db, id, 'new-session');
+    expect(result).toBe(true); // 90 min < 120 min adaptive cooldown
+    db.close();
+  });
+
+  it('uses default cooldown with insufficient data', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+    seedFeedback(db, id, 2, 2); // only 2 invocations — below threshold
+
+    // 45 minutes ago — inside 60-min default window
+    db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
+      VALUES (?, 'past-sess', 'user_prompt', 2, 1, datetime('now', '-45 minutes'))`).run(id);
+
+    const result = isRecentlyRecommended(db, id, 'new-session');
+    expect(result).toBe(true); // 45 min < 60 min default cooldown
+    db.close();
+  });
+});

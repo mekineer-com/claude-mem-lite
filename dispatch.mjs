@@ -661,6 +661,30 @@ export function isSessionCapped(db, sessionId) {
   return sessionCount.cnt >= SESSION_RECOMMEND_CAP;
 }
 
+/**
+ * Compute adaptive cooldown based on recent adoption rate.
+ * High adoption → shorter cooldown (user welcomes recommendations).
+ * Low adoption → longer cooldown (reduce noise).
+ * @param {Database} db Registry database
+ * @returns {number} Cooldown in minutes
+ */
+function getAdaptiveCooldown(db) {
+  try {
+    const stats = db.prepare(`
+      SELECT COUNT(*) as total,
+             SUM(CASE WHEN adopted = 1 THEN 1 ELSE 0 END) as adopted
+      FROM invocations
+      WHERE recommended = 1 AND created_at > datetime('now', '-7 days')
+    `).get();
+    if (!stats || stats.total < 5) return COOLDOWN_MINUTES; // Not enough data, use default
+    const rate = stats.adopted / stats.total;
+    if (rate > 0.5) return 30;   // High adoption: 30 min
+    if (rate > 0.2) return 60;   // Medium: 60 min (default)
+    if (rate > 0.1) return 120;  // Low: 2 hours
+    return 240;                   // Very low: 4 hours
+  } catch { return COOLDOWN_MINUTES; }
+}
+
 export function isRecentlyRecommended(db, resourceId, sessionId) {
   // Check 1: Session cap (loop-invariant — callers should prefer isSessionCapped for filter loops)
   if (sessionId) {
@@ -673,10 +697,11 @@ export function isRecentlyRecommended(db, resourceId, sessionId) {
     if (sessionHit) return true;
   }
 
-  // Check 3: Recommended within cooldown window (cross-session cooldown)
+  // Check 3: Recommended within adaptive cooldown window (cross-session cooldown)
+  const cooldown = getAdaptiveCooldown(db);
   const cooldownHit = db.prepare(
     `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', ?) LIMIT 1`
-  ).get(resourceId, `-${COOLDOWN_MINUTES} minutes`);
+  ).get(resourceId, `-${cooldown} minutes`);
   return !!cooldownHit;
 }
 
