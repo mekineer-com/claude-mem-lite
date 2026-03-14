@@ -942,6 +942,52 @@ describe('Suite 8a: Additional E2E', () => {
     expect(highImportance.compressed_into).toBeNull();
   });
 
+  it('auto-compress creates weekly summaries for old low-value observations', () => {
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    const sessId = `hook-parent--testproj-${randomUUID().slice(0, 8)}`;
+    const ninetyDaysAgo = Date.now() - 90 * 86400000;
+
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'parent--testproj', ?, ?, 'completed')
+    `).run(sessId, sessId, now.toISOString(), now.getTime());
+
+    // Insert 4 old, low-importance, never-accessed observations in the same week
+    for (let i = 0; i < 4; i++) {
+      const epoch = ninetyDaysAgo + i * 3600000; // 1 hour apart, same week
+      db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+          concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+        VALUES (?, 'parent--testproj', 'old text', 'change', ?, '', '', '', '', '[]', '[]', 1, 0, ?, ?)
+      `).run(sessId, `Old change ${i}`, new Date(epoch).toISOString(), epoch);
+    }
+
+    // Clear the last-auto-maintain file so maintenance runs
+    const maintainFile = join(tmpHome, '.claude-mem-lite', 'runtime', 'last-auto-maintain.json');
+    try { unlinkSync(maintainFile); } catch {}
+
+    db.close();
+
+    // Session-start triggers auto-compress with weekly summary grouping
+    runHook('session-start', { env: { HOME: tmpHome } });
+
+    const db2 = openTestDb(tmpHome);
+    // Should have: 4 original (compressed_into = summaryId) + 1 summary (importance=2)
+    const summary = db2.prepare(
+      "SELECT id, title, importance FROM observations WHERE title LIKE 'Weekly summary%'"
+    ).get();
+    expect(summary).toBeTruthy();
+    expect(summary.title).toContain('Weekly summary');
+    expect(summary.importance).toBe(2);
+
+    const compressed = db2.prepare(
+      'SELECT COUNT(*) as c FROM observations WHERE compressed_into = ?'
+    ).get(summary.id);
+    expect(compressed.c).toBe(4);
+    db2.close();
+  });
+
   it('CLAUDE.md created from scratch when none exists', () => {
     const projDir3 = join(tmpHome, 'parent', 'noclaudemd');
     mkdirSync(projDir3, { recursive: true });

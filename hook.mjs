@@ -487,7 +487,8 @@ async function handleSessionStart() {
           SELECT id, project, type, title, created_at_epoch
           FROM observations
           WHERE COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
-            AND created_at_epoch < ? AND compressed_into IS NULL
+            AND created_at_epoch < ?
+            AND (compressed_into IS NULL OR compressed_into = ${COMPRESSED_AUTO})
           ORDER BY project, created_at_epoch
         `).all(compressCutoff);
         if (compressCandidates.length >= 3) {
@@ -497,10 +498,8 @@ async function handleSessionStart() {
             if (!groups.has(key)) groups.set(key, []);
             groups.get(key).push(c);
           }
-          let totalCompressed = 0;
-          for (const [key, obs] of groups) {
-            if (obs.length < 3) continue;
-            const [proj] = key.split('::');
+          // Transact each group to prevent orphan summaries on crash
+          const compressGroup = db.transaction((proj, obs) => {
             const types = {};
             for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
             const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
@@ -510,12 +509,26 @@ async function handleSessionStart() {
             const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
             const sessionId = `compress-${proj}`;
             const now = new Date();
-            db.prepare(`INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?,?,?,?,?,'active')`).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
-            const summaryResult = db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`).run(sessionId, proj, narrative, dominantType, title, narrative, new Date(medianEpoch).toISOString(), medianEpoch);
+            db.prepare(`INSERT OR IGNORE INTO sdk_sessions
+              (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+              VALUES (?,?,?,?,?,'active')`
+            ).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
+            const summaryResult = db.prepare(`INSERT INTO observations
+              (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+               files_read, files_modified, importance, created_at, created_at_epoch)
+              VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`
+            ).run(sessionId, proj, narrative, dominantType, title, narrative, new Date(medianEpoch).toISOString(), medianEpoch);
             const summaryId = Number(summaryResult.lastInsertRowid);
             const obsIds = obs.map(o => o.id);
-            db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`).run(summaryId, ...obsIds);
-            totalCompressed += obs.length;
+            db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`)
+              .run(summaryId, ...obsIds);
+            return obs.length;
+          });
+          let totalCompressed = 0;
+          for (const [key, obs] of groups) {
+            if (obs.length < 3) continue;
+            const [proj] = key.split('::');
+            totalCompressed += compressGroup(proj, obs);
           }
           if (totalCompressed > 0) {
             debugLog('DEBUG', 'session-start', `auto-compressed ${totalCompressed} observations into weekly summaries`);
