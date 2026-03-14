@@ -477,6 +477,59 @@ function inferTechFromPrompt(prompt) {
   return [...tags].join(',');
 }
 
+// ─── Phase Transition Detection ─────────────────────────────────────────────
+
+const PHASE_TOOL_MAP = {
+  Read: 'EXPLORE', Glob: 'EXPLORE', Grep: 'EXPLORE', LSP: 'EXPLORE',
+  Edit: 'IMPLEMENT', Write: 'IMPLEMENT', NotebookEdit: 'IMPLEMENT',
+};
+
+/**
+ * Infer current session phase from recent tool events.
+ * @param {object[]} events Recent tool events
+ * @returns {string} Phase: EXPLORE | IMPLEMENT | DEBUG | TEST | COMMIT
+ */
+export function inferSessionPhase(events) {
+  if (!events || events.length === 0) return 'EXPLORE';
+
+  // Look at last 5 events, filter to significant ones (skip Read-only)
+  const recent = events.slice(-5);
+  const lastSignificant = recent.filter(e =>
+    e.tool_name !== 'Read' && e.tool_name !== 'Glob' && e.tool_name !== 'Grep'
+  ).slice(-3);
+
+  if (lastSignificant.length === 0) return 'EXPLORE';
+
+  const last = lastSignificant[lastSignificant.length - 1];
+
+  if (last.tool_name === 'Bash') {
+    const cmd = (last.tool_input?.command || '').toLowerCase();
+    const resp = (last.tool_response || '');
+    if (/\bgit\s+(commit|push|merge|tag)\b/.test(cmd)) return 'COMMIT';
+    if (/\b(test|jest|vitest|pytest|mocha)\b/.test(cmd)) return 'TEST';
+    if (/error|fail|exception/i.test(resp) && resp.length > 30) return 'DEBUG';
+    return 'IMPLEMENT';
+  }
+
+  return PHASE_TOOL_MAP[last.tool_name] || 'IMPLEMENT';
+}
+
+/**
+ * Check if a phase transition occurred.
+ * @param {string|null} prev Previous phase
+ * @param {string} current Current phase
+ * @returns {boolean}
+ */
+export function isPhaseTransition(prev, current) {
+  return prev !== null && prev !== current;
+}
+
+// Module-level phase state for dispatchOnPreToolUse
+let _lastPhase = null;
+
+/** Reset phase state (for testing). */
+export function _resetPhaseState() { _lastPhase = null; }
+
 /**
  * Infer action type from tool name and input.
  * @param {string} toolName Claude Code tool name (e.g. "Bash", "Edit")
@@ -1100,13 +1153,21 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const { skip } = shouldSkipDispatch(event);
     if (skip) return null;
 
+    // Phase transition gate: only dispatch on phase transitions to reduce noise.
+    // The first few events (≤3) always pass to allow initial recommendations.
+    const allEvents = peekToolEvents();
+    const currentPhase = inferSessionPhase(allEvents);
+    const phaseChanged = isPhaseTransition(_lastPhase, currentPhase);
+    _lastPhase = currentPhase;
+
+    if (!phaseChanged && allEvents.length > 3) return null;
+
     // Tier 1: Extract context signals
     const signals = extractContextSignals(event, sessionCtx);
 
     // Suite protection: if a suite auto-flow is active, suppress recommendations
     // for stages the suite already covers
-    const events = peekToolEvents();
-    const activeSuite = detectActiveSuite(events);
+    const activeSuite = detectActiveSuite(allEvents);
     if (activeSuite) {
       const stage = inferCurrentStage(signals.primaryIntent, activeSuite, signals.suppressedIntents);
       if (stage) {
