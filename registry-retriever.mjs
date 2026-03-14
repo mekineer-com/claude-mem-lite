@@ -346,30 +346,30 @@ const COMPOSITE_EXPR = `(
     bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
     - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
     - (
-        (r.success_count + 1.0) / (r.recommend_count + 2.0) * 0.5
+        (COALESCE(r.success_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) * 0.5
         + COALESCE(
             (SELECT (SUM(CASE WHEN i.outcome='success' THEN 1 ELSE 0 END) + 1.0)
                   / (COUNT(*) + 2.0)
              FROM invocations i WHERE i.resource_id = r.id
                AND i.created_at > datetime('now', '-30 days')),
-            (r.success_count + 1.0) / (r.recommend_count + 2.0)
+            (COALESCE(r.success_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0)
           ) * 0.5
       ) * 0.15
     - (
-        (r.adopt_count + 1.0) / (r.recommend_count + 2.0) * 0.5
+        (COALESCE(r.adopt_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) * 0.5
         + COALESCE(
             (SELECT (SUM(CASE WHEN i.adopted=1 THEN 1 ELSE 0 END) + 1.0)
                   / (COUNT(*) + 2.0)
              FROM invocations i WHERE i.resource_id = r.id
                AND i.created_at > datetime('now', '-30 days')),
-            (r.adopt_count + 1.0) / (r.recommend_count + 2.0)
+            (COALESCE(r.adopt_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0)
           ) * 0.5
       ) * 0.10
-    - CASE WHEN r.recommend_count < 10
-        THEN 0.10 * (1.0 - r.recommend_count * 1.0 / 10.0)
+    - CASE WHEN COALESCE(r.recommend_count, 0) < 10
+        THEN 0.10 * (1.0 - COALESCE(r.recommend_count, 0) * 1.0 / 10.0)
         ELSE 0 END
-    + CASE WHEN r.recommend_count > 15
-           AND (r.adopt_count + 1.0) / (r.recommend_count + 2.0) < 0.1
+    + CASE WHEN COALESCE(r.recommend_count, 0) > 15
+           AND (COALESCE(r.adopt_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) < 0.1
         THEN 0.10
         ELSE 0 END
   )`;

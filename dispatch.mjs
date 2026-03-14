@@ -335,7 +335,7 @@ const RAW_KW_STOP = new Set([
   'review', 'deploy', 'commit', 'push', 'plan', 'clean', 'refactor',
   'find', 'get', 'set', 'show', 'list', 'change', 'move', 'copy', 'send',
   'start', 'stop', 'open', 'close', 'save', 'load', 'install', 'setup',
-  'implement', 'configure', 'code', 'file', 'function', 'module', 'app',
+  'implement', 'configure', 'code', 'file', 'function', 'module', 'app', 'system',
 ]);
 
 /**
@@ -754,9 +754,11 @@ function passesConfidenceGate(results, signals) {
   // No structured intent → skip gate (rawKeywords match FTS5 text columns, not intent_tags)
   if (intentTokens.length === 0) return results;
 
-  // Expand ALL intent tokens through DISPATCH_SYNONYMS
-  const rawKw = signals?.rawKeywords || [];
-  const intentSet = new Set([...intentTokens, ...rawKw]);
+  // Expand ALL intent tokens through DISPATCH_SYNONYMS.
+  // rawKeywords are excluded from intentSet — they contribute to FTS5 scoring
+  // but must NOT bypass the intent gate. Including them caused false positives
+  // (e.g. "debug the dispatch system" → llm-router matched on "dispatch" tag).
+  const intentSet = new Set(intentTokens);
   for (const token of intentTokens) {
     const syns = DISPATCH_SYNONYMS[token];
     if (syns) for (const s of syns) intentSet.add(s);
@@ -773,7 +775,7 @@ function passesConfidenceGate(results, signals) {
   // incidental context (e.g. recommending git-workflow when user primarily wants to debug).
   if (intentTokens.length > 1 && passing.length > 1) {
     const primaryIntent = signals?.primaryIntent || intentTokens[0] || '';
-    const primarySet = new Set([primaryIntent, ...rawKw]);
+    const primarySet = new Set([primaryIntent]);
     const primarySyns = DISPATCH_SYNONYMS[primaryIntent];
     if (primarySyns) for (const s of primarySyns) primarySet.add(s);
 
