@@ -456,16 +456,65 @@ export function computeRuleImportance(episode) {
  * @param {string} text Input text containing CJK characters
  * @returns {string} Space-separated bigrams
  */
+// Common CJK compound words (2-4 chars) — dictionary-first tokenization.
+// When a compound word is found, it's emitted as a whole token instead of being
+// split into overlapping bigrams. This dramatically reduces noise:
+// "数据库" → "数据库" (1 token) instead of "数据 据库" (2 noisy tokens)
+const CJK_COMPOUNDS = new Set([
+  // tech/programming
+  '数据库', '数据', '接口', '函数', '变量', '组件', '模块', '配置', '框架', '部署',
+  '测试', '调试', '编译', '打包', '构建', '缓存', '索引', '迁移', '回滚', '权限',
+  '认证', '授权', '加密', '解密', '序列', '并发', '异步', '同步', '线程', '进程',
+  '容器', '集群', '服务器', '中间件', '网关', '负载', '监控', '日志', '告警',
+  '前端', '后端', '全栈', '响应式', '路由', '状态', '渲染', '样式', '布局',
+  // actions
+  '修复', '重构', '优化', '升级', '安装', '卸载', '导入', '导出', '上传', '下载',
+  '提交', '推送', '合并', '发布', '上线', '回退', '审查', '审核', '评审',
+  // errors/issues
+  '报错', '崩溃', '泄露', '溢出', '死锁', '超时', '中断', '异常', '故障',
+  // architecture
+  '架构', '设计', '方案', '规划', '文档', '注释', '版本', '分支', '依赖',
+  '性能', '安全', '漏洞', '补丁',
+]);
+
+// Sort by length descending for greedy matching
+const CJK_SORTED = [...CJK_COMPOUNDS].sort((a, b) => b.length - a.length);
+
+/**
+ * Generate search tokens from CJK text using dictionary-first tokenization.
+ * Compound words are emitted whole; remaining chars use bigram fallback.
+ * "修复了数据库崩溃" → "修复 数据库 崩溃" (3 clean tokens)
+ * vs old bigram: "修复 复了 了数 数据 据库 库崩 崩溃" (7 noisy tokens)
+ * @param {string} text Input text containing CJK characters
+ * @returns {string} Space-separated tokens
+ */
 export function cjkBigrams(text) {
   if (!text) return '';
   const runs = text.match(/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/g) || [];
-  const bigrams = [];
+  const tokens = [];
   for (const run of runs) {
-    for (let i = 0; i < run.length - 1; i++) {
-      bigrams.push(run[i] + run[i + 1]);
+    let i = 0;
+    while (i < run.length) {
+      let matched = false;
+      // Greedy dictionary match (longest first)
+      for (const word of CJK_SORTED) {
+        if (i + word.length <= run.length && run.slice(i, i + word.length) === word) {
+          tokens.push(word);
+          i += word.length;
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        // Fallback: bigram for unknown compound
+        if (i + 1 < run.length) {
+          tokens.push(run[i] + run[i + 1]);
+        }
+        i++;
+      }
     }
   }
-  return bigrams.join(' ');
+  return [...new Set(tokens)].join(' ');
 }
 
 // ─── Project Inference ───────────────────────────────────────────────────────

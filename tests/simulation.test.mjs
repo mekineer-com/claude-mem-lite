@@ -929,7 +929,8 @@ describe('Utility Edge Cases', () => {
     expect(cjkBigrams(null)).toBe('');
     expect(cjkBigrams('hello')).toBe('');
     expect(cjkBigrams('修复')).toBe('修复');
-    expect(cjkBigrams('修复了系统崩溃')).toBe('修复 复了 了系 系统 统崩 崩溃');
+    // Dictionary-based: "修复" and "崩溃" are compounds; "了系" and "统崩" are bigram fallback
+    expect(cjkBigrams('修复了系统崩溃')).toBe('修复 了系 系统 统崩 崩溃');
   });
 
   it('extractMatchKeywords combines files and text', () => {

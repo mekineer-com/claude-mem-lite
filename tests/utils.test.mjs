@@ -270,12 +270,14 @@ describe('cjkBigrams', () => {
   });
 
   it('generates bigrams from CJK runs', () => {
+    // Dictionary-based: "系统" and "崩溃" are compounds, "统崩" is bigram fallback
     expect(cjkBigrams('系统崩溃')).toBe('系统 统崩 崩溃');
     expect(cjkBigrams('修复')).toBe('修复');
   });
 
   it('handles multiple CJK runs separated by non-CJK', () => {
-    expect(cjkBigrams('系统修复 服务器崩溃')).toBe('系统 统修 修复 服务 务器 器崩 崩溃');
+    // Dictionary: "系统","修复","服务器","崩溃" are compounds; "统修" is bigram fallback
+    expect(cjkBigrams('系统修复 服务器崩溃')).toBe('系统 统修 修复 服务器 崩溃');
   });
 
   it('skips single CJK characters (no bigram from length 1)', () => {

@@ -29,8 +29,9 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     const cutoff = Date.now() - MEMORY_LOOKBACK_MS;
     const excludeSet = new Set(excludeIds);
 
+    // Phase 1: Same-project search (highest priority)
     const selectStmt = db.prepare(`
-      SELECT o.id, o.type, o.title, o.importance, o.lesson_learned,
+      SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
              bm25(observations_fts, 10, 5, 5, 3, 3, 2) as relevance
       FROM observations_fts
       JOIN observations o ON o.id = observations_fts.rowid
@@ -44,16 +45,41 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     `);
     const rows = selectStmt.all(ftsQuery, project, cutoff);
 
-    // Score: BM25 × type boost × lesson boost, filter by threshold, exclude Key Context IDs
-    const scored = rows
+    // Phase 2: Cross-project search for high-value decisions/discoveries
+    // These are transferable insights (debugging patterns, architectural reasons, gotchas)
+    let crossRows = [];
+    try {
+      crossRows = db.prepare(`
+        SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
+               bm25(observations_fts, 10, 5, 5, 3, 3, 2) as relevance
+        FROM observations_fts
+        JOIN observations o ON o.id = observations_fts.rowid
+        WHERE observations_fts MATCH ?
+          AND o.project != ?
+          AND o.type IN ('decision', 'discovery')
+          AND o.importance >= 2
+          AND o.created_at_epoch > ?
+          AND COALESCE(o.compressed_into, 0) = 0
+        ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
+        LIMIT 5
+      `).all(ftsQuery, project, cutoff);
+    } catch (e) { debugCatch(e, 'crossProjectSearch'); }
+
+    // Merge and score: same-project full weight, cross-project 0.7x
+    const allRows = [...rows, ...crossRows];
+    const scored = allRows
       .filter(r => !excludeSet.has(r.id))
-      .map(r => ({
-        ...r,
-        score: Math.abs(r.relevance)
-          * (MEMORY_TYPE_BOOST[r.type] || 1.0)
-          * (r.lesson_learned ? 1.5 : 1.0)
-          * (r.importance >= 2 ? 1.0 : 0.6),  // Penalize importance=1
-      }))
+      .map(r => {
+        const crossProjectPenalty = r.project === project ? 1.0 : 0.7;
+        return {
+          ...r,
+          score: Math.abs(r.relevance)
+            * (MEMORY_TYPE_BOOST[r.type] || 1.0)
+            * (r.lesson_learned ? 1.5 : 1.0)
+            * (r.importance >= 2 ? 1.0 : 0.6)
+            * crossProjectPenalty,
+        };
+      })
       .sort((a, b) => b.score - a.score);
 
     // Strict threshold: raised from 1.0 to 1.5 to compensate for wider pool

@@ -659,6 +659,28 @@ function getAdaptiveCooldown(db) {
   } catch { return COOLDOWN_MINUTES; }
 }
 
+/**
+ * Compute per-resource cooldown based on its individual adoption rate.
+ * High-adoption resources (like code-review-expert at 90%) get shorter cooldown,
+ * ensuring valuable resources are recommended more frequently.
+ * @param {Database} db Registry database
+ * @param {number} resourceId Resource ID
+ * @param {number} globalCd Global adaptive cooldown (fallback)
+ * @returns {number} Cooldown in minutes for this specific resource
+ */
+function getPerResourceCooldown(db, resourceId, globalCd) {
+  try {
+    const stats = db.prepare(
+      'SELECT recommend_count, adopt_count FROM resources WHERE id = ?'
+    ).get(resourceId);
+    if (!stats || stats.recommend_count < 5) return globalCd; // Not enough data
+    const rate = (stats.adopt_count + 1) / (stats.recommend_count + 2); // Laplace smoothed
+    if (rate > 0.5) return Math.min(globalCd, 15);   // Very high adoption: 15 min
+    if (rate > 0.3) return Math.min(globalCd, 30);   // High adoption: 30 min
+    return globalCd; // Default: use global cooldown
+  } catch { return globalCd; }
+}
+
 const CONSECUTIVE_REJECT_THRESHOLD = 8;
 const CONSECUTIVE_REJECT_WINDOW_DAYS = 7;
 const SILENCE_DAYS = 30;
@@ -720,11 +742,12 @@ export function isRecentlyRecommended(db, resourceId, sessionId, { skipCapCheck 
   if (isConsecutivelyRejected(db, resourceId)) return true;
 
   // Check 4: Recommended within adaptive cooldown window (cross-session cooldown)
-  // cooldown is loop-invariant — callers should hoist getAdaptiveCooldown and pass it in
-  const cd = cooldown ?? getAdaptiveCooldown(db);
+  // Per-resource cooldown: high-adoption resources get shorter cooldown
+  const globalCd = cooldown ?? getAdaptiveCooldown(db);
+  const resourceCd = getPerResourceCooldown(db, resourceId, globalCd);
   const cooldownHit = db.prepare(
     `SELECT 1 FROM invocations WHERE resource_id = ? AND created_at > datetime('now', ?) LIMIT 1`
-  ).get(resourceId, `-${cd} minutes`);
+  ).get(resourceId, `-${resourceCd} minutes`);
   return !!cooldownHit;
 }
 
