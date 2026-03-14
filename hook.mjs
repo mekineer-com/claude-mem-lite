@@ -11,7 +11,7 @@ import {
   truncate, typeIcon, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
-  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE,
+  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, isoWeekKey,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -481,6 +481,47 @@ async function handleSessionStart() {
         if (purged.changes > 0) {
           debugLog('DEBUG', 'session-start', `auto-purged ${purged.changes} stale observations`);
         }
+        // Auto-compress: group old marked observations into weekly summaries
+        const compressCutoff = Date.now() - 60 * 86400000; // 60 days
+        const compressCandidates = db.prepare(`
+          SELECT id, project, type, title, created_at_epoch
+          FROM observations
+          WHERE COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
+            AND created_at_epoch < ? AND compressed_into IS NULL
+          ORDER BY project, created_at_epoch
+        `).all(compressCutoff);
+        if (compressCandidates.length >= 3) {
+          const groups = new Map();
+          for (const c of compressCandidates) {
+            const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(c);
+          }
+          let totalCompressed = 0;
+          for (const [key, obs] of groups) {
+            if (obs.length < 3) continue;
+            const [proj] = key.split('::');
+            const types = {};
+            for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
+            const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
+            const title = `Weekly summary: ${obs.length} ${dominantType} observations`;
+            const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
+            const sortedEpochs = obs.map(o => o.created_at_epoch).sort((a, b) => a - b);
+            const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
+            const sessionId = `compress-${proj}`;
+            const now = new Date();
+            db.prepare(`INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?,?,?,?,?,'active')`).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
+            const summaryResult = db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch) VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`).run(sessionId, proj, narrative, dominantType, title, narrative, new Date(medianEpoch).toISOString(), medianEpoch);
+            const summaryId = Number(summaryResult.lastInsertRowid);
+            const obsIds = obs.map(o => o.id);
+            db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`).run(summaryId, ...obsIds);
+            totalCompressed += obs.length;
+          }
+          if (totalCompressed > 0) {
+            debugLog('DEBUG', 'session-start', `auto-compressed ${totalCompressed} observations into weekly summaries`);
+          }
+        }
+
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
       } catch (e) { debugCatch(e, 'auto-maintain'); }
     }

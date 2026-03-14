@@ -225,8 +225,8 @@ function searchObservations(ctx) {
       }
     }
 
-    // Two-phase query expansion for sparse results
-    if (rows.length > 0 && results.length < limit) {
+    // Two-phase query expansion for sparse results (only when well below limit)
+    if (rows.length > 0 && results.length < Math.ceil(limit / 2)) {
       const existingIds = new Set(results.map(r => r.id));
       expandObsByConceptCo(ctx, now, existingIds, results);
       expandObsByPRF(ctx, now, rows.length, existingIds, results);

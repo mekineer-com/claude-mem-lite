@@ -58,7 +58,7 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
 
   // Candidate pool: tiered time windows by importance (adaptive)
   const obsPool = db.prepare(`
-    SELECT id, type, title, narrative, importance, created_at_epoch, files_modified
+    SELECT id, type, title, narrative, importance, created_at_epoch, files_modified, lesson_learned
     FROM observations
     WHERE project = ? AND COALESCE(compressed_into, 0) = 0
       AND (
@@ -87,7 +87,8 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
     const ageDays = (now_ms - o.created_at_epoch) / 86400000;
     const recency = 1 / (1 + ageDays);
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
-    const value = recency * impBoost;
+    const lessonBoost = o.lesson_learned ? 1.3 : 1.0;
+    const value = recency * impBoost * lessonBoost;
     const cost = estimateTokens((o.title || '') + (o.narrative || ''));
     return { ...o, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
   });
