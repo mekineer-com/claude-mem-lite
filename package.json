@@ -38,6 +38,7 @@
     "dispatch.mjs",
     "dispatch-inject.mjs",
     "dispatch-feedback.mjs",
+    "dispatch-patterns.mjs",
     "dispatch-workflow.mjs",
     "registry.mjs",
     "registry-retriever.mjs",
