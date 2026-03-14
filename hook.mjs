@@ -11,7 +11,7 @@ import {
   truncate, typeIcon, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
-  COMPRESSED_AUTO,
+  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -464,6 +464,26 @@ async function handleSessionStart() {
         debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
       }
     })();
+
+    // Auto-purge: delete stale observations daily (COMPRESSED_PENDING_PURGE, 7-day retention)
+    const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
+    let shouldMaintain = true;
+    try {
+      const last = JSON.parse(readFileSync(maintainFile, 'utf8'));
+      if (Date.now() - last.epoch < 24 * 3600000) shouldMaintain = false;
+    } catch {}
+    if (shouldMaintain) {
+      try {
+        const purged = db.prepare(`
+          DELETE FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE}
+            AND created_at_epoch < ?
+        `).run(Date.now() - 7 * 86400000);
+        if (purged.changes > 0) {
+          debugLog('DEBUG', 'session-start', `auto-purged ${purged.changes} stale observations`);
+        }
+        writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
+      } catch (e) { debugCatch(e, 'auto-maintain'); }
+    }
 
     // ── Non-transactional operations (side effects, background work) ──
 

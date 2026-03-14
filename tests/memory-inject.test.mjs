@@ -44,6 +44,34 @@ describe('searchRelevantMemories', () => {
     expect(results.length).toBe(0);
   });
 
+  it('retrieves importance=1 observations with high BM25 relevance', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'bugfix',
+      title: 'Race condition fix in worker pool',
+      narrative: 'Fixed thread safety issue in worker pool',
+      text: 'race condition worker pool thread safety fix',
+      importance: 1
+    });
+    const results = searchRelevantMemories(db, 'race condition worker pool', 'proj', []);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].title).toContain('Race condition');
+  });
+
+  it('does not retrieve importance=1 observations with low BM25 relevance (below threshold after penalty)', () => {
+    // Insert an importance=1 observation with a topic that will get low BM25 score
+    // against the search query (minimal keyword overlap)
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'change',
+      title: 'Minor tweak to settings',
+      narrative: 'Small change to settings file',
+      text: 'settings yaml minor tweak adjustment',
+      importance: 1
+    });
+    const results = searchRelevantMemories(db, 'dispatch race condition', 'proj', []);
+    // importance=1 with weak BM25 match should be filtered by the 0.6x penalty + 1.5 threshold
+    expect(results.length).toBe(0);
+  });
+
   it('excludes observations already in Key Context', () => {
     const info = insertObs(db, {
       sessionId: 'sess-1', project: 'proj', type: 'bugfix',

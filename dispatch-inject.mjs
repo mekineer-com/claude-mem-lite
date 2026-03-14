@@ -42,37 +42,53 @@ function isNativeSkill(name) {
 // ─── Injection Templates ─────────────────────────────────────────────────────
 
 /**
+ * Build the lead line: reason if available, otherwise capability summary.
+ */
+function leadLine(resource, reason) {
+  return reason || truncate(resource.capability_summary, 120);
+}
+
+/**
  * Invocable skill template -- tells Claude to invoke via Skill tool.
  * Used when the resource has an invocation_name (registered as a Claude Code skill/plugin).
  * @param {object} resource Resource object from DB
+ * @param {string} [reason] Why this was recommended
  * @returns {string} Injection text instructing Skill tool invocation
  */
-function injectSkillInvocable(resource) {
-  return `[Auto-suggestion] A relevant skill is available for this task. ` +
-    `Invoke it now: use the Skill tool with skill="${resource.invocation_name}". ` +
-    `Capability: ${truncate(resource.capability_summary, 100)}`;
+function injectSkillInvocable(resource, reason) {
+  const lines = [`[Recommended] ${leadLine(resource, reason)}`];
+  lines.push(`→ Invoke: Skill tool with skill="${resource.invocation_name}"`);
+  if (reason && resource.capability_summary) {
+    lines.push(`Capability: ${truncate(resource.capability_summary, 100)}`);
+  }
+  return lines.join('\n');
 }
 
 /**
  * Native skill template -- tells Claude to use the skill command.
  * Used when skill exists in ~/.claude/skills/ but has no invocation_name.
  * @param {object} resource Resource object from DB
+ * @param {string} [reason] Why this was recommended
  * @returns {string} Injection text referencing the native skill command
  */
-function injectSkillNative(resource) {
-  return `[Auto-suggestion] A relevant skill "${resource.name}" is available for this task. ` +
-    `Use: /skill ${resource.name}. ` +
-    `Capability: ${truncate(resource.capability_summary, 100)}`;
+function injectSkillNative(resource, reason) {
+  const lines = [`[Recommended] ${leadLine(resource, reason)}`];
+  lines.push(`→ Use: /skill ${resource.name}`);
+  if (reason && resource.capability_summary) {
+    lines.push(`Capability: ${truncate(resource.capability_summary, 100)}`);
+  }
+  return lines.join('\n');
 }
 
 /**
  * Managed skill template -- includes content for Claude to use directly.
  * Used when skill is in managed/ directory (not installed natively).
  * @param {object} resource Resource object from DB
+ * @param {string} [reason] Why this was recommended
  * @returns {string} Injection text with embedded skill content
  */
-function injectSkillManaged(resource) {
-  if (!isAllowedPath(resource.local_path)) return injectSkillNative(resource);
+function injectSkillManaged(resource, reason) {
+  if (!isAllowedPath(resource.local_path)) return injectSkillNative(resource, reason);
   let content = '';
   try {
     content = readFileSync(resource.local_path, 'utf8');
@@ -89,23 +105,28 @@ function injectSkillManaged(resource) {
 
   const truncatedContent = truncateContent(content, MAX_INJECTION_CHARS - 300);
 
-  return `[Auto-suggestion] Recommended skill for this task: "${resource.name}"
-Capability: ${truncate(resource.capability_summary, 100)}
-<skill-content>
-${truncatedContent}
-</skill-content>`;
+  const lines = [`[Recommended] "${resource.name}" — ${truncate(resource.capability_summary, 100)}`];
+  if (reason) lines.push(`Why: ${reason}`);
+  lines.push('<skill-content>');
+  lines.push(truncatedContent);
+  lines.push('</skill-content>');
+  return lines.join('\n');
 }
 
 /**
  * Agent template -- guides Claude to use Agent tool with the agent definition.
  * @param {object} resource Resource object from DB
+ * @param {string} [reason] Why this was recommended
  * @returns {string} Injection text with agent definition for Agent tool delegation
  */
-function injectAgent(resource) {
+function injectAgent(resource, reason) {
   if (!isAllowedPath(resource.local_path)) {
-    return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task. ` +
-      `Capability: ${truncate(resource.capability_summary, 100)}. ` +
-      `Use the Agent tool to delegate this work.`;
+    const lines = [`[Recommended] ${leadLine(resource, reason)}`];
+    lines.push(`→ Use Agent tool to delegate: "${resource.name}"`);
+    if (reason && resource.capability_summary) {
+      lines.push(`Capability: ${truncate(resource.capability_summary, 100)}`);
+    }
+    return lines.join('\n');
   }
   let agentDef = '';
   try {
@@ -122,17 +143,21 @@ function injectAgent(resource) {
 
   if (agentDef) {
     const truncatedDef = truncateContent(agentDef, MAX_INJECTION_CHARS - 300);
-    return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task.
-Capability: ${truncate(resource.capability_summary, 100)}
-Use the Agent tool with this agent definition:
-<agent-definition>
-${truncatedDef}
-</agent-definition>`;
+    const lines = [`[Recommended] "${resource.name}" — ${truncate(resource.capability_summary, 100)}`];
+    if (reason) lines.push(`Why: ${reason}`);
+    lines.push('Use the Agent tool with this agent definition:');
+    lines.push('<agent-definition>');
+    lines.push(truncatedDef);
+    lines.push('</agent-definition>');
+    return lines.join('\n');
   }
 
-  return `[Auto-suggestion] A specialized agent "${resource.name}" is recommended for this task. ` +
-    `Capability: ${truncate(resource.capability_summary, 100)}. ` +
-    `Use the Agent tool to delegate this work.`;
+  const lines = [`[Recommended] ${leadLine(resource, reason)}`];
+  lines.push(`→ Use Agent tool to delegate: "${resource.name}"`);
+  if (reason && resource.capability_summary) {
+    lines.push(`Capability: ${truncate(resource.capability_summary, 100)}`);
+  }
+  return lines.join('\n');
 }
 
 // ─── Main Render ─────────────────────────────────────────────────────────────
@@ -153,17 +178,15 @@ export function renderInjection(resource, reason) {
     // Priority: if invocation_name is set, the skill is a registered Claude Code skill/plugin
     // → instruct Claude to invoke via Skill tool (enables adoption tracking)
     if (resource.invocation_name) {
-      injection = injectSkillInvocable(resource);
+      injection = injectSkillInvocable(resource, reason);
     } else if (isNativeSkill(resource.name)) {
-      injection = injectSkillNative(resource);
+      injection = injectSkillNative(resource, reason);
     } else {
-      injection = injectSkillManaged(resource);
+      injection = injectSkillManaged(resource, reason);
     }
   } else {
-    injection = injectAgent(resource);
+    injection = injectAgent(resource, reason);
   }
-
-  if (reason) injection += `\nReason: ${reason}`;
 
   // Hard limit enforcement
   if (injection.length > MAX_INJECTION_CHARS) {

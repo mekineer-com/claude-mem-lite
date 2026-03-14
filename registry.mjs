@@ -107,7 +107,7 @@ const INVOCATIONS_SCHEMA = `
     adopted       INTEGER DEFAULT 0,
     outcome       TEXT CHECK(outcome IN ('success','partial','failure','skipped','ignored') OR outcome IS NULL),
     score         REAL,
-    rejection_reason TEXT CHECK(rejection_reason IN ('alternative','manual','context_switch','session_end','unknown') OR rejection_reason IS NULL),
+    rejection_reason TEXT CHECK(rejection_reason IN ('alternative','manual','context_switch','session_end','unknown','no_events','unclassified') OR rejection_reason IS NULL),
     created_at    TEXT DEFAULT (datetime('now'))
   );
 

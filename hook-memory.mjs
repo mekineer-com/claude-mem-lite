@@ -4,7 +4,7 @@
 import { sanitizeFtsQuery, debugCatch } from './utils.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
-const MEMORY_LOOKBACK_MS = 30 * 86400000; // 30 days
+const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
 const MEMORY_TYPE_BOOST = { bugfix: 1.5, decision: 1.3, discovery: 1.0, feature: 0.8, change: 0.5, refactor: 0.5 };
 
 const FILE_RECALL_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -12,7 +12,7 @@ const MAX_FILE_RECALL = 2;
 
 /**
  * Search for relevant past observations to inject as memory context.
- * Strict quality gates: importance>=2, type-boosted, lesson-boosted, BM25-thresholded.
+ * Quality gates: importance>=1 (with 0.6x penalty), type-boosted, lesson-boosted, BM25-thresholded (>=1.5).
  * @param {import('better-sqlite3').Database} db Memory database
  * @param {string} userPrompt User's prompt text
  * @param {string} project Current project
@@ -36,7 +36,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       JOIN observations o ON o.id = observations_fts.rowid
       WHERE observations_fts MATCH ?
         AND o.project = ?
-        AND o.importance >= 2
+        AND o.importance >= 1
         AND o.created_at_epoch > ?
         AND COALESCE(o.compressed_into, 0) = 0
       ORDER BY bm25(observations_fts, 10, 5, 5, 3, 3, 2)
@@ -49,12 +49,15 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       .filter(r => !excludeSet.has(r.id))
       .map(r => ({
         ...r,
-        score: Math.abs(r.relevance) * (MEMORY_TYPE_BOOST[r.type] || 1.0) * (r.lesson_learned ? 1.5 : 1.0),
+        score: Math.abs(r.relevance)
+          * (MEMORY_TYPE_BOOST[r.type] || 1.0)
+          * (r.lesson_learned ? 1.5 : 1.0)
+          * (r.importance >= 2 ? 1.0 : 0.6),  // Penalize importance=1
       }))
       .sort((a, b) => b.score - a.score);
 
-    // Strict threshold: only inject if best match has meaningful score
-    if (scored.length === 0 || scored[0].score < 1.0) return [];
+    // Strict threshold: raised from 1.0 to 1.5 to compensate for wider pool
+    if (scored.length === 0 || scored[0].score < 1.5) return [];
 
     // Update access_count for injected memories
     const result = scored.slice(0, MAX_MEMORY_INJECTIONS);

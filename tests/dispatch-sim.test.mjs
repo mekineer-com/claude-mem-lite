@@ -589,19 +589,16 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
   // ─── Scenario 6: dispatchOnSessionStart full E2E ──────────────────────────
 
   describe('dispatchOnSessionStart — full E2E', () => {
-    it('returns injection text for "write tests" prompt', async () => {
+    // DISABLED: dispatchOnSessionStart always returns null (0/119 adoption rate).
+    // Session-start context injection remains active; only resource dispatch is disabled.
+    it('returns null — session_start dispatch disabled (0/119 adoption)', async () => {
       const result = await dispatchOnSessionStart(db, 'write tests for the auth module', 'sim-sess', { hasHandoff: true });
-      expect(result).toBeTruthy();
-      expect(result).toContain('[Auto-suggestion]');
-      // After filterAutoLoadedSkills, plugin-namespaced skills (superpowers:*) are excluded;
-      // the unit-testing agent (non-plugin) should surface instead
-      expect(result).toContain('unit-testing');
+      expect(result).toBeNull();
     });
 
-    it('returns injection text for Chinese prompt "帮我修复bug"', async () => {
+    it('returns null for Chinese prompt — session_start dispatch disabled', async () => {
       const result = await dispatchOnSessionStart(db, '帮我修复bug', 'sim-sess-cn', { hasHandoff: true });
-      expect(result).toBeTruthy();
-      expect(result).toContain('[Auto-suggestion]');
+      expect(result).toBeNull();
     });
 
     it('returns null for empty prompt', async () => {
@@ -614,27 +611,26 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       expect(result).toBeNull();
     });
 
-    it('session dedup: second call for same session returns null', async () => {
+    it('all calls return null — session_start dispatch disabled', async () => {
       const r1 = await dispatchOnSessionStart(db, 'write tests', 'sim-dedup', { hasHandoff: true });
-      expect(r1).toBeTruthy();
-      const _r2 = await dispatchOnSessionStart(db, 'write more tests', 'sim-dedup', { hasHandoff: true });
-      // r2 is null if same resource is top result again (session dedup) or session cap hit
+      expect(r1).toBeNull();
+      const r2 = await dispatchOnSessionStart(db, 'write more tests', 'sim-dedup', { hasHandoff: true });
+      expect(r2).toBeNull();
     });
 
-    it('respects session recommendation cap', async () => {
+    it('session cap is moot — session_start dispatch disabled', async () => {
       const results = [];
       const prompts = [
         'write tests for auth',
         'fix the login bug',
         'review my changes',
-        'refactor the code',  // 4th — should be blocked by SESSION_RECOMMEND_CAP=3
+        'refactor the code',
       ];
       for (const p of prompts) {
         results.push(await dispatchOnSessionStart(db, p, 'sim-cap', { hasHandoff: true }));
       }
-      // First 3 should succeed, 4th should be null (cap reached)
-      const nonNull = results.filter(r => r !== null);
-      expect(nonNull.length).toBeLessThanOrEqual(SESSION_RECOMMEND_CAP);
+      // All null — dispatch disabled
+      expect(results.every(r => r === null)).toBe(true);
     });
   });
 
@@ -646,7 +642,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       // it skips when needsHaikuDispatch returns true (low FTS5 confidence).
       // This is correct behavior — avoid noisy mid-session recommendations.
       const result = await dispatchOnUserPrompt(db, 'now let me debug this error', 'sim-prompt');
-      expect(result === null || result.includes('[Auto-suggestion]')).toBe(true);
+      expect(result === null || result.includes('[Recommended]')).toBe(true);
     });
 
     it('returns null for ambiguous/low-signal prompt', async () => {
@@ -654,13 +650,13 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       expect(result).toBeNull();
     });
 
-    it('does not double-recommend with session_start', async () => {
-      // First: session_start recommends TDD
-      await dispatchOnSessionStart(db, 'write tests for auth', 'sim-double', { hasHandoff: true });
-      // Then: user_prompt for same intent — should not recommend same resource
+    it('does not double-recommend with session_start (session_start disabled)', async () => {
+      // session_start dispatch is disabled (0/119 adoption) — always returns null
+      const r0 = await dispatchOnSessionStart(db, 'write tests for auth', 'sim-double', { hasHandoff: true });
+      expect(r0).toBeNull();
+      // user_prompt for same intent — may or may not recommend
       const result = await dispatchOnUserPrompt(db, 'add tests for the login', 'sim-double');
-      // Either null (same resource deduped) or a different resource
-      expect(result === null || !result.includes('superpowers-tdd')).toBe(true);
+      expect(result === null || result.includes('[Recommended]')).toBe(true);
     });
   });
 
@@ -701,40 +697,37 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
         { userPrompt: 'write tests for the app', sessionId: 'sim-pre-edit' });
       // May or may not recommend depending on FTS5 confidence
       // But should not error
-      expect(result === null || result.includes('[Auto-suggestion]')).toBe(true);
+      expect(result === null || result.includes('[Recommended]')).toBe(true);
     });
 
     it('can recommend for complex Bash commands', async () => {
       const result = await dispatchOnPreToolUse(db,
         { tool_name: 'Bash', tool_input: { command: 'npm run build && npm test' } },
         { userPrompt: 'build and test the project', sessionId: 'sim-pre-bash' });
-      expect(result === null || result.includes('[Auto-suggestion]')).toBe(true);
+      expect(result === null || result.includes('[Recommended]')).toBe(true);
     });
   });
 
   // ─── Scenario 9: Cooldown and dedup across sessions ───────────────────────
 
   describe('cooldown and dedup', () => {
-    it('same resource blocked in same session', async () => {
+    // session_start dispatch is disabled (0/119 adoption) — all calls return null.
+    // Cooldown/dedup tests retained to validate dispatchOnUserPrompt paths.
+    it('session_start always returns null (dispatch disabled)', async () => {
       const r1 = await dispatchOnSessionStart(db, 'write tests', 'same-sess', { hasHandoff: true });
-      expect(r1).toBeTruthy();
-      // Same session, same prompt → blocked
+      expect(r1).toBeNull();
       const r2 = await dispatchOnSessionStart(db, 'write tests', 'same-sess', { hasHandoff: true });
-      // r2 is either null (dedup blocked) or a different resource
-      expect(r2 === null || r2 !== r1).toBe(true);
+      expect(r2).toBeNull();
     });
 
-    it('same resource blocked across sessions within cooldown', async () => {
-      // Session 1
-      await dispatchOnSessionStart(db, 'write tests', 'sess-a', { hasHandoff: true });
-      // Session 2 (different session, but within 60min cooldown)
+    it('session_start returns null across sessions (dispatch disabled)', async () => {
+      const r1 = await dispatchOnSessionStart(db, 'write tests', 'sess-a', { hasHandoff: true });
+      expect(r1).toBeNull();
       const r2 = await dispatchOnSessionStart(db, 'write tests', 'sess-b', { hasHandoff: true });
-      // Should either return different resource or null (cooldown blocks same resource)
-      // r2 is either null (cooldown blocked) or a different resource
-      expect(r2 === null || typeof r2 === 'string').toBe(true);
+      expect(r2).toBeNull();
     });
 
-    it('session cap enforced across different intents', async () => {
+    it('session cap via session_start is moot (dispatch disabled)', async () => {
       const session = 'cap-test';
       const prompts = [
         'write tests for auth',
@@ -748,7 +741,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
         const r = await dispatchOnSessionStart(db, p, session, { hasHandoff: true });
         if (r) recommendCount++;
       }
-      expect(recommendCount).toBeLessThanOrEqual(SESSION_RECOMMEND_CAP);
+      expect(recommendCount).toBe(0);
     });
   });
 
@@ -761,7 +754,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
         const text = renderInjection(resource);
         expect(text).toContain('Skill tool');
         expect(text).toContain(resource.invocation_name);
-        expect(text).toContain('[Auto-suggestion]');
+        expect(text).toContain('[Recommended]');
         expect(text.length).toBeLessThanOrEqual(3000);
       }
     });
@@ -772,7 +765,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
         const text = renderInjection(resource);
         expect(text).toContain('Agent tool');
         expect(text).toContain(resource.name);
-        expect(text).toContain('[Auto-suggestion]');
+        expect(text).toContain('[Recommended]');
         expect(text.length).toBeLessThanOrEqual(3000);
       }
     });
@@ -819,6 +812,38 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
     });
   });
 
+  // ─── Scenario 11b: Explicit request path filters auto-loaded skills ──────
+
+  describe('explicit request path filters auto-loaded skills', () => {
+    it('explicit request for auto-loaded skill does not recommend that skill', async () => {
+      // "use the superpowers-debugging skill" → explicit request extracts "superpowers-debugging"
+      // superpowers-debugging has invocation_name 'superpowers:systematic-debugging' (non-empty)
+      // Even with explicit request, auto-loaded skills should NOT be recommended
+      const result = await dispatchOnUserPrompt(db, 'use the superpowers-debugging skill', 'explicit-filter-sess');
+      // Result may be null or a different community resource — but never the auto-loaded skill itself
+      if (result) {
+        expect(result).not.toContain('superpowers:systematic-debugging');
+        expect(result).not.toContain('superpowers-debugging');
+      }
+    });
+
+    it('explicit request for community skill (empty invocation_name) can still recommend', async () => {
+      // Add a community skill that matches an explicit request
+      seed(db, {
+        name: 'playwright-community', type: 'skill',
+        invocation_name: '', // community resource — no invocation_name
+        intent_tags: 'playwright,browser,e2e,test',
+        capability_summary: 'Community Playwright browser automation skill for e2e testing',
+        keywords: 'playwright browser e2e test',
+        trigger_patterns: 'when user needs browser automation',
+      });
+      const result = await dispatchOnUserPrompt(db, 'use the playwright-community skill', 'explicit-community-sess');
+      // Community skill should be recommendable (may still be null if BM25 too low, but shouldn't be filtered)
+      // The key invariant is: auto-loaded skills ARE filtered, community skills are NOT filtered
+      expect(result === null || result.includes('[Recommended]')).toBe(true);
+    });
+  });
+
   // ─── Scenario 12: Multi-turn session simulation ───────────────────────────
 
   describe('multi-turn session simulation', () => {
@@ -826,10 +851,10 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
       const session = 'dev-session-001';
       const turns = [];
 
-      // Turn 1: User starts with planning
+      // Turn 1: session_start dispatch is disabled (0/119 adoption) — always returns null
       const r1 = await dispatchOnSessionStart(db, 'I need to plan the new auth system architecture', session, { hasHandoff: true });
       turns.push({ prompt: 'plan auth architecture', result: r1 });
-      expect(r1 === null || r1.includes('[Auto-suggestion]')).toBe(true);
+      expect(r1).toBeNull();
 
       // Turn 2: User starts coding — triggers pre-tool-use
       const r2 = await dispatchOnPreToolUse(db,

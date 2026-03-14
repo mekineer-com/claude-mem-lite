@@ -585,36 +585,9 @@ function extractErrorDomain(cmd, response) {
  * @returns {boolean} true if Haiku should be called
  */
 export function needsHaikuDispatch(results) {
-  // Circuit breaker: if Haiku is tripped, never escalate (regardless of result quality)
-  if (isHaikuCircuitOpen()) return false;
-
-  if (results.length === 0) return true;
-
-  // Prefer composite_score (includes behavioral signals) over raw BM25 relevance.
-  // Both are negative (more negative = better). Use absolute values for comparison.
-  const scoreOf = r => Math.abs(r.composite_score ?? r.relevance);
-  const topScore = scoreOf(results[0]);
-
-  // Relative threshold: if only one result or few results, use absolute minimum
-  // For larger result sets, use mean-relative threshold
-  if (results.length === 1) {
-    // Single result: needs at least moderate relevance
-    return topScore < 2.0;
-  }
-
-  // Compute mean relevance across results
-  const meanScore = results.reduce((sum, r) => sum + scoreOf(r), 0) / results.length;
-
-  // Top result should be significantly above mean (at least 1.5x)
-  if (topScore < meanScore * 1.5 && topScore < 3.0) return true;
-
-  // Top two results too close → ambiguous, need Haiku to disambiguate
-  if (results.length > 1) {
-    const gap = topScore - scoreOf(results[1]);
-    // Gap should be at least 10% of top score, or at least 0.5 absolute
-    if (gap < Math.max(topScore * 0.1, 0.5)) return true;
-  }
-
+  // DISABLED: 0/58 adoption rate. Haiku semantic dispatch adds ~500ms latency
+  // and API cost with zero proven value. FTS5 BM25 composite scoring is sufficient.
+  // When FTS5 confidence is low, returning null is better than escalating to Haiku.
   return false;
 }
 
@@ -869,17 +842,20 @@ function passesConfidenceGate(results, signals) {
 // ─── Auto-loaded Skill Filter ────────────────────────────────────────────────
 
 /**
- * Filter out skills that are already auto-loaded by Claude Code plugins.
- * Plugin-namespaced skills (invocation_name contains ':') are always present
- * in the system-reminder, making dispatch recommendations structurally redundant.
+ * Filter out skills that are already available to Claude Code.
+ * Two categories filtered:
+ * 1. Plugin-namespaced skills (invocation_name contains ':') — auto-loaded in system-reminder
+ * 2. User-installed skills (non-empty invocation_name without ':') — already in ~/.claude/skills/
+ * Only community resources (empty/null invocation_name) should be recommended.
  * @param {object[]} results FTS5 results
- * @returns {object[]} Filtered results
+ * @returns {object[]} Filtered results — community resources only
  */
 function filterAutoLoadedSkills(results) {
   return results.filter(r => {
     if (r.type !== 'skill') return true;
-    const inv = r.invocation_name || '';
-    return !inv.includes(':');
+    const inv = (r.invocation_name || '').trim();
+    // Any non-empty invocation_name means this skill is already installed/available
+    return inv === '';
   });
 }
 
@@ -975,6 +951,11 @@ function buildRecommendReason(signals, { explicit = false } = {}) {
  * @returns {Promise<string|null>} Injection text or null
  */
 export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHandoff = false } = {}) {
+  // DISABLED: 0/119 adoption rate across all session_start recommendations.
+  // Session-start context injection (Last Session, Key Context) remains active.
+  // Re-enable via: CLAUDE_MEM_SESSION_DISPATCH=1
+  if (!process.env.CLAUDE_MEM_SESSION_DISPATCH) return null;
+
   if (!db) return null;
   if (!hasHandoff) return null;  // Only dispatch when continuing from a previous session
   if (!userPrompt) return null;  // Prompt still required for FTS query
@@ -1077,6 +1058,8 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
       const textQuery = buildQueryFromText(explicit.searchTerm);
       if (textQuery) {
         let explicitResults = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
+        explicitResults = filterAutoLoadedSkills(explicitResults);
+        explicitResults = filterGarbageMetadata(explicitResults);
         explicitResults = applyAdoptionDecay(explicitResults, db);
         if (explicitResults.length > 0) {
           const best = explicitResults[0];

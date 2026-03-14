@@ -458,24 +458,25 @@ describe('Dispatch: Cooldown & Session Cap', () => {
   });
 });
 
-describe('Dispatch: Haiku Circuit Breaker Decision', () => {
-  it('needsHaikuDispatch returns true for empty results', () => {
-    expect(needsHaikuDispatch([])).toBe(true);
+// DISABLED: Haiku Tier3 dispatch always returns false (0/58 adoption rate).
+describe('Dispatch: Haiku Circuit Breaker Decision (Tier3 disabled)', () => {
+  it('needsHaikuDispatch returns false for empty results (Tier3 disabled)', () => {
+    expect(needsHaikuDispatch([])).toBe(false);
   });
 
   it('needsHaikuDispatch returns false for strong single result', () => {
     expect(needsHaikuDispatch([{ relevance: -10 }])).toBe(false);
   });
 
-  it('needsHaikuDispatch returns true for weak single result', () => {
-    expect(needsHaikuDispatch([{ relevance: -0.5 }])).toBe(true);
+  it('needsHaikuDispatch returns false for weak single result (Tier3 disabled)', () => {
+    expect(needsHaikuDispatch([{ relevance: -0.5 }])).toBe(false);
   });
 
-  it('needsHaikuDispatch returns true when top two are close', () => {
+  it('needsHaikuDispatch returns false when top two are close (Tier3 disabled)', () => {
     expect(needsHaikuDispatch([
       { relevance: -5 },
       { relevance: -4.9 },
-    ])).toBe(true);
+    ])).toBe(false);
   });
 
   it('needsHaikuDispatch returns false when gap is large', () => {
@@ -527,9 +528,9 @@ describe('Injection Rendering', () => {
   it('renders invocable skill injection', () => {
     const resource = { name: 'tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development', capability_summary: 'TDD workflow guidance' };
     const result = renderInjection(resource, 'test intent detected');
-    expect(result).toContain('[Auto-suggestion]');
+    expect(result).toContain('[Recommended]');
     expect(result).toContain('superpowers:test-driven-development');
-    expect(result).toContain('Reason: test intent detected');
+    expect(result).toContain('test intent detected');
   });
 
   it('enforces MAX_INJECTION_CHARS limit', () => {
@@ -541,7 +542,7 @@ describe('Injection Rendering', () => {
   it('renders agent injection', () => {
     const resource = { name: 'code-architect', type: 'agent', capability_summary: 'Designs feature architectures', local_path: '/nonexistent' };
     const result = renderInjection(resource);
-    expect(result).toContain('[Auto-suggestion]');
+    expect(result).toContain('[Recommended]');
     expect(result).toContain('code-architect');
   });
 });

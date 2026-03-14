@@ -97,8 +97,12 @@ const server = new McpServer(
       '- Non-obvious debugging discovery → mem_save with type="bugfix"',
       '- Key architecture decision → mem_save with type="decision"',
       '- Important pattern or convention found → mem_save with type="discovery"',
+      '- Do NOT save: ephemeral task state, git history, obvious code patterns, or info derivable from code.',
       '',
-      'WORKFLOW: mem_search → mem_timeline(anchor=ID) → mem_get(ids=[...]) for full context.',
+      'SEARCH WORKFLOW: mem_search → mem_timeline(anchor=ID) for surrounding context → mem_get(ids=[...]) for full details.',
+      'Search tips: use short keywords (2-3 words), not full sentences. Filter with obs_type when relevant.',
+      '',
+      'MAINTENANCE: mem_compress consolidates old observations. mem_maintain runs dedup/cleanup/reindex.',
     ].join('\n'),
   },
 );
@@ -214,7 +218,7 @@ function searchObservations(ctx) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery) {
         try {
-          const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.8, withSnippet: true, withOffset: true }))
+          const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.5, withSnippet: true, withOffset: true }))
             .all(...buildObsFtsParams({ now, projectBoost, ftsQuery: orQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
           for (const r of orRows) results.push(ftsRowToResult(r, { snippet: true }));
         } catch (e) { debugCatch(e, 'searchObservations-or-fallback'); }

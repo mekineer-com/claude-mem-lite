@@ -742,4 +742,80 @@ describe('lesson_learned and search_aliases extraction', () => {
     const parsed = parseJsonFromLLM(raw);
     expect(parsed.lesson_learned).toBeNull();
   });
+
+  it('lesson_learned "none" is stored as null in DB', async () => {
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'change',
+      title: 'Minor config update',
+      narrative: 'Updated port settings',
+      concepts: ['config'],
+      facts: ['Port changed to 3001'],
+      importance: 1,
+      lesson_learned: 'none',
+      search_aliases: ['config change'],
+    }));
+
+    const db = createTestDb();
+    db._realClose = db.close;
+    db.close = () => {};
+    openDb.mockReturnValue(db);
+
+    const tmpFile2 = join(tmpdir(), `hook-llm-test-none-${Date.now()}.json`);
+    const origArgv3 = process.argv[3];
+    process.argv[3] = tmpFile2;
+    process.env.CLAUDE_MEM_NO_DELAY = '1';
+
+    writeFileSync(tmpFile2, JSON.stringify({
+      sessionId: 'none-sess', project: 'test-proj',
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Update port config', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    const obs = db.prepare('SELECT lesson_learned FROM observations WHERE memory_session_id = ?').get('none-sess');
+    expect(obs).toBeDefined();
+    expect(obs.lesson_learned).toBeNull();
+
+    process.argv[3] = origArgv3;
+    db._realClose();
+  });
+
+  it('lesson_learned "None" (capitalized) is stored as null in DB', async () => {
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'change',
+      title: 'Routine file edit',
+      narrative: 'Standard update',
+      concepts: [],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'None',
+      search_aliases: [],
+    }));
+
+    const db = createTestDb();
+    db._realClose = db.close;
+    db.close = () => {};
+    openDb.mockReturnValue(db);
+
+    const tmpFile2 = join(tmpdir(), `hook-llm-test-None-${Date.now()}.json`);
+    const origArgv3 = process.argv[3];
+    process.argv[3] = tmpFile2;
+    process.env.CLAUDE_MEM_NO_DELAY = '1';
+
+    writeFileSync(tmpFile2, JSON.stringify({
+      sessionId: 'none-cap-sess', project: 'test-proj',
+      files: ['app.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Standard edit', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    const obs = db.prepare('SELECT lesson_learned FROM observations WHERE memory_session_id = ?').get('none-cap-sess');
+    expect(obs).toBeDefined();
+    expect(obs.lesson_learned).toBeNull();
+
+    process.argv[3] = origArgv3;
+    db._realClose();
+  });
 });

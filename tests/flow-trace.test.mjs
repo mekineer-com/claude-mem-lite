@@ -78,25 +78,21 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
   });
   afterEach(() => { db.close(); });
 
-  // Stage 1: SessionStart dispatches on previous session's next_steps
-  describe('SessionStart trigger', () => {
-    it('dispatches injection for relevant next_steps', async () => {
+  // Stage 1: SessionStart — DISABLED (0/119 adoption rate)
+  describe('SessionStart trigger (disabled)', () => {
+    it('returns null — session_start dispatch disabled (0/119 adoption)', async () => {
       const result = await dispatchOnSessionStart(
         db, 'Debug remaining indexing script errors', 'session-1', { hasHandoff: true }
       );
-      expect(result).not.toBeNull();
-      expect(result).toContain('[Auto-suggestion]');
+      expect(result).toBeNull();
     });
 
-    it('records invocation with session_start trigger', async () => {
+    it('does not record invocation (dispatch disabled)', async () => {
       await dispatchOnSessionStart(
         db, 'Debug remaining indexing script errors', 'session-1', { hasHandoff: true }
       );
       const invocations = getSessionInvocations(db, 'session-1');
-      expect(invocations).toHaveLength(1);
-      expect(invocations[0].trigger).toBe('session_start');
-      expect(invocations[0].recommended).toBe(1);
-      expect(invocations[0].adopted).toBe(0);
+      expect(invocations).toHaveLength(0);
     });
 
     it('returns null for empty next_steps', async () => {
@@ -135,17 +131,20 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
   });
 
   // Stage 2b: Cross-hook dedup (SessionStart → UserPrompt)
-  describe('SessionStart→UserPrompt dedup', () => {
-    it('UserPrompt deduped against preceding SessionStart', async () => {
+  // SessionStart dispatch is disabled — no invocation recorded, so no dedup effect
+  describe('SessionStart→UserPrompt dedup (session_start disabled)', () => {
+    it('UserPrompt not affected by disabled SessionStart', async () => {
       const startResult = await dispatchOnSessionStart(
         db, 'Write unit tests for the auth module', 'session-3', { hasHandoff: true }
       );
-      expect(startResult).not.toBeNull();
+      expect(startResult).toBeNull(); // session_start dispatch disabled
 
+      // UserPrompt can still recommend since session_start didn't create any invocation
       const promptResult = await dispatchOnUserPrompt(
         db, 'Write unit tests for the login flow', 'session-3'
       );
-      expect(promptResult).toBeNull();
+      // May or may not recommend depending on FTS5 confidence
+      expect(promptResult === null || typeof promptResult === 'string').toBe(true);
     });
   });
 
@@ -174,7 +173,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       );
       // Should match superpowers-tdd (test intent + edit action)
       // Result can be null if BM25 confidence gate rejects — both outcomes are valid
-      expect(result === null || result.includes('[Auto-suggestion]')).toBe(true);
+      expect(result === null || result.includes('[Recommended]')).toBe(true);
     });
 
     it('records invocation with pre_tool_use trigger', async () => {
@@ -230,7 +229,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       );
       // No sessionId → skips dedup filter, may return recommendation
       if (result) {
-        expect(result).toContain('[Auto-suggestion]');
+        expect(result).toContain('[Recommended]');
       }
     });
   });
@@ -377,7 +376,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
     it('skill injection is well-formed', () => {
       const skill = db.prepare('SELECT * FROM resources WHERE name = ?').get('superpowers-tdd');
       const injection = renderInjection(skill);
-      expect(injection).toContain('[Auto-suggestion]');
+      expect(injection).toContain('[Recommended]');
       expect(injection).toContain('superpowers-tdd');
       expect(injection.length).toBeLessThanOrEqual(3000);
     });
@@ -385,7 +384,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
     it('agent injection mentions Agent tool', () => {
       const agent = db.prepare('SELECT * FROM resources WHERE name = ?').get('code-review-ai');
       const injection = renderInjection(agent);
-      expect(injection).toContain('[Auto-suggestion]');
+      expect(injection).toContain('[Recommended]');
       expect(injection).toContain('code-review-ai');
       expect(injection).toContain('Agent tool');
       expect(injection.length).toBeLessThanOrEqual(3000);

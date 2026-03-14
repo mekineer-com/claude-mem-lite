@@ -107,9 +107,16 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   ].sort((a, b) => b.valueDensity - a.valueDensity);
 
   const selectedFiles = new Set();
+  const selectedTypes = new Map(); // type → count for diversity constraint
 
   for (const c of allCandidates) {
     if (totalTokens + c.cost > budget) continue;
+
+    // Type diversity: max 3 observations of same type (checked first to avoid file set pollution)
+    if (c._kind === 'obs' && c.type) {
+      const typeCount = selectedTypes.get(c.type) || 0;
+      if (typeCount >= 3) continue;
+    }
 
     // Diversity penalty: reduce value for file overlap with already-selected
     if (c._kind === 'obs' && c.files_modified) {
@@ -119,9 +126,14 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
         const overlap = cFiles.filter(f => selectedFiles.has(f)).length;
         const overlapRatio = overlap / cFiles.length;
         const penalizedValue = c.valueDensity * (1 - 0.3 * overlapRatio);
-        if (penalizedValue < 0.001) continue; // Skip if too redundant
+        if (penalizedValue < 0.001) continue;
       }
       for (const f of cFiles) selectedFiles.add(f);
+    }
+
+    // Commit type diversity counter after both gates pass
+    if (c._kind === 'obs' && c.type) {
+      selectedTypes.set(c.type, (selectedTypes.get(c.type) || 0) + 1);
     }
 
     totalTokens += c.cost;

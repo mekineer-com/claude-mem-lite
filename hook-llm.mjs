@@ -268,10 +268,10 @@ File: ${episode.files.join(', ') || 'unknown'}
 Action: ${e.desc}
 Error: ${e.isError ? 'yes' : 'no'}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight or null if routine","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"]}
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)
-lesson_learned: If this episode revealed something NON-OBVIOUS (a debugging insight, a gotcha, a design reason), capture it as a reusable lesson. null if routine.
+importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
+lesson_learned: REQUIRED field. State what was learned that isn't obvious from reading the code. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". If purely routine with nothing learned, write "none" (not null).
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
   } else {
     const actionList = episode.entries.map((e, i) =>
@@ -285,10 +285,10 @@ Files: ${fileList}
 Actions (${episode.entries.length} total):
 ${actionList}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or null if routine","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"]}
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: 0=not worth saving (pure browsing, trivial query, no learning value), 1=routine, 2=notable (error fix, arch decision, config change), 3=critical (breaking change, security fix, data migration)
-lesson_learned: If this episode revealed something NON-OBVIOUS (a debugging insight, a gotcha, a design reason), capture it as a reusable lesson. null if routine.
+importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
+lesson_learned: REQUIRED field. State what was learned that isn't obvious from reading the code. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". If purely routine with nothing learned, write "none" (not null).
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
   }
 
@@ -323,7 +323,10 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
         return;
       }
 
-      const lessonLearned = typeof parsed.lesson_learned === 'string' ? parsed.lesson_learned.slice(0, 500) : null;
+      const lessonLearned = typeof parsed.lesson_learned === 'string'
+        && parsed.lesson_learned.toLowerCase() !== 'none'
+        && parsed.lesson_learned.trim().length > 0
+        ? parsed.lesson_learned.slice(0, 500) : null;
       const searchAliases = Array.isArray(parsed.search_aliases)
         ? parsed.search_aliases.slice(0, 6).join(' ')
         : null;

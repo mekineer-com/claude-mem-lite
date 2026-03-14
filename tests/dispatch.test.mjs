@@ -639,26 +639,28 @@ describe('dispatch.mjs', () => {
     });
   });
 
-  describe('needsHaikuDispatch', () => {
+  // DISABLED: Haiku Tier3 dispatch always returns false (0/58 adoption rate).
+  // Haiku semantic dispatch added ~500ms latency and API cost with zero proven value.
+  describe('needsHaikuDispatch (disabled — always false)', () => {
     beforeEach(() => { _resetCircuitBreaker(); });
 
-    it('returns true for empty results', () => {
-      expect(needsHaikuDispatch([])).toBe(true);
+    it('returns false for empty results (Tier3 disabled)', () => {
+      expect(needsHaikuDispatch([])).toBe(false);
     });
 
-    it('returns true for single low-confidence result (below absolute minimum)', () => {
-      expect(needsHaikuDispatch([{ relevance: -1.0 }])).toBe(true);
+    it('returns false for single low-confidence result (Tier3 disabled)', () => {
+      expect(needsHaikuDispatch([{ relevance: -1.0 }])).toBe(false);
     });
 
     it('returns false for single high-confidence result', () => {
       expect(needsHaikuDispatch([{ relevance: -5.0 }])).toBe(false);
     });
 
-    it('returns true when top results are close (gap < 10% of top score)', () => {
+    it('returns false when top results are close (Tier3 disabled)', () => {
       expect(needsHaikuDispatch([
         { relevance: -5.0 },
         { relevance: -4.8 },
-      ])).toBe(true);
+      ])).toBe(false);
     });
 
     it('returns false when top result has decisive lead', () => {
@@ -668,13 +670,12 @@ describe('dispatch.mjs', () => {
       ])).toBe(false);
     });
 
-    it('uses relative threshold: top must be 1.5x mean or above 3.0', () => {
-      // All results similar and low → needs Haiku
+    it('returns false regardless of result quality (Tier3 disabled)', () => {
       expect(needsHaikuDispatch([
         { relevance: -1.5 },
         { relevance: -1.2 },
         { relevance: -1.0 },
-      ])).toBe(true);
+      ])).toBe(false);
     });
   });
 });
@@ -692,7 +693,7 @@ describe('dispatch-inject.mjs', () => {
       });
       expect(text).toContain('tdd-workflow');
       expect(text).toContain('Test-driven development');
-      expect(text).toContain('[Auto-suggestion]');
+      expect(text).toContain('[Recommended]');
     });
 
     it('renders agent injection with Agent tool guidance', () => {
@@ -928,6 +929,94 @@ describe('dispatch-feedback.mjs', () => {
       ];
       expect(detectAdoption(inv, events)).toBe(false);
     });
+
+    it('behavioral adoption requires activity within 120s of recommendation', () => {
+      const inv = {
+        resource_name: 'superpowers-debugging',
+        resource_type: 'skill',
+        invocation_name: 'superpowers:systematic-debugging',
+        created_at: '2026-03-14T10:00:00Z',
+      };
+
+      // Activity 30s after recommendation → adopted
+      const nearEvents = [
+        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:00:10Z').getTime() },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:00:20Z').getTime() },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:00:30Z').getTime() },
+      ];
+      expect(detectAdoption(inv, nearEvents)).toBe(true);
+
+      // Activity 5 minutes after recommendation → not adopted (coincidental debugging)
+      const farEvents = [
+        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:05:10Z').getTime() },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:05:20Z').getTime() },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:05:30Z').getTime() },
+      ];
+      expect(detectAdoption(inv, farEvents)).toBe(false);
+    });
+
+    it('behavioral code-review adoption requires activity within 120s of recommendation', () => {
+      const inv = {
+        resource_name: 'superpowers-code-review',
+        resource_type: 'skill',
+        invocation_name: 'superpowers:requesting-code-review',
+        created_at: '2026-03-14T10:00:00Z',
+      };
+
+      // Agent review 30s after recommendation → adopted
+      const nearEvents = [
+        { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code', description: 'Code review' }, timestamp: new Date('2026-03-14T10:00:30Z').getTime() },
+      ];
+      expect(detectAdoption(inv, nearEvents)).toBe(true);
+
+      // Agent review 5 minutes after recommendation → not adopted
+      const farEvents = [
+        { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code', description: 'Code review' }, timestamp: new Date('2026-03-14T10:05:30Z').getTime() },
+      ];
+      expect(detectAdoption(inv, farEvents)).toBe(false);
+    });
+  });
+
+  describe('rejection_reason classification', () => {
+    it('sets rejection_reason to "no_events" when session events are empty', async () => {
+      const id = seedResource(db, { name: 'noreason-skill', type: 'skill' });
+      recordInvocation(db, {
+        resource_id: id,
+        session_id: 'sess-no-events',
+        trigger: 'user_prompt',
+        tier: 2,
+        recommended: 1,
+      });
+
+      await collectFeedback(db, 'sess-no-events', []);
+      const inv = db.prepare('SELECT * FROM invocations WHERE session_id = ?').get('sess-no-events');
+      expect(inv.adopted).toBe(0);
+      expect(inv.rejection_reason).toBe('no_events');
+    });
+
+    it('non-adopted with no matching pattern gets "unclassified" or specific reason, never empty', async () => {
+      const id = seedResource(db, { name: 'fallback-skill', type: 'skill' });
+      recordInvocation(db, {
+        resource_id: id,
+        session_id: 'sess-unclassified',
+        trigger: 'user_prompt',
+        tier: 2,
+        recommended: 1,
+        created_at: '2026-03-14T10:00:00Z',
+      });
+
+      // Provide events that don't match any known rejection pattern
+      const events = [
+        { tool_name: 'Read', tool_input: { file_path: '/a.js' }, timestamp: new Date('2026-03-14T10:00:05Z').getTime() },
+      ];
+      await collectFeedback(db, 'sess-unclassified', events);
+      const inv = db.prepare('SELECT * FROM invocations WHERE session_id = ?').get('sess-unclassified');
+      expect(inv.adopted).toBe(0);
+      expect(inv.rejection_reason).toBeTruthy();
+      // Should never be empty string or null for non-adopted
+      expect(inv.rejection_reason).not.toBe('');
+      expect(inv.rejection_reason).not.toBeNull();
+    });
   });
 });
 
@@ -1154,7 +1243,8 @@ describe('Haiku circuit breaker', () => {
 
   it('fresh breaker allows Haiku dispatch', () => {
     expect(_isHaikuCircuitOpen()).toBe(false);
-    expect(needsHaikuDispatch([])).toBe(true);
+    // needsHaikuDispatch is disabled (always false) — circuit breaker infra still works
+    expect(needsHaikuDispatch([])).toBe(false);
   });
 
   it('opens after 3 consecutive failures', () => {
@@ -1281,9 +1371,8 @@ describe('dispatchOnSessionStart handoff gate', () => {
     expect(result).toBeNull();
   });
 
-  it('returns injection when hasHandoff=true', async () => {
-    // Seed multiple resources so BM25 IDF is meaningful (single-doc corpora score ~0)
-    // Use non-plugin invocation_name and genuine capability_summary to pass new filters
+  // DISABLED: dispatchOnSessionStart always returns null (0/119 adoption rate).
+  it('returns null even with hasHandoff=true (dispatch disabled)', async () => {
     seedResource(db, {
       name: 'planning-skill', type: 'skill', intent_tags: 'plan,design,architecture',
       trigger_patterns: 'when user needs to plan features, design architecture, create implementation plans',
@@ -1302,7 +1391,7 @@ describe('dispatchOnSessionStart handoff gate', () => {
       capability_summary: 'Interactive debugging workflow with root cause analysis and fix suggestions',
     });
     const result = await dispatchOnSessionStart(db, 'plan the feature', 'sess-2', { hasHandoff: true });
-    expect(result).toBeTruthy();
+    expect(result).toBeNull();
   });
 });
 
@@ -1558,16 +1647,17 @@ describe('consecutive rejection silencing', () => {
 // ─── filterAutoLoadedSkills ─────────────────────────────────────────────────
 
 describe('filterAutoLoadedSkills', () => {
-  it('filters skills with plugin-namespaced invocation_name', () => {
+  it('filters skills with any non-empty invocation_name (plugin-namespaced or user-installed)', () => {
     const results = [
       { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development' },
       { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging' },
       { name: 'code-review-expert', type: 'skill', invocation_name: 'code-review-expert' },
       { name: 'frontend-design', type: 'skill', invocation_name: 'frontend-design:frontend-design' },
+      { name: 'community-only', type: 'skill', invocation_name: '' },
     ];
     const filtered = _filterAutoLoadedSkills(results);
     expect(filtered).toHaveLength(1);
-    expect(filtered[0].name).toBe('code-review-expert');
+    expect(filtered[0].name).toBe('community-only');
   });
 
   it('keeps agents regardless of invocation_name', () => {
@@ -1586,6 +1676,18 @@ describe('filterAutoLoadedSkills', () => {
     ];
     const filtered = _filterAutoLoadedSkills(results);
     expect(filtered).toHaveLength(2);
+  });
+
+  it('filters skills with non-empty invocation_name (user-installed)', () => {
+    const results = [
+      { name: 'claude-code-plugin-dev', type: 'skill', invocation_name: 'claude-code-plugin-dev' },
+      { name: 'build-error-resolver', type: 'skill', invocation_name: 'build-error-resolver' },
+      { name: 'community-tool', type: 'skill', invocation_name: '' },
+      { name: 'another-community', type: 'skill' },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(2);
+    expect(filtered.map(r => r.name)).toEqual(['community-tool', 'another-community']);
   });
 });
 

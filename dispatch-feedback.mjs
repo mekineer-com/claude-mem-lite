@@ -101,23 +101,43 @@ function detectAdoption(invocation, sessionEvents) {
   }
 
   // Behavioral adoption: detect usage patterns matching the recommended resource
+  // Only count patterns starting within 2 minutes of the recommendation to avoid
+  // false positives from coincidental user behavior (e.g. debugging regardless of rec)
   const resourceLower = resource_name.toLowerCase();
+  const recTime = invocation.created_at ? new Date(invocation.created_at).getTime() : 0;
+  const BEHAVIORAL_WINDOW_MS = 120000; // 2 minutes
 
   // Debugging pattern: Read→Bash(error)→Read→Edit cycle
   if (resourceLower.includes('debug') || resourceLower.includes('troubleshoot')) {
-    let hasRead = false, hasBashError = false, hasEditAfterError = false;
-    for (const e of sessionEvents) {
-      if (e.tool_name === 'Read') hasRead = true;
-      if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) hasBashError = true;
-      if (hasBashError && EDIT_TOOLS.has(e.tool_name)) hasEditAfterError = true;
+    // Only count if first relevant event is within behavioral window
+    const firstRelevant = sessionEvents.find(e =>
+      e.tool_name === 'Read' ||
+      (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || ''))
+    );
+    const delta = firstRelevant?.timestamp ? firstRelevant.timestamp - recTime : 0;
+    const isNearby = !recTime || !firstRelevant?.timestamp ||
+      (delta >= 0 && delta <= BEHAVIORAL_WINDOW_MS);
+
+    if (isNearby) {
+      let hasRead = false, hasBashError = false, hasEditAfterError = false;
+      for (const e of sessionEvents) {
+        if (e.tool_name === 'Read') hasRead = true;
+        if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) hasBashError = true;
+        if (hasBashError && EDIT_TOOLS.has(e.tool_name)) hasEditAfterError = true;
+      }
+      if (hasRead && hasBashError && hasEditAfterError) return true;
     }
-    if (hasRead && hasBashError && hasEditAfterError) return true;
   }
 
   // Code review pattern: Agent with 'review' in prompt/description
   if (resourceLower.includes('review')) {
     for (const e of sessionEvents) {
       if (e.tool_name === 'Agent') {
+        // Only count if event is within behavioral window
+        const delta = e.timestamp ? e.timestamp - recTime : 0;
+        const isNearby = !recTime || !e.timestamp ||
+          (delta >= 0 && delta <= BEHAVIORAL_WINDOW_MS);
+        if (!isNearby) continue;
         const text = ((e.tool_input?.prompt || '') + (e.tool_input?.description || '')).toLowerCase();
         if (text.includes('review')) return true;
       }
@@ -175,7 +195,7 @@ function detectOutcome(sessionEvents) {
  * @returns {string} Rejection reason
  */
 function classifyRejection(invocation, sessionEvents) {
-  if (!sessionEvents || sessionEvents.length === 0) return 'session_end';
+  if (!sessionEvents || sessionEvents.length === 0) return 'no_events';
 
   const recTime = new Date(invocation.created_at).getTime();
   const afterEvents = sessionEvents.filter(e =>
@@ -233,7 +253,7 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
       const adopted = detectAdoption(inv, sessionEvents);
       const outcome = adopted ? detectOutcome(sessionEvents) : 'ignored';
       const score = adopted ? (outcome === 'success' ? 1.0 : outcome === 'partial' ? 0.5 : 0.2) : 0;
-      const rejection_reason = adopted ? null : classifyRejection(inv, sessionEvents);
+      const rejection_reason = adopted ? null : (classifyRejection(inv, sessionEvents) || 'unclassified');
 
       // Update invocation record
       updateInvocation(db, inv.id, {
