@@ -69,7 +69,7 @@ function detectSkillAdoption(resourceName, invocationName, skillInput) {
 const BEHAVIORAL_WINDOW_MS = 600000; // 10 minutes (widened from 2 min for methodology skills)
 
 function isWithinWindow(eventTs, recTime, windowMs = BEHAVIORAL_WINDOW_MS) {
-  if (!recTime || !eventTs) return true; // No timestamps → assume within window
+  if (recTime == null || eventTs == null) return true; // No timestamps → assume within window
   const delta = eventTs - recTime;
   return delta >= 0 && delta <= windowMs;
 }
@@ -105,7 +105,7 @@ function detectVerificationPattern(events, recTime) {
     const cmd = (e.tool_input?.command || '').toLowerCase();
     const resp = e.tool_response || '';
     const isVerifyCmd = /\b(test|lint|eslint|build|tsc|typecheck|vitest|jest)\b/.test(cmd);
-    const isSuccess = !/error|fail|exception/i.test(resp) || resp.length < 15;
+    const isSuccess = resp.length > 0 && !/error|fail|exception/i.test(resp);
     return isVerifyCmd && isSuccess;
   });
 }

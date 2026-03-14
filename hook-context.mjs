@@ -165,13 +165,14 @@ export function updateClaudeMd(contextBlock) {
   const newSection = `${startTag}\n${contextBlock}\n${endTag}`;
 
   const startIdx = content.indexOf(startTag);
-  const endIdx = content.indexOf(endTag);
+  // Use lastIndexOf for end tag to handle multiple/mismatched sections
+  const endIdx = content.lastIndexOf(endTag);
 
   if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {
     // Skip write if content is unchanged — reduces git noise
     const existingSection = content.slice(startIdx, endIdx + endTag.length);
     if (existingSection === newSection) return;
-    // Replace existing section in-place — preserves surrounding content (including hint if present)
+    // Replace from first start to last end — collapses any duplicate sections into one
     content = content.slice(0, startIdx) + newSection + content.slice(endIdx + endTag.length);
   } else if (content.length > 0) {
     // Append to end — never disturb existing CLAUDE.md structure

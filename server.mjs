@@ -429,11 +429,17 @@ function searchPrompts(ctx) {
 
 function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCrossSource) {
   if (paginatedResults.length === 0) {
-    const hint = ['No results found.'];
-    if (args.query) {
-      const expanded = ftsQuery || args.query;
-      if (expanded !== args.query) hint.push(`Searched as: ${expanded}`);
-      hint.push('Tip: check spelling, try broader terms, or use mem_stats to see available data.');
+    const hint = [];
+    if (args.query && !ftsQuery) {
+      hint.push(`Query "${args.query}" was filtered (FTS5 keywords/special chars only).`);
+      hint.push('Tip: use content words instead of operators (AND, OR, NOT, NEAR).');
+    } else {
+      hint.push('No results found.');
+      if (args.query) {
+        const expanded = ftsQuery || args.query;
+        if (expanded !== args.query) hint.push(`Searched as: ${expanded}`);
+        hint.push('Tip: check spelling, try broader terms, or use mem_stats to see available data.');
+      }
     }
     return { content: [{ type: 'text', text: hint.join('\n') }] };
   }
@@ -489,8 +495,13 @@ server.registerTool(
     if (epochTo !== null && args.date_to && /^\d{4}-\d{2}-\d{2}$/.test(args.date_to)) {
       epochTo += 86400000 - 1; // extend to 23:59:59.999
     }
-    if (epochFrom !== null && isNaN(epochFrom)) throw new Error(`Invalid date_from: ${args.date_from}`);
-    if (epochTo !== null && isNaN(epochTo)) throw new Error(`Invalid date_to: ${args.date_to}`);
+    if (epochFrom !== null && isNaN(epochFrom)) throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
+    if (epochTo !== null && isNaN(epochTo)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
+
+    // Early return when query was provided but sanitized to nothing (all FTS5 keywords/special chars)
+    if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance) {
+      return formatSearchOutput([], args, ftsQuery, 0, false);
+    }
 
     const ctx = { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
     const results = [];
@@ -732,7 +743,10 @@ server.registerTool(
     });
     const result = deleteTx();
 
-    return { content: [{ type: 'text', text: `Deleted ${result.changes} observation(s).` }] };
+    const missing = args.ids.filter(id => !rows.some(r => r.id === id));
+    const msg = [`Deleted ${result.changes} observation(s).`];
+    if (missing.length > 0) msg.push(`Note: ID(s) ${missing.join(', ')} not found.`);
+    return { content: [{ type: 'text', text: msg.join(' ') }] };
   })
 );
 

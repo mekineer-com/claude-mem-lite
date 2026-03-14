@@ -117,6 +117,9 @@ const INVOCATIONS_SCHEMA = `
 
   CREATE INDEX IF NOT EXISTS idx_inv_session
     ON invocations(session_id);
+
+  CREATE INDEX IF NOT EXISTS idx_inv_created_at
+    ON invocations(created_at);
 `;
 
 const PREINSTALLED_SCHEMA = `
