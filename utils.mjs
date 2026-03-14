@@ -563,8 +563,8 @@ export function inferProject() {
  */
 export function detectBashSignificance(input, response) {
   const cmd = (input.command || '').toLowerCase();
-  const isError = /\berror\b|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
-    && response.length > 30;
+  const isError = /\berror\b|\bERR!|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
+    && response.length > 15;
   const isTest = /\b(test|jest|pytest|vitest|mocha|spec|cypress|playwright)\b/i.test(cmd);
   const isBuild = /\b(build|compile|tsc|webpack|vite|rollup|esbuild|make|cargo)\b/i.test(cmd);
   const isGit = /\bgit\s+(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);

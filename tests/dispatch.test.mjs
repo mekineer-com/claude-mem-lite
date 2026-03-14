@@ -1,23 +1,17 @@
 // Tests for v3 dispatch system: registry, retriever, dispatch, inject, feedback
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import os from 'os';
-import { join } from 'path';
-import { unlinkSync } from 'fs';
 import { upsertResource, getActiveResources, getResourceByName,
   updateResourceStats, recordInvocation, getSessionInvocations,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
-import { shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
+import { shouldSkipDispatch, extractContextSignals,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP, dispatchOnSessionStart,
-  _resetCircuitBreaker, _recordHaikuFailure, _recordHaikuSuccess,
-  _isHaikuCircuitOpen, _setBreakerFile, _NEGATION_EN, _NEGATION_CJK,
+  _NEGATION_EN, _NEGATION_CJK,
   _applyAdoptionDecay, _passesConfidenceGate as passesConfidenceGate,
-  _filterAutoLoadedSkills, _filterGarbageMetadata,
-  HAIKU_CONFIDENCE_THRESHOLD } from '../dispatch.mjs';
+  _filterAutoLoadedSkills, _filterGarbageMetadata } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
-import { RUNTIME_DIR } from '../hook-shared.mjs';
 
 // ─── Registry DB Helper ─────────────────────────────────────────────────────
 
@@ -638,46 +632,6 @@ describe('dispatch.mjs', () => {
       expect(signals.primaryIntent).toBe('design');
     });
   });
-
-  // DISABLED: Haiku Tier3 dispatch always returns false (0/58 adoption rate).
-  // Haiku semantic dispatch added ~500ms latency and API cost with zero proven value.
-  describe('needsHaikuDispatch (disabled — always false)', () => {
-    beforeEach(() => { _resetCircuitBreaker(); });
-
-    it('returns false for empty results (Tier3 disabled)', () => {
-      expect(needsHaikuDispatch([])).toBe(false);
-    });
-
-    it('returns false for single low-confidence result (Tier3 disabled)', () => {
-      expect(needsHaikuDispatch([{ relevance: -1.0 }])).toBe(false);
-    });
-
-    it('returns false for single high-confidence result', () => {
-      expect(needsHaikuDispatch([{ relevance: -5.0 }])).toBe(false);
-    });
-
-    it('returns false when top results are close (Tier3 disabled)', () => {
-      expect(needsHaikuDispatch([
-        { relevance: -5.0 },
-        { relevance: -4.8 },
-      ])).toBe(false);
-    });
-
-    it('returns false when top result has decisive lead', () => {
-      expect(needsHaikuDispatch([
-        { relevance: -8.0 },
-        { relevance: -3.0 },
-      ])).toBe(false);
-    });
-
-    it('returns false regardless of result quality (Tier3 disabled)', () => {
-      expect(needsHaikuDispatch([
-        { relevance: -1.5 },
-        { relevance: -1.2 },
-        { relevance: -1.0 },
-      ])).toBe(false);
-    });
-  });
 });
 
 // ─── Injection Tests ─────────────────────────────────────────────────────────
@@ -909,7 +863,7 @@ describe('dispatch-feedback.mjs', () => {
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'PASS' },
       ];
-      expect(detectAdoption(inv, events)).toBe(true);
+      expect(detectAdoption(inv, events).adopted).toBe(true);
     });
 
     it('detects code-review pattern (Agent with review in prompt) after review recommendation', () => {
@@ -917,7 +871,7 @@ describe('dispatch-feedback.mjs', () => {
       const events = [
         { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code changes for quality issues', description: 'Code quality review' } },
       ];
-      expect(detectAdoption(inv, events)).toBe(true);
+      expect(detectAdoption(inv, events).adopted).toBe(true);
     });
 
     it('does NOT detect debugging pattern for unrelated resources', () => {
@@ -927,10 +881,10 @@ describe('dispatch-feedback.mjs', () => {
         { tool_name: 'Bash', tool_input: { command: 'test' }, tool_response: 'FAIL' },
         { tool_name: 'Edit', tool_input: {} },
       ];
-      expect(detectAdoption(inv, events)).toBe(false);
+      expect(detectAdoption(inv, events).adopted).toBe(false);
     });
 
-    it('behavioral adoption requires activity within 120s of recommendation', () => {
+    it('behavioral adoption requires activity within 10min of recommendation', () => {
       const inv = {
         resource_name: 'superpowers-debugging',
         resource_type: 'skill',
@@ -944,18 +898,18 @@ describe('dispatch-feedback.mjs', () => {
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:00:20Z').getTime() },
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:00:30Z').getTime() },
       ];
-      expect(detectAdoption(inv, nearEvents)).toBe(true);
+      expect(detectAdoption(inv, nearEvents).adopted).toBe(true);
 
-      // Activity 5 minutes after recommendation → not adopted (coincidental debugging)
+      // Activity 15 minutes after recommendation → not adopted (outside 10min window)
       const farEvents = [
-        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:05:10Z').getTime() },
-        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:05:20Z').getTime() },
-        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:05:30Z').getTime() },
+        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:15:10Z').getTime() },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:15:20Z').getTime() },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:15:30Z').getTime() },
       ];
-      expect(detectAdoption(inv, farEvents)).toBe(false);
+      expect(detectAdoption(inv, farEvents).adopted).toBe(false);
     });
 
-    it('behavioral code-review adoption requires activity within 120s of recommendation', () => {
+    it('behavioral code-review adoption requires activity within 10min of recommendation', () => {
       const inv = {
         resource_name: 'superpowers-code-review',
         resource_type: 'skill',
@@ -967,13 +921,13 @@ describe('dispatch-feedback.mjs', () => {
       const nearEvents = [
         { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code', description: 'Code review' }, timestamp: new Date('2026-03-14T10:00:30Z').getTime() },
       ];
-      expect(detectAdoption(inv, nearEvents)).toBe(true);
+      expect(detectAdoption(inv, nearEvents).adopted).toBe(true);
 
-      // Agent review 5 minutes after recommendation → not adopted
+      // Agent review 15 minutes after recommendation → not adopted
       const farEvents = [
-        { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code', description: 'Code review' }, timestamp: new Date('2026-03-14T10:05:30Z').getTime() },
+        { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code', description: 'Code review' }, timestamp: new Date('2026-03-14T10:15:30Z').getTime() },
       ];
-      expect(detectAdoption(inv, farEvents)).toBe(false);
+      expect(detectAdoption(inv, farEvents).adopted).toBe(false);
     });
   });
 
@@ -1230,73 +1184,6 @@ describe('Composite ranking formula', () => {
   });
 });
 
-// ─── Circuit Breaker Tests ──────────────────────────────────────────────────
-
-describe('Haiku circuit breaker', () => {
-  const tmpBreakerFile = join(os.tmpdir(), `breaker-test-${process.pid}.json`);
-  beforeAll(() => { _setBreakerFile(tmpBreakerFile); });
-  afterAll(() => {
-    _setBreakerFile(join(RUNTIME_DIR, 'haiku-breaker.json'));
-    try { unlinkSync(tmpBreakerFile); } catch {}
-  });
-  beforeEach(() => { _resetCircuitBreaker(); });
-
-  it('fresh breaker allows Haiku dispatch', () => {
-    expect(_isHaikuCircuitOpen()).toBe(false);
-    // needsHaikuDispatch is disabled (always false) — circuit breaker infra still works
-    expect(needsHaikuDispatch([])).toBe(false);
-  });
-
-  it('opens after 3 consecutive failures', () => {
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    expect(_isHaikuCircuitOpen()).toBe(false); // 2 failures: still closed
-    _recordHaikuFailure();
-    expect(_isHaikuCircuitOpen()).toBe(true); // 3 failures: open
-  });
-
-  it('blocks Haiku dispatch when circuit is open', () => {
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    // Circuit open → needsHaikuDispatch should return false (don't escalate)
-    expect(needsHaikuDispatch([])).toBe(false);
-    expect(needsHaikuDispatch([{ relevance: -0.5 }])).toBe(false);
-  });
-
-  it('resets on success', () => {
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    _recordHaikuSuccess(); // reset
-    _recordHaikuFailure(); // only 1 failure now
-    expect(_isHaikuCircuitOpen()).toBe(false);
-  });
-
-  it('success after open resets breaker', () => {
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    expect(_isHaikuCircuitOpen()).toBe(true);
-    _recordHaikuSuccess();
-    expect(_isHaikuCircuitOpen()).toBe(false);
-  });
-
-  it('persists state to file across separate read/write cycles', () => {
-    // Simulate cross-process: write failures, then read in separate calls
-    _resetCircuitBreaker();
-    _recordHaikuFailure();
-    _recordHaikuFailure();
-    // State should survive — each call reads from disk
-    expect(_isHaikuCircuitOpen()).toBe(false); // 2 failures: still closed
-    _recordHaikuFailure();
-    // Now at threshold — breaker opens (persisted to file)
-    expect(_isHaikuCircuitOpen()).toBe(true);
-    // Reset and verify persisted reset
-    _resetCircuitBreaker();
-    expect(_isHaikuCircuitOpen()).toBe(false);
-  });
-});
-
 // ─── Cooldown & Dedup Tests ─────────────────────────────────────────────────
 
 describe('isRecentlyRecommended', () => {
@@ -1428,15 +1315,6 @@ describe('applyAdoptionDecay with db rejection dampening', () => {
   });
 });
 
-// ─── Haiku Confidence Threshold ─────────────────────────────────────────────
-
-describe('haikuDispatch confidence', () => {
-  it('HAIKU_CONFIDENCE_THRESHOLD is exported and >= 0.5', () => {
-    expect(HAIKU_CONFIDENCE_THRESHOLD).toBeGreaterThanOrEqual(0.5);
-    expect(HAIKU_CONFIDENCE_THRESHOLD).toBeLessThanOrEqual(1.0);
-  });
-});
-
 // ─── passesConfidenceGate BM25 floor ────────────────────────────────────────
 
 describe('passesConfidenceGate BM25 floor', () => {
@@ -1563,12 +1441,12 @@ describe('adaptive cooldown', () => {
 
 // ─── Consecutive Rejection Silencing ────────────────────────────────────────
 
-describe('consecutive rejection silencing', () => {
-  it('silences resource after 8 consecutive rejections and sets silenced_until', () => {
+describe('consecutive rejection silencing (exponential backoff)', () => {
+  it('silences with 1h backoff on first rejection cycle', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // 8 consecutive rejections (no outcome required — uses adopted=0 default)
+    // 8 consecutive rejections
     for (let i = 0; i < 8; i++) {
       recordInvocation(db, {
         resource_id: id, session_id: `sess-${i}`, trigger: 'user_prompt', tier: 2, recommended: 1,
@@ -1576,11 +1454,66 @@ describe('consecutive rejection silencing', () => {
     }
 
     const result = isRecentlyRecommended(db, id, 'new-session');
-    expect(result).toBe(true); // Silenced = treated as recently recommended
+    expect(result).toBe(true);
 
-    // Verify silenced_until was set on the resource
-    const row = db.prepare('SELECT silenced_until FROM resources WHERE id = ?').get(id);
+    const row = db.prepare('SELECT silenced_until, cooldown_hours FROM resources WHERE id = ?').get(id);
     expect(row.silenced_until).toBeTruthy();
+    expect(row.cooldown_hours).toBe(1); // First backoff = 1 hour
+    db.close();
+  });
+
+  it('doubles backoff on second rejection cycle', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // Pre-set cooldown_hours to 1 (first cycle already happened)
+    db.prepare('UPDATE resources SET cooldown_hours = 1 WHERE id = ?').run(id);
+
+    for (let i = 0; i < 8; i++) {
+      recordInvocation(db, {
+        resource_id: id, session_id: `sess-${i}`, trigger: 'user_prompt', tier: 2, recommended: 1,
+      });
+    }
+
+    isRecentlyRecommended(db, id, 'new-session');
+    const row = db.prepare('SELECT cooldown_hours FROM resources WHERE id = ?').get(id);
+    expect(row.cooldown_hours).toBe(2); // Doubled: 1 → 2
+    db.close();
+  });
+
+  it('caps backoff at 256 hours', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    db.prepare('UPDATE resources SET cooldown_hours = 256 WHERE id = ?').run(id);
+
+    for (let i = 0; i < 8; i++) {
+      recordInvocation(db, {
+        resource_id: id, session_id: `sess-${i}`, trigger: 'user_prompt', tier: 2, recommended: 1,
+      });
+    }
+
+    isRecentlyRecommended(db, id, 'new-session');
+    const row = db.prepare('SELECT cooldown_hours FROM resources WHERE id = ?').get(id);
+    expect(row.cooldown_hours).toBe(256); // Capped, not 512
+    db.close();
+  });
+
+  it('resets backoff after 7+ days without recommendation', () => {
+    const db = createRegistryDb();
+    const id = seedResource(db);
+
+    // Set existing backoff state
+    db.prepare('UPDATE resources SET cooldown_hours = 64 WHERE id = ?').run(id);
+
+    // Only 1 old recommendation (>7 days ago)
+    db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
+      VALUES (?, 'old-sess', 'user_prompt', 2, 1, datetime('now', '-10 days'))`).run(id);
+
+    const result = isRecentlyRecommended(db, id, 'new-session');
+    // Should have reset backoff (not silenced — only 1 rec, below threshold)
+    const row = db.prepare('SELECT cooldown_hours FROM resources WHERE id = ?').get(id);
+    expect(row.cooldown_hours).toBe(0); // Reset!
     db.close();
   });
 
@@ -1588,7 +1521,6 @@ describe('consecutive rejection silencing', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // 7 rejections then 1 adoption — all 2 days ago to avoid cooldown interference
     for (let i = 0; i < 7; i++) {
       db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
         VALUES (?, ?, 'user_prompt', 2, 1, 0, 'ignored', 0, datetime('now', '-2 days'))`).run(id, `sess-${i}`);
@@ -1597,7 +1529,7 @@ describe('consecutive rejection silencing', () => {
       VALUES (?, 'sess-7', 'user_prompt', 2, 1, 1, 'success', 1.0, datetime('now', '-2 days'))`).run(id);
 
     const result = isRecentlyRecommended(db, id, null);
-    expect(result).toBe(false); // Not silenced, and no cooldown hit
+    expect(result).toBe(false);
     db.close();
   });
 
@@ -1605,26 +1537,24 @@ describe('consecutive rejection silencing', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // Only 5 rejections — 2 days ago to avoid cooldown interference
     for (let i = 0; i < 5; i++) {
       db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
         VALUES (?, ?, 'user_prompt', 2, 1, 0, 'ignored', 0, datetime('now', '-2 days'))`).run(id, `sess-${i}`);
     }
 
     const result = isRecentlyRecommended(db, id, null);
-    expect(result).toBe(false); // Not enough rejections to silence
+    expect(result).toBe(false);
     db.close();
   });
 
-  it('respects hard-silence even without invocation history', () => {
+  it('respects active silence even without invocation history', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // Manually set silenced_until in the future
     db.prepare("UPDATE resources SET silenced_until = datetime('now', '+7 days') WHERE id = ?").run(id);
 
     const result = isRecentlyRecommended(db, id, 'any-session');
-    expect(result).toBe(true); // Hard-silenced
+    expect(result).toBe(true);
     db.close();
   });
 
@@ -1632,14 +1562,13 @@ describe('consecutive rejection silencing', () => {
     const db = createRegistryDb();
     const id = seedResource(db);
 
-    // 8 invocations with NO outcome set (simulates feedback collection delay)
     for (let i = 0; i < 8; i++) {
       db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
         VALUES (?, ?, 'user_prompt', 2, 1, datetime('now', '-${i} hours'))`).run(id, `sess-${i}`);
     }
 
     const result = isRecentlyRecommended(db, id, 'new-session');
-    expect(result).toBe(true); // Should silence even without outcomes
+    expect(result).toBe(true);
     db.close();
   });
 });
@@ -1647,17 +1576,27 @@ describe('consecutive rejection silencing', () => {
 // ─── filterAutoLoadedSkills ─────────────────────────────────────────────────
 
 describe('filterAutoLoadedSkills', () => {
-  it('filters skills with any non-empty invocation_name (plugin-namespaced or user-installed)', () => {
+  it('filters plugin-namespaced skills (auto-loaded via hooks)', () => {
     const results = [
       { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development' },
       { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging' },
-      { name: 'code-review-expert', type: 'skill', invocation_name: 'code-review-expert' },
       { name: 'frontend-design', type: 'skill', invocation_name: 'frontend-design:frontend-design' },
       { name: 'community-only', type: 'skill', invocation_name: '' },
     ];
     const filtered = _filterAutoLoadedSkills(results);
     expect(filtered).toHaveLength(1);
     expect(filtered[0].name).toBe('community-only');
+  });
+
+  it('keeps standalone installed skills (no plugin namespace)', () => {
+    const results = [
+      { name: 'claude-code-plugin-dev', type: 'skill', invocation_name: 'claude-code-plugin-dev' },
+      { name: 'build-error-resolver', type: 'skill', invocation_name: 'build-error-resolver' },
+      { name: 'community-tool', type: 'skill', invocation_name: '' },
+      { name: 'another-community', type: 'skill' },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(4);
   });
 
   it('keeps agents regardless of invocation_name', () => {
@@ -1678,16 +1617,15 @@ describe('filterAutoLoadedSkills', () => {
     expect(filtered).toHaveLength(2);
   });
 
-  it('filters skills with non-empty invocation_name (user-installed)', () => {
+  it('distinguishes plugin-namespaced from standalone installed', () => {
     const results = [
-      { name: 'claude-code-plugin-dev', type: 'skill', invocation_name: 'claude-code-plugin-dev' },
-      { name: 'build-error-resolver', type: 'skill', invocation_name: 'build-error-resolver' },
+      { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging' },
+      { name: 'code-review-expert', type: 'skill', invocation_name: 'code-review-expert' },
       { name: 'community-tool', type: 'skill', invocation_name: '' },
-      { name: 'another-community', type: 'skill' },
     ];
     const filtered = _filterAutoLoadedSkills(results);
     expect(filtered).toHaveLength(2);
-    expect(filtered.map(r => r.name)).toEqual(['community-tool', 'another-community']);
+    expect(filtered.map(r => r.name)).toEqual(['code-review-expert', 'community-tool']);
   });
 });
 

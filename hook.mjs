@@ -20,7 +20,7 @@ import {
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { selectWithTokenBudget, updateClaudeMd, buildSummaryLines } from './hook-context.mjs';
-import { dispatchOnSessionStart, dispatchOnPreToolUse, dispatchOnUserPrompt } from './dispatch.mjs';
+import { dispatchOnPreToolUse, dispatchOnUserPrompt } from './dispatch.mjs';
 import { collectFeedback } from './dispatch-feedback.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
@@ -29,6 +29,7 @@ import {
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
   resetInjectionBudget, hasInjectionBudget, incrementInjection,
+  cachePrevContext, readAndClearPrevContext,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
@@ -798,20 +799,13 @@ async function handleSessionStart() {
     // CLAUDE.md: slim (summary + handoff state — observations already in stdout)
     updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
 
-    // Dispatch: recommend skill/agent based on session context
-    try {
-      const rdb = getRegistryDb();
-      if (rdb && hasInjectionBudget()) {
-        // Build prompt context with fallbacks: next_steps → request → completed (empty = no dispatch)
-        const promptCtx = latestSummary?.next_steps || latestSummary?.request || latestSummary?.completed || '';
-        const hasHandoff = !!prevSessionId;  // prevSessionId set when /clear or rapid restart detected
-        const dispatchResult = await dispatchOnSessionStart(rdb, promptCtx, sessionId, { hasHandoff });
-        if (dispatchResult) {
-          process.stdout.write(dispatchResult + '\n');
-          incrementInjection();
-        }
-      }
-    } catch (e) { debugCatch(e, 'handleSessionStart-dispatch'); }
+    // Cache previous session context for user-prompt dispatch enrichment.
+    // Session-start has project history but zero user intent — dispatching here
+    // produced 0/119 adoption. Instead, cache next_steps and combine with
+    // the first user-prompt for richer signal (see handleUserPrompt).
+    if (latestSummary?.next_steps) {
+      cachePrevContext(latestSummary.next_steps);
+    }
 
     // Background rescan: detect changed/new managed resources since last scan.
     // TTL-based (1h) — avoids redundant filesystem scans on every session.
@@ -967,13 +961,13 @@ async function handleUserPrompt() {
 
   // Dispatch: recommend skill/agent based on user's actual prompt.
   // This is the ideal dispatch point — fires when the user submits their prompt,
-  // before Claude starts working. SessionStart uses stale next_steps from previous session;
-  // PreToolUse fires too late (after Claude committed to an approach via read-only tools).
-  // Cooldown + session dedup (invocations table) prevents double-recommending with SessionStart.
+  // before Claude starts working. Previous session's next_steps (cached at session-start)
+  // enriches the signal when available, combining project history with user intent.
   try {
     const rdb = getRegistryDb();
     if (rdb && hasInjectionBudget()) {
-      const result = await dispatchOnUserPrompt(rdb, promptText, sessionId);
+      const prevContext = readAndClearPrevContext();
+      const result = await dispatchOnUserPrompt(rdb, promptText, sessionId, { prevContext });
       if (result) {
         process.stdout.write(result + '\n');
         incrementInjection();

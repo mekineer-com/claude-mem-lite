@@ -38,6 +38,7 @@ const RESOURCES_SCHEMA = `
     adopt_count       INTEGER DEFAULT 0,
     success_count     INTEGER DEFAULT 0,
     silenced_until TEXT,
+    cooldown_hours    INTEGER DEFAULT 0,
     indexed_at    TEXT,
     created_at    TEXT DEFAULT (datetime('now')),
     updated_at    TEXT DEFAULT (datetime('now'))
@@ -162,6 +163,7 @@ export function ensureRegistryDb(dbPath) {
     const resCols = new Set(db.prepare("PRAGMA table_info(resources)").all().map(c => c.name));
     if (!resCols.has('invocation_name')) db.exec("ALTER TABLE resources ADD COLUMN invocation_name TEXT DEFAULT ''");
     if (!resCols.has('silenced_until')) db.exec("ALTER TABLE resources ADD COLUMN silenced_until TEXT");
+    if (!resCols.has('cooldown_hours')) db.exec("ALTER TABLE resources ADD COLUMN cooldown_hours INTEGER DEFAULT 0");
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
   // FTS5 + triggers: only create if not exists

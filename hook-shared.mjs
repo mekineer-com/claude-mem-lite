@@ -140,6 +140,27 @@ export function incrementInjection() { _injectionCount++; }
 export function resetInjectionBudget() { _injectionCount = 0; }
 export function hasInjectionBudget() { return _injectionCount < MAX_INJECTIONS_PER_SESSION; }
 
+// ─── Previous Session Context (for user-prompt dispatch enrichment) ──────────
+// Session-start caches next_steps; first user-prompt reads+clears for richer dispatch.
+
+export function prevContextFile() {
+  return join(RUNTIME_DIR, `prev-context-${inferProject()}`);
+}
+
+export function cachePrevContext(nextSteps) {
+  try { writeFileSync(prevContextFile(), JSON.stringify({ nextSteps, ts: Date.now() })); } catch {}
+}
+
+export function readAndClearPrevContext() {
+  const file = prevContextFile();
+  try {
+    const data = JSON.parse(readFileSync(file, 'utf8'));
+    try { unlinkSync(file); } catch {}
+    if (Date.now() - data.ts > 12 * 3600000) return null; // 12h expiry
+    return data.nextSteps || null;
+  } catch { return null; }
+}
+
 // ─── Tool Event Tracking (for dispatch feedback) ────────────────────────────
 // PostToolUse appends feedback-relevant tool events (Skill, Task, Edit, Write, Bash errors).
 // Stop handler reads them and passes to collectFeedback for adoption/outcome detection.

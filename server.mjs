@@ -56,6 +56,27 @@ function getRegistryDb() {
 
 // inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate, fmtDate imported from utils.mjs
 
+// ─── Project Name Resolution ────────────────────────────────────────────────
+// Users naturally type short names like "mem" but inferProject() stores
+// "projects--mem" (parent--base from CWD). resolveProject() bridges this gap.
+
+const _projectCache = new Map();
+
+function resolveProject(name) {
+  if (!name) return name;
+  if (_projectCache.has(name)) return _projectCache.get(name);
+  // Already a canonical name (contains "--")? Use as-is.
+  if (name.includes('--')) { _projectCache.set(name, name); return name; }
+  // Short name: prefer the canonical "parent--name" form (from inferProject())
+  // which typically has far more data than manually-saved short names.
+  const suffixed = db.prepare(
+    'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
+  ).get(`%--${name}`);
+  const resolved = suffixed ? suffixed.project : name;
+  _projectCache.set(name, resolved);
+  return resolved;
+}
+
 // ─── Scoring Model Constants ────────────────────────────────────────────────
 //
 // Composite scoring: BM25(weights) × recency_decay × [project_boost] × [importance] × [access_bonus]
@@ -450,6 +471,7 @@ server.registerTool(
     inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
     const limit = args.limit ?? 20;
     const offset = args.offset ?? 0;
     const ftsQuery = sanitizeFtsQuery(args.query);
@@ -510,6 +532,7 @@ server.registerTool(
     inputSchema: memTimelineSchema,
   },
   safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
     const before = args.before ?? 5;
     const after = args.after ?? 5;
     let anchorId = args.anchor;
@@ -722,6 +745,7 @@ server.registerTool(
     inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
     const now = new Date();
     const project = args.project || inferProject();
     const type = args.type || 'discovery';
@@ -774,6 +798,7 @@ server.registerTool(
     inputSchema: memStatsSchema,
   },
   safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
     const days = args.days ?? 30;
     const cutoff = Date.now() - days * 86400000;
     const projectFilter = args.project ? 'AND project = ?' : '';
@@ -869,6 +894,7 @@ server.registerTool(
     inputSchema: memCompressSchema,
   },
   safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
     const preview = args.preview !== false;
     const ageDays = args.age_days ?? 60;
     const cutoff = Date.now() - ageDays * 86400000;
@@ -981,6 +1007,7 @@ server.registerTool(
     inputSchema: memMaintainSchema,
   },
   safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
     const STALE_AGE_MS = 30 * 86400000;
     const SIMILARITY_THRESHOLD = 0.7;
     const SCAN_LIMIT = 500;

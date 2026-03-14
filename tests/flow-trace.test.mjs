@@ -334,7 +334,7 @@ describe('Pipeline integration: dispatch → feedback lifecycle', () => {
       const inv = getSessionInvocations(db, 'session-9')[0];
       expect(inv.adopted).toBe(1);
       expect(inv.outcome).toBe('partial');
-      expect(inv.score).toBe(0.5);
+      expect(inv.score).toBe(0.7); // explicit adoption (1.0) × partial outcome (0.7)
     });
   });
 

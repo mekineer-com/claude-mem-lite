@@ -1,17 +1,15 @@
-// claude-mem-lite: Dispatch orchestration — 3-tier intelligent resource dispatch
+// claude-mem-lite: Dispatch orchestration — 2-tier intelligent resource dispatch
 // Tier 0: Local fast filter (<1ms)
 // Tier 1: Context signal extraction (<1ms)
 // Tier 2: Enhanced FTS5 retrieval (<5ms)
-// Tier 3: Haiku semantic dispatch (~500ms, only when needed)
 
 import { basename, join } from 'path';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
 import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
-import { callHaikuJSON } from './haiku-client.mjs';
-import { debugCatch, truncate } from './utils.mjs';
-import { peekToolEvents, RUNTIME_DIR } from './hook-shared.mjs';
+import { debugCatch } from './utils.mjs';
+import { peekToolEvents } from './hook-shared.mjs';
 import { detectActiveSuite, shouldRecommendForStage, detectExplicitRequest, inferCurrentStage } from './dispatch-workflow.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -28,74 +26,6 @@ export const SESSION_RECOMMEND_CAP = 3;
 // Minimum absolute BM25 composite score to recommend. Typical good matches score 5-50;
 // this filters only near-zero noise matches from incidental text overlap.
 export const BM25_MIN_THRESHOLD = 1.5;
-
-// Minimum confidence from Haiku semantic dispatch to replace FTS5 results.
-// Prevents low-confidence Haiku queries (e.g. 0.2) from overriding good FTS5 matches.
-export const HAIKU_CONFIDENCE_THRESHOLD = 0.6;
-
-// ─── Haiku Circuit Breaker ──────────────────────────────────────────────────
-// Prevents cascading latency when Haiku API is down or slow.
-// After BREAKER_THRESHOLD consecutive failures, disable for BREAKER_RESET_MS.
-// KNOWN LIMITATION: File-based state has a TOCTOU race under concurrent hook
-// processes. Worst case: breaker trips on failure N+1 instead of N. This is
-// acceptable — the breaker is a latency guard, not a correctness mechanism.
-
-const BREAKER_THRESHOLD = 3;
-const BREAKER_RESET_MS = 5 * 60 * 1000; // 5 minutes
-let breakerFile = join(RUNTIME_DIR, 'haiku-breaker.json');
-
-function _readBreakerState() {
-  try {
-    if (!existsSync(breakerFile)) return { failures: 0, openUntil: 0 };
-    return JSON.parse(readFileSync(breakerFile, 'utf8'));
-  } catch { return { failures: 0, openUntil: 0 }; }
-}
-
-function _writeBreakerState(state) {
-  try { writeFileSync(breakerFile, JSON.stringify(state)); } catch {}
-}
-
-/** Override breaker file path (for testing isolation). */
-export function _setBreakerFile(path) { breakerFile = path; }
-
-function isHaikuCircuitOpen() {
-  const state = _readBreakerState();
-  if (state.openUntil > 0 && Date.now() < state.openUntil) return true;
-  if (state.openUntil > 0 && Date.now() >= state.openUntil) {
-    // Half-open: single probe failure re-trips immediately
-    _writeBreakerState({ failures: BREAKER_THRESHOLD - 1, openUntil: 0 });
-  }
-  return false;
-}
-
-function recordHaikuSuccess() {
-  _writeBreakerState({ failures: 0, openUntil: 0 });
-}
-
-// NOTE: read-modify-write without file locking — concurrent hook processes may lose
-// one increment. Acceptable: threshold is 3, worst case trips on 4th failure instead.
-function recordHaikuFailure() {
-  const state = _readBreakerState();
-  state.failures++;
-  if (state.failures >= BREAKER_THRESHOLD) {
-    state.openUntil = Date.now() + BREAKER_RESET_MS;
-  }
-  _writeBreakerState(state);
-}
-
-/** Reset circuit breaker state (for testing). */
-export function _resetCircuitBreaker() {
-  _writeBreakerState({ failures: 0, openUntil: 0 });
-}
-
-/** Simulate Haiku failure (for testing). */
-export function _recordHaikuFailure() { recordHaikuFailure(); }
-
-/** Simulate Haiku success (for testing). */
-export function _recordHaikuSuccess() { recordHaikuSuccess(); }
-
-/** Check if circuit is open (for testing). */
-export function _isHaikuCircuitOpen() { return isHaikuCircuitOpen(); }
 
 // ─── Project Domain Detection ─────────────────────────────────────────────────
 
@@ -575,49 +505,6 @@ function extractErrorDomain(cmd, response) {
   return 'error';
 }
 
-// ─── Tier 3: Haiku Semantic Dispatch ─────────────────────────────────────────
-
-/**
- * Check if Haiku dispatch is needed based on FTS5 results.
- * Uses relative confidence: top result must be strong enough relative to result set,
- * and gap between top two must be decisive.
- * @param {object[]} results FTS5 results with relevance scores
- * @returns {boolean} true if Haiku should be called
- */
-export function needsHaikuDispatch(results) {
-  // DISABLED: 0/58 adoption rate. Haiku semantic dispatch adds ~500ms latency
-  // and API cost with zero proven value. FTS5 BM25 composite scoring is sufficient.
-  // When FTS5 confidence is low, returning null is better than escalating to Haiku.
-  return false;
-}
-
-/**
- * Call Haiku LLM to semantically resolve the best resource query.
- * @param {string} userPrompt User's prompt text
- * @param {string} toolContext Current tool action context
- * @returns {Promise<{query: string, type: string, confidence: number}|null>} Haiku result or null
- */
-async function haikuDispatch(userPrompt, toolContext) {
-  // Circuit breaker: skip if Haiku is tripped
-  if (isHaikuCircuitOpen()) return null;
-
-  const prompt = `Given this coding context, which resource (skill or agent) would be most helpful?
-Return ONLY valid JSON.
-
-User intent: ${truncate(userPrompt || '', 200)}
-Current action: ${truncate(toolContext || '', 200)}
-
-JSON: {"query":"search keywords for finding the right skill or agent","type":"skill|agent|either","confidence":0.0-1.0}`;
-
-  const result = await callHaikuJSON(prompt, { timeout: 3000, maxTokens: 100 });
-  if (result) {
-    recordHaikuSuccess();
-  } else {
-    recordHaikuFailure();
-  }
-  return result;
-}
-
 // ─── Cooldown & Dedup (DB-persisted, survives process restarts) ─────────────
 
 /**
@@ -683,15 +570,15 @@ function getPerResourceCooldown(db, resourceId, globalCd) {
 
 const CONSECUTIVE_REJECT_THRESHOLD = 8;
 const CONSECUTIVE_REJECT_WINDOW_DAYS = 7;
-const SILENCE_DAYS = 30;
+const BASE_COOLDOWN_HOURS = 1;
+const MAX_COOLDOWN_HOURS = 256; // ~10.7 days cap
+const COOLDOWN_RESET_DAYS = 7;  // Reset backoff if no recommendation in 7 days
 
 /**
  * Check if a resource has been consecutively rejected (not adopted) in recent history.
- * Uses adopted=0 (default) instead of outcome IS NOT NULL to avoid feedback timing issues.
- *
- * Side-effect: when threshold is met, sets silenced_until on the resource row
- * to hard-silence it for SILENCE_DAYS. This write is intentional — the check
- * and silence are an atomic decision to avoid re-evaluating on every call.
+ * Uses exponential backoff instead of binary 30-day silence:
+ *   1h → 2h → 4h → 8h → ... → 256h (cap)
+ * Backoff resets after COOLDOWN_RESET_DAYS of no recommendations.
  *
  * @param {Database} db Registry database
  * @param {number} resourceId Resource ID
@@ -699,11 +586,24 @@ const SILENCE_DAYS = 30;
  */
 function isConsecutivelyRejected(db, resourceId) {
   try {
-    // Check hard-silence first (most efficient)
-    const silenced = db.prepare(
-      `SELECT 1 FROM resources WHERE id = ? AND silenced_until > datetime('now')`
+    // Check active silence first (most efficient)
+    const res = db.prepare(
+      `SELECT silenced_until, cooldown_hours FROM resources WHERE id = ?`
     ).get(resourceId);
-    if (silenced) return true;
+    if (!res) return false;
+    if (res.silenced_until && new Date(res.silenced_until) > new Date()) return true;
+
+    // Reset backoff if no recommendation in COOLDOWN_RESET_DAYS
+    const lastRec = db.prepare(
+      `SELECT created_at FROM invocations WHERE resource_id = ? AND recommended = 1 ORDER BY created_at DESC LIMIT 1`
+    ).get(resourceId);
+    if (lastRec) {
+      const daysSince = (Date.now() - new Date(lastRec.created_at).getTime()) / 86400000;
+      if (daysSince > COOLDOWN_RESET_DAYS && (res.cooldown_hours || 0) > 0) {
+        db.prepare('UPDATE resources SET cooldown_hours = 0, silenced_until = NULL WHERE id = ?').run(resourceId);
+        return false;
+      }
+    }
 
     const recent = db.prepare(`
       SELECT adopted FROM invocations
@@ -716,11 +616,17 @@ function isConsecutivelyRejected(db, resourceId) {
     if (recent.length < CONSECUTIVE_REJECT_THRESHOLD) return false;
     if (!recent.every(r => r.adopted === 0)) return false;
 
-    // Hard-silence: set silenced_until on the resource
+    // Exponential backoff: double cooldown each cycle (or start at base)
+    const currentHours = res.cooldown_hours || 0;
+    const nextHours = Math.min(
+      currentHours === 0 ? BASE_COOLDOWN_HOURS : currentHours * 2,
+      MAX_COOLDOWN_HOURS
+    );
+
     try {
       db.prepare(
-        `UPDATE resources SET silenced_until = datetime('now', ?) WHERE id = ?`
-      ).run(`+${SILENCE_DAYS} days`, resourceId);
+        `UPDATE resources SET silenced_until = datetime('now', '+${nextHours} hours'), cooldown_hours = ? WHERE id = ?`
+      ).run(nextHours, resourceId);
     } catch { /* best-effort */ }
     return true;
   } catch { return false; }
@@ -848,7 +754,7 @@ function passesConfidenceGate(results, signals) {
   // No structured intent → skip gate (rawKeywords match FTS5 text columns, not intent_tags)
   if (intentTokens.length === 0) return results;
 
-  // Expand intent tokens through DISPATCH_SYNONYMS so "fast" also matches "performance", etc.
+  // Expand ALL intent tokens through DISPATCH_SYNONYMS
   const rawKw = signals?.rawKeywords || [];
   const intentSet = new Set([...intentTokens, ...rawKw]);
   for (const token of intentTokens) {
@@ -856,29 +762,55 @@ function passesConfidenceGate(results, signals) {
     if (syns) for (const s of syns) intentSet.add(s);
   }
 
-  return results.filter(r => {
+  // Filter: resource must match at least one intent
+  const passing = results.filter(r => {
     const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/).filter(Boolean);
     return tags.some(t => intentSet.has(t));
   });
+
+  // Primary intent preference: when multiple intents extracted (e.g. "fix,commit"),
+  // prefer resources matching the primary intent to avoid false positives from
+  // incidental context (e.g. recommending git-workflow when user primarily wants to debug).
+  if (intentTokens.length > 1 && passing.length > 1) {
+    const primaryIntent = signals?.primaryIntent || intentTokens[0] || '';
+    const primarySet = new Set([primaryIntent, ...rawKw]);
+    const primarySyns = DISPATCH_SYNONYMS[primaryIntent];
+    if (primarySyns) for (const s of primarySyns) primarySet.add(s);
+
+    const primaryMatches = passing.filter(r => {
+      const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/).filter(Boolean);
+      return tags.some(t => primarySet.has(t));
+    });
+    if (primaryMatches.length > 0) return primaryMatches;
+  }
+
+  return passing;
 }
 
 // ─── Auto-loaded Skill Filter ────────────────────────────────────────────────
 
 /**
- * Filter out skills that are already available to Claude Code.
- * Two categories filtered:
- * 1. Plugin-namespaced skills (invocation_name contains ':') — auto-loaded in system-reminder
- * 2. User-installed skills (non-empty invocation_name without ':') — already in ~/.claude/skills/
- * Only community resources (empty/null invocation_name) should be recommended.
+ * Filter out skills that are auto-loaded via plugin hooks (listed in system-reminder).
+ * These skills don't need dispatch recommendations because the plugin's own hooks
+ * already surface them to Claude at the right moment.
+ *
+ * User-installed standalone skills (non-namespaced invocation_name like "build-error-resolver")
+ * are KEPT — users may not remember to invoke them at the right time, so contextual
+ * recommendations still add value (installed skills have 11.5% adoption vs 6.1% community).
+ *
  * @param {object[]} results FTS5 results
- * @returns {object[]} Filtered results — community resources only
+ * @returns {object[]} Filtered results — community + standalone installed skills
  */
 function filterAutoLoadedSkills(results) {
   return results.filter(r => {
     if (r.type !== 'skill') return true;
     const inv = (r.invocation_name || '').trim();
-    // Any non-empty invocation_name means this skill is already installed/available
-    return inv === '';
+    if (inv === '') return true; // Community resource — always recommend
+    // Plugin-namespaced skills (e.g. "superpowers:systematic-debugging") are auto-loaded
+    // via the plugin's own hooks in system-reminder — dispatch recommendation is redundant
+    if (inv.includes(':')) return false;
+    // Standalone installed skills (e.g. "build-error-resolver") — keep for contextual recommendations
+    return true;
   });
 }
 
@@ -1011,28 +943,6 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
 
     results = postProcessResults(results, signals, db);
 
-    let tier = 2;
-
-    // Tier 3: Haiku semantic fallback (SessionStart has 10s budget)
-    if (needsHaikuDispatch(results)) {
-      tier = 3;
-      const haikuResult = await haikuDispatch(userPrompt, '');
-      if (haikuResult?.query && (haikuResult.confidence ?? 0) >= HAIKU_CONFIDENCE_THRESHOLD) {
-        const haikuQuery = buildQueryFromText(haikuResult.query);
-        if (haikuQuery) {
-          let haikuResults = retrieveResources(db, haikuQuery, {
-            type: haikuResult.type === 'either' ? undefined : haikuResult.type,
-            limit: 3,
-            projectDomains,
-          });
-          if (haikuResults.length > 0) {
-            haikuResults = postProcessResults(haikuResults, signals, db);
-            if (haikuResults.length > 0) results = haikuResults;
-          }
-        }
-      }
-    }
-
     if (results.length === 0) return null;
 
     // Filter by DB-persisted cooldown + session dedup (hoisted cap + cooldown avoids N queries)
@@ -1050,7 +960,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
       resource_id: best.id,
       session_id: sessionId || null,
       trigger: 'session_start',
-      tier,
+      tier: 2,
       recommended: 1,
     });
     updateResourceStats(db, best.id, 'recommend_count');
@@ -1071,7 +981,7 @@ export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHan
  * @param {string} [sessionId] Session identifier for dedup
  * @returns {Promise<string|null>} Injection text or null
  */
-export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionEvents } = {}) {
+export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionEvents, prevContext } = {}) {
   if (!userPrompt || !db) return null;
 
   try {
@@ -1101,8 +1011,14 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
 
     const projectDomains = detectProjectDomains();
 
+    // Enrich prompt with previous session context (cached at session-start).
+    // Combines project history (next_steps) with user intent for richer signal.
+    const enrichedPrompt = prevContext
+      ? `${userPrompt}\n[Previous session: ${prevContext}]`
+      : userPrompt;
+
     // Intent-aware enhanced query (column-targeted)
-    const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt });
+    const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt: enrichedPrompt });
 
     // Check if active suite covers the current stage
     if (activeSuite) {
@@ -1139,9 +1055,6 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
     results = postProcessResults(results, signals, db);
 
     if (results.length === 0) return null;
-
-    // Low confidence → skip (no Haiku in user_prompt path — stay fast)
-    if (needsHaikuDispatch(results)) return null;
 
     // Filter by cooldown + session dedup (hoisted cap + cooldown avoids N queries)
     if (sessionId && isSessionCapped(db, sessionId)) return null;
@@ -1212,11 +1125,6 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     results = postProcessResults(results, signals, db);
     if (results.length === 0) return null;
 
-    const tier = 2; // Tier 3 disabled for PreToolUse — 2s hook timeout insufficient
-
-    // Low-confidence results: skip recommendation rather than suggest unreliable match
-    if (needsHaikuDispatch(results)) return null;
-
     // Apply DB-persisted cooldown and session dedup (hoisted cap + cooldown avoids N queries)
     const sid = sessionCtx.sessionId || null;
     if (sid && isSessionCapped(db, sid)) return null;
@@ -1232,7 +1140,7 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
       resource_id: best.id,
       session_id: sid,
       trigger: 'pre_tool_use',
-      tier,
+      tier: 2,
       recommended: 1,
     });
     updateResourceStats(db, best.id, 'recommend_count');

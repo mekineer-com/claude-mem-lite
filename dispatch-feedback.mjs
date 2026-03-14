@@ -60,26 +60,80 @@ function detectSkillAdoption(resourceName, invocationName, skillInput) {
 }
 
 /**
- * Check if a recommended resource was adopted in the session events.
+ * Check if event timestamp is within the behavioral detection window.
+ * @param {number} eventTs Event timestamp (ms)
+ * @param {number} recTime Recommendation time (ms)
+ * @param {number} windowMs Window size (default 10 minutes)
+ * @returns {boolean}
+ */
+const BEHAVIORAL_WINDOW_MS = 600000; // 10 minutes (widened from 2 min for methodology skills)
+
+function isWithinWindow(eventTs, recTime, windowMs = BEHAVIORAL_WINDOW_MS) {
+  if (!recTime || !eventTs) return true; // No timestamps → assume within window
+  const delta = eventTs - recTime;
+  return delta >= 0 && delta <= windowMs;
+}
+
+/**
+ * Detect TDD pattern: Bash(test fail) → Edit → Bash(test pass)
+ */
+function detectTDDPattern(events, recTime) {
+  let testFailed = false, edited = false;
+  for (const e of events) {
+    if (!isWithinWindow(e.timestamp, recTime)) continue;
+    const cmd = (e.tool_input?.command || '').toLowerCase();
+    const resp = e.tool_response || '';
+    if (e.tool_name === 'Bash' && /test|jest|vitest|pytest|mocha/i.test(cmd) && /fail|error|FAIL/i.test(resp)) {
+      testFailed = true;
+    }
+    if (testFailed && EDIT_TOOLS.has(e.tool_name)) edited = true;
+    if (edited && e.tool_name === 'Bash' && /test|jest|vitest|pytest|mocha/i.test(cmd) && /pass|passed|✓|\bok\b/i.test(resp) && !/fail|error/i.test(resp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Detect verification pattern: successful test/lint/build near session end
+ */
+function detectVerificationPattern(events, recTime) {
+  const lastEvents = events.slice(-5);
+  return lastEvents.some(e => {
+    if (!isWithinWindow(e.timestamp, recTime)) return false;
+    if (e.tool_name !== 'Bash') return false;
+    const cmd = (e.tool_input?.command || '').toLowerCase();
+    const resp = e.tool_response || '';
+    const isVerifyCmd = /\b(test|lint|eslint|build|tsc|typecheck|vitest|jest)\b/.test(cmd);
+    const isSuccess = !/error|fail|exception/i.test(resp) || resp.length < 15;
+    return isVerifyCmd && isSuccess;
+  });
+}
+
+/**
+ * Multi-tier adoption detection for recommended resources.
+ * Returns { adopted: boolean, score: number } where score indicates confidence:
+ *   1.0 = explicit (Skill/Agent tool invocation)
+ *   0.5 = behavioral (detected methodology pattern: TDD, debug, review)
+ *   0.2 = inferred (verification pattern near session end)
+ *
  * @param {object} invocation Invocation record with resource info
  * @param {object[]} sessionEvents Array of tool events from the session
- * @returns {boolean} true if the resource was used
+ * @returns {{ adopted: boolean, score: number }}
  */
 function detectAdoption(invocation, sessionEvents) {
-  if (!sessionEvents || sessionEvents.length === 0) return false;
+  if (!sessionEvents || sessionEvents.length === 0) return { adopted: false, score: 0 };
 
   const { resource_name, resource_type, invocation_name } = invocation;
 
+  // Tier 1: Explicit adoption — Skill/Agent tool invocation (strongest signal)
   for (const event of sessionEvents) {
-    // Skill adoption: Claude used the Skill tool with matching name
     if (resource_type === 'skill' && event.tool_name === 'Skill') {
       if (detectSkillAdoption(resource_name, invocation_name || '', event.tool_input?.skill)) {
-        return true;
+        return { adopted: true, score: 1.0 };
       }
     }
 
-    // Agent adoption: Claude used Agent tool with matching agent type/description
-    // Normalizes hyphens/colons to spaces for comparison (e.g. "code-review-ai" ↔ "code review ai")
     if (resource_type === 'agent' && event.tool_name === 'Agent') {
       const desc = (event.tool_input?.description || '').toLowerCase();
       const prompt = (event.tool_input?.prompt || '').toLowerCase();
@@ -95,56 +149,59 @@ function detectAdoption(invocation, sessionEvents) {
           subTypeCompact === nameCompact ||
           subType.includes(nameNorm) || subType.includes(nameCompact) ||
           subTypeNorm.includes(nameNorm)) {
-        return true;
+        return { adopted: true, score: 1.0 };
       }
     }
   }
 
-  // Behavioral adoption: detect usage patterns matching the recommended resource
-  // Only count patterns starting within 2 minutes of the recommendation to avoid
-  // false positives from coincidental user behavior (e.g. debugging regardless of rec)
+  // Tier 2: Behavioral adoption — methodology patterns (10 min window)
   const resourceLower = resource_name.toLowerCase();
   const recTime = invocation.created_at ? new Date(invocation.created_at).getTime() : 0;
-  const BEHAVIORAL_WINDOW_MS = 120000; // 2 minutes
 
-  // Debugging pattern: Read→Bash(error)→Read→Edit cycle
+  // TDD pattern: Bash(test fail) → Edit → Bash(test pass)
+  if (resourceLower.includes('tdd') || resourceLower.includes('test-driven')) {
+    if (detectTDDPattern(sessionEvents, recTime)) {
+      return { adopted: true, score: 0.5 };
+    }
+  }
+
+  // Debugging pattern: Read → Bash(error) → Edit cycle
   if (resourceLower.includes('debug') || resourceLower.includes('troubleshoot')) {
-    // Only count if first relevant event is within behavioral window
     const firstRelevant = sessionEvents.find(e =>
       e.tool_name === 'Read' ||
       (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || ''))
     );
-    const delta = firstRelevant?.timestamp ? firstRelevant.timestamp - recTime : 0;
-    const isNearby = !recTime || !firstRelevant?.timestamp ||
-      (delta >= 0 && delta <= BEHAVIORAL_WINDOW_MS);
-
-    if (isNearby) {
+    if (isWithinWindow(firstRelevant?.timestamp, recTime)) {
       let hasRead = false, hasBashError = false, hasEditAfterError = false;
       for (const e of sessionEvents) {
         if (e.tool_name === 'Read') hasRead = true;
         if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) hasBashError = true;
         if (hasBashError && EDIT_TOOLS.has(e.tool_name)) hasEditAfterError = true;
       }
-      if (hasRead && hasBashError && hasEditAfterError) return true;
+      if (hasRead && hasBashError && hasEditAfterError) {
+        return { adopted: true, score: 0.5 };
+      }
     }
   }
 
   // Code review pattern: Agent with 'review' in prompt/description
   if (resourceLower.includes('review')) {
     for (const e of sessionEvents) {
-      if (e.tool_name === 'Agent') {
-        // Only count if event is within behavioral window
-        const delta = e.timestamp ? e.timestamp - recTime : 0;
-        const isNearby = !recTime || !e.timestamp ||
-          (delta >= 0 && delta <= BEHAVIORAL_WINDOW_MS);
-        if (!isNearby) continue;
+      if (e.tool_name === 'Agent' && isWithinWindow(e.timestamp, recTime)) {
         const text = ((e.tool_input?.prompt || '') + (e.tool_input?.description || '')).toLowerCase();
-        if (text.includes('review')) return true;
+        if (text.includes('review')) return { adopted: true, score: 0.5 };
       }
     }
   }
 
-  return false;
+  // Tier 3: Inferred adoption — verification near session end
+  if (resourceLower.includes('verif') || resourceLower.includes('quality') || resourceLower.includes('check')) {
+    if (detectVerificationPattern(sessionEvents, recTime)) {
+      return { adopted: true, score: 0.2 };
+    }
+  }
+
+  return { adopted: false, score: 0 };
 }
 
 // ─── Outcome Detection ───────────────────────────────────────────────────────
@@ -250,9 +307,11 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
       // Skip if already collected (prevents double-collection from stop + session-start)
       if (inv.outcome) continue;
 
-      const adopted = detectAdoption(inv, sessionEvents);
+      const { adopted, score: adoptScore } = detectAdoption(inv, sessionEvents);
       const outcome = adopted ? detectOutcome(sessionEvents) : 'ignored';
-      const score = adopted ? (outcome === 'success' ? 1.0 : outcome === 'partial' ? 0.5 : 0.2) : 0;
+      // Combine adoption confidence with outcome quality
+      const outcomeMultiplier = outcome === 'success' ? 1.0 : outcome === 'partial' ? 0.7 : 0.3;
+      const score = adopted ? adoptScore * outcomeMultiplier : 0;
       const rejection_reason = adopted ? null : (classifyRejection(inv, sessionEvents) || 'unclassified');
 
       // Update invocation record

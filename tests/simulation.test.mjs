@@ -14,7 +14,7 @@ import {
 import { initSchema, ensureFTS, rebuildFTS, checkFTSIntegrity } from '../schema.mjs';
 import { buildSummaryLines, computeAdaptiveWindows, selectWithTokenBudget } from '../hook-context.mjs';
 import {
-  shouldSkipDispatch, extractContextSignals, needsHaikuDispatch,
+  shouldSkipDispatch, extractContextSignals,
   isRecentlyRecommended, isSessionCapped, SESSION_RECOMMEND_CAP,
 } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
@@ -458,34 +458,7 @@ describe('Dispatch: Cooldown & Session Cap', () => {
   });
 });
 
-// DISABLED: Haiku Tier3 dispatch always returns false (0/58 adoption rate).
-describe('Dispatch: Haiku Circuit Breaker Decision (Tier3 disabled)', () => {
-  it('needsHaikuDispatch returns false for empty results (Tier3 disabled)', () => {
-    expect(needsHaikuDispatch([])).toBe(false);
-  });
-
-  it('needsHaikuDispatch returns false for strong single result', () => {
-    expect(needsHaikuDispatch([{ relevance: -10 }])).toBe(false);
-  });
-
-  it('needsHaikuDispatch returns false for weak single result (Tier3 disabled)', () => {
-    expect(needsHaikuDispatch([{ relevance: -0.5 }])).toBe(false);
-  });
-
-  it('needsHaikuDispatch returns false when top two are close (Tier3 disabled)', () => {
-    expect(needsHaikuDispatch([
-      { relevance: -5 },
-      { relevance: -4.9 },
-    ])).toBe(false);
-  });
-
-  it('needsHaikuDispatch returns false when gap is large', () => {
-    expect(needsHaikuDispatch([
-      { relevance: -10 },
-      { relevance: -2 },
-    ])).toBe(false);
-  });
-});
+// Haiku Tier3 tests removed — Haiku dispatch disabled and code removed (P5)
 
 // ─── 5. Adoption Detection ──────────────────────────────────────────────────
 
@@ -493,13 +466,13 @@ describe('Dispatch Feedback: Adoption Detection', () => {
   it('detects skill adoption by exact invocation_name match', () => {
     const inv = { resource_name: 'superpowers-tdd', resource_type: 'skill', invocation_name: 'superpowers:test-driven-development' };
     const events = [{ tool_name: 'Skill', tool_input: { skill: 'superpowers:test-driven-development' } }];
-    expect(_detectAdoption(inv, events)).toBe(true);
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 1.0 });
   });
 
   it('detects agent adoption by description match', () => {
     const inv = { resource_name: 'code-review', resource_type: 'agent' };
     const events = [{ tool_name: 'Agent', tool_input: { description: 'Perform code review', prompt: 'Review the changes' } }];
-    expect(_detectAdoption(inv, events)).toBe(true);
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 1.0 });
   });
 
   it('detects behavioral debugging adoption', () => {
@@ -509,7 +482,7 @@ describe('Dispatch Feedback: Adoption Detection', () => {
       { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: ENOENT: no such file or directory, this is a long error message' },
       { tool_name: 'Edit', tool_input: {} },
     ];
-    expect(_detectAdoption(inv, events)).toBe(true);
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 0.5 });
   });
 
   it('does not detect adoption for unrelated events', () => {
@@ -518,7 +491,7 @@ describe('Dispatch Feedback: Adoption Detection', () => {
       { tool_name: 'Read', tool_input: {} },
       { tool_name: 'Edit', tool_input: {} },
     ];
-    expect(_detectAdoption(inv, events)).toBe(false);
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: false, score: 0 });
   });
 });
 

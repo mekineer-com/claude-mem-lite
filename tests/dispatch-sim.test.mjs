@@ -7,7 +7,7 @@ import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../re
 import { shouldSkipDispatch, extractContextSignals,
   SESSION_RECOMMEND_CAP,
   dispatchOnSessionStart, dispatchOnUserPrompt, dispatchOnPreToolUse,
-  _resetCircuitBreaker, _reRankByKeywords, _applyAdoptionDecay, _passesConfidenceGate } from '../dispatch.mjs';
+  _reRankByKeywords, _applyAdoptionDecay, _passesConfidenceGate } from '../dispatch.mjs';
 import { upsertResource } from '../registry.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
@@ -329,7 +329,7 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
   beforeEach(() => {
     db = createRegistryDb();
     seedProductionCatalog(db);
-    _resetCircuitBreaker();
+    // Circuit breaker removed (P5 — Haiku dispatch disabled)
   });
   afterEach(() => { db.close(); });
 
