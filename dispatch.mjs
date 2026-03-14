@@ -746,6 +746,21 @@ function passesConfidenceGate(results, signals) {
     return Math.abs(raw) >= minThreshold;
   });
 
+  // Gap check: if top-2 results are too close in score, the query is ambiguous.
+  // This prevents recommending when multiple resources match equally well,
+  // which usually means the match is incidental rather than precise.
+  if (results.length >= 2) {
+    const top1 = Math.abs(results[0].composite_score ?? results[0].relevance ?? 0);
+    const top2 = Math.abs(results[1].composite_score ?? results[1].relevance ?? 0);
+    if (top1 > 0) {
+      const gapRatio = (top1 - top2) / top1;
+      if (gapRatio < 0.2) {
+        // Top-1 has no clear lead — ambiguous match, suppress recommendation
+        return [];
+      }
+    }
+  }
+
   // signals.intent is a comma-separated string (e.g. "test,fix"), not an array
   const intentTokens = typeof signals?.intent === 'string'
     ? signals.intent.split(',').filter(Boolean)

@@ -1337,6 +1337,54 @@ describe('passesConfidenceGate BM25 floor', () => {
   });
 });
 
+// ─── passesConfidenceGate gap-ratio check ────────────────────────────────────
+
+describe('passesConfidenceGate gap-ratio check', () => {
+  it('filters when top-2 results are too close (ambiguous query)', () => {
+    const results = [
+      { intent_tags: 'test,tdd', composite_score: -3.0 },
+      { intent_tags: 'test,coverage', composite_score: -2.8 },
+      { intent_tags: 'test', composite_score: -1.0 },
+    ];
+    const signals = { intent: 'test', primaryIntent: 'test' };
+    const filtered = passesConfidenceGate(results, signals);
+    // Gap between 3.0 and 2.8 = 0.2, ratio = 0.2/3.0 = 0.067 < 0.2 → filtered
+    expect(filtered.length).toBe(0);
+  });
+
+  it('keeps results when top-1 has clear lead over top-2', () => {
+    const results = [
+      { intent_tags: 'test,tdd', composite_score: -10.0 },
+      { intent_tags: 'test', composite_score: -3.0 },
+    ];
+    const signals = { intent: 'test', primaryIntent: 'test' };
+    const filtered = passesConfidenceGate(results, signals);
+    // Gap = 7.0, ratio = 7.0/10.0 = 0.7 > 0.2 → keeps
+    expect(filtered.length).toBeGreaterThan(0);
+  });
+
+  it('passes single result through without gap check', () => {
+    const results = [
+      { intent_tags: 'test', composite_score: -5.0 },
+    ];
+    const signals = { intent: 'test', primaryIntent: 'test' };
+    const filtered = passesConfidenceGate(results, signals);
+    expect(filtered.length).toBe(1);
+  });
+
+  it('skips gap check when top1 score is zero', () => {
+    const results = [
+      { intent_tags: 'test', composite_score: 0 },
+      { intent_tags: 'test', composite_score: 0 },
+    ];
+    const signals = { intent: 'test', primaryIntent: 'test' };
+    // top1 = 0, skip gap check (division by zero guard)
+    // But composite_score=0 means abs(0) = 0 < 0.5 minimum → filtered by BM25 floor
+    const filtered = passesConfidenceGate(results, signals);
+    expect(filtered.length).toBe(0);
+  });
+});
+
 // ─── upsertResource repo_stars protection ───────────────────────────────────
 
 describe('upsertResource repo_stars protection', () => {
