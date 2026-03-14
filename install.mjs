@@ -1854,6 +1854,75 @@ const RESOURCE_METADATA = {
 
 };
 
+// ─── Marketing / SEO resources → on_request mode ────────────────────────────
+// These resources are rarely useful during programming sessions.
+// They only surface when the user explicitly asks for marketing/SEO help.
+const MARKETING_ON_REQUEST = new Set([
+  // Skills — marketing domain
+  'skill:ab-test-setup',
+  'skill:ad-creative',
+  'skill:ai-seo',
+  'skill:analytics-tracking',
+  'skill:churn-prevention',
+  'skill:cold-email',
+  'skill:competitor-alternatives',
+  'skill:content-strategy',
+  'skill:copy-editing',
+  'skill:copywriting',
+  'skill:email-sequence',
+  'skill:form-cro',
+  'skill:free-tool-strategy',
+  'skill:launch-strategy',
+  'skill:marketing-ideas',
+  'skill:marketing-psychology',
+  'skill:onboarding-cro',
+  'skill:page-cro',
+  'skill:paid-ads',
+  'skill:paywall-upgrade-cro',
+  'skill:popup-cro',
+  'skill:pricing-strategy',
+  'skill:product-marketing-context',
+  'skill:programmatic-seo',
+  'skill:referral-program',
+  'skill:schema-markup',
+  'skill:mktg-seo-audit',
+  'skill:signup-flow-cro',
+  'skill:social-content',
+  // Skills — SEO domain
+  'skill:seo-audit',
+  'skill:seo-competitor-pages',
+  'skill:seo-content',
+  'skill:seo-geo',
+  'skill:seo-hreflang',
+  'skill:seo-images',
+  'skill:seo-page',
+  'skill:seo-plan',
+  'skill:seo-programmatic',
+  'skill:seo-schema',
+  'skill:seo-sitemap',
+  'skill:seo-technical',
+  // Agents — SEO
+  'agent:seo-content-agent',
+  'agent:seo-performance-agent',
+  'agent:seo-schema-agent',
+  'agent:seo-sitemap-agent',
+  'agent:seo-technical-agent',
+  'agent:seo-visual-agent',
+  'agent:seo-analysis-monitoring',
+  'agent:seo-content-creation',
+  'agent:seo-technical-optimization',
+  // Agents — marketing / sales
+  'agent:content-marketing',
+  'agent:customer-sales-automation',
+]);
+
+// Stamp recommendation_mode into metadata so both insert and update paths read it
+for (const key of MARKETING_ON_REQUEST) {
+  if (RESOURCE_METADATA[key]) {
+    RESOURCE_METADATA[key].recommendation_mode = 'on_request';
+  }
+}
+
 /**
  * Apply curated metadata to existing resource DB entries.
  * Fixes existing installs that have generic name-echo metadata.
@@ -1865,6 +1934,7 @@ function reindexKnownResources(rdb) {
       intent_tags = ?, domain_tags = ?,
       capability_summary = ?, trigger_patterns = ?,
       invocation_name = CASE WHEN ? != '' THEN ? ELSE invocation_name END,
+      recommendation_mode = CASE WHEN ? != '' THEN ? ELSE recommendation_mode END,
       updated_at = datetime('now')
     WHERE type = ? AND name = ?
   `);
@@ -1876,10 +1946,12 @@ function reindexKnownResources(rdb) {
       const type = key.slice(0, sep);
       const name = key.slice(sep + 1);
       const invName = meta.invocation_name || '';
+      const recMode = meta.recommendation_mode || '';
       update.run(
         meta.intent_tags, meta.domain_tags,
         meta.capability_summary, meta.trigger_patterns,
         invName, invName,
+        recMode, recMode,
         type, name
       );
     }
@@ -1897,9 +1969,9 @@ function registerVirtualResources(rdb) {
   const insert = rdb.prepare(`
     INSERT OR IGNORE INTO resources (name, type, status, source, local_path, invocation_name,
       intent_tags, domain_tags, capability_summary, trigger_patterns,
-      keywords, tech_stack, use_cases,
+      keywords, tech_stack, use_cases, recommendation_mode,
       created_at, updated_at)
-    VALUES (?, ?, 'active', 'preinstalled', '', ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+    VALUES (?, ?, 'active', 'preinstalled', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
   `);
 
   // Backfill FTS5 fields for existing resources that have empty keywords/tech_stack/use_cases
@@ -1930,6 +2002,7 @@ function registerVirtualResources(rdb) {
         meta.keywords || '',
         meta.tech_stack || '',
         meta.use_cases || '',
+        meta.recommendation_mode || 'proactive',
       );
       count += changes;
 
