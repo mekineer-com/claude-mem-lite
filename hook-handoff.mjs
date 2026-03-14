@@ -42,19 +42,16 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       .map(e => e.desc);
     if (pendingDescs.length > 0) unfinished = pendingDescs.join('; ');
   }
-  // Only the most recent bugfix is an "unfinished" signal (earlier ones are likely resolved)
-  if (!unfinished) {
-    const lastBugfix = completed.find(o => o.type === 'bugfix');
-    if (lastBugfix) unfinished = lastBugfix.title;
-  }
   // Enrich unfinished with full session edit history from observation narratives.
   // Since handoff is UPSERT (max 2 rows per project), storing more data is free.
+  // Always use \n---\n separator so extractUnfinishedSummary can distinguish
+  // pending work (before separator) from narrative history (after separator).
   const narratives = completed
     .filter(c => c.narrative)
     .map(c => c.narrative);
   if (narratives.length > 0) {
     const editHistory = narratives.join('\n');
-    unfinished = [unfinished, editHistory].filter(Boolean).join('\n---\n');
+    unfinished += '\n---\n' + editHistory;
   }
 
   // 4. Key files — from episode snapshot + observations
@@ -98,7 +95,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     project, type, sessionId,
     truncate(workingOn, 1000),
     completed.map(c => `[${c.type}] ${c.title}`).join('\n'),
-    truncate(unfinished, 3000),
+    unfinished.length > 3000 ? unfinished.slice(0, 2999) + '…' : unfinished,
     JSON.stringify([...fileSet].slice(0, 20)),
     decisions.map(d => d.title).join('\n'),
     keywords,
@@ -116,12 +113,19 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
  * @returns {boolean}
  */
 export function detectContinuationIntent(db, promptText, project) {
-  // Stage 0: Non-expired 'clear' handoff = always continue (/clear means user is resuming)
+  // Stage 0: Non-expired 'clear' handoff — assume continuation unless long unrelated prompt
   const clearHandoff = db.prepare(`
-    SELECT created_at_epoch FROM session_handoffs WHERE project = ? AND type = 'clear'
+    SELECT created_at_epoch, match_keywords FROM session_handoffs WHERE project = ? AND type = 'clear'
   `).get(project);
   if (clearHandoff && (Date.now() - clearHandoff.created_at_epoch <= HANDOFF_EXPIRY_CLEAR)) {
-    return true;
+    // Short/ambiguous prompts: assume continuation (user may say "ok", "start", etc.)
+    if (promptText.length < 40) return true;
+    // Long prompts: check keyword overlap to confirm same-task intent
+    if (!clearHandoff.match_keywords) return true; // no keywords stored, can't verify
+    const clearPromptTokens = tokenizeHandoff(promptText);
+    const clearHandoffTokens = new Set(tokenizeHandoff(clearHandoff.match_keywords));
+    if (clearPromptTokens.some(t => clearHandoffTokens.has(t))) return true;
+    // Long prompt with zero keyword overlap → likely new task, fall through
   }
 
   // Stage 1: Explicit keyword match — always works, even without handoff
@@ -195,7 +199,11 @@ export function renderHandoffInjection(db, project) {
     lines.push('## Completed', ...handoff.completed.split('\n').map(l => `- ${l}`), '');
   }
   if (handoff.unfinished) {
-    lines.push('## Unfinished', ...handoff.unfinished.split('; ').map(l => `- ${l}`), '');
+    // Extract only the pending-work portion (before narrative history separator)
+    const pending = extractUnfinishedSummary(handoff.unfinished);
+    if (pending) {
+      lines.push('## Unfinished', ...pending.split('; ').map(l => `- ${l}`), '');
+    }
   }
   if (handoff.key_files) {
     try {

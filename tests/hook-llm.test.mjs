@@ -582,6 +582,31 @@ describe('handleLLMSummary', () => {
     expect(summaries[0].next_steps).toBe('Add refresh token rotation');
   });
 
+  it('upgrades existing fast summary instead of creating duplicate', async () => {
+    insertSession(db, { id: 'test-session', project: 'test-proj' });
+    // Simulate fast summary created by handleStop
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+      VALUES (?, ?, 'fast request', '', '', 'fast completed', '', '', '[]', '[]', 'fast', ?, ?)
+    `).run('test-session', 'test-proj', new Date().toISOString(), Date.now());
+
+    for (let i = 0; i < 3; i++) {
+      db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+        VALUES (?, ?, '', 'feature', ?, '', 'Narrative text', '', '', '[]', '[]', 1, ?, ?)
+      `).run('test-session', 'test-proj', `Observation ${i}`, new Date().toISOString(), Date.now() + i);
+    }
+
+    await handleLLMSummary();
+
+    const summaries = db.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').all('test-session');
+    // Should have exactly 1 summary (upgraded, not duplicated)
+    expect(summaries.length).toBe(1);
+    expect(summaries[0].notes).toBe('llm');
+    expect(summaries[0].request).toBe('Implementing auth system');
+    expect(summaries[0].completed).toBe('Basic auth flow with login/logout');
+  });
+
   it('skips summary when no observations exist', async () => {
     insertSession(db, { id: 'test-session', project: 'test-proj' });
 

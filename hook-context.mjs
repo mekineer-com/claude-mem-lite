@@ -168,6 +168,9 @@ export function updateClaudeMd(contextBlock) {
   const endIdx = content.indexOf(endTag);
 
   if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {
+    // Skip write if content is unchanged — reduces git noise
+    const existingSection = content.slice(startIdx, endIdx + endTag.length);
+    if (existingSection === newSection) return;
     // Replace existing section in-place — preserves surrounding content (including hint if present)
     content = content.slice(0, startIdx) + newSection + content.slice(endIdx + endTag.length);
   } else if (content.length > 0) {

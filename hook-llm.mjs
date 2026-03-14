@@ -474,17 +474,41 @@ key_decisions: Only decisions with lasting impact (library choices, architecture
         ? JSON.stringify(llmParsed.lessons) : null;
       const decisionsJson = Array.isArray(llmParsed.key_decisions) && llmParsed.key_decisions.length > 0
         ? JSON.stringify(llmParsed.key_decisions) : null;
-      db.prepare(`
-        INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, lessons, key_decisions, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?, ?, ?)
-      `).run(
-        sessionId, project,
-        llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
-        llmParsed.completed || '', llmParsed.next_steps || '',
-        llmParsed.remaining_items || '',
-        lessonsJson, decisionsJson,
-        now.toISOString(), now.getTime()
-      );
+
+      // Upgrade existing fast summary instead of creating a duplicate
+      const existingFast = db.prepare(`
+        SELECT id FROM session_summaries
+        WHERE memory_session_id = ? AND notes = 'fast'
+        LIMIT 1
+      `).get(sessionId);
+
+      if (existingFast) {
+        db.prepare(`
+          UPDATE session_summaries
+          SET request=?, investigated=?, learned=?, completed=?, next_steps=?, remaining_items=?,
+              lessons=?, key_decisions=?, notes='llm', created_at=?, created_at_epoch=?
+          WHERE id = ?
+        `).run(
+          llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
+          llmParsed.completed || '', llmParsed.next_steps || '',
+          llmParsed.remaining_items || '',
+          lessonsJson, decisionsJson,
+          now.toISOString(), now.getTime(),
+          existingFast.id
+        );
+      } else {
+        db.prepare(`
+          INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, lessons, key_decisions, created_at, created_at_epoch)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?, ?, ?)
+        `).run(
+          sessionId, project,
+          llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
+          llmParsed.completed || '', llmParsed.next_steps || '',
+          llmParsed.remaining_items || '',
+          lessonsJson, decisionsJson,
+          now.toISOString(), now.getTime()
+        );
+      }
     }
   } finally {
     db.close();

@@ -273,7 +273,7 @@ describe('buildAndSaveHandoff', () => {
     expect(row.match_keywords).toContain('hook');
   });
 
-  it('falls back to most recent bugfix for unfinished when no episode snapshot', () => {
+  it('does not treat completed bugfixes as unfinished', () => {
     seedSession(db, 's1', 'test-proj');
     seedPrompt(db, 's1', 'fix bugs', 1);
     seedObservation(db, 's1', 'test-proj', 'Fixed null pointer earlier', 'bugfix', 1, null);
@@ -282,9 +282,10 @@ describe('buildAndSaveHandoff', () => {
     buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
 
     const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj'`).get();
-    // Only the most recent bugfix (first in DESC order) is used
-    expect(row.unfinished).toContain('TypeError in dispatch');
-    expect(row.unfinished).not.toContain('Fixed null pointer');
+    // Bugfixes in completed list should NOT appear as the pending portion of unfinished
+    const pending = row.unfinished ? row.unfinished.split('\n---\n')[0] : '';
+    expect(pending).not.toContain('TypeError in dispatch');
+    expect(pending).not.toContain('Fixed null pointer');
   });
 
   it('enriches unfinished with observation narratives (full edit history)', () => {
@@ -331,11 +332,26 @@ describe('detectContinuationIntent', () => {
       VALUES ('test-proj', 'exit', 's1', 'implement handoff', 'handoff dispatch hook schema intent detection', ?)`).run(Date.now());
   });
 
-  it('Stage 0: always returns true for non-expired clear handoff regardless of prompt', () => {
+  it('Stage 0: returns true for short prompts with non-expired clear handoff', () => {
     db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
-      VALUES ('test-proj', 'clear', 's2', 'handoff work', ?)`).run(Date.now());
+      VALUES ('test-proj', 'clear', 's2', 'handoff dispatch work', ?)`).run(Date.now());
+    // Short prompts (< 40 chars) assume continuation regardless of content
     expect(detectContinuationIntent(db, 'hello how are you', 'test-proj')).toBe(true);
     expect(detectContinuationIntent(db, 'build a new REST API', 'test-proj')).toBe(true);
+  });
+
+  it('Stage 0: returns false for long unrelated prompt with clear handoff', () => {
+    db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+      VALUES ('test-proj', 'clear', 's2', 'handoff dispatch hook schema', ?)`).run(Date.now());
+    // Long prompt with zero keyword overlap → new task, don't inject stale context
+    expect(detectContinuationIntent(db, 'I want to build a completely new REST API for the customer management system from scratch', 'test-proj')).toBe(false);
+  });
+
+  it('Stage 0: returns true for long prompt with keyword overlap and clear handoff', () => {
+    db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+      VALUES ('test-proj', 'clear', 's2', 'handoff dispatch hook schema', ?)`).run(Date.now());
+    // Long prompt that mentions handoff-related terms → same task
+    expect(detectContinuationIntent(db, 'Now lets fix the schema validation issue in the handoff system that was causing problems', 'test-proj')).toBe(true);
   });
 
   it('Stage 0: expired clear handoff does not auto-match', () => {
@@ -453,6 +469,33 @@ describe('renderHandoffInjection', () => {
     const result = renderHandoffInjection(db, 'p');
     expect(result).toContain('Remaining: hook.mjs: missing EDIT_TOOLS import');
     expect(result).toContain('schema.mjs: remaining_items column needed');
+  });
+
+  it('renders only pending portion of unfinished, not narrative history', () => {
+    const unfinished = 'Edit hook.mjs: add logic; Test failed\n---\nhook.mjs: changed import order\ndispatch.mjs: fixed scoring';
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, unfinished, created_at_epoch)
+      VALUES ('p', 'clear', 's1', 'refactor', ?, ?)`).run(unfinished, Date.now());
+
+    const result = renderHandoffInjection(db, 'p');
+    // Should show pending entries
+    expect(result).toContain('add logic');
+    expect(result).toContain('Test failed');
+    // Should NOT show narrative history (after ---separator)
+    expect(result).not.toContain('changed import order');
+    expect(result).not.toContain('fixed scoring');
+  });
+
+  it('omits Unfinished section when only narrative history exists (no pending)', () => {
+    // When no episode pending entries exist, unfinished starts with separator:
+    // '\n---\nnarrative...' — extractUnfinishedSummary gets empty pending portion
+    const unfinished = '\n---\nhook.mjs: changed imports\ndispatch.mjs: fixed scoring';
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, unfinished, created_at_epoch)
+      VALUES ('p', 'clear', 's1', 'work', ?, ?)`).run(unfinished, Date.now());
+
+    const result = renderHandoffInjection(db, 'p');
+    expect(result).not.toContain('## Unfinished');
+    // Narrative history should also not leak into rendering
+    expect(result).not.toContain('changed imports');
   });
 
   it('returns null when no handoff exists', () => {

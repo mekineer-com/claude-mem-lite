@@ -279,6 +279,15 @@ describe('updateClaudeMd', () => {
     expect(content).toContain('session data');
   });
 
+  it('skips write when content is unchanged', () => {
+    const existing = `# Project\n\n<claude-mem-context>\ntest content\n</claude-mem-context>\n`;
+    writeFileSync(testClaudeMd, existing);
+    updateClaudeMd('test content');
+    const content = readFileSync(testClaudeMd, 'utf8');
+    // Content should be identical — updateClaudeMd skips write when section unchanged
+    expect(content).toBe(existing);
+  });
+
   it('preserves surrounding content when replacing', () => {
     const before = '# Header\n\nSome important config.\n\n';
     const after = '\n\n# Other Section\n\nMore stuff.\n';

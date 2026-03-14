@@ -355,6 +355,30 @@ async function handleStop() {
       // Save handoff snapshot for cross-session continuity
       try { buildAndSaveHandoff(db, sessionId, project, 'exit', episodeSnapshot); }
       catch (e) { debugCatch(e, 'handleStop-handoff'); }
+
+      // Fast summary baseline — ensures summary exists even if background LLM fails
+      try {
+        const firstPrompt = db.prepare(`
+          SELECT prompt_text FROM user_prompts
+          WHERE content_session_id = ?
+          ORDER BY prompt_number ASC LIMIT 1
+        `).get(sessionId);
+        const recentObs = db.prepare(`
+          SELECT title FROM observations
+          WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+          ORDER BY created_at_epoch DESC LIMIT 5
+        `).all(sessionId);
+        const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
+        const fastCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
+        if (fastRequest || fastCompleted) {
+          const now = new Date();
+          db.prepare(`
+            INSERT INTO session_summaries
+            (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+            VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
+          `).run(sessionId, project, fastRequest, truncate(fastCompleted, 300), now.toISOString(), now.getTime());
+        }
+      } catch (e) { debugCatch(e, 'handleStop-fast-summary'); }
     } finally {
       db.close();
     }
@@ -743,7 +767,8 @@ async function handleSessionStart() {
       handoffLines.push('### Working State (from /clear)');
       if (prevClearHandoff.working_on) handoffLines.push(`- Working on: ${truncate(prevClearHandoff.working_on, 200)}`);
       if (prevClearHandoff.unfinished) {
-        handoffLines.push(`- Unfinished: ${truncate(extractUnfinishedSummary(prevClearHandoff.unfinished), 200)}`);
+        const pendingSummary = extractUnfinishedSummary(prevClearHandoff.unfinished);
+        if (pendingSummary) handoffLines.push(`- Unfinished: ${truncate(pendingSummary, 200)}`);
       }
       if (prevClearHandoff.key_files) {
         try {
