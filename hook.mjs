@@ -390,12 +390,9 @@ async function handleStop() {
   // Always clear event file to prevent stale events accumulating if registry DB is unavailable.
   try {
     const sessionEvents = readAndClearToolEvents();
-    // Skip feedback for zero-interaction sessions (no tool events = no meaningful signal)
-    if (sessionEvents.length > 0) {
-      const rdb = getRegistryDb();
-      if (rdb) {
-        await collectFeedback(rdb, sessionId, sessionEvents);
-      }
+    const rdb = getRegistryDb();
+    if (rdb) {
+      await collectFeedback(rdb, sessionId, sessionEvents);
     }
   } catch (e) { debugCatch(e, 'handleStop-feedback'); }
 
