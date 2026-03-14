@@ -198,7 +198,7 @@ export function buildDegradedTitle(episode) {
       const errMatch = errEntry.desc.match(/→ ERROR: (.{3,80})/);
       if (errMatch) {
         // Clean JSON/noise from the error snippet
-        const cleaned = errMatch[1].replace(/[{"\[\]]/g, '').replace(/\\n/g, ' ').trim();
+        const cleaned = errMatch[1].replace(/[{"[\]]/g, '').replace(/\\n/g, ' ').trim();
         if (cleaned.length >= 4) errorHint = `: ${truncate(cleaned, 50)}`;
       }
     }
@@ -207,7 +207,13 @@ export function buildDegradedTitle(episode) {
   if (files.length > 0) {
     const names = files.map(f => basename(f)).slice(0, 3).join(', ');
     const suffix = files.length > 3 ? ` +${files.length - 3} more` : '';
-    if (hasError) return `Error in ${names}${suffix}${errorHint}`;
+    if (hasError) {
+      // Include the triggering command for richer context: "Error: dispatch.mjs — npm test failed"
+      const errEntry = episode.entries.find(e => e.isError);
+      const cmd = errEntry?.desc?.match(/^(.{3,30}?) →/)?.[1]?.trim();
+      const cmdHint = cmd ? ` — ${cmd}` : '';
+      return `Error: ${names}${suffix}${errorHint || cmdHint}`;
+    }
     if (hasEdit) return `Modified ${names}${suffix}`;
     return `Worked on ${names}${suffix}`;
   }
@@ -244,6 +250,20 @@ export function buildImmediateObservation(episode) {
     title = truncate(buildDegradedTitle(episode), 120);
   }
 
+  const ruleImportance = computeRuleImportance(episode);
+  // Low-signal degraded titles ("Error in...", "Modified...") should not inflate importance.
+  // Cap at 1 unless rule-based signals indicate genuine importance (error-in-test → 3, config → 2).
+  const LOW_SIGNAL = /^(Error (while working|in)|Modified |Worked on |Reviewed \d+ files:)/;
+  const isLowSignal = LOW_SIGNAL.test(title);
+  let importance;
+  if (isReviewPattern) {
+    importance = Math.max(2, ruleImportance);
+  } else if (isLowSignal && ruleImportance <= 2) {
+    importance = 1; // Degraded titles stay low unless rule signals critical (imp=3)
+  } else {
+    importance = ruleImportance;
+  }
+
   return {
     type: inferredType,
     title,
@@ -253,7 +273,7 @@ export function buildImmediateObservation(episode) {
     facts: [],
     files: episode.files,
     filesRead: episode.filesRead || [],
-    importance: isReviewPattern ? Math.max(2, computeRuleImportance(episode)) : computeRuleImportance(episode),
+    importance,
   };
 }
 

@@ -855,7 +855,11 @@ function filterGarbageMetadata(results) {
  * @param {number} [limit=3] Maximum results to return
  * @returns {object[]} Post-processed results
  */
-function postProcessResults(results, signals, db, limit = 3) {
+function postProcessResults(results, signals, db, limit = 3, { allowOnRequest = false } = {}) {
+  // Filter on_request resources from proactive dispatch (they're only for explicit user requests)
+  if (!allowOnRequest) {
+    results = results.filter(r => (r.recommendation_mode || 'proactive') === 'proactive');
+  }
   results = filterAutoLoadedSkills(results);
   results = filterGarbageMetadata(results);
   results = reRankByKeywords(results, signals.rawKeywords);
@@ -897,81 +901,13 @@ function buildRecommendReason(signals, { explicit = false } = {}) {
 // ─── Main Dispatch Functions ─────────────────────────────────────────────────
 
 /**
- * Dispatch on SessionStart: analyze user prompt, return best resource suggestion.
- * Only dispatches when continuing from a previous session (handoff).
- * Cold starts (no previous session) showed 0% adoption — skip dispatch entirely.
- * @param {Database} db Registry database
- * @param {string} userPrompt User's prompt text
- * @param {string} [sessionId] Session identifier for dedup
- * @param {Object} [options]
- * @param {boolean} [options.hasHandoff=false] Whether a previous session handoff exists
- * @returns {Promise<string|null>} Injection text or null
+ * Dispatch on SessionStart — permanently disabled.
+ * Data: 0/122 adoption across all session_start recommendations.
+ * Session-start context injection (Last Session, Key Context) remains active via hook.mjs.
+ * Resource dispatch at session-start adds no value — user_prompt and pre_tool_use cover all needs.
  */
-export async function dispatchOnSessionStart(db, userPrompt, sessionId, { hasHandoff = false } = {}) {
-  // DISABLED: 0/119 adoption rate across all session_start recommendations.
-  // Session-start context injection (Last Session, Key Context) remains active.
-  // Re-enable via: CLAUDE_MEM_SESSION_DISPATCH=1
-  if (!process.env.CLAUDE_MEM_SESSION_DISPATCH) return null;
-
-  if (!db) return null;
-  if (!hasHandoff) return null;  // Only dispatch when continuing from a previous session
-  if (!userPrompt) return null;  // Prompt still required for FTS query
-
-  try {
-    const projectDomains = detectProjectDomains();
-
-    // Primary: intent-aware enhanced query (column-targeted, better for mixed-domain prompts)
-    const signals = extractContextSignals({ tool_name: '_session_start' }, { userPrompt });
-    const enhancedQuery = buildEnhancedQuery(signals);
-
-    // Fetch extra results when rawKeywords present — BM25 may rank intent-matching
-    // resources above domain-specific ones; extra headroom lets reRankByKeywords promote them.
-    const fetchLimit = signals.rawKeywords.length > 0 ? 8 : 3;
-    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: fetchLimit, projectDomains }) : [];
-
-    // Fallback: broad text query (catches prompts without clear intent patterns)
-    if (results.length === 0) {
-      const textQuery = buildQueryFromText(userPrompt);
-      if (!textQuery) return null;
-      results = retrieveResources(db, textQuery, { limit: 3, projectDomains });
-      // Filter out resources matching suppressed intents (e.g. TDD for test-running prompts)
-      if (signals.suppressedIntents.length > 0) {
-        results = results.filter(r => {
-          const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/);
-          return !signals.suppressedIntents.some(s => tags.includes(s));
-        });
-      }
-    }
-
-    results = postProcessResults(results, signals, db);
-
-    if (results.length === 0) return null;
-
-    // Filter by DB-persisted cooldown + session dedup (hoisted cap + cooldown avoids N queries)
-    if (sessionId && isSessionCapped(db, sessionId)) return null;
-    const cooldown = getAdaptiveCooldown(db);
-    const viable = sessionId
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true, cooldown }))
-      : results;
-    if (viable.length === 0) return null;
-
-    const best = viable[0];
-
-    // Record invocation (also serves as cooldown/dedup marker for future checks)
-    recordInvocation(db, {
-      resource_id: best.id,
-      session_id: sessionId || null,
-      trigger: 'session_start',
-      tier: 2,
-      recommended: 1,
-    });
-    updateResourceStats(db, best.id, 'recommend_count');
-
-    return renderInjection(best, buildRecommendReason(signals));
-  } catch (e) {
-    debugCatch(e, 'dispatchOnSessionStart');
-    return null;
-  }
+export async function dispatchOnSessionStart() {
+  return null;
 }
 
 /**

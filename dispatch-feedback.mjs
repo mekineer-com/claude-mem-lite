@@ -2,7 +2,7 @@
 // Runs at Stop hook to track adoption and outcomes of recommendations
 
 import { getSessionInvocations, updateInvocation, updateResourceStats } from './registry.mjs';
-import { debugCatch, EDIT_TOOLS } from './utils.mjs';
+import { debugCatch, debugLog, EDIT_TOOLS } from './utils.mjs';
 
 // ─── Adoption Detection ──────────────────────────────────────────────────────
 
@@ -69,7 +69,7 @@ function detectSkillAdoption(resourceName, invocationName, skillInput) {
 const BEHAVIORAL_WINDOW_MS = 600000; // 10 minutes (widened from 2 min for methodology skills)
 
 function isWithinWindow(eventTs, recTime, windowMs = BEHAVIORAL_WINDOW_MS) {
-  if (recTime == null || eventTs == null) return true; // No timestamps → assume within window
+  if (recTime === null || recTime === undefined || eventTs === null || eventTs === undefined) return true;
   const delta = eventTs - recTime;
   return delta >= 0 && delta <= windowMs;
 }
@@ -330,8 +330,34 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
         }
       }
     }
+
+    // Auto-demote zombie resources: >10 recommendations with 0 adoptions → on_request mode
+    // This prevents chronic false positives from continuing to waste recommendation slots
+    autodemoteZombies(db);
   } catch (e) {
     debugCatch(e, 'collectFeedback');
+  }
+}
+
+/**
+ * Auto-demote resources with high recommendation count and zero adoption to on_request mode.
+ * Zombie threshold: recommend_count > 10 AND adopt_count = 0.
+ * Only demotes resources currently in 'proactive' mode.
+ */
+function autodemoteZombies(db) {
+  try {
+    const demoted = db.prepare(`
+      UPDATE resources SET recommendation_mode = 'on_request', updated_at = datetime('now')
+      WHERE COALESCE(recommend_count, 0) > 10
+        AND COALESCE(adopt_count, 0) = 0
+        AND COALESCE(recommendation_mode, 'proactive') = 'proactive'
+        AND status = 'active'
+    `).run();
+    if (demoted.changes > 0) {
+      debugLog('INFO', 'feedback', `auto-demoted ${demoted.changes} zombie resources to on_request`);
+    }
+  } catch (e) {
+    debugCatch(e, 'autodemoteZombies');
   }
 }
 

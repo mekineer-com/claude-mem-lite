@@ -164,8 +164,9 @@ export function updateClaudeMd(contextBlock) {
   const hintComment = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
   const newSection = `${startTag}\n${contextBlock}\n${endTag}`;
 
-  const startIdx = content.indexOf(startTag);
-  // Use lastIndexOf for end tag to handle multiple/mismatched sections
+  // Use lastIndexOf for both tags — prevents matching documentation references
+  // to <claude-mem-context> that appear in code/markdown before the actual context block
+  const startIdx = content.lastIndexOf(startTag);
   const endIdx = content.lastIndexOf(endTag);
 
   if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {

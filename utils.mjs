@@ -458,12 +458,10 @@ export function computeRuleImportance(episode) {
     if (files.some(f => /\.config\.|tsconfig|Dockerfile|docker-compose|package\.json|\.yml$|\.yaml$/i.test(basename(f))) && importance < 2) importance = 2;
   }
 
-  // Tool diversity: Edit + Bash + another tool = complete dev cycle
-  if (toolTypes.size >= 3 && toolTypes.has('Edit') && importance < 2) importance = 2;
   // Debug cycle: error followed by edit = active debugging
   if (hasErrorThenEdit && importance < 2) importance = 2;
-  // Broad change: many files touched
-  if ((episode.files || []).length >= 5 && importance < 2) importance = 2;
+  // Broad change: many files touched (8+ indicates significant scope)
+  if ((episode.files || []).length >= 8 && importance < 2) importance = 2;
 
   return importance;
 }

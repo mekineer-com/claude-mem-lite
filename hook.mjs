@@ -152,7 +152,7 @@ async function handlePostToolUse() {
   if (tool_name.startsWith('mem_') || tool_name.startsWith('mcp__mem__') || tool_name.startsWith('mcp__plugin_claude-mem-lite')) return;
   if (tool_name.startsWith('mcp__sequential') || tool_name.startsWith('mcp__plugin_context7')) return;
 
-  const resp = typeof tool_response === 'string' ? tool_response : JSON.stringify(tool_response || '');
+  const resp = normalizeToolResponse(tool_response);
   if (!resp || resp.length < 10) return;
 
   const toolInput = typeof tool_input === 'string' ? tryParseJson(tool_input) : (tool_input || {});
@@ -1070,6 +1070,42 @@ function readStdin() {
 
 function tryParseJson(str) {
   try { return JSON.parse(str); } catch { return {}; }
+}
+
+// Strip ANSI escape codes and extract readable text from tool responses.
+// Bash responses come as {stdout, stderr} objects or JSON strings — extract the text content
+// instead of producing noisy `{"stdout":"\u001b[1m..."}` in episode descriptions.
+// eslint-disable-next-line no-control-regex
+const ANSI_RE = /\u001b\[[0-9;]*[a-zA-Z]/g;
+function extractStdio(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const { stdout, stderr } = obj;
+  if (typeof stdout === 'string' || typeof stderr === 'string') {
+    const parts = [];
+    if (stdout) parts.push(stdout);
+    if (stderr) parts.push(stderr);
+    return parts.join('\n');
+  }
+  return null;
+}
+function normalizeToolResponse(toolResponse) {
+  if (typeof toolResponse === 'string') {
+    // Try to parse JSON strings like '{"stdout":"...","stderr":"..."}'
+    if (toolResponse.startsWith('{"stdout"') || toolResponse.startsWith('{"stderr"')) {
+      try {
+        const parsed = JSON.parse(toolResponse);
+        const extracted = extractStdio(parsed);
+        if (extracted) return extracted.replace(ANSI_RE, '');
+      } catch {}
+    }
+    return toolResponse.replace(ANSI_RE, '');
+  }
+  if (toolResponse && typeof toolResponse === 'object') {
+    const extracted = extractStdio(toolResponse);
+    if (extracted) return extracted.replace(ANSI_RE, '');
+    return JSON.stringify(toolResponse).replace(ANSI_RE, '');
+  }
+  return '';
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────

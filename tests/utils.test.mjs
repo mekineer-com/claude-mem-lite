@@ -422,13 +422,13 @@ describe('computeRuleImportance', () => {
     expect(computeRuleImportance(ep)).toBe(1);
   });
 
-  it('returns 2 for tool diversity (Edit + Bash + Read)', () => {
+  it('returns 1 for tool diversity alone (removed — too common to be meaningful)', () => {
     const ep = mkEpisode([
       mkEntry({ tool: 'Edit', files: ['/src/a.js'] }),
       mkEntry({ tool: 'Bash', files: [] }),
       mkEntry({ tool: 'Grep', files: [] }),
     ]);
-    expect(computeRuleImportance(ep)).toBe(2);
+    expect(computeRuleImportance(ep)).toBe(1);
   });
 
   it('returns 2 for error→edit debug cycle', () => {
@@ -439,20 +439,19 @@ describe('computeRuleImportance', () => {
     expect(computeRuleImportance(ep)).toBe(2);
   });
 
-  it('returns 2 for broad changes (5+ files)', () => {
+  it('returns 2 for broad changes (8+ files)', () => {
     const ep = {
       entries: [mkEntry({ tool: 'Edit', files: ['/a.js'] })],
-      files: ['/a.js', '/b.js', '/c.js', '/d.js', '/e.js'],
+      files: ['/a.js', '/b.js', '/c.js', '/d.js', '/e.js', '/f.js', '/g.js', '/h.js'],
     };
     expect(computeRuleImportance(ep)).toBe(2);
   });
 
-  it('does not upgrade to 2 for tool diversity without Edit', () => {
-    const ep = mkEpisode([
-      mkEntry({ tool: 'Bash', files: [] }),
-      mkEntry({ tool: 'Grep', files: [] }),
-      mkEntry({ tool: 'Read', files: [] }),
-    ]);
+  it('returns 1 for 5 files (below new 8-file threshold)', () => {
+    const ep = {
+      entries: [mkEntry({ tool: 'Edit', files: ['/a.js'] })],
+      files: ['/a.js', '/b.js', '/c.js', '/d.js', '/e.js'],
+    };
     expect(computeRuleImportance(ep)).toBe(1);
   });
 });
