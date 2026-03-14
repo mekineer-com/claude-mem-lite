@@ -195,3 +195,19 @@ export function renderInjection(resource, reason) {
 
   return injection;
 }
+
+/**
+ * Render a lightweight one-line hint for medium-confidence recommendations.
+ * Costs ~30 tokens instead of ~500 for full injection.
+ * @param {object} resource Resource object from DB
+ * @returns {string} Single-line hint text
+ */
+export function renderHint(resource) {
+  const cap = truncate(resource.capability_summary || '', 80);
+  const invoke = resource.invocation_name
+    ? ` (Skill: "${resource.invocation_name}")`
+    : resource.type === 'agent'
+      ? ` (Agent: "${resource.name}")`
+      : '';
+  return `[Hint] Consider: "${resource.name}" — ${cap}${invoke}`;
+}
