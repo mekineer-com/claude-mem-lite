@@ -11,6 +11,7 @@ import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { debugCatch } from './utils.mjs';
 import { peekToolEvents } from './hook-shared.mjs';
 import { detectActiveSuite, shouldRecommendForStage, detectExplicitRequest, inferCurrentStage } from './dispatch-workflow.mjs';
+import { detectFailurePattern } from './dispatch-patterns.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -144,6 +145,7 @@ export function extractContextSignals(event, sessionCtx = {}) {
     techStack: '',
     action: '',
     errorDomain: '',
+    failurePattern: null, // detected failure pattern from session events (repeated-test-fail, etc.)
   };
 
   // Extract weighted intent from user prompt (primary intent is first element)
@@ -186,6 +188,23 @@ export function extractContextSignals(event, sessionCtx = {}) {
     if (/error|fail|exception|panic/i.test(resp)) {
       signals.errorDomain = extractErrorDomain(event.tool_input.command, resp);
     }
+  }
+
+  // Failure pattern detection: override signals when Claude is struggling
+  const failurePattern = sessionCtx?.sessionEvents
+    ? detectFailurePattern(sessionCtx.sessionEvents)
+    : null;
+
+  if (failurePattern) {
+    if (!signals.primaryIntent || failurePattern.confidence > 0.7) {
+      signals.primaryIntent = failurePattern.resource_intent;
+      if (!signals.intent.includes(failurePattern.resource_intent)) {
+        signals.intent = signals.intent
+          ? `${failurePattern.resource_intent},${signals.intent}`
+          : failurePattern.resource_intent;
+      }
+    }
+    signals.failurePattern = failurePattern;
   }
 
   return signals;
