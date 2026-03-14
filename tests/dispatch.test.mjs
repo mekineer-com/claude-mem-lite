@@ -8,7 +8,8 @@ import { shouldSkipDispatch, extractContextSignals,
   isRecentlyRecommended, SESSION_RECOMMEND_CAP, dispatchOnSessionStart,
   _NEGATION_EN, _NEGATION_CJK,
   _applyAdoptionDecay, _passesConfidenceGate as passesConfidenceGate,
-  _filterAutoLoadedSkills, _filterGarbageMetadata } from '../dispatch.mjs';
+  _filterAutoLoadedSkills, _filterGarbageMetadata,
+  inferSessionPhase, isPhaseTransition } from '../dispatch.mjs';
 import { renderInjection } from '../dispatch-inject.mjs';
 import { collectFeedback, _detectAdoption as detectAdoption } from '../dispatch-feedback.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
@@ -1660,5 +1661,55 @@ describe('filterGarbageMetadata', () => {
     ];
     const filtered = _filterGarbageMetadata(results);
     expect(filtered).toHaveLength(2);
+  });
+});
+
+describe('phase transition', () => {
+  it('detects EXPLORE phase from Read-only tools', () => {
+    const events = [
+      { tool_name: 'Read', tool_input: {} },
+      { tool_name: 'Glob', tool_input: {} },
+      { tool_name: 'Grep', tool_input: {} },
+    ];
+    expect(inferSessionPhase(events)).toBe('EXPLORE');
+  });
+
+  it('detects IMPLEMENT from Edit tool', () => {
+    const events = [
+      { tool_name: 'Read', tool_input: {} },
+      { tool_name: 'Edit', tool_input: { file_path: '/src/a.js' } },
+    ];
+    expect(inferSessionPhase(events)).toBe('IMPLEMENT');
+  });
+
+  it('detects TEST from test command', () => {
+    const events = [
+      { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: '5 passed' },
+    ];
+    expect(inferSessionPhase(events)).toBe('TEST');
+  });
+
+  it('detects DEBUG from bash error output', () => {
+    const events = [
+      { tool_name: 'Bash', tool_input: { command: 'node app.js' }, tool_response: 'TypeError: Cannot read property x of undefined\n    at foo.js:10' },
+    ];
+    expect(inferSessionPhase(events)).toBe('DEBUG');
+  });
+
+  it('detects COMMIT from git commands', () => {
+    const events = [
+      { tool_name: 'Bash', tool_input: { command: 'git commit -m "fix"' }, tool_response: '1 file changed' },
+    ];
+    expect(inferSessionPhase(events)).toBe('COMMIT');
+  });
+
+  it('returns EXPLORE for empty events', () => {
+    expect(inferSessionPhase([])).toBe('EXPLORE');
+  });
+
+  it('isPhaseTransition detects change', () => {
+    expect(isPhaseTransition('EXPLORE', 'IMPLEMENT')).toBe(true);
+    expect(isPhaseTransition('IMPLEMENT', 'IMPLEMENT')).toBe(false);
+    expect(isPhaseTransition(null, 'EXPLORE')).toBe(false);
   });
 });
