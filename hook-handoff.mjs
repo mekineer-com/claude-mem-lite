@@ -25,7 +25,14 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   `).all(sessionId);
   if (prompts.length === 0) return;  // Empty session — nothing to hand off
 
-  const workingOn = prompts.map(p => truncate(p.prompt_text, 200)).join(' → ');
+  const seen = new Set();
+  const uniquePrompts = prompts.filter(p => {
+    const t = truncate(p.prompt_text, 200);
+    if (seen.has(t)) return false;
+    seen.add(t);
+    return true;
+  });
+  const workingOn = uniquePrompts.map(p => truncate(p.prompt_text, 200)).join(' → ');
 
   // 2. Completed — from observations (include narrative for richer handoff)
   const completed = db.prepare(`
@@ -37,9 +44,11 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   // 3. Unfinished — episode snapshot + full session edit history from narratives
   let unfinished = '';
   if (episodeSnapshot?.entries) {
+    const seenDescs = new Set();
     const pendingDescs = episodeSnapshot.entries
       .filter(e => e.isSignificant || e.isError)
-      .map(e => e.desc);
+      .map(e => e.desc)
+      .filter(d => { if (seenDescs.has(d)) return false; seenDescs.add(d); return true; });
     if (pendingDescs.length > 0) unfinished = pendingDescs.join('; ');
   }
   // Enrich unfinished with full session edit history from observation narratives.
@@ -56,23 +65,26 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
 
   // 4. Key files — from episode snapshot + observations
   const fileSet = new Set();
-  if (episodeSnapshot?.files) episodeSnapshot.files.forEach(f => fileSet.add(f));
+  const isValidFile = f => f && f.length > 2 && f.includes('/') && f.indexOf('/', 1) !== -1
+    && !f.startsWith('/dev/') && !f.startsWith('/proc/') && !f.startsWith('/tmp/');
+  if (episodeSnapshot?.files) episodeSnapshot.files.filter(isValidFile).forEach(f => fileSet.add(f));
   const obsFiles = db.prepare(`
     SELECT files_modified FROM observations
     WHERE memory_session_id = ? AND files_modified IS NOT NULL
     ORDER BY created_at_epoch DESC LIMIT 10
   `).all(sessionId);
   for (const row of obsFiles) {
-    try { JSON.parse(row.files_modified).forEach(f => fileSet.add(f)); } catch {}
+    try { JSON.parse(row.files_modified).filter(isValidFile).forEach(f => fileSet.add(f)); } catch {}
   }
 
-  // 5. Key decisions — high importance observations
+  // 5. Key decisions — high importance observations (skip low-signal degraded titles)
+  const LOW_SIGNAL_TITLE = /^(Error (while working|in)|Modified |Worked on |Reviewed \d+ files:)/;
   const decisions = db.prepare(`
     SELECT title FROM observations
     WHERE memory_session_id = ? AND COALESCE(importance, 1) >= 2
       AND COALESCE(compressed_into, 0) = 0
-    ORDER BY created_at_epoch DESC LIMIT 5
-  `).all(sessionId);
+    ORDER BY created_at_epoch DESC LIMIT 10
+  `).all(sessionId).filter(d => d.title && !LOW_SIGNAL_TITLE.test(d.title)).slice(0, 5);
 
   // 6. Match keywords
   const allText = [workingOn, ...completed.map(c => c.title).filter(Boolean), unfinished].join(' ');

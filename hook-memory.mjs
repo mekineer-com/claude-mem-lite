@@ -112,7 +112,10 @@ export function recallForFile(db, filePath, project) {
   try {
     const basename = filePath.split('/').pop();
     const cutoff = Date.now() - FILE_RECALL_LOOKBACK_MS;
-    const likePattern = `%"${basename}"%`;
+    // Match both full paths (/path/to/file.mjs) and basename-only entries ("file.mjs")
+    // Two patterns avoid false positives: %/file.mjs"% won't match /webapp.mjs
+    const pathPattern = `%/${basename}"%`;
+    const namePattern = `%"${basename}"%`;
     const rows = db.prepare(`
       SELECT id, type, title, importance, lesson_learned
       FROM observations
@@ -120,10 +123,10 @@ export function recallForFile(db, filePath, project) {
         AND importance >= 2
         AND COALESCE(compressed_into, 0) = 0
         AND created_at_epoch > ?
-        AND files_modified LIKE ?
+        AND (files_modified LIKE ? OR files_modified LIKE ?)
       ORDER BY created_at_epoch DESC
       LIMIT ?
-    `).all(project, cutoff, likePattern, MAX_FILE_RECALL);
+    `).all(project, cutoff, pathPattern, namePattern, MAX_FILE_RECALL);
     const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id = ?');
     for (const r of rows) updateStmt.run(r.id);
     return rows;

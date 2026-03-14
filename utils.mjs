@@ -33,8 +33,11 @@ export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * 86400000;
  */
 export function jaccardSimilarity(a, b) {
   if (!a || !b) return 0;
-  const setA = new Set(a.toLowerCase().split(/\s+/));
-  const setB = new Set(b.toLowerCase().split(/\s+/));
+  // Strip trailing punctuation from tokens to match MinHash normalization
+  // (prevents "server.rs," ≠ "server.rs" dedup failures)
+  const norm = s => s.toLowerCase().split(/\s+/).map(t => t.replace(/[,;:!?]+$/, ''));
+  const setA = new Set(norm(a));
+  const setB = new Set(norm(b));
   let intersection = 0;
   for (const w of setA) { if (setB.has(w)) intersection++; }
   const union = setA.size + setB.size - intersection;
@@ -109,12 +112,26 @@ export function scrubSecrets(text) {
 // ─── Token Estimation ─────────────────────────────────────────────────────
 
 /**
- * Estimate token count for a string using the ~4 chars/token heuristic.
+ * Estimate token count for a string.
+ * Uses ~4 chars/token for ASCII, ~1.5 chars/token for CJK characters.
  * @param {string} text Input text
  * @returns {number} Estimated token count (minimum 1)
  */
 export function estimateTokens(text) {
-  return Math.ceil(((text || '').length || 1) / 4);
+  const s = text || '';
+  if (!s) return 1;
+  // Count CJK characters (each ~1 token) vs ASCII (~4 chars/token)
+  let cjkCount = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if ((c >= 0x4e00 && c <= 0x9fff) || (c >= 0x3400 && c <= 0x4dbf) ||
+        (c >= 0x3000 && c <= 0x303f) || (c >= 0xff00 && c <= 0xffef) ||
+        (c >= 0xac00 && c <= 0xd7af)) {
+      cjkCount++;
+    }
+  }
+  const asciiLen = s.length - cjkCount;
+  return Math.max(1, Math.ceil(asciiLen / 4) + Math.ceil(cjkCount / 1.5));
 }
 
 // ─── MinHash Signatures ──────────────────────────────────────────────────
@@ -351,7 +368,7 @@ export function sanitizeFtsQuery(query) {
     .replace(/(^|\s)-/g, '$1')
     .trim();
   if (!cleaned) return null;
-  const tokens = cleaned.split(/\s+/).filter(t => t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()));
+  const tokens = cleaned.split(/\s+/).filter(t => t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR\/\d+$/i.test(t));
   if (tokens.length === 0) return null;
   // Replace single CJK character tokens with bigrams for better phrase matching.
   // Individual CJK chars ("系","统") are too noisy; bigrams ("系统") capture compound words.

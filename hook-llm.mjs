@@ -39,7 +39,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       VALUES (?, ?, ?, ?, ?, 'active')
     `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
-    // Two-tier dedup
+    // Three-tier dedup
     // Tier 1 (fast): 5-min Jaccard on titles
     const fiveMinAgo = now.getTime() - DEDUP_WINDOW_MS;
     const recent = db.prepare(`
@@ -50,6 +50,21 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
 
     if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > 0.7)) {
       return null;
+    }
+
+    // Tier 1.5: Extended title dedup for low-signal degraded titles (1-day window)
+    // "Error in X", "Modified X" titles are low-specificity → use longer dedup window
+    const LOW_SIGNAL = /^(Error (while working|in)|Modified |Worked on |Reviewed \d+ files:)/;
+    if (obs.title && LOW_SIGNAL.test(obs.title)) {
+      const oneDayAgo = now.getTime() - 86400000;
+      const extRecent = db.prepare(`
+        SELECT title FROM observations
+        WHERE project = ? AND created_at_epoch > ? AND created_at_epoch <= ?
+        ORDER BY created_at_epoch DESC LIMIT 30
+      `).all(project, oneDayAgo, fiveMinAgo);
+      if (extRecent.some(r => jaccardSimilarity(r.title, obs.title) > 0.85)) {
+        return null;
+      }
     }
 
     // Tier 2 (slow): MinHash cross-session dedup (7-day window)
@@ -174,10 +189,25 @@ export function buildDegradedTitle(episode) {
   const hasError = episode.entries.some(e => e.isError);
   const hasEdit = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
 
+  // Extract a short error hint from the first error entry's desc
+  let errorHint = '';
+  if (hasError) {
+    const errEntry = episode.entries.find(e => e.isError);
+    if (errEntry?.desc) {
+      // Extract meaningful error text from "cmd → ERROR: ..." format
+      const errMatch = errEntry.desc.match(/→ ERROR: (.{3,80})/);
+      if (errMatch) {
+        // Clean JSON/noise from the error snippet
+        const cleaned = errMatch[1].replace(/[{"\[\]]/g, '').replace(/\\n/g, ' ').trim();
+        if (cleaned.length >= 4) errorHint = `: ${truncate(cleaned, 50)}`;
+      }
+    }
+  }
+
   if (files.length > 0) {
     const names = files.map(f => basename(f)).slice(0, 3).join(', ');
     const suffix = files.length > 3 ? ` +${files.length - 3} more` : '';
-    if (hasError) return `Error while working on ${names}${suffix}`;
+    if (hasError) return `Error in ${names}${suffix}${errorHint}`;
     if (hasEdit) return `Modified ${names}${suffix}`;
     return `Worked on ${names}${suffix}`;
   }

@@ -292,8 +292,8 @@ describe('handleLLMEpisode', () => {
 
     const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
     expect(obs[0].type).toBe('bugfix');
-    // buildDegradedTitle: file + error → "Error while working on app.mjs"
-    expect(obs[0].title).toBe('Error while working on app.mjs');
+    // buildDegradedTitle: file + error → "Error in app.mjs"
+    expect(obs[0].title).toBe('Error in app.mjs');
   });
 
   it('returns early when no tmpFile specified', async () => {
