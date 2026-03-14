@@ -360,14 +360,15 @@ export function sanitizeFtsQuery(query) {
   const hasBigrams = bigramSet.size > 0;
   const finalTokens = [];
   const seen = new Set();
+  const rawTokensSeen = new Set(); // track raw tokens to prevent bigram duplicates
   for (const t of tokens) {
     // Skip single CJK characters when we have bigrams — they're subsumed by bigram tokens
     if (hasBigrams && /^[\u4e00-\u9fff\u3400-\u4dbf]$/.test(t)) continue;
     const expanded = expandToken(t);
-    if (!seen.has(expanded)) { seen.add(expanded); finalTokens.push(expanded); }
+    if (!seen.has(expanded)) { seen.add(expanded); rawTokensSeen.add(t); finalTokens.push(expanded); }
   }
   for (const bg of bigramSet) {
-    if (!seen.has(bg)) { seen.add(bg); finalTokens.push(bg); }
+    if (!seen.has(bg) && !rawTokensSeen.has(bg)) { seen.add(bg); finalTokens.push(bg); }
   }
   if (finalTokens.length === 0) return null;
   // FTS5 requires explicit AND after parenthesized OR groups
@@ -612,7 +613,9 @@ export function extractFilePaths(input) {
     if (match) {
       for (const m of match) {
         const p = m.trim();
-        if (!p.startsWith('/dev/') && !p.startsWith('/proc/') && !p.startsWith('/tmp/')) {
+        if (!p.startsWith('/dev/') && !p.startsWith('/proc/') && !p.startsWith('/tmp/')
+          // Skip single-component paths like /exit, /clear — likely slash commands, not files
+          && (p.indexOf('/', 1) !== -1 || /\.\w+$/.test(p))) {
           paths.push(p);
         }
       }

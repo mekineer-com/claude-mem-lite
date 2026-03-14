@@ -20,7 +20,7 @@ const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h if rate-limited
 // ── Main Entry ─────────────────────────────────────────────
 export async function checkForUpdate() {
   try {
-    if (isDevMode()) return null;
+    if (isDevMode() || process.env.CLAUDE_MEM_SKIP_UPDATE) return null;
 
     const state = readState();
     if (!shouldCheck(state)) {
@@ -187,6 +187,11 @@ async function downloadAndInstall(tarballUrl) {
     mkdirSync(tmpDir, { recursive: true });
 
     // Download tarball via curl (available on all supported platforms)
+    // Validate URL to prevent command injection via crafted tarball URLs
+    if (!/^https:\/\/[a-zA-Z0-9./-]+$/.test(tarballUrl)) {
+      debugLog('WARN', 'hook-update', `Rejected suspicious tarball URL: ${tarballUrl}`);
+      return false;
+    }
     execSync(
       `curl -sL -H "Accept: application/vnd.github+json" "${tarballUrl}" | tar xz -C "${tmpDir}" --strip-components=1`,
       { timeout: 30000, stdio: 'pipe' }
