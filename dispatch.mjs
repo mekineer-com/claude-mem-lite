@@ -6,7 +6,7 @@
 import { basename, join } from 'path';
 import { existsSync } from 'fs';
 import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
-import { renderInjection } from './dispatch-inject.mjs';
+import { renderInjection, renderHint } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { debugCatch } from './utils.mjs';
 import { peekToolEvents } from './hook-shared.mjs';
@@ -333,7 +333,7 @@ function extractIntent(prompt) {
 }
 
 /** Exported for testing. */
-export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate, filterAutoLoadedSkills as _filterAutoLoadedSkills, filterGarbageMetadata as _filterGarbageMetadata };
+export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate, filterAutoLoadedSkills as _filterAutoLoadedSkills, filterGarbageMetadata as _filterGarbageMetadata, decideTier as _decideTier };
 
 // Stop words for raw keyword extraction.
 // Includes common English stop words + action verbs already covered by intent patterns.
@@ -902,6 +902,34 @@ function postProcessResults(results, signals, db, limit = 3, { allowOnRequest = 
   return results.slice(0, limit);
 }
 
+// ─── Tiered Rendering ────────────────────────────────────────────────────────
+
+/**
+ * Decide rendering tier based on composite score.
+ * High confidence → full injection (~500 tokens)
+ * Medium confidence → one-line hint (~30 tokens)
+ * Low confidence → silent (no injection)
+ *
+ * @param {object} resource Best resource from post-processing
+ * @param {object} signals Context signals (may include failurePattern)
+ * @returns {'full'|'hint'|'silent'}
+ */
+function decideTier(resource, signals) {
+  const raw = Math.abs(resource.composite_score ?? resource.relevance ?? 0);
+
+  // Pattern-detected pain point: boost confidence
+  const patternBoost = signals?.failurePattern?.confidence ?? 0;
+
+  // Normalize: typical good matches score 5-50, great matches 20+
+  // Sigmoid-like mapping to 0-1 range
+  const normalized = raw / (raw + 5.0); // 5→0.5, 10→0.67, 20→0.8, 50→0.91
+  const confidence = Math.min(1.0, normalized + patternBoost * 0.3);
+
+  if (confidence >= 0.55) return 'full';
+  if (confidence >= 0.3) return 'hint';
+  return 'silent';
+}
+
 // ─── Recommendation Reason ──────────────────────────────────────────────────
 
 const INTENT_LABELS = {
@@ -1047,6 +1075,9 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
     });
     updateResourceStats(db, best.id, 'recommend_count');
 
+    const tier = decideTier(best, signals);
+    if (tier === 'silent') return null;
+    if (tier === 'hint') return renderHint(best);
     return renderInjection(best, buildRecommendReason(signals));
   } catch (e) {
     debugCatch(e, 'dispatchOnUserPrompt');
@@ -1117,6 +1148,9 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     });
     updateResourceStats(db, best.id, 'recommend_count');
 
+    const tier = decideTier(best, signals);
+    if (tier === 'silent') return null;
+    if (tier === 'hint') return renderHint(best);
     return renderInjection(best, buildRecommendReason(signals));
   } catch (e) {
     debugCatch(e, 'dispatchOnPreToolUse');
