@@ -175,7 +175,7 @@ const SOURCE_FILES = [
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
-  'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-workflow.mjs',
+  'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-patterns.mjs', 'dispatch-workflow.mjs',
   'install.mjs',
 ];
 
