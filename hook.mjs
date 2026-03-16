@@ -7,6 +7,7 @@
 import { randomUUID } from 'crypto';
 import { join, basename } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statSync } from 'fs';
+import { homedir } from 'os';
 import {
   truncate, typeIcon, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
@@ -40,6 +41,22 @@ import { checkForUpdate } from './hook-update.mjs';
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
 const event = process.argv[2];
 const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'resource-scan']);
+
+// Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
+// install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin
+// in Claude UI does not automatically remove them. Exit early to make disable actually work.
+const PLUGIN_KEY = 'claude-mem-lite@sdsrss';
+function isPluginExplicitlyDisabled() {
+  try {
+    const settingsPath = join(homedir(), '.claude', 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf8'));
+    return settings.enabledPlugins?.[PLUGIN_KEY] === false;
+  } catch {
+    return false;
+  }
+}
+
+if (event && isPluginExplicitlyDisabled()) process.exit(0);
 if (process.env.CLAUDE_MEM_HOOK_RUNNING && !BG_EVENTS.has(event)) process.exit(0);
 
 // Crash-safe: flush episode buffer on unexpected termination to prevent data loss
@@ -820,7 +837,10 @@ async function handleSessionStart() {
       if (updateResult?.updated) {
         process.stdout.write(`\n🔄 claude-mem-lite: v${updateResult.from} → v${updateResult.to} updated\n`);
       } else if (updateResult?.updateAvailable) {
-        process.stdout.write(`\n📦 claude-mem-lite: v${updateResult.to} available (current: v${updateResult.from})\n`);
+        const hint = updateResult.installDeferred
+          ? ' — plugin mode only checks for updates; reinstall/update the plugin to apply it'
+          : '';
+        process.stdout.write(`\n📦 claude-mem-lite: v${updateResult.to} available (current: v${updateResult.from})${hint}\n`);
       }
     } catch (e) { debugCatch(e, 'session-start-update'); }
 

@@ -22,6 +22,8 @@ const INSTALL_DIR = DATA_DIR;
 const SERVER_PATH = join(INSTALL_DIR, 'server.mjs');
 const HOOK_PATH = join(INSTALL_DIR, 'hook.mjs');
 const MARKETPLACE_KEY = 'sdsrss';
+const PLUGIN_KEY = `claude-mem-lite@${MARKETPLACE_KEY}`;
+const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
 // ─── Curated Resource Metadata ───────────────────────────────────────────────
 // Replaces generic name-echo fallback with FTS5-optimized metadata per resource.
@@ -2033,8 +2035,8 @@ function registerVirtualResources(rdb) {
   return count;
 }
 
-const cmd = process.argv[2];
-const flags = new Set(process.argv.slice(3));
+let cmd = process.argv[2];
+let flags = new Set(process.argv.slice(3));
 
 function log(msg) { console.log(`  ${msg}`); }
 function ok(msg) { console.log(`  ✓ ${msg}`); }
@@ -2063,7 +2065,7 @@ async function install() {
     'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
     'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs',
     'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
-    'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
+    'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
     'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-patterns.mjs', 'dispatch-workflow.mjs',
@@ -2120,17 +2122,15 @@ async function install() {
   // 2. npm install (skip for --dev: node_modules is symlinked)
   if (IS_DEV) {
     ok('Dependencies: using dev dir (symlinked)');
-  } else if (!existsSync(join(INSTALL_DIR, 'node_modules'))) {
-    log('Installing dependencies...');
+  } else {
+    log('Ensuring dependencies installed...');
     try {
-      execSync('npm install --omit=dev', { cwd: INSTALL_DIR, stdio: 'pipe' });
+      execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: 'pipe' });
       ok('Dependencies installed');
     } catch (e) {
       fail('npm install failed: ' + e.message);
       process.exit(1);
     }
-  } else {
-    ok('Dependencies already installed');
   }
 
   // 3. Register MCP server
@@ -2187,6 +2187,9 @@ async function install() {
   // 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
   log('Configuring hooks...');
   const settings = readSettings();
+  if (clearPluginDisabledMarkerForDirectInstall(settings)) {
+    ok('Cleared stale disabled plugin flag so install.mjs-managed hooks can run');
+  }
   settings.hooks = settings.hooks || {};
 
   const PREFILTER_PATH = join(INSTALL_DIR, 'scripts', 'post-tool-use.sh');
@@ -2543,74 +2546,72 @@ async function uninstall() {
 
   // 2. Remove hooks from settings.json (match both npx and git-clone install paths)
   const settings = readSettings();
-  if (settings.hooks) {
-    for (const [event, configs] of Object.entries(settings.hooks)) {
-      if (!Array.isArray(configs)) continue;
-      settings.hooks[event] = configs.filter(cfg => !isMemHook(cfg));
-      if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  cleanupMemHooksFromSettings(settings);
+
+  // 3. Clean plugin registry entries conservatively (avoid deleting other plugins
+  // from the same marketplace publisher)
+  const pluginsDir = join(homedir(), '.claude', 'plugins');
+  const installedPath = join(pluginsDir, 'installed_plugins.json');
+  let canRemoveMarketplaceArtifacts;
+  try {
+    const installed = JSON.parse(readFileSync(installedPath, 'utf8'));
+    const plugins = getInstalledPluginEntries(installed);
+    let cleaned = false;
+    if (PLUGIN_KEY in plugins) {
+      delete plugins[PLUGIN_KEY];
+      cleaned = true;
     }
-    if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+    canRemoveMarketplaceArtifacts = !hasOtherMarketplacePlugins(installed);
+    if (cleaned) {
+      writeFileSync(installedPath, JSON.stringify(installed, null, 2) + '\n');
+      ok('Removed from installed_plugins.json');
+    }
+  } catch {
+    // Conservative default: if registry shape is unknown, preserve marketplace cache.
+    canRemoveMarketplaceArtifacts = false;
   }
 
-  // 3. Clean plugin system entries from settings.json
-  const pluginKey = `claude-mem-lite@${MARKETPLACE_KEY}`;
+  // 4. Clean plugin system entries from settings.json
   const marketplaceKey = MARKETPLACE_KEY;
   if (settings.enabledPlugins) {
-    delete settings.enabledPlugins[pluginKey];
+    delete settings.enabledPlugins[PLUGIN_KEY];
   }
-  if (settings.extraKnownMarketplaces) {
+  if (settings.extraKnownMarketplaces && canRemoveMarketplaceArtifacts) {
     delete settings.extraKnownMarketplaces[marketplaceKey];
   }
   writeSettings(settings);
   ok('Hooks and plugin settings cleaned');
 
-  // 4. Clean plugin system registry files
-  const pluginsDir = join(homedir(), '.claude', 'plugins');
-
-  // 4a. Remove marketplace directory
+  // 5. Clean plugin system registry files (only if no other marketplace plugins remain)
   const marketplaceDir = join(pluginsDir, 'marketplaces', marketplaceKey);
-  if (existsSync(marketplaceDir)) {
+  if (canRemoveMarketplaceArtifacts && existsSync(marketplaceDir)) {
     rmSync(marketplaceDir, { recursive: true, force: true });
     ok('Marketplace directory removed');
   }
 
-  // 4b. Remove cache directory
+  // 5b. Remove cache directory
   const cacheDir = join(pluginsDir, 'cache', marketplaceKey);
-  if (existsSync(cacheDir)) {
+  if (canRemoveMarketplaceArtifacts && existsSync(cacheDir)) {
     rmSync(cacheDir, { recursive: true, force: true });
     ok('Plugin cache removed');
   }
 
-  // 4c. Clean known_marketplaces.json
+  // 5c. Clean known_marketplaces.json
   const knownPath = join(pluginsDir, 'known_marketplaces.json');
   try {
     const known = JSON.parse(readFileSync(knownPath, 'utf8'));
-    if (marketplaceKey in known) {
+    if (canRemoveMarketplaceArtifacts && marketplaceKey in known) {
       delete known[marketplaceKey];
       writeFileSync(knownPath, JSON.stringify(known, null, 2) + '\n');
       ok('Removed from known_marketplaces.json');
     }
   } catch { /* file may not exist */ }
 
-  // 4d. Clean installed_plugins.json
-  const installedPath = join(pluginsDir, 'installed_plugins.json');
-  try {
-    const installed = JSON.parse(readFileSync(installedPath, 'utf8'));
-    const plugins = installed.plugins || installed;
-    let cleaned = false;
-    for (const key of Object.keys(plugins)) {
-      if (key.includes('claude-mem-lite') || key.includes('sdsrss')) {
-        delete plugins[key];
-        cleaned = true;
-      }
-    }
-    if (cleaned) {
-      writeFileSync(installedPath, JSON.stringify(installed, null, 2) + '\n');
-      ok('Removed from installed_plugins.json');
-    }
-  } catch { /* file may not exist */ }
+  if (!canRemoveMarketplaceArtifacts && (existsSync(marketplaceDir) || existsSync(cacheDir))) {
+    log('Marketplace cache preserved (other plugins may still depend on sdsrss marketplace)');
+  }
 
-  // 5. Purge data if requested
+  // 6. Purge data if requested
   if (flags.has('--purge')) {
     const expectedPurgePath = join(homedir(), '.claude-mem-lite');
     if (existsSync(DATA_DIR) && DATA_DIR === expectedPurgePath) {
@@ -2624,6 +2625,24 @@ async function uninstall() {
   }
 
   console.log('\n  Done!\n');
+}
+
+// ─── Cleanup Hooks ───────────────────────────────────────────────────────────
+
+async function cleanupHooks() {
+  console.log('\nclaude-mem-lite cleanup-hooks\n');
+
+  const settings = readSettings();
+  const removed = cleanupMemHooksFromSettings(settings);
+
+  if (removed > 0) {
+    writeSettings(settings);
+    ok(`Removed ${removed} claude-mem-lite hook configuration${removed === 1 ? '' : 's'} from settings.json`);
+  } else {
+    ok('No claude-mem-lite hooks found in settings.json');
+  }
+
+  console.log('');
 }
 
 // ─── Status ─────────────────────────────────────────────────────────────────
@@ -2645,11 +2664,24 @@ async function status() {
 
   // Hooks
   const settings = readSettings();
-  const hasHooks = settings.hooks && Object.values(settings.hooks).some(configs =>
-    configs.some(cfg => cfg.hooks?.some(h => h.command?.includes('hook.mjs')))
-  );
-  if (hasHooks) {
+  const hasHooks = hasMemHooksConfigured(settings);
+  const pluginDisabled = isPluginExplicitlyDisabled(settings);
+  const pluginEnabled = settings.enabledPlugins?.[PLUGIN_KEY] === true;
+
+  if (pluginEnabled) {
+    ok('Plugin: enabled in settings');
+  } else if (pluginDisabled) {
+    warn('Plugin: disabled in settings');
+  } else {
+    warn('Plugin: not present in enabledPlugins');
+  }
+
+  if (hasHooks && pluginDisabled) {
+    warn('Hooks: still configured in settings.json while plugin is disabled (runtime ignores them; run cleanup-hooks or uninstall to clean up)');
+  } else if (hasHooks) {
     ok('Hooks: configured');
+  } else if (pluginDisabled) {
+    ok('Hooks: not configured');
   } else {
     fail('Hooks: not configured');
   }
@@ -2727,6 +2759,21 @@ async function doctor() {
     issues++;
   }
 
+  // Plugin/hook lifecycle state
+  const settings = readSettings();
+  const hasHooks = hasMemHooksConfigured(settings);
+  const pluginDisabled = isPluginExplicitlyDisabled(settings);
+  if (pluginDisabled && hasHooks) {
+    fail('Plugin lifecycle: plugin is disabled but claude-mem-lite hooks still remain in settings.json');
+    issues++;
+  } else if (pluginDisabled) {
+    ok('Plugin lifecycle: disabled cleanly (no active mem hooks)');
+  } else if (hasHooks) {
+    ok('Plugin lifecycle: hooks active');
+  } else {
+    warn('Plugin lifecycle: hooks not configured');
+  }
+
   // Database
   if (existsSync(DB_PATH)) {
     try {
@@ -2799,6 +2846,50 @@ function isMemHook(cfg) {
   });
 }
 
+function hasMemHooksConfigured(settings) {
+  if (!settings?.hooks) return false;
+  return Object.values(settings.hooks).some(configs =>
+    Array.isArray(configs) && configs.some(cfg => isMemHook(cfg))
+  );
+}
+
+export function clearPluginDisabledMarkerForDirectInstall(settings) {
+  if (settings?.enabledPlugins?.[PLUGIN_KEY] !== false) return false;
+  delete settings.enabledPlugins[PLUGIN_KEY];
+  if (Object.keys(settings.enabledPlugins).length === 0) delete settings.enabledPlugins;
+  return true;
+}
+
+function cleanupMemHooksFromSettings(settings) {
+  if (!settings?.hooks) return 0;
+
+  let removed = 0;
+  for (const [event, configs] of Object.entries(settings.hooks)) {
+    if (!Array.isArray(configs)) continue;
+    const kept = configs.filter(cfg => !isMemHook(cfg));
+    removed += configs.length - kept.length;
+    if (kept.length > 0) settings.hooks[event] = kept;
+    else delete settings.hooks[event];
+  }
+
+  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  return removed;
+}
+
+function isPluginExplicitlyDisabled(settings) {
+  return settings?.enabledPlugins?.[PLUGIN_KEY] === false;
+}
+
+function getInstalledPluginEntries(installed) {
+  if (installed?.plugins && typeof installed.plugins === 'object') return installed.plugins;
+  return installed && typeof installed === 'object' ? installed : {};
+}
+
+export function hasOtherMarketplacePlugins(installed, marketplaceKey = MARKETPLACE_KEY, pluginKey = PLUGIN_KEY) {
+  const plugins = getInstalledPluginEntries(installed);
+  return Object.keys(plugins).some(key => key !== pluginKey && key.endsWith(`@${marketplaceKey}`));
+}
+
 function readSettings() {
   try {
     return JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'));
@@ -2823,10 +2914,12 @@ async function manualUpdate() {
   // Force check by importing hook-update (bypasses throttle for manual use)
   const { checkForUpdate, getCurrentVersion } = await import('./hook-update.mjs');
   log('Checking for updates...');
-  const result = await checkForUpdate();
+  const result = await checkForUpdate({ force: true, allowInstall: true });
 
   if (result?.updated) {
     ok(`Updated: v${result.from} → v${result.to}`);
+  } else if (result?.updateAvailable && result?.installDeferred) {
+    warn(`v${result.to} available — plugin mode only checks for updates, reinstall/update the plugin to apply it`);
   } else if (result?.updateAvailable) {
     warn(`v${result.to} available but install failed — try: node install.mjs install`);
   } else {
@@ -2881,31 +2974,38 @@ function syncVersions() {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-switch (cmd) {
-  case 'install':
-    await install();
-    break;
-  case 'uninstall':
-    await uninstall();
-    break;
-  case 'status':
-    await status();
-    break;
-  case 'doctor':
-    await doctor();
-    break;
-  case 'update':
-    await manualUpdate();
-    break;
-  case 'release':
-    syncVersions();
-    break;
-  default:
-    if (IS_NPX) {
-      // npx claude-mem-lite (no args) → auto install
+export async function main(argv = process.argv.slice(2)) {
+  cmd = argv[0];
+  flags = new Set(argv.slice(1));
+
+  switch (cmd) {
+    case 'install':
       await install();
-    } else {
-      console.log(`
+      break;
+    case 'uninstall':
+      await uninstall();
+      break;
+    case 'status':
+      await status();
+      break;
+    case 'doctor':
+      await doctor();
+      break;
+    case 'cleanup-hooks':
+      await cleanupHooks();
+      break;
+    case 'update':
+      await manualUpdate();
+      break;
+    case 'release':
+      syncVersions();
+      break;
+    default:
+      if (IS_NPX) {
+        // npx claude-mem-lite (no args) → auto install
+        await install();
+      } else {
+        console.log(`
 claude-mem-lite — Lightweight memory system for Claude Code
 
 Usage:
@@ -2915,10 +3015,15 @@ Usage:
   node install.mjs uninstall --purge  Remove and delete all data
   node install.mjs status             Show current status
   node install.mjs doctor             Diagnose issues
+  node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
   node install.mjs update             Check for and install updates
   node install.mjs release            Sync version to plugin.json + marketplace.json
 
   npx claude-mem-lite                 Install via npx (one-liner)
 `);
-    }
+      }
+  }
 }
+
+const IS_MAIN = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (IS_MAIN) await main();

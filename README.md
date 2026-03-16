@@ -121,7 +121,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 /plugin install claude-mem-lite
 ```
 
-The plugin system handles everything: hooks, MCP server, and dependency installation (via Setup hook). Dependencies are installed automatically on first run.
+Plugin mode manages its own hooks/runtime. On session start it only **checks and reports** new claude-mem-lite versions; it does **not** self-overwrite plugin files in place. Update plugin-mode installs through Claude's plugin workflow.
 
 ### Method 2: npx (one-liner)
 
@@ -375,6 +375,8 @@ node install.mjs uninstall            # Remove (keep data)
 node install.mjs uninstall --purge    # Remove and delete all data
 node install.mjs status               # Show current status
 node install.mjs doctor               # Diagnose issues
+node install.mjs cleanup-hooks        # Remove only stale claude-mem-lite hooks from settings.json
+node install.mjs update               # Force-check for updates and install them (direct install / npx mode)
 
 # npx install:
 npx claude-mem-lite                   # Install / reinstall
@@ -382,13 +384,18 @@ npx claude-mem-lite uninstall         # Remove (keep data)
 npx claude-mem-lite doctor            # Diagnose issues
 ```
 
+Notes:
+- Plugin mode only reports available updates; it does not self-update plugin files.
+- Direct install / npx mode keeps auto-update enabled and uses staged replacement with rollback on install failure.
+- If you disabled the plugin but still have old mem hooks in `~/.claude/settings.json`, run `node install.mjs cleanup-hooks`.
+
 ### doctor
 
 Checks Node.js version, dependencies, server/hook files, database integrity, FTS5 indexes, and stale processes.
 
 ### status
 
-Shows MCP registration, hook configuration, and database stats (observation/session counts).
+Shows MCP registration, hook configuration, plugin disabled state, and database stats (observation/session counts).
 
 ## Uninstall
 

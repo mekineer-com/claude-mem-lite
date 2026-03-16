@@ -1,2 +1,4 @@
 #!/usr/bin/env node
-import './install.mjs';
+import { main } from './install.mjs';
+
+await main(process.argv.slice(2));

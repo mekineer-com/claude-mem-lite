@@ -129,6 +129,27 @@ afterEach(() => {
 });
 
 describe('Suite 1: Full Session Lifecycle', () => {
+  it('disabled plugin setting makes session-start exit without side effects', () => {
+    const settingsDir = join(tmpHome, '.claude');
+    mkdirSync(settingsDir, { recursive: true });
+    writeFileSync(join(settingsDir, 'settings.json'), JSON.stringify({
+      enabledPlugins: { 'claude-mem-lite@sdsrss': false },
+      hooks: {
+        SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: `node "${HOOK_PATH}" session-start` }] }]
+      }
+    }, null, 2));
+
+    const { stdout, exitCode } = runHook('session-start', { env: { HOME: tmpHome } });
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe('');
+    expect(getSessionFile(tmpHome)).toBeNull();
+
+    const db = openTestDb(tmpHome);
+    const sessions = db.prepare('SELECT COUNT(*) as c FROM sdk_sessions').get();
+    db.close();
+    expect(sessions.c).toBe(0);
+  });
+
   it('session-start creates session row and outputs context', () => {
     const { stdout, exitCode } = runHook('session-start', { env: { HOME: tmpHome } });
     expect(exitCode).toBe(0);

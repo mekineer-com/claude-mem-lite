@@ -121,7 +121,7 @@
 /plugin install claude-mem-lite
 ```
 
-插件系统会处理一切：钩子、MCP 服务器和依赖安装（通过 Setup 钩子）。依赖会在首次运行时自动安装。
+插件模式会管理自己的运行时与钩子。SessionStart 时它现在只会**检查并提示**新版本，不会直接覆盖插件目录中的文件。插件模式请通过 Claude 的插件更新流程完成升级。
 
 ### 方式二：npx（一行命令）
 
@@ -375,6 +375,8 @@ node install.mjs uninstall            # 移除（保留数据）
 node install.mjs uninstall --purge    # 移除并删除所有数据
 node install.mjs status               # 显示当前状态
 node install.mjs doctor               # 诊断问题
+node install.mjs cleanup-hooks        # 只清理 settings.json 中残留的 claude-mem-lite hooks
+node install.mjs update               # 强制检查并安装更新（direct install / npx 模式）
 
 # npx 安装：
 npx claude-mem-lite                   # 安装 / 重新安装
@@ -382,13 +384,18 @@ npx claude-mem-lite uninstall         # 移除（保留数据）
 npx claude-mem-lite doctor            # 诊断问题
 ```
 
+说明：
+- 插件模式只提示可用更新，不会自更新插件文件。
+- direct install / npx 模式保留自动更新，并使用 staged replacement；若依赖安装失败会回滚。
+- 如果你禁用了插件，但 `~/.claude/settings.json` 里还有旧的 mem hooks，可运行 `node install.mjs cleanup-hooks`。
+
 ### doctor
 
 检查 Node.js 版本、依赖、服务器/钩子文件、数据库完整性、FTS5 索引和残留进程。
 
 ### status
 
-显示 MCP 注册状态、钩子配置和数据库统计（观察/会话数量）。
+显示 MCP 注册状态、钩子配置、插件禁用状态和数据库统计（观察/会话数量）。
 
 ## 卸载
 

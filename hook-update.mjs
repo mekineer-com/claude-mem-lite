@@ -3,8 +3,8 @@
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
 import { execSync } from 'node:child_process';
-import { readFileSync, writeFileSync, copyFileSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, copyFileSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DB_DIR } from './schema.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
@@ -16,17 +16,29 @@ const STATE_FILE = join(INSTALL_DIR, 'runtime', 'update-state.json');
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;       // 24 hours
 const FETCH_TIMEOUT_MS = 3000;                         // 3s network timeout
 const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h if rate-limited
+const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
 // ── Main Entry ─────────────────────────────────────────────
-export async function checkForUpdate() {
+export async function checkForUpdate(options = {}) {
   try {
+    const pluginMode = isPluginMode();
+    const force = Boolean(options.force);
+    const allowInstall = options.allowInstall ?? !pluginMode;
+
     if (isDevMode() || process.env.CLAUDE_MEM_SKIP_UPDATE) return null;
 
     const state = readState();
-    if (!shouldCheck(state)) {
+    if (!force && !shouldCheck(state)) {
       // Return cached update info if previously detected
       if (state.updateAvailable && state.latestVersion) {
-        return { updateAvailable: true, from: state.installedVersion, to: state.latestVersion };
+        return {
+          updateAvailable: true,
+          updated: false,
+          from: state.installedVersion,
+          to: state.latestVersion,
+          installDeferred: pluginMode || !allowInstall,
+          pluginMode,
+        };
       }
       return null;
     }
@@ -42,7 +54,8 @@ export async function checkForUpdate() {
 
     if (hasUpdate) {
       debugLog('DEBUG', 'hook-update', `Update available: ${currentVersion} → ${latest.version}`);
-      const success = await downloadAndInstall(latest.tarballUrl);
+      const canInstall = !pluginMode && Boolean(allowInstall);
+      const success = canInstall ? await downloadAndInstall(latest.tarballUrl) : false;
       const newState = {
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : currentVersion,
@@ -58,6 +71,8 @@ export async function checkForUpdate() {
         updated: success,
         from: currentVersion,
         to: latest.version,
+        installDeferred: !canInstall,
+        pluginMode,
       };
     }
 
@@ -74,6 +89,10 @@ export async function checkForUpdate() {
     debugCatch(err, 'checkForUpdate');
     return null;
   }
+}
+
+function isPluginMode() {
+  return Boolean(process.env.CLAUDE_PLUGIN_ROOT);
 }
 
 // ── Dev Mode Detection ─────────────────────────────────────
@@ -172,12 +191,13 @@ const SOURCE_FILES = [
   'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
   'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs',
   'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
-  'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'skill.md',
+  'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
   'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-patterns.mjs', 'dispatch-workflow.mjs',
   'install.mjs',
 ];
+const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
 
 // ── Download & Install ─────────────────────────────────────
 // Direct file copy instead of running old install.mjs (avoids symlink overwrite in dev)
@@ -197,65 +217,111 @@ async function downloadAndInstall(tarballUrl) {
       { timeout: 30000, stdio: 'pipe' }
     );
 
-    // Direct copy: overwrite source files in INSTALL_DIR
-    // Safer than running old install.mjs which may not respect CLAUDE_MEM_DIR
-    let copied = 0;
-    for (const f of SOURCE_FILES) {
-      const src = join(tmpDir, f);
-      const dest = join(INSTALL_DIR, f);
-      if (existsSync(src)) {
-        copyFileSync(src, dest);
-        copied++;
-      }
-    }
-
-    // Copy scripts/ directory if present
-    const srcScripts = join(tmpDir, 'scripts');
-    if (existsSync(srcScripts)) {
-      const destScripts = join(INSTALL_DIR, 'scripts');
-      mkdirSync(destScripts, { recursive: true });
-      for (const f of readdirSync(srcScripts)) {
-        copyFileSync(join(srcScripts, f), join(destScripts, f));
-      }
-      // Ensure all shell scripts are executable (copyFileSync doesn't preserve mode)
-      for (const sf of readdirSync(destScripts).filter(n => n.endsWith('.sh'))) {
-        try { execSync(`chmod +x "${join(destScripts, sf)}"`, { stdio: 'pipe' }); } catch {}
-      }
-    }
-
-    // Copy registry manifest (preinstalled.json) — needed for discovering new resources
-    const srcRegistry = join(tmpDir, 'registry');
-    if (existsSync(srcRegistry)) {
-      const destRegistry = join(INSTALL_DIR, 'registry');
-      mkdirSync(destRegistry, { recursive: true });
-      for (const f of readdirSync(srcRegistry)) {
-        copyFileSync(join(srcRegistry, f), join(destRegistry, f));
-      }
-    }
-
-    // Run npm install for dependencies (skip if node_modules is a symlink = dev mode)
-    const nmPath = join(INSTALL_DIR, 'node_modules');
-    if (!existsSync(nmPath) || !lstatSync(nmPath).isSymbolicLink()) {
-      try {
-        execSync('npm install --omit=dev', {
-          cwd: INSTALL_DIR,
-          timeout: 60000,
-          stdio: 'pipe',
-        });
-      } catch (err) {
-        debugCatch(err, 'downloadAndInstall-npm');
-        // Non-fatal: old node_modules may still work
-      }
-    }
-
-    debugLog('DEBUG', 'hook-update', `Auto-update: ${copied} files copied`);
-    return true;
+    return installExtractedRelease(tmpDir);
   } catch (err) {
     debugCatch(err, 'downloadAndInstall');
     return false;
   } finally {
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
+}
+
+export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
+  const ts = `${Date.now()}-${process.pid}`;
+  const stagingDir = join(targetDir, `.update-staging-${ts}`);
+  const backupDir = join(targetDir, `.update-backup-${ts}`);
+  const backedUp = [];
+  const installed = [];
+
+  try {
+    mkdirSync(stagingDir, { recursive: true });
+    mkdirSync(backupDir, { recursive: true });
+
+    copyReleaseIntoStaging(sourceDir, stagingDir);
+    execSync(NPM_INSTALL_CMD, {
+      cwd: stagingDir,
+      timeout: 60000,
+      stdio: 'pipe',
+    });
+
+    for (const relPath of SWITCHABLE_PATHS) {
+      const stagedPath = join(stagingDir, relPath);
+      if (!existsSync(stagedPath)) continue;
+
+      const targetPath = join(targetDir, relPath);
+      const backupPath = join(backupDir, relPath);
+
+      mkdirSync(dirname(targetPath), { recursive: true });
+      mkdirSync(dirname(backupPath), { recursive: true });
+
+      if (existsSync(targetPath)) {
+        renameSync(targetPath, backupPath);
+        backedUp.push(relPath);
+      }
+
+      renameSync(stagedPath, targetPath);
+      installed.push(relPath);
+    }
+
+    rmSync(stagingDir, { recursive: true, force: true });
+    rmSync(backupDir, { recursive: true, force: true });
+    debugLog('DEBUG', 'hook-update', `Auto-update: switched ${installed.length} paths`);
+    return true;
+  } catch (err) {
+    debugCatch(err, 'installExtractedRelease');
+
+    for (const relPath of installed.reverse()) {
+      try { rmSync(join(targetDir, relPath), { recursive: true, force: true }); } catch {}
+    }
+    for (const relPath of backedUp.reverse()) {
+      const backupPath = join(backupDir, relPath);
+      const targetPath = join(targetDir, relPath);
+      try {
+        if (existsSync(backupPath)) {
+          mkdirSync(dirname(targetPath), { recursive: true });
+          renameSync(backupPath, targetPath);
+        }
+      } catch (restoreErr) {
+        debugCatch(restoreErr, `installExtractedRelease-restore-${relPath}`);
+      }
+    }
+
+    try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+    try { rmSync(backupDir, { recursive: true, force: true }); } catch {}
+    return false;
+  }
+}
+
+function copyReleaseIntoStaging(sourceDir, stagingDir) {
+  let copied = 0;
+
+  for (const f of SOURCE_FILES) {
+    const src = join(sourceDir, f);
+    const dest = join(stagingDir, f);
+    if (!existsSync(src)) continue;
+    mkdirSync(dirname(dest), { recursive: true });
+    copyFileSync(src, dest);
+    copied++;
+  }
+
+  for (const dirName of ['scripts', 'registry']) {
+    const srcDir = join(sourceDir, dirName);
+    const destDir = join(stagingDir, dirName);
+    if (!existsSync(srcDir)) continue;
+    mkdirSync(destDir, { recursive: true });
+    for (const entry of readdirSync(srcDir)) {
+      copyFileSync(join(srcDir, entry), join(destDir, entry));
+    }
+  }
+
+  const stagedScripts = join(stagingDir, 'scripts');
+  if (existsSync(stagedScripts)) {
+    for (const sf of readdirSync(stagedScripts).filter(n => n.endsWith('.sh'))) {
+      try { execSync(`chmod +x "${join(stagedScripts, sf)}"`, { stdio: 'pipe' }); } catch {}
+    }
+  }
+
+  debugLog('DEBUG', 'hook-update', `Auto-update staged ${copied} source files`);
 }
 
 // ── State Persistence ──────────────────────────────────────
