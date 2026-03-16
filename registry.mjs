@@ -227,6 +227,11 @@ export function ensureRegistryDb(dbPath) {
     }
   } catch (e) { debugCatch(e, 'rejection_reason-migration'); }
 
+  // Migrate: ensure composite index on invocations(resource_id, created_at) for correlated subqueries
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_invocations_resource_created ON invocations(resource_id, created_at)`);
+  } catch (e) { debugCatch(e, 'invocations-resource-created-index-migration'); }
+
   db.exec(PREINSTALLED_SCHEMA);
 
   return db;

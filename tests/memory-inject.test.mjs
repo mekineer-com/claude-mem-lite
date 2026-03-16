@@ -222,4 +222,24 @@ describe('file-aware recall', () => {
       expect(r.importance).toBeGreaterThanOrEqual(2);
     }
   });
+
+  it('escapes LIKE wildcards in filenames (% and _)', () => {
+    // A file named "test_100%.mjs" should NOT match "testX100Y.mjs" (unescaped _ and %)
+    insertObs(db, {
+      type: 'bugfix', title: 'Fix in test_100%.mjs',
+      text: 'test_100%.mjs fix',
+      importance: 2, filesModified: '["test_100%.mjs"]',
+      epochOffset: -2 * 86400000
+    });
+    insertObs(db, {
+      type: 'bugfix', title: 'Fix in testX100Y.mjs',
+      text: 'testX100Y.mjs fix',
+      importance: 2, filesModified: '["testX100Y.mjs"]',
+      epochOffset: -2 * 86400000
+    });
+    // Should only match the exact filename, not the wildcard-expanded one
+    const results = recallForFile(db, 'test_100%.mjs', 'test');
+    expect(results.length).toBe(1);
+    expect(results[0].title).toContain('test_100%.mjs');
+  });
 });
