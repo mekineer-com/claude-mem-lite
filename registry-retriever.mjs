@@ -23,6 +23,7 @@ export const DISPATCH_SYNONYMS = {
   'plan':     ['planning', 'architecture', 'spec', 'blueprint', 'rfc', 'proposal', 'roadmap'],
   'build':    ['compile', 'bundle', 'webpack', 'vite', 'typescript', 'tsc', 'esbuild', 'rollup', 'parcel', 'babel', 'swc', 'transpile'],
   'lint':     ['eslint', 'prettier', 'biome', 'stylelint', 'format', 'style'],
+  'search':   ['lookup', 'latest', 'best-practices', 'perplexity'],
   // Chinese intent mappings
   '清理':     ['refactor', 'clean', 'lint', 'format', 'simplify'],
   '测试':     ['test', 'testing', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest'],
@@ -44,6 +45,7 @@ export const DISPATCH_SYNONYMS = {
   '打包':     ['bundle', 'build', 'webpack', 'vite'],
   '容器':     ['docker', 'container', 'kubernetes', 'infrastructure'],
   '运维':     ['devops', 'infrastructure', 'deploy', 'docker'],
+  '搜索':     ['search', 'lookup', 'latest', 'perplexity'],
 };
 
 // ─── CJK Tokenization ───────────────────────────────────────────────────────
@@ -98,6 +100,9 @@ const CJK_INTENT_MAP = {
   '接口': 'api', '路由': 'route',
   // plan
   '规划': 'planning', '架构': 'architecture', '方案': 'plan', '设计方案': 'architecture',
+  // search — only web/info search, NOT code search (grep/find)
+  '联网搜索': 'search', '网上搜索': 'search', '查资料': 'search', '找资料': 'search',
+  '搜索最新': 'search', '搜索资料': 'search', '搜索文档': 'search',
 };
 
 // Merge all CJK keys from both maps, longest-first to avoid partial matches

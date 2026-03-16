@@ -216,7 +216,7 @@ const NEGATION_CJK = /(?:不要|别|不用|先别|暂时不|不需要|跳过|停
 
 // Test-run vs test-write disambiguation (module-scoped for performance)
 const _RUN_TEST = /\b(run\w*\s+(?:the\s+)?tests?|npm\s+test|npx\s+(?:vitest|jest|mocha|pytest)|yarn\s+test|pnpm\s+test|make\s+test|cargo\s+test|go\s+test|check\s+(?:if\s+)?tests?\s+pass|execute\s+(?:the\s+)?tests?)\b/i;
-const _RUN_TEST_CJK = /(?:运行测试|跑测试|跑一下测试|跑单测|执行测试|测试跑|看测试)/;
+const _RUN_TEST_CJK = /(?:运行测试|跑测试|跑一下测试|跑单测|跑一下单测|执行测试|执行单测|测试跑|看测试|看单测)/;
 const _WRITE_TEST = /\b(write\s+tests?|add\s+tests?|create\s+tests?|need\s+tests?|missing\s+tests?|tdd|test.?driven|red.?green|increase\s+coverage|improve\s+coverage)\b/i;
 const _WRITE_TEST_CJK = /(?:写测试|加测试|补测试|补单测|缺测试|测试覆盖)/;
 
@@ -259,7 +259,7 @@ const _INTENT_PATTERNS = (() => {
     // ── Chinese patterns ──
     [/(测试|写测试|单测|单元测试|用例|覆盖率)/, 'test'],
     [/(修复|修bug|改bug|找bug|有bug|调试|排错|报错|出错|有问题|不工作|跑不起来|不能用|挂了|崩溃)/, 'fix'],
-    [/(审查|审核|代码审查|评审|代码审核|看看代码|review)/, 'review'],
+    [/(审查|审核|审计|代码审查|评审|代码审核|看看代码|review)/, 'review'],
     [/(提交|推送|上传)/, 'commit'],
     [/(部署|上线|发布|回滚)/, 'deploy'],
     [/(规划|架构|方案|设计方案)/, 'plan'],
@@ -273,6 +273,10 @@ const _INTENT_PATTERNS = (() => {
     [/(优化|性能|卡顿|耗时|太慢|慢死了|好慢|缓存)/, 'fast'],
     [/(格式化|代码风格|代码规范|类型检查)/, 'lint'],
     [/(界面|前端|样式|页面|组件|布局)/, 'design'],
+    // search: only unambiguous web/info search indicators — NOT code search (grep/find).
+    // "搜索" alone is ambiguous (code search vs web search), so require context modifiers.
+    [/(联网搜索|网上搜索|在线搜索|上网查|搜索.{0,2}最新|搜一下.{0,2}最新|查.{0,2}最新|查资料|找资料|搜索资料|搜索文档)/, 'search'],
+    [/\b(google|search\s+online|web\s+search|look\s+up\s+(?:the\s+)?(?:latest|newest|recent|docs?|documentation))\b/i, 'search'],
   ];
   // Pre-compile global variants for matchAll — avoids creating new RegExp on every extractIntent call
   return raw.map(([p, tag]) => [p, new RegExp(p.source, p.flags.includes('g') ? p.flags : p.flags + 'g'), tag]);
@@ -311,15 +315,19 @@ function extractIntent(prompt) {
   }
 
   const found = [];
+  const suppressed = [];
   for (const tag of tagMatched) {
     if (tagHasAffirmative.get(tag) && !found.includes(tag)) {
       found.push(tag);
+    } else if (!tagHasAffirmative.get(tag)) {
+      // Tag was matched but ALL instances were negated → suppress it.
+      // This feeds the text-fallback filter to prevent recommending negated resources.
+      suppressed.push(tag);
     }
   }
 
   // Distinguish test-running from test-writing: "run tests" / "npm test" / "运行测试" should NOT
   // trigger TDD recommendations. Only keep 'test' intent when the prompt implies *writing* tests.
-  const suppressed = [];
   if (found.includes('test')) {
     const isRunning = _RUN_TEST.test(prompt) || _RUN_TEST_CJK.test(prompt);
     const isWriting = _WRITE_TEST.test(prompt) || _WRITE_TEST_CJK.test(prompt);
@@ -810,8 +818,13 @@ function applyAdoptionDecay(results, db) {
  */
 function passesConfidenceGate(results, signals) {
   // BM25 absolute minimum: filter weak text matches.
-  // Stricter threshold for 3+ results (reliable IDF); gentler floor for 1-2 results.
-  const minThreshold = results.length >= 3 ? BM25_MIN_THRESHOLD : 0.5;
+  // Threshold is relative to the top result's score to handle varying corpus sizes:
+  // small corpora (< 50 resources) naturally produce lower BM25 IDF values,
+  // so an absolute threshold would over-filter genuine matches.
+  const baseThreshold = results.length >= 3 ? BM25_MIN_THRESHOLD : 0.5;
+  const topScore = results.length > 0 ? Math.abs(results[0].composite_score ?? results[0].relevance ?? 0) : 0;
+  // Use the lower of: absolute threshold OR 30% of top score (corpus-size-adaptive floor)
+  const minThreshold = topScore > 0 ? Math.min(baseThreshold, topScore * 0.3) : baseThreshold;
   results = results.filter(r => {
     const raw = r.composite_score ?? r.relevance;
     if (raw === null || raw === undefined) return true; // no score → pass (pre-scored or synthetic result)
@@ -821,10 +834,15 @@ function passesConfidenceGate(results, signals) {
   // Gap check: if top-2 results are too close in score, the query is ambiguous.
   // This prevents recommending when multiple resources match equally well,
   // which usually means the match is incidental rather than precise.
+  // Skip the gap check when rawKeywords promoted #1 (keyword re-ranking changes order,
+  // so the BM25 gap no longer reflects true relevance — the keyword match is extra signal).
   if (results.length >= 2) {
     const top1 = Math.abs(results[0].composite_score ?? results[0].relevance ?? 0);
     const top2 = Math.abs(results[1].composite_score ?? results[1].relevance ?? 0);
-    if (top1 > 0) {
+    // After keyword re-ranking, #1 may have lower raw BM25 than #2.
+    // The keyword match provides additional confidence, so skip the gap check.
+    const wasReRanked = signals?.rawKeywords?.length > 0 && top1 < top2;
+    if (!wasReRanked && top1 > 0) {
       const gapRatio = (top1 - top2) / top1;
       if (gapRatio < 0.2) {
         // Top-1 has no clear lead — ambiguous match, suppress recommendation
@@ -976,7 +994,24 @@ function decideTier(resource, signals) {
   // Normalize: typical good matches score 5-50, great matches 20+
   // Sigmoid-like mapping to 0-1 range
   const normalized = raw / (raw + 5.0); // 5→0.5, 10→0.67, 20→0.8, 50→0.91
-  const confidence = Math.min(1.0, normalized + patternBoost * 0.3);
+
+  // Signal-based confidence floor: if the result passed structured intent matching
+  // + keyword re-ranking, BM25 score alone shouldn't downgrade to 'silent'.
+  // Small corpora produce low BM25 scores even for strong matches.
+  let signalBoost = 0;
+  if (signals?.primaryIntent) {
+    const tags = (resource.intent_tags || '').toLowerCase().split(/[\s,]+/);
+    // Direct intent match: resource's intent_tags contain the detected primary intent.
+    // Strong boost (0.3) ensures small-corpus matches still reach 'hint' tier.
+    if (tags.includes(signals.primaryIntent)) signalBoost += 0.3;
+    else signalBoost += 0.1;
+  }
+  if (signals?.rawKeywords?.length > 0) {
+    const tags = (resource.intent_tags || '').toLowerCase();
+    if (signals.rawKeywords.some(kw => tags.includes(kw))) signalBoost += 0.2;
+  }
+
+  const confidence = Math.min(1.0, normalized + patternBoost * 0.3 + signalBoost);
 
   if (confidence >= 0.55) return 'full';
   if (confidence >= 0.3) return 'hint';
