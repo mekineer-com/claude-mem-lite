@@ -2,7 +2,7 @@
 // Checks for new versions on SessionStart, downloads and installs automatically.
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, copyFileSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -195,7 +195,7 @@ const SOURCE_FILES = [
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
   'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-patterns.mjs', 'dispatch-workflow.mjs',
-  'install.mjs',
+  'install.mjs', 'install-metadata.mjs',
 ];
 const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
 
@@ -317,7 +317,7 @@ function copyReleaseIntoStaging(sourceDir, stagingDir) {
   const stagedScripts = join(stagingDir, 'scripts');
   if (existsSync(stagedScripts)) {
     for (const sf of readdirSync(stagedScripts).filter(n => n.endsWith('.sh'))) {
-      try { execSync(`chmod +x "${join(stagedScripts, sf)}"`, { stdio: 'pipe' }); } catch {}
+      try { execFileSync('chmod', ['+x', join(stagedScripts, sf)], { stdio: 'pipe' }); } catch {}
     }
   }
 

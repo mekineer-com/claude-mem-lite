@@ -461,7 +461,7 @@ claude-mem-lite/
     convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
     index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
-  tests/               # Unit, property, integration, contract, E2E, pipeline tests (789 tests)
+  tests/               # Unit, property, integration, contract, E2E, pipeline tests
   benchmark/           # BM25 search quality benchmarks + CI gate
 ```
 
@@ -483,7 +483,7 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 
 ```bash
 npm run lint              # ESLint static analysis
-npm test                  # Run all 789 tests (vitest)
+npm test                  # Run full test suite (vitest)
 npm run test:smoke        # Run 5 core smoke tests
 npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
 npm run benchmark         # Run full search quality benchmark

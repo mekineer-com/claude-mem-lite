@@ -5,7 +5,7 @@
 import Database from 'better-sqlite3';
 import { homedir } from 'os';
 import { join } from 'path';
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, chmodSync } from 'fs';
 
 export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
@@ -185,7 +185,7 @@ export function ensureDb() {
     if (!existsSync(DB_DIR)) renameSync(oldUnhidden, DB_DIR);
   }
 
-  if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
+  if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true, mode: 0o700 });
 
   // Auto-migrate old filename in same directory (claude-mem.db → claude-mem-lite.db)
   const oldPath = join(DB_DIR, 'claude-mem.db');
@@ -197,6 +197,7 @@ export function ensureDb() {
   }
 
   const db = new Database(DB_PATH);
+  try { chmodSync(DB_PATH, 0o600); } catch {}
   db.pragma('journal_mode = WAL');
   db.pragma('busy_timeout = 3000');
   db.pragma('synchronous = NORMAL');
