@@ -237,8 +237,9 @@ async function install() {
   }
 
   // 3. Register MCP server (skip if plugin system already handles it)
-  // Plugin package exposes MCP source at claude-plugin/.mcp.json.
-  // Claude Code installs that into the cache as root .mcp.json → plugin:*:mem.
+  // Plugin source keeps MCP manifest at claude-plugin/.mcp.json.
+  // Release packaging materializes that as root .mcp.json so Claude Code loads
+  // plugin:*:mem from the installed cache.
   // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem__* server.
   // Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
   const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
@@ -272,15 +273,16 @@ async function install() {
   //
   // MCP dedup: Claude Code loads .mcp.json from BOTH marketplace root (generic scan)
   // and cache dir (plugin runtime). Root-level .mcp.json in the marketplace clone
-  // would duplicate the cache-installed plugin MCP. Keep source manifest under
-  // claude-plugin/.mcp.json so cache install still gets a root .mcp.json, while
-  // the marketplace root stays clear. Remove any stale marketplace-root copy here.
+  // would duplicate the cache-installed plugin MCP. Keep the source manifest under
+  // claude-plugin/.mcp.json and only materialize root .mcp.json in the release
+  // package, while the marketplace root stays clear. Remove stale marketplace-root
+  // copies here.
   const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
   const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
 
   if (existsSync(pluginDir)) {
     // Clear root-level .mcp.json if it exists (stale from older git versions).
-    // Source MCP manifest now lives in claude-plugin/.mcp.json to avoid marketplace-root duplication.
+    // Source MCP manifest stays in claude-plugin/.mcp.json; only the release package gets root .mcp.json.
     const rootMcpPath = join(pluginDir, '.mcp.json');
     try {
       if (existsSync(rootMcpPath)) {
