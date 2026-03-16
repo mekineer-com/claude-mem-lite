@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderInjection, renderHint } from '../dispatch-inject.mjs';
+import { renderHint } from '../dispatch-inject.mjs';
 
 describe('renderHint', () => {
   it('renders a short one-line hint for skill', () => {

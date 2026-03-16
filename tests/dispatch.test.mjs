@@ -1,5 +1,5 @@
 // Tests for v3 dispatch system: registry, retriever, dispatch, inject, feedback
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { upsertResource, getActiveResources, getResourceByName,
   updateResourceStats, recordInvocation, getSessionInvocations,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
@@ -1559,7 +1559,7 @@ describe('consecutive rejection silencing (exponential backoff)', () => {
     db.prepare(`INSERT INTO invocations (resource_id, session_id, trigger, tier, recommended, created_at)
       VALUES (?, 'old-sess', 'user_prompt', 2, 1, datetime('now', '-10 days'))`).run(id);
 
-    const result = isRecentlyRecommended(db, id, 'new-session');
+    isRecentlyRecommended(db, id, 'new-session');
     // Should have reset backoff (not silenced — only 1 rec, below threshold)
     const row = db.prepare('SELECT cooldown_hours FROM resources WHERE id = ?').get(id);
     expect(row.cooldown_hours).toBe(0); // Reset!
