@@ -2,6 +2,12 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.10.4] - 2026-03-16
+
+### Fixed
+- Made plugin SessionStart MCP cleanup idempotent so old direct-install `mem` entries in `~/.claude.json` are removed even if an earlier migration marker already exists.
+- Added a regression test covering stale global `mem` cleanup when older dedup markers are present.
+
 ## [2.10.3] - 2026-03-16
 
 ### Fixed

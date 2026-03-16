@@ -85,15 +85,16 @@ if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   fi
 fi
 
-# 7. One-time MCP migration: clean stale registrations from pre-2.10 versions.
-#    Only runs once per version — skips if marker file exists.
+# 7. MCP cleanup: idempotently clean stale registrations from pre-2.10 direct installs.
+#    This runs on every plugin SessionStart because old global mem entries may still
+#    exist even after an earlier migration marker was written.
 #    Before 2.10: old direct installs left a global mem MCP alongside plugin MCP.
 #    - Global mcpServers.mem in ~/.claude.json (from old install.mjs)
 #    - Possibly stale marketplace root .mcp.json (from old git clone)
 #    Root .mcp.json in the installed plugin cache is required for Claude Code to
 #    register plugin MCP; only stale global/marketplace copies should be removed.
-MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10"
-if [[ ! -f "$MCP_MIGRATION" && -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10.4"
+if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   CLAUDE_JSON="$HOME/.claude.json" ROOT="$ROOT" node -e '
     const fs = require("fs");
     let changed = false;
@@ -119,7 +120,7 @@ if [[ ! -f "$MCP_MIGRATION" && -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
           if (m.mcpServers?.mem) {
             delete m.mcpServers.mem;
             fs.writeFileSync(mktMcp, JSON.stringify(m, null, 2) + "\n");
-            process.stderr.write("✓ Cleared marketplace root .mcp.json (source manifest now lives in claude-plugin/)\n");
+            process.stderr.write("✓ Cleared stale marketplace root .mcp.json\n");
             changed = true;
           }
         }

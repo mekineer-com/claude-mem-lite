@@ -246,8 +246,38 @@ describe('install lifecycle checks', () => {
       const marketplaceMcp = JSON.parse(readFileSync(join(marketplaceDir, '.mcp.json'), 'utf8'));
       expect(marketplaceMcp.mcpServers?.mem).toBeUndefined();
 
-      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10'))).toBe(true);
+      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10.4'))).toBe(true);
       expect(existsSync(join(dataDir, 'runtime'))).toBe(true);
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('plugin setup re-clears stale global mem even if an older migration marker already exists', () => {
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+      mkdirSync(pluginRoot, { recursive: true });
+      symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
+
+      writeFileSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10'), 'done\n');
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } }
+      }, null, 2));
+
+      const output = execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      expect(output).toBe('');
+      const claudeJson = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
+      expect(claudeJson.mcpServers?.mem).toBeUndefined();
+      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10'))).toBe(true);
+      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10.4'))).toBe(true);
     } finally {
       try { rmSync(home, { recursive: true, force: true }); } catch {}
     }
