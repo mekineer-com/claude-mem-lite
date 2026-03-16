@@ -83,10 +83,15 @@ export async function checkForUpdate(options = {}) {
       latestVersion: latest.version,
       updateAvailable: false,
       rateLimited: false,
+      lastError: null,
     });
     return null;
   } catch (err) {
     debugCatch(err, 'checkForUpdate');
+    try {
+      const s = readState();
+      saveState({ ...s, lastCheck: new Date().toISOString(), lastError: err.message });
+    } catch {}
     return null;
   }
 }

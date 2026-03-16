@@ -485,7 +485,7 @@ claude-mem-lite/
 npm run lint              # ESLint 静态分析
 npm test                  # 运行完整测试套件（vitest）
 npm run test:smoke        # 运行 5 个核心冒烟测试
-npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
+npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥75% 行/函数，≥65% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试
 npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 ```

@@ -13,6 +13,7 @@ export default defineConfig({
         'hook-episode.mjs', 'hook-context.mjs', 'hook-semaphore.mjs',
         'hook-shared.mjs', 'hook-llm.mjs', 'haiku-client.mjs',
       ],
+      // Entry files (install.mjs, server.mjs, hook.mjs) are tested via E2E/integration, not unit coverage
       exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'benchmark/**', 'scripts/**'],
       thresholds: {
         lines: 75,

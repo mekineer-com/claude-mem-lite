@@ -945,6 +945,7 @@ async function doctor() {
       if (state.lastUpdate) parts.push(`last update: ${state.lastUpdate}`);
       if (state.updateAvailable) parts.push('update pending');
       if (state.rateLimited) parts.push('rate-limited');
+      if (state.lastError) parts.push(`last error: ${state.lastError}`);
       ok(`Update state: ${parts.join(', ') || 'empty'}`);
     } else {
       warn('Update state: no state file (first run?)');
@@ -969,7 +970,7 @@ async function doctor() {
       }
     }
     if (staleCount > 0) {
-      warn(`Stale temp files: ${staleCount} found (run cleanup to remove)`);
+      warn(`Stale temp files: ${staleCount} found (run: node install.mjs cleanup)`);
     } else {
       ok('Stale temp files: none');
     }
@@ -1068,6 +1069,47 @@ function writeSettings(settings) {
   renameSync(tmp, SETTINGS_PATH);
 }
 
+// ─── Cleanup Stale Files ─────────────────────────────────────────────────────
+
+function cleanup() {
+  console.log('\nclaude-mem-lite cleanup\n');
+  let removed = 0;
+
+  // Clean .update-staging-* / .update-backup-* in INSTALL_DIR
+  const stalePatterns = ['.update-staging-', '.update-backup-'];
+  if (existsSync(INSTALL_DIR)) {
+    for (const f of readdirSync(INSTALL_DIR)) {
+      if (stalePatterns.some(p => f.startsWith(p))) {
+        try {
+          rmSync(join(INSTALL_DIR, f), { recursive: true, force: true });
+          ok(`Removed: ${f}`);
+          removed++;
+        } catch (e) {
+          warn(`Failed to remove ${f}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  // Clean pending-* / ep-flush-* in runtime/
+  const runtimeDir = join(INSTALL_DIR, 'runtime');
+  if (existsSync(runtimeDir)) {
+    for (const f of readdirSync(runtimeDir)) {
+      if (f.startsWith('pending-') || f.startsWith('ep-flush-')) {
+        try {
+          rmSync(join(runtimeDir, f), { force: true });
+          ok(`Removed: runtime/${f}`);
+          removed++;
+        } catch (e) {
+          warn(`Failed to remove runtime/${f}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  console.log(`\n  ${removed === 0 ? 'No stale files found.' : `Removed ${removed} stale file(s).`}\n`);
+}
+
 // ─── Manual Update ───────────────────────────────────────────────────────────
 
 async function manualUpdate() {
@@ -1156,6 +1198,9 @@ export async function main(argv = process.argv.slice(2)) {
     case 'cleanup-hooks':
       await cleanupHooks();
       break;
+    case 'cleanup':
+      cleanup();
+      break;
     case 'update':
       await manualUpdate();
       break;
@@ -1177,6 +1222,7 @@ Usage:
   node install.mjs uninstall --purge  Remove and delete all data
   node install.mjs status             Show current status
   node install.mjs doctor             Diagnose issues
+  node install.mjs cleanup            Remove stale temp/staging files
   node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
   node install.mjs update             Check for and install updates
   node install.mjs release            Sync version to plugin.json + marketplace.json

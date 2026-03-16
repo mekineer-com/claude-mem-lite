@@ -485,7 +485,7 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 npm run lint              # ESLint static analysis
 npm test                  # Run full test suite (vitest)
 npm run test:smoke        # Run 5 core smoke tests
-npm run test:coverage     # Run tests with V8 coverage (≥70% lines/functions, ≥60% branches)
+npm run test:coverage     # Run tests with V8 coverage (≥75% lines/functions, ≥65% branches)
 npm run benchmark         # Run full search quality benchmark
 npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% tolerance
 ```
