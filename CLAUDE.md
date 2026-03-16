@@ -48,13 +48,13 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 本地还有没有没提交的代码
+Request: 提交代码发布新版本
 
 ### Key Context
-- [feature] MCP pull-based skill discovery with dispatch update (#3798)
-- [bugfix] Error: registry-retriever.mjs, dispatch.mjs, hook-update.mjs: 7a24012 fix(polis… (#3790)
-- [bugfix] Claude Code plugin .mcp.json duplicate MCP fix — move to .claude-plugin/ subdir (#3773)
-- [feature] Add 'search' action to mem_registry tool for capability discovery (#3765)
-- [bugfix] Error: toolu_019i6CyzUxCspeqseeNMrDk7.txt, install.mjs, server.mjs: 101→       … (#3763)
+- [bugfix] Error: hook.mjs: diff --git a/hook.mjs b/hook.mjs index 4cb6138..a… (#3879)
+- [bugfix] echo "HEAD: $(git rev-parse HEAD)" && echo "BASE:… → HEAD: 9fe8d03fb9a2ada59080… (#3877)
+- [bugfix] Error: dispatch-feedback.mjs: ✓ tests/dispatch-sim.test.mjs > Dispatch Simulati… (#3876)
+- [bugfix] Error: e2e.test.mjs: ✓ tests/dispatch.test.mjs > consecutive rejection… (#3875)
+- [bugfix] Error: dispatch.test.mjs: 1943|     const resource = db.prepare('SELECT wei… (#3872)
 
 </claude-mem-context>

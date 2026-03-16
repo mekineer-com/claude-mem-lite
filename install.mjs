@@ -271,28 +271,17 @@ async function install() {
   // point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
   // while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
   //
-  // MCP dedup: Claude Code loads .mcp.json from BOTH marketplace root (generic scan)
-  // and cache dir (plugin runtime). Keep root .mcp.json in the plugin so Claude
-  // Code can register MCP correctly, but remove stale marketplace-root copies and
-  // old global ~/.claude.json mem config to avoid duplicate registrations.
+  // MCP dedup: Claude Code copies .mcp.json from marketplace clone → plugin cache.
+  // Do NOT modify marketplace .mcp.json — it breaks the MCP server registration chain.
+  // Dedup is handled by skipping global `claude mcp add` when plugin system is active.
   const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
   const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
 
   if (existsSync(pluginDir)) {
-    // Clear root-level .mcp.json if it exists (stale from older git versions).
-    // Root .mcp.json is required in the installed plugin cache; only remove stale
-    // marketplace clone copies here.
-    const rootMcpPath = join(pluginDir, '.mcp.json');
-    try {
-      if (existsSync(rootMcpPath)) {
-        const pluginMcp = JSON.parse(readFileSync(rootMcpPath, 'utf8'));
-        if (pluginMcp.mcpServers?.mem) {
-          delete pluginMcp.mcpServers.mem;
-          writeFileSync(rootMcpPath, JSON.stringify(pluginMcp, null, 2) + '\n');
-          ok('Marketplace plugin: root .mcp.json cleared (source manifest now lives in claude-plugin/)');
-        }
-      }
-    } catch (e) { warn(`Marketplace MCP dedup: ${e.message}`); }
+    // NOTE: Do NOT clear marketplace .mcp.json — Claude Code copies from
+    // marketplace clone → plugin cache on updates. Clearing it causes the
+    // cache .mcp.json to lose the MCP server definition, breaking plugin MCP.
+    // Dedup is already handled by skipping global `claude mcp add` above.
 
     // Clear plugin hooks to prevent double hook execution
     try {
