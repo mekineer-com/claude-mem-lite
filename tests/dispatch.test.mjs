@@ -855,16 +855,31 @@ describe('dispatch-feedback.mjs', () => {
   });
 
   describe('behavioral adoption detection', () => {
-    it('detects debugging pattern (Read→Bash→Edit cycle) after debugging recommendation', () => {
+    it('detects debugging pattern requiring 2+ error→edit cycles', () => {
       const inv = { resource_name: 'superpowers-debugging', resource_type: 'skill', invocation_name: 'superpowers:systematic-debugging' };
+      // Two error→edit cycles
       const events = [
         { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL: expected 1, got 2' },
-        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: still broken' },
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'PASS' },
       ];
-      expect(detectAdoption(inv, events).adopted).toBe(true);
+      const result = detectAdoption(inv, events);
+      expect(result.adopted).toBe(true);
+      expect(result.score).toBe(0.4);
+    });
+
+    it('does NOT detect debugging pattern with only 1 error→edit cycle', () => {
+      const inv = { resource_name: 'superpowers-debugging', resource_type: 'skill', invocation_name: 'superpowers:systematic-debugging' };
+      // Only one error→edit cycle — too loose, should not trigger
+      const events = [
+        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL: expected 1, got 2' },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
+      ];
+      expect(detectAdoption(inv, events).adopted).toBe(false);
     });
 
     it('detects code-review pattern (Agent with review in prompt) after review recommendation', () => {
@@ -885,7 +900,7 @@ describe('dispatch-feedback.mjs', () => {
       expect(detectAdoption(inv, events).adopted).toBe(false);
     });
 
-    it('behavioral adoption requires activity within 10min of recommendation', () => {
+    it('behavioral adoption requires 2+ error→edit cycles within 10min of recommendation', () => {
       const inv = {
         resource_name: 'superpowers-debugging',
         resource_type: 'skill',
@@ -893,19 +908,23 @@ describe('dispatch-feedback.mjs', () => {
         created_at: '2026-03-14T10:00:00Z',
       };
 
-      // Activity 30s after recommendation → adopted
+      // 2 error→edit cycles within window → adopted
       const nearEvents = [
         { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:00:10Z').getTime() },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:00:20Z').getTime() },
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:00:30Z').getTime() },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: still broken', timestamp: new Date('2026-03-14T10:00:40Z').getTime() },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:00:50Z').getTime() },
       ];
       expect(detectAdoption(inv, nearEvents).adopted).toBe(true);
 
-      // Activity 15 minutes after recommendation → not adopted (outside 10min window)
+      // 2 error→edit cycles outside 10min window → not adopted
       const farEvents = [
         { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:15:10Z').getTime() },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: expected 1, got 2', timestamp: new Date('2026-03-14T10:15:20Z').getTime() },
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:15:30Z').getTime() },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: still broken', timestamp: new Date('2026-03-14T10:15:40Z').getTime() },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' }, timestamp: new Date('2026-03-14T10:15:50Z').getTime() },
       ];
       expect(detectAdoption(inv, farEvents).adopted).toBe(false);
     });
@@ -929,6 +948,54 @@ describe('dispatch-feedback.mjs', () => {
         { tool_name: 'Agent', tool_input: { subagent_type: 'Explore', prompt: 'review the code', description: 'Code review' }, timestamp: new Date('2026-03-14T10:15:30Z').getTime() },
       ];
       expect(detectAdoption(inv, farEvents).adopted).toBe(false);
+    });
+  });
+
+  describe('autodemoteZombies threshold (unified with COMPOSITE_EXPR)', () => {
+    it('demotes resource with recommend_count > 8 and adopt_rate < 0.1 (Laplace-smoothed)', async () => {
+      // recommend_count=9, adopt_count=0 → rate = (0+1)/(9+2) = 0.0909 < 0.1 → demote
+      const id = seedResource(db, { name: 'zombie-9recs', type: 'skill', recommend_count: 9, adopt_count: 0 });
+      recordInvocation(db, { resource_id: id, session_id: 'sess-zombie-9', trigger: 'user_prompt', tier: 2, recommended: 1 });
+
+      // Provide unrelated events so no adoption is detected, triggering feedback + autodemote
+      await collectFeedback(db, 'sess-zombie-9', [{ tool_name: 'Read', tool_input: {} }]);
+
+      const res = db.prepare('SELECT recommendation_mode FROM resources WHERE id = ?').get(id);
+      expect(res.recommendation_mode).toBe('on_request');
+    });
+
+    it('does NOT demote resource with recommend_count <= 8', async () => {
+      // recommend_count=8, adopt_count=0 → threshold not met (need > 8)
+      const id = seedResource(db, { name: 'borderline-8recs', type: 'skill', recommend_count: 8, adopt_count: 0 });
+      recordInvocation(db, { resource_id: id, session_id: 'sess-borderline-8', trigger: 'user_prompt', tier: 2, recommended: 1 });
+
+      await collectFeedback(db, 'sess-borderline-8', [{ tool_name: 'Read', tool_input: {} }]);
+
+      const res = db.prepare('SELECT recommendation_mode FROM resources WHERE id = ?').get(id);
+      expect(res.recommendation_mode).not.toBe('on_request');
+    });
+
+    it('does NOT demote resource with adopt_rate >= 0.1 even with high recommend_count', async () => {
+      // recommend_count=20, adopt_count=1 → rate = (1+1)/(20+2) = 0.0909 < 0.1 → SHOULD demote
+      // recommend_count=20, adopt_count=2 → rate = (2+1)/(20+2) = 0.1364 >= 0.1 → should NOT demote
+      const id = seedResource(db, { name: 'low-adopt-ok', type: 'skill', recommend_count: 20, adopt_count: 2 });
+      recordInvocation(db, { resource_id: id, session_id: 'sess-low-adopt', trigger: 'user_prompt', tier: 2, recommended: 1 });
+
+      await collectFeedback(db, 'sess-low-adopt', [{ tool_name: 'Read', tool_input: {} }]);
+
+      const res = db.prepare('SELECT recommendation_mode FROM resources WHERE id = ?').get(id);
+      expect(res.recommendation_mode).not.toBe('on_request');
+    });
+
+    it('demotes resource with 1 adopt out of 20 recs (rate < 0.1 after Laplace smoothing)', async () => {
+      // recommend_count=20, adopt_count=1 → rate = (1+1)/(20+2) = 0.0909 < 0.1 → demote
+      const id = seedResource(db, { name: 'near-zombie', type: 'skill', recommend_count: 20, adopt_count: 1 });
+      recordInvocation(db, { resource_id: id, session_id: 'sess-near-zombie', trigger: 'user_prompt', tier: 2, recommended: 1 });
+
+      await collectFeedback(db, 'sess-near-zombie', [{ tool_name: 'Read', tool_input: {} }]);
+
+      const res = db.prepare('SELECT recommendation_mode FROM resources WHERE id = ?').get(id);
+      expect(res.recommendation_mode).toBe('on_request');
     });
   });
 

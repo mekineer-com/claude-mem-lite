@@ -475,14 +475,26 @@ describe('Dispatch Feedback: Adoption Detection', () => {
     expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 1.0 });
   });
 
-  it('detects behavioral debugging adoption', () => {
+  it('detects behavioral debugging adoption with 2+ error→edit cycles', () => {
+    const inv = { resource_name: 'debugging-helper', resource_type: 'skill' };
+    const events = [
+      { tool_name: 'Read', tool_input: {} },
+      { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: ENOENT: no such file or directory, this is a long error message' },
+      { tool_name: 'Edit', tool_input: {} },
+      { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: EACCES: permission denied, still failing' },
+      { tool_name: 'Edit', tool_input: {} },
+    ];
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 0.4 });
+  });
+
+  it('does NOT detect debugging adoption with only 1 error→edit cycle', () => {
     const inv = { resource_name: 'debugging-helper', resource_type: 'skill' };
     const events = [
       { tool_name: 'Read', tool_input: {} },
       { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: ENOENT: no such file or directory, this is a long error message' },
       { tool_name: 'Edit', tool_input: {} },
     ];
-    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 0.5 });
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: false, score: 0 });
   });
 
   it('does not detect adoption for unrelated events', () => {

@@ -114,7 +114,8 @@ function detectVerificationPattern(events, recTime) {
  * Multi-tier adoption detection for recommended resources.
  * Returns { adopted: boolean, score: number } where score indicates confidence:
  *   1.0 = explicit (Skill/Agent tool invocation)
- *   0.5 = behavioral (detected methodology pattern: TDD, debug, review)
+ *   0.5 = behavioral (detected methodology pattern: TDD, review)
+ *   0.4 = behavioral (debugging: 2+ error→edit cycles, lower confidence)
  *   0.2 = inferred (verification pattern near session end)
  *
  * @param {object} invocation Invocation record with resource info
@@ -165,21 +166,30 @@ function detectAdoption(invocation, sessionEvents) {
     }
   }
 
-  // Debugging pattern: Read → Bash(error) → Edit cycle
+  // Debugging pattern: requires 2+ error→edit cycles (not just one)
+  // A single error→edit is too common in normal coding and doesn't indicate
+  // systematic debugging methodology was actually applied.
   if (resourceLower.includes('debug') || resourceLower.includes('troubleshoot')) {
     const firstRelevant = sessionEvents.find(e =>
       e.tool_name === 'Read' ||
       (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || ''))
     );
     if (isWithinWindow(firstRelevant?.timestamp, recTime)) {
-      let hasRead = false, hasBashError = false, hasEditAfterError = false;
+      let hasRead = false;
+      let cycles = 0;
+      let sawError = false;
       for (const e of sessionEvents) {
         if (e.tool_name === 'Read') hasRead = true;
-        if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) hasBashError = true;
-        if (hasBashError && EDIT_TOOLS.has(e.tool_name)) hasEditAfterError = true;
+        if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) {
+          sawError = true;
+        }
+        if (sawError && EDIT_TOOLS.has(e.tool_name)) {
+          cycles++;
+          sawError = false; // Reset for next cycle
+        }
       }
-      if (hasRead && hasBashError && hasEditAfterError) {
-        return { adopted: true, score: 0.5 };
+      if (hasRead && cycles >= 2) {
+        return { adopted: true, score: 0.4 };
       }
     }
   }
@@ -331,8 +341,8 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
       }
     }
 
-    // Auto-demote zombie resources: >10 recommendations with 0 adoptions → on_request mode
-    // This prevents chronic false positives from continuing to waste recommendation slots
+    // Auto-demote zombie resources: >8 recs with adopt_rate < 0.1 → on_request mode
+    // Unified with COMPOSITE_EXPR zombie penalty threshold in registry-retriever.mjs
     autodemoteZombies(db);
   } catch (e) {
     debugCatch(e, 'collectFeedback');
@@ -340,16 +350,18 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
 }
 
 /**
- * Auto-demote resources with high recommendation count and zero adoption to on_request mode.
- * Zombie threshold: recommend_count > 10 AND adopt_count = 0.
+ * Auto-demote resources with high recommendation count and near-zero adoption to on_request mode.
+ * Zombie threshold (unified with COMPOSITE_EXPR penalty):
+ *   recommend_count > 8 AND Laplace-smoothed adopt_rate < 0.1
+ *   adopt_rate = (adopt_count + 1) / (recommend_count + 2)
  * Only demotes resources currently in 'proactive' mode.
  */
 function autodemoteZombies(db) {
   try {
     const demoted = db.prepare(`
       UPDATE resources SET recommendation_mode = 'on_request', updated_at = datetime('now')
-      WHERE COALESCE(recommend_count, 0) > 10
-        AND COALESCE(adopt_count, 0) = 0
+      WHERE COALESCE(recommend_count, 0) > 8
+        AND (COALESCE(adopt_count, 0) + 1.0) / (COALESCE(recommend_count, 0) + 2.0) < 0.1
         AND COALESCE(recommendation_mode, 'proactive') = 'proactive'
         AND status = 'active'
     `).run();
