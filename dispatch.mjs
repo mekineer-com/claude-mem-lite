@@ -899,28 +899,45 @@ function passesConfidenceGate(results, signals) {
 
 // ─── Auto-loaded Skill Filter ────────────────────────────────────────────────
 
+// Plugin-namespaced skills with high adoption rates deserve proactive recommendations
+// even though they're listed in system-reminder. The listing alone doesn't guarantee
+// Claude invokes them at the right moment — a contextual nudge at the right time
+// is more effective than a static list.
+const AUTOLOADED_MIN_ADOPTIONS = 3;    // Must have been adopted at least N times total
+const AUTOLOADED_MIN_ADOPT_RATE = 0.08; // Minimum adoption rate to keep recommending
+
 /**
- * Filter out skills that are auto-loaded via plugin hooks (listed in system-reminder).
- * These skills don't need dispatch recommendations because the plugin's own hooks
- * already surface them to Claude at the right moment.
+ * Filter auto-loaded skills with adoption-aware logic.
  *
- * User-installed standalone skills (non-namespaced invocation_name like "build-error-resolver")
- * are KEPT — users may not remember to invoke them at the right time, so contextual
- * recommendations still add value (installed skills have 11.5% adoption vs 6.1% community).
+ * Plugin-namespaced skills (e.g. "superpowers:systematic-debugging") are listed
+ * in system-reminder, so Claude already knows about them. However, blanket filtering
+ * removes high-value skills that users actually adopt when recommended contextually.
+ *
+ * Strategy: filter auto-loaded skills that have poor adoption history (recommend fatigue),
+ * but keep those that users actually adopt — the contextual timing adds real value.
+ *
+ * User-installed standalone skills (non-namespaced like "build-error-resolver")
+ * are always KEPT — contextual recommendations still add value.
  *
  * @param {object[]} results FTS5 results
- * @returns {object[]} Filtered results — community + standalone installed skills
+ * @returns {object[]} Filtered results
  */
 function filterAutoLoadedSkills(results) {
   return results.filter(r => {
     if (r.type !== 'skill') return true;
     const inv = (r.invocation_name || '').trim();
     if (inv === '') return true; // Community resource — always recommend
-    // Plugin-namespaced skills (e.g. "superpowers:systematic-debugging") are auto-loaded
-    // via the plugin's own hooks in system-reminder — dispatch recommendation is redundant
-    if (inv.includes(':')) return false;
-    // Standalone installed skills (e.g. "build-error-resolver") — keep for contextual recommendations
-    return true;
+    // Standalone installed skills (e.g. "build-error-resolver") — keep
+    if (!inv.includes(':')) return true;
+    // Plugin-namespaced: adoption-aware filter
+    // Cold start: keep if never recommended (no data to judge yet)
+    const recs = r.recommend_count || 0;
+    if (recs < 5) return true;
+    // Keep if adoption rate is healthy
+    const adopts = r.adopt_count || 0;
+    if (adopts >= AUTOLOADED_MIN_ADOPTIONS && (adopts + 1) / (recs + 2) >= AUTOLOADED_MIN_ADOPT_RATE) return true;
+    // Poor adoption history — suppress proactive recommendation
+    return false;
   });
 }
 

@@ -1624,19 +1624,37 @@ describe('consecutive rejection silencing (exponential backoff)', () => {
   });
 });
 
-// ─── filterAutoLoadedSkills ─────────────────────────────────────────────────
+// ─── filterAutoLoadedSkills (adoption-aware) ──────────────────────────────────
 
 describe('filterAutoLoadedSkills', () => {
-  it('filters plugin-namespaced skills (auto-loaded via hooks)', () => {
+  it('filters plugin-namespaced skills with poor adoption (high recs, low adopts)', () => {
     const results = [
-      { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development' },
-      { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging' },
-      { name: 'frontend-design', type: 'skill', invocation_name: 'frontend-design:frontend-design' },
+      { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development', recommend_count: 50, adopt_count: 1 },
+      { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging', recommend_count: 30, adopt_count: 0 },
       { name: 'community-only', type: 'skill', invocation_name: '' },
     ];
     const filtered = _filterAutoLoadedSkills(results);
     expect(filtered).toHaveLength(1);
     expect(filtered[0].name).toBe('community-only');
+  });
+
+  it('keeps plugin-namespaced skills with healthy adoption', () => {
+    const results = [
+      { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development', recommend_count: 20, adopt_count: 5 },
+      { name: 'frontend-design', type: 'skill', invocation_name: 'frontend-design:frontend-design', recommend_count: 10, adopt_count: 3 },
+      { name: 'community-only', type: 'skill', invocation_name: '' },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(3);
+  });
+
+  it('keeps plugin-namespaced skills during cold start (< 5 recommendations)', () => {
+    const results = [
+      { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development', recommend_count: 2, adopt_count: 0 },
+      { name: 'frontend-design', type: 'skill', invocation_name: 'frontend-design:frontend-design', recommend_count: 0, adopt_count: 0 },
+    ];
+    const filtered = _filterAutoLoadedSkills(results);
+    expect(filtered).toHaveLength(2);
   });
 
   it('keeps standalone installed skills (no plugin namespace)', () => {
@@ -1652,7 +1670,7 @@ describe('filterAutoLoadedSkills', () => {
 
   it('keeps agents regardless of invocation_name', () => {
     const results = [
-      { name: 'gsd-executor', type: 'agent', invocation_name: 'gsd:executor' },
+      { name: 'gsd-executor', type: 'agent', invocation_name: 'gsd:executor', recommend_count: 100, adopt_count: 0 },
       { name: 'code-review-ai/reviewer', type: 'agent', invocation_name: '' },
     ];
     const filtered = _filterAutoLoadedSkills(results);
@@ -1668,15 +1686,16 @@ describe('filterAutoLoadedSkills', () => {
     expect(filtered).toHaveLength(2);
   });
 
-  it('distinguishes plugin-namespaced from standalone installed', () => {
+  it('distinguishes by adoption: namespaced with good adoption kept, poor adoption filtered', () => {
     const results = [
-      { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging' },
+      { name: 'superpowers-debugging', type: 'skill', invocation_name: 'superpowers:systematic-debugging', recommend_count: 20, adopt_count: 0 },
+      { name: 'superpowers-tdd', type: 'skill', invocation_name: 'superpowers:test-driven-development', recommend_count: 15, adopt_count: 4 },
       { name: 'code-review-expert', type: 'skill', invocation_name: 'code-review-expert' },
       { name: 'community-tool', type: 'skill', invocation_name: '' },
     ];
     const filtered = _filterAutoLoadedSkills(results);
-    expect(filtered).toHaveLength(2);
-    expect(filtered.map(r => r.name)).toEqual(['code-review-expert', 'community-tool']);
+    expect(filtered).toHaveLength(3);
+    expect(filtered.map(r => r.name)).toEqual(['superpowers-tdd', 'code-review-expert', 'community-tool']);
   });
 });
 

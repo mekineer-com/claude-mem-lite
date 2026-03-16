@@ -6,8 +6,8 @@ function readJson(path) {
 }
 
 describe('plugin manifests', () => {
-  it('declares plugin-mode MCP launcher in .mcp.json', () => {
-    const manifest = readJson('.mcp.json');
+  it('declares plugin-mode MCP launcher in .claude-plugin/.mcp.json', () => {
+    const manifest = readJson('.claude-plugin/.mcp.json');
     expect(manifest.mcpServers).toBeTruthy();
     expect(manifest.mcpServers.mem).toEqual({
       command: 'node',

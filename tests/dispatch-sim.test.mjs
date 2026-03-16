@@ -822,16 +822,24 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
   // ─── Scenario 11b: Explicit request path filters auto-loaded skills ──────
 
-  describe('explicit request path filters auto-loaded skills', () => {
-    it('explicit request for auto-loaded skill does not recommend that skill', async () => {
-      // "use the superpowers-debugging skill" → explicit request extracts "superpowers-debugging"
-      // superpowers-debugging has invocation_name 'superpowers:systematic-debugging' (non-empty)
-      // Even with explicit request, auto-loaded skills should NOT be recommended
+  describe('explicit request path filters auto-loaded skills (adoption-aware)', () => {
+    it('explicit request for auto-loaded skill with poor adoption does not recommend', async () => {
+      // Give superpowers-debugging high recommend count but zero adoption → poor adoption
+      db.prepare("UPDATE resources SET recommend_count = 50, adopt_count = 0 WHERE name = 'superpowers-debugging'").run();
       const result = await dispatchOnUserPrompt(db, 'use the superpowers-debugging skill', 'explicit-filter-sess');
-      // Result may be null or a different community resource — but never the auto-loaded skill itself
       if (result) {
         expect(result).not.toContain('superpowers:systematic-debugging');
         expect(result).not.toContain('superpowers-debugging');
+      }
+    });
+
+    it('explicit request for auto-loaded skill with healthy adoption can recommend', async () => {
+      // Give superpowers-debugging healthy adoption stats
+      db.prepare("UPDATE resources SET recommend_count = 20, adopt_count = 5 WHERE name = 'superpowers-debugging'").run();
+      const result = await dispatchOnUserPrompt(db, 'use the superpowers-debugging skill', 'explicit-filter-sess-2');
+      // Should recommend since adoption is healthy
+      if (result) {
+        expect(result).toContain('superpowers:systematic-debugging');
       }
     });
 

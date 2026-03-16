@@ -5,7 +5,7 @@
 import { execSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, copyFileSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { DB_DIR } from './schema.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
 
@@ -270,6 +270,20 @@ export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
 
     rmSync(stagingDir, { recursive: true, force: true });
     rmSync(backupDir, { recursive: true, force: true });
+
+    // Post-update migration: clean stale global MCP if plugin handles it
+    try {
+      if (isPluginMode()) {
+        const claudeJsonPath = join(homedir(), '.claude.json');
+        const cfg = JSON.parse(readFileSync(claudeJsonPath, 'utf8'));
+        if (cfg.mcpServers?.mem) {
+          delete cfg.mcpServers.mem;
+          writeFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n');
+          debugLog('DEBUG', 'hook-update', 'Post-update: removed stale global MCP "mem"');
+        }
+      }
+    } catch (e) { debugCatch(e, 'post-update-mcp-dedup'); }
+
     debugLog('DEBUG', 'hook-update', `Auto-update: switched ${installed.length} paths`);
     return true;
   } catch (err) {

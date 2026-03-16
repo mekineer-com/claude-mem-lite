@@ -92,8 +92,9 @@ export const memMaintainSchema = {
 };
 
 export const memRegistrySchema = {
-  action: z.enum(['list', 'stats', 'import', 'remove', 'reindex']).describe('Registry operation'),
-  type: z.enum(['skill', 'agent']).optional().describe('Filter by resource type (for list)'),
+  action: z.enum(['list', 'stats', 'search', 'import', 'remove', 'reindex']).describe('Registry operation'),
+  query: z.string().optional().describe('Search query — keywords describing what you need (for search)'),
+  type: z.enum(['skill', 'agent']).optional().describe('Filter by resource type (for list/search)'),
   name: z.string().optional().describe('Resource name (for import/remove)'),
   resource_type: z.enum(['skill', 'agent']).optional().describe('Resource type (for import/remove)'),
   source: z.enum(['preinstalled', 'user']).optional().describe('Source (for import, default: user)'),

@@ -85,5 +85,49 @@ if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   fi
 fi
 
+# 7. One-time MCP migration: clean stale registrations from pre-2.10 versions.
+#    Only runs once per version — skips if marker file exists.
+#    Before 2.10: .mcp.json at repo root caused duplicate MCP servers.
+#    - Global mcpServers.mem in ~/.claude.json (from old install.mjs)
+#    - Marketplace root .mcp.json (from old git clone)
+#    Now: .mcp.json in .claude-plugin/ → plugin system handles MCP exclusively.
+MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10"
+if [[ ! -f "$MCP_MIGRATION" && -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+  CLAUDE_JSON="$HOME/.claude.json" ROOT="$ROOT" node -e '
+    const fs = require("fs");
+    let changed = false;
+    // 1. Remove stale global MCP registration
+    try {
+      const p = process.env.CLAUDE_JSON;
+      const d = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (d.mcpServers?.mem) {
+        delete d.mcpServers.mem;
+        fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
+        process.stderr.write("✓ Removed stale global MCP \"mem\" (plugin handles it)\n");
+        changed = true;
+      }
+    } catch {}
+    // 2. Remove stale marketplace root .mcp.json
+    try {
+      const root = process.env.ROOT;
+      if (root.includes("/plugins/cache/")) {
+        const key = root.split("/plugins/cache/")[1].split("/")[0];
+        const mktMcp = require("path").join(require("os").homedir(), ".claude/plugins/marketplaces", key, ".mcp.json");
+        if (fs.existsSync(mktMcp)) {
+          const m = JSON.parse(fs.readFileSync(mktMcp, "utf8"));
+          if (m.mcpServers?.mem) {
+            delete m.mcpServers.mem;
+            fs.writeFileSync(mktMcp, JSON.stringify(m, null, 2) + "\n");
+            process.stderr.write("✓ Cleared marketplace root .mcp.json (moved to .claude-plugin/)\n");
+            changed = true;
+          }
+        }
+      }
+    } catch {}
+    if (!changed) process.stderr.write("✓ MCP migration: already clean\n");
+  ' 2>&2 || true
+  touch "$MCP_MIGRATION"
+fi
+
 log_ok "claude-mem-lite ready"
 exit 0

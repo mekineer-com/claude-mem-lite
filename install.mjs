@@ -236,37 +236,57 @@ async function install() {
     }
   }
 
-  // 3. Register MCP server
-  log('Registering MCP server...');
+  // 3. Register MCP server (skip if plugin system already handles it)
+  // Plugin system registers MCP from .claude-plugin/.mcp.json → mcp__plugin_claude-mem-lite_mem__*
+  // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem__* server.
+  // Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
+  const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
+  let pluginHandlesMcp = false;
   try {
-    // Remove existing first (ignore errors)
-    try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); } catch {}
-    execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
-    // Remove project-level registration that shadows global (from .mcp.json)
-    try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', 'mem'], { stdio: 'pipe' }); } catch {}
-    ok('MCP server registered: mem');
-  } catch (e) {
-    fail('MCP registration failed: ' + e.message);
-    warn('Try manually: claude mcp add -s user -t stdio mem -- node ' + SERVER_PATH);
+    const installed = JSON.parse(readFileSync(installedPluginsPath, 'utf8'));
+    pluginHandlesMcp = !!installed?.plugins?.[PLUGIN_KEY]?.length;
+  } catch { /* not installed via plugin system */ }
+
+  if (pluginHandlesMcp) {
+    log('MCP server: plugin system handles registration (skipping global)');
+    // Clean up stale global registration if it exists (from older install.mjs versions)
+    try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); ok('Removed stale global MCP registration'); } catch {}
+  } else {
+    log('Registering MCP server...');
+    try {
+      try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); } catch {}
+      execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
+      try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', 'mem'], { stdio: 'pipe' }); } catch {}
+      ok('MCP server registered: mem');
+    } catch (e) {
+      fail('MCP registration failed: ' + e.message);
+      warn('Try manually: claude mcp add -s user -t stdio mem -- node ' + SERVER_PATH);
+    }
   }
 
   // 3b. Deduplicate: if marketplace plugin also registers MCP + hooks,
   // clear them to prevent double execution. install.mjs hooks (in settings.json)
   // point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
   // while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
+  //
+  // MCP dedup: Claude Code loads .mcp.json from BOTH marketplace root (generic scan)
+  // and cache dir (plugin system). Root-level .mcp.json → duplicate mcp__mem__*.
+  // Fix: .mcp.json moved to .claude-plugin/ (plugin installer reads from there,
+  // generic scanner only scans root). Clear any stale root copy here.
   const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
-  const pluginMcpPath = join(pluginDir, '.mcp.json');
   const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
 
   if (existsSync(pluginDir)) {
-    // Clear plugin MCP to prevent duplicate "mem" server
+    // Clear root-level .mcp.json if it exists (stale from older git versions).
+    // .mcp.json is now in .claude-plugin/ to avoid generic scanner duplicate.
+    const rootMcpPath = join(pluginDir, '.mcp.json');
     try {
-      if (existsSync(pluginMcpPath)) {
-        const pluginMcp = JSON.parse(readFileSync(pluginMcpPath, 'utf8'));
+      if (existsSync(rootMcpPath)) {
+        const pluginMcp = JSON.parse(readFileSync(rootMcpPath, 'utf8'));
         if (pluginMcp.mcpServers?.mem) {
           delete pluginMcp.mcpServers.mem;
-          writeFileSync(pluginMcpPath, JSON.stringify(pluginMcp, null, 2) + '\n');
-          ok('Marketplace plugin: MCP cleared (prevents duplicate)');
+          writeFileSync(rootMcpPath, JSON.stringify(pluginMcp, null, 2) + '\n');
+          ok('Marketplace plugin: root .mcp.json cleared (moved to .claude-plugin/)');
         }
       }
     } catch (e) { warn(`Marketplace MCP dedup: ${e.message}`); }

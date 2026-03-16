@@ -9,6 +9,7 @@ import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { searchResources } from './registry-retriever.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -122,6 +123,13 @@ const server = new McpServer(
       '',
       'SEARCH WORKFLOW: mem_search → mem_timeline(anchor=ID) for surrounding context → mem_get(ids=[...]) for full details.',
       'Search tips: use short keywords (2-3 words), not full sentences. Filter with obs_type when relevant.',
+      '',
+      'SKILL/AGENT DISCOVERY (mem_registry):',
+      '- When your installed skills/agents don\'t cover the current workflow → mem_registry(action="search", query="<what you need>")',
+      '- When the user asks for a capability you lack → search the registry first',
+      '- When starting complex multi-step work → check if specialized agents exist: mem_registry(action="search", query="<task domain>", type="agent")',
+      '- Filter by type: type="skill" for workflow skills, type="agent" for specialized agents',
+      '- Say: "Searching mem for [purpose]..." when using this feature',
       '',
       'MAINTENANCE: mem_compress consolidates old observations. mem_maintain runs dedup/cleanup/reindex.',
     ].join('\n'),
@@ -1201,7 +1209,7 @@ server.registerTool(
 server.registerTool(
   'mem_registry',
   {
-    description: 'Manage tool resource registry: list resources, view stats, import/remove tools, reindex FTS5.',
+    description: 'Manage tool resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex FTS5.',
     inputSchema: memRegistrySchema,
   },
   safeHandler(async (args) => {
@@ -1211,6 +1219,26 @@ server.registerTool(
     }
 
     const action = args.action;
+
+    if (action === 'search') {
+      if (!args.query) {
+        return { content: [{ type: 'text', text: 'search requires a query parameter' }], isError: true };
+      }
+      const results = searchResources(rdb, args.query, {
+        type: args.type || undefined,
+        limit: 5,
+      });
+      if (results.length === 0) {
+        return { content: [{ type: 'text', text: `No matching resources for: "${args.query}"` }] };
+      }
+      const lines = results.map(r => {
+        const howToUse = r.type === 'skill'
+          ? (r.invocation_name ? `Skill tool: skill="${r.invocation_name}"` : `Community skill: ${r.name}`)
+          : `Agent tool: subagent_type="${r.name}"`;
+        return `${r.type === 'skill' ? 'S' : 'A'} **${r.name}** — ${truncate(r.capability_summary || '', 80)}\n  Use: ${howToUse}`;
+      });
+      return { content: [{ type: 'text', text: `Found ${results.length} resource(s) for "${args.query}":\n\n${lines.join('\n\n')}` }] };
+    }
 
     if (action === 'list') {
       const typeFilter = args.type;
@@ -1287,7 +1315,7 @@ server.registerTool(
       return { content: [{ type: 'text', text: `FTS5 reindexed. ${count.c} active resources.` }] };
     }
 
-    return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: list, stats, import, remove, reindex` }], isError: true };
+    return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: search, list, stats, import, remove, reindex` }], isError: true };
   })
 );
 
