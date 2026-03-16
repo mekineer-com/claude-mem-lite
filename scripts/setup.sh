@@ -90,7 +90,8 @@ fi
 #    Before 2.10: .mcp.json at repo root caused duplicate MCP servers.
 #    - Global mcpServers.mem in ~/.claude.json (from old install.mjs)
 #    - Marketplace root .mcp.json (from old git clone)
-#    Now: .mcp.json in .claude-plugin/ → plugin system handles MCP exclusively.
+#    Now: source manifest lives in claude-plugin/.mcp.json so the cache install
+#    gets a root .mcp.json, while the marketplace root stays clear.
 MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10"
 if [[ ! -f "$MCP_MIGRATION" && -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   CLAUDE_JSON="$HOME/.claude.json" ROOT="$ROOT" node -e '
@@ -118,7 +119,7 @@ if [[ ! -f "$MCP_MIGRATION" && -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
           if (m.mcpServers?.mem) {
             delete m.mcpServers.mem;
             fs.writeFileSync(mktMcp, JSON.stringify(m, null, 2) + "\n");
-            process.stderr.write("✓ Cleared marketplace root .mcp.json (moved to .claude-plugin/)\n");
+            process.stderr.write("✓ Cleared marketplace root .mcp.json (source manifest now lives in claude-plugin/)\n");
             changed = true;
           }
         }

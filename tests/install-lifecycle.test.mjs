@@ -1,12 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, readlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { clearPluginDisabledMarkerForDirectInstall, hasOtherMarketplacePlugins } from '../install.mjs';
 
 const INSTALL_PATH = resolve('install.mjs');
+const SETUP_PATH = resolve('scripts/setup.sh');
 
 function makeTmpDir() {
   const dir = join(tmpdir(), `mem-install-${randomUUID().slice(0, 8)}`);
@@ -14,12 +15,74 @@ function makeTmpDir() {
   return dir;
 }
 
-function runInstall(command, home, args = []) {
+function runInstall(command, home, args = [], extraEnv = {}) {
   return execFileSync(process.execPath, [INSTALL_PATH, command, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home },
+    env: { ...process.env, HOME: home, ...extraEnv },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+}
+
+function makeFakeClaudeBin(home) {
+  const binDir = join(home, 'bin');
+  mkdirSync(binDir, { recursive: true });
+  const script = join(binDir, 'claude');
+  writeFileSync(script, [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    `STATE="${home}/.claude/mcp-state.txt"`,
+    `mkdir -p "${home}/.claude"`,
+    'touch "$STATE"',
+    'if [[ "${1:-}" != "mcp" ]]; then',
+    '  exit 0',
+    'fi',
+    'shift',
+    'cmd="${1:-}"',
+    'shift || true',
+    'case "$cmd" in',
+    '  add)',
+    '    scope="user"',
+    '    name=""',
+    '    while [[ $# -gt 0 ]]; do',
+    '      case "$1" in',
+    '        -s) scope="$2"; shift 2 ;;',
+    '        -t) shift 2 ;;',
+    '        --) break ;;',
+    '        *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;;',
+    '      esac',
+    '    done',
+    '    if [[ -n "$name" ]]; then',
+    '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" || true',
+    '      mv "$STATE.tmp" "$STATE"',
+    "      printf '%s:%s\\n' \"$scope\" \"$name\" >> \"$STATE\"",
+    '    fi',
+    '    ;;',
+    '  remove)',
+    '    scope="user"',
+    '    name=""',
+    '    while [[ $# -gt 0 ]]; do',
+    '      case "$1" in',
+    '        -s) scope="$2"; shift 2 ;;',
+    '        *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;;',
+    '      esac',
+    '    done',
+    '    if [[ -n "$name" ]]; then',
+    '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" || true',
+    '      mv "$STATE.tmp" "$STATE"',
+    '    fi',
+    '    ;;',
+    '  list)',
+    '    while IFS= read -r line; do',
+    '      [[ -n "$line" ]] || continue',
+    '      name="${line#*:}"',
+    "      printf '%s: stdio\\n' \"$name\"",
+    '    done < "$STATE"',
+    '    ;;',
+    'esac',
+    '',
+  ].join('\n'));
+  execFileSync('chmod', ['+x', script]);
+  return binDir;
 }
 
 describe('install lifecycle checks', () => {
@@ -104,5 +167,89 @@ describe('install lifecycle checks', () => {
         'other-tool@vendor': {},
       }
     })).toBe(false);
+  });
+
+  it('uninstall removes plugin registry and cache when no other marketplace plugins remain', () => {
+    const home = makeTmpDir();
+    try {
+      const claudeDir = join(home, '.claude');
+      const pluginsDir = join(claudeDir, 'plugins');
+      const marketplaceDir = join(pluginsDir, 'marketplaces', 'sdsrss');
+      const cacheDir = join(pluginsDir, 'cache', 'sdsrss');
+      mkdirSync(marketplaceDir, { recursive: true });
+      mkdirSync(cacheDir, { recursive: true });
+      mkdirSync(join(home, '.claude-mem-lite'), { recursive: true });
+      writeFileSync(join(claudeDir, 'settings.json'), JSON.stringify({
+        enabledPlugins: { 'claude-mem-lite@sdsrss': true },
+        extraKnownMarketplaces: { sdsrss: { url: 'https://example.com' } },
+        hooks: {
+          SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: 'node "/tmp/.claude-mem-lite/hook.mjs" session-start' }] }]
+        }
+      }, null, 2));
+      writeFileSync(join(pluginsDir, 'installed_plugins.json'), JSON.stringify({
+        plugins: { 'claude-mem-lite@sdsrss': [{ version: '2.10.0' }] }
+      }, null, 2));
+      writeFileSync(join(pluginsDir, 'known_marketplaces.json'), JSON.stringify({
+        sdsrss: { url: 'https://example.com' }
+      }, null, 2));
+
+      const binDir = makeFakeClaudeBin(home);
+      const output = runInstall('uninstall', home, ['--purge'], { PATH: `${binDir}:${process.env.PATH}` });
+      expect(output).toContain('Removed from installed_plugins.json');
+      expect(output).toContain('Marketplace directory removed');
+      expect(output).toContain('Plugin cache removed');
+      expect(output).toContain('Removed from known_marketplaces.json');
+      expect(output).toContain('Data purged');
+
+      const settings = JSON.parse(readFileSync(join(claudeDir, 'settings.json'), 'utf8'));
+      expect(settings.enabledPlugins?.['claude-mem-lite@sdsrss']).toBeUndefined();
+      expect(settings.extraKnownMarketplaces?.sdsrss).toBeUndefined();
+      expect(settings.hooks?.SessionStart).toBeUndefined();
+      expect(existsSync(marketplaceDir)).toBe(false);
+      expect(existsSync(cacheDir)).toBe(false);
+      expect(existsSync(join(home, '.claude-mem-lite'))).toBe(false);
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('plugin setup clears stale MCP registrations and links dependencies from data dir', () => {
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      const marketplaceDir = join(home, '.claude', 'plugins', 'marketplaces', 'sdsrss');
+      mkdirSync(dataDir, { recursive: true });
+      mkdirSync(pluginRoot, { recursive: true });
+      mkdirSync(marketplaceDir, { recursive: true });
+      symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
+
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } }
+      }, null, 2));
+      writeFileSync(join(marketplaceDir, '.mcp.json'), JSON.stringify({
+        mcpServers: { mem: { command: 'node', args: ['old-plugin-server.mjs'] } }
+      }, null, 2));
+
+      const output = execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      expect(output).toBe('');
+      expect(readlinkSync(join(pluginRoot, 'node_modules'))).toBe(join(dataDir, 'node_modules'));
+
+      const claudeJson = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
+      expect(claudeJson.mcpServers?.mem).toBeUndefined();
+
+      const marketplaceMcp = JSON.parse(readFileSync(join(marketplaceDir, '.mcp.json'), 'utf8'));
+      expect(marketplaceMcp.mcpServers?.mem).toBeUndefined();
+
+      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10'))).toBe(true);
+      expect(existsSync(join(dataDir, 'runtime'))).toBe(true);
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
   });
 });

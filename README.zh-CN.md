@@ -425,7 +425,8 @@ claude-mem-lite/
   .claude-plugin/
     plugin.json      # 插件清单
     marketplace.json # 市场目录
-  .mcp.json          # MCP 服务器定义（插件模式）
+  claude-plugin/
+    .mcp.json        # MCP 服务器定义源（安装后落到 cache 根目录）
   hooks/
     hooks.json       # 钩子定义（插件模式）
   commands/

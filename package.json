@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.10.0",
+  "version": "2.10.1",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -58,9 +58,9 @@
     "scripts/launch.mjs",
     "scripts/setup.sh",
     "scripts/post-tool-use.sh",
+    "claude-plugin/.mcp.json",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",
-    ".mcp.json",
     "README.md",
     "registry/preinstalled.json"
   ],
