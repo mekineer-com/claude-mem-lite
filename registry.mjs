@@ -36,6 +36,7 @@ const RESOURCES_SCHEMA = `
     complexity    TEXT DEFAULT 'intermediate',
     recommend_count   INTEGER DEFAULT 0,
     adopt_count       INTEGER DEFAULT 0,
+    weighted_adopt_sum REAL DEFAULT 0,
     success_count     INTEGER DEFAULT 0,
     silenced_until TEXT,
     cooldown_hours    INTEGER DEFAULT 0,
@@ -170,6 +171,8 @@ export function ensureRegistryDb(dbPath) {
     if (!resCols.has('cooldown_hours')) db.exec("ALTER TABLE resources ADD COLUMN cooldown_hours INTEGER DEFAULT 0");
     // recommendation_mode: 'proactive' (default, actively recommended), 'on_request' (only when explicitly asked)
     if (!resCols.has('recommendation_mode')) db.exec("ALTER TABLE resources ADD COLUMN recommendation_mode TEXT DEFAULT 'proactive'");
+    // weighted_adopt_sum: continuous adoption score accumulator (vs binary adopt_count)
+    if (!resCols.has('weighted_adopt_sum')) db.exec("ALTER TABLE resources ADD COLUMN weighted_adopt_sum REAL DEFAULT 0");
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
   // FTS5 + triggers: only create if not exists
@@ -328,6 +331,16 @@ export function updateResourceStats(db, id, field) {
   // String interpolation required: SQLite cannot parameterize column names.
   // Safety: field is validated against allowlist above.
   db.prepare(`UPDATE resources SET ${field} = ${field} + 1, updated_at = datetime('now') WHERE id = ?`).run(id);
+}
+
+/**
+ * Atomically increment weighted_adopt_sum by a continuous score value.
+ * @param {Database} db Registry database
+ * @param {number} id Resource ID
+ * @param {number} score Adoption confidence score (0.0-1.0)
+ */
+export function incrementWeightedAdopt(db, id, score) {
+  db.prepare(`UPDATE resources SET weighted_adopt_sum = COALESCE(weighted_adopt_sum, 0) + ?, updated_at = datetime('now') WHERE id = ?`).run(score, id);
 }
 
 /**

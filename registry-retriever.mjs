@@ -361,13 +361,13 @@ const COMPOSITE_EXPR = `(
           ) * 0.5
       ) * 0.15
     - (
-        (COALESCE(r.adopt_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) * 0.5
+        (COALESCE(r.weighted_adopt_sum, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) * 0.5
         + COALESCE(
-            (SELECT (SUM(CASE WHEN i.adopted=1 THEN 1 ELSE 0 END) + 1.0)
+            (SELECT (SUM(COALESCE(i.score, 0)) + 1.0)
                   / (COUNT(*) + 2.0)
              FROM invocations i WHERE i.resource_id = r.id
                AND i.created_at > datetime('now', '-30 days')),
-            (COALESCE(r.adopt_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0)
+            (COALESCE(r.weighted_adopt_sum, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0)
           ) * 0.5
       ) * 0.10
     - CASE WHEN COALESCE(r.recommend_count, 0) < 10

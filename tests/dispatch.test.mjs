@@ -1,7 +1,7 @@
 // Tests for v3 dispatch system: registry, retriever, dispatch, inject, feedback
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { upsertResource, getActiveResources, getResourceByName,
-  updateResourceStats, recordInvocation, getSessionInvocations,
+  updateResourceStats, incrementWeightedAdopt, recordInvocation, getSessionInvocations,
   updateInvocation, getResourceSuccessRates } from '../registry.mjs';
 import { buildEnhancedQuery, buildQueryFromText, retrieveResources } from '../registry-retriever.mjs';
 import { shouldSkipDispatch, extractContextSignals,
@@ -1886,5 +1886,143 @@ describe('phase transition', () => {
     expect(prevPhase).toBe(null);
     // null prev → no transition (first event, no prior phase to compare)
     expect(isPhaseTransition(prevPhase, currentPhase)).toBe(false);
+  });
+});
+
+// ─── Continuous Adoption Scoring ──────────────────────────────────────────────
+
+describe('incrementWeightedAdopt', () => {
+  let db;
+  beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
+
+  it('increments weighted_adopt_sum by the given score', () => {
+    const id = seedResource(db);
+    incrementWeightedAdopt(db, id, 1.0);
+    const row = db.prepare('SELECT weighted_adopt_sum FROM resources WHERE id = ?').get(id);
+    expect(row.weighted_adopt_sum).toBeCloseTo(1.0);
+  });
+
+  it('accumulates multiple scores', () => {
+    const id = seedResource(db);
+    incrementWeightedAdopt(db, id, 1.0);
+    incrementWeightedAdopt(db, id, 0.5);
+    incrementWeightedAdopt(db, id, 0.2);
+    const row = db.prepare('SELECT weighted_adopt_sum FROM resources WHERE id = ?').get(id);
+    expect(row.weighted_adopt_sum).toBeCloseTo(1.7);
+  });
+
+  it('defaults to 0 for new resources', () => {
+    const id = seedResource(db);
+    const row = db.prepare('SELECT weighted_adopt_sum FROM resources WHERE id = ?').get(id);
+    expect(row.weighted_adopt_sum).toBe(0);
+  });
+});
+
+describe('collectFeedback updates weighted_adopt_sum', () => {
+  let db;
+  beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
+
+  it('increments weighted_adopt_sum on explicit adoption (score 1.0)', async () => {
+    const id = seedResource(db, { name: 'explicit-adopt', type: 'skill' });
+    recordInvocation(db, {
+      resource_id: id,
+      session_id: 'sess-weighted-explicit',
+      trigger: 'user_prompt',
+      tier: 2,
+      recommended: 1,
+    });
+
+    const events = [
+      { tool_name: 'Skill', tool_input: { skill: 'explicit-adopt' } },
+      { tool_name: 'Edit', tool_input: { file_path: '/test.js' } },
+    ];
+
+    await collectFeedback(db, 'sess-weighted-explicit', events);
+    const resource = db.prepare('SELECT weighted_adopt_sum FROM resources WHERE id = ?').get(id);
+    // Explicit adoption: adoptScore=1.0, outcome=success → outcomeMultiplier=1.0, score=1.0
+    expect(resource.weighted_adopt_sum).toBeCloseTo(1.0);
+  });
+
+  it('increments weighted_adopt_sum with lower score for behavioral adoption', async () => {
+    const id = seedResource(db, { name: 'superpowers-tdd', type: 'skill' });
+    recordInvocation(db, {
+      resource_id: id,
+      session_id: 'sess-weighted-behavioral',
+      trigger: 'user_prompt',
+      tier: 2,
+      recommended: 1,
+    });
+
+    // TDD pattern: test fail → edit → test pass
+    const events = [
+      { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL test.spec.js\n1 failed' },
+      { tool_name: 'Edit', tool_input: { file_path: '/src/code.js' } },
+      { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Tests: 1 passed, ok' },
+    ];
+
+    await collectFeedback(db, 'sess-weighted-behavioral', events);
+    const resource = db.prepare('SELECT weighted_adopt_sum FROM resources WHERE id = ?').get(id);
+    // Behavioral TDD: adoptScore=0.5, outcome=success → outcomeMultiplier=1.0, score=0.5
+    expect(resource.weighted_adopt_sum).toBeCloseTo(0.5);
+  });
+
+  it('does NOT increment weighted_adopt_sum when not adopted', async () => {
+    const id = seedResource(db, { name: 'ignored-skill', type: 'skill' });
+    recordInvocation(db, {
+      resource_id: id,
+      session_id: 'sess-weighted-ignored',
+      trigger: 'user_prompt',
+      tier: 2,
+      recommended: 1,
+    });
+
+    await collectFeedback(db, 'sess-weighted-ignored', [{ tool_name: 'Read', tool_input: {} }]);
+    const resource = db.prepare('SELECT weighted_adopt_sum FROM resources WHERE id = ?').get(id);
+    expect(resource.weighted_adopt_sum).toBe(0);
+  });
+});
+
+describe('Continuous adoption scores affect ranking', () => {
+  let db;
+  beforeEach(() => { db = createRegistryDb(); });
+  afterEach(() => { db.close(); });
+
+  it('resource with fewer high-confidence adoptions ranks above many low-confidence adoptions', () => {
+    // Resource A: 3 explicit adoptions (score 1.0 each) → weighted_adopt_sum = 3.0
+    const idA = seedResource(db, {
+      name: 'high-quality-adopt',
+      intent_tags: 'test,testing,tdd',
+      trigger_patterns: 'when user needs to run tests and write test suites',
+      capability_summary: 'Automated test runner and suite executor',
+      recommend_count: 10,
+      adopt_count: 3,
+      success_count: 3,
+      repo_stars: 100,
+    });
+    db.prepare('UPDATE resources SET weighted_adopt_sum = ? WHERE id = ?').run(3.0, idA);
+
+    // Resource B: 6 behavioral adoptions (score 0.2 each) → weighted_adopt_sum = 1.2
+    // More adopt_count (binary) but lower weighted sum
+    const idB = seedResource(db, {
+      name: 'low-quality-adopt',
+      intent_tags: 'test,testing,tdd',
+      trigger_patterns: 'when user needs to run tests and write test suites',
+      capability_summary: 'Automated test runner and suite executor',
+      recommend_count: 10,
+      adopt_count: 6,
+      success_count: 1,
+      repo_stars: 100,
+    });
+    db.prepare('UPDATE resources SET weighted_adopt_sum = ? WHERE id = ?').run(1.2, idB);
+
+    const results = retrieveResources(db, 'test OR testing OR tdd', { limit: 5 });
+    expect(results.length).toBe(2);
+
+    // High-quality adopt should rank above low-quality adopt
+    // With binary adopt_count only, B (6 adopts) would rank above A (3 adopts)
+    // With weighted_adopt_sum, A (3.0 sum) should rank above B (1.2 sum)
+    expect(results[0].name).toBe('high-quality-adopt');
   });
 });

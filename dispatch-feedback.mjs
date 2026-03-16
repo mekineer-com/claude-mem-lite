@@ -1,7 +1,7 @@
 // claude-mem-lite: Dispatch feedback collection
 // Runs at Stop hook to track adoption and outcomes of recommendations
 
-import { getSessionInvocations, updateInvocation, updateResourceStats } from './registry.mjs';
+import { getSessionInvocations, updateInvocation, updateResourceStats, incrementWeightedAdopt } from './registry.mjs';
 import { debugCatch, debugLog, EDIT_TOOLS } from './utils.mjs';
 
 // ─── Adoption Detection ──────────────────────────────────────────────────────
@@ -335,6 +335,7 @@ export async function collectFeedback(db, sessionId, sessionEvents = []) {
       // Update resource stats
       if (adopted) {
         updateResourceStats(db, inv.resource_id, 'adopt_count');
+        incrementWeightedAdopt(db, inv.resource_id, score);
         if (outcome === 'success') {
           updateResourceStats(db, inv.resource_id, 'success_count');
         }
