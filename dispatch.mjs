@@ -1022,13 +1022,13 @@ function decideTier(resource, signals) {
   if (signals?.primaryIntent) {
     const tags = (resource.intent_tags || '').toLowerCase().split(/[\s,]+/);
     // Direct intent match: resource's intent_tags contain the detected primary intent.
-    // Strong boost (0.3) ensures small-corpus matches still reach 'hint' tier.
-    if (tags.includes(signals.primaryIntent)) signalBoost += 0.3;
+    // Moderate boost (0.2) ensures BM25 quality still matters for tier decision.
+    if (tags.includes(signals.primaryIntent)) signalBoost += 0.2;
     else signalBoost += 0.1;
   }
   if (signals?.rawKeywords?.length > 0) {
     const tagArr = (resource.intent_tags || '').toLowerCase().split(/[\s,]+/);
-    if (signals.rawKeywords.some(kw => tagArr.includes(kw))) signalBoost += 0.2;
+    if (signals.rawKeywords.some(kw => tagArr.includes(kw))) signalBoost += 0.15;
   }
 
   const confidence = Math.min(1.0, normalized + patternBoost * 0.3 + signalBoost);

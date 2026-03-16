@@ -327,7 +327,7 @@ export function filterByProjectDomain(results, projectDomains) {
 // ─── FTS5 Retrieval ──────────────────────────────────────────────────────────
 
 // BM25 weights (8 columns, positional — must match FTS5 column order in registry.mjs):
-//   trigger_patterns(5), keywords(3), capability_summary(3),
+//   trigger_patterns(3), keywords(3), capability_summary(3),
 //   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
 //
 // Composite ranking formula:
@@ -348,7 +348,7 @@ export function filterByProjectDomain(results, projectDomains) {
 // Composite score expression (shared between SELECT and ORDER BY)
 // Sign convention: more negative = better. BM25 is negative, behavioral signals are subtracted.
 const COMPOSITE_EXPR = `(
-    bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
+    bm25(resources_fts, 3.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
     - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
     - (
         (COALESCE(r.success_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) * 0.5
@@ -382,7 +382,7 @@ const COMPOSITE_EXPR = `(
 const SEARCH_SQL = `
   SELECT *, composite_score FROM (
     SELECT r.*,
-      bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
+      bm25(resources_fts, 3.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
       ${COMPOSITE_EXPR} AS composite_score
     FROM resources_fts
     JOIN resources r ON r.id = resources_fts.rowid
@@ -396,7 +396,7 @@ const SEARCH_SQL = `
 const SEARCH_BY_TYPE_SQL = `
   SELECT *, composite_score FROM (
     SELECT r.*,
-      bm25(resources_fts, 5.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
+      bm25(resources_fts, 3.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) AS relevance,
       ${COMPOSITE_EXPR} AS composite_score
     FROM resources_fts
     JOIN resources r ON r.id = resources_fts.rowid
