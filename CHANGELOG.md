@@ -2,11 +2,11 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
-## [2.10.2] - 2026-03-16
+## [2.10.3] - 2026-03-16
 
 ### Fixed
-- Restored real Claude Code plugin MCP registration by generating a package-root `.mcp.json` from `claude-plugin/.mcp.json` during `prepack`, matching the cache layout Claude Code actually loads.
-- Kept the marketplace clone root free of `.mcp.json` so plugin installs avoid the duplicate `mem` MCP registration seen in pre-2.10 builds.
+- Restored real Claude Code plugin MCP registration by moving `.mcp.json` back to the plugin root, which is the location Claude Code actually loads for marketplace installs.
+- Kept duplicate-avoidance focused on removing stale global `mem` registrations and stale marketplace copies instead of moving the plugin MCP manifest out of the root.
 
 ## [2.10.1] - 2026-03-16
 

@@ -237,9 +237,9 @@ async function install() {
   }
 
   // 3. Register MCP server (skip if plugin system already handles it)
-  // Plugin source keeps MCP manifest at claude-plugin/.mcp.json.
-  // Release packaging materializes that as root .mcp.json so Claude Code loads
-  // plugin:*:mem from the installed cache.
+  // Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem.
+  // Duplicate mem registrations in practice come from old global install.mjs state
+  // (claude mcp add) or stale marketplace copies, not from the cache root itself.
   // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem__* server.
   // Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
   const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
@@ -272,17 +272,16 @@ async function install() {
   // while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
   //
   // MCP dedup: Claude Code loads .mcp.json from BOTH marketplace root (generic scan)
-  // and cache dir (plugin runtime). Root-level .mcp.json in the marketplace clone
-  // would duplicate the cache-installed plugin MCP. Keep the source manifest under
-  // claude-plugin/.mcp.json and only materialize root .mcp.json in the release
-  // package, while the marketplace root stays clear. Remove stale marketplace-root
-  // copies here.
+  // and cache dir (plugin runtime). Keep root .mcp.json in the plugin so Claude
+  // Code can register MCP correctly, but remove stale marketplace-root copies and
+  // old global ~/.claude.json mem config to avoid duplicate registrations.
   const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
   const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
 
   if (existsSync(pluginDir)) {
     // Clear root-level .mcp.json if it exists (stale from older git versions).
-    // Source MCP manifest stays in claude-plugin/.mcp.json; only the release package gets root .mcp.json.
+    // Root .mcp.json is required in the installed plugin cache; only remove stale
+    // marketplace clone copies here.
     const rootMcpPath = join(pluginDir, '.mcp.json');
     try {
       if (existsSync(rootMcpPath)) {

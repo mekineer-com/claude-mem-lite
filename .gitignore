@@ -5,7 +5,6 @@
 /managed
 /resource-registry.db*
 .tmp/
-.mcp.json
 .claude-mem-lite/
 *.db
 *.db-wal

@@ -425,8 +425,7 @@ claude-mem-lite/
   .claude-plugin/
     plugin.json      # Plugin manifest
     marketplace.json # Marketplace catalog
-  claude-plugin/
-    .mcp.json        # MCP server definition source (installed into cache root)
+  .mcp.json          # MCP server definition (plugin root)
   hooks/
     hooks.json       # Hook definitions (plugin mode)
   commands/

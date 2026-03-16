@@ -87,11 +87,11 @@ fi
 
 # 7. One-time MCP migration: clean stale registrations from pre-2.10 versions.
 #    Only runs once per version — skips if marker file exists.
-#    Before 2.10: .mcp.json at repo root caused duplicate MCP servers.
+#    Before 2.10: old direct installs left a global mem MCP alongside plugin MCP.
 #    - Global mcpServers.mem in ~/.claude.json (from old install.mjs)
-#    - Marketplace root .mcp.json (from old git clone)
-#    Now: source manifest lives in claude-plugin/.mcp.json and release packaging
-#    materializes cache root .mcp.json, while the marketplace root stays clear.
+#    - Possibly stale marketplace root .mcp.json (from old git clone)
+#    Root .mcp.json in the installed plugin cache is required for Claude Code to
+#    register plugin MCP; only stale global/marketplace copies should be removed.
 MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10"
 if [[ ! -f "$MCP_MIGRATION" && -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   CLAUDE_JSON="$HOME/.claude.json" ROOT="$ROOT" node -e '

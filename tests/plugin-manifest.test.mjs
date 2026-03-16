@@ -1,16 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-import { cleanupPackageMcp, syncPackageMcp } from '../scripts/sync-package-mcp.mjs';
+import { existsSync, readFileSync } from 'fs';
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }
 
 describe('plugin manifests', () => {
-  it('declares plugin-mode MCP launcher in claude-plugin/.mcp.json', () => {
-    const manifest = readJson('claude-plugin/.mcp.json');
+  it('declares plugin-mode MCP launcher in root .mcp.json', () => {
+    const manifest = readJson('.mcp.json');
     expect(manifest.mcpServers).toBeTruthy();
     expect(manifest.mcpServers.mem).toEqual({
       command: 'node',
@@ -18,31 +15,15 @@ describe('plugin manifests', () => {
     });
   });
 
-  it('keeps MCP manifest under claude-plugin/ and not at repo root or .claude-plugin/', () => {
-    expect(existsSync('claude-plugin/.mcp.json')).toBe(true);
+  it('keeps MCP manifest at plugin root and not under plugin metadata directories', () => {
+    expect(existsSync('.mcp.json')).toBe(true);
+    expect(existsSync('claude-plugin/.mcp.json')).toBe(false);
     expect(existsSync('.claude-plugin/.mcp.json')).toBe(false);
-    expect(existsSync('.mcp.json')).toBe(false);
 
     const pkg = readJson('package.json');
     expect(pkg.files).toContain('.mcp.json');
-    expect(pkg.files).not.toContain('claude-plugin/.mcp.json');
     expect(pkg.files).not.toContain('.claude-plugin/.mcp.json');
-  });
-
-  it('prepack sync creates root .mcp.json from claude-plugin source and cleanup removes it', () => {
-    const root = mkdtempSync(join(tmpdir(), 'mem-pack-'));
-    try {
-      mkdirSync(join(root, 'claude-plugin'), { recursive: true });
-      writeFileSync(join(root, 'claude-plugin/.mcp.json'), '{"mcpServers":{"mem":{"command":"node"}}}\n');
-
-      syncPackageMcp(root);
-      expect(readFileSync(join(root, '.mcp.json'), 'utf8')).toContain('"mcpServers"');
-
-      cleanupPackageMcp(root);
-      expect(existsSync(join(root, '.mcp.json'))).toBe(false);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
+    expect(pkg.files).not.toContain('claude-plugin/.mcp.json');
   });
 
   it('keeps package, plugin, and marketplace versions in sync for releases', () => {
