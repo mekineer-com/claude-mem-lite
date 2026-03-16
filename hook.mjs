@@ -512,61 +512,10 @@ async function handleSessionStart() {
         if (purged.changes > 0) {
           debugLog('DEBUG', 'session-start', `auto-purged ${purged.changes} stale observations`);
         }
-        // Auto-compress: group old marked observations into weekly summaries
-        const compressCutoff = Date.now() - 60 * 86400000; // 60 days
-        const compressCandidates = db.prepare(`
-          SELECT id, project, type, title, created_at_epoch
-          FROM observations
-          WHERE COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
-            AND created_at_epoch < ?
-            AND (compressed_into IS NULL OR compressed_into = ${COMPRESSED_AUTO})
-          ORDER BY project, created_at_epoch
-        `).all(compressCutoff);
-        if (compressCandidates.length >= 3) {
-          const groups = new Map();
-          for (const c of compressCandidates) {
-            const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
-            if (!groups.has(key)) groups.set(key, []);
-            groups.get(key).push(c);
-          }
-          // Transact each group to prevent orphan summaries on crash
-          const compressGroup = db.transaction((proj, obs) => {
-            const types = {};
-            for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
-            const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
-            const title = `Weekly summary: ${obs.length} ${dominantType} observations`;
-            const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
-            const sortedEpochs = obs.map(o => o.created_at_epoch).sort((a, b) => a - b);
-            const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
-            const sessionId = `compress-${proj}`;
-            const now = new Date();
-            db.prepare(`INSERT OR IGNORE INTO sdk_sessions
-              (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-              VALUES (?,?,?,?,?,'active')`
-            ).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
-            const summaryResult = db.prepare(`INSERT INTO observations
-              (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
-               files_read, files_modified, importance, created_at, created_at_epoch)
-              VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`
-            ).run(sessionId, proj, narrative, dominantType, title, narrative, new Date(medianEpoch).toISOString(), medianEpoch);
-            const summaryId = Number(summaryResult.lastInsertRowid);
-            const obsIds = obs.map(o => o.id);
-            db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`)
-              .run(summaryId, ...obsIds);
-            return obs.length;
-          });
-          let totalCompressed = 0;
-          for (const [key, obs] of groups) {
-            if (obs.length < 3) continue;
-            const [proj] = key.split('::');
-            totalCompressed += compressGroup(proj, obs);
-          }
-          if (totalCompressed > 0) {
-            debugLog('DEBUG', 'session-start', `auto-compressed ${totalCompressed} observations into weekly summaries`);
-          }
-        }
-
+        // Mark maintenance as done (24h gate) — even though compression runs in background
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
+        // Weekly summary grouping runs in background to avoid blocking SessionStart
+        spawnBackground('auto-compress');
       } catch (e) { debugCatch(e, 'auto-maintain'); }
     }
 
@@ -824,8 +773,8 @@ async function handleSessionStart() {
     }
 
     // Auto-update check (24h throttle, 3s timeout, silent on failure)
-    try {
-      const updateResult = await checkForUpdate();
+    // Fire-and-forget: don't block SessionStart for up to 3s network timeout
+    checkForUpdate().then(updateResult => {
       if (updateResult?.updated) {
         process.stdout.write(`\n🔄 claude-mem-lite: v${updateResult.from} → v${updateResult.to} updated\n`);
       } else if (updateResult?.updateAvailable) {
@@ -834,7 +783,7 @@ async function handleSessionStart() {
           : '';
         process.stdout.write(`\n📦 claude-mem-lite: v${updateResult.to} available (current: v${updateResult.from})${hint}\n`);
       }
-    } catch (e) { debugCatch(e, 'session-start-update'); }
+    }).catch(e => debugCatch(e, 'session-start-update'));
 
   } finally {
     db.close();
@@ -988,6 +937,77 @@ async function handleUserPrompt() {
   } catch (e) { debugCatch(e, 'handleUserPrompt-dispatch'); }
 }
 
+// ─── Auto-Compress (Background Worker) ───────────────────────────────────────
+
+/**
+ * Background worker: group old low-value observations into weekly summaries.
+ * Spawned by SessionStart daily after the fast purge DELETE.
+ * Iterates 60-day-old observations, groups by project+week, creates summary per group.
+ */
+function handleAutoCompress() {
+  const db = openDb();
+  if (!db) return;
+
+  try {
+    const compressCutoff = Date.now() - 60 * 86400000; // 60 days
+    const compressCandidates = db.prepare(`
+      SELECT id, project, type, title, created_at_epoch
+      FROM observations
+      WHERE COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
+        AND created_at_epoch < ?
+        AND (compressed_into IS NULL OR compressed_into = ${COMPRESSED_AUTO})
+      ORDER BY project, created_at_epoch
+    `).all(compressCutoff);
+    if (compressCandidates.length < 3) return;
+
+    const groups = new Map();
+    for (const c of compressCandidates) {
+      const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(c);
+    }
+    // Transact each group to prevent orphan summaries on crash
+    const compressGroup = db.transaction((proj, obs) => {
+      const types = {};
+      for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
+      const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
+      const title = `Weekly summary: ${obs.length} ${dominantType} observations`;
+      const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
+      const sortedEpochs = obs.map(o => o.created_at_epoch).sort((a, b) => a - b);
+      const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
+      const sessionId = `compress-${proj}`;
+      const now = new Date();
+      db.prepare(`INSERT OR IGNORE INTO sdk_sessions
+        (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+        VALUES (?,?,?,?,?,'active')`
+      ).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
+      const summaryResult = db.prepare(`INSERT INTO observations
+        (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+         files_read, files_modified, importance, created_at, created_at_epoch)
+        VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`
+      ).run(sessionId, proj, narrative, dominantType, title, narrative, new Date(medianEpoch).toISOString(), medianEpoch);
+      const summaryId = Number(summaryResult.lastInsertRowid);
+      const obsIds = obs.map(o => o.id);
+      db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`)
+        .run(summaryId, ...obsIds);
+      return obs.length;
+    });
+    let totalCompressed = 0;
+    for (const [key, obs] of groups) {
+      if (obs.length < 3) continue;
+      const [proj] = key.split('::');
+      totalCompressed += compressGroup(proj, obs);
+    }
+    if (totalCompressed > 0) {
+      debugLog('DEBUG', 'auto-compress', `auto-compressed ${totalCompressed} observations into weekly summaries`);
+    }
+  } catch (e) {
+    debugCatch(e, 'auto-compress');
+  } finally {
+    db.close();
+  }
+}
+
 // ─── Resource Rescan (Background Worker) ─────────────────────────────────────
 
 const RESCAN_MARKER = join(RUNTIME_DIR, 'last-resource-scan');
@@ -1132,6 +1152,7 @@ try {
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
     case 'resource-scan':    await handleResourceScan(); break;
+    case 'auto-compress':    handleAutoCompress(); break;
   }
 } catch (err) {
   // Always log fatal errors (ungated) with structured format

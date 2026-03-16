@@ -991,8 +991,10 @@ describe('Suite 8a: Additional E2E', () => {
 
     db.close();
 
-    // Session-start triggers auto-compress with weekly summary grouping
+    // Session-start triggers daily maintenance (purge) and spawns auto-compress background worker.
+    // In production, auto-compress runs as a detached process; here we call it directly.
     runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('auto-compress', { env: { HOME: tmpHome } });
 
     const db2 = openTestDb(tmpHome);
     // Should have: 4 original (compressed_into = summaryId) + 1 summary (importance=2)
