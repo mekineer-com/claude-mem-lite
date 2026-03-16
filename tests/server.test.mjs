@@ -817,67 +817,15 @@ describe('adaptive time windows logic', () => {
   });
 });
 
-// ─── SKIP_TOOLS sync: hook.mjs ↔ post-tool-use.sh ──────────────────────────
+// ─── SKIP_TOOLS sync: skip-tools.mjs ↔ post-tool-use.sh ────────────────────
+// Full consistency test is in tests/skip-tools.test.mjs
+// This test verifies hook.mjs imports from skip-tools.mjs (no inline definition)
 
 describe('SKIP_TOOLS sync between hook.mjs and post-tool-use.sh', () => {
-  it('bash skip list matches hook.mjs SKIP_TOOLS + prefix filters', () => {
-    // Extract SKIP_TOOLS from hook.mjs
+  it('hook.mjs uses skip-tools.mjs as source of truth', () => {
     const hookSrc = readFileSync(resolve('hook.mjs'), 'utf8');
-    const skipMatch = hookSrc.match(/const SKIP_TOOLS\s*=\s*new Set\(\[([\s\S]*?)\]\)/);
-    expect(skipMatch, 'Could not find SKIP_TOOLS in hook.mjs').toBeTruthy();
-    const hookTools = skipMatch[1]
-      .split(',')
-      .map(s => s.replace(/\/\/.*$/gm, '').trim().replace(/^['"]|['"]$/g, ''))
-      .filter(Boolean);
-
-    // Extract prefix filters from hook.mjs (tool_name.startsWith checks)
-    const prefixMatches = hookSrc.matchAll(/tool_name\.startsWith\(['"]([^'"]+)['"]\)/g);
-    const hookPrefixes = [...prefixMatches].map(m => m[1]);
-
-    // Extract from post-tool-use.sh
-    const bashSrc = readFileSync(resolve('scripts/post-tool-use.sh'), 'utf8');
-
-    // Extract exact-match tools from the case statement
-    const caseMatch = bashSrc.match(/# Exact matches[\s\S]*?exit 0\s*;;/);
-    expect(caseMatch, 'Could not find exact matches in post-tool-use.sh').toBeTruthy();
-    const bashTools = caseMatch[0]
-      .replace(/# .*$/gm, '')
-      .replace(/exit 0\s*;;/, '')
-      .replace(/\\\n/g, '')
-      .split('|')
-      .map(s => s.trim().replace(/[)]/g, ''))
-      .filter(s => s && s !== 'Read'); // Read is handled separately in bash
-
-    // Extract prefix filters from bash
-    const prefixMatch = bashSrc.match(/# Prefix filters\s*\n\s*(.*?)exit 0/s);
-    expect(prefixMatch, 'Could not find prefix filters in post-tool-use.sh').toBeTruthy();
-    const bashPrefixes = prefixMatch[1]
-      .replace(/\)/, '')
-      .split('|')
-      .map(s => s.trim().replace(/\*$/, ''))
-      .filter(Boolean);
-
-    // Compare: hook SKIP_TOOLS should be a superset of bash exact tools (bash includes Read separately)
-    const hookSet = new Set(hookTools);
-    for (const tool of bashTools) {
-      expect(hookSet.has(tool), `Tool "${tool}" in post-tool-use.sh but not in hook.mjs SKIP_TOOLS`).toBe(true);
-    }
-
-    // Compare: all non-Read hook tools should be in bash
-    const bashSet = new Set([...bashTools, 'Read']); // Read is handled separately
-    for (const tool of hookTools) {
-      expect(bashSet.has(tool), `Tool "${tool}" in hook.mjs SKIP_TOOLS but not in post-tool-use.sh`).toBe(true);
-    }
-
-    // Compare prefixes
-    const hookPrefixSet = new Set(hookPrefixes);
-    const bashPrefixSet = new Set(bashPrefixes);
-    for (const p of bashPrefixes) {
-      expect(hookPrefixSet.has(p), `Prefix "${p}" in post-tool-use.sh but not in hook.mjs`).toBe(true);
-    }
-    for (const p of hookPrefixes) {
-      expect(bashPrefixSet.has(p), `Prefix "${p}" in hook.mjs but not in post-tool-use.sh`).toBe(true);
-    }
+    expect(hookSrc).toContain("from './skip-tools.mjs'");
+    expect(hookSrc).not.toMatch(/^const SKIP_TOOLS\s*=\s*new Set\(/m);
   });
 });
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # claude-mem-lite: Fast bash pre-filter for PostToolUse hook
 # Skips known low-value tools in ~5ms instead of launching Node (~80-150ms)
-# SYNC: Skip list must match hook.mjs SKIP_TOOLS + prefix filters
+# SYNC: Skip list must match skip-tools.mjs (source of truth)
+# Consistency enforced by tests/skip-tools.test.mjs
 
 # Prevent recursive hooks
 [[ -n "$CLAUDE_MEM_HOOK_RUNNING" ]] && exit 0
@@ -39,7 +40,7 @@ if [[ "$tool" == "Read" ]]; then
   exit 0
 fi
 
-# SYNC: Must match SKIP_TOOLS set and prefix filters in hook.mjs
+# SYNC: Must match SKIP_TOOLS and SKIP_PREFIXES in skip-tools.mjs
 case "$tool" in
   # Exact matches (SKIP_TOOLS set — Read handled above)
   Glob|TodoRead|TodoWrite|TaskList|TaskGet|TaskCreate|TaskUpdate|\

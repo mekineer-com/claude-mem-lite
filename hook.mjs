@@ -36,6 +36,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
+import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
@@ -135,16 +136,8 @@ function flushEpisode(episode) {
 
 // ─── PostToolUse Handler ────────────────────────────────────────────────────
 
-// Tier 1 D: Skip low-value tools entirely
-// SYNC: Skip list must match scripts/post-tool-use.sh
-const SKIP_TOOLS = new Set([
-  'Read', 'Glob',  // noise — just opening/finding files
-  'TodoRead', 'TodoWrite', 'TaskList', 'TaskGet', 'TaskCreate', 'TaskUpdate',
-  'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode',
-  'mcp__claude-in-chrome__screenshot', 'mcp__claude-in-chrome__read_page',
-  'mcp__claude-in-chrome__tabs_context_mcp', 'mcp__claude-in-chrome__computer',
-  'mcp__claude-in-chrome__find', 'mcp__claude-in-chrome__navigate',
-]);
+// Tier 1 D: Skip low-value tools entirely (source of truth: skip-tools.mjs)
+// Consistency enforced by tests/skip-tools.test.mjs
 
 async function handlePostToolUse() {
   let raw;
@@ -164,10 +157,9 @@ async function handlePostToolUse() {
   const { tool_name, tool_input, tool_response } = hookData;
   if (!tool_name) return;
 
-  // Skip noise
+  // Skip noise (source of truth: skip-tools.mjs)
   if (SKIP_TOOLS.has(tool_name)) return;
-  if (tool_name.startsWith('mem_') || tool_name.startsWith('mcp__mem__') || tool_name.startsWith('mcp__plugin_claude-mem-lite')) return;
-  if (tool_name.startsWith('mcp__sequential') || tool_name.startsWith('mcp__plugin_context7')) return;
+  if (SKIP_PREFIXES.some(p => tool_name.startsWith(p))) return;
 
   const resp = normalizeToolResponse(tool_response);
   if (!resp || resp.length < 10) return;
