@@ -461,7 +461,7 @@ claude-mem-lite/
     convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
     index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）
-  tests/               # 单元、属性、集成、契约、E2E、管线测试（789 个）
+  tests/               # 单元、属性、集成、契约、E2E、管线测试
   benchmark/           # BM25 搜索质量基准 + CI 门控
 ```
 
@@ -483,7 +483,7 @@ claude-mem-lite/
 
 ```bash
 npm run lint              # ESLint 静态分析
-npm test                  # 运行全部 789 个测试（vitest）
+npm test                  # 运行完整测试套件（vitest）
 npm run test:smoke        # 运行 5 个核心冒烟测试
 npm run test:coverage     # 运行测试并生成 V8 覆盖率（≥70% 行/函数，≥60% 分支）
 npm run benchmark         # 运行完整搜索质量基准测试

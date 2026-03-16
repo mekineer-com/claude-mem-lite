@@ -15,9 +15,9 @@ export default defineConfig({
       ],
       exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'benchmark/**', 'scripts/**'],
       thresholds: {
-        lines: 25,
-        functions: 25,
-        branches: 20,
+        lines: 75,
+        functions: 75,
+        branches: 65,
       },
     },
   },
