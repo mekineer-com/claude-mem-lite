@@ -217,6 +217,21 @@ async function downloadAndInstall(tarballUrl) {
       for (const f of readdirSync(srcScripts)) {
         copyFileSync(join(srcScripts, f), join(destScripts, f));
       }
+      // Ensure bash scripts are executable (copyFileSync doesn't preserve mode)
+      const postToolUse = join(destScripts, 'post-tool-use.sh');
+      if (existsSync(postToolUse)) {
+        try { execSync(`chmod +x "${postToolUse}"`, { stdio: 'pipe' }); } catch {}
+      }
+    }
+
+    // Copy registry manifest (preinstalled.json) — needed for discovering new resources
+    const srcRegistry = join(tmpDir, 'registry');
+    if (existsSync(srcRegistry)) {
+      const destRegistry = join(INSTALL_DIR, 'registry');
+      mkdirSync(destRegistry, { recursive: true });
+      for (const f of readdirSync(srcRegistry)) {
+        copyFileSync(join(srcRegistry, f), join(destRegistry, f));
+      }
     }
 
     // Run npm install for dependencies (skip if node_modules is a symlink = dev mode)
