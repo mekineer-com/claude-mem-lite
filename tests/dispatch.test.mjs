@@ -1781,4 +1781,43 @@ describe('phase transition', () => {
     expect(isPhaseTransition('IMPLEMENT', 'IMPLEMENT')).toBe(false);
     expect(isPhaseTransition(null, 'EXPLORE')).toBe(false);
   });
+
+  it('detects phase transition from events by comparing current vs previous window', () => {
+    // Events transition from EXPLORE to IMPLEMENT
+    const events = [
+      { tool_name: 'Read', tool_input: {} },
+      { tool_name: 'Grep', tool_input: {} },
+      { tool_name: 'Edit', tool_input: { file_path: '/src/a.js' } },
+    ];
+    const currentPhase = inferSessionPhase(events);
+    const prevPhase = inferSessionPhase(events.slice(0, -1));
+    expect(currentPhase).toBe('IMPLEMENT');
+    expect(prevPhase).toBe('EXPLORE');
+    expect(isPhaseTransition(prevPhase, currentPhase)).toBe(true);
+  });
+
+  it('no phase transition when events stay in same phase', () => {
+    const events = [
+      { tool_name: 'Edit', tool_input: { file_path: '/src/a.js' } },
+      { tool_name: 'Write', tool_input: { file_path: '/src/b.js' } },
+    ];
+    const currentPhase = inferSessionPhase(events);
+    const prevPhase = inferSessionPhase(events.slice(0, -1));
+    expect(currentPhase).toBe('IMPLEMENT');
+    expect(prevPhase).toBe('IMPLEMENT');
+    expect(isPhaseTransition(prevPhase, currentPhase)).toBe(false);
+  });
+
+  it('derives prevPhase as EXPLORE when only one event exists', () => {
+    // With only one event, slice(0,-1) is empty → inferSessionPhase returns EXPLORE
+    const events = [
+      { tool_name: 'Edit', tool_input: { file_path: '/src/a.js' } },
+    ];
+    const currentPhase = inferSessionPhase(events);
+    const prevPhase = events.length > 1 ? inferSessionPhase(events.slice(0, -1)) : null;
+    expect(currentPhase).toBe('IMPLEMENT');
+    expect(prevPhase).toBe(null);
+    // null prev → no transition (first event, no prior phase to compare)
+    expect(isPhaseTransition(prevPhase, currentPhase)).toBe(false);
+  });
 });

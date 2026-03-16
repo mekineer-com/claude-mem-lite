@@ -532,11 +532,6 @@ export function isPhaseTransition(prev, current) {
   return prev !== null && prev !== current;
 }
 
-// Module-level phase state for dispatchOnPreToolUse
-let _lastPhase = null;
-
-/** Reset phase state (for testing). */
-export function _resetPhaseState() { _lastPhase = null; }
 
 /**
  * Infer action type from tool name and input.
@@ -1212,8 +1207,8 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     // The first few events (≤3) always pass to allow initial recommendations.
     const allEvents = peekToolEvents();
     const currentPhase = inferSessionPhase(allEvents);
-    const phaseChanged = isPhaseTransition(_lastPhase, currentPhase);
-    _lastPhase = currentPhase;
+    const prevPhase = allEvents.length > 1 ? inferSessionPhase(allEvents.slice(0, -1)) : null;
+    const phaseChanged = isPhaseTransition(prevPhase, currentPhase);
 
     if (!phaseChanged && allEvents.length > 3) return null;
 
