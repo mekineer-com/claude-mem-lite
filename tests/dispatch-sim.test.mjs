@@ -704,15 +704,15 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
         { tool_name: 'Edit', tool_input: { file_path: '/src/app.test.js' } },
         { userPrompt: 'write tests for the app', sessionId: 'sim-pre-edit' });
       // May or may not recommend depending on FTS5 confidence
-      // But should not error
-      expect(result === null || result.includes('[Recommended]')).toBe(true);
+      // But should not error — result can be null, [Recommended], or [Hint]
+      expect(result === null || result.includes('[Recommended]') || result.includes('[Hint]')).toBe(true);
     });
 
     it('can recommend for complex Bash commands', async () => {
       const result = await dispatchOnPreToolUse(db,
         { tool_name: 'Bash', tool_input: { command: 'npm run build && npm test' } },
         { userPrompt: 'build and test the project', sessionId: 'sim-pre-bash' });
-      expect(result === null || result.includes('[Recommended]')).toBe(true);
+      expect(result === null || result.includes('[Recommended]') || result.includes('[Hint]')).toBe(true);
     });
   });
 
