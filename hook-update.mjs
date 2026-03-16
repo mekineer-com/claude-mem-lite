@@ -217,10 +217,9 @@ async function downloadAndInstall(tarballUrl) {
       for (const f of readdirSync(srcScripts)) {
         copyFileSync(join(srcScripts, f), join(destScripts, f));
       }
-      // Ensure bash scripts are executable (copyFileSync doesn't preserve mode)
-      const postToolUse = join(destScripts, 'post-tool-use.sh');
-      if (existsSync(postToolUse)) {
-        try { execSync(`chmod +x "${postToolUse}"`, { stdio: 'pipe' }); } catch {}
+      // Ensure all shell scripts are executable (copyFileSync doesn't preserve mode)
+      for (const sf of readdirSync(destScripts).filter(n => n.endsWith('.sh'))) {
+        try { execSync(`chmod +x "${join(destScripts, sf)}"`, { stdio: 'pipe' }); } catch {}
       }
     }
 

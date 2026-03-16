@@ -840,8 +840,11 @@ function passesConfidenceGate(results, signals) {
     const top1 = Math.abs(results[0].composite_score ?? results[0].relevance ?? 0);
     const top2 = Math.abs(results[1].composite_score ?? results[1].relevance ?? 0);
     // After keyword re-ranking, #1 may have lower raw BM25 than #2.
-    // The keyword match provides additional confidence, so skip the gap check.
-    const wasReRanked = signals?.rawKeywords?.length > 0 && top1 < top2;
+    // Only skip gap check if #1 was actually promoted by a keyword match
+    // (not just any rawKeywords present with incidentally inverted scores).
+    const top1Tags = (results[0].intent_tags || '').toLowerCase();
+    const top1MatchesKw = signals?.rawKeywords?.some(kw => top1Tags.includes(kw));
+    const wasReRanked = top1MatchesKw && top1 < top2;
     if (!wasReRanked && top1 > 0) {
       const gapRatio = (top1 - top2) / top1;
       if (gapRatio < 0.2) {
@@ -1007,8 +1010,8 @@ function decideTier(resource, signals) {
     else signalBoost += 0.1;
   }
   if (signals?.rawKeywords?.length > 0) {
-    const tags = (resource.intent_tags || '').toLowerCase();
-    if (signals.rawKeywords.some(kw => tags.includes(kw))) signalBoost += 0.2;
+    const tagArr = (resource.intent_tags || '').toLowerCase().split(/[\s,]+/);
+    if (signals.rawKeywords.some(kw => tagArr.includes(kw))) signalBoost += 0.2;
   }
 
   const confidence = Math.min(1.0, normalized + patternBoost * 0.3 + signalBoost);
