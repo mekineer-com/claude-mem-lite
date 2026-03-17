@@ -61,6 +61,16 @@ describe('registry.mjs', () => {
       expect(row.status).toBe('active');
     });
 
+    it('has category, quality_tier, popularity_score, personal_score columns', () => {
+      const id = seedResource(db);
+      const row = db.prepare('SELECT category, quality_tier, popularity_score, personal_score FROM resources WHERE id = ?').get(id);
+      expect(row.quality_tier).toBe('community');
+      expect(row.popularity_score).toBe(0);
+      expect(row.personal_score).toBe(0);
+      // category defaults to null
+      expect(row.category).toBeNull();
+    });
+
     it('upserts on conflict (same type+name)', () => {
       seedResource(db, { capability_summary: 'v1' });
       seedResource(db, { capability_summary: 'v2' });
@@ -1249,6 +1259,37 @@ describe('Composite ranking formula', () => {
     // With identical BM25 and both past exploration threshold, proven should rank higher
     expect(results.length).toBe(2);
     expect(results[0].name).toBe('proven-reliable');
+  });
+
+  it('quality_tier installed boosts resource above community', () => {
+    // Community resource with identical text signals
+    seedResource(db, {
+      name: 'community-skill',
+      intent_tags: 'test,testing,tdd',
+      trigger_patterns: 'when user needs to run tests and write test suites',
+      capability_summary: 'Automated test runner and suite executor',
+      recommend_count: 10,
+      adopt_count: 5,
+      success_count: 5,
+      repo_stars: 100,
+    });
+    // Installed resource — same text signals but quality_tier = 'installed'
+    const installedId = seedResource(db, {
+      name: 'installed-skill',
+      intent_tags: 'test,testing,tdd',
+      trigger_patterns: 'when user needs to run tests and write test suites',
+      capability_summary: 'Automated test runner and suite executor',
+      recommend_count: 10,
+      adopt_count: 5,
+      success_count: 5,
+      repo_stars: 100,
+    });
+    db.prepare("UPDATE resources SET quality_tier = 'installed' WHERE id = ?").run(installedId);
+
+    const results = retrieveResources(db, 'test OR testing OR tdd', { limit: 5 });
+    expect(results.length).toBe(2);
+    // Installed resource should rank first due to 3.0x BM25 multiplier
+    expect(results[0].name).toBe('installed-skill');
   });
 });
 

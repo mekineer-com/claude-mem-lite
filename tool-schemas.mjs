@@ -108,4 +108,6 @@ export const memRegistrySchema = {
   keywords: z.string().optional().describe('Search keywords (for import)'),
   tech_stack: z.string().optional().describe('Technology stack tags (for import)'),
   use_cases: z.string().optional().describe('Usage scenarios (for import)'),
+  category: z.string().optional().describe("Filter by category (e.g., 'testing', 'code-quality', 'debugging')"),
+  quality: z.enum(['installed', 'verified', 'community']).optional().describe('Filter by quality tier (default: all)'),
 };

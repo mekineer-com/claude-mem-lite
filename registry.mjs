@@ -34,6 +34,10 @@ const RESOURCES_SCHEMA = `
     tech_stack    TEXT DEFAULT '',
     use_cases     TEXT DEFAULT '',
     complexity    TEXT DEFAULT 'intermediate',
+    category          TEXT,
+    quality_tier      TEXT DEFAULT 'community',
+    popularity_score  REAL DEFAULT 0,
+    personal_score    REAL DEFAULT 0,
     recommend_count   INTEGER DEFAULT 0,
     adopt_count       INTEGER DEFAULT 0,
     weighted_adopt_sum REAL DEFAULT 0,
@@ -173,6 +177,13 @@ export function ensureRegistryDb(dbPath) {
     if (!resCols.has('recommendation_mode')) db.exec("ALTER TABLE resources ADD COLUMN recommendation_mode TEXT DEFAULT 'proactive'");
     // weighted_adopt_sum: continuous adoption score accumulator (vs binary adopt_count)
     if (!resCols.has('weighted_adopt_sum')) db.exec("ALTER TABLE resources ADD COLUMN weighted_adopt_sum REAL DEFAULT 0");
+    // Phase 2: Registry optimization columns
+    if (!resCols.has('category')) db.exec("ALTER TABLE resources ADD COLUMN category TEXT");
+    if (!resCols.has('quality_tier')) db.exec("ALTER TABLE resources ADD COLUMN quality_tier TEXT DEFAULT 'community'");
+    if (!resCols.has('popularity_score')) db.exec("ALTER TABLE resources ADD COLUMN popularity_score REAL DEFAULT 0");
+    if (!resCols.has('personal_score')) db.exec("ALTER TABLE resources ADD COLUMN personal_score REAL DEFAULT 0");
+    // Auto-set quality_tier for installed preinstalled resources
+    db.exec("UPDATE resources SET quality_tier = 'installed' WHERE source = 'preinstalled' AND quality_tier = 'community'");
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
   // FTS5 + triggers: only create if not exists

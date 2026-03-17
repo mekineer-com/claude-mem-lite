@@ -349,6 +349,11 @@ export function filterByProjectDomain(results, projectDomains) {
 // Sign convention: more negative = better. BM25 is negative, behavioral signals are subtracted.
 const COMPOSITE_EXPR = `(
     bm25(resources_fts, 3.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
+    * CASE COALESCE(r.quality_tier, 'community')
+        WHEN 'installed' THEN 3.0
+        WHEN 'verified' THEN 2.0
+        ELSE 1.0
+      END
     - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
     - (
         (COALESCE(r.success_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) * 0.5

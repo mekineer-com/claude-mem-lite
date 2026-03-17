@@ -301,6 +301,24 @@ describe('mem_registry schema', () => {
   it('rejects invalid resource_type', () => {
     expect(parseSchema(memRegistrySchema, { action: 'import', name: 'x', resource_type: 'invalid' }).success).toBe(false);
   });
+
+  it('accepts search with category filter', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'search', query: 'test', category: 'testing' }).success).toBe(true);
+  });
+
+  it('accepts search with quality filter', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'search', query: 'test', quality: 'installed' }).success).toBe(true);
+  });
+
+  it('accepts all valid quality enum values', () => {
+    for (const q of ['installed', 'verified', 'community']) {
+      expect(parseSchema(memRegistrySchema, { action: 'search', query: 'x', quality: q }).success).toBe(true);
+    }
+  });
+
+  it('rejects invalid quality enum value', () => {
+    expect(parseSchema(memRegistrySchema, { action: 'search', query: 'x', quality: 'premium' }).success).toBe(false);
+  });
 });
 
 // ─── LLM string coercion ─────────────────────────────────────────────────────

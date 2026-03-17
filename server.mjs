@@ -1269,10 +1269,12 @@ server.registerTool(
         return { content: [{ type: 'text', text: `No matching resources for: "${args.query}"` }] };
       }
       const lines = results.map(r => {
+        const qualityBadge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
+        const categoryLabel = r.category ? ` [${r.category}]` : '';
         const howToUse = r.type === 'skill'
           ? (r.invocation_name ? `Skill tool: skill="${r.invocation_name}"` : `Community skill: ${r.name}`)
           : `Agent tool: subagent_type="${r.name}"`;
-        return `${r.type === 'skill' ? 'S' : 'A'} **${r.name}** — ${truncate(r.capability_summary || '', 80)}\n  Use: ${howToUse}`;
+        return `${qualityBadge} ${r.type === 'skill' ? 'S' : 'A'} **${r.name}**${categoryLabel} — ${truncate(r.capability_summary || '', 80)}\n  Use: ${howToUse}`;
       });
       return { content: [{ type: 'text', text: `Found ${results.length} resource(s) for "${args.query}":\n\n${lines.join('\n\n')}` }] };
     }
