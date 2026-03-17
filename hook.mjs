@@ -256,13 +256,16 @@ async function handlePostToolUse() {
     // Track feedback-relevant tool events for dispatch adoption detection.
     // Skill/Agent: adoption detection checks these tool names.
     // Edit/Write/NotebookEdit: outcome detection checks for edits.
+    // Grep: investigation signal for debugging pattern detection.
     // Bash errors: outcome detection checks for error signals.
-    if (['Skill', 'Agent', 'Edit', 'Write', 'NotebookEdit'].includes(tool_name) ||
-        (tool_name === 'Bash' && bashSig?.isError)) {
+    // Bash test/build success: TDD and verification pattern detection.
+    const isTrackableBash = tool_name === 'Bash' && (bashSig?.isError || bashSig?.isTest || bashSig?.isBuild);
+    if (['Skill', 'Agent', 'Edit', 'Write', 'NotebookEdit', 'Grep'].includes(tool_name) || isTrackableBash) {
       appendToolEvent({
         tool_name,
         tool_input: toolInput,
-        tool_response: (tool_name === 'Bash' && bashSig?.isError) ? scrubSecrets(resp.slice(0, 500)) : '',
+        tool_response: (tool_name === 'Bash' && bashSig?.isSignificant) ? scrubSecrets(resp.slice(0, 500)) : '',
+        timestamp: Date.now(),
       });
     }
   } finally {

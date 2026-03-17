@@ -475,22 +475,33 @@ describe('Dispatch Feedback: Adoption Detection', () => {
     expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 1.0 });
   });
 
-  it('detects behavioral debugging adoption with 2+ error→edit cycles', () => {
+  it('detects behavioral debugging adoption with 2+ error→edit cycles (no investigation)', () => {
     const inv = { resource_name: 'debugging-helper', resource_type: 'skill' };
     const events = [
-      { tool_name: 'Read', tool_input: {} },
       { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: ENOENT: no such file or directory, this is a long error message' },
       { tool_name: 'Edit', tool_input: {} },
       { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: EACCES: permission denied, still failing' },
       { tool_name: 'Edit', tool_input: {} },
     ];
-    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 0.4 });
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 0.35 });
+  });
+
+  it('detects behavioral debugging adoption with Grep investigation (higher score)', () => {
+    const inv = { resource_name: 'debugging-helper', resource_type: 'skill' };
+    const events = [
+      { tool_name: 'Grep', tool_input: {} },
+      { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: ENOENT: no such file or directory, this is a long error message' },
+      { tool_name: 'Edit', tool_input: {} },
+      { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: EACCES: permission denied, still failing' },
+      { tool_name: 'Edit', tool_input: {} },
+    ];
+    expect(_detectAdoption(inv, events)).toEqual({ adopted: true, score: 0.5 });
   });
 
   it('does NOT detect debugging adoption with only 1 error→edit cycle', () => {
     const inv = { resource_name: 'debugging-helper', resource_type: 'skill' };
     const events = [
-      { tool_name: 'Read', tool_input: {} },
+      { tool_name: 'Grep', tool_input: {} },
       { tool_name: 'Bash', tool_input: {}, tool_response: 'Error: ENOENT: no such file or directory, this is a long error message' },
       { tool_name: 'Edit', tool_input: {} },
     ];

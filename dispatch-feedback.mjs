@@ -169,17 +169,19 @@ function detectAdoption(invocation, sessionEvents) {
   // Debugging pattern: requires 2+ error→edit cycles (not just one)
   // A single error→edit is too common in normal coding and doesn't indicate
   // systematic debugging methodology was actually applied.
+  // Investigation signal: Grep (tracked) indicates code exploration; Read is not
+  // tracked (skipped by bash pre-filter) so we use Grep as the investigation proxy.
   if (resourceLower.includes('debug') || resourceLower.includes('troubleshoot')) {
     const firstRelevant = sessionEvents.find(e =>
-      e.tool_name === 'Read' ||
+      e.tool_name === 'Grep' ||
       (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || ''))
     );
     if (isWithinWindow(firstRelevant?.timestamp, recTime)) {
-      let hasRead = false;
+      let hasInvestigated = false;
       let cycles = 0;
       let sawError = false;
       for (const e of sessionEvents) {
-        if (e.tool_name === 'Read') hasRead = true;
+        if (e.tool_name === 'Grep') hasInvestigated = true;
         if (e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')) {
           sawError = true;
         }
@@ -188,8 +190,10 @@ function detectAdoption(invocation, sessionEvents) {
           sawError = false; // Reset for next cycle
         }
       }
-      if (hasRead && cycles >= 2) {
-        return { adopted: true, score: 0.4 };
+      // 2+ error→edit cycles indicates systematic debugging; investigation (Grep)
+      // is a quality signal but not required — cycles alone are sufficient evidence
+      if (cycles >= 2) {
+        return { adopted: true, score: hasInvestigated ? 0.5 : 0.35 };
       }
     }
   }

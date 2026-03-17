@@ -57,10 +57,18 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     const LOW_SIGNAL = /^(Error (while working|in)|Modified |Worked on |Reviewed \d+ files:)/;
     if (obs.title && LOW_SIGNAL.test(obs.title)) {
       const oneDayAgo = now.getTime() - 86400000;
+      // Phase 1: exact title match (no LIMIT needed — indexed, fast)
+      const exactDup = db.prepare(`
+        SELECT 1 FROM observations
+        WHERE project = ? AND title = ? AND created_at_epoch > ? AND created_at_epoch <= ?
+        LIMIT 1
+      `).get(project, obs.title, oneDayAgo, fiveMinAgo);
+      if (exactDup) return null;
+      // Phase 2: Jaccard similarity for near-duplicates (wider window than before)
       const extRecent = db.prepare(`
         SELECT title FROM observations
         WHERE project = ? AND created_at_epoch > ? AND created_at_epoch <= ?
-        ORDER BY created_at_epoch DESC LIMIT 30
+        ORDER BY created_at_epoch DESC LIMIT 60
       `).all(project, oneDayAgo, fiveMinAgo);
       if (extRecent.some(r => jaccardSimilarity(r.title, obs.title) > 0.85)) {
         return null;
@@ -74,7 +82,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       const recentSigs = db.prepare(`
         SELECT minhash_sig FROM observations
         WHERE project = ? AND created_at_epoch > ? AND minhash_sig IS NOT NULL
-        ORDER BY created_at_epoch DESC LIMIT 100
+        ORDER BY created_at_epoch DESC LIMIT 200
       `).all(project, sevenDaysAgo);
 
       if (recentSigs.some(r => estimateJaccardFromMinHash(minhashSig, r.minhash_sig) > 0.8)) {

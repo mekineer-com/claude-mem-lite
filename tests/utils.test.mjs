@@ -140,7 +140,9 @@ describe('sanitizeFtsQuery', () => {
     expect(sanitizeFtsQuery('test{foo}')).toBe('(test OR spec OR 测试) AND foo');
     expect(sanitizeFtsQuery('test(bar)')).toBe('(test OR spec OR 测试) AND bar');
     expect(sanitizeFtsQuery('test[baz]')).toBe('(test OR spec OR 测试) AND baz');
-    expect(sanitizeFtsQuery('a^b~c*d:e')).toBe('a b c d e');
+    // Single ASCII letters are filtered as too noisy for FTS5
+    expect(sanitizeFtsQuery('a^b~c*d:e')).toBeNull();
+    expect(sanitizeFtsQuery('foo^bar~baz')).toBe('foo bar baz');
   });
 
   it('filters out FTS5 boolean keywords', () => {

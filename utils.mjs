@@ -368,7 +368,11 @@ export function sanitizeFtsQuery(query) {
     .replace(/(^|\s)-/g, '$1')
     .trim();
   if (!cleaned) return null;
-  const tokens = cleaned.split(/\s+/).filter(t => t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR\/\d+$/i.test(t));
+  const tokens = cleaned.split(/\s+/).filter(t =>
+    t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR\/\d+$/i.test(t)
+    // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
+    && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
+  );
   if (tokens.length === 0) return null;
   // Replace single CJK character tokens with bigrams for better phrase matching.
   // Individual CJK chars ("系","统") are too noisy; bigrams ("系统") capture compound words.

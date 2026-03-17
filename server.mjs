@@ -73,9 +73,12 @@ function resolveProject(name) {
   const suffixed = db.prepare(
     'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
   ).get(`%--${name}`);
-  const resolved = suffixed ? suffixed.project : name;
-  _projectCache.set(name, resolved);
-  return resolved;
+  if (suffixed) { _projectCache.set(name, suffixed.project); return suffixed.project; }
+  // Fallback: synthesize canonical form from current directory
+  const inferred = inferProject();
+  if (inferred.endsWith(`--${name}`)) { _projectCache.set(name, inferred); return inferred; }
+  _projectCache.set(name, name);
+  return name;
 }
 
 // ─── Scoring Model Constants ────────────────────────────────────────────────
@@ -492,9 +495,9 @@ server.registerTool(
     const searchType = args.type;
     const currentProject = inferProject();
 
-    const isCrossSource = !searchType;
-    const perSourceLimit = isCrossSource ? Math.max(limit * 3, offset + limit + 10) : limit;
-    const perSourceOffset = isCrossSource ? 0 : offset;
+    const isCrossSourceRaw = !searchType;
+    const perSourceLimit = isCrossSourceRaw ? Math.max(limit * 3, offset + limit + 10) : limit;
+    const perSourceOffset = isCrossSourceRaw ? 0 : offset;
 
     // Parse date bounds to epoch (with validation)
     // date_to with date-only format (YYYY-MM-DD) extends to end-of-day (23:59:59.999Z)
@@ -511,12 +514,15 @@ server.registerTool(
       return formatSearchOutput([], args, ftsQuery, 0, false);
     }
 
-    const ctx = { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
+    // When obs_type is specified, implicitly restrict to observations only
+    const effectiveType = searchType || (args.obs_type ? 'observations' : undefined);
+    const isCrossSource = !effectiveType;
+    const ctx = { ftsQuery, searchType: effectiveType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
     const results = [];
 
-    if (!searchType || searchType === 'observations') results.push(...searchObservations(ctx));
-    if (!searchType || searchType === 'sessions')     results.push(...searchSessions(ctx));
-    if (!searchType || searchType === 'prompts')       results.push(...searchPrompts(ctx));
+    if (!effectiveType || effectiveType === 'observations') results.push(...searchObservations(ctx));
+    if (!effectiveType || effectiveType === 'sessions')     results.push(...searchSessions(ctx));
+    if (!effectiveType || effectiveType === 'prompts')       results.push(...searchPrompts(ctx));
 
     // Global sort (cross-source)
     if (isCrossSource && results.length > 0) {
@@ -685,6 +691,8 @@ server.registerTool(
       for (const f of fields) {
         const val = row[f];
         if (val === null || val === undefined || val === '') continue;
+        // Skip 'text' field when it duplicates narrative (text = narrative + optional CJK bigrams)
+        if (f === 'text' && row.narrative && typeof val === 'string' && val.startsWith(row.narrative)) continue;
         lines.push(`${f}: ${typeof val === 'string' && val.length > 200 ? val.slice(0, 200) + '…' : val}`);
       }
       parts.push(lines.join('\n'));

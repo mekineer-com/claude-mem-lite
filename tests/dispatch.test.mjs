@@ -865,11 +865,11 @@ describe('dispatch-feedback.mjs', () => {
   });
 
   describe('behavioral adoption detection', () => {
-    it('detects debugging pattern requiring 2+ error→edit cycles', () => {
+    it('detects debugging pattern with 2+ error→edit cycles and Grep investigation', () => {
       const inv = { resource_name: 'superpowers-debugging', resource_type: 'skill', invocation_name: 'superpowers:systematic-debugging' };
-      // Two error→edit cycles
+      // Two error→edit cycles with Grep investigation
       const events = [
-        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Grep', tool_input: { pattern: 'bug' } },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL: expected 1, got 2' },
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: still broken' },
@@ -878,14 +878,27 @@ describe('dispatch-feedback.mjs', () => {
       ];
       const result = detectAdoption(inv, events);
       expect(result.adopted).toBe(true);
-      expect(result.score).toBe(0.4);
+      expect(result.score).toBe(0.5);
+    });
+
+    it('detects debugging pattern with 2+ error→edit cycles without investigation (lower score)', () => {
+      const inv = { resource_name: 'superpowers-debugging', resource_type: 'skill', invocation_name: 'superpowers:systematic-debugging' };
+      // Two error→edit cycles without Grep
+      const events = [
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL: expected 1, got 2' },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'Error: still broken' },
+        { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
+      ];
+      const result = detectAdoption(inv, events);
+      expect(result.adopted).toBe(true);
+      expect(result.score).toBe(0.35);
     });
 
     it('does NOT detect debugging pattern with only 1 error→edit cycle', () => {
       const inv = { resource_name: 'superpowers-debugging', resource_type: 'skill', invocation_name: 'superpowers:systematic-debugging' };
-      // Only one error→edit cycle — too loose, should not trigger
       const events = [
-        { tool_name: 'Read', tool_input: { file_path: '/src/bug.js' } },
+        { tool_name: 'Grep', tool_input: { pattern: 'bug' } },
         { tool_name: 'Bash', tool_input: { command: 'npx vitest run' }, tool_response: 'FAIL: expected 1, got 2' },
         { tool_name: 'Edit', tool_input: { file_path: '/src/bug.js' } },
       ];
