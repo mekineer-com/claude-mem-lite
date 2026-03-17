@@ -1272,11 +1272,18 @@ server.registerTool(
       }
       let results = searchResources(rdb, args.query, {
         type: args.type || undefined,
-        limit: args.category || args.quality ? 20 : 5, // fetch more when filtering
+        limit: args.category || args.quality ? 20 : 10, // fetch more for post-filtering
       });
       // Apply category/quality filters if provided
       if (args.category) results = results.filter(r => r.category === args.category);
       if (args.quality) results = results.filter(r => r.quality_tier === args.quality);
+      // Prioritize directly invocable resources (with invocation_name) over community resources
+      results.sort((a, b) => {
+        const aInvocable = a.invocation_name ? 1 : 0;
+        const bInvocable = b.invocation_name ? 1 : 0;
+        if (aInvocable !== bInvocable) return bInvocable - aInvocable;
+        return 0; // preserve FTS5 ranking within same tier
+      });
       results = results.slice(0, 5);
       if (results.length === 0) {
         return { content: [{ type: 'text', text: `No matching resources for: "${args.query}"` }] };

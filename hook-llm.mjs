@@ -275,6 +275,22 @@ export function buildImmediateObservation(episode) {
     importance = ruleImportance;
   }
 
+  // Separate files_modified (from Edit/Write tools) from files_read (everything else)
+  const modifiedFiles = new Set();
+  const searchedFiles = new Set();
+  for (const entry of episode.entries) {
+    if (!entry.files) continue;
+    if (EDIT_TOOLS.has(entry.tool)) {
+      for (const f of entry.files) modifiedFiles.add(f);
+    } else {
+      for (const f of entry.files) searchedFiles.add(f);
+    }
+  }
+  // Merge bash-tracked reads and search tool files into filesRead
+  const allReads = new Set([...(episode.filesRead || []), ...searchedFiles]);
+  // Remove files that were both searched AND modified — they're modified
+  for (const f of modifiedFiles) allReads.delete(f);
+
   return {
     type: inferredType,
     title,
@@ -282,8 +298,8 @@ export function buildImmediateObservation(episode) {
     narrative: episode.entries.map(e => e.desc).join('; '),
     concepts: [],
     facts: [],
-    files: episode.files,
-    filesRead: episode.filesRead || [],
+    files: [...modifiedFiles],
+    filesRead: [...allReads],
     importance,
   };
 }

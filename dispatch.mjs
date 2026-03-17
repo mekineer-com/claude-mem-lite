@@ -1114,16 +1114,16 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     const textQuery = buildQueryFromText(explicit.searchTerm);
     if (!textQuery) return null;
 
-    let results = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
-    results = filterAutoLoadedSkills(results);
+    // Explicit requests bypass project domain filtering — if the user asks
+    // "use the playwright skill", don't filter by project tech stack
+    let results = retrieveResources(db, textQuery, { limit: 3 });
     results = filterGarbageMetadata(results);
     // Community resources without invocation_name can't be easily invoked
     results = results.filter(r => r.quality_tier !== 'community' || r.invocation_name);
-    results = applyAdoptionDecay(results, db);
+    // Explicit requests skip adoption decay and cooldown — user asked for this
     if (results.length === 0) return null;
 
     const best = results[0];
-    if (sessionId && isRecentlyRecommended(db, best.id, sessionId)) return null;
 
     recordInvocation(db, { resource_id: best.id, session_id: sessionId, trigger: 'user_prompt', tier: 1, recommended: 1 });
     updateResourceStats(db, best.id, 'recommend_count');

@@ -137,7 +137,7 @@ export const RESOURCE_METADATA = {
     capability_summary: 'Browser automation with Playwright for testing forms screenshots and web interactions',
     trigger_patterns: 'when user needs to automate browser interactions test web pages or take screenshots with Playwright',
     keywords: 'playwright-test,browser-script,page-interaction,screenshot',
-    tech_stack: 'chromium,jest,vitest,pytest',
+    tech_stack: 'javascript,node,typescript,chromium,jest,vitest,pytest',
   },
   'skill:planning-with-files': {
     intent_tags: 'plan,files,organize,structure,project,scope',

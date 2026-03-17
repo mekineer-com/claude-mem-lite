@@ -10,6 +10,8 @@ export const DISPATCH_SYNONYMS = {
   'clean':    ['refactor', 'lint', 'format', 'organize', 'tidy', 'simplify', 'restructure', 'rewrite', 'smell', 'debt'],
   'test':     ['testing', 'unittest', 'e2e', 'coverage', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest', 'mocha', 'cypress', 'playwright'],
   'fix':      ['debug', 'bugfix', 'troubleshoot', 'diagnose', 'repair', 'error', 'crash', 'broken', 'issue', 'problem'],
+  'debug':    ['debugging', 'fix', 'bugfix', 'troubleshoot', 'diagnose', 'error', 'crash', 'bug', 'breakpoint'],
+  'debugging':['debug', 'fix', 'bugfix', 'troubleshoot', 'diagnose', 'error', 'crash', 'bug', 'systematic'],
   'fast':     ['performance', 'optimize', 'profile', 'benchmark', 'speed', 'latency', 'bottleneck', 'slow', 'cache'],
   'deploy':   ['release', 'publish', 'ci', 'cd', 'ship', 'rollout', 'staging', 'production'],
   'commit':   ['git', 'push', 'merge', 'pr', 'branch', 'version', 'rebase', 'stash', 'tag'],

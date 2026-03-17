@@ -821,25 +821,22 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
   // ─── Scenario 11b: Explicit request path filters auto-loaded skills ──────
 
-  describe('explicit request path filters auto-loaded skills (adoption-aware)', () => {
-    it('explicit request for auto-loaded skill with poor adoption does not recommend', async () => {
-      // Give superpowers-debugging high recommend count but zero adoption → poor adoption
+  describe('explicit request always honors user intent (bypasses adoption/cooldown filters)', () => {
+    it('explicit request returns result regardless of adoption stats', async () => {
+      // Even with high recommend count and zero adoption, explicit request should work
       db.prepare("UPDATE resources SET recommend_count = 50, adopt_count = 0 WHERE name = 'superpowers-debugging'").run();
       const result = await dispatchOnUserPrompt(db, 'use the superpowers-debugging skill', 'explicit-filter-sess');
-      if (result) {
-        expect(result).not.toContain('superpowers:systematic-debugging');
-        expect(result).not.toContain('superpowers-debugging');
-      }
+      // User explicitly asked → should always return the resource
+      expect(result).toBeTruthy();
+      expect(result).toContain('superpowers:systematic-debugging');
     });
 
-    it('explicit request for auto-loaded skill with healthy adoption can recommend', async () => {
+    it('explicit request with healthy adoption also works', async () => {
       // Give superpowers-debugging healthy adoption stats
       db.prepare("UPDATE resources SET recommend_count = 20, adopt_count = 5 WHERE name = 'superpowers-debugging'").run();
       const result = await dispatchOnUserPrompt(db, 'use the superpowers-debugging skill', 'explicit-filter-sess-2');
-      // Should recommend since adoption is healthy
-      if (result) {
-        expect(result).toContain('superpowers:systematic-debugging');
-      }
+      expect(result).toBeTruthy();
+      expect(result).toContain('superpowers:systematic-debugging');
     });
 
     it('explicit request for community skill (empty invocation_name) can still recommend', async () => {

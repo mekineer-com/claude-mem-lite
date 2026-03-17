@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.12.0
+- **Version**: 2.12.1
 - **Package manager**: npm
 - **Test**: `npx vitest run` (29 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -48,16 +48,18 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 提交代码发布新版本 (Submit code and release new version)
-Completed: Version synchronized to 2.11.3 in plugin.json and marketplace.json
-Remaining: Git commit creation and version tag/release publication
-Next: Create git commit with version bump, then push and create release tag for version 2.11.3
+Completed: Error: mem, utils.mjs, hook-llm.mjs: Columns: id, resource_id, session_id, trigger, ti…; Error: dispatch-workflow.mjs, …
 
 ### Key Context
-- [bugfix] Error: test-runtime-ux.mjs: ╔════════════════════════════════════════════════… (#4061)
-- [bugfix] Error: test-dispatch-fixes.mjs, test-runtime-ux.mjs: Loaded 229 resources from … (#4060)
-- [bugfix] Error: utils.mjs, dispatch.mjs: ======================================== Dispat… (#4055)
-- [bugfix] Error: hook-llm.mjs, test-hooks-ux.mjs, test-dispatch-ux.mjs: ═════════════════… (#4050)
-- [bugfix] Error: test-dispatch-ux.mjs, test-mem-ux.mjs, test-hooks-ux.mjs: 🧪 claude-mem-… (#4049)
+- [bugfix] Error: mem, utils.mjs, hook-llm.mjs: Columns: id, resource_id, session_id, trig… (#4093)
+- [bugfix] Error: dispatch-workflow.mjs, hook.mjs, utils.mjs: input:有没有一个code review的工具,re… (#4091)
+- [discovery] Reviewed 4 files: utils.mjs, hook.mjs, hook-shared.mjs, dispatch.mjs (#4090)
+- [bugfix] Error: ci.yml: in_progress		fix(ci): use plain vitest for Node 1… (#4084)
+- [discovery] Reviewed 2 files: dispatch.mjs, hook.mjs (#4080)
+
+### Working State (from /clear)
+- Working on: 有没有一个code review的工具 → try the build-error-resolver skill → 帮我调试一个React组件的bug → use the code review skill
+- Unfinished: # Test 4 with more detail: capture stdout/stderr … → EXIT=0 === STDERR === === STDOUT ===
+- Key files: dispatch.mjs, mem
 
 </claude-mem-context>

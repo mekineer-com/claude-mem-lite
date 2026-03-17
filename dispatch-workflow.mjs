@@ -138,14 +138,14 @@ export function inferCurrentStage(primaryIntent, activeSuite, suppressedIntents 
 // ─── Explicit Request Detection ──────────────────────────────────────────────
 
 const EXPLICIT_REQUEST_PATTERNS = [
-  // EN: "use the playwright skill", "try the ppt skill"
-  /(?:use|try|invoke|run|activate|load)\s+(?:the\s+)?(\S+?)\s+(?:skill|agent|tool|plugin)\b/i,
-  // CN: "用ppt的技能", "帮我用playwright的skill"
-  /(?:用|使用|帮我用|试试|启用)\s*(\S+?)\s*(?:的|的技能|的skill|的agent|技能|skill|agent|工具|插件)/,
-  // "有没有xxx的skill", "is there a xxx agent"
-  /(?:有没有|有无|是否有|do you have|is there)\s*(?:一个|a|an)?\s*(\S+?)\s*(?:的|skill|agent|技能|工具)/i,
-  // "推荐一个xxx", "recommend a xxx agent"
-  /(?:推荐|suggest|recommend)\s*(?:一个|a|an)?\s*(\S+?)\s*(?:的|skill|agent|技能|工具)/i,
+  // EN: "use the playwright skill", "try the code review skill" (multi-word support)
+  /(?:use|try|invoke|run|activate|load)\s+(?:the\s+)?(.+?)\s+(?:skill|agent|tool|plugin)\b/i,
+  // CN: "用ppt的技能", "帮我用code review的skill" (multi-word support)
+  /(?:用|使用|帮我用|试试|启用)\s*(.+?)\s*(?:的技能|的skill|的agent|的工具|的插件|技能|skill|agent|工具|插件)/,
+  // "有没有code review的skill", "is there a code review agent"
+  /(?:有没有|有无|是否有|do you have|is there)\s*(?:一个|a|an)?\s*(.+?)\s*(?:的|skill|agent|技能|工具)/i,
+  // "推荐一个code review的", "recommend a testing agent"
+  /(?:推荐|suggest|recommend)\s*(?:一个|a|an)?\s*(.+?)\s*(?:的|skill|agent|技能|工具)/i,
 ];
 
 /**
