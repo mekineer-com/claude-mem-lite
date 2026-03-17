@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.11.2
+- **Version**: 2.11.3
 - **Package manager**: npm
 - **Test**: `npx vitest run` (29 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -48,10 +48,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Commit code changes and publish a release version for the projects--mem plugin
-Completed: Version bump from 2.11.0 to 2.11.1 with synchronized version numbers in plugin.json and marketplace.json; fixes applied…
-Remaining: Unclear if changelog/release notes were created; observation text truncated preventing full scope verification
-Next: Verify all release artifacts (changelog, GitHub release, marketplace listing); test plugin in production environment
+Request: 这下有了，需要发版本不，其它用户安装插件不会遇到这问题吧
 
 ### Key Context
 - [change] Bump plugin version from 2.11.0 to 2.11.1 (#4036)
