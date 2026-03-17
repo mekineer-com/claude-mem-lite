@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.11.1
+- **Version**: 2.11.2
 - **Package manager**: npm
 - **Test**: `npx vitest run` (29 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -48,18 +48,16 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Commit code and release a new version
-Completed: Version bump from 2.10.7 to 2.11.0; commit created via commit-commands:commit skill
-Remaining: Push to remote; create/merge PR; actual release creation (tag/publish); verify marketplace.json presence if needed
-Next: Push the commit to remote branch; create PR if needed for review; tag release and publish to distribution channels
-Lessons: Marketplace.json may not exist in all project variants — conditional presence should be documented
-Decisions: Minor version bump (2.10.7 → 2.11.0) selected for release, indicating new feature(s) rather than patch
+Request: Commit code changes and publish a release version for the projects--mem plugin
+Completed: Version bump from 2.11.0 to 2.11.1 with synchronized version numbers in plugin.json and marketplace.json; fixes applied…
+Remaining: Unclear if changelog/release notes were created; observation text truncated preventing full scope verification
+Next: Verify all release artifacts (changelog, GitHub release, marketplace listing); test plugin in production environment
 
 ### Key Context
-- [bugfix] Address code review findings in dispatch module (#4004)
-- [discovery] Reviewed 9 files: mem, hook.mjs, dispatch.mjs, utils.mjs +5 more (#3997)
-- [bugfix] Error: dispatch.mjs: 92341f7 feat(registry): add quality_tier, categor… (#3994)
-- [bugfix] Error: contract.test.mjs, dispatch.test.mjs: ✓ accumulates multiple scores 1ms … (#3989)
-- [bugfix] Error: server.mjs: main 00ce865 feat(dispatch): simplify to explicit… (#3984)
+- [change] Bump plugin version from 2.11.0 to 2.11.1 (#4036)
+- [bugfix] Error: hook-llm.mjs, server.mjs, utils.mjs +1 more: When ID 1055 was saved (202… (#4033)
+- [bugfix] Error: hook-shared.mjs: === FIRST 5 in chronological order === 1. ID 1039… (#4032)
+- [bugfix] Error: mem: === Error while working on daagu (IDs, titles, ti… (#4031)
+- [discovery] 44 duplicate episode title prefixes found in observation summaries (#4030)
 
 </claude-mem-context>

@@ -2,6 +2,11 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.11.2] - 2026-03-17
+
+### Fixed
+- Stopped `setup.sh` from clearing marketplace `.mcp.json` on every SessionStart, which caused MCP server registration to disappear after plugin updates. Claude Code copies `.mcp.json` from marketplace → cache, so clearing the marketplace copy broke the chain.
+
 ## [2.10.4] - 2026-03-16
 
 ### Fixed
