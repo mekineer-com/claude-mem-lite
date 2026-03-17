@@ -635,6 +635,22 @@ describe('Suite 5: User Prompt', () => {
     expect(prompts[0].prompt_text).toBe('Using the new prompt field name');
   });
 
+  it('task-notification prompts are silently dropped (not stored)', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+
+    const { exitCode } = runHook('user-prompt', {
+      stdin: JSON.stringify({ prompt: '<task-notification>\n<task-id>abc123</task-id>\n<status>completed</status>\n</task-notification>' }),
+      env: { HOME: tmpHome },
+    });
+    expect(exitCode).toBe(0);
+
+    const db = openTestDb(tmpHome);
+    const prompts = db.prepare('SELECT * FROM user_prompts WHERE content_session_id = ?').all(sessionId);
+    db.close();
+    expect(prompts.length).toBe(0);
+  });
+
   it('prompt counter increments across multiple prompts', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);

@@ -246,7 +246,7 @@ const TEXT_QUERY_STOP_WORDS = new Set([
 export function buildQueryFromText(text) {
   if (!text || typeof text !== 'string') return null;
 
-  const cleaned = text.replace(/[{}()[\]^~*:@#$%&]/g, ' ').trim();
+  const cleaned = text.replace(/[{}()[\]^~*:@#$%&"\\]/g, ' ').trim();
 
   // Extract CJK compound words before whitespace split (Chinese has no spaces)
   const cjkTokens = extractCJKTokens(cleaned);

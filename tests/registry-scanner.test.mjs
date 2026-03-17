@@ -284,4 +284,17 @@ describe('diffResources', () => {
     expect(toDisable[0].name).toBe('old-plugin/gone');
     db.close();
   });
+
+  it('does not disable resources without local_path (metadata-imported)', () => {
+    const db = createRegistryDb();
+    // Resources imported via mem_registry or install.mjs — empty local_path
+    db.prepare('INSERT INTO resources (name, type, source, file_hash, local_path) VALUES (?, ?, ?, ?, ?)')
+      .run('imported-skill', 'skill', 'preinstalled', 'hash', '');
+    db.prepare('INSERT INTO resources (name, type, source, file_hash, local_path) VALUES (?, ?, ?, ?, ?)')
+      .run('another-imported', 'skill', 'preinstalled', 'hash2', '');
+
+    const { toDisable } = diffResources(db, []);
+    expect(toDisable).toHaveLength(0);
+    db.close();
+  });
 });

@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.12.1
+- **Version**: 2.12.2
 - **Package manager**: npm
 - **Test**: `npx vitest run` (29 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -48,18 +48,14 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Completed: Error: mem, utils.mjs, hook-llm.mjs: Columns: id, resource_id, session_id, trigger, ti…; Error: dispatch-workflow.mjs, …
+Request: 提交代码，发布新版本，检查github上有无错误
+Completed: Error: CLAUDE.md: in_progress		fix(dispatch+search): explicit reque…; Error: plugin.json, marketplace.json: CLAUDE.md  …
 
 ### Key Context
+- [bugfix] Error: CLAUDE.md: in_progress		fix(dispatch+search): explicit reque… (#4097)
+- [bugfix] Error: plugin.json, marketplace.json: CLAUDE.md                   | 20 ++++++++… (#4096)
+- [discovery] mem_registry synonym expansion hits edge cases with multi-word patterns (#4095)
 - [bugfix] Error: mem, utils.mjs, hook-llm.mjs: Columns: id, resource_id, session_id, trig… (#4093)
 - [bugfix] Error: dispatch-workflow.mjs, hook.mjs, utils.mjs: input:有没有一个code review的工具,re… (#4091)
-- [discovery] Reviewed 4 files: utils.mjs, hook.mjs, hook-shared.mjs, dispatch.mjs (#4090)
-- [bugfix] Error: ci.yml: in_progress		fix(ci): use plain vitest for Node 1… (#4084)
-- [discovery] Reviewed 2 files: dispatch.mjs, hook.mjs (#4080)
-
-### Working State (from /clear)
-- Working on: 有没有一个code review的工具 → try the build-error-resolver skill → 帮我调试一个React组件的bug → use the code review skill
-- Unfinished: # Test 4 with more detail: capture stdout/stderr … → EXIT=0 === STDERR === === STDOUT ===
-- Key files: dispatch.mjs, mem
 
 </claude-mem-context>

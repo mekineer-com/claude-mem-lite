@@ -220,7 +220,7 @@ export function scanAllResources(config = {}) {
  */
 export function diffResources(db, scanned) {
   const existing = new Map();
-  const rows = db.prepare('SELECT id, type, name, file_hash, status FROM resources').all();
+  const rows = db.prepare('SELECT id, type, name, file_hash, local_path, status FROM resources').all();
   for (const r of rows) existing.set(`${r.type}:${r.name}`, r);
 
   const toIndex = [];
@@ -242,9 +242,12 @@ export function diffResources(db, scanned) {
   }
 
   // Resources in DB but not on filesystem → disable
+  // Only disable resources that have a local_path (filesystem-backed).
+  // Resources without local_path were imported via metadata/registry and
+  // cannot be validated by filesystem scan.
   const toDisable = [];
   for (const [key, row] of existing) {
-    if (!scannedKeys.has(key) && row.status === 'active') {
+    if (!scannedKeys.has(key) && row.status === 'active' && row.local_path) {
       toDisable.push(row);
     }
   }

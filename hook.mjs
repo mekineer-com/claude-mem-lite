@@ -759,7 +759,6 @@ async function handleSessionStart() {
     // CLAUDE.md: slim (summary + handoff state — observations already in stdout)
     updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
 
-    // Cache previous session context for user-prompt dispatch enrichment.
     // Background rescan: detect changed/new managed resources since last scan.
     // TTL-based (1h) — avoids redundant filesystem scans on every session.
     // Non-blocking: spawns detached worker, results available before first user prompt.
@@ -841,6 +840,9 @@ async function handleUserPrompt() {
 
   const promptText = hookData.prompt || hookData.user_prompt;
   if (!promptText || typeof promptText !== 'string') return;
+
+  // Skip internal Claude Code protocol messages — not real user input
+  if (promptText.startsWith('<task-notification>')) return;
 
   const sessionId = getSessionId();
   const db = openDb();

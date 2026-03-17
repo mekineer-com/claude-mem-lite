@@ -157,7 +157,7 @@ function detectAdoption(invocation, sessionEvents) {
 
   // Tier 2: Behavioral adoption — methodology patterns (10 min window)
   const resourceLower = resource_name.toLowerCase();
-  const recTime = invocation.created_at ? new Date(invocation.created_at).getTime() : 0;
+  const recTime = invocation.created_at ? new Date(invocation.created_at).getTime() : null;
 
   // TDD pattern: Bash(test fail) → Edit → Bash(test pass)
   if (resourceLower.includes('tdd') || resourceLower.includes('test-driven')) {
@@ -365,7 +365,7 @@ function autodemoteZombies(db) {
   try {
     const demoted = db.prepare(`
       UPDATE resources SET recommendation_mode = 'on_request', updated_at = datetime('now')
-      WHERE COALESCE(recommend_count, 0) > 5
+      WHERE COALESCE(recommend_count, 0) > 8
         AND (COALESCE(adopt_count, 0) + 1.0) / (COALESCE(recommend_count, 0) + 2.0) < 0.1
         AND COALESCE(recommendation_mode, 'proactive') = 'proactive'
         AND status = 'active'

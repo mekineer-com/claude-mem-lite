@@ -83,7 +83,7 @@ function fallbackExtract(resource) {
 
   return {
     intent_tags: intentTags || resource.type,
-    domain_tags: domainTags || 'general',
+    domain_tags: domainTags || '',
     action_type: resource.type === 'agent' ? 'analyze' : 'generate',
     trigger_patterns: `when user needs ${name.replace(/-/g, ' ')} functionality`,
     capability_summary: truncate(`${resource.type}: ${name.replace(/-/g, ' ')}`, 100),
