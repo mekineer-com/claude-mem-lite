@@ -8,8 +8,8 @@ import { existsSync } from 'fs';
 import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
 import { renderInjection, renderHint } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
-import { debugCatch } from './utils.mjs';
-import { peekToolEvents } from './hook-shared.mjs';
+import { debugCatch, extractErrorKeywords, truncate, inferProject } from './utils.mjs';
+import { peekToolEvents, openDb } from './hook-shared.mjs';
 import { detectActiveSuite, shouldRecommendForStage, detectExplicitRequest, inferCurrentStage } from './dispatch-workflow.mjs';
 import { detectFailurePattern } from './dispatch-patterns.mjs';
 
@@ -1076,112 +1076,38 @@ export async function dispatchOnSessionStart() {
 }
 
 /**
- * Dispatch on UserPromptSubmit: analyze user's actual prompt, return best resource suggestion.
- * Tier 1+2 only (no Haiku fallback) for fast response within hook timeout.
- * Cooldown + session dedup prevents double-recommending with SessionStart.
+ * Dispatch on UserPromptSubmit: only fires for explicit user requests.
+ * All ambient/proactive recommendations removed — 9.7% adoption rate showed they were noise.
+ * Users who need a skill/agent should explicitly ask ("I need X", "find me a tool for Y")
+ * or use mem_registry search directly.
  * @param {Database} db Registry database
  * @param {string} userPrompt User's prompt text
  * @param {string} [sessionId] Session identifier for dedup
  * @returns {Promise<string|null>} Injection text or null
  */
-export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionEvents, prevContext } = {}) {
+export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
   if (!userPrompt || !db) return null;
 
   try {
-    // 1. Explicit request → highest priority, bypass cooldown but apply adoption decay
+    // Only dispatch on explicit user requests ("I need a skill for X", "find me a tool for Y")
     const explicit = detectExplicitRequest(userPrompt);
-    if (explicit.isExplicit) {
-      const textQuery = buildQueryFromText(explicit.searchTerm);
-      if (textQuery) {
-        let explicitResults = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
-        explicitResults = filterAutoLoadedSkills(explicitResults);
-        explicitResults = filterGarbageMetadata(explicitResults);
-        explicitResults = applyAdoptionDecay(explicitResults, db);
-        if (explicitResults.length > 0) {
-          const best = explicitResults[0];
-          if (!sessionId || !isRecentlyRecommended(db, best.id, sessionId)) {
-            recordInvocation(db, { resource_id: best.id, session_id: sessionId, trigger: 'user_prompt', tier: 1, recommended: 1 });
-            updateResourceStats(db, best.id, 'recommend_count');
-            return renderInjection(best, buildRecommendReason(null, { explicit: true }));
-          }
-        }
-      }
-    }
+    if (!explicit.isExplicit) return null;
 
-    // 2. Suite auto-flow protection
-    const events = sessionEvents || peekToolEvents();
-    const activeSuite = detectActiveSuite(events);
+    const textQuery = buildQueryFromText(explicit.searchTerm);
+    if (!textQuery) return null;
 
-    const projectDomains = detectProjectDomains();
-
-    // Enrich prompt with previous session context (cached at session-start).
-    // Combines project history (next_steps) with user intent for richer signal.
-    const enrichedPrompt = prevContext
-      ? `${userPrompt}\n[Previous session: ${prevContext}]`
-      : userPrompt;
-
-    // Intent-aware enhanced query (column-targeted)
-    const signals = extractContextSignals({ tool_name: '_user_prompt' }, { userPrompt: enrichedPrompt });
-
-    // Check if active suite covers the current stage
-    if (activeSuite) {
-      const currentStage = inferCurrentStage(signals.primaryIntent, activeSuite, signals.suppressedIntents);
-      if (currentStage) {
-        const { shouldRecommend } = shouldRecommendForStage(activeSuite, currentStage);
-        if (!shouldRecommend) return null;
-      }
-    }
-
-    // 3. Normal FTS flow
-    const enhancedQuery = buildEnhancedQuery(signals);
-
-    // Fetch extra results when rawKeywords are present — the top-3 by BM25 may be
-    // dominated by intent synonyms (e.g. "review" expands to many code-review terms),
-    // pushing domain-specific resources (e.g. SEO) below the limit. Extra headroom
-    // lets reRankByKeywords() promote domain-matched resources to the top.
-    const fetchLimit = signals.rawKeywords.length > 0 ? 8 : 3;
-    let results = enhancedQuery ? retrieveResources(db, enhancedQuery, { limit: fetchLimit, projectDomains }) : [];
-
-    // Fallback: broad text query
-    if (results.length === 0) {
-      const textQuery = buildQueryFromText(userPrompt);
-      if (!textQuery) return null;
-      results = retrieveResources(db, textQuery, { limit: 3, projectDomains });
-      if (signals.suppressedIntents.length > 0) {
-        results = results.filter(r => {
-          const tags = (r.intent_tags || '').toLowerCase().split(/[\s,]+/);
-          return !signals.suppressedIntents.some(s => tags.includes(s));
-        });
-      }
-    }
-
-    results = postProcessResults(results, signals, db);
-
+    let results = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
+    results = filterAutoLoadedSkills(results);
+    results = filterGarbageMetadata(results);
+    results = applyAdoptionDecay(results, db);
     if (results.length === 0) return null;
 
-    // Filter by cooldown + session dedup (hoisted cap + cooldown avoids N queries)
-    if (sessionId && isSessionCapped(db, sessionId)) return null;
-    const cooldown = getAdaptiveCooldown(db);
-    const viable = sessionId
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sessionId, { skipCapCheck: true, cooldown }))
-      : results;
-    if (viable.length === 0) return null;
+    const best = results[0];
+    if (sessionId && isRecentlyRecommended(db, best.id, sessionId)) return null;
 
-    const best = viable[0];
-
-    recordInvocation(db, {
-      resource_id: best.id,
-      session_id: sessionId || null,
-      trigger: 'user_prompt',
-      tier: 2,
-      recommended: 1,
-    });
+    recordInvocation(db, { resource_id: best.id, session_id: sessionId, trigger: 'user_prompt', tier: 1, recommended: 1 });
     updateResourceStats(db, best.id, 'recommend_count');
-
-    const tier = decideTier(best, signals);
-    if (tier === 'silent') return null;
-    if (tier === 'hint') return renderHint(best);
-    return renderInjection(best, buildRecommendReason(signals));
+    return renderInjection(best, buildRecommendReason(null, { explicit: true }));
   } catch (e) {
     debugCatch(e, 'dispatchOnUserPrompt');
     return null;
@@ -1189,82 +1115,102 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId, { sessionE
 }
 
 /**
- * Dispatch on PreToolUse: filter, analyze, and optionally recommend.
- * @param {Database} db Registry database
+ * Dispatch on PreToolUse: error recall only.
+ * When Claude is stuck in an error loop, search past observations for similar errors.
+ * No ambient resource recommendations — only inject past solutions.
+ * @param {Database} db Registry database (unused, kept for API compat)
  * @param {object} event Hook event data
- * @param {object} [sessionCtx] Session context (userPrompt, recentFiles, sessionId)
+ * @param {object} [sessionCtx] Session context
  * @returns {Promise<string|null>} Injection text or null
  */
 export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
-  if (!db || !event) return null;
+  if (!event) return null;
 
   try {
-    // Tier 0: Fast filter
-    const { skip } = shouldSkipDispatch(event);
-    if (skip) return null;
+    // Only process Bash tool events (error patterns come from bash)
+    if (event.tool_name !== 'Bash') return null;
 
-    // Phase transition gate: only dispatch on phase transitions to reduce noise.
-    // The first few events (≤3) always pass to allow initial recommendations.
+    // Detect failure patterns from session event history
     const allEvents = peekToolEvents();
-    const currentPhase = inferSessionPhase(allEvents);
-    const prevPhase = allEvents.length > 1 ? inferSessionPhase(allEvents.slice(0, -1)) : null;
-    const phaseChanged = isPhaseTransition(prevPhase, currentPhase);
+    const failurePattern = detectFailurePattern(allEvents);
+    if (!failurePattern) return null;
 
-    if (!phaseChanged && allEvents.length > 3) return null;
+    // Extract error keywords from the failing command/output
+    const cmd = event.tool_input?.command || '';
+    const response = sessionCtx?.tool_response || event.tool_output || '';
+    const keywords = extractErrorKeywords(cmd, response);
+    if (!keywords || keywords.length === 0) return null;
 
-    // Tier 1: Extract context signals
-    const signals = extractContextSignals(event, sessionCtx);
-
-    // Suite protection: if a suite auto-flow is active, suppress recommendations
-    // for stages the suite already covers
-    const activeSuite = detectActiveSuite(allEvents);
-    if (activeSuite) {
-      const stage = inferCurrentStage(signals.primaryIntent, activeSuite, signals.suppressedIntents);
-      if (stage) {
-        const { shouldRecommend } = shouldRecommendForStage(activeSuite, stage);
-        if (!shouldRecommend) return null;
-      }
-    }
-    let query = buildEnhancedQuery(signals);
-    if (!query && sessionCtx?.userPrompt) {
-      query = buildQueryFromText(sessionCtx.userPrompt);
-      if (!query) return null;
-    }
-    if (!query) return null;
-
-    const projectDomains = detectProjectDomains();
-
-    // Tier 2: FTS5 retrieval
-    let results = retrieveResources(db, query, { limit: 3, projectDomains });
-    results = postProcessResults(results, signals, db);
-    if (results.length === 0) return null;
-
-    // Apply DB-persisted cooldown and session dedup (hoisted cap + cooldown avoids N queries)
-    const sid = sessionCtx.sessionId || null;
-    if (sid && isSessionCapped(db, sid)) return null;
-    const cooldown = getAdaptiveCooldown(db);
-    const viable = sid
-      ? results.filter(r => !isRecentlyRecommended(db, r.id, sid, { skipCapCheck: true, cooldown }))
-      : results;
-    if (viable.length === 0) return null;
-    const best = viable[0];
-
-    // Record invocation (also serves as cooldown/dedup marker)
-    recordInvocation(db, {
-      resource_id: best.id,
-      session_id: sid,
-      trigger: 'pre_tool_use',
-      tier: 2,
-      recommended: 1,
-    });
-    updateResourceStats(db, best.id, 'recommend_count');
-
-    const tier = decideTier(best, signals);
-    if (tier === 'silent') return null;
-    if (tier === 'hint') return renderHint(best);
-    return renderInjection(best, buildRecommendReason(signals));
+    // Search past observations for similar errors (Option A: observations only, no registry)
+    return recallSimilarErrors(keywords, inferProject(), sessionCtx?._obsDb);
   } catch (e) {
     debugCatch(e, 'dispatchOnPreToolUse');
     return null;
+  }
+}
+
+// ─── Error Recall ─────────────────────────────────────────────────────────────
+
+/**
+ * Search past observations for similar errors and return formatted context.
+ * @param {string[]} errorKeywords Keywords extracted from current error
+ * @param {string} project Current project name
+ * @returns {string|null} Formatted recall text or null
+ */
+export function recallSimilarErrors(errorKeywords, project, externalDb) {
+  const db = externalDb || openDb();
+  if (!db) return null;
+  const shouldClose = !externalDb;
+
+  try {
+    const query = errorKeywords.map(k => k.replace(/['"()]/g, '')).join(' OR ');
+    if (!query.trim()) return null;
+
+    // Search project-scoped bugfixes first
+    let rows = db.prepare(`
+      SELECT id, type, title, narrative, lesson_learned, importance, created_at
+      FROM observations
+      WHERE id IN (
+        SELECT rowid FROM observations_fts WHERE observations_fts MATCH ?
+      )
+      AND type = 'bugfix'
+      AND importance >= 2
+      AND project = ?
+      ORDER BY importance DESC, created_at DESC
+      LIMIT 3
+    `).all(query, project);
+
+    // Fallback: search across all projects
+    if (rows.length === 0) {
+      rows = db.prepare(`
+        SELECT id, type, title, narrative, lesson_learned, importance, created_at
+        FROM observations
+        WHERE id IN (
+          SELECT rowid FROM observations_fts WHERE observations_fts MATCH ?
+        )
+        AND type = 'bugfix'
+        AND importance >= 2
+        ORDER BY importance DESC, created_at DESC
+        LIMIT 3
+      `).all(query);
+    }
+
+    if (rows.length === 0) return null;
+
+    const lines = ['<memory-recall source="error-pattern">'];
+    lines.push('You encountered similar errors before:');
+    for (const r of rows) {
+      lines.push(`- #${r.id}: ${truncate(r.title, 80)}`);
+      if (r.lesson_learned) lines.push(`  Lesson: ${r.lesson_learned}`);
+      else if (r.narrative) lines.push(`  Context: ${truncate(r.narrative, 120)}`);
+    }
+    lines.push('Use mem_get(ids=[...]) for full details.');
+    lines.push('</memory-recall>');
+    return lines.join('\n');
+  } catch (e) {
+    debugCatch(e, 'recallSimilarErrors');
+    return null;
+  } finally {
+    if (shouldClose) db.close();
   }
 }

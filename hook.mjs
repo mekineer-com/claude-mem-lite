@@ -920,15 +920,11 @@ async function handleUserPrompt() {
     db.close();
   }
 
-  // Dispatch: recommend skill/agent based on user's actual prompt.
-  // This is the ideal dispatch point — fires when the user submits their prompt,
-  // before Claude starts working. Previous session's next_steps (cached at session-start)
-  // enriches the signal when available, combining project history with user intent.
+  // Dispatch: only fires for explicit user requests ("I need X skill", "find me a tool for Y")
   try {
     const rdb = getRegistryDb();
     if (rdb && hasInjectionBudget()) {
-      const prevContext = readAndClearPrevContext();
-      const result = await dispatchOnUserPrompt(rdb, promptText, sessionId, { prevContext });
+      const result = await dispatchOnUserPrompt(rdb, promptText, sessionId);
       if (result) {
         process.stdout.write(result + '\n');
         incrementInjection();
