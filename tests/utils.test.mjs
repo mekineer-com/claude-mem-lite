@@ -1021,8 +1021,15 @@ describe('scrubSecrets', () => {
   it('preserves key names while scrubbing values', () => {
     const result = scrubSecrets('password=secret123 token=abc user=john');
     expect(result).toContain('password=***');
-    expect(result).toContain('token=***');
-    expect(result).toContain('user=john'); // not a secret key
+    expect(result).toContain('token=abc');  // short value (<6 chars), not a real secret
+    expect(result).toContain('user=john');  // not a secret key
+  });
+
+  it('does not scrub code-like values (null, undefined, function calls)', () => {
+    expect(scrubSecrets('token = null')).toBe('token = null');
+    expect(scrubSecrets('password = undefined')).toBe('password = undefined');
+    expect(scrubSecrets('token = getToken()')).toBe('token = getToken()');
+    expect(scrubSecrets('token = false')).toBe('token = false');
   });
 
   it('handles multiple secrets in one string', () => {

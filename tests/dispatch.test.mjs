@@ -1464,16 +1464,29 @@ describe('passesConfidenceGate BM25 floor', () => {
 // ─── passesConfidenceGate gap-ratio check ────────────────────────────────────
 
 describe('passesConfidenceGate gap-ratio check', () => {
-  it('filters when top-2 results are too close (ambiguous query)', () => {
+  it('filters when top-2 results are too close (ambiguous query, no structured intent)', () => {
     const results = [
       { intent_tags: 'test,tdd', composite_score: -3.0 },
       { intent_tags: 'test,coverage', composite_score: -2.8 },
       { intent_tags: 'test', composite_score: -1.0 },
     ];
-    const signals = { intent: 'test', primaryIntent: 'test' };
+    // No structured intent → gap check applies
+    const signals = { intent: '', primaryIntent: '' };
     const filtered = passesConfidenceGate(results, signals);
     // Gap between 3.0 and 2.8 = 0.2, ratio = 0.2/3.0 = 0.067 < 0.2 → filtered
     expect(filtered.length).toBe(0);
+  });
+
+  it('skips gap check when structured intent is present (close scores expected)', () => {
+    const results = [
+      { intent_tags: 'test,tdd', composite_score: -3.0 },
+      { intent_tags: 'test,coverage', composite_score: -2.8 },
+      { intent_tags: 'test', composite_score: -1.0 },
+    ];
+    // With structured intent → gap check skipped, close scores are expected
+    const signals = { intent: 'test', primaryIntent: 'test' };
+    const filtered = passesConfidenceGate(results, signals);
+    expect(filtered.length).toBeGreaterThan(0);
   });
 
   it('keeps results when top-1 has clear lead over top-2', () => {
