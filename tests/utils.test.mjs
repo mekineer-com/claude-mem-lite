@@ -586,6 +586,29 @@ describe('detectBashSignificance', () => {
     expect(detectBashSignificance({ command: 'x' }, 'Traceback (most recent call last): in foo.py').isError).toBe(true);
     expect(detectBashSignificance({ command: 'x' }, 'bash: command not found: nonexistent_tool').isError).toBe(true);
   });
+
+  it('does NOT flag grep/search output containing error keywords as isError', () => {
+    expect(detectBashSignificance(
+      { command: 'grep -n error dispatch.mjs' },
+      '11:import { debugCatch } from ./utils.mjs;\n238:    [/\\b(debug|error|fail)\\b/i]'
+    ).isError).toBe(false);
+    expect(detectBashSignificance(
+      { command: 'rg "error" src/' },
+      'src/handler.mjs:42: throw new Error("not found")'
+    ).isError).toBe(false);
+    expect(detectBashSignificance(
+      { command: 'cat error.log' },
+      'Error: connection refused at line 12\nTraceback in module xyz'
+    ).isError).toBe(false);
+  });
+
+  it('does NOT flag commands with "test" in comments/args as isTest', () => {
+    expect(detectBashSignificance({ command: '# Test hook simulation\necho hello' }, 'ok').isTest).toBe(false);
+    expect(detectBashSignificance({ command: 'grep test file.mjs' }, 'ok').isTest).toBe(false);
+    expect(detectBashSignificance({ command: 'cat test-results.json' }, 'ok').isTest).toBe(false);
+    expect(detectBashSignificance({ command: 'find . -name "*.test.js"' }, 'ok').isTest).toBe(false);
+    expect(detectBashSignificance({ command: 'ls tests/' }, 'ok').isTest).toBe(false);
+  });
 });
 
 // ─── extractErrorKeywords ────────────────────────────────────────────────────

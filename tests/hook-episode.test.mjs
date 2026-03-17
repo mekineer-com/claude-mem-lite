@@ -117,9 +117,28 @@ describe('hook-episode.mjs', () => {
       expect(episodeHasSignificantContent(ep)).toBe(true);
     });
 
-    it('returns true for episodes with Bash error entries', () => {
+    it('returns true for episodes with test/build Bash error entries', () => {
       const ep = createEpisode('s', 'p');
-      ep.entries.push({ tool: 'Bash', desc: 'npm test', isError: true });
+      ep.entries.push({ tool: 'Bash', desc: 'npm test', isError: true, bashSig: { isTest: true, isBuild: false } });
+      expect(episodeHasSignificantContent(ep)).toBe(true);
+    });
+
+    it('returns true for episodes with build error entries', () => {
+      const ep = createEpisode('s', 'p');
+      ep.entries.push({ tool: 'Bash', desc: 'npm run build', isError: true, bashSig: { isTest: false, isBuild: true } });
+      expect(episodeHasSignificantContent(ep)).toBe(true);
+    });
+
+    it('returns false for plain Bash error without test/build (noise reduction)', () => {
+      const ep = createEpisode('s', 'p');
+      ep.entries.push({ tool: 'Bash', desc: 'curl api endpoint', isError: true, bashSig: { isTest: false, isBuild: false } });
+      expect(episodeHasSignificantContent(ep)).toBe(false);
+    });
+
+    it('returns true for plain Bash error followed by an edit (debug cycle)', () => {
+      const ep = createEpisode('s', 'p');
+      ep.entries.push({ tool: 'Bash', desc: 'node app.js', isError: true, bashSig: { isTest: false, isBuild: false } });
+      ep.entries.push({ tool: 'Edit', desc: 'fix the bug', isError: false });
       expect(episodeHasSignificantContent(ep)).toBe(true);
     });
 
