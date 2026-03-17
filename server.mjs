@@ -791,16 +791,17 @@ server.registerTool(
     // Dedup: skip if a similar title or content was saved recently (5 min window)
     const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
     const recent = db.prepare(`
-      SELECT title, text FROM observations
+      SELECT id, title, text FROM observations
       WHERE project = ? AND created_at_epoch > ?
       ORDER BY created_at_epoch DESC LIMIT 50
     `).all(project, fiveMinAgo);
 
-    if (title && recent.some(r =>
+    const dupMatch = title && recent.find(r =>
       jaccardSimilarity(r.title, title) > 0.7 ||
       jaccardSimilarity(r.text || '', args.content) > 0.7
-    )) {
-      return { content: [{ type: 'text', text: `Skipped: a similar observation already exists in project "${project}".` }] };
+    );
+    if (dupMatch) {
+      return { content: [{ type: 'text', text: `Skipped: similar to existing #${dupMatch.id} in project "${project}". Use mem_get(ids=[${dupMatch.id}]) to review.` }] };
     }
 
     const safeContent = scrubSecrets(args.content);

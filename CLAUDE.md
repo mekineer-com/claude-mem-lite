@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.11.3
+- **Version**: 2.12.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (29 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -48,13 +48,16 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 这下有了，需要发版本不，其它用户安装插件不会遇到这问题吧
+Request: 提交代码发布新版本 (Submit code and release new version)
+Completed: Version synchronized to 2.11.3 in plugin.json and marketplace.json
+Remaining: Git commit creation and version tag/release publication
+Next: Create git commit with version bump, then push and create release tag for version 2.11.3
 
 ### Key Context
-- [change] Bump plugin version from 2.11.0 to 2.11.1 (#4036)
-- [bugfix] Error: hook-llm.mjs, server.mjs, utils.mjs +1 more: When ID 1055 was saved (202… (#4033)
-- [bugfix] Error: hook-shared.mjs: === FIRST 5 in chronological order === 1. ID 1039… (#4032)
-- [bugfix] Error: mem: === Error while working on daagu (IDs, titles, ti… (#4031)
-- [discovery] 44 duplicate episode title prefixes found in observation summaries (#4030)
+- [bugfix] Error: test-runtime-ux.mjs: ╔════════════════════════════════════════════════… (#4061)
+- [bugfix] Error: test-dispatch-fixes.mjs, test-runtime-ux.mjs: Loaded 229 resources from … (#4060)
+- [bugfix] Error: utils.mjs, dispatch.mjs: ======================================== Dispat… (#4055)
+- [bugfix] Error: hook-llm.mjs, test-hooks-ux.mjs, test-dispatch-ux.mjs: ═════════════════… (#4050)
+- [bugfix] Error: test-dispatch-ux.mjs, test-mem-ux.mjs, test-hooks-ux.mjs: 🧪 claude-mem-… (#4049)
 
 </claude-mem-context>

@@ -52,24 +52,27 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       return null;
     }
 
-    // Tier 1.5: Extended title dedup for low-signal degraded titles (1-day window)
+    // Tier 1.5: Extended title dedup for low-signal degraded titles
     // "Error in X", "Modified X" titles are low-specificity → use longer dedup window
+    // 7-day exact match prevents cross-day accumulation of "Modified package.json" noise;
+    // 3-day Jaccard catches near-duplicates without blocking legitimately new observations
     const LOW_SIGNAL = /^(Error (while working|in)|Modified |Worked on |Reviewed \d+ files:)/;
     if (obs.title && LOW_SIGNAL.test(obs.title)) {
-      const oneDayAgo = now.getTime() - 86400000;
-      // Phase 1: exact title match (no LIMIT needed — indexed, fast)
+      const sevenDaysAgo = now.getTime() - 7 * 86400000;
+      const threeDaysAgo = now.getTime() - 3 * 86400000;
+      // Phase 1: exact title match within 7 days
       const exactDup = db.prepare(`
         SELECT 1 FROM observations
         WHERE project = ? AND title = ? AND created_at_epoch > ? AND created_at_epoch <= ?
         LIMIT 1
-      `).get(project, obs.title, oneDayAgo, fiveMinAgo);
+      `).get(project, obs.title, sevenDaysAgo, fiveMinAgo);
       if (exactDup) return null;
-      // Phase 2: Jaccard similarity for near-duplicates (wider window than before)
+      // Phase 2: Jaccard similarity for near-duplicates (3-day window)
       const extRecent = db.prepare(`
         SELECT title FROM observations
         WHERE project = ? AND created_at_epoch > ? AND created_at_epoch <= ?
         ORDER BY created_at_epoch DESC LIMIT 60
-      `).all(project, oneDayAgo, fiveMinAgo);
+      `).all(project, threeDaysAgo, fiveMinAgo);
       if (extRecent.some(r => jaccardSimilarity(r.title, obs.title) > 0.85)) {
         return null;
       }

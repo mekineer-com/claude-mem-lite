@@ -74,7 +74,7 @@ export const memStatsSchema = {
 
 export const memCompressSchema = {
   preview: coerceBool.optional().describe('true=count candidates, false=execute compression (default: true)'),
-  age_days: coerceInt.pipe(z.number().int().min(30).max(365)).optional().describe('Min age in days (default: 30)'),
+  age_days: coerceInt.pipe(z.number().int().min(30).max(365)).optional().describe('Min age in days (default: 30, minimum: 30)'),
   project: z.string().optional().describe('Filter by project'),
 };
 

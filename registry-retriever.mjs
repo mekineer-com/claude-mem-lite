@@ -378,7 +378,7 @@ const COMPOSITE_EXPR = `(
     - CASE WHEN COALESCE(r.recommend_count, 0) < 10
         THEN 0.10 * (1.0 - COALESCE(r.recommend_count, 0) * 1.0 / 10.0)
         ELSE 0 END
-    + CASE WHEN COALESCE(r.recommend_count, 0) > 8
+    + CASE WHEN COALESCE(r.recommend_count, 0) > 5
            AND (COALESCE(r.adopt_count, 0) + 1.0) / (COALESCE(r.recommend_count, 0) + 2.0) < 0.1
         THEN 0.10
         ELSE 0 END

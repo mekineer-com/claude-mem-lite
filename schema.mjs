@@ -162,6 +162,47 @@ export function initSchema(db) {
   ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes', 'remaining_items']);
   ensureFTS(db, 'user_prompts_fts', 'user_prompts', ['prompt_text']);
 
+  // Project name normalization: migrate short names ("mem") to canonical form ("projects--mem")
+  // Strategy: exact suffix match first, then substring match for package-name aliases
+  // Idempotent: only runs when short-name records exist
+  try {
+    const shortProjects = db.prepare(`
+      SELECT DISTINCT project FROM observations
+      WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
+      UNION
+      SELECT DISTINCT project FROM sdk_sessions
+      WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
+    `).all();
+    if (shortProjects.length > 0) {
+      const normalize = db.transaction(() => {
+        for (const { project: shortName } of shortProjects) {
+          // Strategy 1: exact suffix match (e.g., "mem" → "projects--mem")
+          let canonical = db.prepare(
+            `SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
+          ).get(`%--${shortName}`);
+          // Strategy 2: substring match for aliases (e.g., "claude-mem-lite" → match project containing "mem")
+          // Extract the most distinctive token from the short name for fuzzy matching
+          if (!canonical) {
+            const tokens = shortName.split(/[-_.]/).filter(t => t.length >= 3);
+            for (const token of tokens) {
+              canonical = db.prepare(
+                `SELECT project FROM observations WHERE project LIKE ? AND project LIKE '%--_%'
+                 GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
+              ).get(`%${token}%`);
+              if (canonical) break;
+            }
+          }
+          if (canonical) {
+            for (const table of ['observations', 'sdk_sessions', 'session_summaries']) {
+              db.prepare(`UPDATE ${table} SET project = ? WHERE project = ?`).run(canonical.project, shortName);
+            }
+          }
+        }
+      });
+      normalize();
+    }
+  } catch { /* non-critical — normalization can retry on next open */ }
+
   return db;
 }
 

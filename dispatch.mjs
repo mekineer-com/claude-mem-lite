@@ -994,6 +994,12 @@ function postProcessResults(results, signals, db, limit = 3, { allowOnRequest = 
   }
   results = filterAutoLoadedSkills(results);
   results = filterGarbageMetadata(results);
+  // Community resources without invocation_name can't be easily invoked — skip in proactive mode
+  if (!allowOnRequest) {
+    results = results.filter(r =>
+      r.quality_tier !== 'community' || r.invocation_name
+    );
+  }
   results = reRankByKeywords(results, signals.rawKeywords);
   results = applyAdoptionDecay(results, db);
   results = passesConfidenceGate(results, signals);
