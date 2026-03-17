@@ -30,7 +30,6 @@ import {
   sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
   closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
   resetInjectionBudget, hasInjectionBudget, incrementInjection,
-  cachePrevContext, readAndClearPrevContext,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
@@ -758,13 +757,6 @@ async function handleSessionStart() {
     updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
 
     // Cache previous session context for user-prompt dispatch enrichment.
-    // Session-start has project history but zero user intent — dispatching here
-    // produced 0/119 adoption. Instead, cache next_steps and combine with
-    // the first user-prompt for richer signal (see handleUserPrompt).
-    if (latestSummary?.next_steps) {
-      cachePrevContext(latestSummary.next_steps);
-    }
-
     // Background rescan: detect changed/new managed resources since last scan.
     // TTL-based (1h) — avoids redundant filesystem scans on every session.
     // Non-blocking: spawns detached worker, results available before first user prompt.

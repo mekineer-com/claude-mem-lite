@@ -6,11 +6,11 @@
 import { basename, join } from 'path';
 import { existsSync } from 'fs';
 import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
-import { renderInjection, renderHint } from './dispatch-inject.mjs';
+import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
-import { debugCatch, extractErrorKeywords, truncate, inferProject } from './utils.mjs';
+import { debugCatch, extractErrorKeywords, truncate, inferProject, sanitizeFtsQuery } from './utils.mjs';
 import { peekToolEvents, openDb } from './hook-shared.mjs';
-import { detectActiveSuite, shouldRecommendForStage, detectExplicitRequest, inferCurrentStage } from './dispatch-workflow.mjs';
+import { detectExplicitRequest } from './dispatch-workflow.mjs';
 import { detectFailurePattern } from './dispatch-patterns.mjs';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -1135,11 +1135,14 @@ export async function dispatchOnPreToolUse(db, event, sessionCtx = {}) {
     const failurePattern = detectFailurePattern(allEvents);
     if (!failurePattern) return null;
 
-    // Extract error keywords from the failing command/output
-    const cmd = event.tool_input?.command || '';
-    const response = sessionCtx?.tool_response || event.tool_output || '';
-    const keywords = extractErrorKeywords(cmd, response);
-    if (!keywords || keywords.length === 0) return null;
+    // Extract error keywords from PREVIOUS failing events (not current — tool hasn't executed yet)
+    const failingEvents = allEvents.filter(e =>
+      e.tool_name === 'Bash' && /error|fail|exception/i.test(e.tool_response || '')
+    ).slice(-3);
+    const keywords = [...new Set(failingEvents.flatMap(e =>
+      extractErrorKeywords(e.tool_input?.command || '', e.tool_response || '') || []
+    ))];
+    if (keywords.length === 0) return null;
 
     // Search past observations for similar errors (Option A: observations only, no registry)
     return recallSimilarErrors(keywords, inferProject(), sessionCtx?._obsDb);
@@ -1163,8 +1166,8 @@ export function recallSimilarErrors(errorKeywords, project, externalDb) {
   const shouldClose = !externalDb;
 
   try {
-    const query = errorKeywords.map(k => k.replace(/['"()]/g, '')).join(' OR ');
-    if (!query.trim()) return null;
+    const query = sanitizeFtsQuery(errorKeywords.join(' '));
+    if (!query || !query.trim()) return null;
 
     // Search project-scoped bugfixes first
     let rows = db.prepare(`

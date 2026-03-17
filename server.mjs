@@ -1261,10 +1261,14 @@ server.registerTool(
       if (!args.query) {
         return { content: [{ type: 'text', text: 'search requires a query parameter' }], isError: true };
       }
-      const results = searchResources(rdb, args.query, {
+      let results = searchResources(rdb, args.query, {
         type: args.type || undefined,
-        limit: 5,
+        limit: args.category || args.quality ? 20 : 5, // fetch more when filtering
       });
+      // Apply category/quality filters if provided
+      if (args.category) results = results.filter(r => r.category === args.category);
+      if (args.quality) results = results.filter(r => r.quality_tier === args.quality);
+      results = results.slice(0, 5);
       if (results.length === 0) {
         return { content: [{ type: 'text', text: `No matching resources for: "${args.query}"` }] };
       }

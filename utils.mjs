@@ -568,7 +568,7 @@ export function detectBashSignificance(input, response) {
     && /\berror\b|\bERR!|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
     && response.length > 15;
   // Match actual test runner invocations, not commands that merely reference "test" as a keyword
-  const isTest = /\b(npm\s+test|npm\s+run\s+test|yarn\s+test)\b/i.test(cmd)
+  const isTest = /\b(npm\s+test|npm\s+run\s+test|yarn\s+test|pnpm\s+test|pnpm\s+run\s+test|bun\s+test|go\s+test|cargo\s+test)\b/i.test(cmd)
     || /\b(jest|pytest|vitest|mocha|cypress|playwright)\b/i.test(cmd);
   const isBuild = /\b(build|compile|tsc|webpack|vite|rollup|esbuild|make|cargo)\b/i.test(cmd);
   const isGit = /\bgit\s+(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);
