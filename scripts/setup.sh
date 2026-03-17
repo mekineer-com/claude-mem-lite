@@ -95,10 +95,10 @@ fi
 #    register plugin MCP; only stale global/marketplace copies should be removed.
 MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10.4"
 if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
-  CLAUDE_JSON="$HOME/.claude.json" ROOT="$ROOT" node -e '
+  CLAUDE_JSON="$HOME/.claude.json" node -e '
     const fs = require("fs");
     let changed = false;
-    // 1. Remove stale global MCP registration
+    // Remove stale global MCP registration (plugin .mcp.json handles it)
     try {
       const p = process.env.CLAUDE_JSON;
       const d = JSON.parse(fs.readFileSync(p, "utf8"));
@@ -109,23 +109,9 @@ if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
         changed = true;
       }
     } catch {}
-    // 2. Remove stale marketplace root .mcp.json
-    try {
-      const root = process.env.ROOT;
-      if (root.includes("/plugins/cache/")) {
-        const key = root.split("/plugins/cache/")[1].split("/")[0];
-        const mktMcp = require("path").join(require("os").homedir(), ".claude/plugins/marketplaces", key, ".mcp.json");
-        if (fs.existsSync(mktMcp)) {
-          const m = JSON.parse(fs.readFileSync(mktMcp, "utf8"));
-          if (m.mcpServers?.mem) {
-            delete m.mcpServers.mem;
-            fs.writeFileSync(mktMcp, JSON.stringify(m, null, 2) + "\n");
-            process.stderr.write("✓ Cleared stale marketplace root .mcp.json\n");
-            changed = true;
-          }
-        }
-      }
-    } catch {}
+    // NOTE: Do NOT touch marketplace .mcp.json — Claude Code copies it from
+    // marketplace → plugin cache on updates. Clearing it causes the cache
+    // .mcp.json to lose the MCP server definition, breaking plugin MCP.
     if (!changed) process.stderr.write("✓ MCP migration: already clean\n");
   ' 2>&2 || true
   touch "$MCP_MIGRATION"

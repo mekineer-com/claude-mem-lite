@@ -243,8 +243,9 @@ describe('install lifecycle checks', () => {
       const claudeJson = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
       expect(claudeJson.mcpServers?.mem).toBeUndefined();
 
+      // Marketplace .mcp.json must NOT be cleared — Claude Code copies it to cache on updates
       const marketplaceMcp = JSON.parse(readFileSync(join(marketplaceDir, '.mcp.json'), 'utf8'));
-      expect(marketplaceMcp.mcpServers?.mem).toBeUndefined();
+      expect(marketplaceMcp.mcpServers?.mem).toBeDefined();
 
       expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10.4'))).toBe(true);
       expect(existsSync(join(dataDir, 'runtime'))).toBe(true);
