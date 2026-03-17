@@ -918,7 +918,7 @@ server.registerTool(
   safeHandler(async (args) => {
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const preview = args.preview !== false;
-    const ageDays = args.age_days ?? 60;
+    const ageDays = args.age_days ?? 30;
     const cutoff = Date.now() - ageDays * 86400000;
     const projectFilter = args.project ? 'AND project = ?' : '';
     const baseParams = args.project ? [args.project] : [];
@@ -1103,9 +1103,32 @@ server.registerTool(
         `  Pending purge (idle-marked): ${pendingPurge.count}`,
       ];
       if (duplicates.length > 0) {
-        lines.push('', 'Top duplicates:');
-        for (const d of duplicates.slice(0, DUPLICATE_DISPLAY)) {
-          lines.push(`  [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`);
+        const AUTO_MERGE_THRESHOLD = 0.85;
+        const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
+        const manualReview = duplicates.filter(d => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);
+
+        if (autoMergeable.length > 0) {
+          lines.push('', `Auto-mergeable pairs (similarity >= ${AUTO_MERGE_THRESHOLD}):`);
+          for (const d of autoMergeable.slice(0, DUPLICATE_DISPLAY)) {
+            // Keep the higher-importance or newer observation
+            const keep = d.a.importance >= d.b.importance ? d.a : d.b;
+            const remove = keep === d.a ? d.b : d.a;
+            lines.push(`  [${keep.id}] "${truncate(keep.title, 40)}" <-> [${remove.id}] "${truncate(remove.title, 40)}" (${d.similarity})`);
+          }
+          // Build ready-to-use merge_ids for auto-mergeable pairs
+          const mergeIds = autoMergeable.map(d => {
+            const keep = d.a.importance >= d.b.importance ? d.a : d.b;
+            const remove = keep === d.a ? d.b : d.a;
+            return [keep.id, remove.id];
+          });
+          lines.push('', `Ready-to-use command:`, `  mem_maintain(action="execute", operations=["dedup"], merge_ids=${JSON.stringify(mergeIds)})`);
+        }
+
+        if (manualReview.length > 0) {
+          lines.push('', 'Needs review:');
+          for (const d of manualReview.slice(0, DUPLICATE_DISPLAY)) {
+            lines.push(`  [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`);
+          }
         }
       }
       return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -1146,7 +1169,21 @@ server.registerTool(
               LIMIT ${OP_ROW_CAP}
             )
           `).run(staleAge, ...baseParams);
-          results.push(`Decayed ${decayed.changes} stale observations` + (decayed.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
+
+          // Mark importance=1, never-accessed, old observations as pending-purge
+          const idleMarked = db.prepare(`
+            UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
+            WHERE id IN (
+              SELECT id FROM observations
+              WHERE COALESCE(compressed_into, 0) = 0
+                AND COALESCE(importance, 1) = 1
+                AND COALESCE(access_count, 0) = 0
+                AND created_at_epoch < ?
+                ${projectFilter}
+              LIMIT ${OP_ROW_CAP}
+            )
+          `).run(staleAge, ...baseParams);
+          results.push(`Decayed ${decayed.changes} stale observations, marked ${idleMarked.changes} idle as pending-purge` + ((decayed.changes >= OP_ROW_CAP || idleMarked.changes >= OP_ROW_CAP) ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('boost')) {
