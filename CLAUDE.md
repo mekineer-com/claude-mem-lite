@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.11.0
+- **Version**: 2.11.1
 - **Package manager**: npm
 - **Test**: `npx vitest run` (29 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -48,13 +48,18 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 提交代码发布新版本
+Request: Commit code and release a new version
+Completed: Version bump from 2.10.7 to 2.11.0; commit created via commit-commands:commit skill
+Remaining: Push to remote; create/merge PR; actual release creation (tag/publish); verify marketplace.json presence if needed
+Next: Push the commit to remote branch; create PR if needed for review; tag release and publish to distribution channels
+Lessons: Marketplace.json may not exist in all project variants — conditional presence should be documented
+Decisions: Minor version bump (2.10.7 → 2.11.0) selected for release, indicating new feature(s) rather than patch
 
 ### Key Context
-- [bugfix] Error: hook.mjs: diff --git a/hook.mjs b/hook.mjs index 4cb6138..a… (#3879)
-- [bugfix] echo "HEAD: $(git rev-parse HEAD)" && echo "BASE:… → HEAD: 9fe8d03fb9a2ada59080… (#3877)
-- [bugfix] Error: dispatch-feedback.mjs: ✓ tests/dispatch-sim.test.mjs > Dispatch Simulati… (#3876)
-- [bugfix] Error: e2e.test.mjs: ✓ tests/dispatch.test.mjs > consecutive rejection… (#3875)
-- [bugfix] Error: dispatch.test.mjs: 1943|     const resource = db.prepare('SELECT wei… (#3872)
+- [bugfix] Address code review findings in dispatch module (#4004)
+- [discovery] Reviewed 9 files: mem, hook.mjs, dispatch.mjs, utils.mjs +5 more (#3997)
+- [bugfix] Error: dispatch.mjs: 92341f7 feat(registry): add quality_tier, categor… (#3994)
+- [bugfix] Error: contract.test.mjs, dispatch.test.mjs: ✓ accumulates multiple scores 1ms … (#3989)
+- [bugfix] Error: server.mjs: main 00ce865 feat(dispatch): simplify to explicit… (#3984)
 
 </claude-mem-context>
