@@ -122,7 +122,7 @@ function injectSkillManaged(resource, reason) {
 function injectAgent(resource, reason) {
   if (!isAllowedPath(resource.local_path)) {
     const lines = [`[Recommended] ${leadLine(resource, reason)}`];
-    lines.push(`→ Use Agent tool to delegate: "${resource.name}"`);
+    lines.push(`→ Invoke: Agent tool with subagent_type="${resource.invocation_name || resource.name}"`);
     if (reason && resource.capability_summary) {
       lines.push(`Capability: ${truncate(resource.capability_summary, 100)}`);
     }
@@ -153,7 +153,7 @@ function injectAgent(resource, reason) {
   }
 
   const lines = [`[Recommended] ${leadLine(resource, reason)}`];
-  lines.push(`→ Use Agent tool to delegate: "${resource.name}"`);
+  lines.push(`→ Invoke: Agent tool with subagent_type="${resource.invocation_name || resource.name}"`);
   if (reason && resource.capability_summary) {
     lines.push(`Capability: ${truncate(resource.capability_summary, 100)}`);
   }

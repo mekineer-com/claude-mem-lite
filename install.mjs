@@ -28,8 +28,22 @@ const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 
 /**
+ * Derive invocation_name from resource name when metadata doesn't provide one.
+ * Rules:
+ *   "parent/child" → "parent:child"  (plugin:resource format)
+ *   "simple-name"  → "simple-name"   (standalone resource)
+ * @param {string} name Resource name
+ * @returns {string} Derived invocation name
+ */
+function deriveInvocationName(name) {
+  if (name.includes('/')) return name.replace('/', ':');
+  return name;
+}
+
+/**
  * Apply curated metadata to existing resource DB entries.
  * Fixes existing installs that have generic name-echo metadata.
+ * Also syncs keywords, tech_stack, use_cases and auto-derives invocation_name.
  * @param {Database} rdb Registry database handle
  */
 function reindexKnownResources(rdb) {
@@ -37,10 +51,13 @@ function reindexKnownResources(rdb) {
     UPDATE resources SET
       intent_tags = ?, domain_tags = ?,
       capability_summary = ?, trigger_patterns = ?,
-      invocation_name = CASE WHEN ? != '' THEN ? ELSE invocation_name END,
-      recommendation_mode = CASE WHEN ? != '' THEN ? ELSE recommendation_mode END,
+      invocation_name = CASE WHEN ?1 != '' THEN ?1 ELSE invocation_name END,
+      recommendation_mode = CASE WHEN ?2 != '' THEN ?2 ELSE recommendation_mode END,
+      keywords = CASE WHEN ?3 != '' THEN ?3 ELSE keywords END,
+      tech_stack = CASE WHEN ?4 != '' THEN ?4 ELSE tech_stack END,
+      use_cases = CASE WHEN ?5 != '' THEN ?5 ELSE use_cases END,
       updated_at = datetime('now')
-    WHERE type = ? AND name = ?
+    WHERE type = ?6 AND name = ?7
   `);
 
   rdb.transaction(() => {
@@ -49,13 +66,16 @@ function reindexKnownResources(rdb) {
       if (sep < 0) continue; // skip malformed keys without type:name separator
       const type = key.slice(0, sep);
       const name = key.slice(sep + 1);
-      const invName = meta.invocation_name || '';
+      const invName = meta.invocation_name || deriveInvocationName(name);
       const recMode = meta.recommendation_mode || '';
       update.run(
         meta.intent_tags, meta.domain_tags,
         meta.capability_summary, meta.trigger_patterns,
-        invName, invName,
-        recMode, recMode,
+        invName,
+        recMode,
+        meta.keywords || '',
+        meta.tech_stack || '',
+        meta.use_cases || '',
         type, name
       );
     }
@@ -98,7 +118,7 @@ function registerVirtualResources(rdb) {
       const name = key.slice(sep + 1);
       const { changes } = insert.run(
         name, type,
-        meta.invocation_name || '',
+        meta.invocation_name || deriveInvocationName(name),
         meta.intent_tags || name.replace(/-/g, ' '),
         meta.domain_tags || '',
         meta.capability_summary || `${type}: ${name.replace(/-/g, ' ')}`,
@@ -132,6 +152,21 @@ function registerVirtualResources(rdb) {
           )
       `);
       backfill.run();
+    } catch {}
+
+    // Backfill invocation_name for resources that still have it empty
+    // Derive from name: "parent/child" → "parent:child", otherwise use name as-is
+    try {
+      const emptyInvoc = rdb.prepare(`
+        SELECT id, name FROM resources
+        WHERE status = 'active' AND (invocation_name IS NULL OR invocation_name = '')
+      `).all();
+      if (emptyInvoc.length > 0) {
+        const setInvoc = rdb.prepare('UPDATE resources SET invocation_name = ? WHERE id = ?');
+        for (const r of emptyInvoc) {
+          setInvoc.run(deriveInvocationName(r.name), r.id);
+        }
+      }
     } catch {}
   })();
   return count;
@@ -583,7 +618,7 @@ async function install() {
                 repo_stars: res.repoStars || 0,
                 local_path: res.localPath,
                 file_hash: res.fileHash,
-                invocation_name: meta?.invocation_name || '',
+                invocation_name: meta?.invocation_name || deriveInvocationName(res.name),
                 intent_tags: meta?.intent_tags || res.name.replace(/-/g, ' '),
                 domain_tags: meta?.domain_tags || '',
                 trigger_patterns: meta?.trigger_patterns || `when user needs ${res.name.replace(/-/g, ' ')}`,
