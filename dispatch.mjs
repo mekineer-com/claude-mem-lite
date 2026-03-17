@@ -5,7 +5,7 @@
 
 import { basename, join } from 'path';
 import { existsSync } from 'fs';
-import { retrieveResources, buildEnhancedQuery, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
+import { retrieveResources, buildQueryFromText, DISPATCH_SYNONYMS } from './registry-retriever.mjs';
 import { renderInjection } from './dispatch-inject.mjs';
 import { updateResourceStats, recordInvocation } from './registry.mjs';
 import { debugCatch, extractErrorKeywords, truncate, inferProject, sanitizeFtsQuery } from './utils.mjs';
@@ -350,7 +350,7 @@ function extractIntent(prompt) {
 }
 
 /** Exported for testing. */
-export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate, filterAutoLoadedSkills as _filterAutoLoadedSkills, filterGarbageMetadata as _filterGarbageMetadata, decideTier as _decideTier };
+export { NEGATION_EN as _NEGATION_EN, NEGATION_CJK as _NEGATION_CJK, reRankByKeywords as _reRankByKeywords, applyAdoptionDecay as _applyAdoptionDecay, passesConfidenceGate as _passesConfidenceGate, filterAutoLoadedSkills as _filterAutoLoadedSkills, filterGarbageMetadata as _filterGarbageMetadata, decideTier as _decideTier, _postProcessResults };
 
 // Stop words for raw keyword extraction.
 // Includes common English stop words + action verbs already covered by intent patterns.
@@ -987,7 +987,7 @@ function filterGarbageMetadata(results) {
  * @param {number} [limit=3] Maximum results to return
  * @returns {object[]} Post-processed results
  */
-function postProcessResults(results, signals, db, limit = 3, { allowOnRequest = false } = {}) {
+function _postProcessResults(results, signals, db, limit = 3, { allowOnRequest = false } = {}) {
   // Filter on_request resources from proactive dispatch (they're only for explicit user requests)
   if (!allowOnRequest) {
     results = results.filter(r => (r.recommendation_mode || 'proactive') === 'proactive');
@@ -1117,6 +1117,8 @@ export async function dispatchOnUserPrompt(db, userPrompt, sessionId) {
     let results = retrieveResources(db, textQuery, { limit: 3, projectDomains: detectProjectDomains() });
     results = filterAutoLoadedSkills(results);
     results = filterGarbageMetadata(results);
+    // Community resources without invocation_name can't be easily invoked
+    results = results.filter(r => r.quality_tier !== 'community' || r.invocation_name);
     results = applyAdoptionDecay(results, db);
     if (results.length === 0) return null;
 
