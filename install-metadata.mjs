@@ -1912,15 +1912,6 @@ export const RESOURCE_METADATA = {
   },
 
   // ─── Missing Agents ─────────────────────────────────────────────────────
-  'agent:gsd-debugger': {
-    intent_tags: 'debug,systematic,root-cause,hypothesis,fix,gsd',
-    domain_tags: 'gsd,debugging',
-    capability_summary: 'Systematic GSD debugging with root cause analysis and hypothesis-driven investigation',
-    trigger_patterns: 'when GSD project encounters bugs or failures needing systematic debugging',
-    invocation_name: 'gsd:debugger',
-    keywords: 'root-cause,hypothesis-test,systematic-debug',
-    tech_stack: 'gsd',
-  },
   'agent:code-graph-code-explorer': {
     intent_tags: 'explore,understand,code,ast,knowledge-graph,trace,architecture',
     domain_tags: 'code-graph,ast,analysis',
