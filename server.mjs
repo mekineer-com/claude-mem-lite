@@ -1293,7 +1293,7 @@ server.registerTool(
         const categoryLabel = r.category ? ` [${r.category}]` : '';
         const howToUse = r.type === 'skill'
           ? (r.invocation_name ? `Skill tool: skill="${r.invocation_name}"` : `Community skill: ${r.name}`)
-          : `Agent tool: subagent_type="${r.name}"`;
+          : `Agent tool: subagent_type="${r.invocation_name || r.name}"`;
         return `${qualityBadge} ${r.type === 'skill' ? 'S' : 'A'} **${r.name}**${categoryLabel} — ${truncate(r.capability_summary || '', 80)}\n  Use: ${howToUse}`;
       });
       return { content: [{ type: 'text', text: `Found ${results.length} resource(s) for "${args.query}":\n\n${lines.join('\n\n')}` }] };

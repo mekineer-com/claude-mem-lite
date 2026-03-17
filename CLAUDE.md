@@ -48,14 +48,17 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 提交代码，发布新版本，检查github上有无错误
-Completed: Error: CLAUDE.md: in_progress		fix(dispatch+search): explicit reque…; Error: plugin.json, marketplace.json: CLAUDE.md  …
+Request: 以使用者的身份模拟测试一下该项目的各个功能包括用户体验,发现问题就修复问题，体验看能有效地提高claude的编程效率不。
 
 ### Key Context
+- [change] Version bump 2.12.1 → 2.12.2 with cross-file sync (#4112)
+- [discovery] Reviewed 7 files: mem, registry-retriever.mjs, registry-scanner.mjs, registry-i… (#4105)
+- [discovery] Reviewed 5 files: mem, hook.mjs, server.mjs, hook-context.mjs +1 more (#4102)
+- [discovery] Reviewed 6 files: registry-retriever.mjs, mem, hook-context.mjs, registry.mjs +… (#4101)
 - [bugfix] Error: CLAUDE.md: in_progress		fix(dispatch+search): explicit reque… (#4097)
-- [bugfix] Error: plugin.json, marketplace.json: CLAUDE.md                   | 20 ++++++++… (#4096)
-- [discovery] mem_registry synonym expansion hits edge cases with multi-word patterns (#4095)
-- [bugfix] Error: mem, utils.mjs, hook-llm.mjs: Columns: id, resource_id, session_id, trig… (#4093)
-- [bugfix] Error: dispatch-workflow.mjs, hook.mjs, utils.mjs: input:有没有一个code review的工具,re… (#4091)
+
+### Working State (from /clear)
+- Working on: 以使用者的身份模拟测试一下该项目的各个功能包括用户体验,发现问题就修复问题，体验看能有效地提高claude的编程效率不。
+- Key files: hook.mjs
 
 </claude-mem-context>
