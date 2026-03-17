@@ -31,7 +31,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
-      - run: npm run test:coverage
+      - run: ${{ matrix.node-version >= 20 && 'npm run test:coverage' || 'npx vitest run' }}
       - name: Upload coverage report
         if: always() && matrix.node-version == 22
         uses: actions/upload-artifact@v4
