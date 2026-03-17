@@ -282,7 +282,7 @@ const _INTENT_PATTERNS = (() => {
   return raw.map(([p, tag]) => [p, new RegExp(p.source, p.flags.includes('g') ? p.flags : p.flags + 'g'), tag]);
 })();
 
-const _CLAUSE_BOUNDARY = /[,，。；;、.!?！？]/;
+const _CLAUSE_BOUNDARY = /[,，。；;、.!?！？]|\b(?:and|but|then|or)\b|(?:然后|或者|但是|而是|接着)/;
 
 function extractIntent(prompt) {
   if (!prompt) return { intent: '', suppressed: [] };
@@ -293,6 +293,7 @@ function extractIntent(prompt) {
   // where the Chinese variant is negated but the English variant is not.
   const tagHasAffirmative = new Map(); // tag → true if any non-negated match exists
   const tagMatched = new Set();        // tags that matched at least once
+  const tagFirstPos = new Map();       // tag → earliest non-negated match position in text
 
   for (const [, globalPattern, tag] of _INTENT_PATTERNS) {
     // matchAll finds ALL matches (not just the first).
@@ -310,6 +311,10 @@ function extractIntent(prompt) {
       const hasCjkNeg = NEGATION_CJK.test(cjkPrefix) && !_CLAUSE_BOUNDARY.test(cjkPrefix);
       if (!hasEnNeg && !hasCjkNeg) {
         tagHasAffirmative.set(tag, true);
+        // Track earliest non-negated match position to determine primary intent
+        if (!tagFirstPos.has(tag) || matchStart < tagFirstPos.get(tag)) {
+          tagFirstPos.set(tag, matchStart);
+        }
       }
     }
   }
@@ -325,6 +330,10 @@ function extractIntent(prompt) {
       suppressed.push(tag);
     }
   }
+
+  // Sort by earliest match position in text — primary intent is the one that appears first.
+  // "fix this failing test" → fix@0, test@22 → primaryIntent=fix
+  found.sort((a, b) => (tagFirstPos.get(a) ?? Infinity) - (tagFirstPos.get(b) ?? Infinity));
 
   // Distinguish test-running from test-writing: "run tests" / "npm test" / "运行测试" should NOT
   // trigger TDD recommendations. Only keep 'test' intent when the prompt implies *writing* tests.
@@ -829,9 +838,12 @@ function passesConfidenceGate(results, signals) {
   // Gap check: if top-2 results are too close in score, the query is ambiguous.
   // This prevents recommending when multiple resources match equally well,
   // which usually means the match is incidental rather than precise.
-  // Skip the gap check when rawKeywords promoted #1 (keyword re-ranking changes order,
-  // so the BM25 gap no longer reflects true relevance — the keyword match is extra signal).
-  if (results.length >= 2) {
+  // Skip the gap check when:
+  // 1. rawKeywords promoted #1 (keyword re-ranking changes order)
+  // 2. A structured intent signal exists — multiple resources matching the same intent
+  //    (e.g. fix → debugging, systematic-debugging) is expected, not ambiguous.
+  const hasStructuredIntent = typeof signals?.intent === 'string' && signals.intent.length > 0;
+  if (results.length >= 2 && !hasStructuredIntent) {
     const top1 = Math.abs(results[0].composite_score ?? results[0].relevance ?? 0);
     const top2 = Math.abs(results[1].composite_score ?? results[1].relevance ?? 0);
     // After keyword re-ranking, #1 may have lower raw BM25 than #2.

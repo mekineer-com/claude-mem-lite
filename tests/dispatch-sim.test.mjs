@@ -582,10 +582,10 @@ describe('Dispatch Simulation — Real User Scenarios', () => {
 
     it('"fix the failing tests" → primary=fix (not test)', () => {
       const { signals } = fullPipeline(db, 'fix the failing tests');
-      // "fix" and "tests" both match, but fix should be primary (appears first in patterns)
-      expect(signals.primaryIntent).toBe('test');
+      // "fix" appears before "tests" in text → primary intent is fix
+      expect(signals.primaryIntent).toBe('fix');
       // Both should be present
-      expect(signals.intent).toContain('fix');
+      expect(signals.intent).toContain('test');
     });
 
     it('"create a responsive layout with tailwind" → primary=design', () => {
