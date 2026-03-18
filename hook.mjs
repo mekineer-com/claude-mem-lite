@@ -21,15 +21,11 @@ import {
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { selectWithTokenBudget, updateClaudeMd, buildSummaryLines } from './hook-context.mjs';
-import { dispatchOnPreToolUse, dispatchOnUserPrompt } from './dispatch.mjs';
-import { collectFeedback } from './dispatch-feedback.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
-  RESOURCE_RESCAN_INTERVAL_MS,
-  sessionFile, getSessionId, createSessionId, openDb, getRegistryDb,
-  closeRegistryDb, spawnBackground, appendToolEvent, readAndClearToolEvents,
-  resetInjectionBudget, hasInjectionBudget, incrementInjection,
+  sessionFile, getSessionId, createSessionId, openDb,
+  spawnBackground,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
@@ -38,9 +34,9 @@ import { checkForUpdate } from './hook-update.mjs';
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
 
 // Prevent recursive hooks from background claude -p calls
-// Background workers (llm-episode, llm-summary, resource-scan) are exempt — they're ours
+// Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'resource-scan']);
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
 
 // Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
 // install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin
@@ -253,21 +249,6 @@ async function handlePostToolUse() {
 
     writeEpisode(episode);
 
-    // Track feedback-relevant tool events for dispatch adoption detection.
-    // Skill/Agent: adoption detection checks these tool names.
-    // Edit/Write/NotebookEdit: outcome detection checks for edits.
-    // Grep: investigation signal for debugging pattern detection.
-    // Bash errors: outcome detection checks for error signals.
-    // Bash test/build success: TDD and verification pattern detection.
-    const isTrackableBash = tool_name === 'Bash' && (bashSig?.isError || bashSig?.isTest || bashSig?.isBuild);
-    if (['Skill', 'Agent', 'Edit', 'Write', 'NotebookEdit', 'Grep'].includes(tool_name) || isTrackableBash) {
-      appendToolEvent({
-        tool_name,
-        tool_input: toolInput,
-        tool_response: (tool_name === 'Bash' && bashSig?.isSignificant) ? scrubSecrets(resp.slice(0, 500)) : '',
-        timestamp: Date.now(),
-      });
-    }
   } finally {
     releaseLock();
     if (db) try { db.close(); } catch {}
@@ -396,18 +377,6 @@ async function handleStop() {
     }
   }
 
-  // Dispatch: collect feedback on recommendations using actual tool events
-  // PostToolUse tracks Skill/Task/Edit/Write/Bash events in a JSONL file.
-  // These events drive adoption detection (Skill/Task) and outcome detection (Edit/Bash errors).
-  // Always clear event file to prevent stale events accumulating if registry DB is unavailable.
-  try {
-    const sessionEvents = readAndClearToolEvents();
-    const rdb = getRegistryDb();
-    if (rdb) {
-      await collectFeedback(rdb, sessionId, sessionEvents);
-    }
-  } catch (e) { debugCatch(e, 'handleStop-feedback'); }
-
   // Spawn background for session summary (pass sessionId and project)
   spawnBackground('llm-summary', sessionId, project);
 
@@ -418,8 +387,6 @@ async function handleStop() {
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
 async function handleSessionStart() {
-  resetInjectionBudget();
-
   // Snapshot episode BEFORE flush for handoff extraction
   const episodeSnapshot = readEpisodeRaw();
 
@@ -537,15 +504,6 @@ async function handleSessionStart() {
           'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ?'
         ).get(prevProject || project, 'clear');
       } catch {}
-
-      // Collect dispatch feedback for previous session
-      try {
-        const rdb = getRegistryDb();
-        if (rdb) {
-          const sessionEvents = readAndClearToolEvents();
-          await collectFeedback(rdb, prevSessionId, sessionEvents);
-        }
-      } catch (e) { debugCatch(e, 'session-start-prev-feedback'); }
 
       // Generate session summary for previous session (background Haiku — richer version)
       spawnBackground('llm-summary', prevSessionId, prevProject || project);
@@ -759,13 +717,6 @@ async function handleSessionStart() {
     // CLAUDE.md: slim (summary + handoff state — observations already in stdout)
     updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
 
-    // Background rescan: detect changed/new managed resources since last scan.
-    // TTL-based (1h) — avoids redundant filesystem scans on every session.
-    // Non-blocking: spawns detached worker, results available before first user prompt.
-    if (needsResourceRescan()) {
-      spawnBackground('resource-scan');
-    }
-
     // Auto-update check (24h throttle, 3s timeout, silent on failure)
     // Fire-and-forget: don't block SessionStart for up to 3s network timeout
     checkForUpdate().then(updateResult => {
@@ -781,51 +732,6 @@ async function handleSessionStart() {
 
   } finally {
     db.close();
-  }
-}
-
-// ─── PreToolUse Handler (Dispatch) ──────────────────────────────────────────
-
-async function handlePreToolUse() {
-  let raw;
-  try { raw = await readStdin(); } catch { return; }
-
-  let hookData;
-  try { hookData = JSON.parse(raw.text); } catch { return; }
-
-  const rdb = getRegistryDb();
-  if (!rdb) return;
-
-  // Quick session context from user prompts DB + episode buffer
-  const sessionId = getSessionId();
-  const sessionCtx = { sessionId };
-  const db = openDb();
-  if (db) {
-    try {
-      const latest = db.prepare(
-        'SELECT prompt_text FROM user_prompts WHERE content_session_id = ? ORDER BY created_at_epoch DESC LIMIT 1'
-      ).get(sessionId);
-      if (latest) sessionCtx.userPrompt = latest.prompt_text;
-    } catch (e) { debugCatch(e, 'handlePreToolUse-queryPrompt'); } finally { db.close(); }
-  }
-  // Collect recent file paths from episode buffer for tech stack inference
-  try {
-    const episode = readEpisodeRaw();
-    if (episode?.entries) {
-      const files = new Set();
-      for (const e of episode.entries) {
-        if (e.files) for (const f of e.files) files.add(f);
-      }
-      if (files.size > 0) sessionCtx.recentFiles = [...files].slice(-10);
-    }
-  } catch {}
-
-  if (hasInjectionBudget()) {
-    const injection = await dispatchOnPreToolUse(rdb, hookData, sessionCtx);
-    if (injection) {
-      process.stdout.write(injection + '\n');
-      incrementInjection();
-    }
   }
 }
 
@@ -874,13 +780,12 @@ async function handleUserPrompt() {
     );
 
     // Cross-session handoff injection (first 3 prompts window, before semantic memory)
-    if (counter?.prompt_counter <= 3 && hasInjectionBudget()) {
+    if (counter?.prompt_counter <= 3) {
       try {
         if (detectContinuationIntent(db, promptText, project)) {
           const injection = renderHandoffInjection(db, project);
           if (injection) {
             process.stdout.write(injection + '\n');
-            incrementInjection();
             // Consume clear handoff after injection to prevent duplicate injection on prompts 2-3.
             // Exit handoffs are kept (7d TTL, content-dependent keyword/FTS matching won't re-trigger).
             try { db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear'").run(project); } catch {}
@@ -890,44 +795,29 @@ async function handleUserPrompt() {
     }
 
     // Semantic memory injection: search past observations for the user's prompt
-    if (hasInjectionBudget()) {
-      try {
-        const keyObs = db.prepare(`
-          SELECT id FROM observations
-          WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-            AND COALESCE(importance, 1) >= 2
-          ORDER BY created_at_epoch DESC LIMIT 5
-        `).all(project);
-        const keyContextIds = keyObs.map(o => o.id);
+    try {
+      const keyObs = db.prepare(`
+        SELECT id FROM observations
+        WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+          AND COALESCE(importance, 1) >= 2
+        ORDER BY created_at_epoch DESC LIMIT 5
+      `).all(project);
+      const keyContextIds = keyObs.map(o => o.id);
 
-        const memories = searchRelevantMemories(db, promptText, project, keyContextIds);
-        if (memories.length > 0) {
-          const lines = ['<memory-context relevance="high">'];
-          for (const m of memories) {
-            const lessonTag = m.lesson_learned ? ` | Lesson: ${m.lesson_learned}` : '';
-            lines.push(`- [${m.type}] ${truncate(m.title, 80)}${lessonTag} (#${m.id})`);
-          }
-          lines.push('</memory-context>');
-          process.stdout.write(lines.join('\n') + '\n');
-          incrementInjection();
+      const memories = searchRelevantMemories(db, promptText, project, keyContextIds);
+      if (memories.length > 0) {
+        const lines = ['<memory-context relevance="high">'];
+        for (const m of memories) {
+          const lessonTag = m.lesson_learned ? ` | Lesson: ${m.lesson_learned}` : '';
+          lines.push(`- [${m.type}] ${truncate(m.title, 80)}${lessonTag} (#${m.id})`);
         }
-      } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
-    }
+        lines.push('</memory-context>');
+        process.stdout.write(lines.join('\n') + '\n');
+      }
+    } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
   } finally {
     db.close();
   }
-
-  // Dispatch: only fires for explicit user requests ("I need X skill", "find me a tool for Y")
-  try {
-    const rdb = getRegistryDb();
-    if (rdb && hasInjectionBudget()) {
-      const result = await dispatchOnUserPrompt(rdb, promptText, sessionId);
-      if (result) {
-        process.stdout.write(result + '\n');
-        incrementInjection();
-      }
-    }
-  } catch (e) { debugCatch(e, 'handleUserPrompt-dispatch'); }
 }
 
 // ─── Auto-Compress (Background Worker) ───────────────────────────────────────
@@ -1001,77 +891,6 @@ function handleAutoCompress() {
   }
 }
 
-// ─── Resource Rescan (Background Worker) ─────────────────────────────────────
-
-const RESCAN_MARKER = join(RUNTIME_DIR, 'last-resource-scan');
-
-/**
- * Check if resource rescan is needed (marker older than RESOURCE_RESCAN_INTERVAL_MS).
- * @returns {boolean}
- */
-function needsResourceRescan() {
-  try {
-    const marker = statSync(RESCAN_MARKER);
-    return (Date.now() - marker.mtimeMs) > RESOURCE_RESCAN_INTERVAL_MS;
-  } catch {
-    return true; // No marker = never scanned
-  }
-}
-
-/**
- * Background worker: scan filesystem for changed resources, upsert any diffs.
- * Spawned by SessionStart when marker is stale. Non-blocking to the hook caller.
- */
-async function handleResourceScan() {
-  const rdb = getRegistryDb();
-  if (!rdb) return;
-
-  try {
-    const { scanAllResources, diffResources } = await import('./registry-scanner.mjs');
-    const { upsertResource } = await import('./registry.mjs');
-
-    const scanned = scanAllResources();
-    const { toIndex, toDisable } = diffResources(rdb, scanned);
-
-    if (toIndex.length === 0 && toDisable.length === 0) {
-      // Touch marker even if nothing changed — avoids rescanning every session
-      writeFileSync(RESCAN_MARKER, String(Date.now()));
-      return;
-    }
-
-    // Upsert changed resources with fallback metadata (no Haiku)
-    let upsertErrors = 0;
-    for (const res of toIndex) {
-      try {
-        upsertResource(rdb, {
-          name: res.name,
-          type: res.type,
-          status: 'active',
-          source: res.source,
-          repo_url: res.repoUrl || null,
-          local_path: res.localPath,
-          file_hash: res.fileHash,
-          intent_tags: res.name.replace(/-/g, ' ').replace(/\//g, ' '),
-          trigger_patterns: `when user needs ${res.name.replace(/-/g, ' ').replace(/\//g, ' ')}`,
-          capability_summary: `${res.type}: ${res.name.replace(/-/g, ' ')}`,
-        });
-      } catch (e) { upsertErrors++; if (upsertErrors <= 3) debugCatch(e, `handleResourceScan-upsert[${upsertErrors}]`); }
-    }
-
-    // Disable resources no longer on filesystem
-    for (const row of toDisable) {
-      try {
-        rdb.prepare("UPDATE resources SET status = 'disabled', updated_at = datetime('now') WHERE id = ?").run(row.id);
-      } catch {}
-    }
-
-    debugLog('DEBUG', 'resource-scan', `indexed ${toIndex.length}, disabled ${toDisable.length}`);
-    writeFileSync(RESCAN_MARKER, String(Date.now()));
-  } catch (e) {
-    debugCatch(e, 'handleResourceScan');
-  }
-}
-
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function readStdin() {
@@ -1137,14 +956,12 @@ function normalizeToolResponse(toolResponse) {
 
 try {
   switch (event) {
-    case 'pre-tool-use':     await handlePreToolUse(); break;
     case 'post-tool-use':    await handlePostToolUse(); break;
     case 'session-start':    await handleSessionStart(); break;
     case 'stop':             await handleStop(); break;
     case 'user-prompt':      await handleUserPrompt(); break;
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
-    case 'resource-scan':    await handleResourceScan(); break;
     case 'auto-compress':    handleAutoCompress(); break;
   }
 } catch (err) {
@@ -1152,8 +969,5 @@ try {
   const ts = new Date().toISOString();
   console.error(`[claude-mem-lite] [${ts}] [ERROR] ${event}: ${err.message}`);
 }
-
-// Close singleton registry DB to prevent WAL residue
-closeRegistryDb();
 
 process.exit(0);

@@ -205,8 +205,7 @@ async function install() {
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
-    'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-patterns.mjs', 'dispatch-workflow.mjs',
-    'install-metadata.mjs',
+    'install-metadata.mjs', 'mem-cli.mjs',
   ];
 
   if (IS_DEV) {
@@ -235,6 +234,12 @@ async function install() {
     if (existsSync(join(PROJECT_DIR, 'registry'))) {
       symlinkSync(join(PROJECT_DIR, 'registry'), regLink);
     }
+    // Symlink commands/ directory
+    const cmdLink = join(DATA_DIR, 'commands');
+    if (existsSync(cmdLink)) try { rmSync(cmdLink, { recursive: true, force: true }); } catch {}
+    if (existsSync(join(PROJECT_DIR, 'commands'))) {
+      symlinkSync(join(PROJECT_DIR, 'commands'), cmdLink);
+    }
     ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
   } else {
     log('Installing to ~/.claude-mem-lite/...');
@@ -247,8 +252,19 @@ async function install() {
     // Copy scripts
     const postToolSrc = join(PROJECT_DIR, 'scripts', 'post-tool-use.sh');
     if (existsSync(postToolSrc)) copyFileSync(postToolSrc, join(scriptsDir, 'post-tool-use.sh'));
+    const promptSearchSrc = join(PROJECT_DIR, 'scripts', 'user-prompt-search.js');
+    if (existsSync(promptSearchSrc)) copyFileSync(promptSearchSrc, join(scriptsDir, 'user-prompt-search.js'));
     // Ensure bash script is executable
     try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
+    // Copy commands directory
+    const commandsDir = join(DATA_DIR, 'commands');
+    if (!existsSync(commandsDir)) mkdirSync(commandsDir, { recursive: true });
+    const commandsSrc = join(PROJECT_DIR, 'commands');
+    if (existsSync(commandsSrc)) {
+      for (const f of readdirSync(commandsSrc).filter(f => f.endsWith('.md'))) {
+        copyFileSync(join(commandsSrc, f), join(commandsDir, f));
+      }
+    }
     // Copy registry manifest
     const registryDir = join(DATA_DIR, 'registry');
     if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
@@ -371,32 +387,38 @@ async function install() {
     }]
   };
 
-  const memPreToolUse = {
-    matcher: '*',
-    hooks: [{
-      type: 'command',
-      command: `node "${HOOK_PATH}" pre-tool-use`,
-      timeout: 2
-    }]
-  };
+  const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
 
   const memUserPrompt = {
     matcher: '*',
-    hooks: [{
-      type: 'command',
-      command: `node "${HOOK_PATH}" user-prompt`,
-      timeout: 5
-    }]
+    hooks: [
+      {
+        type: 'command',
+        command: `node "${join(SCRIPTS_PATH, 'user-prompt-search.js')}"`,
+        timeout: 2
+      },
+      {
+        type: 'command',
+        command: `node "${HOOK_PATH}" user-prompt`,
+        timeout: 5
+      }
+    ]
   };
 
   // Filter out existing mem hooks, then append fresh ones
-  for (const [event, config] of [['PostToolUse', memPostToolUse], ['PreToolUse', memPreToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
+  for (const [event, config] of [['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
     const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
     settings.hooks[event] = [...existing, config];
   }
 
+  // Clean up stale PreToolUse hook from previous versions
+  if (Array.isArray(settings.hooks.PreToolUse)) {
+    settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter(cfg => !isMemHook(cfg));
+    if (settings.hooks.PreToolUse.length === 0) delete settings.hooks.PreToolUse;
+  }
+
   writeSettings(settings);
-  ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
+  ok('Hooks configured (PostToolUse, SessionStart, Stop, UserPromptSubmit)');
 
   // 5. Migrate from old ~/.claude-mem/ if needed
   if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH) && !existsSync(join(DATA_DIR, 'claude-mem.db'))) {

@@ -6,8 +6,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: [
-        'utils.mjs', 'schema.mjs', 'server-internals.mjs',
-        'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs',
+        'utils.mjs', 'schema.mjs', 'server-internals.mjs', 'mem-cli.mjs',
         'registry.mjs', 'registry-retriever.mjs', 'registry-scanner.mjs',
         'resource-discovery.mjs',
         'hook-episode.mjs', 'hook-context.mjs', 'hook-semaphore.mjs',

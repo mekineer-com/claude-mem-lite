@@ -194,13 +194,12 @@ export function getCurrentVersion() {
 // ── Source files to copy (must match install.mjs SOURCE_FILES) ──
 const SOURCE_FILES = [
   'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
-  'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs',
+  'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
   'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
-  'dispatch.mjs', 'dispatch-inject.mjs', 'dispatch-feedback.mjs', 'dispatch-patterns.mjs', 'dispatch-workflow.mjs',
-  'install.mjs', 'install-metadata.mjs',
+  'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs',
 ];
 const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
 
