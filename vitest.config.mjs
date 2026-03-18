@@ -7,13 +7,12 @@ export default defineConfig({
       provider: 'v8',
       include: [
         'utils.mjs', 'schema.mjs', 'server-internals.mjs', 'mem-cli.mjs',
-        'registry.mjs', 'registry-retriever.mjs', 'registry-scanner.mjs',
-        'resource-discovery.mjs',
+        'registry-scanner.mjs', 'resource-discovery.mjs',
         'hook-episode.mjs', 'hook-context.mjs', 'hook-semaphore.mjs',
         'hook-shared.mjs', 'hook-llm.mjs', 'haiku-client.mjs',
       ],
-      // Entry files (install.mjs, server.mjs, hook.mjs) are tested via E2E/integration, not unit coverage
-      exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'benchmark/**', 'scripts/**'],
+      // Entry files and MCP-only modules tested via E2E/integration, not unit coverage
+      exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'registry.mjs', 'registry-retriever.mjs', 'benchmark/**', 'scripts/**'],
       thresholds: {
         lines: 75,
         functions: 75,
