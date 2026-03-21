@@ -40,6 +40,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         AND o.importance >= 1
         AND o.created_at_epoch > ?
         AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
       ORDER BY ${OBS_BM25}
       LIMIT 10
     `);
@@ -60,6 +61,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
           AND o.importance >= 2
           AND o.created_at_epoch > ?
           AND COALESCE(o.compressed_into, 0) = 0
+          AND o.superseded_at IS NULL
         ORDER BY ${OBS_BM25}
         LIMIT 5
       `).all(ftsQuery, project, cutoff);

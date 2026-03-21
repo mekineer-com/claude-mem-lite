@@ -82,7 +82,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 1 },
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 2 },
     ];
-    markSuperseded(results);
+    markSuperseded(null, results);
     expect(results[0].superseded).toBe(true);
     expect(results[1].superseded).toBeUndefined();
   });
@@ -92,7 +92,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 3 },
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 1 },
     ];
-    markSuperseded(results);
+    markSuperseded(null, results);
     expect(results[0].superseded).toBeUndefined(); // imp 3 > newest imp 1
     expect(results[1].superseded).toBeUndefined(); // newest
   });
@@ -101,7 +101,7 @@ describe('markSuperseded', () => {
     const results = [
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["only.js"]', importance: 1 },
     ];
-    markSuperseded(results);
+    markSuperseded(null, results);
     expect(results[0].superseded).toBeUndefined();
   });
 
@@ -111,7 +111,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["b.js","c.js"]', importance: 1 },
       { source: 'obs', id: 3, date: '2026-03-01', files_modified: '["c.js","d.js"]', importance: 1 },
     ];
-    markSuperseded(results);
+    markSuperseded(null, results);
     // For b.js: #1 (oldest) superseded by #2 (newest for b.js)
     expect(results[0].superseded).toBe(true);
     // For c.js: #2 superseded by #3 (newest for c.js)
@@ -120,9 +120,9 @@ describe('markSuperseded', () => {
   });
 
   it('handles empty results', () => {
-    expect(() => markSuperseded([])).not.toThrow();
-    expect(() => markSuperseded(null)).not.toThrow();
-    expect(() => markSuperseded(undefined)).not.toThrow();
+    expect(() => markSuperseded(null, [])).not.toThrow();
+    expect(() => markSuperseded(null, null)).not.toThrow();
+    expect(() => markSuperseded(null, undefined)).not.toThrow();
   });
 });
 

@@ -50,7 +50,7 @@ describe('search pipeline integration', () => {
     reRankWithContext(db, results, 'test');
 
     // Step 3: markSuperseded
-    markSuperseded(results);
+    markSuperseded(db, results);
 
     // The older lower-importance auth.js obs should be superseded
     const oldAuth = results.find(r => r.title.includes('token refresh'));

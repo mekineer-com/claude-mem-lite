@@ -64,8 +64,10 @@ export function reRankWithContext(db, results, project) {
  * Mutates result objects in-place by adding superseded=true flag.
  * @param {object[]} results Array of search result objects with source, files_modified, date, importance
  */
-export function markSuperseded(results) {
+export function markSuperseded(db, results) {
   if (!results || results.length === 0) return;
+  const now = Date.now();
+  const updateStmt = db ? db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ? AND superseded_at IS NULL') : null;
   // Build map: file → [result objects], only for obs with files
   const fileMap = new Map();
   for (const r of results) {
@@ -85,6 +87,11 @@ export function markSuperseded(results) {
     for (let i = 1; i < obsForFile.length; i++) {
       if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
         obsForFile[i].superseded = true;
+        if (db) {
+          try {
+            updateStmt.run(now, newest.id, obsForFile[i].id);
+          } catch (e) { debugCatch(e, 'markSuperseded-persist'); }
+        }
       }
     }
   }

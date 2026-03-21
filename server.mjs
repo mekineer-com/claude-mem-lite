@@ -173,6 +173,7 @@ function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset } = {})
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE observations_fts MATCH ?
       AND COALESCE(o.compressed_into, 0) = 0
+      AND o.superseded_at IS NULL
       AND (? IS NULL OR o.project = ?)
       AND (? IS NULL OR o.type = ?)
       AND (? IS NULL OR o.created_at_epoch >= ?)
@@ -242,7 +243,7 @@ function searchObservations(ctx) {
     }
   } else {
     const params = [];
-    const wheres = ['COALESCE(compressed_into, 0) = 0'];
+    const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
     if (args.project) { wheres.push('project = ?'); params.push(args.project); }
     if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
     if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
@@ -530,7 +531,7 @@ server.registerTool(
     if (ftsQuery && results.some(r => r.source === 'obs')) {
       const obsResults = results.filter(r => r.source === 'obs');
       reRankWithContext(db, obsResults, currentProject);
-      markSuperseded(obsResults);
+      markSuperseded(db, obsResults);
       results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 

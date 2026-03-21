@@ -132,6 +132,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
   const wheres = [
     'observations_fts MATCH ?',
     'COALESCE(o.compressed_into, 0) = 0',
+    'o.superseded_at IS NULL',
   ];
   if (project) { wheres.push('o.project = ?'); whereParams.push(project); }
   if (type) { wheres.push('o.type = ?'); whereParams.push(type); }
@@ -164,7 +165,7 @@ function cmdRecent(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   const params = [];
-  const wheres = ['COALESCE(compressed_into, 0) = 0'];
+  const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
   if (project) { wheres.push('project = ?'); params.push(project); }
   params.push(limit);
 

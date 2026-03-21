@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { getCurrentBranch } from '../utils.mjs';
+import { markSuperseded } from '../server-internals.mjs';
 
 describe('Phase 1 schema migrations', () => {
   let db;
@@ -110,5 +111,56 @@ describe('branch-scoped search', () => {
       WHERE (? IS NULL OR branch = ?) AND COALESCE(compressed_into, 0) = 0
     `).all(null, null);
     expect(rows).toHaveLength(3);
+  });
+});
+
+describe('supersession persistence', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('excludes superseded observations from search by default', () => {
+    insertObs(db, { title: 'old fix', type: 'bugfix', filesModified: '["auth.mjs"]', importance: 1, epochOffset: -86400000 });
+    insertObs(db, { title: 'new fix', type: 'bugfix', filesModified: '["auth.mjs"]', importance: 2 });
+
+    const oldObs = db.prepare("SELECT id FROM observations WHERE title = 'old fix'").get();
+    const newObs = db.prepare("SELECT id FROM observations WHERE title = 'new fix'").get();
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?')
+      .run(Date.now(), newObs.id, oldObs.id);
+
+    const active = db.prepare(`
+      SELECT id, title FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
+    `).all();
+    expect(active).toHaveLength(1);
+    expect(active[0].title).toBe('new fix');
+  });
+
+  it('can still retrieve superseded observations when explicitly requested', () => {
+    insertObs(db, { title: 'superseded obs', supersededAt: Date.now(), supersededBy: 999 });
+    const all = db.prepare('SELECT * FROM observations').all();
+    expect(all).toHaveLength(1);
+    expect(all[0].superseded_at).not.toBeNull();
+  });
+
+  it('markSuperseded with db persists to database', () => {
+    insertObs(db, { title: 'older', type: 'bugfix', filesModified: '["x.mjs"]', importance: 1, epochOffset: -86400000 });
+    insertObs(db, { title: 'newer', type: 'bugfix', filesModified: '["x.mjs"]', importance: 2 });
+
+    const results = db.prepare('SELECT id, type, title, created_at as date, files_modified, importance FROM observations ORDER BY created_at_epoch ASC').all();
+    const searchResults = results.map(r => ({ source: 'obs', ...r }));
+
+    markSuperseded(db, searchResults);
+
+    // In-memory flag should be set
+    expect(searchResults[0].superseded).toBe(true);
+    // DB should be persisted
+    const dbRow = db.prepare('SELECT superseded_at, superseded_by FROM observations WHERE id = ?').get(results[0].id);
+    expect(dbRow.superseded_at).not.toBeNull();
+    expect(dbRow.superseded_by).toBe(results[1].id);
   });
 });
