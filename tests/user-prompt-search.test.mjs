@@ -84,9 +84,12 @@ describe('shouldSkip', () => {
 // ─── Unit Tests: Intent Detection ────────────────────────────────────────────
 
 const INTENTS = [
+  // Error/debug intent
   { pattern: /error|bug|crash|broken|fail|fix|报错|出错|错误|崩溃|修复/i, type: 'bugfix', limit: 3 },
-  { pattern: /before|previously|last time|remember|之前|上次|以前|记得/i, type: null, limit: 5, useRecent: true },
+  // Decision/architecture intent (before recall — "为什么...之前" is a decision question, not recall)
   { pattern: /why|decided|architecture|design|为什么|决定|架构|设计/i, type: 'decision', limit: 3 },
+  // Recall/history intent (catch-all temporal, lowest priority)
+  { pattern: /before|previously|last time|remember|之前|上次|以前|记得/i, type: null, limit: 5, useRecent: true },
 ];
 
 function detectIntent(text) {
@@ -128,10 +131,19 @@ describe('detectIntent', () => {
     expect(detectIntent('实现用户注册功能')).toBeNull();
   });
 
-  it('prioritizes first match (bugfix over recall over decision)', () => {
+  it('prioritizes first match (bugfix over decision over recall)', () => {
     // "fix" matches bugfix, "before" matches recall — bugfix wins (first in list)
     const intent = detectIntent('Fix the error we saw before');
     expect(intent).toHaveProperty('type', 'bugfix');
+  });
+
+  it('prioritizes decision over recall (为什么...之前 is a decision question)', () => {
+    // "why" matches decision, "before" matches recall — decision wins (higher priority)
+    const intent = detectIntent('Why did we decide on this design before?');
+    expect(intent).toHaveProperty('type', 'decision');
+    // CJK: "为什么" matches decision, "之前" matches recall — decision wins
+    const cjkIntent = detectIntent('为什么之前选了这个方案？');
+    expect(cjkIntent).toHaveProperty('type', 'decision');
   });
 });
 

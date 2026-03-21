@@ -329,7 +329,10 @@ const SYNONYM_PAIRS = [
   // Database Operations
   ['迁移', 'migration'], ['迁移', 'migrate'],
   ['索引', 'index'], ['查询', 'query'], ['查询', 'search'],
+  ['搜索', 'search'], ['搜索', 'query'],
   ['排序', 'sort'], ['分页', 'pagination'],
+  ['实现', 'implement'], ['实现', 'implementation'],
+  ['功能', 'feature'], ['功能', 'function'],
   // Validation & Security
   ['验证', 'validate'], ['验证', 'validation'],
   ['加密', 'encrypt'], ['加密', 'encryption'],
@@ -366,6 +369,30 @@ for (const [abbr, full] of SYNONYM_PAIRS) {
   SYNONYM_MAP.get(fLow).add(aLow);
 }
 
+// Extract known CJK words (from SYNONYM_MAP) out of unsegmented CJK text.
+// Greedy longest-match: "数据库的全文搜索" → ["数据库", "搜索"] (skips particles/unknown).
+const _cjkSynonymKeys = [...SYNONYM_MAP.keys()]
+  .filter(k => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(k))
+  .sort((a, b) => b.length - a.length); // longest first
+
+function extractCjkSynonymTokens(text) {
+  const found = [];
+  let i = 0;
+  while (i < text.length) {
+    let matched = false;
+    for (const key of _cjkSynonymKeys) {
+      if (text.startsWith(key, i)) {
+        found.push(key);
+        i += key.length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) i++;
+  }
+  return found;
+}
+
 // Format a term for FTS5: quote if it contains spaces, hyphens, or special chars
 function ftsToken(term) {
   // Bare tokens are safe if purely alphanumeric or CJK characters
@@ -397,15 +424,33 @@ export function sanitizeFtsQuery(query) {
     .replace(/(^|\s)-/g, '$1')
     .trim();
   if (!cleaned) return null;
-  const tokens = cleaned.split(/\s+/).filter(t =>
+  let tokens = cleaned.split(/\s+/).filter(t =>
     t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR\/\d+$/i.test(t)
     // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
     && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
   );
+  // Split unsegmented CJK tokens into known vocabulary words for synonym expansion.
+  // e.g. "数据库的全文搜索" → ["数据库", "搜索"] (both have EN synonyms in SYNONYM_MAP)
+  const expandedTokens = [];
+  let cjkExtracted = false;
+  for (const t of tokens) {
+    if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(t) && t.length > 2) {
+      const cjkWords = extractCjkSynonymTokens(t);
+      if (cjkWords.length > 0) {
+        expandedTokens.push(...cjkWords);
+        cjkExtracted = true;
+        continue;
+      }
+    }
+    expandedTokens.push(t);
+  }
+  tokens = expandedTokens;
   if (tokens.length === 0) return null;
   // Replace single CJK character tokens with bigrams for better phrase matching.
   // Individual CJK chars ("系","统") are too noisy; bigrams ("系统") capture compound words.
-  const bigrams = cjkBigrams(cleaned);
+  // Skip bigrams when CJK synonym extraction already produced meaningful tokens —
+  // bigrams joined with AND would make the query too restrictive.
+  const bigrams = cjkExtracted ? null : cjkBigrams(cleaned);
   const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(Boolean) : []);
   const hasBigrams = bigramSet.size > 0;
   const finalTokens = [];

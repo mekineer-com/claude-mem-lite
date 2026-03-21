@@ -1314,10 +1314,16 @@ server.registerTool(
           for (const group of args.merge_ids) {
             if (group.length < 2) continue;
             const [keepId, ...removeIds] = group;
-            for (const removeId of removeIds) mergeStmt.run(keepId, removeId);
-            totalMerged += removeIds.length;
+            for (const removeId of removeIds) {
+              const result = mergeStmt.run(keepId, removeId);
+              totalMerged += result.changes;
+            }
           }
           results.push(`Merged ${totalMerged} duplicate observations`);
+        }
+
+        if (!ops.includes('dedup') && args.merge_ids) {
+          results.push('Warning: merge_ids provided but "dedup" not in operations — merge_ids ignored');
         }
 
         if (ops.includes('purge_stale')) {
