@@ -52,7 +52,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 
 ## Features
 
-- **Automatic capture** -- Hooks into Claude Code lifecycle (PostToolUse, PreToolUse, SessionStart, Stop, UserPromptSubmit) to record observations without manual effort
+- **Automatic capture** -- Hooks into Claude Code lifecycle (PostToolUse, SessionStart, Stop, UserPromptSubmit) to record observations without manual effort
 - **FTS5 search** -- BM25-ranked full-text search across observations, session summaries, and user prompts with importance weighting
 - **Timeline browsing** -- Navigate observations chronologically with anchor-based context windows
 - **Episode batching** -- Groups related file operations into coherent episodes before LLM encoding
@@ -79,20 +79,19 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Atomic writes** -- All file writes (episodes, CLAUDE.md) use write-to-tmp + rename to prevent corruption on crash
 - **Robust locking** -- PID-aware lock files with automatic stale/orphan cleanup (>30s timeout or dead PID)
 - **Stale session cleanup** -- Sessions active for >24h are automatically marked as abandoned on next start
-- **Intelligent dispatch** -- 3-tier progressive dispatch system automatically recommends the right skill or agent for the current task, triggered on SessionStart, UserPromptSubmit, and PreToolUse
-- **Resource registry** -- Indexes installed skills and agents with FTS5 search, composite scoring, and invocation tracking
+- **Resource registry** -- Indexes installed skills and agents with FTS5 search, composite scoring, and invocation tracking; searchable via `mem_registry` MCP tool
 - **Unified resource discovery** -- Shared filesystem traversal layer (`resource-discovery.mjs`) used by both runtime scanner and offline indexer, supporting flat directories, plugin nesting, and loose `.md` files
-- **Closed-loop feedback** -- Tracks whether recommendations were adopted and whether sessions succeeded, improving future dispatch quality
-- **Bilingual intent recognition** -- Understands user intent in both English and Chinese (15+ EN + 12+ CN intent categories)
-- **Domain synonym expansion** -- Dispatch queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
-- **DB-persisted cooldown** -- 5-minute cross-session cooldown and per-session dedup prevent repeated recommendations
+- **Domain synonym expansion** -- Registry search queries expand to domain synonyms (e.g., "fix" → debug, bugfix, troubleshoot, diagnose, repair)
 - **Dual LLM mode** -- Auto-detects `ANTHROPIC_API_KEY` for direct API calls; falls back to `claude -p` CLI when no key is available
-- **Haiku circuit breaker** -- After 3 consecutive LLM failures, disables Haiku dispatch for 5 minutes to prevent cascading latency
-- **Negation-aware intent** -- Handles complex prompts like "don't test, just fix the bug" — correctly excludes negated intents even in mixed English/Chinese input
+- **Lesson-learned indexing** -- `lesson_learned` field indexed in FTS5 with weight 8, making past debugging insights directly searchable
+- **Cross-source normalization** -- `mem_search` normalizes scores across observations, sessions, and prompts before merging, preventing any source from dominating results
+- **Exponential recency decay** -- Type-differentiated half-lives (decisions: 90d, discoveries: 60d, bugfixes: 14d, changes: 7d) consistently applied in all ranking paths
+- **Prompt-time memory injection** -- UserPromptSubmit hook automatically searches and injects relevant past observations with recency and importance weighting
+- **Dual injection dedup** -- `user-prompt-search.js` and `handleUserPrompt` coordinate via temp file to prevent duplicate memory injection
 - **Configurable LLM model** -- Switch between Haiku (fast/cheap) and Sonnet (deeper analysis) via `CLAUDE_MEM_MODEL` env var
 - **DB auto-recovery** -- Detects and cleans corrupted WAL/SHM files on startup; periodic WAL checkpoints prevent unbounded growth
 - **Schema auto-migration** -- Idempotent `ALTER TABLE` migrations run on every startup, safely adding new columns and indexes without data loss
-- **Exploration bonus** -- New resources in the registry get a fair chance in composite ranking; zombie resources (high recommend, zero adopt) are penalized
+- **Exploration bonus** -- New resources in the registry get a fair chance in composite ranking; zombie resources (high recommend, zero adopt) are penalized in scoring
 - **LLM concurrency control** -- File-based semaphore limits background workers to 2 concurrent LLM calls, preventing resource contention
 - **stdin overflow protection** -- Hook input truncated at 256KB with regex-based action salvage for oversized tool outputs
 - **Cross-session handoff** -- Captures session state (request, completed work, next steps, key files) on `/clear` or `/exit`, then injects context when the next session detects continuation intent via explicit keywords or FTS5 term overlap
@@ -144,8 +143,8 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem` server with 7 tools (search, timeline, get, save, stats, delete, compress)
-3. **Configure hooks** -- `PostToolUse`, `PreToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
+2. **Register MCP server** -- `mem` server with 9 tools (search, timeline, get, save, stats, delete, compress, maintain, registry)
+3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
 6. **Initialize database** -- SQLite with WAL mode, FTS5 indexes created on first server start
@@ -203,6 +202,8 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | `mem_stats` | View statistics: counts, type distribution, top projects, daily activity. |
 | `mem_delete` | Delete observations by ID with preview/confirm workflow. FTS5 cleanup is automatic. |
 | `mem_compress` | Compress old low-value observations into weekly summaries to reduce noise. |
+| `mem_maintain` | Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/dedup operations. |
+| `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. |
 
 ### Skill Commands (in Claude Code chat)
 
@@ -231,13 +232,15 @@ Five core tables with FTS5 virtual tables for search:
 ```
 id, memory_session_id, project, type, title, subtitle,
 text, narrative, concepts, facts, files_read, files_modified,
-importance, related_ids, created_at, created_at_epoch
+importance, related_ids, created_at, created_at_epoch,
+lesson_learned, minhash_sig, access_count, compressed_into, search_aliases
 ```
 
 **session_summaries** -- LLM-generated session summaries
 ```
 id, memory_session_id, project, request, investigated,
-learned, completed, next_steps, files_read, files_edited, notes
+learned, completed, next_steps, files_read, files_edited, notes,
+remaining_items, lessons, key_decisions
 ```
 
 **sdk_sessions** -- Session tracking
@@ -257,7 +260,7 @@ project, type, session_id, working_on, completed, unfinished,
 key_files, key_decisions, match_keywords, created_at_epoch
 ```
 
-FTS5 indexes: `observations_fts`, `session_summaries_fts`, `user_prompts_fts`
+FTS5 indexes: `observations_fts` (title, subtitle, narrative, text, facts, concepts, lesson_learned), `session_summaries_fts`, `user_prompts_fts`
 
 ## How It Works
 
@@ -270,7 +273,6 @@ SessionStart
   -> Clean orphaned/stale lock files
   -> Query recent observations (24h)
   -> Inject context into CLAUDE.md + stdout
-  -> Dispatch: recommend skill/agent based on user prompt (Tier 0→1→2→3)
 
 PostToolUse (every tool execution)
   -> Bash pre-filter skips noise in ~5ms (Read paths tracked to reads file)
@@ -282,75 +284,36 @@ PostToolUse (every tool execution)
   -> Spawn LLM episode worker for significant episodes
   -> Error-triggered recall: search memory for related past fixes
 
-PreToolUse (before tool execution)
-  -> Dispatch: recommend skill/agent based on current action context (Tier 0→1→2)
-
-UserPromptSubmit
-  -> Capture user prompt text to user_prompts table
-  -> Increment session prompt counter
-  -> Handoff: detect continuation intent → inject previous session context
-  -> Dispatch: recommend skill/agent based on user's actual prompt (Tier 0→1→2)
-  -> Primary dispatch point — user intent is clearest here
+UserPromptSubmit (two parallel paths)
+  -> [user-prompt-search.js] Auto-search memory via FTS5 + active file context
+  -> [user-prompt-search.js] Inject relevant past observations with recency/importance weighting
+  -> [user-prompt-search.js] Write injected IDs to temp file for dedup
+  -> [hook.mjs handleUserPrompt] Capture user prompt text to user_prompts table
+  -> [hook.mjs handleUserPrompt] Increment session prompt counter
+  -> [hook.mjs handleUserPrompt] Handoff: detect continuation intent → inject previous session context
+  -> [hook.mjs handleUserPrompt] Semantic memory injection (hook-memory.mjs), deduped via temp file
 
 Stop
   -> Flush final episode buffer
   -> Save handoff snapshot (on /exit)
-  -> Collect dispatch feedback: adoption detection + outcome scoring
   -> Mark session completed
   -> Spawn LLM summary worker (poll-based wait)
 ```
 
-### Intelligent Dispatch
+### Resource Registry
 
-The dispatch system proactively recommends skills and agents during coding sessions via a 3-tier progressive architecture:
+The resource registry (`registry.mjs`, `registry-retriever.mjs`) indexes installed skills and agents into a searchable FTS5 database. Unlike the previous proactive dispatch system, the registry is now on-demand — Claude searches it via the `mem_registry` MCP tool when it needs to discover relevant skills or agents.
 
 ```
-Tier 0: Fast Filter (<1ms)
-  -> Skip read-only tools (Read, Glob, Grep, LSP...)
-  -> Skip simple Bash queries (ls, cat, git status...)
-  -> Skip when Claude already chose a Skill or Task agent
-  -> Skip MCP-internal tools
-
-Tier 1: Context Signal Extraction (<1ms)
-  -> Intent: extract from user prompt (test, fix, deploy, review...)
-  -> Tech stack: infer from recent file extensions (.ts → typescript)
-  -> Action: infer from tool name (Edit → edit, Bash+jest → test)
-  -> Error domain: classify errors (type-error, test-fail, build-fail...)
-
-Tier 2: FTS5 Retrieval (<5ms)
-  -> Expand signals with domain synonyms (15+ EN, 12+ CN categories)
-  -> BM25-ranked search over resource registry
-  -> Composite scoring: BM25 (40%) + repo stars (15%) + success rate (15%) + adoption rate (10%)
-
-Tier 3: Haiku Semantic Dispatch (~500ms, SessionStart only)
-  -> Activated when FTS5 confidence is low or top results are ambiguous
-  -> LLM generates semantic search query for refined retrieval
-  -> Disabled for PreToolUse (2s hook timeout insufficient)
+Registry pipeline:
+  -> registry-scanner.mjs discovers skills/agents on filesystem
+  -> resource-discovery.mjs handles flat dirs, plugin nesting, loose .md files
+  -> registry-indexer.mjs indexes content into FTS5 with metadata
+  -> registry-retriever.mjs provides BM25-ranked search with synonym expansion
+  -> mem_registry MCP tool exposes search/list/stats/import/remove/reindex actions
 ```
 
-**Dispatch triggers:**
-
-| Hook | Budget | Tiers | Use case |
-|------|--------|-------|----------|
-| SessionStart | 10s | 0→1→2→3 | Analyze previous session's next_steps, suggest skill/agent upfront |
-| UserPromptSubmit | 2s | 0→1→2 | Primary dispatch point — user's actual prompt has clearest intent |
-| PreToolUse | 2s | 0→1→2 | React to current action context in real-time |
-
-**Feedback loop (Stop hook):**
-
-At session end, the system reviews all recommendations made during the session:
-- **Adoption detection** -- Did Claude actually use the recommended skill (`Skill` tool) or agent (`Task` tool)?
-- **Outcome detection** -- Was the session successful (edits without errors), partial (errors then fixes), or failed?
-- **Score calculation** -- Adopted + success = 1.0, adopted + partial = 0.5, adopted + failure = 0.2
-- Stats feed back into composite scoring, improving future dispatch quality over time
-
-**Injection templates:**
-
-| Resource type | Location | Template |
-|---------------|----------|----------|
-| Skill | `~/.claude/skills/` (native) | Short hint: use `/skill <name>` |
-| Skill | managed directory | Full skill content injected (up to 3KB) |
-| Agent | any | Agent definition injected for `Task` tool delegation |
+Composite scoring for search results: BM25 relevance (40%) + repo stars (15%) + success rate (15%) + adoption rate (10%) + freshness (10%) + exploration bonus (10%). Domain filtering ensures platform-specific resources (iOS, Go, Rust) only surface for matching projects.
 
 ### Episode Encoding
 
@@ -438,16 +401,15 @@ claude-mem-lite/
   hook-handoff.mjs     # Cross-session handoff: state extraction, intent detection, injection
   hook-context.mjs     # CLAUDE.md context injection and token budgeting
   hook-episode.mjs     # Episode buffer management: atomic writes, pending entry merging
+  hook-memory.mjs      # Semantic memory injection on user prompt
   hook-semaphore.mjs   # LLM concurrency control: file-based semaphore for background workers
   schema.mjs           # Database schema: single source of truth for tables, migrations, FTS5
   tool-schemas.mjs     # Shared Zod schemas for MCP tool validation
-  utils.mjs            # Shared utilities: FTS5 query building, MinHash dedup, secret scrubbing
-  # Intelligent dispatch
-  dispatch.mjs         # 3-tier dispatch orchestration: fast filter, context signals, FTS5, Haiku
-  dispatch-inject.mjs  # Injection template rendering for skill/agent recommendations
-  dispatch-feedback.mjs # Closed-loop feedback: adoption detection, outcome tracking
+  utils.mjs            # Shared utilities: FTS5 query building, BM25 weight constants, MinHash dedup, secret scrubbing
+  # Resource registry
   registry.mjs         # Resource registry DB: schema, CRUD, FTS5, invocation tracking
   registry-retriever.mjs # FTS5 retrieval with synonym expansion and composite scoring
+  registry-indexer.mjs # Resource indexing pipeline
   registry-scanner.mjs # Filesystem scanner: reads content + hashes, delegates discovery
   resource-discovery.mjs # Shared discovery layer: flat dirs, plugin nesting, loose .md files
   haiku-client.mjs     # Unified Haiku LLM wrapper: direct API or CLI fallback
@@ -458,6 +420,7 @@ claude-mem-lite/
   scripts/
     setup.sh           # Setup hook: npm install + migration (hidden dir + old dir)
     post-tool-use.sh   # Bash pre-filter: skips noise in ~5ms, tracks Read paths
+    user-prompt-search.js # UserPromptSubmit hook: auto-search memory on user prompts
     convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
     index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)
@@ -495,7 +458,7 @@ npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% toleranc
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CLAUDE_MEM_DIR` | Custom data directory. All databases, runtime files, and managed resources are stored here. | `~/.claude-mem-lite/` |
-| `CLAUDE_MEM_MODEL` | LLM model for background calls (episode extraction, session summaries, dispatch). Accepts `haiku` or `sonnet`. | `haiku` |
+| `CLAUDE_MEM_MODEL` | LLM model for background calls (episode extraction, session summaries). Accepts `haiku` or `sonnet`. | `haiku` |
 | `CLAUDE_MEM_DEBUG` | Enable debug logging (`1` to enable). | _(disabled)_ |
 
 ## License
