@@ -40,10 +40,10 @@ describe('Phase 1 schema migrations', () => {
 });
 
 describe('getCurrentBranch', () => {
-  it('returns a non-empty string in a git repo', () => {
+  it('returns string or null (detached HEAD in CI)', () => {
     const branch = getCurrentBranch();
-    expect(typeof branch).toBe('string');
-    expect(branch.length).toBeGreaterThan(0);
+    expect(branch === null || typeof branch === 'string').toBe(true);
+    if (branch !== null) expect(branch.length).toBeGreaterThan(0);
   });
 
   it('returns null or string (never throws)', () => {
