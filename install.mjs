@@ -205,7 +205,7 @@ async function install() {
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
-    'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs',
+    'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
   ];
 
   if (IS_DEV) {

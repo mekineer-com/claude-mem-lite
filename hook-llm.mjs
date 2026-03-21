@@ -10,6 +10,7 @@ import {
   getCurrentBranch,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
+import { getVocabulary, computeVector } from './tfidf.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
   sessionFile, getSessionId, openDb, callLLM, sleep,
@@ -114,7 +115,22 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       getCurrentBranch(),
       now.toISOString(), now.getTime()
     );
-    return Number(result.lastInsertRowid);
+    const savedId = Number(result.lastInsertRowid);
+
+    // Write TF-IDF vector (non-critical)
+    try {
+      const vocab = getVocabulary(db);
+      if (vocab) {
+        const vecText = [obs.title || '', obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
+        const vec = computeVector(vecText, vocab);
+        if (vec) {
+          db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+            .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+        }
+      }
+    } catch (e) { debugCatch(e, 'saveObservation-vector'); }
+
+    return savedId;
   } finally {
     if (!externalDb) db.close();
   }
@@ -464,6 +480,19 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
       );
       savedId = episode.savedId;
       debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+
+      // Update TF-IDF vector with enriched content
+      try {
+        const vocab = getVocabulary(db);
+        if (vocab) {
+          const vecText = [obs.title || '', obs.narrative || '', conceptsText].filter(Boolean).join(' ');
+          const vec = computeVector(vecText, vocab);
+          if (vec) {
+            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+              .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+          }
+        }
+      } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
     } else {
       savedId = saveObservation(obs, episode.project, episode.sessionId, db);
     }

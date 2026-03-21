@@ -5,6 +5,7 @@
 import { ensureDb, DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
+import { getVocabulary, computeVector } from './tfidf.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -417,6 +418,18 @@ function cmdSave(db, args) {
     INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
     VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?, ?)
   `).run(sessionId, project, textField, type, safeTitle, safeContent, importance, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+
+  // Write TF-IDF vector
+  try {
+    const vocab = getVocabulary(db);
+    if (vocab) {
+      const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
+      if (vec) {
+        db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+          .run(Number(result.lastInsertRowid), Buffer.from(vec.buffer), vocab.version, Date.now());
+      }
+    }
+  } catch { /* non-critical */ }
 
   out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 60)}" (project: ${project})`);
 }

@@ -190,6 +190,17 @@ export function initSchema(db) {
     }
   } catch { /* non-critical */ }
 
+  // Observation vectors table for TF-IDF vector search
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS observation_vectors (
+      observation_id INTEGER PRIMARY KEY,
+      vector BLOB NOT NULL,
+      vocab_version TEXT NOT NULL,
+      created_at_epoch INTEGER NOT NULL,
+      FOREIGN KEY(observation_id) REFERENCES observations(id) ON DELETE CASCADE
+    )
+  `);
+
   // Project name normalization: migrate short names ("mem") to canonical form ("projects--mem")
   // Strategy: exact suffix match first, then substring match for package-name aliases
   // Idempotent: only runs when short-name records exist

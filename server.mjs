@@ -11,6 +11,7 @@ import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
+import { getVocabulary, computeVector } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -834,6 +835,18 @@ server.registerTool(
       INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
       VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?, ?)
     `).run(sessionId, project, textField, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+
+    // Write TF-IDF vector
+    try {
+      const vocab = getVocabulary(db);
+      if (vocab) {
+        const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
+        if (vec) {
+          db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+            .run(Number(result.lastInsertRowid), Buffer.from(vec.buffer), vocab.version, Date.now());
+        }
+      }
+    } catch (e) { debugCatch(e, 'mem_save-vector'); }
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
   })

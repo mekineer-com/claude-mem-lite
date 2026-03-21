@@ -1,6 +1,6 @@
 // tests/tfidf.test.mjs
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { tokenize, buildVocabulary, getVocabulary, computeVector, cosineSimilarity, VOCAB_DIM, _resetVocabCache } from '../tfidf.mjs';
+import { tokenize, buildVocabulary, computeVector, cosineSimilarity, VOCAB_DIM, _resetVocabCache } from '../tfidf.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('tokenize', () => {
@@ -145,7 +145,7 @@ describe('cosineSimilarity', () => {
   });
 
   it('similar texts score higher than dissimilar', () => {
-    let db = createTestDb();
+    const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
     insertObs(db, { title: 'auth token refresh', narrative: 'fix the authentication token expiry' });
     insertObs(db, { title: 'database schema migration', narrative: 'update the database tables' });

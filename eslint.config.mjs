@@ -18,6 +18,7 @@ export default [
         fetch: 'readonly',
         AbortController: 'readonly',
         performance: 'readonly',
+        Buffer: 'readonly',
       },
     },
     rules: {
