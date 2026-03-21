@@ -132,7 +132,7 @@ describe('sanitizeFtsQuery', () => {
 
   it('strips leading minus (FTS5 NOT operator)', () => {
     expect(sanitizeFtsQuery('-excluded term')).toBe('excluded term');
-    expect(sanitizeFtsQuery('term -other')).toBe('term other');
+    expect(sanitizeFtsQuery('term -extra')).toBe('term extra');
   });
 
   it('strips FTS5 special characters', () => {
@@ -222,6 +222,25 @@ describe('sanitizeFtsQuery', () => {
     // Single CJK character — no bigram possible, should keep it
     const result = sanitizeFtsQuery('猫');
     expect(result).toBe('猫');
+  });
+});
+
+// ─── sanitizeFtsQuery stop-word filtering ────────────────────────────────────
+
+describe('sanitizeFtsQuery stop-word filtering', () => {
+  it('removes English stop words from FTS query', () => {
+    const q = sanitizeFtsQuery('how does the search work in this system');
+    expect(q).not.toMatch(/\bhow\b/);
+    expect(q).not.toMatch(/\bdoes\b/);
+    expect(q).not.toMatch(/\bthe\b/);
+    expect(q).toMatch(/search/i);
+    expect(q).toMatch(/work/);
+    expect(q).toMatch(/system/);
+  });
+
+  it('keeps all tokens if filtering would leave empty query', () => {
+    const q = sanitizeFtsQuery('the and or but');
+    expect(q).not.toBeNull();
   });
 });
 

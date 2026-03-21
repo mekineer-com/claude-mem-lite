@@ -411,6 +411,19 @@ function expandToken(token) {
   return `(${parts.join(' OR ')})`;
 }
 
+const FTS_STOP_WORDS = new Set([
+  'the','a','an','is','are','was','were','be','been','being',
+  'have','has','had','do','does','did','will','would','could',
+  'should','may','might','can','shall','to','of','in','for',
+  'on','with','at','by','from','as','into','about','between',
+  'after','before','above','below','and','or','but','not','no',
+  'this','that','these','those','it','its','my','your','his',
+  'her','our','their','me','him','us','them','i','you','he',
+  'she','we','they','what','which','who','when','where','how',
+  'all','each','every','both','few','more','most','other','some',
+  'such','than','too','very','just','also','then','so','if',
+]);
+
 /**
  * Sanitize and expand a user query into a valid FTS5 query string.
  * Strips special characters, expands synonyms, and joins with AND/space.
@@ -429,6 +442,9 @@ export function sanitizeFtsQuery(query) {
     // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
     && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
   );
+  // Filter stop words (but keep all if filtering would empty the query)
+  const filtered = tokens.filter(t => !FTS_STOP_WORDS.has(t.toLowerCase()));
+  if (filtered.length > 0) tokens = filtered;
   // Split unsegmented CJK tokens into known vocabulary words for synonym expansion.
   // e.g. "数据库的全文搜索" → ["数据库", "搜索"] (both have EN synonyms in SYNONYM_MAP)
   const expandedTokens = [];

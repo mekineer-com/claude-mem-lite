@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, debugCatch, OBS_BM25 } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25 } from './utils.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -44,13 +44,21 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       ORDER BY ${OBS_BM25}
       LIMIT 10
     `);
-    const rows = selectStmt.all(ftsQuery, project, cutoff);
+    let rows = selectStmt.all(ftsQuery, project, cutoff);
+
+    // OR fallback when AND returns nothing
+    if (rows.length === 0) {
+      const orQuery = relaxFtsQueryToOr(ftsQuery);
+      if (orQuery) {
+        try { rows = selectStmt.all(orQuery, project, cutoff); } catch {}
+      }
+    }
 
     // Phase 2: Cross-project search for high-value decisions/discoveries
     // These are transferable insights (debugging patterns, architectural reasons, gotchas)
     let crossRows = [];
     try {
-      crossRows = db.prepare(`
+      const crossStmt = db.prepare(`
         SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
                ${OBS_BM25} as relevance
         FROM observations_fts
@@ -64,7 +72,14 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
           AND o.superseded_at IS NULL
         ORDER BY ${OBS_BM25}
         LIMIT 5
-      `).all(ftsQuery, project, cutoff);
+      `);
+      crossRows = crossStmt.all(ftsQuery, project, cutoff);
+      if (crossRows.length === 0) {
+        const orQuery = relaxFtsQueryToOr(ftsQuery);
+        if (orQuery) {
+          try { crossRows = crossStmt.all(orQuery, project, cutoff); } catch {}
+        }
+      }
     } catch (e) { debugCatch(e, 'crossProjectSearch'); }
 
     // Merge and score: same-project full weight, cross-project 0.7x

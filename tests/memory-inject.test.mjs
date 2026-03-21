@@ -243,3 +243,38 @@ describe('file-aware recall', () => {
     expect(results[0].title).toContain('test_100%.mjs');
   });
 });
+
+describe('OR fallback in searchRelevantMemories', () => {
+  let db;
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-or-test', project: 'test-project' });
+
+    // Background noise for BM25 IDF
+    for (let i = 900; i <= 920; i++) {
+      insertObs(db, {
+        sessionId: 'sess-or-test', project: 'test-project', type: 'change',
+        title: `Updated config file ${i}`, text: `config yaml settings update number ${i}`,
+        importance: 2
+      });
+    }
+  });
+  afterEach(() => { db?.close(); });
+
+  it('falls back to OR query when AND returns no results', () => {
+    // Insert observation with only partial keyword match
+    insertObs(db, {
+      sessionId: 'sess-or-test', project: 'test-project', type: 'bugfix',
+      title: 'Fixed database connection timeout',
+      narrative: 'The pool was exhausted',
+      text: 'database connection timeout pool exhausted',
+      importance: 2
+    });
+
+    // AND query for "database performance optimization" won't match (no "performance" or "optimization")
+    // but OR fallback should find it via "database"
+    const results = searchRelevantMemories(db, 'database performance optimization', 'test-project');
+    expect(results.length).toBeGreaterThan(0);
+  });
+});
