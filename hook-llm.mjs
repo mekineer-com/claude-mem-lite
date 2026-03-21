@@ -7,6 +7,7 @@ import {
   jaccardSimilarity, truncate, clampImportance, computeRuleImportance,
   inferProject, parseJsonFromLLM,
   computeMinHash, estimateJaccardFromMinHash, cjkBigrams, EDIT_TOOLS, debugCatch, debugLog, OBS_BM25,
+  getCurrentBranch,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import {
@@ -96,8 +97,8 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     const { conceptsText, factsText, textField } = buildFtsTextField(obs);
 
     const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, branch, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       sessionId, project,
       textField, obs.type, obs.title, obs.subtitle || '',
@@ -110,6 +111,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       minhashSig,
       obs.lessonLearned || null,
       obs.searchAliases || null,
+      getCurrentBranch(),
       now.toISOString(), now.getTime()
     );
     return Number(result.lastInsertRowid);

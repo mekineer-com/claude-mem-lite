@@ -3,7 +3,7 @@
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
 import { ensureDb, DB_PATH } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -412,9 +412,9 @@ function cmdSave(db, args) {
   `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
   const result = db.prepare(`
-    INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, created_at, created_at_epoch)
-    VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?)
-  `).run(sessionId, project, textField, type, safeTitle, safeContent, importance, minhashSig, now.toISOString(), now.getTime());
+    INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
+    VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?, ?)
+  `).run(sessionId, project, textField, type, safeTitle, safeContent, importance, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
 
   out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 60)}" (project: ${project})`);
 }

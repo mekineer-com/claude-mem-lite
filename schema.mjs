@@ -104,6 +104,10 @@ const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN search_aliases TEXT DEFAULT NULL',
   'ALTER TABLE session_summaries ADD COLUMN lessons TEXT DEFAULT NULL',
   'ALTER TABLE session_summaries ADD COLUMN key_decisions TEXT DEFAULT NULL',
+  'ALTER TABLE observations ADD COLUMN branch TEXT DEFAULT NULL',
+  'ALTER TABLE observations ADD COLUMN superseded_at INTEGER DEFAULT NULL',
+  'ALTER TABLE observations ADD COLUMN superseded_by INTEGER DEFAULT NULL',
+  'ALTER TABLE observations ADD COLUMN last_accessed_at INTEGER DEFAULT NULL',
 ];
 
 /**
@@ -157,6 +161,8 @@ export function initSchema(db) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_project_epoch_minhash ON observations(project, created_at_epoch DESC) WHERE minhash_sig IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_user_prompts_session ON user_prompts(content_session_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_at) WHERE superseded_at IS NOT NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_branch ON observations(branch) WHERE branch IS NOT NULL`);
 
   // FTS5 migration: add lesson_learned column to observations_fts (one-time)
   // Detect old FTS5 table missing lesson_learned and recreate with full column set

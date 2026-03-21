@@ -2,6 +2,7 @@
 // Used by server.mjs, hook.mjs, and tests
 
 import { basename, dirname } from 'path';
+import { execSync } from 'child_process';
 
 // ─── Sentinel Values ────────────────────────────────────────────────────────
 
@@ -902,3 +903,22 @@ export function extractMatchKeywords(text, files) {
   }
   return [...terms].join(' ');
 }
+
+// ─── Git Branch Detection ──────────────────────────────────────────────────
+
+let _cachedBranch;
+export function getCurrentBranch() {
+  if (_cachedBranch !== undefined) return _cachedBranch;
+  try {
+    const result = execSync('git rev-parse --abbrev-ref HEAD', {
+      encoding: 'utf8', timeout: 2000, stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    _cachedBranch = (result && result !== 'HEAD') ? result : null;
+  } catch {
+    _cachedBranch = null;
+  }
+  return _cachedBranch;
+}
+
+/** Reset cached branch (for testing or after git checkout) */
+export function _resetBranchCache() { _cachedBranch = undefined; }
