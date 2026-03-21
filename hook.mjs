@@ -32,6 +32,7 @@ import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
+import { buildVocabulary } from './tfidf.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
@@ -717,6 +718,9 @@ async function handleSessionStart() {
 
     // CLAUDE.md: slim (summary + handoff state — observations already in stdout)
     updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
+
+    // Pre-build TF-IDF vocabulary cache for this session
+    try { buildVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }
 
     // Auto-update check (24h throttle, 3s timeout, silent on failure)
     // Fire-and-forget: don't block SessionStart for up to 3s network timeout

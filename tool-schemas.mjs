@@ -82,8 +82,8 @@ export const memCompressSchema = {
 
 export const memMaintainSchema = {
   action: z.enum(['scan', 'execute']).describe('scan=analyze candidates, execute=apply changes'),
-  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'purge_stale'])).optional()
-    .describe('Operations to execute (for action=execute). purge_stale deletes idle-marked observations after user confirmation.'),
+  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'purge_stale', 'rebuild_vectors'])).optional()
+    .describe('Operations to execute (for action=execute). purge_stale deletes idle-marked observations after user confirmation. rebuild_vectors rebuilds TF-IDF vocabulary and all observation vectors.'),
   merge_ids: z.preprocess(
     (v) => Array.isArray(v) ? v.map(g => Array.isArray(g) ? g.map(x => typeof x === 'string' ? parseInt(x, 10) : x) : g) : v,
     z.array(z.array(z.number().int()).min(2))

@@ -11,7 +11,7 @@ import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
+import { getVocabulary, buildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -1340,6 +1340,40 @@ server.registerTool(
       // FTS5 optimize (outside transaction)
       db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");
       results.push('FTS5 index optimized');
+
+      // rebuild_vectors: outside main transaction (creates its own internal transaction)
+      if (ops.includes('rebuild_vectors')) {
+        try {
+          _resetVocabCache();
+          const vocab = buildVocabulary(db);
+          if (!vocab) {
+            results.push('Vectors: no observations to build vocabulary from');
+          } else {
+            const allObs = db.prepare(`
+              SELECT id, title, narrative, concepts FROM observations
+              WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
+            `).all();
+            let updated = 0;
+            const insertStmt = db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)');
+            const now = Date.now();
+            db.transaction(() => {
+              db.prepare('DELETE FROM observation_vectors').run();
+              for (const obs of allObs) {
+                const text = [obs.title || '', obs.narrative || '', obs.concepts || ''].filter(Boolean).join(' ');
+                const vec = computeVector(text, vocab);
+                if (vec) {
+                  insertStmt.run(obs.id, Buffer.from(vec.buffer), vocab.version, now);
+                  updated++;
+                }
+              }
+            })();
+            results.push(`Vectors: rebuilt vocabulary (${vocab.terms.size} terms), updated ${updated}/${allObs.length} vectors`);
+          }
+        } catch (e) {
+          debugCatch(e, 'rebuild_vectors');
+          results.push(`Vectors: rebuild failed — ${e.message}`);
+        }
+      }
 
       return { content: [{ type: 'text', text: results.join('\n') }] };
     }
