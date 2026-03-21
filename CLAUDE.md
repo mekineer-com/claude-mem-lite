@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.14.0
+- **Version**: 2.15.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (24 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -47,13 +47,13 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 修复这些问题
+Request: 本地和远程的分支合并并清理没？
 
 ### Key Context
-- [discovery] Reviewed 1 files: mem (#4292)
-- [bugfix] Error: user-prompt-search.js: === Scenario 1: New session context injection ===… (#4288)
-- [bugfix] Error: hook.mjs: #4118 bugfix 2026-03-17 Title: Error: dispatch.mj… (#4199)
-- [bugfix] Error: hook.mjs, mem-cli.mjs, cli.mjs +1 more: mem 3 results for fts5 tokenizer… (#4195)
-- [discovery] Worked on README.md, architecture.md, hook-system.md +6 more (#4141)
+- [change] Modified schema.mjs, README.md (#4358)
+- [discovery] Codebase exploration: projects--mem schema, FTS5 search, hook events (#4352)
+- [discovery] Reviewed 3 files: schema.mjs, server.mjs, hook.mjs (#4350)
+- [discovery] Reviewed 6 files: schema.mjs, server.mjs, hook.mjs, hook-context.mjs +2 more (#4342)
+- [discovery] Reviewed 10 files: beax27x3g.txt, utils.mjs, schema.mjs, hook-context.mjs +6 mo… (#4338)
 
 </claude-mem-context>
