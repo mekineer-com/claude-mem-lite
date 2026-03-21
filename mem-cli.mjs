@@ -5,7 +5,7 @@
 import { ensureDb, DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { getVocabulary, computeVector } from './tfidf.mjs';
+import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -147,7 +147,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
   const params = [...whereParams, ...orderParams, limit];
 
   // Scoring aligned with server.mjs: BM25 × type-decay × project_boost × importance × access_bonus
-  return db.prepare(`
+  const ftsRows = db.prepare(`
     SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.lesson_learned
     FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
@@ -159,6 +159,43 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
       * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
     LIMIT ?
   `).all(...params);
+
+  // Hybrid: vector search + RRF merge (best-effort)
+  try {
+    const vocab = getVocabulary(db);
+    if (vocab) {
+      const queryText = ftsQuery.replace(/['"()]/g, ' ');
+      const queryVec = computeVector(queryText, vocab);
+      if (queryVec) {
+        const vecResults = vectorSearch(db, queryVec, {
+          project: project || null,
+          vocabVersion: vocab.version,
+          limit: 500,
+        });
+        if (vecResults.length > 0 && ftsRows.length > 0) {
+          const rrfRanking = rrfMerge(ftsRows, vecResults);
+          const rowMap = new Map(ftsRows.map(r => [r.id, r]));
+          for (const vr of vecResults) {
+            if (!rowMap.has(vr.id)) {
+              const obs = db.prepare('SELECT id, type, title, subtitle, created_at, lesson_learned FROM observations WHERE id = ?').get(vr.id);
+              if (obs) rowMap.set(vr.id, obs);
+            }
+          }
+          return rrfRanking
+            .filter(rr => rowMap.has(rr.id))
+            .map(rr => rowMap.get(rr.id))
+            .slice(0, limit);
+        } else if (vecResults.length > 0 && ftsRows.length === 0) {
+          return vecResults
+            .map(vr => db.prepare('SELECT id, type, title, subtitle, created_at, lesson_learned FROM observations WHERE id = ?').get(vr.id))
+            .filter(Boolean)
+            .slice(0, limit);
+        }
+      }
+    }
+  } catch { /* vector search is best-effort */ }
+
+  return ftsRows;
 }
 
 function cmdRecent(db, args) {
