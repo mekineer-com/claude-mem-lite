@@ -7,6 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
+import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
@@ -535,6 +536,28 @@ server.registerTool(
       results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 
+    // Tier post-filter: batch-lookup full rows and classify
+    if (args.tier) {
+      const obsIds = results.filter(r => r.source === 'obs').map(r => r.id);
+      if (obsIds.length > 0) {
+        const placeholders = obsIds.map(() => '?').join(',');
+        const fullRows = db.prepare(
+          `SELECT id, compressed_into, superseded_at, memory_session_id, project, importance, last_accessed_at, created_at_epoch, type FROM observations WHERE id IN (${placeholders})`
+        ).all(...obsIds);
+        const rowMap = new Map(fullRows.map(r => [r.id, r]));
+        const tierCtx = { now: Date.now(), currentProject: currentProject, currentSessionId: '' };
+        const filtered = results.filter(r => {
+          if (r.source !== 'obs') return true;
+          const full = rowMap.get(r.id);
+          return full && computeTier(full, tierCtx) === args.tier;
+        });
+        results.length = 0;
+        results.push(...filtered);
+      } else if (args.tier !== 'archive') {
+        // No obs results but tier filter set — keep non-obs results
+      }
+    }
+
     const totalBeforePagination = results.length;
     const paginatedResults = isCrossSource ? results.slice(offset, offset + limit) : results;
 
@@ -886,6 +909,17 @@ server.registerTool(
       SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}
     `).get(...baseParams);
 
+    // Tier distribution
+    const tierCtx = { now: Date.now(), currentProject: args.project || inferProject(), currentSessionId: '' };
+    const tdParams = tierSqlParams(tierCtx);
+    const tierDist = db.prepare(`
+      SELECT tier, COUNT(*) as c FROM (
+        SELECT ${TIER_CASE_SQL} as tier FROM observations
+        WHERE 1=1 ${projectFilter}
+      ) GROUP BY tier ORDER BY tier
+    `).all(...tdParams, ...baseParams);
+    const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));
+
     const lines = [
       `Memory Statistics${args.project ? ` (project: ${args.project})` : ''}:`,
       '',
@@ -906,6 +940,9 @@ server.registerTool(
       `  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`,
       `  Compressed: ${compressedCount.c}`,
       ...(noiseRatio > 0.6 ? ['  ⚠️ High noise ratio — consider running mem_compress'] : []),
+      '',
+      'Tier distribution:',
+      `  🔴 Working: ${tierMap.working ?? 0} | 🟡 Active: ${tierMap.active ?? 0} | 🔵 Archive: ${tierMap.archive ?? 0}`,
     ];
 
     return { content: [{ type: 'text', text: lines.join('\n') }] };

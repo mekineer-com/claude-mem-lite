@@ -37,6 +37,7 @@ export const memSearchSchema = {
   date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD). Date-only format is inclusive (covers full day)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
   branch: z.string().optional().describe('Filter by git branch name'),
+  tier: z.enum(['working', 'active', 'archive']).optional().describe('Filter by memory tier (working=current session, active=within decay window, archive=old/compressed)'),
   limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max results (default 20)'),
   offset: coerceInt.pipe(z.number().int().min(0)).optional().describe('Offset for pagination'),
 };

@@ -199,7 +199,7 @@ const SOURCE_FILES = [
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
-  'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs',
+  'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs',
 ];
 const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
 
