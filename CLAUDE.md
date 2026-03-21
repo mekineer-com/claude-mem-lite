@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.13.0
+- **Version**: 2.14.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (24 test files, vitest)
 - **Lint**: `npx eslint .`
