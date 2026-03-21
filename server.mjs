@@ -11,7 +11,7 @@ import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { getVocabulary, buildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
+import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -1351,7 +1351,7 @@ server.registerTool(
       if (ops.includes('rebuild_vectors')) {
         try {
           _resetVocabCache();
-          const vocab = buildVocabulary(db);
+          const vocab = rebuildVocabulary(db);
           if (!vocab) {
             results.push('Vectors: no observations to build vocabulary from');
           } else {

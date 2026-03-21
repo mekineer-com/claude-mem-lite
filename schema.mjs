@@ -201,6 +201,18 @@ export function initSchema(db) {
     )
   `);
 
+  // Persisted vocabulary for stable TF-IDF vector indexing
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS vocab_state (
+      term TEXT NOT NULL,
+      term_index INTEGER NOT NULL,
+      idf REAL NOT NULL,
+      version TEXT NOT NULL,
+      created_at_epoch INTEGER NOT NULL
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_vocab_state_version ON vocab_state(version)');
+
   // Project name normalization: migrate short names ("mem") to canonical form ("projects--mem")
   // Strategy: exact suffix match first, then substring match for package-name aliases
   // Idempotent: only runs when short-name records exist

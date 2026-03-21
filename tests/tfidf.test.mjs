@@ -1,6 +1,6 @@
 // tests/tfidf.test.mjs
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { tokenize, buildVocabulary, computeVector, cosineSimilarity, VOCAB_DIM, _resetVocabCache } from '../tfidf.mjs';
+import { tokenize, buildVocabulary, rebuildVocabulary, getVocabulary, computeVector, cosineSimilarity, vectorSearch, VOCAB_DIM, _resetVocabCache } from '../tfidf.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('tokenize', () => {
@@ -198,6 +198,56 @@ describe('buildVocabulary noise filtering', () => {
     expect(terms).not.toContain('10');
     expect(terms).toContain('error');
     expect(terms).toContain('performance');
+    db.close();
+  });
+});
+
+describe('persisted vocabulary', () => {
+  it('rebuildVocabulary persists to vocab_state table', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'database schema migration', narrative: 'alter table add column' });
+    insertObs(db, { title: 'search query optimization', narrative: 'FTS5 BM25 ranking' });
+    const vocab = rebuildVocabulary(db);
+    expect(vocab).not.toBeNull();
+    const rows = db.prepare('SELECT COUNT(*) as c FROM vocab_state').get();
+    expect(rows.c).toBe(vocab.terms.size);
+    const versionRow = db.prepare('SELECT DISTINCT version FROM vocab_state').get();
+    expect(versionRow.version).toBe(vocab.version);
+    db.close();
+  });
+
+  it('getVocabulary loads from DB without recomputing', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'test observation one', narrative: 'content here' });
+    const v1 = rebuildVocabulary(db);
+    _resetVocabCache();
+    const v2 = getVocabulary(db);
+    expect(v2.version).toBe(v1.version);
+    expect(v2.terms.size).toBe(v1.terms.size);
+    for (const [term, entry] of v1.terms) {
+      expect(v2.terms.get(term)?.index).toBe(entry.index);
+    }
+    db.close();
+  });
+
+  it('vectors use persisted vocab version and match on search', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'database error fix', narrative: 'fixed the schema bug' });
+    insertObs(db, { title: 'search optimization', narrative: 'improved query ranking' });
+    insertObs(db, { title: 'hook implementation', narrative: 'session start handler' });
+    const vocab = rebuildVocabulary(db);
+    const obs = db.prepare('SELECT id, title, narrative FROM observations').all();
+    const insertVec = db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)');
+    for (const o of obs) {
+      const vec = computeVector(o.title + ' ' + o.narrative, vocab);
+      if (vec) insertVec.run(o.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+    }
+    const queryVec = computeVector('database schema error', vocab);
+    const results = vectorSearch(db, queryVec, { vocabVersion: vocab.version });
+    expect(results.length).toBeGreaterThan(0);
     db.close();
   });
 });

@@ -118,11 +118,55 @@ export function buildVocabulary(db) {
 }
 
 /**
- * Get cached vocabulary or build if needed.
+ * Rebuild vocabulary from corpus AND persist to vocab_state table.
+ * @param {object} db - better-sqlite3 database
+ * @returns {object|null} The new vocabulary
+ */
+export function rebuildVocabulary(db) {
+  const vocab = buildVocabulary(db);
+  if (!vocab) return null;
+
+  db.prepare('DELETE FROM vocab_state').run();
+  const insertStmt = db.prepare(
+    'INSERT INTO vocab_state (term, term_index, idf, version, created_at_epoch) VALUES (?, ?, ?, ?, ?)'
+  );
+  const now = Date.now();
+  db.transaction(() => {
+    for (const [term, entry] of vocab.terms) {
+      insertStmt.run(term, entry.index, entry.idf, vocab.version, now);
+    }
+  })();
+
+  _vocabCache = vocab;
+  return vocab;
+}
+
+/**
+ * Get cached vocabulary, load from DB, or rebuild from corpus.
+ * @param {object} db - better-sqlite3 database
+ * @returns {object|null} vocabulary
  */
 export function getVocabulary(db) {
   if (_vocabCache) return _vocabCache;
-  return buildVocabulary(db);
+
+  // Try loading from persisted vocab_state
+  try {
+    const rows = db.prepare(
+      'SELECT term, term_index, idf, version FROM vocab_state ORDER BY term_index'
+    ).all();
+    if (rows.length > 0) {
+      const terms = new Map();
+      for (const r of rows) {
+        terms.set(r.term, { index: r.term_index, idf: r.idf });
+      }
+      const vocab = { terms, version: rows[0].version, dim: VOCAB_DIM };
+      _vocabCache = vocab;
+      return vocab;
+    }
+  } catch { /* table may not exist in old/test DBs */ }
+
+  // Fallback: compute and persist (first run)
+  return rebuildVocabulary(db);
 }
 
 // ─── Vector Computation ─────────────────────────────────────────────────────
