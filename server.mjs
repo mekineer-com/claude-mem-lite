@@ -178,6 +178,7 @@ function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset } = {})
       AND (? IS NULL OR o.created_at_epoch >= ?)
       AND (? IS NULL OR o.created_at_epoch <= ?)
       AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+      AND (? IS NULL OR o.branch = ?)
     ORDER BY score
     LIMIT ?${withOffset ? ' OFFSET ?' : ''}`;
 }
@@ -193,6 +194,7 @@ function buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epoch
     epochFrom, epochFrom,
     epochTo, epochTo,
     args.importance ?? null, args.importance ?? null,
+    args.branch ?? null, args.branch ?? null,
     limit,
   );
   if (offset !== undefined) params.push(offset);
@@ -246,6 +248,7 @@ function searchObservations(ctx) {
     if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
     if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
     if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
+    if (args.branch) { wheres.push('branch = ?'); params.push(args.branch); }
     const where = `WHERE ${wheres.join(' AND ')}`;
     params.push(perSourceLimit, perSourceOffset);
     const rows = db.prepare(`

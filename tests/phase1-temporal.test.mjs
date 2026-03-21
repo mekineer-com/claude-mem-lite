@@ -83,3 +83,32 @@ describe('branch on observation creation', () => {
     expect(obs.last_accessed_at).toBe(now);
   });
 });
+
+describe('branch-scoped search', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'fix on main', branch: 'main', type: 'bugfix', text: 'fixed the auth bug' });
+    insertObs(db, { title: 'fix on feature', branch: 'feat/auth', type: 'bugfix', text: 'fixed the auth refactor' });
+    insertObs(db, { title: 'fix no branch', branch: null, type: 'bugfix', text: 'legacy fix' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('filters observations by branch when specified', () => {
+    const rows = db.prepare(`
+      SELECT id, title FROM observations
+      WHERE branch = ? AND COALESCE(compressed_into, 0) = 0
+    `).all('main');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].title).toBe('fix on main');
+  });
+
+  it('returns all branches when branch filter is null', () => {
+    const rows = db.prepare(`
+      SELECT id, title FROM observations
+      WHERE (? IS NULL OR branch = ?) AND COALESCE(compressed_into, 0) = 0
+    `).all(null, null);
+    expect(rows).toHaveLength(3);
+  });
+});
