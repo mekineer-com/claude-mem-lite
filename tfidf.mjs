@@ -126,12 +126,12 @@ export function rebuildVocabulary(db) {
   const vocab = buildVocabulary(db);
   if (!vocab) return null;
 
-  db.prepare('DELETE FROM vocab_state').run();
   const insertStmt = db.prepare(
     'INSERT INTO vocab_state (term, term_index, idf, version, created_at_epoch) VALUES (?, ?, ?, ?, ?)'
   );
   const now = Date.now();
   db.transaction(() => {
+    db.prepare('DELETE FROM vocab_state').run();
     for (const [term, entry] of vocab.terms) {
       insertStmt.run(term, entry.index, entry.idf, vocab.version, now);
     }
