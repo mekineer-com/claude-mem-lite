@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { buildVocabulary, computeVector, _resetVocabCache, VOCAB_DIM, vectorSearch, rrfMerge, cosineSimilarity } from '../tfidf.mjs';
+import { buildVocabulary, computeVector, _resetVocabCache, VOCAB_DIM, vectorSearch, rrfMerge } from '../tfidf.mjs';
 
 describe('observation_vectors table', () => {
   let db;

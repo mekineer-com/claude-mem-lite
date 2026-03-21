@@ -688,7 +688,7 @@ server.registerTool(
     const beforeRows = db.prepare(`
       SELECT id, type, title, subtitle, project, created_at
       FROM observations
-      WHERE created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
+      WHERE created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
       ORDER BY created_at_epoch DESC
       LIMIT ?
     `).all(anchorRow.created_at_epoch, ...baseParams, before);
@@ -697,7 +697,7 @@ server.registerTool(
     const afterRows = db.prepare(`
       SELECT id, type, title, subtitle, project, created_at
       FROM observations
-      WHERE created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
+      WHERE created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
       ORDER BY created_at_epoch ASC
       LIMIT ?
     `).all(anchorRow.created_at_epoch, ...baseParams, after);
