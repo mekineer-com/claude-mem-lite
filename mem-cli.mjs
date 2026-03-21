@@ -151,7 +151,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE ${wheres.join(' AND ')}
     ORDER BY ${OBS_BM25}
-      * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
+      * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
       * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
       * (0.5 + 0.5 * COALESCE(o.importance, 1))
       * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
@@ -241,7 +241,7 @@ function cmdGet(db, args) {
   const placeholders = ids.map(() => '?').join(',');
 
   // Update access_count (aligned with MCP mem_get)
-  db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id IN (${placeholders})`).run(...ids);
+  db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
 
   const rows = db.prepare(`
     SELECT id, type, title, subtitle, narrative, text, concepts, facts,
@@ -311,7 +311,7 @@ function cmdTimeline(db, args) {
   }
 
   // Update access_count for anchor (aligned with MCP mem_timeline)
-  db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id = ?').run(anchorId);
+  db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
 
   // Get anchor epoch
   const anchorRow = db.prepare('SELECT created_at_epoch, project FROM observations WHERE id = ?').get(anchorId);

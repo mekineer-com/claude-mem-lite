@@ -89,9 +89,10 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
 
     // Update access_count for injected memories
     const result = scored.slice(0, MAX_MEMORY_INJECTIONS);
-    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id = ?');
+    const now = Date.now();
+    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
     for (const r of result) {
-      updateStmt.run(r.id);
+      updateStmt.run(now, r.id);
     }
 
     return result;
@@ -131,8 +132,9 @@ export function recallForFile(db, filePath, project) {
       ORDER BY created_at_epoch DESC
       LIMIT ?
     `).all(project, cutoff, pathPattern, namePattern, MAX_FILE_RECALL);
-    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id = ?');
-    for (const r of rows) updateStmt.run(r.id);
+    const now = Date.now();
+    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
+    for (const r of rows) updateStmt.run(now, r.id);
     return rows;
   } catch (e) {
     debugCatch(e, 'recallForFile');

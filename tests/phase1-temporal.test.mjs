@@ -164,3 +164,40 @@ describe('supersession persistence', () => {
     expect(dbRow.superseded_by).toBe(results[1].id);
   });
 });
+
+describe('last_accessed_at tracking', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('updates last_accessed_at when access_count increments', () => {
+    insertObs(db, { title: 'accessed obs' });
+    const before = db.prepare("SELECT last_accessed_at FROM observations WHERE title = 'accessed obs'").get();
+    expect(before.last_accessed_at).toBeNull();
+
+    db.prepare("UPDATE observations SET access_count = access_count + 1, last_accessed_at = ? WHERE title = 'accessed obs'").run(Date.now());
+
+    const after = db.prepare("SELECT last_accessed_at, access_count FROM observations WHERE title = 'accessed obs'").get();
+    expect(after.last_accessed_at).not.toBeNull();
+    expect(after.access_count).toBe(1);
+  });
+
+  it('MAX scoring uses last_accessed_at when more recent than created_at', () => {
+    const recentAccess = Date.now() - 86400000; // 1 day ago
+    insertObs(db, { title: 'old but accessed', epochOffset: -30 * 86400000, lastAccessedAt: recentAccess });
+    insertObs(db, { title: 'old never accessed', epochOffset: -30 * 86400000 });
+
+    // Verify MAX picks the larger value
+    const rows = db.prepare(`
+      SELECT title,
+        MAX(created_at_epoch, COALESCE(last_accessed_at, created_at_epoch)) as freshness
+      FROM observations
+      ORDER BY freshness DESC
+    `).all();
+    expect(rows[0].title).toBe('old but accessed');
+    expect(rows[0].freshness).toBe(recentAccess);
+  });
+});

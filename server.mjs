@@ -147,13 +147,13 @@ function safeHandler(fn) {
 
 // Score expression variants for FTS5 queries (see Scoring Model Constants above)
 const FULL_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
+  * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
+  * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * (0.5 + 0.5 * COALESCE(o.importance, 1))`;
 
 /**
@@ -664,8 +664,8 @@ server.registerTool(
     } else {
       // Increment access_count for retrieved observations (batch UPDATE)
       db.prepare(
-        `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1 WHERE id IN (${placeholders})`
-      ).run(...args.ids);
+        `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`
+      ).run(Date.now(), ...args.ids);
       // Auto-boost importance for frequently accessed observations
       autoBoostIfNeeded(db, args.ids);
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
