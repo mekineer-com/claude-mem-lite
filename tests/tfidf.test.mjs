@@ -163,6 +163,45 @@ describe('cosineSimilarity', () => {
   });
 });
 
+describe('buildVocabulary noise filtering', () => {
+  it('excludes English stop words from vocabulary', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'the and or but in on at to for of is it', narrative: 'the cat sat on the mat with the hat' });
+    insertObs(db, { title: 'database migration schema', narrative: 'fix the error in schema migration' });
+    insertObs(db, { title: 'hook implementation', narrative: 'implement the hook for this feature' });
+    const vocab = buildVocabulary(db);
+    const terms = [...vocab.terms.keys()];
+    expect(terms).not.toContain('the');
+    expect(terms).not.toContain('and');
+    expect(terms).not.toContain('in');
+    expect(terms).not.toContain('on');
+    expect(terms).not.toContain('for');
+    expect(terms).not.toContain('of');
+    expect(terms).not.toContain('is');
+    expect(terms).toContain('database');
+    expect(terms).toContain('migration');
+    expect(terms).toContain('schema');
+    db.close();
+  });
+
+  it('excludes pure numeric tokens from vocabulary', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'error 2026 03 21 fix 404', narrative: 'date 2026-03-21 status 404 500' });
+    insertObs(db, { title: 'performance test 10 20 30', narrative: 'run 100 iterations in 50ms' });
+    const vocab = buildVocabulary(db);
+    const terms = [...vocab.terms.keys()];
+    expect(terms).not.toContain('2026');
+    expect(terms).not.toContain('03');
+    expect(terms).not.toContain('21');
+    expect(terms).not.toContain('10');
+    expect(terms).toContain('error');
+    expect(terms).toContain('performance');
+    db.close();
+  });
+});
+
 describe('Float32Array BLOB roundtrip', () => {
   it('survives Buffer serialization', () => {
     const original = new Float32Array([1.5, -2.3, 0, 0.001, 999.99]);

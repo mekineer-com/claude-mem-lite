@@ -8,6 +8,26 @@ import { createHash } from 'crypto';
 
 export const VOCAB_DIM = 512;
 
+const VOCAB_STOP_WORDS = new Set([
+  'the','a','an','is','are','was','were','be','been','being',
+  'have','has','had','do','does','did','will','would','could',
+  'should','may','might','can','shall','to','of','in','for',
+  'on','with','at','by','from','as','into','about','between',
+  'after','before','above','below','and','or','but','not','no',
+  'this','that','these','those','it','its','my','your','his',
+  'her','our','their','me','him','us','them','i','you','he',
+  'she','we','they','what','which','who','when','where','how',
+  'all','each','every','both','few','more','most','other','some',
+  'such','than','too','very','just','also','then','so','if',
+  'now','only','still','here','there','up','out','am',
+]);
+
+function isNoiseTerm(term) {
+  if (VOCAB_STOP_WORDS.has(term)) return true;
+  if (/^\d+$/.test(term)) return true;
+  return false;
+}
+
 // ─── Tokenization ───────────────────────────────────────────────────────────
 
 const CJK_RANGE = /[\u4e00-\u9fff\u3400-\u4dbf]/;
@@ -76,8 +96,9 @@ export function buildVocabulary(db) {
     }
   }
 
-  // Sort by DF descending, take top VOCAB_DIM
+  // Sort by DF descending, filter noise, take top VOCAB_DIM
   const sortedTerms = [...df.entries()]
+    .filter(([term]) => !isNoiseTerm(term))
     .sort((a, b) => b[1] - a[1])
     .slice(0, VOCAB_DIM);
 
