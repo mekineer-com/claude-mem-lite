@@ -127,6 +127,7 @@ export function recallForFile(db, filePath, project) {
       WHERE project = ?
         AND importance >= 2
         AND COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
         AND created_at_epoch > ?
         AND (files_modified LIKE ? ESCAPE '\\' OR files_modified LIKE ? ESCAPE '\\')
       ORDER BY created_at_epoch DESC
