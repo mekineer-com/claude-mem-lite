@@ -11,7 +11,7 @@ import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { getVocabulary, computeVector } from './tfidf.mjs';
+import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -243,6 +243,58 @@ function searchObservations(ctx) {
       expandObsByConceptCo(ctx, now, existingIds, results);
       expandObsByPRF(ctx, now, rows.length, existingIds, results);
     }
+
+    // Vector search + RRF hybrid merge
+    try {
+      const vocab = getVocabulary(db);
+      if (vocab) {
+        const queryText = ftsQuery.replace(/['"()]/g, ' ');
+        const queryVec = computeVector(queryText, vocab);
+        if (queryVec) {
+          const vecResults = vectorSearch(db, queryVec, {
+            project: args.project ?? null,
+            type: args.obs_type ?? null,
+            vocabVersion: vocab.version,
+          });
+          if (vecResults.length > 0 && results.length > 0) {
+            // RRF merge: combine BM25 ranked results with vector ranked results
+            const rrfRanking = rrfMerge(results, vecResults);
+            const resultMap = new Map(results.map(r => [r.id, r]));
+            // Add vector-only results (found by similarity but not by FTS5)
+            for (const vr of vecResults) {
+              if (!resultMap.has(vr.id)) {
+                const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch FROM observations WHERE id = ?').get(vr.id);
+                if (obs) {
+                  // Apply same filter constraints as FTS5
+                  if (epochFrom !== null && obs.created_at_epoch < epochFrom) continue;
+                  if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
+                  if (args.importance && (obs.importance ?? 1) < args.importance) continue;
+                  if (args.branch && obs.branch !== args.branch) continue;
+                  resultMap.set(vr.id, { source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, snippet: '' });
+                }
+              }
+            }
+            // Re-order by RRF score
+            const reordered = rrfRanking
+              .filter(rr => resultMap.has(rr.id))
+              .map(rr => ({ ...resultMap.get(rr.id), score: -rr.rrfScore })); // negative for BM25-compatible sort
+            results.length = 0;
+            results.push(...reordered);
+          } else if (vecResults.length > 0 && results.length === 0) {
+            // FTS5 found nothing but vector found results
+            for (const vr of vecResults) {
+              const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch FROM observations WHERE id = ?').get(vr.id);
+              if (!obs) continue;
+              if (epochFrom !== null && obs.created_at_epoch < epochFrom) continue;
+              if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
+              if (args.importance && (obs.importance ?? 1) < args.importance) continue;
+              if (args.branch && obs.branch !== args.branch) continue;
+              results.push({ source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, score: -vr.similarity, snippet: '' });
+            }
+          }
+        }
+      }
+    } catch (e) { debugCatch(e, 'searchObservations-vector'); }
   } else {
     const params = [];
     const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];

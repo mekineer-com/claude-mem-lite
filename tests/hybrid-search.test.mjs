@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { buildVocabulary, computeVector, _resetVocabCache, VOCAB_DIM } from '../tfidf.mjs';
+import { buildVocabulary, computeVector, _resetVocabCache, VOCAB_DIM, vectorSearch, rrfMerge, cosineSimilarity } from '../tfidf.mjs';
 
 describe('observation_vectors table', () => {
   let db;
@@ -64,5 +64,84 @@ describe('vector write helper', () => {
     expect(row.vocab_version).toBe(vocab.version);
     const restored = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4);
     expect(restored.length).toBe(VOCAB_DIM);
+  });
+});
+
+describe('rrfMerge', () => {
+  it('merges two ranked lists with correct RRF formula', () => {
+    const bm25 = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    const vector = [{ id: 2 }, { id: 4 }, { id: 1 }];
+    const merged = rrfMerge(bm25, vector);
+    expect(merged[0].id).toBe(2);
+    const id1 = merged.find(r => r.id === 1);
+    const id4 = merged.find(r => r.id === 4);
+    expect(id1.rrfScore).toBeGreaterThan(id4.rrfScore);
+  });
+
+  it('handles empty inputs', () => {
+    expect(rrfMerge([], [])).toEqual([]);
+    expect(rrfMerge([{ id: 1 }], []).length).toBe(1);
+  });
+
+  it('RRF score formula is 1/(k+rank)', () => {
+    const result = rrfMerge([{ id: 1 }], [{ id: 1 }], 60);
+    expect(result[0].rrfScore).toBeCloseTo(2 / 61, 6);
+  });
+});
+
+describe('vectorSearch', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1' }); _resetVocabCache(); });
+  afterEach(() => { db.close(); });
+
+  it('finds similar observations by vector', () => {
+    insertObs(db, { title: 'auth token refresh', narrative: 'fix the authentication token expiry bug in login' });
+    insertObs(db, { title: 'database migration script', narrative: 'update database schema for new user table columns' });
+    insertObs(db, { title: 'auth session fix', narrative: 'the authentication session was broken after logout' });
+
+    const vocab = buildVocabulary(db);
+    if (!vocab) return;
+
+    const allObs = db.prepare('SELECT id, title, narrative FROM observations').all();
+    for (const o of allObs) {
+      const vec = computeVector(o.title + ' ' + o.narrative, vocab);
+      if (vec) {
+        db.prepare('INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+          .run(o.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+      }
+    }
+
+    const queryVec = computeVector('authentication problem', vocab);
+    if (!queryVec) return;
+    const results = vectorSearch(db, queryVec, { vocabVersion: vocab.version });
+
+    expect(results.length).toBeGreaterThan(0);
+    const dbObs = allObs.find(o => o.title.includes('database'));
+    const authResults = results.filter(r => r.id !== dbObs.id);
+    expect(authResults.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('excludes compressed observations', () => {
+    insertObs(db, { title: 'active auth fix', narrative: 'authentication repair work' });
+    insertObs(db, { title: 'compressed auth fix', narrative: 'old authentication repair work', compressedInto: -1 });
+
+    const vocab = buildVocabulary(db);
+    if (!vocab) return;
+
+    const allObs = db.prepare('SELECT id, title, narrative FROM observations').all();
+    for (const o of allObs) {
+      const vec = computeVector(o.title + ' ' + o.narrative, vocab);
+      if (vec) {
+        db.prepare('INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+          .run(o.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+      }
+    }
+
+    const queryVec = computeVector('authentication', vocab);
+    if (!queryVec) return;
+    const results = vectorSearch(db, queryVec, { vocabVersion: vocab.version });
+
+    const compressedObs = db.prepare("SELECT id FROM observations WHERE compressed_into IS NOT NULL").get();
+    expect(results.every(r => r.id !== compressedObs?.id)).toBe(true);
   });
 });
