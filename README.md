@@ -53,7 +53,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 ## Features
 
 - **Automatic capture** -- Hooks into Claude Code lifecycle (PostToolUse, SessionStart, Stop, UserPromptSubmit) to record observations without manual effort
-- **FTS5 search** -- BM25-ranked full-text search across observations, session summaries, and user prompts with importance weighting
+- **Hybrid search** -- FTS5 BM25 + TF-IDF vector cosine similarity, merged via Reciprocal Rank Fusion (RRF). FTS5 handles keyword matching; 512-dim TF-IDF vectors capture semantic similarity for recall beyond exact terms
 - **Timeline browsing** -- Navigate observations chronologically with anchor-based context windows
 - **Episode batching** -- Groups related file operations into coherent episodes before LLM encoding
 - **Error-triggered recall** -- Automatically searches memory when Bash errors occur, surfacing relevant past fixes
@@ -67,7 +67,10 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Read file tracking** -- Tracks files read during sessions for richer episode context
 - **Zero data loss** -- If LLM fails, observations are saved with degraded (inferred) metadata instead of being discarded
 - **Two-tier dedup** -- Jaccard similarity (5-minute window) + MinHash signatures (7-day cross-session window) prevent duplicates
-- **Synonym expansion** -- Abbreviations like `K8s`, `DB`, `auth` automatically expand to full forms in FTS5 search (48+ pairs)
+- **Synonym expansion** -- Abbreviations like `K8s`, `DB`, `auth` automatically expand to full forms in FTS5 search (100+ pairs including CJK↔EN cross-language mappings)
+- **CJK synonym extraction** -- Unsegmented Chinese text is scanned for known vocabulary words (数据库→database, 搜索→search, etc.) enabling cross-language memory recall
+- **Stop-word filtering** -- English stop words filtered from both TF-IDF vocabulary (reclaiming ~18% of vector dimensions) and FTS queries (preventing false negatives from noise terms like "how", "the", "does")
+- **Persisted vocabulary** -- TF-IDF vocabulary persisted to `vocab_state` table, preventing vector staleness when document frequencies shift. Vectors stay valid until explicit rebuild
 - **Pseudo-relevance feedback (PRF)** -- Top results seed expansion queries for broader recall
 - **Concept co-occurrence** -- Shared concepts across observations expand search to related topics
 - **Context-aware re-ranking** -- Active file overlap boosts relevance (exact match + directory-level half-weight)
@@ -88,6 +91,8 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Exponential recency decay** -- Type-differentiated half-lives (decisions: 90d, discoveries: 60d, bugfixes: 14d, changes: 7d) consistently applied in all ranking paths
 - **Prompt-time memory injection** -- UserPromptSubmit hook automatically searches and injects relevant past observations with recency and importance weighting
 - **Dual injection dedup** -- `user-prompt-search.js` and `handleUserPrompt` coordinate via temp file to prevent duplicate memory injection
+- **Result-dedup cooldown** -- User-prompt memory injection uses result-overlap detection (>80% ID overlap → skip) instead of time-based cooldown, allowing topic switches within seconds while preventing redundant injections
+- **OR query fallback** -- When AND-joined FTS5 queries return zero results, automatically relaxes to OR-joined queries for broader recall (applied in both user-prompt-search and hook-memory paths)
 - **Configurable LLM model** -- Switch between Haiku (fast/cheap) and Sonnet (deeper analysis) via `CLAUDE_MEM_MODEL` env var
 - **DB auto-recovery** -- Detects and cleans corrupted WAL/SHM files on startup; periodic WAL checkpoints prevent unbounded growth
 - **Schema auto-migration** -- Idempotent `ALTER TABLE` migrations run on every startup, safely adding new columns and indexes without data loss
@@ -202,7 +207,7 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | `mem_stats` | View statistics: counts, type distribution, top projects, daily activity. |
 | `mem_delete` | Delete observations by ID with preview/confirm workflow. FTS5 cleanup is automatic. |
 | `mem_compress` | Compress old low-value observations into weekly summaries to reduce noise. |
-| `mem_maintain` | Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/dedup operations. |
+| `mem_maintain` | Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/dedup/rebuild_vectors operations. |
 | `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. |
 
 ### Skill Commands (in Claude Code chat)
@@ -258,6 +263,16 @@ id, content_session_id, prompt_text, prompt_number
 ```
 project, type, session_id, working_on, completed, unfinished,
 key_files, key_decisions, match_keywords, created_at_epoch
+```
+
+**observation_vectors** -- TF-IDF vector embeddings for hybrid search
+```
+observation_id, vector (BLOB Float32Array), vocab_version, created_at_epoch
+```
+
+**vocab_state** -- Persisted TF-IDF vocabulary for stable vector indexing
+```
+term, term_index, idf, version, created_at_epoch
 ```
 
 FTS5 indexes: `observations_fts` (title, subtitle, narrative, text, facts, concepts, lesson_learned), `session_summaries_fts`, `user_prompts_fts`
@@ -405,7 +420,9 @@ claude-mem-lite/
   hook-semaphore.mjs   # LLM concurrency control: file-based semaphore for background workers
   schema.mjs           # Database schema: single source of truth for tables, migrations, FTS5
   tool-schemas.mjs     # Shared Zod schemas for MCP tool validation
-  utils.mjs            # Shared utilities: FTS5 query building, BM25 weight constants, MinHash dedup, secret scrubbing
+  tfidf.mjs            # TF-IDF vector engine: tokenization, vocabulary building, vector computation, cosine similarity, RRF merge
+  tier.mjs             # Temporal tier system: activity-based time window classification
+  utils.mjs            # Shared utilities: FTS5 query building, BM25 weight constants, MinHash dedup, secret scrubbing, CJK synonym extraction
   # Resource registry
   registry.mjs         # Resource registry DB: schema, CRUD, FTS5, invocation tracking
   registry-retriever.mjs # FTS5 retrieval with synonym expansion and composite scoring
