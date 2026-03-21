@@ -15,9 +15,9 @@ Add lightweight local vector search using TF-IDF sparse vectors (zero new depend
 ### Vocabulary
 
 Built from all non-archived observations' `title`, `narrative`, and `concepts` fields:
-1. Tokenize: lowercase, split on non-alphanumeric (preserving CJK characters), filter tokens < 2 chars
+1. Tokenize: lowercase, split on non-alphanumeric for ASCII; reuse `cjkBigrams()` from `utils.mjs` for CJK text segments (consistent with FTS5 indexing); filter tokens < 2 chars
 2. Compute document frequency (DF) for each term across all documents
-3. Compute IDF: `log(N / (1 + DF))` where N = total document count
+3. Compute IDF: `log(1 + N / (1 + DF))` where N = total document count (non-negative, avoids -Infinity for common terms)
 4. Keep top-N terms by DF (N = 512) as the fixed vocabulary dimension
 5. Store vocabulary version as hash of sorted term list (for staleness detection)
 
@@ -25,6 +25,8 @@ Built from all non-archived observations' `title`, `narrative`, and `concepts` f
 - Session start (hook.mjs session-start event)
 - After mem_compress or mem_maintain operations (vocabulary may shift)
 - Manual: `mem_maintain` with `operations: ['rebuild_vectors']`
+
+**Empty vocabulary guard:** If N=0 (no observations), `buildVocabulary` returns `null`. All callers check for null and skip vector operations gracefully.
 
 **Caching:** Module-level `Map` cache, rebuilt when version changes or on session start.
 
@@ -77,30 +79,55 @@ Vector format: `Float32Array` of `VOCAB_DIM` (512) floats = 2048 bytes per obser
 
 ## Write Path Integration
 
-### `hook-llm.mjs` — `saveObservation`
+### `hook-llm.mjs` — `saveObservation` (INSERT path)
 
-After successful INSERT into `observations`, immediately:
+**Critical:** `saveObservation` manages its own DB lifecycle (`openDb()` → use → `db.close()` in `finally`). The vector insert must go **inside** the function, before the `finally { if (!externalDb) db.close() }` block, not after it. Add the vector write right after the successful INSERT:
+
 ```javascript
-const vocab = getVocabulary(db);
-const text = [obs.title, obs.narrative, obs.concepts?.join?.(' ')].filter(Boolean).join(' ');
-const vec = computeVector(text, vocab);
-if (vec) {
-  db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-    .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
-}
+// Inside saveObservation, after result = db.prepare(...INSERT...).run(...)
+try {
+  const vocab = getVocabulary(db);
+  if (vocab) {
+    const vecText = [obs.title, obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
+    const vec = computeVector(vecText, vocab);
+    if (vec) {
+      db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+        .run(Number(result.lastInsertRowid), Buffer.from(vec.buffer), vocab.version, Date.now());
+    }
+  }
+} catch (e) { debugCatch(e, 'saveObservation-vector'); }
+```
+
+### `hook-llm.mjs` — `handleLLMEpisode` (UPDATE/upgrade path)
+
+When an LLM-enriched observation upgrades a pre-saved one via UPDATE (line ~446-466), the vector must also be recomputed since the text content changes significantly (from rule-based title to LLM-enriched title+narrative+concepts). Add vector re-computation after the UPDATE:
+
+```javascript
+// After db.prepare('UPDATE observations SET ...').run(...) in handleLLMEpisode
+try {
+  const vocab = getVocabulary(db);
+  if (vocab) {
+    const vecText = [obs.title, obs.narrative || '', conceptsText].filter(Boolean).join(' ');
+    const vec = computeVector(vecText, vocab);
+    if (vec) {
+      db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+        .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+    }
+  }
+} catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
 ```
 
 ### `server.mjs` — `mem_save`
 
-Same pattern after the INSERT.
+Same pattern after the INSERT. Server uses module-level `db`, so no lifecycle issue.
 
 ### `mem-cli.mjs` — `cmdSave`
 
-Same pattern after the INSERT.
+Same pattern after the INSERT. CLI uses `ensureDb()` result, vector insert goes before the `finally { db.close() }`.
 
 ### Failure handling
 
-Vector write failures are non-critical — catch and log, don't fail the observation save. Missing vectors just mean that observation won't appear in vector search results (FTS5 still finds it).
+Vector write failures are non-critical — catch and log via `debugCatch`, don't fail the observation save. Missing vectors just mean that observation won't appear in vector search results (FTS5 still finds it).
 
 ## Search Path: RRF Hybrid
 
