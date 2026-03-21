@@ -5,13 +5,11 @@
 
 import { ensureDb } from '../schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE } from '../utils.mjs';
-import { statSync, writeFileSync } from 'fs';
+import { writeFileSync, readFileSync } from 'fs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-const COOLDOWN_FILE = `/tmp/.claude-mem-prompt-ctx-${inferProject()}`;
 const INJECTED_IDS_FILE = `/tmp/.claude-mem-injected-${inferProject()}`;
-const COOLDOWN_MS = 60_000;
 const MAX_RESULTS = 5;
 const LOOKBACK_MS = 60 * 86400000; // 60 days
 
@@ -30,17 +28,23 @@ function shouldSkip(text) {
   return false;
 }
 
-// ─── Cooldown ───────────────────────────────────────────────────────────────
+// ─── Result Dedup ───────────────────────────────────────────────────────────
 
-function checkCooldown() {
+const MAX_SESSION_INJECTIONS = 15;
+const DEDUP_STALE_MS = 300_000; // 5 minutes
+
+function shouldSkipByDedup(newIds) {
+  if (!newIds || newIds.length === 0) return true;
   try {
-    const stat = statSync(COOLDOWN_FILE);
-    return (Date.now() - stat.mtimeMs) < COOLDOWN_MS;
+    const raw = readFileSync(INJECTED_IDS_FILE, 'utf8');
+    const { ids: prevIds, ts, count = 0 } = JSON.parse(raw);
+    if (count >= MAX_SESSION_INJECTIONS) return true;
+    if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
+    if (!Array.isArray(prevIds) || prevIds.length === 0) return false;
+    const prevSet = new Set(prevIds);
+    const overlapCount = newIds.filter(id => prevSet.has(id)).length;
+    return overlapCount / newIds.length >= 0.8;
   } catch { return false; }
-}
-
-function touchCooldown() {
-  try { writeFileSync(COOLDOWN_FILE, String(Date.now())); } catch {}
 }
 
 // ─── Intent Detection ───────────────────────────────────────────────────────
@@ -226,9 +230,6 @@ async function main() {
   // Skip short/confirmation/slash-command/simple-op prompts
   if (shouldSkip(promptText)) return;
 
-  // Cooldown check — avoid flooding context on rapid prompts
-  if (checkCooldown()) return;
-
   let db;
   try {
     db = ensureDb();
@@ -264,14 +265,24 @@ async function main() {
       rows = rows.slice(0, MAX_RESULTS);
     }
 
+    const candidateIds = rows.map(r => r.id);
+    if (shouldSkipByDedup(candidateIds)) return;
+
     const output = formatResults(rows);
     if (output) {
       process.stdout.write(output + '\n');
-      touchCooldown();
-      // Write injected IDs for dedup with hook.mjs handleUserPrompt
+      // Write injected IDs for dedup with hook.mjs handleUserPrompt + self-dedup
       try {
-        const ids = rows.map(r => r.id);
-        writeFileSync(INJECTED_IDS_FILE, JSON.stringify({ ids, ts: Date.now() }));
+        let prevCount = 0;
+        try {
+          const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
+          if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS) prevCount = prev.count || 0;
+        } catch {}
+        writeFileSync(INJECTED_IDS_FILE, JSON.stringify({
+          ids: candidateIds,
+          ts: Date.now(),
+          count: prevCount + 1,
+        }));
       } catch {}
     }
   } catch {

@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { resolve, join } from 'path';
-import { unlinkSync, existsSync, mkdirSync, rmSync } from 'fs';
+import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
@@ -542,5 +542,65 @@ describe('search query functions (in-memory DB)', () => {
     expect(rows.length).toBe(3);
     // Most recent should be first (highest epochOffset)
     expect(rows[0].title).toBe('Obs 4');
+  });
+});
+
+// ─── Unit Tests: Result Dedup Cooldown ──────────────────────────────────────
+
+const MAX_SESSION_INJECTIONS = 15;
+const DEDUP_STALE_MS = 300_000;
+
+function shouldSkipByDedup(newIds, injectedFile) {
+  if (!newIds || newIds.length === 0) return true;
+  try {
+    const raw = readFileSync(injectedFile, 'utf8');
+    const { ids: prevIds, ts, count = 0 } = JSON.parse(raw);
+    if (count >= MAX_SESSION_INJECTIONS) return true;
+    if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
+    if (!Array.isArray(prevIds) || prevIds.length === 0) return false;
+    const prevSet = new Set(prevIds);
+    const overlapCount = newIds.filter(id => prevSet.has(id)).length;
+    return overlapCount / newIds.length >= 0.8;
+  } catch { return false; }
+}
+
+describe('result-dedup cooldown', () => {
+  const testDir = resolve(import.meta.dirname, '.tmp-dedup-test');
+
+  beforeEach(() => {
+    try { mkdirSync(testDir, { recursive: true }); } catch {}
+  });
+
+  afterEach(() => {
+    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+  });
+
+  it('skips injection when >80% overlap with previously injected', () => {
+    const injectedFile = join(testDir, '.claude-mem-injected-dedup1');
+    writeFileSync(injectedFile, JSON.stringify({ ids: [1,2,3,4,5], ts: Date.now() }));
+    expect(shouldSkipByDedup([1,2,3,4,6], injectedFile)).toBe(true);
+  });
+
+  it('allows injection when ≤80% overlap', () => {
+    const injectedFile = join(testDir, '.claude-mem-injected-dedup2');
+    writeFileSync(injectedFile, JSON.stringify({ ids: [1,2,3,4,5], ts: Date.now() }));
+    expect(shouldSkipByDedup([1,2,6,7,8], injectedFile)).toBe(false);
+  });
+
+  it('allows injection when no previous injections exist', () => {
+    const injectedFile = join(testDir, '.claude-mem-injected-nonexistent');
+    expect(shouldSkipByDedup([1,2,3], injectedFile)).toBe(false);
+  });
+
+  it('allows injection when previous injections are stale (>5min)', () => {
+    const injectedFile = join(testDir, '.claude-mem-injected-stale');
+    writeFileSync(injectedFile, JSON.stringify({ ids: [1,2,3,4,5], ts: Date.now() - 400_000 }));
+    expect(shouldSkipByDedup([1,2,3,4,5], injectedFile)).toBe(false);
+  });
+
+  it('skips when session injection limit reached', () => {
+    const injectedFile = join(testDir, '.claude-mem-injected-limit');
+    writeFileSync(injectedFile, JSON.stringify({ ids: [99], ts: Date.now(), count: 15 }));
+    expect(shouldSkipByDedup([1,2,3], injectedFile)).toBe(true);
   });
 });
