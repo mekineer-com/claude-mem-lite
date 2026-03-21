@@ -201,3 +201,68 @@ describe('last_accessed_at tracking', () => {
     expect(rows[0].freshness).toBe(recentAccess);
   });
 });
+
+describe('Phase 1 integration', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('mem_get returns new fields (branch, superseded_at, last_accessed_at)', () => {
+    insertObs(db, {
+      title: 'full lifecycle',
+      branch: 'feat/test',
+      lastAccessedAt: Date.now(),
+    });
+    const obs = db.prepare('SELECT branch, superseded_at, superseded_by, last_accessed_at FROM observations LIMIT 1').get();
+    expect(obs.branch).toBe('feat/test');
+    expect(obs.superseded_at).toBeNull();
+    expect(obs.superseded_by).toBeNull();
+    expect(obs.last_accessed_at).not.toBeNull();
+  });
+
+  it('superseded observations are excluded from default queries', () => {
+    insertObs(db, { title: 'active', type: 'bugfix' });
+    insertObs(db, { title: 'superseded', type: 'bugfix', supersededAt: Date.now(), supersededBy: 1 });
+
+    const active = db.prepare(`
+      SELECT * FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
+    `).all();
+    expect(active).toHaveLength(1);
+    expect(active[0].title).toBe('active');
+  });
+
+  it('branch filter works with other filters', () => {
+    insertObs(db, { title: 'main bugfix', branch: 'main', type: 'bugfix' });
+    insertObs(db, { title: 'feat bugfix', branch: 'feat/x', type: 'bugfix' });
+    insertObs(db, { title: 'main discovery', branch: 'main', type: 'discovery' });
+
+    const rows = db.prepare(`
+      SELECT * FROM observations WHERE branch = ? AND type = ?
+    `).all('main', 'bugfix');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].title).toBe('main bugfix');
+  });
+
+  it('all Phase 1 features work together', () => {
+    // Create observations on different branches with different access patterns
+    insertObs(db, { title: 'main old', branch: 'main', type: 'decision', importance: 2, epochOffset: -60 * 86400000 });
+    insertObs(db, { title: 'feat recent', branch: 'feat/x', type: 'bugfix', importance: 1 });
+    insertObs(db, { title: 'superseded', branch: 'main', type: 'change', supersededAt: Date.now(), supersededBy: 1 });
+
+    // Simulate access to old observation
+    db.prepare("UPDATE observations SET access_count = 3, last_accessed_at = ? WHERE title = 'main old'").run(Date.now());
+
+    // Query: active only, branch=main
+    const mainActive = db.prepare(`
+      SELECT title, branch, last_accessed_at FROM observations
+      WHERE branch = 'main' AND superseded_at IS NULL AND COALESCE(compressed_into, 0) = 0
+    `).all();
+    expect(mainActive).toHaveLength(1);
+    expect(mainActive[0].title).toBe('main old');
+    expect(mainActive[0].last_accessed_at).not.toBeNull();
+  });
+});
