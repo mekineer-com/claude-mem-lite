@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'help']);
+const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'browse', 'help']);
 
 const cmd = process.argv[2];
 

@@ -4,6 +4,7 @@
 
 import { ensureDb, DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
+import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -498,6 +499,90 @@ function cmdContext(_db, _args) {
   out(`[mem] Current context:\n${block}`);
 }
 
+// ─── Browse (tier-grouped dashboard) ────────────────────────────────────────
+
+function cmdBrowse(db, args) {
+  const { flags } = parseArgs(args);
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const tierFilter = flags.tier || null;
+  if (tierFilter && !['working', 'active', 'archive'].includes(tierFilter)) {
+    out(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
+    return;
+  }
+  const limit = parseInt(flags.limit, 10) || (tierFilter ? 20 : 5);
+  const now = Date.now();
+
+  const ctx = {
+    now,
+    currentProject: project,
+    currentSessionId: getActiveSessionId(db, project),
+  };
+  const params = tierSqlParams(ctx);
+
+  const tiers = ['working', 'active', 'archive'];
+  const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
+  const showTiers = tierFilter ? [tierFilter] : tiers;
+
+  out(`📊 Memory Dashboard (${project})\n`);
+
+  let grandTotal = 0;
+  const tierCounts = {};
+
+  for (const tier of showTiers) {
+    const countRow = db.prepare(`
+      SELECT COUNT(*) as c FROM (
+        SELECT ${TIER_CASE_SQL} as tier FROM observations
+        WHERE project = ?
+      ) WHERE tier = ?
+    `).get(...params, project, tier);
+    const count = countRow?.c ?? 0;
+    tierCounts[tier] = count;
+    grandTotal += count;
+
+    out(`${tierLabels[tier]} (${count})`);
+
+    if (tier === 'archive' && !tierFilter) {
+      if (count > 0) out('');
+      continue;
+    }
+
+    if (count === 0) { out(''); continue; }
+
+    const rows = db.prepare(`
+      SELECT * FROM (
+        SELECT id, type, title, created_at_epoch, ${TIER_CASE_SQL} as tier
+        FROM observations
+        WHERE project = ?
+      ) WHERE tier = ?
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all(...params, project, tier, limit);
+
+    for (const r of rows) {
+      out(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 60)} | ${relativeTime(r.created_at_epoch)}`);
+    }
+    if (count > rows.length) out(`  ... and ${count - rows.length} more`);
+    out('');
+  }
+
+  if (grandTotal === 0) {
+    out('No observations found. Start a coding session to build memory.');
+    return;
+  }
+
+  if (!tierFilter) {
+    const parts = tiers.map(t => `${t[0].toUpperCase() + t.slice(1)}: ${tierCounts[t] ?? 0}`);
+    out(`Totals: ${grandTotal} observations | ${parts.join(' | ')}`);
+  }
+}
+
+function getActiveSessionId(db, project) {
+  const row = db.prepare(
+    "SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND status = 'active' ORDER BY started_at_epoch DESC LIMIT 1"
+  ).get(project);
+  return row?.memory_session_id ?? '';
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -539,6 +624,11 @@ Commands:
 
   context               Show current CLAUDE.md context block
 
+  browse                Tier-grouped memory dashboard
+    --tier T            Filter: working|active|archive
+    --project P         Filter by project
+    --limit N           Max entries per tier (default 5)
+
 DB: ${DB_PATH}`);
 }
 
@@ -573,6 +663,7 @@ export async function run(argv) {
       case 'save':    cmdSave(db, cmdArgs); break;
       case 'stats':   cmdStats(db, cmdArgs); break;
       case 'context': cmdContext(db, cmdArgs); break;
+      case 'browse':  cmdBrowse(db, cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');
