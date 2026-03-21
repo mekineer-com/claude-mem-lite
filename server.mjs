@@ -504,7 +504,7 @@ server.registerTool(
     // sessions (-6) and prompts (-1) regardless of actual relevance
     if (isCrossSource && results.length > 0 && ftsQuery) {
       for (const source of ['obs', 'session', 'prompt']) {
-        const sourceResults = results.filter(r => r.source === source && r.score != null);
+        const sourceResults = results.filter(r => r.source === source && r.score !== null && r.score !== undefined);
         // Skip normalization for single-result sources — avoids inflating a weak match to -1.0
         if (sourceResults.length < 2) continue;
         const maxAbs = Math.max(...sourceResults.map(r => Math.abs(r.score)));
