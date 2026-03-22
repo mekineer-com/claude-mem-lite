@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.17.1
+- **Version**: 2.18.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (24 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,19 +49,18 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 以使用者的身份模拟测试claude-mem-lite项目的各个功能（MCP工具、CLI命令、hook系统），检查用户体验，发现问题就修复，评估是否有效提高Claude编程效率。这是第2/3轮或第3/3轮测试（第1轮已在调度时立即执行）。如…
-Remaining: npx vitest run tests/hook-context.test.mjs tests/… → RUN  v4.0.18 /mnt/data_ssd/dev/projects/mem   ✓ tests/memor…; npx …
+Request: Check current project's existing functionality, update README.md documentation, merge and clean branches, commit code a…
+Completed: Updated memory system documentation with TF-IDF vector encoding module for semantic search (tfidf.mjs module, observati…
+Remaining: README.md alignment with TF-IDF feature, branch cleanup, git commit and push, version release creation, GitHub CI/CD ve…
+Next: 1. Update README.md documenting TF-IDF vector encoding feature 2. Clean and merge feature branches 3. Commit changes wi…
+Lessons: TF-IDF vector encoding provides semantic search capability beyond keyword matching - converts observations into comparable vectors for relevance ranking
+Decisions: Dedicated tfidf.mjs module for vector encoding instead of inline utilities - improves modularity and testability; Replaced utils.mjs with dedicated TFIDF module - cleaner separation of concerns for semantic search operations
 
 ### Key Context
-- [bugfix] Error: server.mjs, tool-schemas.mjs: mem 5 results for memory search optimizati… (#4523)
-- [discovery] Worked on schema.mjs, hook.mjs (#4521)
-- [bugfix] Error: phase1-temporal.test.mjs: in_progress running CI 2026-03-21T11:42:36Z co… (#4515)
-- [feature] Add rebuild_vectors operation to mem MCP server (#4512)
-- [bugfix] Error: eslint.config.mjs, mem-cli.mjs: Saved working directory and index state … (#4508)
-
-### Working State (from /clear)
-- Working on: 以使用者的身份模拟测试claude-mem-lite项目的各个功能（MCP工具、CLI命令、hook系统），检查用户体验，发现问题就修复，评估是否有效提高Claude编程效率。这是第2/3轮或第3/3轮测试（第1轮已在调度时立即执行）。如果这是第3轮，完成后用CronDelete取消此任务。
-- Unfinished: npx vitest run tests/hook-context.test.mjs tests/… → RUN  v4.0.18 /mnt/data_ssd/dev/projects/mem   ✓ tests/memor…; npx vitest run tests/user-prompt-search.test.mjs … → RUN  v4.0.18 /mnt/data_ssd/dev/…
-- Key files: mem-cli.mjs
+- [feature] TF-IDF vector encoding for semantic memory search (#4571) — TF-IDF vector encoding layers semantic similarity search on…
+- [change] Modified schema.mjs, tfidf.mjs, server.mjs +1 more (#4550)
+- [discovery] Reviewed 1 files: 2026-03-21-hybrid-search-and-search-quality.md (#4542)
+- [discovery] Reviewed 4 files: server.mjs, utils.mjs, schema.mjs, hook.mjs (#4533)
+- [bugfix] Error: utils.mjs: CJK sentence: (数据库 OR database OR db) CJK questio… (#4531)
 
 </claude-mem-context>
