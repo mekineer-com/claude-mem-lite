@@ -144,7 +144,7 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem` 服务器，包含 7 个工具（search、timeline、get、save、stats、delete、compress）
+2. **注册 MCP 服务器** -- `mem` 服务器，包含 12 个工具（search、timeline、get、save、update、stats、delete、compress、maintain、registry、export、fts_check）
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
@@ -200,9 +200,14 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 | `mem_timeline` | 围绕锚点按时间顺序浏览观察。 |
 | `mem_get` | 获取指定观察 ID 的完整详情（包含重要度和关联 ID）。 |
 | `mem_save` | 手动保存记忆/观察。 |
+| `mem_update` | 原地更新已有观察，保留原始 ID 和引用关系。 |
 | `mem_stats` | 查看统计：计数、类型分布、热门项目、每日活动。 |
 | `mem_delete` | 按 ID 删除观察，支持预览/确认工作流。FTS5 自动清理。 |
 | `mem_compress` | 压缩旧的低价值观察为每周摘要，减少噪声。 |
+| `mem_maintain` | 记忆维护：扫描重复/过期/损坏条目，执行清理/去重/向量重建操作。 |
+| `mem_export` | 导出观察为 JSON 或 JSONL 格式，支持按项目、类型、日期范围过滤。 |
+| `mem_fts_check` | 检查 FTS5 索引完整性或重建索引。搜索结果异常或数据库恢复后使用。 |
+| `mem_registry` | 管理资源注册表：按需搜索技能/代理、列表、统计、导入/移除、重索引。 |
 
 ### 技能命令（在 Claude Code 聊天中使用）
 
@@ -441,7 +446,16 @@ claude-mem-lite/
   hook-semaphore.mjs   # LLM 并发控制：基于文件的信号量
   schema.mjs           # 数据库 schema：表、迁移、FTS5 的单一事实来源
   tool-schemas.mjs     # 共享 Zod schema，用于 MCP 工具校验
-  utils.mjs            # 共享工具：FTS5 查询构建、MinHash 去重、秘密擦除
+  utils.mjs            # 重导出中心：所有工具模块的向后兼容入口
+  nlp.mjs              # FTS5 查询构建：同义词扩展、CJK 二元组、查询清洗
+  scoring-sql.mjs      # BM25 权重常量和类型差异化衰减半衰期
+  stop-words.mjs       # 共享基础停用词集
+  synonyms.mjs         # 统一同义词源：SYNONYM_MAP（双向）+ DISPATCH_SYNONYMS
+  project-utils.mjs    # 共享项目名解析（含进程内缓存）
+  secret-scrub.mjs     # API 密钥、令牌、PEM 证书等凭据模式擦除
+  format-utils.mjs     # 字符串格式化：截断、类型图标、日期/时间格式化
+  hash-utils.mjs       # MinHash 签名、Jaccard 相似度（去重用）
+  bash-utils.mjs       # Bash 输出显著性检测：错误、测试、构建、部署
   # 智能调度
   dispatch.mjs         # 三级调度编排：快速过滤、上下文信号、FTS5、Haiku
   dispatch-inject.mjs  # 注入模板渲染：skill/agent 推荐

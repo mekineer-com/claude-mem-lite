@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.18.0
+- **Version**: 2.19.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (24 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,18 +49,18 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Check current project's existing functionality, update README.md documentation, merge and clean branches, commit code a…
-Completed: Updated memory system documentation with TF-IDF vector encoding module for semantic search (tfidf.mjs module, observati…
-Remaining: README.md alignment with TF-IDF feature, branch cleanup, git commit and push, version release creation, GitHub CI/CD ve…
-Next: 1. Update README.md documenting TF-IDF vector encoding feature 2. Clean and merge feature branches 3. Commit changes wi…
-Lessons: TF-IDF vector encoding provides semantic search capability beyond keyword matching - converts observations into comparable vectors for relevance ranking
-Decisions: Dedicated tfidf.mjs module for vector encoding instead of inline utilities - improves modularity and testability; Replaced utils.mjs with dedicated TFIDF module - cleaner separation of concerns for semantic search operations
+Request: Implement atomic TF-IDF indexing and searchable storage for user prompts in the memory system, refactor shared utilitie…
+Completed: Created user-prompt-search.js (7554 bytes) with atomic search implementation; created prompt-search-utils.mjs (2805 byt…
+Remaining: Fix test suite failures: tests/user-prompt-search.test.mjs (unspecified failures); tests/registry-retriever.test.mjs (S…
+Next: 1) Investigate schema.mjs to verify resources table column definition matches test expectations; 2) Run full vitest sui…
+Lessons: Schema changes require coordinated updates in both database creation code and test fixtures—column mismatches (stars column absence) break tests across multiple files; Extracting utilities to separate modules improves reusability but creates hidden dependencies between test files and refactored modules; import paths become fragile; Atomic transactions (saveTx) for observation insertion add complexity—must ensure all observation types (decision, bugfix, feature, etc.) maintain referential integrity across observations and observation_files tables
+Decisions: Implemented atomic TF-IDF indexing using saveTx transactions—ensures observations and file vectors are inserted atomically, preventing partial state on failure; Extracted utilities to dedicated prompt-search-utils.mjs module—centralized shared functions (jaccardSimilarity, truncate, typeIcon) reduces duplication and improves maintainability across server-internals.mjs, registry-retriever.mjs, and nlp.mjs; Modified scoring-sql.mjs as separate module rather than inline—enables reuse and testability of SQL-based scoring logic but introduces module dependency chain that caused hook-llm test failures
 
 ### Key Context
-- [feature] TF-IDF vector encoding for semantic memory search (#4571) — TF-IDF vector encoding layers semantic similarity search on…
-- [change] Modified schema.mjs, tfidf.mjs, server.mjs +1 more (#4550)
-- [discovery] Reviewed 1 files: 2026-03-21-hybrid-search-and-search-quality.md (#4542)
-- [discovery] Reviewed 4 files: server.mjs, utils.mjs, schema.mjs, hook.mjs (#4533)
-- [bugfix] Error: utils.mjs: CJK sentence: (数据库 OR database OR db) CJK questio… (#4531)
+- [feature] Atomic TF-IDF indexing for user prompt search (#4662) — Full-text search consistency requires atomic transactions —…
+- [refactor] Export expandToken + add scoring-sql module causes hook-llm test failure (#4653) — Exporting internal utilities without updating test setup/mo…
+- [refactor] Normalize error handling comment in schema.mjs catch block (#4642)
+- [change] Modified server-internals.mjs, tests, schema.mjs +1 more (#4639)
+- [discovery] Reviewed 4 files: mem, test-helpers.mjs, schema.mjs, registry-retriever.mjs (#4638)
 
 </claude-mem-context>

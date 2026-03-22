@@ -100,6 +100,12 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **LLM concurrency control** -- File-based semaphore limits background workers to 2 concurrent LLM calls, preventing resource contention
 - **stdin overflow protection** -- Hook input truncated at 256KB with regex-based action salvage for oversized tool outputs
 - **Cross-session handoff** -- Captures session state (request, completed work, next steps, key files) on `/clear` or `/exit`, then injects context when the next session detects continuation intent via explicit keywords or FTS5 term overlap
+- **In-place observation updates** -- `mem_update` tool modifies existing observations atomically (field update + FTS text rebuild + vector re-computation in one transaction), preserving original IDs and references
+- **Bulk export** -- `mem_export` tool exports observations as JSON or JSONL, with project/type/date filtering and 1000-row pagination cap with batch guidance
+- **FTS integrity management** -- `mem_fts_check` tool verifies FTS5 index health or rebuilds indexes on demand, useful after database recovery or when search results seem wrong
+- **Atomic multi-table writes** -- `saveObservation` wraps observations + observation_files + observation_vectors INSERTs in a single `db.transaction()`, preventing orphaned rows on crash
+- **Modular NLP pipeline** -- Synonym maps, stop words, scoring constants, and query building extracted into focused modules (`synonyms.mjs`, `stop-words.mjs`, `scoring-sql.mjs`, `nlp.mjs`) for independent testing and maintenance
+- **Porter-aligned PRF** -- Pseudo-relevance feedback terms are now stemmed with the same Porter algorithm used by FTS5, ensuring PRF expansion terms match the search index
 
 ## Platform Support
 
@@ -148,7 +154,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem` server with 9 tools (search, timeline, get, save, stats, delete, compress, maintain, registry)
+2. **Register MCP server** -- `mem` server with 12 tools (search, timeline, get, save, update, stats, delete, compress, maintain, registry, export, fts_check)
 3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
@@ -204,10 +210,13 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | `mem_timeline` | Browse observations chronologically around an anchor point. |
 | `mem_get` | Retrieve full details for specific observation IDs (includes importance and related_ids). |
 | `mem_save` | Manually save a memory/observation. |
+| `mem_update` | Update an existing observation in-place. Preserves original ID and references. |
 | `mem_stats` | View statistics: counts, type distribution, top projects, daily activity. |
 | `mem_delete` | Delete observations by ID with preview/confirm workflow. FTS5 cleanup is automatic. |
 | `mem_compress` | Compress old low-value observations into weekly summaries to reduce noise. |
 | `mem_maintain` | Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/dedup/rebuild_vectors operations. |
+| `mem_export` | Export observations as JSON or JSONL for backup or migration. Filters by project, type, date range. |
+| `mem_fts_check` | Check FTS5 index integrity or rebuild indexes. Use when search results seem wrong or after DB recovery. |
 | `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. |
 
 ### Skill Commands (in Claude Code chat)
@@ -238,7 +247,8 @@ Five core tables with FTS5 virtual tables for search:
 id, memory_session_id, project, type, title, subtitle,
 text, narrative, concepts, facts, files_read, files_modified,
 importance, related_ids, created_at, created_at_epoch,
-lesson_learned, minhash_sig, access_count, compressed_into, search_aliases
+lesson_learned, minhash_sig, access_count, compressed_into, search_aliases,
+branch, superseded_at, superseded_by, last_accessed_at
 ```
 
 **session_summaries** -- LLM-generated session summaries
@@ -263,6 +273,11 @@ id, content_session_id, prompt_text, prompt_number
 ```
 project, type, session_id, working_on, completed, unfinished,
 key_files, key_decisions, match_keywords, created_at_epoch
+```
+
+**observation_files** -- Normalized file membership for efficient file-based recall
+```
+obs_id, filename
 ```
 
 **observation_vectors** -- TF-IDF vector embeddings for hybrid search
@@ -422,7 +437,16 @@ claude-mem-lite/
   tool-schemas.mjs     # Shared Zod schemas for MCP tool validation
   tfidf.mjs            # TF-IDF vector engine: tokenization, vocabulary building, vector computation, cosine similarity, RRF merge
   tier.mjs             # Temporal tier system: activity-based time window classification
-  utils.mjs            # Shared utilities: FTS5 query building, BM25 weight constants, MinHash dedup, secret scrubbing, CJK synonym extraction
+  utils.mjs            # Re-export hub: backward-compatible surface for all utility modules
+  nlp.mjs              # FTS5 query building: synonym expansion, CJK bigrams, sanitization
+  scoring-sql.mjs      # BM25 weight constants and type-differentiated decay half-lives
+  stop-words.mjs       # Shared base stop-word set for all NLP/search modules
+  synonyms.mjs         # Unified synonym source: SYNONYM_MAP (bidirectional) + DISPATCH_SYNONYMS
+  project-utils.mjs    # Shared project name resolution with in-process cache
+  secret-scrub.mjs     # API key, token, PEM, and credential pattern redaction
+  format-utils.mjs     # String formatting: truncate, typeIcon, date/time/week formatting
+  hash-utils.mjs       # MinHash signatures, Jaccard similarity for dedup
+  bash-utils.mjs       # Bash output significance detection: errors, tests, builds, deploys
   # Resource registry
   registry.mjs         # Resource registry DB: schema, CRUD, FTS5, invocation tracking
   registry-retriever.mjs # FTS5 retrieval with synonym expansion and composite scoring
