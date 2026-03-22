@@ -84,7 +84,7 @@ export const memCompressSchema = {
 export const memMaintainSchema = {
   action: z.enum(['scan', 'execute']).describe('scan=analyze candidates, execute=apply changes'),
   operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'purge_stale', 'rebuild_vectors'])).optional()
-    .describe('Operations to execute (for action=execute). purge_stale deletes idle-marked observations after user confirmation. rebuild_vectors rebuilds TF-IDF vocabulary and all observation vectors.'),
+    .describe('Operations: dedup=find/merge duplicate observations, decay=reduce importance of old low-value obs, cleanup=remove orphaned records, boost=promote frequently-accessed obs, purge_stale=delete decayed obs (needs confirm via scan first), rebuild_vectors=rebuild TF-IDF vocabulary and all observation vectors'),
   merge_ids: z.preprocess(
     (v) => Array.isArray(v) ? v.map(g => Array.isArray(g) ? g.map(x => typeof x === 'string' ? parseInt(x, 10) : x) : g) : v,
     z.array(z.array(z.number().int()).min(2))
@@ -92,6 +92,29 @@ export const memMaintainSchema = {
   retain_days: coerceInt.pipe(z.number().int().min(7).max(365)).optional()
     .describe('For purge_stale: keep observations newer than N days (default 30)'),
   project: z.string().optional().describe('Filter by project'),
+};
+
+export const memUpdateSchema = {
+  id: coerceInt.pipe(z.number().int().positive()).describe('Observation ID to update'),
+  title: z.string().optional().describe('New title'),
+  narrative: z.string().optional().describe('New narrative/content'),
+  type: OBS_TYPE_ENUM.optional().describe('New observation type'),
+  importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('New importance (1-3)'),
+  lesson_learned: z.string().optional().describe('Add or update lesson learned'),
+  concepts: z.string().optional().describe('Space-separated concept tags'),
+};
+
+export const memExportSchema = {
+  project: z.string().optional().describe('Filter by project'),
+  type: OBS_TYPE_ENUM.optional().describe('Filter by observation type'),
+  format: z.enum(['json', 'jsonl']).optional().describe('Output format (default: json)'),
+  date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
+  date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
+  include_compressed: coerceBool.optional().describe('Include compressed observations (default: false)'),
+};
+
+export const memFtsCheckSchema = {
+  action: z.enum(['check', 'rebuild']).describe('check=verify FTS integrity, rebuild=rebuild FTS indexes'),
 };
 
 export const memRegistrySchema = {

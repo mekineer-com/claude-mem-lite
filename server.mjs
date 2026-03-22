@@ -6,10 +6,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
-import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
+import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memRegistrySchema } from './tool-schemas.mjs';
+import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memFtsCheckSchema, memRegistrySchema } from './tool-schemas.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
@@ -1513,6 +1513,100 @@ server.registerTool(
     }
 
     return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: search, list, stats, import, remove, reindex` }], isError: true };
+  })
+);
+
+// ─── Tool: mem_update ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_update',
+  {
+    description: 'Update an existing observation in-place. Preserves original ID and references.',
+    inputSchema: memUpdateSchema,
+  },
+  safeHandler(async (args) => {
+    const obs = db.prepare('SELECT id, title FROM observations WHERE id = ?').get(args.id);
+    if (!obs) return { content: [{ type: 'text', text: `Observation #${args.id} not found` }], isError: true };
+
+    const updates = [];
+    const params = [];
+    for (const [key, col] of [['title','title'],['narrative','narrative'],['type','type'],['importance','importance'],['lesson_learned','lesson_learned'],['concepts','concepts']]) {
+      if (args[key] !== undefined) { updates.push(`${col} = ?`); params.push(args[key]); }
+    }
+    if (updates.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
+
+    params.push(args.id);
+    db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+
+    // Rebuild FTS text field
+    const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts FROM observations WHERE id = ?').get(args.id);
+    const textField = [row.title, row.subtitle, row.narrative, row.concepts, row.facts].filter(Boolean).join(' ');
+    db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, args.id);
+
+    return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}` }] };
+  })
+);
+
+// ─── Tool: mem_export ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_export',
+  {
+    description: 'Export observations as JSON or JSONL for backup or migration.',
+    inputSchema: memExportSchema,
+  },
+  safeHandler(async (args) => {
+    const wheres = [];
+    const params = [];
+    if (!args.include_compressed) wheres.push('COALESCE(compressed_into, 0) = 0');
+    wheres.push('superseded_at IS NULL');
+    if (args.project) { wheres.push('project = ?'); params.push(resolveProject(args.project)); }
+    if (args.type) { wheres.push('type = ?'); params.push(args.type); }
+    if (args.date_from) {
+      const epoch = new Date(args.date_from).getTime();
+      if (!isNaN(epoch)) { wheres.push('created_at_epoch >= ?'); params.push(epoch); }
+    }
+    if (args.date_to) {
+      const d = args.date_to.length === 10 ? args.date_to + 'T23:59:59.999Z' : args.date_to;
+      const epoch = new Date(d).getTime();
+      if (!isNaN(epoch)) { wheres.push('created_at_epoch <= ?'); params.push(epoch); }
+    }
+
+    const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
+    const rows = db.prepare(`SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, created_at, created_at_epoch FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT 1000`).all(...params);
+
+    if (rows.length === 0) return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
+
+    const output = args.format === 'jsonl'
+      ? rows.map(r => JSON.stringify(r)).join('\n')
+      : JSON.stringify(rows, null, 2);
+
+    return { content: [{ type: 'text', text: `Exported ${rows.length} observations:\n${output}` }] };
+  })
+);
+
+// ─── Tool: mem_fts_check ─────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_fts_check',
+  {
+    description: 'Check FTS5 index integrity or rebuild indexes. Use when search results seem wrong or after database recovery.',
+    inputSchema: memFtsCheckSchema,
+  },
+  safeHandler(async (args) => {
+    if (args.action === 'check') {
+      const result = checkFTSIntegrity(db);
+      return { content: [{ type: 'text', text: result.healthy
+        ? 'FTS5 indexes are healthy — all integrity checks passed.'
+        : `FTS5 issues found:\n${result.details.join('\n')}` }] };
+    }
+    if (args.action === 'rebuild') {
+      const result = rebuildFTS(db);
+      const summary = result.errors.length > 0
+        ? `Rebuilt: ${result.rebuilt.join(', ')}. Errors: ${result.errors.join(', ')}`
+        : `Successfully rebuilt: ${result.rebuilt.join(', ')}`;
+      return { content: [{ type: 'text', text: summary }] };
+    }
   })
 );
 

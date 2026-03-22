@@ -1669,3 +1669,96 @@ describe('dedup migration is atomic', () => {
     rawDb.close();
   });
 });
+
+// ─── mem_update logic ──────────────────────────────────────────────────────
+
+describe('mem_update', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('should update observation fields by ID', () => {
+    insertSession(db, { id: 'sess-upd', project: 'test' });
+    const result = insertObs(db, { sessionId: 'sess-upd', title: 'Original Title', type: 'discovery', importance: 1 });
+    const id = Number(result.lastInsertRowid);
+
+    // Update via direct SQL (simulating the handler logic)
+    db.prepare('UPDATE observations SET title = ?, importance = ? WHERE id = ?').run('Updated Title', 2, id);
+    const row = db.prepare('SELECT title, importance FROM observations WHERE id = ?').get(id);
+    expect(row.title).toBe('Updated Title');
+    expect(row.importance).toBe(2);
+  });
+});
+
+// ─── mem_export logic ──────────────────────────────────────────────────────
+
+describe('mem_export', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('should filter by project and type', () => {
+    insertSession(db, { id: 'sess-exp', project: 'export-test' });
+    insertObs(db, { sessionId: 'sess-exp', project: 'export-test', title: 'Bug 1', type: 'bugfix', importance: 2 });
+    insertObs(db, { sessionId: 'sess-exp', project: 'export-test', title: 'Feature 1', type: 'feature', importance: 1 });
+    insertObs(db, { sessionId: 'sess-exp', project: 'other-proj', title: 'Other', type: 'bugfix', importance: 1 });
+
+    const bugfixes = db.prepare("SELECT * FROM observations WHERE project = ? AND type = ? AND COALESCE(compressed_into, 0) = 0").all('export-test', 'bugfix');
+    expect(bugfixes).toHaveLength(1);
+    expect(bugfixes[0].title).toBe('Bug 1');
+  });
+});
+
+// ─── mem_fts_check logic ───────────────────────────────────────────────────
+
+describe('mem_fts_check', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('should report healthy FTS indexes', async () => {
+    const { checkFTSIntegrity } = await import('../schema.mjs');
+    const result = checkFTSIntegrity(db);
+    expect(result.healthy).toBe(true);
+    expect(result.details).toHaveLength(3);
+    expect(result.details.every(d => d.endsWith(': ok'))).toBe(true);
+  });
+
+  it('should rebuild FTS indexes', async () => {
+    const { rebuildFTS } = await import('../schema.mjs');
+    insertSession(db, { id: 'sess-fts', project: 'test' });
+    insertObs(db, { sessionId: 'sess-fts', title: 'Test obs' });
+    const result = rebuildFTS(db);
+    expect(result.rebuilt).toHaveLength(3);
+    expect(result.errors).toHaveLength(0);
+  });
+});
+
+// ─── tool-schemas exports ──────────────────────────────────────────────────
+
+describe('tool-schemas exports', () => {
+  it('should export memUpdateSchema', async () => {
+    const schemas = await import('../tool-schemas.mjs');
+    expect(schemas.memUpdateSchema).toBeDefined();
+    expect(schemas.memUpdateSchema.id).toBeDefined();
+  });
+
+  it('should export memExportSchema', async () => {
+    const schemas = await import('../tool-schemas.mjs');
+    expect(schemas.memExportSchema).toBeDefined();
+    expect(schemas.memExportSchema.format).toBeDefined();
+  });
+
+  it('should export memFtsCheckSchema', async () => {
+    const schemas = await import('../tool-schemas.mjs');
+    expect(schemas.memFtsCheckSchema).toBeDefined();
+    expect(schemas.memFtsCheckSchema.action).toBeDefined();
+  });
+
+  it('should have updated mem_maintain operations description', async () => {
+    const { memMaintainSchema } = await import('../tool-schemas.mjs');
+    const desc = memMaintainSchema.operations.description;
+    expect(desc).toContain('dedup=find/merge duplicate observations');
+    expect(desc).toContain('rebuild_vectors=rebuild TF-IDF vocabulary');
+  });
+});
