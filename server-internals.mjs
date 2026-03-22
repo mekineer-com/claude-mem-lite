@@ -14,21 +14,15 @@ import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from 
  */
 export function reRankWithContext(db, results, project) {
   if (!results || results.length === 0) return;
-  // Get recently active files (last 2 hours, same project)
+  // Get recently active files (last 2 hours, same project) via observation_files junction table
   const twoHoursAgo = Date.now() - 2 * 3600000;
-  const recentObs = db.prepare(`
-    SELECT files_modified FROM observations
-    WHERE project = ? AND created_at_epoch > ?
-    ORDER BY created_at_epoch DESC LIMIT 10
+  const recentFiles = db.prepare(`
+    SELECT DISTINCT of2.filename FROM observation_files of2
+    JOIN observations o ON o.id = of2.obs_id
+    WHERE o.project = ? AND o.created_at_epoch > ?
   `).all(project, twoHoursAgo);
 
-  const activeFiles = new Set();
-  for (const r of recentObs) {
-    try {
-      const files = JSON.parse(r.files_modified || '[]');
-      for (const f of files) activeFiles.add(f);
-    } catch (e) { debugCatch(e, 'reRankWithContext-parse'); }
-  }
+  const activeFiles = new Set(recentFiles.map(r => r.filename));
   if (activeFiles.size === 0) return;
 
   // Pre-compute active directories for directory-level matching
@@ -38,11 +32,25 @@ export function reRankWithContext(db, results, project) {
     if (lastSlash > 0) activeDirs.add(f.substring(0, lastSlash));
   }
 
-  for (const result of results) {
-    if (result.source !== 'obs' || !result.files_modified) continue;
-    let resultFiles;
-    try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch (e) { debugCatch(e, 'reRankWithContext-resultFiles'); continue; }
-    if (resultFiles.length === 0) continue;
+  // Batch-fetch observation_files for all obs result IDs
+  const obsResults = results.filter(r => r.source === 'obs' && r.id);
+  if (obsResults.length === 0) return;
+  const obsIds = obsResults.map(r => r.id);
+  const placeholders = obsIds.map(() => '?').join(',');
+  const fileRows = db.prepare(
+    `SELECT obs_id, filename FROM observation_files WHERE obs_id IN (${placeholders})`
+  ).all(...obsIds);
+
+  // Build map: obs_id → [filenames]
+  const obsFileMap = new Map();
+  for (const row of fileRows) {
+    if (!obsFileMap.has(row.obs_id)) obsFileMap.set(row.obs_id, []);
+    obsFileMap.get(row.obs_id).push(row.filename);
+  }
+
+  for (const result of obsResults) {
+    const resultFiles = obsFileMap.get(result.id);
+    if (!resultFiles || resultFiles.length === 0) continue;
     const exactMatches = resultFiles.filter(f => activeFiles.has(f)).length;
     // Directory-level: same parent dir but different file (half weight)
     const dirMatches = resultFiles.filter(f => {

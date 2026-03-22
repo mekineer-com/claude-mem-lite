@@ -495,8 +495,8 @@ describe('search query functions (in-memory DB)', () => {
     expect(rows.every(r => r.title !== 'Compressed observation')).toBe(true);
   });
 
-  // Test searchByFile logic
-  it('finds observations by file name in files_modified', () => {
+  // Test searchByFile logic via observation_files junction table
+  it('finds observations by file name via observation_files', () => {
     insertObs(db, {
       sessionId: 'mem-s1', project: 'test--project', type: 'change',
       title: 'Updated schema', text: 'schema change',
@@ -504,16 +504,17 @@ describe('search query functions (in-memory DB)', () => {
     });
     const cutoff = Date.now() - 60 * 86400000;
     const rows = db.prepare(`
-      SELECT id, type, title, lesson_learned
-      FROM observations
-      WHERE project = ?
-        AND importance >= 1
-        AND COALESCE(compressed_into, 0) = 0
-        AND created_at_epoch > ?
-        AND (files_modified LIKE ? OR files_read LIKE ?)
-      ORDER BY created_at_epoch DESC
+      SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
+      FROM observations o
+      JOIN observation_files of2 ON of2.obs_id = o.id
+      WHERE o.project = ?
+        AND o.importance >= 1
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND o.created_at_epoch > ?
+        AND (of2.filename = ? OR of2.filename LIKE ?)
+      ORDER BY o.created_at_epoch DESC
       LIMIT 5
-    `).all('test--project', cutoff, '%schema.mjs%', '%schema.mjs%');
+    `).all('test--project', cutoff, 'src/schema.mjs', '%schema.mjs');
 
     expect(rows.length).toBeGreaterThan(0);
     expect(rows[0].title).toBe('Updated schema');

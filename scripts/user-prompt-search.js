@@ -128,20 +128,20 @@ function searchByFile(db, files, project, limit) {
     const basename = file.split('/').pop();
     if (!basename || basename.length < 2) continue;
     const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const pathPattern = `%/${escaped}"%`;
-    const namePattern = `%"${escaped}"%`;
+    const likePattern = `%${escaped}`;
 
     const rows = db.prepare(`
-      SELECT id, type, title, lesson_learned
-      FROM observations
-      WHERE project = ?
-        AND importance >= 1
-        AND COALESCE(compressed_into, 0) = 0
-        AND created_at_epoch > ?
-        AND (files_modified LIKE ? ESCAPE '\\' OR files_read LIKE ? ESCAPE '\\')
-      ORDER BY created_at_epoch DESC
+      SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
+      FROM observations o
+      JOIN observation_files of2 ON of2.obs_id = o.id
+      WHERE o.project = ?
+        AND o.importance >= 1
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND o.created_at_epoch > ?
+        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+      ORDER BY o.created_at_epoch DESC
       LIMIT ?
-    `).all(project, cutoff, pathPattern, namePattern, limit);
+    `).all(project, cutoff, file, likePattern, limit);
 
     results.push(...rows);
   }

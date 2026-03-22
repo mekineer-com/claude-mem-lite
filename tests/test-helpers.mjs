@@ -43,8 +43,24 @@ export function insertSession(db, { id, project = 'test', memoryId = null }) {
 
 export function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, text = '', narrative = '', importance = 1, relatedIds = '[]', epochOffset = 0, filesModified = '[]', accessCount = 0, compressedInto = null, lessonLearned = null, searchAliases = null, branch = null, supersededAt = null, supersededBy = null, lastAccessedAt = null }) {
   const now = Date.now() + epochOffset;
-  return db.prepare(`
+  const result = db.prepare(`
     INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, related_ids, access_count, compressed_into, lesson_learned, search_aliases, branch, superseded_at, superseded_by, last_accessed_at, created_at, created_at_epoch)
     VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(sessionId, project, text, type, title, narrative, filesModified, importance, relatedIds, accessCount, compressedInto, lessonLearned, searchAliases, branch, supersededAt, supersededBy, lastAccessedAt, new Date(now).toISOString(), now);
+
+  // Also populate observation_files junction table (mirrors saveObservation behavior)
+  if (filesModified && filesModified !== '[]') {
+    try {
+      const files = JSON.parse(filesModified);
+      if (Array.isArray(files)) {
+        const obsId = Number(result.lastInsertRowid);
+        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+        for (const f of files) {
+          if (typeof f === 'string' && f.length > 0) insertFile.run(obsId, f);
+        }
+      }
+    } catch { /* skip malformed JSON */ }
+  }
+
+  return result;
 }

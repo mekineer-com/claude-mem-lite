@@ -27,6 +27,11 @@ function buildFtsTextField(obs) {
   return { conceptsText, factsText, textField: [conceptsText, factsText, aliasesText, bigramText].filter(Boolean).join(' ') };
 }
 
+/**
+ * Save an observation to the database with three-tier dedup.
+ * @returns {number|null} The saved observation ID, or null if deduped.
+ *   Throws on DB error (callers should catch if needed).
+ */
 export function saveObservation(obs, projectOverride, sessionIdOverride, externalDb) {
   const db = externalDb || openDb();
   if (!db) return null;
@@ -41,7 +46,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       VALUES (?, ?, ?, ?, ?, 'active')
     `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
-    // Three-tier dedup
+    // Three-tier dedup — returns null (not throw) for dedup hits
     // Tier 1 (fast): 5-min Jaccard on titles
     const fiveMinAgo = now.getTime() - DEDUP_WINDOW_MS;
     const recent = db.prepare(`
@@ -51,7 +56,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     `).all(project, fiveMinAgo);
 
     if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > 0.7)) {
-      return null;
+      return null; // dedup: Jaccard title match
     }
 
     // Tier 1.5: Extended title dedup for low-signal degraded titles
@@ -68,7 +73,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
         WHERE project = ? AND title = ? AND created_at_epoch > ? AND created_at_epoch <= ?
         LIMIT 1
       `).get(project, obs.title, sevenDaysAgo, fiveMinAgo);
-      if (exactDup) return null;
+      if (exactDup) return null; // dedup: exact title match
       // Phase 2: Jaccard similarity for near-duplicates (3-day window)
       const extRecent = db.prepare(`
         SELECT title FROM observations
@@ -76,7 +81,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
         ORDER BY created_at_epoch DESC LIMIT 60
       `).all(project, threeDaysAgo, fiveMinAgo);
       if (extRecent.some(r => jaccardSimilarity(r.title, obs.title) > 0.85)) {
-        return null;
+        return null; // dedup: low-signal Jaccard match
       }
     }
 
@@ -91,7 +96,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       `).all(project, sevenDaysAgo);
 
       if (recentSigs.some(r => estimateJaccardFromMinHash(minhashSig, r.minhash_sig) > 0.8)) {
-        return null;
+        return null; // dedup: MinHash similarity match
       }
     }
 
@@ -116,6 +121,16 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       now.toISOString(), now.getTime()
     );
     const savedId = Number(result.lastInsertRowid);
+
+    // Populate observation_files junction table (non-critical)
+    if (savedId && obs.files && obs.files.length > 0) {
+      try {
+        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+        for (const f of obs.files) {
+          if (typeof f === 'string' && f.length > 0) insertFile.run(savedId, f);
+        }
+      } catch (e) { debugCatch(e, 'saveObservation-obsFiles'); }
+    }
 
     // Write TF-IDF vector (non-critical)
     try {

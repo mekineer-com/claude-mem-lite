@@ -14,12 +14,15 @@ describe('reRankWithContext', () => {
   afterEach(() => { db.close(); });
 
   it('boosts results with exact file match', () => {
-    // Insert recent obs editing auth.js
+    // Insert recent obs editing auth.js (active file — within 2h window)
     insertObs(db, { title: 'recent edit', filesModified: '["src/auth.js"]', epochOffset: -1000 });
+    // Insert OLD result obs (outside 2h window so they don't contribute to active files)
+    const r1 = insertObs(db, { title: 'auth result', filesModified: '["src/auth.js"]', epochOffset: -3 * 3600000 });
+    const r2 = insertObs(db, { title: 'other result', filesModified: '["lib/other.js"]', epochOffset: -3 * 3600000 });
 
     const results = [
-      { source: 'obs', id: 1, score: -5.0, files_modified: '["src/auth.js"]' },
-      { source: 'obs', id: 2, score: -5.0, files_modified: '["lib/other.js"]' },
+      { source: 'obs', id: Number(r1.lastInsertRowid), score: -5.0 },
+      { source: 'obs', id: Number(r2.lastInsertRowid), score: -5.0 },
     ];
     reRankWithContext(db, results, 'test');
 
@@ -30,24 +33,29 @@ describe('reRankWithContext', () => {
   });
 
   it('applies half-weight for directory-level matches', () => {
+    // Active file: Button.js (within 2h window)
     insertObs(db, { title: 'recent edit', filesModified: '["src/components/Button.js"]', epochOffset: -1000 });
+    // Result obs touches Modal.js (same dir, different file) — outside 2h window
+    const r1 = insertObs(db, { title: 'modal result', filesModified: '["src/components/Modal.js"]', epochOffset: -3 * 3600000 });
 
     const results = [
-      { source: 'obs', id: 1, score: -5.0, files_modified: '["src/components/Modal.js"]' },
+      { source: 'obs', id: Number(r1.lastInsertRowid), score: -5.0 },
     ];
     reRankWithContext(db, results, 'test');
 
     // Should be boosted but less than exact match (half weight)
     expect(results[0].score).toBeLessThan(-5.0);
     const boost = results[0].score / (-5.0);
-    // 0.3 * 0.5 * (1/1) = 0.15 → multiplier = 1.15
+    // 0.3 * 0.5 * (1/1) = 0.15 -> multiplier = 1.15
     expect(boost).toBeCloseTo(1.15, 1);
   });
 
   it('skips when no active files', () => {
-    // No recent observations → no active files
+    // No recent observations -> no active files
+    const r1 = insertObs(db, { title: 'old obs', filesModified: '["foo.js"]', epochOffset: -3 * 3600000 });
+
     const results = [
-      { source: 'obs', id: 1, score: -5.0, files_modified: '["foo.js"]' },
+      { source: 'obs', id: Number(r1.lastInsertRowid), score: -5.0 },
     ];
     reRankWithContext(db, results, 'test');
     expect(results[0].score).toBe(-5.0);
@@ -57,17 +65,19 @@ describe('reRankWithContext', () => {
     insertObs(db, { title: 'recent', filesModified: '["foo.js"]', epochOffset: -1000 });
 
     const results = [
-      { source: 'session', id: 1, score: -5.0, files_modified: '["foo.js"]' },
+      { source: 'session', id: 999, score: -5.0 },
     ];
     reRankWithContext(db, results, 'test');
     expect(results[0].score).toBe(-5.0);
   });
 
-  it('handles JSON parse errors gracefully', () => {
+  it('handles obs without observation_files entries gracefully', () => {
     insertObs(db, { title: 'recent', filesModified: '["foo.js"]', epochOffset: -1000 });
+    // Result obs with no files
+    const r1 = insertObs(db, { title: 'no files', filesModified: '[]', epochOffset: -5000 });
 
     const results = [
-      { source: 'obs', id: 1, score: -5.0, files_modified: 'invalid json' },
+      { source: 'obs', id: Number(r1.lastInsertRowid), score: -5.0 },
     ];
     expect(() => reRankWithContext(db, results, 'test')).not.toThrow();
     expect(results[0].score).toBe(-5.0);

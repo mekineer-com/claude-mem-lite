@@ -91,11 +91,27 @@ afterEach(() => {
 
 function seedObs({ type = 'discovery', title, text = '', importance = 1, filesModified = '[]', lessonLearned = null, epochOffset = 0 }) {
   const epoch = Date.now() + epochOffset;
-  return db.prepare(`
+  const result = db.prepare(`
     INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
                               files_read, files_modified, importance, lesson_learned, created_at, created_at_epoch)
     VALUES ('e2e-sess', 'parent--testproj', ?, ?, ?, '', ?, '', '', '[]', ?, ?, ?, ?, ?)
   `).run(text || title, type, title, text || title, filesModified, importance, lessonLearned, new Date(epoch).toISOString(), epoch);
+
+  // Populate observation_files junction table (mirrors production saveObservation behavior)
+  if (filesModified && filesModified !== '[]') {
+    try {
+      const files = JSON.parse(filesModified);
+      if (Array.isArray(files)) {
+        const obsId = Number(result.lastInsertRowid);
+        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+        for (const f of files) {
+          if (typeof f === 'string' && f.length > 0) insertFile.run(obsId, f);
+        }
+      }
+    } catch { /* skip malformed JSON */ }
+  }
+
+  return result;
 }
 
 // ─── Test Suites ─────────────────────────────────────────────────────────────

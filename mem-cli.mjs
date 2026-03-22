@@ -5,7 +5,7 @@
 import { ensureDb, DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
+import { getVocabulary, computeVector, vectorSearch, rrfMerge, VECTOR_SCAN_LIMIT } from './tfidf.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -170,7 +170,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
         const vecResults = vectorSearch(db, queryVec, {
           project: project || null,
           vocabVersion: vocab.version,
-          limit: 500,
+          limit: VECTOR_SCAN_LIMIT,
         });
         if (vecResults.length > 0 && ftsRows.length > 0) {
           const rrfRanking = rrfMerge(ftsRows, vecResults);
@@ -240,15 +240,18 @@ function cmdRecall(db, args) {
   const filename = basename(file);
   const limit = parseInt(flags.limit, 10) || 10;
 
-  // Search both files_modified and files_read for the filename
+  // Search via observation_files junction table for indexed filename lookups
+  const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
+  const likePattern = `%${escaped}`;
   const rows = db.prepare(`
-    SELECT id, type, title, lesson_learned, created_at
-    FROM observations
-    WHERE COALESCE(compressed_into, 0) = 0
-      AND (files_modified LIKE ? OR files_read LIKE ?)
-    ORDER BY created_at_epoch DESC
+    SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at
+    FROM observations o
+    JOIN observation_files of2 ON of2.obs_id = o.id
+    WHERE COALESCE(o.compressed_into, 0) = 0
+      AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+    ORDER BY o.created_at_epoch DESC
     LIMIT ?
-  `).all(`%${filename}%`, `%${filename}%`, limit);
+  `).all(filename, likePattern, limit);
 
   if (rows.length === 0) {
     out(`[mem] No history for "${filename}"`);

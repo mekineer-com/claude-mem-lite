@@ -12,6 +12,9 @@ export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
+// Increment when schema changes (tables, columns, indexes, FTS, migrations)
+export const CURRENT_SCHEMA_VERSION = 18;
+
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +119,12 @@ const MIGRATIONS = [
  * The DB should have foreign_keys OFF before calling (enabled after dedup migration).
  */
 export function initSchema(db) {
+  // Fast path: skip all migrations if schema is already at current version
+  try {
+    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+    if (row && row.version === CURRENT_SCHEMA_VERSION) return db;
+  } catch { /* table may not exist yet */ }
+
   // Create core tables
   db.exec(CORE_SCHEMA);
 
@@ -136,23 +145,21 @@ export function initSchema(db) {
       GROUP BY memory_session_id HAVING cnt > 1
     `).all();
 
-    if (dupes.length > 0) {
-      const dedup = db.transaction(() => {
-        for (const { memory_session_id } of dupes) {
-          const rows = db.prepare(`
-            SELECT s.id FROM sdk_sessions s
-            WHERE s.memory_session_id = ?
-            ORDER BY s.id ASC
-          `).all(memory_session_id);
-          for (let i = 1; i < rows.length; i++) {
-            db.prepare('DELETE FROM sdk_sessions WHERE id = ?').run(rows[i].id);
-          }
+    // Atomic: dedup + create unique index in one transaction
+    const dedupAndIndex = db.transaction(() => {
+      for (const { memory_session_id } of dupes) {
+        const rows = db.prepare(`
+          SELECT s.id FROM sdk_sessions s
+          WHERE s.memory_session_id = ?
+          ORDER BY s.id ASC
+        `).all(memory_session_id);
+        for (let i = 1; i < rows.length; i++) {
+          db.prepare('DELETE FROM sdk_sessions WHERE id = ?').run(rows[i].id);
         }
-      });
-      dedup();
-    }
-
-    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sess_memory_sid ON sdk_sessions(memory_session_id)`);
+      }
+      db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sess_memory_sid ON sdk_sessions(memory_session_id)`);
+    });
+    dedupAndIndex();
   }
   db.pragma('foreign_keys = ON');
 
@@ -189,6 +196,45 @@ export function initSchema(db) {
       db.exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`);
     }
   } catch { /* non-critical */ }
+
+  // Observation files junction table for normalized file lookups (replaces LIKE scans on files_modified JSON)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS observation_files (
+      obs_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+      filename TEXT NOT NULL,
+      UNIQUE(obs_id, filename)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_obsfiles_filename ON observation_files(filename)`);
+
+  // Data migration: populate observation_files from existing observations.files_modified JSON
+  // Only runs once: when observation_files is empty but observations has rows with files_modified
+  try {
+    const obsFilesCount = db.prepare('SELECT COUNT(*) as c FROM observation_files').get().c;
+    if (obsFilesCount === 0) {
+      const obsWithFiles = db.prepare(
+        `SELECT id, files_modified FROM observations WHERE files_modified IS NOT NULL AND files_modified != '[]'`
+      ).all();
+      if (obsWithFiles.length > 0) {
+        const migrateFiles = db.transaction(() => {
+          const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+          for (const row of obsWithFiles) {
+            try {
+              const files = JSON.parse(row.files_modified);
+              if (Array.isArray(files)) {
+                for (const f of files) {
+                  if (typeof f === 'string' && f.length > 0) {
+                    insertFile.run(row.id, f);
+                  }
+                }
+              }
+            } catch { /* skip malformed JSON */ }
+          }
+        });
+        migrateFiles();
+      }
+    }
+  } catch { /* non-critical — migration can retry on next open */ }
 
   // Observation vectors table for TF-IDF vector search
   db.exec(`
@@ -253,6 +299,11 @@ export function initSchema(db) {
       normalize();
     }
   } catch { /* non-critical — normalization can retry on next open */ }
+
+  // Record schema version for fast-path on subsequent calls
+  db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)');
+  db.exec('DELETE FROM schema_version');
+  db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(CURRENT_SCHEMA_VERSION);
 
   return db;
 }

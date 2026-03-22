@@ -132,22 +132,20 @@ export function recallForFile(db, filePath, project) {
     const cutoff = Date.now() - FILE_RECALL_LOOKBACK_MS;
     // Escape SQL LIKE wildcards in filename to prevent injection
     const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    // Match both full paths (/path/to/file.mjs) and basename-only entries ("file.mjs")
-    // Two patterns avoid false positives: %/file.mjs"% won't match /webapp.mjs
-    const pathPattern = `%/${escaped}"%`;
-    const namePattern = `%"${escaped}"%`;
+    const likePattern = `%${escaped}`;
     const rows = db.prepare(`
-      SELECT id, type, title, importance, lesson_learned
-      FROM observations
-      WHERE project = ?
-        AND importance >= 2
-        AND COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
-        AND created_at_epoch > ?
-        AND (files_modified LIKE ? ESCAPE '\\' OR files_modified LIKE ? ESCAPE '\\')
-      ORDER BY created_at_epoch DESC
+      SELECT DISTINCT o.id, o.type, o.title, o.importance, o.lesson_learned
+      FROM observations o
+      JOIN observation_files of2 ON of2.obs_id = o.id
+      WHERE o.project = ?
+        AND o.importance >= 2
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
+        AND o.created_at_epoch > ?
+        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+      ORDER BY o.created_at_epoch DESC
       LIMIT ?
-    `).all(project, cutoff, pathPattern, namePattern, MAX_FILE_RECALL);
+    `).all(project, cutoff, filePath, likePattern, MAX_FILE_RECALL);
     const now = Date.now();
     const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
     for (const r of rows) updateStmt.run(now, r.id);
