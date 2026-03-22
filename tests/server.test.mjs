@@ -1520,6 +1520,114 @@ describe('mem_save atomic transaction', () => {
   });
 });
 
+// ─── mem_save observation_files population ───────────────────────────────────
+
+describe('mem_save observation_files population', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    const now = new Date();
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run('files-test', 'files-test', 'test', now.toISOString(), now.getTime());
+  });
+  afterEach(() => { db.close(); });
+
+  it('inserts observation_files rows when files are provided', () => {
+    const now = Date.now();
+    const files = ['src/auth.js', 'src/utils.js'];
+    const saveTx = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, 1, ?, ?)
+      `).run('files-test', 'test', 'test content', 'discovery', 'test title', 'test content', JSON.stringify(files), new Date(now).toISOString(), now);
+      const obsId = Number(result.lastInsertRowid);
+
+      // Populate observation_files junction table (same pattern as mem_save should use)
+      if (files.length > 0) {
+        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+        for (const f of files) {
+          if (typeof f === 'string' && f.length > 0) insertFile.run(obsId, f);
+        }
+      }
+
+      return obsId;
+    });
+
+    const obsId = saveTx();
+    const obsFiles = db.prepare('SELECT filename FROM observation_files WHERE obs_id = ? ORDER BY filename').all(obsId);
+    expect(obsFiles.length).toBe(2);
+    expect(obsFiles[0].filename).toBe('src/auth.js');
+    expect(obsFiles[1].filename).toBe('src/utils.js');
+  });
+
+  it('handles empty files array without errors', () => {
+    const now = Date.now();
+    const files = [];
+    const saveTx = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, 1, ?, ?)
+      `).run('files-test', 'test', 'test content', 'discovery', 'no files', 'test content', JSON.stringify(files), new Date(now).toISOString(), now);
+      return Number(result.lastInsertRowid);
+    });
+
+    const obsId = saveTx();
+    const obsFiles = db.prepare('SELECT filename FROM observation_files WHERE obs_id = ?').all(obsId);
+    expect(obsFiles.length).toBe(0);
+  });
+
+  it('observation_files are queryable for recallForFile pattern', () => {
+    const now = Date.now();
+    const files = ['src/server.mjs'];
+    const saveTx = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, 1, ?, ?)
+      `).run('files-test', 'test', 'fixed server bug', 'bugfix', 'server fix', 'fixed server bug', JSON.stringify(files), new Date(now).toISOString(), now);
+      const obsId = Number(result.lastInsertRowid);
+      const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+      for (const f of files) insertFile.run(obsId, f);
+      return obsId;
+    });
+
+    const obsId = saveTx();
+    // Query pattern: find observations by file path using junction table
+    const rows = db.prepare(`
+      SELECT o.id, o.title FROM observations o
+      JOIN observation_files of ON o.id = of.obs_id
+      WHERE of.filename = ?
+    `).all('src/server.mjs');
+    expect(rows.length).toBe(1);
+    expect(rows[0].id).toBe(obsId);
+    expect(rows[0].title).toBe('server fix');
+  });
+});
+
+// ─── Schema indexes ─────────────────────────────────────────────────────────
+
+describe('schema indexes', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it('idx_obs_vectors_version exists', () => {
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_obs_vectors_version'").get();
+    expect(row).toBeDefined();
+  });
+
+  it('idx_sessions_project exists', () => {
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sessions_project'").get();
+    expect(row).toBeDefined();
+  });
+
+  it('idx_obs_not_compressed exists', () => {
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_obs_not_compressed'").get();
+    expect(row).toBeDefined();
+  });
+});
+
 // ─── Task 3: dedup migration transaction ─────────────────────────────────────
 
 describe('dedup migration is atomic', () => {

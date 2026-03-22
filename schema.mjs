@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 18;
+export const CURRENT_SCHEMA_VERSION = 19;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -170,6 +170,8 @@ export function initSchema(db) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_user_prompts_session ON user_prompts(content_session_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_at) WHERE superseded_at IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_branch ON observations(branch) WHERE branch IS NOT NULL`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sdk_sessions(project)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_not_compressed ON observations(created_at_epoch DESC) WHERE COALESCE(compressed_into, 0) = 0`);
 
   // FTS5 migration: add lesson_learned column to observations_fts (one-time)
   // Detect old FTS5 table missing lesson_learned and recreate with full column set
@@ -247,6 +249,8 @@ export function initSchema(db) {
     )
   `);
 
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_vectors_version ON observation_vectors(vocab_version)`);
+
   // Persisted vocabulary for stable TF-IDF vector indexing
   db.exec(`
     CREATE TABLE IF NOT EXISTS vocab_state (
@@ -302,8 +306,10 @@ export function initSchema(db) {
 
   // Record schema version for fast-path on subsequent calls
   db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)');
-  db.exec('DELETE FROM schema_version');
-  db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(CURRENT_SCHEMA_VERSION);
+  db.transaction(() => {
+    db.exec('DELETE FROM schema_version');
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(CURRENT_SCHEMA_VERSION);
+  })();
 
   return db;
 }

@@ -883,12 +883,22 @@ server.registerTool(
     const bigramText = cjkBigrams(safeTitle + ' ' + safeContent);
     const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
 
-    // Atomic: insert observation + TF-IDF vector in one transaction
+    // Atomic: insert observation + observation_files + TF-IDF vector in one transaction
+    const saveFiles = args.files || [];
     const saveTx = db.transaction(() => {
       const result = db.prepare(`
         INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?, ?)
-      `).run(sessionId, project, textField, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?)
+      `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), args.importance ?? 1, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+      const savedId = Number(result.lastInsertRowid);
+
+      // Populate observation_files junction table
+      if (savedId && saveFiles.length > 0) {
+        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
+        for (const f of saveFiles) {
+          if (typeof f === 'string' && f.length > 0) insertFile.run(savedId, f);
+        }
+      }
 
       // Write TF-IDF vector
       try {
@@ -897,7 +907,7 @@ server.registerTool(
           const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
           if (vec) {
             db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-              .run(Number(result.lastInsertRowid), Buffer.from(vec.buffer), vocab.version, Date.now());
+              .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
           }
         }
       } catch (e) { debugCatch(e, 'mem_save-vector'); }

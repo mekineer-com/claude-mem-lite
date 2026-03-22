@@ -102,48 +102,51 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
 
     const { conceptsText, factsText, textField } = buildFtsTextField(obs);
 
-    const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, branch, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      sessionId, project,
-      textField, obs.type, obs.title, obs.subtitle || '',
-      obs.narrative || '',
-      conceptsText,
-      factsText,
-      JSON.stringify(obs.filesRead || []),
-      JSON.stringify(obs.files || []),
-      obs.importance ?? 1,
-      minhashSig,
-      obs.lessonLearned || null,
-      obs.searchAliases || null,
-      getCurrentBranch(),
-      now.toISOString(), now.getTime()
-    );
-    const savedId = Number(result.lastInsertRowid);
+    // Atomic: observation INSERT + observation_files + vector in one transaction
+    const savedId = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, branch, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        sessionId, project,
+        textField, obs.type, obs.title, obs.subtitle || '',
+        obs.narrative || '',
+        conceptsText,
+        factsText,
+        JSON.stringify(obs.filesRead || []),
+        JSON.stringify(obs.files || []),
+        obs.importance ?? 1,
+        minhashSig,
+        obs.lessonLearned || null,
+        obs.searchAliases || null,
+        getCurrentBranch(),
+        now.toISOString(), now.getTime()
+      );
+      const id = Number(result.lastInsertRowid);
 
-    // Populate observation_files junction table (non-critical)
-    if (savedId && obs.files && obs.files.length > 0) {
-      try {
+      // Populate observation_files junction table
+      if (id && obs.files && obs.files.length > 0) {
         const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
         for (const f of obs.files) {
-          if (typeof f === 'string' && f.length > 0) insertFile.run(savedId, f);
-        }
-      } catch (e) { debugCatch(e, 'saveObservation-obsFiles'); }
-    }
-
-    // Write TF-IDF vector (non-critical)
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const vecText = [obs.title || '', obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
-        const vec = computeVector(vecText, vocab);
-        if (vec) {
-          db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-            .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+          if (typeof f === 'string' && f.length > 0) insertFile.run(id, f);
         }
       }
-    } catch (e) { debugCatch(e, 'saveObservation-vector'); }
+
+      // Write TF-IDF vector (non-critical — catch inside transaction to avoid rollback)
+      try {
+        const vocab = getVocabulary(db);
+        if (vocab) {
+          const vecText = [obs.title || '', obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
+          const vec = computeVector(vecText, vocab);
+          if (vec) {
+            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+              .run(id, Buffer.from(vec.buffer), vocab.version, Date.now());
+          }
+        }
+      } catch (e) { debugCatch(e, 'saveObservation-vector'); }
+
+      return id;
+    })();
 
     return savedId;
   } finally {

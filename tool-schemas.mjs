@@ -67,6 +67,7 @@ export const memSaveSchema = {
   type: OBS_TYPE_ENUM.optional().describe('Observation type (default: discovery)'),
   project: z.string().optional().describe('Project name (default: inferred from CWD)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 1)'),
+  files: z.array(z.string()).optional().describe('File paths associated with this observation'),
 };
 
 export const memStatsSchema = {
