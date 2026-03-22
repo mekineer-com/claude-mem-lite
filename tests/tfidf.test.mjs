@@ -74,13 +74,13 @@ describe('buildVocabulary', () => {
     expect(authEntry.idf).toBeGreaterThan(0);
   });
 
-  it('uses information gain ranking (df × idf) instead of pure DF', () => {
-    // Insert observations where a rare-but-present term has higher info gain
+  it('uses IDF ranking to prioritize rare discriminative terms', () => {
+    // Insert observations where a rare-but-present term has higher IDF
     // than a super-common term
     for (let i = 0; i < 10; i++) {
       insertObs(db, { title: `common${i} shared data`, narrative: `common shared data entry ${i}` });
     }
-    // 'database' appears in exactly 2 docs — moderate DF, high IDF
+    // 'database' appears in exactly 2 docs — low DF, high IDF
     insertObs(db, { title: 'database schema fix', narrative: 'database migration issue' });
     insertObs(db, { title: 'database query bug', narrative: 'database optimization needed' });
 
@@ -88,9 +88,34 @@ describe('buildVocabulary', () => {
     expect(vocab).not.toBeNull();
     // 'databas' (stemmed) appears in 2/12 docs, 'data' appears in 10/12
     // Both should be in vocab since df>=2
-    // Under info gain ranking, discriminative terms are prioritized
-    const terms = [...vocab.terms.keys()];
-    expect(terms.length).toBeGreaterThan(0);
+    // Under IDF ranking, 'databas' (rare, higher IDF) should rank before 'data' (common, lower IDF)
+    const databIdx = vocab.terms.get('databas')?.index;
+    const dataIdx = vocab.terms.get('data')?.index;
+    expect(databIdx).toBeDefined();
+    expect(dataIdx).toBeDefined();
+    expect(databIdx).toBeLessThan(dataIdx);
+  });
+
+  it('should rank high-IDF (rare) terms before mid-IDF (common) terms in vocab', () => {
+    // Create a corpus where common terms have high df (low IDF) but high IG (df*idf),
+    // and rare terms have low df (high IDF) but low IG.
+    // Under IDF ranking, rare terms should come first in the vocab index order.
+    for (let i = 0; i < 20; i++) {
+      insertObs(db, { title: `Common pattern observation ${i}`, narrative: 'uses the common pattern repeatedly', importance: 1 });
+    }
+    // "raretermxyz" appears in exactly 2 docs — high IDF, low IG
+    insertObs(db, { title: 'Rare jargon alpha', narrative: 'uses raretermxyz for special purpose', importance: 1 });
+    insertObs(db, { title: 'Another rare jargon', narrative: 'raretermxyz appears again here', importance: 1 });
+
+    const vocab = buildVocabulary(db);
+    expect(vocab).not.toBeNull();
+    expect(vocab.terms.has('raretermxyz')).toBe(true);
+
+    // Under IDF ranking, 'raretermxyz' (df=2, IDF≈2.12) should have a lower index
+    // (= higher priority) than 'common' (df=20, IDF≈0.72)
+    const rareIdx = vocab.terms.get('raretermxyz').index;
+    const commonIdx = vocab.terms.get('common').index;
+    expect(rareIdx).toBeLessThan(commonIdx);
   });
 
   it('excludes hapax legomena (df=1 terms)', () => {

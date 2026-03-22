@@ -211,12 +211,12 @@ export function buildVocabulary(db) {
     }
   }
 
-  // Compute IDF and sort by information gain (df × idf), filter noise + hapax
+  // Compute IDF and sort by IDF (rare discriminative terms first), filter noise + hapax
   const idf = (freq) => Math.log(1 + N / (1 + freq));
   const sortedTerms = [...df.entries()]
     .filter(([term, freq]) => !isNoiseTerm(term) && freq >= 2)
     .map(([term, freq]) => ({ term, df: freq, idf: idf(freq), ig: freq * idf(freq) }))
-    .sort((a, b) => b.ig - a.ig)
+    .sort((a, b) => b.idf - a.idf)
     .slice(0, VOCAB_DIM);
 
   // Build terms map with index and IDF
