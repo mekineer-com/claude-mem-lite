@@ -51,13 +51,13 @@ function reindexKnownResources(rdb) {
     UPDATE resources SET
       intent_tags = ?, domain_tags = ?,
       capability_summary = ?, trigger_patterns = ?,
-      invocation_name = CASE WHEN ?1 != '' THEN ?1 ELSE invocation_name END,
-      recommendation_mode = CASE WHEN ?2 != '' THEN ?2 ELSE recommendation_mode END,
-      keywords = CASE WHEN ?3 != '' THEN ?3 ELSE keywords END,
-      tech_stack = CASE WHEN ?4 != '' THEN ?4 ELSE tech_stack END,
-      use_cases = CASE WHEN ?5 != '' THEN ?5 ELSE use_cases END,
+      invocation_name = CASE WHEN ? != '' THEN ? ELSE invocation_name END,
+      recommendation_mode = CASE WHEN ? != '' THEN ? ELSE recommendation_mode END,
+      keywords = CASE WHEN ? != '' THEN ? ELSE keywords END,
+      tech_stack = CASE WHEN ? != '' THEN ? ELSE tech_stack END,
+      use_cases = CASE WHEN ? != '' THEN ? ELSE use_cases END,
       updated_at = datetime('now')
-    WHERE type = ?6 AND name = ?7
+    WHERE type = ? AND name = ?
   `);
 
   rdb.transaction(() => {
@@ -68,14 +68,17 @@ function reindexKnownResources(rdb) {
       const name = key.slice(sep + 1);
       const invName = meta.invocation_name || deriveInvocationName(name);
       const recMode = meta.recommendation_mode || '';
+      const kw = meta.keywords || '';
+      const ts = meta.tech_stack || '';
+      const uc = meta.use_cases || '';
       update.run(
         meta.intent_tags, meta.domain_tags,
         meta.capability_summary, meta.trigger_patterns,
-        invName,
-        recMode,
-        meta.keywords || '',
-        meta.tech_stack || '',
-        meta.use_cases || '',
+        invName, invName,
+        recMode, recMode,
+        kw, kw,
+        ts, ts,
+        uc, uc,
         type, name
       );
     }

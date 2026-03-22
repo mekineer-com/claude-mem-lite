@@ -147,7 +147,7 @@ describe('supersession persistence', () => {
     expect(all[0].superseded_at).not.toBeNull();
   });
 
-  it('markSuperseded with db persists to database', () => {
+  it('markSuperseded sets in-memory flag without persisting to database', () => {
     insertObs(db, { title: 'older', type: 'bugfix', filesModified: '["x.mjs"]', importance: 1, epochOffset: -86400000 });
     insertObs(db, { title: 'newer', type: 'bugfix', filesModified: '["x.mjs"]', importance: 2 });
 
@@ -158,10 +158,10 @@ describe('supersession persistence', () => {
 
     // In-memory flag should be set
     expect(searchResults[0].superseded).toBe(true);
-    // DB should be persisted
+    // DB should NOT be modified (read path should not write)
     const dbRow = db.prepare('SELECT superseded_at, superseded_by FROM observations WHERE id = ?').get(results[0].id);
-    expect(dbRow.superseded_at).not.toBeNull();
-    expect(dbRow.superseded_by).toBe(results[1].id);
+    expect(dbRow.superseded_at).toBeNull();
+    expect(dbRow.superseded_by).toBeNull();
   });
 });
 

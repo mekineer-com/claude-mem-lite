@@ -102,7 +102,7 @@ describe('vectorSearch', () => {
     insertObs(db, { title: 'auth session fix', narrative: 'the authentication session was broken after logout' });
 
     const vocab = buildVocabulary(db);
-    if (!vocab) return;
+    expect(vocab).not.toBeNull();
 
     const allObs = db.prepare('SELECT id, title, narrative FROM observations').all();
     for (const o of allObs) {
@@ -114,7 +114,7 @@ describe('vectorSearch', () => {
     }
 
     const queryVec = computeVector('authentication problem', vocab);
-    if (!queryVec) return;
+    expect(queryVec).not.toBeNull();
     const results = vectorSearch(db, queryVec, { vocabVersion: vocab.version });
 
     expect(results.length).toBeGreaterThan(0);
@@ -124,11 +124,14 @@ describe('vectorSearch', () => {
   });
 
   it('excludes compressed observations', () => {
-    insertObs(db, { title: 'active auth fix', narrative: 'authentication repair work' });
-    insertObs(db, { title: 'compressed auth fix', narrative: 'old authentication repair work', compressedInto: -1 });
+    insertObs(db, { title: 'active auth fix', narrative: 'authentication repair work for login system' });
+    insertObs(db, { title: 'compressed auth fix', narrative: 'old authentication repair work for session', compressedInto: -1 });
+    // Extra docs to ensure df>=2 for vocabulary building
+    insertObs(db, { title: 'auth token update', narrative: 'authentication token refresh and repair logic' });
+    insertObs(db, { title: 'login auth flow', narrative: 'authentication flow repair in login module' });
 
     const vocab = buildVocabulary(db);
-    if (!vocab) return;
+    expect(vocab).not.toBeNull();
 
     const allObs = db.prepare('SELECT id, title, narrative FROM observations').all();
     for (const o of allObs) {
@@ -140,7 +143,7 @@ describe('vectorSearch', () => {
     }
 
     const queryVec = computeVector('authentication', vocab);
-    if (!queryVec) return;
+    expect(queryVec).not.toBeNull();
     const results = vectorSearch(db, queryVec, { vocabVersion: vocab.version });
 
     const compressedObs = db.prepare("SELECT id FROM observations WHERE compressed_into IS NOT NULL").get();

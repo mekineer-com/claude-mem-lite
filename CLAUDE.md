@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.19.0
+- **Version**: 2.20.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (24 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,18 +49,17 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Implement atomic TF-IDF indexing and searchable storage for user prompts in the memory system, refactor shared utilitie…
-Completed: Created user-prompt-search.js (7554 bytes) with atomic search implementation; created prompt-search-utils.mjs (2805 byt…
-Remaining: Fix test suite failures: tests/user-prompt-search.test.mjs (unspecified failures); tests/registry-retriever.test.mjs (S…
-Next: 1) Investigate schema.mjs to verify resources table column definition matches test expectations; 2) Run full vitest sui…
-Lessons: Schema changes require coordinated updates in both database creation code and test fixtures—column mismatches (stars column absence) break tests across multiple files; Extracting utilities to separate modules improves reusability but creates hidden dependencies between test files and refactored modules; import paths become fragile; Atomic transactions (saveTx) for observation insertion add complexity—must ensure all observation types (decision, bugfix, feature, etc.) maintain referential integrity across observations and observation_files tables
-Decisions: Implemented atomic TF-IDF indexing using saveTx transactions—ensures observations and file vectors are inserted atomically, preventing partial state on failure; Extracted utilities to dedicated prompt-search-utils.mjs module—centralized shared functions (jaccardSimilarity, truncate, typeIcon) reduces duplication and improves maintainability across server-internals.mjs, registry-retriever.mjs, and nlp.mjs; Modified scoring-sql.mjs as separate module rather than inline—enables reuse and testability of SQL-based scoring logic but introduces module dependency chain that caused hook-llm test failures
+Request: Check current project functionality and align README.md documentation; merge and clean up branches; commit and push cod…
+Completed: Updated marketplace.json version to 2.19.0; modified README.zh-CN.md, package.json, and plugin.json; updated mem servic…
+Remaining: Git branch merge/cleanup; git commit with messages and push; create GitHub release tag; verify GitHub Actions CI passes…
+Next: Execute git operations (branch cleanup, commit, push); create GitHub release via gh CLI or web UI; monitor GitHub Actio…
+Decisions: API field rename: observation_vectors → observation_files reflects data structure semantics more accurately, improving API clarity for consumers
 
 ### Key Context
-- [feature] Atomic TF-IDF indexing for user prompt search (#4662) — Full-text search consistency requires atomic transactions —…
-- [refactor] Export expandToken + add scoring-sql module causes hook-llm test failure (#4653) — Exporting internal utilities without updating test setup/mo…
-- [refactor] Normalize error handling comment in schema.mjs catch block (#4642)
-- [change] Modified server-internals.mjs, tests, schema.mjs +1 more (#4639)
-- [discovery] Reviewed 4 files: mem, test-helpers.mjs, schema.mjs, registry-retriever.mjs (#4638)
+- [bugfix] Fix PRF term extraction alignment with synonym handling (#4712) — PRF term extraction logic must match vocabulary indexing se…
+- [discovery] Reviewed 6 files: schema.mjs, server.mjs, hook-llm.mjs, tool-schemas.mjs +2 more (#4694)
+- [discovery] Reviewed 4 files: hook-llm.mjs, tool-schemas.mjs, schema.mjs, server.mjs (#4691)
+- [discovery] Reviewed 2 files: server.mjs, tfidf.mjs (#4690)
+- [discovery] Reviewed 4 files: tests, server-internals.mjs, vitest.config.mjs, server.mjs (#4673)
 
 </claude-mem-context>

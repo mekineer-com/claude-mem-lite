@@ -327,7 +327,7 @@ describe('tool flow: save → search → get roundtrip', () => {
 
 // ─── WAL Concurrent Stress Test ─────────────────────────────────────────────
 
-describe('WAL concurrent stress test', () => {
+describe('WAL batch stress test', () => {
   let db;
   beforeEach(() => {
     db = createTestDb();
@@ -335,7 +335,7 @@ describe('WAL concurrent stress test', () => {
   });
   afterEach(() => { db.close(); });
 
-  it('parallel inserts all succeed without corruption', async () => {
+  it('batch inserts all succeed without corruption', async () => {
     const workerCount = 10;
     const insertsPerWorker = 5;
 

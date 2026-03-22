@@ -723,8 +723,9 @@ async function handleSessionStart() {
     try { getVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }
 
     // Auto-update check (24h throttle, 3s timeout, silent on failure)
-    // Fire-and-forget: don't block SessionStart for up to 3s network timeout
-    checkForUpdate().then(updateResult => {
+    // Awaited so process.exit(0) doesn't kill the promise before notification
+    try {
+      const updateResult = await checkForUpdate();
       if (updateResult?.updated) {
         process.stdout.write(`\n🔄 claude-mem-lite: v${updateResult.from} → v${updateResult.to} updated\n`);
       } else if (updateResult?.updateAvailable) {
@@ -733,7 +734,7 @@ async function handleSessionStart() {
           : '';
         process.stdout.write(`\n📦 claude-mem-lite: v${updateResult.to} available (current: v${updateResult.from})${hint}\n`);
       }
-    }).catch(e => debugCatch(e, 'session-start-update'));
+    } catch (e) { debugCatch(e, 'session-start-update'); }
 
   } finally {
     db.close();

@@ -294,8 +294,11 @@ export function extractMatchKeywords(text, files) {
 // ─── Git Branch Detection ──────────────────────────────────────────────────
 
 let _cachedBranch;
+let _branchCacheTime = 0;
+const BRANCH_CACHE_TTL = 60000; // 60s TTL for long-running MCP server process
 export function getCurrentBranch() {
-  if (_cachedBranch !== undefined) return _cachedBranch;
+  const now = Date.now();
+  if (_cachedBranch !== undefined && (now - _branchCacheTime) < BRANCH_CACHE_TTL) return _cachedBranch;
   try {
     const result = execSync('git rev-parse --abbrev-ref HEAD', {
       encoding: 'utf8', timeout: 2000, stdio: ['pipe', 'pipe', 'pipe'],
@@ -304,8 +307,9 @@ export function getCurrentBranch() {
   } catch {
     _cachedBranch = null;
   }
+  _branchCacheTime = now;
   return _cachedBranch;
 }
 
 /** Reset cached branch (for testing or after git checkout) */
-export function _resetBranchCache() { _cachedBranch = undefined; }
+export function _resetBranchCache() { _cachedBranch = undefined; _branchCacheTime = 0; }

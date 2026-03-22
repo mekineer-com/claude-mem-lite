@@ -76,8 +76,6 @@ export function reRankWithContext(db, results, project) {
  */
 export function markSuperseded(db, results) {
   if (!results || results.length === 0) return;
-  const now = Date.now();
-  const updateStmt = db ? db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ? AND superseded_at IS NULL') : null;
   // Build map: file → [result objects], only for obs with files
   const fileMap = new Map();
   for (const r of results) {
@@ -89,7 +87,9 @@ export function markSuperseded(db, results) {
       fileMap.get(f).push(r);
     }
   }
-  // For each file with 2+ observations: mark older lower-importance as superseded
+  // For each file with 2+ observations: mark older lower-importance as superseded (in-memory only)
+  // Note: DB persistence removed — search is a read operation and should not write.
+  // Persistent superseding belongs in mem_maintain/mem_compress write paths.
   for (const [, obsForFile] of fileMap) {
     if (obsForFile.length < 2) continue;
     obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
@@ -97,11 +97,6 @@ export function markSuperseded(db, results) {
     for (let i = 1; i < obsForFile.length; i++) {
       if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
         obsForFile[i].superseded = true;
-        if (db) {
-          try {
-            updateStmt.run(now, newest.id, obsForFile[i].id);
-          } catch (e) { debugCatch(e, 'markSuperseded-persist'); }
-        }
       }
     }
   }

@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
-import { autoBoostIfNeeded, runIdleCleanup } from '../server-internals.mjs';
+import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup } from '../server-internals.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 
@@ -419,61 +419,48 @@ describe('reRankWithContext', () => {
   afterEach(() => { db.close(); });
 
   it('boosts file-overlapping results', () => {
-    // Insert a recent observation editing auth.js
+    // Insert a recent observation editing auth.js (populates observation_files)
     insertObs(db, { title: 'recent auth edit', filesModified: '["auth.js"]', epochOffset: -1000 });
-    // Insert two search results
+    // Insert older search-result observations (outside 2h window so they don't affect activeFiles)
+    const oldOffset = -3 * 3600000; // 3 hours ago
+    const r1 = insertObs(db, { title: 'bug in auth', filesModified: '["auth.js"]', epochOffset: oldOffset });
+    const r2 = insertObs(db, { title: 'unrelated fix', filesModified: '["utils.js"]', epochOffset: oldOffset });
+    const id1 = Number(r1.lastInsertRowid);
+    const id2 = Number(r2.lastInsertRowid);
+
     const results = [
-      { source: 'obs', id: 100, title: 'bug in auth', score: -5.0, files_modified: '["auth.js"]', importance: 1 },
-      { source: 'obs', id: 101, title: 'unrelated fix', score: -5.0, files_modified: '["utils.js"]', importance: 1 },
+      { source: 'obs', id: id1, title: 'bug in auth', score: -5.0, importance: 1 },
+      { source: 'obs', id: id2, title: 'unrelated fix', score: -5.0, importance: 1 },
     ];
 
-    // Simulate reRankWithContext logic
-    const twoHoursAgo = Date.now() - 2 * 3600000;
-    const recentObs = db.prepare(`
-      SELECT files_modified FROM observations WHERE project = 'test' AND created_at_epoch > ?
-    `).all(twoHoursAgo);
+    reRankWithContext(db, results, 'test');
 
-    const activeFiles = new Set();
-    for (const r of recentObs) {
-      try { for (const f of JSON.parse(r.files_modified || '[]')) activeFiles.add(f); } catch {}
-    }
-
-    for (const result of results) {
-      let resultFiles;
-      try { resultFiles = JSON.parse(result.files_modified || '[]'); } catch { continue; }
-      const common = resultFiles.filter(f => activeFiles.has(f));
-      const overlap = common.length / resultFiles.length;
-      result.score *= (1.0 + 0.3 * overlap);
-    }
-    results.sort((a, b) => a.score - b.score);
-
-    // auth.js result should be boosted (more negative)
-    expect(results[0].id).toBe(100);
-    expect(results[0].score).toBeLessThan(results[1].score);
+    // auth.js result should be boosted (more negative score = higher rank)
+    const authResult = results.find(r => r.id === id1);
+    const otherResult = results.find(r => r.id === id2);
+    expect(authResult.score).toBeLessThan(otherResult.score);
   });
 
   it('handles no active files gracefully', () => {
+    // Insert obs from a different project so activeFiles is empty for 'test'
+    const r1 = insertObs(db, { title: 'test', project: 'other', filesModified: '["foo.js"]' });
+    const id1 = Number(r1.lastInsertRowid);
     const results = [
-      { source: 'obs', id: 100, title: 'test', score: -5.0, files_modified: '["foo.js"]', importance: 1 },
+      { source: 'obs', id: id1, title: 'test', score: -5.0, importance: 1 },
     ];
-    // No recent observations → activeFiles is empty → no boost applied
-    const twoHoursAgo = Date.now() - 2 * 3600000;
-    const recentObs = db.prepare(`
-      SELECT files_modified FROM observations WHERE project = 'test' AND created_at_epoch > ?
-    `).all(twoHoursAgo);
-    expect(recentObs.length).toBe(0);
-    // Score unchanged
+    reRankWithContext(db, results, 'empty-project');
+    // No active files → no boost → score unchanged
     expect(results[0].score).toBe(-5.0);
   });
 
-  it('handles empty files_modified', () => {
+  it('handles obs with no files in junction table', () => {
+    const r1 = insertObs(db, { title: 'test', filesModified: '[]' });
+    const id1 = Number(r1.lastInsertRowid);
     const results = [
-      { source: 'obs', id: 100, title: 'test', score: -5.0, files_modified: '[]', importance: 1 },
+      { source: 'obs', id: id1, title: 'test', score: -5.0, importance: 1 },
     ];
-    let files;
-    try { files = JSON.parse(results[0].files_modified); } catch { files = []; }
-    expect(files.length).toBe(0);
-    // No crash, score unchanged
+    reRankWithContext(db, results, 'test');
+    // No files → no crash, score unchanged
     expect(results[0].score).toBe(-5.0);
   });
 });
@@ -486,28 +473,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 1 },
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 2 },
     ];
-
-    // Simulate markSuperseded
-    const fileMap = new Map();
-    for (const r of results) {
-      let files;
-      try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
-      for (const f of files) {
-        if (!fileMap.has(f)) fileMap.set(f, []);
-        fileMap.get(f).push(r);
-      }
-    }
-    for (const [, obsForFile] of fileMap) {
-      if (obsForFile.length < 2) continue;
-      obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-      const newest = obsForFile[0];
-      for (let i = 1; i < obsForFile.length; i++) {
-        if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
-          obsForFile[i].superseded = true;
-        }
-      }
-    }
-
+    markSuperseded(null, results);
     expect(results[0].superseded).toBe(true);  // old, imp=1 <= newest imp=2
     expect(results[1].superseded).toBeUndefined();  // newest
   });
@@ -517,27 +483,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 3 },
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 1 },
     ];
-
-    const fileMap = new Map();
-    for (const r of results) {
-      let files;
-      try { files = JSON.parse(r.files_modified || '[]'); } catch { continue; }
-      for (const f of files) {
-        if (!fileMap.has(f)) fileMap.set(f, []);
-        fileMap.get(f).push(r);
-      }
-    }
-    for (const [, obsForFile] of fileMap) {
-      if (obsForFile.length < 2) continue;
-      obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-      const newest = obsForFile[0];
-      for (let i = 1; i < obsForFile.length; i++) {
-        if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
-          obsForFile[i].superseded = true;
-        }
-      }
-    }
-
+    markSuperseded(null, results);
     expect(results[0].superseded).toBeUndefined();  // imp=3 > newest imp=1
     expect(results[1].superseded).toBeUndefined();  // newest
   });
@@ -547,12 +493,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', importance: 1 },
       { source: 'session', id: 2, date: '2026-02-01' },
     ];
-    // No files_modified → no crash
-    expect(() => {
-      for (const r of results) {
-        try { JSON.parse(r.files_modified || '[]'); } catch { /* skip */ }
-      }
-    }).not.toThrow();
+    expect(() => markSuperseded(null, results)).not.toThrow();
   });
 });
 
@@ -1704,8 +1645,7 @@ describe('mem_update', () => {
 
   it('should handle no fields to update', () => {
     insertSession(db, { id: 'sess-nf', project: 'test' });
-    const result = insertObs(db, { sessionId: 'sess-nf', title: 'No Fields', importance: 1 });
-    const _id = Number(result.lastInsertRowid);
+    insertObs(db, { sessionId: 'sess-nf', title: 'No Fields', importance: 1 });
     // With no update args, the field mapping loop produces empty updates
     const updates = [];
     const args = {};

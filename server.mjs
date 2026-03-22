@@ -729,7 +729,7 @@ server.registerTool(
       // Auto-boost importance for frequently accessed observations
       autoBoostIfNeeded(db, args.ids);
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
-      allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
+      allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
       prefix = '#';
     }
 
@@ -1531,7 +1531,10 @@ server.registerTool(
     const updates = [];
     const params = [];
     for (const [key, col] of [['title','title'],['narrative','narrative'],['type','type'],['importance','importance'],['lesson_learned','lesson_learned'],['concepts','concepts']]) {
-      if (args[key] !== undefined) { updates.push(`${col} = ?`); params.push(args[key]); }
+      if (args[key] !== undefined) {
+        updates.push(`${col} = ?`);
+        params.push(typeof args[key] === 'string' ? scrubSecrets(args[key]) : args[key]);
+      }
     }
     if (updates.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
 
@@ -1541,9 +1544,11 @@ server.registerTool(
     db.transaction(() => {
       db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
 
-      // Rebuild FTS text field
-      const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts FROM observations WHERE id = ?').get(args.id);
-      const textField = [row.title, row.subtitle, row.narrative, row.concepts, row.facts].filter(Boolean).join(' ');
+      // Rebuild FTS text field (must include CJK bigrams + search_aliases to match mem_save/hook-llm)
+      const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts, lesson_learned, search_aliases FROM observations WHERE id = ?').get(args.id);
+      const base = [row.title, row.subtitle, row.narrative, row.concepts, row.facts, row.lesson_learned, row.search_aliases].filter(Boolean).join(' ');
+      const bigrams = cjkBigrams((row.title || '') + ' ' + (row.narrative || ''));
+      const textField = bigrams ? base + ' ' + bigrams : base;
       db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, args.id);
 
       // Re-vectorize (non-critical — catch to avoid rollback)
@@ -1589,7 +1594,8 @@ server.registerTool(
     }
 
     const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
-    const rows = db.prepare(`SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, created_at, created_at_epoch FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT 1000`).all(...params);
+    const exportLimit = Math.min(args.limit ?? 200, 1000);
+    const rows = db.prepare(`SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, created_at, created_at_epoch FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`).all(...params, exportLimit);
 
     if (rows.length === 0) return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
 
@@ -1597,7 +1603,7 @@ server.registerTool(
       ? rows.map(r => JSON.stringify(r)).join('\n')
       : JSON.stringify(rows, null, 2);
 
-    const cap = rows.length >= 1000 ? '\nNote: Results capped at 1000. Use date_from/date_to to export in batches.' : '';
+    const cap = rows.length >= exportLimit ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
     return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
   })
 );

@@ -1,20 +1,8 @@
 // Tests for cross-session handoff: schema, utils, extraction, intent detection, injection
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
-import { initSchema } from '../schema.mjs';
+import { createTestDb } from './test-helpers.mjs';
 import { extractMatchKeywords, tokenizeHandoff, isSpecificTerm } from '../utils.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from '../hook-handoff.mjs';
-
-// ─── DB Helper ──────────────────────────────────────────────────────────────
-
-function createTestDb() {
-  const db = new Database(':memory:');
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
-  db.pragma('foreign_keys = OFF');
-  initSchema(db);
-  return db;
-}
 
 function seedSession(db, sessionId, project) {
   db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, ?, datetime('now'), ?, 'active')`).run(sessionId, sessionId, project, Date.now());

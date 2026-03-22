@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.19.0",
+  "version": "2.20.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -46,6 +46,11 @@
     "skip-tools.mjs",
     "tool-schemas.mjs",
     "utils.mjs",
+    "nlp.mjs",
+    "scoring-sql.mjs",
+    "stop-words.mjs",
+    "tier.mjs",
+    "tfidf.mjs",
     "project-utils.mjs",
     "secret-scrub.mjs",
     "format-utils.mjs",

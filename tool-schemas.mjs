@@ -111,6 +111,7 @@ export const memExportSchema = {
   date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
   date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
   include_compressed: coerceBool.optional().describe('Include compressed observations (default: false)'),
+  limit: coerceInt.optional().describe('Max observations to export (default: 200, max: 1000)'),
 };
 
 export const memFtsCheckSchema = {

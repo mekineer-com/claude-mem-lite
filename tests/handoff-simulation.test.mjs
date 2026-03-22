@@ -1,21 +1,10 @@
 // Handoff simulation tests — validates /clear and /exit from user's perspective
 // Each test simulates a realistic user workflow and verifies the handoff output
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
-import { initSchema } from '../schema.mjs';
+import { createTestDb } from './test-helpers.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from '../hook-handoff.mjs';
 import { buildSummaryLines } from '../hook-context.mjs';
 import { truncate } from '../utils.mjs';
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function createTestDb() {
-  const db = new Database(':memory:');
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = OFF');
-  initSchema(db);
-  return db;
-}
 
 function seedSession(db, id, project) {
   db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)

@@ -170,14 +170,16 @@ describe('computeVector', () => {
   });
 
   it('produces L2-normalized vectors', () => {
-    insertObs(db, { title: 'test', narrative: 'data' });
+    // Need 2+ docs with shared terms for df>=2 filter
+    insertObs(db, { title: 'test observation', narrative: 'some data content here' });
+    insertObs(db, { title: 'test content fix', narrative: 'another test data entry' });
     const vocab = buildVocabulary(db);
+    expect(vocab).not.toBeNull();
     const vec = computeVector('test data', vocab);
-    if (vec) {
-      let norm = 0;
-      for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
-      expect(Math.abs(Math.sqrt(norm) - 1.0)).toBeLessThan(0.001);
-    }
+    expect(vec).not.toBeNull();
+    let norm = 0;
+    for (let i = 0; i < vec.length; i++) norm += vec[i] * vec[i];
+    expect(Math.abs(Math.sqrt(norm) - 1.0)).toBeLessThan(0.001);
   });
 
   it('returns zero vector for text with no vocabulary terms', () => {
@@ -207,18 +209,21 @@ describe('cosineSimilarity', () => {
   it('similar texts score higher than dissimilar', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
-    insertObs(db, { title: 'auth token refresh', narrative: 'fix the authentication token expiry' });
-    insertObs(db, { title: 'database schema migration', narrative: 'update the database tables' });
-    insertObs(db, { title: 'auth session bug', narrative: 'session authentication was broken' });
+    // Need 5+ docs with overlapping terms to ensure df>=2 filter passes
+    insertObs(db, { title: 'auth token refresh', narrative: 'fix the authentication token expiry problem' });
+    insertObs(db, { title: 'database schema migration', narrative: 'update the database tables and schema' });
+    insertObs(db, { title: 'auth session bug', narrative: 'session authentication was broken and token expired' });
+    insertObs(db, { title: 'auth middleware update', narrative: 'improved the authentication token validation logic' });
+    insertObs(db, { title: 'database backup script', narrative: 'automated the database backup and migration' });
     const vocab = buildVocabulary(db);
-    if (vocab) {
-      const q = computeVector('authentication token problem', vocab);
-      const authVec = computeVector('auth token refresh fix the authentication token expiry', vocab);
-      const dbVec = computeVector('database schema migration update the database tables', vocab);
-      if (q && authVec && dbVec) {
-        expect(cosineSimilarity(q, authVec)).toBeGreaterThan(cosineSimilarity(q, dbVec));
-      }
-    }
+    expect(vocab).not.toBeNull();
+    const q = computeVector('authentication token problem', vocab);
+    const authVec = computeVector('auth token refresh fix the authentication token expiry', vocab);
+    const dbVec = computeVector('database schema migration update the database tables', vocab);
+    expect(q).not.toBeNull();
+    expect(authVec).not.toBeNull();
+    expect(dbVec).not.toBeNull();
+    expect(cosineSimilarity(q, authVec)).toBeGreaterThan(cosineSimilarity(q, dbVec));
     db.close();
   });
 });
