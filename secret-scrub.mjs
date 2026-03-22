@@ -7,7 +7,7 @@ export const SECRET_PATTERNS = [
   // Key-value assignments: password=xxx, token=xxx, api_key=xxx, secret=xxx, etc.
   // Excludes code-like values: null, undefined, true, false, None, empty, function calls (word()),
   // and short values (<6 chars) that are typically variable names not secrets.
-  [/(\b(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer)\s*[=:]\s*)(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)(?!\w+\()(?!new\s)(?!process\.env\.)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  [/(\b(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // AWS access keys (AKIA...)
   [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
   // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold

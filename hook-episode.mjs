@@ -194,12 +194,15 @@ export function mergePendingEntries(episode) {
       if (pending.ts < oneHourAgo) { try { unlinkSync(fp); } catch {} continue; }
       // Only merge entries belonging to the same project
       if (pending.project && episode.project && pending.project !== episode.project) continue;
-      unlinkSync(fp);
       if (pending.entry) {
+        unlinkSync(fp);
         episode.entries.push(pending.entry);
         episode.lastAt = Math.max(episode.lastAt, pending.entry.ts || pending.ts);
         addFileToEpisode(episode, pending.entry.files || []);
         merged++;
+      } else {
+        // No entry data — clean up the file without merging
+        try { unlinkSync(fp); } catch {}
       }
     } catch {
       // Corrupt pending file — remove

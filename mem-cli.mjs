@@ -414,7 +414,7 @@ function cmdRecent(db, args) {
   for (const r of rows) {
     const time = relativeTime(r.created_at_epoch);
     const title = truncate(r.title || r.subtitle || '(untitled)', 60);
-    out(`#${r.id} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
+    out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
   }
 }
 
@@ -598,7 +598,7 @@ function cmdTimeline(db, args) {
     for (const r of rows.reverse()) {
       const time = relativeTime(r.created_at_epoch);
       const title = truncate(r.title || r.subtitle || '(untitled)', 60);
-      out(`#${r.id} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
+      out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
     }
     return;
   }
@@ -646,7 +646,7 @@ function cmdTimeline(db, args) {
     const marker = r.id === anchorId ? ' <--' : '';
     const time = relativeTime(r.created_at_epoch);
     const title = truncate(r.title || r.subtitle || '(untitled)', 60);
-    out(`#${r.id} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}${marker}`);
+    out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}${marker}`);
   }
 }
 
@@ -908,7 +908,7 @@ function cmdBrowse(db, args) {
     const countRow = db.prepare(`
       SELECT COUNT(*) as c FROM (
         SELECT ${TIER_CASE_SQL} as tier FROM observations
-        WHERE project = ?
+        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
       ) WHERE tier = ?
     `).get(...params, project, tier);
     const count = countRow?.c ?? 0;
@@ -928,7 +928,7 @@ function cmdBrowse(db, args) {
       SELECT * FROM (
         SELECT id, type, title, created_at_epoch, ${TIER_CASE_SQL} as tier
         FROM observations
-        WHERE project = ?
+        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
       ) WHERE tier = ?
       ORDER BY created_at_epoch DESC
       LIMIT ?
@@ -1038,8 +1038,22 @@ function cmdUpdate(db, args) {
   const params = [];
   if (flags.title) { updates.push('title = ?'); params.push(scrubSecrets(flags.title)); }
   if (flags.narrative) { updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative)); }
-  if (flags.type) { updates.push('type = ?'); params.push(flags.type); }
-  if (flags.importance) { updates.push('importance = ?'); params.push(Math.max(1, Math.min(3, parseInt(flags.importance, 10)))); }
+  if (flags.type) {
+    const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+    if (!validTypes.has(flags.type)) {
+      out(`[mem] Invalid type "${flags.type}". Valid: ${[...validTypes].join(', ')}`);
+      return;
+    }
+    updates.push('type = ?'); params.push(flags.type);
+  }
+  if (flags.importance) {
+    const imp = parseInt(flags.importance, 10);
+    if (isNaN(imp) || imp < 1 || imp > 3) {
+      out(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
+      return;
+    }
+    updates.push('importance = ?'); params.push(imp);
+  }
   if (flags.lesson || flags['lesson-learned']) { updates.push('lesson_learned = ?'); params.push(scrubSecrets(flags.lesson || flags['lesson-learned'])); }
   if (flags.concepts) { updates.push('concepts = ?'); params.push(flags.concepts); }
 
@@ -1675,13 +1689,13 @@ Commands:
     --age-days N        Min age in days (default 30)
     --project P         Filter by project
 
-  maintain <scan|exec>  Memory maintenance
+  maintain <scan|execute>  Memory maintenance
     --ops O             Comma-separated: cleanup,decay,boost,dedup,purge_stale,rebuild_vectors
     --merge-ids K:R,... For dedup: keepId:removeId pairs (e.g. 10:11,20:21:22)
     --project P         Filter by project
     --retain-days N     For purge_stale: keep last N days (default 30)
 
-  fts-check <chk|rbld>  FTS5 index check or rebuild
+  fts-check <check|rebuild>  FTS5 index check or rebuild
 
   stats                 Show memory statistics
     --project P         Filter by project

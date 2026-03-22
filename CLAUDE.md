@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.23.0
+- **Version**: 2.23.1
 - **Package manager**: npm
 - **Test**: `npx vitest run` (35 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,14 +49,14 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 修复
-Completed: Modified server-internals.mjs, mem-cli.mjs, utils.mjs
+Request: 修复这些问题
+Completed: Modified mem, user-prompt-search.js; Modified install.mjs, server.mjs, hook-episode.mjs +5 more; Modified registry.mjs,…
 
 ### Key Context
-- [discovery] Reviewed 3 files: server.mjs, mem-cli.mjs, tool-schemas.mjs (#4913)
-- [change] Modified server.mjs, mem-cli.mjs, registry.mjs +2 more (#4907)
-- [bugfix] Error: mem-cli.mjs: mem Recent (projects--mem): #4816 🔴 20m ago  Err… (#4829)
-- [bugfix] Error: scoring-sql.mjs: mem 5 results for 数据库: #2503 🔵 2026-03-12 Add da… (#4816)
-- [bugfix] Fix TF-IDF vocab sorting (IDF→IG) and server.mjs pagination for single-source e… (#4810)
+- [discovery] Reviewed 6 files: schema.mjs, mem, mem-cli.mjs, tfidf.mjs +2 more (#4935)
+- [discovery] Reviewed 10 files: utils.mjs, mem, hook-semaphore.mjs, scoring-sql.mjs +6 more (#4934)
+- [discovery] Reviewed 6 files: mem, hook-semaphore.mjs, mem-cli.mjs, hook-llm.mjs +2 more (#4933)
+- [discovery] Reviewed 9 files: hook-episode.mjs, mem, server.mjs, scoring-sql.mjs +5 more (#4932)
+- [discovery] Reviewed 21 files: hook-update.mjs, mem, tier.mjs, utils.mjs +17 more (#4931)
 
 </claude-mem-context>

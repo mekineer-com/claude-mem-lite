@@ -3,14 +3,15 @@
 // Runs as UserPromptSubmit hook — injects relevant memories before Claude sees the prompt
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
-import { ensureDb } from '../schema.mjs';
+import { ensureDb, DB_DIR } from '../schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE } from '../utils.mjs';
 import { writeFileSync, readFileSync } from 'fs';
+import { join } from 'path';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS } from './prompt-search-utils.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-const INJECTED_IDS_FILE = `/tmp/.claude-mem-injected-${inferProject()}`;
+const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
 const MAX_RESULTS = 5;
 const LOOKBACK_MS = 60 * 86400000; // 60 days
 

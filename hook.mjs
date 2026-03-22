@@ -812,7 +812,7 @@ async function handleUserPrompt() {
 
       // Read IDs already injected by user-prompt-search.js to avoid duplicate injection
       try {
-        const injectedFile = `/tmp/.claude-mem-injected-${project}`;
+        const injectedFile = join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
         const raw = readFileSync(injectedFile, 'utf8');
         const { ids, ts } = JSON.parse(raw);
         // Only use if written within last 10 seconds (same prompt cycle)

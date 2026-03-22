@@ -148,7 +148,7 @@ export function sanitizeFtsQuery(query) {
     .trim();
   if (!cleaned) return null;
   let tokens = cleaned.split(/\s+/).filter(t =>
-    t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR\/\d+$/i.test(t)
+    t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR(\/\d*)?$/i.test(t)
     // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
     && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
   );

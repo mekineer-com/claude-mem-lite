@@ -394,7 +394,7 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
 
   const results = [];
   for (const row of rows) {
-    const vec = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4);
+    const vec = new Float32Array(row.vector.buffer.slice(row.vector.byteOffset, row.vector.byteOffset + row.vector.byteLength));
     const sim = cosineSimilarity(queryVec, vec);
     if (sim > MIN_COSINE_SIMILARITY) results.push({ id: row.observation_id, similarity: sim });
   }

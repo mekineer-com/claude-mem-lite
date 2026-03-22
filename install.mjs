@@ -3,7 +3,7 @@
 
 import { execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync } from 'fs';
-import { join, resolve, dirname } from 'path';
+import { join, resolve, dirname, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
 
@@ -594,6 +594,9 @@ async function install() {
           mkdirSync(join(managedDir, 'skills'), { recursive: true });
           mkdirSync(join(managedDir, 'agents'), { recursive: true });
           for (const entry of entries) {
+            // Path traversal guard: reject entries with '..' or absolute paths
+            if (entry.path.includes('..') || entry.name.includes('..') ||
+                isAbsolute(entry.path) || isAbsolute(entry.name)) continue;
             const srcPath = entry.path === '.' ? clonePath : join(clonePath, entry.path);
             const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
             const destPath = join(destDir, entry.name);

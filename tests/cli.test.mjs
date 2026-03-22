@@ -703,14 +703,15 @@ describe('CLI update command', () => {
     expect(row.type).toBe('bugfix');
   });
 
-  it('updates importance clamped to 1-3', async () => {
+  it('rejects invalid importance values', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
       title: 'Importance test', text: 'content',
     });
-    await captureStdout(() => run(['update', '1', '--importance', '5']));
+    const output = await captureStdout(() => run(['update', '1', '--importance', '5']));
+    expect(output).toContain('Invalid importance');
     const row = testDb.prepare('SELECT importance FROM observations WHERE id = 1').get();
-    expect(row.importance).toBe(3);
+    expect(row.importance).toBe(1); // unchanged (default)
   });
 
   it('updates lesson_learned via --lesson', async () => {

@@ -1747,6 +1747,7 @@ server.registerTool(
         : `Successfully rebuilt: ${result.rebuilt.join(', ')}`;
       return { content: [{ type: 'text', text: summary }] };
     }
+    return { content: [{ type: 'text', text: `Unknown action: ${args.action}` }], isError: true };
   })
 );
 
@@ -1785,7 +1786,7 @@ server.registerTool(
       const countRow = db.prepare(`
         SELECT COUNT(*) as c FROM (
           SELECT ${TIER_CASE_SQL} as tier FROM observations
-          WHERE project = ?
+          WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
         ) WHERE tier = ?
       `).get(...params, project, tier);
       const count = countRow?.c ?? 0;
@@ -1805,7 +1806,7 @@ server.registerTool(
         SELECT * FROM (
           SELECT id, type, title, created_at, created_at_epoch, ${TIER_CASE_SQL} as tier
           FROM observations
-          WHERE project = ?
+          WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
         ) WHERE tier = ?
         ORDER BY created_at_epoch DESC
         LIMIT ?

@@ -206,7 +206,8 @@ export function ensureRegistryDb(dbPath) {
         if (hasOld) db.exec(`DROP TABLE invocations_old`);
         db.exec(`ALTER TABLE invocations RENAME TO invocations_old`);
         db.exec(INVOCATIONS_SCHEMA);
-        db.exec(`INSERT INTO invocations
+        // Omit rejection_reason — column may not exist yet on old DBs; ADD COLUMN migration below handles it
+          db.exec(`INSERT INTO invocations
           (id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
           SELECT id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at
           FROM invocations_old`);
@@ -224,6 +225,7 @@ export function ensureRegistryDb(dbPath) {
         if (hasOld) db.exec(`DROP TABLE invocations_old`);
         db.exec(`ALTER TABLE invocations RENAME TO invocations_old`);
         db.exec(INVOCATIONS_SCHEMA);
+        // Omit rejection_reason — column may not exist yet on old DBs; ADD COLUMN migration below handles it
         db.exec(`INSERT INTO invocations
           (id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
           SELECT id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at

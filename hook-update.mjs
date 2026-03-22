@@ -218,10 +218,11 @@ async function downloadAndInstall(tarballUrl) {
       debugLog('WARN', 'hook-update', `Rejected suspicious tarball URL: ${tarballUrl}`);
       return false;
     }
-    execSync(
-      `curl -sL -H "Accept: application/vnd.github+json" "${tarballUrl}" | tar xz -C "${tmpDir}" --strip-components=1`,
-      { timeout: 30000, stdio: 'pipe' }
-    );
+    const tarballPath = join(tmpDir, 'release.tar.gz');
+    execFileSync('curl', ['-sL', '-H', 'Accept: application/vnd.github+json', tarballUrl, '-o', tarballPath],
+      { timeout: 30000, stdio: 'pipe' });
+    execFileSync('tar', ['xzf', tarballPath, '-C', tmpDir, '--strip-components=1'],
+      { timeout: 30000, stdio: 'pipe' });
 
     return installExtractedRelease(tmpDir);
   } catch (err) {
@@ -387,6 +388,8 @@ function saveState(state) {
   try {
     const dir = join(INSTALL_DIR, 'runtime');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+    const tmpFile = STATE_FILE + `.tmp-${process.pid}`;
+    writeFileSync(tmpFile, JSON.stringify(state, null, 2));
+    renameSync(tmpFile, STATE_FILE);
   } catch {}
 }
