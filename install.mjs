@@ -353,6 +353,21 @@ async function install() {
         }
       }
     } catch (e) { warn(`Marketplace hooks dedup: ${e.message}`); }
+
+    // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection
+    try {
+      const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
+      if (existsSync(cacheBase)) {
+        const srcLaunch = join(PROJECT_DIR, 'scripts', 'launch.mjs');
+        for (const ver of readdirSync(cacheBase)) {
+          const dest = join(cacheBase, ver, 'scripts', 'launch.mjs');
+          if (existsSync(join(cacheBase, ver, 'scripts'))) {
+            copyFileSync(srcLaunch, dest);
+          }
+        }
+        ok('Plugin cache: launch.mjs synced (dev mode MCP routing)');
+      }
+    } catch (e) { warn(`Plugin cache sync: ${e.message}`); }
   }
 
   // 4. Configure hooks (merge: preserve user's existing hooks, replace ours)

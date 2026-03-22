@@ -49,17 +49,16 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Check current project functionality and align README.md documentation; merge and clean up branches; commit and push cod…
-Completed: Updated marketplace.json version to 2.19.0; modified README.zh-CN.md, package.json, and plugin.json; updated mem servic…
-Remaining: Git branch merge/cleanup; git commit with messages and push; create GitHub release tag; verify GitHub Actions CI passes…
-Next: Execute git operations (branch cleanup, commit, push); create GitHub release via gh CLI or web UI; monitor GitHub Actio…
-Decisions: API field rename: observation_vectors → observation_files reflects data structure semantics more accurately, improving API clarity for consumers
+Completed: Reviewed 2 files: tool-schemas.mjs, server.mjs; Modified server-internals.mjs, server.mjs; Modified prompt-search-utils…
 
 ### Key Context
+- [discovery] Reviewed 2 files: tool-schemas.mjs, server.mjs (#4776)
+- [discovery] Reviewed 7 files: server.mjs, package.json, vitest.config.mjs, install.mjs +3 m… (#4749)
+- [discovery] Reviewed 9 files: server.mjs, hook-update.mjs, hook.mjs, install.mjs +5 more (#4745)
 - [bugfix] Fix PRF term extraction alignment with synonym handling (#4712) — PRF term extraction logic must match vocabulary indexing se…
 - [discovery] Reviewed 6 files: schema.mjs, server.mjs, hook-llm.mjs, tool-schemas.mjs +2 more (#4694)
-- [discovery] Reviewed 4 files: hook-llm.mjs, tool-schemas.mjs, schema.mjs, server.mjs (#4691)
-- [discovery] Reviewed 2 files: server.mjs, tfidf.mjs (#4690)
-- [discovery] Reviewed 4 files: tests, server-internals.mjs, vitest.config.mjs, server.mjs (#4673)
+
+### Working State (from /clear)
+- Working on: “以使用者的身份模拟测试一下该项目的各个功能包括用户体验,发现问题就修复问题，体验看能有效地提高claude的编程效率不。”使用loop插件循环执行三遍。ultrathink
 
 </claude-mem-context>

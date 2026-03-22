@@ -14,3 +14,22 @@ export const BASE_STOP_WORDS = new Set([
   'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some',
   'such', 'than', 'too', 'very', 'just', 'also', 'then', 'so', 'if',
 ]);
+
+/** CJK stop words — particles, function words, and fillers that add noise to FTS queries. */
+export const CJK_STOP_WORDS = new Set([
+  // Particles & structural
+  '的', '了', '是', '在', '有', '和', '与', '被', '把', '给',
+  '个', '这', '那', '也', '就', '都', '而', '及', '或', '但',
+  '还', '到', '让', '很', '得', '着', '过', '会', '要',
+  '能', '不', '没',
+  // Question words (intent detection handles these separately)
+  '什么', '怎么', '如何', '为何', '哪个',
+  // Quantifiers & demonstratives
+  '一下', '一些', '一个', '一种',
+  // Directional/auxiliary
+  '来', '去', '做', '从', '向', '比', '对',
+  // Sentence-final particles
+  '吗', '吧', '呢', '呀', '啊', '嗯', '哦',
+  // Common filler phrases
+  '看看', '帮我', '没有', '可以', '怎么样',
+]);

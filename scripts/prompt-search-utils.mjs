@@ -10,7 +10,11 @@ const SLASH_CMD_RE = /^\//;
 const PURE_OP_RE = /^(git\s+(commit|push|merge)|npm\s+(publish|deploy))\b/i;
 
 export function shouldSkip(text) {
-  if (!text || text.length < 8) return true;
+  if (!text) return true;
+  // CJK characters carry ~3x semantic weight per char vs Latin
+  const cjkCount = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+  const effectiveLen = (text.length - cjkCount) + cjkCount * 3;
+  if (effectiveLen < 8) return true;
   const trimmed = text.trim();
   if (CONFIRM_RE.test(trimmed)) return true;
   if (SLASH_CMD_RE.test(trimmed)) return true;

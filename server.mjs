@@ -569,7 +569,7 @@ server.registerTool(
     if (ftsQuery && results.some(r => r.source === 'obs')) {
       const obsResults = results.filter(r => r.source === 'obs');
       reRankWithContext(db, obsResults, currentProject);
-      markSuperseded(db, obsResults);
+      markSuperseded(obsResults);
       results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 

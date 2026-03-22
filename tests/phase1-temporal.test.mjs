@@ -154,7 +154,7 @@ describe('supersession persistence', () => {
     const results = db.prepare('SELECT id, type, title, created_at as date, files_modified, importance FROM observations ORDER BY created_at_epoch ASC').all();
     const searchResults = results.map(r => ({ source: 'obs', ...r }));
 
-    markSuperseded(db, searchResults);
+    markSuperseded(searchResults);
 
     // In-memory flag should be set
     expect(searchResults[0].superseded).toBe(true);

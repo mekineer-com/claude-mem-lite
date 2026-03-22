@@ -171,8 +171,8 @@ describe('sanitizeFtsQuery', () => {
   it('handles mixed hyphens and operators', () => {
     // "next-auth" stays quoted (has hyphen), "error" expands via synonym map
     // Uses AND joiner because of parenthesized group
-    // "error" has abbreviation "err", semantic synonyms "bug", "failure", and CJK "错误"
-    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug OR failure OR 错误)');
+    // "error" has abbreviation "err", semantic synonyms "bug", "failure", CJK "错误", "报错"
+    expect(sanitizeFtsQuery('-next-auth error')).toBe('"next-auth" AND (error OR err OR bug OR failure OR 错误 OR 报错)');
   });
 
   it('expands abbreviation synonyms', () => {
@@ -199,10 +199,12 @@ describe('sanitizeFtsQuery', () => {
   });
 
   it('appends CJK bigrams for Chinese phrase matching', () => {
-    // "系统崩溃" → individual chars skipped, bigrams "系统 统崩 崩溃" used
+    // "系统崩溃" → extracted via merged CJK dictionary as compound words with synonyms
     const result = sanitizeFtsQuery('系统崩溃');
-    expect(result).toContain('系统');
-    expect(result).toContain('崩溃');
+    expect(result).toContain('系统');  // from CJK_COMPOUNDS
+    expect(result).toContain('崩溃');  // from CJK_COMPOUNDS + SYNONYM_MAP → (崩溃 OR crash)
+    expect(result).toContain('system'); // synonym for 系统
+    expect(result).toContain('crash');  // synonym for 崩溃
   });
 
   it('handles mixed CJK and Latin tokens with bigrams', () => {
@@ -214,8 +216,8 @@ describe('sanitizeFtsQuery', () => {
 
   it('skips single CJK chars when bigrams available', () => {
     const result = sanitizeFtsQuery('系统');
-    // Should use bigram "系统" not individual chars "系" and "统"
-    expect(result).toBe('系统');
+    // "系统" is now in CJK_COMPOUNDS + SYNONYM_MAP → expanded with synonym
+    expect(result).toBe('(系统 OR system)');
   });
 
   it('preserves single CJK chars when no bigrams possible', () => {
@@ -291,14 +293,14 @@ describe('cjkBigrams', () => {
   });
 
   it('generates bigrams from CJK runs', () => {
-    // Dictionary-based: "系统" and "崩溃" are compounds, "统崩" is bigram fallback
-    expect(cjkBigrams('系统崩溃')).toBe('系统 统崩 崩溃');
+    // Dictionary-based: "系统" and "崩溃" are both in CJK_COMPOUNDS → clean tokens
+    expect(cjkBigrams('系统崩溃')).toBe('系统 崩溃');
     expect(cjkBigrams('修复')).toBe('修复');
   });
 
   it('handles multiple CJK runs separated by non-CJK', () => {
-    // Dictionary: "系统","修复","服务器","崩溃" are compounds; "统修" is bigram fallback
-    expect(cjkBigrams('系统修复 服务器崩溃')).toBe('系统 统修 修复 服务器 崩溃');
+    // Dictionary: "系统","修复","服务器","崩溃" are all compounds → clean tokens
+    expect(cjkBigrams('系统修复 服务器崩溃')).toBe('系统 修复 服务器 崩溃');
   });
 
   it('skips single CJK characters (no bigram from length 1)', () => {

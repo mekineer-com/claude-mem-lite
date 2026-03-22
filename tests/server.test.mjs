@@ -473,7 +473,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 1 },
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 2 },
     ];
-    markSuperseded(null, results);
+    markSuperseded(results);
     expect(results[0].superseded).toBe(true);  // old, imp=1 <= newest imp=2
     expect(results[1].superseded).toBeUndefined();  // newest
   });
@@ -483,7 +483,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 3 },
       { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 1 },
     ];
-    markSuperseded(null, results);
+    markSuperseded(results);
     expect(results[0].superseded).toBeUndefined();  // imp=3 > newest imp=1
     expect(results[1].superseded).toBeUndefined();  // newest
   });
@@ -493,7 +493,7 @@ describe('markSuperseded', () => {
       { source: 'obs', id: 1, date: '2026-01-01', importance: 1 },
       { source: 'session', id: 2, date: '2026-02-01' },
     ];
-    expect(() => markSuperseded(null, results)).not.toThrow();
+    expect(() => markSuperseded(results)).not.toThrow();
   });
 });
 

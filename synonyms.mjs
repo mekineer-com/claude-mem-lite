@@ -120,11 +120,26 @@ export const SYNONYM_PAIRS = [
   ['打包', 'bundle'], ['类型', 'type'], ['类型', 'typescript'],
   // Errors
   ['错误', 'error'], ['异常', 'exception'],
+  ['报错', 'error'], ['崩溃', 'crash'],
   // Infrastructure
   ['容器', 'container'], ['容器', 'docker'],
   ['集群', 'cluster'], ['集群', 'kubernetes'],
   ['网关', 'gateway'], ['负载', 'load balancing'],
   ['队列', 'queue'], ['序列化', 'serialize'],
+  // Code structure (missing from earlier CJK pairs)
+  ['函数', 'function'], ['变量', 'variable'],
+  ['模块', 'module'], ['框架', 'framework'],
+  ['编译', 'compile'], ['服务器', 'server'],
+  ['前端', 'frontend'], ['后端', 'backend'],
+  ['优化', 'optimize'], ['优化', 'optimization'],
+  ['架构', 'architecture'], ['设计', 'design'],
+  ['文档', 'documentation'], ['文档', 'docs'],
+  ['版本', 'version'], ['分支', 'branch'],
+  ['提交', 'commit'], ['推送', 'push'],
+  ['合并', 'merge'], ['升级', 'upgrade'],
+  ['安装', 'install'], ['导入', 'import'],
+  ['导出', 'export'], ['状态', 'state'],
+  ['系统', 'system'], ['算法', 'algorithm'],
 ];
 
 // ─── Bidirectional SYNONYM_MAP (case-insensitive) ──────────────────────────────
@@ -160,7 +175,7 @@ export const CJK_COMPOUNDS = new Set([
   '报错', '崩溃', '泄露', '溢出', '死锁', '超时', '中断', '异常', '故障',
   // architecture
   '架构', '设计', '方案', '规划', '文档', '注释', '版本', '分支', '依赖',
-  '性能', '安全', '漏洞', '补丁',
+  '性能', '安全', '漏洞', '补丁', '系统', '算法',
 ]);
 
 // ─── Dispatch Synonyms (unidirectional, broader groupings) ──────────────────

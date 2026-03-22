@@ -74,7 +74,7 @@ export function reRankWithContext(db, results, project) {
  * Mutates result objects in-place by adding superseded=true flag.
  * @param {object[]} results Array of search result objects with source, files_modified, date, importance
  */
-export function markSuperseded(db, results) {
+export function markSuperseded(results) {
   if (!results || results.length === 0) return;
   // Build map: file → [result objects], only for obs with files
   const fileMap = new Map();

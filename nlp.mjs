@@ -1,7 +1,7 @@
 // nlp.mjs -- FTS5 query building, synonym expansion, CJK tokenization.
 // Extracted from utils.mjs for focused module boundaries.
 
-import { BASE_STOP_WORDS } from './stop-words.mjs';
+import { BASE_STOP_WORDS, CJK_STOP_WORDS } from './stop-words.mjs';
 import { SYNONYM_MAP, CJK_COMPOUNDS } from './synonyms.mjs';
 
 // Re-export for backward compatibility (consumers import from nlp.mjs or utils.mjs)
@@ -51,7 +51,7 @@ export function cjkBigrams(text) {
   return [...new Set(tokens)].join(' ');
 }
 
-// ─── CJK Synonym Extraction ─────────────────────────────────────────────────
+// ─── CJK Keyword Extraction ─────────────────────────────────────────────────
 
 // Extract known CJK words (from SYNONYM_MAP) out of unsegmented CJK text.
 // Greedy longest-match: "数据库的全文搜索" → ["数据库", "搜索"] (skips particles/unknown).
@@ -68,6 +68,37 @@ export function extractCjkSynonymTokens(text) {
       if (text.startsWith(key, i)) {
         found.push(key);
         i += key.length;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) i++;
+  }
+  return found;
+}
+
+// Merged CJK dictionary: CJK_COMPOUNDS + CJK keys from SYNONYM_MAP — sorted longest first.
+// Gives broadest coverage: "搜索" from SYNONYM_MAP + "函数" from CJK_COMPOUNDS.
+const _cjkMergedKeys = [...new Set([...CJK_COMPOUNDS, ..._cjkSynonymKeys])]
+  .sort((a, b) => b.length - a.length);
+
+/**
+ * Extract CJK keywords using merged dictionary (CJK_COMPOUNDS + SYNONYM_MAP keys).
+ * Broader than either source alone. Filters CJK stop words.
+ * "这个函数是做什么的" → ["函数"] (not noisy bigrams)
+ * "修复数据库性能优化" → ["修复", "数据库", "性能", "优化"]
+ * "之前修复的FTS搜索排序" → ["修复", "搜索", "排序"]
+ */
+export function extractCjkKeywords(text) {
+  const found = [];
+  let i = 0;
+  while (i < text.length) {
+    if (!/[\u4e00-\u9fff\u3400-\u4dbf]/.test(text[i])) { i++; continue; }
+    let matched = false;
+    for (const word of _cjkMergedKeys) {
+      if (text.startsWith(word, i) && !CJK_STOP_WORDS.has(word)) {
+        found.push(word);
+        i += word.length;
         matched = true;
         break;
       }
@@ -124,13 +155,14 @@ export function sanitizeFtsQuery(query) {
   // Filter stop words (but keep all if filtering would empty the query)
   const filtered = tokens.filter(t => !FTS_STOP_WORDS.has(t.toLowerCase()));
   if (filtered.length > 0) tokens = filtered;
-  // Split unsegmented CJK tokens into known vocabulary words for synonym expansion.
-  // e.g. "数据库的全文搜索" → ["数据库", "搜索"] (both have EN synonyms in SYNONYM_MAP)
+  // Split unsegmented CJK tokens into known vocabulary words using CJK_COMPOUNDS dictionary.
+  // Uses broader dictionary than synonym-only extraction for better recall.
+  // e.g. "这个函数是做什么的" → ["函数"] (not noisy bigrams)
   const expandedTokens = [];
   let cjkExtracted = false;
   for (const t of tokens) {
     if (/[\u4e00-\u9fff\u3400-\u4dbf]/.test(t) && t.length > 2) {
-      const cjkWords = extractCjkSynonymTokens(t);
+      const cjkWords = extractCjkKeywords(t);
       if (cjkWords.length > 0) {
         expandedTokens.push(...cjkWords);
         cjkExtracted = true;
@@ -146,7 +178,7 @@ export function sanitizeFtsQuery(query) {
   // Skip bigrams when CJK synonym extraction already produced meaningful tokens —
   // bigrams joined with AND would make the query too restrictive.
   const bigrams = cjkExtracted ? null : cjkBigrams(cleaned);
-  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(Boolean) : []);
+  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(b => b && !CJK_STOP_WORDS.has(b)) : []);
   const hasBigrams = bigramSet.size > 0;
   const finalTokens = [];
   const seen = new Set();
