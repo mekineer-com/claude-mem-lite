@@ -4,23 +4,138 @@
 // cosine similarity, vector search, and RRF merging.
 
 import { cjkBigrams } from './utils.mjs';
+import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { createHash } from 'crypto';
 
 export const VOCAB_DIM = 512;
+export const MIN_COSINE_SIMILARITY = 0.05;
+export const VECTOR_SCAN_LIMIT = 500;
 
 const VOCAB_STOP_WORDS = new Set([
-  'the','a','an','is','are','was','were','be','been','being',
-  'have','has','had','do','does','did','will','would','could',
-  'should','may','might','can','shall','to','of','in','for',
-  'on','with','at','by','from','as','into','about','between',
-  'after','before','above','below','and','or','but','not','no',
-  'this','that','these','those','it','its','my','your','his',
-  'her','our','their','me','him','us','them','i','you','he',
-  'she','we','they','what','which','who','when','where','how',
-  'all','each','every','both','few','more','most','other','some',
-  'such','than','too','very','just','also','then','so','if',
+  ...BASE_STOP_WORDS,
   'now','only','still','here','there','up','out','am',
 ]);
+
+// ─── Porter Stemmer ──────────────────────────────────────────────────────────
+// Minimal Porter stemmer (1980) aligned with SQLite FTS5's built-in porter tokenizer.
+
+const step2map = {
+  ational:'ate', tional:'tion', enci:'ence', anci:'ance', izer:'ize',
+  abli:'able', alli:'al', entli:'ent', eli:'e', ousli:'ous', ization:'ize',
+  ation:'ate', ator:'ate', alism:'al', iveness:'ive', fulness:'ful',
+  ousness:'ous', aliti:'al', iviti:'ive', biliti:'ble', logi:'log',
+};
+const step3map = {
+  icate:'ic', ative:'', alize:'al', iciti:'ic', ical:'ic', ful:'', ness:'',
+};
+
+function consonant(word, i) {
+  const c = word[i];
+  if (/[aeiou]/.test(c)) return false;
+  if (c === 'y') return i === 0 || !/[aeiou]/.test(word[i - 1]);
+  return true;
+}
+
+function measure(word) {
+  let m = 0, prev = true; // start assuming consonant context
+  for (let i = 0; i < word.length; i++) {
+    const c = consonant(word, i);
+    if (!c && prev) m++;
+    prev = c;
+  }
+  return m;
+}
+
+function hasVowel(word) {
+  for (let i = 0; i < word.length; i++) if (!consonant(word, i)) return true;
+  return false;
+}
+
+function endsDouble(word) {
+  const l = word.length;
+  return l >= 2 && word[l - 1] === word[l - 2] && consonant(word, l - 1);
+}
+
+function cvc(word) {
+  const l = word.length;
+  return l >= 3 && consonant(word, l - 1) && !consonant(word, l - 2) && consonant(word, l - 3)
+    && !/[wxy]/.test(word[l - 1]);
+}
+
+export function porterStem(w) {
+  if (w.length <= 2) return w;
+  let word = w;
+
+  // Step 1a
+  if (word.endsWith('sses')) word = word.slice(0, -2);
+  else if (word.endsWith('ies')) word = word.slice(0, -2);
+  else if (!word.endsWith('ss') && word.endsWith('s')) word = word.slice(0, -1);
+
+  // Step 1b
+  let step1b2 = false;
+  if (word.endsWith('eed')) {
+    if (measure(word.slice(0, -3)) > 0) word = word.slice(0, -1);
+  } else if (word.endsWith('ed') && hasVowel(word.slice(0, -2))) {
+    word = word.slice(0, -2); step1b2 = true;
+  } else if (word.endsWith('ing') && hasVowel(word.slice(0, -3))) {
+    word = word.slice(0, -3); step1b2 = true;
+  }
+  if (step1b2) {
+    if (word.endsWith('at') || word.endsWith('bl') || word.endsWith('iz')) word += 'e';
+    else if (endsDouble(word) && !/[lsz]/.test(word[word.length - 1])) word = word.slice(0, -1);
+    else if (measure(word) === 1 && cvc(word)) word += 'e';
+  }
+
+  // Step 1c
+  if (word.endsWith('y') && hasVowel(word.slice(0, -1))) {
+    word = word.slice(0, -1) + 'i';
+  }
+
+  // Step 2
+  for (const [suffix, repl] of Object.entries(step2map)) {
+    if (word.endsWith(suffix)) {
+      const stem = word.slice(0, -suffix.length);
+      if (measure(stem) > 0) word = stem + repl;
+      break;
+    }
+  }
+
+  // Step 3
+  for (const [suffix, repl] of Object.entries(step3map)) {
+    if (word.endsWith(suffix)) {
+      const stem = word.slice(0, -suffix.length);
+      if (measure(stem) > 0) word = stem + repl;
+      break;
+    }
+  }
+
+  // Step 4
+  const step4suffixes = ['al','ance','ence','er','ic','able','ible','ant','ement','ment',
+    'ent','ion','ou','ism','ate','iti','ous','ive','ize'];
+  for (const suffix of step4suffixes) {
+    if (word.endsWith(suffix)) {
+      const stem = word.slice(0, -suffix.length);
+      if (measure(stem) > 1) {
+        if (suffix === 'ion' && stem.length > 0 && /[st]$/.test(stem)) word = stem;
+        else if (suffix !== 'ion') word = stem;
+      }
+      break;
+    }
+  }
+
+  // Step 5a
+  if (word.endsWith('e')) {
+    const stem = word.slice(0, -1);
+    if (measure(stem) > 1 || (measure(stem) === 1 && !cvc(stem))) word = stem;
+  }
+
+  // Step 5b
+  if (measure(word) > 1 && endsDouble(word) && word.endsWith('l')) {
+    word = word.slice(0, -1);
+  }
+
+  return word;
+}
 
 function isNoiseTerm(term) {
   if (VOCAB_STOP_WORDS.has(term)) return true;
@@ -34,7 +149,7 @@ const CJK_RANGE = /[\u4e00-\u9fff\u3400-\u4dbf]/;
 
 /**
  * Tokenize text into terms for TF-IDF.
- * ASCII: lowercase + split on non-alphanumeric.
+ * ASCII: lowercase + split + Porter stem (aligned with FTS5's porter tokenizer).
  * CJK: reuse cjkBigrams() for consistency with FTS5.
  */
 export function tokenize(text) {
@@ -55,9 +170,9 @@ export function tokenize(text) {
         }
       }
     } else {
-      // ASCII: split on non-alphanumeric
+      // ASCII: split on non-alphanumeric, then Porter stem
       for (const t of part.split(/[^a-z0-9]+/)) {
-        if (t.length >= 2) tokens.push(t);
+        if (t.length >= 2) tokens.push(porterStem(t));
       }
     }
   }
@@ -96,20 +211,22 @@ export function buildVocabulary(db) {
     }
   }
 
-  // Sort by DF descending, filter noise, take top VOCAB_DIM
+  // Compute IDF and sort by information gain (df × idf), filter noise + hapax
+  const idf = (freq) => Math.log(1 + N / (1 + freq));
   const sortedTerms = [...df.entries()]
-    .filter(([term]) => !isNoiseTerm(term))
-    .sort((a, b) => b[1] - a[1])
+    .filter(([term, freq]) => !isNoiseTerm(term) && freq >= 2)
+    .map(([term, freq]) => ({ term, df: freq, idf: idf(freq), ig: freq * idf(freq) }))
+    .sort((a, b) => b.ig - a.ig)
     .slice(0, VOCAB_DIM);
 
   // Build terms map with index and IDF
   const terms = new Map();
-  sortedTerms.forEach(([term, freq], index) => {
-    terms.set(term, { index, idf: Math.log(1 + N / (1 + freq)) });
+  sortedTerms.forEach((entry, index) => {
+    terms.set(entry.term, { index, idf: entry.idf });
   });
 
   // Version hash for staleness detection
-  const termList = sortedTerms.map(([t]) => t).join(',');
+  const termList = sortedTerms.map(e => e.term).join(',');
   const version = createHash('md5').update(termList).digest('hex').slice(0, 12);
 
   const vocab = { terms, version, dim: VOCAB_DIM };
@@ -187,13 +304,13 @@ export function computeVector(text, vocab) {
     tf.set(t, (tf.get(t) || 0) + 1);
   }
 
-  // Build TF-IDF vector
+  // Build TF-IDF vector with sublinear TF: 1 + log(tf)
   const vec = new Float32Array(vocab.dim);
   let hasNonZero = false;
   for (const [term, freq] of tf) {
     const entry = vocab.terms.get(term);
     if (entry) {
-      vec[entry.index] = freq * entry.idf;
+      vec[entry.index] = (1 + Math.log(freq)) * entry.idf;
       hasNonZero = true;
     }
   }
@@ -231,8 +348,13 @@ export function cosineSimilarity(a, b) {
  * @param {object} opts - { project?, type?, vocabVersion, limit? }
  * @returns {{ id: number, similarity: number }[]}
  */
-export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit = 500 }) {
+const VECTOR_TIME_WINDOW_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
+const VECTOR_MIN_RESULTS = 50; // fallback to full scan if time-window yields fewer
+
+export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit = VECTOR_SCAN_LIMIT }) {
   if (!queryVec) return [];
+
+  const now = Date.now();
 
   const wheres = [
     'COALESCE(o.compressed_into, 0) = 0',
@@ -243,22 +365,38 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
 
   if (project) { wheres.push('o.project = ?'); params.push(project); }
   if (type) { wheres.push('o.type = ?'); params.push(type); }
-  params.push(limit);
 
-  const rows = db.prepare(`
+  // Time-window prefilter: try 90 days first, fallback to full if too few results
+  const timeWheres = [...wheres, 'o.created_at_epoch > ?'];
+  const timeParams = [...params, now - VECTOR_TIME_WINDOW_MS, limit];
+
+  let rows = db.prepare(`
     SELECT ov.observation_id, ov.vector
     FROM observation_vectors ov
     JOIN observations o ON ov.observation_id = o.id
-    WHERE ${wheres.join(' AND ')}
+    WHERE ${timeWheres.join(' AND ')}
     ORDER BY o.created_at_epoch DESC
     LIMIT ?
-  `).all(...params);
+  `).all(...timeParams);
+
+  // Fallback: if time-window yields too few, scan without time constraint
+  if (rows.length < VECTOR_MIN_RESULTS) {
+    params.push(limit);
+    rows = db.prepare(`
+      SELECT ov.observation_id, ov.vector
+      FROM observation_vectors ov
+      JOIN observations o ON ov.observation_id = o.id
+      WHERE ${wheres.join(' AND ')}
+      ORDER BY o.created_at_epoch DESC
+      LIMIT ?
+    `).all(...params);
+  }
 
   const results = [];
   for (const row of rows) {
     const vec = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.vector.byteLength / 4);
     const sim = cosineSimilarity(queryVec, vec);
-    if (sim > 0.05) results.push({ id: row.observation_id, similarity: sim });
+    if (sim > MIN_COSINE_SIMILARITY) results.push({ id: row.observation_id, similarity: sim });
   }
   results.sort((a, b) => b.similarity - a.similarity);
   return results.slice(0, 20);

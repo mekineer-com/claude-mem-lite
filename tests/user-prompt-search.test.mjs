@@ -1,36 +1,28 @@
 // Tests for scripts/user-prompt-search.js — auto-search hook on user prompt
 // Since the script runs main() on import and reads from stdin, we test via:
 // 1. Subprocess execution with stdin piping (integration tests)
-// 2. Inline function logic validation (unit tests for skip/intent/format patterns)
+// 2. Direct imports from prompt-search-utils.mjs (unit tests — no more code duplication)
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { resolve, join } from 'path';
-import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'fs';
+import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { typeIcon, truncate } from '../utils.mjs';
+import {
+  shouldSkip,
+  detectIntent,
+  shouldSkipByDedup,
+  extractFiles,
+} from '../scripts/prompt-search-utils.mjs';
 
 const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
 
 // ─── Unit Tests: Skip Patterns ───────────────────────────────────────────────
-// Re-implement the skip logic from the script for direct unit testing
-
-const CONFIRM_RE = /^(y(es)?|no?|ok|done|go|sure|lgtm|thanks?|ty|继续|确认|好的|是的|对|嗯|行|可以|没问题)$/i;
-const SLASH_CMD_RE = /^\//;
-const PURE_OP_RE = /^(git\s+(commit|push|merge)|npm\s+(publish|deploy))\b/i;
-
-function shouldSkip(text) {
-  if (!text || text.length < 8) return true;
-  const trimmed = text.trim();
-  if (CONFIRM_RE.test(trimmed)) return true;
-  if (SLASH_CMD_RE.test(trimmed)) return true;
-  if (PURE_OP_RE.test(trimmed)) return true;
-  return false;
-}
 
 describe('shouldSkip', () => {
   it('skips empty/null/undefined text', () => {
@@ -83,22 +75,6 @@ describe('shouldSkip', () => {
 
 // ─── Unit Tests: Intent Detection ────────────────────────────────────────────
 
-const INTENTS = [
-  // Error/debug intent
-  { pattern: /error|bug|crash|broken|fail|fix|报错|出错|错误|崩溃|修复/i, type: 'bugfix', limit: 3 },
-  // Decision/architecture intent (before recall — "为什么...之前" is a decision question, not recall)
-  { pattern: /why|decided|architecture|design|为什么|决定|架构|设计/i, type: 'decision', limit: 3 },
-  // Recall/history intent (catch-all temporal, lowest priority)
-  { pattern: /before|previously|last time|remember|之前|上次|以前|记得/i, type: null, limit: 5, useRecent: true },
-];
-
-function detectIntent(text) {
-  for (const intent of INTENTS) {
-    if (intent.pattern.test(text)) return intent;
-  }
-  return null;
-}
-
 describe('detectIntent', () => {
   it('detects bugfix intent from error keywords', () => {
     expect(detectIntent('There is an error in the login module')).toHaveProperty('type', 'bugfix');
@@ -148,11 +124,6 @@ describe('detectIntent', () => {
 });
 
 // ─── Unit Tests: File Path Detection ─────────────────────────────────────────
-
-function extractFiles(text) {
-  const matches = text.match(/[\w./-]+\.\w{1,10}/g) || [];
-  return matches.filter(m => m.includes('.') && !m.startsWith('http'));
-}
 
 describe('extractFiles', () => {
   it('extracts file paths from text', () => {
@@ -495,8 +466,8 @@ describe('search query functions (in-memory DB)', () => {
     expect(rows.every(r => r.title !== 'Compressed observation')).toBe(true);
   });
 
-  // Test searchByFile logic via observation_files junction table
-  it('finds observations by file name via observation_files', () => {
+  // Test searchByFile logic
+  it('finds observations by file name in files_modified', () => {
     insertObs(db, {
       sessionId: 'mem-s1', project: 'test--project', type: 'change',
       title: 'Updated schema', text: 'schema change',
@@ -504,17 +475,16 @@ describe('search query functions (in-memory DB)', () => {
     });
     const cutoff = Date.now() - 60 * 86400000;
     const rows = db.prepare(`
-      SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
-      FROM observations o
-      JOIN observation_files of2 ON of2.obs_id = o.id
-      WHERE o.project = ?
-        AND o.importance >= 1
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.created_at_epoch > ?
-        AND (of2.filename = ? OR of2.filename LIKE ?)
-      ORDER BY o.created_at_epoch DESC
+      SELECT id, type, title, lesson_learned
+      FROM observations
+      WHERE project = ?
+        AND importance >= 1
+        AND COALESCE(compressed_into, 0) = 0
+        AND created_at_epoch > ?
+        AND (files_modified LIKE ? OR files_read LIKE ?)
+      ORDER BY created_at_epoch DESC
       LIMIT 5
-    `).all('test--project', cutoff, 'src/schema.mjs', '%schema.mjs');
+    `).all('test--project', cutoff, '%schema.mjs%', '%schema.mjs%');
 
     expect(rows.length).toBeGreaterThan(0);
     expect(rows[0].title).toBe('Updated schema');
@@ -547,23 +517,6 @@ describe('search query functions (in-memory DB)', () => {
 });
 
 // ─── Unit Tests: Result Dedup Cooldown ──────────────────────────────────────
-
-const MAX_SESSION_INJECTIONS = 15;
-const DEDUP_STALE_MS = 300_000;
-
-function shouldSkipByDedup(newIds, injectedFile) {
-  if (!newIds || newIds.length === 0) return true;
-  try {
-    const raw = readFileSync(injectedFile, 'utf8');
-    const { ids: prevIds, ts, count = 0 } = JSON.parse(raw);
-    if (count >= MAX_SESSION_INJECTIONS) return true;
-    if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
-    if (!Array.isArray(prevIds) || prevIds.length === 0) return false;
-    const prevSet = new Set(prevIds);
-    const overlapCount = newIds.filter(id => prevSet.has(id)).length;
-    return overlapCount / newIds.length >= 0.8;
-  } catch { return false; }
-}
 
 describe('result-dedup cooldown', () => {
   const testDir = resolve(import.meta.dirname, '.tmp-dedup-test');

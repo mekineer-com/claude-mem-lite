@@ -2,6 +2,7 @@
 // Tier 2 of the 3-tier dispatch intelligence architecture
 
 import { debugCatch } from './utils.mjs';
+import { BASE_STOP_WORDS } from './stop-words.mjs';
 
 // ─── Domain Synonyms ─────────────────────────────────────────────────────────
 
@@ -227,16 +228,8 @@ export function buildEnhancedQuery(signals) {
  * @returns {string|null} FTS5 query string or null
  */
 const TEXT_QUERY_STOP_WORDS = new Set([
-  'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-  'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-  'should', 'may', 'might', 'can', 'shall', 'to', 'of', 'in', 'for',
-  'on', 'with', 'at', 'by', 'from', 'as', 'into', 'about', 'between',
-  'after', 'before', 'above', 'below', 'and', 'or', 'but', 'not', 'no',
-  'this', 'that', 'these', 'those', 'it', 'its', 'my', 'your', 'his',
-  'her', 'our', 'their', 'me', 'him', 'us', 'them', 'i', 'you', 'he',
-  'she', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'how',
-  'all', 'each', 'every', 'both', 'few', 'more', 'most', 'other', 'some',
-  'such', 'than', 'too', 'very', 'just', 'also', 'then', 'so', 'if',
+  ...BASE_STOP_WORDS,
+  // CJK stop words (particles, pronouns, common verbs)
   '的', '了', '是', '在', '我', '有', '和', '就', '不', '人', '都',
   '一', '一个', '上', '也', '这', '那', '你', '他', '她', '它', '们',
   '把', '让', '给', '用', '来', '去', '做', '说', '要', '会', '能',

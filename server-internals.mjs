@@ -2,6 +2,7 @@
 // Extracted from server.mjs for testability (server.mjs has top-level side effects)
 
 import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from './utils.mjs';
+import { BASE_STOP_WORDS } from './stop-words.mjs';
 
 // ─── Search Re-ranking Helpers ────────────────────────────────────────────
 
@@ -112,10 +113,8 @@ export function markSuperseded(db, results) {
 
 /** @type {Set<string>} Common words excluded from PRF term extraction */
 export const PRF_STOP_WORDS = new Set([
-  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'was', 'were', 'been',
-  'have', 'has', 'had', 'are', 'but', 'not', 'all', 'can', 'into', 'when',
-  'which', 'their', 'will', 'would', 'could', 'should', 'also', 'than',
-  'then', 'its', 'use', 'used', 'using', 'some', 'new', 'added', 'updated',
+  ...BASE_STOP_WORDS,
+  'use', 'used', 'using', 'new', 'added', 'updated',
   'file', 'files', 'code', 'change', 'changed', 'changes',
 ]);
 
