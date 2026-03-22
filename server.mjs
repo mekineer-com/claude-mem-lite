@@ -5,6 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
+import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
@@ -62,26 +63,9 @@ function getRegistryDb() {
 // ─── Project Name Resolution ────────────────────────────────────────────────
 // Users naturally type short names like "mem" but inferProject() stores
 // "projects--mem" (parent--base from CWD). resolveProject() bridges this gap.
+// Implementation extracted to project-utils.mjs; local adapter closes over module-level `db`.
 
-const _projectCache = new Map();
-
-function resolveProject(name) {
-  if (!name) return name;
-  if (_projectCache.has(name)) return _projectCache.get(name);
-  // Already a canonical name (contains "--")? Use as-is.
-  if (name.includes('--')) { _projectCache.set(name, name); return name; }
-  // Short name: prefer the canonical "parent--name" form (from inferProject())
-  // which typically has far more data than manually-saved short names.
-  const suffixed = db.prepare(
-    'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
-  ).get(`%--${name}`);
-  if (suffixed) { _projectCache.set(name, suffixed.project); return suffixed.project; }
-  // Fallback: synthesize canonical form from current directory
-  const inferred = inferProject();
-  if (inferred.endsWith(`--${name}`)) { _projectCache.set(name, inferred); return inferred; }
-  _projectCache.set(name, name);
-  return name;
-}
+function resolveProject(name) { return _resolveProjectShared(db, name); }
 
 // ─── Scoring Model Constants ────────────────────────────────────────────────
 //

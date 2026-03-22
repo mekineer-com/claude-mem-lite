@@ -46,6 +46,7 @@
     "skip-tools.mjs",
     "tool-schemas.mjs",
     "utils.mjs",
+    "project-utils.mjs",
     "schema.mjs",
     "skill.md",
     "commands/mem.md",

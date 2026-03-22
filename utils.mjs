@@ -10,6 +10,7 @@ import { execSync } from 'child_process';
 
 export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, OBS_FTS_COLUMNS } from './scoring-sql.mjs';
 export { cjkBigrams, extractCjkSynonymTokens, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
+export { resolveProject, _resetProjectCache } from './project-utils.mjs';
 
 // ─── Sentinel Values ────────────────────────────────────────────────────────
 

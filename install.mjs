@@ -206,7 +206,7 @@ async function install() {
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
     'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
-    'nlp.mjs', 'scoring-sql.mjs', 'stop-words.mjs',
+    'nlp.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
   ];
 
   if (IS_DEV) {

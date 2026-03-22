@@ -200,6 +200,7 @@ const SOURCE_FILES = [
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
   'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
+  'project-utils.mjs',
 ];
 const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
 

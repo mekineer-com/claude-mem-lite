@@ -4,6 +4,7 @@
 
 import { ensureDb, DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, scrubSecrets, cjkBigrams, OBS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
+import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge, VECTOR_SCAN_LIMIT } from './tfidf.mjs';
 import { basename, join } from 'path';
@@ -58,20 +59,6 @@ function relativeTime(epochMs) {
 function fmtDateShort(iso) {
   if (!iso) return '';
   return iso.slice(0, 10); // YYYY-MM-DD
-}
-
-// ─── Project Resolution ──────────────────────────────────────────────────────
-
-function resolveProject(db, name) {
-  if (!name) return name;
-  if (name.includes('--')) return name;
-  const suffixed = db.prepare(
-    'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
-  ).get(`%--${name}`);
-  if (suffixed) return suffixed.project;
-  const inferred = inferProject();
-  if (inferred.endsWith(`--${name}`)) return inferred;
-  return name;
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
