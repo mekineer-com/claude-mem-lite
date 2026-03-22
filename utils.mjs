@@ -11,6 +11,14 @@ import { execSync } from 'child_process';
 export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, OBS_FTS_COLUMNS } from './scoring-sql.mjs';
 export { cjkBigrams, extractCjkSynonymTokens, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
 export { resolveProject, _resetProjectCache } from './project-utils.mjs';
+export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
+export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey } from './format-utils.mjs';
+export { computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity } from './hash-utils.mjs';
+export { detectBashSignificance, extractErrorKeywords, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
+
+// Internal imports for functions that remain in this module
+import { truncate } from './format-utils.mjs';
+import { stripTestSuffix } from './bash-utils.mjs';
 
 // ─── Sentinel Values ────────────────────────────────────────────────────────
 
@@ -18,94 +26,6 @@ export { resolveProject, _resetProjectCache } from './project-utils.mjs';
 export const COMPRESSED_AUTO = -1;
 /** compressed_into sentinel: pending user-confirmed purge (marked by idle cleanup) */
 export const COMPRESSED_PENDING_PURGE = -2;
-
-// ─── String Utilities ────────────────────────────────────────────────────────
-
-/**
- * Compute word-level Jaccard similarity between two strings.
- * @param {string} a First string
- * @param {string} b Second string
- * @returns {number} Similarity score between 0 and 1
- */
-export function jaccardSimilarity(a, b) {
-  if (!a || !b) return 0;
-  // Strip trailing punctuation from tokens to match MinHash normalization
-  // (prevents "server.rs," ≠ "server.rs" dedup failures)
-  const norm = s => s.toLowerCase().split(/\s+/).map(t => t.replace(/[,;:!?]+$/, ''));
-  const setA = new Set(norm(a));
-  const setB = new Set(norm(b));
-  let intersection = 0;
-  for (const w of setA) { if (setB.has(w)) intersection++; }
-  const union = setA.size + setB.size - intersection;
-  return union === 0 ? 0 : intersection / union;
-}
-
-/**
- * Truncate a string to a maximum length, replacing newlines with spaces.
- * @param {string} str Input string
- * @param {number} [max=80] Maximum character length
- * @returns {string} Truncated string with ellipsis if needed
- */
-export function truncate(str, max = 80) {
-  if (!str) return '';
-  str = str.replace(/\n/g, ' ').trim();
-  return str.length > max ? str.slice(0, max - 1) + '…' : str;
-}
-
-// ─── Secret Scrubbing ──────────────────────────────────────────────────────
-
-const SECRET_PATTERNS = [
-  // Key-value assignments: password=xxx, token=xxx, api_key=xxx, secret=xxx, etc.
-  // Excludes code-like values: null, undefined, true, false, None, empty, function calls (word()),
-  // and short values (<6 chars) that are typically variable names not secrets.
-  [/(\b(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer)\s*[=:]\s*)(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)(?!\w+\()(?!new\s)(?!process\.env\.)[^\s,;'"}\]]{6,}/gi, '$1***'],
-  // AWS access keys (AKIA...)
-  [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
-  // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold
-  [/\bsk-(?:proj|ant|ant-api\d{2})-[a-zA-Z0-9_-]{8,}\b/g, '***'],
-  [/\bsk-[a-zA-Z0-9_-]{20,}\b/g, '***'],
-  // GitHub tokens (ghp_, gho_, github_pat_)
-  [/\b(?:ghp_|gho_|ghs_|ghr_)[a-zA-Z0-9_]{30,}\b/g, '***'],
-  [/\bgithub_pat_[a-zA-Z0-9_]{22,}\b/g, '***'],
-  // GitLab tokens (glpat-)
-  [/\bglpat-[a-zA-Z0-9_-]{20,}\b/g, '***'],
-  // Slack tokens (xox[bpas]-)
-  [/\bxox[bpas]-[a-zA-Z0-9-]{10,}\b/g, '***'],
-  // JWT tokens (eyJ...eyJ...)
-  [/\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+\b/g, '***'],
-  // PEM private key blocks
-  [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, '***PEM_KEY***'],
-  // Long hex strings in assignments (e.g. SECRET_KEY=abc123def456...)
-  [/(\b(?:key|secret|token|hash)\s*[=:]\s*)[0-9a-f]{32,}\b/gi, '$1***'],
-  // Google Cloud API keys (AIza...)
-  [/\bAIza[A-Za-z0-9_-]{35}\b/g, '***'],
-  // Generic Bearer tokens in Authorization headers
-  [/(Authorization:\s*Bearer\s+)[^\s,;'"}\]]+/gi, '$1***'],
-  // Supabase / generic long base64 keys (40+ chars, common in env vars)
-  [/(\b(?:SUPABASE_KEY|SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL|REDIS_URL)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
-  // Basic auth in URLs (https://user:password@host)
-  [/https?:\/\/[^@/\s]+:[^@/\s]+@/gi, 'https://***:***@'],
-  // Database connection strings (postgres, mysql, mongodb, redis, amqp)
-  [/\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s,;'"}\]]+/gi, '$1://***'],
-  // npm tokens (npm_...)
-  [/\bnpm_[a-zA-Z0-9]{36,}\b/g, '***'],
-  // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_)
-  [/\b[srp]k_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
-];
-
-/**
- * Scrub known secret patterns (API keys, tokens, credentials) from text.
- * @param {string} text Input text potentially containing secrets
- * @returns {string} Text with secrets replaced by '***'
- */
-export function scrubSecrets(text) {
-  if (!text || typeof text !== 'string') return text || '';
-  let result = text;
-  for (const [pattern, replacement] of SECRET_PATTERNS) {
-    result = result.replace(pattern, replacement);
-  }
-  return result;
-}
 
 // ─── Token Estimation ─────────────────────────────────────────────────────
 
@@ -130,72 +50,6 @@ export function estimateTokens(text) {
   }
   const asciiLen = s.length - cjkCount;
   return Math.max(1, Math.ceil(asciiLen / 4) + Math.ceil(cjkCount / 1.5));
-}
-
-// ─── MinHash Signatures ──────────────────────────────────────────────────
-
-// FNV-1a hash: fast, non-cryptographic, ~10x faster than SHA-256 for MinHash
-function fnv1a(str) {
-  let hash = 0x811c9dc5; // FNV offset basis (32-bit)
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193); // FNV prime
-    hash >>>= 0; // Keep as uint32
-  }
-  return hash;
-}
-
-/**
- * Compute a MinHash signature for approximate set similarity.
- * Returns null for texts with fewer than 3 tokens.
- * @param {string} text Input text to hash
- * @param {number} [numHashes=64] Number of hash functions
- * @returns {string|null} Hex-encoded MinHash signature or null
- */
-export function computeMinHash(text, numHashes = 64) {
-  if (!text || typeof text !== 'string') return null;
-  const tokens = text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
-    .filter(t => t.length > 2);
-  // Require at least 3 tokens for meaningful signature (avoids high collision on short texts)
-  if (tokens.length < 3) return null;
-
-  const mins = new Array(numHashes).fill(0xFFFFFFFF);
-  for (const token of tokens) {
-    for (let i = 0; i < numHashes; i++) {
-      const val = fnv1a(`${i}-${token}`);
-      if (val < mins[i]) mins[i] = val;
-    }
-  }
-  return mins.map(v => v.toString(16).padStart(8, '0')).join('');
-}
-
-/**
- * Estimate Jaccard similarity from two MinHash signatures.
- * @param {string} sig1 First hex-encoded MinHash signature
- * @param {string} sig2 Second hex-encoded MinHash signature
- * @returns {number} Estimated Jaccard similarity between 0 and 1
- */
-export function estimateJaccardFromMinHash(sig1, sig2) {
-  if (!sig1 || !sig2) return 0;
-  if (sig1.length !== sig2.length) return 0;
-  const numHashes = sig1.length / 8;
-  if (numHashes === 0) return 0;
-  let matches = 0;
-  for (let i = 0; i < numHashes; i++) {
-    const offset = i * 8;
-    if (sig1.slice(offset, offset + 8) === sig2.slice(offset, offset + 8)) matches++;
-  }
-  return matches / numHashes;
-}
-
-/**
- * Map observation type to its display emoji icon.
- * @param {string} type Observation type (decision, bugfix, feature, etc.)
- * @returns {string} Emoji icon for the type
- */
-export function typeIcon(type) {
-  const icons = { decision: '🟡', bugfix: '🔴', feature: '🟢', refactor: '🔵', discovery: '🔍', change: '📝' };
-  return icons[type] || '⚪';
 }
 
 // ─── Importance ──────────────────────────────────────────────────────────────
@@ -268,112 +122,7 @@ export function inferProject() {
   return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
 }
 
-// ─── Bash Analysis ───────────────────────────────────────────────────────────
-
-/**
- * Detect significance signals in a Bash command and its response.
- * Checks for errors, test runs, builds, git operations, and deployments.
- * @param {object} input Tool input with command field
- * @param {string} response Command output text
- * @returns {{isError: boolean, isTest: boolean, isBuild: boolean, isGit: boolean, isDeploy: boolean, isSignificant: boolean}}
- */
-export function detectBashSignificance(input, response) {
-  const cmd = (input.command || '').toLowerCase();
-  // Skip error keyword matching when the command is a read/search operation
-  // (grep output naturally contains matched keywords like "error")
-  const isSearchCmd = /\b(grep|rg|ag|ack|cat|head|tail|less|more|find|locate|wc|file|which|type)\b/i.test(cmd);
-  const isError = !isSearchCmd
-    && /\berror\b|\bERR!|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
-    && response.length > 15;
-  // Match actual test runner invocations, not commands that merely reference "test" as a keyword
-  const isTest = /\b(npm\s+test|npm\s+run\s+test|yarn\s+test|pnpm\s+test|pnpm\s+run\s+test|bun\s+test|go\s+test|cargo\s+test)\b/i.test(cmd)
-    || /\b(jest|pytest|vitest|mocha|cypress|playwright)\b/i.test(cmd);
-  const isBuild = /\b(build|compile|tsc|webpack|vite|rollup|esbuild|make|cargo)\b/i.test(cmd);
-  const isGit = /\bgit\s+(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);
-  const isDeploy = /\b(deploy|docker|kubectl|terraform)\b/i.test(cmd);
-  return {
-    isError, isTest, isBuild, isGit, isDeploy,
-    isSignificant: isError || isTest || isBuild || isGit || isDeploy,
-  };
-}
-
-const ERROR_STOP_WORDS = new Set([
-  'error', 'failed', 'cannot', 'could', 'with', 'from', 'that', 'this',
-  'have', 'been', 'were', 'does', 'will', 'would', 'should', 'must',
-  'true', 'false', 'null', 'undefined', 'function', 'return', 'const',
-  'node', 'require', 'stack', 'trace',
-]);
-
-/**
- * Extract discriminative keywords from a failed command and its error output.
- * Filters out common stop words to produce useful FTS5 search terms.
- * @param {string} cmd The command that was executed
- * @param {string} response The error output text
- * @returns {string[]|null} Array of 1-6 keywords or null if none found
- */
-export function extractErrorKeywords(cmd, response) {
-  const words = new Set();
-  const cmdParts = cmd.split(/[\s/\\|&;]+/).filter(w => w.length > 2 && !/^-/.test(w));
-  for (const w of cmdParts.slice(0, 3)) {
-    const lw = w.toLowerCase();
-    if (!ERROR_STOP_WORDS.has(lw)) words.add(lw);
-  }
-  const errLines = response.split('\n').filter(l =>
-    /error|fail|exception|cannot|not found|undefined|null/i.test(l)
-  ).slice(0, 3);
-  for (const line of errLines) {
-    const tokens = line.replace(/[^a-zA-Z0-9_.-]/g, ' ').split(/\s+/)
-      .filter(w => w.length > 3 && !/^\d+$/.test(w));
-    for (const t of tokens.slice(0, 5)) {
-      const lt = t.toLowerCase();
-      if (!ERROR_STOP_WORDS.has(lt)) words.add(lt);
-    }
-  }
-  const result = [...words].slice(0, 6);
-  return result.length >= 1 ? result : null;
-}
-
-// ─── File Paths ──────────────────────────────────────────────────────────────
-
-/**
- * Extract file paths from tool input (file_path, path, filePath, or command args).
- * Deduplicates and excludes /dev/, /proc/, and /tmp/ paths.
- * @param {object} input Tool input object
- * @returns {string[]} Unique array of file paths
- */
-export function extractFilePaths(input) {
-  const paths = [];
-  if (input.file_path) paths.push(input.file_path);
-  if (input.path) paths.push(input.path);
-  if (input.filePath) paths.push(input.filePath);
-  if (input.command) {
-    // Match absolute paths; extension optional to support Makefile, Dockerfile etc.
-    const match = input.command.match(/(?:^|\s)(\/[\w./-]+\w)/g);
-    if (match) {
-      for (const m of match) {
-        const p = m.trim();
-        if (!p.startsWith('/dev/') && !p.startsWith('/proc/') && !p.startsWith('/tmp/')
-          // Skip single-component paths like /exit, /clear — likely slash commands, not files
-          && (p.indexOf('/', 1) !== -1 || /\.\w+$/.test(p))) {
-          paths.push(p);
-        }
-      }
-    }
-  }
-  return [...new Set(paths)];
-}
-
 // ─── Episode Logic ───────────────────────────────────────────────────────────
-
-/**
- * Strip test/spec/e2e suffixes from a filename for sibling matching.
- * Example: auth.test.ts → auth.ts, auth.spec.js → auth.js
- * @param {string} filePath File path to strip
- * @returns {string} Basename with test suffix removed
- */
-export function stripTestSuffix(filePath) {
-  return basename(filePath).replace(/\.(test|spec|e2e)\./i, '.');
-}
 
 /**
  * Check if new files are related to an existing episode's file set.
@@ -434,53 +183,6 @@ export function makeEntryDesc(toolName, input, resp) {
     default:
       return `${toolName}: ${truncate(resp, 50)}`;
   }
-}
-
-// ─── Date Formatting ─────────────────────────────────────────────────────────
-
-const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-/**
- * Format an ISO date string as "Mon DD HH:MM" for compact display.
- * @param {string} iso ISO 8601 date string
- * @returns {string} Formatted date or empty string
- */
-export function fmtDate(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  const mon = MONTHS[d.getUTCMonth()];
-  const day = d.getUTCDate();
-  const h = String(d.getUTCHours()).padStart(2, '0');
-  const m = String(d.getUTCMinutes()).padStart(2, '0');
-  return `${mon} ${day} ${h}:${m}`;
-}
-
-/**
- * Format an ISO date string as "HH:MM" for time-only display.
- * @param {string} iso ISO 8601 date string
- * @returns {string} Formatted time or empty string
- */
-export function fmtTime(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
-}
-
-// ─── ISO Week ────────────────────────────────────────────────────────────────
-
-/**
- * Convert an epoch timestamp to an ISO week key string (e.g. "2026-W06").
- * @param {number} epochMs Epoch timestamp in milliseconds
- * @returns {string} ISO week key in format "YYYY-Wnn"
- */
-export function isoWeekKey(epochMs) {
-  const d = new Date(epochMs);
-  const tmp = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  tmp.setUTCDate(tmp.getUTCDate() + 4 - (tmp.getUTCDay() || 7));
-  const yearStart = new Date(Date.UTC(tmp.getUTCFullYear(), 0, 1));
-  const weekNum = Math.ceil(((tmp - yearStart) / 86400000 + 1) / 7);
-  const isoYear = tmp.getUTCFullYear();
-  return `${isoYear}-W${String(weekNum).padStart(2, '0')}`;
 }
 
 // ─── Structured Logging ──────────────────────────────────────────────────────

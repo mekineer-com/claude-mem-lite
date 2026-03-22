@@ -207,6 +207,7 @@ async function install() {
     'registry-retriever.mjs', 'resource-discovery.mjs',
     'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
     'nlp.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
+    'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
   ];
 
   if (IS_DEV) {
