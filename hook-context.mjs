@@ -82,14 +82,19 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const selectedSess = [];
   let totalTokens = 0;
 
-  // Score each candidate: value = recency * importance, cost = tokens
+  // Type quality multipliers — aligned with scoring-sql.mjs TYPE_QUALITY_CASE
+  // Demotes bugfix (noisy error logs) and promotes high-signal types
+  const TYPE_QUALITY = { decision: 1.5, discovery: 1.3, feature: 1.2, refactor: 1.0, change: 0.8, bugfix: 0.35 };
+
+  // Score each candidate: value = recency * type_quality * importance, cost = tokens
   // Recency uses exponential half-life (consistent with server.mjs BM25 scoring)
   const scoredObs = obsPool.map(o => {
     const halfLifeMs = DECAY_HALF_LIFE_BY_TYPE[o.type] || DEFAULT_DECAY_HALF_LIFE_MS;
     const recency = 1.0 + Math.exp(-0.693 * (now_ms - o.created_at_epoch) / halfLifeMs);
+    const typeQuality = TYPE_QUALITY[o.type] || 1.0;
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const lessonBoost = o.lesson_learned ? 1.3 : 1.0;
-    const value = recency * impBoost * lessonBoost;
+    const value = recency * typeQuality * impBoost * lessonBoost;
     const cost = estimateTokens((o.title || '') + (o.narrative || ''));
     return { ...o, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
   });

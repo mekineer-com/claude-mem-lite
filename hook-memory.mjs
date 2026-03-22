@@ -5,7 +5,9 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25 } from './uti
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
-const MEMORY_TYPE_BOOST = { bugfix: 1.5, decision: 1.3, discovery: 1.0, feature: 0.8, change: 0.5, refactor: 0.5 };
+// Aligned with TYPE_QUALITY_CASE: high-signal types > noisy types
+// Bugfix lessons are still surfaced via the separate lesson_learned boost (1.5×)
+const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, feature: 1.2, refactor: 1.0, change: 0.8, bugfix: 0.5 };
 
 const FILE_RECALL_LOOKBACK_MS = 60 * 86400000; // 60 days
 const MAX_FILE_RECALL = 2;

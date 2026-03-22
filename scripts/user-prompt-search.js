@@ -4,7 +4,7 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE } from '../utils.mjs';
 import { writeFileSync, readFileSync } from 'fs';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS } from './prompt-search-utils.mjs';
 
@@ -28,6 +28,7 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25}
              * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
+             * ${TYPE_QUALITY_CASE}
              * (0.5 + 0.5 * COALESCE(o.importance, 1)) as relevance
     FROM observations_fts
     JOIN observations o ON o.id = observations_fts.rowid

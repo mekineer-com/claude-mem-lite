@@ -202,7 +202,7 @@ async function install() {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
   const SOURCE_FILES = [
-    'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
+    'cli.mjs', 'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
     'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
     'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
@@ -259,6 +259,8 @@ async function install() {
     if (existsSync(postToolSrc)) copyFileSync(postToolSrc, join(scriptsDir, 'post-tool-use.sh'));
     const promptSearchSrc = join(PROJECT_DIR, 'scripts', 'user-prompt-search.js');
     if (existsSync(promptSearchSrc)) copyFileSync(promptSearchSrc, join(scriptsDir, 'user-prompt-search.js'));
+    const promptSearchUtilsSrc = join(PROJECT_DIR, 'scripts', 'prompt-search-utils.mjs');
+    if (existsSync(promptSearchUtilsSrc)) copyFileSync(promptSearchUtilsSrc, join(scriptsDir, 'prompt-search-utils.mjs'));
     // Ensure bash script is executable
     try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
     // Copy commands directory
@@ -289,6 +291,31 @@ async function install() {
     } catch (e) {
       fail('npm install failed: ' + e.message);
       process.exit(1);
+    }
+  }
+
+  // 2b. Create global CLI symlink (claude-mem-lite command)
+  const cliSource = join(INSTALL_DIR, 'cli.mjs');
+  if (existsSync(cliSource)) {
+    try { execFileSync('chmod', ['+x', cliSource], { stdio: 'pipe' }); } catch {}
+    // Try ~/.local/bin first (user-writable, commonly on PATH)
+    const localBin = join(homedir(), '.local', 'bin');
+    const cliLink = join(localBin, 'claude-mem-lite');
+    try {
+      if (!existsSync(localBin)) mkdirSync(localBin, { recursive: true });
+      if (existsSync(cliLink)) unlinkSync(cliLink);
+      symlinkSync(cliSource, cliLink);
+      ok(`CLI: ${cliLink} → ${cliSource}`);
+    } catch (e) {
+      // Fallback: try /usr/local/bin (may need sudo)
+      try {
+        const globalLink = '/usr/local/bin/claude-mem-lite';
+        if (existsSync(globalLink)) unlinkSync(globalLink);
+        symlinkSync(cliSource, globalLink);
+        ok(`CLI: ${globalLink} → ${cliSource}`);
+      } catch {
+        warn('CLI symlink failed — run manually: ln -sf ' + cliSource + ' ~/.local/bin/claude-mem-lite');
+      }
     }
   }
 
@@ -736,6 +763,14 @@ async function uninstall() {
     warn('MCP server not found or already removed');
   }
 
+  // 1b. Remove CLI symlink
+  for (const binDir of [join(homedir(), '.local', 'bin'), '/usr/local/bin']) {
+    const cliLink = join(binDir, 'claude-mem-lite');
+    try {
+      if (existsSync(cliLink)) { unlinkSync(cliLink); ok(`CLI symlink removed: ${cliLink}`); }
+    } catch { /* may not have permissions */ }
+  }
+
   // 2. Remove hooks from settings.json (match both npx and git-clone install paths)
   const settings = readSettings();
   cleanupMemHooksFromSettings(settings);
@@ -892,6 +927,18 @@ async function status() {
     }
   } else {
     warn('Database: not found');
+  }
+
+  // CLI
+  try {
+    const cliVer = execSync('claude-mem-lite --help 2>/dev/null && echo OK', { encoding: 'utf8', timeout: 5000 });
+    if (cliVer.includes('OK')) {
+      ok('CLI: claude-mem-lite command available');
+    } else {
+      warn('CLI: command not on PATH');
+    }
+  } catch {
+    warn('CLI: command not on PATH — run install again to create symlink');
   }
 
   // Old system
@@ -1081,6 +1128,23 @@ async function doctor() {
     } catch (e) {
       warn('DB stats: ' + e.message);
     }
+  }
+
+  // Plugin cache versions
+  const pluginCacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
+  if (existsSync(pluginCacheBase)) {
+    try {
+      const versions = readdirSync(pluginCacheBase).filter(n => /^\d+\./.test(n));
+      let sizeStr;
+      try {
+        sizeStr = execFileSync('du', ['-sh', pluginCacheBase], { encoding: 'utf8', timeout: 5000 }).trim().split('\t')[0];
+      } catch { sizeStr = '?'; }
+      if (versions.length > 3) {
+        warn(`Plugin cache: ${versions.length} versions (${sizeStr}) — run setup.sh or update to auto-prune to 3`);
+      } else {
+        ok(`Plugin cache: ${versions.length} version(s) (${sizeStr})`);
+      }
+    } catch {}
   }
 
   console.log(`\n  ${issues === 0 ? 'All checks passed!' : `${issues} issue(s) found.`}\n`);

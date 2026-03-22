@@ -4,12 +4,13 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memFtsCheckSchema, memRegistrySchema } from './tool-schemas.mjs';
+import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema } from './tool-schemas.mjs';
+import { basename } from 'path';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
@@ -104,9 +105,16 @@ const server = new McpServer(
       '  claude-mem-lite get 42,43                   — full details by ID',
       '  claude-mem-lite timeline --anchor 42        — chronological context',
       '',
-      'MCP tools: mem_search, mem_save, mem_get, mem_timeline for programmatic access.',
+      'MCP tools: mem_search, mem_save, mem_get, mem_recall, mem_timeline for programmatic access.',
       'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
       'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
+      '',
+      'WHEN TO USE (proactive triggers):',
+      '  • Before fixing a bug → recall the file: claude-mem-lite recall "file.mjs"',
+      '  • Encountering an error → search for similar: claude-mem-lite search "error message" --type bugfix',
+      '  • Starting work on a module → recall past decisions: claude-mem-lite search "module-name" --type decision',
+      '  • After solving a non-obvious problem → save the lesson: mem_save with lesson_learned',
+      '  • When hook-injected context mentions a relevant ID → get details: claude-mem-lite get ID',
     ].join('\n'),
   },
 );
@@ -132,14 +140,17 @@ function safeHandler(fn) {
 // TYPE_DECAY_CASE imported from utils.mjs
 
 // Score expression variants for FTS5 queries (see Scoring Model Constants above)
+// TYPE_QUALITY_CASE demotes bugfix (×0.6) and promotes decision/discovery (×1.5/1.3)
 const FULL_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+  * ${TYPE_QUALITY_CASE}
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+  * ${TYPE_QUALITY_CASE}
   * (0.5 + 0.5 * COALESCE(o.importance, 1))`;
 
 /**
@@ -541,6 +552,26 @@ server.registerTool(
     if (!effectiveType || effectiveType === 'sessions')     results.push(...searchSessions(ctx));
     if (!effectiveType || effectiveType === 'prompts')       results.push(...searchPrompts(ctx));
 
+    // Type-list fallback: when obs_type is specified and FTS finds nothing,
+    // list recent observations of that type (user likely wants to browse by type)
+    if (results.length === 0 && args.obs_type) {
+      const typeWheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL', 'type = ?'];
+      const typeParams = [args.obs_type];
+      if (args.project) { typeWheres.push('project = ?'); typeParams.push(args.project); }
+      if (epochFrom !== null) { typeWheres.push('created_at_epoch >= ?'); typeParams.push(epochFrom); }
+      if (epochTo !== null) { typeWheres.push('created_at_epoch <= ?'); typeParams.push(epochTo); }
+      if (args.importance) { typeWheres.push('COALESCE(importance, 1) >= ?'); typeParams.push(args.importance); }
+      typeParams.push(limit);
+      const typeRows = db.prepare(`
+        SELECT id, type, title, subtitle, project, created_at, importance, files_modified
+        FROM observations WHERE ${typeWheres.join(' AND ')}
+        ORDER BY created_at_epoch DESC LIMIT ?
+      `).all(...typeParams);
+      for (const r of typeRows) {
+        results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, importance: r.importance, files_modified: r.files_modified, score: 0, snippet: '' });
+      }
+    }
+
     // Cross-source score normalization: normalize each source to [-1, 0] before merging
     // Prevents observations (BM25 scores can reach -40) from systematically outranking
     // sessions (-6) and prompts (-1) regardless of actual relevance
@@ -596,7 +627,8 @@ server.registerTool(
     }
 
     const totalBeforePagination = results.length;
-    const paginatedResults = isCrossSource ? results.slice(offset, offset + limit) : results;
+    // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
+    const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
 
     return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, isCrossSource);
   })
@@ -664,6 +696,9 @@ server.registerTool(
     if (!anchorRow) {
       return { content: [{ type: 'text', text: `Observation #${anchorId} not found.` }] };
     }
+
+    // Update access_count for anchor (aligned with CLI timeline)
+    db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
 
     const projectFilter = args.project ? 'AND project = ?' : '';
     const baseParams = args.project ? [args.project] : [];
@@ -873,7 +908,7 @@ server.registerTool(
       const result = db.prepare(`
         INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
         VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?)
-      `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), args.importance ?? 1, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+      `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), args.importance ?? 2, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
       const savedId = Number(result.lastInsertRowid);
 
       // Populate observation_files junction table
@@ -1605,6 +1640,49 @@ server.registerTool(
 
     const cap = rows.length >= exportLimit ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
     return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
+  })
+);
+
+// ─── Tool: mem_recall ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_recall',
+  {
+    description: 'Recall observations related to a file. Use before editing a file to recall past bugfixes, decisions, and context.',
+    inputSchema: memRecallSchema,
+  },
+  safeHandler(async (args) => {
+    const filename = basename(args.file);
+    const limit = args.limit ?? 10;
+
+    const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const likePattern = `%${escaped}`;
+    const rows = db.prepare(`
+      SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at, o.project
+      FROM observations o
+      JOIN observation_files of2 ON of2.obs_id = o.id
+      WHERE COALESCE(o.compressed_into, 0) = 0
+        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+      ORDER BY o.created_at_epoch DESC
+      LIMIT ?
+    `).all(filename, likePattern, limit);
+
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: `No history for "${filename}". This file hasn't been observed yet.` }] };
+    }
+
+    // Update access_count for recalled observations
+    const recalledIds = rows.map(r => r.id);
+    const ph = recalledIds.map(() => '?').join(',');
+    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...recalledIds);
+
+    const lines = [`History for ${filename} (${rows.length} observation${rows.length !== 1 ? 's' : ''}):\n`];
+    for (const r of rows) {
+      const lesson = r.lesson_learned ? `\n     Lesson: ${truncate(r.lesson_learned, 100)}` : '';
+      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}${lesson}`);
+    }
+    lines.push(`\nWorkflow: mem_get(ids=[...]) for full details`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   })
 );
 

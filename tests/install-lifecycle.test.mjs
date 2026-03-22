@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, readlinkSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, symlinkSync, readlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -279,6 +279,39 @@ describe('install lifecycle checks', () => {
       expect(claudeJson.mcpServers?.mem).toBeUndefined();
       expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10'))).toBe(true);
       expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10.4'))).toBe(true);
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('plugin setup prunes old cache versions keeping latest 3', () => {
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const cacheBase = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      const pluginRoot = join(cacheBase, '2.21.0');
+      mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+      symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
+
+      // Create 5 version dirs
+      for (const v of ['1.0.0', '2.0.0', '2.10.0', '2.20.0', '2.21.0']) {
+        mkdirSync(join(cacheBase, v), { recursive: true });
+      }
+
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({}, null, 2));
+
+      execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      const remaining = readdirSync(cacheBase).filter(n => /^\d+\./.test(n)).sort();
+      expect(remaining).toHaveLength(3);
+      // Oldest 2 should be removed
+      expect(remaining).not.toContain('1.0.0');
+      expect(remaining).not.toContain('2.0.0');
+      expect(remaining).toContain('2.21.0');
     } finally {
       try { rmSync(home, { recursive: true, force: true }); } catch {}
     }

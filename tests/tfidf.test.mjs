@@ -88,18 +88,18 @@ describe('buildVocabulary', () => {
     expect(vocab).not.toBeNull();
     // 'databas' (stemmed) appears in 2/12 docs, 'data' appears in 10/12
     // Both should be in vocab since df>=2
-    // Under IDF ranking, 'databas' (rare, higher IDF) should rank before 'data' (common, lower IDF)
+    // Under IG ranking (df×idf), 'data' (df=10, moderate IDF, high IG) ranks before 'databas' (df=2, high IDF, low IG)
     const databIdx = vocab.terms.get('databas')?.index;
     const dataIdx = vocab.terms.get('data')?.index;
     expect(databIdx).toBeDefined();
     expect(dataIdx).toBeDefined();
-    expect(databIdx).toBeLessThan(dataIdx);
+    expect(dataIdx).toBeLessThan(databIdx);
   });
 
-  it('should rank high-IDF (rare) terms before mid-IDF (common) terms in vocab', () => {
+  it('should rank high-IG (frequent + discriminative) terms before low-IG (rare) terms in vocab', () => {
     // Create a corpus where common terms have high df (low IDF) but high IG (df*idf),
     // and rare terms have low df (high IDF) but low IG.
-    // Under IDF ranking, rare terms should come first in the vocab index order.
+    // Under IG ranking, common terms should come first in the vocab index order.
     for (let i = 0; i < 20; i++) {
       insertObs(db, { title: `Common pattern observation ${i}`, narrative: 'uses the common pattern repeatedly', importance: 1 });
     }
@@ -111,11 +111,11 @@ describe('buildVocabulary', () => {
     expect(vocab).not.toBeNull();
     expect(vocab.terms.has('raretermxyz')).toBe(true);
 
-    // Under IDF ranking, 'raretermxyz' (df=2, IDF≈2.12) should have a lower index
-    // (= higher priority) than 'common' (df=20, IDF≈0.72)
+    // Under IG ranking, 'common' (df=20, IG=20*0.72≈14.4) should have a lower index
+    // (= higher priority) than 'raretermxyz' (df=2, IG=2*2.12≈4.24)
     const rareIdx = vocab.terms.get('raretermxyz').index;
     const commonIdx = vocab.terms.get('common').index;
-    expect(rareIdx).toBeLessThan(commonIdx);
+    expect(commonIdx).toBeLessThan(rareIdx);
   });
 
   it('excludes hapax legomena (df=1 terms)', () => {

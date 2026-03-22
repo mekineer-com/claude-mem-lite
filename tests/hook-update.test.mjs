@@ -120,3 +120,46 @@ describe('hook update lifecycle', () => {
   });
 });
 
+describe('plugin cache pruning', () => {
+  it('removes old versions and keeps the latest 3', async () => {
+    const home = makeDir('mem-prune-home');
+    const cacheBase = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+    const versions = ['1.0.0', '1.1.0', '2.0.0', '2.1.0', '2.5.0'];
+    for (const v of versions) {
+      mkdirSync(join(cacheBase, v), { recursive: true });
+      writeFileSync(join(cacheBase, v, 'server.mjs'), `// v${v}`);
+    }
+
+    const origHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { prunePluginCache } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+      const removed = prunePluginCache();
+      expect(removed).toBe(2);
+
+      const remaining = readdirSync(cacheBase).sort();
+      expect(remaining).toEqual(['2.0.0', '2.1.0', '2.5.0']);
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
+
+  it('does nothing when 3 or fewer versions exist', async () => {
+    const home = makeDir('mem-prune-home2');
+    const cacheBase = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+    for (const v of ['1.0.0', '2.0.0']) {
+      mkdirSync(join(cacheBase, v), { recursive: true });
+    }
+
+    const origHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { prunePluginCache } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+      expect(prunePluginCache()).toBe(0);
+      expect(readdirSync(cacheBase)).toHaveLength(2);
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
+});
+

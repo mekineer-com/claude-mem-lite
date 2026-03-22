@@ -1,9 +1,12 @@
 #!/usr/bin/env node
-const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'browse', 'help']);
+const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'browse', 'delete', 'update', 'export', 'compress', 'maintain', 'fts-check', 'help']);
 
 const cmd = process.argv[2];
 
-if (CLI_COMMANDS.has(cmd)) {
+if (cmd === '--help' || cmd === '-h') {
+  const { run } = await import('./mem-cli.mjs');
+  await run(['help']);
+} else if (CLI_COMMANDS.has(cmd)) {
   const { run } = await import('./mem-cli.mjs');
   await run(process.argv.slice(2));
 } else {

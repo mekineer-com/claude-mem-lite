@@ -10,6 +10,7 @@ import {
   memStatsSchema,
   memCompressSchema,
   memMaintainSchema,
+  memRecallSchema,
   memRegistrySchema,
 } from '../tool-schemas.mjs';
 
@@ -116,6 +117,36 @@ describe('mem_get schema', () => {
   it('rejects missing ids', () => {
     const result = parseSchema(memGetSchema, {});
     expect(result.success).toBe(false);
+  });
+});
+
+// ─── mem_recall schema ─────────────────────────────────────────────────────
+
+describe('mem_recall schema', () => {
+  it('accepts file path', () => {
+    const result = parseSchema(memRecallSchema, { file: 'server.mjs' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts file with limit', () => {
+    const result = parseSchema(memRecallSchema, { file: 'utils.mjs', limit: 5 });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects empty file', () => {
+    const result = parseSchema(memRecallSchema, { file: '' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects missing file', () => {
+    const result = parseSchema(memRecallSchema, {});
+    expect(result.success).toBe(false);
+  });
+
+  it('coerces string limit', () => {
+    const result = parseSchema(memRecallSchema, { file: 'test.mjs', limit: '10' });
+    expect(result.success).toBe(true);
+    expect(result.data.limit).toBe(10);
   });
 });
 

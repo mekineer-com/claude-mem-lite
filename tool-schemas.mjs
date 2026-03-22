@@ -66,7 +66,7 @@ export const memSaveSchema = {
   title: z.string().optional().describe('Short title'),
   type: OBS_TYPE_ENUM.optional().describe('Observation type (default: discovery)'),
   project: z.string().optional().describe('Project name (default: inferred from CWD)'),
-  importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 1)'),
+  importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 2 for explicit saves)'),
   files: z.array(z.string()).optional().describe('File paths associated with this observation'),
 };
 
@@ -112,6 +112,11 @@ export const memExportSchema = {
   date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
   include_compressed: coerceBool.optional().describe('Include compressed observations (default: false)'),
   limit: coerceInt.optional().describe('Max observations to export (default: 200, max: 1000)'),
+};
+
+export const memRecallSchema = {
+  file: z.string().min(1).describe('File path or filename to recall observations for'),
+  limit: coerceInt.pipe(z.number().int().min(1).max(50)).optional().describe('Max results (default 10)'),
 };
 
 export const memFtsCheckSchema = {

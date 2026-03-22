@@ -193,7 +193,7 @@ export function getCurrentVersion() {
 
 // ── Source files to copy (must match install.mjs SOURCE_FILES) ──
 const SOURCE_FILES = [
-  'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
+  'cli.mjs', 'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
   'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
   'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
@@ -285,6 +285,9 @@ export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
       }
     } catch (e) { debugCatch(e, 'post-update-mcp-dedup'); }
 
+    // Post-update: prune old plugin cache versions (keep latest 3)
+    try { prunePluginCache(); } catch (e) { debugCatch(e, 'prunePluginCache'); }
+
     debugLog('DEBUG', 'hook-update', `Auto-update: switched ${installed.length} paths`);
     return true;
   } catch (err) {
@@ -342,6 +345,33 @@ function copyReleaseIntoStaging(sourceDir, stagingDir) {
   }
 
   debugLog('DEBUG', 'hook-update', `Auto-update staged ${copied} source files`);
+}
+
+// ── Plugin Cache Pruning ──────────────────────────────────
+const PLUGIN_CACHE_KEEP = 3;
+
+export function prunePluginCache() {
+  const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+  if (!existsSync(cacheBase)) return 0;
+
+  const entries = readdirSync(cacheBase)
+    .filter(name => /^\d+\.\d+/.test(name))  // version-like dirs only
+    .sort((a, b) => compareVersions(b, a));   // newest first
+
+  if (entries.length <= PLUGIN_CACHE_KEEP) return 0;
+
+  const toRemove = entries.slice(PLUGIN_CACHE_KEEP);
+  let removed = 0;
+  for (const ver of toRemove) {
+    try {
+      rmSync(join(cacheBase, ver), { recursive: true, force: true });
+      removed++;
+    } catch {}
+  }
+  if (removed > 0) {
+    debugLog('DEBUG', 'hook-update', `Plugin cache pruned: removed ${removed} old version(s), kept latest ${PLUGIN_CACHE_KEEP}`);
+  }
+  return removed;
 }
 
 // ── State Persistence ──────────────────────────────────────

@@ -113,8 +113,23 @@ if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
     // marketplace → plugin cache on updates. Clearing it causes the cache
     // .mcp.json to lose the MCP server definition, breaking plugin MCP.
     if (!changed) process.stderr.write("✓ MCP migration: already clean\n");
-  ' 2>&2 || true
+  ' || true
   touch "$MCP_MIGRATION"
+fi
+
+# 8. Prune old plugin cache versions (keep latest 3)
+if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+  CACHE_DIR="$HOME/.claude/plugins/cache/sdsrss/claude-mem-lite"
+  if [[ -d "$CACHE_DIR" ]]; then
+    # List version dirs sorted by semver descending, skip top 3
+    mapfile -t OLD_VERS < <(ls -1 "$CACHE_DIR" | grep -E '^[0-9]+\.' | sort -t. -k1,1nr -k2,2nr -k3,3nr | tail -n +4)
+    if [[ ${#OLD_VERS[@]} -gt 0 ]]; then
+      for ver in "${OLD_VERS[@]}"; do
+        rm -rf "${CACHE_DIR:?}/$ver" 2>/dev/null || true
+      done
+      log_ok "Plugin cache pruned: removed ${#OLD_VERS[@]} old version(s)"
+    fi
+  fi
 fi
 
 log_ok "claude-mem-lite ready"

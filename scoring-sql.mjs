@@ -39,3 +39,20 @@ export const TYPE_DECAY_CASE = `(
     ELSE 1209600000.0
   END
 )`;
+
+/**
+ * Type quality multiplier — demotes noisy types (bugfix error logs)
+ * and promotes high-signal types (decisions, discoveries).
+ * Applied as: BM25 × time_decay × TYPE_QUALITY × project_boost × importance
+ */
+export const TYPE_QUALITY_CASE = `(
+  CASE o.type
+    WHEN 'decision'  THEN 1.5
+    WHEN 'discovery' THEN 1.3
+    WHEN 'feature'   THEN 1.2
+    WHEN 'refactor'  THEN 1.0
+    WHEN 'change'    THEN 0.8
+    WHEN 'bugfix'    THEN 0.35
+    ELSE 1.0
+  END
+)`;
