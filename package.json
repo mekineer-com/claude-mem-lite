@@ -51,6 +51,7 @@
     "format-utils.mjs",
     "hash-utils.mjs",
     "bash-utils.mjs",
+    "synonyms.mjs",
     "schema.mjs",
     "skill.md",
     "commands/mem.md",

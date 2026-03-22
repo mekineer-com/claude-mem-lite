@@ -206,7 +206,7 @@ async function install() {
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
     'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
-    'nlp.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
+    'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
     'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
   ];
 

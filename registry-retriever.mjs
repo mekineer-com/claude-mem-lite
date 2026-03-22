@@ -3,53 +3,10 @@
 
 import { debugCatch } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';
+import { DISPATCH_SYNONYMS } from './synonyms.mjs';
 
-// ─── Domain Synonyms ─────────────────────────────────────────────────────────
-
-export const DISPATCH_SYNONYMS = {
-  // English intent synonyms
-  'clean':    ['refactor', 'lint', 'format', 'organize', 'tidy', 'simplify', 'restructure', 'rewrite', 'smell', 'debt'],
-  'test':     ['testing', 'unittest', 'e2e', 'coverage', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest', 'mocha', 'cypress', 'playwright'],
-  'fix':      ['debug', 'bugfix', 'troubleshoot', 'diagnose', 'repair', 'error', 'crash', 'broken', 'issue', 'problem'],
-  'debug':    ['debugging', 'fix', 'bugfix', 'troubleshoot', 'diagnose', 'error', 'crash', 'bug', 'breakpoint'],
-  'debugging':['debug', 'fix', 'bugfix', 'troubleshoot', 'diagnose', 'error', 'crash', 'bug', 'systematic'],
-  'fast':     ['performance', 'optimize', 'profile', 'benchmark', 'speed', 'latency', 'bottleneck', 'slow', 'cache'],
-  'deploy':   ['release', 'publish', 'ci', 'cd', 'ship', 'rollout', 'staging', 'production'],
-  'commit':   ['git', 'push', 'merge', 'pr', 'branch', 'version', 'rebase', 'stash', 'tag'],
-  'secure':   ['security', 'vulnerability', 'audit', 'secrets', 'auth', 'xss', 'csrf', 'injection', 'encrypt', 'ssl', 'tls', 'cors', 'oauth', 'jwt', 'cve'],
-  'review':   ['code-review', 'pr-review', 'quality', 'inspect', 'check', 'audit'],
-  'doc':      ['documentation', 'readme', 'docs', 'comment', 'jsdoc', 'typedoc', 'changelog', 'wiki', 'guide'],
-  'design':   ['ui', 'ux', 'frontend', 'layout', 'css', 'component', 'tailwind', 'responsive', 'theme'],
-  'infra':    ['infrastructure', 'devops', 'docker', 'kubernetes', 'terraform', 'ansible', 'helm', 'aws', 'gcp', 'azure', 'nginx', 'pipeline', 'cloud'],
-  'db':       ['database', 'sql', 'postgres', 'mysql', 'mongodb', 'schema', 'migration', 'orm', 'prisma', 'redis', 'sqlite', 'drizzle', 'sequelize'],
-  'api':      ['endpoint', 'rest', 'graphql', 'route', 'backend', 'grpc', 'websocket', 'middleware', 'swagger', 'openapi'],
-  'plan':     ['planning', 'architecture', 'spec', 'blueprint', 'rfc', 'proposal', 'roadmap'],
-  'build':    ['compile', 'bundle', 'webpack', 'vite', 'typescript', 'tsc', 'esbuild', 'rollup', 'parcel', 'babel', 'swc', 'transpile'],
-  'lint':     ['eslint', 'prettier', 'biome', 'stylelint', 'format', 'style'],
-  'search':   ['lookup', 'latest', 'best-practices', 'perplexity'],
-  // Chinese intent mappings
-  '清理':     ['refactor', 'clean', 'lint', 'format', 'simplify'],
-  '测试':     ['test', 'testing', 'tdd', 'qa', 'spec', 'jest', 'vitest', 'pytest'],
-  '提交':     ['commit', 'git', 'push', 'pr'],
-  '部署':     ['deploy', 'release', 'ci', 'ship'],
-  '优化':     ['optimize', 'performance', 'fast', 'speed', 'cache'],
-  '安全':     ['security', 'audit', 'vulnerability', 'auth', 'xss', 'csrf'],
-  '审查':     ['review', 'code-review', 'pr-review', 'quality'],
-  '修复':     ['fix', 'debug', 'bugfix', 'repair', 'error', 'crash'],
-  '文档':     ['documentation', 'readme', 'docs'],
-  '设计':     ['design', 'ui', 'ux', 'frontend', 'layout', 'component'],
-  '构建':     ['build', 'compile', 'bundle', 'webpack', 'vite'],
-  '重构':     ['refactor', 'restructure', 'simplify', 'clean'],
-  '数据库':   ['database', 'sql', 'schema', 'migration', 'orm'],
-  '接口':     ['api', 'endpoint', 'rest', 'route', 'backend'],
-  '规划':     ['planning', 'architecture', 'spec', 'blueprint'],
-  '格式化':   ['lint', 'format', 'eslint', 'prettier', 'style'],
-  '编译':     ['compile', 'build', 'bundle', 'transpile'],
-  '打包':     ['bundle', 'build', 'webpack', 'vite'],
-  '容器':     ['docker', 'container', 'kubernetes', 'infrastructure'],
-  '运维':     ['devops', 'infrastructure', 'deploy', 'docker'],
-  '搜索':     ['search', 'lookup', 'latest', 'perplexity'],
-};
+// Re-export for backward compatibility
+export { DISPATCH_SYNONYMS };
 
 // ─── CJK Tokenization ───────────────────────────────────────────────────────
 // Chinese text has no word boundaries (no spaces between words).

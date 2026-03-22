@@ -200,7 +200,7 @@ const SOURCE_FILES = [
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
   'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
-  'project-utils.mjs',
+  'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
   'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
 ];
 const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
