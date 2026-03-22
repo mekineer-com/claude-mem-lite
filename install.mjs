@@ -306,7 +306,7 @@ async function install() {
       if (existsSync(cliLink)) unlinkSync(cliLink);
       symlinkSync(cliSource, cliLink);
       ok(`CLI: ${cliLink} → ${cliSource}`);
-    } catch (e) {
+    } catch {
       // Fallback: try /usr/local/bin (may need sudo)
       try {
         const globalLink = '/usr/local/bin/claude-mem-lite';
