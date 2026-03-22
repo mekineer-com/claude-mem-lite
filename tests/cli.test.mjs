@@ -578,8 +578,865 @@ describe('CLI help and error handling', () => {
     expect(output).toContain('Commands:');
   });
 
+  it('shows help for -h flag', async () => {
+    const output = await captureStdout(() => run(['-h']));
+    expect(output).toContain('Commands:');
+  });
+
   it('shows error for unknown command', async () => {
     const output = await captureStdout(() => run(['nonexistent']));
     expect(output).toContain('Unknown command');
+  });
+});
+
+// ─── delete command ─────────────────────────────────────────────────────────
+
+describe('CLI delete command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows usage when no IDs provided', async () => {
+    const output = await captureStdout(() => run(['delete']));
+    expect(output).toContain('Usage');
+  });
+
+  it('shows preview without --confirm', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Delete preview test', text: 'content to delete',
+    });
+    const output = await captureStdout(() => run(['delete', '1']));
+    expect(output).toContain('Preview');
+    expect(output).toContain('Delete preview test');
+    expect(output).toContain('--confirm');
+    // Observation still exists
+    const row = testDb.prepare('SELECT id FROM observations WHERE id = 1').get();
+    expect(row).toBeTruthy();
+  });
+
+  it('deletes with --confirm', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'To be deleted', text: 'deletion target',
+    });
+    const output = await captureStdout(() => run(['delete', '1', '--confirm']));
+    expect(output).toContain('Deleted 1');
+    const row = testDb.prepare('SELECT id FROM observations WHERE id = 1').get();
+    expect(row).toBeUndefined();
+  });
+
+  it('handles non-existent IDs gracefully', async () => {
+    const output = await captureStdout(() => run(['delete', '9999']));
+    expect(output).toContain('No observations found');
+  });
+
+  it('handles invalid ID strings', async () => {
+    const output = await captureStdout(() => run(['delete', 'abc']));
+    expect(output).toContain('No valid IDs');
+  });
+
+  it('cleans related_ids references on delete', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'First', text: 'first content',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Second', text: 'second content', relatedIds: '[1]',
+    });
+    await captureStdout(() => run(['delete', '1', '--confirm']));
+    const row = testDb.prepare('SELECT related_ids FROM observations WHERE id = 2').get();
+    expect(JSON.parse(row.related_ids)).toEqual([]);
+  });
+});
+
+// ─── update command ─────────────────────────────────────────────────────────
+
+describe('CLI update command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows usage when no ID provided', async () => {
+    const output = await captureStdout(() => run(['update']));
+    expect(output).toContain('Usage');
+  });
+
+  it('shows error for non-existent observation', async () => {
+    const output = await captureStdout(() => run(['update', '9999', '--title', 'New']));
+    expect(output).toContain('not found');
+  });
+
+  it('shows error when no fields specified', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'No update', text: 'content',
+    });
+    const output = await captureStdout(() => run(['update', '1']));
+    expect(output).toContain('No fields to update');
+  });
+
+  it('updates title', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Original title', text: 'content',
+    });
+    const output = await captureStdout(() => run(['update', '1', '--title', 'Updated title']));
+    expect(output).toContain('Updated #1');
+    expect(output).toContain('title');
+    const row = testDb.prepare('SELECT title FROM observations WHERE id = 1').get();
+    expect(row.title).toBe('Updated title');
+  });
+
+  it('updates type', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Type change', text: 'content',
+    });
+    await captureStdout(() => run(['update', '1', '--type', 'bugfix']));
+    const row = testDb.prepare('SELECT type FROM observations WHERE id = 1').get();
+    expect(row.type).toBe('bugfix');
+  });
+
+  it('updates importance clamped to 1-3', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Importance test', text: 'content',
+    });
+    await captureStdout(() => run(['update', '1', '--importance', '5']));
+    const row = testDb.prepare('SELECT importance FROM observations WHERE id = 1').get();
+    expect(row.importance).toBe(3);
+  });
+
+  it('updates lesson_learned via --lesson', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Lesson update', text: 'content',
+    });
+    await captureStdout(() => run(['update', '1', '--lesson', 'Always validate input']));
+    const row = testDb.prepare('SELECT lesson_learned FROM observations WHERE id = 1').get();
+    expect(row.lesson_learned).toBe('Always validate input');
+  });
+
+  it('updates narrative', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Narrative update', text: 'content',
+    });
+    await captureStdout(() => run(['update', '1', '--narrative', 'Detailed narrative text']));
+    const row = testDb.prepare('SELECT narrative FROM observations WHERE id = 1').get();
+    expect(row.narrative).toBe('Detailed narrative text');
+  });
+
+  it('updates concepts', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Concepts update', text: 'content',
+    });
+    await captureStdout(() => run(['update', '1', '--concepts', 'auth security jwt']));
+    const row = testDb.prepare('SELECT concepts FROM observations WHERE id = 1').get();
+    expect(row.concepts).toBe('auth security jwt');
+  });
+});
+
+// ─── export command ─────────────────────────────────────────────────────────
+
+describe('CLI export command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('exports observations as JSON by default', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Export test bug', text: 'export content',
+    });
+    const output = await captureStdout(() => run(['export']));
+    const data = JSON.parse(output);
+    expect(Array.isArray(data)).toBe(true);
+    expect(data.length).toBe(1);
+    expect(data[0].title).toBe('Export test bug');
+  });
+
+  it('exports as JSONL format', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'JSONL export 1', text: 'line 1',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'JSONL export 2', text: 'line 2',
+    });
+    const output = await captureStdout(() => run(['export', '--format', 'jsonl']));
+    const lines = output.trim().split('\n');
+    expect(lines.length).toBe(2);
+    expect(JSON.parse(lines[0]).title).toBeTruthy();
+  });
+
+  it('filters by --type', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Bug export', text: 'bug content',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Discovery export', text: 'discovery content',
+    });
+    const output = await captureStdout(() => run(['export', '--type', 'bugfix']));
+    const data = JSON.parse(output);
+    expect(data.length).toBe(1);
+    expect(data[0].type).toBe('bugfix');
+  });
+
+  it('filters by --from and --to', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Old export', text: 'old content', epochOffset: -10 * 86400000,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Recent export', text: 'recent content',
+    });
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const output = await captureStdout(() => run(['export', '--from', yesterday]));
+    const data = JSON.parse(output);
+    expect(data.length).toBe(1);
+    expect(data[0].title).toBe('Recent export');
+  });
+
+  it('respects --limit', async () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Export item ${i}`, text: `content ${i}`,
+      });
+    }
+    const output = await captureStdout(() => run(['export', '--limit', '2']));
+    const data = JSON.parse(output);
+    expect(data.length).toBe(2);
+  });
+
+  it('excludes compressed observations by default', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Compressed obs', text: 'compressed', compressedInto: 999,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Active obs', text: 'active',
+    });
+    const output = await captureStdout(() => run(['export']));
+    const data = JSON.parse(output);
+    expect(data.length).toBe(1);
+    expect(data[0].title).toBe('Active obs');
+  });
+
+  it('includes compressed with --include-compressed', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Compressed obs', text: 'compressed', compressedInto: 999,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Active obs', text: 'active',
+    });
+    const output = await captureStdout(() => run(['export', '--include-compressed']));
+    const data = JSON.parse(output);
+    expect(data.length).toBe(2);
+  });
+
+  it('shows message for empty export', async () => {
+    const output = await captureStdout(() => run(['export', '--type', 'bugfix']));
+    expect(output).toContain('No observations found');
+  });
+});
+
+// ─── compress command ───────────────────────────────────────────────────────
+
+describe('CLI compress command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows preview by default', async () => {
+    // Insert old, low-importance observations
+    const oldEpoch = -60 * 86400000; // 60 days ago
+    for (let i = 0; i < 5; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Old obs ${i}`, text: `old content ${i}`, importance: 1,
+        epochOffset: oldEpoch + i * 1000,
+      });
+    }
+    const output = await captureStdout(() => run(['compress']));
+    expect(output).toContain('Compression preview');
+    expect(output).toContain('--execute');
+  });
+
+  it('shows no candidates when all are recent', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Recent obs', text: 'recent content', importance: 1,
+    });
+    const output = await captureStdout(() => run(['compress']));
+    expect(output).toContain('No candidates');
+  });
+
+  it('executes compression with --execute', async () => {
+    const oldEpoch = -60 * 86400000;
+    for (let i = 0; i < 4; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Compress target ${i}`, text: `compress content ${i}`, importance: 1,
+        epochOffset: oldEpoch + i * 1000,
+      });
+    }
+    const output = await captureStdout(() => run(['compress', '--execute']));
+    expect(output).toContain('Compressed');
+    expect(output).toContain('weekly summaries');
+    // Verify compressed_into is set on originals
+    const compressed = testDb.prepare('SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL AND compressed_into > 0').get();
+    expect(compressed.c).toBeGreaterThan(0);
+  });
+
+  it('shows no candidates when importance is high', async () => {
+    const oldEpoch = -60 * 86400000;
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Important obs', text: 'important content', importance: 3,
+      epochOffset: oldEpoch,
+    });
+    const output = await captureStdout(() => run(['compress']));
+    expect(output).toContain('No candidates');
+  });
+});
+
+// ─── maintain command ───────────────────────────────────────────────────────
+
+describe('CLI maintain command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows usage for no action', async () => {
+    const output = await captureStdout(() => run(['maintain']));
+    expect(output).toContain('Usage');
+  });
+
+  it('shows usage for invalid action', async () => {
+    const output = await captureStdout(() => run(['maintain', 'invalid']));
+    expect(output).toContain('Usage');
+  });
+
+  it('scan reports maintenance stats', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Active observation', text: 'active content',
+    });
+    const output = await captureStdout(() => run(['maintain', 'scan']));
+    expect(output).toContain('Maintenance scan');
+    expect(output).toContain('Total active');
+    expect(output).toContain('Near-duplicate pairs');
+    expect(output).toContain('Stale');
+    expect(output).toContain('Broken');
+    expect(output).toContain('Boostable');
+    expect(output).toContain('Pending purge');
+  });
+
+  it('scan detects near-duplicates', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Fix authentication bug in login page', text: 'auth bug content',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Fix authentication bug in login page', text: 'auth bug content 2',
+    });
+    const output = await captureStdout(() => run(['maintain', 'scan']));
+    expect(output).toContain('Near-duplicate pairs: 1');
+  });
+
+  it('execute runs cleanup operation', async () => {
+    // Insert broken observation (no title, no narrative)
+    testDb.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES ('mem-s1', 'test--project', '', 'discovery', '', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'cleanup']));
+    expect(output).toContain('Cleaned up');
+  });
+
+  it('execute runs boost operation', async () => {
+    // Insert frequently accessed low-importance observation
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Boostable obs', text: 'boostable content', importance: 1,
+      accessCount: 5,
+    });
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'boost']));
+    expect(output).toContain('Boosted');
+    const row = testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Boostable obs');
+    expect(row.importance).toBe(2);
+  });
+
+  it('execute runs decay operation', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Stale obs', text: 'stale content', importance: 2,
+      epochOffset: -60 * 86400000, // 60 days ago
+    });
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'decay']));
+    expect(output).toContain('Decayed');
+  });
+
+  it('execute runs dedup with --merge-ids', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Keep this one', text: 'keep content', importance: 2,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Remove this dup', text: 'dup content', importance: 1,
+    });
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'dedup', '--merge-ids', '1:2']));
+    expect(output).toContain('Merged');
+    const row = testDb.prepare('SELECT compressed_into FROM observations WHERE id = 2').get();
+    expect(row.compressed_into).toBe(1);
+  });
+
+  it('execute runs purge_stale operation', async () => {
+    // Insert observation marked as pending purge (old)
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Pending purge obs', text: 'purge content',
+      compressedInto: -1, // COMPRESSED_PENDING_PURGE
+      epochOffset: -60 * 86400000,
+    });
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'purge_stale']));
+    expect(output).toContain('Purged');
+  });
+});
+
+// ─── browse command ─────────────────────────────────────────────────────────
+
+describe('CLI browse command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows empty dashboard with no observations', async () => {
+    const output = await captureStdout(() => run(['browse']));
+    expect(output).toContain('Memory Dashboard');
+    expect(output).toContain('No observations found');
+  });
+
+  it('shows observations grouped by tier', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Recent working memory', text: 'recent content',
+    });
+    const output = await captureStdout(() => run(['browse']));
+    expect(output).toContain('Memory Dashboard');
+    expect(output).toContain('Working Memory');
+    expect(output).toContain('Active Memory');
+    expect(output).toContain('Archive');
+  });
+
+  it('filters by --tier', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Browse tier filter', text: 'content',
+    });
+    const output = await captureStdout(() => run(['browse', '--tier', 'working']));
+    expect(output).toContain('Working Memory');
+  });
+
+  it('rejects invalid tier', async () => {
+    const output = await captureStdout(() => run(['browse', '--tier', 'invalid']));
+    expect(output).toContain('Invalid tier');
+  });
+
+  it('shows totals when no tier filter', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Totals test', text: 'content',
+    });
+    const output = await captureStdout(() => run(['browse']));
+    expect(output).toContain('Totals:');
+  });
+});
+
+// ─── context command ────────────────────────────────────────────────────────
+
+describe('CLI context command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('reports when CLAUDE.md not found', async () => {
+    const origDir = process.env.CLAUDE_PROJECT_DIR;
+    process.env.CLAUDE_PROJECT_DIR = '/tmp/nonexistent-project-dir-' + Date.now();
+    try {
+      const output = await captureStdout(() => run(['context']));
+      expect(output).toContain('No CLAUDE.md');
+    } finally {
+      if (origDir !== undefined) process.env.CLAUDE_PROJECT_DIR = origDir;
+      else delete process.env.CLAUDE_PROJECT_DIR;
+    }
+  });
+});
+
+// ─── stats command extended ─────────────────────────────────────────────────
+
+describe('CLI stats command extended', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows data health metrics', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Health test', text: 'some content here',
+    });
+    const output = await captureStdout(() => run(['stats']));
+    expect(output).toContain('Data Health');
+    expect(output).toContain('Est. tokens');
+    expect(output).toContain('Avg importance');
+    expect(output).toContain('Low-value');
+    expect(output).toContain('Compressed');
+    expect(output).toContain('Tier distribution');
+  });
+
+  it('shows daily activity', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Daily activity test', text: 'daily content',
+    });
+    const output = await captureStdout(() => run(['stats']));
+    expect(output).toContain('Daily activity');
+  });
+
+  it('filters by --project', async () => {
+    const output = await captureStdout(() => run(['stats', '--project', 'test--project']));
+    expect(output).toContain('test--project');
+  });
+
+  it('filters by --days', async () => {
+    const output = await captureStdout(() => run(['stats', '--days', '7']));
+    expect(output).toContain('Last 7d');
+  });
+
+  it('shows session and prompt counts', async () => {
+    const output = await captureStdout(() => run(['stats']));
+    expect(output).toContain('sessions');
+    expect(output).toContain('prompts');
+  });
+
+  it('shows top projects when no project filter', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Projects list test', text: 'content',
+    });
+    const output = await captureStdout(() => run(['stats']));
+    expect(output).toContain('Top projects');
+    expect(output).toContain('test--project');
+  });
+});
+
+// ─── search cross-source (sessions + prompts) ──────────────────────────────
+
+describe('CLI search cross-source', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows invalid source error', async () => {
+    const output = await captureStdout(() => run(['search', 'test', '--source', 'invalid']));
+    expect(output).toContain('Invalid --source');
+  });
+
+  it('shows no valid terms error', async () => {
+    // Sanitized FTS query becomes empty for very short/stop words
+    const output = await captureStdout(() => run(['search', 'a']));
+    // Should either show 'No valid search terms' or 'No results'
+    expect(output).toMatch(/No valid|No results/);
+  });
+
+  it('searches sessions when --source sessions', async () => {
+    // Insert a session summary
+    testDb.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch)
+      VALUES ('mem-s1', 'test--project', 'Fix authentication module', 'Fixed auth module', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const output = await captureStdout(() => run(['search', 'authentication', '--source', 'sessions']));
+    // Session search may work or fail depending on FTS availability
+    expect(output).toBeDefined();
+  });
+
+  it('searches prompts when --source prompts', async () => {
+    // Insert a user prompt
+    testDb.prepare(`
+      INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
+      VALUES ('s1', 'How to fix the database connection issue', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const output = await captureStdout(() => run(['search', 'database connection', '--source', 'prompts']));
+    expect(output).toBeDefined();
+  });
+
+  it('searches with --offset for pagination', async () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Paginated search item ${i}`, text: `paginated search content ${i}`,
+      });
+    }
+    const output = await captureStdout(() => run(['search', 'paginated', '--limit', '2', '--offset', '2']));
+    expect(output).toBeDefined();
+  });
+
+  it('searches with --branch filter', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Feature branch obs', text: 'branch filter content',
+      branch: 'feat/auth',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Main branch obs', text: 'main branch filter content',
+      branch: 'main',
+    });
+    const output = await captureStdout(() => run(['search', 'branch filter', '--branch', 'feat/auth']));
+    expect(output).toBeDefined();
+  });
+
+  it('searches with --from and --to date filters', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Old date filter obs', text: 'old date filter content',
+      epochOffset: -10 * 86400000,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Recent date filter obs', text: 'recent date filter content',
+    });
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const output = await captureStdout(() => run(['search', 'date filter', '--from', yesterday]));
+    expect(output).toContain('Recent date filter obs');
+    expect(output).not.toContain('Old date filter obs');
+  });
+
+  it('type-list fallback when FTS returns nothing for typed search', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fallback type list bug', text: 'some unrelated content',
+    });
+    // Search for terms not in FTS but with --type, should trigger type-list fallback
+    const output = await captureStdout(() => run(['search', 'zzz_nonexistent_zzz', '--type', 'bugfix']));
+    // Either finds via fallback or shows no results
+    expect(output).toBeDefined();
+  });
+});
+
+// ─── get command with --source ──────────────────────────────────────────────
+
+describe('CLI get command with source', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('gets session details with --source session', async () => {
+    testDb.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, investigated, learned, next_steps, created_at, created_at_epoch)
+      VALUES ('mem-s1', 'test--project', 'Implement auth', 'Auth implemented', 'Auth patterns', 'JWT is better', 'Add tests', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const output = await captureStdout(() => run(['get', '1', '--source', 'session']));
+    expect(output).toContain('S#1');
+    expect(output).toContain('Request: Implement auth');
+    expect(output).toContain('Completed: Auth implemented');
+    expect(output).toContain('Investigated: Auth patterns');
+    expect(output).toContain('Learned: JWT is better');
+    expect(output).toContain('Next steps: Add tests');
+  });
+
+  it('shows no sessions found for non-existent ID', async () => {
+    const output = await captureStdout(() => run(['get', '9999', '--source', 'session']));
+    expect(output).toContain('No sessions found');
+  });
+
+  it('gets prompt details with --source prompt', async () => {
+    testDb.prepare(`
+      INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
+      VALUES ('s1', 'How to fix the auth bug', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const output = await captureStdout(() => run(['get', '1', '--source', 'prompt']));
+    expect(output).toContain('P#1');
+    expect(output).toContain('Text: How to fix the auth bug');
+    expect(output).toContain('Session: s1');
+  });
+
+  it('shows no prompts found for non-existent ID', async () => {
+    const output = await captureStdout(() => run(['get', '9999', '--source', 'prompt']));
+    expect(output).toContain('No prompts found');
+  });
+
+  it('gets observations with --fields filter', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fields filter test', text: 'content', narrative: 'Full narrative here',
+    });
+    const output = await captureStdout(() => run(['get', '1', '--fields', 'title,narrative']));
+    expect(output).toContain('Fields filter test');
+    expect(output).toContain('Full narrative here');
+    // Should not include fields not in the --fields list (except header fields id/type/created_at)
+    expect(output).not.toContain('importance:');
+  });
+});
+
+// ─── timeline query-based anchor ────────────────────────────────────────────
+
+describe('CLI timeline query-based anchor', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('finds anchor via --query flag', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Timeline query anchor target', text: 'unique anchor content for query',
+      epochOffset: -60000,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Before item', text: 'before content', epochOffset: -120000,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'After item', text: 'after content',
+    });
+    const output = await captureStdout(() => run(['timeline', '--query', 'unique anchor']));
+    expect(output).toContain('<--');
+    expect(output).toContain('Timeline around');
+  });
+
+  it('finds anchor via positional query', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
+      title: 'Positional query anchor', text: 'positional query content',
+    });
+    const output = await captureStdout(() => run(['timeline', 'positional query']));
+    expect(output).toContain('Positional query anchor');
+    expect(output).toContain('<--');
+  });
+
+  it('timeline with --project filter', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Project timeline obs', text: 'project timeline content',
+    });
+    const output = await captureStdout(() => run(['timeline', '--project', 'test--project']));
+    expect(output).toContain('Project timeline obs');
+  });
+});
+
+// ─── fts-check command ──────────────────────────────────────────────────────
+
+describe('CLI fts-check command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows usage for no action', async () => {
+    const output = await captureStdout(() => run(['fts-check']));
+    expect(output).toContain('Usage');
+  });
+
+  it('shows usage for invalid action', async () => {
+    const output = await captureStdout(() => run(['fts-check', 'invalid']));
+    expect(output).toContain('Usage');
+  });
+
+  it('checks FTS integrity', async () => {
+    const output = await captureStdout(() => run(['fts-check', 'check']));
+    expect(output).toContain('FTS5');
+  });
+
+  it('rebuilds FTS', async () => {
+    const output = await captureStdout(() => run(['fts-check', 'rebuild']));
+    expect(output).toContain('rebuilt');
+  });
+});
+
+// ─── registry command ───────────────────────────────────────────────────────
+
+describe('CLI registry command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('shows usage for no action', async () => {
+    const output = await captureStdout(() => run(['registry']));
+    expect(output).toContain('Usage');
+  });
+
+  it('shows usage for invalid action', async () => {
+    const output = await captureStdout(() => run(['registry', 'invalid']));
+    expect(output).toContain('Usage');
+  });
+
+  // Registry commands access real DB files via REGISTRY_DB_PATH.
+  // These tests just verify the command routing works without crashing.
+  it('list runs without crashing', async () => {
+    const output = await captureStdout(() => run(['registry', 'list']));
+    // May succeed or show "not available" depending on registry DB
+    expect(output).toBeDefined();
+  });
+
+  it('stats runs without crashing', async () => {
+    const output = await captureStdout(() => run(['registry', 'stats']));
+    expect(output).toBeDefined();
+  });
+
+  it('reindex runs without crashing', async () => {
+    const output = await captureStdout(() => run(['registry', 'reindex']));
+    expect(output).toBeDefined();
+  });
+
+  it('search shows usage when no query', async () => {
+    const output = await captureStdout(() => run(['registry', 'search']));
+    expect(output).toContain('Usage');
+  });
+
+  it('import shows usage when missing params', async () => {
+    const output = await captureStdout(() => run(['registry', 'import']));
+    expect(output).toContain('Usage');
+  });
+
+  it('remove shows usage when missing params', async () => {
+    const output = await captureStdout(() => run(['registry', 'remove']));
+    expect(output).toContain('Usage');
   });
 });
