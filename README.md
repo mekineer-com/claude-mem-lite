@@ -154,7 +154,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem` server with 12 tools (search, timeline, get, save, update, stats, delete, compress, maintain, registry, export, fts_check)
+2. **Register MCP server** -- `mem` server with 15 tools (search, recent, recall, timeline, get, save, update, stats, delete, compress, maintain, export, fts_check, browse, registry)
 3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
@@ -207,6 +207,8 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | Tool | Description |
 |------|-------------|
 | `mem_search` | FTS5 full-text search with BM25 ranking. Filters by type, project, date range, importance level. |
+| `mem_recent` | Show most recent observations, ordered by time. Quick snapshot of latest activity. |
+| `mem_recall` | Recall observations related to a file. Use before editing to surface past bugfixes and context. |
 | `mem_timeline` | Browse observations chronologically around an anchor point. |
 | `mem_get` | Retrieve full details for specific observation IDs (includes importance and related_ids). |
 | `mem_save` | Manually save a memory/observation. |
@@ -217,6 +219,7 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | `mem_maintain` | Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/dedup/rebuild_vectors operations. |
 | `mem_export` | Export observations as JSON or JSONL for backup or migration. Filters by project, type, date range. |
 | `mem_fts_check` | Check FTS5 index integrity or rebuild indexes. Use when search results seem wrong or after DB recovery. |
+| `mem_browse` | Tier-grouped memory dashboard. Shows observations organized by memory tier (working/active/archive). |
 | `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. |
 
 ### Skill Commands (in Claude Code chat)
@@ -224,9 +227,11 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 ```
 /mem search <query>        # Full-text search across all memories
 /mem recent [n]            # Show recent N observations (default 10)
+/mem recall <file>         # Show past observations for a file
 /mem save <text>           # Save a manual memory/note
 /mem stats                 # Show memory statistics
 /mem timeline <query>      # Browse timeline around a match
+/mem browse                # Tier-grouped memory dashboard
 /mem <query>               # Shorthand for search
 ```
 

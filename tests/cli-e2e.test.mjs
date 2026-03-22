@@ -252,7 +252,7 @@ describe('CLI E2E: get', () => {
     expect(stdout).toContain('Connection pool fix');
     expect(stdout).toContain('pool.mjs');
     expect(stdout).toContain('Monitor pool size');
-    expect(stdout).toContain('Importance: 3');
+    expect(stdout).toContain('importance: 3');
   });
 
   it('updates access_count', () => {
@@ -406,10 +406,11 @@ describe('CLI E2E: stats', () => {
     const { stdout, exitCode } = runCli(['stats']);
     expect(exitCode).toBe(0);
     expect(stdout).toContain('[mem] Stats');
-    expect(stdout).toContain('Observations:');
-    expect(stdout).toContain('Sessions:');
-    expect(stdout).toContain('bugfix=2');
-    expect(stdout).toContain('discovery=1');
+    expect(stdout).toContain('Total:');
+    expect(stdout).toContain('observations');
+    expect(stdout).toContain('sessions');
+    expect(stdout).toContain('bugfix: 2');
+    expect(stdout).toContain('discovery: 1');
   });
 
   it('filters by --project', () => {

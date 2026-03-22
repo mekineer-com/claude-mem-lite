@@ -9,7 +9,7 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema } from './tool-schemas.mjs';
+import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema } from './tool-schemas.mjs';
 import { basename } from 'path';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
@@ -105,7 +105,7 @@ const server = new McpServer(
       '  claude-mem-lite get 42,43                   — full details by ID',
       '  claude-mem-lite timeline --anchor 42        — chronological context',
       '',
-      'MCP tools: mem_search, mem_save, mem_get, mem_recall, mem_timeline for programmatic access.',
+      'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access.',
       'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
       'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
       '',
@@ -631,6 +631,45 @@ server.registerTool(
     const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
 
     return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, isCrossSource);
+  })
+);
+
+// ─── Tool: mem_recent ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_recent',
+  {
+    description: 'Show most recent observations, ordered by time. Quick way to see latest activity without a search query.',
+    inputSchema: memRecentSchema,
+  },
+  safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    const limit = args.limit ?? 10;
+    const project = args.project || inferProject();
+
+    const params = [];
+    const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
+    if (project) { wheres.push('project = ?'); params.push(project); }
+    params.push(limit);
+
+    const rows = db.prepare(`
+      SELECT id, type, title, subtitle, project, created_at, created_at_epoch
+      FROM observations
+      WHERE ${wheres.join(' AND ')}
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all(...params);
+
+    if (rows.length === 0) {
+      return { content: [{ type: 'text', text: `No recent observations${project ? ` (${project})` : ''}.` }] };
+    }
+
+    const lines = [`Recent observations (${project || 'all'}):\n`];
+    for (const r of rows) {
+      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`);
+    }
+    lines.push(`\nWorkflow: mem_get(ids=[...]) for full details | mem_timeline(anchor=ID) for context`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   })
 );
 
@@ -1277,7 +1316,7 @@ server.registerTool(
     }
 
     if (action === 'execute') {
-      const ops = args.operations || [];
+      const ops = args.operations || ['cleanup', 'decay', 'boost'];
       const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;
       const OP_ROW_CAP = 1000; // safety cap per operation
@@ -1708,6 +1747,87 @@ server.registerTool(
         : `Successfully rebuilt: ${result.rebuilt.join(', ')}`;
       return { content: [{ type: 'text', text: summary }] };
     }
+  })
+);
+
+// ─── Tool: mem_browse ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_browse',
+  {
+    description: 'Tier-grouped memory dashboard. Shows observations organized by memory tier (working/active/archive).',
+    inputSchema: memBrowseSchema,
+  },
+  safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    const project = args.project || inferProject();
+    const tierFilter = args.tier || null;
+    const limit = args.limit ?? (tierFilter ? 20 : 5);
+    const now = Date.now();
+
+    // Get active session for tier classification
+    const activeSession = db.prepare(
+      "SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND status = 'active' ORDER BY started_at_epoch DESC LIMIT 1"
+    ).get(project);
+
+    const ctx = { now, currentProject: project, currentSessionId: activeSession?.memory_session_id ?? '' };
+    const params = tierSqlParams(ctx);
+
+    const tiers = ['working', 'active', 'archive'];
+    const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
+    const showTiers = tierFilter ? [tierFilter] : tiers;
+
+    const lines = [`Memory Dashboard (${project})\n`];
+    let grandTotal = 0;
+    const tierCounts = {};
+
+    for (const tier of showTiers) {
+      const countRow = db.prepare(`
+        SELECT COUNT(*) as c FROM (
+          SELECT ${TIER_CASE_SQL} as tier FROM observations
+          WHERE project = ?
+        ) WHERE tier = ?
+      `).get(...params, project, tier);
+      const count = countRow?.c ?? 0;
+      tierCounts[tier] = count;
+      grandTotal += count;
+
+      lines.push(`${tierLabels[tier]} (${count})`);
+
+      if (tier === 'archive' && !tierFilter) {
+        if (count > 0) lines.push('');
+        continue;
+      }
+
+      if (count === 0) { lines.push(''); continue; }
+
+      const rows = db.prepare(`
+        SELECT * FROM (
+          SELECT id, type, title, created_at, created_at_epoch, ${TIER_CASE_SQL} as tier
+          FROM observations
+          WHERE project = ?
+        ) WHERE tier = ?
+        ORDER BY created_at_epoch DESC
+        LIMIT ?
+      `).all(...params, project, tier, limit);
+
+      for (const r of rows) {
+        lines.push(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 60)} | ${fmtDate(r.created_at)}`);
+      }
+      if (count > rows.length) lines.push(`  ... and ${count - rows.length} more`);
+      lines.push('');
+    }
+
+    if (grandTotal === 0) {
+      return { content: [{ type: 'text', text: 'No observations found. Start a coding session to build memory.' }] };
+    }
+
+    if (!tierFilter) {
+      const parts = tiers.map(t => `${t[0].toUpperCase() + t.slice(1)}: ${tierCounts[t] ?? 0}`);
+      lines.push(`Totals: ${grandTotal} observations | ${parts.join(' | ')}`);
+    }
+
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
   })
 );
 

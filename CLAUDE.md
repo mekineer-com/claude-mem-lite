@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.22.0
+- **Version**: 2.23.0
 - **Package manager**: npm
-- **Test**: `npx vitest run` (24 test files, vitest)
+- **Test**: `npx vitest run` (35 test files, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs`
 - **DB**: better-sqlite3 + FTS5 full-text search
@@ -17,7 +17,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 | Module | Role |
 |--------|------|
 | `cli.mjs` | CLI entry point — routes subcommands to mem-cli.mjs or install.mjs |
-| `mem-cli.mjs` | CLI commands: search, recent, recall, get, timeline, save, delete, update, export, compress, maintain, fts-check, stats, context, browse |
+| `mem-cli.mjs` | CLI commands: search, recent, recall, get, timeline, save, delete, update, export, compress, maintain, fts-check, stats, context, browse, registry |
 | `hook.mjs` | Main hook entry — handles session-start/stop/post-tool-use/user-prompt |
 | `hook-context.mjs` | CLAUDE.md context injection, adaptive time windows, token budgeting |
 | `hook-llm.mjs` | Haiku-based summarization and title generation |
@@ -27,7 +27,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 | `hook-shared.mjs` | Shared constants/utilities (RUNTIME_DIR, session mgmt) |
 | `hook-semaphore.mjs` | Concurrency control for hook execution |
 | `hook-update.mjs` | Auto-update via GitHub Releases (24h check, dev-mode skip) |
-| `server.mjs` | MCP server — mem_search/mem_save/mem_get/mem_recall/mem_timeline/mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_fts_check/mem_stats/mem_registry |
+| `server.mjs` | MCP server — mem_search/mem_recent/mem_save/mem_get/mem_recall/mem_timeline/mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_fts_check/mem_stats/mem_registry/mem_browse |
 | `registry.mjs` | Resource registry DB schema + CRUD |
 | `registry-retriever.mjs` | FTS5 search + BM25 composite scoring + domain filtering |
 | `registry-indexer.mjs` | Resource indexing pipeline |
@@ -40,7 +40,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Key Patterns
 
-- CLI commands: `claude-mem-lite search|recent|recall|get|timeline|save|delete|update|export|compress|maintain|fts-check|stats|context|browse`
+- CLI commands: `claude-mem-lite search|recent|recall|get|timeline|save|delete|update|export|compress|maintain|fts-check|stats|context|browse|registry`
 - Tool name mapping: Claude Code Agent tool = `'Agent'` (not `'Task'`); Skill via `event.tool_input?.skill`
 - Tests use `:memory:` DB — schema changes must sync to test files
 - FTS5 search: sanitizeFtsQuery (synonym expansion) → BM25 scoring → OR fallback → concept co-occurrence
@@ -49,13 +49,14 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 按“建议修复优先级“进行修复
+Request: 修复
+Completed: Modified server-internals.mjs, mem-cli.mjs, utils.mjs
 
 ### Key Context
+- [discovery] Reviewed 3 files: server.mjs, mem-cli.mjs, tool-schemas.mjs (#4913)
+- [change] Modified server.mjs, mem-cli.mjs, registry.mjs +2 more (#4907)
 - [bugfix] Error: mem-cli.mjs: mem Recent (projects--mem): #4816 🔴 20m ago  Err… (#4829)
 - [bugfix] Error: scoring-sql.mjs: mem 5 results for 数据库: #2503 🔵 2026-03-12 Add da… (#4816)
 - [bugfix] Fix TF-IDF vocab sorting (IDF→IG) and server.mjs pagination for single-source e… (#4810)
-- [bugfix] Error: server.mjs: mem 5 results for error fix: #4783 🔴 2026-03-22 … (#4809)
-- [bugfix] Error: tfidf.mjs: Key terms after fix: databas      idx=154 idf=3.0… (#4804)
 
 </claude-mem-context>

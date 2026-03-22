@@ -2,11 +2,14 @@
 // claude-mem-lite CLI — lightweight command layer for direct memory access
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
-import { ensureDb, DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch } from './utils.mjs';
+import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
-import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
+import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge, VECTOR_SCAN_LIMIT, rebuildVocabulary, _resetVocabCache } from './tfidf.mjs';
+import { autoBoostIfNeeded, reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
+import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { searchResources } from './registry-retriever.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -67,12 +70,13 @@ function cmdSearch(db, args) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    out('[mem] Usage: mem search <query> [--type TYPE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N]');
+    out('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N]');
     return;
   }
 
-  const limit = parseInt(flags.limit, 10) || 5;
+  const limit = parseInt(flags.limit, 10) || 20;
   const type = flags.type || null;
+  const source = flags.source || null; // observations|sessions|prompts (null = all)
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const dateFrom = flags.from ? new Date(flags.from).getTime() : null;
   let dateTo = flags.to ? new Date(flags.to).getTime() : null;
@@ -80,6 +84,12 @@ function cmdSearch(db, args) {
   const minImportance = flags.importance ? parseInt(flags.importance, 10) : null;
   const branch = flags.branch || null;
   const offset = parseInt(flags.offset, 10) || 0;
+  const tier = flags.tier || null;
+
+  if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
+    out(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
+    return;
+  }
 
   const ftsQuery = sanitizeFtsQuery(query);
   if (!ftsQuery) {
@@ -87,48 +97,195 @@ function cmdSearch(db, args) {
     return;
   }
 
-  let rows = searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset });
+  // When --type (obs_type) is specified, implicitly restrict to observations
+  const effectiveSource = source || (type ? 'observations' : null);
 
-  // OR fallback when AND returns 0 results
-  if (rows.length === 0) {
-    const orQuery = relaxFtsQueryToOr(ftsQuery);
-    if (orQuery) {
-      try { rows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset }); } catch {}
+  const results = [];
+
+  // Search observations
+  if (!effectiveSource || effectiveSource === 'observations') {
+    let obsRows = searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: effectiveSource ? offset : 0 });
+    if (obsRows.length === 0) {
+      const orQuery = relaxFtsQueryToOr(ftsQuery);
+      if (orQuery) {
+        try { obsRows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: effectiveSource ? offset : 0 }); } catch {}
+      }
+    }
+    // Type-list fallback
+    if (obsRows.length === 0 && type) {
+      const typeWheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL', 'type = ?'];
+      const typeParams = [type];
+      if (project) { typeWheres.push('project = ?'); typeParams.push(project); }
+      if (dateFrom) { typeWheres.push('created_at_epoch >= ?'); typeParams.push(dateFrom); }
+      if (dateTo) { typeWheres.push('created_at_epoch <= ?'); typeParams.push(dateTo); }
+      if (minImportance) { typeWheres.push('COALESCE(importance, 1) >= ?'); typeParams.push(minImportance); }
+      if (branch) { typeWheres.push('branch = ?'); typeParams.push(branch); }
+      typeParams.push(limit);
+      obsRows = db.prepare(`
+        SELECT id, type, title, subtitle, created_at, lesson_learned
+        FROM observations
+        WHERE ${typeWheres.join(' AND ')}
+        ORDER BY created_at_epoch DESC
+        LIMIT ?
+      `).all(...typeParams);
+    }
+    // Tier post-filter
+    if (tier && obsRows.length > 0) {
+      const rowIds = obsRows.map(r => r.id);
+      const ph = rowIds.map(() => '?').join(',');
+      const fullRows = db.prepare(
+        `SELECT id, compressed_into, superseded_at, memory_session_id, project, importance, last_accessed_at, created_at_epoch, type FROM observations WHERE id IN (${ph})`
+      ).all(...rowIds);
+      const rowMap = new Map(fullRows.map(r => [r.id, r]));
+      const tierCtx = { now: Date.now(), currentProject: project || inferProject(), currentSessionId: '' };
+      obsRows = obsRows.filter(r => {
+        const full = rowMap.get(r.id);
+        return full && computeTier(full, tierCtx) === tier;
+      });
+    }
+    for (const r of obsRows) results.push({ ...r, _source: 'obs', score: r.score ?? 0 });
+
+    // Concept co-occurrence + PRF expansion (aligned with MCP searchObservations)
+    if (obsRows.length > 0 && results.filter(r => r._source === 'obs').length < Math.ceil(limit / 2)) {
+      const existingIds = new Set(results.filter(r => r._source === 'obs').map(r => r.id));
+      // Concept co-occurrence expansion
+      const expanded = expandQueryByConcepts(db, ftsQuery, project || null);
+      if (expanded.length > 0) {
+        const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
+        try {
+          const expRows = searchFts(db, expansionFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: 0 });
+          for (const r of expRows) {
+            if (!existingIds.has(r.id)) {
+              existingIds.add(r.id);
+              results.push({ ...r, _source: 'obs', score: (r.score ?? 0) * 0.7 });
+            }
+          }
+        } catch { /* expansion is best-effort */ }
+      }
+      // PRF expansion (only if ≥3 primary results)
+      if (obsRows.length >= 3) {
+        const topResults = db.prepare(`
+          SELECT o.title, o.narrative FROM observations_fts
+          JOIN observations o ON observations_fts.rowid = o.id
+          WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+            AND (? IS NULL OR o.project = ?)
+          ORDER BY ${OBS_BM25}
+          LIMIT 8
+        `).all(ftsQuery, project ?? null, project ?? null);
+        const prfTerms = extractPRFTerms(topResults, ftsQuery);
+        if (prfTerms.length > 0) {
+          const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+          try {
+            const prfRows = searchFts(db, prfFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: 0 });
+            for (const r of prfRows) {
+              if (!existingIds.has(r.id)) {
+                existingIds.add(r.id);
+                results.push({ ...r, _source: 'obs', score: (r.score ?? 0) * 0.6 });
+              }
+            }
+          } catch { /* PRF is best-effort */ }
+        }
+      }
     }
   }
 
-  // Type-list fallback: when --type is specified and FTS finds nothing,
-  // list recent observations of that type (user likely wants to browse by type)
-  if (rows.length === 0 && type) {
-    const typeWheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL', 'type = ?'];
-    const typeParams = [type];
-    if (project) { typeWheres.push('project = ?'); typeParams.push(project); }
-    if (dateFrom) { typeWheres.push('created_at_epoch >= ?'); typeParams.push(dateFrom); }
-    if (dateTo) { typeWheres.push('created_at_epoch <= ?'); typeParams.push(dateTo); }
-    if (minImportance) { typeWheres.push('COALESCE(importance, 1) >= ?'); typeParams.push(minImportance); }
-    if (branch) { typeWheres.push('branch = ?'); typeParams.push(branch); }
-    typeParams.push(limit);
-    rows = db.prepare(`
-      SELECT id, type, title, subtitle, created_at, lesson_learned
-      FROM observations
-      WHERE ${typeWheres.join(' AND ')}
-      ORDER BY created_at_epoch DESC
-      LIMIT ?
-    `).all(...typeParams);
+  // Search sessions (aligned with MCP mem_search)
+  if (!effectiveSource || effectiveSource === 'sessions') {
+    const now = Date.now();
+    const sessionProjectBoost = project ? null : inferProject();
+    const sessWheres = ['session_summaries_fts MATCH ?'];
+    const sessParams = [now, sessionProjectBoost, sessionProjectBoost, ftsQuery];
+    if (project) { sessWheres.push('s.project = ?'); sessParams.push(project); }
+    if (dateFrom) { sessWheres.push('s.created_at_epoch >= ?'); sessParams.push(dateFrom); }
+    if (dateTo) { sessWheres.push('s.created_at_epoch <= ?'); sessParams.push(dateTo); }
+    sessParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
+    try {
+      const sessRows = db.prepare(`
+        SELECT s.id, s.request, s.completed, s.project, s.created_at,
+               ${SESS_BM25}
+                 * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${DEFAULT_DECAY_HALF_LIFE_MS}.0))
+                 * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
+        FROM session_summaries_fts
+        JOIN session_summaries s ON session_summaries_fts.rowid = s.id
+        WHERE ${sessWheres.join(' AND ')}
+        ORDER BY score
+        LIMIT ? OFFSET ?
+      `).all(...sessParams);
+      for (const r of sessRows) results.push({ ...r, _source: 'session' });
+    } catch { /* session FTS may not exist in older DBs */ }
   }
 
-  if (rows.length === 0) {
+  // Search prompts (aligned with MCP mem_search)
+  if (!effectiveSource || effectiveSource === 'prompts') {
+    const promptWheres = ['user_prompts_fts MATCH ?'];
+    const promptParams = [ftsQuery];
+    if (project) { promptWheres.push('s.project = ?'); promptParams.push(project); }
+    if (dateFrom) { promptWheres.push('p.created_at_epoch >= ?'); promptParams.push(dateFrom); }
+    if (dateTo) { promptWheres.push('p.created_at_epoch <= ?'); promptParams.push(dateTo); }
+    promptParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
+    try {
+      const promptRows = db.prepare(`
+        SELECT p.id, p.prompt_text, p.content_session_id, p.created_at,
+               bm25(user_prompts_fts, 1) as score
+        FROM user_prompts_fts
+        JOIN user_prompts p ON user_prompts_fts.rowid = p.id
+        JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+        WHERE ${promptWheres.join(' AND ')}
+        ORDER BY score
+        LIMIT ? OFFSET ?
+      `).all(...promptParams);
+      for (const r of promptRows) results.push({ ...r, _source: 'prompt' });
+    } catch { /* prompt FTS may not exist in older DBs */ }
+  }
+
+  if (results.length === 0) {
     out(`[mem] No results for "${query}"`);
     return;
   }
 
-  out(`[mem] ${rows.length} result${rows.length !== 1 ? 's' : ''} for "${query}":`);
-  for (const r of rows) {
-    const date = fmtDateShort(r.created_at);
-    const title = truncate(r.title || r.subtitle || '(untitled)', 70);
-    out(`#${r.id} ${typeIcon(r.type)} ${date} ${title}`);
-    if (r.lesson_learned) {
-      out(`  -> ${truncate(r.lesson_learned, 80)}`);
+  // Cross-source score normalization (aligned with MCP mem_search)
+  const isCrossSource = !effectiveSource;
+  if (isCrossSource && results.length > 0) {
+    for (const src of ['obs', 'session', 'prompt']) {
+      const srcResults = results.filter(r => r._source === src && r.score !== null && r.score !== undefined);
+      if (srcResults.length < 2) continue;
+      const maxAbs = Math.max(...srcResults.map(r => Math.abs(r.score)));
+      if (maxAbs > 0) {
+        for (const r of srcResults) r.score = r.score / maxAbs;
+      }
+    }
+    results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+  }
+
+  // Context re-ranking + superseded marking (aligned with MCP mem_search)
+  const obsResults = results.filter(r => r._source === 'obs');
+  if (obsResults.length > 0) {
+    // reRankWithContext/markSuperseded expect source='obs' — alias _source for compatibility
+    for (const r of obsResults) r.source = 'obs';
+    reRankWithContext(db, obsResults, project || inferProject());
+    markSuperseded(obsResults);
+    if (isCrossSource) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+  }
+
+  // Cross-source: trim to limit with offset
+  const paged = effectiveSource ? results : results.slice(offset, offset + limit);
+
+  out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}":`);
+  for (const r of paged) {
+    if (r._source === 'session') {
+      const date = fmtDateShort(r.created_at);
+      out(`S#${r.id} 📋 ${date} ${truncate(r.request || r.completed || '(no summary)', 70)}`);
+    } else if (r._source === 'prompt') {
+      const date = fmtDateShort(r.created_at);
+      out(`P#${r.id} 💬 ${date} ${truncate(r.prompt_text || '(empty)', 70)}`);
+    } else {
+      const date = fmtDateShort(r.created_at);
+      const title = truncate(r.title || r.subtitle || '(untitled)', 70);
+      const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
+      out(`#${r.id} ${typeIcon(r.type)} ${date} ${title}${supersededTag}`);
+      if (r.lesson_learned) {
+        out(`  -> ${truncate(r.lesson_learned, 80)}`);
+      }
     }
   }
 }
@@ -152,13 +309,20 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
   if (minImportance) { wheres.push('COALESCE(o.importance, 1) >= ?'); whereParams.push(minImportance); }
   if (branch) { wheres.push('o.branch = ?'); whereParams.push(branch); }
 
-  // ORDER BY params come after WHERE params, then LIMIT/OFFSET
-  const orderParams = [now, currentProject, currentProject];
-  const params = [...whereParams, ...orderParams, limit, offset || 0];
+  // Param order: SELECT scoring (now, proj, proj) → WHERE (ftsQuery, filters...) → ORDER BY scoring (now, proj, proj) → LIMIT/OFFSET
+  const scoreParams = [now, currentProject, currentProject];
+  const params = [...scoreParams, ...whereParams, ...scoreParams, limit, offset || 0];
 
   // Scoring aligned with server.mjs: BM25 × type-decay × type-quality × project_boost × importance × access_bonus
   const ftsRows = db.prepare(`
-    SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.lesson_learned
+    SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.lesson_learned,
+           o.files_modified, o.importance,
+           ${OBS_BM25}
+             * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+             * ${TYPE_QUALITY_CASE}
+             * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
+             * (0.5 + 0.5 * COALESCE(o.importance, 1))
+             * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
     FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE ${wheres.join(' AND ')}
@@ -188,7 +352,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
           const rowMap = new Map(ftsRows.map(r => [r.id, r]));
           for (const vr of vecResults) {
             if (!rowMap.has(vr.id)) {
-              const obs = db.prepare('SELECT id, type, title, subtitle, created_at, created_at_epoch, lesson_learned, importance, branch FROM observations WHERE id = ?').get(vr.id);
+              const obs = db.prepare('SELECT id, type, title, subtitle, created_at, created_at_epoch, lesson_learned, importance, branch, files_modified FROM observations WHERE id = ?').get(vr.id);
               if (obs) {
                 // Apply same filters as FTS5 query (aligned with MCP searchObservations)
                 if (dateFrom && obs.created_at_epoch < dateFrom) continue;
@@ -225,7 +389,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
 
 function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
-  const limit = parseInt(positional[0], 10) || 5;
+  const limit = parseInt(positional[0], 10) || 10;
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   const params = [];
@@ -269,7 +433,7 @@ function cmdRecall(db, args) {
   const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
   const likePattern = `%${escaped}`;
   const rows = db.prepare(`
-    SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at
+    SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at, o.project
     FROM observations o
     JOIN observation_files of2 ON of2.obs_id = o.id
     WHERE COALESCE(o.compressed_into, 0) = 0
@@ -288,11 +452,12 @@ function cmdRecall(db, args) {
   const recallPh = recalledIds.map(() => '?').join(',');
   db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${recallPh})`).run(Date.now(), ...recalledIds);
 
-  out(`[mem] History for ${filename}:`);
+  out(`[mem] History for ${filename} (${rows.length}):`);
   for (const r of rows) {
     const title = truncate(r.title || '(untitled)', 60);
-    const lesson = r.lesson_learned ? ` -- ${truncate(r.lesson_learned, 50)}` : '';
-    out(`#${r.id} ${typeIcon(r.type)} ${title}${lesson}`);
+    const lesson = r.lesson_learned ? `\n     Lesson: ${truncate(r.lesson_learned, 80)}` : '';
+    const date = fmtDateShort(r.created_at);
+    out(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${title} | ${r.project} | ${date}${lesson}`);
   }
 }
 
@@ -300,7 +465,7 @@ function cmdGet(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    out('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt]');
+    out('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]');
     return;
   }
 
@@ -345,14 +510,16 @@ function cmdGet(db, args) {
     return;
   }
 
-  // Default: observations
-  // Update access_count (aligned with MCP mem_get)
+  // Default: observations (aligned with MCP mem_get)
+  const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
+  const requestedFields = flags.fields ? flags.fields.split(',').map(s => s.trim()).filter(f => OBS_FIELDS.includes(f)) : null;
+
+  // Update access_count + auto-boost (aligned with MCP mem_get)
   db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
+  autoBoostIfNeeded(db, ids);
 
   const rows = db.prepare(`
-    SELECT id, type, title, subtitle, narrative, text, concepts, facts,
-           files_read, files_modified, lesson_learned, importance, created_at, project
-    FROM observations
+    SELECT * FROM observations
     WHERE id IN (${placeholders})
     ORDER BY created_at_epoch ASC
   `).all(...ids);
@@ -362,26 +529,20 @@ function cmdGet(db, args) {
     return;
   }
 
+  const fields = requestedFields || OBS_FIELDS;
   const parts = [];
   for (const r of rows) {
     const lines = [`#${r.id} [${r.type}] ${fmtDateShort(r.created_at)}`];
-    if (r.title) lines.push(`Title: ${r.title}`);
-    if (r.subtitle) lines.push(`Subtitle: ${r.subtitle}`);
-
-    // Collect files from JSON arrays
-    const files = [];
-    try {
-      const modified = JSON.parse(r.files_modified || '[]');
-      const read = JSON.parse(r.files_read || '[]');
-      if (modified.length) files.push(...modified.map(f => basename(f)));
-      if (read.length && !modified.length) files.push(...read.map(f => basename(f)));
-    } catch {}
-    if (files.length) lines.push(`Files: ${files.join(', ')}`);
-
-    if (r.lesson_learned) lines.push(`Lesson: ${r.lesson_learned}`);
-    if (r.narrative) lines.push(`Narrative: ${truncate(r.narrative, 200)}`);
-    if (r.concepts) lines.push(`Concepts: ${r.concepts}`);
-    if (r.importance) lines.push(`Importance: ${r.importance}`);
+    for (const f of fields) {
+      if (f === 'id' || f === 'type' || f === 'created_at') continue; // already in header
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      // Skip 'text' field when it duplicates narrative (aligned with MCP mem_get)
+      if (f === 'text' && r.narrative && typeof val === 'string' && val.startsWith(r.narrative)) continue;
+      const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
+      const display = typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
+      lines.push(`${f}: ${display}`);
+    }
     parts.push(lines.join('\n'));
   }
 
@@ -396,23 +557,49 @@ function cmdTimeline(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : null;
 
   // Support query-based anchor: `timeline --query "search terms"` or positional
+  // Uses recency-weighted BM25 + project filter (aligned with MCP mem_timeline)
   const queryStr = flags.query || positional.join(' ');
   if ((!anchorId || isNaN(anchorId)) && queryStr) {
     const ftsQuery = sanitizeFtsQuery(queryStr);
     if (ftsQuery) {
+      const nowT = Date.now();
       const match = db.prepare(`
         SELECT o.id FROM observations_fts
         JOIN observations o ON observations_fts.rowid = o.id
-        WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+        WHERE observations_fts MATCH ?
+          AND (? IS NULL OR o.project = ?)
+          AND COALESCE(o.compressed_into, 0) = 0
         ORDER BY ${OBS_BM25}
+          * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${DEFAULT_DECAY_HALF_LIFE_MS}.0))
         LIMIT 1
-      `).get(ftsQuery);
+      `).get(ftsQuery, project ?? null, project ?? null, nowT);
       if (match) anchorId = match.id;
     }
   }
 
+  // No anchor: show most recent observations (aligned with MCP mem_timeline fallback)
   if (!anchorId || isNaN(anchorId)) {
-    out('[mem] Usage: mem timeline --anchor <id> [--query "text"] [--before N] [--after N] [--project P]');
+    const compressedFilter = 'COALESCE(compressed_into, 0) = 0';
+    const projectFilter = project ? `WHERE ${compressedFilter} AND project = ?` : `WHERE ${compressedFilter}`;
+    const fallbackParams = project ? [project, before + after + 1] : [before + after + 1];
+    const rows = db.prepare(`
+      SELECT id, type, title, subtitle, created_at, created_at_epoch
+      FROM observations ${projectFilter}
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all(...fallbackParams);
+
+    if (rows.length === 0) {
+      out('[mem] No observations found.');
+      return;
+    }
+
+    out(`[mem] Timeline (most recent ${rows.length}):`);
+    for (const r of rows.reverse()) {
+      const time = relativeTime(r.created_at_epoch);
+      const title = truncate(r.title || r.subtitle || '(untitled)', 60);
+      out(`#${r.id} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
+    }
     return;
   }
 
@@ -511,12 +698,12 @@ function cmdSave(db, args) {
   const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
 
   const now = new Date();
-  const sessionId = `cli-${now.getTime()}`;
+  const sessionId = `manual-${project}`;
 
   // Ensure a session exists for the FK constraint
   db.prepare(`
     INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-    VALUES (?, ?, ?, ?, ?, 'completed')
+    VALUES (?, ?, ?, ?, ?, 'active')
   `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
   // Atomic: insert observation + observation_files + TF-IDF vector (aligned with MCP mem_save)
@@ -561,46 +748,104 @@ function cmdStats(db, args) {
   const baseParams = project ? [project] : [];
 
   const now = Date.now();
-  const thirtyDaysAgo = now - days * 86400000;
-  const sevenDaysAgo = now - 7 * 86400000;
+  const cutoff = now - days * 86400000;
 
-  // Total observations
+  // Total counts (aligned with MCP mem_stats: use session_summaries, not sdk_sessions)
   const obsTotal = db.prepare(
     `SELECT COUNT(*) as c FROM observations WHERE 1=1 ${projectFilter}`
   ).get(...baseParams);
-
-  // 30d and 7d counts
-  const obs30d = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE created_at_epoch >= ? ${projectFilter}`
-  ).get(thirtyDaysAgo, ...baseParams);
-
-  const obs7d = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE created_at_epoch >= ? ${projectFilter}`
-  ).get(sevenDaysAgo, ...baseParams);
-
-  // Session count
   const sessTotal = db.prepare(
-    `SELECT COUNT(*) as c FROM sdk_sessions WHERE 1=1 ${project ? 'AND project = ?' : ''}`
+    `SELECT COUNT(*) as c FROM session_summaries WHERE 1=1 ${projectFilter}`
   ).get(...baseParams);
+  const promptTotal = project
+    ? db.prepare('SELECT COUNT(*) as c FROM user_prompts p JOIN sdk_sessions s ON p.content_session_id = s.content_session_id WHERE s.project = ?').get(project)
+    : db.prepare('SELECT COUNT(*) as c FROM user_prompts').get();
 
-  // Project count
-  const projCount = db.prepare(
-    'SELECT COUNT(DISTINCT project) as c FROM observations'
-  ).get();
+  // Recent counts
+  const obsRecent = db.prepare(
+    `SELECT COUNT(*) as c FROM observations WHERE created_at_epoch >= ? ${projectFilter}`
+  ).get(cutoff, ...baseParams);
+  const sessRecent = db.prepare(
+    `SELECT COUNT(*) as c FROM session_summaries WHERE created_at_epoch >= ? ${projectFilter}`
+  ).get(cutoff, ...baseParams);
 
-  // Type distribution
+  // Type distribution (recent)
   const types = db.prepare(`
     SELECT type, COUNT(*) as c FROM observations
-    WHERE 1=1 ${projectFilter}
+    WHERE created_at_epoch >= ? ${projectFilter}
     GROUP BY type ORDER BY c DESC
-  `).all(...baseParams);
+  `).all(cutoff, ...baseParams);
 
-  const typeLine = types.map(t => `${t.type}=${t.c}`).join(' ');
+  // Top projects (global view — skipped when filtering by single project; aligned with MCP)
+  const projects = project ? [] : db.prepare(`
+    SELECT project, COUNT(*) as c FROM observations
+    GROUP BY project ORDER BY c DESC LIMIT 20
+  `).all();
+
+  // Daily activity (last 7 days; aligned with MCP mem_stats)
+  const daily = db.prepare(`
+    SELECT date(created_at) as day, COUNT(*) as c FROM observations
+    WHERE created_at_epoch >= ? ${projectFilter}
+    GROUP BY day ORDER BY day DESC LIMIT 7
+  `).all(now - 7 * 86400000, ...baseParams);
+
+  // Data health (aligned with MCP mem_stats)
+  const tokenEst = db.prepare(`
+    SELECT SUM(LENGTH(COALESCE(title,'')) + LENGTH(COALESCE(narrative,'')) + LENGTH(COALESCE(text,''))) / 4 as t
+    FROM observations WHERE 1=1 ${projectFilter}
+  `).get(...baseParams);
+  const avgImp = db.prepare(
+    `SELECT AVG(COALESCE(importance,1)) as v FROM observations WHERE 1=1 ${projectFilter}`
+  ).get(...baseParams);
+  const thirtyDaysAgo = now - 30 * 86400000;
+  const lowVal = db.prepare(`
+    SELECT COUNT(*) as c FROM observations
+    WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+      AND created_at_epoch < ? ${projectFilter}
+  `).get(thirtyDaysAgo, ...baseParams);
+  const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
+  const compressedCount = db.prepare(
+    `SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}`
+  ).get(...baseParams);
+
+  // Tier distribution (aligned with MCP mem_stats)
+  const tierCtx = { now, currentProject: project || inferProject(), currentSessionId: '' };
+  const tdParams = tierSqlParams(tierCtx);
+  const tierDist = db.prepare(`
+    SELECT tier, COUNT(*) as c FROM (
+      SELECT ${TIER_CASE_SQL} as tier FROM observations WHERE 1=1 ${projectFilter}
+    ) GROUP BY tier ORDER BY tier
+  `).all(...tdParams, ...baseParams);
+  const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));
 
   out(`[mem] Stats${project ? ` (${project})` : ''}:`);
-  out(`Observations: ${obsTotal.c.toLocaleString()} (30d: ${obs30d.c}, 7d: ${obs7d.c})`);
-  out(`Sessions: ${sessTotal.c} | Projects: ${projCount.c}`);
-  if (typeLine) out(`Types: ${typeLine}`);
+  out(`Total: ${obsTotal.c.toLocaleString()} observations | ${sessTotal.c} sessions | ${promptTotal.c} prompts`);
+  out(`Last ${days}d: ${obsRecent.c} observations | ${sessRecent.c} sessions`);
+  out('');
+  if (types.length) {
+    out('Type distribution (recent):');
+    for (const t of types) out(`  ${t.type}: ${t.c}`);
+    out('');
+  }
+  if (projects.length) {
+    out('Top projects:');
+    for (const p of projects) out(`  ${p.project}: ${p.c}`);
+    out('');
+  }
+  if (daily.length) {
+    out('Daily activity (last 7d):');
+    for (const d of daily) out(`  ${d.day}: ${d.c} observations`);
+    out('');
+  }
+  out('Data Health:');
+  out(`  Est. tokens: ${tokenEst.t ?? 0}`);
+  out(`  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`);
+  out(`  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`);
+  out(`  Compressed: ${compressedCount.c}`);
+  if (noiseRatio > 0.6) out('  ⚠️ High noise ratio — consider running mem compress');
+  out('');
+  out('Tier distribution:');
+  out(`  🔴 Working: ${tierMap.working ?? 0} | 🟡 Active: ${tierMap.active ?? 0} | 🔵 Archive: ${tierMap.archive ?? 0}`);
 }
 
 function cmdContext(_db, _args) {
@@ -795,11 +1040,11 @@ function cmdUpdate(db, args) {
   if (flags.narrative) { updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative)); }
   if (flags.type) { updates.push('type = ?'); params.push(flags.type); }
   if (flags.importance) { updates.push('importance = ?'); params.push(Math.max(1, Math.min(3, parseInt(flags.importance, 10)))); }
-  if (flags.lesson) { updates.push('lesson_learned = ?'); params.push(scrubSecrets(flags.lesson)); }
+  if (flags.lesson || flags['lesson-learned']) { updates.push('lesson_learned = ?'); params.push(scrubSecrets(flags.lesson || flags['lesson-learned'])); }
   if (flags.concepts) { updates.push('concepts = ?'); params.push(flags.concepts); }
 
   if (updates.length === 0) {
-    out('[mem] No fields to update. Use --title, --type, --importance, --lesson, --narrative, --concepts');
+    out('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
     return;
   }
 
@@ -836,8 +1081,13 @@ function cmdUpdate(db, args) {
 
 function cmdExport(db, args) {
   const { flags } = parseArgs(args);
-  const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
+  const wheres = [];
   const params = [];
+  // --include-compressed: include compressed observations (aligned with MCP mem_export)
+  if (!(flags['include-compressed'] === true || flags['include-compressed'] === 'true')) {
+    wheres.push('COALESCE(compressed_into, 0) = 0');
+  }
+  wheres.push('superseded_at IS NULL');
 
   const project = flags.project ? resolveProject(db, flags.project) : null;
   if (project) { wheres.push('project = ?'); params.push(project); }
@@ -1042,9 +1292,30 @@ function cmdMaintain(db, args) {
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
     out(`  Pending purge: ${pendingPurge.count}`);
     if (duplicates.length > 0) {
-      out('  Duplicates:');
-      for (const d of duplicates.slice(0, 15)) {
-        out(`    [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`);
+      const AUTO_MERGE_THRESHOLD = 0.85;
+      const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
+      const manualReview = duplicates.filter(d => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);
+
+      if (autoMergeable.length > 0) {
+        out(`  Auto-mergeable (similarity >= ${AUTO_MERGE_THRESHOLD}):`);
+        for (const d of autoMergeable.slice(0, 15)) {
+          const keep = (d.a.importance ?? 1) >= (d.b.importance ?? 1) ? d.a : d.b;
+          const remove = keep === d.a ? d.b : d.a;
+          out(`    [${keep.id}] "${truncate(keep.title, 40)}" <-> [${remove.id}] "${truncate(remove.title, 40)}" (${d.similarity})`);
+        }
+        const mergeIds = autoMergeable.map(d => {
+          const keep = (d.a.importance ?? 1) >= (d.b.importance ?? 1) ? d.a : d.b;
+          const remove = keep === d.a ? d.b : d.a;
+          return `${keep.id}:${remove.id}`;
+        });
+        out(`  Ready-to-use: claude-mem-lite maintain execute --ops dedup --merge-ids ${mergeIds.join(',')}`);
+      }
+
+      if (manualReview.length > 0) {
+        out('  Needs review:');
+        for (const d of manualReview.slice(0, 15)) {
+          out(`    [${d.a.id}] "${truncate(d.a.title, 40)}" <-> [${d.b.id}] "${truncate(d.b.title, 40)}" (${d.similarity})`);
+        }
       }
     }
     return;
@@ -1212,23 +1483,150 @@ function cmdFtsCheck(db, args) {
   }
 }
 
+// ─── Registry ─────────────────────────────────────────────────────────────────
+
+function cmdRegistry(_memDb, args) {
+  const { positional, flags } = parseArgs(args);
+  const action = positional[0];
+  if (!action || !['list', 'stats', 'search', 'import', 'remove', 'reindex'].includes(action)) {
+    out('[mem] Usage: mem registry <list|stats|search|import|remove|reindex> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
+    return;
+  }
+
+  let rdb;
+  try {
+    rdb = ensureRegistryDb(REGISTRY_DB_PATH);
+    rdb.pragma('busy_timeout = 3000');
+  } catch (e) {
+    out(`[mem] Registry DB not available: ${e.message}`);
+    return;
+  }
+
+  try {
+    if (action === 'search') {
+      const query = flags.query || positional.slice(1).join(' ');
+      if (!query) { out('[mem] Usage: mem registry search <query> [--type skill|agent] [--category C] [--quality Q]'); return; }
+      let results = searchResources(rdb, query, {
+        type: flags.type || undefined,
+        limit: (flags.category || flags.quality) ? 20 : 10,
+      });
+      // Apply category/quality post-filters (aligned with MCP mem_registry)
+      if (flags.category) results = results.filter(r => r.category === flags.category);
+      if (flags.quality) results = results.filter(r => r.quality_tier === flags.quality);
+      // Prioritize directly invocable resources (aligned with MCP mem_registry)
+      results.sort((a, b) => {
+        const aInvocable = a.invocation_name ? 1 : 0;
+        const bInvocable = b.invocation_name ? 1 : 0;
+        if (aInvocable !== bInvocable) return bInvocable - aInvocable;
+        return 0;
+      });
+      results = results.slice(0, 5);
+      if (results.length === 0) { out(`[mem] No matching resources for: "${query}"`); return; }
+      out(`[mem] ${results.length} resource(s) for "${query}":`);
+      for (const r of results) {
+        const badge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
+        const categoryLabel = r.category ? ` [${r.category}]` : '';
+        const howToUse = r.type === 'skill'
+          ? (r.invocation_name ? `skill="${r.invocation_name}"` : r.name)
+          : `subagent_type="${r.invocation_name || r.name}"`;
+        out(`  ${badge} ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${categoryLabel} — ${truncate(r.capability_summary || '', 60)} | Use: ${howToUse}`);
+      }
+      return;
+    }
+
+    if (action === 'list') {
+      const typeFilter = flags.type;
+      const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
+      const params = typeFilter ? [typeFilter, 'active'] : ['active'];
+      const resources = rdb.prepare(`
+        SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
+        FROM resources ${where} ORDER BY type, name
+      `).all(...params);
+      if (resources.length === 0) { out('[mem] No resources found.'); return; }
+      out(`[mem] Resources (${resources.length}):`);
+      for (const r of resources) {
+        out(`  ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 50)}`);
+      }
+      return;
+    }
+
+    if (action === 'stats') {
+      const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
+      const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
+      const topAdopted = rdb.prepare(
+        'SELECT name, type, adopt_count, recommend_count FROM resources WHERE status = ? AND adopt_count > 0 ORDER BY adopt_count DESC LIMIT 10'
+      ).all('active');
+      const zeroAdopt = rdb.prepare(
+        'SELECT COUNT(*) as c FROM resources WHERE status = ? AND recommend_count > 0 AND adopt_count = 0'
+      ).get('active');
+      const userAdded = rdb.prepare(
+        "SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'"
+      ).get('active');
+      out(`[mem] Registry Stats:`);
+      out(`  Total active: ${total.c}`);
+      for (const t of byType) out(`  ${t.type}: ${t.c}`);
+      out(`  User-added: ${userAdded.c}`);
+      out(`  Zero adoption (recommended but never adopted): ${zeroAdopt.c}`);
+      if (topAdopted.length > 0) {
+        out('  Top adopted:');
+        for (const r of topAdopted) out(`    ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
+      }
+      return;
+    }
+
+    if (action === 'import') {
+      const name = flags.name;
+      const resourceType = flags['resource-type'];
+      if (!name || !resourceType) { out('[mem] Usage: mem registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
+      const fields = { name, type: resourceType, status: 'active', source: flags.source || 'user' };
+      for (const f of ['repo-url', 'local-path', 'invocation-name', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
+        const camel = f.replace(/-([a-z])/g, (_, c) => '_' + c);
+        fields[camel] = flags[f] || '';
+      }
+      const id = upsertResource(rdb, fields);
+      out(`[mem] Imported: ${resourceType}:${name} (id=${id})`);
+      return;
+    }
+
+    if (action === 'remove') {
+      const name = flags.name;
+      const resourceType = flags['resource-type'];
+      if (!name || !resourceType) { out('[mem] Usage: mem registry remove --name N --resource-type skill|agent'); return; }
+      const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(resourceType, name);
+      out(result.changes > 0 ? `[mem] Removed: ${resourceType}:${name}` : '[mem] Not found.');
+      return;
+    }
+
+    if (action === 'reindex') {
+      rdb.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
+      const count = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
+      out(`[mem] FTS5 reindexed. ${count.c} active resources.`);
+      return;
+    }
+  } finally {
+    try { rdb.close(); } catch {}
+  }
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
   out(`claude-mem-lite CLI
 
 Commands:
-  search <query>        FTS5 search observations
-    --type T            Filter by type (bugfix|decision|discovery|feature|refactor|change)
-    --limit N           Max results (default 5)
+  search <query>        FTS5 search across observations, sessions, and prompts
+    --source S          Table: observations|sessions|prompts (default: all)
+    --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
+    --limit N           Max results (default 20)
     --project P         Filter by project
     --from DATE         Start date (YYYY-MM-DD or ISO 8601)
     --to DATE           End date (YYYY-MM-DD or ISO 8601)
     --importance N      Minimum importance (1-3)
     --branch B          Filter by git branch
     --offset N          Skip first N results (pagination)
+    --tier T            Filter by tier (working|active|archive)
 
-  recent [N]            Show N most recent observations (default 5)
+  recent [N]            Show N most recent observations (default 10)
     --project P         Filter by project
 
   recall <file>         Show observations related to a file
@@ -1236,8 +1634,9 @@ Commands:
 
   get <id1,id2,...>     Get full details by ID
     --source S          Record type: obs (default), session, prompt
+    --fields f1,f2,...  Select specific fields to return
 
-  timeline              Show observations around an anchor
+  timeline              Show observations around an anchor (shows recent if no anchor)
     --anchor ID         Center on this observation ID
     --query "text"      Find anchor by FTS5 search
     --before N          Show N before anchor (default 5)
@@ -1258,7 +1657,7 @@ Commands:
     --title T           New title
     --type T            New type
     --importance N      New importance (1-3)
-    --lesson T          Add/update lesson learned
+    --lesson T          Add/update lesson learned (alias: --lesson-learned)
     --narrative T       New narrative
     --concepts T        Space-separated concept tags
 
@@ -1268,6 +1667,7 @@ Commands:
     --format F          json (default) or jsonl
     --from DATE         Start date
     --to DATE           End date
+    --include-compressed  Include compressed observations
     --limit N           Max results (default 200, max 1000)
 
   compress              Compress old low-value observations
@@ -1293,6 +1693,14 @@ Commands:
     --tier T            Filter: working|active|archive
     --project P         Filter by project
     --limit N           Max entries per tier (default 5)
+
+  registry <action>     Manage tool resource registry
+    list                List all resources [--type skill|agent]
+    stats               Registry statistics
+    search <query>      Search resources [--type skill|agent] [--category C] [--quality Q]
+    import              Import resource --name N --resource-type T [--repo-url U] [--local-path P] [--use-cases U]
+    remove              Remove resource --name N --resource-type T
+    reindex             Rebuild FTS5 index
 
 DB: ${DB_PATH}`);
 }
@@ -1335,6 +1743,7 @@ export async function run(argv) {
       case 'stats':     cmdStats(db, cmdArgs); break;
       case 'context':   cmdContext(db, cmdArgs); break;
       case 'browse':    cmdBrowse(db, cmdArgs); break;
+      case 'registry':  cmdRegistry(db, cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');

@@ -218,8 +218,8 @@ describe('CLI recent command', () => {
   });
   afterEach(() => { testDb.close(); });
 
-  it('shows recent observations with default count (5)', async () => {
-    for (let i = 0; i < 8; i++) {
+  it('shows recent observations with default count (10)', async () => {
+    for (let i = 0; i < 12; i++) {
       insertObs(testDb, {
         sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
         title: `Observation ${i}`, text: `content ${i}`, epochOffset: i * 60000,
@@ -228,7 +228,7 @@ describe('CLI recent command', () => {
     const output = await captureStdout(() => run(['recent']));
     expect(output).toContain('[mem] Recent');
     const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
-    expect(resultLines.length).toBe(5);
+    expect(resultLines.length).toBe(10);
   });
 
   it('respects explicit count', async () => {
@@ -335,8 +335,8 @@ describe('CLI get command', () => {
     });
     const output = await captureStdout(() => run(['get', '1']));
     expect(output).toContain('#1 [decision]');
-    expect(output).toContain('Title: Chose PostgreSQL over MySQL');
-    expect(output).toContain('Narrative: We evaluated both databases');
+    expect(output).toContain('title: Chose PostgreSQL over MySQL');
+    expect(output).toContain('narrative: We evaluated both databases');
   });
 
   it('shows multiple IDs', async () => {
@@ -365,7 +365,7 @@ describe('CLI get command', () => {
       filesModified: '["src/config.ts", "src/db.ts"]',
     });
     const output = await captureStdout(() => run(['get', '1']));
-    expect(output).toContain('Files: config.ts, db.ts');
+    expect(output).toContain('files_modified: ["src/config.ts", "src/db.ts"]');
   });
 
   it('shows lesson when present', async () => {
@@ -375,7 +375,7 @@ describe('CLI get command', () => {
       lessonLearned: 'Always clear intervals on unmount',
     });
     const output = await captureStdout(() => run(['get', '1']));
-    expect(output).toContain('Lesson: Always clear intervals on unmount');
+    expect(output).toContain('lesson_learned: Always clear intervals on unmount');
   });
 
   it('shows usage when no IDs provided', async () => {
@@ -430,9 +430,19 @@ describe('CLI timeline command', () => {
     expect(output).toContain('not found');
   });
 
-  it('shows usage when no --anchor provided', async () => {
+  it('shows recent observations when no --anchor provided', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Recent obs', text: 'content', epochOffset: 0,
+    });
     const output = await captureStdout(() => run(['timeline']));
-    expect(output).toContain('Usage');
+    expect(output).toContain('Timeline (most recent');
+    expect(output).toContain('Recent obs');
+  });
+
+  it('shows "No observations" when no --anchor and DB empty', async () => {
+    const output = await captureStdout(() => run(['timeline']));
+    expect(output).toContain('No observations');
   });
 });
 
@@ -498,9 +508,9 @@ describe('CLI save command', () => {
 
   it('creates a session for FK constraint', async () => {
     await captureStdout(() => run(['save', 'New observation via CLI']));
-    const sessions = testDb.prepare("SELECT * FROM sdk_sessions WHERE content_session_id LIKE 'cli-%'").all();
+    const sessions = testDb.prepare("SELECT * FROM sdk_sessions WHERE content_session_id LIKE 'manual-%'").all();
     expect(sessions.length).toBe(1);
-    expect(sessions[0].status).toBe('completed');
+    expect(sessions[0].status).toBe('active');
   });
 });
 
@@ -529,18 +539,18 @@ describe('CLI stats command', () => {
 
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('[mem] Stats');
-    expect(output).toContain('Observations:');
-    expect(output).toContain('Sessions:');
-    expect(output).toContain('Projects:');
-    expect(output).toContain('Types:');
-    expect(output).toContain('bugfix=2');
-    expect(output).toContain('discovery=1');
+    expect(output).toContain('Total:');
+    expect(output).toContain('observations');
+    expect(output).toContain('sessions');
+    expect(output).toContain('Type distribution');
+    expect(output).toContain('bugfix: 2');
+    expect(output).toContain('discovery: 1');
   });
 
   it('shows stats for empty DB', async () => {
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('[mem] Stats');
-    expect(output).toContain('Observations: 0');
+    expect(output).toContain('Total: 0 observations');
   });
 });
 

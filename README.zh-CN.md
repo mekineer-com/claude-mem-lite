@@ -144,7 +144,7 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem` 服务器，包含 12 个工具（search、timeline、get、save、update、stats、delete、compress、maintain、registry、export、fts_check）
+2. **注册 MCP 服务器** -- `mem` 服务器，包含 15 个工具（search、recent、recall、timeline、get、save、update、stats、delete、compress、maintain、export、fts_check、browse、registry）
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
@@ -197,6 +197,8 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 | 工具 | 描述 |
 |------|------|
 | `mem_search` | 基于 BM25 排名的 FTS5 全文搜索。支持按类型、项目、日期范围、重要度过滤。 |
+| `mem_recent` | 显示最近的观察，按时间排序。快速查看最新活动。 |
+| `mem_recall` | 召回与文件相关的观察。编辑文件前使用，回顾过去的修复和上下文。 |
 | `mem_timeline` | 围绕锚点按时间顺序浏览观察。 |
 | `mem_get` | 获取指定观察 ID 的完整详情（包含重要度和关联 ID）。 |
 | `mem_save` | 手动保存记忆/观察。 |
@@ -207,6 +209,7 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 | `mem_maintain` | 记忆维护：扫描重复/过期/损坏条目，执行清理/去重/向量重建操作。 |
 | `mem_export` | 导出观察为 JSON 或 JSONL 格式，支持按项目、类型、日期范围过滤。 |
 | `mem_fts_check` | 检查 FTS5 索引完整性或重建索引。搜索结果异常或数据库恢复后使用。 |
+| `mem_browse` | 分层记忆仪表盘。按记忆层级（working/active/archive）分组展示观察。 |
 | `mem_registry` | 管理资源注册表：按需搜索技能/代理、列表、统计、导入/移除、重索引。 |
 
 ### 技能命令（在 Claude Code 聊天中使用）
@@ -214,9 +217,11 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 ```
 /mem search <query>        # 全文搜索所有记忆
 /mem recent [n]            # 显示最近 N 条观察（默认 10）
+/mem recall <file>         # 显示文件相关的历史观察
 /mem save <text>           # 保存手动记忆/笔记
 /mem stats                 # 显示记忆统计
 /mem timeline <query>      # 围绕匹配结果浏览时间线
+/mem browse                # 分层记忆仪表盘
 /mem <query>               # search 的简写
 ```
 

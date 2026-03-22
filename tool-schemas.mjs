@@ -42,6 +42,11 @@ export const memSearchSchema = {
   offset: coerceInt.pipe(z.number().int().min(0)).optional().describe('Offset for pagination'),
 };
 
+export const memRecentSchema = {
+  limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max results (default 10)'),
+  project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
+};
+
 export const memTimelineSchema = {
   anchor: coerceInt.pipe(z.number().int()).optional().describe('Observation ID as center point'),
   query: z.string().optional().describe('FTS5 query to auto-find anchor'),
@@ -142,4 +147,10 @@ export const memRegistrySchema = {
   use_cases: z.string().optional().describe('Usage scenarios (for import)'),
   category: z.string().optional().describe("Filter by category (e.g., 'testing', 'code-quality', 'debugging')"),
   quality: z.enum(['installed', 'verified', 'community']).optional().describe('Filter by quality tier (default: all)'),
+};
+
+export const memBrowseSchema = {
+  project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
+  tier: z.enum(['working', 'active', 'archive']).optional().describe('Show only this tier'),
+  limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max entries per tier (default 5, or 20 when filtering by tier)'),
 };

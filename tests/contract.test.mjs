@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import {
   memSearchSchema,
+  memRecentSchema,
   memTimelineSchema,
   memGetSchema,
   memDeleteSchema,
@@ -12,6 +13,7 @@ import {
   memMaintainSchema,
   memRecallSchema,
   memRegistrySchema,
+  memBrowseSchema,
 } from '../tool-schemas.mjs';
 
 // Helper: parse object against schema (Zod object from flat dict)
@@ -68,6 +70,31 @@ describe('mem_search schema', () => {
     expect(parseSchema(memSearchSchema, { limit: 1 }).success).toBe(true);
     expect(parseSchema(memSearchSchema, { limit: 100 }).success).toBe(true);
     expect(parseSchema(memSearchSchema, { offset: 0 }).success).toBe(true);
+  });
+});
+
+// ─── mem_recent schema ──────────────────────────────────────────────────────
+
+describe('mem_recent schema', () => {
+  it('accepts empty args (all optional)', () => {
+    expect(parseSchema(memRecentSchema, {}).success).toBe(true);
+  });
+
+  it('accepts limit and project', () => {
+    const result = parseSchema(memRecentSchema, { limit: 10, project: 'mem' });
+    expect(result.success).toBe(true);
+    expect(result.data.limit).toBe(10);
+  });
+
+  it('rejects limit out of range', () => {
+    expect(parseSchema(memRecentSchema, { limit: 0 }).success).toBe(false);
+    expect(parseSchema(memRecentSchema, { limit: 101 }).success).toBe(false);
+  });
+
+  it('coerces string limit', () => {
+    const result = parseSchema(memRecentSchema, { limit: '5' });
+    expect(result.success).toBe(true);
+    expect(result.data.limit).toBe(5);
   });
 });
 
@@ -349,6 +376,31 @@ describe('mem_registry schema', () => {
 
   it('rejects invalid quality enum value', () => {
     expect(parseSchema(memRegistrySchema, { action: 'search', query: 'x', quality: 'premium' }).success).toBe(false);
+  });
+});
+
+// ─── memBrowseSchema ─────────────────────────────────────────────────────────
+
+describe('memBrowseSchema', () => {
+  it('accepts empty args (all defaults)', () => {
+    expect(parseSchema(memBrowseSchema, {}).success).toBe(true);
+  });
+
+  it('accepts project and tier filter', () => {
+    const r = parseSchema(memBrowseSchema, { project: 'my-project', tier: 'working', limit: 10 });
+    expect(r.success).toBe(true);
+    expect(r.data.tier).toBe('working');
+    expect(r.data.limit).toBe(10);
+  });
+
+  it('rejects invalid tier', () => {
+    expect(parseSchema(memBrowseSchema, { tier: 'invalid' }).success).toBe(false);
+  });
+
+  it('coerces string limit', () => {
+    const r = parseSchema(memBrowseSchema, { limit: '15' });
+    expect(r.success).toBe(true);
+    expect(r.data.limit).toBe(15);
   });
 });
 
