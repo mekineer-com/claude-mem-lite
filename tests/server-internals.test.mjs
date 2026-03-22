@@ -198,6 +198,27 @@ describe('extractPRFTerms', () => {
   });
 });
 
+// ─── extractPRFTerms stemming ────────────────────────────────────────────────
+
+describe('extractPRFTerms stemming', () => {
+  it('should stem PRF terms to align with FTS5 porter tokenizer', () => {
+    const results = [
+      { title: 'Implementing the caching layer', narrative: 'Implemented a caching mechanism for database queries' },
+      { title: 'Cache implementation details', narrative: 'The implementation uses Redis for distributed caching' },
+      { title: 'Testing caching behavior', narrative: 'Verified the caching implementation works correctly' },
+    ];
+    const terms = extractPRFTerms(results, 'database query');
+    // All forms of "implement*" should be stemmed to the same root
+    // "cach" is the porter stem of "caching"/"cache"
+    const hasStemmedTerms = terms.some(t => t === 'implement' || t === 'cach');
+    expect(hasStemmedTerms).toBe(true);
+    // Should NOT contain unstemmed forms
+    expect(terms).not.toContain('implementing');
+    expect(terms).not.toContain('implementation');
+    expect(terms).not.toContain('implemented');
+  });
+});
+
 // ─── expandQueryByConcepts ──────────────────────────────────────────────────
 
 describe('expandQueryByConcepts', () => {

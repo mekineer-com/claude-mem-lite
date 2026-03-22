@@ -3,6 +3,7 @@
 
 import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';
+import { porterStem } from './tfidf.mjs';
 
 // ─── Search Re-ranking Helpers ────────────────────────────────────────────
 
@@ -127,20 +128,21 @@ export const PRF_STOP_WORDS = new Set([
  * @returns {string[]} Array of discriminative terms for query expansion
  */
 export function extractPRFTerms(results, ftsQuery, limit = 3) {
-  // Extract query tokens for exclusion
+  // Extract query tokens for exclusion (stemmed to match FTS5 porter tokenizer)
   const queryTokens = new Set(
     ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
-      .map(t => t.toLowerCase())
+      .map(t => porterStem(t.toLowerCase()))
       .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
   );
 
-  // Count term frequencies across top results' full text
+  // Count term frequencies across top results' full text (stemmed)
   const termFreq = {};
   const docCount = Math.min(results.length, 8);
   for (let i = 0; i < docCount; i++) {
     const r = results[i];
     const text = ((r.title || '') + ' ' + (r.narrative || '')).toLowerCase();
     const tokens = text.replace(/[^a-z0-9_-]/g, ' ').split(/\s+/)
+      .map(t => porterStem(t))
       .filter(t => t.length >= 3 && !PRF_STOP_WORDS.has(t) && !queryTokens.has(t));
     const seen = new Set();
     for (const t of tokens) {
