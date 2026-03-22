@@ -26,13 +26,16 @@ function parseArgs(argv) {
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
+      if (next !== undefined && !next.startsWith('--') && !next.startsWith('-')) {
         flags[key] = next;
         i += 2;
       } else {
         flags[key] = true;
         i++;
       }
+    } else if (arg === '-h') {
+      flags.help = true;
+      i++;
     } else {
       positional.push(arg);
       i++;
@@ -70,21 +73,28 @@ function cmdSearch(db, args) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    out('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N]');
+    out('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance]');
     return;
   }
 
-  const limit = parseInt(flags.limit, 10) || 20;
+  const limit = Math.max(1, parseInt(flags.limit, 10) || 20);
   const type = flags.type || null;
   const source = flags.source || null; // observations|sessions|prompts (null = all)
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const dateFrom = flags.from ? new Date(flags.from).getTime() : null;
   let dateTo = flags.to ? new Date(flags.to).getTime() : null;
   if (dateTo && flags.to && /^\d{4}-\d{2}-\d{2}$/.test(flags.to)) dateTo += 86400000 - 1;
+  if (flags.from && isNaN(dateFrom)) { out(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
+  if (flags.to && isNaN(dateTo)) { out(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
   const minImportance = flags.importance ? parseInt(flags.importance, 10) : null;
   const branch = flags.branch || null;
-  const offset = parseInt(flags.offset, 10) || 0;
+  const offset = Math.max(0, parseInt(flags.offset, 10) || 0);
   const tier = flags.tier || null;
+  const sort = flags.sort || 'relevance';
+  if (!['relevance', 'time', 'importance'].includes(sort)) {
+    out(`[mem] Invalid --sort "${sort}". Use: relevance, time, importance`);
+    return;
+  }
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
     out(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
@@ -97,8 +107,8 @@ function cmdSearch(db, args) {
     return;
   }
 
-  // When --type (obs_type) is specified, implicitly restrict to observations
-  const effectiveSource = source || (type ? 'observations' : null);
+  // When --type/--tier/--importance (obs-only fields) is specified, implicitly restrict to observations
+  const effectiveSource = source || ((type || tier || minImportance) ? 'observations' : null);
 
   const results = [];
 
@@ -217,7 +227,7 @@ function cmdSearch(db, args) {
 
   // Search prompts (aligned with MCP mem_search)
   if (!effectiveSource || effectiveSource === 'prompts') {
-    const promptWheres = ['user_prompts_fts MATCH ?'];
+    const promptWheres = ['user_prompts_fts MATCH ?', "p.prompt_text NOT LIKE '<task-notification>%'"];
     const promptParams = [ftsQuery];
     if (project) { promptWheres.push('s.project = ?'); promptParams.push(project); }
     if (dateFrom) { promptWheres.push('p.created_at_epoch >= ?'); promptParams.push(dateFrom); }
@@ -267,6 +277,14 @@ function cmdSearch(db, args) {
     if (isCrossSource) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
   }
 
+  // Apply user-requested sort (after relevance scoring)
+  if (sort === 'time') {
+    results.sort((a, b) => (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
+  } else if (sort === 'importance') {
+    results.sort((a, b) => (b.importance ?? 1) - (a.importance ?? 1) || (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
+  }
+  // else 'relevance' keeps BM25 score order (already sorted)
+
   // Cross-source: trim to limit with offset
   const paged = effectiveSource ? results : results.slice(offset, offset + limit);
 
@@ -274,13 +292,13 @@ function cmdSearch(db, args) {
   for (const r of paged) {
     if (r._source === 'session') {
       const date = fmtDateShort(r.created_at);
-      out(`S#${r.id} 📋 ${date} ${truncate(r.request || r.completed || '(no summary)', 70)}`);
+      out(`S#${r.id} 📋 ${date} ${truncate(r.request || r.completed || '(no summary)', 80)}`);
     } else if (r._source === 'prompt') {
       const date = fmtDateShort(r.created_at);
-      out(`P#${r.id} 💬 ${date} ${truncate(r.prompt_text || '(empty)', 70)}`);
+      out(`P#${r.id} 💬 ${date} ${truncate(r.prompt_text || '(empty)', 80)}`);
     } else {
       const date = fmtDateShort(r.created_at);
-      const title = truncate(r.title || r.subtitle || '(untitled)', 70);
+      const title = truncate(r.title || r.subtitle || '(untitled)', 80);
       const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
       out(`#${r.id} ${typeIcon(r.type)} ${date} ${title}${supersededTag}`);
       if (r.lesson_learned) {
@@ -389,7 +407,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
 
 function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
-  const limit = parseInt(positional[0], 10) || 10;
+  const limit = Math.max(1, parseInt(positional[0], 10) || 10);
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   const params = [];
@@ -413,7 +431,7 @@ function cmdRecent(db, args) {
   out(`[mem] Recent (${project || 'all'}):`);
   for (const r of rows) {
     const time = relativeTime(r.created_at_epoch);
-    const title = truncate(r.title || r.subtitle || '(untitled)', 60);
+    const title = truncate(r.title || r.subtitle || '(untitled)', 80);
     out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
   }
 }
@@ -427,7 +445,7 @@ function cmdRecall(db, args) {
   }
 
   const filename = basename(file);
-  const limit = parseInt(flags.limit, 10) || 10;
+  const limit = Math.max(1, parseInt(flags.limit, 10) || 10);
 
   // Search via observation_files junction table for indexed filename lookups
   const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
@@ -454,7 +472,7 @@ function cmdRecall(db, args) {
 
   out(`[mem] History for ${filename} (${rows.length}):`);
   for (const r of rows) {
-    const title = truncate(r.title || '(untitled)', 60);
+    const title = truncate(r.title || '(untitled)', 80);
     const lesson = r.lesson_learned ? `\n     Lesson: ${truncate(r.lesson_learned, 80)}` : '';
     const date = fmtDateShort(r.created_at);
     out(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${title} | ${r.project} | ${date}${lesson}`);
@@ -597,7 +615,7 @@ function cmdTimeline(db, args) {
     out(`[mem] Timeline (most recent ${rows.length}):`);
     for (const r of rows.reverse()) {
       const time = relativeTime(r.created_at_epoch);
-      const title = truncate(r.title || r.subtitle || '(untitled)', 60);
+      const title = truncate(r.title || r.subtitle || '(untitled)', 80);
       out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
     }
     return;
@@ -645,7 +663,7 @@ function cmdTimeline(db, args) {
   for (const r of all) {
     const marker = r.id === anchorId ? ' <--' : '';
     const time = relativeTime(r.created_at_epoch);
-    const title = truncate(r.title || r.subtitle || '(untitled)', 60);
+    const title = truncate(r.title || r.subtitle || '(untitled)', 80);
     out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}${marker}`);
   }
 }
@@ -736,7 +754,7 @@ function cmdSave(db, args) {
   });
   const result = saveTx();
 
-  out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 60)}" (project: ${project})`);
+  out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 80)}" (project: ${project})`);
 }
 
 function cmdStats(db, args) {
@@ -848,7 +866,10 @@ function cmdStats(db, args) {
   out(`  🔴 Working: ${tierMap.working ?? 0} | 🟡 Active: ${tierMap.active ?? 0} | 🔵 Archive: ${tierMap.archive ?? 0}`);
 }
 
-function cmdContext(_db, _args) {
+function cmdContext(_db, args) {
+  const { flags } = parseArgs(args);
+  const jsonOutput = flags.json === true || flags.json === 'true' || flags.format === 'json';
+
   // Read the project's CLAUDE.md and extract the context block
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
   const claudeMdPath = join(projectDir, 'CLAUDE.md');
@@ -857,7 +878,8 @@ function cmdContext(_db, _args) {
   try {
     content = readFileSync(claudeMdPath, 'utf8');
   } catch {
-    out(`[mem] No CLAUDE.md found at ${claudeMdPath}`);
+    if (jsonOutput) { out(JSON.stringify({ error: 'No CLAUDE.md found' })); }
+    else { out(`[mem] No CLAUDE.md found at ${claudeMdPath}`); }
     return;
   }
 
@@ -867,12 +889,32 @@ function cmdContext(_db, _args) {
   const endIdx = content.lastIndexOf(endTag);
 
   if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
-    out('[mem] No claude-mem-context block found in CLAUDE.md');
+    if (jsonOutput) { out(JSON.stringify({ error: 'No context block found' })); }
+    else { out('[mem] No claude-mem-context block found in CLAUDE.md'); }
     return;
   }
 
   const block = content.slice(startIdx + startTag.length, endIdx).trim();
-  out(`[mem] Current context:\n${block}`);
+
+  if (jsonOutput) {
+    // Parse markdown sections into structured JSON
+    const result = { raw: block, sections: {} };
+    const sectionRegex = /^###?\s+(.+)$/gm;
+    let match;
+    const sectionStarts = [];
+    while ((match = sectionRegex.exec(block)) !== null) {
+      sectionStarts.push({ name: match[1].trim(), index: match.index, headerEnd: match.index + match[0].length });
+    }
+    for (let i = 0; i < sectionStarts.length; i++) {
+      const start = sectionStarts[i].headerEnd;
+      const end = i + 1 < sectionStarts.length ? sectionStarts[i + 1].index : block.length;
+      const key = sectionStarts[i].name.replace(/\s+/g, '_').toLowerCase();
+      result.sections[key] = block.slice(start, end).trim();
+    }
+    out(JSON.stringify(result, null, 2));
+  } else {
+    out(`[mem] Current context:\n${block}`);
+  }
 }
 
 // ─── Browse (tier-grouped dashboard) ────────────────────────────────────────
@@ -885,7 +927,7 @@ function cmdBrowse(db, args) {
     out(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
     return;
   }
-  const limit = parseInt(flags.limit, 10) || (tierFilter ? 20 : 5);
+  const limit = Math.max(1, parseInt(flags.limit, 10) || (tierFilter ? 20 : 5));
   const now = Date.now();
 
   const ctx = {
@@ -935,7 +977,7 @@ function cmdBrowse(db, args) {
     `).all(...params, project, tier, limit);
 
     for (const r of rows) {
-      out(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 60)} | ${relativeTime(r.created_at_epoch)}`);
+      out(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${relativeTime(r.created_at_epoch)}`);
     }
     if (count > rows.length) out(`  ... and ${count - rows.length} more`);
     out('');
@@ -1108,16 +1150,22 @@ function cmdExport(db, args) {
   if (flags.type) { wheres.push('type = ?'); params.push(flags.type); }
   if (flags.from) {
     const epoch = new Date(flags.from).getTime();
-    if (!isNaN(epoch)) { wheres.push('created_at_epoch >= ?'); params.push(epoch); }
+    if (isNaN(epoch)) { out(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
+    wheres.push('created_at_epoch >= ?'); params.push(epoch);
   }
   if (flags.to) {
     let epoch = new Date(flags.to).getTime();
-    if (flags.to && /^\d{4}-\d{2}-\d{2}$/.test(flags.to)) epoch += 86400000 - 1;
-    if (!isNaN(epoch)) { wheres.push('created_at_epoch <= ?'); params.push(epoch); }
+    if (isNaN(epoch)) { out(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) epoch += 86400000 - 1;
+    wheres.push('created_at_epoch <= ?'); params.push(epoch);
   }
 
-  const limit = Math.min(parseInt(flags.limit, 10) || 200, 1000);
+  const limit = Math.min(Math.max(1, parseInt(flags.limit, 10) || 200), 1000);
   const format = flags.format || 'json';
+  if (!['json', 'jsonl'].includes(format)) {
+    out(`[mem] Invalid format "${format}". Use: json or jsonl`);
+    return;
+  }
 
   const rows = db.prepare(`
     SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, created_at, created_at_epoch
@@ -1146,7 +1194,8 @@ function cmdExport(db, args) {
 function cmdCompress(db, args) {
   const { flags } = parseArgs(args);
   const preview = flags.execute !== true && flags.execute !== 'true';
-  const ageDays = parseInt(flags['age-days'], 10) || 30;
+  const ageDaysRaw = parseInt(flags['age-days'], 10);
+  const ageDays = Number.isFinite(ageDaysRaw) && ageDaysRaw >= 1 ? ageDaysRaw : 30;
   const cutoff = Date.now() - ageDays * 86400000;
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const projectFilter = project ? 'AND project = ?' : '';
@@ -1336,8 +1385,14 @@ function cmdMaintain(db, args) {
   }
 
   // Execute
+  const VALID_OPS = ['cleanup', 'decay', 'boost', 'dedup', 'purge_stale', 'rebuild_vectors'];
   const opsStr = flags.ops || 'cleanup,decay,boost';
   const ops = opsStr.split(',').map(s => s.trim());
+  const invalidOps = ops.filter(op => !VALID_OPS.includes(op));
+  if (invalidOps.length > 0) {
+    out(`[mem] Unknown operation(s): ${invalidOps.join(', ')}. Valid: ${VALID_OPS.join(', ')}`);
+    return;
+  }
   const staleAge = Date.now() - STALE_AGE_MS;
   const OP_CAP = 1000;
   const results = [];
@@ -1543,7 +1598,7 @@ function cmdRegistry(_memDb, args) {
         const howToUse = r.type === 'skill'
           ? (r.invocation_name ? `skill="${r.invocation_name}"` : r.name)
           : `subagent_type="${r.invocation_name || r.name}"`;
-        out(`  ${badge} ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${categoryLabel} — ${truncate(r.capability_summary || '', 60)} | Use: ${howToUse}`);
+        out(`  ${badge} ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${categoryLabel} — ${truncate(r.capability_summary || '', 80)} | Use: ${howToUse}`);
       }
       return;
     }
@@ -1598,7 +1653,14 @@ function cmdRegistry(_memDb, args) {
         fields[camel] = flags[f] || '';
       }
       const id = upsertResource(rdb, fields);
+      // User-imported resources get 'installed' quality tier (user explicitly chose to add them)
+      if (id && !flags.source) {
+        rdb.prepare("UPDATE resources SET quality_tier = 'installed' WHERE id = ?").run(id);
+      }
       out(`[mem] Imported: ${resourceType}:${name} (id=${id})`);
+      if (!flags['capability-summary'] && !flags['use-cases']) {
+        out('[mem] Tip: Add --capability-summary or --use-cases so the resource appears in searches.');
+      }
       return;
     }
 
@@ -1638,7 +1700,8 @@ Commands:
     --importance N      Minimum importance (1-3)
     --branch B          Filter by git branch
     --offset N          Skip first N results (pagination)
-    --tier T            Filter by tier (working|active|archive)
+    --tier T            Filter by tier (working|active|archive, observations only)
+    --sort S            Sort: relevance (default), time, importance
 
   recent [N]            Show N most recent observations (default 10)
     --project P         Filter by project
@@ -1702,6 +1765,7 @@ Commands:
     --days N            Lookback window (default 30)
 
   context               Show current CLAUDE.md context block
+    --json              Output as structured JSON
 
   browse                Tier-grouped memory dashboard
     --tier T            Filter: working|active|archive
@@ -1726,6 +1790,12 @@ export async function run(argv) {
   const cmdArgs = argv.slice(1);
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+    cmdHelp();
+    return;
+  }
+
+  // Support `<cmd> --help` or `<cmd> -h` for any subcommand
+  if (cmdArgs.includes('--help') || cmdArgs.includes('-h')) {
     cmdHelp();
     return;
   }

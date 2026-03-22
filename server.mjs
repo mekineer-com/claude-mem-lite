@@ -427,6 +427,7 @@ function searchPrompts(ctx) {
       JOIN user_prompts p ON user_prompts_fts.rowid = p.id
       JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
       WHERE user_prompts_fts MATCH ?
+        AND p.prompt_text NOT LIKE '<task-notification>%'
         AND (? IS NULL OR s.project = ?)
         AND (? IS NULL OR p.created_at_epoch >= ?)
         AND (? IS NULL OR p.created_at_epoch <= ?)
@@ -625,6 +626,15 @@ server.registerTool(
         // No obs results but tier filter set — keep non-obs results
       }
     }
+
+    // Apply user-requested sort (after relevance scoring)
+    const sort = args.sort || 'relevance';
+    if (sort === 'time') {
+      results.sort((a, b) => (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
+    } else if (sort === 'importance') {
+      results.sort((a, b) => (b.importance ?? 1) - (a.importance ?? 1) || (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
+    }
+    // else 'relevance' keeps BM25 score order (already sorted)
 
     const totalBeforePagination = results.length;
     // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
@@ -1523,7 +1533,7 @@ server.registerTool(
       if (resources.length === 0) return { content: [{ type: 'text', text: 'No resources found.' }] };
 
       const lines = resources.map(r =>
-        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 60)}`
+        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 80)}`
       );
       return { content: [{ type: 'text', text: `Resources (${resources.length}):\n${lines.join('\n')}` }] };
     }
@@ -1813,7 +1823,7 @@ server.registerTool(
       `).all(...params, project, tier, limit);
 
       for (const r of rows) {
-        lines.push(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 60)} | ${fmtDate(r.created_at)}`);
+        lines.push(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${fmtDate(r.created_at)}`);
       }
       if (count > rows.length) lines.push(`  ... and ${count - rows.length} more`);
       lines.push('');

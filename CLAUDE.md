@@ -49,14 +49,18 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 修复这些问题
-Completed: Modified mem, user-prompt-search.js; Modified install.mjs, server.mjs, hook-episode.mjs +5 more; Modified registry.mjs,…
+Request: Simulate comprehensive CLI feature and user experience testing for claude-mem-lite project (all commands), identify and…
+Completed: Added --version command support to CLI; modified install.mjs, cli.mjs, mem-cli.mjs to enhance search and install comman…
+Remaining: Complete comprehensive CLI testing of all commands (mem_search, mem_recent, mem_get, mem_timeline, mem_save, mem_update…
+Next: Continue loop-driven testing iterations 2-3; systematically test each CLI command with various arguments; validate user…
+Lessons: CLI tool registration patterns require explicit command case matching in both cli.mjs and downstream command handlers; Version flag support is standard user expectation and should be added early in CLI development
+Decisions: Added --version command to improve CLI standard compliance and user experience
 
 ### Key Context
-- [discovery] Reviewed 6 files: schema.mjs, mem, mem-cli.mjs, tfidf.mjs +2 more (#4935)
-- [discovery] Reviewed 10 files: utils.mjs, mem, hook-semaphore.mjs, scoring-sql.mjs +6 more (#4934)
-- [discovery] Reviewed 6 files: mem, hook-semaphore.mjs, mem-cli.mjs, hook-llm.mjs +2 more (#4933)
-- [discovery] Reviewed 9 files: hook-episode.mjs, mem, server.mjs, scoring-sql.mjs +5 more (#4932)
-- [discovery] Reviewed 21 files: hook-update.mjs, mem, tier.mjs, utils.mjs +17 more (#4931)
+- [feature] Add --version command support to claude-mem-lite CLI (#4992)
+- [bugfix] Error: mem-cli.mjs: mem 5 results for error: #4957 🔍 2026-03-22 Work… (#4979)
+- [bugfix] Error: install.mjs, cli.mjs: mem 3 results for fix test failure: #4717 🟢 2026… (#4974)
+- [bugfix] Error: CLAUDE.md: title:	v2.23.1 tag:	v2.23.1 draft:	false prerelea… (#4971)
+- [discovery] Worked on hook.mjs, registry-scanner.test.mjs, test-helpers.mjs +3 more (#4957)
 
 </claude-mem-context>

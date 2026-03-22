@@ -40,6 +40,7 @@ export const memSearchSchema = {
   tier: z.enum(['working', 'active', 'archive']).optional().describe('Filter by memory tier (working=current session, active=within decay window, archive=old/compressed)'),
   limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max results (default 20)'),
   offset: coerceInt.pipe(z.number().int().min(0)).optional().describe('Offset for pagination'),
+  sort: z.enum(['relevance', 'time', 'importance']).optional().describe('Sort order: relevance (default, BM25), time (newest first), importance (highest first)'),
 };
 
 export const memRecentSchema = {
@@ -116,7 +117,7 @@ export const memExportSchema = {
   date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
   date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
   include_compressed: coerceBool.optional().describe('Include compressed observations (default: false)'),
-  limit: coerceInt.optional().describe('Max observations to export (default: 200, max: 1000)'),
+  limit: coerceInt.pipe(z.number().int().min(1).max(1000)).optional().describe('Max observations to export (default: 200, max: 1000)'),
 };
 
 export const memRecallSchema = {
