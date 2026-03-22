@@ -478,21 +478,26 @@ describe('CLI save command', () => {
     expect(row.title).toBe('Cache architecture');
   });
 
-  it('saves with --importance clamped to 1-3', async () => {
-    await captureStdout(() => run(['save', 'Test importance high', '--importance', '5']));
-    const row = testDb.prepare('SELECT * FROM observations ORDER BY id DESC LIMIT 1').get();
-    expect(row.importance).toBe(3); // clamped to max
+  it('rejects out-of-range importance (must be 1-3)', async () => {
+    const out5 = await captureStdout(() => run(['save', 'Test importance high', '--importance', '5']));
+    expect(out5).toContain('Invalid importance');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
 
+    const out0 = await captureStdout(() => run(['save', 'Test importance zero', '--importance', '0']));
+    expect(out0).toContain('Invalid importance');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+
+    const outNeg = await captureStdout(() => run(['save', 'Test importance neg', '--importance', '-1']));
+    expect(outNeg).toContain('Invalid importance');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+
+    // Valid importance 1 saves successfully
     await captureStdout(() => run(['save', 'Test importance one', '--importance', '1']));
-    const row2 = testDb.prepare('SELECT * FROM observations ORDER BY id DESC LIMIT 1').get();
-    expect(row2.importance).toBe(1); // min value
-  });
-
-  it('defaults importance to 2 when --importance is 0 (falsy)', async () => {
-    // parseInt('0') is 0, which is falsy → `|| 2` defaults to 2
-    await captureStdout(() => run(['save', 'Test importance zero', '--importance', '0']));
     const row = testDb.prepare('SELECT * FROM observations ORDER BY id DESC LIMIT 1').get();
-    expect(row.importance).toBe(2); // 0 is falsy, falls back to default 2, then clamped
+    expect(row.importance).toBe(1);
   });
 
   it('rejects invalid type', async () => {

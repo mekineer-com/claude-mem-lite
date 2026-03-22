@@ -26,7 +26,7 @@ function parseArgs(argv) {
     if (arg.startsWith('--')) {
       const key = arg.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--') && !next.startsWith('-')) {
+      if (next !== undefined && !next.startsWith('--') && (!next.startsWith('-') || /^-\d/.test(next))) {
         flags[key] = next;
         i += 2;
       } else {
@@ -48,6 +48,11 @@ function parseArgs(argv) {
 
 function out(text) {
   process.stdout.write(text + '\n');
+}
+
+function fail(text) {
+  process.stdout.write(text + '\n');
+  process.exitCode = 1;
 }
 
 function relativeTime(epochMs) {
@@ -73,7 +78,7 @@ function cmdSearch(db, args) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    out('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance]');
+    fail('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance]');
     return;
   }
 
@@ -84,27 +89,33 @@ function cmdSearch(db, args) {
   const dateFrom = flags.from ? new Date(flags.from).getTime() : null;
   let dateTo = flags.to ? new Date(flags.to).getTime() : null;
   if (dateTo && flags.to && /^\d{4}-\d{2}-\d{2}$/.test(flags.to)) dateTo += 86400000 - 1;
-  if (flags.from && isNaN(dateFrom)) { out(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
-  if (flags.to && isNaN(dateTo)) { out(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
+  if (flags.from && isNaN(dateFrom)) { fail(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
+  if (flags.to && isNaN(dateTo)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
   const minImportance = flags.importance ? parseInt(flags.importance, 10) : null;
   const branch = flags.branch || null;
   const offset = Math.max(0, parseInt(flags.offset, 10) || 0);
   const tier = flags.tier || null;
   const sort = flags.sort || 'relevance';
   if (!['relevance', 'time', 'importance'].includes(sort)) {
-    out(`[mem] Invalid --sort "${sort}". Use: relevance, time, importance`);
+    fail(`[mem] Invalid --sort "${sort}". Use: relevance, time, importance`);
     return;
   }
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
-    out(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
+    fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
     return;
   }
 
   const ftsQuery = sanitizeFtsQuery(query);
   if (!ftsQuery) {
-    out(`[mem] No valid search terms in "${query}"`);
+    fail(`[mem] No valid search terms in "${query}"`);
     return;
+  }
+
+  // Warn if obs-only filters used with non-observation source
+  if (source && source !== 'observations' && (type || tier || minImportance)) {
+    const ignored = [type && '--type', tier && '--tier', minImportance && '--importance'].filter(Boolean);
+    process.stderr.write(`[mem] Note: ${ignored.join(', ')} only apply to observations, ignored for --source ${source}\n`);
   }
 
   // When --type/--tier/--importance (obs-only fields) is specified, implicitly restrict to observations
@@ -211,7 +222,7 @@ function cmdSearch(db, args) {
     sessParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
     try {
       const sessRows = db.prepare(`
-        SELECT s.id, s.request, s.completed, s.project, s.created_at,
+        SELECT s.id, s.request, s.completed, s.project, s.created_at, s.created_at_epoch,
                ${SESS_BM25}
                  * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${DEFAULT_DECAY_HALF_LIFE_MS}.0))
                  * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
@@ -235,7 +246,7 @@ function cmdSearch(db, args) {
     promptParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
     try {
       const promptRows = db.prepare(`
-        SELECT p.id, p.prompt_text, p.content_session_id, p.created_at,
+        SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch,
                bm25(user_prompts_fts, 1) as score
         FROM user_prompts_fts
         JOIN user_prompts p ON user_prompts_fts.rowid = p.id
@@ -285,22 +296,29 @@ function cmdSearch(db, args) {
   }
   // else 'relevance' keeps BM25 score order (already sorted)
 
-  // Cross-source: trim to limit with offset
-  const paged = effectiveSource ? results : results.slice(offset, offset + limit);
+  // Trim to limit with offset
+  const paged = results.slice(offset, offset + limit);
 
+  if (paged.length === 0) {
+    out(`[mem] No results for "${query}" at offset ${offset}`);
+    return;
+  }
+
+  const showTime = sort === 'time';
   out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}":`);
   for (const r of paged) {
+    const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
     if (r._source === 'session') {
       const date = fmtDateShort(r.created_at);
-      out(`S#${r.id} 📋 ${date} ${truncate(r.request || r.completed || '(no summary)', 80)}`);
+      out(`S#${r.id} 📋 ${date}${timeStr} ${truncate(r.request || r.completed || '(no summary)', 80)}`);
     } else if (r._source === 'prompt') {
       const date = fmtDateShort(r.created_at);
-      out(`P#${r.id} 💬 ${date} ${truncate(r.prompt_text || '(empty)', 80)}`);
+      out(`P#${r.id} 💬 ${date}${timeStr} ${truncate(r.prompt_text || '(empty)', 80)}`);
     } else {
       const date = fmtDateShort(r.created_at);
       const title = truncate(r.title || r.subtitle || '(untitled)', 80);
       const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
-      out(`#${r.id} ${typeIcon(r.type)} ${date} ${title}${supersededTag}`);
+      out(`#${r.id} ${typeIcon(r.type)} ${date}${timeStr} ${title}${supersededTag}`);
       if (r.lesson_learned) {
         out(`  -> ${truncate(r.lesson_learned, 80)}`);
       }
@@ -333,7 +351,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
 
   // Scoring aligned with server.mjs: BM25 × type-decay × type-quality × project_boost × importance × access_bonus
   const ftsRows = db.prepare(`
-    SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.lesson_learned,
+    SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.created_at_epoch, o.lesson_learned,
            o.files_modified, o.importance,
            ${OBS_BM25}
              * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
@@ -407,7 +425,8 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
 
 function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
-  const limit = Math.max(1, parseInt(positional[0], 10) || 10);
+  const rawLimit = parseInt(positional[0], 10);
+  const limit = Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 10);
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   const params = [];
@@ -440,7 +459,7 @@ function cmdRecall(db, args) {
   const { positional, flags } = parseArgs(args);
   const file = positional.join(' ');
   if (!file) {
-    out('[mem] Usage: mem recall <file>');
+    fail('[mem] Usage: mem recall <file>');
     return;
   }
 
@@ -483,13 +502,13 @@ function cmdGet(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    out('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]');
+    fail('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]');
     return;
   }
 
   const ids = idStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
   if (ids.length === 0) {
-    out('[mem] No valid IDs provided');
+    fail('[mem] No valid IDs provided');
     return;
   }
 
@@ -498,7 +517,7 @@ function cmdGet(db, args) {
 
   if (source === 'session') {
     const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
-    if (rows.length === 0) { out('[mem] No sessions found for given IDs'); return; }
+    if (rows.length === 0) { fail('[mem] No sessions found for given IDs'); return; }
     const parts = [];
     for (const r of rows) {
       const lines = [`S#${r.id} ${fmtDateShort(r.created_at)}`];
@@ -516,7 +535,7 @@ function cmdGet(db, args) {
 
   if (source === 'prompt') {
     const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
-    if (rows.length === 0) { out('[mem] No prompts found for given IDs'); return; }
+    if (rows.length === 0) { fail('[mem] No prompts found for given IDs'); return; }
     const parts = [];
     for (const r of rows) {
       const lines = [`P#${r.id} ${fmtDateShort(r.created_at)}`];
@@ -543,7 +562,7 @@ function cmdGet(db, args) {
   `).all(...ids);
 
   if (rows.length === 0) {
-    out('[mem] No observations found for given IDs');
+    fail('[mem] No observations found for given IDs');
     return;
   }
 
@@ -627,7 +646,7 @@ function cmdTimeline(db, args) {
   // Get anchor epoch
   const anchorRow = db.prepare('SELECT created_at_epoch, project FROM observations WHERE id = ?').get(anchorId);
   if (!anchorRow) {
-    out(`[mem] Observation #${anchorId} not found`);
+    fail(`[mem] Observation #${anchorId} not found`);
     return;
   }
 
@@ -672,20 +691,25 @@ function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
   const text = positional.join(' ');
   if (!text) {
-    out('[mem] Usage: mem save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2]');
+    fail('[mem] Usage: mem save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2]');
     return;
   }
 
   const type = flags.type || 'discovery';
   const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
   if (!validTypes.has(type)) {
-    out(`[mem] Invalid type "${type}". Valid: ${[...validTypes].join(', ')}`);
+    fail(`[mem] Invalid type "${type}". Valid: ${[...validTypes].join(', ')}`);
     return;
   }
 
   const rawTitle = flags.title || text.slice(0, 100);
   // Explicit saves default to importance=2 (notable) — user chose to save
-  const importance = Math.max(1, Math.min(3, parseInt(flags.importance, 10) || 2));
+  const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
+  if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
+    fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
+    return;
+  }
+  const importance = rawImp;
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const saveFiles = flags.files ? flags.files.split(',').map(f => f.trim()).filter(Boolean) : [];
 
@@ -831,7 +855,8 @@ function cmdStats(db, args) {
   const tdParams = tierSqlParams(tierCtx);
   const tierDist = db.prepare(`
     SELECT tier, COUNT(*) as c FROM (
-      SELECT ${TIER_CASE_SQL} as tier FROM observations WHERE 1=1 ${projectFilter}
+      SELECT ${TIER_CASE_SQL} as tier FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
     ) GROUP BY tier ORDER BY tier
   `).all(...tdParams, ...baseParams);
   const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));
@@ -924,7 +949,7 @@ function cmdBrowse(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const tierFilter = flags.tier || null;
   if (tierFilter && !['working', 'active', 'archive'].includes(tierFilter)) {
-    out(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
+    fail(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
     return;
   }
   const limit = Math.max(1, parseInt(flags.limit, 10) || (tierFilter ? 20 : 5));
@@ -1007,13 +1032,13 @@ function cmdDelete(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    out('[mem] Usage: mem delete <id1,id2,...> [--confirm]');
+    fail('[mem] Usage: mem delete <id1,id2,...> [--confirm]');
     return;
   }
 
   const ids = idStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
   if (ids.length === 0) {
-    out('[mem] No valid IDs provided');
+    fail('[mem] No valid IDs provided');
     return;
   }
 
@@ -1022,7 +1047,7 @@ function cmdDelete(db, args) {
   const rows = db.prepare(`SELECT id, type, title, project FROM observations WHERE id IN (${placeholders})`).all(...ids);
 
   if (rows.length === 0) {
-    out('[mem] No observations found for given IDs');
+    fail('[mem] No observations found for given IDs');
     return;
   }
 
@@ -1066,24 +1091,24 @@ function cmdUpdate(db, args) {
   const { positional, flags } = parseArgs(args);
   const id = parseInt(positional[0], 10);
   if (!id || isNaN(id)) {
-    out('[mem] Usage: mem update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
+    fail('[mem] Usage: mem update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
     return;
   }
 
   const obs = db.prepare('SELECT id, title FROM observations WHERE id = ?').get(id);
   if (!obs) {
-    out(`[mem] Observation #${id} not found`);
+    fail(`[mem] Observation #${id} not found`);
     return;
   }
 
   const updates = [];
   const params = [];
-  if (flags.title) { updates.push('title = ?'); params.push(scrubSecrets(flags.title)); }
-  if (flags.narrative) { updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative)); }
+  if (flags.title !== undefined) { updates.push('title = ?'); params.push(scrubSecrets(flags.title)); }
+  if (flags.narrative !== undefined) { updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative)); }
   if (flags.type) {
     const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
     if (!validTypes.has(flags.type)) {
-      out(`[mem] Invalid type "${flags.type}". Valid: ${[...validTypes].join(', ')}`);
+      fail(`[mem] Invalid type "${flags.type}". Valid: ${[...validTypes].join(', ')}`);
       return;
     }
     updates.push('type = ?'); params.push(flags.type);
@@ -1091,16 +1116,16 @@ function cmdUpdate(db, args) {
   if (flags.importance) {
     const imp = parseInt(flags.importance, 10);
     if (isNaN(imp) || imp < 1 || imp > 3) {
-      out(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
+      fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
       return;
     }
     updates.push('importance = ?'); params.push(imp);
   }
-  if (flags.lesson || flags['lesson-learned']) { updates.push('lesson_learned = ?'); params.push(scrubSecrets(flags.lesson || flags['lesson-learned'])); }
-  if (flags.concepts) { updates.push('concepts = ?'); params.push(flags.concepts); }
+  if (flags.lesson !== undefined || flags['lesson-learned'] !== undefined) { updates.push('lesson_learned = ?'); params.push(scrubSecrets(flags.lesson ?? flags['lesson-learned'] ?? '')); }
+  if (flags.concepts !== undefined) { updates.push('concepts = ?'); params.push(flags.concepts); }
 
   if (updates.length === 0) {
-    out('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
+    fail('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
     return;
   }
 
@@ -1150,12 +1175,12 @@ function cmdExport(db, args) {
   if (flags.type) { wheres.push('type = ?'); params.push(flags.type); }
   if (flags.from) {
     const epoch = new Date(flags.from).getTime();
-    if (isNaN(epoch)) { out(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
+    if (isNaN(epoch)) { fail(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
     wheres.push('created_at_epoch >= ?'); params.push(epoch);
   }
   if (flags.to) {
     let epoch = new Date(flags.to).getTime();
-    if (isNaN(epoch)) { out(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
+    if (isNaN(epoch)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
     if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) epoch += 86400000 - 1;
     wheres.push('created_at_epoch <= ?'); params.push(epoch);
   }
@@ -1163,7 +1188,7 @@ function cmdExport(db, args) {
   const limit = Math.min(Math.max(1, parseInt(flags.limit, 10) || 200), 1000);
   const format = flags.format || 'json';
   if (!['json', 'jsonl'].includes(format)) {
-    out(`[mem] Invalid format "${format}". Use: json or jsonl`);
+    fail(`[mem] Invalid format "${format}". Use: json or jsonl`);
     return;
   }
 
@@ -1292,7 +1317,7 @@ function cmdMaintain(db, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
   if (!action || !['scan', 'execute'].includes(action)) {
-    out('[mem] Usage: mem maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...]');
+    fail('[mem] Usage: mem maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...]');
     return;
   }
 
@@ -1353,7 +1378,7 @@ function cmdMaintain(db, args) {
     out(`  Stale (>30d, imp=1, no access): ${stats.stale}`);
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
-    out(`  Pending purge: ${pendingPurge.count}`);
+    out(`  Pending purge: ${pendingPurge.count} (compressed originals awaiting cleanup)`);
     if (duplicates.length > 0) {
       const AUTO_MERGE_THRESHOLD = 0.85;
       const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
@@ -1390,7 +1415,7 @@ function cmdMaintain(db, args) {
   const ops = opsStr.split(',').map(s => s.trim());
   const invalidOps = ops.filter(op => !VALID_OPS.includes(op));
   if (invalidOps.length > 0) {
-    out(`[mem] Unknown operation(s): ${invalidOps.join(', ')}. Valid: ${VALID_OPS.join(', ')}`);
+    fail(`[mem] Unknown operation(s): ${invalidOps.join(', ')}. Valid: ${VALID_OPS.join(', ')}`);
     return;
   }
   const staleAge = Date.now() - STALE_AGE_MS;
@@ -1527,7 +1552,7 @@ function cmdFtsCheck(db, args) {
   const { positional } = parseArgs(args);
   const action = positional[0];
   if (!action || !['check', 'rebuild'].includes(action)) {
-    out('[mem] Usage: mem fts-check <check|rebuild>');
+    fail('[mem] Usage: mem fts-check <check|rebuild>');
     return;
   }
 
@@ -1558,7 +1583,7 @@ function cmdRegistry(_memDb, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
   if (!action || !['list', 'stats', 'search', 'import', 'remove', 'reindex'].includes(action)) {
-    out('[mem] Usage: mem registry <list|stats|search|import|remove|reindex> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
+    fail('[mem] Usage: mem registry <list|stats|search|import|remove|reindex> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
     return;
   }
 
@@ -1574,7 +1599,7 @@ function cmdRegistry(_memDb, args) {
   try {
     if (action === 'search') {
       const query = flags.query || positional.slice(1).join(' ');
-      if (!query) { out('[mem] Usage: mem registry search <query> [--type skill|agent] [--category C] [--quality Q]'); return; }
+      if (!query) { fail('[mem] Usage: mem registry search <query> [--type skill|agent] [--category C] [--quality Q]'); return; }
       let results = searchResources(rdb, query, {
         type: flags.type || undefined,
         limit: (flags.category || flags.quality) ? 20 : 10,
@@ -1646,7 +1671,7 @@ function cmdRegistry(_memDb, args) {
     if (action === 'import') {
       const name = flags.name;
       const resourceType = flags['resource-type'];
-      if (!name || !resourceType) { out('[mem] Usage: mem registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
+      if (!name || !resourceType) { fail('[mem] Usage: mem registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
       const fields = { name, type: resourceType, status: 'active', source: flags.source || 'user' };
       for (const f of ['repo-url', 'local-path', 'invocation-name', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
         const camel = f.replace(/-([a-z])/g, (_, c) => '_' + c);
@@ -1667,7 +1692,7 @@ function cmdRegistry(_memDb, args) {
     if (action === 'remove') {
       const name = flags.name;
       const resourceType = flags['resource-type'];
-      if (!name || !resourceType) { out('[mem] Usage: mem registry remove --name N --resource-type skill|agent'); return; }
+      if (!name || !resourceType) { fail('[mem] Usage: mem registry remove --name N --resource-type skill|agent'); return; }
       const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(resourceType, name);
       out(result.changes > 0 ? `[mem] Removed: ${resourceType}:${name}` : '[mem] Not found.');
       return;

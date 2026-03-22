@@ -1064,7 +1064,7 @@ server.registerTool(
     const tierDist = db.prepare(`
       SELECT tier, COUNT(*) as c FROM (
         SELECT ${TIER_CASE_SQL} as tier FROM observations
-        WHERE 1=1 ${projectFilter}
+        WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
       ) GROUP BY tier ORDER BY tier
     `).all(...tdParams, ...baseParams);
     const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));

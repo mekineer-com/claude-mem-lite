@@ -394,7 +394,7 @@ describe('CLI E2E: save', () => {
   it('rejects invalid type', () => {
     const { stdout, exitCode } = runCli(['save', 'test content', '--type', 'invalid_type']);
     expect(stdout).toContain('Invalid type');
-    expect(exitCode).toBe(0); // graceful error, not crash
+    expect(exitCode).toBe(1); // validation error sets exit code 1
   });
 });
 

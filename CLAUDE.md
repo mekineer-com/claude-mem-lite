@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.24.0
+- **Version**: 2.24.1
 - **Package manager**: npm
 - **Test**: `npx vitest run` (35 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,18 +49,17 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Simulate comprehensive CLI feature and user experience testing for claude-mem-lite project (all commands), identify and…
-Completed: Added --version command support to CLI; modified install.mjs, cli.mjs, mem-cli.mjs to enhance search and install comman…
-Remaining: Complete comprehensive CLI testing of all commands (mem_search, mem_recent, mem_get, mem_timeline, mem_save, mem_update…
-Next: Continue loop-driven testing iterations 2-3; systematically test each CLI command with various arguments; validate user…
-Lessons: CLI tool registration patterns require explicit command case matching in both cli.mjs and downstream command handlers; Version flag support is standard user expectation and should be added early in CLI development
-Decisions: Added --version command to improve CLI standard compliance and user experience
+Request: Test all CLI functions of projects--mem memory management tool (including user experience), fix discovered problems, an…
+Completed: Initial CLI testing started; identified issue in mem-cli.mjs related to search functionality across observations and pr…
+Remaining: Complete full CLI surface testing (remaining command variants); finish identified bug fixes; verify all fixes; execute …
+Next: Run loop plugin iteration 2-3; fix mem-cli.mjs search command issues; test all remaining CLI operations (list, get, upd…
+Lessons: Search command source parameter handling needs verification across different query types (observations vs prompts vs sessions)
 
 ### Key Context
-- [feature] Add --version command support to claude-mem-lite CLI (#4992)
-- [bugfix] Error: mem-cli.mjs: mem 5 results for error: #4957 🔍 2026-03-22 Work… (#4979)
-- [bugfix] Error: install.mjs, cli.mjs: mem 3 results for fix test failure: #4717 🟢 2026… (#4974)
-- [bugfix] Error: CLAUDE.md: title:	v2.23.1 tag:	v2.23.1 draft:	false prerelea… (#4971)
-- [discovery] Worked on hook.mjs, registry-scanner.test.mjs, test-helpers.mjs +3 more (#4957)
+- [bugfix] Error: mem-cli.mjs: 📊 Memory Dashboard (projects--mem)  🔴 Working M… (#5080)
+- [refactor] Route usage/error messages through fail() instead of out() (#5064)
+- [bugfix] Error: mem-cli.mjs: mem 3 results for fix   bug   error: #4957 🔍 202… (#5061)
+- [bugfix] Error: mem-cli.mjs, server.mjs: mem Recent (projects--mem): # 5046 🔴 just now … (#5047)
+- [bugfix] Error: mem-cli.mjs: mem 5 results for performance optimization: P#448… (#5046)
 
 </claude-mem-context>
