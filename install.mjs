@@ -1357,6 +1357,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'cleanup':
       cleanup();
       break;
+    case 'self-update':
     case 'update':
       await manualUpdate();
       break;
@@ -1380,7 +1381,7 @@ Usage:
   node install.mjs doctor             Diagnose issues
   node install.mjs cleanup            Remove stale temp/staging files
   node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
-  node install.mjs update             Check for and install updates
+  node install.mjs self-update         Check for and install updates
   node install.mjs release            Sync version to plugin.json + marketplace.json
 
   npx claude-mem-lite                 Install via npx (one-liner)

@@ -186,12 +186,13 @@ export function ensureRegistryDb(dbPath) {
     db.exec("UPDATE resources SET quality_tier = 'installed' WHERE source = 'preinstalled' AND quality_tier = 'community'");
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
-  // FTS5 + triggers: only create if not exists
+  // FTS5: create if not exists
   const hasFts = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_fts'`).get();
   if (!hasFts) {
     db.exec(FTS5_SCHEMA);
-    db.exec(TRIGGERS_SCHEMA);
   }
+  // Triggers: always ensure (IF NOT EXISTS) — fixes DBs where FTS5 was created without triggers
+  db.exec(TRIGGERS_SCHEMA);
 
   db.exec(INVOCATIONS_SCHEMA);
 
