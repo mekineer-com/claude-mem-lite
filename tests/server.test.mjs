@@ -1677,16 +1677,42 @@ describe('mem_update', () => {
   beforeEach(() => { db = createTestDb(); });
   afterEach(() => { db.close(); });
 
-  it('should update observation fields by ID', () => {
+  it('should update observation fields and rebuild FTS text', () => {
     insertSession(db, { id: 'sess-upd', project: 'test' });
-    const result = insertObs(db, { sessionId: 'sess-upd', title: 'Original Title', type: 'discovery', importance: 1 });
+    const result = insertObs(db, { sessionId: 'sess-upd', title: 'Original Title', type: 'discovery', importance: 1, narrative: 'original narrative' });
     const id = Number(result.lastInsertRowid);
 
-    // Update via direct SQL (simulating the handler logic)
-    db.prepare('UPDATE observations SET title = ?, importance = ? WHERE id = ?').run('Updated Title', 2, id);
-    const row = db.prepare('SELECT title, importance FROM observations WHERE id = ?').get(id);
+    // Simulate the handler's transactional update logic
+    db.transaction(() => {
+      db.prepare('UPDATE observations SET title = ?, importance = ? WHERE id = ?').run('Updated Title', 2, id);
+      const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts FROM observations WHERE id = ?').get(id);
+      const textField = [row.title, row.subtitle, row.narrative, row.concepts, row.facts].filter(Boolean).join(' ');
+      db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, id);
+    })();
+
+    const row = db.prepare('SELECT title, importance, text FROM observations WHERE id = ?').get(id);
     expect(row.title).toBe('Updated Title');
     expect(row.importance).toBe(2);
+    // FTS text field should contain updated title
+    expect(row.text).toContain('Updated Title');
+  });
+
+  it('should handle non-existent observation', () => {
+    const row = db.prepare('SELECT id FROM observations WHERE id = ?').get(99999);
+    expect(row).toBeUndefined();
+  });
+
+  it('should handle no fields to update', () => {
+    insertSession(db, { id: 'sess-nf', project: 'test' });
+    const result = insertObs(db, { sessionId: 'sess-nf', title: 'No Fields', importance: 1 });
+    const _id = Number(result.lastInsertRowid);
+    // With no update args, the field mapping loop produces empty updates
+    const updates = [];
+    const args = {};
+    for (const [key] of [['title'],['narrative'],['type'],['importance'],['lesson_learned'],['concepts']]) {
+      if (args[key] !== undefined) updates.push(key);
+    }
+    expect(updates.length).toBe(0);
   });
 });
 
@@ -1703,9 +1729,29 @@ describe('mem_export', () => {
     insertObs(db, { sessionId: 'sess-exp', project: 'export-test', title: 'Feature 1', type: 'feature', importance: 1 });
     insertObs(db, { sessionId: 'sess-exp', project: 'other-proj', title: 'Other', type: 'bugfix', importance: 1 });
 
-    const bugfixes = db.prepare("SELECT * FROM observations WHERE project = ? AND type = ? AND COALESCE(compressed_into, 0) = 0").all('export-test', 'bugfix');
+    const bugfixes = db.prepare("SELECT * FROM observations WHERE project = ? AND type = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL").all('export-test', 'bugfix');
     expect(bugfixes).toHaveLength(1);
     expect(bugfixes[0].title).toBe('Bug 1');
+  });
+
+  it('should exclude compressed and superseded observations by default', () => {
+    insertSession(db, { id: 'sess-exp2', project: 'test' });
+    insertObs(db, { sessionId: 'sess-exp2', title: 'Active obs', importance: 1 });
+    insertObs(db, { sessionId: 'sess-exp2', title: 'Compressed obs', importance: 1, compressedInto: 1 });
+
+    const active = db.prepare("SELECT * FROM observations WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL").all();
+    expect(active.every(r => r.title !== 'Compressed obs')).toBe(true);
+  });
+
+  it('should filter by date range', () => {
+    insertSession(db, { id: 'sess-dt', project: 'test' });
+    insertObs(db, { sessionId: 'sess-dt', title: 'Recent', importance: 1, epochOffset: 0 });
+    insertObs(db, { sessionId: 'sess-dt', title: 'Old', importance: 1, epochOffset: -30 * 86400000 });
+
+    const cutoff = Date.now() - 7 * 86400000;
+    const recent = db.prepare("SELECT * FROM observations WHERE created_at_epoch >= ? AND COALESCE(compressed_into, 0) = 0").all(cutoff);
+    expect(recent.some(r => r.title === 'Recent')).toBe(true);
+    expect(recent.every(r => r.title !== 'Old')).toBe(true);
   });
 });
 

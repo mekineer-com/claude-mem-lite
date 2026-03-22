@@ -1536,12 +1536,28 @@ server.registerTool(
     if (updates.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
 
     params.push(args.id);
-    db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
 
-    // Rebuild FTS text field
-    const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts FROM observations WHERE id = ?').get(args.id);
-    const textField = [row.title, row.subtitle, row.narrative, row.concepts, row.facts].filter(Boolean).join(' ');
-    db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, args.id);
+    // Atomic: update fields + rebuild FTS text + re-vectorize
+    db.transaction(() => {
+      db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+
+      // Rebuild FTS text field
+      const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts FROM observations WHERE id = ?').get(args.id);
+      const textField = [row.title, row.subtitle, row.narrative, row.concepts, row.facts].filter(Boolean).join(' ');
+      db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, args.id);
+
+      // Re-vectorize (non-critical — catch to avoid rollback)
+      try {
+        const vocab = getVocabulary(db);
+        if (vocab) {
+          const vec = computeVector(textField, vocab);
+          if (vec) {
+            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+              .run(args.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+          }
+        }
+      } catch (e) { debugCatch(e, 'mem_update-vector'); }
+    })();
 
     return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}` }] };
   })
@@ -1581,7 +1597,8 @@ server.registerTool(
       ? rows.map(r => JSON.stringify(r)).join('\n')
       : JSON.stringify(rows, null, 2);
 
-    return { content: [{ type: 'text', text: `Exported ${rows.length} observations:\n${output}` }] };
+    const cap = rows.length >= 1000 ? '\nNote: Results capped at 1000. Use date_from/date_to to export in batches.' : '';
+    return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
   })
 );
 
