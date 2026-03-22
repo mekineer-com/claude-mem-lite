@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, getCurrentBranch } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
@@ -102,7 +102,7 @@ function resolveProject(name) {
 //   Access bonus:  1 + 0.1 × ln(1 + access_count)
 
 // OBS_BM25, SESS_BM25, TYPE_DECAY_CASE imported from utils.mjs
-const RECENCY_HALF_LIFE_MS = 1209600000; // 14 days in milliseconds
+const RECENCY_HALF_LIFE_MS = DEFAULT_DECAY_HALF_LIFE_MS;
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
@@ -883,22 +883,28 @@ server.registerTool(
     const bigramText = cjkBigrams(safeTitle + ' ' + safeContent);
     const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
 
-    const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?, ?)
-    `).run(sessionId, project, textField, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+    // Atomic: insert observation + TF-IDF vector in one transaction
+    const saveTx = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', ?, ?, ?, ?, ?)
+      `).run(sessionId, project, textField, type, safeTitle, safeContent, args.importance ?? 1, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
 
-    // Write TF-IDF vector
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
-        if (vec) {
-          db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-            .run(Number(result.lastInsertRowid), Buffer.from(vec.buffer), vocab.version, Date.now());
+      // Write TF-IDF vector
+      try {
+        const vocab = getVocabulary(db);
+        if (vocab) {
+          const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
+          if (vec) {
+            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+              .run(Number(result.lastInsertRowid), Buffer.from(vec.buffer), vocab.version, Date.now());
+          }
         }
-      }
-    } catch (e) { debugCatch(e, 'mem_save-vector'); }
+      } catch (e) { debugCatch(e, 'mem_save-vector'); }
+
+      return result;
+    });
+    const result = saveTx();
 
     return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
   })

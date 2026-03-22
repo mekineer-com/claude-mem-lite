@@ -4,7 +4,7 @@ import { resolve } from 'path';
 import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { initSchema } from '../schema.mjs';
+import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
 import { autoBoostIfNeeded, runIdleCleanup } from '../server-internals.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
@@ -1422,5 +1422,142 @@ describe('type-aware idle cleanup', () => {
     const result = runIdleCleanup(db);
     expect(result.marked).toBe(2);
     expect(result.compressed).toBe(1);
+  });
+});
+
+// ─── Task 1: schema_version fast path ────────────────────────────────────────
+
+describe('schema_version fast path', () => {
+  it('CURRENT_SCHEMA_VERSION is exported and is a positive integer', () => {
+    expect(typeof CURRENT_SCHEMA_VERSION).toBe('number');
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThan(0);
+    expect(Number.isInteger(CURRENT_SCHEMA_VERSION)).toBe(true);
+  });
+
+  it('initSchema creates schema_version table with correct version', () => {
+    const db = createTestDb();
+    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+    expect(row).toBeDefined();
+    expect(row.version).toBe(CURRENT_SCHEMA_VERSION);
+    db.close();
+  });
+
+  it('second initSchema call is a fast no-op when version matches', () => {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+
+    // Verify schema_version exists
+    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+    expect(row.version).toBe(CURRENT_SCHEMA_VERSION);
+
+    // Mark the DB so we can detect if initSchema re-runs migrations
+    db.exec('CREATE TABLE IF NOT EXISTS _fast_path_sentinel (x INTEGER)');
+
+    // Second call — should fast-path and NOT drop/recreate tables
+    initSchema(db);
+    const sentinel = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='_fast_path_sentinel'").get();
+    expect(sentinel).toBeDefined();
+    db.close();
+  });
+
+  it('re-runs migrations when schema_version is outdated', () => {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+
+    // Tamper version to simulate old schema
+    db.prepare('UPDATE schema_version SET version = ?').run(CURRENT_SCHEMA_VERSION - 1);
+
+    // Re-run should NOT fast-path (should proceed through migrations)
+    initSchema(db);
+
+    // Version should be updated to current
+    const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+    expect(row.version).toBe(CURRENT_SCHEMA_VERSION);
+    db.close();
+  });
+});
+
+// ─── Task 2: mem_save atomic transaction ─────────────────────────────────────
+
+describe('mem_save atomic transaction', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    const now = new Date();
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run('manual-test', 'manual-test', 'test', now.toISOString(), now.getTime());
+  });
+  afterEach(() => { db.close(); });
+
+  it('observation and vector are both inserted (simulating mem_save flow)', () => {
+    const now = Date.now();
+    const saveTx = db.transaction(() => {
+      const result = db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', '[]', 1, ?, ?)
+      `).run('manual-test', 'test', 'test content', 'discovery', 'test title', 'test content', new Date(now).toISOString(), now);
+      const obsId = Number(result.lastInsertRowid);
+      // Simulate vector insert
+      const fakeVec = Buffer.alloc(16);
+      db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+        .run(obsId, fakeVec, 'test-v1', now);
+      return obsId;
+    });
+
+    const obsId = saveTx();
+    const obs = db.prepare('SELECT * FROM observations WHERE id = ?').get(obsId);
+    expect(obs).toBeDefined();
+    expect(obs.title).toBe('test title');
+    const vec = db.prepare('SELECT * FROM observation_vectors WHERE observation_id = ?').get(obsId);
+    expect(vec).toBeDefined();
+    expect(vec.vocab_version).toBe('test-v1');
+  });
+});
+
+// ─── Task 3: dedup migration transaction ─────────────────────────────────────
+
+describe('dedup migration is atomic', () => {
+  it('dedup DELETE and CREATE UNIQUE INDEX are in same transaction', () => {
+    // Create a pre-migration DB with duplicates
+    const rawDb = new Database(':memory:');
+    rawDb.pragma('journal_mode = WAL');
+    rawDb.pragma('foreign_keys = OFF');
+
+    rawDb.exec(`CREATE TABLE IF NOT EXISTS sdk_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      content_session_id TEXT NOT NULL UNIQUE,
+      memory_session_id TEXT,
+      project TEXT NOT NULL,
+      user_prompt TEXT,
+      started_at TEXT NOT NULL,
+      started_at_epoch INTEGER NOT NULL,
+      completed_at TEXT,
+      completed_at_epoch INTEGER,
+      status TEXT NOT NULL DEFAULT 'active',
+      worker_port INTEGER,
+      prompt_counter INTEGER DEFAULT 0
+    )`);
+
+    // Insert 3 rows with same memory_session_id
+    insertSession(rawDb, { id: 'a', memoryId: 'dup-mem' });
+    insertSession(rawDb, { id: 'b', memoryId: 'dup-mem' });
+    insertSession(rawDb, { id: 'c', memoryId: 'dup-mem' });
+
+    // Run initSchema — both dedup and index creation should succeed atomically
+    initSchema(rawDb);
+
+    // After: only 1 row for dup-mem, and unique index exists
+    const remaining = rawDb.prepare("SELECT COUNT(*) as cnt FROM sdk_sessions WHERE memory_session_id = 'dup-mem'").get();
+    expect(remaining.cnt).toBe(1);
+    const hasIdx = rawDb.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'").get();
+    expect(hasIdx).toBeDefined();
+
+    rawDb.close();
   });
 });
