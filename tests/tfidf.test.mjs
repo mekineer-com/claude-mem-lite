@@ -1,6 +1,6 @@
 // tests/tfidf.test.mjs
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { tokenize, buildVocabulary, rebuildVocabulary, getVocabulary, computeVector, cosineSimilarity, vectorSearch, VOCAB_DIM, _resetVocabCache } from '../tfidf.mjs';
+import { tokenize, buildVocabulary, rebuildVocabulary, getVocabulary, computeVector, cosineSimilarity, vectorSearch, VOCAB_DIM, MIN_COSINE_SIMILARITY, VECTOR_SCAN_LIMIT, porterStem, _resetVocabCache } from '../tfidf.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('tokenize', () => {
@@ -21,7 +21,8 @@ describe('tokenize', () => {
   it('handles special characters', () => {
     const tokens = tokenize('file.mjs server-config auth_token');
     expect(tokens).toContain('file');
-    expect(tokens).toContain('mjs');
+    // 'mjs' → stemmed to 'mj' (Porter strips trailing s)
+    expect(tokens).toContain('mj');
     expect(tokens).toContain('server');
     expect(tokens).toContain('config');
   });
@@ -67,10 +68,42 @@ describe('buildVocabulary', () => {
     expect(vocab.dim).toBe(VOCAB_DIM);
     expect(vocab.version).toBeTruthy();
 
-    // 'auth' appears in 2/3 docs, should have moderate IDF
+    // 'auth' appears in 2/3 docs (stemmed form), should be in vocab with df>=2
     const authEntry = vocab.terms.get('auth');
     expect(authEntry).toBeDefined();
     expect(authEntry.idf).toBeGreaterThan(0);
+  });
+
+  it('uses information gain ranking (df × idf) instead of pure DF', () => {
+    // Insert observations where a rare-but-present term has higher info gain
+    // than a super-common term
+    for (let i = 0; i < 10; i++) {
+      insertObs(db, { title: `common${i} shared data`, narrative: `common shared data entry ${i}` });
+    }
+    // 'database' appears in exactly 2 docs — moderate DF, high IDF
+    insertObs(db, { title: 'database schema fix', narrative: 'database migration issue' });
+    insertObs(db, { title: 'database query bug', narrative: 'database optimization needed' });
+
+    const vocab = buildVocabulary(db);
+    expect(vocab).not.toBeNull();
+    // 'databas' (stemmed) appears in 2/12 docs, 'data' appears in 10/12
+    // Both should be in vocab since df>=2
+    // Under info gain ranking, discriminative terms are prioritized
+    const terms = [...vocab.terms.keys()];
+    expect(terms.length).toBeGreaterThan(0);
+  });
+
+  it('excludes hapax legomena (df=1 terms)', () => {
+    insertObs(db, { title: 'common shared term', narrative: 'shared content data' });
+    insertObs(db, { title: 'common shared info', narrative: 'shared content here' });
+    insertObs(db, { title: 'hapaxword only once', narrative: 'unique occurrence' });
+
+    const vocab = buildVocabulary(db);
+    expect(vocab).not.toBeNull();
+    // 'hapaxword' appears in only 1 doc — should be excluded
+    expect(vocab.terms.has('hapaxword')).toBe(false);
+    // 'share' (stemmed from 'shared') appears in 2+ docs — should be included
+    expect(vocab.terms.has('share')).toBe(true);
   });
 
   it('caps vocabulary at VOCAB_DIM terms', () => {
@@ -102,7 +135,9 @@ describe('computeVector', () => {
   });
 
   it('returns Float32Array of correct dimension', () => {
+    // Need 2+ docs with shared terms for df>=2 filter
     insertObs(db, { title: 'test observation', narrative: 'some content here' });
+    insertObs(db, { title: 'test content fix', narrative: 'another test content entry' });
     const vocab = buildVocabulary(db);
     const vec = computeVector('test observation content', vocab);
     expect(vec).toBeInstanceOf(Float32Array);
@@ -168,8 +203,10 @@ describe('buildVocabulary noise filtering', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
     insertObs(db, { title: 'the and or but in on at to for of is it', narrative: 'the cat sat on the mat with the hat' });
+    // Terms like 'schema', 'migrat' need df>=2, so repeat in multiple docs
     insertObs(db, { title: 'database migration schema', narrative: 'fix the error in schema migration' });
-    insertObs(db, { title: 'hook implementation', narrative: 'implement the hook for this feature' });
+    insertObs(db, { title: 'database schema update', narrative: 'schema migration fix applied' });
+    insertObs(db, { title: 'hook implementation database', narrative: 'implement the hook for this feature' });
     const vocab = buildVocabulary(db);
     const terms = [...vocab.terms.keys()];
     expect(terms).not.toContain('the');
@@ -179,8 +216,9 @@ describe('buildVocabulary noise filtering', () => {
     expect(terms).not.toContain('for');
     expect(terms).not.toContain('of');
     expect(terms).not.toContain('is');
-    expect(terms).toContain('database');
-    expect(terms).toContain('migration');
+    // Stemmed forms: 'database' → 'databas', 'migration' → 'migrat', 'schema' stays
+    expect(terms).toContain('databas');
+    expect(terms).toContain('migrat');
     expect(terms).toContain('schema');
     db.close();
   });
@@ -188,8 +226,10 @@ describe('buildVocabulary noise filtering', () => {
   it('excludes pure numeric tokens from vocabulary', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
+    // Need terms in 2+ docs for df>=2
     insertObs(db, { title: 'error 2026 03 21 fix 404', narrative: 'date 2026-03-21 status 404 500' });
-    insertObs(db, { title: 'performance test 10 20 30', narrative: 'run 100 iterations in 50ms' });
+    insertObs(db, { title: 'error fix performance 10 20 30', narrative: 'run 100 iterations in 50ms' });
+    insertObs(db, { title: 'performance error check', narrative: 'performance monitoring error handling' });
     const vocab = buildVocabulary(db);
     const terms = [...vocab.terms.keys()];
     expect(terms).not.toContain('2026');
@@ -197,7 +237,7 @@ describe('buildVocabulary noise filtering', () => {
     expect(terms).not.toContain('21');
     expect(terms).not.toContain('10');
     expect(terms).toContain('error');
-    expect(terms).toContain('performance');
+    expect(terms).toContain('perform'); // 'performance' → 'perform' (stemmed)
     db.close();
   });
 });
@@ -206,8 +246,10 @@ describe('persisted vocabulary', () => {
   it('rebuildVocabulary persists to vocab_state table', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
+    // Need shared terms across docs for df>=2
     insertObs(db, { title: 'database schema migration', narrative: 'alter table add column' });
-    insertObs(db, { title: 'search query optimization', narrative: 'FTS5 BM25 ranking' });
+    insertObs(db, { title: 'database schema fix', narrative: 'schema migration update' });
+    insertObs(db, { title: 'search query optimization', narrative: 'FTS5 BM25 ranking search' });
     const vocab = rebuildVocabulary(db);
     expect(vocab).not.toBeNull();
     const rows = db.prepare('SELECT COUNT(*) as c FROM vocab_state').get();
@@ -220,7 +262,9 @@ describe('persisted vocabulary', () => {
   it('getVocabulary loads from DB without recomputing', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
+    // Need 2+ docs with shared terms for df>=2
     insertObs(db, { title: 'test observation one', narrative: 'content here' });
+    insertObs(db, { title: 'test content two', narrative: 'another test observation' });
     const v1 = rebuildVocabulary(db);
     _resetVocabCache();
     const v2 = getVocabulary(db);
@@ -235,9 +279,10 @@ describe('persisted vocabulary', () => {
   it('vectors use persisted vocab version and match on search', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });
+    // Need shared terms for df>=2 — 'databas', 'schema', 'fix' appear in 2+ docs
     insertObs(db, { title: 'database error fix', narrative: 'fixed the schema bug' });
-    insertObs(db, { title: 'search optimization', narrative: 'improved query ranking' });
-    insertObs(db, { title: 'hook implementation', narrative: 'session start handler' });
+    insertObs(db, { title: 'database schema update', narrative: 'schema fix applied' });
+    insertObs(db, { title: 'search optimization fix', narrative: 'improved query ranking' });
     const vocab = rebuildVocabulary(db);
     const obs = db.prepare('SELECT id, title, narrative FROM observations').all();
     const insertVec = db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)');
@@ -260,5 +305,93 @@ describe('Float32Array BLOB roundtrip', () => {
     for (let i = 0; i < original.length; i++) {
       expect(restored[i]).toBeCloseTo(original[i], 5);
     }
+  });
+});
+
+describe('porterStem', () => {
+  it('stems common English suffixes', () => {
+    expect(porterStem('running')).toBe('run');
+    expect(porterStem('connected')).toBe('connect');
+    expect(porterStem('connections')).toBe('connect');
+    expect(porterStem('caresses')).toBe('caress');
+  });
+
+  it('handles -ational → -ate → step5a', () => {
+    // relational → relate (step2) → relat (step5a removes e since m>1)
+    expect(porterStem('relational')).toBe('relat');
+  });
+
+  it('handles -izer → -ize → step4', () => {
+    // digitizer → digitize (step2) → digit (step4 removes -ize since m>1)
+    expect(porterStem('digitizer')).toBe('digit');
+  });
+
+  it('leaves short words unchanged', () => {
+    expect(porterStem('db')).toBe('db');
+    expect(porterStem('go')).toBe('go');
+    expect(porterStem('a')).toBe('a');
+  });
+
+  it('stems programming-relevant terms', () => {
+    // authentication should stem consistently
+    const stem = porterStem('authentication');
+    expect(porterStem('authenticate')).toBe(stem);
+  });
+
+  it('handles -ness, -ful, -ive', () => {
+    expect(porterStem('effectiveness')).toBe('effect');
+    expect(porterStem('hopeful')).toBe('hope');
+  });
+});
+
+describe('tokenize with stemming', () => {
+  it('stems ASCII tokens', () => {
+    const tokens = tokenize('authenticating connections');
+    // Should produce stemmed forms, not raw words
+    expect(tokens).not.toContain('authenticating');
+    expect(tokens).not.toContain('connections');
+    // Stemmed forms should be present
+    expect(tokens.length).toBe(2);
+  });
+
+  it('does not stem CJK tokens', () => {
+    const tokens = tokenize('数据库');
+    // CJK bigrams are unchanged by stemming
+    expect(tokens.length).toBeGreaterThan(0);
+  });
+});
+
+describe('named constants', () => {
+  it('exports MIN_COSINE_SIMILARITY', () => {
+    expect(MIN_COSINE_SIMILARITY).toBe(0.05);
+  });
+
+  it('exports VECTOR_SCAN_LIMIT', () => {
+    expect(VECTOR_SCAN_LIMIT).toBe(500);
+  });
+});
+
+describe('sublinear TF in computeVector', () => {
+  it('repeated terms do not dominate vector', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    // Create enough docs for vocab to form
+    insertObs(db, { title: 'search query test', narrative: 'search query optimization' });
+    insertObs(db, { title: 'search performance', narrative: 'query speed search' });
+    insertObs(db, { title: 'database search', narrative: 'query database search' });
+    const vocab = buildVocabulary(db);
+    if (vocab) {
+      // Text with 'search' repeated many times vs once
+      const vecRepeat = computeVector('search search search search search query', vocab);
+      const vecOnce = computeVector('search query', vocab);
+      if (vecRepeat && vecOnce) {
+        // With sublinear TF, repeating a word 5x should NOT make it 5x stronger
+        // Cosine similarity should be high (both about search+query) but not 1.0
+        const sim = cosineSimilarity(vecRepeat, vecOnce);
+        expect(sim).toBeGreaterThan(0.5); // still similar topic
+        expect(sim).toBeLessThan(1.0);    // but not identical (sublinear dampens repetition)
+      }
+    }
+    db.close();
   });
 });

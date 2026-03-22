@@ -49,11 +49,13 @@ describe('vector write helper', () => {
   afterEach(() => { db.close(); });
 
   it('can write and read back a computed vector', () => {
-    insertObs(db, { title: 'auth token', narrative: 'fix authentication issue' });
+    // Need shared terms across docs for df>=2 vocabulary filter
+    insertObs(db, { title: 'auth token fix', narrative: 'fix authentication issue with token' });
+    insertObs(db, { title: 'auth token refresh', narrative: 'token authentication refresh fix' });
     insertObs(db, { title: 'database query', narrative: 'optimize SQL performance' });
     const vocab = buildVocabulary(db);
 
-    const obsId = db.prepare("SELECT id FROM observations WHERE title = 'auth token'").get().id;
+    const obsId = db.prepare("SELECT id FROM observations WHERE title = 'auth token fix'").get().id;
     const vec = computeVector('auth token fix authentication issue', vocab);
     expect(vec).not.toBeNull();
 
