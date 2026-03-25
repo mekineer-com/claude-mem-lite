@@ -439,7 +439,6 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
         bashSig: null,
       }],
       filesRead: [],
-      fileHistoryShown: [],
     }));
 
     // Run llm-episode — it reads the flush file, calls mock LLM, saves observation
@@ -484,7 +483,6 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
         bashSig: null,
       }],
       filesRead: [],
-      fileHistoryShown: [],
     }));
 
     // Use a mock that returns garbage (non-existent script → callLLM returns null)
@@ -533,7 +531,7 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
         ts: Date.now() - 1000,
         isError: false, isSignificant: true, bashSig: null,
       }],
-      filesRead: [], fileHistoryShown: [],
+      filesRead: [],
     }));
     runHook('llm-episode', { env: { HOME: tmpHome, CLAUDE_MEM_NO_DELAY: '1' }, args: [flush2] });
 
@@ -756,7 +754,7 @@ describe('Suite 8a: Cross-Session MinHash Dedup', () => {
         ts: Date.now(),
         isError: false, isSignificant: true, bashSig: null,
       }],
-      filesRead: [], fileHistoryShown: [],
+      filesRead: [],
     }));
 
     // Run llm-episode - the mock LLM will return a generic title, which won't match

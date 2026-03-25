@@ -133,7 +133,6 @@ export function createEpisode(sessionId, project) {
     files: [],
     entries: [],
     filesRead: [],
-    fileHistoryShown: [],
   };
 }
 

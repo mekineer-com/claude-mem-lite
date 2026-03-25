@@ -28,7 +28,7 @@ import {
   spawnBackground,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
-import { searchRelevantMemories, recallForFile } from './hook-memory.mjs';
+import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
@@ -225,28 +225,7 @@ async function handlePostToolUse() {
     episode.lastAt = Date.now();
     addFileToEpisode(episode, files);
 
-    // Proactive file history: show past observations for files being edited
-    // Uses recallForFile for importance>=2 with lesson context
-    if (EDIT_TOOLS.has(tool_name) && files.length > 0) {
-      const d = getDb();
-      if (d) {
-        for (const f of files) {
-          if (episode.fileHistoryShown?.includes(f)) continue;
-          try {
-            const recalled = recallForFile(d, f, project);
-            if (recalled.length > 0) {
-              const hints = recalled.map(r => {
-                const lesson = r.lesson_learned ? ` | ${r.lesson_learned}` : '';
-                return `  #${r.id} [${r.type}] ${truncate(r.title, 60)}${lesson}`;
-              }).join('\n');
-              process.stdout.write(`[claude-mem-lite] History for ${basename(f)}:\n${hints}\n`);
-            }
-          } catch (e) { debugCatch(e, 'fileHistory'); }
-          if (!episode.fileHistoryShown) episode.fileHistoryShown = [];
-          episode.fileHistoryShown.push(f);
-        }
-      }
-    }
+    // File history injection moved to PreToolUse hook (scripts/pre-tool-recall.js)
 
     writeEpisode(episode);
 

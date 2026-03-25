@@ -67,7 +67,6 @@ describe('hook-episode.mjs', () => {
       expect(ep.entries).toEqual([]);
       expect(ep.files).toEqual([]);
       expect(ep.filesRead).toEqual([]);
-      expect(ep.fileHistoryShown).toEqual([]);
       expect(ep.startedAt).toBeGreaterThan(0);
       expect(ep.lastAt).toBeGreaterThan(0);
     });
