@@ -629,23 +629,50 @@ async function handleSessionStart() {
     const summaryLines = buildSummaryLines(latestSummary);
 
     // Key context: top high-importance observations for CLAUDE.md persistence
+    // Split into "File Lessons" (actionable, has lesson + file) and "Key Context" (informational)
     const keyObs = db.prepare(`
-      SELECT id, type, title, lesson_learned FROM observations
-      WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-        AND COALESCE(importance, 1) >= 2
-      ORDER BY created_at_epoch DESC LIMIT 5
+      SELECT o.id, o.type, o.title, o.lesson_learned, o.files_modified FROM observations o
+      WHERE o.project = ? AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
+        AND COALESCE(o.importance, 1) >= 2
+      ORDER BY o.created_at_epoch DESC LIMIT 10
     `).all(project);
+
     if (keyObs.length > 0) {
-      summaryLines.push('### Key Context');
+      const fileLessons = [];
+      const keyContext = [];
+
       for (const o of keyObs) {
-        // Strip raw JSON output from degraded Bash-style titles
         const clean = (o.title || '(untitled)')
           .replace(/ → (?:ERROR: )?\{".*$/, '')
           .replace(/ → (?:ERROR: )?\{[^}]*\.{3}$/, '');
-        const lesson = o.lesson_learned ? ` — ${truncate(o.lesson_learned, 60)}` : '';
-        summaryLines.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
+        const hasLesson = o.lesson_learned && o.lesson_learned.trim();
+        const hasFiles = o.files_modified && o.files_modified !== '[]';
+
+        if (hasLesson && hasFiles) {
+          try {
+            const files = JSON.parse(o.files_modified);
+            const fname = basename(Array.isArray(files) && files.length > 0 ? files[0] : '');
+            if (fname) {
+              fileLessons.push(`- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})`);
+              continue;
+            }
+          } catch {}
+        }
+        const lesson = hasLesson ? ` — ${truncate(o.lesson_learned, 60)}` : '';
+        keyContext.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
       }
-      summaryLines.push('');
+
+      if (fileLessons.length > 0) {
+        summaryLines.push('### File Lessons');
+        summaryLines.push(...fileLessons.slice(0, 5));
+        summaryLines.push('');
+      }
+      if (keyContext.length > 0) {
+        summaryLines.push('### Key Context');
+        summaryLines.push(...keyContext.slice(0, 5));
+        summaryLines.push('');
+      }
     } else if (!latestSummary) {
       // Fallback: no summary AND no key observations — show recent activity
       const recentObs = (observations.length >= 3 ? observations : fallbackObs).slice(0, 3);
