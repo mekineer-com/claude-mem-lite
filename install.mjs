@@ -452,20 +452,25 @@ async function install() {
     ]
   };
 
+  const memPreToolUse = {
+    matcher: 'Edit|Write|NotebookEdit',
+    hooks: [
+      {
+        type: 'command',
+        command: `node "${join(SCRIPTS_PATH, 'pre-tool-recall.js')}"`,
+        timeout: 3
+      }
+    ]
+  };
+
   // Filter out existing mem hooks, then append fresh ones
-  for (const [event, config] of [['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
+  for (const [event, config] of [['PreToolUse', memPreToolUse], ['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
     const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
     settings.hooks[event] = [...existing, config];
   }
 
-  // Clean up stale PreToolUse hook from previous versions
-  if (Array.isArray(settings.hooks.PreToolUse)) {
-    settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter(cfg => !isMemHook(cfg));
-    if (settings.hooks.PreToolUse.length === 0) delete settings.hooks.PreToolUse;
-  }
-
   writeSettings(settings);
-  ok('Hooks configured (PostToolUse, SessionStart, Stop, UserPromptSubmit)');
+  ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
 
   // 5. Migrate from old ~/.claude-mem/ if needed
   if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH) && !existsSync(join(DATA_DIR, 'claude-mem.db'))) {
