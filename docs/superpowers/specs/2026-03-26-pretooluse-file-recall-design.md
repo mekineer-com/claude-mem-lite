@@ -231,7 +231,7 @@ observations without lesson or files → "### Key Context" section
 | `scripts/pre-tool-recall.js` | **Create** | Lightweight PreToolUse recall script |
 | `hooks/hooks.json` | Modify | Add PreToolUse section |
 | `hook.mjs` | Modify | Remove file-history hints from PostToolUse |
-| `hook-context.mjs` | Modify | Split Key Context into File Lessons + Key Context |
+| `hook.mjs` | Modify | Split Key Context into File Lessons + Key Context (lines 650-669) |
 | `install.mjs` | Modify | Remove PreToolUse cleanup, add PreToolUse registration |
 | `package.json` | Modify | Add pre-tool-recall.js to files array |
 
