@@ -122,7 +122,11 @@ if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   CACHE_DIR="$HOME/.claude/plugins/cache/sdsrss/claude-mem-lite"
   if [[ -d "$CACHE_DIR" ]]; then
     # List version dirs sorted by semver descending, skip top 3
-    mapfile -t OLD_VERS < <(ls -1 "$CACHE_DIR" | grep -E '^[0-9]+\.' | sort -t. -k1,1nr -k2,2nr -k3,3nr | tail -n +4)
+    # Use while-read instead of mapfile for bash 3.2 (macOS) compatibility
+    OLD_VERS=()
+    while IFS= read -r ver; do
+      [[ -n "$ver" ]] && OLD_VERS+=("$ver")
+    done < <(ls -1 "$CACHE_DIR" | grep -E '^[0-9]+\.' | sort -t. -k1,1nr -k2,2nr -k3,3nr | tail -n +4)
     if [[ ${#OLD_VERS[@]} -gt 0 ]]; then
       for ver in "${OLD_VERS[@]}"; do
         rm -rf "${CACHE_DIR:?}/$ver" 2>/dev/null || true

@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.24.1
+- **Version**: 2.24.2
 - **Package manager**: npm
 - **Test**: `npx vitest run` (35 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,17 +49,16 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Test all CLI functions of projects--mem memory management tool (including user experience), fix discovered problems, an…
-Completed: Initial CLI testing started; identified issue in mem-cli.mjs related to search functionality across observations and pr…
-Remaining: Complete full CLI surface testing (remaining command variants); finish identified bug fixes; verify all fixes; execute …
-Next: Run loop plugin iteration 2-3; fix mem-cli.mjs search command issues; test all remaining CLI operations (list, get, upd…
-Lessons: Search command source parameter handling needs verification across different query types (observations vs prompts vs sessions)
+Request: Merge and clean branches, commit code and push, publish new version including release version, check GitHub for errors
+Completed: Code changes made to CLAUDE.md and mem-cli.mjs; commit created (c9ef852 with 'docs: update' message)
+Remaining: Push to remote repository; publish new version/release; verify GitHub for errors; branch cleanup/merge
+Next: Push commits with 'git push origin main'; create release/tag for new version; verify package published to registry; che…
 
 ### Key Context
+- [bugfix] Error: CLAUDE.md: diff --git a/mem-cli.mjs b/mem-cli.mjs index 44b5… (#5103)
+- [bugfix] Error: mem-cli.mjs: mem 3 results for error: #4992 🟢 2026-03-22 Add … (#5085)
 - [bugfix] Error: mem-cli.mjs: 📊 Memory Dashboard (projects--mem)  🔴 Working M… (#5080)
 - [refactor] Route usage/error messages through fail() instead of out() (#5064)
 - [bugfix] Error: mem-cli.mjs: mem 3 results for fix   bug   error: #4957 🔍 202… (#5061)
-- [bugfix] Error: mem-cli.mjs, server.mjs: mem Recent (projects--mem): # 5046 🔴 just now … (#5047)
-- [bugfix] Error: mem-cli.mjs: mem 5 results for performance optimization: P#448… (#5046)
 
 </claude-mem-context>

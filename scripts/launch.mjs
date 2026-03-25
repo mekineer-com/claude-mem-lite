@@ -20,6 +20,28 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
   process.stderr.write('[claude-mem-lite] Dependencies installed\n');
 }
 
+// Verify MCP SDK is importable (exports mapping intact).
+// Incomplete installs can leave the directory present but package.json missing,
+// causing Node.js to fail resolving subpath exports like /server/mcp.js.
+try {
+  await import('@modelcontextprotocol/sdk/server/mcp.js');
+} catch (firstErr) {
+  process.stderr.write(`[claude-mem-lite] MCP SDK broken (${firstErr.code || firstErr.message}) — reinstalling...\n`);
+  try {
+    execSync('npm install @modelcontextprotocol/sdk --force --omit=dev --no-audit --no-fund', {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'inherit'],
+      timeout: 60_000,
+    });
+    // Verify the reinstall actually fixed it
+    await import('@modelcontextprotocol/sdk/server/mcp.js');
+    process.stderr.write('[claude-mem-lite] MCP SDK repaired\n');
+  } catch (e) {
+    process.stderr.write(`[claude-mem-lite] MCP SDK repair failed: ${e.message}\n`);
+    process.exit(1);
+  }
+}
+
 // Dev mode: prefer ~/.claude-mem-lite/server.mjs (symlinked to source) over
 // CLAUDE_PLUGIN_ROOT (potentially stale plugin cache). This ensures the MCP
 // server always runs the latest code when installed with `install --dev`.

@@ -977,11 +977,11 @@ async function doctor() {
     issues++;
   }
 
-  const mcpPath = join(INSTALL_DIR, 'node_modules', '@modelcontextprotocol');
-  if (existsSync(mcpPath)) {
-    ok('@modelcontextprotocol/sdk: installed');
-  } else {
-    fail('@modelcontextprotocol/sdk: not installed');
+  try {
+    await import('@modelcontextprotocol/sdk/server/mcp.js');
+    ok('@modelcontextprotocol/sdk: verified (import OK)');
+  } catch (e) {
+    fail(`@modelcontextprotocol/sdk: import failed (${e.message})`);
     issues++;
   }
 
