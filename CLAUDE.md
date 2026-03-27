@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.25.0
+- **Version**: 2.26.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (35 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -49,14 +49,23 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 1
-Completed: Modified hook.mjs, install.mjs, package.json; Modified hook.mjs, hook-episode.mjs; Modified hooks.json; Error: pre-tool…
+Request: 好
+Completed: Modified hook.mjs, mem-cli.mjs
+Remaining: hook.mjs: "// Auto-purge: delete stale observation…" → "// Auto-maintain: cleanup + decay + boo…"
+
+### File Lessons
+- mem-cli.mjs: CLI tools must validate arguments explicitly and fail fast with clear error messages rather than si… (#5243)
 
 ### Key Context
-- [feature] v2.25.0: PreToolUse file recall + actionable Key Context (#5234)
-- [bugfix] Error: pre-tool-recall.test.mjs: err: Command failed: node scripts/pre-tool-rec… (#5228)
-- [discovery] Reviewed 8 files: registry.mjs, mem, schema.mjs, hook-memory.mjs +4 more (#5220)
-- [bugfix] macOS install fixes: bash 3.2 mapfile + MCP SDK auto-repair (#5209)
-- [bugfix] Error: CLAUDE.md: diff --git a/mem-cli.mjs b/mem-cli.mjs index 44b5… (#5103)
+- [discovery] Reviewed 5 files: mem, hook.mjs, hook-episode.mjs, hook-llm.mjs +1 more (#5323)
+- [bugfix] Error: mem-cli.mjs: mem Timeline (most recent 11): # 5304 📝 5m ago  … (#5320)
+- [bugfix] # Test compress preview node cli.mjs compress --a… → [mem] No candidates for co… (#5315)
+- [change] Modified cli.mjs (#5272)
+- [bugfix] Error: mem-cli.mjs: mem 5 results for error debugging fix performance… (#5245)
+
+### Working State (from /clear)
+- Working on: 好
+- Unfinished: hook.mjs: "// Auto-purge: delete stale observation…" → "// Auto-maintain: cleanup + decay + boo…"
+- Key files: hook.mjs, mem-cli.mjs
 
 </claude-mem-context>

@@ -319,7 +319,8 @@ function cmdSearch(db, args) {
   }
 
   const showTime = sort === 'time';
-  out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}":`);
+  const hasMixed = paged.some(r => r._source === 'session' || r._source === 'prompt');
+  out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}":${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
   for (const r of paged) {
     const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
     if (r._source === 'session') {
@@ -564,7 +565,19 @@ function cmdGet(db, args) {
 
   // Default: observations (aligned with MCP mem_get)
   const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
-  const requestedFields = flags.fields ? flags.fields.split(',').map(s => s.trim()).filter(f => OBS_FIELDS.includes(f)) : null;
+  let requestedFields = null;
+  if (flags.fields) {
+    const allRequested = flags.fields.split(',').map(s => s.trim());
+    const invalid = allRequested.filter(f => !OBS_FIELDS.includes(f));
+    if (invalid.length > 0) {
+      process.stderr.write(`[mem] Unknown field(s): ${invalid.join(', ')}. Valid: ${OBS_FIELDS.join(', ')}\n`);
+    }
+    requestedFields = allRequested.filter(f => OBS_FIELDS.includes(f));
+    if (requestedFields.length === 0) {
+      fail('[mem] No valid fields specified');
+      return;
+    }
+  }
 
   // Update access_count + auto-boost (aligned with MCP mem_get)
   db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
@@ -631,6 +644,9 @@ function cmdTimeline(db, args) {
 
   // No anchor: show most recent observations (aligned with MCP mem_timeline fallback)
   if (!anchorId || isNaN(anchorId)) {
+    if (queryStr) {
+      process.stderr.write(`[mem] No anchor found for "${queryStr}", showing recent timeline\n`);
+    }
     const compressedFilter = 'COALESCE(compressed_into, 0) = 0';
     const projectFilter = project ? `WHERE ${compressedFilter} AND project = ?` : `WHERE ${compressedFilter}`;
     const fallbackParams = project ? [project, before + after + 1] : [before + after + 1];

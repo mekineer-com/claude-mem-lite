@@ -445,7 +445,7 @@ async function handleSessionStart() {
       }
     })();
 
-    // Auto-purge: delete stale observations daily (COMPRESSED_PENDING_PURGE, 7-day retention)
+    // Auto-maintain: cleanup + decay + boost + purge, gated to once per 24h
     const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
     let shouldMaintain = true;
     try {
@@ -454,13 +454,69 @@ async function handleSessionStart() {
     } catch {}
     if (shouldMaintain) {
       try {
+        const STALE_AGE = Date.now() - 30 * 86400000;
+        const OP_CAP = 500;
+
+        // Purge FIRST: delete entries already marked pending-purge from previous cycles (7-day retention)
+        // Must run before decay/idle-mark to avoid same-cycle delete of newly-marked entries
         const purged = db.prepare(`
           DELETE FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE}
             AND created_at_epoch < ?
         `).run(Date.now() - 7 * 86400000);
-        if (purged.changes > 0) {
-          debugLog('DEBUG', 'session-start', `auto-purged ${purged.changes} stale observations`);
-        }
+        if (purged.changes > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged.changes} stale observations`);
+
+        // Cleanup: remove broken observations (no title AND no narrative)
+        const cleaned = db.prepare(`
+          DELETE FROM observations WHERE id IN (
+            SELECT id FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
+            LIMIT ${OP_CAP}
+          )
+        `).run();
+        if (cleaned.changes > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned.changes} broken observations`);
+
+        // Decay: reduce importance of old, never-accessed observations
+        const decayed = db.prepare(`
+          UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
+          WHERE id IN (
+            SELECT id FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND COALESCE(importance, 1) > 1
+              AND COALESCE(access_count, 0) = 0
+              AND created_at_epoch < ?
+            LIMIT ${OP_CAP}
+          )
+        `).run(STALE_AGE);
+        if (decayed.changes > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed.changes} stale observations`);
+
+        // Mark idle: importance=1, never-accessed, old → pending-purge (will be purged next cycle)
+        const idleMarked = db.prepare(`
+          UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
+          WHERE id IN (
+            SELECT id FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND COALESCE(importance, 1) = 1
+              AND COALESCE(access_count, 0) = 0
+              AND created_at_epoch < ?
+            LIMIT ${OP_CAP}
+          )
+        `).run(STALE_AGE);
+        if (idleMarked.changes > 0) debugLog('DEBUG', 'auto-maintain', `marked ${idleMarked.changes} idle as pending-purge`);
+
+        // Boost: increase importance of frequently-accessed observations
+        const boosted = db.prepare(`
+          UPDATE observations SET importance = MIN(3, COALESCE(importance, 1) + 1)
+          WHERE id IN (
+            SELECT id FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND COALESCE(access_count, 0) > 3
+              AND COALESCE(importance, 1) < 3
+            LIMIT ${OP_CAP}
+          )
+        `).run();
+        if (boosted.changes > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted.changes} frequently-accessed observations`);
+
         // Mark maintenance as done (24h gate) — even though compression runs in background
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
         // Weekly summary grouping runs in background to avoid blocking SessionStart

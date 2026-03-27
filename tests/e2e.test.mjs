@@ -955,9 +955,10 @@ describe('Suite 8a: Additional E2E', () => {
     `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
 
     // Old, higher-importance observation (should NOT be auto-compressed)
+    // access_count=1 prevents auto-maintain decay from reducing importance
     db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, 'parent--testproj', 'old notable note', 'decision', 'Old notable observation', '', '', '', '', '[]', '[]', 2, ?, ?)
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'old notable note', 'decision', 'Old notable observation', '', '', '', '', '[]', '[]', 2, 1, ?, ?)
     `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
 
     db.close();

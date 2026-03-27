@@ -488,7 +488,8 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
   const countLabel = isCrossSource && totalCount > paginatedResults.length
     ? `${paginatedResults.length} of ${totalCount}`
     : `${paginatedResults.length}`;
-  lines.push(`Found ${countLabel} result(s)${args.query ? ` for "${args.query}"` : ''}:\n`);
+  const hasMixed = paginatedResults.some(r => r.source === 'session' || r.source === 'prompt');
+  lines.push(`Found ${countLabel} result(s)${args.query ? ` for "${args.query}"` : ''}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
 
   for (const r of paginatedResults) {
     if (r.source === 'obs') {
