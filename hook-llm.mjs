@@ -6,7 +6,7 @@ import { existsSync, readFileSync, unlinkSync, readdirSync } from 'fs';
 import {
   jaccardSimilarity, truncate, clampImportance, computeRuleImportance,
   inferProject, parseJsonFromLLM,
-  computeMinHash, estimateJaccardFromMinHash, cjkBigrams, EDIT_TOOLS, debugCatch, debugLog, OBS_BM25,
+  computeMinHash, estimateJaccardFromMinHash, cjkBigrams, EDIT_TOOLS, LOW_SIGNAL_TITLE, debugCatch, debugLog, OBS_BM25,
   getCurrentBranch,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
@@ -63,7 +63,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     // "Error in X", "Modified X" titles are low-specificity → use longer dedup window
     // 7-day exact match prevents cross-day accumulation of "Modified package.json" noise;
     // 3-day Jaccard catches near-duplicates without blocking legitimately new observations
-    const LOW_SIGNAL = /^(Error (while working|in)|Error: |Modified |Worked on |Reviewed \d+ files:|# |node |npm |npx |\(no description\)|\(error\)$)/;
+    const LOW_SIGNAL = LOW_SIGNAL_TITLE;
     if (obs.title && LOW_SIGNAL.test(obs.title)) {
       const sevenDaysAgo = now.getTime() - 7 * 86400000;
       const threeDaysAgo = now.getTime() - 3 * 86400000;
@@ -301,7 +301,7 @@ export function buildImmediateObservation(episode) {
   const ruleImportance = computeRuleImportance(episode);
   // Low-signal degraded titles ("Error in...", "Modified...") should not inflate importance.
   // Cap at 1 unless rule-based signals indicate genuine importance (error-in-test → 3, config → 2).
-  const LOW_SIGNAL = /^(Error (while working|in)|Error: |Modified |Worked on |Reviewed \d+ files:|# |node |npm |npx |\(no description\)|\(error\)$)/;
+  const LOW_SIGNAL = LOW_SIGNAL_TITLE;
   const isLowSignal = LOW_SIGNAL.test(title);
   let importance;
   if (isReviewPattern) {

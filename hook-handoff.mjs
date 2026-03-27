@@ -2,7 +2,7 @@
 // Extracted for testability — hook.mjs has module-level side effects
 
 import { basename } from 'path';
-import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm } from './utils.mjs';
+import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE } from './utils.mjs';
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
 } from './hook-shared.mjs';
@@ -78,7 +78,6 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   }
 
   // 5. Key decisions — high importance observations (skip low-signal degraded titles)
-  const LOW_SIGNAL_TITLE = /^(Error (while working|in)|Modified |Worked on |Reviewed \d+ files:)/;
   const decisions = db.prepare(`
     SELECT title FROM observations
     WHERE memory_session_id = ? AND COALESCE(importance, 1) >= 2

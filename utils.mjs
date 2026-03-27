@@ -73,6 +73,9 @@ export function clampImportance(val) {
 // Tools that produce file edits (used for significance detection, feedback, importance)
 export const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 
+// Low-signal degraded title patterns — shared by hook-llm.mjs (dedup + importance cap) and hook-handoff.mjs (decision filter)
+export const LOW_SIGNAL_TITLE = /^(Error (while working|in)|Error: |Modified |Worked on |Reviewed \d+ files:|# |node |npm |npx |\(no description\)|\(error\)$)/;
+
 export function computeRuleImportance(episode) {
   let importance = 1;
   const toolTypes = new Set();
