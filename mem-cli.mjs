@@ -82,8 +82,14 @@ function cmdSearch(db, args) {
     return;
   }
 
-  const limit = Math.max(1, parseInt(flags.limit, 10) || 20);
+  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
+  const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 20;
   const type = flags.type || null;
+  const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+  if (type && !validObsTypes.has(type)) {
+    fail(`[mem] Invalid --type "${type}". Valid: ${[...validObsTypes].join(', ')}`);
+    return;
+  }
   const source = flags.source || null; // observations|sessions|prompts (null = all)
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const dateFrom = flags.from ? new Date(flags.from).getTime() : null;
@@ -91,10 +97,18 @@ function cmdSearch(db, args) {
   if (dateTo && flags.to && /^\d{4}-\d{2}-\d{2}$/.test(flags.to)) dateTo += 86400000 - 1;
   if (flags.from && isNaN(dateFrom)) { fail(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
   if (flags.to && isNaN(dateTo)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
-  const minImportance = flags.importance ? parseInt(flags.importance, 10) : null;
+  const minImportance = flags.importance !== undefined ? parseInt(flags.importance, 10) : null;
+  if (minImportance !== null && (isNaN(minImportance) || minImportance < 1 || minImportance > 3)) {
+    fail(`[mem] Invalid --importance "${flags.importance}". Must be 1, 2, or 3.`);
+    return;
+  }
   const branch = flags.branch || null;
   const offset = Math.max(0, parseInt(flags.offset, 10) || 0);
   const tier = flags.tier || null;
+  if (tier && !['working', 'active', 'archive'].includes(tier)) {
+    fail(`[mem] Invalid --tier "${tier}". Use: working, active, archive`);
+    return;
+  }
   const sort = flags.sort || 'relevance';
   if (!['relevance', 'time', 'importance'].includes(sort)) {
     fail(`[mem] Invalid --sort "${sort}". Use: relevance, time, importance`);
@@ -464,7 +478,8 @@ function cmdRecall(db, args) {
   }
 
   const filename = basename(file);
-  const limit = Math.max(1, parseInt(flags.limit, 10) || 10);
+  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
+  const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 10;
 
   // Search via observation_files junction table for indexed filename lookups
   const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
@@ -952,7 +967,8 @@ function cmdBrowse(db, args) {
     fail(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
     return;
   }
-  const limit = Math.max(1, parseInt(flags.limit, 10) || (tierFilter ? 20 : 5));
+  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
+  const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : (tierFilter ? 20 : 5);
   const now = Date.now();
 
   const ctx = {
@@ -1185,7 +1201,8 @@ function cmdExport(db, args) {
     wheres.push('created_at_epoch <= ?'); params.push(epoch);
   }
 
-  const limit = Math.min(Math.max(1, parseInt(flags.limit, 10) || 200), 1000);
+  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
+  const limit = Math.min(Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 200, 1000);
   const format = flags.format || 'json';
   if (!['json', 'jsonl'].includes(format)) {
     fail(`[mem] Invalid format "${format}". Use: json or jsonl`);

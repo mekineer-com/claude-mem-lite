@@ -49,16 +49,14 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Merge and clean branches, commit code and push, publish new version including release version, check GitHub for errors
-Completed: Code changes made to CLAUDE.md and mem-cli.mjs; commit created (c9ef852 with 'docs: update' message)
-Remaining: Push to remote repository; publish new version/release; verify GitHub for errors; branch cleanup/merge
-Next: Push commits with 'git push origin main'; create release/tag for new version; verify package published to registry; che…
+Request: 1
+Completed: Modified hook.mjs, install.mjs, package.json; Modified hook.mjs, hook-episode.mjs; Modified hooks.json; Error: pre-tool…
 
 ### Key Context
+- [feature] v2.25.0: PreToolUse file recall + actionable Key Context (#5234)
+- [bugfix] Error: pre-tool-recall.test.mjs: err: Command failed: node scripts/pre-tool-rec… (#5228)
+- [discovery] Reviewed 8 files: registry.mjs, mem, schema.mjs, hook-memory.mjs +4 more (#5220)
+- [bugfix] macOS install fixes: bash 3.2 mapfile + MCP SDK auto-repair (#5209)
 - [bugfix] Error: CLAUDE.md: diff --git a/mem-cli.mjs b/mem-cli.mjs index 44b5… (#5103)
-- [bugfix] Error: mem-cli.mjs: mem 3 results for error: #4992 🟢 2026-03-22 Add … (#5085)
-- [bugfix] Error: mem-cli.mjs: 📊 Memory Dashboard (projects--mem)  🔴 Working M… (#5080)
-- [refactor] Route usage/error messages through fail() instead of out() (#5064)
-- [bugfix] Error: mem-cli.mjs: mem 3 results for fix   bug   error: #4957 🔍 202… (#5061)
 
 </claude-mem-context>
