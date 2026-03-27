@@ -266,7 +266,7 @@ export function buildDegradedTitle(episode) {
   }
   // No files: strip raw output (JSON, arrays, long tails) from Bash descriptions
   const desc = episode.entries[0]?.desc || '(no description)';
-  return desc.replace(/ → (?:ERROR: )?[\[{].*$/, hasError ? ' (error)' : '')
+  return desc.replace(/ → (?:ERROR: )?[[{].*$/, hasError ? ' (error)' : '')
     .replace(/ → .*---EXIT:\d+$/, hasError ? ' (error)' : '');
 }
 
