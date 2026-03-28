@@ -285,9 +285,9 @@ async function main() {
     }
 
     const candidateIds = rows.map(r => r.id);
-    if (shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE)) return;
+    const dedupSkip = shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE);
 
-    const output = formatResults(rows);
+    const output = !dedupSkip ? formatResults(rows) : null;
     if (output) {
       process.stdout.write(output + '\n');
       // Write injected IDs for dedup with hook.mjs handleUserPrompt + self-dedup
