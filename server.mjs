@@ -1643,7 +1643,7 @@ server.registerTool(
     if (!row) {
       const results = searchResources(rdb, name, { type, limit: 1 });
       if (results.length > 0) {
-        row = rdb.prepare(`SELECT id, name, type, local_path, invocation_name, capability_summary FROM resources WHERE name = ? AND type = ?`).get(results[0].name, results[0].type);
+        row = rdb.prepare(`SELECT id, name, type, local_path, invocation_name, capability_summary FROM resources WHERE name = ? AND type = ? AND status = 'active'`).get(results[0].name, results[0].type);
       }
     }
 
@@ -1676,7 +1676,7 @@ server.registerTool(
     try {
       rdb.prepare(`
         INSERT INTO invocations (resource_id, session_id, trigger, adopted, outcome)
-        VALUES (?, ?, 'mem_use', 1, 'loaded')
+        VALUES (?, ?, 'user_explicit', 1, 'success')
       `).run(row.id, process.env.CLAUDE_SESSION_ID || 'unknown');
     } catch { /* non-critical */ }
 
