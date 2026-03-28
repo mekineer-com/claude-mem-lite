@@ -1854,6 +1854,110 @@ Commands:
 DB: ${DB_PATH}`);
 }
 
+// ─── Import (GitHub) ────────────────────────────────────────────────────────
+
+async function cmdImport(db, argv) {
+  const { positional, flags } = parseArgs(argv);
+  const url = positional[0];
+
+  if (!url) { fail('[mem] Usage: claude-mem-lite import <github-url> [--enrich]'); return; }
+
+  let rdb;
+  try {
+    rdb = ensureRegistryDb(REGISTRY_DB_PATH);
+    rdb.pragma('busy_timeout = 3000');
+  } catch (e) {
+    fail(`[mem] Registry DB error: ${e.message}`);
+    return;
+  }
+
+  try {
+    const { importFromGitHub } = await import('./registry-importer.mjs');
+    out(`[mem] Importing from ${url}...`);
+    const results = await importFromGitHub(rdb, url);
+
+    if (results.length === 0) {
+      out('[mem] No skills/agents found in this repository.');
+      return;
+    }
+
+    out(`[mem] Imported ${results.length} resource(s):`);
+    for (const r of results) {
+      out(`  ${r.type === 'skill' ? 'S' : 'A'} ${r.name} (id=${r.id})`);
+    }
+
+    if (flags.enrich) {
+      out('[mem] Running LLM enrichment...');
+      const { enrichResource } = await import('./registry-enricher.mjs');
+      let enriched = 0;
+      for (const r of results) {
+        const row = rdb.prepare('SELECT local_path FROM resources WHERE id = ?').get(r.id);
+        if (!row?.local_path) continue;
+        try {
+          const content = readFileSync(row.local_path, 'utf8');
+          const ok = await enrichResource(rdb, r.name, r.type, content);
+          if (ok) enriched++;
+        } catch {}
+      }
+      out(`[mem] Enriched ${enriched}/${results.length} resources.`);
+    }
+  } catch (e) {
+    fail(`[mem] Import failed: ${e.message}`);
+  } finally {
+    try { rdb.close(); } catch {}
+  }
+}
+
+// ─── Enrich ─────────────────────────────────────────────────────────────────
+
+async function cmdEnrich(db, argv) {
+  const { positional, flags } = parseArgs(argv);
+  const name = positional[0];
+
+  let rdb;
+  try {
+    rdb = ensureRegistryDb(REGISTRY_DB_PATH);
+    rdb.pragma('busy_timeout = 3000');
+  } catch (e) {
+    fail(`[mem] Registry DB error: ${e.message}`);
+    return;
+  }
+
+  try {
+    const { enrichResource } = await import('./registry-enricher.mjs');
+
+    if (flags.all) {
+      const rows = rdb.prepare("SELECT name, type, local_path FROM resources WHERE status = 'active' AND (enrichment_status IS NULL OR enrichment_status = 'failed')").all();
+      if (rows.length === 0) { out('[mem] All resources already enriched.'); return; }
+      out(`[mem] Enriching ${rows.length} resources...`);
+      let ok = 0, failCount = 0;
+      for (const r of rows) {
+        if (!r.local_path) { failCount++; continue; }
+        try {
+          const content = readFileSync(r.local_path, 'utf8');
+          const success = await enrichResource(rdb, r.name, r.type, content);
+          if (success) ok++; else failCount++;
+          if (!flags.batch) await new Promise(resolve => setTimeout(resolve, 500));
+        } catch { failCount++; }
+      }
+      out(`[mem] Done: ${ok} enriched, ${failCount} failed.`);
+    } else if (name) {
+      const row = rdb.prepare("SELECT name, type, local_path FROM resources WHERE name = ? AND status = 'active'").get(name);
+      if (!row) { fail(`[mem] Resource not found: ${name}`); return; }
+      if (!row.local_path) { fail(`[mem] No local_path for ${name}`); return; }
+      const content = readFileSync(row.local_path, 'utf8');
+      const success = await enrichResource(rdb, row.name, row.type, content);
+      out(success ? `[mem] Enriched: ${name}` : `[mem] Enrichment failed for ${name}`);
+    } else {
+      fail('[mem] Usage: claude-mem-lite enrich <name> OR claude-mem-lite enrich --all [--batch]');
+    }
+  } catch (e) {
+    fail(`[mem] Enrich error: ${e.message}`);
+  } finally {
+    try { rdb.close(); } catch {}
+  }
+}
+
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {
@@ -1899,6 +2003,8 @@ export async function run(argv) {
       case 'context':   cmdContext(db, cmdArgs); break;
       case 'browse':    cmdBrowse(db, cmdArgs); break;
       case 'registry':  cmdRegistry(db, cmdArgs); break;
+      case 'import':    await cmdImport(db, cmdArgs); break;
+      case 'enrich':    await cmdEnrich(db, cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');

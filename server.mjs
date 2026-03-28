@@ -1606,7 +1606,62 @@ server.registerTool(
       return { content: [{ type: 'text', text: `FTS5 reindexed. ${count.c} active resources.` }] };
     }
 
-    return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: search, list, stats, import, remove, reindex` }], isError: true };
+    if (action === 'import_url') {
+      if (!args.url) {
+        return { content: [{ type: 'text', text: 'import_url requires a url parameter' }], isError: true };
+      }
+      const { importFromGitHub } = await import('./registry-importer.mjs');
+      try {
+        const results = await importFromGitHub(rdb, args.url);
+        if (results.length === 0) {
+          return { content: [{ type: 'text', text: `No skills/agents found in: ${args.url}` }] };
+        }
+
+        let enrichMsg = '';
+        if (args.enrich) {
+          const { enrichResource } = await import('./registry-enricher.mjs');
+          let ok = 0;
+          for (const r of results) {
+            const row = rdb.prepare('SELECT local_path FROM resources WHERE id = ?').get(r.id);
+            if (!row?.local_path) continue;
+            try {
+              const content = readFileSync(row.local_path, 'utf8');
+              if (await enrichResource(rdb, r.name, r.type, content)) ok++;
+            } catch {}
+          }
+          enrichMsg = `\nEnriched: ${ok}/${results.length}`;
+        }
+
+        const lines = results.map(r => `${r.type === 'skill' ? 'S' : 'A'} ${r.name} (id=${r.id})`);
+        return { content: [{ type: 'text', text: `Imported ${results.length} resource(s) from ${args.url}:\n${lines.join('\n')}${enrichMsg}` }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Import failed: ${e.message}` }], isError: true };
+      }
+    }
+
+    if (action === 'enrich') {
+      if (!args.name) {
+        return { content: [{ type: 'text', text: 'enrich requires a name parameter' }], isError: true };
+      }
+      const row = rdb.prepare("SELECT name, type, local_path FROM resources WHERE name = ? AND status = 'active'").get(args.name);
+      if (!row) {
+        return { content: [{ type: 'text', text: `Resource not found: ${args.name}` }], isError: true };
+      }
+      if (!row.local_path) {
+        return { content: [{ type: 'text', text: `No local_path for ${args.name}` }], isError: true };
+      }
+
+      const { enrichResource } = await import('./registry-enricher.mjs');
+      try {
+        const content = readFileSync(row.local_path, 'utf8');
+        const ok = await enrichResource(rdb, row.name, row.type, content);
+        return { content: [{ type: 'text', text: ok ? `Enriched: ${args.name}` : `Enrichment failed for ${args.name}` }] };
+      } catch (e) {
+        return { content: [{ type: 'text', text: `Enrich error: ${e.message}` }], isError: true };
+      }
+    }
+
+    return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: search, list, stats, import, remove, reindex, import_url, enrich` }], isError: true };
   })
 );
 

@@ -130,7 +130,7 @@ export const memFtsCheckSchema = {
 };
 
 export const memRegistrySchema = {
-  action: z.enum(['list', 'stats', 'search', 'import', 'remove', 'reindex']).describe('Registry operation'),
+  action: z.enum(['list', 'stats', 'search', 'import', 'remove', 'reindex', 'import_url', 'enrich']).describe('Registry operation'),
   query: z.string().optional().describe('Search query — keywords describing what you need (for search)'),
   type: z.enum(['skill', 'agent']).optional().describe('Filter by resource type (for list/search)'),
   name: z.string().optional().describe('Resource name (for import/remove)'),
@@ -146,6 +146,8 @@ export const memRegistrySchema = {
   keywords: z.string().optional().describe('Search keywords (for import)'),
   tech_stack: z.string().optional().describe('Technology stack tags (for import)'),
   use_cases: z.string().optional().describe('Usage scenarios (for import)'),
+  url: z.string().optional().describe('GitHub repository URL (for import_url action)'),
+  enrich: coerceBool.optional().describe('Auto-enrich imported resources (for import_url action)'),
   category: z.string().optional().describe("Filter by category (e.g., 'testing', 'code-quality', 'debugging')"),
   quality: z.enum(['installed', 'verified', 'community']).optional().describe('Filter by quality tier (default: all)'),
 };
