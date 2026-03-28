@@ -1724,7 +1724,10 @@ server.registerTool(
     try {
       content = readFileSync(skillPath, 'utf8');
     } catch {
-      return { content: [{ type: 'text', text: `Found ${type} "${row.name}" but cannot read file: ${skillPath}` }], isError: true };
+      const msg = skillPath.endsWith('.md')
+        ? `Found ${type} "${row.name}" but cannot read file: ${skillPath}`
+        : `Found ${type} "${row.name}" but no SKILL.md or AGENT.md in: ${skillPath}`;
+      return { content: [{ type: 'text', text: msg }], isError: true };
     }
 
     // 5. Record invocation

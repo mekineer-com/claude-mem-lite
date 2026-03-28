@@ -135,7 +135,7 @@ export const memRegistrySchema = {
   type: z.enum(['skill', 'agent']).optional().describe('Filter by resource type (for list/search)'),
   name: z.string().optional().describe('Resource name (for import/remove)'),
   resource_type: z.enum(['skill', 'agent']).optional().describe('Resource type (for import/remove)'),
-  source: z.enum(['preinstalled', 'user']).optional().describe('Source (for import, default: user)'),
+  source: z.enum(['preinstalled', 'user', 'github']).optional().describe('Source (for import, default: user)'),
   repo_url: z.string().optional().describe('GitHub repository URL (for import)'),
   local_path: z.string().optional().describe('Local file path (for import)'),
   invocation_name: z.string().optional().describe('Invocation name like "plugin:skill" (for import)'),
