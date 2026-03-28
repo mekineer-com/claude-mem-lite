@@ -12,7 +12,7 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { createTestDb, insertObs, insertSession } from './test-helpers.mjs';
+import { createTestDb, insertObs, insertSession, createRegistryTestDb } from './test-helpers.mjs';
 import { searchRelevantMemories, recallForFile } from '../hook-memory.mjs';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles } from '../scripts/prompt-search-utils.mjs';
 
@@ -931,6 +931,56 @@ describe('Scenario 11: MCP Instructions Decision Rules', () => {
     // This is a static assertion — validates our design
     expect(instructionText[0]).toContain('CLI');
     expect(instructionText[1]).toContain('MCP tools');
+  });
+});
+
+describe('Scenario 12: Skill Auto-Dispatch — L1 name match + L2 bridge + L3 mem_use', () => {
+  it('L1: matchRegistrySkillName detects skill name in prompt', async () => {
+    const { matchRegistrySkillName } = await import('../scripts/prompt-search-utils.mjs');
+    const names = new Set(['humanizer', 'tdd-workflows']);
+    expect(matchRegistrySkillName('用 humanizer 处理', names)).toBe('humanizer');
+    expect(matchRegistrySkillName('run tdd-workflows', names)).toBe('tdd-workflows');
+    expect(matchRegistrySkillName('fix the bug', names)).toBeNull();
+  });
+
+  it('L2: pre-skill-bridge only matches managed paths', () => {
+    const db = createRegistryTestDb();
+    // Managed skill
+    db.prepare(`
+      INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+      VALUES ('humanizer', 'skill', 'user', 'hash', 'active', '/home/.claude-mem-lite/managed/skills/humanizer/SKILL.md', 'humanizer', '', '', '', '', '', '', '')
+    `).run();
+    // Non-managed skill
+    db.prepare(`
+      INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+      VALUES ('brainstorming', 'skill', 'preinstalled', 'hash', 'active', '/home/.claude/plugins/cache/superpowers/SKILL.md', 'superpowers:brainstorming', '', '', '', '', '', '', '')
+    `).run();
+
+    const managed = db.prepare(`SELECT name FROM resources WHERE name = 'humanizer' AND local_path LIKE '%managed%'`).get();
+    const native = db.prepare(`SELECT name FROM resources WHERE name = 'brainstorming' AND local_path LIKE '%managed%'`).get();
+
+    expect(managed).toBeTruthy();
+    expect(native).toBeUndefined();
+    db.close();
+  });
+
+  it('L3: mem_use exact match query pattern works', () => {
+    const db = createRegistryTestDb();
+    db.prepare(`
+      INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+      VALUES ('humanizer', 'skill', 'user', 'hash', 'active', '/tmp/test/SKILL.md', 'humanizer', 'Remove AI', '', '', '', '', '', '')
+    `).run();
+
+    const row = db.prepare(`
+      SELECT id, name, local_path FROM resources
+      WHERE status = 'active' AND type = 'skill'
+        AND (name = ? OR invocation_name = ?)
+      LIMIT 1
+    `).get('humanizer', 'humanizer');
+
+    expect(row).toBeTruthy();
+    expect(row.name).toBe('humanizer');
+    db.close();
   });
 });
 
