@@ -23,7 +23,7 @@ vi.mock('../hook-shared.mjs', async () => {
   };
 });
 
-import { saveObservation, handleLLMEpisode, handleLLMSummary } from '../hook-llm.mjs';
+import { saveObservation, handleLLMEpisode, handleLLMSummary, buildDegradedTitle } from '../hook-llm.mjs';
 import { openDb, callLLM } from '../hook-shared.mjs';
 import { acquireLLMSlot } from '../hook-semaphore.mjs';
 
@@ -842,5 +842,38 @@ describe('lesson_learned and search_aliases extraction', () => {
 
     process.argv[3] = origArgv3;
     db._realClose();
+  });
+});
+
+// ─── buildDegradedTitle ─────────────────────────────────────────────────────
+
+describe('buildDegradedTitle', () => {
+  it('strips tab characters and CI status from error hints', () => {
+    const episode = {
+      files: ['plugin.json'],
+      entries: [{
+        tool: 'Bash',
+        desc: 'gh run list → ERROR: in_progress\t\tchore(release): bump version',
+        isError: true,
+      }],
+    };
+    const title = buildDegradedTitle(episode);
+    expect(title).not.toMatch(/\t/);
+    expect(title).not.toMatch(/in_progress/);
+    expect(title).toMatch(/^Error: plugin\.json/);
+  });
+
+  it('strips tabs from no-file fallback desc', () => {
+    const episode = {
+      files: [],
+      entries: [{
+        tool: 'Bash',
+        desc: 'check\tstatus\there',
+        isError: false,
+      }],
+    };
+    const title = buildDegradedTitle(episode);
+    expect(title).not.toMatch(/\t/);
+    expect(title).toBe('check status here');
   });
 });

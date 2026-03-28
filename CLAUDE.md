@@ -49,23 +49,20 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 好
-Completed: Modified hook.mjs, mem-cli.mjs
-Remaining: hook.mjs: "// Auto-purge: delete stale observation…" → "// Auto-maintain: cleanup + decay + boo…"
+Request: 检查下我们插件上下文token占用情况
 
 ### File Lessons
-- mem-cli.mjs: CLI tools must validate arguments explicitly and fail fast with clear error messages rather than si… (#5243)
+- utils.mjs: Weak regex in command/function name parsers silently skip edge cases — catch with typed test fixtur… (#5588)
+- hook-llm.mjs: FTS5 column name mismatches silently trigger degraded mode without explicit error — need defensive … (#5571)
 
 ### Key Context
-- [discovery] Reviewed 5 files: mem, hook.mjs, hook-episode.mjs, hook-llm.mjs +1 more (#5323)
-- [bugfix] Error: mem-cli.mjs: mem Timeline (most recent 11): # 5304 📝 5m ago  … (#5320)
-- [bugfix] # Test compress preview node cli.mjs compress --a… → [mem] No candidates for co… (#5315)
-- [change] Modified cli.mjs (#5272)
-- [bugfix] Error: mem-cli.mjs: mem 5 results for error debugging fix performance… (#5245)
+- [bugfix] Error: schema.mjs: --- False positive test --- Old regex match: true… (#5624)
+- [bugfix] # Scenario 1: 模拟 session-start — 新描述会在 MCP instru… → === Scenario 1: Session St… (#5621)
+- [bugfix] Fix makeEntryDesc false-positive ERROR labeling + register missing PreToolUse h… (#5597)
+- [bugfix] Error: test.mjs: Error: Cannot find module better-sqlite3 at requi… (#5581)
+- [bugfix] Error: schema.mjs: mem Timeline (most recent 11): # 5547 🔴 24m ago … (#5563)
 
 ### Working State (from /clear)
-- Working on: 好
-- Unfinished: hook.mjs: "// Auto-purge: delete stale observation…" → "// Auto-maintain: cleanup + decay + boo…"
-- Key files: hook.mjs, mem-cli.mjs
+- Working on: 检查下我们插件上下文token占用情况
 
 </claude-mem-context>

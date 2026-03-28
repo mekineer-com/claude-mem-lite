@@ -164,20 +164,6 @@ function cmdSearch(db, args) {
         LIMIT ?
       `).all(...typeParams);
     }
-    // Tier post-filter
-    if (tier && obsRows.length > 0) {
-      const rowIds = obsRows.map(r => r.id);
-      const ph = rowIds.map(() => '?').join(',');
-      const fullRows = db.prepare(
-        `SELECT id, compressed_into, superseded_at, memory_session_id, project, importance, last_accessed_at, created_at_epoch, type FROM observations WHERE id IN (${ph})`
-      ).all(...rowIds);
-      const rowMap = new Map(fullRows.map(r => [r.id, r]));
-      const tierCtx = { now: Date.now(), currentProject: project || inferProject(), currentSessionId: '' };
-      obsRows = obsRows.filter(r => {
-        const full = rowMap.get(r.id);
-        return full && computeTier(full, tierCtx) === tier;
-      });
-    }
     for (const r of obsRows) results.push({ ...r, _source: 'obs', score: r.score ?? 0 });
 
     // Concept co-occurrence + PRF expansion (aligned with MCP searchObservations)
@@ -219,6 +205,27 @@ function cmdSearch(db, args) {
               }
             }
           } catch { /* PRF is best-effort */ }
+        }
+      }
+    }
+
+    // Tier post-filter — applied to ALL obs results (initial + expansion + PRF)
+    if (tier) {
+      const obsInResults = results.filter(r => r._source === 'obs');
+      if (obsInResults.length > 0) {
+        const obsIds = obsInResults.map(r => r.id);
+        const ph = obsIds.map(() => '?').join(',');
+        const fullRows = db.prepare(
+          `SELECT id, compressed_into, superseded_at, memory_session_id, project, importance, last_accessed_at, created_at_epoch, type FROM observations WHERE id IN (${ph})`
+        ).all(...obsIds);
+        const rowMap = new Map(fullRows.map(r => [r.id, r]));
+        const tierCtx = { now: Date.now(), currentProject: project || inferProject(), currentSessionId: '' };
+        const allowedIds = new Set();
+        for (const [id, full] of rowMap) {
+          if (computeTier(full, tierCtx) === tier) allowedIds.add(id);
+        }
+        for (let i = results.length - 1; i >= 0; i--) {
+          if (results[i]._source === 'obs' && !allowedIds.has(results[i].id)) results.splice(i, 1);
         }
       }
     }
@@ -1663,16 +1670,22 @@ function cmdRegistry(_memDb, args) {
 
     if (action === 'list') {
       const typeFilter = flags.type;
+      const rawLimit = parseInt(flags.limit, 10);
+      const listLimit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : 20;
       const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
       const params = typeFilter ? [typeFilter, 'active'] : ['active'];
-      const resources = rdb.prepare(`
+      const allResources = rdb.prepare(`
         SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
-        FROM resources ${where} ORDER BY type, name
+        FROM resources ${where} ORDER BY adopt_count DESC, recommend_count DESC, type, name
       `).all(...params);
-      if (resources.length === 0) { out('[mem] No resources found.'); return; }
-      out(`[mem] Resources (${resources.length}):`);
+      if (allResources.length === 0) { out('[mem] No resources found.'); return; }
+      const resources = allResources.slice(0, listLimit);
+      out(`[mem] Resources (showing ${resources.length} of ${allResources.length}):`);
       for (const r of resources) {
         out(`  ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 50)}`);
+      }
+      if (allResources.length > listLimit) {
+        out(`[mem] Use --limit N to see more, or "registry search <query>" to find specific resources.`);
       }
       return;
     }
@@ -1831,7 +1844,7 @@ Commands:
     --limit N           Max entries per tier (default 5)
 
   registry <action>     Manage tool resource registry
-    list                List all resources [--type skill|agent]
+    list                List resources [--type skill|agent] [--limit N] (default 20)
     stats               Registry statistics
     search <query>      Search resources [--type skill|agent] [--category C] [--quality Q]
     import              Import resource --name N --resource-type T [--repo-url U] [--local-path P] [--use-cases U]

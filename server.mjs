@@ -514,7 +514,7 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
 server.registerTool(
   'mem_search',
   {
-    description: 'FTS5 full-text search across observations, sessions, and prompts with BM25 ranking. Returns compact index (use mem_get for details).',
+    description: 'Search project memory for past bugfixes, decisions, and discoveries. Use when: encountering a familiar error, investigating a module before changes, or looking for prior art on a problem. Returns compact index (use mem_get for full details).',
     inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
@@ -650,7 +650,7 @@ server.registerTool(
 server.registerTool(
   'mem_recent',
   {
-    description: 'Show most recent observations, ordered by time. Quick way to see latest activity without a search query.',
+    description: 'Show most recent observations. Use when: checking what happened recently in the project, reviewing progress after being away, or verifying that a recent change was captured.',
     inputSchema: memRecentSchema,
   },
   safeHandler(async (args) => {
@@ -689,7 +689,7 @@ server.registerTool(
 server.registerTool(
   'mem_timeline',
   {
-    description: 'Browse observations as a timeline around an anchor point. Use query to auto-find anchor, or specify anchor ID directly.',
+    description: 'Browse observations as a timeline around an anchor point. Use when: exploring what happened before/after a specific observation, understanding the sequence of changes that led to a bug, or reviewing a session chronologically.',
     inputSchema: memTimelineSchema,
   },
   safeHandler(async (args) => {
@@ -790,7 +790,7 @@ server.registerTool(
 server.registerTool(
   'mem_get',
   {
-    description: 'Get full details for one or more records by ID. Use after mem_search to drill into specific records.',
+    description: 'Get full details for one or more records by ID. Use when: hook-injected context mentions a relevant observation ID, or after mem_search to drill into specific results for narrative, lesson_learned, and file details.',
     inputSchema: memGetSchema,
   },
   safeHandler(async (args) => {
@@ -912,7 +912,7 @@ server.registerTool(
 server.registerTool(
   'mem_save',
   {
-    description: 'Manually save a memory/observation. Use for important findings, decisions, or notes worth preserving.',
+    description: 'Save a memory/observation. Use when: solving a non-obvious bug (save the lesson), making an architecture decision, discovering something not obvious from code alone, or when the user asks to remember something.',
     inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
@@ -994,7 +994,7 @@ server.registerTool(
 server.registerTool(
   'mem_stats',
   {
-    description: 'Get statistics about stored memories: counts, types, projects, recent activity.',
+    description: 'Get memory statistics: counts, types, projects, daily activity, data health. Use when: assessing memory system health, checking how much project history exists, or diagnosing search quality issues.',
     inputSchema: memStatsSchema,
   },
   safeHandler(async (args) => {

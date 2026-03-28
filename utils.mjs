@@ -157,9 +157,11 @@ export function isRelatedToEpisode(episode, newFiles) {
  * @param {string} toolName Name of the tool (Edit, Write, Bash, etc.)
  * @param {object} input Tool input parameters
  * @param {string} resp Tool response text
+ * @param {object} [opts] Optional signals from detectBashSignificance
+ * @param {boolean} [opts.isError] If provided, overrides inline error regex detection
  * @returns {string} Concise description of the action
  */
-export function makeEntryDesc(toolName, input, resp) {
+export function makeEntryDesc(toolName, input, resp, opts) {
   switch (toolName) {
     case 'Edit':
       return `${basename(input.file_path || '')}: "${truncate(input.old_string || '', 40)}" → "${truncate(input.new_string || '', 40)}"`;
@@ -169,7 +171,9 @@ export function makeEntryDesc(toolName, input, resp) {
       return `Notebook cell: ${truncate(input.new_source || '', 60)}`;
     case 'Bash': {
       const cmd = truncate(input.command || '', 50);
-      const isErr = /error|fail|exception|panic/i.test(resp) && resp.length > 30;
+      // Use caller-provided bashSig.isError (word-boundary aware) when available;
+      // fall back to inline regex only for standalone callers (tests, etc.)
+      const isErr = opts?.isError ?? (/\berror\b|\bfail(ed|ure)?\b|\bexception\b|\bpanic\b/i.test(resp) && resp.length > 30);
       const snippet = truncate(resp, 60);
       return isErr ? `${cmd} → ERROR: ${snippet}` : `${cmd} → ${snippet}`;
     }

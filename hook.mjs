@@ -169,7 +169,7 @@ async function handlePostToolUse() {
   // Build episode entry
   const entry = {
     tool: tool_name,
-    desc: scrubSecrets(makeEntryDesc(tool_name, toolInput, resp)),
+    desc: scrubSecrets(makeEntryDesc(tool_name, toolInput, resp, bashSig)),
     files,
     ts: Date.now(),
     isError: bashSig?.isError || false,
@@ -516,6 +516,24 @@ async function handleSessionStart() {
           )
         `).run();
         if (boosted.changes > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted.changes} frequently-accessed observations`);
+
+        // Auto-dedup: merge near-identical observations (same title, same project, within 1h)
+        const dupPairs = db.prepare(`
+          SELECT a.id as keep_id, b.id as remove_id
+          FROM observations a
+          JOIN observations b ON a.title = b.title AND a.project = b.project
+            AND a.id < b.id
+            AND ABS(a.created_at_epoch - b.created_at_epoch) < 3600000
+            AND COALESCE(a.compressed_into, 0) = 0
+            AND COALESCE(b.compressed_into, 0) = 0
+          LIMIT 20
+        `).all();
+        if (dupPairs.length > 0) {
+          const removeIds = dupPairs.map(p => p.remove_id);
+          const ph = removeIds.map(() => '?').join(',');
+          db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph})`).run(Date.now(), ...removeIds);
+          debugLog('DEBUG', 'auto-maintain', `auto-deduped ${dupPairs.length} near-identical observations`);
+        }
 
         // Mark maintenance as done (24h gate) — even though compression runs in background
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));

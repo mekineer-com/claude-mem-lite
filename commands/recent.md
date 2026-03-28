@@ -1,5 +1,5 @@
 ---
-description: Show recent memory observations
+description: "Show recent memory observations. Use when: checking what happened recently, reviewing session progress, or verifying recent changes were captured"
 argument-hint: [count]
 ---
 

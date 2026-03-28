@@ -1,5 +1,5 @@
 ---
-description: Browse memory timeline around an observation
+description: "Browse memory timeline around an observation. Use when: exploring what happened before/after a specific event, understanding the sequence of changes that led to a bug, or reviewing chronological context"
 argument-hint: <observation_id>
 ---
 
