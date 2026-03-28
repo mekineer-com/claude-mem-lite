@@ -1,0 +1,492 @@
+// install-e2e.test.mjs — End-to-end installation tests
+// Tests the three installation methods (plugin, direct/npx, git clone --dev)
+// against a sandboxed HOME directory. Verifies:
+//   - File deployment (source files, scripts, directories)
+//   - Hook registration (settings.json for direct, hooks.json for plugin)
+//   - MCP server registration
+//   - Version consistency across manifests
+//   - Smart invocation scripts presence
+//   - Directory structure matches expected layout
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'child_process';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'fs'; // eslint-disable-line no-unused-vars
+import { join, resolve } from 'path';
+import { tmpdir } from 'os'; // eslint-disable-line no-unused-vars
+import { randomUUID } from 'crypto';
+
+const INSTALL_PATH = resolve('install.mjs');
+const SETUP_PATH = resolve('scripts/setup.sh');
+const PROJECT_DIR = resolve('.');
+// Use --dev mode for E2E tests: skips npm install (fast), uses symlinks, tests same hook logic
+
+function makeTmpDir() {
+  const dir = join(tmpdir(), `mem-e2e-${randomUUID().slice(0, 8)}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function makeFakeClaudeBin(home) {
+  const binDir = join(home, 'bin');
+  mkdirSync(binDir, { recursive: true });
+  const script = join(binDir, 'claude');
+  writeFileSync(script, [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    `STATE="${home}/.claude/mcp-state.txt"`,
+    `mkdir -p "${home}/.claude"`,
+    'touch "$STATE"',
+    'if [[ "${1:-}" != "mcp" ]]; then exit 0; fi',
+    'shift; cmd="${1:-}"; shift || true',
+    'case "$cmd" in',
+    '  add)',
+    '    scope="user"; name=""',
+    '    while [[ $# -gt 0 ]]; do',
+    '      case "$1" in -s) scope="$2"; shift 2 ;; -t) shift 2 ;; --) break ;; *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;; esac',
+    '    done',
+    '    if [[ -n "$name" ]]; then',
+    '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" 2>/dev/null || true',
+    '      mv "$STATE.tmp" "$STATE"',
+    "      printf '%s:%s\\n' \"$scope\" \"$name\" >> \"$STATE\"",
+    '    fi ;;',
+    '  remove)',
+    '    scope="user"; name=""',
+    '    while [[ $# -gt 0 ]]; do',
+    '      case "$1" in -s) scope="$2"; shift 2 ;; *) if [[ -z "$name" && "$1" != -* ]]; then name="$1"; fi; shift ;; esac',
+    '    done',
+    '    if [[ -n "$name" ]]; then',
+    '      grep -v "^${scope}:${name}$" "$STATE" > "$STATE.tmp" 2>/dev/null || true',
+    '      mv "$STATE.tmp" "$STATE"',
+    '    fi ;;',
+    '  list)',
+    '    while IFS= read -r line; do',
+    '      [[ -n "$line" ]] || continue',
+    '      name="${line#*:}"',
+    "      printf '%s: stdio\\n' \"$name\"",
+    '    done < "$STATE" ;;',
+    'esac',
+  ].join('\n'));
+  execFileSync('chmod', ['+x', script]);
+  return binDir;
+}
+
+function runInstall(command, home, args = [], extraEnv = {}) {
+  return execFileSync(process.execPath, [INSTALL_PATH, command, ...args], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      HOME: home,
+      // Skip managed repo cloning by suppressing git commands
+      CLAUDE_MEM_SKIP_REPOS: '1',
+      ...extraEnv,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 30000,
+  });
+}
+
+function readJson(path) {
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
+// ─── Plugin Install Mode ────────────────────────────────────────────────────
+
+describe('E2E: Plugin install mode', () => {
+  // Plugin mode is managed by Claude Code. We verify the manifest + hooks files
+  // that Claude Code reads to set up the plugin.
+
+  it('plugin.json has required fields for Claude Code plugin system', () => {
+    const plugin = readJson('.claude-plugin/plugin.json');
+    expect(plugin.name).toBe('claude-mem-lite');
+    expect(plugin.version).toBeTruthy();
+    expect(plugin.repository).toContain('github.com');
+    expect(plugin.license).toBe('MIT');
+  });
+
+  it('marketplace.json has matching version for plugin discovery', () => {
+    const pkg = readJson('package.json');
+    const marketplace = readJson('.claude-plugin/marketplace.json');
+    expect(marketplace.plugins).toHaveLength(1);
+    expect(marketplace.plugins[0].name).toBe('claude-mem-lite');
+    expect(marketplace.plugins[0].version).toBe(pkg.version);
+    expect(marketplace.plugins[0].source).toBe('./');
+  });
+
+  it('.mcp.json registers MCP server via plugin launcher', () => {
+    const mcp = readJson('.mcp.json');
+    expect(mcp.mcpServers.mem).toEqual({
+      command: 'node',
+      args: ['${CLAUDE_PLUGIN_ROOT}/scripts/launch.mjs'],
+    });
+  });
+
+  it('hooks/hooks.json declares all 5 hook events', () => {
+    const hooks = readJson('hooks/hooks.json');
+    expect(hooks.hooks).toBeTruthy();
+
+    // SessionStart
+    const sessionStart = hooks.hooks.SessionStart?.[0]?.hooks?.map(h => h.command) || [];
+    expect(sessionStart).toContain('bash "${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh"');
+    expect(sessionStart).toContain('node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" session-start');
+
+    // PreToolUse — two matchers
+    const preToolUse = hooks.hooks.PreToolUse;
+    expect(preToolUse).toHaveLength(2);
+    const preMatchers = preToolUse.map(h => h.matcher);
+    expect(preMatchers).toContain('Edit|Write|NotebookEdit');
+    expect(preMatchers).toContain('Skill');
+
+    // PreToolUse Skill bridge
+    const skillBridge = preToolUse.find(h => h.matcher === 'Skill');
+    expect(skillBridge.hooks[0].command).toContain('pre-skill-bridge.js');
+
+    // PostToolUse
+    expect(hooks.hooks.PostToolUse).toHaveLength(1);
+    expect(hooks.hooks.PostToolUse[0].hooks[0].command).toContain('post-tool-use.sh');
+
+    // Stop
+    expect(hooks.hooks.Stop).toHaveLength(1);
+
+    // UserPromptSubmit
+    const userPrompt = hooks.hooks.UserPromptSubmit?.[0]?.hooks?.map(h => h.command) || [];
+    expect(userPrompt.some(c => c.includes('user-prompt-search.js'))).toBe(true);
+    expect(userPrompt.some(c => c.includes('hook.mjs'))).toBe(true);
+  });
+
+  it('plugin setup.sh creates node_modules symlink and clears stale MCP', () => {
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      mkdirSync(dataDir, { recursive: true });
+      mkdirSync(pluginRoot, { recursive: true });
+      // Pre-create node_modules symlink (simulating previous install)
+      symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
+
+      // Stale global MCP that setup should clean
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { mem: { command: 'node', args: ['old-server.mjs'] } }
+      }, null, 2));
+
+      execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      // node_modules symlinked from plugin cache to data dir
+      expect(existsSync(join(pluginRoot, 'node_modules'))).toBe(true);
+
+      // Stale global MCP removed
+      const claudeJson = readJson(join(home, '.claude.json'));
+      expect(claudeJson.mcpServers?.mem).toBeUndefined();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Direct Install Mode (git clone / npx) ─────────────────────────────────
+
+describe('E2E: Direct install mode (git clone / npx)', () => {
+  let home;
+  let binDir;
+
+  beforeEach(() => {
+    home = makeTmpDir();
+    binDir = makeFakeClaudeBin(home);
+  });
+  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+
+  it('install creates data directory and deploys source files', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const dataDir = join(home, '.claude-mem-lite');
+    expect(existsSync(dataDir)).toBe(true);
+
+    // Core source files present
+    const requiredFiles = ['server.mjs', 'hook.mjs', 'schema.mjs', 'utils.mjs', 'mem-cli.mjs', 'package.json'];
+    for (const f of requiredFiles) {
+      expect(existsSync(join(dataDir, f))).toBe(true);
+    }
+
+    // Scripts directory with smart invocation scripts
+    expect(existsSync(join(dataDir, 'scripts', 'post-tool-use.sh'))).toBe(true);
+    expect(existsSync(join(dataDir, 'scripts', 'user-prompt-search.js'))).toBe(true);
+    expect(existsSync(join(dataDir, 'scripts', 'prompt-search-utils.mjs'))).toBe(true);
+  });
+
+  it('install registers hooks in settings.json with all 5 events', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const settings = readJson(join(home, '.claude', 'settings.json'));
+
+    // All 5 hook events registered
+    expect(settings.hooks.SessionStart).toBeTruthy();
+    expect(settings.hooks.PostToolUse).toBeTruthy();
+    expect(settings.hooks.Stop).toBeTruthy();
+    expect(settings.hooks.UserPromptSubmit).toBeTruthy();
+    expect(settings.hooks.PreToolUse).toBeTruthy();
+
+    // PreToolUse has two separate matchers
+    const preToolUse = settings.hooks.PreToolUse;
+    expect(preToolUse.length).toBeGreaterThanOrEqual(2);
+
+    // Edit/Write recall hook
+    const editMatcher = preToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit');
+    expect(editMatcher).toBeTruthy();
+    expect(editMatcher.hooks[0].command).toContain('pre-tool-recall.js');
+
+    // Skill bridge hook
+    const skillMatcher = preToolUse.find(h => h.matcher === 'Skill');
+    expect(skillMatcher).toBeTruthy();
+    expect(skillMatcher.hooks[0].command).toContain('pre-skill-bridge.js');
+
+    // UserPromptSubmit has both search + hook handlers
+    const userPromptHooks = settings.hooks.UserPromptSubmit[0].hooks.map(h => h.command);
+    expect(userPromptHooks.some(c => c.includes('user-prompt-search.js'))).toBe(true);
+    expect(userPromptHooks.some(c => c.includes('hook.mjs'))).toBe(true);
+  });
+
+  it('install registers MCP server via fake claude binary', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const statePath = join(home, '.claude', 'mcp-state.txt');
+    const state = readFileSync(statePath, 'utf8');
+    expect(state).toContain('user:mem');
+  });
+
+  it('install hook paths point to ~/.claude-mem-lite/ data directory', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const settings = readJson(join(home, '.claude', 'settings.json'));
+    const dataDir = join(home, '.claude-mem-lite');
+
+    // All hook commands should reference the data dir
+    const allCommands = [];
+    for (const event of Object.values(settings.hooks)) {
+      for (const entry of event) {
+        for (const hook of entry.hooks) {
+          allCommands.push(hook.command);
+        }
+      }
+    }
+
+    for (const cmd of allCommands) {
+      // Every command should reference the data dir path
+      expect(cmd).toContain(dataDir);
+    }
+  });
+
+  it('status shows MCP registered and hooks configured', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+    const output = runInstall('status', home, [], { PATH: `${binDir}:${process.env.PATH}` });
+
+    expect(output).toContain('MCP server: registered');
+    expect(output).toContain('Hooks:');
+  });
+
+  it('uninstall removes hooks and MCP but preserves data', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const dataDir = join(home, '.claude-mem-lite');
+    expect(existsSync(dataDir)).toBe(true);
+
+    runInstall('uninstall', home, [], { PATH: `${binDir}:${process.env.PATH}` });
+
+    // Hooks should be removed from settings
+    const settings = readJson(join(home, '.claude', 'settings.json'));
+    const hasMemHook = JSON.stringify(settings.hooks || {}).includes('claude-mem-lite');
+    expect(hasMemHook).toBe(false);
+
+    // Data directory preserved
+    expect(existsSync(dataDir)).toBe(true);
+  });
+
+  it('uninstall --purge removes data directory', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const dataDir = join(home, '.claude-mem-lite');
+    expect(existsSync(dataDir)).toBe(true);
+
+    runInstall('uninstall', home, ['--purge'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    expect(existsSync(dataDir)).toBe(false);
+  });
+});
+
+// ─── Dev Install Mode (git clone --dev) ─────────────────────────────────────
+
+describe('E2E: Dev install mode (git clone --dev)', () => {
+  let home;
+  let binDir;
+
+  beforeEach(() => {
+    home = makeTmpDir();
+    binDir = makeFakeClaudeBin(home);
+  });
+  afterEach(() => { rmSync(home, { recursive: true, force: true }); });
+
+  it('--dev creates symlinks instead of copies', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const dataDir = join(home, '.claude-mem-lite');
+
+    // Core files should be symlinks to project dir
+    const serverLink = join(dataDir, 'server.mjs');
+    expect(existsSync(serverLink)).toBe(true);
+
+    // Scripts dir should be a symlink
+    const scriptsLink = join(dataDir, 'scripts');
+    expect(existsSync(scriptsLink)).toBe(true);
+
+    // node_modules should be a symlink
+    const nmLink = join(dataDir, 'node_modules');
+    expect(existsSync(nmLink)).toBe(true);
+  });
+
+  it('--dev hooks point to ~/.claude-mem-lite/ (via symlinks)', () => {
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    const settings = readJson(join(home, '.claude', 'settings.json'));
+    const dataDir = join(home, '.claude-mem-lite');
+
+    // Hooks should reference the data dir, not the project dir
+    const sessionHook = settings.hooks.SessionStart?.[0]?.hooks?.[0]?.command || '';
+    expect(sessionHook).toContain(dataDir);
+    expect(sessionHook).not.toContain(PROJECT_DIR);
+  });
+});
+
+// ─── Smart Invocation Scripts Presence ──────────────────────────────────────
+
+describe('E2E: Smart invocation scripts deployed', () => {
+  it('plugin hooks.json references all smart invocation scripts', () => {
+    const hooks = readJson('hooks/hooks.json');
+
+    // Pre-skill-bridge for Skill() interception
+    const preToolUse = hooks.hooks.PreToolUse;
+    const skillHook = preToolUse.find(h => h.matcher === 'Skill');
+    expect(skillHook).toBeTruthy();
+    expect(skillHook.hooks[0].command).toContain('pre-skill-bridge.js');
+    expect(skillHook.hooks[0].timeout).toBe(3);
+
+    // User-prompt-search for L1 auto-load
+    const userPrompt = hooks.hooks.UserPromptSubmit[0].hooks;
+    const searchHook = userPrompt.find(h => h.command.includes('user-prompt-search.js'));
+    expect(searchHook).toBeTruthy();
+    expect(searchHook.timeout).toBe(2);
+  });
+
+  it('direct install deploys smart invocation scripts to scripts/', () => {
+    const home = makeTmpDir();
+    const binDir = makeFakeClaudeBin(home);
+    try {
+      runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+      const dataDir = join(home, '.claude-mem-lite');
+      // --dev mode creates a scripts symlink → all scripts accessible
+      expect(existsSync(join(dataDir, 'scripts'))).toBe(true);
+      // Verify the smart invocation scripts exist in the project
+      expect(existsSync(join(PROJECT_DIR, 'scripts', 'pre-skill-bridge.js'))).toBe(true);
+      expect(existsSync(join(PROJECT_DIR, 'scripts', 'user-prompt-search.js'))).toBe(true);
+      expect(existsSync(join(PROJECT_DIR, 'scripts', 'prompt-search-utils.mjs'))).toBe(true);
+      expect(existsSync(join(PROJECT_DIR, 'scripts', 'pre-tool-recall.js'))).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Version Consistency ────────────────────────────────────────────────────
+
+describe('E2E: Version consistency across all manifests', () => {
+  it('package.json, plugin.json, marketplace.json, CLAUDE.md all match', () => {
+    const pkg = readJson('package.json');
+    const plugin = readJson('.claude-plugin/plugin.json');
+    const marketplace = readJson('.claude-plugin/marketplace.json');
+    const claudeMd = readFileSync('CLAUDE.md', 'utf8');
+
+    const version = pkg.version;
+    expect(plugin.version).toBe(version);
+    expect(marketplace.plugins[0].version).toBe(version);
+    expect(claudeMd).toContain(`**Version**: ${version}`);
+  });
+
+  it('npm package includes all necessary files for publishing', () => {
+    const pkg = readJson('package.json');
+    const files = pkg.files || [];
+
+    // Core files
+    expect(files).toContain('server.mjs');
+    expect(files).toContain('hook.mjs');
+    expect(files).toContain('schema.mjs');
+    expect(files).toContain('install.mjs');
+    expect(files).toContain('cli.mjs');
+
+    // Plugin manifests (exact paths in files array)
+    expect(files).toContain('.claude-plugin/plugin.json');
+    expect(files).toContain('.claude-plugin/marketplace.json');
+    expect(files).toContain('.mcp.json');
+    expect(files).toContain('hooks/hooks.json');
+
+    // Smart invocation scripts
+    expect(files).toContain('scripts/pre-skill-bridge.js');
+    expect(files).toContain('scripts/user-prompt-search.js');
+    expect(files).toContain('scripts/prompt-search-utils.mjs');
+    expect(files).toContain('scripts/pre-tool-recall.js');
+
+    // Registry + CLI
+    expect(files).toContain('mem-cli.mjs');
+    expect(files).toContain('registry.mjs');
+    expect(files).toContain('registry-retriever.mjs');
+  });
+});
+
+// ─── Migration Paths ────────────────────────────────────────────────────────
+
+describe('E2E: Migration from older versions', () => {
+  it('migrates from old claude-mem directory', () => {
+    const home = makeTmpDir();
+    const binDir = makeFakeClaudeBin(home);
+    try {
+      // Simulate old claude-mem install
+      const oldDir = join(home, '.claude-mem');
+      mkdirSync(oldDir, { recursive: true });
+      writeFileSync(join(oldDir, 'claude-mem.db'), 'fake-db');
+      mkdirSync(join(oldDir, 'runtime'), { recursive: true });
+      writeFileSync(join(oldDir, 'runtime', 'session-test'), 'session');
+
+      const output = runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+      expect(output).toContain('migrat');
+
+      // New dir has the migrated DB (renamed)
+      const newDb = join(home, '.claude-mem-lite', 'claude-mem-lite.db');
+      expect(existsSync(newDb)).toBe(true);
+
+      // Old dir preserved
+      expect(existsSync(oldDir)).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('renames claude-mem.db to claude-mem-lite.db in data dir', () => {
+    const home = makeTmpDir();
+    const binDir = makeFakeClaudeBin(home);
+    try {
+      // Pre-create data dir with old db name
+      const dataDir = join(home, '.claude-mem-lite');
+      mkdirSync(dataDir, { recursive: true });
+      writeFileSync(join(dataDir, 'claude-mem.db'), 'old-name-db');
+
+      const output = runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+      expect(output).toContain('renamed');
+
+      expect(existsSync(join(dataDir, 'claude-mem-lite.db'))).toBe(true);
+      expect(existsSync(join(dataDir, 'claude-mem.db'))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

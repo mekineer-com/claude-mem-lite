@@ -529,8 +529,9 @@ async function install() {
   }
 
   // 6. Install pre-installed resources (skills + agents)
-  log('Setting up skill/agent registry...');
-  try {
+  if (process.env.CLAUDE_MEM_SKIP_REPOS) {
+    ok('Skill/agent registry: skipped (CLAUDE_MEM_SKIP_REPOS)');
+  } else try {
     const manifestPath = join(INSTALL_DIR, 'registry', 'preinstalled.json');
     if (!existsSync(manifestPath)) {
       // For git-clone mode, check PROJECT_DIR
