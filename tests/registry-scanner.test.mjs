@@ -298,3 +298,17 @@ describe('diffResources', () => {
     db.close();
   });
 });
+
+// ─── Schema: enrichment columns ───────────────────────────────────────────────
+
+describe('resources table schema', () => {
+  it('has enrichment_status and repo metadata columns', () => {
+    const db = createRegistryTestDb();
+    const cols = db.prepare("PRAGMA table_info(resources)").all().map(c => c.name);
+    expect(cols).toContain('enrichment_status');
+    expect(cols).toContain('enriched_at');
+    expect(cols).toContain('repo_updated_at');
+    expect(cols).toContain('repo_forks');
+    db.close();
+  });
+});

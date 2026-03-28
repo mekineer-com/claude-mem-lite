@@ -47,7 +47,11 @@ const RESOURCES_SCHEMA = `
     recommendation_mode TEXT DEFAULT 'proactive',
     indexed_at    TEXT,
     created_at    TEXT DEFAULT (datetime('now')),
-    updated_at    TEXT DEFAULT (datetime('now'))
+    updated_at    TEXT DEFAULT (datetime('now')),
+    enrichment_status TEXT DEFAULT NULL,
+    enriched_at INTEGER DEFAULT NULL,
+    repo_updated_at TEXT DEFAULT NULL,
+    repo_forks INTEGER DEFAULT 0
   );
 
   CREATE UNIQUE INDEX IF NOT EXISTS idx_res_type_name
@@ -182,6 +186,10 @@ export function ensureRegistryDb(dbPath) {
     if (!resCols.has('quality_tier')) db.exec("ALTER TABLE resources ADD COLUMN quality_tier TEXT DEFAULT 'community'");
     if (!resCols.has('popularity_score')) db.exec("ALTER TABLE resources ADD COLUMN popularity_score REAL DEFAULT 0");
     if (!resCols.has('personal_score')) db.exec("ALTER TABLE resources ADD COLUMN personal_score REAL DEFAULT 0");
+    if (!resCols.has('enrichment_status')) db.exec("ALTER TABLE resources ADD COLUMN enrichment_status TEXT DEFAULT NULL");
+    if (!resCols.has('enriched_at')) db.exec("ALTER TABLE resources ADD COLUMN enriched_at INTEGER DEFAULT NULL");
+    if (!resCols.has('repo_updated_at')) db.exec("ALTER TABLE resources ADD COLUMN repo_updated_at TEXT DEFAULT NULL");
+    if (!resCols.has('repo_forks')) db.exec("ALTER TABLE resources ADD COLUMN repo_forks INTEGER DEFAULT 0");
     // Auto-set quality_tier for installed preinstalled resources
     db.exec("UPDATE resources SET quality_tier = 'installed' WHERE source = 'preinstalled' AND quality_tier = 'community'");
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
