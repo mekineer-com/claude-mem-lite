@@ -288,9 +288,10 @@ describe('user-prompt-search subprocess integration', () => {
     cleanupTestFiles();
     // Remove cooldown file before each test
     try { if (existsSync(COOLDOWN_FILE)) unlinkSync(COOLDOWN_FILE); } catch {}
-    // Create a test directory with a DB
+    // Create a test directory with a DB (clean slate — rmSync first to prevent stale WAL data)
     testDir = resolve(import.meta.dirname, '.tmp-prompt-search-dir');
-    try { mkdirSync(testDir, { recursive: true }); } catch {}
+    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+    mkdirSync(testDir, { recursive: true });
     const dbPath = join(testDir, 'claude-mem-lite.db');
     db = createFileDb(dbPath);
     insertSession(db, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });

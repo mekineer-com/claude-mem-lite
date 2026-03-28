@@ -1,5 +1,5 @@
 ---
-description: Search memory for past bugfixes, decisions, discoveries
+description: "Search memory for past bugfixes, decisions, discoveries. Use when: encountering a familiar error, investigating a module before changes, or looking for prior solutions to a similar problem"
 argument-hint: <query>
 ---
 

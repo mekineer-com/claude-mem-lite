@@ -1,5 +1,5 @@
 ---
-description: Search and manage project memory (observations, sessions, prompts)
+description: "Search and manage project memory (observations, sessions, prompts). Use when: user asks about past work, wants to find a previous bugfix, check project history, save a decision, or manage stored memories"
 ---
 
 # Memory

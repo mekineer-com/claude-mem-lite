@@ -24,7 +24,25 @@ function buildFtsTextField(obs) {
   const factsText = Array.isArray(obs.facts) ? obs.facts.join(' ') : '';
   const aliasesText = obs.searchAliases || '';
   const bigramText = cjkBigrams((obs.title || '') + ' ' + (obs.narrative || ''));
-  return { conceptsText, factsText, textField: [conceptsText, factsText, aliasesText, bigramText].filter(Boolean).join(' ') };
+
+  // Degraded fallback: when LLM enrichment is missing, extract lightweight keywords
+  // from title + narrative so degraded observations remain FTS-searchable
+  let fallbackText = '';
+  if (!conceptsText && !factsText && !aliasesText) {
+    const raw = (obs.title || '') + ' ' + (obs.narrative || '');
+    // Extract file basenames (without extension) as searchable terms
+    const fileNames = [...new Set(
+      [...raw.matchAll(/\b([\w.-]+\.(?:mjs|js|ts|tsx|jsx|py|rs|go|vue|css|html|json|yaml|yml|md|sh|sql|toml|cfg))\b/g)]
+        .map(m => m[1].replace(/\.[^.]+$/, ''))
+    )];
+    // Extract error keywords from "→ ERROR: ..." patterns
+    const errorTerms = raw.split(/→ ERROR[: ]+/).slice(1)
+      .map(s => s.split(/[;{[\]"\\|→\n]/)[0].trim())
+      .filter(t => t.length >= 4 && t.length <= 50);
+    fallbackText = [...fileNames, ...errorTerms].join(' ');
+  }
+
+  return { conceptsText, factsText, textField: [conceptsText, factsText, aliasesText, bigramText, fallbackText].filter(Boolean).join(' ') };
 }
 
 /**
@@ -244,8 +262,14 @@ export function buildDegradedTitle(episode) {
       // Extract meaningful error text from "cmd → ERROR: ..." format
       const errMatch = errEntry.desc.match(/→ ERROR: (.{3,80})/);
       if (errMatch) {
-        // Clean JSON/noise from the error snippet
-        const cleaned = errMatch[1].replace(/[{"[\]]/g, '').replace(/\\n/g, ' ').trim();
+        // Clean JSON/noise/tabs/CI-status from the error snippet
+        const cleaned = errMatch[1]
+          .replace(/\t/g, ' ')
+          .replace(/[{"[\]]/g, '')
+          .replace(/\\n/g, ' ')
+          .replace(/\b(?:in_progress|completed|queued|failure|success|waiting)\b/gi, '')
+          .replace(/\s{2,}/g, ' ')
+          .trim();
         if (cleaned.length >= 4) errorHint = `: ${truncate(cleaned, 50)}`;
       }
     }
@@ -267,7 +291,10 @@ export function buildDegradedTitle(episode) {
   // No files: strip raw output (JSON, arrays, long tails) from Bash descriptions
   const desc = episode.entries[0]?.desc || '(no description)';
   return desc.replace(/ → (?:ERROR: )?[[{].*$/, hasError ? ' (error)' : '')
-    .replace(/ → .*---EXIT:\d+$/, hasError ? ' (error)' : '');
+    .replace(/ → .*---EXIT:\d+$/, hasError ? ' (error)' : '')
+    .replace(/\t/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 /**
