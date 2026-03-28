@@ -19,25 +19,14 @@ When the user invokes `/mem:tools`:
 
 ### With GitHub URL
 
-1. Use WebFetch to fetch the repository README and skill/agent files:
-   - Try `https://raw.githubusercontent.com/{owner}/{repo}/main/README.md`
-   - Look for skill definitions (`.md` files with frontmatter), agent definitions, plugin.json
-   - If the repo has a `commands/` directory, fetch skill files from there
-2. Identify all skills and agents in the repository
-3. For each tool found, extract metadata using your understanding of the content:
-   - `name`: tool name (lowercase, hyphenated)
-   - `resource_type`: "skill" or "agent"
-   - `repo_url`: the GitHub URL
-   - `intent_tags`: comma-separated intent keywords (what the tool helps with)
-   - `domain_tags`: comma-separated technology/domain tags
-   - `capability_summary`: one-line description of what the tool does
-   - `trigger_patterns`: when to recommend this tool (natural language)
-   - `keywords`: additional search terms
-   - `tech_stack`: technology stack tags
-   - `use_cases`: usage scenarios
-4. Call `mem_registry(action="import", ...)` for each tool with extracted metadata
-5. Call `mem_registry(action="reindex")` to update FTS5 index
-6. Report imported tools in a table format
+1. Call `mem_registry(action="import_url", url="<github-url>", enrich=true)` to import all skills/agents
+2. The import pipeline automatically:
+   - Fetches repo file tree via GitHub API
+   - Discovers SKILL.md/AGENT.md files
+   - Parses frontmatter and extracts metadata
+   - Downloads files to managed/ directory
+   - Runs LLM enrichment for semantic tags (when enrich=true)
+3. Report imported tools in a table format
 
 ### With GitHub URL + instructions
 
