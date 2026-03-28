@@ -13,6 +13,7 @@ import {
   memMaintainSchema,
   memRecallSchema,
   memRegistrySchema,
+  memUseSchema,
   memBrowseSchema,
 } from '../tool-schemas.mjs';
 
@@ -376,6 +377,21 @@ describe('mem_registry schema', () => {
 
   it('rejects invalid quality enum value', () => {
     expect(parseSchema(memRegistrySchema, { action: 'search', query: 'x', quality: 'premium' }).success).toBe(false);
+  });
+});
+
+// ─── memUseSchema ────────────────────────────────────────────────────────────
+
+describe('memUseSchema', () => {
+  it('memUseSchema accepts valid input', () => {
+    const schema = z.object(memUseSchema);
+    expect(schema.parse({ name: 'humanizer' })).toEqual({ name: 'humanizer' });
+    expect(schema.parse({ name: 'tdd-workflows', type: 'agent' })).toEqual({ name: 'tdd-workflows', type: 'agent' });
+  });
+
+  it('memUseSchema rejects missing name', () => {
+    const schema = z.object(memUseSchema);
+    expect(() => schema.parse({})).toThrow();
   });
 });
 

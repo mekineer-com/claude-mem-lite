@@ -150,6 +150,11 @@ export const memRegistrySchema = {
   quality: z.enum(['installed', 'verified', 'community']).optional().describe('Filter by quality tier (default: all)'),
 };
 
+export const memUseSchema = {
+  name: z.string().min(1).describe('Skill or agent name to load (exact name or search query)'),
+  type: z.enum(['skill', 'agent']).optional().describe('Resource type (default: skill)'),
+};
+
 export const memBrowseSchema = {
   project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
   tier: z.enum(['working', 'active', 'archive']).optional().describe('Show only this tier'),
