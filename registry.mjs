@@ -195,9 +195,11 @@ export function ensureRegistryDb(dbPath) {
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
   // Migrate: add 'github' to source CHECK constraint (required for smart import)
+  // Must disable FK checks during table recreation (RENAME triggers FK validation)
   try {
     const resSchema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='resources'`).get();
     if (resSchema?.sql && !resSchema.sql.includes("'github'")) {
+      db.pragma('foreign_keys = OFF');
       db.transaction(() => {
         const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_old'`).get();
         if (hasOld) db.exec(`DROP TABLE resources_old`);
@@ -214,6 +216,7 @@ export function ensureRegistryDb(dbPath) {
         db.exec(`INSERT INTO resources (${common}) SELECT ${common} FROM resources_old`);
         db.exec(`DROP TABLE resources_old`);
       })();
+      db.pragma('foreign_keys = ON');
     }
   } catch (e) { debugCatch(e, 'resources-source-check-migration'); }
 

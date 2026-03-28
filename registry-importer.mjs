@@ -66,6 +66,18 @@ export function discoverFromTree(treeData, pathFilter) {
       results.push({ name: 'root', type: 'skill', filePath: p });
       continue;
     }
+
+    // Generic: any-dir/SKILL.md or any-dir/AGENT.md (non-standard layouts)
+    const genericSkill = p.match(/^([^/]+)\/SKILL\.md$/);
+    if (genericSkill) {
+      results.push({ name: genericSkill[1], type: 'skill', filePath: p });
+      continue;
+    }
+    const genericAgent = p.match(/^([^/]+)\/AGENT\.md$/);
+    if (genericAgent) {
+      results.push({ name: genericAgent[1], type: 'agent', filePath: p });
+      continue;
+    }
   }
 
   return results;
