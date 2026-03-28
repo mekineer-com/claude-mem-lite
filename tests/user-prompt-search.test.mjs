@@ -17,6 +17,7 @@ import {
   detectIntent,
   shouldSkipByDedup,
   extractFiles,
+  matchRegistrySkillName,
 } from '../scripts/prompt-search-utils.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -163,6 +164,37 @@ describe('extractFiles', () => {
   it('handles nested paths', () => {
     const files = extractFiles('Look at packages/core/src/index.ts');
     expect(files).toContain('packages/core/src/index.ts');
+  });
+});
+
+// ─── Unit Tests: Registry Skill Name Matching ──────────────────────────────
+
+describe('matchRegistrySkillName', () => {
+  const skillNames = new Set(['humanizer', 'tdd-workflows', 'code-review-expert', 'audit-website']);
+
+  it('matches exact skill name in prompt', () => {
+    expect(matchRegistrySkillName('用 humanizer 处理这段文字', skillNames)).toBe('humanizer');
+  });
+
+  it('matches skill name as word boundary', () => {
+    expect(matchRegistrySkillName('run the tdd-workflows agent', skillNames)).toBe('tdd-workflows');
+  });
+
+  it('returns null when no match', () => {
+    expect(matchRegistrySkillName('fix the database bug', skillNames)).toBeNull();
+  });
+
+  it('matches case-insensitively', () => {
+    expect(matchRegistrySkillName('Use Humanizer on this text', skillNames)).toBe('humanizer');
+  });
+
+  it('does not match partial names embedded in other words', () => {
+    expect(matchRegistrySkillName('audit the code', skillNames)).toBeNull();
+  });
+
+  it('returns longest match when multiple skills could match', () => {
+    const names = new Set(['code-review', 'code-review-expert']);
+    expect(matchRegistrySkillName('use code-review-expert', names)).toBe('code-review-expert');
   });
 });
 

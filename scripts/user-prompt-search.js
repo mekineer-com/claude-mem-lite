@@ -3,11 +3,12 @@
 // Runs as UserPromptSubmit hook — injects relevant memories before Claude sees the prompt
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
-import { ensureDb, DB_DIR } from '../schema.mjs';
+import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE } from '../utils.mjs';
-import { writeFileSync, readFileSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS } from './prompt-search-utils.mjs';
+import Database from 'better-sqlite3';
+import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -152,6 +153,81 @@ function formatResults(rows) {
   return lines.join('\n');
 }
 
+// ─── Registry Skill Auto-Load ──────────────────────────────────────────────
+
+const SKILL_COOLDOWN_FILE = join(DB_DIR, 'runtime', `.skill-cooldown-${inferProject()}`);
+const SKILL_COOLDOWN_MS = 300_000; // 5 minutes
+const SKILL_TOKEN_LIMIT = 16000;   // ~4000 tokens
+
+function loadManagedSkillNames() {
+  if (!existsSync(REGISTRY_DB_PATH)) return new Set();
+  try {
+    const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
+    rdb.pragma('busy_timeout = 500');
+    try {
+      const rows = rdb.prepare(`
+        SELECT name FROM resources
+        WHERE status = 'active' AND local_path LIKE '%managed%'
+      `).all();
+      return new Set(rows.map(r => r.name.toLowerCase()));
+    } finally { rdb.close(); }
+  } catch { return new Set(); }
+}
+
+function loadSkillContent(skillName) {
+  if (!existsSync(REGISTRY_DB_PATH)) return null;
+  try {
+    const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
+    rdb.pragma('busy_timeout = 500');
+    try {
+      const row = rdb.prepare(`
+        SELECT name, local_path FROM resources
+        WHERE status = 'active'
+          AND (name = ? OR invocation_name = ?)
+          AND local_path LIKE '%managed%'
+        LIMIT 1
+      `).get(skillName, skillName);
+
+      if (!row || !row.local_path) return null;
+
+      let path = row.local_path;
+      if (!path.endsWith('.md')) {
+        for (const candidate of [join(path, 'SKILL.md'), join(path, 'AGENT.md')]) {
+          if (existsSync(candidate)) { path = candidate; break; }
+        }
+      }
+      if (!existsSync(path)) return null;
+
+      const content = readFileSync(path, 'utf8');
+      if (content.length > SKILL_TOKEN_LIMIT) {
+        return `<skill-auto-loaded name="${row.name}" source="registry" truncated="true">\n${content.slice(0, 800)}\n...\n</skill-auto-loaded>\nSkill too large for auto-inject. Use mem_use(name="${row.name}") to load full content.`;
+      }
+      return `<skill-auto-loaded name="${row.name}" source="registry">\n${content}\n</skill-auto-loaded>`;
+    } finally { rdb.close(); }
+  } catch { return null; }
+}
+
+function getSkillCooldown() {
+  try {
+    const raw = readFileSync(SKILL_COOLDOWN_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    const now = Date.now();
+    const cleaned = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (now - v < SKILL_COOLDOWN_MS) cleaned[k] = v;
+    }
+    return cleaned;
+  } catch { return {}; }
+}
+
+function setSkillCooldown(name) {
+  try {
+    const data = getSkillCooldown();
+    data[name] = Date.now();
+    writeFileSync(SKILL_COOLDOWN_FILE, JSON.stringify(data));
+  } catch { /* silent */ }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -228,6 +304,22 @@ async function main() {
         }));
       } catch {}
     }
+
+    // ─── L1: Registry skill auto-load ───────────────────────────────────
+    try {
+      const skillNames = loadManagedSkillNames();
+      const matched = matchRegistrySkillName(promptText, skillNames);
+      if (matched) {
+        const cooldown = getSkillCooldown();
+        if (!cooldown[matched]) {
+          const skillContent = loadSkillContent(matched);
+          if (skillContent) {
+            process.stdout.write('\n' + skillContent + '\n');
+            setSkillCooldown(matched);
+          }
+        }
+      }
+    } catch { /* silent — never block on registry failure */ }
   } catch {
     // Hooks must never break Claude Code — swallow all errors
   } finally {
