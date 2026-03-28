@@ -28,6 +28,16 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-skill-bridge.js\"",
+            "timeout": 3
+          }
+        ]
       }
     ],
     "PostToolUse": [

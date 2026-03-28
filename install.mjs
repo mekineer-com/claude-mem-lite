@@ -452,7 +452,7 @@ async function install() {
     ]
   };
 
-  const memPreToolUse = {
+  const memPreToolRecall = {
     matcher: 'Edit|Write|NotebookEdit',
     hooks: [
       {
@@ -463,10 +463,30 @@ async function install() {
     ]
   };
 
+  const memPreSkillBridge = {
+    matcher: 'Skill',
+    hooks: [
+      {
+        type: 'command',
+        command: `node "${join(SCRIPTS_PATH, 'pre-skill-bridge.js')}"`,
+        timeout: 3
+      }
+    ]
+  };
+
   // Filter out existing mem hooks, then append fresh ones
-  for (const [event, config] of [['PreToolUse', memPreToolUse], ['PostToolUse', memPostToolUse], ['SessionStart', memSessionStart], ['Stop', memStop], ['UserPromptSubmit', memUserPrompt]]) {
+  // PreToolUse has two separate matchers, so we register both
+  const hookConfigs = {
+    PreToolUse: [memPreToolRecall, memPreSkillBridge],
+    PostToolUse: [memPostToolUse],
+    SessionStart: [memSessionStart],
+    Stop: [memStop],
+    UserPromptSubmit: [memUserPrompt],
+  };
+
+  for (const [event, configs] of Object.entries(hookConfigs)) {
     const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
-    settings.hooks[event] = [...existing, config];
+    settings.hooks[event] = [...existing, ...configs];
   }
 
   writeSettings(settings);
