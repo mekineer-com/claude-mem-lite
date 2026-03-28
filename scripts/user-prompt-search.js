@@ -7,6 +7,7 @@ import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE } from '../utils.mjs';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import Database from 'better-sqlite3';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
 
@@ -167,11 +168,16 @@ function loadManagedSkillNames() {
     try {
       const rows = rdb.prepare(`
         SELECT name FROM resources
-        WHERE status = 'active' AND local_path LIKE '%managed%'
+        WHERE status = 'active' AND local_path LIKE '%/.claude-mem-lite/managed/%'
       `).all();
       return new Set(rows.map(r => r.name.toLowerCase()));
     } finally { rdb.close(); }
   } catch { return new Set(); }
+}
+
+function toPortablePath(absPath) {
+  const home = homedir();
+  return absPath.startsWith(home) ? '~' + absPath.slice(home.length) : absPath;
 }
 
 function loadSkillContent(skillName) {
@@ -181,10 +187,10 @@ function loadSkillContent(skillName) {
     rdb.pragma('busy_timeout = 500');
     try {
       const row = rdb.prepare(`
-        SELECT name, local_path FROM resources
+        SELECT name, type, local_path FROM resources
         WHERE status = 'active'
           AND (name = ? OR invocation_name = ?)
-          AND local_path LIKE '%managed%'
+          AND local_path LIKE '%/.claude-mem-lite/managed/%'
         LIMIT 1
       `).get(skillName, skillName);
 
@@ -192,17 +198,19 @@ function loadSkillContent(skillName) {
 
       let path = row.local_path;
       if (!path.endsWith('.md')) {
-        for (const candidate of [join(path, 'SKILL.md'), join(path, 'AGENT.md')]) {
-          if (existsSync(candidate)) { path = candidate; break; }
-        }
+        // Only skills can be directory paths (9 cases); agents always have full .md paths
+        const candidate = join(path, 'SKILL.md');
+        if (existsSync(candidate)) path = candidate;
       }
       if (!existsSync(path)) return null;
 
+      const portablePath = toPortablePath(path);
+      const sourceLabel = row.type === 'agent' ? 'managed-agent' : 'managed-skill';
       const content = readFileSync(path, 'utf8');
       if (content.length > SKILL_TOKEN_LIMIT) {
-        return `<skill-auto-loaded name="${row.name}" source="registry" truncated="true">\n${content.slice(0, 800)}\n...\n</skill-auto-loaded>\nSkill too large for auto-inject. Use mem_use(name="${row.name}") to load full content.`;
+        return `<skill-auto-loaded name="${row.name}" source="${sourceLabel}" path="${portablePath}" truncated="true">\n${content.slice(0, 800)}\n...\n</skill-auto-loaded>\nSkill truncated. Full content: Read("${portablePath}") or mem_use(name="${row.name}")`;
       }
-      return `<skill-auto-loaded name="${row.name}" source="registry">\n${content}\n</skill-auto-loaded>`;
+      return `<skill-auto-loaded name="${row.name}" source="${sourceLabel}" path="${portablePath}">\n${content}\n</skill-auto-loaded>\nFollow the instructions above. Reload: Read("${portablePath}")`;
     } finally { rdb.close(); }
   } catch { return null; }
 }

@@ -2,6 +2,7 @@
 // claude-mem-lite CLI — lightweight command layer for direct memory access
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
+import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
@@ -1657,13 +1658,25 @@ function cmdRegistry(_memDb, args) {
       results = results.slice(0, 5);
       if (results.length === 0) { out(`[mem] No matching resources for: "${query}"`); return; }
       out(`[mem] ${results.length} resource(s) for "${query}":`);
+      const home = homedir();
       for (const r of results) {
         const badge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
         const categoryLabel = r.category ? ` [${r.category}]` : '';
-        const howToUse = r.type === 'skill'
-          ? (r.invocation_name ? `skill="${r.invocation_name}"` : r.name)
-          : `subagent_type="${r.invocation_name || r.name}"`;
-        out(`  ${badge} ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${categoryLabel} — ${truncate(r.capability_summary || '', 80)} | Use: ${howToUse}`);
+        const isManaged = r.local_path && r.local_path.includes('/.claude-mem-lite/managed/');
+        const portablePath = isManaged && r.local_path.startsWith(home) ? '~' + r.local_path.slice(home.length) : (r.local_path || '');
+        let howToUse;
+        if (isManaged) {
+          const resolvedPath = portablePath.endsWith('.md') ? portablePath : `${portablePath}/SKILL.md`;
+          howToUse = `Read("${resolvedPath}") or mem_use(name="${r.name}"${r.type === 'agent' ? ', type="agent"' : ''})`;
+        } else if (r.invocation_name) {
+          howToUse = r.type === 'skill'
+            ? `Skill("${r.invocation_name}")`
+            : `Agent(subagent_type="${r.invocation_name}")`;
+        } else {
+          howToUse = `mem_use(name="${r.name}"${r.type === 'agent' ? ', type="agent"' : ''})`;
+        }
+        const pathLine = portablePath ? `\n    Path: ${portablePath}` : '';
+        out(`  ${badge} ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${categoryLabel} — ${truncate(r.capability_summary || '', 80)}${pathLine}\n    Use: ${howToUse}`);
       }
       return;
     }

@@ -8,7 +8,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 
 const REGISTRY_DB_PATH = join(homedir(), '.claude-mem-lite', 'resource-registry.db');
-const MANAGED_MARKER = '.claude-mem-lite/managed';
+const MANAGED_MARKER = '/.claude-mem-lite/managed/';
 
 try {
   // Skip if recursive hook
@@ -50,15 +50,11 @@ try {
 
     if (!row || !row.local_path) process.exit(0);
 
-    // Resolve SKILL.md path
+    // Resolve path: directory skills → SKILL.md (agents always have full .md paths)
     let skillPath = row.local_path;
     if (!skillPath.endsWith('.md')) {
-      for (const candidate of [
-        join(skillPath, 'SKILL.md'),
-        join(skillPath, 'AGENT.md'),
-      ]) {
-        if (existsSync(candidate)) { skillPath = candidate; break; }
-      }
+      const candidate = join(skillPath, 'SKILL.md');
+      if (existsSync(candidate)) skillPath = candidate;
     }
 
     if (!existsSync(skillPath)) process.exit(0);

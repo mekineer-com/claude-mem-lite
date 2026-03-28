@@ -11,6 +11,7 @@ import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcep
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema } from './tool-schemas.mjs';
 import { basename, join } from 'path';
+import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
@@ -1520,13 +1521,30 @@ server.registerTool(
       if (results.length === 0) {
         return { content: [{ type: 'text', text: `No matching resources for: "${args.query}"` }] };
       }
+      const home = homedir();
+      const toPortable = (p) => p && p.startsWith(home) ? '~' + p.slice(home.length) : (p || '');
       const lines = results.map(r => {
         const qualityBadge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
         const categoryLabel = r.category ? ` [${r.category}]` : '';
-        const howToUse = r.type === 'skill'
-          ? (r.invocation_name ? `mem_use(name="${r.name}") or Skill("${r.invocation_name}")` : `mem_use(name="${r.name}")`)
-          : `mem_use(name="${r.name}", type="agent") or Agent(subagent_type="${r.invocation_name || r.name}")`;
-        return `${qualityBadge} ${r.type === 'skill' ? 'S' : 'A'} **${r.name}**${categoryLabel} — ${truncate(r.capability_summary || '', 80)}\n  Use: ${howToUse}`;
+        const isManaged = r.local_path && r.local_path.includes('/.claude-mem-lite/managed/');
+        const portablePath = isManaged ? toPortable(r.local_path) : '';
+        let howToUse;
+        if (isManaged) {
+          // Managed: use Read(path) or mem_use — Skill() won't work for managed resources
+          // Agents always have complete .md paths (e.g., agents/group/agents/name.md)
+          // Only skills can be directory paths (9 cases) — resolve to /SKILL.md
+          const resolvedPath = portablePath.endsWith('.md') ? portablePath : `${portablePath}/SKILL.md`;
+          howToUse = `Read("${resolvedPath}") or mem_use(name="${r.name}"${r.type === 'agent' ? ', type="agent"' : ''})`;
+        } else if (r.invocation_name) {
+          // Native plugin/user skill: Skill() with full invocation name
+          howToUse = r.type === 'skill'
+            ? `Skill("${r.invocation_name}")`
+            : `Agent(subagent_type="${r.invocation_name}")`;
+        } else {
+          howToUse = `mem_use(name="${r.name}"${r.type === 'agent' ? ', type="agent"' : ''})`;
+        }
+        const pathLine = portablePath ? `\n  Path: ${portablePath}` : '';
+        return `${qualityBadge} ${r.type === 'skill' ? 'S' : 'A'} **${r.name}**${categoryLabel} — ${truncate(r.capability_summary || '', 80)}${pathLine}\n  Use: ${howToUse}`;
       });
       return { content: [{ type: 'text', text: `Found ${results.length} resource(s) for "${args.query}":\n\n${lines.join('\n\n')}` }] };
     }
@@ -1671,7 +1689,7 @@ server.registerTool(
   'mem_use',
   {
     description: 'Load and activate a skill or agent from the managed registry. '
-      + 'Returns the full SKILL.md/AGENT.md content for execution. '
+      + 'Returns the full skill/agent content for execution. '
       + 'Use when: you found a skill via mem_registry search and want to use it, '
       + 'or you know a managed skill/agent name and want to load its instructions.',
     inputSchema: memUseSchema,
@@ -1706,14 +1724,12 @@ server.registerTool(
       return { content: [{ type: 'text', text: `No ${type} found for "${name}". Try mem_registry(action="search", query="${name}") to browse.` }] };
     }
 
-    // 3. Resolve SKILL.md path
+    // 3. Resolve path: directory skills → SKILL.md (agents always have full .md paths)
     let skillPath = row.local_path || '';
     if (skillPath && !skillPath.endsWith('.md')) {
       for (const candidate of [
         join(skillPath, 'SKILL.md'),
-        join(skillPath, 'AGENT.md'),
         join(skillPath, `skills/${row.name}/SKILL.md`),
-        join(skillPath, `agents/${row.name}/AGENT.md`),
       ]) {
         if (existsSync(candidate)) { skillPath = candidate; break; }
       }
@@ -1726,7 +1742,7 @@ server.registerTool(
     } catch {
       const msg = skillPath.endsWith('.md')
         ? `Found ${type} "${row.name}" but cannot read file: ${skillPath}`
-        : `Found ${type} "${row.name}" but no SKILL.md or AGENT.md in: ${skillPath}`;
+        : `Found ${type} "${row.name}" but no .md file in: ${skillPath}`;
       return { content: [{ type: 'text', text: msg }], isError: true };
     }
 
@@ -1738,7 +1754,11 @@ server.registerTool(
       `).run(row.id, process.env.CLAUDE_SESSION_ID || 'unknown');
     } catch { /* non-critical */ }
 
-    return { content: [{ type: 'text', text: `<skill-loaded name="${row.name}" type="${row.type}">\n${content}\n</skill-loaded>\n\nFollow the instructions above to execute this ${row.type}.` }] };
+    const _home = homedir();
+    const portablePath = skillPath && skillPath.startsWith(_home) ? '~' + skillPath.slice(_home.length) : (skillPath || '');
+    const pathAttr = portablePath ? ` path="${portablePath}"` : '';
+    const reloadHint = portablePath ? ` Reload: Read("${portablePath}")` : '';
+    return { content: [{ type: 'text', text: `<skill-loaded name="${row.name}" type="${row.type}"${pathAttr}>\n${content}\n</skill-loaded>\n\nFollow the instructions above to execute this ${row.type}.${reloadHint}` }] };
   }),
 );
 

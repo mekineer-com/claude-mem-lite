@@ -49,20 +49,13 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 检查下我们插件上下文token占用情况
-
-### File Lessons
-- utils.mjs: Weak regex in command/function name parsers silently skip edge cases — catch with typed test fixtur… (#5588)
-- hook-llm.mjs: FTS5 column name mismatches silently trigger degraded mode without explicit error — need defensive … (#5571)
+Request: 提交代码
 
 ### Key Context
-- [bugfix] Error: schema.mjs: --- False positive test --- Old regex match: true… (#5624)
-- [bugfix] # Scenario 1: 模拟 session-start — 新描述会在 MCP instru… → === Scenario 1: Session St… (#5621)
-- [bugfix] Fix makeEntryDesc false-positive ERROR labeling + register missing PreToolUse h… (#5597)
-- [bugfix] Error: test.mjs: Error: Cannot find module better-sqlite3 at requi… (#5581)
-- [bugfix] Error: schema.mjs: mem Timeline (most recent 11): # 5547 🔴 24m ago … (#5563)
-
-### Working State (from /clear)
-- Working on: 检查下我们插件上下文token占用情况
+- [discovery] Database path constants absent from schema.mjs (#5656)
+- [refactor] Rename prompt-search-utils section header from file path to registry skill matc… (#5655)
+- [feature] Implement pre-skill-bridge hook with version sync validation (#5654)
+- [feature] Implement mem_use MCP tool with pattern-based design (#5652)
+- [discovery] Initial exploration of mem project structure and schema (#5645)
 
 </claude-mem-context>
