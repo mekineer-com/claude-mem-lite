@@ -1,7 +1,16 @@
-// claude-mem-lite: Registry importer — tree discovery, frontmatter parsing, keyword extraction
-// Used by importFromGitHub() (Task 5) to process GitHub repos into registry entries
+// claude-mem-lite: Registry importer — tree discovery, frontmatter parsing, keyword extraction, GitHub import pipeline
 // GitHub API helpers (parseGitHubUrl, buildTreeUrl, buildContentUrl, buildHeaders)
-// are in registry-github.mjs — imported by importFromGitHub when added.
+// are in registry-github.mjs.
+
+import { parseGitHubUrl, buildTreeUrl, buildContentUrl, buildRepoUrl, buildHeaders } from './registry-github.mjs';
+import { upsertResource } from './registry.mjs';
+import { debugLog } from './utils.mjs';
+import { createHash } from 'crypto';
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
+
+const MANAGED_DIR = join(homedir(), '.claude-mem-lite', 'managed');
 
 // ─── Tree Discovery ─────────────────────────────────────────────────────────
 
@@ -187,4 +196,145 @@ export function extractKeywords(content) {
   const domainTags = domains.join(' ');
 
   return { keywords, intentTags, domainTags };
+}
+
+// ─── GitHub Import Pipeline ─────────────────────────────────────────────────
+
+/**
+ * Import skills/agents from a GitHub URL into the registry.
+ * Stage 1 only — pure code, no LLM.
+ * @param {Database} db Registry database
+ * @param {string} url GitHub URL
+ * @param {object} opts Options
+ * @param {Function} opts.fetchFn Override fetch function (for testing)
+ * @param {string} opts.managedDir Override managed directory (for testing)
+ * @returns {Promise<Array<{ name: string, type: string, id: number }>>}
+ */
+export async function importFromGitHub(db, url, opts = {}) {
+  const fetchFn = opts.fetchFn || globalThis.fetch;
+  const managedDir = opts.managedDir || MANAGED_DIR;
+  const headers = buildHeaders();
+
+  // 1. Parse GitHub URL
+  const parsed = parseGitHubUrl(url);
+  if (!parsed) throw new Error('Invalid GitHub URL');
+  const { owner, repo, branch, path: pathFilter } = parsed;
+
+  // 2. Fetch repo metadata (stars, forks, updated_at)
+  const repoResp = await fetchFn(buildRepoUrl(owner, repo), { headers });
+  if (!repoResp.ok) {
+    if (repoResp.status === 404) throw new Error(`Repository not found: ${owner}/${repo}`);
+    if (repoResp.status === 403) throw new Error(`GitHub API rate limit exceeded`);
+    throw new Error(`GitHub API error: ${repoResp.status}`);
+  }
+  const repoMeta = await repoResp.json();
+  const repoStars = repoMeta.stargazers_count || 0;
+  const repoForks = repoMeta.forks_count || 0;
+  const repoUpdatedAt = repoMeta.updated_at || null;
+
+  // 3. Fetch file tree via GitHub API (recursive)
+  const treeResp = await fetchFn(buildTreeUrl(owner, repo, branch), { headers });
+  if (!treeResp.ok) {
+    if (treeResp.status === 404) throw new Error(`Branch not found: ${branch}`);
+    if (treeResp.status === 403) throw new Error(`GitHub API rate limit exceeded`);
+    throw new Error(`GitHub API error: ${treeResp.status}`);
+  }
+  const treeData = await treeResp.json();
+
+  // 4. Discover skills/agents from tree
+  const discovered = discoverFromTree(treeData, pathFilter);
+  if (discovered.length === 0) return [];
+
+  const repoUrl = `https://github.com/${owner}/${repo}`;
+  const results = [];
+
+  // 5. Process each discovered item
+  for (const item of discovered) {
+    try {
+      // 5a. Fetch content via raw GitHub URL
+      const contentUrl = buildContentUrl(owner, repo, branch, item.filePath);
+      const contentResp = await fetchFn(contentUrl, { headers });
+      if (!contentResp.ok) {
+        debugLog('WARN', 'importer', `Failed to fetch ${item.filePath}: ${contentResp.status}`);
+        continue;
+      }
+      const content = await contentResp.text();
+
+      // 5b. Parse frontmatter
+      const { frontmatter, body } = parseFrontmatter(content);
+
+      // Root skill naming: use frontmatter name if present, else repo name for root, else discovered name
+      const name = frontmatter.name || (item.name === 'root' ? repo : item.name);
+      const description = frontmatter.description || '';
+      const fullText = `${name} ${description} ${body}`;
+
+      // 5c. Extract keywords/intents/domains
+      const { keywords, intentTags, domainTags } = extractKeywords(fullText);
+
+      // 5d. SHA-256 hash for dedup
+      const fileHash = createHash('sha256').update(content).digest('hex');
+      const existing = db.prepare(
+        'SELECT file_hash FROM resources WHERE type = ? AND name = ?'
+      ).get(item.type, name);
+      if (existing && existing.file_hash === fileHash) {
+        debugLog('DEBUG', 'importer', `Skipping ${name} — unchanged`);
+        continue;
+      }
+
+      // 5e. Download to managed directory
+      const typeDir = item.type === 'agent' ? 'agents' : 'skills';
+      const destDir = join(managedDir, typeDir, name);
+      mkdirSync(destDir, { recursive: true });
+      const fileName = item.type === 'agent' ? 'AGENT.md' : 'SKILL.md';
+      writeFileSync(join(destDir, fileName), content, 'utf8');
+
+      // 5f. Upsert to registry DB
+      const resourceId = upsertResource(db, {
+        name,
+        type: item.type,
+        status: 'active',
+        source: 'github',
+        repo_url: repoUrl,
+        repo_stars: repoStars,
+        local_path: join(destDir, fileName),
+        file_hash: fileHash,
+        invocation_name: frontmatter['invocation-name'] || frontmatter.invocation_name || '',
+        intent_tags: intentTags,
+        domain_tags: domainTags,
+        action_type: frontmatter.action_type || frontmatter['action-type'] || '',
+        trigger_patterns: frontmatter.trigger_patterns || frontmatter['trigger-patterns'] || '',
+        capability_summary: description,
+        input_type: frontmatter.input_type || frontmatter['input-type'] || '',
+        output_type: frontmatter.output_type || frontmatter['output-type'] || '',
+        prerequisites: frontmatter.prerequisites || '{}',
+        keywords,
+        tech_stack: frontmatter.tech_stack || frontmatter['tech-stack'] || '',
+        use_cases: frontmatter.use_cases || frontmatter['use-cases'] || '',
+        complexity: frontmatter.complexity || 'intermediate',
+        quality_tier: 'community',
+        indexed_at: new Date().toISOString(),
+      });
+
+      // 5g. Update repo_forks and repo_updated_at (not in upsert SQL)
+      db.prepare(
+        'UPDATE resources SET repo_forks = ?, repo_updated_at = ?, quality_tier = ? WHERE id = ?'
+      ).run(repoForks, repoUpdatedAt, 'community', resourceId);
+
+      results.push({ name, type: item.type, id: resourceId });
+      debugLog('INFO', 'importer', `Imported ${item.type}:${name} (id=${resourceId})`);
+    } catch (err) {
+      debugLog('ERROR', 'importer', `Failed to import ${item.name}: ${err.message}`);
+      // Skip individual failures, continue with next
+    }
+  }
+
+  // 6. Rebuild FTS5 index
+  try {
+    db.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
+  } catch (err) {
+    debugLog('WARN', 'importer', `FTS rebuild failed: ${err.message}`);
+  }
+
+  // 7. Return imported resources
+  return results;
 }
