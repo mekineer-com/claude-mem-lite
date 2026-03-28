@@ -1524,8 +1524,8 @@ server.registerTool(
         const qualityBadge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
         const categoryLabel = r.category ? ` [${r.category}]` : '';
         const howToUse = r.type === 'skill'
-          ? (r.invocation_name ? `Skill tool: skill="${r.invocation_name}"` : `Community skill: ${r.name}`)
-          : `Agent tool: subagent_type="${r.invocation_name || r.name}"`;
+          ? (r.invocation_name ? `mem_use(name="${r.name}") or Skill("${r.invocation_name}")` : `mem_use(name="${r.name}")`)
+          : `mem_use(name="${r.name}", type="agent") or Agent(subagent_type="${r.invocation_name || r.name}")`;
         return `${qualityBadge} ${r.type === 'skill' ? 'S' : 'A'} **${r.name}**${categoryLabel} — ${truncate(r.capability_summary || '', 80)}\n  Use: ${howToUse}`;
       });
       return { content: [{ type: 'text', text: `Found ${results.length} resource(s) for "${args.query}":\n\n${lines.join('\n\n')}` }] };
