@@ -9,8 +9,8 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema } from './tool-schemas.mjs';
-import { basename } from 'path';
+import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema } from './tool-schemas.mjs';
+import { basename, join } from 'path';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
@@ -21,7 +21,7 @@ const { version: PKG_VERSION } = require('./package.json');
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-import { rmSync } from 'fs';
+import { rmSync, existsSync, readFileSync } from 'fs';
 
 let db;
 try {
@@ -1608,6 +1608,80 @@ server.registerTool(
 
     return { content: [{ type: 'text', text: `Unknown action: ${action}. Valid: search, list, stats, import, remove, reindex` }], isError: true };
   })
+);
+
+// ─── Tool: mem_use ──────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_use',
+  {
+    description: 'Load and activate a skill or agent from the managed registry. '
+      + 'Returns the full SKILL.md/AGENT.md content for execution. '
+      + 'Use when: you found a skill via mem_registry search and want to use it, '
+      + 'or you know a managed skill/agent name and want to load its instructions.',
+    inputSchema: memUseSchema,
+  },
+  safeHandler(async (args) => {
+    const rdb = getRegistryDb();
+    if (!rdb) {
+      return { content: [{ type: 'text', text: 'Registry DB not available.' }], isError: true };
+    }
+
+    const name = args.name.trim();
+    const type = args.type || 'skill';
+
+    // 1. Exact match by name or invocation_name
+    let row = rdb.prepare(`
+      SELECT id, name, type, local_path, invocation_name, capability_summary
+      FROM resources
+      WHERE status = 'active' AND type = ?
+        AND (name = ? OR invocation_name = ?)
+      LIMIT 1
+    `).get(type, name, name);
+
+    // 2. Fuzzy fallback: FTS5 search, take top result
+    if (!row) {
+      const results = searchResources(rdb, name, { type, limit: 1 });
+      if (results.length > 0) {
+        row = rdb.prepare(`SELECT id, name, type, local_path, invocation_name, capability_summary FROM resources WHERE name = ? AND type = ?`).get(results[0].name, results[0].type);
+      }
+    }
+
+    if (!row) {
+      return { content: [{ type: 'text', text: `No ${type} found for "${name}". Try mem_registry(action="search", query="${name}") to browse.` }] };
+    }
+
+    // 3. Resolve SKILL.md path
+    let skillPath = row.local_path || '';
+    if (skillPath && !skillPath.endsWith('.md')) {
+      for (const candidate of [
+        join(skillPath, 'SKILL.md'),
+        join(skillPath, 'AGENT.md'),
+        join(skillPath, `skills/${row.name}/SKILL.md`),
+        join(skillPath, `agents/${row.name}/AGENT.md`),
+      ]) {
+        if (existsSync(candidate)) { skillPath = candidate; break; }
+      }
+    }
+
+    // 4. Read content
+    let content;
+    try {
+      content = readFileSync(skillPath, 'utf8');
+    } catch {
+      return { content: [{ type: 'text', text: `Found ${type} "${row.name}" but cannot read file: ${skillPath}` }], isError: true };
+    }
+
+    // 5. Record invocation
+    try {
+      rdb.prepare(`
+        INSERT INTO invocations (resource_id, session_id, trigger, adopted, outcome)
+        VALUES (?, ?, 'mem_use', 1, 'loaded')
+      `).run(row.id, process.env.CLAUDE_SESSION_ID || 'unknown');
+    } catch { /* non-critical */ }
+
+    return { content: [{ type: 'text', text: `<skill-loaded name="${row.name}" type="${row.type}">\n${content}\n</skill-loaded>\n\nFollow the instructions above to execute this ${row.type}.` }] };
+  }),
 );
 
 // ─── Tool: mem_update ────────────────────────────────────────────────────────
