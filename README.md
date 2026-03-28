@@ -90,6 +90,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 - **Cross-source normalization** -- `mem_search` normalizes scores across observations, sessions, and prompts before merging, preventing any source from dominating results
 - **Exponential recency decay** -- Type-differentiated half-lives (decisions: 90d, discoveries: 60d, bugfixes: 14d, changes: 7d) consistently applied in all ranking paths
 - **Prompt-time memory injection** -- UserPromptSubmit hook automatically searches and injects relevant past observations with recency and importance weighting
+- **Smart skill invocation** -- Auto-loaded and searched managed skills/agents include portable `~` paths with `Read()` guidance; native plugin skills recommend `Skill("full:name")`; prevents `Skill()` misuse for managed resources that aren't registered with Claude Code's native handler
 - **Dual injection dedup** -- `user-prompt-search.js` and `handleUserPrompt` coordinate via temp file to prevent duplicate memory injection
 - **Result-dedup cooldown** -- User-prompt memory injection uses result-overlap detection (>80% ID overlap → skip) instead of time-based cooldown, allowing topic switches within seconds while preventing redundant injections
 - **OR query fallback** -- When AND-joined FTS5 queries return zero results, automatically relaxes to OR-joined queries for broader recall (applied in both user-prompt-search and hook-memory paths)
@@ -154,7 +155,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem` server with 15 tools (search, recent, recall, timeline, get, save, update, stats, delete, compress, maintain, export, fts_check, browse, registry)
+2. **Register MCP server** -- `mem` server with 16 tools (search, recent, recall, timeline, get, save, update, stats, delete, compress, maintain, export, fts_check, browse, registry, use)
 3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
@@ -195,8 +196,8 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
     ep-flush-*.json      # Flushed episodes awaiting processing
     reads-<project>.txt  # Read file paths (collected on flush)
   managed/
-    skills/              # Standalone skills (flat layout)
-    agents/              # Agent plugins (nested: agents/*.md + skills/*/SKILL.md)
+    skills/              # Standalone skills: {name}/SKILL.md
+    agents/              # Agent plugins: {group}/agents/{name}.md + skills/*/SKILL.md
     repos/               # Shallow-cloned source repos
 ```
 
@@ -220,7 +221,8 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | `mem_export` | Export observations as JSON or JSONL for backup or migration. Filters by project, type, date range. |
 | `mem_fts_check` | Check FTS5 index integrity or rebuild indexes. Use when search results seem wrong or after DB recovery. |
 | `mem_browse` | Tier-grouped memory dashboard. Shows observations organized by memory tier (working/active/archive). |
-| `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. |
+| `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. Search results differentiate managed (Read path) vs native (Skill full name) invocation. |
+| `mem_use` | Load a skill or agent from the managed registry by name. Returns full content with portable `~` path for reload via `Read()`. |
 
 ### Skill Commands (in Claude Code chat)
 
@@ -323,6 +325,9 @@ UserPromptSubmit (two parallel paths)
   -> [user-prompt-search.js] Auto-search memory via FTS5 + active file context
   -> [user-prompt-search.js] Inject relevant past observations with recency/importance weighting
   -> [user-prompt-search.js] Write injected IDs to temp file for dedup
+  -> [user-prompt-search.js] L1 skill auto-load: match managed skill names in prompt
+     -> Load content with portable ~ path + Read() guidance
+     -> source="managed-skill|managed-agent", path="~/.claude-mem-lite/managed/..."
   -> [hook.mjs handleUserPrompt] Capture user prompt text to user_prompts table
   -> [hook.mjs handleUserPrompt] Increment session prompt counter
   -> [hook.mjs handleUserPrompt] Handoff: detect continuation intent → inject previous session context
@@ -346,6 +351,15 @@ Registry pipeline:
   -> registry-indexer.mjs indexes content into FTS5 with metadata
   -> registry-retriever.mjs provides BM25-ranked search with synonym expansion
   -> mem_registry MCP tool exposes search/list/stats/import/remove/reindex actions
+
+Smart invocation (three layers):
+  L1 auto-load: UserPromptSubmit matches managed skill name in prompt
+     -> Loads content with path="~/.claude-mem-lite/managed/.../SKILL.md"
+     -> Guides: Read("path") or mem_use(name="..."), never Skill()
+  L2 bridge: PreToolUse hook intercepts Skill("name") for managed resources
+     -> Outputs content, prevents native handler failure
+  L3 explicit: mem_use(name="...") loads full content with reload path
+  Search: managed resources → Read(path), native plugins → Skill("full:name")
 ```
 
 Composite scoring for search results: BM25 relevance (40%) + repo stars (15%) + success rate (15%) + adoption rate (10%) + freshness (10%) + exploration bonus (10%). Domain filtering ensures platform-specific resources (iOS, Go, Rust) only surface for matching projects.
@@ -466,7 +480,10 @@ claude-mem-lite/
   scripts/
     setup.sh           # Setup hook: npm install + migration (hidden dir + old dir)
     post-tool-use.sh   # Bash pre-filter: skips noise in ~5ms, tracks Read paths
-    user-prompt-search.js # UserPromptSubmit hook: auto-search memory on user prompts
+    user-prompt-search.js # UserPromptSubmit hook: auto-search memory + L1 skill auto-load
+    pre-skill-bridge.js  # PreToolUse hook: L2 skill bridge for managed resources
+    pre-tool-recall.js   # PreToolUse hook: file lesson recall before Edit/Write
+    prompt-search-utils.mjs # Shared logic: skip patterns, intent detection, name matching
     convert-commands.mjs # Converts command .md → SKILL.md in managed plugins
     index-managed.mjs  # Offline indexer for managed resources
   # Test & benchmark (dev only)

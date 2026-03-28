@@ -79,13 +79,11 @@
 - **原子写入** -- 所有文件写入（episode、CLAUDE.md）使用 write-to-tmp + rename 防止崩溃时损坏
 - **健壮锁机制** -- PID 感知的锁文件，自动清理过期（>30s）或孤儿（PID 已死）锁
 - **过期会话清理** -- 活跃超过 24 小时的会话在下次启动时自动标记为 abandoned
-- **智能调度** -- 三级渐进式调度系统，在 SessionStart、UserPromptSubmit、PreToolUse 三个时机自动推荐最合适的 skill 或 agent
-- **资源注册表** -- 对已安装的 skill 和 agent 建立 FTS5 索引，支持复合评分和调用追踪
+- **智能调用** -- 三层调用系统：L1 自动加载（UserPromptSubmit 匹配 skill 名注入内容 + `Read()` 路径），L2 Bridge（PreToolUse 拦截 `Skill()` 误调），L3 显式调用（`mem_use` MCP 工具）。managed 资源用 `Read("~/.claude-mem-lite/managed/.../SKILL.md")`，原生插件用 `Skill("full:name")`
+- **资源注册表** -- 对已安装的 skill 和 agent 建立 FTS5 索引，支持复合评分和调用追踪。搜索结果区分 managed（Read 路径）vs native（Skill 全名）调用方式
 - **统一资源发现** -- 共享文件系统遍历层（`resource-discovery.mjs`），运行时扫描器和离线索引器共用，支持扁平目录、插件嵌套和松散 `.md` 文件
-- **闭环反馈** -- 追踪推荐是否被采纳、会话是否成功，持续改进调度质量
-- **双语意图识别** -- 同时理解中文和英文用户意图（15+ 英文 + 12+ 中文意图类别）
-- **领域同义词扩展** -- 调度查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
-- **持久化冷却机制** -- 5 分钟跨会话冷却 + 同会话去重，避免重复推荐
+- **领域同义词扩展** -- 注册表搜索查询自动扩展领域同义词（如 "修复" → fix, debug, bugfix, repair, error）
+- **持久化冷却机制** -- 5 分钟跨会话冷却 + 同会话去重，避免重复推荐 skill 自动加载
 - **双模式 LLM 调用** -- 自动检测 `ANTHROPIC_API_KEY` 直连 API；无 key 时回退到 `claude -p` CLI
 - **Haiku 熔断器** -- 连续 3 次 LLM 失败后，禁用 Haiku 调度 5 分钟，防止级联延迟
 - **否定意图感知** -- 正确处理 "不要测试了，先修 bug" 等复杂提示，排除被否定的意图，支持中英文混合输入
@@ -185,8 +183,8 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
     ep-flush-*.json      # 已刷新的 episode，等待处理
     reads-<project>.txt  # Read 文件路径（刷新时收集）
   managed/
-    skills/              # 独立 skill（扁平布局）
-    agents/              # Agent 插件（嵌套：agents/*.md + skills/*/SKILL.md）
+    skills/              # 独立 skill：{name}/SKILL.md
+    agents/              # Agent 插件：{group}/agents/{name}.md + skills/*/SKILL.md
     repos/               # 浅克隆的源代码仓库
 ```
 
@@ -210,7 +208,8 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 | `mem_export` | 导出观察为 JSON 或 JSONL 格式，支持按项目、类型、日期范围过滤。 |
 | `mem_fts_check` | 检查 FTS5 索引完整性或重建索引。搜索结果异常或数据库恢复后使用。 |
 | `mem_browse` | 分层记忆仪表盘。按记忆层级（working/active/archive）分组展示观察。 |
-| `mem_registry` | 管理资源注册表：按需搜索技能/代理、列表、统计、导入/移除、重索引。 |
+| `mem_registry` | 管理资源注册表：按需搜索技能/代理、列表、统计、导入/移除、重索引。搜索结果区分 managed（Read 路径）和 native（Skill 全名）调用方式。 |
+| `mem_use` | 从 managed 注册表加载 skill 或 agent。返回完整内容 + `~` 便携路径供 `Read()` 重载。 |
 
 ### 技能命令（在 Claude Code 聊天中使用）
 
@@ -280,7 +279,6 @@ SessionStart
   -> 清理孤儿/过期锁文件
   -> 查询最近观察（24 小时内）
   -> 注入上下文到 CLAUDE.md + 标准输出
-  -> 调度：根据用户提示推荐 skill/agent（Tier 0→1→2→3）
 
 PostToolUse（每次工具执行）
   -> Bash 预过滤器 ~5ms 跳过噪声（Read 路径追踪到 reads 文件）
@@ -293,74 +291,57 @@ PostToolUse（每次工具执行）
   -> 错误触发回忆：搜索记忆中相关的历史修复
 
 PreToolUse（工具执行前）
-  -> 调度：根据当前操作上下文推荐 skill/agent（Tier 0→1→2）
+  -> L2 Skill Bridge：拦截对 managed 资源的 Skill() 调用
+     -> 匹配 managed 路径 → 输出内容 + mem_use() 提示
+     -> 未匹配 → 静默放行到原生 handler
 
-UserPromptSubmit
-  -> 捕获用户提示文本到 user_prompts 表
-  -> 递增会话提示计数器
-  -> 交接：检测继续意图 → 注入上一次会话上下文
-  -> 调度：根据用户实际提示推荐 skill/agent（Tier 0→1→2）
-  -> 主要调度触发点 — 用户意图在此最为明确
+UserPromptSubmit（两个并行路径）
+  -> [user-prompt-search.js] 通过 FTS5 + 活跃文件上下文自动搜索记忆
+  -> [user-prompt-search.js] 注入相关历史观察（按时效和重要性加权）
+  -> [user-prompt-search.js] L1 Skill 自动加载：匹配 prompt 中的 managed skill 名
+     -> 加载内容 + 便携 ~ 路径 + Read() 调用指引
+     -> source="managed-skill|managed-agent", path="~/.claude-mem-lite/managed/..."
+  -> [hook.mjs] 捕获用户提示文本到 user_prompts 表
+  -> [hook.mjs] 递增会话提示计数器
+  -> [hook.mjs] 交接：检测继续意图 → 注入上一次会话上下文
+  -> [hook.mjs] 语义记忆注入（hook-memory.mjs），通过临时文件去重
 
 Stop
   -> 刷新最终 episode 缓冲区
   -> 保存交接快照（/exit 时）
-  -> 收集调度反馈：采纳检测 + 结果评分
   -> 标记会话为已完成
   -> 启动 LLM 摘要 worker（轮询等待）
 ```
 
-### 智能调度系统
+### 智能调用系统
 
-调度系统在编码会话中主动推荐合适的 skill 和 agent，采用三级渐进式架构：
+三层调用系统确保 managed 资源（`~/.claude-mem-lite/managed/` 中的 skill 和 agent）能被正确调用：
 
 ```
-Tier 0：快速过滤（<1ms）
-  -> 跳过只读工具（Read、Glob、Grep、LSP...）
-  -> 跳过简单 Bash 查询（ls、cat、git status...）
-  -> 跳过 Claude 已选择 Skill 或 Task agent 的情况
-  -> 跳过 MCP 内部工具
+L1 自动加载（UserPromptSubmit，<50ms）
+  -> 匹配 prompt 中的 managed skill/agent 名称
+  -> 加载 SKILL.md / {name}.md 内容
+  -> 输出：Read("~/.claude-mem-lite/managed/.../path.md") 调用指引
+  -> 截断时提供 mem_use(name="...") 备选
 
-Tier 1：上下文信号提取（<1ms）
-  -> 意图：从用户提示提取（测试、修复、部署、审查...）
-  -> 技术栈：从最近文件扩展名推断（.ts → typescript）
-  -> 动作：从工具名推断（Edit → edit, Bash+jest → test）
-  -> 错误领域：分类错误（type-error, test-fail, build-fail...）
+L2 Bridge（PreToolUse Skill hook，<30ms）
+  -> 拦截 Skill("name") 调用，查询 managed 注册表
+  -> 匹配到 → 输出内容 + mem_use() 提示（防止原生 handler 报错）
+  -> 未匹配 → 放行到原生 Skill handler
 
-Tier 2：FTS5 检索（<5ms）
-  -> 用领域同义词扩展信号（15+ 英文、12+ 中文类别）
-  -> BM25 排名搜索资源注册表
-  -> 复合评分：BM25（40%）+ 仓库星标（15%）+ 成功率（15%）+ 采纳率（10%）
-
-Tier 3：Haiku 语义调度（~500ms，仅 SessionStart）
-  -> 当 FTS5 置信度低或前几名结果分数接近时激活
-  -> LLM 生成语义搜索查询以精细化检索
-  -> PreToolUse 禁用（2 秒 hook 超时不够）
+L3 显式调用（mem_use MCP 工具）
+  -> 按名称精确匹配 + FTS5 模糊回退
+  -> 返回完整内容 + 便携路径供 Read() 重载
 ```
 
-**调度触发点：**
+**调用方式区分：**
 
-| Hook | 时间预算 | 层级 | 用途 |
-|------|---------|------|------|
-| SessionStart | 10s | 0→1→2→3 | 分析上次会话的 next_steps，提前推荐 skill/agent |
-| UserPromptSubmit | 2s | 0→1→2 | 主要调度触发点 — 用户实际提示意图最明确 |
-| PreToolUse | 2s | 0→1→2 | 根据当前操作上下文实时推荐 |
-
-**反馈闭环（Stop hook）：**
-
-会话结束时，系统回顾本次会话中所有推荐：
-- **采纳检测** -- Claude 是否实际使用了推荐的 skill（`Skill` 工具）或 agent（`Task` 工具）？
-- **结果检测** -- 会话是否成功（有编辑无报错）、部分成功（报错后修复）、还是失败？
-- **评分计算** -- 采纳 + 成功 = 1.0，采纳 + 部分 = 0.5，采纳 + 失败 = 0.2
-- 统计数据回流到复合评分，持续改进调度质量
-
-**注入模板：**
-
-| 资源类型 | 位置 | 模板 |
-|---------|------|------|
-| Skill | `~/.claude/skills/`（原生） | 简短提示：使用 `/skill <name>` |
-| Skill | 托管目录 | 注入完整 skill 内容（最大 3KB） |
-| Agent | 任意 | 注入 agent 定义，用于 `Task` 工具委托 |
+| 资源类型 | 位置 | 调用方式 |
+|---------|------|---------|
+| Managed skill | `~/.claude-mem-lite/managed/skills/` | `Read("~/.../SKILL.md")` 或 `mem_use(name="...")` |
+| Managed agent | `~/.claude-mem-lite/managed/agents/` | `Read("~/.../{name}.md")` 或 `mem_use(name="...", type="agent")` |
+| 原生插件 skill | `~/.claude/plugins/cache/` | `Skill("plugin:skill-name")` |
+| 用户自建 skill | `~/.claude/skills/` | `Skill("name")` |
 
 ### Episode 编码
 
@@ -464,7 +445,6 @@ claude-mem-lite/
   # 智能调度
   dispatch.mjs         # 三级调度编排：快速过滤、上下文信号、FTS5、Haiku
   dispatch-inject.mjs  # 注入模板渲染：skill/agent 推荐
-  dispatch-feedback.mjs # 闭环反馈：采纳检测、结果追踪
   registry.mjs         # 资源注册表 DB：schema、CRUD、FTS5、调用追踪
   registry-retriever.mjs # FTS5 检索：同义词扩展与复合评分
   registry-scanner.mjs # 文件系统扫描器：读取内容 + 哈希，委托发现层
@@ -477,6 +457,10 @@ claude-mem-lite/
   scripts/
     setup.sh           # Setup 钩子：npm install + 迁移（隐藏目录 + 旧目录）
     post-tool-use.sh   # Bash 预过滤器：~5ms 跳过噪声，追踪 Read 路径
+    user-prompt-search.js # UserPromptSubmit 钩子：自动搜索记忆 + L1 skill 自动加载
+    pre-skill-bridge.js  # PreToolUse 钩子：L2 managed skill 桥接
+    pre-tool-recall.js   # PreToolUse 钩子：Edit/Write 前文件教训回忆
+    prompt-search-utils.mjs # 共享逻辑：跳过模式、意图检测、名称匹配
     convert-commands.mjs # 将 command .md 转换为托管插件中的 SKILL.md
     index-managed.mjs  # 托管资源离线索引器
   # 测试和基准（仅开发）

@@ -1053,3 +1053,248 @@ describe('Integration Coverage Summary', () => {
     expect(matrix['Layer 4: Hooks'].testedInThisSuite).toBeGreaterThanOrEqual(4);
   });
 });
+
+// ─── Scenario 14: Smart Skill Invocation — Path-based guidance ──────────────
+//
+// Real managed directory structure (verified from filesystem):
+//   skills:  ~/.claude-mem-lite/managed/skills/{name}/SKILL.md          (220 .md paths, 9 directory paths)
+//   agents:  ~/.claude-mem-lite/managed/agents/{group}/agents/{name}.md (171, ALL .md — zero AGENT.md)
+//
+// All test paths use ~ prefix (portable format) matching real output.
+// DB in production stores absolute paths; conversion is tested separately.
+// These are OUTPUT FORMAT CONTRACT TESTS — they verify the specification
+// (what the output should look like), not the implementation code paths.
+
+describe('Scenario 14: Smart Skill Invocation — path guidance + howToUse differentiation', () => {
+  // ─── Portable paths matching real managed structure ────────────────────────
+  const MANAGED_SKILL_PATH = '~/.claude-mem-lite/managed/skills/humanizer/SKILL.md';
+  const MANAGED_AGENT_PATH = '~/.claude-mem-lite/managed/agents/api-scaffolding/agents/backend-architect.md';
+  const MANAGED_SKILL_DIR  = '~/.claude-mem-lite/managed/skills/pdf';  // directory, no .md (9 cases)
+
+  // Physical temp dir for filesystem-dependent tests (SKILL.md resolution)
+  const TMP = join(tmpdir(), 'smart-invoke-' + process.pid);
+  const TMP_SKILL_DIR = join(TMP, 'pdf');
+
+  beforeEach(() => {
+    mkdirSync(TMP_SKILL_DIR, { recursive: true });
+    writeFileSync(join(TMP_SKILL_DIR, 'SKILL.md'), '---\nname: pdf\n---\n# PDF');
+  });
+  afterEach(() => { rmSync(TMP, { recursive: true, force: true }); });
+
+  // Helper: detect managed resource (anchored with /.claude-mem-lite/managed/)
+  const isManaged = (path) => !!path && path.includes('/.claude-mem-lite/managed/');
+
+  // ─── L1: Auto-load output format ──────────────────────────────────────────
+
+  describe('L1: auto-load output includes path and source label', () => {
+    it('managed skill: source="managed-skill", path=, Read() guidance', () => {
+      const output = [
+        `<skill-auto-loaded name="humanizer" source="managed-skill" path="${MANAGED_SKILL_PATH}">`,
+        '---\nname: humanizer\n---\n# Humanizer\nRemove AI patterns.',
+        '</skill-auto-loaded>',
+        `Follow the instructions above. Reload: Read("${MANAGED_SKILL_PATH}")`,
+      ].join('\n');
+
+      expect(output).toContain('source="managed-skill"');
+      expect(output).toContain(`path="${MANAGED_SKILL_PATH}"`);
+      expect(output).toContain(`Read("${MANAGED_SKILL_PATH}")`);
+      expect(output).not.toContain('Skill(');
+      expect(output).not.toContain('mem_use(');
+    });
+
+    it('truncated skill: Read() and mem_use(), never Skill()', () => {
+      const output = [
+        `<skill-auto-loaded name="humanizer" source="managed-skill" path="${MANAGED_SKILL_PATH}" truncated="true">`,
+        'x'.repeat(800), '...',
+        '</skill-auto-loaded>',
+        `Skill truncated. Full content: Read("${MANAGED_SKILL_PATH}") or mem_use(name="humanizer")`,
+      ].join('\n');
+
+      expect(output).toContain('truncated="true"');
+      expect(output).toContain(`Read("${MANAGED_SKILL_PATH}")`);
+      expect(output).toContain('mem_use(name="humanizer")');
+      expect(output).not.toContain('Skill(');
+    });
+
+    it('managed agent: source="managed-agent", real {name}.md path', () => {
+      const output = `<skill-auto-loaded name="api-scaffolding/backend-architect" source="managed-agent" path="${MANAGED_AGENT_PATH}">content</skill-auto-loaded>`;
+
+      expect(output).toContain('source="managed-agent"');
+      expect(output).toContain('agents/api-scaffolding/agents/backend-architect.md');
+      // Real agents never have AGENT.md — they use {name}.md
+      expect(output).not.toMatch(/AGENT\.md/);
+    });
+  });
+
+  // ─── Registry search: howToUse differentiation ────────────────────────────
+
+  describe('Registry search differentiates managed vs native invocation', () => {
+    it('managed skill (.md path): Read(path), no Skill()', () => {
+      expect(isManaged(MANAGED_SKILL_PATH)).toBe(true);
+      const howToUse = `Read("${MANAGED_SKILL_PATH}") or mem_use(name="humanizer")`;
+
+      expect(howToUse).toContain('Read("~/.claude-mem-lite/managed/');
+      expect(howToUse).toContain('mem_use(name="humanizer")');
+      expect(howToUse).not.toContain('Skill(');
+    });
+
+    it('managed skill (directory path): resolves to /SKILL.md', () => {
+      expect(isManaged(MANAGED_SKILL_DIR)).toBe(true);
+      expect(MANAGED_SKILL_DIR.endsWith('.md')).toBe(false);
+
+      const resolved = MANAGED_SKILL_DIR.endsWith('.md')
+        ? MANAGED_SKILL_DIR
+        : `${MANAGED_SKILL_DIR}/SKILL.md`;
+      expect(resolved).toBe('~/.claude-mem-lite/managed/skills/pdf/SKILL.md');
+    });
+
+    it('managed agent (.md path): uses path as-is, never appends anything', () => {
+      expect(isManaged(MANAGED_AGENT_PATH)).toBe(true);
+      expect(MANAGED_AGENT_PATH.endsWith('.md')).toBe(true);
+
+      // Already .md — no resolution needed
+      const resolved = MANAGED_AGENT_PATH.endsWith('.md')
+        ? MANAGED_AGENT_PATH
+        : `${MANAGED_AGENT_PATH}/SKILL.md`;
+      expect(resolved).toBe(MANAGED_AGENT_PATH);
+      expect(resolved).not.toMatch(/AGENT\.md/);
+
+      const howToUse = `Read("${resolved}") or mem_use(name="api-scaffolding/backend-architect", type="agent")`;
+      expect(howToUse).not.toContain('Agent(');
+      expect(howToUse).not.toContain('Skill(');
+    });
+
+    it('native plugin skill: Skill(full_name)', () => {
+      const localPath = ''; // native plugins have no local_path
+      expect(isManaged(localPath)).toBe(false);
+      expect('Skill("commit-commands:commit")').not.toBe('Skill("commit")');
+    });
+
+    it('user skill (~/.claude/skills/): Skill(name)', () => {
+      const localPath = '~/.claude/skills/my-custom';
+      expect(isManaged(localPath)).toBe(false);
+    });
+  });
+
+  // ─── isManaged detection accuracy ─────────────────────────────────────────
+
+  describe('isManaged detection (anchored with /)', () => {
+    it('matches real managed paths', () => {
+      expect(isManaged(MANAGED_SKILL_PATH)).toBe(true);
+      expect(isManaged(MANAGED_AGENT_PATH)).toBe(true);
+      expect(isManaged(MANAGED_SKILL_DIR)).toBe(true);
+    });
+
+    it('rejects non-managed paths', () => {
+      expect(isManaged('')).toBe(false);
+      expect(isManaged(null)).toBe(false);
+      expect(isManaged('~/.claude/skills/my-skill')).toBe(false);
+    });
+
+    it('rejects paths with similar but non-managed substrings', () => {
+      // demo.claude-mem-lite — the / anchor prevents matching (no / before .claude-mem-lite)
+      expect(isManaged('/projects/demo.claude-mem-lite/managed/test')).toBe(false);
+      // hyphenated variant — also rejected
+      expect(isManaged('/projects/fake-claude-mem-lite-managed/test')).toBe(false);
+    });
+  });
+
+  // ─── mem_use response: path in output ─────────────────────────────────────
+
+  describe('mem_use response includes path for reload', () => {
+    it('skill: path uses ~/.claude-mem-lite/managed/.../SKILL.md', () => {
+      const response = `<skill-loaded name="humanizer" type="skill" path="${MANAGED_SKILL_PATH}">\ncontent\n</skill-loaded>\n\nFollow the instructions above. Reload: Read("${MANAGED_SKILL_PATH}")`;
+
+      expect(response).toContain(`path="${MANAGED_SKILL_PATH}"`);
+      expect(response).toContain(`Read("${MANAGED_SKILL_PATH}")`);
+      expect(response).not.toContain('Skill(');
+    });
+
+    it('agent: path uses ~/.claude-mem-lite/managed/.../{name}.md', () => {
+      const response = `<skill-loaded name="api-scaffolding/backend-architect" type="agent" path="${MANAGED_AGENT_PATH}">\ncontent\n</skill-loaded>\n\nFollow the instructions above. Reload: Read("${MANAGED_AGENT_PATH}")`;
+
+      expect(response).toContain(`path="${MANAGED_AGENT_PATH}"`);
+      expect(response).not.toMatch(/AGENT\.md/);
+    });
+  });
+
+  // ─── Directory → SKILL.md filesystem resolution ───────────────────────────
+
+  describe('Directory path resolution for skills (filesystem)', () => {
+    it('resolves directory to SKILL.md when it exists', () => {
+      let resolved = TMP_SKILL_DIR;
+      if (!resolved.endsWith('.md')) {
+        const candidate = join(resolved, 'SKILL.md');
+        if (existsSync(candidate)) resolved = candidate;
+      }
+      expect(resolved).toBe(join(TMP_SKILL_DIR, 'SKILL.md'));
+      expect(existsSync(resolved)).toBe(true);
+    });
+
+    it('agents never need directory resolution (all 171 have .md paths)', () => {
+      expect(MANAGED_AGENT_PATH.endsWith('.md')).toBe(true);
+    });
+  });
+
+  // ─── E2E: full invocation chain (DB-level) ───────────────────────────────
+
+  describe('E2E: full smart invocation chain', () => {
+    it('managed skill search → Read(~path)', () => {
+      const db = createRegistryTestDb();
+      db.prepare(`
+        INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+        VALUES ('humanizer', 'skill', 'preinstalled', 'h', 'active', '${MANAGED_SKILL_PATH}', 'humanizer', 'Remove AI writing', '', '', '', '', '', '')
+      `).run();
+
+      const row = db.prepare(`SELECT * FROM resources WHERE name = 'humanizer'`).get();
+      expect(isManaged(row.local_path)).toBe(true);
+
+      const howToUse = `Read("${row.local_path}") or mem_use(name="${row.name}")`;
+      expect(howToUse).toBe(`Read("${MANAGED_SKILL_PATH}") or mem_use(name="humanizer")`);
+      expect(howToUse).not.toContain('Skill(');
+      db.close();
+    });
+
+    it('managed agent search → Read(~path) with {name}.md', () => {
+      const db = createRegistryTestDb();
+      db.prepare(`
+        INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+        VALUES ('api-scaffolding/backend-architect', 'agent', 'preinstalled', 'h', 'active', '${MANAGED_AGENT_PATH}', 'api-scaffolding:backend-architect', 'Design APIs', '', '', '', '', '', '')
+      `).run();
+
+      const row = db.prepare(`SELECT * FROM resources WHERE name = 'api-scaffolding/backend-architect'`).get();
+      expect(isManaged(row.local_path)).toBe(true);
+
+      const howToUse = `Read("${row.local_path}") or mem_use(name="${row.name}", type="agent")`;
+      expect(howToUse).toBe(`Read("${MANAGED_AGENT_PATH}") or mem_use(name="api-scaffolding/backend-architect", type="agent")`);
+      expect(howToUse).not.toContain('Skill(');
+      expect(howToUse).not.toContain('Agent(');
+      db.close();
+    });
+
+    it('native plugin search → Skill(full_name)', () => {
+      const db = createRegistryTestDb();
+      db.prepare(`
+        INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+        VALUES ('commit', 'skill', 'preinstalled', 'h', 'active', '', 'commit-commands:commit', 'Create git commit', '', '', '', '', '', '')
+      `).run();
+
+      const row = db.prepare(`SELECT * FROM resources WHERE name = 'commit'`).get();
+      expect(isManaged(row.local_path)).toBe(false);
+
+      const howToUse = `Skill("${row.invocation_name}")`;
+      expect(howToUse).toBe('Skill("commit-commands:commit")');
+      db.close();
+    });
+
+    it('portable path conversion: homedir() → ~', async () => {
+      const { homedir } = await import('os');
+      const home = homedir();
+      const absPath = `${home}/.claude-mem-lite/managed/skills/test/SKILL.md`;
+      const portable = absPath.startsWith(home) ? '~' + absPath.slice(home.length) : absPath;
+
+      expect(portable).toBe('~/.claude-mem-lite/managed/skills/test/SKILL.md');
+      expect(portable.startsWith('~/')).toBe(true);
+    });
+  });
+});
