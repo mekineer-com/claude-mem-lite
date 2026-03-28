@@ -984,6 +984,41 @@ describe('Scenario 12: Skill Auto-Dispatch — L1 name match + L2 bridge + L3 me
   });
 });
 
+describe('Scenario 13: Smart Import Pipeline — GitHub URL to registry', () => {
+  it('Stage 1: discoverFromTree finds skills in all layouts', async () => {
+    const { discoverFromTree } = await import('../registry-importer.mjs');
+    const tree = {
+      tree: [
+        { path: 'skills/foo/SKILL.md', type: 'blob' },
+        { path: 'agents/bar/AGENT.md', type: 'blob' },
+        { path: 'SKILL.md', type: 'blob' },
+      ],
+    };
+    const results = discoverFromTree(tree, '');
+    expect(results.length).toBe(3);
+    expect(results.map(r => r.type)).toContain('skill');
+    expect(results.map(r => r.type)).toContain('agent');
+  });
+
+  it('Stage 1: parseFrontmatter extracts name and description', async () => {
+    const { parseFrontmatter } = await import('../registry-importer.mjs');
+    const { frontmatter } = parseFrontmatter('---\nname: test\ndescription: |\n  A test skill for testing\n---\n# Body');
+    expect(frontmatter.name).toBe('test');
+    expect(frontmatter.description).toContain('test skill');
+  });
+
+  it('Stage 2: applyEnrichment fills empty fields only', async () => {
+    const { applyEnrichment } = await import('../registry-enricher.mjs');
+    const db = createRegistryTestDb();
+    db.prepare(`INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack) VALUES ('x', 'skill', 'github', 'h', 'active', '/tmp', 'x', 'existing', '', '', '', '', '', '')`).run();
+    applyEnrichment(db, 'x', 'skill', { capability_summary: 'new', intent_tags: 'new', quality_assessment: { has_clear_instructions: true, specificity: 'high' } });
+    const row = db.prepare("SELECT * FROM resources WHERE name = 'x'").get();
+    expect(row.capability_summary).toBe('existing'); // not overwritten
+    expect(row.intent_tags).toBe('new'); // was empty, now filled
+    db.close();
+  });
+});
+
 // ─── Coverage Summary ───────────────────────────────────────────────────────
 
 describe('Integration Coverage Summary', () => {
