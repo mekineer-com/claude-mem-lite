@@ -278,8 +278,8 @@ describe('CLI E2E: get', () => {
   });
 
   it('handles non-existent ID gracefully', () => {
-    const { stdout } = runCli(['get', '999999']);
-    expect(stdout).toContain('No observations found');
+    const { stderr } = runCli(['get', '999999']);
+    expect(stderr).toContain('No observations found');
   });
 });
 
@@ -392,8 +392,8 @@ describe('CLI E2E: save', () => {
   });
 
   it('rejects invalid type', () => {
-    const { stdout, exitCode } = runCli(['save', 'test content', '--type', 'invalid_type']);
-    expect(stdout).toContain('Invalid type');
+    const { stderr, exitCode } = runCli(['save', 'test content', '--type', 'invalid_type']);
+    expect(stderr).toContain('Invalid type');
     expect(exitCode).toBe(1); // validation error sets exit code 1
   });
 });
@@ -449,8 +449,8 @@ describe('CLI E2E: help and errors', () => {
   it('reports unknown command', () => {
     // Direct CLI commands only — 'unknown_cmd' is not in CLI_COMMANDS set
     // so it routes to install.mjs which handles it
-    const { stdout } = runCli(['search']); // search without query
-    expect(stdout).toContain('Usage');
+    const { stderr } = runCli(['search']); // search without query
+    expect(stderr).toContain('Usage');
   });
 });
 

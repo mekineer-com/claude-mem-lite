@@ -214,7 +214,7 @@ async function downloadAndInstall(tarballUrl) {
 
     // Download tarball via curl (available on all supported platforms)
     // Validate URL to prevent command injection via crafted tarball URLs
-    if (!/^https:\/\/[a-zA-Z0-9./-]+$/.test(tarballUrl)) {
+    if (!/^https:\/\/(?:api\.)?github\.com\/[a-zA-Z0-9./_-]+$/.test(tarballUrl)) {
       debugLog('WARN', 'hook-update', `Rejected suspicious tarball URL: ${tarballUrl}`);
       return false;
     }

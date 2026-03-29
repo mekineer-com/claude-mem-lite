@@ -200,23 +200,26 @@ export function ensureRegistryDb(dbPath) {
     const resSchema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='resources'`).get();
     if (resSchema?.sql && !resSchema.sql.includes("'github'")) {
       db.pragma('foreign_keys = OFF');
-      db.transaction(() => {
-        const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_old'`).get();
-        if (hasOld) db.exec(`DROP TABLE resources_old`);
-        // Drop FTS triggers first (reference resources table)
-        db.exec(`DROP TRIGGER IF EXISTS res_fts_insert`);
-        db.exec(`DROP TRIGGER IF EXISTS res_fts_update`);
-        db.exec(`DROP TRIGGER IF EXISTS res_fts_delete`);
-        db.exec(`ALTER TABLE resources RENAME TO resources_old`);
-        db.exec(RESOURCES_SCHEMA);
-        // Copy all existing data
-        const cols = db.prepare("PRAGMA table_info(resources_old)").all().map(c => c.name);
-        const newCols = new Set(db.prepare("PRAGMA table_info(resources)").all().map(c => c.name));
-        const common = cols.filter(c => newCols.has(c)).join(', ');
-        db.exec(`INSERT INTO resources (${common}) SELECT ${common} FROM resources_old`);
-        db.exec(`DROP TABLE resources_old`);
-      })();
-      db.pragma('foreign_keys = ON');
+      try {
+        db.transaction(() => {
+          const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_old'`).get();
+          if (hasOld) db.exec(`DROP TABLE resources_old`);
+          // Drop FTS triggers first (reference resources table)
+          db.exec(`DROP TRIGGER IF EXISTS res_fts_insert`);
+          db.exec(`DROP TRIGGER IF EXISTS res_fts_update`);
+          db.exec(`DROP TRIGGER IF EXISTS res_fts_delete`);
+          db.exec(`ALTER TABLE resources RENAME TO resources_old`);
+          db.exec(RESOURCES_SCHEMA);
+          // Copy all existing data
+          const cols = db.prepare("PRAGMA table_info(resources_old)").all().map(c => c.name);
+          const newCols = new Set(db.prepare("PRAGMA table_info(resources)").all().map(c => c.name));
+          const common = cols.filter(c => newCols.has(c)).join(', ');
+          db.exec(`INSERT INTO resources (${common}) SELECT ${common} FROM resources_old`);
+          db.exec(`DROP TABLE resources_old`);
+        })();
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
     }
   } catch (e) { debugCatch(e, 'resources-source-check-migration'); }
 

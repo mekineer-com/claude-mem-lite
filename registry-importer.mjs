@@ -4,7 +4,7 @@
 
 import { parseGitHubUrl, buildTreeUrl, buildContentUrl, buildRepoUrl, buildHeaders } from './registry-github.mjs';
 import { upsertResource } from './registry.mjs';
-import { debugLog } from './utils.mjs';
+import { debugLog, isPathConfined } from './utils.mjs';
 import { createHash } from 'crypto';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
@@ -276,7 +276,14 @@ export async function importFromGitHub(db, url, opts = {}) {
       const { frontmatter, body } = parseFrontmatter(content);
 
       // Root skill naming: use frontmatter name if present, else repo name for root, else discovered name
-      const name = frontmatter.name || (item.name === 'root' ? repo : item.name);
+      const rawName = frontmatter.name || (item.name === 'root' ? repo : item.name);
+      const name = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      // Path traversal guard: reject names that would escape managed directory
+      const typeDir = item.type === 'agent' ? 'agents' : 'skills';
+      if (!isPathConfined(join(managedDir, typeDir, name), managedDir)) {
+        debugLog('WARN', 'importer', `Rejected path-traversal name: ${rawName}`);
+        continue;
+      }
       const description = frontmatter.description || '';
       const fullText = `${name} ${description} ${body}`;
 
@@ -294,7 +301,6 @@ export async function importFromGitHub(db, url, opts = {}) {
       }
 
       // 5e. Download to managed directory
-      const typeDir = item.type === 'agent' ? 'agents' : 'skills';
       const destDir = join(managedDir, typeDir, name);
       mkdirSync(destDir, { recursive: true });
       const fileName = item.type === 'agent' ? 'AGENT.md' : 'SKILL.md';

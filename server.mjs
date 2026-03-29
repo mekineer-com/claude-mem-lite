@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
@@ -758,7 +758,9 @@ server.registerTool(
     }
 
     // Update access_count for anchor (aligned with CLI timeline)
-    db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
+    try {
+      db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
+    } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
     const projectFilter = args.project ? 'AND project = ?' : '';
     const baseParams = args.project ? [args.project] : [];
@@ -818,11 +820,12 @@ server.registerTool(
       prefix = 'P#';
     } else {
       // Increment access_count for retrieved observations (batch UPDATE)
-      db.prepare(
-        `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`
-      ).run(Date.now(), ...args.ids);
-      // Auto-boost importance for frequently accessed observations
-      autoBoostIfNeeded(db, args.ids);
+      try {
+        db.prepare(
+          `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`
+        ).run(Date.now(), ...args.ids);
+        autoBoostIfNeeded(db, args.ids);
+      } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
       allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
       prefix = '#';
@@ -1668,6 +1671,10 @@ server.registerTool(
       if (!row.local_path) {
         return { content: [{ type: 'text', text: `No local_path for ${args.name}` }], isError: true };
       }
+      const enrichBase = join(homedir(), '.claude-mem-lite');
+      if (!isPathConfined(row.local_path, enrichBase)) {
+        return { content: [{ type: 'text', text: `Access denied: path outside managed directory` }], isError: true };
+      }
 
       const { enrichResource } = await import('./registry-enricher.mjs');
       try {
@@ -1735,7 +1742,13 @@ server.registerTool(
       }
     }
 
-    // 4. Read content
+    // 4. Path confinement check — prevent reading arbitrary files via crafted local_path
+    const managedBase = join(homedir(), '.claude-mem-lite');
+    if (skillPath && !isPathConfined(skillPath, managedBase)) {
+      return { content: [{ type: 'text', text: `Access denied: path "${skillPath}" is outside managed directory` }], isError: true };
+    }
+
+    // 5. Read content
     let content;
     try {
       content = readFileSync(skillPath, 'utf8');
@@ -1885,7 +1898,9 @@ server.registerTool(
     // Update access_count for recalled observations
     const recalledIds = rows.map(r => r.id);
     const ph = recalledIds.map(() => '?').join(',');
-    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...recalledIds);
+    try {
+      db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...recalledIds);
+    } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
     const lines = [`History for ${filename} (${rows.length} observation${rows.length !== 1 ? 's' : ''}):\n`];
     for (const r of rows) {

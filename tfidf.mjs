@@ -381,7 +381,7 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
 
   // Fallback: if time-window yields too few, scan without time constraint
   if (rows.length < VECTOR_MIN_RESULTS) {
-    params.push(limit);
+    const fallbackParams = [...params, limit];
     rows = db.prepare(`
       SELECT ov.observation_id, ov.vector
       FROM observation_vectors ov
@@ -389,7 +389,7 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
       WHERE ${wheres.join(' AND ')}
       ORDER BY o.created_at_epoch DESC
       LIMIT ?
-    `).all(...params);
+    `).all(...fallbackParams);
   }
 
   const results = [];

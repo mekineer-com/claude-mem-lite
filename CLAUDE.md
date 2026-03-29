@@ -49,13 +49,16 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: 提交代码
+Request: Fix CLI tests and linting errors in the projects--mem memory system
+Completed: Fixed eslint errors in hook-semaphore.mjs by removing unused writeFileSync import and refactoring variable initializati…
+Remaining: Fix failing CLI E2E tests in tests/cli-e2e.test.mjs (FAIL: CLI E2E > get > handles non-e... and others shown in vitest …
+Next: Debug and resolve failing E2E tests in cli-e2e.test.mjs; verify test modifications are correctly applied; run full test…
 
 ### Key Context
-- [discovery] Database path constants absent from schema.mjs (#5656)
-- [refactor] Rename prompt-search-utils section header from file path to registry skill matc… (#5655)
-- [feature] Implement pre-skill-bridge hook with version sync validation (#5654)
-- [feature] Implement mem_use MCP tool with pattern-based design (#5652)
-- [discovery] Initial exploration of mem project structure and schema (#5645)
+- [change] Modified tfidf.mjs, schema.mjs, registry.mjs (#5715)
+- [change] Modified scoring-sql.mjs, schema.mjs, hook.mjs (#5704)
+- [discovery] Reviewed 1 files: integration-scenarios.test.mjs (#5691)
+- [discovery] Reviewed 3 files: install.mjs, tests, registry-importer.mjs (#5687)
+- [discovery] Reviewed 11 files: mem, server.test.mjs, install.mjs, server.mjs +7 more (#5685)
 
 </claude-mem-context>

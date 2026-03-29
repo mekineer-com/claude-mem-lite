@@ -37,7 +37,7 @@ import { getVocabulary } from './tfidf.mjs';
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary']);
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress']);
 
 // Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
 // install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin

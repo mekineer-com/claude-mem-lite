@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 19;
+export const CURRENT_SCHEMA_VERSION = 20;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -173,11 +173,11 @@ export function initSchema(db) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sdk_sessions(project)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_not_compressed ON observations(created_at_epoch DESC) WHERE COALESCE(compressed_into, 0) = 0`);
 
-  // FTS5 migration: add lesson_learned column to observations_fts (one-time)
-  // Detect old FTS5 table missing lesson_learned and recreate with full column set
+  // FTS5 migration: recreate observations_fts when columns are missing (one-time)
+  // Detect old FTS5 table missing lesson_learned or search_aliases and recreate with full column set
   try {
     const ftsDdl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations_fts'`).get();
-    if (ftsDdl && !ftsDdl.sql.includes('lesson_learned')) {
+    if (ftsDdl && (!ftsDdl.sql.includes('lesson_learned') || !ftsDdl.sql.includes('search_aliases'))) {
       db.exec(`DROP TRIGGER IF EXISTS observations_ai`);
       db.exec(`DROP TRIGGER IF EXISTS observations_ad`);
       db.exec(`DROP TRIGGER IF EXISTS observations_au`);
@@ -284,7 +284,7 @@ export function initSchema(db) {
           // Strategy 2: substring match for aliases (e.g., "claude-mem-lite" → match project containing "mem")
           // Extract the most distinctive token from the short name for fuzzy matching
           if (!canonical) {
-            const tokens = shortName.split(/[-_.]/).filter(t => t.length >= 3);
+            const tokens = shortName.split(/[-_.]/).filter(t => t.length >= 5);
             for (const token of tokens) {
               canonical = db.prepare(
                 `SELECT project FROM observations WHERE project LIKE ? AND project LIKE '%--_%'

@@ -52,7 +52,7 @@ function out(text) {
 }
 
 function fail(text) {
-  process.stdout.write(text + '\n');
+  process.stderr.write(text + '\n');
   process.exitCode = 1;
 }
 
@@ -115,13 +115,15 @@ function cmdSearch(db, args) {
     fail(`[mem] Invalid --sort "${sort}". Use: relevance, time, importance`);
     return;
   }
+  const useOr = flags.or === true || flags.or === 'true';
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
     fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
     return;
   }
 
-  const ftsQuery = sanitizeFtsQuery(query);
+  let ftsQuery = sanitizeFtsQuery(query);
+  if (ftsQuery && useOr) ftsQuery = relaxFtsQueryToOr(ftsQuery) || ftsQuery;
   if (!ftsQuery) {
     fail(`[mem] No valid search terms in "${query}"`);
     return;
@@ -449,7 +451,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
 function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
   const rawLimit = parseInt(positional[0], 10);
-  const limit = Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 10);
+  const limit = (Number.isInteger(rawLimit) && rawLimit > 0) ? rawLimit : 10;
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   const params = [];
@@ -511,7 +513,9 @@ function cmdRecall(db, args) {
   // Update access_count for recalled observations (aligned with MCP mem_recall)
   const recalledIds = rows.map(r => r.id);
   const recallPh = recalledIds.map(() => '?').join(',');
-  db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${recallPh})`).run(Date.now(), ...recalledIds);
+  try {
+    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${recallPh})`).run(Date.now(), ...recalledIds);
+  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
   out(`[mem] History for ${filename} (${rows.length}):`);
   for (const r of rows) {
@@ -588,8 +592,10 @@ function cmdGet(db, args) {
   }
 
   // Update access_count + auto-boost (aligned with MCP mem_get)
-  db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
-  autoBoostIfNeeded(db, ids);
+  try {
+    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
+    autoBoostIfNeeded(db, ids);
+  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
   const rows = db.prepare(`
     SELECT * FROM observations
@@ -680,7 +686,9 @@ function cmdTimeline(db, args) {
   }
 
   // Update access_count for anchor (aligned with MCP mem_timeline)
-  db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
+  try {
+    db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
+  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
   // Get anchor epoch
   const anchorRow = db.prepare('SELECT created_at_epoch, project FROM observations WHERE id = ?').get(anchorId);
@@ -1786,6 +1794,7 @@ Commands:
     --offset N          Skip first N results (pagination)
     --tier T            Filter by tier (working|active|archive, observations only)
     --sort S            Sort: relevance (default), time, importance
+    --or                Use OR instead of AND between search terms
 
   recent [N]            Show N most recent observations (default 10)
     --project P         Filter by project
@@ -1869,7 +1878,7 @@ DB: ${DB_PATH}`);
 
 // ─── Import (GitHub) ────────────────────────────────────────────────────────
 
-async function cmdImport(db, argv) {
+async function cmdImport(argv) {
   const { positional, flags } = parseArgs(argv);
   const url = positional[0];
 
@@ -1923,7 +1932,7 @@ async function cmdImport(db, argv) {
 
 // ─── Enrich ─────────────────────────────────────────────────────────────────
 
-async function cmdEnrich(db, argv) {
+async function cmdEnrich(argv) {
   const { positional, flags } = parseArgs(argv);
   const name = positional[0];
 
@@ -2016,8 +2025,8 @@ export async function run(argv) {
       case 'context':   cmdContext(db, cmdArgs); break;
       case 'browse':    cmdBrowse(db, cmdArgs); break;
       case 'registry':  cmdRegistry(db, cmdArgs); break;
-      case 'import':    await cmdImport(db, cmdArgs); break;
-      case 'enrich':    await cmdEnrich(db, cmdArgs); break;
+      case 'import':    await cmdImport(cmdArgs); break;
+      case 'enrich':    await cmdEnrich(cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');

@@ -2,7 +2,7 @@
 // Used by server.mjs, hook.mjs, and tests
 
 
-import { basename, dirname } from 'path';
+import { basename, dirname, resolve, sep } from 'path';
 import { execSync } from 'child_process';
 
 // ─── Re-exports from extracted modules ──────────────────────────────────────
@@ -26,6 +26,21 @@ import { stripTestSuffix } from './bash-utils.mjs';
 export const COMPRESSED_AUTO = -1;
 /** compressed_into sentinel: pending user-confirmed purge (marked by idle cleanup) */
 export const COMPRESSED_PENDING_PURGE = -2;
+
+// ─── Path Safety ──────────────────────────────────────────────────────────
+
+/**
+ * Check if a resolved path is confined within an allowed base directory.
+ * Prevents path traversal attacks via '../' sequences.
+ * @param {string} candidate Path to check
+ * @param {string} allowedBase Base directory the path must stay within
+ * @returns {boolean} true if safe
+ */
+export function isPathConfined(candidate, allowedBase) {
+  const resolved = resolve(candidate);
+  const base = resolve(allowedBase);
+  return resolved === base || resolved.startsWith(base + sep);
+}
 
 // ─── Token Estimation ─────────────────────────────────────────────────────
 

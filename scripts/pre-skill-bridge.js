@@ -4,10 +4,11 @@
 // Lightweight standalone (~30ms): only imports better-sqlite3, fs, path, os
 
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 import { homedir } from 'os';
 
 const REGISTRY_DB_PATH = join(homedir(), '.claude-mem-lite', 'resource-registry.db');
+const MANAGED_BASE = join(homedir(), '.claude-mem-lite');
 const MANAGED_MARKER = '/.claude-mem-lite/managed/';
 
 try {
@@ -58,6 +59,10 @@ try {
     }
 
     if (!existsSync(skillPath)) process.exit(0);
+
+    // Path confinement check — prevent LIKE bypass via '../' in local_path
+    const resolvedPath = resolve(skillPath);
+    if (resolvedPath !== MANAGED_BASE && !resolvedPath.startsWith(MANAGED_BASE + sep)) process.exit(0);
 
     // Read and output
     const content = readFileSync(skillPath, 'utf8');

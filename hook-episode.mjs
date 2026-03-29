@@ -107,7 +107,7 @@ export function readEpisode() {
  */
 export function writeEpisode(episode) {
   const target = episodeFile();
-  const tmp = target + '.tmp';
+  const tmp = target + `.tmp-${process.pid}`;
   const { _fileSet, ...serializable } = episode;
   writeFileSync(tmp, JSON.stringify(serializable));
   try {

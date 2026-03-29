@@ -14,14 +14,43 @@ import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 let testDb;
 
-// Capture stdout output from synchronous code
+// Capture stdout + stderr combined (fail() writes to stderr, out() to stdout)
 function captureStdout(fn) {
+  let output = '';
+  const origOut = process.stdout.write;
+  const origErr = process.stderr.write;
+  process.stdout.write = (str) => { output += str; return true; };
+  process.stderr.write = (str) => { output += str; return true; };
+  try {
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      return result.then(() => {
+        process.stdout.write = origOut;
+        process.stderr.write = origErr;
+        return output;
+      }).catch((err) => {
+        process.stdout.write = origOut;
+        process.stderr.write = origErr;
+        throw err;
+      });
+    }
+  } catch (err) {
+    process.stdout.write = origOut;
+    process.stderr.write = origErr;
+    throw err;
+  }
+  process.stdout.write = origOut;
+  process.stderr.write = origErr;
+  return output;
+}
+
+// Capture stdout only (for JSON output tests that must not mix stderr)
+function captureStdoutOnly(fn) {
   let output = '';
   const original = process.stdout.write;
   process.stdout.write = (str) => { output += str; return true; };
   try {
     const result = fn();
-    // Handle async functions (run() is async)
     if (result && typeof result.then === 'function') {
       return result.then(() => {
         process.stdout.write = original;
@@ -764,7 +793,7 @@ describe('CLI export command', () => {
       sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
       title: 'Export test bug', text: 'export content',
     });
-    const output = await captureStdout(() => run(['export']));
+    const output = await captureStdoutOnly(() => run(['export']));
     const data = JSON.parse(output);
     expect(Array.isArray(data)).toBe(true);
     expect(data.length).toBe(1);
@@ -780,7 +809,7 @@ describe('CLI export command', () => {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
       title: 'JSONL export 2', text: 'line 2',
     });
-    const output = await captureStdout(() => run(['export', '--format', 'jsonl']));
+    const output = await captureStdoutOnly(() => run(['export', '--format', 'jsonl']));
     const lines = output.trim().split('\n');
     expect(lines.length).toBe(2);
     expect(JSON.parse(lines[0]).title).toBeTruthy();
@@ -795,7 +824,7 @@ describe('CLI export command', () => {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
       title: 'Discovery export', text: 'discovery content',
     });
-    const output = await captureStdout(() => run(['export', '--type', 'bugfix']));
+    const output = await captureStdoutOnly(() => run(['export', '--type', 'bugfix']));
     const data = JSON.parse(output);
     expect(data.length).toBe(1);
     expect(data[0].type).toBe('bugfix');
@@ -811,7 +840,7 @@ describe('CLI export command', () => {
       title: 'Recent export', text: 'recent content',
     });
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-    const output = await captureStdout(() => run(['export', '--from', yesterday]));
+    const output = await captureStdoutOnly(() => run(['export', '--from', yesterday]));
     const data = JSON.parse(output);
     expect(data.length).toBe(1);
     expect(data[0].title).toBe('Recent export');
@@ -824,7 +853,7 @@ describe('CLI export command', () => {
         title: `Export item ${i}`, text: `content ${i}`,
       });
     }
-    const output = await captureStdout(() => run(['export', '--limit', '2']));
+    const output = await captureStdoutOnly(() => run(['export', '--limit', '2']));
     const data = JSON.parse(output);
     expect(data.length).toBe(2);
   });
@@ -838,7 +867,7 @@ describe('CLI export command', () => {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
       title: 'Active obs', text: 'active',
     });
-    const output = await captureStdout(() => run(['export']));
+    const output = await captureStdoutOnly(() => run(['export']));
     const data = JSON.parse(output);
     expect(data.length).toBe(1);
     expect(data[0].title).toBe('Active obs');
@@ -853,7 +882,7 @@ describe('CLI export command', () => {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
       title: 'Active obs', text: 'active',
     });
-    const output = await captureStdout(() => run(['export', '--include-compressed']));
+    const output = await captureStdoutOnly(() => run(['export', '--include-compressed']));
     const data = JSON.parse(output);
     expect(data.length).toBe(2);
   });

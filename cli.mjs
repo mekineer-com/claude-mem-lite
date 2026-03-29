@@ -16,7 +16,19 @@ if (cmd === '--version' || cmd === '-v') {
 } else if (CLI_COMMANDS.has(cmd)) {
   const { run } = await import('./mem-cli.mjs');
   await run(process.argv.slice(2));
-} else if (!cmd || INSTALL_COMMANDS.has(cmd)) {
+} else if (!cmd) {
+  // No command: show CLI help if installed, install help if not
+  const { existsSync } = await import('fs');
+  const { join } = await import('path');
+  const dbPath = join(process.env.HOME || '', '.claude-mem-lite', 'claude-mem-lite.db');
+  if (existsSync(dbPath)) {
+    const { run } = await import('./mem-cli.mjs');
+    await run(['help']);
+  } else {
+    const { main } = await import('./install.mjs');
+    await main([]);
+  }
+} else if (INSTALL_COMMANDS.has(cmd)) {
   const { main } = await import('./install.mjs');
   await main(process.argv.slice(2));
 } else {

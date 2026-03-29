@@ -4,8 +4,8 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE } from '../utils.mjs';
-import { writeFileSync, readFileSync, existsSync } from 'fs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, isPathConfined } from '../utils.mjs';
+import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import Database from 'better-sqlite3';
@@ -198,10 +198,12 @@ function loadSkillContent(skillName) {
 
       let path = row.local_path;
       if (!path.endsWith('.md')) {
-        // Only skills can be directory paths (9 cases); agents always have full .md paths
         const candidate = join(path, 'SKILL.md');
         if (existsSync(candidate)) path = candidate;
       }
+      // Path confinement check — prevent LIKE bypass via '../' in local_path
+      const managedBase = join(homedir(), '.claude-mem-lite');
+      if (!isPathConfined(path, managedBase)) return null;
       if (!existsSync(path)) return null;
 
       const portablePath = toPortablePath(path);
@@ -232,7 +234,9 @@ function setSkillCooldown(name) {
   try {
     const data = getSkillCooldown();
     data[name] = Date.now();
-    writeFileSync(SKILL_COOLDOWN_FILE, JSON.stringify(data));
+    const tmp = SKILL_COOLDOWN_FILE + `.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(data));
+    renameSync(tmp, SKILL_COOLDOWN_FILE);
   } catch { /* silent */ }
 }
 
