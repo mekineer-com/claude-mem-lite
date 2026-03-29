@@ -8,7 +8,7 @@
 [[ -n "$CLAUDE_MEM_HOOK_RUNNING" ]] && exit 0
 
 # Read stdin (tool hook JSON)
-input=$(cat)
+input=$(head -c 262144)
 
 # Extract tool_name via bash regex — no subprocess
 if [[ "$input" =~ \"tool_name\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then

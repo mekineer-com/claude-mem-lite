@@ -10,9 +10,9 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'fs'; // eslint-disable-line no-unused-vars
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
-import { tmpdir } from 'os'; // eslint-disable-line no-unused-vars
+import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 
 const INSTALL_PATH = resolve('install.mjs');

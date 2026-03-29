@@ -2,7 +2,7 @@
 // Limits concurrent claude -p calls to prevent resource contention
 
 import { join } from 'path';
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, openSync, closeSync, writeSync, constants as fsConstants } from 'fs';
+import { readFileSync, unlinkSync, readdirSync, openSync, closeSync, writeSync, constants as fsConstants } from 'fs';
 import { RUNTIME_DIR } from './hook-shared.mjs';
 
 export const LLM_SEM_MAX = 2;
@@ -21,7 +21,7 @@ export async function acquireLLMSlot() {
 
   while (Date.now() < deadline) {
     // Acquire-then-verify: atomically create our slot first, then check total count
-    let created = false;
+    let created;
     try {
       let fd;
       try {
@@ -33,8 +33,9 @@ export async function acquireLLMSlot() {
         if (fd !== undefined) closeSync(fd);
       }
     } catch {
-      // Slot file already exists for this PID — update timestamp
-      try { writeFileSync(slotFile, JSON.stringify({ pid: process.pid, ts: Date.now() })); created = true; } catch {}
+      // Slot file already exists for this PID — stale cleanup should have removed it;
+      // retry and let O_CREAT|O_EXCL succeed on next iteration (avoid non-atomic fallback)
+      continue;
     }
 
     if (!created) { await sleepMs(200 + Math.random() * 800); continue; }

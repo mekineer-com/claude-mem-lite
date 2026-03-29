@@ -566,7 +566,7 @@ async function install() {
         };
 
         for (const [repoUrl, entries] of repos) {
-          const repoName = repoUrl.split('/').slice(-2).join('-');
+          const repoName = repoUrl.split('/').slice(-2).join('-').replace(/[^a-zA-Z0-9._-]/g, '_');
           const clonePath = join(managedDir, 'repos', repoName);
           let repoReady = false;
 
@@ -960,12 +960,8 @@ async function status() {
 
   // CLI
   try {
-    const cliVer = execSync('claude-mem-lite --help 2>/dev/null && echo OK', { encoding: 'utf8', timeout: 5000 });
-    if (cliVer.includes('OK')) {
-      ok('CLI: claude-mem-lite command available');
-    } else {
-      warn('CLI: command not on PATH');
-    }
+    execFileSync('claude-mem-lite', ['--help'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
+    ok('CLI: claude-mem-lite command available');
   } catch {
     warn('CLI: command not on PATH — run install again to create symlink');
   }
@@ -1088,7 +1084,7 @@ async function doctor() {
 
   // Check for stale processes
   try {
-    const procs = execSync('pgrep -af "chroma|claude-mem.*worker" 2>/dev/null', { encoding: 'utf8' }).trim();
+    const procs = execFileSync('pgrep', ['-af', 'chroma|claude-mem.*worker'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim();
     // Filter out the pgrep process itself (matches its own pattern)
     const real = procs.split('\n').filter(l => !l.includes('pgrep'));
     if (real.length > 0) {
