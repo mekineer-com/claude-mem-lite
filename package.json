@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.28.2",
+  "version": "2.29.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -64,10 +64,6 @@
     "skill.md",
     "commands/mem.md",
     "commands/memory.md",
-    "commands/search.md",
-    "commands/recall.md",
-    "commands/recent.md",
-    "commands/timeline.md",
     "commands/update.md",
     "commands/tools.md",
     "hooks/hooks.json",
