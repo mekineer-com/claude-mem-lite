@@ -5,12 +5,14 @@
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch } from './utils.mjs';
+import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge, VECTOR_SCAN_LIMIT, rebuildVocabulary, _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
+import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { basename, join } from 'path';
 import { readFileSync } from 'fs';
 
@@ -280,6 +282,31 @@ function cmdSearch(db, args) {
         LIMIT ? OFFSET ?
       `).all(...promptParams);
       for (const r of promptRows) results.push({ ...r, _source: 'prompt' });
+      // CJK LIKE fallback: FTS5 unicode61 can't tokenize CJK substrings in prompts
+      if (promptRows.length === 0) {
+        const cjkPatterns = extractCjkLikePatterns(query);
+        if (cjkPatterns.length > 0) {
+          const likeConds = cjkPatterns.map(() => 'p.prompt_text LIKE ?');
+          const likeParams = cjkPatterns.map(p => `%${p}%`);
+          if (project) likeParams.push(project);
+          if (dateFrom) likeParams.push(dateFrom);
+          if (dateTo) likeParams.push(dateTo);
+          likeParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
+          const fallbackRows = db.prepare(`
+            SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
+            FROM user_prompts p
+            JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+            WHERE (${likeConds.join(' OR ')})
+              AND p.prompt_text NOT LIKE '<task-notification>%'
+              ${project ? 'AND s.project = ?' : ''}
+              ${dateFrom ? 'AND p.created_at_epoch >= ?' : ''}
+              ${dateTo ? 'AND p.created_at_epoch <= ?' : ''}
+            ORDER BY p.created_at_epoch DESC
+            LIMIT ? OFFSET ?
+          `).all(...likeParams);
+          for (const r of fallbackRows) results.push({ ...r, _source: 'prompt', score: 0 });
+        }
+      }
     } catch { /* prompt FTS may not exist in older DBs */ }
   }
 
@@ -1980,6 +2007,39 @@ async function cmdEnrich(argv) {
   }
 }
 
+async function cmdOptimize(db, args) {
+  const run = args.includes('--run');
+  const runAll = args.includes('--run-all');
+  const taskIdx = args.indexOf('--task');
+  const tasks = taskIdx >= 0 && args[taskIdx + 1] ? [args[taskIdx + 1]] : undefined;
+  const maxIdx = args.indexOf('--max');
+  const maxItems = maxIdx >= 0 ? parseInt(args[maxIdx + 1], 10) || 15 : 15;
+
+  if (!run && !runAll) {
+    const preview = optimizePreview(db);
+    out('[mem] 🔍 LLM Optimization Preview:');
+    out(`  Re-enrich candidates: ${preview.reenrich}`);
+    out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
+    out(`  Cluster-merge: ${preview.clusterMerge} clusters`);
+    out(`  Smart-compress: ${preview.smartCompress} clusters`);
+    out(`  Total: ${preview.total} items`);
+    out('');
+    out('Run with --run to execute, --run-all to bypass gates.');
+    return;
+  }
+
+  out('[mem] Running LLM optimization...');
+  const results = await optimizeRun(db, { tasks, maxItems, force: runAll });
+
+  if (results.reenrich) out(`  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`);
+  if (results.normalize) {
+    if (results.normalize.skipped) out(`  Normalize: skipped (${results.normalize.reason})`);
+    else out(`  Normalize: ${results.normalize.processed || 0} updated, ${results.normalize.groups || 0} synonym groups`);
+  }
+  if (results.clusterMerge) out(`  Cluster-merge: ${results.clusterMerge.merged || 0} merged of ${results.clusterMerge.processed || 0} clusters`);
+  if (results.smartCompress) out(`  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`);
+}
+
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {
@@ -2020,6 +2080,7 @@ export async function run(argv) {
       case 'export':    cmdExport(db, cmdArgs); break;
       case 'compress':  cmdCompress(db, cmdArgs); break;
       case 'maintain':  cmdMaintain(db, cmdArgs); break;
+      case 'optimize':  await cmdOptimize(db, cmdArgs); break;
       case 'fts-check': cmdFtsCheck(db, cmdArgs); break;
       case 'stats':     cmdStats(db, cmdArgs); break;
       case 'context':   cmdContext(db, cmdArgs); break;
