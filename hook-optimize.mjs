@@ -593,3 +593,83 @@ export async function executeSmartCompress(db, maxClusters = 5) {
 
   return { processed: toProcess.length, compressed };
 }
+
+// ─── Pipeline Orchestrator ──────────────────────────────────────────────────
+
+export function optimizePreview(db) {
+  const reenrich = findReenrichCandidates(db, 1000).length;
+
+  const concepts = extractUniqueConcepts(db);
+  const normalizeReady = shouldRunNormalize() && concepts.length >= 5;
+
+  const mergeClusters = findMergeCandidates(db, 50);
+  const clusterMerge = mergeClusters.length;
+
+  const compressCandidates = findSmartCompressCandidates(db);
+  const compressClusters = clusterForCompression(compressCandidates, db);
+  const smartCompress = compressClusters.length;
+
+  return {
+    reenrich,
+    normalize: normalizeReady ? concepts.length : 0,
+    normalizeGateOpen: shouldRunNormalize(),
+    clusterMerge,
+    smartCompress,
+    total: reenrich + (normalizeReady ? 1 : 0) + clusterMerge + smartCompress,
+  };
+}
+
+export async function optimizeRun(db, { tasks, maxItems = 15, force = false } = {}) {
+  const allTasks = ['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'];
+  const selectedTasks = tasks && tasks.length > 0 ? tasks : allTasks;
+  const budget = distributeBudget(maxItems);
+  const results = {};
+
+  for (const task of selectedTasks) {
+    try {
+      switch (task) {
+        case 're-enrich':
+          results.reenrich = await executeReenrich(db, budget.reenrich);
+          break;
+        case 'normalize':
+          results.normalize = await executeNormalize(db, force);
+          break;
+        case 'cluster-merge':
+          results.clusterMerge = await executeClusterMerge(db, budget.clusterMerge);
+          break;
+        case 'smart-compress':
+          results.smartCompress = await executeSmartCompress(db, budget.smartCompress);
+          break;
+      }
+    } catch (e) {
+      debugCatch(e, `optimize:${task}`);
+      results[task] = { error: e.message };
+    }
+  }
+
+  return results;
+}
+
+export async function handleLLMOptimize() {
+  const { ensureDb } = await import('./schema.mjs');
+  let db;
+  try {
+    db = ensureDb();
+  } catch {
+    return;
+  }
+
+  try {
+    const results = await optimizeRun(db);
+    const parts = [];
+    if (results.reenrich?.processed) parts.push(`re-enriched: ${results.reenrich.processed}`);
+    if (results.normalize?.processed) parts.push(`normalized: ${results.normalize.processed}`);
+    if (results.clusterMerge?.merged) parts.push(`merged: ${results.clusterMerge.merged}`);
+    if (results.smartCompress?.compressed) parts.push(`compressed: ${results.smartCompress.compressed}`);
+    if (parts.length > 0) debugLog('DEBUG', 'llm-optimize', parts.join(', '));
+  } catch (e) {
+    debugCatch(e, 'llm-optimize');
+  } finally {
+    db.close();
+  }
+}

@@ -255,3 +255,34 @@ describe('smart-compress', () => {
     expect(summary.title).toContain('Utils.mjs');
   });
 });
+
+describe('pipeline', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSON.mockReset();
+  });
+  afterEach(() => { db.close(); });
+
+  it('preview returns candidate counts without executing', async () => {
+    const { optimizePreview } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Degraded obs', narrative: 'No enrichment' });
+    const result = optimizePreview(db);
+    expect(result).toHaveProperty('reenrich');
+    expect(result).toHaveProperty('normalize');
+    expect(result).toHaveProperty('clusterMerge');
+    expect(result).toHaveProperty('smartCompress');
+    expect(result.reenrich).toBeGreaterThanOrEqual(0);
+  });
+
+  it('distributeBudget allocates correctly', async () => {
+    const { distributeBudget } = await import('../hook-optimize.mjs');
+    const budget = distributeBudget(15);
+    expect(budget.reenrich).toBe(6);
+    expect(budget.normalize).toBe(1);
+    expect(budget.clusterMerge).toBe(5);
+    expect(budget.smartCompress).toBeGreaterThan(0);
+    expect(budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress).toBeLessThanOrEqual(16);
+  });
+});
