@@ -22,7 +22,7 @@ vi.mock('../utils.mjs', () => ({
 }));
 
 import { execFileSync } from 'child_process';
-import { detectMode, _resetMode, getClaudePath, callHaiku, callHaikuJSON } from '../haiku-client.mjs';
+import { detectMode, _resetMode, getClaudePath, callHaiku, callHaikuJSON, callLLMWithModel, callModelJSON } from '../haiku-client.mjs';
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -200,6 +200,148 @@ describe('haiku-client.mjs', () => {
       });
 
       const result = await callHaikuJSON('test prompt');
+      expect(result).toBeNull();
+    });
+  });
+
+  // ─── callLLMWithModel ─────────────────────────────────────────────────────
+
+  describe('callLLMWithModel', () => {
+    it('is exported', async () => {
+      const mod = await import('../haiku-client.mjs');
+      expect(typeof mod.callLLMWithModel).toBe('function');
+    });
+
+    it('returns null for empty prompt', async () => {
+      const result = await callLLMWithModel('', 'haiku');
+      expect(result).toBeNull();
+    });
+
+    it('returns null for null prompt', async () => {
+      const result = await callLLMWithModel(null, 'haiku');
+      expect(result).toBeNull();
+    });
+
+    it('defaults to haiku for unknown model', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockReturnValue('response text');
+
+      const result = await callLLMWithModel('test prompt', 'unknown-model');
+      expect(result).toEqual({ text: 'response text' });
+      expect(execFileSync).toHaveBeenCalledWith(
+        expect.any(String),
+        ['-p', '--model', 'haiku'],
+        expect.objectContaining({ input: 'test prompt' })
+      );
+    });
+
+    it('routes to CLI with sonnet model', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockReturnValue('sonnet response');
+
+      const result = await callLLMWithModel('test prompt', 'sonnet');
+      expect(result).toEqual({ text: 'sonnet response' });
+      expect(execFileSync).toHaveBeenCalledWith(
+        expect.any(String),
+        ['-p', '--model', 'sonnet'],
+        expect.objectContaining({ input: 'test prompt' })
+      );
+    });
+
+    it('routes to API with haiku model', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-test-key');
+      _resetMode();
+
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ content: [{ text: 'api haiku response' }] }),
+      }));
+
+      const result = await callLLMWithModel('test prompt', 'haiku');
+      expect(result).toEqual({ text: 'api haiku response' });
+    });
+
+    it('routes to API with sonnet model using correct model ID', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-test-key');
+      _resetMode();
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ content: [{ text: 'api sonnet response' }] }),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      const result = await callLLMWithModel('test prompt', 'sonnet');
+      expect(result).toEqual({ text: 'api sonnet response' });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.model).toBe('claude-sonnet-4-5-20250929');
+    });
+
+    it('respects custom timeout and maxTokens options', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-test-key');
+      _resetMode();
+
+      const mockFetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ content: [{ text: 'response' }] }),
+      });
+      vi.stubGlobal('fetch', mockFetch);
+
+      await callLLMWithModel('test prompt', 'haiku', { timeout: 5000, maxTokens: 200 });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.max_tokens).toBe(200);
+    });
+
+    it('returns null on CLI error (never throws)', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockImplementation(() => {
+        throw new Error('command failed');
+      });
+
+      const result = await callLLMWithModel('test prompt', 'haiku');
+      expect(result).toBeNull();
+    });
+  });
+
+  // ─── callModelJSON ────────────────────────────────────────────────────────
+
+  describe('callModelJSON', () => {
+    it('is exported', async () => {
+      const mod = await import('../haiku-client.mjs');
+      expect(typeof mod.callModelJSON).toBe('function');
+    });
+
+    it('parses JSON response', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockReturnValue('{"result": "ok"}');
+
+      const result = await callModelJSON('test prompt', 'haiku');
+      expect(result).toEqual({ result: 'ok' });
+    });
+
+    it('returns null on non-JSON response', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockReturnValue('not json');
+
+      const result = await callModelJSON('test prompt', 'haiku');
+      expect(result).toBeNull();
+    });
+
+    it('returns null when callLLMWithModel returns null', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockImplementation(() => {
+        throw new Error('failed');
+      });
+
+      const result = await callModelJSON('test prompt', 'haiku');
       expect(result).toBeNull();
     });
   });

@@ -100,6 +100,109 @@ export async function callHaikuJSON(prompt, opts) {
   return parseJsonFromLLM(result.text);
 }
 
+// ─── Model-Selectable API ────────────────────────────────────────────────────
+
+/**
+ * Call LLM with explicit model selection. Supports 'haiku' and 'sonnet'.
+ * Reuses existing API/CLI dual-mode infrastructure.
+ * Never throws — returns null on any error.
+ *
+ * @param {string} prompt The prompt text
+ * @param {'haiku'|'sonnet'} model Model to use (default: 'haiku')
+ * @param {object} [opts] Options
+ * @param {number} [opts.timeout=15000] Timeout in milliseconds
+ * @param {number} [opts.maxTokens=1000] Max tokens in response
+ * @returns {Promise<{text: string}|null>} Response or null on failure
+ */
+export async function callLLMWithModel(prompt, model = 'haiku', { timeout = 15000, maxTokens = 1000 } = {}) {
+  if (!prompt) return null;
+  const resolvedModel = MODEL_MAP[model] ? model : 'haiku';
+  const mode = detectMode();
+
+  try {
+    if (mode === 'api') {
+      return await callModelAPI(prompt, resolvedModel, { timeout, maxTokens });
+    }
+    return callModelCLI(prompt, resolvedModel, { timeout });
+  } catch (e) {
+    debugCatch(e, `callLLMWithModel:${resolvedModel}`);
+    return null;
+  }
+}
+
+/**
+ * Call LLM with model selection and parse JSON response.
+ * @param {string} prompt
+ * @param {'haiku'|'sonnet'} model
+ * @param {object} [opts]
+ * @returns {Promise<object|null>}
+ */
+export async function callModelJSON(prompt, model = 'haiku', opts) {
+  const result = await callLLMWithModel(prompt, model, opts);
+  if (!result?.text) return null;
+  return parseJsonFromLLM(result.text);
+}
+
+async function callModelAPI(prompt, model, { timeout, maxTokens }) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const modelId = MODEL_MAP[model];
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: modelId,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      debugLog('WARN', `${model}-api`, `HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const text = data.content?.[0]?.text;
+    return text ? { text } : null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function callModelCLI(prompt, model, { timeout }) {
+  const modelName = MODEL_MAP[model] ? model : 'haiku';
+  try {
+    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName], {
+      input: prompt,
+      timeout,
+      encoding: 'utf8',
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: '/tmp',
+    });
+    const text = result.trim();
+    return text ? { text } : null;
+  } catch (e) {
+    const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
+    if (out && out.startsWith('{') && out.endsWith('}')) {
+      try { JSON.parse(out); return { text: out }; } catch {}
+    }
+    debugCatch(e, `${model}-cli`);
+    return null;
+  }
+}
+
 // ─── API Mode ────────────────────────────────────────────────────────────────
 
 async function callHaikuAPI(prompt, { timeout, maxTokens }) {
