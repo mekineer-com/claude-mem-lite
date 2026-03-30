@@ -256,6 +256,29 @@ describe('smart-compress', () => {
   });
 });
 
+describe('hook integration', () => {
+  it('BG_EVENTS includes llm-optimize', async () => {
+    const { readFileSync } = await import('fs');
+    const hookSrc = readFileSync(new URL('../hook.mjs', import.meta.url), 'utf8');
+    expect(hookSrc).toContain("'llm-optimize'");
+  });
+
+  it('hook.mjs imports handleLLMOptimize', async () => {
+    const { readFileSync } = await import('fs');
+    const hookSrc = readFileSync(new URL('../hook.mjs', import.meta.url), 'utf8');
+    expect(hookSrc).toContain('handleLLMOptimize');
+  });
+
+  it('hook.mjs spawns llm-optimize after auto-compress', async () => {
+    const { readFileSync } = await import('fs');
+    const hookSrc = readFileSync(new URL('../hook.mjs', import.meta.url), 'utf8');
+    const autoCompressIdx = hookSrc.indexOf("spawnBackground('auto-compress')");
+    const llmOptimizeIdx = hookSrc.indexOf("spawnBackground('llm-optimize')");
+    expect(autoCompressIdx).toBeGreaterThan(-1);
+    expect(llmOptimizeIdx).toBeGreaterThan(autoCompressIdx);
+  });
+});
+
 describe('pipeline', () => {
   let db;
   beforeEach(() => {

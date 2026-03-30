@@ -57,6 +57,7 @@ function runHook(event, { stdin, env = {}, args = [] } = {}) {
     CLAUDE_MEM_HOOK_RUNNING: undefined, // Don't inherit — let hooks run
     CLAUDE_MEM_DEBUG: '1',
     CLAUDE_MEM_SKIP_UPDATE: '1', // Skip auto-update network calls in tests
+    CLAUDE_MEM_SKIP_OPTIMIZE: '1', // Skip llm-optimize background worker in tests
     ...env,
   };
 

@@ -31,13 +31,14 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
+import { handleLLMOptimize } from './hook-optimize.mjs';
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
 import { getVocabulary } from './tfidf.mjs';
 
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress']);
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize']);
 
 // Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
 // install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin
@@ -122,6 +123,22 @@ function flushEpisode(episode) {
 
   if (isSignificant) {
     spawnBackground('llm-episode', flushFile);
+
+    // P3: Auto-save hint — detect error→fix pattern (error entry followed by Edit/Write)
+    // and nudge Claude to save the lesson for future recall
+    try {
+      const entries = episode.entries || [];
+      const hasError = entries.some(e => e.isError);
+      const hasEdit = entries.some(e => EDIT_TOOLS.has(e.tool));
+      if (hasError && hasEdit && entries.length >= 3) {
+        const editFiles = entries.filter(e => EDIT_TOOLS.has(e.tool)).flatMap(e => e.files || []);
+        const uniqueFiles = [...new Set(editFiles)].slice(0, 3);
+        const filesHint = uniqueFiles.length > 0 ? ` (files: ${uniqueFiles.join(', ')})` : '';
+        process.stdout.write(
+          `[mem] 💡 Error→fix pattern detected${filesHint}. Consider: mem_save(type="bugfix", lesson_learned="root cause & fix")\n`,
+        );
+      }
+    } catch { /* never block on hint */ }
   } else {
     try { unlinkSync(flushFile); } catch {}
   }
@@ -539,6 +556,7 @@ async function handleSessionStart() {
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
         // Weekly summary grouping runs in background to avoid blocking SessionStart
         spawnBackground('auto-compress');
+        if (!process.env.CLAUDE_MEM_SKIP_OPTIMIZE) spawnBackground('llm-optimize');
       } catch (e) { debugCatch(e, 'auto-maintain'); }
     }
 
@@ -1060,6 +1078,7 @@ try {
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
     case 'auto-compress':    handleAutoCompress(); break;
+    case 'llm-optimize':   await handleLLMOptimize(); break;
   }
 } catch (err) {
   // Always log fatal errors (ungated) with structured format
