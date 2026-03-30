@@ -5,11 +5,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined } from './utils.mjs';
+import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema } from './tool-schemas.mjs';
+import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema } from './tool-schemas.mjs';
+import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
@@ -110,12 +112,14 @@ const server = new McpServer(
       'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
       'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
       '',
-      'WHEN TO USE (proactive triggers):',
-      '  • Before fixing a bug → recall the file: claude-mem-lite recall "file.mjs"',
-      '  • Encountering an error → search for similar: claude-mem-lite search "error message" --type bugfix',
-      '  • Starting work on a module → recall past decisions: claude-mem-lite search "module-name" --type decision',
-      '  • After solving a non-obvious problem → save the lesson: mem_save with lesson_learned',
-      '  • When hook-injected context mentions a relevant ID → get details: claude-mem-lite get ID',
+      'WHEN TO USE (proactive triggers during coding):',
+      '  • About to Edit/Write a file → mem_recall(file="path") FIRST — past bugfixes & lessons',
+      '  • Test failure or error → mem_search(query="error keywords", obs_type="bugfix")',
+      '  • Before refactoring → mem_search(query="module-name", obs_type="refactor") for past decisions',
+      '  • Starting new feature → mem_search(query="feature area") for prior art & patterns',
+      '  • After fixing a tricky bug → mem_save(type="bugfix", lesson_learned="root cause & fix")',
+      '  • After architecture decision → mem_save(type="decision", lesson_learned="rationale")',
+      '  • Hook-injected context mentions #ID → mem_get(ids=[ID]) for full details',
       '',
       'Decision rules (use INSTEAD OF multi-step search):',
       '  • "what happened recently?" → mem_recent (NOT search with empty query)',
@@ -453,6 +457,35 @@ function searchPrompts(ctx) {
     for (const r of rows) {
       results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: r.score });
     }
+    // CJK LIKE fallback: FTS5 unicode61 can't tokenize CJK substrings in prompts
+    if (rows.length === 0 && args.query) {
+      const cjkPatterns = extractCjkLikePatterns(args.query);
+      if (cjkPatterns.length > 0) {
+        const likeConds = cjkPatterns.map(() => 'p.prompt_text LIKE ?');
+        const likeParams = cjkPatterns.map(p => `%${p}%`);
+        const fallbackRows = db.prepare(`
+          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at
+          FROM user_prompts p
+          JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+          WHERE (${likeConds.join(' OR ')})
+            AND p.prompt_text NOT LIKE '<task-notification>%'
+            AND (? IS NULL OR s.project = ?)
+            AND (? IS NULL OR p.created_at_epoch >= ?)
+            AND (? IS NULL OR p.created_at_epoch <= ?)
+          ORDER BY p.created_at_epoch DESC
+          LIMIT ? OFFSET ?
+        `).all(
+          ...likeParams,
+          args.project ?? null, args.project ?? null,
+          epochFrom, epochFrom,
+          epochTo, epochTo,
+          perSourceLimit, perSourceOffset
+        );
+        for (const r of fallbackRows) {
+          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: 0 });
+        }
+      }
+    }
   } else if (searchType === 'prompts') {
     const params = [];
     const wheres = [];
@@ -524,7 +557,7 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
 server.registerTool(
   'mem_search',
   {
-    description: 'Search project memory for past bugfixes, decisions, and discoveries. Use when: encountering a familiar error, investigating a module before changes, or looking for prior art on a problem. Returns compact index (use mem_get for full details).',
+    description: 'Search project memory for past bugfixes, decisions, and discoveries. Use proactively when: encountering an error (search with obs_type="bugfix"), investigating a module before changes, or looking for prior art. Returns compact index (use mem_get for full details).',
     inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
@@ -699,7 +732,7 @@ server.registerTool(
 server.registerTool(
   'mem_timeline',
   {
-    description: 'Browse observations as a timeline around an anchor point. Use when: exploring what happened before/after a specific observation, understanding the sequence of changes that led to a bug, or reviewing a session chronologically.',
+    description: 'Browse observations as a timeline around an anchor point. Accepts anchor ID or a query string to auto-find the anchor via FTS. Use when: exploring what happened before/after a specific observation, understanding the sequence of changes that led to a bug, or reviewing a session chronologically. Example: mem_timeline(query="FTS5 search bug") or mem_timeline(anchor=42).',
     inputSchema: memTimelineSchema,
   },
   safeHandler(async (args) => {
@@ -802,7 +835,7 @@ server.registerTool(
 server.registerTool(
   'mem_get',
   {
-    description: 'Get full details for one or more records by ID. Use when: hook-injected context mentions a relevant observation ID, or after mem_search to drill into specific results for narrative, lesson_learned, and file details.',
+    description: 'Get full details for one or more records by ID. Use when: hook-injected context mentions a relevant observation ID, or after mem_search to drill into specific results for narrative, lesson_learned, and file details. For session results (S#15), pass source="session". For prompt results (P#22), pass source="prompt".',
     inputSchema: memGetSchema,
   },
   safeHandler(async (args) => {
@@ -925,7 +958,7 @@ server.registerTool(
 server.registerTool(
   'mem_save',
   {
-    description: 'Save a memory/observation. Use when: solving a non-obvious bug (save the lesson), making an architecture decision, discovering something not obvious from code alone, or when the user asks to remember something.',
+    description: 'Save a memory/observation with optional lesson_learned. Use after: solving a non-obvious bug (pass lesson_learned="root cause & fix"), making an architecture decision (pass lesson_learned="rationale"), or discovering something not obvious from code. Also when user asks to remember something.',
     inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
@@ -960,18 +993,20 @@ server.registerTool(
 
     const safeContent = scrubSecrets(args.content);
     const safeTitle = scrubSecrets(title);
+    const safeLesson = args.lesson_learned ? scrubSecrets(args.lesson_learned) : null;
     const minhashSig = computeMinHash(safeTitle + ' ' + safeContent);
     // Append CJK bigrams to text field for FTS5 indexing of Chinese content
-    const bigramText = cjkBigrams(safeTitle + ' ' + safeContent);
+    const indexText = [safeTitle, safeContent, safeLesson].filter(Boolean).join(' ');
+    const bigramText = cjkBigrams(indexText);
     const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
 
     // Atomic: insert observation + observation_files + TF-IDF vector in one transaction
     const saveFiles = args.files || [];
     const saveTx = db.transaction(() => {
       const result = db.prepare(`
-        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?)
-      `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), args.importance ?? 2, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, branch, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?)
+      `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), args.importance ?? 2, minhashSig, safeLesson, getCurrentBranch(), now.toISOString(), now.getTime());
       const savedId = Number(result.lastInsertRowid);
 
       // Populate observation_files junction table
@@ -998,7 +1033,8 @@ server.registerTool(
     });
     const result = saveTx();
 
-    return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".` }] };
+    const lessonNote = safeLesson ? ` 💡lesson captured` : '';
+    return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".${lessonNote}` }] };
   })
 );
 
@@ -1486,6 +1522,50 @@ server.registerTool(
   })
 );
 
+// ─── Tool: mem_optimize ────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_optimize',
+  {
+    description: 'LLM-powered database optimization: re-enrich degraded records, normalize concepts, merge related observations, smart-compress old data. Use when: database quality seems low, search results are noisy, or for periodic deep maintenance.',
+    inputSchema: memOptimizeSchema,
+  },
+  safeHandler(async (args) => {
+    const action = args.action || 'preview';
+
+    if (action === 'preview') {
+      const preview = optimizePreview(db);
+      const lines = [
+        `🔍 LLM Optimization Preview:`,
+        `  Re-enrich candidates: ${preview.reenrich}`,
+        `  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`,
+        `  Cluster-merge candidates: ${preview.clusterMerge} clusters`,
+        `  Smart-compress candidates: ${preview.smartCompress} clusters`,
+        `  Total: ${preview.total} items`,
+      ];
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+
+    const force = action === 'run_all';
+    const results = await optimizeRun(db, {
+      tasks: args.tasks,
+      maxItems: args.max_items || 15,
+      force,
+    });
+
+    const lines = ['🔧 LLM Optimization Results:'];
+    if (results.reenrich) lines.push(`  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`);
+    if (results.normalize) {
+      if (results.normalize.skipped) lines.push(`  Normalize: skipped (${results.normalize.reason})`);
+      else lines.push(`  Normalize: ${results.normalize.processed || 0} updated, ${results.normalize.groups || 0} synonym groups`);
+    }
+    if (results.clusterMerge) lines.push(`  Cluster-merge: ${results.clusterMerge.merged || 0} merged of ${results.clusterMerge.processed || 0} clusters`);
+    if (results.smartCompress) lines.push(`  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`);
+
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  })
+);
+
 // ─── Tool: mem_registry ─────────────────────────────────────────────────────
 
 server.registerTool(
@@ -1872,7 +1952,7 @@ server.registerTool(
 server.registerTool(
   'mem_recall',
   {
-    description: 'Recall observations related to a file. Use when: about to edit a file, investigating a file with past issues, or before refactoring to recall past bugfixes, decisions, and context.',
+    description: 'Recall observations related to a file. ALWAYS use before editing a file with known issues. Also use when: investigating a file, or before refactoring to recall past bugfixes, decisions, and context.',
     inputSchema: memRecallSchema,
   },
   safeHandler(async (args) => {

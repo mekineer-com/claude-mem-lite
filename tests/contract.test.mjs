@@ -11,6 +11,7 @@ import {
   memStatsSchema,
   memCompressSchema,
   memMaintainSchema,
+  memOptimizeSchema,
   memRecallSchema,
   memRegistrySchema,
   memUseSchema,
@@ -417,6 +418,55 @@ describe('memBrowseSchema', () => {
     const r = parseSchema(memBrowseSchema, { limit: '15' });
     expect(r.success).toBe(true);
     expect(r.data.limit).toBe(15);
+  });
+});
+
+// ─── memOptimizeSchema ──────────────────────────────────────────────────────
+
+describe('memOptimizeSchema', () => {
+  it('accepts empty args (all optional with defaults)', () => {
+    expect(parseSchema(memOptimizeSchema, {}).success).toBe(true);
+  });
+
+  it('defaults action to preview', () => {
+    const r = parseSchema(memOptimizeSchema, {});
+    expect(r.success).toBe(true);
+    expect(r.data.action).toBe('preview');
+  });
+
+  it('accepts all valid action values', () => {
+    for (const action of ['preview', 'run', 'run_all']) {
+      expect(parseSchema(memOptimizeSchema, { action }).success).toBe(true);
+    }
+  });
+
+  it('rejects invalid action', () => {
+    expect(parseSchema(memOptimizeSchema, { action: 'execute' }).success).toBe(false);
+  });
+
+  it('accepts tasks array', () => {
+    const r = parseSchema(memOptimizeSchema, { action: 'run', tasks: ['re-enrich', 'normalize'] });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects invalid task', () => {
+    expect(parseSchema(memOptimizeSchema, { tasks: ['invalid'] }).success).toBe(false);
+  });
+
+  it('accepts max_items within range', () => {
+    expect(parseSchema(memOptimizeSchema, { max_items: 1 }).success).toBe(true);
+    expect(parseSchema(memOptimizeSchema, { max_items: 100 }).success).toBe(true);
+  });
+
+  it('rejects max_items out of range', () => {
+    expect(parseSchema(memOptimizeSchema, { max_items: 0 }).success).toBe(false);
+    expect(parseSchema(memOptimizeSchema, { max_items: 101 }).success).toBe(false);
+  });
+
+  it('coerces string max_items', () => {
+    const r = parseSchema(memOptimizeSchema, { max_items: '10' });
+    expect(r.success).toBe(true);
+    expect(r.data.max_items).toBe(10);
   });
 });
 

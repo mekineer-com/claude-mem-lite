@@ -74,6 +74,7 @@ export const memSaveSchema = {
   project: z.string().optional().describe('Project name (default: inferred from CWD)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 2 for explicit saves)'),
   files: z.array(z.string()).optional().describe('File paths associated with this observation'),
+  lesson_learned: z.string().max(500).optional().describe('Key lesson or takeaway (for bugfix: root cause & fix; for decision: rationale)'),
 };
 
 export const memStatsSchema = {
@@ -85,6 +86,15 @@ export const memCompressSchema = {
   preview: coerceBool.optional().describe('true=count candidates, false=execute compression (default: true)'),
   age_days: coerceInt.pipe(z.number().int().min(30).max(365)).optional().describe('Min age in days (default: 30, minimum: 30)'),
   project: z.string().optional().describe('Filter by project'),
+};
+
+export const memOptimizeSchema = {
+  action: z.enum(['preview', 'run', 'run_all']).optional().default('preview')
+    .describe('preview=scan candidates, run=execute with limits, run_all=bypass gates'),
+  tasks: z.array(z.enum(['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'])).optional()
+    .describe('Which optimization tasks to run (default: all)'),
+  max_items: coerceInt.pipe(z.number().int().min(1).max(100)).optional().default(15)
+    .describe('Maximum LLM calls across all tasks (default: 15)'),
 };
 
 export const memMaintainSchema = {
