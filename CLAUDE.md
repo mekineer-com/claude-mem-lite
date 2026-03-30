@@ -6,7 +6,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 - **Version**: 2.28.2
 - **Package manager**: npm
-- **Test**: `npx vitest run` (35 test files, vitest)
+- **Test**: `npx vitest run` (44 test files, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs`
 - **DB**: better-sqlite3 + FTS5 full-text search
@@ -27,7 +27,8 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 | `hook-shared.mjs` | Shared constants/utilities (RUNTIME_DIR, session mgmt) |
 | `hook-semaphore.mjs` | Concurrency control for hook execution |
 | `hook-update.mjs` | Auto-update via GitHub Releases (24h check, dev-mode skip) |
-| `server.mjs` | MCP server — mem_search/mem_recent/mem_save/mem_get/mem_recall/mem_timeline/mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_fts_check/mem_stats/mem_registry/mem_browse |
+| `hook-optimize.mjs` | LLM-powered optimization: re-enrich, normalize, cluster-merge, smart-compress |
+| `server.mjs` | MCP server — mem_search/mem_recent/mem_save/mem_get/mem_recall/mem_timeline/mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_optimize/mem_fts_check/mem_stats/mem_registry/mem_browse |
 | `registry.mjs` | Resource registry DB schema + CRUD |
 | `registry-retriever.mjs` | FTS5 search + BM25 composite scoring + domain filtering |
 | `registry-indexer.mjs` | Resource indexing pipeline |
@@ -40,7 +41,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Key Patterns
 
-- CLI commands: `claude-mem-lite search|recent|recall|get|timeline|save|delete|update|export|compress|maintain|fts-check|stats|context|browse|registry`
+- CLI commands: `claude-mem-lite search|recent|recall|get|timeline|save|delete|update|export|compress|maintain|optimize|fts-check|stats|context|browse|registry`
 - Tool name mapping: Claude Code Agent tool = `'Agent'` (not `'Task'`); Skill via `event.tool_input?.skill`
 - Tests use `:memory:` DB — schema changes must sync to test files
 - FTS5 search: sanitizeFtsQuery (synonym expansion) → BM25 scoring → OR fallback → concept co-occurrence
@@ -49,16 +50,15 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 <claude-mem-context>
 ### Last Session
-Request: Fix CLI tests and linting errors in the projects--mem memory system
-Completed: Fixed eslint errors in hook-semaphore.mjs by removing unused writeFileSync import and refactoring variable initializati…
-Remaining: Fix failing CLI E2E tests in tests/cli-e2e.test.mjs (FAIL: CLI E2E > get > handles non-e... and others shown in vitest …
-Next: Debug and resolve failing E2E tests in cli-e2e.test.mjs; verify test modifications are correctly applied; run full test…
+Request: No user request has been made yet
+Remaining: Awaiting user instruction for this session
+Next: User to provide task or request
 
 ### Key Context
-- [change] Modified tfidf.mjs, schema.mjs, registry.mjs (#5715)
-- [change] Modified scoring-sql.mjs, schema.mjs, hook.mjs (#5704)
-- [discovery] Reviewed 1 files: integration-scenarios.test.mjs (#5691)
-- [discovery] Reviewed 3 files: install.mjs, tests, registry-importer.mjs (#5687)
-- [discovery] Reviewed 11 files: mem, server.test.mjs, install.mjs, server.mjs +7 more (#5685)
+- [discovery] Worked on server.mjs, schema.mjs (#5801)
+- [change] Modified schema.mjs, hook-memory.mjs, tool-schemas.mjs +1 more (#5793)
+- [discovery] Reviewed 15 files: server.mjs, tool-schemas.mjs, post-tool-use.sh, user-prompt-… (#5782)
+- [discovery] Reviewed 2 files: server.mjs, tool-schemas.mjs (#5780)
+- [change] Modified cli-e2e.test.mjs, cli.test.mjs (#5731)
 
 </claude-mem-context>
