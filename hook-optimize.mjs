@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import {
   truncate, debugLog, debugCatch, COMPRESSED_AUTO,
-  computeMinHash, clampImportance, cjkBigrams,
+  computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity, clampImportance, cjkBigrams,
 } from './utils.mjs';
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
@@ -249,4 +249,150 @@ export async function executeNormalize(db, force = false) {
   try { writeFileSync(NORMALIZE_GATE_FILE, JSON.stringify({ epoch: Date.now() })); } catch {}
 
   return { processed: result.updated, groups: groups.length };
+}
+
+// ─── Task 3: Cluster-merge ─────────────────────────────────────────────────
+
+const MERGE_TIME_WINDOW_MS = 30 * 86400000;
+const MERGE_JACCARD_LOW = 0.4;
+const MERGE_JACCARD_HIGH = 0.85;
+
+export function findMergeCandidates(db, maxClusters = 5) {
+  const cutoff = Date.now() - MERGE_TIME_WINDOW_MS;
+  const rows = db.prepare(`
+    SELECT id, title, narrative, project, access_count, created_at_epoch, minhash_sig
+    FROM observations
+    WHERE COALESCE(compressed_into, 0) = 0
+      AND optimized_at IS NULL
+      AND title IS NOT NULL AND title != ''
+      AND created_at_epoch > ?
+    ORDER BY created_at_epoch DESC
+    LIMIT 200
+  `).all(cutoff);
+
+  const used = new Set();
+  const clusters = [];
+
+  for (let i = 0; i < rows.length && clusters.length < maxClusters; i++) {
+    if (used.has(rows[i].id)) continue;
+    const cluster = [rows[i]];
+
+    for (let j = i + 1; j < rows.length && cluster.length < 5; j++) {
+      if (used.has(rows[j].id)) continue;
+      if (rows[i].project !== rows[j].project) continue;
+      if (Math.abs(rows[i].created_at_epoch - rows[j].created_at_epoch) > MERGE_TIME_WINDOW_MS) continue;
+
+      if (rows[i].minhash_sig && rows[j].minhash_sig) {
+        const est = estimateJaccardFromMinHash(rows[i].minhash_sig, rows[j].minhash_sig);
+        if (est < MERGE_JACCARD_LOW * 0.8) continue;
+      }
+
+      const titleSim = jaccardSimilarity(rows[i].title, rows[j].title);
+      if (titleSim >= MERGE_JACCARD_LOW && titleSim < MERGE_JACCARD_HIGH) {
+        cluster.push(rows[j]);
+        used.add(rows[j].id);
+      }
+    }
+
+    if (cluster.length >= 2) {
+      used.add(rows[i].id);
+      clusters.push(cluster);
+    }
+  }
+
+  return clusters;
+}
+
+export async function executeMergeCluster(db, cluster) {
+  if (cluster.length < 2) return { merged: false };
+
+  const gotSlot = await acquireLLMSlot();
+  if (!gotSlot) return { merged: false };
+
+  try {
+    const obsDescriptions = cluster.map((o, i) =>
+      `${i + 1}. [${o.type || 'change'}] "${o.title}" — ${o.narrative || '(no narrative)'}`
+    ).join('\n');
+
+    const prompt = `These observations from a code memory database may be about the same topic. Should they be merged into a single observation?
+
+Observations:
+${obsDescriptions}
+
+Return ONLY valid JSON:
+- If they should NOT be merged: {"should_merge":false}
+- If they SHOULD be merged: {"should_merge":true,"merged_title":"≤120 char comprehensive title","merged_narrative":"comprehensive ≤800 char summary preserving all key details","merged_concepts":["kw1","kw2"],"merged_facts":["specific fact 1"],"merged_lesson":"synthesized non-obvious lesson or null","importance":2}`;
+
+    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    if (!parsed || !parsed.should_merge) return { merged: false };
+
+    const keeper = cluster.reduce((best, o) =>
+      (o.access_count || 0) > (best.access_count || 0) ? o : best
+    , cluster[0]);
+    const others = cluster.filter(o => o.id !== keeper.id);
+
+    const concepts = Array.isArray(parsed.merged_concepts) ? parsed.merged_concepts.slice(0, 10) : [];
+    const facts = Array.isArray(parsed.merged_facts) ? parsed.merged_facts.slice(0, 10) : [];
+    const conceptsText = concepts.join(' ');
+    const factsText = facts.join(' ');
+    const title = truncate(parsed.merged_title, 120);
+    const narrative = truncate(parsed.merged_narrative || '', 800);
+    const lessonLearned = typeof parsed.merged_lesson === 'string'
+      && parsed.merged_lesson.trim().length > 0
+      ? parsed.merged_lesson.slice(0, 500) : null;
+
+    const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
+    const textField = [conceptsText, factsText, bigramText].filter(Boolean).join(' ');
+    const minhashSig = computeMinHash((title || '') + ' ' + (narrative || ''));
+    const importance = clampImportance(parsed.importance || 2);
+
+    db.transaction(() => {
+      db.prepare(`
+        UPDATE observations SET title=?, narrative=?, concepts=?, facts=?, text=?,
+          importance=?, lesson_learned=?, minhash_sig=?, optimized_at=?
+        WHERE id = ?
+      `).run(title, narrative, conceptsText, factsText, textField,
+        importance, lessonLearned, minhashSig, Date.now(), keeper.id);
+
+      const otherIds = others.map(o => o.id);
+      const ph = otherIds.map(() => '?').join(',');
+      db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${ph})`)
+        .run(keeper.id, ...otherIds);
+    })();
+
+    try {
+      const vocab = getVocabulary(db);
+      if (vocab) {
+        const vecText = [title, narrative, conceptsText].filter(Boolean).join(' ');
+        const vec = computeVector(vecText, vocab);
+        if (vec) {
+          db.prepare(`
+            INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
+            VALUES (?, ?, ?, ?)
+          `).run(keeper.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+        }
+      }
+    } catch (e) { debugCatch(e, 'merge-vector'); }
+
+    debugLog('DEBUG', 'llm-optimize', `merged ${cluster.length} observations into #${keeper.id}`);
+    return { merged: true, keeperId: keeper.id, mergedCount: others.length };
+  } catch (e) {
+    debugCatch(e, 'cluster-merge');
+    return { merged: false };
+  } finally {
+    releaseLLMSlot();
+  }
+}
+
+export async function executeClusterMerge(db, maxClusters = 5) {
+  const clusters = findMergeCandidates(db, maxClusters);
+  if (clusters.length === 0) return { processed: 0, merged: 0 };
+
+  let merged = 0;
+  for (const cluster of clusters) {
+    const result = await executeMergeCluster(db, cluster);
+    if (result.merged) merged++;
+  }
+
+  return { processed: clusters.length, merged };
 }

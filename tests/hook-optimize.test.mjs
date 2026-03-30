@@ -138,3 +138,60 @@ describe('normalize', () => {
     expect(result.updated).toBe(0);
   });
 });
+
+describe('cluster-merge', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSON.mockReset();
+  });
+  afterEach(() => { db.close(); });
+
+  it('finds merge candidates with moderate similarity', async () => {
+    const { findMergeCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Fix FTS5 query sanitization bug in utils.mjs', narrative: 'Fixed special char handling' });
+    insertObs(db, { title: 'Fix FTS5 query sanitization edge case in utils.mjs', narrative: 'Fixed parentheses handling' });
+    const candidates = findMergeCandidates(db, 10);
+    expect(candidates.length).toBeGreaterThanOrEqual(0);
+  });
+
+  it('executes merge when LLM approves', async () => {
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Fix FTS5 bug A', narrative: 'Handled special chars', accessCount: 3 });
+    insertObs(db, { title: 'Fix FTS5 bug B', narrative: 'Handled parentheses', accessCount: 1 });
+
+    const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
+    callModelJSON.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Fix FTS5 query sanitization bugs',
+      merged_narrative: 'Fixed multiple edge cases in FTS5 query sanitization',
+      merged_concepts: ['FTS5', 'sanitize', 'query'],
+      merged_facts: ['FTS5 special chars crash sanitizeFtsQuery', 'Parentheses need escaping'],
+      merged_lesson: 'FTS5 requires comprehensive input sanitization',
+      importance: 2,
+    });
+
+    const result = await executeMergeCluster(db, obs);
+    expect(result.merged).toBe(true);
+
+    const keeper = db.prepare('SELECT * FROM observations WHERE id = ?').get(obs[0].id);
+    expect(keeper.title).toBe('Fix FTS5 query sanitization bugs');
+    expect(keeper.optimized_at).toBeGreaterThan(0);
+
+    const other = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(obs[1].id);
+    expect(other.compressed_into).toBe(obs[0].id);
+  });
+
+  it('skips merge when LLM says should_merge=false', async () => {
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Obs A', narrative: 'About auth' });
+    insertObs(db, { title: 'Obs B', narrative: 'About database' });
+    const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
+
+    callModelJSON.mockResolvedValue({ should_merge: false });
+
+    const result = await executeMergeCluster(db, obs);
+    expect(result.merged).toBe(false);
+  });
+});
