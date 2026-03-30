@@ -195,3 +195,63 @@ describe('cluster-merge', () => {
     expect(result.merged).toBe(false);
   });
 });
+
+describe('smart-compress', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSON.mockReset();
+  });
+  afterEach(() => { db.close(); });
+
+  it('finds compress candidates (old, low-importance, no access)', async () => {
+    const { findSmartCompressCandidates } = await import('../hook-optimize.mjs');
+    const oldEpoch = -(31 * 86400000);
+    insertObs(db, { title: 'Old obs 1', epochOffset: oldEpoch, importance: 1, accessCount: 0 });
+    insertObs(db, { title: 'Old obs 2', epochOffset: oldEpoch - 1000, importance: 1, accessCount: 0 });
+    insertObs(db, { title: 'Old obs 3', epochOffset: oldEpoch - 2000, importance: 1, accessCount: 0 });
+    const candidates = findSmartCompressCandidates(db);
+    expect(candidates.length).toBe(3);
+  });
+
+  it('skips recent or important observations', async () => {
+    const { findSmartCompressCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Recent obs', importance: 1, accessCount: 0 });
+    insertObs(db, { title: 'Important obs', epochOffset: -(31 * 86400000), importance: 2, accessCount: 0 });
+    const candidates = findSmartCompressCandidates(db);
+    expect(candidates.length).toBe(0);
+  });
+
+  it('creates smart summary from a cluster', async () => {
+    const { executeSmartCompressCluster } = await import('../hook-optimize.mjs');
+    const oldEpoch = -(31 * 86400000);
+    insertObs(db, { title: 'Modified utils.mjs', narrative: 'Changed sanitize fn', epochOffset: oldEpoch });
+    insertObs(db, { title: 'Updated utils.mjs tests', narrative: 'Added test cases', epochOffset: oldEpoch - 1000 });
+    insertObs(db, { title: 'Fixed utils.mjs lint', narrative: 'Resolved lint warnings', epochOffset: oldEpoch - 2000 });
+
+    const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
+
+    callModelJSON.mockResolvedValue({
+      title: 'Utils.mjs maintenance: sanitize improvements and cleanup',
+      narrative: 'Series of changes to utils.mjs including sanitize function updates, test additions, and lint fixes.',
+      concepts: ['utils', 'sanitize', 'lint'],
+      facts: ['sanitize function in utils.mjs was updated', 'lint warnings resolved'],
+      lesson_learned: 'none',
+      search_aliases: ['utils cleanup', 'sanitize refactor'],
+    });
+
+    const result = await executeSmartCompressCluster(db, obs, 'test');
+    expect(result.compressed).toBe(true);
+    expect(result.summaryId).toBeGreaterThan(0);
+
+    for (const o of obs) {
+      const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(o.id);
+      expect(row.compressed_into).toBe(result.summaryId);
+    }
+
+    const summary = db.prepare('SELECT * FROM observations WHERE id = ?').get(result.summaryId);
+    expect(summary.importance).toBe(2);
+    expect(summary.title).toContain('Utils.mjs');
+  });
+});

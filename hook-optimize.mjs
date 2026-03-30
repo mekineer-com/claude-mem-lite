@@ -10,7 +10,7 @@ import {
 } from './utils.mjs';
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
-import { getVocabulary, computeVector } from './tfidf.mjs';
+import { getVocabulary, computeVector, cosineSimilarity } from './tfidf.mjs';
 import { DB_DIR } from './schema.mjs';
 
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
@@ -395,4 +395,201 @@ export async function executeClusterMerge(db, maxClusters = 5) {
   }
 
   return { processed: clusters.length, merged };
+}
+
+// ─── Task 4: Smart-compress ────────────────────────────────────────────────
+
+const COMPRESS_TIME_SPLIT_MS = 14 * 86400000;
+const COMPRESS_COSINE_THRESHOLD = 0.3;
+
+export function findSmartCompressCandidates(db, ageDays = 30) {
+  const cutoff = Date.now() - ageDays * 86400000;
+  return db.prepare(`
+    SELECT id, title, narrative, lesson_learned, project, type, created_at_epoch
+    FROM observations
+    WHERE COALESCE(compressed_into, 0) = 0
+      AND COALESCE(importance, 1) = 1
+      AND COALESCE(access_count, 0) = 0
+      AND created_at_epoch < ?
+    ORDER BY project, created_at_epoch
+  `).all(cutoff);
+}
+
+export function clusterForCompression(candidates, db) {
+  if (candidates.length < 3) return [];
+
+  const byProject = new Map();
+  for (const c of candidates) {
+    if (!byProject.has(c.project)) byProject.set(c.project, []);
+    byProject.get(c.project).push(c);
+  }
+
+  const clusters = [];
+
+  for (const [project, obs] of byProject) {
+    if (obs.length < 3) continue;
+
+    let vocab;
+    try { vocab = getVocabulary(db); } catch {}
+
+    if (vocab) {
+      const vectors = obs.map(o => {
+        const text = [o.title || '', o.narrative || ''].join(' ');
+        return computeVector(text, vocab);
+      });
+
+      const used = new Set();
+      for (let i = 0; i < obs.length; i++) {
+        if (used.has(i) || !vectors[i]) continue;
+        const cluster = [{ obs: obs[i], idx: i }];
+        used.add(i);
+
+        for (let j = i + 1; j < obs.length; j++) {
+          if (used.has(j) || !vectors[j]) continue;
+          const sim = cosineSimilarity(vectors[i], vectors[j]);
+          if (sim >= COMPRESS_COSINE_THRESHOLD) {
+            cluster.push({ obs: obs[j], idx: j });
+            used.add(j);
+          }
+        }
+
+        if (cluster.length >= 3) {
+          const sorted = cluster.map(c => c.obs).sort((a, b) => a.created_at_epoch - b.created_at_epoch);
+          let subCluster = [sorted[0]];
+          for (let k = 1; k < sorted.length; k++) {
+            if (sorted[k].created_at_epoch - subCluster[0].created_at_epoch > COMPRESS_TIME_SPLIT_MS) {
+              if (subCluster.length >= 3) clusters.push({ project, observations: subCluster });
+              subCluster = [sorted[k]];
+            } else {
+              subCluster.push(sorted[k]);
+            }
+          }
+          if (subCluster.length >= 3) clusters.push({ project, observations: subCluster });
+        }
+      }
+    } else {
+      // Fallback: group by time window only
+      const sorted = obs.sort((a, b) => a.created_at_epoch - b.created_at_epoch);
+      let subCluster = [sorted[0]];
+      for (let k = 1; k < sorted.length; k++) {
+        if (sorted[k].created_at_epoch - subCluster[0].created_at_epoch > COMPRESS_TIME_SPLIT_MS) {
+          if (subCluster.length >= 3) clusters.push({ project, observations: subCluster });
+          subCluster = [sorted[k]];
+        } else {
+          subCluster.push(sorted[k]);
+        }
+      }
+      if (subCluster.length >= 3) clusters.push({ project, observations: subCluster });
+    }
+  }
+
+  return clusters;
+}
+
+export async function executeSmartCompressCluster(db, observations, project) {
+  if (observations.length < 3) return { compressed: false };
+
+  const gotSlot = await acquireLLMSlot();
+  if (!gotSlot) return { compressed: false };
+
+  try {
+    const obsDescriptions = observations.map((o, i) =>
+      `${i + 1}. [${o.type || 'change'}] "${o.title || '(untitled)'}" — ${o.narrative || '(no narrative)'}${o.lesson_learned ? ` | Lesson: ${o.lesson_learned}` : ''}`
+    ).join('\n');
+
+    const prompt = `Summarize these related code memory observations into ONE comprehensive summary. Preserve all important decisions, lessons, and specific facts. Return ONLY valid JSON.
+
+Observations:
+${obsDescriptions}
+
+JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive summary ≤800 chars preserving key decisions and lessons","concepts":["kw1","kw2"],"facts":["all specific facts preserved"],"lesson_learned":"most important synthesized lesson or 'none'","search_aliases":["alt search 1","alt search 2"]}`;
+
+    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    if (!parsed || !parsed.title) return { compressed: false };
+
+    const title = truncate(parsed.title, 120);
+    const narrative = truncate(parsed.narrative || '', 800);
+    const concepts = Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [];
+    const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [];
+    const conceptsText = concepts.join(' ');
+    const factsText = facts.join(' ');
+    const lessonLearned = typeof parsed.lesson_learned === 'string'
+      && parsed.lesson_learned.toLowerCase() !== 'none'
+      && parsed.lesson_learned.trim().length > 0
+      ? parsed.lesson_learned.slice(0, 500) : null;
+    const searchAliases = Array.isArray(parsed.search_aliases)
+      ? parsed.search_aliases.slice(0, 6).join(' ') : null;
+
+    const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
+    const textField = [conceptsText, factsText, searchAliases || '', bigramText].filter(Boolean).join(' ');
+
+    const epochs = observations.map(o => o.created_at_epoch).sort((a, b) => a - b);
+    const medianEpoch = epochs[Math.floor(epochs.length / 2)];
+
+    const summaryId = db.transaction(() => {
+      const sessionId = `compress-${project}`;
+      const now = new Date();
+      db.prepare(`INSERT OR IGNORE INTO sdk_sessions
+        (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+        VALUES (?,?,?,?,?,'active')`
+      ).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+
+      const result = db.prepare(`INSERT INTO observations
+        (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+         files_read, files_modified, importance, lesson_learned, search_aliases, optimized_at,
+         created_at, created_at_epoch)
+        VALUES (?,?,?,?,?,'',?,?,?,'[]','[]',2,?,?,?,?,?)`
+      ).run(sessionId, project, textField, 'discovery', title, narrative,
+        conceptsText, factsText, lessonLearned, searchAliases, Date.now(),
+        new Date(medianEpoch).toISOString(), medianEpoch);
+
+      const sId = Number(result.lastInsertRowid);
+
+      const obsIds = observations.map(o => o.id);
+      const ph = obsIds.map(() => '?').join(',');
+      db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${ph})`)
+        .run(sId, ...obsIds);
+
+      return sId;
+    })();
+
+    try {
+      const vocab = getVocabulary(db);
+      if (vocab) {
+        const vecText = [title, narrative, conceptsText].filter(Boolean).join(' ');
+        const vec = computeVector(vecText, vocab);
+        if (vec) {
+          db.prepare(`
+            INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
+            VALUES (?, ?, ?, ?)
+          `).run(summaryId, Buffer.from(vec.buffer), vocab.version, Date.now());
+        }
+      }
+    } catch (e) { debugCatch(e, 'smart-compress-vector'); }
+
+    debugLog('DEBUG', 'llm-optimize', `smart-compressed ${observations.length} observations into #${summaryId}`);
+    return { compressed: true, summaryId, count: observations.length };
+  } catch (e) {
+    debugCatch(e, 'smart-compress');
+    return { compressed: false };
+  } finally {
+    releaseLLMSlot();
+  }
+}
+
+export async function executeSmartCompress(db, maxClusters = 5) {
+  const candidates = findSmartCompressCandidates(db);
+  if (candidates.length < 3) return { processed: 0, compressed: 0 };
+
+  const clusters = clusterForCompression(candidates, db);
+  if (clusters.length === 0) return { processed: 0, compressed: 0 };
+
+  let compressed = 0;
+  const toProcess = clusters.slice(0, maxClusters);
+  for (const cluster of toProcess) {
+    const result = await executeSmartCompressCluster(db, cluster.observations, cluster.project);
+    if (result.compressed) compressed++;
+  }
+
+  return { processed: toProcess.length, compressed };
 }
