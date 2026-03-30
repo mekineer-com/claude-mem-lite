@@ -2,6 +2,8 @@
 // Background worker for intelligent maintenance: re-enrich, normalize, cluster-merge, smart-compress
 // Triggered from auto-maintain (24h) or manually via mem_optimize MCP tool / CLI
 
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import {
   truncate, debugLog, debugCatch, COMPRESSED_AUTO,
   computeMinHash, clampImportance, cjkBigrams,
@@ -9,6 +11,9 @@ import {
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { getVocabulary, computeVector } from './tfidf.mjs';
+import { DB_DIR } from './schema.mjs';
+
+const RUNTIME_DIR = join(DB_DIR, 'runtime');
 
 // ─── Budget ─────────────────────────────────────────────────────────────────
 
@@ -123,4 +128,125 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
 
   if (processed > 0) debugLog('DEBUG', 'llm-optimize', `re-enriched ${processed} degraded observations`);
   return { processed, skipped };
+}
+
+// ─── Task 2: Normalize ─────────────────────────────────────────────────────
+
+const NORMALIZE_GATE_FILE = join(RUNTIME_DIR, 'last-normalize.json');
+const NORMALIZE_INTERVAL_MS = 7 * 86400000; // 7 days
+
+export function shouldRunNormalize() {
+  try {
+    const last = JSON.parse(readFileSync(NORMALIZE_GATE_FILE, 'utf8'));
+    return Date.now() - last.epoch >= NORMALIZE_INTERVAL_MS;
+  } catch {
+    return true;
+  }
+}
+
+export function extractUniqueConcepts(db, limit = 500) {
+  const rows = db.prepare(`
+    SELECT concepts FROM observations
+    WHERE COALESCE(compressed_into, 0) = 0
+      AND concepts IS NOT NULL AND concepts != ''
+    ORDER BY created_at_epoch DESC
+    LIMIT 2000
+  `).all();
+
+  const conceptSet = new Set();
+  for (const row of rows) {
+    for (const c of row.concepts.split(/\s+/)) {
+      const trimmed = c.trim();
+      if (trimmed.length >= 2) conceptSet.add(trimmed);
+    }
+  }
+  return [...conceptSet].slice(0, limit);
+}
+
+export async function identifySynonymGroups(concepts) {
+  const gotSlot = await acquireLLMSlot();
+  if (!gotSlot) return [];
+
+  try {
+    const prompt = `Analyze these concept terms from a code memory database and identify synonym groups (terms that refer to the same concept). Include cross-language synonyms (English/Chinese). Return ONLY valid JSON.
+
+Concepts: ${concepts.join(', ')}
+
+JSON: {"groups":[{"canonical":"preferred term","aliases":["synonym1","synonym2"]}, ...]}
+
+Rules:
+- Only include groups where you are confident the terms are true synonyms
+- canonical should be the most specific/technical term
+- Include CJK ↔ English equivalents if present
+- Skip terms that have no synonyms in the list`;
+
+    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    if (!parsed?.groups || !Array.isArray(parsed.groups)) return [];
+    return parsed.groups.filter(g => g.canonical && Array.isArray(g.aliases) && g.aliases.length > 0);
+  } catch (e) {
+    debugCatch(e, 'normalize-identify');
+    return [];
+  } finally {
+    releaseLLMSlot();
+  }
+}
+
+export function applyNormalization(db, groups) {
+  if (!groups || groups.length === 0) return { updated: 0 };
+
+  const aliasMap = new Map();
+  for (const g of groups) {
+    for (const alias of g.aliases) {
+      aliasMap.set(alias.toLowerCase(), g.canonical);
+    }
+  }
+
+  const rows = db.prepare(`
+    SELECT id, concepts, search_aliases FROM observations
+    WHERE COALESCE(compressed_into, 0) = 0
+      AND concepts IS NOT NULL AND concepts != ''
+  `).all();
+
+  let updated = 0;
+  const updateStmt = db.prepare(`
+    UPDATE observations SET concepts = ?, search_aliases = ?, optimized_at = ? WHERE id = ?
+  `);
+
+  for (const row of rows) {
+    const terms = row.concepts.split(/\s+/);
+    let changed = false;
+    const newTerms = terms.map(t => {
+      const canonical = aliasMap.get(t.toLowerCase());
+      if (canonical && canonical !== t) { changed = true; return canonical; }
+      return t;
+    });
+
+    if (changed) {
+      const uniqueConcepts = [...new Set(newTerms)].join(' ');
+      const existingAliases = row.search_aliases || '';
+      const originalTerms = terms.filter(t => aliasMap.has(t.toLowerCase()) && aliasMap.get(t.toLowerCase()) !== t);
+      const newAliases = [existingAliases, ...originalTerms].filter(Boolean).join(' ');
+      updateStmt.run(uniqueConcepts, newAliases, Date.now(), row.id);
+      updated++;
+    }
+  }
+
+  if (updated > 0) debugLog('DEBUG', 'llm-optimize', `normalized concepts in ${updated} observations`);
+  return { updated };
+}
+
+export async function executeNormalize(db, force = false) {
+  if (!force && !shouldRunNormalize()) return { skipped: true, reason: 'gate' };
+
+  const concepts = extractUniqueConcepts(db);
+  if (concepts.length < 5) return { skipped: true, reason: 'too few concepts' };
+
+  const groups = await identifySynonymGroups(concepts);
+  if (groups.length === 0) return { processed: 0, groups: 0 };
+
+  const result = applyNormalization(db, groups);
+
+  try { writeFileSync(NORMALIZE_GATE_FILE, JSON.stringify({ epoch: Date.now() })); } catch {}
+
+  return { processed: result.updated, groups: groups.length };
 }

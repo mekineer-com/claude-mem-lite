@@ -94,3 +94,47 @@ describe('re-enrich', () => {
     expect(obs.optimized_at).toBeGreaterThan(0);
   });
 });
+
+describe('normalize', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSON.mockReset();
+  });
+  afterEach(() => { db.close(); });
+
+  it('extracts unique concepts from active observations', async () => {
+    const { extractUniqueConcepts } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'obs1', text: 'FTS5 search' });
+    db.prepare("UPDATE observations SET concepts = 'FTS5 full-text' WHERE id = 1").run();
+    insertObs(db, { title: 'obs2', text: 'FTS query' });
+    db.prepare("UPDATE observations SET concepts = 'FTS search query' WHERE id = 2").run();
+
+    const concepts = extractUniqueConcepts(db);
+    expect(concepts).toContain('FTS5');
+    expect(concepts).toContain('full-text');
+    expect(concepts).toContain('search');
+  });
+
+  it('applies synonym groups to observations', async () => {
+    const { applyNormalization } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'obs1', text: 'full-text search' });
+    db.prepare("UPDATE observations SET concepts = 'full-text search' WHERE id = 1").run();
+
+    const groups = [
+      { canonical: 'FTS5', aliases: ['full-text', 'FTS', '全文搜索'] }
+    ];
+    const result = applyNormalization(db, groups);
+    expect(result.updated).toBeGreaterThan(0);
+
+    const obs = db.prepare('SELECT concepts, search_aliases FROM observations WHERE id = 1').get();
+    expect(obs.concepts).toContain('FTS5');
+  });
+
+  it('returns 0 updated for empty groups', async () => {
+    const { applyNormalization } = await import('../hook-optimize.mjs');
+    const result = applyNormalization(db, []);
+    expect(result.updated).toBe(0);
+  });
+});
