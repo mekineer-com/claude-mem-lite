@@ -555,7 +555,7 @@ async function handleSessionStart() {
         // Mark maintenance as done (24h gate) — even though compression runs in background
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
         // Weekly summary grouping runs in background to avoid blocking SessionStart
-        spawnBackground('auto-compress');
+        if (!process.env.CLAUDE_MEM_SKIP_COMPRESS) spawnBackground('auto-compress');
         if (!process.env.CLAUDE_MEM_SKIP_OPTIMIZE) spawnBackground('llm-optimize');
       } catch (e) { debugCatch(e, 'auto-maintain'); }
     }
