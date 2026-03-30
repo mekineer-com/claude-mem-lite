@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 20;
+export const CURRENT_SCHEMA_VERSION = 21;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -111,6 +111,7 @@ const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN superseded_at INTEGER DEFAULT NULL',
   'ALTER TABLE observations ADD COLUMN superseded_by INTEGER DEFAULT NULL',
   'ALTER TABLE observations ADD COLUMN last_accessed_at INTEGER DEFAULT NULL',
+  'ALTER TABLE observations ADD COLUMN optimized_at INTEGER DEFAULT NULL',
 ];
 
 /**
