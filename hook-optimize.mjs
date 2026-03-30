@@ -18,12 +18,32 @@ const RUNTIME_DIR = join(DB_DIR, 'runtime');
 // ─── Budget ─────────────────────────────────────────────────────────────────
 
 export function distributeBudget(total = 15) {
-  return {
-    reenrich: Math.ceil(total * 0.4),
-    normalize: 1,
-    clusterMerge: Math.ceil(total * 0.3),
-    smartCompress: Math.max(1, total - Math.ceil(total * 0.4) - 1 - Math.ceil(total * 0.3)),
-  };
+  const normalize = 1;
+  const reenrich = Math.max(1, Math.floor(total * 0.4));
+  const clusterMerge = Math.max(1, Math.floor(total * 0.3));
+  const smartCompress = Math.max(1, total - reenrich - normalize - clusterMerge);
+  // Clamp: if total is too small for 4 tasks, cap each so sum ≤ total
+  if (reenrich + normalize + clusterMerge + smartCompress > total) {
+    return { reenrich: Math.max(1, total - 3), normalize: 1, clusterMerge: 1, smartCompress: 1 };
+  }
+  return { reenrich, normalize, clusterMerge, smartCompress };
+}
+
+// ─── Shared Helpers ─────────────────────────────────────────────────────────
+
+/** Rebuild TF-IDF vector for an observation. Non-critical — swallows errors. */
+function rebuildVector(db, obsId, textParts) {
+  try {
+    const vocab = getVocabulary(db);
+    if (!vocab) return;
+    const vec = computeVector(textParts.filter(Boolean).join(' '), vocab);
+    if (vec) {
+      db.prepare(`
+        INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
+        VALUES (?, ?, ?, ?)
+      `).run(obsId, Buffer.from(vec.buffer), vocab.version, Date.now());
+    }
+  } catch (e) { debugCatch(e, 'optimize-vector'); }
 }
 
 // ─── Task 1: Re-enrich ─────────────────────────────────────────────────────
@@ -57,8 +77,8 @@ export async function executeReenrich(db, limit = 10) {
     try {
       const prompt = `Re-enrich this observation with structured metadata. Return ONLY valid JSON, no markdown fences.
 
-Title: ${cand.title || '(untitled)'}
-Narrative: ${cand.narrative || '(no narrative)'}
+Title: ${truncate(cand.title || '(untitled)', 200)}
+Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
 Type: ${cand.type || 'change'}
 
 JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"improved ≤120 char title","narrative":"improved 2-3 sentence narrative","concepts":["kw1","kw2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"]}
@@ -102,20 +122,7 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       `).run(type, title, narrative, conceptsText, factsText, textField,
         importance, lessonLearned, searchAliases, minhashSig, Date.now(), cand.id);
 
-      // Rebuild TF-IDF vector
-      try {
-        const vocab = getVocabulary(db);
-        if (vocab) {
-          const vecText = [title, narrative, conceptsText].filter(Boolean).join(' ');
-          const vec = computeVector(vecText, vocab);
-          if (vec) {
-            db.prepare(`
-              INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
-              VALUES (?, ?, ?, ?)
-            `).run(cand.id, Buffer.from(vec.buffer), vocab.version, Date.now());
-          }
-        }
-      } catch (e) { debugCatch(e, 'reenrich-vector'); }
+      rebuildVector(db, cand.id, [title, narrative, conceptsText]);
 
       processed++;
     } catch (e) {
@@ -311,7 +318,7 @@ export async function executeMergeCluster(db, cluster) {
 
   try {
     const obsDescriptions = cluster.map((o, i) =>
-      `${i + 1}. [${o.type || 'change'}] "${o.title}" — ${o.narrative || '(no narrative)'}`
+      `${i + 1}. [${o.type || 'change'}] "${truncate(o.title, 200)}" — ${truncate(o.narrative || '(no narrative)', 500)}`
     ).join('\n');
 
     const prompt = `These observations from a code memory database may be about the same topic. Should they be merged into a single observation?
@@ -360,19 +367,7 @@ Return ONLY valid JSON:
         .run(keeper.id, ...otherIds);
     })();
 
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const vecText = [title, narrative, conceptsText].filter(Boolean).join(' ');
-        const vec = computeVector(vecText, vocab);
-        if (vec) {
-          db.prepare(`
-            INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
-            VALUES (?, ?, ?, ?)
-          `).run(keeper.id, Buffer.from(vec.buffer), vocab.version, Date.now());
-        }
-      }
-    } catch (e) { debugCatch(e, 'merge-vector'); }
+    rebuildVector(db, keeper.id, [title, narrative, conceptsText]);
 
     debugLog('DEBUG', 'llm-optimize', `merged ${cluster.length} observations into #${keeper.id}`);
     return { merged: true, keeperId: keeper.id, mergedCount: others.length };
@@ -494,7 +489,7 @@ export async function executeSmartCompressCluster(db, observations, project) {
 
   try {
     const obsDescriptions = observations.map((o, i) =>
-      `${i + 1}. [${o.type || 'change'}] "${o.title || '(untitled)'}" — ${o.narrative || '(no narrative)'}${o.lesson_learned ? ` | Lesson: ${o.lesson_learned}` : ''}`
+      `${i + 1}. [${o.type || 'change'}] "${truncate(o.title || '(untitled)', 200)}" — ${truncate(o.narrative || '(no narrative)', 500)}${o.lesson_learned ? ` | Lesson: ${truncate(o.lesson_learned, 200)}` : ''}`
     ).join('\n');
 
     const prompt = `Summarize these related code memory observations into ONE comprehensive summary. Preserve all important decisions, lessons, and specific facts. Return ONLY valid JSON.
@@ -553,19 +548,7 @@ JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive sum
       return sId;
     })();
 
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const vecText = [title, narrative, conceptsText].filter(Boolean).join(' ');
-        const vec = computeVector(vecText, vocab);
-        if (vec) {
-          db.prepare(`
-            INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
-            VALUES (?, ?, ?, ?)
-          `).run(summaryId, Buffer.from(vec.buffer), vocab.version, Date.now());
-        }
-      }
-    } catch (e) { debugCatch(e, 'smart-compress-vector'); }
+    rebuildVector(db, summaryId, [title, narrative, conceptsText]);
 
     debugLog('DEBUG', 'llm-optimize', `smart-compressed ${observations.length} observations into #${summaryId}`);
     return { compressed: true, summaryId, count: observations.length };

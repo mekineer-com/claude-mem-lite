@@ -304,8 +304,16 @@ describe('pipeline', () => {
     const budget = distributeBudget(15);
     expect(budget.reenrich).toBe(6);
     expect(budget.normalize).toBe(1);
-    expect(budget.clusterMerge).toBe(5);
-    expect(budget.smartCompress).toBeGreaterThan(0);
-    expect(budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress).toBeLessThanOrEqual(16);
+    expect(budget.clusterMerge).toBe(4);
+    expect(budget.smartCompress).toBe(4);
+    expect(budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress).toBeLessThanOrEqual(15);
+  });
+
+  it('distributeBudget clamps for small totals', async () => {
+    const { distributeBudget } = await import('../hook-optimize.mjs');
+    const budget = distributeBudget(4);
+    const sum = budget.reenrich + budget.normalize + budget.clusterMerge + budget.smartCompress;
+    expect(sum).toBeLessThanOrEqual(4);
+    expect(budget.normalize).toBe(1);
   });
 });
