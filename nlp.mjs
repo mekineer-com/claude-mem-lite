@@ -108,6 +108,22 @@ export function extractCjkKeywords(text) {
   return found;
 }
 
+/**
+ * Extract CJK patterns suitable for SQL LIKE fallback when FTS5 fails on CJK text.
+ * Uses dictionary extraction + bigram fallback for unmatched portions.
+ * @param {string} query Raw query text
+ * @returns {string[]} CJK patterns (≥2 chars each), empty if no CJK content
+ */
+export function extractCjkLikePatterns(query) {
+  if (!query || !/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/.test(query)) return [];
+  const keywords = extractCjkKeywords(query);
+  // Bigrams for unmatched CJK portions
+  let remainder = query;
+  for (const w of keywords) remainder = remainder.split(w).join(' ');
+  const bigrams = cjkBigrams(remainder).split(' ').filter(Boolean);
+  return [...new Set([...keywords, ...bigrams])];
+}
+
 // ─── FTS5 Token Formatting ──────────────────────────────────────────────────
 
 // Format a term for FTS5: quote if it contains spaces, hyphens, or special chars
@@ -166,6 +182,16 @@ export function sanitizeFtsQuery(query) {
       if (cjkWords.length > 0) {
         expandedTokens.push(...cjkWords);
         cjkExtracted = true;
+        // Preserve unmatched CJK portions as bigrams (don't silently drop them)
+        const matched = new Set(cjkWords);
+        let remainder = t;
+        for (const w of matched) remainder = remainder.split(w).join(' ');
+        const gapBigrams = cjkBigrams(remainder);
+        if (gapBigrams) {
+          for (const bg of gapBigrams.split(' ')) {
+            if (bg && !CJK_STOP_WORDS.has(bg) && !matched.has(bg)) expandedTokens.push(bg);
+          }
+        }
         continue;
       }
     }

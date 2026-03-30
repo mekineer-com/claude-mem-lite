@@ -6,8 +6,13 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25 } from './uti
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
 // Aligned with TYPE_QUALITY_CASE: high-signal types > noisy types
-// Bugfix lessons are still surfaced via the separate lesson_learned boost (1.5×)
-const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, feature: 1.2, refactor: 1.0, change: 0.8, bugfix: 0.5 };
+// Bugfix raised from 0.5→0.75 to match scoring-sql.mjs; lesson_learned boost (1.5×) stacks
+const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, feature: 1.2, refactor: 1.0, change: 0.8, bugfix: 0.75 };
+// Adaptive BM25 thresholds — scale with corpus size to filter noise.
+// Larger corpora produce more weak matches from common words.
+const BM25_THRESHOLD = { TINY: 0, SMALL: 1.5, MEDIUM: 2.5, LARGE: 3.5 };
+// OR fallback max token count — queries with 3+ tokens that fail AND are likely off-topic
+const OR_FALLBACK_MAX_TOKENS = 2;
 
 const FILE_RECALL_LOOKBACK_MS = 60 * 86400000; // 60 days
 const MAX_FILE_RECALL = 2;
@@ -47,18 +52,25 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       LIMIT 10
     `);
     let rows = selectStmt.all(ftsQuery, project, cutoff);
+    let usedOrFallback = false;
 
-    // OR fallback when AND returns nothing
+    // OR fallback when AND returns nothing — only for short queries (specific enough).
+    // 3+ token queries that fail AND are likely off-topic; OR would match individual common words.
+    // Count original search terms (AND-separated groups), not expanded synonym tokens.
+    const queryTokenCount = ftsQuery.includes(' AND ')
+      ? ftsQuery.split(' AND ').length
+      : ftsQuery.split(/\s+/).filter(t => t && !t.startsWith('(') || !t.endsWith(')')).length;
     if (rows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
-      if (orQuery) {
-        try { rows = selectStmt.all(orQuery, project, cutoff); } catch {}
+      if (orQuery && queryTokenCount <= OR_FALLBACK_MAX_TOKENS) {
+        try { rows = selectStmt.all(orQuery, project, cutoff); usedOrFallback = true; } catch {}
       }
     }
 
     // Phase 2: Cross-project search for high-value decisions/discoveries
     // These are transferable insights (debugging patterns, architectural reasons, gotchas)
     let crossRows = [];
+    let crossUsedOr = false;
     try {
       const crossStmt = db.prepare(`
         SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
@@ -78,40 +90,44 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       crossRows = crossStmt.all(ftsQuery, project, cutoff);
       if (crossRows.length === 0) {
         const orQuery = relaxFtsQueryToOr(ftsQuery);
-        if (orQuery) {
-          try { crossRows = crossStmt.all(orQuery, project, cutoff); } catch {}
+        if (orQuery && queryTokenCount <= OR_FALLBACK_MAX_TOKENS) {
+          try { crossRows = crossStmt.all(orQuery, project, cutoff); crossUsedOr = true; } catch {}
         }
       }
     } catch (e) { debugCatch(e, 'crossProjectSearch'); }
 
     // Merge and score: same-project full weight, cross-project 0.7x
-    const allRows = [...rows, ...crossRows];
+    // OR-fallback results get 0.4x penalty — they matched individual words, not the full intent
+    const allRows = [...rows.map(r => ({ ...r, _or: usedOrFallback })), ...crossRows.map(r => ({ ...r, _or: crossUsedOr }))];
     const scored = allRows
       .filter(r => !excludeSet.has(r.id))
       .map(r => {
         const crossProjectPenalty = r.project === project ? 1.0 : 0.7;
+        const orFallbackPenalty = r._or ? 0.4 : 1.0;
         return {
           ...r,
           score: Math.abs(r.relevance)
             * (MEMORY_TYPE_BOOST[r.type] || 1.0)
             * (r.lesson_learned ? 1.5 : 1.0)
             * (r.importance >= 2 ? 1.0 : 0.6)
-            * crossProjectPenalty,
+            * crossProjectPenalty
+            * orFallbackPenalty,
         };
       })
       .sort((a, b) => b.score - a.score);
 
-    // Adaptive threshold: BM25 IDF collapses when corpus has <5 observations,
-    // producing scores ~0.00001 even for exact matches. At 5+ obs, IDF provides
-    // meaningful discrimination and the calibrated 1.5 threshold works well.
+    // Adaptive threshold: scales with corpus size to filter noise.
+    // Each result must individually exceed the threshold (not just the top one).
     const obsCount = db.prepare(
       'SELECT COUNT(*) as c FROM observations WHERE project = ? AND COALESCE(compressed_into, 0) = 0',
     ).get(project)?.c || 0;
-    const threshold = obsCount < 5 ? 0 : 1.5;
-    if (scored.length === 0 || scored[0].score < threshold) return [];
+    const { TINY, SMALL, MEDIUM, LARGE } = BM25_THRESHOLD;
+    const threshold = obsCount < 5 ? TINY : obsCount < 100 ? SMALL : obsCount < 500 ? MEDIUM : LARGE;
+    const aboveThreshold = scored.filter(r => r.score >= threshold);
+    if (aboveThreshold.length === 0) return [];
 
     // Update access_count for injected memories
-    const result = scored.slice(0, MAX_MEMORY_INJECTIONS);
+    const result = aboveThreshold.slice(0, MAX_MEMORY_INJECTIONS);
     const now = Date.now();
     const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
     for (const r of result) {

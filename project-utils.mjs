@@ -20,12 +20,25 @@ export function resolveProject(db, name) {
 
   // Short name: prefer the canonical "parent--name" form (from inferProject())
   // which typically has far more data than manually-saved short names.
+  // 1) Exact suffix match: "mem" → "projects--mem"
   const suffixed = db.prepare(
     'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
   ).get(`%--${name}`);
   if (suffixed) { _cache.set(name, suffixed.project); return suffixed.project; }
 
-  // Fallback: synthesize canonical form from current directory
+  // 2) Prefix-in-suffix match: "code-graph" → "projects--code-graph-mcp"
+  const prefixed = db.prepare(
+    'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
+  ).get(`%--${name}%`);
+  if (prefixed) { _cache.set(name, prefixed.project); return prefixed.project; }
+
+  // 3) Substring match: broader fallback for partial names
+  const substr = db.prepare(
+    'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
+  ).get(`%${name}%`);
+  if (substr) { _cache.set(name, substr.project); return substr.project; }
+
+  // 4) Fallback: synthesize canonical form from current directory
   const inferred = inferProject();
   if (inferred.endsWith(`--${name}`)) { _cache.set(name, inferred); return inferred; }
 

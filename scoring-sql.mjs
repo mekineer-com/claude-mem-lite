@@ -41,8 +41,9 @@ export const TYPE_DECAY_CASE = `(
 )`;
 
 /**
- * Type quality multiplier — demotes noisy types (bugfix error logs)
- * and promotes high-signal types (decisions, discoveries).
+ * Type quality multiplier — promotes high-signal types (decisions, discoveries).
+ * Bugfix raised from 0.35→0.75: lesson_learned bugfixes are valuable during
+ * active debugging; raw error logs are filtered by importance, not type penalty.
  * Applied as: BM25 × time_decay × TYPE_QUALITY × project_boost × importance
  */
 export const TYPE_QUALITY_CASE = `(
@@ -52,7 +53,7 @@ export const TYPE_QUALITY_CASE = `(
     WHEN 'feature'   THEN 1.2
     WHEN 'refactor'  THEN 1.0
     WHEN 'change'    THEN 0.8
-    WHEN 'bugfix'    THEN 0.35
+    WHEN 'bugfix'    THEN 0.75
     ELSE 1.0
   END
 )`;

@@ -262,7 +262,7 @@ describe('OR fallback in searchRelevantMemories', () => {
   });
   afterEach(() => { db?.close(); });
 
-  it('falls back to OR query when AND returns no results', () => {
+  it('falls back to OR query when AND returns no results for short queries', () => {
     // Insert observation with only partial keyword match
     insertObs(db, {
       sessionId: 'sess-or-test', project: 'test-project', type: 'bugfix',
@@ -272,9 +272,23 @@ describe('OR fallback in searchRelevantMemories', () => {
       importance: 2
     });
 
-    // AND query for "database performance optimization" won't match (no "performance" or "optimization")
-    // but OR fallback should find it via "database"
-    const results = searchRelevantMemories(db, 'database performance optimization', 'test-project');
+    // 2-token AND query: "database latency" won't AND-match (no "latency" in text)
+    // but OR fallback finds it via "database" (2 tokens → OR allowed)
+    const results = searchRelevantMemories(db, 'database latency', 'test-project');
     expect(results.length).toBeGreaterThan(0);
+  });
+
+  it('skips OR fallback for 3+ token queries to prevent noise', () => {
+    insertSession(db, { id: 'sess-or-test2', project: 'test-project' });
+    insertObs(db, {
+      sessionId: 'sess-or-test2', project: 'test-project', type: 'bugfix',
+      title: 'Fixed database connection timeout',
+      text: 'database connection timeout pool exhausted',
+      importance: 2
+    });
+
+    // 3-token AND query fails → OR fallback skipped (too many tokens = likely off-topic)
+    const results = searchRelevantMemories(db, 'database performance optimization', 'test-project');
+    expect(results.length).toBe(0);
   });
 });

@@ -88,29 +88,44 @@ try {
     // 60-day lookback to avoid surfacing ancient observations
     const cutoff = Date.now() - 60 * 86400000;
 
+    // Surface actionable lessons first, then high-importance bugfix/decision observations.
+    // Priority: 1) observations with lesson_learned (most actionable for preventing repeat bugs)
+    //           2) bugfix/decision types with importance>=2 (contextual history)
+    // Skip pure change/discovery without lessons — they add noise without actionable value.
     const rows = db.prepare(`
       SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
       FROM observations o
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE o.project = ?
         AND o.importance >= 2
-        AND o.lesson_learned IS NOT NULL
-        AND o.lesson_learned != ''
         AND COALESCE(o.compressed_into, 0) = 0
         AND o.superseded_at IS NULL
         AND o.created_at_epoch > ?
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
-      ORDER BY o.created_at_epoch DESC
+        AND (
+          (o.lesson_learned IS NOT NULL AND o.lesson_learned != '')
+          OR o.type IN ('bugfix', 'decision')
+        )
+      ORDER BY
+        CASE WHEN o.lesson_learned IS NOT NULL AND o.lesson_learned != '' THEN 0 ELSE 1 END,
+        o.created_at_epoch DESC
       LIMIT 2
     `).all(project, cutoff, filePath, likePattern);
 
     if (rows.length > 0) {
       console.log(`[mem] Lessons for ${fname}:`);
       for (const r of rows) {
-        const lesson = r.lesson_learned.length > 120
-          ? r.lesson_learned.slice(0, 117) + '...'
-          : r.lesson_learned;
-        console.log(`  #${r.id} [${r.type}] ${lesson}`);
+        if (r.lesson_learned) {
+          const lesson = r.lesson_learned.length > 120
+            ? r.lesson_learned.slice(0, 117) + '...'
+            : r.lesson_learned;
+          console.log(`  #${r.id} [${r.type}] ${lesson}`);
+        } else {
+          const title = (r.title || '').length > 120
+            ? r.title.slice(0, 117) + '...'
+            : (r.title || '');
+          console.log(`  #${r.id} [${r.type}] ${title}`);
+        }
       }
       // Update cooldown
       cooldown[filePath] = now;

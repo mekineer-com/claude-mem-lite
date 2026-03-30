@@ -83,6 +83,16 @@ describe('detectIntent', () => {
     expect(detectIntent('The app crashed on startup')).toHaveProperty('type', 'bugfix');
     expect(detectIntent('这个函数报错了')).toHaveProperty('type', 'bugfix');
     expect(detectIntent('修复编译错误')).toHaveProperty('type', 'bugfix');
+    // Extended CJK bugfix coverage (mined from real prompts)
+    expect(detectIntent('这个函数不工作了')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('搜索有问题')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('服务挂了')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('排查一下为什么失败')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('帮我诊断一下这个问题')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('定位到哪里出错了')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('异常处理有问题')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('解决这个报错')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('发现问题就修复问题')).toHaveProperty('type', 'bugfix');
   });
 
   it('detects recall intent from history keywords', () => {
@@ -93,6 +103,9 @@ describe('detectIntent', () => {
     expect(detectIntent('之前怎么处理的？')).toHaveProperty('useRecent', true);
     expect(detectIntent('What happened last time with the deployment?')).toHaveProperty('useRecent', true);
     expect(detectIntent('上次是怎么做的？')).toHaveProperty('useRecent', true);
+    // Extended CJK recall coverage
+    expect(detectIntent('刚才做了什么')).toHaveProperty('useRecent', true);
+    expect(detectIntent('回顾一下历史')).toHaveProperty('useRecent', true);
   });
 
   it('detects decision intent from architecture keywords', () => {
@@ -100,12 +113,77 @@ describe('detectIntent', () => {
     expect(detectIntent('What was the architecture decision?')).toHaveProperty('type', 'decision');
     expect(detectIntent('为什么选择这个架构？')).toHaveProperty('type', 'decision');
     expect(detectIntent('这个设计决定是怎么来的？')).toHaveProperty('type', 'decision');
+    // Extended CJK decision coverage
+    expect(detectIntent('当时的考虑是什么')).toHaveProperty('type', 'decision');
+    expect(detectIntent('有什么权衡')).toHaveProperty('type', 'decision');
+    expect(detectIntent('这个方案的原因')).toHaveProperty('type', 'decision');
+    expect(detectIntent('思路是什么')).toHaveProperty('type', 'decision');
+  });
+
+  it('detects review/audit intent (new)', () => {
+    expect(detectIntent('审查一下代码')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('代码审核一下')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('检查一下安全性')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('code review this PR')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('audit the dependency list')).toHaveProperty('type', 'discovery');
   });
 
   it('returns null for prompts with no matching intent', () => {
-    expect(detectIntent('Add a new button to the dashboard')).toBeNull();
-    expect(detectIntent('Refactor the test suite')).toBeNull();
-    expect(detectIntent('实现用户注册功能')).toBeNull();
+    expect(detectIntent('Update the README documentation')).toBeNull();
+    expect(detectIntent('deploy to staging server')).toBeNull();
+    expect(detectIntent('看一下这个文件')).toBeNull();
+  });
+
+  it('detects refactor intent', () => {
+    expect(detectIntent('Refactor the database module')).toHaveProperty('type', 'refactor');
+    expect(detectIntent('重构数据库模块')).toHaveProperty('type', 'refactor');
+    expect(detectIntent('clean up the old code')).toHaveProperty('type', 'refactor');
+    // Extended CJK refactor coverage
+    expect(detectIntent('把这个函数拆分一下')).toHaveProperty('type', 'refactor');
+    expect(detectIntent('提取成独立模块')).toHaveProperty('type', 'refactor');
+    expect(detectIntent('简化这段逻辑')).toHaveProperty('type', 'refactor');
+    expect(detectIntent('解耦这两个模块')).toHaveProperty('type', 'refactor');
+    expect(detectIntent('清理无用代码')).toHaveProperty('type', 'refactor');
+  });
+
+  it('test intent wins over refactor for "Refactor the test suite"', () => {
+    // "test" matches first (higher priority) — surfacing test-related bugfix memories
+    expect(detectIntent('Refactor the test suite')).toHaveProperty('type', 'bugfix');
+  });
+
+  it('detects implementation intent', () => {
+    expect(detectIntent('Add a new button to the dashboard')).toHaveProperty('type', null);
+    expect(detectIntent('implement user registration')).toHaveProperty('type', null);
+    expect(detectIntent('实现用户注册功能')).toHaveProperty('type', null);
+    // Extended CJK implementation coverage
+    expect(detectIntent('开发一个新功能')).toHaveProperty('type', null);
+    expect(detectIntent('写一个工具函数')).toHaveProperty('type', null);
+    expect(detectIntent('做一个缓存层')).toHaveProperty('type', null);
+    expect(detectIntent('创建新的API接口')).toHaveProperty('type', null);
+  });
+
+  it('detects test intent as bugfix type', () => {
+    expect(detectIntent('run the unit tests')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('单元测试失败了')).toHaveProperty('type', 'bugfix');
+    expect(detectIntent('the spec for parser is failing')).toHaveProperty('type', 'bugfix');
+  });
+
+  it('detects performance intent', () => {
+    expect(detectIntent('the API is very slow')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('optimize database performance')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('性能优化方案')).toHaveProperty('type', 'discovery');
+    // Extended CJK performance coverage
+    expect(detectIntent('页面卡顿')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('请求超时了')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('内存泄漏')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('优化搜索排序逻辑')).toHaveProperty('type', 'discovery');
+    expect(detectIntent('加速构建流程')).toHaveProperty('type', 'discovery');
+  });
+
+  it('detects schema/database intent as decision type', () => {
+    expect(detectIntent('update the database schema')).toHaveProperty('type', 'decision');
+    expect(detectIntent('add a migration for users table')).toHaveProperty('type', 'decision');
+    expect(detectIntent('数据库迁移脚本')).toHaveProperty('type', 'decision');
   });
 
   it('prioritizes first match (bugfix over decision over recall)', () => {
@@ -150,11 +228,15 @@ describe('extractFiles', () => {
     expect(files).toContain('config.json');
   });
 
-  it('extracts file-like segments from URLs (by design)', () => {
-    // The regex captures "example.com/api.html" from URLs — this is by design
-    // as file paths embedded in text might look URL-like
+  it('excludes URL paths from file detection', () => {
+    // URLs should not be extracted as file paths — they pollute file-recall queries
     const files = extractFiles('Check https://example.com/api.html');
-    expect(files.some(f => f.includes('api.html'))).toBe(true);
+    expect(files).toEqual([]);
+  });
+
+  it('excludes paths with // (protocol-like)', () => {
+    const files = extractFiles('See //cdn.example.com/lib.js for details');
+    expect(files).toEqual([]);
   });
 
   it('returns empty array when no files found', () => {

@@ -71,6 +71,43 @@ export const SYNONYM_PAIRS = [
   ['debug', 'troubleshoot'],
   ['error', 'failure'],
   ['migrate', 'migration'],
+  // ─── Concurrency & Async ───
+  ['promise', 'async'],
+  ['callback', 'handler'],
+  ['deadlock', 'race condition'],
+  ['mutex', 'lock'],
+  ['semaphore', 'lock'],
+  ['concurrent', 'parallel'],
+  ['thread', 'worker'],
+  ['await', 'async'],
+  // ─── Type System ───
+  ['interface', 'type'],
+  ['generic', 'generics'],
+  ['typedef', 'type'],
+  ['enum', 'enumeration'],
+  // ─── Testing ───
+  ['mock', 'stub'],
+  ['mock', 'fake'],
+  ['fixture', 'testdata'],
+  ['assert', 'assertion'],
+  ['jest', 'vitest'],
+  ['pytest', 'unittest'],
+  ['cypress', 'playwright'],
+  // ─── Networking ───
+  ['http', 'request'],
+  ['rest', 'api'],
+  ['grpc', 'rpc'],
+  ['timeout', 'deadline'],
+  ['retry', 'backoff'],
+  ['cors', 'cross origin'],
+  ['ssl', 'tls'],
+  ['throttle', 'rate limit'],
+  // ─── Build Tools ───
+  ['webpack', 'bundler'],
+  ['vite', 'bundler'],
+  ['rollup', 'bundler'],
+  ['esbuild', 'bundler'],
+  ['transpile', 'compile'],
   // ─── CJK ↔ EN cross-language synonyms ───
   // Authentication & Authorization
   ['认证', 'auth'], ['认证', 'authentication'], ['登录', 'login'], ['登录', 'auth'],
@@ -108,6 +145,16 @@ export const SYNONYM_PAIRS = [
   ['钩子', 'hook'], ['回调', 'callback'],
   ['异步', 'async'], ['同步', 'sync'],
   ['并发', 'concurrent'], ['线程', 'thread'],
+  ['竞态', 'race condition'], ['死锁', 'deadlock'], ['互斥', 'mutex'],
+  ['协程', 'coroutine'], ['事件循环', 'event loop'],
+  ['泛型', 'generic'], ['枚举', 'enum'],
+  ['断言', 'assert'], ['单元测试', 'unit test'], ['集成测试', 'integration test'],
+  ['模拟测试', 'mock'], ['测试覆盖', 'coverage'],
+  ['错误处理', 'error handling'], ['异常捕获', 'try catch'], ['堆栈跟踪', 'stack trace'],
+  ['容错', 'fault tolerance'],
+  ['跨域', 'cors'], ['限流', 'rate limit'], ['熔断', 'circuit breaker'],
+  ['负载均衡', 'load balancing'], ['心跳', 'heartbeat'],
+  ['请求', 'request'], ['失败', 'failure'], ['覆盖率', 'coverage'],
   // Performance
   ['性能', 'performance'], ['性能', 'perf'],
   ['内存', 'memory'], ['泄漏', 'leak'],
@@ -140,6 +187,23 @@ export const SYNONYM_PAIRS = [
   ['安装', 'install'], ['导入', 'import'],
   ['导出', 'export'], ['状态', 'state'],
   ['系统', 'system'], ['算法', 'algorithm'],
+  // Common dev terms (mined from real usage data)
+  ['文件', 'file'], ['代码', 'code'],
+  ['执行', 'execute'], ['执行', 'run'],
+  ['调用', 'call'], ['调用', 'invoke'],
+  ['运行', 'run'], ['运行', 'execute'],
+  ['检查', 'check'], ['检查', 'inspect'],
+  ['分析', 'analyze'], ['分析', 'analysis'],
+  ['项目', 'project'], ['流程', 'workflow'],
+  ['更新', 'update'], ['提示', 'prompt'],
+  ['查找', 'find'], ['记录', 'record'],
+  ['记录', 'log'], ['校验', 'validate'],
+  ['计算', 'compute'], ['计算', 'calculate'],
+  ['单元', 'unit'], ['资源', 'resource'],
+  ['问题', 'issue'], ['问题', 'problem'],
+  ['历史', 'history'], ['描述', 'description'],
+  ['推荐', 'recommend'], ['建议', 'suggestion'],
+  ['智能', 'smart'], ['智能', 'intelligent'],
 ];
 
 // ─── Bidirectional SYNONYM_MAP (case-insensitive) ──────────────────────────────
@@ -168,11 +232,25 @@ export const CJK_COMPOUNDS = new Set([
   '认证', '授权', '加密', '解密', '序列', '并发', '异步', '同步', '线程', '进程',
   '容器', '集群', '服务器', '中间件', '网关', '负载', '监控', '日志', '告警',
   '前端', '后端', '全栈', '响应式', '路由', '状态', '渲染', '样式', '布局',
+  '代码', '文件', '项目', '资源', '单元', '智能',
+  // concurrency & async (extended)
+  '竞态', '死锁', '互斥', '协程', '回调', '事件循环',
+  // type system
+  '泛型', '枚举', '联合类型', '类型推断', '类型守卫', '接口定义',
+  // testing (extended)
+  '单元测试', '集成测试', '端到端', '测试覆盖', '覆盖率', '模拟测试', '断言',
+  // error handling (extended)
+  '错误处理', '异常捕获', '堆栈跟踪', '错误码', '容错', '失败', '请求',
+  // networking
+  '跨域', '限流', '熔断', '负载均衡', '心跳',
   // actions
   '修复', '重构', '优化', '升级', '安装', '卸载', '导入', '导出', '上传', '下载',
   '提交', '推送', '合并', '发布', '上线', '回退', '审查', '审核', '评审',
+  '执行', '调用', '运行', '检查', '分析', '查找', '计算', '校验', '更新', '描述',
   // errors/issues
-  '报错', '崩溃', '泄露', '溢出', '死锁', '超时', '中断', '异常', '故障',
+  '报错', '崩溃', '泄露', '溢出', '超时', '中断', '异常', '故障',
+  // general (tokenization only — keeps CJK segmentation clean)
+  '问题', '使用', '继续', '推荐', '建议', '历史', '记录', '中文', '提示', '流程',
   // architecture
   '架构', '设计', '方案', '规划', '文档', '注释', '版本', '分支', '依赖',
   '性能', '安全', '漏洞', '补丁', '系统', '算法',

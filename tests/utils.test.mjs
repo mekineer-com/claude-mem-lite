@@ -225,6 +225,29 @@ describe('sanitizeFtsQuery', () => {
     const result = sanitizeFtsQuery('猫');
     expect(result).toBe('猫');
   });
+
+  it('preserves unmatched CJK portions as bigrams when dictionary has partial hits', () => {
+    // "提示" and "优化" are both in dictionary; "词" is single char (dropped)
+    const result = sanitizeFtsQuery('提示词优化');
+    expect(result).toContain('优化');
+    expect(result).toContain('提示');
+  });
+
+  it('does not drop CJK text when only tail word matches dictionary', () => {
+    // "中文", "提示", "搜索" all in dictionary now → clean extraction
+    const result = sanitizeFtsQuery('中文提示词搜索');
+    expect(result).toContain('搜索');
+    expect(result).toContain('中文');
+    expect(result).toContain('提示');
+  });
+
+  it('generates bigrams for remainder when dictionary covers partial CJK', () => {
+    // "优化" is in dictionary; "莫名奇妙" is not → bigrams for unmatched part
+    const result = sanitizeFtsQuery('莫名奇妙优化');
+    expect(result).toContain('优化');
+    expect(result).toContain('莫名'); // bigram from unmatched portion
+    expect(result).toContain('奇妙'); // bigram from unmatched portion
+  });
 });
 
 // ─── sanitizeFtsQuery stop-word filtering ────────────────────────────────────

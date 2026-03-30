@@ -25,12 +25,32 @@ export function shouldSkip(text) {
 // ─── Intent Detection ───────────────────────────────────────────────────────
 
 export const INTENTS = [
-  // Error/debug intent
-  { pattern: /error|bug|crash|broken|fail|fix|报错|出错|错误|崩溃|修复/i, type: 'bugfix', limit: 3 },
-  // Decision/architecture intent (before recall — "为什么...之前" is a decision question, not recall)
-  { pattern: /why|decided|architecture|design|为什么|决定|架构|设计/i, type: 'decision', limit: 3 },
+  // Error/debug intent — highest priority, most actionable
+  // CJK: 不工作/有问题/挂了 from real prompts; 异常/失败/排查/定位/诊断 from dev vocabulary
+  { pattern: /error|bug|crash|broken|fail(?:ed|ing|ure)?|fix(?:ed|ing)?|debug|调试|报错|出错|错误|崩溃|修复|故障|不工作|有问题|出了问题|挂了|异常|失败|解决|排查|定位|诊断/i, type: 'bugfix', limit: 3 },
+  // Test intent — test failures surface bugfix memories
+  // CJK: 跑测试/写测试/测试用例/覆盖率 from real prompts
+  { pattern: /\btest(?:s|ing)?\b|spec\b|assert|单元测试|测试失败|test fail|测试|跑测试|写测试|测试用例|覆盖率/i, type: 'bugfix', limit: 3 },
+  // Review/audit intent — from real data: 审查(6x), 检查(9x), 审核, 代码审核
+  { pattern: /\breview\b|audit|inspect|审查|审核|检查|代码审核|审阅|code.?review/i, type: 'discovery', limit: 3 },
+  // Refactor intent — surface past refactor decisions and patterns
+  // CJK: 拆分/提取/简化/解耦/清理 from real prompts; 优化代码 = refactor (not perf)
+  { pattern: /refactor|restructur|cleanup|clean up|重构|整理|代码质量|拆分|提取|简化|解耦|清理/i, type: 'refactor', limit: 3 },
+  // Performance intent — before decision (so "slow" doesn't get classified as decision)
+  // CJK: 卡顿/超时/内存泄漏/优化 from real prompts; 加速/提速 from dev vocabulary
+  { pattern: /performance|perf\b|slow|latency|bottleneck|optimiz|性能|慢|延迟|耗时|效率低|卡顿|超时|内存泄漏|优化|加速|提速/i, type: 'discovery', limit: 3 },
+  // Decision/architecture intent
+  // CJK: 方案/原因/考虑/权衡/思路 from real prompts
+  { pattern: /why\b|decided|architecture|design\b|为什么|决定|架构|设计|方案|原因|考虑|权衡|思路/i, type: 'decision', limit: 3 },
+  // Database/schema intent — surface migration decisions
+  // CJK: 索引/查询/建表/改表 from dev vocabulary
+  { pattern: /schema|migration|数据库|迁移|database\b|表结构|字段|索引|查询|建表|改表/i, type: 'decision', limit: 3 },
+  // Implementation intent — surface related feature history (no type filter for broader recall)
+  // CJK: 开发/编写/创建/构建/做一个/写一个 from real prompts
+  { pattern: /implement|feature\b|add\s+(?:a\s+)?new|实现|添加|新功能|新增|开发|编写|创建|构建|做一个|加一个|写一个/i, type: null, limit: 3 },
   // Recall/history intent (catch-all temporal, lowest priority)
-  { pattern: /before|previously|last time|remember|之前|上次|以前|记得/i, type: null, limit: 5, useRecent: true },
+  // CJK: 刚才/历史/回顾 from real prompts
+  { pattern: /before|previously|last time|remember|之前|上次|以前|记得|刚才|历史|回顾/i, type: null, limit: 5, useRecent: true },
 ];
 
 export function detectIntent(text) {
@@ -42,15 +62,15 @@ export function detectIntent(text) {
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0];
 
-  // Disambiguation: specifically when bugfix and recall both match, use
-  // position-based resolution — the pattern appearing earlier in text wins.
+  // Disambiguation: when recall intent overlaps with an actionable intent,
+  // use position-based resolution — the pattern appearing earlier in text wins.
   // "I remember we fixed..." → recall leads. "fix the bug from before" → bugfix leads.
   const first = matches[0];
-  const second = matches[1];
-  if (first.type === 'bugfix' && second.useRecent) {
-    const bugPos = text.search(first.pattern);
-    const recallPos = text.search(second.pattern);
-    if (recallPos < bugPos) return second;
+  const recallMatch = matches.find(m => m.useRecent);
+  if (recallMatch && first !== recallMatch) {
+    const actionPos = text.search(first.pattern);
+    const recallPos = text.search(recallMatch.pattern);
+    if (recallPos < actionPos) return recallMatch;
   }
   return first;
 }
@@ -112,8 +132,13 @@ export function matchRegistrySkillName(text, skillNames) {
 
 // ─── File Path Detection ─────────────────────────────────────────────────────
 
-/** Detect file paths in text */
+/** Detect file paths in text — excludes URLs and pure version numbers */
 export function extractFiles(text) {
   const matches = text.match(/[\w./-]+\.\w{1,10}/g) || [];
-  return matches.filter(m => m.includes('.') && !m.startsWith('http'));
+  return matches.filter(m =>
+    m.includes('.') &&
+    !m.startsWith('http') &&
+    !m.includes('//') &&
+    !/^\d+\.\d+$/.test(m)  // Exclude pure version numbers like "3.14" (not paths like "1.0/config.json")
+  );
 }

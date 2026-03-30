@@ -1,5 +1,6 @@
 ---
-description: "Auto-maintain memory and resource registry — deduplicate, merge, decay, cleanup, reindex. Use when: search results seem noisy, after bulk imports, or during periodic maintenance"
+name: update
+description: "Use when: search results seem noisy, after bulk imports, or for periodic memory/registry maintenance"
 ---
 
 # Memory & Registry Maintenance
