@@ -13,7 +13,8 @@ import { autoBoostIfNeeded, reRankWithContext, markSuperseded, extractPRFTerms, 
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
-import { basename, join } from 'path';
+import { buildSessionContextLines } from './hook-context.mjs';
+import { basename } from 'path';
 import { readFileSync } from 'fs';
 
 // OBS_BM25, TYPE_DECAY_CASE imported from utils.mjs
@@ -965,35 +966,21 @@ function cmdStats(db, args) {
   out(`  🔴 Working: ${tierMap.working ?? 0} | 🟡 Active: ${tierMap.active ?? 0} | 🔵 Archive: ${tierMap.archive ?? 0}`);
 }
 
-function cmdContext(_db, args) {
+function cmdContext(db, args) {
   const { flags } = parseArgs(args);
   const jsonOutput = flags.json === true || flags.json === 'true' || flags.format === 'json';
 
-  // Read the project's CLAUDE.md and extract the context block
-  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-  const claudeMdPath = join(projectDir, 'CLAUDE.md');
+  // Generate context live from DB — same builder the SessionStart hook uses.
+  // Pre-v2.30 this command parsed a snapshot out of CLAUDE.md, but the hook no
+  // longer writes there; DB is now the single source of truth.
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const block = buildSessionContextLines(db, project).trim();
 
-  let content;
-  try {
-    content = readFileSync(claudeMdPath, 'utf8');
-  } catch {
-    if (jsonOutput) { out(JSON.stringify({ error: 'No CLAUDE.md found' })); }
-    else { out(`[mem] No CLAUDE.md found at ${claudeMdPath}`); }
+  if (!block) {
+    if (jsonOutput) { out(JSON.stringify({ raw: '', sections: {} })); }
+    else { out(`[mem] No context yet for project "${project}"`); }
     return;
   }
-
-  const startTag = '<claude-mem-context>';
-  const endTag = '</claude-mem-context>';
-  const startIdx = content.lastIndexOf(startTag);
-  const endIdx = content.lastIndexOf(endTag);
-
-  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
-    if (jsonOutput) { out(JSON.stringify({ error: 'No context block found' })); }
-    else { out('[mem] No claude-mem-context block found in CLAUDE.md'); }
-    return;
-  }
-
-  const block = content.slice(startIdx + startTag.length, endIdx).trim();
 
   if (jsonOutput) {
     // Parse markdown sections into structured JSON
@@ -1012,7 +999,7 @@ function cmdContext(_db, args) {
     }
     out(JSON.stringify(result, null, 2));
   } else {
-    out(`[mem] Current context:\n${block}`);
+    out(`<claude-mem-context>\n${block}\n</claude-mem-context>`);
   }
 }
 

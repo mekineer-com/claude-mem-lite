@@ -5,13 +5,13 @@
 // Background workers (slow): llm-episode, llm-summary
 
 import { randomUUID } from 'crypto';
-import { join, basename } from 'path';
+import { join } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statSync } from 'fs';
 import { homedir } from 'os';
 import {
-  truncate, typeIcon, inferProject, detectBashSignificance,
+  truncate, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
-  makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog, fmtTime,
+  makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog,
   COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, isoWeekKey, OBS_BM25,
 } from './utils.mjs';
 import {
@@ -20,10 +20,10 @@ import {
   createEpisode, addFileToEpisode,
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
-import { selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines } from './hook-context.mjs';
+import { cleanupClaudeMdLegacyBlock, buildSessionContextLines } from './hook-context.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
-  SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
+  SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS,
   sessionFile, getSessionId, createSessionId, openDb,
   spawnBackground,
 } from './hook-shared.mjs';
@@ -645,28 +645,6 @@ async function handleSessionStart() {
       }
     } catch {}
 
-    // Token-budgeted observation selection (replaces flat LIMIT 15)
-    const selected = selectWithTokenBudget(db, project, 2000);
-    const observations = selected.observations;
-
-    // Fallback: recent across all projects with tiered windows (M7: local variable for clarity)
-    let fallbackObs = [];
-    if (observations.length < 3) {
-      const fbOneDayAgo = Date.now() - STALE_SESSION_MS;
-      const fbSevenDaysAgo = Date.now() - FALLBACK_OBS_WINDOW_MS;
-      fallbackObs = db.prepare(`
-        SELECT id, type, title, project, created_at
-        FROM observations
-        WHERE COALESCE(compressed_into, 0) = 0
-          AND (
-            (created_at_epoch > ? AND importance >= 1)
-            OR (created_at_epoch > ? AND importance >= 2)
-          )
-        ORDER BY created_at_epoch DESC
-        LIMIT 5
-      `).all(fbOneDayAgo, fbSevenDaysAgo);
-    }
-
     // Fallback fast summary: if a recently completed session has no summary yet
     // (e.g. /exit → fast restart before Haiku finishes), build one synchronously.
     // Skipped when prevSessionId is set (already handled above).
@@ -708,112 +686,14 @@ async function handleSessionStart() {
       } catch (e) { debugCatch(e, 'session-start-exit-fast-summary'); }
     }
 
-    // Latest session summary
-    const latestSummary = db.prepare(`
-      SELECT request, completed, next_steps, remaining_items, lessons, key_decisions, created_at
-      FROM session_summaries
-      WHERE project = ?
-      ORDER BY created_at_epoch DESC
-      LIMIT 1
-    `).get(project);
-
-    // Build summary lines (shared by stdout and CLAUDE.md)
-    const summaryLines = buildSummaryLines(latestSummary);
-
-    // Key context: top high-importance observations for CLAUDE.md persistence
-    // Split into "File Lessons" (actionable, has lesson + file) and "Key Context" (informational)
-    const keyObs = db.prepare(`
-      SELECT o.id, o.type, o.title, o.lesson_learned, o.files_modified FROM observations o
-      WHERE o.project = ? AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
-        AND COALESCE(o.importance, 1) >= 2
-      ORDER BY o.created_at_epoch DESC LIMIT 10
-    `).all(project);
-
-    if (keyObs.length > 0) {
-      const fileLessons = [];
-      const keyContext = [];
-
-      for (const o of keyObs) {
-        const clean = (o.title || '(untitled)')
-          .replace(/ → (?:ERROR: )?\{".*$/, '')
-          .replace(/ → (?:ERROR: )?\{[^}]*\.{3}$/, '');
-        const hasLesson = o.lesson_learned && o.lesson_learned.trim();
-        const hasFiles = o.files_modified && o.files_modified !== '[]';
-
-        if (hasLesson && hasFiles) {
-          try {
-            const files = JSON.parse(o.files_modified);
-            const fname = basename(Array.isArray(files) && files.length > 0 ? files[0] : '');
-            if (fname) {
-              fileLessons.push(`- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})`);
-              continue;
-            }
-          } catch {}
-        }
-        const lesson = hasLesson ? ` — ${truncate(o.lesson_learned, 60)}` : '';
-        keyContext.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
-      }
-
-      if (fileLessons.length > 0) {
-        summaryLines.push('### File Lessons');
-        summaryLines.push(...fileLessons.slice(0, 5));
-        summaryLines.push('');
-      }
-      if (keyContext.length > 0) {
-        summaryLines.push('### Key Context');
-        summaryLines.push(...keyContext.slice(0, 5));
-        summaryLines.push('');
-      }
-    } else if (!latestSummary) {
-      // Fallback: no summary AND no key observations — show recent activity
-      const recentObs = (observations.length >= 3 ? observations : fallbackObs).slice(0, 3);
-      if (recentObs.length > 0) {
-        summaryLines.push('### Recent Activity');
-        for (const o of recentObs) {
-          summaryLines.push(`- ${truncate(o.title || '(untitled)', 80)}`);
-        }
-        summaryLines.push('');
-      }
-    }
-
-    // Working state from /clear handoff (persisted to both stdout and CLAUDE.md)
-    const handoffLines = [];
-    if (prevClearHandoff) {
-      handoffLines.push('### Working State (from /clear)');
-      if (prevClearHandoff.working_on) handoffLines.push(`- Working on: ${truncate(prevClearHandoff.working_on, 200)}`);
-      if (prevClearHandoff.unfinished) {
-        const pendingSummary = extractUnfinishedSummary(prevClearHandoff.unfinished);
-        if (pendingSummary) handoffLines.push(`- Unfinished: ${truncate(pendingSummary, 200)}`);
-      }
-      if (prevClearHandoff.key_files) {
-        try {
-          const files = JSON.parse(prevClearHandoff.key_files);
-          if (files.length > 0) handoffLines.push(`- Key files: ${files.map(f => basename(f)).join(', ')}`);
-        } catch {}
-      }
-      handoffLines.push('');
-    }
-
-    // Build observations table (stdout only — not persisted to CLAUDE.md)
-    const obsLines = [];
-    const obsToShow = observations.length >= 3 ? observations : fallbackObs;
-    if (obsToShow.length > 0) {
-      const today = now.toISOString().slice(0, 10);
-      obsLines.push(`### Recent (${today})`);
-      obsLines.push('');
-      obsLines.push('| ID | Time | T | Title |');
-      obsLines.push('|----|------|---|-------|');
-      for (const o of obsToShow) {
-        const proj = o.project ? ` (${o.project})` : '';
-        obsLines.push(`| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${truncate(o.title || '(untitled)', 60)}${proj} |`);
-      }
-    }
+    // Build the full context body via shared helper (also used by `mem-cli context`).
+    // Queries session_summaries, key observations, clear handoff, and the
+    // token-budgeted observation pool directly from the DB.
+    const fullContext = buildSessionContextLines(db, project, now);
 
     // Stdout is the sole context-delivery channel. The SessionStart hook output
     // is injected as a <system-reminder> at session start, giving Claude the
     // full summary + handoff state + observations table fresh from the DB.
-    const fullContext = [...summaryLines, ...handoffLines, ...obsLines].join('\n');
     process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
 
     // One-time migration: remove any stale <claude-mem-context> block left in

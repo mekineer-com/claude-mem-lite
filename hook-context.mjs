@@ -1,9 +1,15 @@
 // claude-mem-lite CLAUDE.md context injection and token budgeting
-// Handles adaptive time windows, token-budgeted selection, and CLAUDE.md persistence
+// Handles adaptive time windows, token-budgeted selection, and legacy CLAUDE.md cleanup.
 
-import { join } from 'path';
+import { basename, join } from 'path';
 import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
-import { estimateTokens, truncate, debugLog, debugCatch, DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
+import {
+  estimateTokens, truncate, typeIcon, fmtTime,
+  debugLog, debugCatch,
+  DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
+} from './utils.mjs';
+import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS } from './hook-shared.mjs';
+import { extractUnfinishedSummary } from './hook-handoff.mjs';
 
 /**
  * Infer the project directory from environment variables or cwd.
@@ -217,6 +223,160 @@ export function cleanupClaudeMdLegacyBlock() {
     try { unlinkSync(tmp); } catch {}
     debugLog('ERROR', 'cleanupClaudeMdLegacyBlock', `CLAUDE.md write failed: ${e.message}`);
   }
+}
+
+/**
+ * Assemble the full markdown body that goes inside the <claude-mem-context>
+ * block emitted at session start. Same shape as the inline builder hook.mjs
+ * used to compose directly; extracted so both the SessionStart hook AND the
+ * `claude-mem-lite context` CLI can read live context from the DB.
+ *
+ * Sections (in order):
+ *   1. Last Session (from session_summaries.latest)
+ *   2. File Lessons / Key Context (top importance≥2 observations)
+ *   3. Recent Activity fallback (when no summary and no key obs)
+ *   4. Working State (from latest clear handoff)
+ *   5. Recent (N) table (observations via selectWithTokenBudget + fallback)
+ *
+ * @param {import('better-sqlite3').Database} db Opened main DB
+ * @param {string} project Canonical project name (from inferProject())
+ * @param {Date} [now=new Date()] Clock reference for time windows and table header
+ * @returns {string} Joined markdown lines (without <claude-mem-context> wrappers)
+ */
+export function buildSessionContextLines(db, project, now = new Date()) {
+  // 1. Token-budgeted observation selection
+  const selected = selectWithTokenBudget(db, project, 2000);
+  const observations = selected.observations;
+
+  // 2. Fallback: recent across all projects with tiered windows (when local pool is thin)
+  let fallbackObs = [];
+  if (observations.length < 3) {
+    const fbOneDayAgo = now.getTime() - STALE_SESSION_MS;
+    const fbSevenDaysAgo = now.getTime() - FALLBACK_OBS_WINDOW_MS;
+    fallbackObs = db.prepare(`
+      SELECT id, type, title, project, created_at
+      FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0
+        AND (
+          (created_at_epoch > ? AND importance >= 1)
+          OR (created_at_epoch > ? AND importance >= 2)
+        )
+      ORDER BY created_at_epoch DESC
+      LIMIT 5
+    `).all(fbOneDayAgo, fbSevenDaysAgo);
+  }
+
+  // 3. Latest session summary → base summaryLines
+  const latestSummary = db.prepare(`
+    SELECT request, completed, next_steps, remaining_items, lessons, key_decisions, created_at
+    FROM session_summaries
+    WHERE project = ?
+    ORDER BY created_at_epoch DESC
+    LIMIT 1
+  `).get(project);
+
+  const summaryLines = buildSummaryLines(latestSummary);
+
+  // 4. Key context: top high-importance observations split into File Lessons (actionable)
+  //    and Key Context (informational). Pushed into summaryLines.
+  const keyObs = db.prepare(`
+    SELECT o.id, o.type, o.title, o.lesson_learned, o.files_modified FROM observations o
+    WHERE o.project = ? AND COALESCE(o.compressed_into, 0) = 0
+      AND o.superseded_at IS NULL
+      AND COALESCE(o.importance, 1) >= 2
+    ORDER BY o.created_at_epoch DESC LIMIT 10
+  `).all(project);
+
+  if (keyObs.length > 0) {
+    const fileLessons = [];
+    const keyContext = [];
+
+    for (const o of keyObs) {
+      const clean = (o.title || '(untitled)')
+        .replace(/ → (?:ERROR: )?\{".*$/, '')
+        .replace(/ → (?:ERROR: )?\{[^}]*\.{3}$/, '');
+      const hasLesson = o.lesson_learned && o.lesson_learned.trim();
+      const hasFiles = o.files_modified && o.files_modified !== '[]';
+
+      if (hasLesson && hasFiles) {
+        try {
+          const files = JSON.parse(o.files_modified);
+          const fname = basename(Array.isArray(files) && files.length > 0 ? files[0] : '');
+          if (fname) {
+            fileLessons.push(`- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})`);
+            continue;
+          }
+        } catch { /* fall through to keyContext */ }
+      }
+      const lesson = hasLesson ? ` — ${truncate(o.lesson_learned, 60)}` : '';
+      keyContext.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
+    }
+
+    if (fileLessons.length > 0) {
+      summaryLines.push('### File Lessons');
+      summaryLines.push(...fileLessons.slice(0, 5));
+      summaryLines.push('');
+    }
+    if (keyContext.length > 0) {
+      summaryLines.push('### Key Context');
+      summaryLines.push(...keyContext.slice(0, 5));
+      summaryLines.push('');
+    }
+  } else if (!latestSummary) {
+    // Fallback: no summary AND no key observations — show recent activity
+    const recentObs = (observations.length >= 3 ? observations : fallbackObs).slice(0, 3);
+    if (recentObs.length > 0) {
+      summaryLines.push('### Recent Activity');
+      for (const o of recentObs) {
+        summaryLines.push(`- ${truncate(o.title || '(untitled)', 80)}`);
+      }
+      summaryLines.push('');
+    }
+  }
+
+  // 5. Working state from latest /clear handoff
+  const prevClearHandoff = db.prepare(`
+    SELECT working_on, unfinished, key_files
+    FROM session_handoffs
+    WHERE project = ? AND type = 'clear'
+    ORDER BY created_at_epoch DESC LIMIT 1
+  `).get(project);
+
+  const handoffLines = [];
+  if (prevClearHandoff) {
+    handoffLines.push('### Working State (from /clear)');
+    if (prevClearHandoff.working_on) {
+      handoffLines.push(`- Working on: ${truncate(prevClearHandoff.working_on, 200)}`);
+    }
+    if (prevClearHandoff.unfinished) {
+      const pendingSummary = extractUnfinishedSummary(prevClearHandoff.unfinished);
+      if (pendingSummary) handoffLines.push(`- Unfinished: ${truncate(pendingSummary, 200)}`);
+    }
+    if (prevClearHandoff.key_files) {
+      try {
+        const files = JSON.parse(prevClearHandoff.key_files);
+        if (files.length > 0) handoffLines.push(`- Key files: ${files.map(f => basename(f)).join(', ')}`);
+      } catch { /* malformed JSON — skip */ }
+    }
+    handoffLines.push('');
+  }
+
+  // 6. Recent observations table
+  const obsLines = [];
+  const obsToShow = observations.length >= 3 ? observations : fallbackObs;
+  if (obsToShow.length > 0) {
+    const today = now.toISOString().slice(0, 10);
+    obsLines.push(`### Recent (${today})`);
+    obsLines.push('');
+    obsLines.push('| ID | Time | T | Title |');
+    obsLines.push('|----|------|---|-------|');
+    for (const o of obsToShow) {
+      const proj = o.project && o.project !== project ? ` (${o.project})` : '';
+      obsLines.push(`| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${truncate(o.title || '(untitled)', 60)}${proj} |`);
+    }
+  }
+
+  return [...summaryLines, ...handoffLines, ...obsLines].join('\n');
 }
 
 /**

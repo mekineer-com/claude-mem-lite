@@ -455,23 +455,43 @@ describe('CLI E2E: help and errors', () => {
 });
 
 describe('CLI E2E: context', () => {
-  it('reports when no CLAUDE.md exists', () => {
-    const { stdout } = runCli(['context']);
-    expect(stdout).toContain('No CLAUDE.md');
+  it('reports empty context for a project with no DB data', () => {
+    // Pre-v2.30 this asserted a "No CLAUDE.md" error. Post-v2.30 the command
+    // generates context live from DB and simply reports no data.
+    const { stdout } = runCli(['context', '--project', 'mem-cli-e2e-empty']);
+    expect(stdout).toContain('No context yet');
   });
 
-  it('extracts claude-mem-context block from CLAUDE.md', () => {
+  it('generates context block live from DB, ignoring any CLAUDE.md file', () => {
+    // Seed DB with a session summary for the default E2E project
+    const db = new Database(join(dataDir, 'claude-mem-lite.db'));
+    const now = Date.now();
+    const sessionId = `cli-e2e-ctx-${randomUUID().slice(0, 8)}`;
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'mem-cli-e2e-ctx', ?, ?, 'completed')
+    `).run(sessionId, sessionId, new Date(now).toISOString(), now);
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'mem-cli-e2e-ctx', 'DB-derived request', 'DB-derived completed', 'DB-derived next', ?, ?)
+    `).run(sessionId, new Date(now).toISOString(), now);
+    db.close();
+
+    // Write a CLAUDE.md with a DIFFERENT context — the CLI must ignore it
     const claudeMd = `# Project
 Some content
 
 <claude-mem-context>
 ### Last Session
-Test context data here
+Stale file-derived data that MUST NOT appear
 </claude-mem-context>
 `;
     writeFileSync(join(projectDir, 'CLAUDE.md'), claudeMd);
-    const { stdout } = runCli(['context']);
-    expect(stdout).toContain('Test context data here');
-    expect(stdout).toContain('[mem] Current context');
+
+    const { stdout } = runCli(['context', '--project', 'mem-cli-e2e-ctx']);
+    expect(stdout).toContain('<claude-mem-context>');
+    expect(stdout).toContain('DB-derived request');
+    expect(stdout).toContain('DB-derived completed');
+    expect(stdout).not.toContain('Stale file-derived data');
   });
 });

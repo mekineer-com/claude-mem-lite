@@ -1122,16 +1122,68 @@ describe('CLI context command', () => {
   });
   afterEach(() => { testDb.close(); });
 
-  it('reports when CLAUDE.md not found', async () => {
-    const origDir = process.env.CLAUDE_PROJECT_DIR;
-    process.env.CLAUDE_PROJECT_DIR = '/tmp/nonexistent-project-dir-' + Date.now();
-    try {
-      const output = await captureStdout(() => run(['context']));
-      expect(output).toContain('No CLAUDE.md');
-    } finally {
-      if (origDir !== undefined) process.env.CLAUDE_PROJECT_DIR = origDir;
-      else delete process.env.CLAUDE_PROJECT_DIR;
-    }
+  it('reports empty context for a project with no data', async () => {
+    const output = await captureStdout(() =>
+      run(['context', '--project', 'test--empty-proj']),
+    );
+    expect(output).toContain('No context yet');
+    expect(output).toContain('test--empty-proj');
+  });
+
+  it('generates context block live from DB when session summary exists', async () => {
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+    const now = Date.now();
+    testDb.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'test--project', 'Fix auth bug', 'Patched middleware', 'Add tests', ?, ?)
+    `).run('mem-s1', new Date(now).toISOString(), now);
+
+    const output = await captureStdout(() =>
+      run(['context', '--project', 'test--project']),
+    );
+    expect(output).toContain('<claude-mem-context>');
+    expect(output).toContain('</claude-mem-context>');
+    expect(output).toContain('### Last Session');
+    expect(output).toContain('Fix auth bug');
+    expect(output).toContain('Patched middleware');
+  });
+
+  it('does not read from CLAUDE.md even when one exists', async () => {
+    // Context now comes from DB only — CLAUDE.md is ignored on purpose.
+    // Seed DB with known data and assert the output comes from the DB, not
+    // from any CLAUDE.md file that might be sitting around.
+    insertSession(testDb, { id: 's2', project: 'test--db-only', memoryId: 'mem-s2' });
+    const now = Date.now();
+    testDb.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'test--db-only', 'DB-derived request', 'DB-derived completed', 'DB-derived next', ?, ?)
+    `).run('mem-s2', new Date(now).toISOString(), now);
+
+    const output = await captureStdout(() =>
+      run(['context', '--project', 'test--db-only']),
+    );
+    expect(output).toContain('DB-derived request');
+    // Ensure the error-paths from the old CLAUDE.md-reading implementation are gone.
+    expect(output).not.toContain('No CLAUDE.md');
+    expect(output).not.toContain('No claude-mem-context block found');
+  });
+
+  it('emits JSON with parsed sections when --json is set', async () => {
+    insertSession(testDb, { id: 's3', project: 'test--json-proj', memoryId: 'mem-s3' });
+    const now = Date.now();
+    testDb.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'test--json-proj', 'Ship v2.30', 'Done', 'Release notes', ?, ?)
+    `).run('mem-s3', new Date(now).toISOString(), now);
+
+    const output = await captureStdout(() =>
+      run(['context', '--project', 'test--json-proj', '--json']),
+    );
+    const parsed = JSON.parse(output);
+    expect(parsed).toHaveProperty('raw');
+    expect(parsed).toHaveProperty('sections');
+    expect(parsed.raw).toContain('Ship v2.30');
+    expect(parsed.sections).toHaveProperty('last_session');
   });
 });
 
