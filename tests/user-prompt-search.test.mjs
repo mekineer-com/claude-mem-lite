@@ -3,8 +3,7 @@
 // 1. Subprocess execution with stdin piping (integration tests)
 // 2. Direct imports from prompt-search-utils.mjs (unit tests — no more code duplication)
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFile, spawn } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import { resolve, join } from 'path';
 import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
@@ -20,7 +19,6 @@ import {
   matchRegistrySkillName,
 } from '../scripts/prompt-search-utils.mjs';
 
-const execFileAsync = promisify(execFile);
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
 
 // ─── Unit Tests: Skip Patterns ───────────────────────────────────────────────
@@ -363,35 +361,51 @@ function cleanupTestFiles() {
 /**
  * Run the user-prompt-search script with piped JSON input.
  * Uses CLAUDE_MEM_DIR env to point at test DB.
+ *
+ * Implementation note: this uses spawn() with manual stdin piping rather than
+ * execFile()+`input` option. The `input` option is only supported by the SYNC
+ * variants (execFileSync, spawnSync) — on async execFile it is silently ignored,
+ * stdin stays empty, readStdin() times out after 2s, and the script returns empty.
+ * An earlier revision of this helper had that bug, which caused every subprocess
+ * test to vacuously pass (they all asserted empty stdout) and wait ~2s each.
  */
-async function runScript(hookData, extraEnv = {}) {
-  const input = JSON.stringify(hookData);
+function runScript(hookData, extraEnv = {}) {
   const testDir = resolve(import.meta.dirname, '.tmp-prompt-search-dir');
-
-  // Ensure test directory exists
   try { mkdirSync(testDir, { recursive: true }); } catch {}
 
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      process.execPath,
-      [SCRIPT_PATH],
-      {
-        timeout: 5000,
-        env: {
-          ...process.env,
-          CLAUDE_MEM_DIR: testDir,
-          CLAUDE_PROJECT_DIR: '/test/project',
-          PWD: '/test/project',
-          ...extraEnv,
-        },
-        input,
+  return new Promise((resolvePromise) => {
+    const proc = spawn(process.execPath, [SCRIPT_PATH], {
+      env: {
+        ...process.env,
+        CLAUDE_MEM_DIR: testDir,
+        CLAUDE_PROJECT_DIR: '/test/project',
+        PWD: '/test/project',
+        ...extraEnv,
       },
-    );
-    return { stdout, stderr };
-  } catch (err) {
-    // Script may exit 0 with no output (expected for skip cases)
-    return { stdout: err.stdout || '', stderr: err.stderr || '' };
-  }
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    // Safety timeout — script should never hang, but if it does, kill it
+    // to avoid stalling the test suite.
+    const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+
+    proc.on('exit', () => {
+      clearTimeout(killTimer);
+      resolvePromise({ stdout, stderr });
+    });
+    proc.on('error', () => {
+      clearTimeout(killTimer);
+      resolvePromise({ stdout, stderr });
+    });
+
+    proc.stdin.write(JSON.stringify(hookData));
+    proc.stdin.end();
+  });
 }
 
 describe('user-prompt-search subprocess integration', () => {
@@ -457,21 +471,23 @@ describe('user-prompt-search subprocess integration', () => {
   });
 
   it('silently handles invalid JSON input', async () => {
-    try {
-      const { stdout } = await execFileAsync(
-        process.execPath,
-        [SCRIPT_PATH],
-        {
-          timeout: 5000,
-          env: { ...process.env, CLAUDE_MEM_DIR: testDir },
-          input: 'not valid json',
-        },
-      );
-      expect(stdout).toBe('');
-    } catch (err) {
-      // Script should not crash — even if it exits non-zero, stdout should be empty
-      expect(err.stdout || '').toBe('');
-    }
+    // Directly pipe invalid JSON — script should JSON.parse fail and return silently
+    const { stdout } = await new Promise((resolvePromise) => {
+      const proc = spawn(process.execPath, [SCRIPT_PATH], {
+        env: { ...process.env, CLAUDE_MEM_DIR: testDir },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+      proc.on('exit', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr }); });
+      proc.on('error', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr }); });
+      proc.stdin.write('not valid json');
+      proc.stdin.end();
+    });
+    expect(stdout).toBe('');
   });
 
   it('skips task-notification protocol messages', async () => {
@@ -485,35 +501,6 @@ describe('user-prompt-search subprocess integration', () => {
   // (Modified X, Worked on X, Reviewed N files:) must not appear in injection output.
   // Both seed obs use type='bugfix' so detectIntent's type filter doesn't
   // eliminate them — the only thing that should filter "Modified X" is the R1 title clause.
-  //
-  // NOTE: this test uses spawn() with manual stdin piping rather than runScript(),
-  // because the runScript() helper uses execFile's async `input` option, which is
-  // only supported on the SYNC variants (execFileSync). With async execFile, input
-  // is silently ignored, readStdin() times out, and the script returns empty stdout.
-  // That's why all existing subprocess tests only assert `stdout === ''` — they never
-  // actually exercise the positive retrieval path.
-  function runScriptWithStdin(hookData, extraEnv = {}) {
-    return new Promise((resolvePromise) => {
-      const proc = spawn(process.execPath, [SCRIPT_PATH], {
-        env: {
-          ...process.env,
-          CLAUDE_MEM_DIR: testDir,
-          CLAUDE_PROJECT_DIR: '/test/project',
-          PWD: '/test/project',
-          ...extraEnv,
-        },
-        stdio: ['pipe', 'pipe', 'pipe'],
-      });
-      let stdout = '';
-      let stderr = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', (d) => { stderr += d.toString(); });
-      proc.on('exit', () => resolvePromise({ stdout, stderr }));
-      proc.stdin.write(JSON.stringify(hookData));
-      proc.stdin.end();
-    });
-  }
-
   it('R1: filters "Modified X" titles from [mem] Related memories output', async () => {
     insertObs(db, {
       sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
@@ -529,7 +516,7 @@ describe('user-prompt-search subprocess integration', () => {
     });
     // Ensure WAL writes are visible to subprocess
     db.pragma('wal_checkpoint(FULL)');
-    const { stdout } = await runScriptWithStdin({
+    const { stdout } = await runScript({
       prompt: 'how do I fix the authentication middleware token expiry validation',
     });
     expect(stdout).toContain('Resolved authentication middleware token expiry');
