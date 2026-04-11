@@ -1303,6 +1303,83 @@ describe('CLI stats command extended', () => {
   });
 });
 
+// N-1: `stats --quality` quality dashboard — baseline for the R-2 Haiku prompt A/B.
+// Surfaces lesson rate, LOW_SIGNAL rate, per-type hit/lesson %, and explicit R-2 targets.
+describe('CLI stats --quality command', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+    // Deterministic seed: 10 obs in-window, known lesson/LOW_SIGNAL/access distribution.
+    // bugfix: 4 total, 2 with lesson (50%), 1 accessed (25% hit)
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed queue race', text: 'q', lessonLearned: 'Always mutex first', accessCount: 1 });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed token expiry', text: 't', lessonLearned: 'Check TTL on refresh' });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed null deref', text: 'n' });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed off-by-one', text: 'o' });
+    // decision: 1 total, 1 with lesson (100%), 1 accessed (100% hit)
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'Switch to RRF merge', text: 'r',
+      lessonLearned: 'BM25+vector beats either alone', accessCount: 2 });
+    // discovery: 1 total, 1 with lesson, 0 accessed
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'FTS5 CJK quirk', text: 'f', lessonLearned: 'Needs bigram workaround' });
+    // change: 3 total, all LOW_SIGNAL titles, 0 lessons, 0 accessed
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Modified auth.mjs', text: 'a' });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Modified server.mjs', text: 's' });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Worked on utils.mjs', text: 'u' });
+    // refactor: 1 total, no lesson, no access
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'refactor',
+      title: 'Extracted helper', text: 'h' });
+    // Totals: 10 obs, 4 with lesson (40%), 3 LOW_SIGNAL (30%), 2 accessed (20% hit)
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('outputs quality snapshot header with --quality flag', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toContain('Quality snapshot');
+  });
+
+  it('reports overall lesson rate as "4 / 10 (40.0%)"', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    // Exact format: `Lesson rate:      4 / 10 (40.0%)` (spacing flexible)
+    expect(output).toMatch(/Lesson rate:\s*4\s*\/\s*10\s*\(40\.0%\)/);
+  });
+
+  it('reports LOW_SIGNAL rate as "3 / 10 (30.0%)"', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toMatch(/LOW_SIGNAL:\s*3\s*\/\s*10\s*\(30\.0%\)/);
+  });
+
+  it('shows per-type breakdown with hit% and lesson%', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    // bugfix row: count=4, hit=25% (1/4 accessed), lesson=50% (2/4)
+    expect(output).toMatch(/bugfix\s+4\s+.*hit\s*25\.0%.*lesson\s*50\.0%/);
+    // change row: count=3, 0% hit, 0% lesson
+    expect(output).toMatch(/change\s+3\s+.*hit\s*0\.0%.*lesson\s*0\.0%/);
+  });
+
+  it('shows R-2 watchdog target lines', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toContain('Targets');
+    // Should show current vs target for lesson rate
+    expect(output).toMatch(/Lesson rate.*15%/);
+    // And for LOW_SIGNAL
+    expect(output).toMatch(/LOW_SIGNAL.*30%/);
+  });
+
+  it('standard `stats` (no --quality) does NOT show quality block', async () => {
+    const output = await captureStdout(() => run(['stats']));
+    expect(output).not.toContain('Quality snapshot');
+    expect(output).not.toContain('LOW_SIGNAL');
+  });
+});
+
 // ─── search cross-source (sessions + prompts) ──────────────────────────────
 
 describe('CLI search cross-source', () => {

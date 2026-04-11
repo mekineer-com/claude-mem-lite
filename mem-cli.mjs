@@ -872,10 +872,131 @@ function cmdSave(db, args) {
   out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 80)}" (project: ${project})`);
 }
 
+// N-1: Quality-focused stats for R-2 A/B baseline.
+//
+// Shows the five numbers that will tell us whether the Haiku prompt change is
+// working: lesson_learned rate, LOW_SIGNAL title rate, per-type hit% and lesson%,
+// and current-vs-target deltas. Designed to be eyeballed once a day during the
+// A/B rollout. All metrics respect --project and --days filters.
+//
+// Targets (aspirational, not enforced):
+//   - Lesson rate ≥ 15%      (current baseline ~4.4%)
+//   - LOW_SIGNAL rate ≤ 30%  (current baseline ~49.4%)
+function renderQualityReport(db, { project, days }) {
+  const projectFilter = project ? 'AND project = ?' : '';
+  const baseParams = project ? [project] : [];
+  const now = Date.now();
+  const cutoff = now - days * 86400000;
+
+  // LOW_SIGNAL is the inverse of notLowSignalTitleClause() — inline a SUM(CASE)
+  // that flips the sign so we count titles that DO match the LOW_SIGNAL regex.
+  const lowSignalIsMatchExpr = `NOT ${notLowSignalTitleClause('')}`;
+
+  // In-window aggregates
+  const windowRow = db.prepare(`
+    SELECT
+      COUNT(*) as total,
+      SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson,
+      SUM(CASE WHEN ${lowSignalIsMatchExpr} THEN 1 ELSE 0 END) as low_signal
+    FROM observations
+    WHERE created_at_epoch >= ? ${projectFilter}
+  `).get(cutoff, ...baseParams);
+
+  // All-time aggregates (context for recent numbers)
+  const allTimeRow = db.prepare(`
+    SELECT
+      COUNT(*) as total,
+      SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson,
+      SUM(CASE WHEN ${lowSignalIsMatchExpr} THEN 1 ELSE 0 END) as low_signal
+    FROM observations
+    WHERE 1=1 ${projectFilter}
+  `).get(...baseParams);
+
+  // Per-type: count, hit rate (access_count > 0), lesson rate
+  const typeRows = db.prepare(`
+    SELECT
+      type,
+      COUNT(*) as total,
+      SUM(CASE WHEN COALESCE(access_count, 0) > 0 THEN 1 ELSE 0 END) as accessed,
+      SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson
+    FROM observations
+    WHERE created_at_epoch >= ? ${projectFilter}
+    GROUP BY type
+    ORDER BY total DESC
+  `).all(cutoff, ...baseParams);
+
+  // Top-5 most-accessed lessons (all-time, this project scope)
+  const topLessons = db.prepare(`
+    SELECT id, type, title, lesson_learned, COALESCE(access_count, 0) as ac
+    FROM observations
+    WHERE lesson_learned IS NOT NULL AND lesson_learned != ''
+      AND COALESCE(access_count, 0) > 0
+      AND COALESCE(compressed_into, 0) = 0
+      ${projectFilter}
+    ORDER BY ac DESC
+    LIMIT 5
+  `).all(...baseParams);
+
+  const pct = (n, d) => d > 0 ? (100 * n / d).toFixed(1) : '0.0';
+  const scope = project ? ` — ${project}` : '';
+  out(`[mem] Quality snapshot${scope} — window: ${days}d`);
+  out('────────────────────────────────────────────────────');
+  out(`  Writes (${days}d):     ${windowRow.total} observations`);
+
+  const lessonPct = pct(windowRow.with_lesson, windowRow.total);
+  const allLessonPct = pct(allTimeRow.with_lesson, allTimeRow.total);
+  out(`  Lesson rate:      ${windowRow.with_lesson} / ${windowRow.total} (${lessonPct}%)    [all-time: ${allTimeRow.with_lesson} / ${allTimeRow.total} = ${allLessonPct}%]`);
+
+  const noisePct = pct(windowRow.low_signal, windowRow.total);
+  const allNoisePct = pct(allTimeRow.low_signal, allTimeRow.total);
+  out(`  LOW_SIGNAL:       ${windowRow.low_signal} / ${windowRow.total} (${noisePct}%)    [all-time: ${allTimeRow.low_signal} / ${allTimeRow.total} = ${allNoisePct}%]`);
+  out('');
+
+  if (typeRows.length > 0) {
+    out(`  Type breakdown (${days}d):`);
+    for (const r of typeRows) {
+      const hit = pct(r.accessed, r.total);
+      const lp = pct(r.with_lesson, r.total);
+      const typeLabel = r.type.padEnd(10);
+      // padStart(5) on count so rows align up to 5-digit totals (99999).
+      out(`    ${typeLabel}${String(r.total).padStart(5)}   hit ${hit.padStart(5)}%   lesson ${lp.padStart(5)}%`);
+    }
+    out('');
+  }
+
+  if (topLessons.length > 0) {
+    out('  Top accessed lessons (all-time):');
+    for (const l of topLessons) {
+      const t = truncate(l.lesson_learned, 80);
+      out(`    #${l.id} [${l.type}] (${l.ac}x) ${t}`);
+    }
+    out('');
+  }
+
+  // R-2 watchdog — explicit targets make progress legible.
+  const lessonNum = parseFloat(lessonPct);
+  const noiseNum = parseFloat(noisePct);
+  const lessonGap = (lessonNum - 15).toFixed(1);
+  const noiseGap = (noiseNum - 30).toFixed(1);
+  const lessonStatus = lessonNum >= 15 ? '✅' : '🔴';
+  const noiseStatus = noiseNum <= 30 ? '✅' : '🔴';
+  out('  Targets (R-2 watchdog):');
+  out(`    ${lessonStatus} Lesson rate ≥ 15%    → currently ${lessonPct}%  (gap ${lessonGap >= 0 ? '+' : ''}${lessonGap}pp)`);
+  out(`    ${noiseStatus} LOW_SIGNAL  ≤ 30%    → currently ${noisePct}%  (gap ${noiseGap >= 0 ? '+' : ''}${noiseGap}pp)`);
+}
+
 function cmdStats(db, args) {
   const { flags } = parseArgs(args);
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const days = parseInt(flags.days, 10) || 30;
+  // N-1: --quality routes to a separate quality-focused report (lesson rate,
+  // LOW_SIGNAL rate, per-type hit+lesson %, R-2 watchdog targets). Intended as
+  // the baseline metric dashboard for the future Haiku prompt A/B test.
+  const quality = flags.quality === true || flags.quality === 'true';
+  if (quality) {
+    renderQualityReport(db, { project, days });
+    return;
+  }
 
   const projectFilter = project ? 'AND project = ?' : '';
   const baseParams = project ? [project] : [];
@@ -1886,6 +2007,8 @@ Commands:
   stats                 Show memory statistics
     --project P         Filter by project
     --days N            Lookback window (default 30)
+    --quality           Quality dashboard: lesson rate, LOW_SIGNAL rate, per-type
+                        hit/lesson %, top-accessed lessons, R-2 watchdog targets
 
   context               Show current CLAUDE.md context block
     --json              Output as structured JSON
