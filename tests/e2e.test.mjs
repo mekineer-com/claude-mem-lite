@@ -989,7 +989,19 @@ describe('Suite 8a: Additional E2E', () => {
     const db = openTestDb(tmpHome);
     const now = new Date();
     const sessId = `hook-parent--testproj-${randomUUID().slice(0, 8)}`;
-    const ninetyDaysAgo = Date.now() - 90 * 86400000;
+
+    // Anchor to Wednesday noon UTC, ≥95 days ago. Avoids the date-flake where
+    // `Date.now() - 90d + N*3600000` straddles a Sunday→Monday boundary depending
+    // on the wall-clock day-of-week, splitting the 4 hourly observations across
+    // two ISO weeks (one of which has only 1 obs and gets skipped by the
+    // `obs.length < 3` floor in handleAutoCompress, breaking the test ~1/7 days).
+    const anchor = new Date(Date.now() - 95 * 86400000);
+    anchor.setUTCHours(12, 0, 0, 0);
+    // Walk forward to the next Wednesday (UTC day 3) so the 4 hourly observations
+    // are guaranteed to land mid-week.
+    const daysToWed = (3 - anchor.getUTCDay() + 7) % 7;
+    anchor.setUTCDate(anchor.getUTCDate() + daysToWed);
+    const wedNoonEpoch = anchor.getTime();
 
     db.prepare(`
       INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
@@ -998,7 +1010,7 @@ describe('Suite 8a: Additional E2E', () => {
 
     // Insert 4 old, low-importance, never-accessed observations in the same week
     for (let i = 0; i < 4; i++) {
-      const epoch = ninetyDaysAgo + i * 3600000; // 1 hour apart, same week
+      const epoch = wedNoonEpoch + i * 3600000; // 1 hour apart on a Wednesday afternoon
       db.prepare(`
         INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
           concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
