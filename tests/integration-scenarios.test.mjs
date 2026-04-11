@@ -396,14 +396,17 @@ describe('Scenario 3: File Edit Pre-Recall — PreToolUse', () => {
     // Note: may be empty if cooldown is active — that's also valid behavior
   });
 
-  it('returns nothing for file with no past observations', () => {
+  it('emits backfill reminder for file with no past observations (R-4)', () => {
     const payload = JSON.stringify({
       tool_name: 'Edit',
       tool_input: { file_path: '/tmp/brand-new-file.js' },
     });
     const { stdout, exitCode } = runScript(PRE_RECALL_PATH, { stdin: payload });
     expect(exitCode).toBe(0);
-    expect(stdout.trim()).toBe('');
+    // R-4: previously silent; now emits a one-line reminder so Claude knows the hook ran
+    // and gets nudged to mem_save a lesson after solving a non-obvious bug.
+    expect(stdout).toContain('[mem] No prior lessons for brand-new-file.js');
+    expect(stdout).toContain('claude-mem-lite save');
   });
 
   it('recallForFile finds observations by filename match', () => {

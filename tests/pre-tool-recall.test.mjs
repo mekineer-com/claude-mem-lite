@@ -3,6 +3,8 @@ import { spawn } from 'child_process';
 import { resolve, join } from 'path';
 import { writeFileSync, mkdirSync, rmSync, readFileSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { initSchema } from '../schema.mjs';
+import Database from 'better-sqlite3';
 import { tmpdir } from 'os';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js');
@@ -184,6 +186,96 @@ describe('pre-tool-recall', () => {
         ? longLesson.slice(0, 117) + '...' : longLesson;
       expect(truncated).toHaveLength(120);
       expect(truncated.endsWith('...')).toBe(true);
+    });
+  });
+
+  // R-4: when no lessons match, emit a short backfill reminder so Claude (a) knows the
+  // system tried and (b) gets nudged to save a lesson after a non-obvious bug solve.
+  // Enabled by CLAUDE_MEM_DB_PATH + CLAUDE_MEM_RUNTIME_DIR env overrides for test isolation.
+  describe('backfill reminder (R-4)', () => {
+    let tmpRoot;
+    let dbPath;
+    let runtimeDir;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = join(tmpdir(), `pre-recall-r4-${process.pid}-${Date.now()}`);
+      mkdirSync(tmpRoot, { recursive: true });
+      dbPath = join(tmpRoot, 'test.db');
+      runtimeDir = join(tmpRoot, 'runtime');
+      mkdirSync(runtimeDir, { recursive: true });
+      // CLAUDE_PROJECT_DIR must be two-segment so inferProject() returns a predictable name.
+      // "parent--r4test" — matches what we insert into observations.project.
+      projectDir = join(tmpRoot, 'parent', 'r4test');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-r4', project: 'parent--r4test', memoryId: 'mem-r4' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function runWithEnv(input) {
+      return runScript(input, {
+        CLAUDE_MEM_DB_PATH: dbPath,
+        CLAUDE_MEM_RUNTIME_DIR: runtimeDir,
+        CLAUDE_PROJECT_DIR: projectDir,
+      });
+    }
+
+    it('emits backfill reminder when no lessons match for the file', async () => {
+      // No observations for this file → no lessons to surface.
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'credit_service.py') },
+      });
+      expect(stdout).toContain('[mem] No prior lessons for credit_service.py');
+      // Should mention the save command so Claude knows how to backfill.
+      expect(stdout).toContain('claude-mem-lite save');
+    });
+
+    it('still surfaces matching lessons when they exist (regression guard)', async () => {
+      // Seed a lesson for the target file.
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'FTS5 broke after schema change',
+        lessonLearned: 'Verify FTS5 integrity after schema changes',
+        filesModified: `["${join(projectDir, 'schema.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'schema.mjs') },
+      });
+      expect(stdout).toContain('[mem] Lessons for schema.mjs:');
+      expect(stdout).toContain('Verify FTS5 integrity');
+      // Reminder should NOT be emitted when a lesson was found.
+      expect(stdout).not.toContain('No prior lessons');
+    });
+
+    it('honors cooldown — second call within window emits neither lesson nor reminder', async () => {
+      const filePath = join(projectDir, 'cool.py');
+      const { stdout: first } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+      });
+      expect(first).toContain('[mem] No prior lessons for cool.py');
+
+      const { stdout: second } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+      });
+      expect(second).toBe('');
     });
   });
 });

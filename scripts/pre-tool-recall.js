@@ -7,8 +7,10 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
 
-const DB_PATH = join(homedir(), '.claude-mem-lite', 'claude-mem-lite.db');
-const RUNTIME_DIR = join(homedir(), '.claude-mem-lite', 'runtime');
+// CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR env overrides allow tests and debug tools to
+// point the hook at an isolated DB + cooldown dir without touching the user's real state.
+const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(homedir(), '.claude-mem-lite', 'claude-mem-lite.db');
+const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(homedir(), '.claude-mem-lite', 'runtime');
 const COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
 const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold
@@ -127,10 +129,16 @@ try {
           console.log(`  #${r.id} [${r.type}] ${title}`);
         }
       }
-      // Update cooldown
-      cooldown[filePath] = now;
-      writeCooldown(cooldown);
+    } else {
+      // R-4: emit a short backfill reminder instead of staying silent.
+      // Two goals: (1) Claude sees that the system actually ran, (2) Claude is
+      // nudged to mem_save a lesson when solving a non-obvious bug. The reminder
+      // is one line to minimize per-Edit context cost.
+      console.log(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: claude-mem-lite save --type bugfix --lesson "<one-line root cause + fix>"`);
     }
+    // Cooldown applies to BOTH branches so the reminder doesn't spam every Edit.
+    cooldown[filePath] = now;
+    writeCooldown(cooldown);
   } catch {
     // Silent failure — never block editing
   } finally {
