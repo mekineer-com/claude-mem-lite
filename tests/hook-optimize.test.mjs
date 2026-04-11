@@ -189,6 +189,21 @@ describe('re-enrich --scope wide (R-7)', () => {
     expect(wide.length).toBe(0);
   });
 
+  // Bug #2: LOW_SIGNAL filter only matched title == '(error)' exactly, not
+  // '... (error)' suffix. makeEntryDesc in utils.mjs appends ' (error)' to the
+  // entry description whenever a tool call failed, which then becomes the title
+  // in degraded-title mode. 110 obs (~4% of wide pool) were leaking through.
+  it('wide scope excludes titles with (error) suffix (Bug #2)', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'gh release list --repo sdsrss/claude-mem-lite --l… (error)',
+      narrative: 'Tool invocation output captured as the degraded title; narrative is the raw gh CLI output with no actual fix or root cause — lesson extraction is impossible from this.',
+    });
+    const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
+    expect(wide.length).toBe(0);
+  });
+
   it('wide scope excludes observations with too-short narratives', async () => {
     const { findReenrichCandidates } = await import('../hook-optimize.mjs');
     // Substantive title but thin narrative — nothing to extract from

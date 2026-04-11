@@ -89,7 +89,13 @@ export function clampImportance(val) {
 export const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 
 // Low-signal degraded title patterns — shared by hook-llm.mjs (dedup + importance cap) and hook-handoff.mjs (decision filter)
-export const LOW_SIGNAL_TITLE = /^(Error (while working|in)|Error: |Modified |Worked on |Reviewed \d+ files:|# |node |npm |npx |\(no description\)|\(error\)$)/;
+// Two top-level alternatives:
+//   1. ^(prefix1|prefix2|...) — title starts with one of the hook-llm fallback prefixes
+//   2. \(error\)$              — title ends with '(error)' (Bug #2 fix: previously this was
+//      inside the prefix group with a meaningless $, so only the exact title '(error)' matched.
+//      Tool-fragment titles like 'gh release list ... (error)' leaked through.)
+// Keep in sync with notLowSignalTitleClause() in scoring-sql.mjs.
+export const LOW_SIGNAL_TITLE = /^(Error (while working|in)|Error: |Modified |Worked on |Reviewed \d+ files:|# |node |npm |npx |\(no description\))|\(error\)$/;
 
 export function computeRuleImportance(episode) {
   let importance = 1;

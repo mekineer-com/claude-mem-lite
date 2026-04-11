@@ -76,6 +76,11 @@ export const TYPE_QUALITY_CASE = `(
  */
 export function notLowSignalTitleClause(alias = 'o') {
   const p = alias ? `${alias}.` : '';
+  // Bug #2 fix: replace `title != '(error)'` (exact match only) with
+  // `title NOT LIKE '%(error)'` (suffix match) so titles like
+  // "gh release list ... (error)" — produced when makeEntryDesc tags a failed
+  // tool invocation — are excluded too. The LIKE form subsumes the exact match.
+  // Keep in sync with LOW_SIGNAL_TITLE regex in utils.mjs.
   return `(
     ${p}title NOT LIKE 'Modified %'
     AND ${p}title NOT LIKE 'Worked on %'
@@ -88,6 +93,6 @@ export function notLowSignalTitleClause(alias = 'o') {
     AND ${p}title NOT LIKE 'npm %'
     AND ${p}title NOT LIKE 'npx %'
     AND ${p}title NOT LIKE '(no description)%'
-    AND ${p}title != '(error)'
+    AND ${p}title NOT LIKE '%(error)'
   )`;
 }
