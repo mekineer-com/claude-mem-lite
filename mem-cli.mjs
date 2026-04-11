@@ -892,12 +892,29 @@ function renderQualityReport(db, { project, days }) {
   // that flips the sign so we count titles that DO match the LOW_SIGNAL regex.
   const lowSignalIsMatchExpr = `NOT ${notLowSignalTitleClause('')}`;
 
+  // Unresolved-bugfix detection: narrative-text proxies for "investigation in progress,
+  // never reached a fix". Heuristic — false positives possible (e.g. a real lesson noting
+  // "the bug persists in legacy clients"), but the directional signal is what we care about.
+  // R-7 micro-experiment surfaced this pollution: ~3/5 of randomly-sampled bugfix narratives
+  // explicitly ended with "root cause not yet identified".
+  const unresolvedNarrativeExpr = `(
+    LOWER(COALESCE(narrative,'')) LIKE '%not yet identified%'
+    OR LOWER(COALESCE(narrative,'')) LIKE '%not yet resolved%'
+    OR LOWER(COALESCE(narrative,'')) LIKE '%not yet fixed%'
+    OR LOWER(COALESCE(narrative,'')) LIKE '%root cause not%'
+    OR LOWER(COALESCE(narrative,'')) LIKE '%still fail%'
+    OR LOWER(COALESCE(narrative,'')) LIKE '%errors persisted%'
+    OR LOWER(COALESCE(narrative,'')) LIKE '%persisted on retry%'
+  )`;
+
   // In-window aggregates
   const windowRow = db.prepare(`
     SELECT
       COUNT(*) as total,
       SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson,
-      SUM(CASE WHEN ${lowSignalIsMatchExpr} THEN 1 ELSE 0 END) as low_signal
+      SUM(CASE WHEN ${lowSignalIsMatchExpr} THEN 1 ELSE 0 END) as low_signal,
+      SUM(CASE WHEN type = 'bugfix' THEN 1 ELSE 0 END) as bugfix_total,
+      SUM(CASE WHEN type = 'bugfix' AND ${unresolvedNarrativeExpr} THEN 1 ELSE 0 END) as bugfix_unresolved
     FROM observations
     WHERE created_at_epoch >= ? ${projectFilter}
   `).get(cutoff, ...baseParams);
@@ -950,6 +967,11 @@ function renderQualityReport(db, { project, days }) {
   const noisePct = pct(windowRow.low_signal, windowRow.total);
   const allNoisePct = pct(allTimeRow.low_signal, allTimeRow.total);
   out(`  LOW_SIGNAL:       ${windowRow.low_signal} / ${windowRow.total} (${noisePct}%)    [all-time: ${allTimeRow.low_signal} / ${allTimeRow.total} = ${allNoisePct}%]`);
+
+  if (windowRow.bugfix_total > 0) {
+    const unresolvedPct = pct(windowRow.bugfix_unresolved, windowRow.bugfix_total);
+    out(`  Unresolved bugfix: ${windowRow.bugfix_unresolved} / ${windowRow.bugfix_total} (${unresolvedPct}%)    [investigation-only narratives — should trend ↓ with R-6 manual-save contract]`);
+  }
   out('');
 
   if (typeRows.length > 0) {

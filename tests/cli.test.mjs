@@ -1380,6 +1380,73 @@ describe('CLI stats --quality command', () => {
   });
 });
 
+// N-1 extension: unresolved_bugfix metric — proxy for "investigation, not fix" pollution.
+// R-7 micro-experiment showed many type=bugfix observations are actually investigations
+// where narrative explicitly ends with "root cause not yet identified" — Haiku tagged
+// them bugfix because hasError, but no fix was applied. This metric tracks the pollution
+// rate so we can see whether R-6 (manual save contract) reduces it over time.
+describe('CLI stats --quality unresolved_bugfix metric', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+    // 5 bugfix observations: 3 unresolved (investigation only), 2 resolved (real fixes).
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Investigate test failure in parser', text: 'p',
+      narrative: 'Ran cargo test and saw the failure. Searched for the symbol but Root cause not yet identified from the output.',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Lint failures in gsd-lite', text: 'l',
+      narrative: 'Investigation of npm lint failures. Errors persisted on retry. Still fails after re-running biome check.',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Test suite failures in executor context', text: 't',
+      narrative: 'TAP output shows failures in buildExecutorContext subtests. Regression suspected but root cause not yet identified.',
+    });
+    // Resolved bugfix #1 — has a clear root cause + fix
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fix race in credit deduction', text: 'r',
+      narrative: 'IntegrityError in concurrent deduction. Root cause: read-then-write without SELECT FOR UPDATE. Added row lock; verified with stress test.',
+      lessonLearned: 'Use SELECT FOR UPDATE for any read-then-write on a contended row',
+    });
+    // Resolved bugfix #2
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fix CJK tokenization in FTS5', text: 'c',
+      narrative: 'FTS5 porter stemmer does not split CJK. Added bigram fallback in utils.mjs and verified search recall.',
+      lessonLearned: 'FTS5 needs CJK bigram workaround',
+    });
+    // Totals: 5 bugfix, 3 unresolved (60%), 2 resolved
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('reports unresolved bugfix count as "3 / 5 (60.0%)"', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toMatch(/Unresolved bugfix:\s*3\s*\/\s*5\s*\(60\.0%\)/);
+  });
+
+  it('flags unresolved bugfix line as a R-6 watchdog (should trend down)', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    // The line should explicitly mention R-6 or "trend down" so users know what to look for.
+    expect(output).toMatch(/Unresolved bugfix:.*R-6|Unresolved bugfix:.*trend.*↓|Unresolved bugfix:.*should.*decrease/);
+  });
+
+  it('matches case-insensitively against narrative pollution markers', async () => {
+    // Add an extra observation with mixed-case marker — should still count
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Edge case', text: 'e',
+      narrative: 'NOT YET RESOLVED — needs follow-up.',
+    });
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    // Now 4 unresolved out of 6 bugfix
+    expect(output).toMatch(/Unresolved bugfix:\s*4\s*\/\s*6/);
+  });
+});
+
 // ─── search cross-source (sessions + prompts) ──────────────────────────────
 
 describe('CLI search cross-source', () => {
