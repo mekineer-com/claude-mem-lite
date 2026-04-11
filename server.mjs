@@ -4,7 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
@@ -155,26 +155,32 @@ function safeHandler(fn) {
 
 // Score expression variants for FTS5 queries (see Scoring Model Constants above)
 // TYPE_QUALITY_CASE demotes bugfix (×0.6) and promotes decision/discovery (×1.5/1.3)
+// R-3: lesson_learned presence adds ×1.3 boost — empirical +6.3pp hit-rate lift on bugfix.
 const FULL_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
-  * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))`;
+  * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
-  * (0.5 + 0.5 * COALESCE(o.importance, 1))`;
+  * (0.5 + 0.5 * COALESCE(o.importance, 1))
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
 
 /**
  * Build an FTS5 observation search query.
  * @param {'full'|'simple'} scoring - full includes project boost + access bonus
- * @param {object} opts - { multiplier, withSnippet, withOffset }
+ * @param {object} opts - { multiplier, withSnippet, withOffset, includeNoise }
+ *   includeNoise=true keeps hook-llm fallback titles ("Modified X", "Worked on X", etc.);
+ *   default false mirrors the filter already applied in hook-memory.mjs / user-prompt-search.js.
  */
-function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset } = {}) {
+function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset, includeNoise } = {}) {
   const scoreExpr = scoring === 'full' ? FULL_SCORE : SIMPLE_SCORE;
   const mult = multiplier ? ` * ${multiplier}` : '';
+  const lowSignalClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
   return `
     SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
            o.files_modified,
@@ -191,6 +197,7 @@ function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset } = {})
       AND (? IS NULL OR o.created_at_epoch <= ?)
       AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
       AND (? IS NULL OR o.branch = ?)
+      ${lowSignalClause}
     ORDER BY score
     LIMIT ?${withOffset ? ' OFFSET ?' : ''}`;
 }
@@ -225,12 +232,14 @@ function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
 function searchObservations(ctx) {
   const { ftsQuery, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit } = ctx;
   const results = [];
+  // R-1: hide hook-llm fallback titles unless caller explicitly opts in via include_noise=true.
+  const includeNoise = args.include_noise === true;
 
   if (ftsQuery) {
     const now = Date.now();
     const projectBoost = args.project ? null : currentProject;
 
-    const rows = db.prepare(buildObsFtsQuery('full', { withSnippet: true, withOffset: true }))
+    const rows = db.prepare(buildObsFtsQuery('full', { withSnippet: true, withOffset: true, includeNoise }))
       .all(...buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
     for (const r of rows) results.push(ftsRowToResult(r, { snippet: true }));
 
@@ -239,7 +248,7 @@ function searchObservations(ctx) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery) {
         try {
-          const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.5, withSnippet: true, withOffset: true }))
+          const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.5, withSnippet: true, withOffset: true, includeNoise }))
             .all(...buildObsFtsParams({ now, projectBoost, ftsQuery: orQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
           for (const r of orRows) results.push(ftsRowToResult(r, { snippet: true }));
         } catch (e) { debugCatch(e, 'searchObservations-or-fallback'); }
@@ -249,8 +258,8 @@ function searchObservations(ctx) {
     // Two-phase query expansion for sparse results (only when well below limit)
     if (rows.length > 0 && results.length < Math.ceil(limit / 2)) {
       const existingIds = new Set(results.map(r => r.id));
-      expandObsByConceptCo(ctx, now, existingIds, results);
-      expandObsByPRF(ctx, now, rows.length, existingIds, results);
+      expandObsByConceptCo(ctx, now, existingIds, results, includeNoise);
+      expandObsByPRF(ctx, now, rows.length, existingIds, results, includeNoise);
     }
 
     // Vector search + RRF hybrid merge
@@ -279,6 +288,9 @@ function searchObservations(ctx) {
                   if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
                   if (args.importance && (obs.importance ?? 1) < args.importance) continue;
                   if (args.branch && obs.branch !== args.branch) continue;
+                  // R-1: parity with FTS5 WHERE — vector path must also reject LOW_SIGNAL titles
+                  // so RRF cannot re-admit what the SQL clause excluded.
+                  if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
                   resultMap.set(vr.id, { source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, snippet: '' });
                 }
               }
@@ -298,6 +310,7 @@ function searchObservations(ctx) {
               if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
               if (args.importance && (obs.importance ?? 1) < args.importance) continue;
               if (args.branch && obs.branch !== args.branch) continue;
+              if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
               results.push({ source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, score: -vr.similarity, snippet: '' });
             }
           }
@@ -329,14 +342,14 @@ function searchObservations(ctx) {
   return results;
 }
 
-function expandObsByConceptCo(ctx, now, existingIds, results) {
+function expandObsByConceptCo(ctx, now, existingIds, results, includeNoise = false) {
   const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
   if (results.length >= Math.ceil(limit / 2)) return;
   const expanded = expandQueryByConcepts(db, ftsQuery, args.project);
   if (expanded.length === 0) return;
   const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
   try {
-    const expRows = db.prepare(buildObsFtsQuery('simple'))
+    const expRows = db.prepare(buildObsFtsQuery('simple', { includeNoise }))
       .all(...buildObsFtsParams({ now, ftsQuery: expansionFts, args, epochFrom, epochTo, limit }));
     for (const r of expRows) {
       if (!existingIds.has(r.id)) {
@@ -347,7 +360,7 @@ function expandObsByConceptCo(ctx, now, existingIds, results) {
   } catch (e) { debugLog('WARN', 'mem_search', `concept expansion error: ${e.message}`); }
 }
 
-function expandObsByPRF(ctx, now, primaryCount, existingIds, results) {
+function expandObsByPRF(ctx, now, primaryCount, existingIds, results, includeNoise = false) {
   const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
   if (primaryCount < 3) return;
   const topResults = db.prepare(`
@@ -362,7 +375,7 @@ function expandObsByPRF(ctx, now, primaryCount, existingIds, results) {
   if (prfTerms.length === 0) return;
   const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
   try {
-    const prfRows = db.prepare(buildObsFtsQuery('simple'))
+    const prfRows = db.prepare(buildObsFtsQuery('simple', { includeNoise }))
       .all(...buildObsFtsParams({ now, ftsQuery: prfFts, args, epochFrom, epochTo, limit }));
     for (const r of prfRows) {
       if (!existingIds.has(r.id)) {

@@ -4,7 +4,7 @@
 
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
@@ -82,7 +82,7 @@ function cmdSearch(db, args) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    fail('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance]');
+    fail('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise]');
     return;
   }
 
@@ -119,6 +119,10 @@ function cmdSearch(db, args) {
     return;
   }
   const useOr = flags.or === true || flags.or === 'true';
+  // R-1: opt-in flag to surface hook-llm fallback titles ("Modified X", "Worked on X", raw
+  // error logs, etc.) which are otherwise filtered from default search. Use for auditing or
+  // when explicitly searching for a file/command that produced a degraded title.
+  const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
     fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
@@ -145,11 +149,11 @@ function cmdSearch(db, args) {
 
   // Search observations
   if (!effectiveSource || effectiveSource === 'observations') {
-    let obsRows = searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: effectiveSource ? offset : 0 });
+    let obsRows = searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: effectiveSource ? offset : 0 });
     if (obsRows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery) {
-        try { obsRows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: effectiveSource ? offset : 0 }); } catch {}
+        try { obsRows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: effectiveSource ? offset : 0 }); } catch {}
       }
     }
     // Type-list fallback
@@ -180,7 +184,7 @@ function cmdSearch(db, args) {
       if (expanded.length > 0) {
         const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
         try {
-          const expRows = searchFts(db, expansionFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: 0 });
+          const expRows = searchFts(db, expansionFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: 0 });
           for (const r of expRows) {
             if (!existingIds.has(r.id)) {
               existingIds.add(r.id);
@@ -203,7 +207,7 @@ function cmdSearch(db, args) {
         if (prfTerms.length > 0) {
           const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
           try {
-            const prfRows = searchFts(db, prfFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset: 0 });
+            const prfRows = searchFts(db, prfFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: 0 });
             for (const r of prfRows) {
               if (!existingIds.has(r.id)) {
                 existingIds.add(r.id);
@@ -379,7 +383,7 @@ function cmdSearch(db, args) {
   }
 }
 
-function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, offset }) {
+function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset }) {
   const now = Date.now();
   // Current project for boost (2× when no explicit project filter)
   const currentProject = !project ? inferProject() : null;
@@ -397,12 +401,18 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
   if (dateTo) { wheres.push('o.created_at_epoch <= ?'); whereParams.push(dateTo); }
   if (minImportance) { wheres.push('COALESCE(o.importance, 1) >= ?'); whereParams.push(minImportance); }
   if (branch) { wheres.push('o.branch = ?'); whereParams.push(branch); }
+  // R-1: exclude hook-llm fallback titles ("Modified X", "Worked on X", raw error logs)
+  // from default search. They compete for BM25 rank but have ~3% access rate. Mirrors the
+  // filter already applied in hook-memory.mjs, hook-context.mjs, and user-prompt-search.js.
+  // Use --include-noise to audit them.
+  if (!includeNoise) wheres.push(notLowSignalTitleClause('o'));
 
   // Param order: SELECT scoring (now, proj, proj) → WHERE (ftsQuery, filters...) → ORDER BY scoring (now, proj, proj) → LIMIT/OFFSET
   const scoreParams = [now, currentProject, currentProject];
   const params = [...scoreParams, ...whereParams, ...scoreParams, limit, offset || 0];
 
-  // Scoring aligned with server.mjs: BM25 × type-decay × type-quality × project_boost × importance × access_bonus
+  // Scoring aligned with server.mjs: BM25 × type-decay × type-quality × project_boost × importance × access_bonus × lesson-boost
+  // R-3: lesson_learned presence adds a +0.3 multiplier (empirical: +6.3pp hit-rate lift on bugfix).
   const ftsRows = db.prepare(`
     SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.created_at_epoch, o.lesson_learned,
            o.files_modified, o.importance,
@@ -411,7 +421,8 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
              * ${TYPE_QUALITY_CASE}
              * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
              * (0.5 + 0.5 * COALESCE(o.importance, 1))
-             * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
+             * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
+             * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL)) as score
     FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE ${wheres.join(' AND ')}
@@ -421,6 +432,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
       * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
       * (0.5 + 0.5 * COALESCE(o.importance, 1))
       * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
+      * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))
     LIMIT ? OFFSET ?
   `).all(...params);
 
@@ -448,6 +460,9 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
                 if (dateTo && obs.created_at_epoch > dateTo) continue;
                 if (minImportance && (obs.importance ?? 1) < minImportance) continue;
                 if (branch && obs.branch !== branch) continue;
+                // R-1: LOW_SIGNAL filter also applies to vector-side additions (the SQL
+                // clause only filtered the FTS5 side) so RRF can't re-admit noise.
+                if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
                 rowMap.set(vr.id, obs);
               }
             }
@@ -465,6 +480,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
               if (dateTo && obs.created_at_epoch > dateTo) return false;
               if (minImportance && (obs.importance ?? 1) < minImportance) return false;
               if (branch && obs.branch !== branch) return false;
+              if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) return false;
               return true;
             })
             .slice(0, limit);

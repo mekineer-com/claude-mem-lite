@@ -47,3 +47,34 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 - FTS5 search: sanitizeFtsQuery (synonym expansion) → BM25 scoring → OR fallback → concept co-occurrence
 - Context delivery: SessionStart hook stdout emits the `<claude-mem-context>` block fresh from DB; CLAUDE.md is no longer auto-updated (pre-v2.30 left a stale snapshot here)
 - Skill commands (`/search`, `/recall`, `/recent`, `/timeline`) use `!` preprocessing for CLI injection
+
+## Mem usage contract (applies to ALL sessions touching this repo)
+
+This project *is* the memory plugin. Dogfood it. The rules below override soft "proactive trigger"
+language in the MCP tool description — when the two conflict, this contract wins.
+
+**Before you Edit/Write any code file**: the PreToolUse hook (`scripts/pre-tool-recall.js`) has
+already run `mem_recall` for that file. If you saw lines like `#NN [bugfix] ...` in your
+tool-result preamble, you **must** cite `#NN` in your response (even a one-liner
+`"per #NN, I avoided re-introducing X"`) so the user can verify you actually consumed the
+lesson. Failure to cite when a lesson was surfaced = contract violation.
+
+**After solving a non-trivial bug** (≠ typo fix, ≠ rename): you **must** call
+`mem_save(type='bugfix', lesson_learned='<one-line root cause + one-line fix>',
+importance=2)`. Test: could a future session touching the same file have avoided this bug
+if they'd seen the lesson? If yes → save it. If no → it wasn't a real bug fix.
+
+**After making a non-obvious architectural decision** (≠ renaming, ≠ moving code): call
+`mem_save(type='decision', lesson_learned='<constraint + why this choice + what it trades off>')`.
+Empirical note: `decision` observations have 72.7% hit rate vs `change` at 16.5% — one good
+decision memory is worth ~20 change memories. Do not inflate this — decision is reserved
+for real tradeoffs, not style choices.
+
+**Do not write `lesson_learned: 'none'` just to satisfy the schema.** Either write a lesson
+that a future session could actually use, or leave the field NULL and accept a low-importance
+observation. The Haiku prompt defaults to "none" far too aggressively; when you save manually,
+you override that default.
+
+**When searching memory via CLI/MCP**: default search now excludes low-signal fallback titles
+(`Modified X`, `Worked on X`, raw error logs). If you're auditing or specifically hunting a
+file-change record, pass `--include-noise` (CLI) or `include_noise=true` (MCP).

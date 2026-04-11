@@ -41,6 +41,7 @@ export const memSearchSchema = {
   limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max results (default 20)'),
   offset: coerceInt.pipe(z.number().int().min(0)).optional().describe('Offset for pagination'),
   sort: z.enum(['relevance', 'time', 'importance']).optional().describe('Sort order: relevance (default, BM25), time (newest first), importance (highest first)'),
+  include_noise: z.boolean().optional().describe('Include hook-llm fallback titles ("Modified X", "Worked on X", raw error logs) — hidden by default as they have ~3% access rate'),
 };
 
 export const memRecentSchema = {

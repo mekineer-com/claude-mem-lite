@@ -232,6 +232,63 @@ describe('CLI search command', () => {
     expect(output).toContain('Alpha discovery');
   });
 
+  // R-1: LOW_SIGNAL title filtering — default search hides hook-llm degraded titles
+  // ("Modified X", "Worked on X", etc.) that compete for BM25 rank but have
+  // ~3% access rate. They remain searchable via --include-noise.
+  it('excludes LOW_SIGNAL titles from default search', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Modified auth.mjs',
+      text: 'uniquealphatoken handling tweaked',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Auth flow uniquealphatoken validation fix',
+      text: 'uniquealphatoken validation root cause',
+    });
+    const output = await captureStdout(() => run(['search', 'uniquealphatoken']));
+    expect(output).toContain('Auth flow uniquealphatoken validation fix');
+    expect(output).not.toContain('Modified auth.mjs');
+  });
+
+  it('--include-noise restores LOW_SIGNAL titles in search results', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Modified auth.mjs',
+      text: 'uniquealphatoken handling tweaked',
+    });
+    const output = await captureStdout(() => run(['search', 'uniquealphatoken', '--include-noise']));
+    expect(output).toContain('Modified auth.mjs');
+  });
+
+  // R-3: lesson_learned presence lifts rank vs identical obs without lesson.
+  // Empirical basis: bugfix with lesson has +6.3pp hit rate over bugfix without.
+  // The multiplier is intentionally small (×1.3) — this is a gentle rerank, not a bucket.
+  it('ranks observations with lesson_learned above identical ones without', async () => {
+    // Insert the WITHOUT-lesson row first (newer) to prove the lesson boost
+    // overcomes any tie-break favoring recency.
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Queue fix uniquebetatoken variant A',
+      text: 'uniquebetatoken race condition in worker queue',
+      epochOffset: 0,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Queue fix uniquebetatoken variant B',
+      text: 'uniquebetatoken race condition in worker queue',
+      lessonLearned: 'Always acquire the mutex before peeking the queue head',
+      epochOffset: -5000,
+    });
+    const output = await captureStdout(() => run(['search', 'uniquebetatoken']));
+    const withIdx = output.indexOf('Queue fix uniquebetatoken variant B');
+    const withoutIdx = output.indexOf('Queue fix uniquebetatoken variant A');
+    expect(withIdx).toBeGreaterThan(-1);
+    expect(withoutIdx).toBeGreaterThan(-1);
+    // Lower index = appears first in ranked output
+    expect(withIdx).toBeLessThan(withoutIdx);
+  });
+
   it('shows usage when no query provided', async () => {
     const output = await captureStdout(() => run(['search']));
     expect(output).toContain('Usage');
