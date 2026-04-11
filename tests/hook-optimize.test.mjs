@@ -95,6 +95,55 @@ describe('re-enrich', () => {
   });
 });
 
+// Bug #1: rebuildVector was writing to a non-existent column `computed_at`.
+// Every executeReenrich silently caught SqliteError: observation_vectors has no column named computed_at.
+// The catch is intentional (non-critical path), so the bug was invisible at runtime.
+// This test calls rebuildVector directly and asserts the row actually lands.
+describe('rebuildVector (Bug #1)', () => {
+  let db;
+  beforeEach(async () => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    // Seed several observations so rebuildVocabulary has enough corpus to build a vocab
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, {
+        type: 'bugfix',
+        title: `Fix issue ${i} in module X`,
+        narrative: `Detailed narrative about issue ${i}: a concurrency bug in the handler released the lock before the side-effect finished, causing a race window that let the second caller overwrite state.`,
+        text: `concurrency lock race handler side-effect state issue-${i}`,
+      });
+    }
+    // Force vocab rebuild so rebuildVector has something to embed against
+    const { rebuildVocabulary, _resetVocabCache } = await import('../tfidf.mjs');
+    _resetVocabCache();
+    rebuildVocabulary(db);
+  });
+  afterEach(() => { db.close(); });
+
+  it('writes a row to observation_vectors for the target observation', async () => {
+    const { rebuildVector } = await import('../hook-optimize.mjs');
+    const obsId = db.prepare("SELECT id FROM observations ORDER BY id LIMIT 1").get().id;
+
+    rebuildVector(db, obsId, ['concurrency race lock', 'handler side-effect state overwrite']);
+
+    const row = db.prepare('SELECT COUNT(*) as c FROM observation_vectors WHERE observation_id = ?').get(obsId);
+    expect(row.c).toBe(1);
+  });
+
+  it('writes the correct column set (schema-aligned: created_at_epoch)', async () => {
+    const { rebuildVector } = await import('../hook-optimize.mjs');
+    const obsId = db.prepare("SELECT id FROM observations ORDER BY id LIMIT 1").get().id;
+
+    rebuildVector(db, obsId, ['concurrency race lock', 'handler side-effect state overwrite']);
+
+    // Row should have a non-null created_at_epoch populated by the helper
+    const row = db.prepare('SELECT observation_id, vocab_version, created_at_epoch FROM observation_vectors WHERE observation_id = ?').get(obsId);
+    expect(row).toBeDefined();
+    expect(row.created_at_epoch).toBeGreaterThan(0);
+    expect(row.vocab_version).toBeTruthy();
+  });
+});
+
 // R-7 micro: widened scope — target observations that have concepts/facts populated
 // but still no lesson_learned. These are the "Haiku filled in everything except the
 // lesson" cases that the narrow filter misses entirely.

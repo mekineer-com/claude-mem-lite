@@ -32,15 +32,23 @@ export function distributeBudget(total = 15) {
 
 // ─── Shared Helpers ─────────────────────────────────────────────────────────
 
-/** Rebuild TF-IDF vector for an observation. Non-critical — swallows errors. */
-function rebuildVector(db, obsId, textParts) {
+/**
+ * Rebuild TF-IDF vector for an observation. Non-critical — swallows errors.
+ * Exported for testing; also kept as the single source of vector-rebuild logic
+ * for the optimize / re-enrich path to avoid drift with the hook-llm write path.
+ */
+export function rebuildVector(db, obsId, textParts) {
   try {
     const vocab = getVocabulary(db);
     if (!vocab) return;
     const vec = computeVector(textParts.filter(Boolean).join(' '), vocab);
     if (vec) {
+      // Bug #1 fix: column is `created_at_epoch`, not `computed_at`. Every other
+      // INSERT callsite (server.mjs, hook-llm.mjs, mem-cli.mjs) uses the correct
+      // name; this was the only drift, silently caught by the catch below until
+      // the R-7 experiment surfaced it.
       db.prepare(`
-        INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, computed_at)
+        INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch)
         VALUES (?, ?, ?, ?)
       `).run(obsId, Buffer.from(vec.buffer), vocab.version, Date.now());
     }
