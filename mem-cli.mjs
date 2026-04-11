@@ -2140,22 +2140,27 @@ async function cmdOptimize(db, args) {
   const tasks = taskIdx >= 0 && args[taskIdx + 1] ? [args[taskIdx + 1]] : undefined;
   const maxIdx = args.indexOf('--max');
   const maxItems = maxIdx >= 0 ? parseInt(args[maxIdx + 1], 10) || 15 : 15;
+  // R-7 micro: --scope wide targets bugfix/refactor/feature/decision with narrative but no
+  // lesson_learned (the "Haiku judged 'none'" cases). Default 'narrow' preserves old behavior.
+  const scopeIdx = args.indexOf('--scope');
+  const reenrichScope = scopeIdx >= 0 && args[scopeIdx + 1] === 'wide' ? 'wide' : 'narrow';
 
   if (!run && !runAll) {
     const preview = optimizePreview(db);
     out('[mem] 🔍 LLM Optimization Preview:');
-    out(`  Re-enrich candidates: ${preview.reenrich}`);
+    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}`);
     out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
     out(`  Cluster-merge: ${preview.clusterMerge} clusters`);
     out(`  Smart-compress: ${preview.smartCompress} clusters`);
     out(`  Total: ${preview.total} items`);
     out('');
     out('Run with --run to execute, --run-all to bypass gates.');
+    out('For R-7 backfill: --run --task re-enrich --scope wide --max N');
     return;
   }
 
-  out('[mem] Running LLM optimization...');
-  const results = await optimizeRun(db, { tasks, maxItems, force: runAll });
+  out(`[mem] Running LLM optimization${reenrichScope === 'wide' ? ' (scope: wide)' : ''}...`);
+  const results = await optimizeRun(db, { tasks, maxItems, force: runAll, reenrichScope });
 
   if (results.reenrich) out(`  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`);
   if (results.normalize) {

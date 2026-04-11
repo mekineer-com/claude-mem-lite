@@ -7,6 +7,7 @@ import { join } from 'path';
 import {
   truncate, debugLog, debugCatch, COMPRESSED_AUTO,
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity, clampImportance, cjkBigrams,
+  notLowSignalTitleClause,
 } from './utils.mjs';
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
@@ -48,7 +49,42 @@ function rebuildVector(db, obsId, textParts) {
 
 // ─── Task 1: Re-enrich ─────────────────────────────────────────────────────
 
-export function findReenrichCandidates(db, limit = 10) {
+/**
+ * Find observations eligible for LLM re-enrichment.
+ *
+ * Two scopes:
+ * - 'narrow' (default): fully-degraded observations — Haiku failed to extract
+ *   concepts / facts / lesson / aliases. Conservative; preserves pre-R-7 behavior.
+ * - 'wide' (R-7): substantive bugfix / refactor / feature / decision observations
+ *   that have concepts + facts populated but are missing lesson_learned.
+ *   Targets the "Haiku ran but judged 'none'" cases that dominate the library.
+ *   Excludes LOW_SIGNAL titles (no source material to extract from) and
+ *   thin narratives (<100 chars → nothing to rewrite into a lesson).
+ *
+ * Both scopes respect optimized_at (idempotent) and skip compressed/superseded rows.
+ *
+ * @param {object} db better-sqlite3 database handle
+ * @param {number} limit max candidates to return
+ * @param {{ scope?: 'narrow' | 'wide' }} [opts]
+ */
+export function findReenrichCandidates(db, limit = 10, { scope = 'narrow' } = {}) {
+  if (scope === 'wide') {
+    return db.prepare(`
+      SELECT id, title, narrative, type, subtitle, concepts, facts
+      FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
+        AND optimized_at IS NULL
+        AND type IN ('bugfix','refactor','feature','decision')
+        AND (lesson_learned IS NULL OR lesson_learned = '')
+        AND LENGTH(COALESCE(narrative, '')) > 100
+        AND ${notLowSignalTitleClause('')}
+      ORDER BY
+        CASE type WHEN 'decision' THEN 0 WHEN 'bugfix' THEN 1 WHEN 'refactor' THEN 2 ELSE 3 END,
+        created_at_epoch DESC
+      LIMIT ?
+    `).all(limit);
+  }
   return db.prepare(`
     SELECT id, title, narrative, type, subtitle
     FROM observations
@@ -63,8 +99,8 @@ export function findReenrichCandidates(db, limit = 10) {
   `).all(limit);
 }
 
-export async function executeReenrich(db, limit = 10) {
-  const candidates = findReenrichCandidates(db, limit);
+export async function executeReenrich(db, limit = 10, { scope = 'narrow' } = {}) {
+  const candidates = findReenrichCandidates(db, limit, { scope });
   if (candidates.length === 0) return { processed: 0, skipped: 0 };
 
   let processed = 0, skipped = 0;
@@ -581,6 +617,9 @@ export async function executeSmartCompress(db, maxClusters = 5) {
 
 export function optimizePreview(db) {
   const reenrich = findReenrichCandidates(db, 1000).length;
+  // R-7: also report the widened-scope candidate count so users can see how many
+  // bugfix/refactor/feature/decision observations are eligible for lesson backfill.
+  const reenrichWide = findReenrichCandidates(db, 5000, { scope: 'wide' }).length;
 
   const concepts = extractUniqueConcepts(db);
   const normalizeReady = shouldRunNormalize() && concepts.length >= 5;
@@ -594,6 +633,7 @@ export function optimizePreview(db) {
 
   return {
     reenrich,
+    reenrichWide,
     normalize: normalizeReady ? concepts.length : 0,
     normalizeGateOpen: shouldRunNormalize(),
     clusterMerge,
@@ -602,17 +642,35 @@ export function optimizePreview(db) {
   };
 }
 
-export async function optimizeRun(db, { tasks, maxItems = 15, force = false } = {}) {
+/**
+ * Run optimization tasks against the memory DB.
+ *
+ * @param {object} db better-sqlite3 handle
+ * @param {object} [opts]
+ * @param {string[]} [opts.tasks] Subset of tasks to run (default: all). When a single
+ *   task is selected, it receives the FULL maxItems budget instead of the proportional
+ *   slice from distributeBudget() — otherwise explicit `--max N --task re-enrich`
+ *   would silently waste 60% of the requested budget.
+ * @param {number} [opts.maxItems=15] Total item budget across all selected tasks.
+ * @param {boolean} [opts.force=false] Bypass time-based gates (e.g. normalize interval).
+ * @param {'narrow'|'wide'} [opts.reenrichScope='narrow'] Scope for the re-enrich task.
+ *   'wide' targets bugfix/refactor/feature/decision with narrative but no lesson (R-7).
+ */
+export async function optimizeRun(db, { tasks, maxItems = 15, force = false, reenrichScope = 'narrow' } = {}) {
   const allTasks = ['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'];
   const selectedTasks = tasks && tasks.length > 0 ? tasks : allTasks;
-  const budget = distributeBudget(maxItems);
+  // Single-task mode: give that task the full budget. Distribution only makes sense
+  // when multiple tasks compete for the same pool.
+  const budget = selectedTasks.length === 1
+    ? { reenrich: maxItems, normalize: maxItems, clusterMerge: maxItems, smartCompress: maxItems }
+    : distributeBudget(maxItems);
   const results = {};
 
   for (const task of selectedTasks) {
     try {
       switch (task) {
         case 're-enrich':
-          results.reenrich = await executeReenrich(db, budget.reenrich);
+          results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope });
           break;
         case 'normalize':
           results.normalize = await executeNormalize(db, force);

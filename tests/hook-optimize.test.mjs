@@ -95,6 +95,174 @@ describe('re-enrich', () => {
   });
 });
 
+// R-7 micro: widened scope — target observations that have concepts/facts populated
+// but still no lesson_learned. These are the "Haiku filled in everything except the
+// lesson" cases that the narrow filter misses entirely.
+describe('re-enrich --scope wide (R-7)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSON.mockReset();
+  });
+  afterEach(() => { db.close(); });
+
+  it('wide scope finds bugfix with narrative but no lesson (narrow scope misses it)', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    // This observation has concepts + facts + a substantive narrative, but no lesson.
+    // Represents the common case: Haiku ran successfully except for the lesson field.
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix race condition in credit deduction',
+      narrative: 'IntegrityError appeared when two concurrent requests deducted credit from the same account. Root cause: balance read-then-write without SELECT FOR UPDATE. Added row-level lock via SELECT FOR UPDATE in the transaction.',
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    db.prepare("UPDATE observations SET concepts = 'credit race', facts = 'credit balance' WHERE id = ?").run(id);
+
+    // Narrow scope (default) should miss it — concepts is populated
+    const narrow = findReenrichCandidates(db, 10);
+    expect(narrow.length).toBe(0);
+
+    // Wide scope should find it
+    const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
+    expect(wide.length).toBe(1);
+    expect(wide[0].title).toContain('credit deduction');
+  });
+
+  it('wide scope excludes LOW_SIGNAL titles (no source material to extract from)', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Modified schema.mjs',
+      narrative: 'long narrative that would otherwise be substantive but the title marks it as a fallback/degraded observation from hook-llm without LLM enrichment — not a real lesson candidate because the episode captured raw tool output',
+    });
+    const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
+    expect(wide.length).toBe(0);
+  });
+
+  it('wide scope excludes observations with too-short narratives', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    // Substantive title but thin narrative — nothing to extract from
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix off-by-one in pager',
+      narrative: 'Fixed it.',
+    });
+    const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
+    expect(wide.length).toBe(0);
+  });
+
+  it('wide scope excludes observations already having lesson_learned', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix memory leak in parser',
+      narrative: 'Long enough narrative describing the problem and the fix in detail with technical specifics',
+      lessonLearned: 'already has a lesson that is long enough',
+    });
+    const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
+    expect(wide.length).toBe(0);
+  });
+
+  it('wide scope excludes non-substantive types (change observations)', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    // change type with long narrative but no lesson — should NOT be picked up by wide scope
+    // (wide scope only targets bugfix/refactor/feature/decision where a lesson is plausible)
+    insertObs(db, {
+      type: 'change',
+      title: 'Bumped version to 2.30.0',
+      narrative: 'Updated package.json, Cargo.toml, and the version constant in cli.mjs. Ran the sync-versions script to propagate the change across all build manifests and verified consistency.',
+    });
+    const wide = findReenrichCandidates(db, 10, { scope: 'wide' });
+    expect(wide.length).toBe(0);
+  });
+
+  it('wide scope respects optimized_at marker (idempotent reruns)', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix CJK tokenization in FTS5',
+      narrative: 'FTS5 porter stemmer does not tokenize CJK — needed to add bigram generation in utils.mjs. Applied a workaround that splits on unicode category and emits overlapping bigrams.',
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+
+    // First call: should find it
+    expect(findReenrichCandidates(db, 10, { scope: 'wide' }).length).toBe(1);
+
+    // Mark optimized
+    db.prepare('UPDATE observations SET optimized_at = ? WHERE id = ?').run(Date.now(), id);
+
+    // Second call: should be excluded
+    expect(findReenrichCandidates(db, 10, { scope: 'wide' }).length).toBe(0);
+  });
+
+  it('optimizeRun({tasks:[re-enrich], maxItems:20, reenrichScope:wide}) gives re-enrich the full 20 budget', async () => {
+    const { optimizeRun } = await import('../hook-optimize.mjs');
+
+    // Seed 25 wide-scope-eligible observations
+    for (let i = 0; i < 25; i++) {
+      insertObs(db, {
+        type: 'bugfix',
+        title: `Fix issue #${i} in module X`,
+        narrative: `Long enough narrative for observation ${i}: traced a concurrency bug in the handler and found that the lock was released before the side-effect completed, causing a race window that let the second caller overwrite state.`,
+      });
+    }
+    // Populate concepts/facts so they're in the WIDE (not narrow) pool
+    db.prepare("UPDATE observations SET concepts = 'race lock', facts = 'handler side-effect'").run();
+
+    // Mock Haiku to always return a real lesson
+    callModelJSON.mockImplementation(async () => ({
+      type: 'bugfix',
+      title: 'Race condition in handler lock release',
+      narrative: 'Lock released before side-effect completed.',
+      concepts: ['race', 'lock'],
+      facts: ['lock released early'],
+      importance: 2,
+      lesson_learned: 'Hold the lock until the side-effect is fully committed',
+      search_aliases: ['race lock bug', 'early unlock'],
+    }));
+
+    const result = await optimizeRun(db, {
+      tasks: ['re-enrich'],
+      maxItems: 20,
+      reenrichScope: 'wide',
+    });
+
+    // Without the fix, distributeBudget(20) would give reenrich only 8.
+    // The test verifies that single-task mode bypasses distribution AND scope=wide is honored.
+    expect(result.reenrich.processed).toBe(20);
+  });
+
+  it('executeReenrich with scope=wide passes through and processes candidates', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix timezone bug in report generator',
+      narrative: 'Report dates were off by one day in some reports because date.today() returned UTC dates but downstream code expected Beijing dates. Needed a consistent timezone-aware helper.',
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    db.prepare("UPDATE observations SET concepts = 'timezone', facts = 'date helper' WHERE id = ?").run(id);
+
+    callModelJSON.mockResolvedValue({
+      type: 'bugfix',
+      title: 'Use timezone-aware helpers for all date operations',
+      narrative: 'Report dates were off by one day because date.today() returned UTC but downstream code expected Beijing.',
+      concepts: ['timezone', 'beijing', 'date'],
+      facts: ['date.today() returns UTC', 'reports need Beijing dates'],
+      importance: 2,
+      lesson_learned: 'In timezone-sensitive apps, never call date.today() directly — always use a timezone-aware helper',
+      search_aliases: ['timezone bug', 'utc beijing mismatch'],
+    });
+
+    const result = await executeReenrich(db, 10, { scope: 'wide' });
+    expect(result.processed).toBe(1);
+
+    const obs = db.prepare('SELECT lesson_learned, optimized_at FROM observations WHERE id = ?').get(id);
+    expect(obs.lesson_learned).toContain('timezone-aware helper');
+    expect(obs.optimized_at).toBeGreaterThan(0);
+  });
+});
+
 describe('normalize', () => {
   let db;
   beforeEach(() => {
