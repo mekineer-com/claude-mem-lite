@@ -1,13 +1,15 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25 } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause } from './utils.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
-// Aligned with TYPE_QUALITY_CASE: high-signal types > noisy types
-// Bugfix raised from 0.5→0.75 to match scoring-sql.mjs; lesson_learned boost (1.5×) stacks
-const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, feature: 1.2, refactor: 1.0, change: 0.8, bugfix: 0.75 };
+// Aligned with TYPE_QUALITY_CASE in scoring-sql.mjs (R2 rebalance).
+// Weights calibrated to empirical avg access_count:
+//   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
+// lesson_learned boost (1.5×) stacks for entries with a real takeaway.
+const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature: 1.0, refactor: 0.6, change: 0.5 };
 // Adaptive BM25 thresholds — scale with corpus size to filter noise.
 // Larger corpora produce more weak matches from common words.
 const BM25_THRESHOLD = { TINY: 0, SMALL: 1.5, MEDIUM: 2.5, LARGE: 3.5 };
@@ -37,6 +39,9 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     const excludeSet = new Set(excludeIds);
 
     // Phase 1: Same-project search (highest priority)
+    // R1: notLowSignalTitleClause() excludes hook-llm fallback titles
+    // ("Modified X", "Worked on X", "Reviewed N files:", raw error logs, etc.)
+    // that almost never get referenced (3.3% access rate) but compete for BM25 rank.
     const selectStmt = db.prepare(`
       SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
              ${OBS_BM25} as relevance
@@ -48,6 +53,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         AND o.created_at_epoch > ?
         AND COALESCE(o.compressed_into, 0) = 0
         AND o.superseded_at IS NULL
+        AND ${notLowSignalTitleClause('o')}
       ORDER BY ${OBS_BM25}
       LIMIT 10
     `);
@@ -84,6 +90,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
           AND o.created_at_epoch > ?
           AND COALESCE(o.compressed_into, 0) = 0
           AND o.superseded_at IS NULL
+          AND ${notLowSignalTitleClause('o')}
         ORDER BY ${OBS_BM25}
         LIMIT 5
       `);

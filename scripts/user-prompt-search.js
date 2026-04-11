@@ -4,7 +4,7 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, isPathConfined } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, isPathConfined, notLowSignalTitleClause } from '../utils.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -27,6 +27,8 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
 
   const typeClause = typeFilter ? 'AND o.type = ?' : '';
   const now = Date.now();
+  // R1: notLowSignalTitleClause() excludes hook-llm degraded titles
+  // ("Modified X", "Worked on X", "Reviewed N files:", raw error logs).
   const sql = `
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25}
@@ -40,6 +42,7 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
       AND o.importance >= 1
       AND o.created_at_epoch > ?
       AND COALESCE(o.compressed_into, 0) = 0
+      AND ${notLowSignalTitleClause('o')}
       ${typeClause}
     ORDER BY relevance
     LIMIT ?
@@ -75,6 +78,7 @@ function searchByFile(db, files, project, limit) {
     const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');
     const likePattern = `%${escaped}`;
 
+    // R1: exclude LOW_SIGNAL degraded titles from file-level recall.
     const rows = db.prepare(`
       SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
       FROM observations o
@@ -84,6 +88,7 @@ function searchByFile(db, files, project, limit) {
         AND COALESCE(o.compressed_into, 0) = 0
         AND o.created_at_epoch > ?
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+        AND ${notLowSignalTitleClause('o')}
       ORDER BY o.created_at_epoch DESC
       LIMIT ?
     `).all(project, cutoff, file, likePattern, limit);
@@ -102,6 +107,9 @@ function searchByFile(db, files, project, limit) {
 
 function searchRecent(db, project, limit) {
   const cutoff = Date.now() - LOOKBACK_MS;
+  // R1: exclude LOW_SIGNAL degraded titles from "recent" recall intent
+  // (e.g. when user asks "what did I do earlier"). Unqualified alias because
+  // this query selects directly from observations with no join.
   return db.prepare(`
     SELECT id, type, title, lesson_learned
     FROM observations
@@ -109,6 +117,7 @@ function searchRecent(db, project, limit) {
       AND importance >= 1
       AND COALESCE(compressed_into, 0) = 0
       AND created_at_epoch > ?
+      AND ${notLowSignalTitleClause('')}
     ORDER BY created_at_epoch DESC
     LIMIT ?
   `).all(project, cutoff, limit);

@@ -3,7 +3,7 @@
 // 1. Subprocess execution with stdin piping (integration tests)
 // 2. Direct imports from prompt-search-utils.mjs (unit tests — no more code duplication)
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { resolve, join } from 'path';
 import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
@@ -479,6 +479,61 @@ describe('user-prompt-search subprocess integration', () => {
       prompt: '<task-notification>some internal protocol message that is long enough</task-notification>',
     });
     expect(stdout).toBe('');
+  });
+
+  // R1: LOW_SIGNAL title filtering — degraded titles from hook-llm fallback
+  // (Modified X, Worked on X, Reviewed N files:) must not appear in injection output.
+  // Both seed obs use type='bugfix' so detectIntent's type filter doesn't
+  // eliminate them — the only thing that should filter "Modified X" is the R1 title clause.
+  //
+  // NOTE: this test uses spawn() with manual stdin piping rather than runScript(),
+  // because the runScript() helper uses execFile's async `input` option, which is
+  // only supported on the SYNC variants (execFileSync). With async execFile, input
+  // is silently ignored, readStdin() times out, and the script returns empty stdout.
+  // That's why all existing subprocess tests only assert `stdout === ''` — they never
+  // actually exercise the positive retrieval path.
+  function runScriptWithStdin(hookData, extraEnv = {}) {
+    return new Promise((resolvePromise) => {
+      const proc = spawn(process.execPath, [SCRIPT_PATH], {
+        env: {
+          ...process.env,
+          CLAUDE_MEM_DIR: testDir,
+          CLAUDE_PROJECT_DIR: '/test/project',
+          PWD: '/test/project',
+          ...extraEnv,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', (d) => { stderr += d.toString(); });
+      proc.on('exit', () => resolvePromise({ stdout, stderr }));
+      proc.stdin.write(JSON.stringify(hookData));
+      proc.stdin.end();
+    });
+  }
+
+  it('R1: filters "Modified X" titles from [mem] Related memories output', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Modified authentication.mjs',
+      text: 'authentication middleware token expiry validation refresh fix bug',
+      importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved authentication middleware token expiry',
+      text: 'authentication middleware token expiry validation refresh fix bug',
+      importance: 3,
+    });
+    // Ensure WAL writes are visible to subprocess
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScriptWithStdin({
+      prompt: 'how do I fix the authentication middleware token expiry validation',
+    });
+    expect(stdout).toContain('Resolved authentication middleware token expiry');
+    expect(stdout).not.toContain('Modified authentication.mjs');
   });
 });
 

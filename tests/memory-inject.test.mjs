@@ -122,6 +122,87 @@ describe('searchRelevantMemories', () => {
     expect(results.length).toBe(0);
   });
 
+  // R1: LOW_SIGNAL title filtering — degraded titles from hook-llm fallback
+  // (Modified X, Worked on X, Reviewed N files:, etc.) must not be injected.
+
+  it('R1: excludes "Modified X" titles from injection', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'change',
+      title: 'Modified dispatch.mjs',
+      text: 'dispatch race condition lock worker pool fix',
+      importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'bugfix',
+      title: 'Fix dispatch race condition',
+      text: 'dispatch race condition lock worker pool fix',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'dispatch race condition fix', 'proj', []);
+    const titles = results.map(r => r.title);
+    expect(titles).toContain('Fix dispatch race condition');
+    expect(titles).not.toContain('Modified dispatch.mjs');
+  });
+
+  it('R1: excludes "Worked on X" titles from injection', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'discovery',
+      title: 'Worked on worker pool',
+      text: 'worker pool thread safety crash recovery',
+      importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'bugfix',
+      title: 'Fix worker pool thread safety',
+      text: 'worker pool thread safety crash recovery',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'worker pool thread safety', 'proj', []);
+    const titles = results.map(r => r.title);
+    expect(titles).toContain('Fix worker pool thread safety');
+    expect(titles).not.toContain('Worked on worker pool');
+  });
+
+  it('R1: excludes "Reviewed N files:" titles from injection', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'discovery',
+      title: 'Reviewed 6 files: cache.mjs, worker.mjs, queue.mjs',
+      text: 'cache worker queue batch throughput optimization',
+      importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'discovery',
+      title: 'Cache worker queue batching pattern',
+      text: 'cache worker queue batch throughput optimization',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'cache worker queue batch', 'proj', []);
+    const titles = results.map(r => r.title);
+    expect(titles).toContain('Cache worker queue batching pattern');
+    expect(titles.some(t => t.startsWith('Reviewed '))).toBe(false);
+  });
+
+  // R2: Type quality rebalancing — bugfix (with empirical 2.4× access rate)
+  // should beat change when BM25 is equal.
+
+  it('R2: ranks bugfix above change when text match is equal', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'change',
+      title: 'Updated auth middleware signature',
+      text: 'auth middleware token validation refresh flow',
+      importance: 2,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'bugfix',
+      title: 'Fixed auth middleware token leak',
+      text: 'auth middleware token validation refresh flow',
+      importance: 2,
+    });
+    const results = searchRelevantMemories(db, 'auth middleware token validation', 'proj', []);
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0].type).toBe('bugfix');
+  });
+
   it('updates access_count for returned memories', () => {
     const info = insertObs(db, {
       sessionId: 'sess-1', project: 'proj', type: 'bugfix',

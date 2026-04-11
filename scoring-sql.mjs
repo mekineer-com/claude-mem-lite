@@ -42,18 +42,52 @@ export const TYPE_DECAY_CASE = `(
 
 /**
  * Type quality multiplier — promotes high-signal types (decisions, discoveries).
- * Bugfix raised from 0.35→0.75: lesson_learned bugfixes are valuable during
- * active debugging; raw error logs are filtered by importance, not type penalty.
+ * Weights calibrated from empirical avg access_count per type in production data:
+ *   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
+ * The old (pre-R2) table had bugfix=0.75 < change=0.8, inverted vs reality.
  * Applied as: BM25 × time_decay × TYPE_QUALITY × project_boost × importance
  */
 export const TYPE_QUALITY_CASE = `(
   CASE o.type
     WHEN 'decision'  THEN 1.5
     WHEN 'discovery' THEN 1.3
-    WHEN 'feature'   THEN 1.2
-    WHEN 'refactor'  THEN 1.0
-    WHEN 'change'    THEN 0.8
-    WHEN 'bugfix'    THEN 0.75
+    WHEN 'bugfix'    THEN 1.1
+    WHEN 'feature'   THEN 1.0
+    WHEN 'refactor'  THEN 0.6
+    WHEN 'change'    THEN 0.5
     ELSE 1.0
   END
 )`;
+
+/**
+ * SQL WHERE clause fragment excluding LOW_SIGNAL degraded titles — the fallback
+ * titles hook-llm.mjs writes when Haiku summarization is unavailable or skipped
+ * (e.g. "Modified X", "Worked on X", "Reviewed N files:", raw "Error: ..." logs).
+ *
+ * Empirical data: 544 such entries in production, 18 ever accessed (3.3% rate).
+ * They are capped at importance=1 on write, but that alone doesn't keep them out
+ * of FTS5 injection when BM25 scores are competitive. This clause removes them
+ * from the candidate pool at the SQL level so real bugfixes/discoveries dominate.
+ *
+ * Mirrors LOW_SIGNAL_TITLE regex in utils.mjs — keep in sync.
+ *
+ * @param {string} [alias='o'] Table alias for the observations row. Use '' for unqualified.
+ * @returns {string} SQL boolean expression (already parenthesized; safe to combine with AND/OR)
+ */
+export function notLowSignalTitleClause(alias = 'o') {
+  const p = alias ? `${alias}.` : '';
+  return `(
+    ${p}title NOT LIKE 'Modified %'
+    AND ${p}title NOT LIKE 'Worked on %'
+    AND ${p}title NOT LIKE 'Reviewed % files:%'
+    AND ${p}title NOT LIKE 'Error while working%'
+    AND ${p}title NOT LIKE 'Error in %'
+    AND ${p}title NOT LIKE 'Error: %'
+    AND ${p}title NOT LIKE '# %'
+    AND ${p}title NOT LIKE 'node %'
+    AND ${p}title NOT LIKE 'npm %'
+    AND ${p}title NOT LIKE 'npx %'
+    AND ${p}title NOT LIKE '(no description)%'
+    AND ${p}title != '(error)'
+  )`;
+}

@@ -3,7 +3,7 @@
 
 import { join } from 'path';
 import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
-import { estimateTokens, truncate, debugLog, debugCatch, DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
+import { estimateTokens, truncate, debugLog, debugCatch, DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
 
 /**
  * Infer the project directory from environment variables or cwd.
@@ -56,11 +56,15 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const tier2Ago = now_ms - windows.tier2;
   const tier3Ago = now_ms - windows.tier3;
 
-  // Candidate pool: tiered time windows by importance (adaptive)
+  // Candidate pool: tiered time windows by importance (adaptive).
+  // R1/R3: exclude LOW_SIGNAL degraded titles ("Modified X", "Worked on X",
+  // "Reviewed N files:", raw error logs) from the Key Context table at
+  // session start — they pollute the visible "Recent" table with noise.
   const obsPool = db.prepare(`
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified, lesson_learned
     FROM observations
     WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+      AND ${notLowSignalTitleClause('')}
       AND (
         (created_at_epoch > ? AND importance >= 1)
         OR (created_at_epoch > ? AND importance >= 2)
@@ -82,9 +86,11 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const selectedSess = [];
   let totalTokens = 0;
 
-  // Type quality multipliers — aligned with scoring-sql.mjs TYPE_QUALITY_CASE
-  // Demotes bugfix (noisy error logs) and promotes high-signal types
-  const TYPE_QUALITY = { decision: 1.5, discovery: 1.3, feature: 1.2, refactor: 1.0, change: 0.8, bugfix: 0.35 };
+  // Type quality multipliers — aligned with scoring-sql.mjs TYPE_QUALITY_CASE (R2).
+  // Weights calibrated from empirical avg access_count per type:
+  //   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
+  // Pre-R2 had bugfix=0.35 (inverted vs reality — bugfixes are 2.4× more used than changes).
+  const TYPE_QUALITY = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature: 1.0, refactor: 0.6, change: 0.5 };
 
   // Score each candidate: value = recency * type_quality * importance, cost = tokens
   // Recency uses exponential half-life (consistent with server.mjs BM25 scoring)

@@ -206,6 +206,50 @@ describe('selectWithTokenBudget', () => {
     expect(titles).toContain('active one');
   });
 
+  // R1/R3: LOW_SIGNAL title filtering in Key Context selection.
+  // Hook-llm fallback titles (Modified X, Worked on X, Reviewed N files:)
+  // should not appear in the session-start Key Context table.
+
+  it('R3: excludes "Modified X" titles from Key Context', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'test',
+      title: 'Modified dispatch.mjs', importance: 2,
+      epochOffset: -1000,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'test',
+      title: 'Fixed dispatch race condition', importance: 2,
+      epochOffset: -2000,
+    });
+    const result = selectWithTokenBudget(db, 'test', 2000);
+    const titles = result.observations.map(o => o.title);
+    expect(titles).toContain('Fixed dispatch race condition');
+    expect(titles).not.toContain('Modified dispatch.mjs');
+  });
+
+  it('R3: excludes "Worked on X" and "Reviewed N files:" from Key Context', () => {
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'test',
+      title: 'Worked on auth cache module', importance: 2,
+      epochOffset: -1000,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'test',
+      title: 'Reviewed 6 files: auth.mjs, cache.mjs, utils.mjs', importance: 2,
+      epochOffset: -2000,
+    });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'test',
+      title: 'Implemented auth middleware', importance: 2,
+      epochOffset: -3000,
+    });
+    const result = selectWithTokenBudget(db, 'test', 2000);
+    const titles = result.observations.map(o => o.title);
+    expect(titles).toContain('Implemented auth middleware');
+    expect(titles).not.toContain('Worked on auth cache module');
+    expect(titles.every(t => !t.startsWith('Reviewed '))).toBe(true);
+  });
+
   it('applies diversity penalty for file overlap', () => {
     // Two observations touching same files should have overlap penalty
     insertObs(db, {
