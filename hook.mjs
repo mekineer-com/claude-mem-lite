@@ -20,7 +20,7 @@ import {
   createEpisode, addFileToEpisode,
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
-import { selectWithTokenBudget, updateClaudeMd, buildSummaryLines } from './hook-context.mjs';
+import { selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines } from './hook-context.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS, FALLBACK_OBS_WINDOW_MS,
@@ -810,12 +810,15 @@ async function handleSessionStart() {
       }
     }
 
-    // Stdout: full context (summary + handoff state + observations table)
+    // Stdout is the sole context-delivery channel. The SessionStart hook output
+    // is injected as a <system-reminder> at session start, giving Claude the
+    // full summary + handoff state + observations table fresh from the DB.
     const fullContext = [...summaryLines, ...handoffLines, ...obsLines].join('\n');
     process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
 
-    // CLAUDE.md: slim (summary + handoff state — observations already in stdout)
-    updateClaudeMd([...summaryLines, ...handoffLines].join('\n'));
+    // One-time migration: remove any stale <claude-mem-context> block left in
+    // CLAUDE.md by pre-v2.30 installs. Idempotent no-op afterwards.
+    cleanupClaudeMdLegacyBlock();
 
     // Pre-load TF-IDF vocabulary cache for this session (from DB, ~1ms)
     try { getVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }

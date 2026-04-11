@@ -903,10 +903,14 @@ describe('Suite 8a: Additional E2E', () => {
     expect(prompts[0].prompt_text.length).toBeLessThanOrEqual(10000);
   });
 
-  it('CLAUDE.md idempotent: two session-starts do not duplicate context', () => {
+  it('CLAUDE.md stays clean across repeated session-starts (no block written)', () => {
+    // Pre-v2.30 this test asserted idempotent writes of a <claude-mem-context>
+    // block. Post-v2.30 the block is never written: context is delivered via
+    // SessionStart hook stdout only.
     const projDir2 = join(tmpHome, 'parent', 'idempotent');
     mkdirSync(projDir2, { recursive: true });
-    writeFileSync(join(projDir2, 'CLAUDE.md'), '# Existing\n\nContent here.\n');
+    const original = '# Existing\n\nContent here.\n';
+    writeFileSync(join(projDir2, 'CLAUDE.md'), original);
 
     // Seed a summary
     const db = openTestDb(tmpHome);
@@ -922,21 +926,21 @@ describe('Suite 8a: Additional E2E', () => {
     `).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
-    // First session-start
-    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
+    // Two session-starts
+    const run1 = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
     const claudeMd1 = readFileSync(join(projDir2, 'CLAUDE.md'), 'utf8');
-
-    // Second session-start
-    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
+    const run2 = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
     const claudeMd2 = readFileSync(join(projDir2, 'CLAUDE.md'), 'utf8');
 
-    // Count context blocks — should be exactly 1
-    const count1 = (claudeMd1.match(/<claude-mem-context>/g) || []).length;
-    const count2 = (claudeMd2.match(/<claude-mem-context>/g) || []).length;
-    expect(count1).toBe(1);
-    expect(count2).toBe(1);
-    // Original content preserved
-    expect(claudeMd2).toContain('# Existing');
+    // CLAUDE.md stays exactly as written (no context block ever appears)
+    expect(claudeMd1).toBe(original);
+    expect(claudeMd2).toBe(original);
+    expect(claudeMd2).not.toContain('<claude-mem-context>');
+
+    // Context is delivered via stdout on both runs
+    expect(run1.stdout).toContain('<claude-mem-context>');
+    expect(run1.stdout).toContain('Test request');
+    expect(run2.stdout).toContain('<claude-mem-context>');
   });
 
   it('auto-compress marks old low-importance observations during session-start', () => {
@@ -1029,12 +1033,13 @@ describe('Suite 8a: Additional E2E', () => {
     db2.close();
   });
 
-  it('CLAUDE.md created from scratch when none exists', () => {
+  it('CLAUDE.md is NOT created when none exists (context goes to stdout only)', () => {
+    // Pre-v2.30 the hook auto-created CLAUDE.md to inject a context block.
+    // Post-v2.30 it must never touch the file: context is stdout-only.
     const projDir3 = join(tmpHome, 'parent', 'noclaudemd');
     mkdirSync(projDir3, { recursive: true });
     // No CLAUDE.md file exists
 
-    // Seed a summary
     const db = openTestDb(tmpHome);
     const now = new Date();
     const sessId = `hook-parent--noclaudemd-${randomUUID().slice(0, 8)}`;
@@ -1048,24 +1053,27 @@ describe('Suite 8a: Additional E2E', () => {
     `).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
-    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3 } });
+    const run = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3 } });
 
-    // CLAUDE.md should be created with context block
+    // CLAUDE.md must NOT be created
     const claudeMdPath = join(projDir3, 'CLAUDE.md');
-    expect(existsSync(claudeMdPath)).toBe(true);
-    const content = readFileSync(claudeMdPath, 'utf8');
-    expect(content).toContain('<claude-mem-context>');
-    expect(content).toContain('Build API');
+    expect(existsSync(claudeMdPath)).toBe(false);
+
+    // Context is delivered via stdout instead
+    expect(run.stdout).toContain('<claude-mem-context>');
+    expect(run.stdout).toContain('Build API');
   });
 });
 
-describe('Suite 8: CLAUDE.md Persistence', () => {
-  it('session-start with summary writes CLAUDE.md context block', () => {
-    // Create a project dir whose path produces project name 'parent--testproj'
+describe('Suite 8: Session-start context delivery', () => {
+  it('session-start emits context via stdout and does not touch CLAUDE.md', () => {
+    // Pre-v2.30 this test asserted CLAUDE.md gained a <claude-mem-context> block.
+    // Post-v2.30 the block is stdout-only; CLAUDE.md is left untouched.
     // inferProject() does: basename(dirname(path)) + '--' + basename(path)
     const projDir = join(tmpHome, 'parent', 'testproj');
     mkdirSync(projDir, { recursive: true });
-    writeFileSync(join(projDir, 'CLAUDE.md'), '# My Project\n\nExisting content.\n');
+    const original = '# My Project\n\nExisting content.\n';
+    writeFileSync(join(projDir, 'CLAUDE.md'), original);
 
     // Seed DB with a session summary for project 'parent--testproj'
     const db = openTestDb(tmpHome);
@@ -1083,20 +1091,56 @@ describe('Suite 8: CLAUDE.md Persistence', () => {
     `).run(sessionId, now.toISOString(), now.getTime());
     db.close();
 
-    runHook('session-start', {
+    const run = runHook('session-start', {
       env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir },
     });
 
-    // CLAUDE.md should have the context block
+    // Context appears in hook stdout (the delivery channel Claude actually reads)
+    expect(run.stdout).toContain('<claude-mem-context>');
+    expect(run.stdout).toContain('</claude-mem-context>');
+    expect(run.stdout).toContain('### Last Session');
+    expect(run.stdout).toContain('Fix auth bug');
+    expect(run.stdout).toContain('Fixed token refresh');
+
+    // CLAUDE.md is untouched — no context block, original content preserved byte-for-byte
     const claudeMd = readFileSync(join(projDir, 'CLAUDE.md'), 'utf8');
-    expect(claudeMd).toContain('<claude-mem-context>');
-    expect(claudeMd).toContain('</claude-mem-context>');
-    expect(claudeMd).toContain('### Last Session');
-    expect(claudeMd).toContain('Fix auth bug');
-    expect(claudeMd).toContain('Fixed token refresh');
-    // Original content preserved
+    expect(claudeMd).toBe(original);
+    expect(claudeMd).not.toContain('<claude-mem-context>');
+  });
+
+  it('session-start cleans up legacy <claude-mem-context> block from pre-v2.30 CLAUDE.md', () => {
+    // Migration test: users upgrading from v2.29 or earlier will have a stale
+    // context block in CLAUDE.md. The hook should remove it on first run.
+    const projDir = join(tmpHome, 'parent', 'migrate');
+    mkdirSync(projDir, { recursive: true });
+    const hint = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
+    writeFileSync(
+      join(projDir, 'CLAUDE.md'),
+      `# My Project\n\n${hint}\n<claude-mem-context>\nstale content from v2.29\n</claude-mem-context>\n\n# Footer\n`,
+    );
+
+    // Seed DB so handleSessionStart actually reaches the cleanup path
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    const sessId = `hook-parent--migrate-${randomUUID().slice(0, 8)}`;
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, 'parent--migrate', ?, ?, 'completed')
+    `).run(sessId, sessId, now.toISOString(), now.getTime());
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES (?, 'parent--migrate', 'Migrate', 'Done', 'Verify', ?, ?)
+    `).run(sessId, now.toISOString(), now.getTime());
+    db.close();
+
+    runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir } });
+
+    const claudeMd = readFileSync(join(projDir, 'CLAUDE.md'), 'utf8');
     expect(claudeMd).toContain('# My Project');
-    expect(claudeMd).toContain('Existing content.');
+    expect(claudeMd).toContain('# Footer');
+    expect(claudeMd).not.toContain('<claude-mem-context>');
+    expect(claudeMd).not.toContain('stale content from v2.29');
+    expect(claudeMd).not.toContain('claude-mem-lite: auto-updated');
   });
 });
 

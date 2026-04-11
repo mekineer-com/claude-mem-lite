@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { computeAdaptiveWindows, selectWithTokenBudget, updateClaudeMd, buildSummaryLines } from '../hook-context.mjs';
+import { computeAdaptiveWindows, selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines } from '../hook-context.mjs';
 
 // ─── computeAdaptiveWindows ──────────────────────────────────────────────────
 
@@ -277,16 +277,17 @@ describe('selectWithTokenBudget', () => {
   });
 });
 
-// ─── updateClaudeMd ─────────────────────────────────────────────────────────
+// ─── cleanupClaudeMdLegacyBlock ─────────────────────────────────────────────
+// Context is now delivered via SessionStart hook stdout only. This cleanup
+// removes the stale <claude-mem-context> block left by pre-v2.30 installs.
 
-describe('updateClaudeMd', () => {
+describe('cleanupClaudeMdLegacyBlock', () => {
   // Use a temp file to avoid modifying the real CLAUDE.md
   const testDir = join(process.env.TMPDIR || '/tmp', `hook-ctx-test-${process.pid}`);
   const testClaudeMd = join(testDir, 'CLAUDE.md');
 
   beforeEach(() => {
     try { mkdirSync(testDir, { recursive: true }); } catch {}
-    // Mock inferProjectDir by setting env var
     vi.stubEnv('CLAUDE_PROJECT_DIR', testDir);
     try { unlinkSync(testClaudeMd); } catch {}
   });
@@ -296,54 +297,72 @@ describe('updateClaudeMd', () => {
     try { unlinkSync(testClaudeMd); } catch {}
   });
 
-  it('creates CLAUDE.md with context block when none exists', () => {
-    updateClaudeMd('### Last Session\nCompleted: fixed bugs');
-    expect(existsSync(testClaudeMd)).toBe(true);
-    const content = readFileSync(testClaudeMd, 'utf8');
-    expect(content).toContain('<claude-mem-context>');
-    expect(content).toContain('### Last Session');
-    expect(content).toContain('</claude-mem-context>');
+  it('is a no-op when CLAUDE.md does not exist', () => {
+    cleanupClaudeMdLegacyBlock();
+    expect(existsSync(testClaudeMd)).toBe(false);
   });
 
-  it('replaces existing context block in-place', () => {
-    writeFileSync(testClaudeMd, `# My Project\n\nSome notes.\n\n<claude-mem-context>\nold content\n</claude-mem-context>\n\n# Footer\n`);
-    updateClaudeMd('new content');
+  it('is a no-op when CLAUDE.md has no context block', () => {
+    const original = '# Existing Project\n\nNotes here.\n';
+    writeFileSync(testClaudeMd, original);
+    cleanupClaudeMdLegacyBlock();
+    const content = readFileSync(testClaudeMd, 'utf8');
+    expect(content).toBe(original);
+  });
+
+  it('removes existing context block, preserving surrounding content', () => {
+    writeFileSync(
+      testClaudeMd,
+      `# My Project\n\nSome notes.\n\n<claude-mem-context>\nold content\n</claude-mem-context>\n\n# Footer\n`,
+    );
+    cleanupClaudeMdLegacyBlock();
     const content = readFileSync(testClaudeMd, 'utf8');
     expect(content).toContain('# My Project');
-    expect(content).toContain('new content');
-    expect(content).not.toContain('old content');
+    expect(content).toContain('Some notes.');
     expect(content).toContain('# Footer');
+    expect(content).not.toContain('<claude-mem-context>');
+    expect(content).not.toContain('</claude-mem-context>');
+    expect(content).not.toContain('old content');
   });
 
-  it('appends to existing CLAUDE.md without context section', () => {
-    writeFileSync(testClaudeMd, '# Existing Project\n\nNotes here.\n');
-    updateClaudeMd('session data');
+  it('removes the legacy hint comment alongside the block', () => {
+    const hint = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
+    writeFileSync(
+      testClaudeMd,
+      `# Project\n\n${hint}\n<claude-mem-context>\nstale\n</claude-mem-context>\n`,
+    );
+    cleanupClaudeMdLegacyBlock();
     const content = readFileSync(testClaudeMd, 'utf8');
-    expect(content).toContain('# Existing Project');
-    expect(content).toContain('<claude-mem-context>');
-    expect(content).toContain('session data');
+    expect(content).toContain('# Project');
+    expect(content).not.toContain('claude-mem-lite: auto-updated');
+    expect(content).not.toContain('<claude-mem-context>');
+    expect(content).not.toContain('stale');
   });
 
-  it('skips write when content is unchanged', () => {
-    const existing = `# Project\n\n<claude-mem-context>\ntest content\n</claude-mem-context>\n`;
-    writeFileSync(testClaudeMd, existing);
-    updateClaudeMd('test content');
-    const content = readFileSync(testClaudeMd, 'utf8');
-    // Content should be identical — updateClaudeMd skips write when section unchanged
-    expect(content).toBe(existing);
+  it('is idempotent on repeated calls', () => {
+    writeFileSync(
+      testClaudeMd,
+      `# Header\n\n<claude-mem-context>\ncontent\n</claude-mem-context>\n\n# Footer\n`,
+    );
+    cleanupClaudeMdLegacyBlock();
+    const after1 = readFileSync(testClaudeMd, 'utf8');
+    cleanupClaudeMdLegacyBlock();
+    const after2 = readFileSync(testClaudeMd, 'utf8');
+    expect(after2).toBe(after1);
+    expect(after1).not.toContain('<claude-mem-context>');
   });
 
-  it('preserves surrounding content when replacing', () => {
-    const before = '# Header\n\nSome important config.\n\n';
-    const after = '\n\n# Other Section\n\nMore stuff.\n';
-    writeFileSync(testClaudeMd, `${before}<claude-mem-context>\nold\n</claude-mem-context>${after}`);
-    updateClaudeMd('updated');
+  it('does not collapse the file into pure whitespace when block spans most of it', () => {
+    writeFileSync(
+      testClaudeMd,
+      `# Only Header\n\n<claude-mem-context>\na\nb\nc\n</claude-mem-context>\n`,
+    );
+    cleanupClaudeMdLegacyBlock();
     const content = readFileSync(testClaudeMd, 'utf8');
-    expect(content).toContain('# Header');
-    expect(content).toContain('Some important config.');
-    expect(content).toContain('# Other Section');
-    expect(content).toContain('updated');
-    expect(content).not.toContain('old');
+    expect(content).toContain('# Only Header');
+    expect(content).not.toContain('<claude-mem-context>');
+    // No excessive trailing blank lines
+    expect(/\n{3,}$/.test(content)).toBe(false);
   });
 });
 

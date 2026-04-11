@@ -160,47 +160,62 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
 }
 
 /**
- * Update the project's CLAUDE.md file with a context block.
- * Replaces existing <claude-mem-context> section or appends a new one.
- * Uses atomic tmp+rename write to prevent partial writes.
- * @param {string} contextBlock Markdown content to inject
+ * One-time cleanup of the legacy <claude-mem-context> block from the project's
+ * CLAUDE.md file. Pre-v2.30 the hook wrote a slim context snapshot here on every
+ * session start, causing constant git noise and stale, one-session-behind content.
+ * Context is now delivered exclusively via SessionStart hook stdout.
+ *
+ * Idempotent: if no legacy block (or no CLAUDE.md) exists, it is a no-op. Also
+ * removes the paired hint comment if present, and normalizes residual whitespace
+ * at the seam. Uses atomic tmp+rename write.
  */
-export function updateClaudeMd(contextBlock) {
+export function cleanupClaudeMdLegacyBlock() {
   const claudeMdPath = join(inferProjectDir(), 'CLAUDE.md');
-  let content = '';
-  try { content = readFileSync(claudeMdPath, 'utf8'); } catch {}
+  let content;
+  try { content = readFileSync(claudeMdPath, 'utf8'); } catch { return; }
 
   const startTag = '<claude-mem-context>';
   const endTag = '</claude-mem-context>';
-  const hintComment = '<!-- claude-mem-lite: auto-updated context. To avoid git noise, add CLAUDE.md to .gitignore -->';
-  const newSection = `${startTag}\n${contextBlock}\n${endTag}`;
 
-  // Use lastIndexOf for both tags — prevents matching documentation references
-  // to <claude-mem-context> that appear in code/markdown before the actual context block
+  // Use lastIndexOf so documentation references to the tag earlier in the file
+  // (e.g. inside a code block in architecture notes) are not accidentally swept.
   const startIdx = content.lastIndexOf(startTag);
   const endIdx = content.lastIndexOf(endTag);
+  if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) return;
 
-  if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {
-    // Skip write if content is unchanged — reduces git noise
-    const existingSection = content.slice(startIdx, endIdx + endTag.length);
-    if (existingSection === newSection) return;
-    // Replace from first start to last end — collapses any duplicate sections into one
-    content = content.slice(0, startIdx) + newSection + content.slice(endIdx + endTag.length);
-  } else if (content.length > 0) {
-    // Append to end — never disturb existing CLAUDE.md structure
-    const hint = content.includes(hintComment) ? '' : hintComment + '\n';
-    content = content.trimEnd() + '\n\n' + hint + newSection + '\n';
-  } else {
-    content = hintComment + '\n' + newSection + '\n';
+  // Extend forward to swallow a trailing newline so we don't leave a stranded blank line.
+  let removeEnd = endIdx + endTag.length;
+  if (content[removeEnd] === '\n') removeEnd += 1;
+
+  // Extend backward if the paired hint comment sits on the line immediately before
+  // the start tag. The hint is the exact string the old updateClaudeMd emitted.
+  let removeStart = startIdx;
+  const hintPattern = '<!-- claude-mem-lite: auto-updated context';
+  const leadingSlice = content.slice(0, startIdx);
+  const hintIdx = leadingSlice.lastIndexOf(hintPattern);
+  if (hintIdx !== -1) {
+    const between = content.slice(hintIdx, startIdx);
+    if (/^<!-- claude-mem-lite: [^\n]*-->\s*$/.test(between)) {
+      removeStart = hintIdx;
+    }
   }
+
+  // Swallow a single preceding newline to avoid leaving a blank-line gap behind.
+  if (removeStart > 0 && content[removeStart - 1] === '\n') removeStart -= 1;
+
+  const cleaned = content.slice(0, removeStart) + content.slice(removeEnd);
+  // Collapse any ≥3 consecutive newlines to two, then ensure exactly one trailing newline.
+  const normalized = cleaned.replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '\n');
+
+  if (normalized === content) return;
 
   const tmp = claudeMdPath + '.mem-tmp';
   try {
-    writeFileSync(tmp, content);
+    writeFileSync(tmp, normalized);
     renameSync(tmp, claudeMdPath);
   } catch (e) {
     try { unlinkSync(tmp); } catch {}
-    debugLog('ERROR', 'updateClaudeMd', `CLAUDE.md write failed: ${e.message}`);
+    debugLog('ERROR', 'cleanupClaudeMdLegacyBlock', `CLAUDE.md write failed: ${e.message}`);
   }
 }
 
