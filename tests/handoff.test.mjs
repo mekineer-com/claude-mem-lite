@@ -40,25 +40,33 @@ describe('session_handoffs schema', () => {
     expect(names).toContain('created_at_epoch');
   });
 
-  it('enforces PRIMARY KEY (project, type)', () => {
+  it('PRIMARY KEY (project, type, session_id) allows parallel sessions to coexist', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch) VALUES ('p1', 'clear', 's1', 1000)`).run();
+    // Different session_id for same (project, type) must NOT collide — parallel sessions
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch) VALUES ('p1', 'clear', 's2', 2000)`).run();
+    const rows = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'p1' AND type = 'clear' ORDER BY session_id`).all();
+    expect(rows.length).toBe(2);
+    expect(rows[0].session_id).toBe('s1');
+    expect(rows[1].session_id).toBe('s2');
+  });
+
+  it('rejects duplicate (project, type, session_id)', () => {
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch) VALUES ('p1', 'clear', 's1', 1000)`).run();
     expect(() => {
-      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch) VALUES ('p1', 'clear', 's2', 2000)`).run();
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch) VALUES ('p1', 'clear', 's1', 2000)`).run();
     }).toThrow(/UNIQUE/);
   });
 
-  it('allows UPSERT via ON CONFLICT', () => {
+  it('allows UPSERT via ON CONFLICT(project, type, session_id)', () => {
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch) VALUES ('p1', 'clear', 's1', 'old', 1000)`).run();
     db.prepare(`
       INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
-      VALUES ('p1', 'clear', 's2', 'new', 2000)
-      ON CONFLICT(project, type) DO UPDATE SET
-        session_id = excluded.session_id,
+      VALUES ('p1', 'clear', 's1', 'new', 2000)
+      ON CONFLICT(project, type, session_id) DO UPDATE SET
         working_on = excluded.working_on,
         created_at_epoch = excluded.created_at_epoch
     `).run();
-    const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'p1' AND type = 'clear'`).get();
-    expect(row.session_id).toBe('s2');
+    const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'p1' AND type = 'clear' AND session_id = 's1'`).get();
     expect(row.working_on).toBe('new');
     expect(row.created_at_epoch).toBe(2000);
   });
@@ -234,18 +242,35 @@ describe('buildAndSaveHandoff', () => {
     expect(row.key_decisions).not.toContain('Minor log fix');
   });
 
-  it('overwrites previous handoff of same type (UPSERT)', () => {
+  it('parallel sessions keep separate handoffs (no cross-session overwrite)', () => {
     seedSession(db, 's1', 'test-proj');
-    seedPrompt(db, 's1', 'old work', 1);
+    seedPrompt(db, 's1', 'session A work', 1);
     buildAndSaveHandoff(db, 's1', 'test-proj', 'clear', null);
 
     seedSession(db, 's2', 'test-proj');
-    seedPrompt(db, 's2', 'new work', 1);
+    seedPrompt(db, 's2', 'session B work', 1);
     buildAndSaveHandoff(db, 's2', 'test-proj', 'clear', null);
 
-    const rows = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj' AND type = 'clear'`).all();
+    const rows = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj' AND type = 'clear' ORDER BY session_id`).all();
+    expect(rows.length).toBe(2);
+    expect(rows[0].session_id).toBe('s1');
+    expect(rows[0].working_on).toContain('session A work');
+    expect(rows[1].session_id).toBe('s2');
+    expect(rows[1].working_on).toContain('session B work');
+  });
+
+  it('UPSERT: same session re-writing its own handoff updates in place', () => {
+    seedSession(db, 's1', 'test-proj');
+    seedPrompt(db, 's1', 'initial work', 1);
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'clear', null);
+
+    // Same session writes again (e.g. another /clear) — should update, not duplicate
+    seedPrompt(db, 's1', 'updated work', 2);
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'clear', null);
+
+    const rows = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj' AND type = 'clear' AND session_id = 's1'`).all();
     expect(rows.length).toBe(1);
-    expect(rows[0].working_on).toContain('new work');
+    expect(rows[0].working_on).toContain('updated work');
   });
 
   it('populates match_keywords for intent matching', () => {
@@ -409,6 +434,84 @@ describe('detectContinuationIntent', () => {
       VALUES ('p', 'exit', 's', 'handoff dispatch hook schema', ?)`).run(Date.now() - 8 * 86400000); // 8 days ago
     expect(detectContinuationIntent(oldDb, 'handoff dispatch hook schema', 'p')).toBe(false);
   });
+
+  // ─── Input validation: tiny / blank prompts must never trigger Stage 0 ────
+  describe('tiny prompt guards (single-char / whitespace)', () => {
+    let tinyDb;
+    beforeEach(() => {
+      tinyDb = createTestDb();
+      tinyDb.prepare(`INSERT INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+        VALUES ('p', 'clear', 's-fresh', 'handoff dispatch hook schema', ?)`).run(Date.now());
+    });
+    afterEach(() => { tinyDb.close(); });
+
+    it('returns false for empty prompt even with fresh clear handoff', () => {
+      expect(detectContinuationIntent(tinyDb, '', 'p')).toBe(false);
+    });
+
+    it('returns false for whitespace-only prompt even with fresh clear handoff', () => {
+      expect(detectContinuationIntent(tinyDb, '   ', 'p')).toBe(false);
+      expect(detectContinuationIntent(tinyDb, '\t\n', 'p')).toBe(false);
+    });
+
+    it('returns false for single-character prompt even with fresh clear handoff (bug.txt case)', () => {
+      // The bug: user types 'a' → Stage 0 auto-injects cross-session handoff
+      expect(detectContinuationIntent(tinyDb, 'a', 'p')).toBe(false);
+      expect(detectContinuationIntent(tinyDb, '1', 'p')).toBe(false);
+      expect(detectContinuationIntent(tinyDb, '好', 'p')).toBe(false);
+    });
+
+    it('still accepts 2-character short prompts (backward compat for "ok", "好的")', () => {
+      expect(detectContinuationIntent(tinyDb, 'ok', 'p')).toBe(true);
+      expect(detectContinuationIntent(tinyDb, '好的', 'p')).toBe(true);
+    });
+  });
+
+  // ─── Session scoping: clear handoffs must not cross sessions ──────────────
+  describe('session-scoped Stage 0 (currentCcSessionId filter)', () => {
+    let scopedDb;
+    beforeEach(() => {
+      scopedDb = createTestDb();
+      // Session A's clear handoff, still fresh
+      scopedDb.prepare(`INSERT INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+        VALUES ('p', 'clear', 'cc-A', 'dispatch hook schema intent', ?)`).run(Date.now());
+    });
+    afterEach(() => { scopedDb.close(); });
+
+    it('short prompt from SAME session passes Stage 0', () => {
+      // Current session = cc-A, handoff also = cc-A → your own /clear, continue
+      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p', 'cc-A')).toBe(true);
+    });
+
+    it('short prompt from DIFFERENT session does NOT pass Stage 0 (prevents cross-session bleed)', () => {
+      // Current session = cc-B, handoff from cc-A → must not auto-inject A's context into B
+      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p', 'cc-B')).toBe(false);
+    });
+
+    it('short prompt from different session still passes Stage 1 via explicit keyword', () => {
+      // Explicit "继续" keyword should always work, regardless of session
+      expect(detectContinuationIntent(scopedDb, '继续', 'p', 'cc-B')).toBe(true);
+    });
+
+    it('cross-session FTS Stage 2 only works for exit handoffs, not clear', () => {
+      // Clear handoff from cc-A (the beforeEach) is intentionally ignored for cc-B:
+      // clear handoffs are inherently "continue my own /clear flow" — never cross-session.
+      // Even with strong keyword overlap.
+      expect(detectContinuationIntent(scopedDb, 'dispatch hook schema intent overlap', 'p', 'cc-B')).toBe(false);
+
+      // But if cc-A had /exit'd (not /clear), cc-B CAN resume via Stage 2 FTS match.
+      scopedDb.prepare(`INSERT INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+        VALUES ('p', 'exit', 'cc-A', 'dispatch hook schema intent', ?)`).run(Date.now() - 1000);
+      expect(detectContinuationIntent(scopedDb, 'dispatch hook schema intent overlap', 'p', 'cc-B')).toBe(true);
+    });
+
+    it('null currentCcSessionId preserves legacy behavior (backward compat)', () => {
+      // Callers that don't pass currentCcSessionId get the old Stage 0 semantics
+      // (short prompt + fresh clear handoff → true), minus the tiny-prompt guard
+      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p')).toBe(true);
+      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p', null)).toBe(true);
+    });
+  });
 });
 
 // ─── renderHandoffInjection Tests ───────────────────────────────────────────
@@ -516,5 +619,53 @@ describe('renderHandoffInjection', () => {
       VALUES ('p', 'exit', 's1', 'recent work', ?)`).run(Date.now() - 3 * 86400000);
     const result = renderHandoffInjection(db, 'p');
     expect(result).toContain('recent work');
+  });
+
+  // ─── Session scoping for injection ────────────────────────────────────────
+  describe('session-scoped injection (currentCcSessionId filter)', () => {
+    it('returns clear handoff only when it matches currentCcSessionId', () => {
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+        VALUES ('p', 'clear', 'cc-A', 'session A work', ?)`).run(Date.now());
+      // Same session → inject
+      const sameResult = renderHandoffInjection(db, 'p', 'cc-A');
+      expect(sameResult).toContain('session A work');
+      // Different session → do NOT inject A's clear handoff into B
+      const crossResult = renderHandoffInjection(db, 'p', 'cc-B');
+      expect(crossResult).toBeNull();
+    });
+
+    it('exit handoff from DIFFERENT session IS rendered (new session resumes old one)', () => {
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+        VALUES ('p', 'exit', 'cc-old', 'old session work', ?)`).run(Date.now() - 3600000);
+      // New session picking up an exit handoff from a previous (different) session — allowed
+      const result = renderHandoffInjection(db, 'p', 'cc-new');
+      expect(result).toContain('old session work');
+    });
+
+    it('exit handoff from SAME session is NOT rendered (you exited, you are not yourself)', () => {
+      // If currentCcSessionId equals the handoff's session, that session already consumed it
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+        VALUES ('p', 'exit', 'cc-A', 'own exit work', ?)`).run(Date.now() - 3600000);
+      const result = renderHandoffInjection(db, 'p', 'cc-A');
+      expect(result).toBeNull();
+    });
+
+    it('picks same-session clear over different-session clear', () => {
+      // Parallel sessions: B's clear is newer, but A should still see A's own
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+        VALUES ('p', 'clear', 'cc-A', 'A own work', ?)`).run(Date.now() - 300000);
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+        VALUES ('p', 'clear', 'cc-B', 'B work', ?)`).run(Date.now() - 60000);
+      const result = renderHandoffInjection(db, 'p', 'cc-A');
+      expect(result).toContain('A own work');
+      expect(result).not.toContain('B work');
+    });
+
+    it('null currentCcSessionId preserves legacy behavior', () => {
+      db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+        VALUES ('p', 'clear', 's1', 'legacy behavior', ?)`).run(Date.now());
+      expect(renderHandoffInjection(db, 'p')).toContain('legacy behavior');
+      expect(renderHandoffInjection(db, 'p', null)).toContain('legacy behavior');
+    });
   });
 });

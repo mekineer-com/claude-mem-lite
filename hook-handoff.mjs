@@ -89,12 +89,12 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   const allText = [workingOn, ...completed.map(c => c.title).filter(Boolean), unfinished].join(' ');
   const keywords = extractMatchKeywords(allText, [...fileSet]);
 
-  // UPSERT
+  // UPSERT keyed on (project, type, session_id) — parallel sessions coexist.
+  // Same session re-writing its own handoff (e.g. repeated /clear) updates in place.
   db.prepare(`
     INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(project, type) DO UPDATE SET
-      session_id = excluded.session_id,
+    ON CONFLICT(project, type, session_id) DO UPDATE SET
       working_on = excluded.working_on,
       completed = excluded.completed,
       unfinished = excluded.unfinished,
@@ -116,18 +116,41 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
 
 /**
  * Detect if user's prompt indicates continuation of previous work.
+ * Stage 0: Non-expired clear handoff + short prompt → auto-continue.
  * Stage 1: Explicit keyword match (zero false positives).
  * Stage 2: FTS5-style term overlap with handoff keywords.
+ *
+ * Session scoping (currentCcSessionId): when provided, clear handoffs from a
+ * DIFFERENT session are excluded from Stage 0 auto-match and from the general
+ * pool (prevents cross-session bleed when running parallel sessions for the
+ * same project — see docs/bug.txt). When null, legacy behavior is preserved.
+ *
  * @param {Database} db Opened main database
  * @param {string} promptText User's prompt text
  * @param {string} project Project identifier
+ * @param {string|null} [currentCcSessionId=null] Claude Code session id for scoping
  * @returns {boolean}
  */
-export function detectContinuationIntent(db, promptText, project) {
-  // Stage 0: Non-expired 'clear' handoff — assume continuation unless long unrelated prompt
-  const clearHandoff = db.prepare(`
-    SELECT created_at_epoch, match_keywords FROM session_handoffs WHERE project = ? AND type = 'clear'
-  `).get(project);
+export function detectContinuationIntent(db, promptText, project, currentCcSessionId = null) {
+  // Input guard: empty / whitespace / single-char prompts never trigger auto-injection.
+  // The bug was a single-char 'a' + fresh clear handoff → Stage 0 auto-match.
+  if (!promptText || typeof promptText !== 'string') return false;
+  if (promptText.trim().length < 2) return false;
+
+  // Stage 0: Non-expired 'clear' handoff — assume continuation unless long unrelated prompt.
+  // Session scoping: with currentCcSessionId, only your OWN clear handoff qualifies.
+  const clearHandoff = currentCcSessionId
+    ? db.prepare(`
+        SELECT created_at_epoch, match_keywords FROM session_handoffs
+        WHERE project = ? AND type = 'clear' AND session_id = ?
+        ORDER BY created_at_epoch DESC LIMIT 1
+      `).get(project, currentCcSessionId)
+    : db.prepare(`
+        SELECT created_at_epoch, match_keywords FROM session_handoffs
+        WHERE project = ? AND type = 'clear'
+        ORDER BY created_at_epoch DESC LIMIT 1
+      `).get(project);
+
   if (clearHandoff && (Date.now() - clearHandoff.created_at_epoch <= HANDOFF_EXPIRY_CLEAR)) {
     // Short/ambiguous prompts: assume continuation (user may say "ok", "start", etc.)
     if (promptText.length < 40) return true;
@@ -142,11 +165,20 @@ export function detectContinuationIntent(db, promptText, project) {
   // Stage 1: Explicit keyword match — always works, even without handoff
   if (CONTINUE_KEYWORDS.test(promptText)) return true;
 
-  // Stage 2: FTS5-style term overlap with handoff keywords
-  const handoffs = db.prepare(`
-    SELECT type, match_keywords, created_at_epoch FROM session_handoffs
-    WHERE project = ? ORDER BY created_at_epoch DESC
-  `).all(project);
+  // Stage 2: FTS5-style term overlap with handoff keywords.
+  // Session scoping: exit handoffs from OTHER sessions are still candidates (you may
+  // be resuming a previous session), but clear handoffs must be same-session.
+  const handoffs = currentCcSessionId
+    ? db.prepare(`
+        SELECT type, match_keywords, created_at_epoch FROM session_handoffs
+        WHERE project = ?
+          AND ((type = 'clear' AND session_id = ?) OR type = 'exit')
+        ORDER BY created_at_epoch DESC
+      `).all(project, currentCcSessionId)
+    : db.prepare(`
+        SELECT type, match_keywords, created_at_epoch FROM session_handoffs
+        WHERE project = ? ORDER BY created_at_epoch DESC
+      `).all(project);
   if (handoffs.length === 0) return false;
 
   // Filter expired handoffs
@@ -176,18 +208,32 @@ export function detectContinuationIntent(db, promptText, project) {
 /**
  * Render handoff injection text for stdout.
  * Reads the most recent handoff + optional session summary.
+ *
+ * Session scoping (currentCcSessionId): when provided,
+ *   - clear handoffs: only from the CURRENT session (you continue your own /clear)
+ *   - exit handoffs:  only from OTHER sessions (you resume a previous exit)
+ * When null, legacy behavior (most-recent handoff regardless of session).
+ *
  * @param {Database} db Opened main database
  * @param {string} project Project identifier
+ * @param {string|null} [currentCcSessionId=null] Claude Code session id for scoping
  * @returns {string|null} Injection text or null if no handoff
  */
-export function renderHandoffInjection(db, project) {
+export function renderHandoffInjection(db, project, currentCcSessionId = null) {
   const now = Date.now();
   // Fetch recent handoffs and find the most recent non-expired one.
-  // A newer but expired 'clear' handoff (1h) must not shadow a still-valid 'exit' handoff (7d).
-  const handoffs = db.prepare(`
-    SELECT * FROM session_handoffs
-    WHERE project = ? ORDER BY created_at_epoch DESC LIMIT 5
-  `).all(project);
+  // A newer but expired 'clear' handoff must not shadow a still-valid 'exit' handoff.
+  const handoffs = currentCcSessionId
+    ? db.prepare(`
+        SELECT * FROM session_handoffs
+        WHERE project = ?
+          AND ((type = 'clear' AND session_id = ?) OR (type = 'exit' AND session_id != ?))
+        ORDER BY created_at_epoch DESC LIMIT 5
+      `).all(project, currentCcSessionId, currentCcSessionId)
+    : db.prepare(`
+        SELECT * FROM session_handoffs
+        WHERE project = ? ORDER BY created_at_epoch DESC LIMIT 5
+      `).all(project);
   const handoff = handoffs.find(h => {
     const age = now - h.created_at_epoch;
     const maxAge = h.type === 'clear' ? HANDOFF_EXPIRY_CLEAR : HANDOFF_EXPIRY_EXIT;

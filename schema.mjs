@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 21;
+export const CURRENT_SCHEMA_VERSION = 22;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -91,7 +91,7 @@ const CORE_SCHEMA = `
     key_decisions TEXT,
     match_keywords TEXT,
     created_at_epoch INTEGER,
-    PRIMARY KEY (project, type)
+    PRIMARY KEY (project, type, session_id)
   );
 `;
 
@@ -136,6 +136,42 @@ export function initSchema(db) {
     }
   }
 
+  // session_handoffs PK widen: (project, type) → (project, type, session_id)
+  // Old PK assumed one session per project, causing cross-session handoff overwrite
+  // (see docs/bug.txt). Rebuild table if still on old PK. Idempotent.
+  try {
+    const handoffDdl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='session_handoffs'`).get();
+    const oldPk = handoffDdl && /PRIMARY KEY\s*\(\s*project\s*,\s*type\s*\)/i.test(handoffDdl.sql);
+    if (oldPk) {
+      const rebuild = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE session_handoffs_new (
+            project TEXT NOT NULL,
+            type TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            working_on TEXT,
+            completed TEXT,
+            unfinished TEXT,
+            key_files TEXT,
+            key_decisions TEXT,
+            match_keywords TEXT,
+            created_at_epoch INTEGER,
+            PRIMARY KEY (project, type, session_id)
+          )
+        `);
+        db.exec(`
+          INSERT INTO session_handoffs_new
+            (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch)
+          SELECT project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch
+          FROM session_handoffs
+        `);
+        db.exec(`DROP TABLE session_handoffs`);
+        db.exec(`ALTER TABLE session_handoffs_new RENAME TO session_handoffs`);
+      });
+      rebuild();
+    }
+  } catch { /* non-critical — next open retries */ }
+
   // Dedup migration: ensure memory_session_id is unique, then enable FK
   const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();
   if (!hasIdx) {
@@ -173,6 +209,7 @@ export function initSchema(db) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_branch ON observations(branch) WHERE branch IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sdk_sessions(project)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_not_compressed ON observations(created_at_epoch DESC) WHERE COALESCE(compressed_into, 0) = 0`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_handoffs_project_time ON session_handoffs(project, type, created_at_epoch DESC)`);
 
   // FTS5 migration: recreate observations_fts when columns are missing (one-time)
   // Detect old FTS5 table missing lesson_learned or search_aliases and recreate with full column set

@@ -547,3 +547,85 @@ describe('Scenario 8: CJK continuation detection', () => {
     expect(detectContinuationIntent(db, '看看效果', project)).toBe(true);
   });
 });
+
+// ─── Scenario 9: parallel sessions, cross-session bleed prevention ─────────
+
+describe('Scenario 9: parallel sessions bleed prevention (docs/bug.txt)', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); _epoch = 0; });
+  afterEach(() => db.close());
+
+  it('session A typing single-char "a" does NOT receive session B /exit handoff', () => {
+    const project = 'mem';
+
+    // Session B was analyzing the GSD plugin and just /exit'd
+    seedSession(db, 'cc-B', project);
+    seedPrompt(db, 'cc-B', '分析 gsd 插件编排工作', 1);
+    seedObs(db, 'cc-B', project, { title: 'GSD plugin orchestration analysis', importance: 2 });
+    buildAndSaveHandoff(db, 'cc-B', project, 'exit', null);
+
+    // Session A (still alive, working on mem refactor) now fires UserPromptSubmit with 'a'
+    // Session A's CC session_id is 'cc-A' (different from B's 'cc-B')
+    // Before fix: single-char 'a' + fresh exit handoff → Stage 0 injects B's content
+    // After fix: tiny-prompt guard rejects; session filter rejects
+    expect(detectContinuationIntent(db, 'a', project, 'cc-A')).toBe(false);
+
+    // Session A also doesn't get B's content via injection render
+    const injection = renderHandoffInjection(db, project, 'cc-A');
+    // Exit handoff from another session CAN be rendered (resume case), but session A
+    // is still alive and didn't trigger continuation — intent gate must hold
+    // (this test asserts the intent path; the render-gate is a defense in depth)
+    // So we only assert the intent gate here.
+    void injection; // not asserting render — detectContinuationIntent gates it upstream
+  });
+
+  it('session A /clear handoff is visible to session A only, not session B', () => {
+    const project = 'mem';
+
+    // Session A did a /clear, writing its handoff
+    seedSession(db, 'cc-A', project);
+    seedPrompt(db, 'cc-A', 'refactor dispatch scoring', 1);
+    seedObs(db, 'cc-A', project, { title: 'Refactored scoring', narrative: 'dispatch.mjs: extracted fn' });
+    buildAndSaveHandoff(db, 'cc-A', project, 'clear', null);
+
+    // Session B (parallel) types a short neutral prompt → must NOT see A's clear handoff
+    // (using 'ok go' avoids accidentally matching CONTINUE_KEYWORDS)
+    expect(detectContinuationIntent(db, 'ok go', project, 'cc-B')).toBe(false);
+    expect(renderHandoffInjection(db, project, 'cc-B')).toBeNull();
+
+    // Session A itself, resuming after /clear → DOES see its own clear handoff
+    expect(detectContinuationIntent(db, 'ok go', project, 'cc-A')).toBe(true);
+    const ownInjection = renderHandoffInjection(db, project, 'cc-A');
+    expect(ownInjection).toContain('dispatch scoring');
+  });
+
+  it('both sessions /exit → later fresh session sees most recent exit handoff', () => {
+    const project = 'mem';
+
+    // Session A exits first
+    seedSession(db, 'cc-A', project);
+    seedPrompt(db, 'cc-A', 'implement feature X', 1);
+    seedObs(db, 'cc-A', project, { title: 'Feature X scaffolding', importance: 2 });
+    buildAndSaveHandoff(db, 'cc-A', project, 'exit', null);
+
+    // Session B exits after A
+    seedSession(db, 'cc-B', project);
+    seedPrompt(db, 'cc-B', 'investigate feature Y', 1);
+    seedObs(db, 'cc-B', project, { title: 'Feature Y investigation', importance: 2 });
+    buildAndSaveHandoff(db, 'cc-B', project, 'exit', null);
+
+    // Force deterministic ordering — Date.now() at sub-ms resolution can tie
+    db.prepare(`UPDATE session_handoffs SET created_at_epoch = ? WHERE session_id = 'cc-A'`).run(Date.now() - 2000);
+    db.prepare(`UPDATE session_handoffs SET created_at_epoch = ? WHERE session_id = 'cc-B'`).run(Date.now() - 1000);
+
+    // Both coexist in DB
+    const rows = db.prepare(`SELECT session_id FROM session_handoffs WHERE project = ? AND type = 'exit' ORDER BY session_id`).all(project);
+    expect(rows.length).toBe(2);
+
+    // A brand-new session cc-C opens → should be able to resume with "most recent exit"
+    const injection = renderHandoffInjection(db, project, 'cc-C');
+    expect(injection).toBeTruthy();
+    // Most recent is B
+    expect(injection).toContain('investigate feature Y');
+  });
+});

@@ -288,8 +288,21 @@ function triggerErrorRecall(db, toolInput, response) {
 // ─── Stop Handler ───────────────────────────────────────────────────────────
 
 async function handleStop() {
-  // Capture session info BEFORE cleanup
-  const sessionId = getSessionId();
+  // Read Claude Code's real session_id from hook stdin for parallel-session scoping.
+  // This is the stable CC identifier — the mem plugin's file-based getSessionId()
+  // collides across parallel sessions for the same project (see docs/bug.txt).
+  let ccSessionId = null;
+  try {
+    const raw = await readStdin();
+    const hookData = JSON.parse(raw.text);
+    if (typeof hookData?.session_id === 'string' && hookData.session_id.length > 0) {
+      ccSessionId = hookData.session_id;
+    }
+  } catch { /* stdin unavailable — fall back to local session id */ }
+
+  // Capture session info BEFORE cleanup. Prefer CC session id (parallel-safe);
+  // fall back to file-based id for backward compat.
+  const sessionId = ccSessionId || getSessionId();
   const project = inferProject();
 
   // Snapshot episode BEFORE flush for handoff extraction
@@ -384,6 +397,17 @@ async function handleStop() {
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
 async function handleSessionStart() {
+  // Read CC real session_id from hook stdin — used to scope handoff rows so parallel
+  // sessions for the same project don't clobber each other (see docs/bug.txt).
+  let ccSessionId = null;
+  try {
+    const raw = await readStdin();
+    const hookData = JSON.parse(raw.text);
+    if (typeof hookData?.session_id === 'string' && hookData.session_id.length > 0) {
+      ccSessionId = hookData.session_id;
+    }
+  } catch { /* stdin unavailable — legacy behavior */ }
+
   // Snapshot episode BEFORE flush for handoff extraction
   const episodeSnapshot = readEpisodeRaw();
 
@@ -566,15 +590,21 @@ async function handleSessionStart() {
     let prevClearHandoff = null;
 
     if (prevSessionId) {
-      // Save handoff for cross-session continuity (/clear or /compact)
-      try { buildAndSaveHandoff(db, prevSessionId, prevProject || project, 'clear', episodeSnapshot); }
+      // Save handoff for cross-session continuity (/clear or /compact).
+      // Prefer CC session id (stable across /clear within same CC session, and
+      // unique across parallel sessions for the same project) so UserPromptSubmit
+      // can scope by hookData.session_id. Fall back to the mem plugin's file-based
+      // id for legacy/test paths.
+      const handoffSessionId = ccSessionId || prevSessionId;
+      try { buildAndSaveHandoff(db, handoffSessionId, prevProject || project, 'clear', episodeSnapshot); }
       catch (e) { debugCatch(e, 'session-start-handoff'); }
 
-      // Read the just-saved handoff for downstream consumers (fast summary remaining, working state)
+      // Read the just-saved handoff for downstream consumers (fast summary remaining, working state).
+      // Session-scoped read to avoid picking up a parallel session's clear handoff.
       try {
         prevClearHandoff = db.prepare(
-          'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ?'
-        ).get(prevProject || project, 'clear');
+          'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ? AND session_id = ?'
+        ).get(prevProject || project, 'clear', handoffSessionId);
       } catch {}
 
       // Generate session summary for previous session (background Haiku — richer version)
@@ -689,7 +719,9 @@ async function handleSessionStart() {
     // Build the full context body via shared helper (also used by `mem-cli context`).
     // Queries session_summaries, key observations, clear handoff, and the
     // token-budgeted observation pool directly from the DB.
-    const fullContext = buildSessionContextLines(db, project, now);
+    // Pass CC session id so the Working State block is scoped to this session,
+    // preventing parallel sessions from seeing each other's /clear handoff.
+    const fullContext = buildSessionContextLines(db, project, now, ccSessionId);
 
     // Stdout is the sole context-delivery channel. The SessionStart hook output
     // is injected as a <system-reminder> at session start, giving Claude the
@@ -766,16 +798,29 @@ async function handleUserPrompt() {
       now.toISOString(), now.getTime()
     );
 
-    // Cross-session handoff injection (first 3 prompts window, before semantic memory)
+    // Cross-session handoff injection (first 3 prompts window, before semantic memory).
+    // Use Claude Code's real session_id from hook stdin to scope handoffs to this CC
+    // session — prevents cross-session bleed when running parallel sessions for the
+    // same project (see docs/bug.txt). Falls back to null (legacy behavior) if the
+    // hook input does not carry session_id.
+    const ccSessionId = typeof hookData.session_id === 'string' && hookData.session_id.length > 0
+      ? hookData.session_id
+      : null;
     if (counter?.prompt_counter <= 3) {
       try {
-        if (detectContinuationIntent(db, promptText, project)) {
-          const injection = renderHandoffInjection(db, project);
+        if (detectContinuationIntent(db, promptText, project, ccSessionId)) {
+          const injection = renderHandoffInjection(db, project, ccSessionId);
           if (injection) {
             process.stdout.write(injection + '\n');
             // Consume clear handoff after injection to prevent duplicate injection on prompts 2-3.
-            // Exit handoffs are kept (7d TTL, content-dependent keyword/FTS matching won't re-trigger).
-            try { db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear'").run(project); } catch {}
+            // Scope the delete to THIS session's clear handoff — do not clobber parallel sessions' rows.
+            try {
+              if (ccSessionId) {
+                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear' AND session_id = ?").run(project, ccSessionId);
+              } else {
+                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear'").run(project);
+              }
+            } catch {}
           }
         }
       } catch (e) { debugCatch(e, 'handleUserPrompt-handoff'); }

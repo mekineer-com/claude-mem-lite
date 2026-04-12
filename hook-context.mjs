@@ -241,9 +241,12 @@ export function cleanupClaudeMdLegacyBlock() {
  * @param {import('better-sqlite3').Database} db Opened main DB
  * @param {string} project Canonical project name (from inferProject())
  * @param {Date} [now=new Date()] Clock reference for time windows and table header
+ * @param {string|null} [currentCcSessionId=null] Claude Code session id — when provided,
+ *   the "Working State (from /clear)" block is filtered to handoffs owned by this
+ *   session, preventing parallel-session bleed (see docs/bug.txt).
  * @returns {string} Joined markdown lines (without <claude-mem-context> wrappers)
  */
-export function buildSessionContextLines(db, project, now = new Date()) {
+export function buildSessionContextLines(db, project, now = new Date(), currentCcSessionId = null) {
   // 1. Token-budgeted observation selection
   const selected = selectWithTokenBudget(db, project, 2000);
   const observations = selected.observations;
@@ -334,13 +337,22 @@ export function buildSessionContextLines(db, project, now = new Date()) {
     }
   }
 
-  // 5. Working state from latest /clear handoff
-  const prevClearHandoff = db.prepare(`
-    SELECT working_on, unfinished, key_files
-    FROM session_handoffs
-    WHERE project = ? AND type = 'clear'
-    ORDER BY created_at_epoch DESC LIMIT 1
-  `).get(project);
+  // 5. Working state from latest /clear handoff.
+  // Session scoping: when currentCcSessionId is provided, restrict to this session's
+  // own clear handoff so parallel sessions don't see each other's Working State block.
+  const prevClearHandoff = currentCcSessionId
+    ? db.prepare(`
+        SELECT working_on, unfinished, key_files
+        FROM session_handoffs
+        WHERE project = ? AND type = 'clear' AND session_id = ?
+        ORDER BY created_at_epoch DESC LIMIT 1
+      `).get(project, currentCcSessionId)
+    : db.prepare(`
+        SELECT working_on, unfinished, key_files
+        FROM session_handoffs
+        WHERE project = ? AND type = 'clear'
+        ORDER BY created_at_epoch DESC LIMIT 1
+      `).get(project);
 
   const handoffLines = [];
   if (prevClearHandoff) {
