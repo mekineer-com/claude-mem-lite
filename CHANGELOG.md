@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.30.1] - 2026-04-12
+
+Bug fix: `session_handoffs` no longer bleeds across parallel Claude Code sessions for the same project. Root cause was a PK-level assumption (`(project, type)`) made at the original feature landing — one row per project per type — which silently overwrote handoffs when you ran two terminals/worktrees against the same project. The visible symptom: in session A, typing a single character like `a` after session B had just `/exit`'d would inject B's entire context into A via the Stage 0 short-prompt auto-match. See `docs/bug.txt` for the full post-mortem.
+
+### Fixed
+- `session_handoffs` schema: PK widened from `(project, type)` to `(project, type, session_id)`. Schema version bumped to 22; idempotent rebuild migration preserves legacy rows and creates a new `idx_handoffs_project_time` index. Zero data loss for existing installs.
+- `hook.mjs` now reads Claude Code's real `session_id` from hook stdin in `handleStop`, `handleSessionStart`, and `handleUserPrompt` — this is parallel-safe, unlike the mem plugin's file-based `getSessionId()` which collides across terminals for the same project. Falls back to the legacy id if stdin is unavailable.
+- `detectContinuationIntent` / `renderHandoffInjection` gained an optional `currentCcSessionId` parameter. With it: `clear` handoffs are matched only against the session that wrote them ("continue my own /clear"), and `exit` handoffs are matched only against *other* sessions ("resume a previous session's exit"). Without it, legacy behavior is preserved for backward compatibility — no existing test or CLI call breaks.
+- `detectContinuationIntent` input guard: empty / whitespace / single-character prompts can no longer trigger Stage 0 auto-injection. The `a` case from the bug report is now rejected at the entry of the function.
+- `buildSessionContextLines` in `hook-context.mjs` accepts a `currentCcSessionId` so the "Working State (from /clear)" block at SessionStart is scoped to the current session, closing the secondary delivery path (SessionStart stdout block).
+- `handleUserPrompt` consume-after-inject `DELETE` now includes `AND session_id = ?` — previously it would wipe out parallel sessions' clear handoffs as a side effect of consuming its own.
+- `buildAndSaveHandoff` UPSERT conflict target updated to `(project, type, session_id)` so same-session re-writes (e.g. repeat `/clear`) still update in place, while parallel sessions coexist as separate rows.
+
+### Tests
+- 15 new unit tests in `tests/handoff.test.mjs` covering schema PK, parallel-session coexistence, tiny-prompt guards (`''`, `' '`, `'a'`, `'好'`), and `currentCcSessionId` filter semantics for both `detectContinuationIntent` and `renderHandoffInjection`.
+- 3 new simulation tests in `tests/handoff-simulation.test.mjs` replaying the `docs/bug.txt` scenarios end-to-end: parallel sessions, single-char bleed prevention, own-clear resumption, and two-exit → fresh-session-resumes-latest.
+- 1395/1395 tests green, no flakes.
+
 ## [2.30.0] - 2026-04-12
 
 Stage 1+2 of the deep-review response: search-quality wins from filter realignment and rank tuning, plus a new quality-metrics dashboard. No breaking changes; all existing CLI/MCP surfaces are backward compatible.
