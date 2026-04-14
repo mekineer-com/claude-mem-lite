@@ -13,6 +13,11 @@ if (cmd === '--version' || cmd === '-v') {
 } else if (cmd === '--help' || cmd === '-h') {
   const { run } = await import('./mem-cli.mjs');
   await run(['help']);
+} else if (cmd === 'doctor' && process.argv.slice(3).includes('--benchmark')) {
+  // doctor --benchmark is a baseline-capture tool, routed through mem-cli (DB layer);
+  // plain `doctor` continues to run the install health-check below.
+  const { run } = await import('./mem-cli.mjs');
+  await run(process.argv.slice(2));
 } else if (CLI_COMMANDS.has(cmd)) {
   const { run } = await import('./mem-cli.mjs');
   await run(process.argv.slice(2));

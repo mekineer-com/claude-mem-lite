@@ -2193,6 +2193,18 @@ async function cmdOptimize(db, args) {
   if (results.smartCompress) out(`  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`);
 }
 
+async function cmdDoctor(db, args) {
+  if (args.includes('--benchmark')) {
+    const { runBenchmark } = await import('./lib/doctor-benchmark.mjs');
+    const project = inferProject();
+    const result = runBenchmark(db, { project });
+    out(JSON.stringify(result, null, 2));
+    return;
+  }
+  out('[mem] doctor: supported flags: --benchmark');
+  process.exitCode = 1;
+}
+
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {
@@ -2241,6 +2253,7 @@ export async function run(argv) {
       case 'registry':  cmdRegistry(db, cmdArgs); break;
       case 'import':    await cmdImport(cmdArgs); break;
       case 'enrich':    await cmdEnrich(cmdArgs); break;
+      case 'doctor':    await cmdDoctor(db, cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');
