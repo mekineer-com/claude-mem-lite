@@ -224,7 +224,8 @@ describe('handleLLMEpisode', () => {
     vi.clearAllMocks();
   });
 
-  it('extracts and saves observation from single-entry episode', async () => {
+  it('extracts and saves event from single-entry episode (feature type → events table)', async () => {
+    // Default mock returns type='feature' → EVENT_TYPE → routes to events.
     const episode = {
       sessionId: 'ep-sess', project: 'test-proj',
       files: ['auth.mjs'], filesRead: ['config.mjs'],
@@ -234,14 +235,18 @@ describe('handleLLMEpisode', () => {
 
     await handleLLMEpisode();
 
-    const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
-    expect(obs.length).toBe(1);
-    expect(obs[0].title).toBe('Add user authentication');
-    expect(obs[0].type).toBe('feature');
-    expect(obs[0].importance).toBe(2);
+    // Feature-typed Haiku summary lands in `events`, not `observations`.
+    const obs = db.prepare('SELECT * FROM observations').all();
+    expect(obs.length).toBe(0);
+    const ev = db.prepare(`SELECT * FROM events WHERE project = ?`).all('test-proj');
+    expect(ev.length).toBe(1);
+    expect(ev[0].title).toBe('Add user authentication');
+    expect(ev[0].event_type).toBe('feature');
+    expect(ev[0].importance).toBe(2);
+    expect(JSON.parse(ev[0].file_paths)).toEqual(['auth.mjs']);
   });
 
-  it('extracts observation from multi-entry episode', async () => {
+  it('extracts event from multi-entry episode (feature type)', async () => {
     const episode = {
       sessionId: 'ep-sess', project: 'test-proj',
       files: ['auth.mjs', 'config.mjs'], filesRead: [],
@@ -255,8 +260,11 @@ describe('handleLLMEpisode', () => {
 
     await handleLLMEpisode();
 
-    const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
-    expect(obs.length).toBe(1);
+    // Feature-typed Haiku summary lands in `events`, not `observations`.
+    const obs = db.prepare('SELECT * FROM observations').all();
+    expect(obs.length).toBe(0);
+    const ev = db.prepare(`SELECT * FROM events WHERE project = ?`).all('test-proj');
+    expect(ev.length).toBe(1);
   });
 
   it('uses degraded fallback when LLM slot unavailable', async () => {
@@ -278,7 +286,9 @@ describe('handleLLMEpisode', () => {
     expect(obs[0].type).toBe('change');
   });
 
-  it('infers bugfix type in fallback when entry has error', async () => {
+  it('infers bugfix type in fallback when entry has error (routes to events)', async () => {
+    // Fallback path with error → buildImmediateObservation infers type='bugfix',
+    // which is an EVENT_TYPE → dispatcher routes to `events`, not `observations`.
     acquireLLMSlot.mockResolvedValueOnce(false);
 
     const episode = {
@@ -290,10 +300,11 @@ describe('handleLLMEpisode', () => {
 
     await handleLLMEpisode();
 
-    const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
-    expect(obs[0].type).toBe('bugfix');
+    expect(db.prepare(`SELECT COUNT(*) c FROM observations WHERE type='bugfix'`).get().c).toBe(0);
+    const ev = db.prepare(`SELECT * FROM events WHERE event_type='bugfix' AND project = ?`).all('test-proj');
+    expect(ev.length).toBe(1);
     // buildDegradedTitle: file + error → "Error: app.mjs"
-    expect(obs[0].title).toBe('Error: app.mjs');
+    expect(ev[0].title).toBe('Error: app.mjs');
   });
 
   it('returns early when no tmpFile specified', async () => {
@@ -320,14 +331,16 @@ describe('handleLLMEpisode', () => {
   });
 
   it('links related observations by FTS5 title match', async () => {
+    // Linking only applies to rows in `observations` — use type='change' (not an
+    // EVENT_TYPE) so both the seed and the new row land in observations.
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
     db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, ?, '', 'feature', ?, '', 'Previous auth work', '', '', '[]', '[]', 1, ?, ?)
+      VALUES (?, ?, '', 'change', ?, '', 'Previous auth work', '', '', '[]', '[]', 1, ?, ?)
     `).run('ep-sess', 'test-proj', 'Authentication middleware setup', new Date().toISOString(), Date.now());
 
     callLLM.mockReturnValue(JSON.stringify({
-      type: 'feature',
+      type: 'change',
       title: 'Add authentication validation layer',
       narrative: 'Extended authentication with validation',
       concepts: ['auth'], facts: [], importance: 1,
@@ -391,8 +404,11 @@ describe('handleLLMEpisode', () => {
       `).run('ep-sess', 'test-proj', `Performance optimization step ${i}`, '["perf.mjs"]', new Date().toISOString(), Date.now() + i);
     }
 
+    // Use type='change' (non-EVENT_TYPE) so the new row lands in `observations`
+    // and `linkRelatedObservations` runs — the cap-at-5 contract is an
+    // observations-linking concern.
     callLLM.mockReturnValue(JSON.stringify({
-      type: 'refactor',
+      type: 'change',
       title: 'Final performance optimization pass',
       narrative: 'Completed performance optimization work',
       concepts: ['optimization'], facts: [], importance: 1,
@@ -411,8 +427,10 @@ describe('handleLLMEpisode', () => {
     expect(relatedIds.length).toBeLessThanOrEqual(5);
   });
 
-  it('upgrades pre-saved observation when savedId is present', async () => {
-    // Pre-save a rule-based observation (simulating what flushEpisode does)
+  it('upgrade-delete: pre-saved observation replaced by event when Haiku classifies as EVENT_TYPE', async () => {
+    // Pre-save a rule-based observation (simulating what flushEpisode does).
+    // Default mock returns type='feature' → EVENT_TYPE → pre-saved observations
+    // row must be DELETED and a fresh event inserted.
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
     const preSavedId = saveObservation(
       { type: 'change', title: 'Modified auth.mjs', narrative: 'Edit auth.mjs', importance: 1 },
@@ -420,7 +438,6 @@ describe('handleLLMEpisode', () => {
     );
     expect(preSavedId).toBeGreaterThan(0);
 
-    // Episode includes savedId — LLM should UPDATE, not INSERT
     writeFileSync(tmpFile, JSON.stringify({
       sessionId: 'ep-sess', project: 'test-proj',
       savedId: preSavedId,
@@ -430,14 +447,59 @@ describe('handleLLMEpisode', () => {
 
     await handleLLMEpisode();
 
-    // Should have exactly 1 observation (upgraded, not duplicated)
+    // Pre-saved observations row is gone.
+    const deleted = db.prepare('SELECT * FROM observations WHERE id = ?').get(preSavedId);
+    expect(deleted).toBeUndefined();
+    // No other observations for this session either.
+    const allObs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
+    expect(allObs.length).toBe(0);
+
+    // A fresh event exists with the LLM-enriched fields.
+    const evs = db.prepare(`SELECT * FROM events WHERE project = ?`).all('test-proj');
+    expect(evs.length).toBe(1);
+    expect(evs[0].title).toBe('Add user authentication');
+    expect(evs[0].event_type).toBe('feature');
+    expect(evs[0].importance).toBe(2);
+    expect(JSON.parse(evs[0].file_paths)).toEqual(['auth.mjs']);
+  });
+
+  it('upgrade-in-place: pre-saved observation stays in observations when Haiku classifies as non-EVENT_TYPE', async () => {
+    // Pre-save a rule-based observation, LLM classifies as 'change' (not an
+    // EVENT_TYPE) → UPDATE existing observations row, do not touch events.
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'change',
+      title: 'Refactored config loading',
+      narrative: 'Extracted env parsing into loader module',
+      concepts: ['config'],
+      facts: [],
+      importance: 2,
+    }));
+
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+    const preSavedId = saveObservation(
+      { type: 'change', title: 'Modified config.mjs', narrative: 'Edit config', importance: 1 },
+      'test-proj', 'ep-sess', db
+    );
+    expect(preSavedId).toBeGreaterThan(0);
+
+    writeFileSync(tmpFile, JSON.stringify({
+      sessionId: 'ep-sess', project: 'test-proj',
+      savedId: preSavedId,
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Refactor config', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    // Same row, enriched.
     const allObs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
     expect(allObs.length).toBe(1);
     expect(allObs[0].id).toBe(preSavedId);
-    // LLM-upgraded fields
-    expect(allObs[0].title).toBe('Add user authentication');
-    expect(allObs[0].type).toBe('feature');
+    expect(allObs[0].title).toBe('Refactored config loading');
+    expect(allObs[0].type).toBe('change');
     expect(allObs[0].importance).toBe(2);
+    // No events written.
+    expect(db.prepare(`SELECT COUNT(*) c FROM events`).get().c).toBe(0);
   });
 
   it('keeps pre-saved observation when LLM fails and savedId present', async () => {
@@ -466,6 +528,38 @@ describe('handleLLMEpisode', () => {
     // No duplicate observations
     const allObs = db.prepare('SELECT COUNT(*) as c FROM observations WHERE memory_session_id = ?').get('ep-sess');
     expect(allObs.c).toBe(1);
+  });
+
+  it('handleLLMEpisode routes bugfix Haiku summary to events, not observations (T9)', async () => {
+    // Full wired-path integration: LLM returns bugfix, handleLLMEpisode must
+    // dispatch through persistHaikuSummary, landing in `events`.
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'bugfix',
+      title: 'fixed null deref in session init',
+      narrative: 'session file was created without atomic rename causing TOCTOU',
+      concepts: ['race-condition'],
+      facts: [],
+      importance: 2,
+      lesson_learned: 'Always use atomic write (tmp+rename) for concurrent file access',
+      search_aliases: ['TOCTOU', 'file race'],
+    }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['session.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Add atomic rename to session init', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    expect(db.prepare(`SELECT COUNT(*) c FROM observations WHERE type='bugfix'`).get().c).toBe(0);
+    const ev = db.prepare(`SELECT * FROM events WHERE event_type='bugfix' AND project = ?`).get('test-proj');
+    expect(ev).toBeDefined();
+    expect(ev.title).toBe('fixed null deref in session init');
+    expect(ev.body).toBe('Always use atomic write (tmp+rename) for concurrent file access');
+    expect(JSON.parse(ev.file_paths)).toEqual(['session.mjs']);
+    expect(ev.importance).toBe(2);
   });
 
   it('discards observation when LLM returns importance=0', async () => {
