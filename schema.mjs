@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 24;
+export const CURRENT_SCHEMA_VERSION = 25;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -171,6 +171,17 @@ export function initSchema(db) {
       rebuild();
     }
   } catch { /* non-critical — next open retries */ }
+
+  // v25 (T10d): commit-anchored continuation — store HEAD sha at handoff time
+  // so detectContinuationIntent can auto-confirm continuation when the working
+  // tree hasn't moved since /exit or /clear. Runs AFTER the PK-widen rebuild
+  // above so the new column is not clobbered by the DROP+CREATE path.
+  try {
+    const handoffCols = db.prepare(`PRAGMA table_info(session_handoffs)`).all().map(c => c.name);
+    if (!handoffCols.includes('git_sha_at_handoff')) {
+      db.exec(`ALTER TABLE session_handoffs ADD COLUMN git_sha_at_handoff TEXT DEFAULT NULL`);
+    }
+  } catch { /* non-critical — migration retries on next open */ }
 
   // Dedup migration: ensure memory_session_id is unique, then enable FK
   const hasIdx = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_sess_memory_sid'`).get();

@@ -72,3 +72,34 @@ describe('events table (T6)', () => {
     expect(idx).toBeTruthy();
   });
 });
+
+describe('session_handoffs.git_sha_at_handoff column (T10d v25)', () => {
+  test('git_sha_at_handoff column exists on session_handoffs', () => {
+    const db = createTestDb();
+    const cols = db.prepare(`PRAGMA table_info(session_handoffs)`).all().map(c => c.name);
+    expect(cols).toContain('git_sha_at_handoff');
+  });
+
+  test('git_sha_at_handoff column is nullable with default NULL', () => {
+    const db = createTestDb();
+    // Insert without providing git_sha_at_handoff — should default to NULL
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch) VALUES (?, ?, ?, ?)`)
+      .run('p', 'exit', 's1', Date.now());
+    const row = db.prepare(`SELECT git_sha_at_handoff FROM session_handoffs WHERE project='p' AND type='exit' AND session_id='s1'`).get();
+    expect(row.git_sha_at_handoff).toBeNull();
+  });
+
+  test('git_sha_at_handoff can store a commit sha', () => {
+    const db = createTestDb();
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch, git_sha_at_handoff) VALUES (?, ?, ?, ?, ?)`)
+      .run('p', 'exit', 's1', Date.now(), 'abc123def456');
+    const row = db.prepare(`SELECT git_sha_at_handoff FROM session_handoffs WHERE project='p' AND type='exit' AND session_id='s1'`).get();
+    expect(row.git_sha_at_handoff).toBe('abc123def456');
+  });
+
+  test('schema version is 25', () => {
+    const db = createTestDb();
+    const row = db.prepare(`SELECT version FROM schema_version LIMIT 1`).get();
+    expect(row.version).toBe(25);
+  });
+});
