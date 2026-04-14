@@ -114,13 +114,40 @@ try {
       LIMIT 2
     `).all(project, cutoff, filePath, likePattern);
 
+    // T9: also query the `events` table — after T9, bugfix/lesson/decision/etc.
+    // route here instead of observations, so we must read both sources to keep
+    // surfacing past lessons. `file_paths` is a JSON array string; the LIKE
+    // patterns match both basename and full-path entries. JSON quoting
+    // (`"<name>"`) prevents partial-match false positives like "foo.mjs"
+    // matching "myfoo.mjs".
+    const fnameEscaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const filePathEscaped = filePath.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    let eventRows = [];
+    try {
+      eventRows = db.prepare(`
+        SELECT id, event_type AS type, title, body AS lesson_learned
+        FROM events
+        WHERE project = ?
+          AND importance >= 2
+          AND superseded_at_epoch IS NULL
+          AND created_at_epoch > ?
+          AND (file_paths LIKE ? ESCAPE '\\' OR file_paths LIKE ? ESCAPE '\\')
+        ORDER BY created_at_epoch DESC
+        LIMIT 2
+      `).all(project, cutoff, `%"${fnameEscaped}"%`, `%"${filePathEscaped}"%`);
+    } catch { /* events table may not exist on pre-v2.31 DBs — silent */ }
+
+    // Merge: observations first (they carry richer lesson_learned), then events,
+    // capped at 3 total so the injected context stays small per Edit/Write.
+    const allRows = [...rows, ...eventRows].slice(0, 3);
+
     // v2.31 T2: emit JSON with hookSpecificOutput.additionalContext so the message
     // reliably renders across CC variants (sdscc drops plain-text stdout from PreToolUse).
     // suppressOutput:true hides it from transcript mode per CC hook docs.
     const lines = [];
-    if (rows.length > 0) {
+    if (allRows.length > 0) {
       lines.push(`[mem] Lessons for ${fname}:`);
-      for (const r of rows) {
+      for (const r of allRows) {
         if (r.lesson_learned) {
           const lesson = r.lesson_learned.length > 120
             ? r.lesson_learned.slice(0, 117) + '...'

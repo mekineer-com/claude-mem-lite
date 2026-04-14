@@ -357,4 +357,183 @@ describe('pre-tool-recall', () => {
       expect(parsed.hookSpecificOutput.additionalContext).toContain('/lesson');
     });
   });
+
+  // T9 (v2.31): pre-tool-recall must query BOTH observations and events,
+  // since hook-llm now routes bugfix/lesson/decision/etc. to `events`.
+  describe('events-table recall (v2.31 T9)', () => {
+    let tmpRoot;
+    let dbPath;
+    let runtimeDir;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = join(tmpdir(), `pre-recall-t9-${process.pid}-${Date.now()}`);
+      mkdirSync(tmpRoot, { recursive: true });
+      dbPath = join(tmpRoot, 'test.db');
+      runtimeDir = join(tmpRoot, 'runtime');
+      mkdirSync(runtimeDir, { recursive: true });
+      projectDir = join(tmpRoot, 'parent', 't9test');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-t9', project: 'parent--t9test', memoryId: 'mem-t9' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function runWithEnv(input) {
+      return runScript(input, {
+        CLAUDE_MEM_DB_PATH: dbPath,
+        CLAUDE_MEM_RUNTIME_DIR: runtimeDir,
+        CLAUDE_PROJECT_DIR: projectDir,
+      });
+    }
+
+    it('surfaces events-table lessons via basename match', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'lesson', ?, ?, ?, 2, ?)
+      `).run(
+        'parent--t9test',
+        'events-table lesson on foo',
+        'remember to flush the cache before rotating keys',
+        JSON.stringify(['foo.mjs']),
+        Date.now(),
+      );
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'foo.mjs') },
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.suppressOutput).toBe(true);
+      expect(parsed.hookSpecificOutput.hookEventName).toBe('PreToolUse');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('[mem] Lessons for foo.mjs:');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('[lesson]');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('flush the cache before rotating keys');
+      // Regression guard: no backfill reminder when an event lesson was found.
+      expect(parsed.hookSpecificOutput.additionalContext).not.toContain('No prior lessons');
+    });
+
+    it('surfaces events-table lessons via full-path match', async () => {
+      const fullPath = join(projectDir, 'bar.mjs');
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'bugfix', ?, ?, ?, 3, ?)
+      `).run(
+        'parent--t9test',
+        'full-path bugfix',
+        'null-check before dereferencing bar()',
+        JSON.stringify([fullPath]),
+        Date.now(),
+      );
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: fullPath },
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('[bugfix]');
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('null-check before dereferencing bar()');
+    });
+
+    it('merges observations and events when both match the same file', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Legacy observations lesson
+      insertObs(db, {
+        sessionId: 'mem-t9', project: 'parent--t9test',
+        type: 'bugfix', importance: 2,
+        title: 'obs-era bugfix',
+        lessonLearned: 'always await the promise before closing db',
+        filesModified: `["${join(projectDir, 'mixed.mjs')}"]`,
+      });
+      // New event lesson
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'lesson', ?, ?, ?, 2, ?)
+      `).run(
+        'parent--t9test',
+        'event-era lesson',
+        'check the feature flag in config before rollout',
+        JSON.stringify(['mixed.mjs']),
+        Date.now(),
+      );
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'mixed.mjs') },
+      });
+      const parsed = JSON.parse(stdout);
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for mixed.mjs:');
+      expect(ctx).toContain('always await the promise before closing db');
+      expect(ctx).toContain('check the feature flag in config before rollout');
+    });
+
+    it('ignores events with importance < 2', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'lesson', ?, ?, ?, 1, ?)
+      `).run(
+        'parent--t9test',
+        'low-importance lesson',
+        'this should not surface',
+        JSON.stringify(['lowimp.mjs']),
+        Date.now(),
+      );
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'lowimp.mjs') },
+      });
+      const parsed = JSON.parse(stdout);
+      // No hit → backfill reminder should show.
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('No prior lessons for lowimp.mjs');
+    });
+
+    it('ignores superseded events', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch, superseded_at_epoch)
+        VALUES (?, 'bugfix', ?, ?, ?, 3, ?, ?)
+      `).run(
+        'parent--t9test',
+        'stale bugfix',
+        'this was replaced — should not surface',
+        JSON.stringify(['stale.mjs']),
+        Date.now(),
+        Date.now(),
+      );
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'stale.mjs') },
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('No prior lessons for stale.mjs');
+    });
+  });
 });

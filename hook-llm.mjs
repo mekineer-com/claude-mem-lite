@@ -15,6 +15,11 @@ import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
   sessionFile, getSessionId, openDb, callLLM, sleep,
 } from './hook-shared.mjs';
+import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
+
+// T9: memdir-incompatible types live in the `events` table, not `observations`.
+// Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
+const EVENT_TYPE_SET = new Set(EVENT_TYPES);
 
 // ─── Save Observation to DB ─────────────────────────────────────────────────
 
@@ -170,6 +175,53 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
   } finally {
     if (!externalDb) db.close();
   }
+}
+
+// ─── T9: Haiku Summary Dispatcher (events vs observations routing) ──────────
+//
+// Routes memdir-incompatible types (the 8 values in EVENT_TYPES) to the
+// activity `events` table, and keeps legacy/memdir-aligned types (e.g.
+// `change`, which is the only non-event type hook-llm currently emits) on
+// the existing observations path.
+//
+// Input shape (matches the v2.31 MVP plan's stable interface):
+//   summary: { type, title, lesson_learned?, narrative?, importance?, files_modified? }
+//   ctx:     { project, session_id }
+//
+// Returns either the new event id (events path) or the saveObservation return
+// value (id | null when deduped / db unavailable).
+export function persistHaikuSummary(db, summary, ctx) {
+  if (EVENT_TYPE_SET.has(summary.type)) {
+    // Route to events table — memdir-incompatible types live here.
+    // Body prefers lesson_learned (actionable) over narrative (descriptive).
+    return saveEvent(db, {
+      project: ctx.project,
+      event_type: summary.type,
+      title: summary.title,
+      body: summary.lesson_learned || summary.narrative || null,
+      file_paths: (Array.isArray(summary.files_modified) && summary.files_modified.length > 0)
+        ? summary.files_modified
+        : null,
+      importance: summary.importance ?? 1,
+      created_at_epoch: Date.now(),
+    });
+  }
+
+  // Fallthrough: memdir-compatible / legacy types use the observations path.
+  // Map the Haiku/plan field names to saveObservation's expected shape.
+  return saveObservation({
+    type: summary.type,
+    title: summary.title,
+    subtitle: summary.subtitle || '',
+    narrative: summary.narrative || '',
+    concepts: summary.concepts || [],
+    facts: summary.facts || [],
+    files: summary.files_modified || [],
+    filesRead: summary.files_read || [],
+    importance: summary.importance ?? 1,
+    lessonLearned: summary.lesson_learned || null,
+    searchAliases: summary.search_aliases || null,
+  }, ctx.project, ctx.session_id, db);
 }
 
 // ─── Related Observation Linking ─────────────────────────────────────────────

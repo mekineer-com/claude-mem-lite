@@ -23,7 +23,7 @@ vi.mock('../hook-shared.mjs', async () => {
   };
 });
 
-import { saveObservation, handleLLMEpisode, handleLLMSummary, buildDegradedTitle } from '../hook-llm.mjs';
+import { saveObservation, handleLLMEpisode, handleLLMSummary, buildDegradedTitle, persistHaikuSummary } from '../hook-llm.mjs';
 import { openDb, callLLM } from '../hook-shared.mjs';
 import { acquireLLMSlot } from '../hook-semaphore.mjs';
 
@@ -842,6 +842,93 @@ describe('lesson_learned and search_aliases extraction', () => {
 
     process.argv[3] = origArgv3;
     db._realClose();
+  });
+});
+
+// ─── buildDegradedTitle ─────────────────────────────────────────────────────
+
+// ─── persistHaikuSummary (T9 routing) ───────────────────────────────────────
+// T9: routes event-typed summaries to the `events` table, keeps non-event
+// types on the legacy observations path so memdir semantics stay intact.
+
+describe('persistHaikuSummary (T9 routing)', () => {
+  let db;
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'mem' });
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it('bugfix-type summary writes to events, not observations', () => {
+    persistHaikuSummary(db, {
+      type: 'bugfix',
+      title: 'fixed null deref in foo',
+      lesson_learned: 'always nullcheck bar() before deref',
+      importance: 2,
+      files_modified: ['foo.mjs'],
+    }, { project: 'mem', session_id: 'sess-1' });
+
+    expect(db.prepare(`SELECT COUNT(*) c FROM events WHERE event_type='bugfix'`).get().c).toBe(1);
+    expect(db.prepare(`SELECT COUNT(*) c FROM observations WHERE type='bugfix'`).get().c).toBe(0);
+
+    const ev = db.prepare(`SELECT * FROM events WHERE event_type='bugfix'`).get();
+    expect(ev.title).toBe('fixed null deref in foo');
+    expect(ev.body).toBe('always nullcheck bar() before deref');
+    expect(JSON.parse(ev.file_paths)).toEqual(['foo.mjs']);
+    expect(ev.importance).toBe(2);
+  });
+
+  it('change-type summary still writes to observations (legacy path)', () => {
+    // `change` is not in EVENT_TYPES and is the actual non-event type Haiku
+    // emits for routine file edits — it must stay on the legacy observations
+    // path so existing consumers (session-summary, compression, FTS5) keep working.
+    persistHaikuSummary(db, {
+      type: 'change',
+      title: 'refactored config loading',
+      narrative: 'moved env parsing into loader',
+      importance: 1,
+      files_modified: ['config.mjs'],
+    }, { project: 'mem', session_id: 'sess-1' });
+
+    expect(db.prepare(`SELECT COUNT(*) c FROM observations WHERE type='change'`).get().c).toBe(1);
+    expect(db.prepare(`SELECT COUNT(*) c FROM events`).get().c).toBe(0);
+  });
+
+  it('discovery / decision / observation / refactor / feature / lesson / bug all route to events', () => {
+    const eventTypes = ['discovery', 'decision', 'observation', 'refactor', 'feature', 'lesson', 'bug'];
+    for (const type of eventTypes) {
+      persistHaikuSummary(db, {
+        type, title: `a ${type}`, importance: 1, files_modified: [],
+      }, { project: 'mem', session_id: 'sess-1' });
+    }
+    expect(db.prepare(`SELECT COUNT(*) c FROM events`).get().c).toBe(eventTypes.length);
+    expect(db.prepare(`SELECT COUNT(*) c FROM observations`).get().c).toBe(0);
+  });
+
+  it('falls back to narrative for event body when lesson_learned absent', () => {
+    persistHaikuSummary(db, {
+      type: 'discovery',
+      title: 'noticed cache invalidation gap',
+      narrative: 'cache misses after rotation',
+      importance: 2,
+      files_modified: [],
+    }, { project: 'mem', session_id: 'sess-1' });
+
+    const ev = db.prepare(`SELECT * FROM events WHERE event_type='discovery'`).get();
+    expect(ev.body).toBe('cache misses after rotation');
+  });
+
+  it('leaves file_paths NULL when files_modified is empty or missing', () => {
+    persistHaikuSummary(db, {
+      type: 'decision', title: 'picked vitest over jest', importance: 2,
+    }, { project: 'mem', session_id: 'sess-1' });
+
+    const ev = db.prepare(`SELECT file_paths FROM events WHERE event_type='decision'`).get();
+    expect(ev.file_paths).toBeNull();
   });
 });
 
