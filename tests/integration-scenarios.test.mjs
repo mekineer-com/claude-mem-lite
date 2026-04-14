@@ -388,10 +388,13 @@ describe('Scenario 3: File Edit Pre-Recall — PreToolUse', () => {
     });
     const { stdout, exitCode } = runScript(PRE_RECALL_PATH, { stdin: payload });
     expect(exitCode).toBe(0);
+    // v2.31 T2: output is JSON with hookSpecificOutput.additionalContext carrying the text.
     // Should surface the FTS5 lesson for hook-llm.mjs
     if (stdout.trim()) {
-      expect(stdout).toContain('[mem] Lessons for');
-      expect(stdout).toMatch(/FTS5|column|mismatch|degraded/i);
+      const parsed = JSON.parse(stdout);
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for');
+      expect(ctx).toMatch(/FTS5|column|mismatch|degraded/i);
     }
     // Note: may be empty if cooldown is active — that's also valid behavior
   });
@@ -404,9 +407,12 @@ describe('Scenario 3: File Edit Pre-Recall — PreToolUse', () => {
     const { stdout, exitCode } = runScript(PRE_RECALL_PATH, { stdin: payload });
     expect(exitCode).toBe(0);
     // R-4: previously silent; now emits a one-line reminder so Claude knows the hook ran
-    // and gets nudged to mem_save a lesson after solving a non-obvious bug.
-    expect(stdout).toContain('[mem] No prior lessons for brand-new-file.js');
-    expect(stdout).toContain('claude-mem-lite save');
+    // and gets nudged to save a lesson after solving a non-obvious bug.
+    // v2.31 T2: output is JSON; parse first. Reminder now points at /lesson (added in Task 8).
+    const parsed = JSON.parse(stdout);
+    const ctx = parsed.hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('[mem] No prior lessons for brand-new-file.js');
+    expect(ctx).toContain('/lesson');
   });
 
   it('recallForFile finds observations by filename match', () => {

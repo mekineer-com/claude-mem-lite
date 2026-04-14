@@ -114,28 +114,40 @@ try {
       LIMIT 2
     `).all(project, cutoff, filePath, likePattern);
 
+    // v2.31 T2: emit JSON with hookSpecificOutput.additionalContext so the message
+    // reliably renders across CC variants (sdscc drops plain-text stdout from PreToolUse).
+    // suppressOutput:true hides it from transcript mode per CC hook docs.
+    const lines = [];
     if (rows.length > 0) {
-      console.log(`[mem] Lessons for ${fname}:`);
+      lines.push(`[mem] Lessons for ${fname}:`);
       for (const r of rows) {
         if (r.lesson_learned) {
           const lesson = r.lesson_learned.length > 120
             ? r.lesson_learned.slice(0, 117) + '...'
             : r.lesson_learned;
-          console.log(`  #${r.id} [${r.type}] ${lesson}`);
+          lines.push(`  #${r.id} [${r.type}] ${lesson}`);
         } else {
           const title = (r.title || '').length > 120
             ? r.title.slice(0, 117) + '...'
             : (r.title || '');
-          console.log(`  #${r.id} [${r.type}] ${title}`);
+          lines.push(`  #${r.id} [${r.type}] ${title}`);
         }
       }
     } else {
       // R-4: emit a short backfill reminder instead of staying silent.
       // Two goals: (1) Claude sees that the system actually ran, (2) Claude is
-      // nudged to mem_save a lesson when solving a non-obvious bug. The reminder
+      // nudged to save a lesson when solving a non-obvious bug. The reminder
       // is one line to minimize per-Edit context cost.
-      console.log(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: claude-mem-lite save --type bugfix --lesson "<one-line root cause + fix>"`);
+      lines.push(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: /lesson --file ${fname} "<root cause + fix>"`);
     }
+
+    process.stdout.write(JSON.stringify({
+      suppressOutput: true,
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext: lines.join('\n'),
+      },
+    }));
     // Cooldown applies to BOTH branches so the reminder doesn't spam every Edit.
     cooldown[filePath] = now;
     writeCooldown(cooldown);
