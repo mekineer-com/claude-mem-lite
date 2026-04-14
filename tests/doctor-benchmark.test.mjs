@@ -15,12 +15,18 @@ describe('doctor --benchmark', () => {
 
   test('reports hook injection rate across prompt fixture', () => {
     insertSession(db, { id: 'sess-bench', project: 'test' });
+    // Seed with literal tokens matching the prompt fixture below.
+    // sanitizeFtsQuery rewrites 'what did we decide about auth' to
+    // 'decide AND (auth OR ...)' — the default FTS5 tokenizer does NOT stem,
+    // so fixture text must contain the bare tokens 'decide' and 'auth' (not
+    // 'decided' / 'decision'). Likewise 'refactor the logger' needs 'refactor'
+    // and 'logger' as bare tokens.
     for (let i = 0; i < 20; i++) {
       insertObs(db, {
         sessionId: 'sess-bench',
         type: 'decision',
-        title: `decision ${i}`,
-        text: 'we decided to use auth tokens and a refactored logger module',
+        title: `decide on auth policy ${i}`,
+        text: 'we decide to use auth tokens and refactor the logger module',
         importance: 3,
         project: 'test',
       });
@@ -35,6 +41,11 @@ describe('doctor --benchmark', () => {
     expect(result.prompt_count).toBe(4);
     expect(result.injection_rate).toBeGreaterThanOrEqual(0);
     expect(result.injection_rate).toBeLessThanOrEqual(1);
+    // Behavioral check: "what did we decide about auth" must match the seeded
+    // 'decision N' rows via FTS, so at least one prompt injects. Catches
+    // silent-false regressions (sanitize eating the query, FTS index missing,
+    // project filter broken, etc.).
+    expect(result.injection_rate).toBeGreaterThan(0);
   });
 
   test('JSON output shape is stable', () => {
