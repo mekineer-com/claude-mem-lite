@@ -4,8 +4,15 @@
 // so they don't pollute the L1 system-prompt memory section.
 
 import { describe, test, expect } from 'vitest';
+import { execFileSync } from 'child_process';
+import { mkdirSync, rmSync } from 'fs';
+import { join, resolve } from 'path';
+import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
+import Database from 'better-sqlite3';
 import { createTestDb } from './test-helpers.mjs';
-import { saveEvent, searchEvents, recentEvents, getEvent } from '../lib/activity.mjs';
+import { initSchema } from '../schema.mjs';
+import { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES } from '../lib/activity.mjs';
 
 describe('activity store', () => {
   test('saveEvent returns id and persists', () => {
@@ -68,5 +75,120 @@ describe('activity store', () => {
     db.prepare(`UPDATE events SET superseded_at_epoch = ? WHERE id = ?`).run(Date.now(), id);
     const hits = searchEvents(db, 'old', { project: 'mem' });
     expect(hits).toHaveLength(0);
+  });
+});
+
+describe('EVENT_TYPES export', () => {
+  test('is a frozen 8-member list matching the CHECK constraint', () => {
+    expect(Array.isArray(EVENT_TYPES)).toBe(true);
+    expect(EVENT_TYPES).toHaveLength(8);
+    expect(EVENT_TYPES).toEqual([
+      'bugfix',
+      'lesson',
+      'bug',
+      'discovery',
+      'refactor',
+      'feature',
+      'observation',
+      'decision',
+    ]);
+    // Frozen: mutation attempts throw in strict mode (ESM is strict-by-default).
+    expect(() => EVENT_TYPES.push('xxx')).toThrow();
+    expect(Object.isFrozen(EVENT_TYPES)).toBe(true);
+  });
+});
+
+// ─── CLI subprocess tests for cmdActivity (T7 follow-ups) ────────────────────
+
+describe('cmdActivity CLI: --type validation', () => {
+  const CLI_PATH = resolve('cli.mjs');
+  let tmpHome;
+  let dataDir;
+  let projectDir;
+
+  function runCli(args) {
+    const env = {
+      ...process.env,
+      CLAUDE_MEM_DIR: dataDir,
+      CLAUDE_PROJECT_DIR: projectDir,
+    };
+    delete env.CLAUDE_MEM_HOOK_RUNNING;
+    try {
+      const stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
+        timeout: 10000,
+        encoding: 'utf8',
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      return { stdout, stderr: '', exitCode: 0 };
+    } catch (e) {
+      return {
+        stdout: e.stdout?.toString() || '',
+        stderr: e.stderr?.toString() || '',
+        exitCode: e.status ?? 1,
+      };
+    }
+  }
+
+  function setupDir() {
+    tmpHome = join(tmpdir(), `mem-activity-cli-${randomUUID().slice(0, 8)}`);
+    dataDir = join(tmpHome, '.claude-mem-lite');
+    projectDir = join(tmpHome, 'parent', 'testproj');
+    mkdirSync(projectDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const dbPath = join(dataDir, 'claude-mem-lite.db');
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+    db.close();
+  }
+
+  function teardownDir() {
+    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  test('activity save --type bogus rejects with non-zero exit', () => {
+    setupDir();
+    try {
+      const { stderr, exitCode } = runCli(['activity', 'save', '--type', 'bogus', 'should fail']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('invalid --type');
+      expect(stderr).toContain('bogus');
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity save --type lesson --files a,b stores array and round-trips via show', () => {
+    setupDir();
+    try {
+      const save = runCli(['activity', 'save', '--type', 'lesson', 'ci unit test title', '--files', 'a.mjs,b.mjs', '--importance', '2']);
+      expect(save.exitCode).toBe(0);
+      const parsed = JSON.parse(save.stdout.trim());
+      expect(parsed.ok).toBe(true);
+      expect(typeof parsed.id).toBe('number');
+
+      const show = runCli(['activity', 'show', String(parsed.id)]);
+      expect(show.exitCode).toBe(0);
+      const row = JSON.parse(show.stdout.trim());
+      // file_paths column stores the JSON array as a string
+      expect(JSON.parse(row.file_paths)).toEqual(['a.mjs', 'b.mjs']);
+      expect(row.event_type).toBe('lesson');
+      expect(row.importance).toBe(2);
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity search --type bogus rejects before DB access', () => {
+    setupDir();
+    try {
+      const { stderr, exitCode } = runCli(['activity', 'search', 'anything', '--type', 'nonsense']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('invalid --type');
+    } finally {
+      teardownDir();
+    }
   });
 });

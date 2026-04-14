@@ -2048,6 +2048,16 @@ Commands:
     remove              Remove resource --name N --resource-type T
     reindex             Rebuild FTS5 index
 
+  activity <action>     Non-memdir event log (v2.31) — bugfix/lesson/bug/discovery/etc.
+    save --type T "<title>" [--body "<text>"] [--files f1,f2] [--file path] [--importance 1-3] [--project P]
+    search "<query>"    Search events [--type T] [--limit N] [--project P]
+    recent [N]          Most recent events [--type T] [--project P]
+    show <id>           Show full event row by id
+
+    Valid types: bugfix, lesson, bug, discovery, refactor, feature, observation, decision
+    --files (plural, comma-split) preferred; --file (singular) kept for back-compat.
+    Use /lesson or /bug slash commands for faster capture (T8).
+
 DB: ${DB_PATH}`);
 }
 
@@ -2222,18 +2232,30 @@ async function cmdActivity(db, args) {
   }
 
   const { positional, flags } = parseArgs(args.slice(1));
-  const { saveEvent, searchEvents, recentEvents, getEvent } = await import('./lib/activity.mjs');
-  const project = inferProject();
+  const { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES } = await import('./lib/activity.mjs');
+  const VALID_EVENT_TYPES = new Set(EVENT_TYPES);
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   if (sub === 'save') {
     const type = flags.type || 'observation';
+    if (!VALID_EVENT_TYPES.has(type)) {
+      fail(`[mem] activity save: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
+      return;
+    }
     const title = flags.title || positional.join(' ').trim();
     if (!title) {
       fail('[mem] activity save: --title or positional text required');
       return;
     }
     const body = flags.body || null;
-    const file = flags.file || null;
+    // Accept both --file (singular, backward compat) and --files (plural,
+    // comma-split, preferred — matches cmdSave). Merge both sources.
+    const filesFromPlural = flags.files && typeof flags.files === 'string'
+      ? flags.files.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    const filesFromSingular = flags.file && typeof flags.file === 'string' ? [flags.file] : [];
+    const file_paths_merged = [...filesFromSingular, ...filesFromPlural];
+    const file_paths = file_paths_merged.length > 0 ? file_paths_merged : null;
     const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
     if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
       fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
@@ -2245,7 +2267,7 @@ async function cmdActivity(db, args) {
       title,
       body,
       importance: rawImp,
-      file_paths: file ? [file] : null,
+      file_paths,
     });
     out(JSON.stringify({ ok: true, id }));
     return;
@@ -2258,6 +2280,10 @@ async function cmdActivity(db, args) {
       return;
     }
     const type = flags.type || null;
+    if (type !== null && !VALID_EVENT_TYPES.has(type)) {
+      fail(`[mem] activity search: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
+      return;
+    }
     const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : 10;
     const rows = searchEvents(db, q, { project, type, limit });
     out(formatActivityResults(rows));
@@ -2270,6 +2296,10 @@ async function cmdActivity(db, args) {
     const flagLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
     const limit = Number.isFinite(posLimit) ? posLimit : (Number.isFinite(flagLimit) ? flagLimit : 20);
     const type = flags.type || null;
+    if (type !== null && !VALID_EVENT_TYPES.has(type)) {
+      fail(`[mem] activity recent: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
+      return;
+    }
     const rows = recentEvents(db, { project, type, limit });
     out(formatActivityResults(rows));
     return;
