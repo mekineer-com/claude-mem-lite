@@ -1,8 +1,10 @@
 // Tests for cross-session handoff: schema, utils, extraction, intent detection, injection
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
 import { extractMatchKeywords, tokenizeHandoff, isSpecificTerm } from '../utils.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from '../hook-handoff.mjs';
+import * as gitStateModule from '../lib/git-state.mjs';
+import * as taskReaderModule from '../lib/task-reader.mjs';
 
 function seedSession(db, sessionId, project) {
   db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status) VALUES (?, ?, ?, datetime('now'), ?, 'active')`).run(sessionId, sessionId, project, Date.now());
@@ -667,5 +669,178 @@ describe('renderHandoffInjection', () => {
       expect(renderHandoffInjection(db, 'p')).toContain('legacy behavior');
       expect(renderHandoffInjection(db, 'p', null)).toContain('legacy behavior');
     });
+  });
+});
+
+// ─── T10d: TaskList-sourced Unfinished + git-commit anchoring ─────────────
+
+describe('T10d: TaskList-sourced Unfinished in buildAndSaveHandoff', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
+  afterEach(() => { db.close(); vi.restoreAllMocks(); });
+
+  it('uses TaskList entries when no episode snapshot and no pending work', () => {
+    seedSession(db, 's1', 'mem');
+    seedPrompt(db, 's1', 'do the thing', 1);
+
+    vi.spyOn(taskReaderModule, 'readProjectTasks').mockReturnValue([
+      { id: 't1', title: 'Implement Task 1', status: 'in_progress', taskListId: 'L', mtime: 0 },
+      { id: 't2', title: 'Implement Task 2', status: 'pending', taskListId: 'L', mtime: 0 },
+    ]);
+
+    buildAndSaveHandoff(db, 's1', 'mem', 'exit', null);
+
+    const row = db.prepare(`SELECT unfinished FROM session_handoffs WHERE project='mem' AND type='exit'`).get();
+    // TaskList entries land in the pending portion (before the \n---\n narrative sep)
+    const pending = row.unfinished.split('\n---\n')[0];
+    expect(pending).toMatch(/Implement Task 1/);
+    expect(pending).toMatch(/Implement Task 2/);
+    expect(pending).toMatch(/\[in_progress\]/);
+    expect(pending).toMatch(/\[pending\]/);
+  });
+
+  it('episode pending entries take precedence over TaskList signal', () => {
+    seedSession(db, 's1', 'mem');
+    seedPrompt(db, 's1', 'fix dispatch', 1);
+
+    const taskSpy = vi.spyOn(taskReaderModule, 'readProjectTasks').mockReturnValue([
+      { id: 't1', title: 'Task file entry', status: 'pending', taskListId: 'L', mtime: 0 },
+    ]);
+
+    buildAndSaveHandoff(db, 's1', 'mem', 'exit', {
+      entries: [{ desc: 'Edit hook.mjs: add dispatch logic', isSignificant: true, isError: false }],
+      files: [],
+    });
+
+    const row = db.prepare(`SELECT unfinished FROM session_handoffs WHERE project='mem' AND type='exit'`).get();
+    const pending = row.unfinished.split('\n---\n')[0];
+    expect(pending).toMatch(/add dispatch logic/);
+    expect(pending).not.toMatch(/Task file entry/);
+    // The task reader should not have been consulted when the episode had pending entries
+    expect(taskSpy).not.toHaveBeenCalled();
+  });
+
+  it('empty TaskList does not clobber the narrative-only fallback', () => {
+    seedSession(db, 's1', 'mem');
+    seedPrompt(db, 's1', 'code review', 1);
+    seedObservation(db, 's1', 'mem', 'Modified hook.mjs', 'change', 1, null, 'hook.mjs: add dashboard');
+
+    vi.spyOn(taskReaderModule, 'readProjectTasks').mockReturnValue([]);
+
+    buildAndSaveHandoff(db, 's1', 'mem', 'exit', null);
+
+    const row = db.prepare(`SELECT unfinished FROM session_handoffs WHERE project='mem' AND type='exit'`).get();
+    // Pending portion is empty (no episode, no tasks); narrative history remains
+    expect(row.unfinished).toContain('add dashboard');
+  });
+});
+
+describe('T10d: git_sha_at_handoff capture in buildAndSaveHandoff', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
+  afterEach(() => { db.close(); vi.restoreAllMocks(); });
+
+  it('stores current HEAD sha in git_sha_at_handoff column', () => {
+    seedSession(db, 's1', 'mem');
+    seedPrompt(db, 's1', 'work on refactor', 1);
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'deadbeef1234',
+    });
+
+    buildAndSaveHandoff(db, 's1', 'mem', 'exit', null);
+
+    const row = db.prepare(`SELECT git_sha_at_handoff FROM session_handoffs WHERE project='mem' AND type='exit'`).get();
+    expect(row.git_sha_at_handoff).toBe('deadbeef1234');
+  });
+
+  it('stores NULL git_sha_at_handoff on non-git cwd', () => {
+    seedSession(db, 's1', 'mem');
+    seedPrompt(db, 's1', 'work anywhere', 1);
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: null, headSha: null,
+    });
+
+    buildAndSaveHandoff(db, 's1', 'mem', 'exit', null);
+
+    const row = db.prepare(`SELECT git_sha_at_handoff FROM session_handoffs WHERE project='mem' AND type='exit'`).get();
+    expect(row.git_sha_at_handoff).toBeNull();
+  });
+});
+
+describe('T10d: git-commit anchor in detectContinuationIntent', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); vi.restoreAllMocks(); });
+
+  it('returns true when current HEAD matches a stored git_sha_at_handoff', () => {
+    // Insert an old exit handoff (24h ago) with a known sha.
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch, match_keywords, git_sha_at_handoff)
+                VALUES (?, 'exit', ?, ?, ?, ?, ?)`)
+      .run('mem', 'sX', 'refactor auth', Date.now() - 24 * 3600000, 'auth refactor', 'abc123');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'abc123',
+    });
+
+    // Prompt alone would NOT match (no overlap, long, no keyword) — anchor decides.
+    const result = detectContinuationIntent(db, 'what time is it in Tokyo', 'mem', 'sX');
+    expect(result).toBe(true);
+  });
+
+  it('returns true even with a tiny prompt when sha matches (anchor beats tiny-prompt guard)', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch, git_sha_at_handoff)
+                VALUES (?, 'exit', ?, ?, ?)`)
+      .run('mem', 'sX', Date.now(), 'abc123');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'abc123',
+    });
+
+    // Actually tiny-prompt guard runs FIRST — verify it still rejects < 2 chars.
+    expect(detectContinuationIntent(db, 'a', 'mem')).toBe(false);
+    // Longer prompt, but would fail Stage 0/1/2 on its own — anchor rescues it.
+    expect(detectContinuationIntent(db, 'hi there', 'mem')).toBe(true);
+  });
+
+  it('does NOT match when HEAD sha differs from stored git_sha_at_handoff', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch, match_keywords, git_sha_at_handoff)
+                VALUES (?, 'exit', ?, ?, ?, ?, ?)`)
+      .run('mem', 'sX', 'refactor auth', Date.now() - 24 * 3600000, 'auth refactor', 'abc123');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'ffff9999', // different sha
+    });
+
+    // Long unrelated prompt — no anchor, no Stage 0, no keyword, no FTS overlap
+    const result = detectContinuationIntent(db, 'what time is it in Tokyo please tell me now', 'mem', 'sX');
+    expect(result).toBe(false);
+  });
+
+  it('does NOT match when git_sha_at_handoff is NULL', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch, match_keywords, git_sha_at_handoff)
+                VALUES (?, 'exit', ?, ?, ?, ?, NULL)`)
+      .run('mem', 'sX', 'refactor auth', Date.now() - 24 * 3600000, 'auth refactor');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: '',  // empty/null
+    });
+
+    const result = detectContinuationIntent(db, 'what time is it in Tokyo please tell me now', 'mem', 'sX');
+    expect(result).toBe(false);
+  });
+
+  it('anchor is project-scoped: handoff from other project with same sha does NOT match', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch, git_sha_at_handoff)
+                VALUES (?, 'exit', ?, ?, ?)`)
+      .run('other-proj', 'sX', Date.now(), 'abc123');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'abc123',
+    });
+
+    const result = detectContinuationIntent(db, 'what time is it in Tokyo please tell me now', 'mem');
+    expect(result).toBe(false);
   });
 });

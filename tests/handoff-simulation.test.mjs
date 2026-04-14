@@ -1,10 +1,26 @@
 // Handoff simulation tests — validates /clear and /exit from user's perspective
 // Each test simulates a realistic user workflow and verifies the handoff output
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from '../hook-handoff.mjs';
 import { buildSummaryLines } from '../hook-context.mjs';
 import { truncate } from '../utils.mjs';
+import * as gitStateModule from '../lib/git-state.mjs';
+import * as taskReaderModule from '../lib/task-reader.mjs';
+
+// T10d: These simulation tests assert realistic handoff/continuation semantics.
+// With T10d's git-commit anchor + TaskList-sourced Unfinished enabled, running
+// them inside this real git repo would (a) fire the anchor on every expired-
+// handoff test and (b) leak the repo's own pending tasks into Unfinished.
+// Stub both readers to neutral values for the entire file — individual tests
+// can still re-spy if they want to assert anchor/TaskList behavior.
+beforeEach(() => {
+  vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+    changed: [], stashes: [], branch: null, headSha: null,
+  });
+  vi.spyOn(taskReaderModule, 'readProjectTasks').mockReturnValue([]);
+});
+afterEach(() => { vi.restoreAllMocks(); });
 
 function seedSession(db, id, project) {
   db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)

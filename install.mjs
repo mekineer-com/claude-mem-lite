@@ -211,6 +211,17 @@ async function install() {
     'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
     'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
     'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
+    // v2.31 T9: hook-llm now statically imports lib/activity.mjs (events routing).
+    // SOURCE_FILES entries with a subdir prefix require install.mjs to mkdir the
+    // parent before symlink/copy — handled in the IS_DEV and else-branch loops.
+    'lib/activity.mjs',
+    // v2.31 T10: startup dashboard aggregator + handoff task/git anchoring.
+    // task-reader + plan-reader + git-state are read by lib/startup-dashboard.mjs
+    // on SessionStart (hook.mjs) and by hook-handoff.mjs on /exit + /clear.
+    'lib/task-reader.mjs',
+    'lib/plan-reader.mjs',
+    'lib/git-state.mjs',
+    'lib/startup-dashboard.mjs',
   ];
 
   if (IS_DEV) {
@@ -220,6 +231,9 @@ async function install() {
       const target = join(PROJECT_DIR, f);
       const link = join(DATA_DIR, f);
       if (existsSync(target)) {
+        // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
+        const linkParent = dirname(link);
+        if (!existsSync(linkParent)) mkdirSync(linkParent, { recursive: true });
         // Remove existing file/symlink before creating
         if (existsSync(link)) try { unlinkSync(link); } catch {}
         symlinkSync(target, link);
@@ -252,7 +266,13 @@ async function install() {
     if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
     for (const f of SOURCE_FILES) {
       const src = join(PROJECT_DIR, f);
-      if (existsSync(src)) copyFileSync(src, join(DATA_DIR, f));
+      const dst = join(DATA_DIR, f);
+      if (existsSync(src)) {
+        // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
+        const dstParent = dirname(dst);
+        if (!existsSync(dstParent)) mkdirSync(dstParent, { recursive: true });
+        copyFileSync(src, dst);
+      }
     }
     // Copy scripts
     const postToolSrc = join(PROJECT_DIR, 'scripts', 'post-tool-use.sh');

@@ -1,0 +1,57 @@
+---
+name: bug
+description: "Use when: logging a known bug + repro steps you can't fix right now. Writes to the mem events table (NOT memdir). Skip for bugs you're actively fixing in the current turn — just fix them."
+---
+
+# /bug
+
+Record a known bug + reproduction steps. Writes to the mem `events` table
+with `event_type='bug'`. Does NOT touch memdir. Useful for bugs you can't
+fix immediately but want future sessions (or yourself after `/clear`) to
+know about and avoid re-investigating.
+
+## When to use
+
+- Bug is known but fix is blocked (waiting on upstream, needs discussion).
+- Bug is intermittent / race condition; you want a repro recipe recorded.
+- Edge case affecting only part of users; not priority now but must not
+  be silently re-discovered.
+
+Don't use for bugs you're actively fixing in the current turn — just fix
+them. Use `/lesson` afterward if there's a non-obvious root cause worth
+recording.
+
+## Arguments
+
+- Positional text: short bug description.
+- `--file <path>` or `--files f1,f2,...`: affected files. Triggers
+  pre-tool-recall warning when these files are edited later.
+- `--repro "step1; step2; step3"`: reproduction steps, semicolon-separated.
+- `--severity low|med|high`: maps to importance `1|2|3`. Default `med`.
+
+## Execution
+
+Map severity to importance:
+
+- `low` → importance 1
+- `med` → importance 2 (default)
+- `high` → importance 3
+
+Build the body as `<description>\n\nRepro:\n<repro-steps>` (or just
+`<description>` if `--repro` is absent).
+
+Run via Bash:
+
+    claude-mem-lite activity save \
+      --type bug \
+      --title "<first 60 chars of description>" \
+      --body "<body>" \
+      [--file <path> | --files f1,f2,...] \
+      --importance <1|2|3>
+
+Confirm to user with: `Bug logged: activity #<id>`.
+
+## Examples
+
+- `/bug intermittent test flake when DB is under load --repro "run pnpm test -- --retry=0; fails ~1 in 20 runs when CPU is busy"`.
+- `/bug --file src/auth.mjs --severity high "session refresh drops the X-Forwarded-For header"` — no repro steps, just a high-severity note.

@@ -15,6 +15,11 @@ import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
   sessionFile, getSessionId, openDb, callLLM, sleep,
 } from './hook-shared.mjs';
+import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
+
+// T9: memdir-incompatible types live in the `events` table, not `observations`.
+// Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
+const EVENT_TYPE_SET = new Set(EVENT_TYPES);
 
 // ─── Save Observation to DB ─────────────────────────────────────────────────
 
@@ -170,6 +175,96 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
   } finally {
     if (!externalDb) db.close();
   }
+}
+
+// ─── obs → summary shape mapping ────────────────────────────────────────────
+// handleLLMEpisode's internal `obs` uses camelCase/legacy names (lessonLearned,
+// files, filesRead). persistHaikuSummary takes the plan's stable snake_case
+// shape. Keep the mapping here so the dispatcher's public signature stays
+// clean for external callers that already use the plan shape.
+function obsToSummary(obs) {
+  return {
+    type: obs.type,
+    title: obs.title,
+    subtitle: obs.subtitle,
+    narrative: obs.narrative,
+    concepts: obs.concepts,
+    facts: obs.facts,
+    files_modified: obs.files,
+    files_read: obs.filesRead,
+    importance: obs.importance,
+    lesson_learned: obs.lessonLearned,
+    search_aliases: obs.searchAliases,
+  };
+}
+
+// ─── T9: Haiku Summary Dispatcher (events vs observations routing) ──────────
+//
+// Routes memdir-incompatible types (the 8 values in EVENT_TYPES) to the
+// activity `events` table, and keeps legacy/memdir-aligned types (e.g.
+// `change`, which is the only non-event type hook-llm currently emits) on
+// the existing observations path.
+//
+// Input shape (matches the v2.31 MVP plan's stable interface):
+//   summary: { type, title, lesson_learned?, narrative?, importance?, files_modified? }
+//   ctx:     { project, session_id, preSavedObsId? }
+//
+// Returns { table: 'events'|'observations', id: number|null }. Callers inspect
+// `table` to decide whether follow-up observations-only logic (linking, vector
+// refresh) applies.
+//
+// NOTE: The foreground pre-save in hook.mjs:110/336 intentionally still writes
+// to `observations` for immediate visibility. When the background worker
+// processes the episode (handleLLMEpisode), it passes the pre-saved id in
+// `ctx.preSavedObsId`; this dispatcher then deletes the pre-saved observations
+// row and inserts a fresh event for event-typed summaries (upgrade-delete
+// semantics). Observations-typed summaries reuse the pre-saved row directly
+// (caller handles the UPDATE, since it needs the enriched FTS fields).
+export function persistHaikuSummary(db, summary, ctx) {
+  if (EVENT_TYPE_SET.has(summary.type)) {
+    // Upgrade-delete: the foreground pre-save landed in `observations` with a
+    // rule-inferred type; now that Haiku has classified it as an event type,
+    // we must remove the stale observations row before inserting the event.
+    // Atomic via better-sqlite3 transaction: either both succeed or neither.
+    const insertEvent = () => saveEvent(db, {
+      project: ctx.project,
+      event_type: summary.type,
+      title: summary.title,
+      body: summary.lesson_learned || summary.narrative || null,
+      file_paths: (Array.isArray(summary.files_modified) && summary.files_modified.length > 0)
+        ? summary.files_modified
+        : null,
+      importance: summary.importance ?? 1,
+      created_at_epoch: Date.now(),
+    });
+
+    if (ctx.preSavedObsId) {
+      const id = db.transaction(() => {
+        db.prepare(`DELETE FROM observations WHERE id = ?`).run(ctx.preSavedObsId);
+        return insertEvent();
+      })();
+      return { table: 'events', id };
+    }
+
+    return { table: 'events', id: insertEvent() };
+  }
+
+  // Fallthrough: memdir-compatible / legacy types use the observations path.
+  // Map the Haiku/plan field names to saveObservation's expected shape.
+  const id = saveObservation({
+    type: summary.type,
+    title: summary.title,
+    subtitle: summary.subtitle || '',
+    narrative: summary.narrative || '',
+    concepts: summary.concepts || [],
+    facts: summary.facts || [],
+    files: summary.files_modified || [],
+    filesRead: summary.files_read || [],
+    importance: summary.importance ?? 1,
+    lessonLearned: summary.lesson_learned || null,
+    searchAliases: summary.search_aliases || null,
+  }, ctx.project, ctx.session_id, db);
+  return { table: 'observations', id };
 }
 
 // ─── Related Observation Linking ─────────────────────────────────────────────
@@ -504,46 +599,72 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
 
   try {
     let savedId;
+    let savedTable;
 
     if (episode.savedId && obs) {
-      // Upgrade pre-saved observation with LLM-enriched data
-      const { conceptsText, factsText, textField } = buildFtsTextField(obs);
-      const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
-      db.prepare(`
-        UPDATE observations SET type=?, title=?, subtitle=?, narrative=?, concepts=?, facts=?,
-          text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?
-        WHERE id = ?
-      `).run(
-        obs.type, truncate(obs.title, 120), obs.subtitle || '',
-        truncate(obs.narrative || '', 500),
-        conceptsText, factsText, textField,
-        obs.importance,
-        JSON.stringify(obs.filesRead || []),
-        minhashSig,
-        obs.lessonLearned || null,
-        obs.searchAliases || null,
-        episode.savedId
-      );
-      savedId = episode.savedId;
-      debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+      if (EVENT_TYPE_SET.has(obs.type)) {
+        // Upgrade-delete: pre-saved observation's rule-inferred type was later
+        // classified by Haiku as an event type. Delete the stale observations
+        // row and insert into events instead. Dispatcher handles the atomic
+        // swap via transaction.
+        const result = persistHaikuSummary(db, obsToSummary(obs), {
+          project: episode.project,
+          session_id: episode.sessionId,
+          preSavedObsId: episode.savedId,
+        });
+        savedId = result.id;
+        savedTable = result.table;
+        debugLog('DEBUG', 'llm-episode', `upgrade-delete: obs #${episode.savedId} → event #${savedId}`);
+      } else {
+        // Non-event type (e.g. `change`) — upgrade pre-saved observations row in place
+        // so the enriched FTS text field + minhash + vector are refreshed atomically.
+        const { conceptsText, factsText, textField } = buildFtsTextField(obs);
+        const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
+        db.prepare(`
+          UPDATE observations SET type=?, title=?, subtitle=?, narrative=?, concepts=?, facts=?,
+            text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?
+          WHERE id = ?
+        `).run(
+          obs.type, truncate(obs.title, 120), obs.subtitle || '',
+          truncate(obs.narrative || '', 500),
+          conceptsText, factsText, textField,
+          obs.importance,
+          JSON.stringify(obs.filesRead || []),
+          minhashSig,
+          obs.lessonLearned || null,
+          obs.searchAliases || null,
+          episode.savedId
+        );
+        savedId = episode.savedId;
+        savedTable = 'observations';
+        debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
 
-      // Update TF-IDF vector with enriched content
-      try {
-        const vocab = getVocabulary(db);
-        if (vocab) {
-          const vecText = [obs.title || '', obs.narrative || '', conceptsText].filter(Boolean).join(' ');
-          const vec = computeVector(vecText, vocab);
-          if (vec) {
-            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-              .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+        // Update TF-IDF vector with enriched content
+        try {
+          const vocab = getVocabulary(db);
+          if (vocab) {
+            const vecText = [obs.title || '', obs.narrative || '', conceptsText].filter(Boolean).join(' ');
+            const vec = computeVector(vecText, vocab);
+            if (vec) {
+              db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+                .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+            }
           }
-        }
-      } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
+        } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
+      }
     } else {
-      savedId = saveObservation(obs, episode.project, episode.sessionId, db);
+      // Clean insert (no pre-save) — dispatcher routes by type.
+      const result = persistHaikuSummary(db, obsToSummary(obs), {
+        project: episode.project,
+        session_id: episode.sessionId,
+      });
+      savedId = result.id;
+      savedTable = result.table;
     }
 
-    if (savedId) {
+    // Related-observation linking only applies to rows in `observations` —
+    // the `events` table has its own lifecycle (supersede/accessed_count).
+    if (savedId && savedTable === 'observations') {
       try {
         linkRelatedObservations(db, savedId, obs, episode);
       } catch (e) { debugCatch(e, 'relatedObsLinking'); }

@@ -2048,6 +2048,16 @@ Commands:
     remove              Remove resource --name N --resource-type T
     reindex             Rebuild FTS5 index
 
+  activity <action>     Non-memdir event log (v2.31) — bugfix/lesson/bug/discovery/etc.
+    save --type T "<title>" [--body "<text>"] [--files f1,f2] [--file path] [--importance 1-3] [--project P]
+    search "<query>"    Search events [--type T] [--limit N] [--project P]
+    recent [N]          Most recent events [--type T] [--project P]
+    show <id>           Show full event row by id
+
+    Valid types: bugfix, lesson, bug, discovery, refactor, feature, observation, decision
+    --files (plural, comma-split) preferred; --file (singular) kept for back-compat.
+    Use /lesson or /bug slash commands for faster capture (T8).
+
 DB: ${DB_PATH}`);
 }
 
@@ -2193,6 +2203,122 @@ async function cmdOptimize(db, args) {
   if (results.smartCompress) out(`  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`);
 }
 
+async function cmdDoctor(db, args) {
+  if (args.includes('--benchmark')) {
+    const { runBenchmark } = await import('./lib/doctor-benchmark.mjs');
+    const project = inferProject();
+    const result = runBenchmark(db, { project });
+    out(JSON.stringify(result, null, 2));
+    return;
+  }
+  out('[mem] doctor: supported flags: --benchmark');
+  process.exitCode = 1;
+}
+
+// ─── Activity (T7 v2.31) ─────────────────────────────────────────────────────
+// Separate namespace from observations. Handlers are thin wrappers over
+// lib/activity.mjs pure functions; imported lazily to match the doctor pattern.
+
+function formatActivityResults(rows) {
+  if (!rows || rows.length === 0) return '(no events)';
+  return rows.map(r => `#${r.id} [${r.event_type}] ${r.title}`).join('\n');
+}
+
+async function cmdActivity(db, args) {
+  const sub = args[0];
+  if (!sub) {
+    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show> ...');
+    return;
+  }
+
+  const { positional, flags } = parseArgs(args.slice(1));
+  const { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES } = await import('./lib/activity.mjs');
+  const VALID_EVENT_TYPES = new Set(EVENT_TYPES);
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+
+  if (sub === 'save') {
+    const type = flags.type || 'observation';
+    if (!VALID_EVENT_TYPES.has(type)) {
+      fail(`[mem] activity save: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
+      return;
+    }
+    const title = flags.title || positional.join(' ').trim();
+    if (!title) {
+      fail('[mem] activity save: --title or positional text required');
+      return;
+    }
+    const body = flags.body || null;
+    // Accept both --file (singular, backward compat) and --files (plural,
+    // comma-split, preferred — matches cmdSave). Merge both sources.
+    const filesFromPlural = flags.files && typeof flags.files === 'string'
+      ? flags.files.split(',').map(s => s.trim()).filter(Boolean)
+      : [];
+    const filesFromSingular = flags.file && typeof flags.file === 'string' ? [flags.file] : [];
+    const file_paths_merged = [...filesFromSingular, ...filesFromPlural];
+    const file_paths = file_paths_merged.length > 0 ? file_paths_merged : null;
+    const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
+    if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
+      fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
+      return;
+    }
+    const id = saveEvent(db, {
+      project,
+      event_type: type,
+      title,
+      body,
+      importance: rawImp,
+      file_paths,
+    });
+    out(JSON.stringify({ ok: true, id }));
+    return;
+  }
+
+  if (sub === 'search') {
+    const q = positional.join(' ');
+    if (!q) {
+      fail('[mem] activity search: query required');
+      return;
+    }
+    const type = flags.type || null;
+    if (type !== null && !VALID_EVENT_TYPES.has(type)) {
+      fail(`[mem] activity search: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
+      return;
+    }
+    const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : 10;
+    const rows = searchEvents(db, q, { project, type, limit });
+    out(formatActivityResults(rows));
+    return;
+  }
+
+  if (sub === 'recent') {
+    // Accept either `activity recent 5` or `activity recent --limit 5`.
+    const posLimit = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
+    const flagLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
+    const limit = Number.isFinite(posLimit) ? posLimit : (Number.isFinite(flagLimit) ? flagLimit : 20);
+    const type = flags.type || null;
+    if (type !== null && !VALID_EVENT_TYPES.has(type)) {
+      fail(`[mem] activity recent: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
+      return;
+    }
+    const rows = recentEvents(db, { project, type, limit });
+    out(formatActivityResults(rows));
+    return;
+  }
+
+  if (sub === 'show') {
+    const id = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
+    if (!Number.isFinite(id)) {
+      fail('[mem] activity show: numeric id required');
+      return;
+    }
+    const row = getEvent(db, id);
+    out(row ? JSON.stringify(row, null, 2) : 'Not found');
+    return;
+  }
+
+  fail(`[mem] Unknown activity subcommand: ${sub}`);
+}
+
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {
@@ -2241,6 +2367,8 @@ export async function run(argv) {
       case 'registry':  cmdRegistry(db, cmdArgs); break;
       case 'import':    await cmdImport(cmdArgs); break;
       case 'enrich':    await cmdEnrich(cmdArgs); break;
+      case 'doctor':    await cmdDoctor(db, cmdArgs); break;
+      case 'activity':  await cmdActivity(db, cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');

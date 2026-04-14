@@ -4,10 +4,9 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, isPathConfined, notLowSignalTitleClause } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause } from '../utils.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import Database from 'better-sqlite3';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
 
@@ -16,6 +15,24 @@ import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_
 const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
 const MAX_RESULTS = 5;
 const LOOKBACK_MS = 60 * 86400000; // 60 days
+
+// T3 (v2.31): BM25 magnitude threshold. OBS_BM25 (in scoring-sql.mjs) returns the
+// raw bm25() value, which in SQLite FTS5 is always negative — lower = better match.
+// The `relevance` column multiplies that negative bm25 by positive decay / type /
+// importance weights, keeping the sign negative. "Stronger match" therefore means
+// larger magnitude, so we compare against `Math.abs(relevance)`.
+//
+// Empirically (see Task 3 probe in docs/plans/2026-04-14-mem-v2.31-mvp.md):
+//   - OR-fallback single-stem match: |rel| ~ 3e-6
+//   - Multi-term AND match w/ importance+type boost: |rel| ~ 2e-5 .. 5e-5
+// The plan's hinted default (3.5) was a guess that's six orders of magnitude too
+// high for this codebase's scoring expression. 1e-5 suppresses OR-fallback noise
+// while preserving real hits. Env-overridable for tuning without a redeploy.
+const BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN || 1e-5);
+// Raw-character minimum length for the prompt. Additional to the CJK-weighted
+// `shouldSkip()` effective-length gate; catches medium-short Latin prompts that
+// survive `shouldSkip` but carry too few tokens to justify an FTS lookup.
+const PROMPT_MIN_LENGTH = 15;
 
 // ─── DB Query Functions ─────────────────────────────────────────────────────
 
@@ -163,11 +180,14 @@ function formatResults(rows) {
   return lines.join('\n');
 }
 
-// ─── Registry Skill Auto-Load ──────────────────────────────────────────────
+// ─── Registry Skill Pointer (T4 v2.31) ─────────────────────────────────────
+// Formerly "auto-load": we used to read the full SKILL.md body (up to 16KB)
+// and inject it into stdout on keyword match. Now we only emit a short
+// pointer line so Claude can decide to invoke via SkillTool. The cooldown
+// and match mechanics below are unchanged.
 
 const SKILL_COOLDOWN_FILE = join(DB_DIR, 'runtime', `.skill-cooldown-${inferProject()}`);
 const SKILL_COOLDOWN_MS = 300_000; // 5 minutes
-const SKILL_TOKEN_LIMIT = 16000;   // ~4000 tokens
 
 function loadManagedSkillNames() {
   if (!existsSync(REGISTRY_DB_PATH)) return new Set();
@@ -182,48 +202,6 @@ function loadManagedSkillNames() {
       return new Set(rows.map(r => r.name.toLowerCase()));
     } finally { rdb.close(); }
   } catch { return new Set(); }
-}
-
-function toPortablePath(absPath) {
-  const home = homedir();
-  return absPath.startsWith(home) ? '~' + absPath.slice(home.length) : absPath;
-}
-
-function loadSkillContent(skillName) {
-  if (!existsSync(REGISTRY_DB_PATH)) return null;
-  try {
-    const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
-    rdb.pragma('busy_timeout = 500');
-    try {
-      const row = rdb.prepare(`
-        SELECT name, type, local_path FROM resources
-        WHERE status = 'active'
-          AND (name = ? OR invocation_name = ?)
-          AND local_path LIKE '%/.claude-mem-lite/managed/%'
-        LIMIT 1
-      `).get(skillName, skillName);
-
-      if (!row || !row.local_path) return null;
-
-      let path = row.local_path;
-      if (!path.endsWith('.md')) {
-        const candidate = join(path, 'SKILL.md');
-        if (existsSync(candidate)) path = candidate;
-      }
-      // Path confinement check — prevent LIKE bypass via '../' in local_path
-      const managedBase = join(homedir(), '.claude-mem-lite');
-      if (!isPathConfined(path, managedBase)) return null;
-      if (!existsSync(path)) return null;
-
-      const portablePath = toPortablePath(path);
-      const sourceLabel = row.type === 'agent' ? 'managed-agent' : 'managed-skill';
-      const content = readFileSync(path, 'utf8');
-      if (content.length > SKILL_TOKEN_LIMIT) {
-        return `<skill-auto-loaded name="${row.name}" source="${sourceLabel}" path="${portablePath}" truncated="true">\n${content.slice(0, 800)}\n...\n</skill-auto-loaded>\nSkill truncated. Full content: Read("${portablePath}") or mem_use(name="${row.name}")`;
-      }
-      return `<skill-auto-loaded name="${row.name}" source="${sourceLabel}" path="${portablePath}">\n${content}\n</skill-auto-loaded>\nFollow the instructions above. Reload: Read("${portablePath}")`;
-    } finally { rdb.close(); }
-  } catch { return null; }
 }
 
 function getSkillCooldown() {
@@ -270,6 +248,11 @@ async function main() {
   // Skip short/confirmation/slash-command/simple-op prompts
   if (shouldSkip(promptText)) return;
 
+  // T3 (v2.31): additional raw-length gate on top of shouldSkip's CJK-weighted
+  // effective-length check. Suppresses medium-short Latin prompts ("run tests",
+  // "fix bug now") that carry too few content tokens for a meaningful FTS lookup.
+  if (promptText.trim().length < PROMPT_MIN_LENGTH) return;
+
   let db;
   try {
     db = ensureDb();
@@ -292,6 +275,16 @@ async function main() {
         ftsRows = searchByFts(db, promptText, project, intent.limit || MAX_RESULTS, null);
       }
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
+
+      // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
+      // magnitude doesn't clear the floor. This targets OR-fallback leakage
+      // where a single-stem match surfaces tangential observations. Only FTS
+      // rows carry a `relevance` column; file-recall rows (searchByFile) have
+      // no relevance and are always kept — file-scoped recall is presumed
+      // intentional and has its own relevance signal (the file name match).
+      ftsRows = ftsRows.filter(r =>
+        typeof r.relevance === 'number' && Math.abs(r.relevance) >= BM25_MIN_SCORE
+      );
 
       // Merge: FTS results first, then file results, deduplicated
       const seen = new Set(ftsRows.map(r => r.id));
@@ -326,18 +319,21 @@ async function main() {
       } catch {}
     }
 
-    // ─── L1: Registry skill auto-load ───────────────────────────────────
+    // ─── L1: Registry skill pointer (T4 v2.31) ──────────────────────────
+    // Previously this block injected the full skill body (up to 16KB) on
+    // keyword match, silently inflating every matched prompt. We now emit a
+    // single pointer line so Claude can decide to invoke via SkillTool on
+    // demand — the cooldown and match preconditions stay identical.
     try {
       const skillNames = loadManagedSkillNames();
       const matched = matchRegistrySkillName(promptText, skillNames);
       if (matched) {
         const cooldown = getSkillCooldown();
         if (!cooldown[matched]) {
-          const skillContent = loadSkillContent(matched);
-          if (skillContent) {
-            process.stdout.write('\n' + skillContent + '\n');
-            setSkillCooldown(matched);
-          }
+          process.stdout.write(
+            `\n[mem] Skill "${matched}" may apply — invoke via SkillTool or run: claude-mem-lite registry show ${matched}\n`
+          );
+          setSkillCooldown(matched);
         }
       }
     } catch { /* silent — never block on registry failure */ }

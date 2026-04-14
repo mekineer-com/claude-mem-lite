@@ -114,28 +114,67 @@ try {
       LIMIT 2
     `).all(project, cutoff, filePath, likePattern);
 
-    if (rows.length > 0) {
-      console.log(`[mem] Lessons for ${fname}:`);
-      for (const r of rows) {
+    // T9: also query the `events` table — after T9, bugfix/lesson/decision/etc.
+    // route here instead of observations, so we must read both sources to keep
+    // surfacing past lessons. `file_paths` is a JSON array string; the LIKE
+    // patterns match both basename and full-path entries. JSON quoting
+    // (`"<name>"`) prevents partial-match false positives like "foo.mjs"
+    // matching "myfoo.mjs".
+    const fnameEscaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const filePathEscaped = filePath.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    let eventRows = [];
+    try {
+      eventRows = db.prepare(`
+        SELECT id, event_type AS type, title, body AS lesson_learned
+        FROM events
+        WHERE project = ?
+          AND importance >= 2
+          AND superseded_at_epoch IS NULL
+          AND created_at_epoch > ?
+          AND (file_paths LIKE ? ESCAPE '\\' OR file_paths LIKE ? ESCAPE '\\')
+        ORDER BY created_at_epoch DESC
+        LIMIT 2
+      `).all(project, cutoff, `%"${fnameEscaped}"%`, `%"${filePathEscaped}"%`);
+    } catch { /* events table may not exist on pre-v2.31 DBs — silent */ }
+
+    // Merge: observations first (they carry richer lesson_learned), then events,
+    // capped at 3 total so the injected context stays small per Edit/Write.
+    const allRows = [...rows, ...eventRows].slice(0, 3);
+
+    // v2.31 T2: emit JSON with hookSpecificOutput.additionalContext so the message
+    // reliably renders across CC variants (sdscc drops plain-text stdout from PreToolUse).
+    // suppressOutput:true hides it from transcript mode per CC hook docs.
+    const lines = [];
+    if (allRows.length > 0) {
+      lines.push(`[mem] Lessons for ${fname}:`);
+      for (const r of allRows) {
         if (r.lesson_learned) {
           const lesson = r.lesson_learned.length > 120
             ? r.lesson_learned.slice(0, 117) + '...'
             : r.lesson_learned;
-          console.log(`  #${r.id} [${r.type}] ${lesson}`);
+          lines.push(`  #${r.id} [${r.type}] ${lesson}`);
         } else {
           const title = (r.title || '').length > 120
             ? r.title.slice(0, 117) + '...'
             : (r.title || '');
-          console.log(`  #${r.id} [${r.type}] ${title}`);
+          lines.push(`  #${r.id} [${r.type}] ${title}`);
         }
       }
     } else {
       // R-4: emit a short backfill reminder instead of staying silent.
       // Two goals: (1) Claude sees that the system actually ran, (2) Claude is
-      // nudged to mem_save a lesson when solving a non-obvious bug. The reminder
+      // nudged to save a lesson when solving a non-obvious bug. The reminder
       // is one line to minimize per-Edit context cost.
-      console.log(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: claude-mem-lite save --type bugfix --lesson "<one-line root cause + fix>"`);
+      lines.push(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: /lesson --file ${fname} "<root cause + fix>"`);
     }
+
+    process.stdout.write(JSON.stringify({
+      suppressOutput: true,
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext: lines.join('\n'),
+      },
+    }));
     // Cooldown applies to BOTH branches so the reminder doesn't spam every Edit.
     cooldown[filePath] = now;
     writeCooldown(cooldown);

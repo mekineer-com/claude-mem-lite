@@ -10,7 +10,16 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema } from './tool-schemas.mjs';
+import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
+
+// Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
+// (discouragement-style, Task 5). This keeps server.mjs from drifting.
+const _toolDescByName = Object.fromEntries(TOOL_DEFS.map((t) => [t.name, t.description]));
+function descriptionOf(name) {
+  const d = _toolDescByName[name];
+  if (!d) throw new Error(`tool-schemas.mjs is missing description for "${name}"`);
+  return d;
+}
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
@@ -570,7 +579,7 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
 server.registerTool(
   'mem_search',
   {
-    description: 'Search project memory for past bugfixes, decisions, and discoveries. Use proactively when: encountering an error (search with obs_type="bugfix"), investigating a module before changes, or looking for prior art. Returns compact index (use mem_get for full details).',
+    description: descriptionOf('mem_search'),
     inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
@@ -706,7 +715,7 @@ server.registerTool(
 server.registerTool(
   'mem_recent',
   {
-    description: 'Show most recent observations. Use when: checking what happened recently in the project, reviewing progress after being away, or verifying that a recent change was captured.',
+    description: descriptionOf('mem_recent'),
     inputSchema: memRecentSchema,
   },
   safeHandler(async (args) => {
@@ -745,7 +754,7 @@ server.registerTool(
 server.registerTool(
   'mem_timeline',
   {
-    description: 'Browse observations as a timeline around an anchor point. Accepts anchor ID or a query string to auto-find the anchor via FTS. Use when: exploring what happened before/after a specific observation, understanding the sequence of changes that led to a bug, or reviewing a session chronologically. Example: mem_timeline(query="FTS5 search bug") or mem_timeline(anchor=42).',
+    description: descriptionOf('mem_timeline'),
     inputSchema: memTimelineSchema,
   },
   safeHandler(async (args) => {
@@ -848,7 +857,7 @@ server.registerTool(
 server.registerTool(
   'mem_get',
   {
-    description: 'Get full details for one or more records by ID. Use when: hook-injected context mentions a relevant observation ID, or after mem_search to drill into specific results for narrative, lesson_learned, and file details. For session results (S#15), pass source="session". For prompt results (P#22), pass source="prompt".',
+    description: descriptionOf('mem_get'),
     inputSchema: memGetSchema,
   },
   safeHandler(async (args) => {
@@ -907,7 +916,7 @@ server.registerTool(
 server.registerTool(
   'mem_delete',
   {
-    description: 'Delete observations by ID. Use when: cleaning up incorrect or duplicate observations, removing test data, or when the user asks to forget something. Use confirm=false to preview, confirm=true to execute.',
+    description: descriptionOf('mem_delete'),
     inputSchema: memDeleteSchema,
   },
   safeHandler(async (args) => {
@@ -971,7 +980,7 @@ server.registerTool(
 server.registerTool(
   'mem_save',
   {
-    description: 'Save a memory/observation with optional lesson_learned. Use after: solving a non-obvious bug (pass lesson_learned="root cause & fix"), making an architecture decision (pass lesson_learned="rationale"), or discovering something not obvious from code. Also when user asks to remember something.',
+    description: descriptionOf('mem_save'),
     inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
@@ -1056,7 +1065,7 @@ server.registerTool(
 server.registerTool(
   'mem_stats',
   {
-    description: 'Get memory statistics: counts, types, projects, daily activity, data health. Use when: assessing memory system health, checking how much project history exists, or diagnosing search quality issues.',
+    description: descriptionOf('mem_stats'),
     inputSchema: memStatsSchema,
   },
   safeHandler(async (args) => {
@@ -1166,7 +1175,7 @@ server.registerTool(
 server.registerTool(
   'mem_compress',
   {
-    description: 'Compress old low-value observations into weekly summaries. Use when: memory database is growing large, observations are months old, or after a major project phase completes. Use preview=true to see candidates first.',
+    description: descriptionOf('mem_compress'),
     inputSchema: memCompressSchema,
   },
   safeHandler(async (args) => {
@@ -1279,7 +1288,7 @@ server.registerTool(
 server.registerTool(
   'mem_maintain',
   {
-    description: 'Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/decay/boost/dedup operations. Use when: search results seem noisy with duplicates, after bulk imports, or during periodic maintenance.',
+    description: descriptionOf('mem_maintain'),
     inputSchema: memMaintainSchema,
   },
   safeHandler(async (args) => {
@@ -1540,7 +1549,7 @@ server.registerTool(
 server.registerTool(
   'mem_optimize',
   {
-    description: 'LLM-powered database optimization: re-enrich degraded records, normalize concepts, merge related observations, smart-compress old data. Use when: database quality seems low, search results are noisy, or for periodic deep maintenance.',
+    description: descriptionOf('mem_optimize'),
     inputSchema: memOptimizeSchema,
   },
   safeHandler(async (args) => {
@@ -1584,7 +1593,7 @@ server.registerTool(
 server.registerTool(
   'mem_registry',
   {
-    description: 'Manage tool resource registry. Use when: looking for a skill or agent to solve a problem, importing tools from a repository, checking what resources are available, or managing installed tools.',
+    description: descriptionOf('mem_registry'),
     inputSchema: memRegistrySchema,
   },
   safeHandler(async (args) => {
@@ -1788,10 +1797,7 @@ server.registerTool(
 server.registerTool(
   'mem_use',
   {
-    description: 'Load and activate a skill or agent from the managed registry. '
-      + 'Returns the full skill/agent content for execution. '
-      + 'Use when: you found a skill via mem_registry search and want to use it, '
-      + 'or you know a managed skill/agent name and want to load its instructions.',
+    description: descriptionOf('mem_use'),
     inputSchema: memUseSchema,
   },
   safeHandler(async (args) => {
@@ -1873,7 +1879,7 @@ server.registerTool(
 server.registerTool(
   'mem_update',
   {
-    description: 'Update an existing observation in-place. Use when: an observation needs correction, additional context was discovered later, or the user asks to update a specific memory. Preserves original ID and references.',
+    description: descriptionOf('mem_update'),
     inputSchema: memUpdateSchema,
   },
   safeHandler(async (args) => {
@@ -1925,7 +1931,7 @@ server.registerTool(
 server.registerTool(
   'mem_export',
   {
-    description: 'Export observations as JSON or JSONL. Use when: backing up memory before migration, sharing observations between machines, or creating a snapshot before major changes.',
+    description: descriptionOf('mem_export'),
     inputSchema: memExportSchema,
   },
   safeHandler(async (args) => {
@@ -1965,7 +1971,7 @@ server.registerTool(
 server.registerTool(
   'mem_recall',
   {
-    description: 'Recall observations related to a file. ALWAYS use before editing a file with known issues. Also use when: investigating a file, or before refactoring to recall past bugfixes, decisions, and context.',
+    description: descriptionOf('mem_recall'),
     inputSchema: memRecallSchema,
   },
   safeHandler(async (args) => {
@@ -2010,7 +2016,7 @@ server.registerTool(
 server.registerTool(
   'mem_fts_check',
   {
-    description: 'Check FTS5 index integrity or rebuild indexes. Use when: search results seem wrong or missing, after database recovery, or after manual DB edits.',
+    description: descriptionOf('mem_fts_check'),
     inputSchema: memFtsCheckSchema,
   },
   safeHandler(async (args) => {
@@ -2036,7 +2042,7 @@ server.registerTool(
 server.registerTool(
   'mem_browse',
   {
-    description: 'Tier-grouped memory dashboard. Use when: getting an overview of memory health, seeing how observations are distributed across tiers, or assessing what to compress or clean up.',
+    description: descriptionOf('mem_browse'),
     inputSchema: memBrowseSchema,
   },
   safeHandler(async (args) => {

@@ -2,6 +2,42 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.31.0] - 2026-04-14
+
+v2.31 MVP — hook quality hardening + activity namespace + SessionStart dashboard. Ten-task slice distilled from the v3.0 / v3.1 refactor proposals (`docs/plans/2026-04-14-mem-v2.31-mvp.md`), delivered additively with zero breaking changes. Schema bumped 22 → 25 via three idempotent additive migrations; 1398 → 1490 tests (+92).
+
+### Added
+
+- **Activity namespace** (`events` table + FTS5, T6–T9): non-memdir event types (`bugfix`, `lesson`, `bug`, `discovery`, `refactor`, `feature`, `observation`, `decision`) now live in a dedicated `events` table so they don't fight sdscc `WHAT_NOT_TO_SAVE` semantics. New compound index `idx_events_project_created` backs hot-path queries.
+- **`activity` CLI subcommand group** (T7): `claude-mem-lite activity save|search|recent|show` with `--project`, `--files` (plural comma-split), `--type` validation against the 8-value enum.
+- **`/lesson` and `/bug` slash commands** (T8): frictionless capture entry points that write to the events table, never to memdir.
+- **`hook-llm` routes non-memdir types to events** (T9): `handleLLMEpisode` clean-insert and upgrade paths now dispatch through `persistHaikuSummary`. Upgrade branch for event-typed summaries is atomic (DELETE observations + INSERT events inside a transaction).
+- **Startup Dashboard** (T10c): SessionStart hook aggregates `git status` + `~/.claude/tasks/*.json` + `~/.claude/plans/*.md` + most-recent exit handoff + events count into a single structured injection, JSON-output via `hookSpecificOutput.additionalContext`.
+- **Git-commit continuation anchor** (T10d): `detectContinuationIntent` adds a Stage -1 anchor — any handoff whose `git_sha_at_handoff` matches current HEAD returns true regardless of TTL. Code state is a stronger continuation signal than wall time.
+- **TaskList-sourced Unfinished** (T10d): `buildAndSaveHandoff` prefers `~/.claude/tasks/<id>/*.json` structured signals over text heuristics when no episode snapshot is available.
+- **`doctor --benchmark`** (T1): baseline token/latency capture; first snapshot committed at `docs/plans/baselines/v2.30.1.json`.
+- Five new helper modules: `lib/activity.mjs`, `lib/task-reader.mjs`, `lib/plan-reader.mjs`, `lib/git-state.mjs`, `lib/startup-dashboard.mjs`.
+
+### Fixed
+
+- **PreToolUse JSON output** (T2): `scripts/pre-tool-recall.js` now emits `{suppressOutput: true, hookSpecificOutput: {hookEventName: 'PreToolUse', additionalContext}}` instead of plain-text `console.log`. Plain-text PreToolUse stdout is silently dropped by sdscc's `messages.ts:3797` (`hook_success` filter); JSON via `hook_additional_context` works across CC variants.
+- **16KB skill auto-load removed** (T4): `scripts/user-prompt-search.js` no longer injects the full body of a matched registry skill; it emits a one-line pointer so Claude can decide to invoke via SkillTool on demand.
+
+### Changed
+
+- **UserPromptSubmit BM25 gate** (T3): `scripts/user-prompt-search.js` now suppresses injection when the top FTS row's relevance magnitude is below `CLAUDE_MEM_UPS_BM25_MIN` (default `1e-5`, env-overridable) or the prompt's raw length is under 15 chars. Calibrated empirically via probe; plan's hinted `3.5` was six orders of magnitude off for this scoring expression.
+- **Discouragement-style MCP descriptions** (T5): all 17 tool descriptions rewritten in `DO NOT use when … / USE when … / Equivalent CLI` format and centralized in `tool-schemas.mjs` (single source of truth; `server.mjs` now resolves each via `descriptionOf(name)`). Target: reduce over-invocation by 40–60% per the `mcp-tool-description-design` pattern.
+
+### Schema
+
+- v23: add `events` table + `events_fts` virtual table + INSERT/DELETE/UPDATE triggers (external-content FTS5 delete pattern uses real `old.*` values, not empty strings — learned during T6 implementation).
+- v24: add compound index `idx_events_project_created ON events(project, created_at_epoch DESC)`.
+- v25: add `session_handoffs.git_sha_at_handoff TEXT`. Placed after the existing PK-widen migration so the rebuild doesn't drop the new column.
+
+### Internal
+
+- Subagent-driven-development workflow: per-task spec compliance + code quality reviews, two reworks (T1 polish: FTS prepared statement hoisted out of hot loop; T9 rework: `persistHaikuSummary` wired into real capture path after initial commit left it as a dead export).
+
 ## [2.30.1] - 2026-04-12
 
 Bug fix: `session_handoffs` no longer bleeds across parallel Claude Code sessions for the same project. Root cause was a PK-level assumption (`(project, type)`) made at the original feature landing — one row per project per type — which silently overwrote handoffs when you ran two terminals/worktrees against the same project. The visible symptom: in session A, typing a single character like `a` after session B had just `/exit`'d would inject B's entire context into A via the Stage 0 short-prompt auto-match. See `docs/bug.txt` for the full post-mortem.
