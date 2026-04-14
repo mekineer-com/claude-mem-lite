@@ -94,6 +94,7 @@
 - **LLM 并发控制** -- 基于文件的信号量将后台 worker 限制为 2 个并发 LLM 调用，防止资源争用
 - **stdin 溢出保护** -- Hook 输入在 256KB 处截断，对超大工具输出使用正则挽救关键信息
 - **跨会话交接** -- 在 `/clear` 或 `/exit` 时捕获会话状态（请求、已完成工作、后续步骤、关键文件），下次会话检测到继续意图时自动注入上下文（支持显式关键词和 FTS5 术语重叠匹配）
+- **插件缓存 hook 自愈** -- Claude Code runtime 从 `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json` 读取插件 hook，而非 marketplace 源。当 `install.mjs` 写入 `settings.json` 的 hooks 与残留 cache `hooks.json` 同时存在（例如曾装过 marketplace 版本，或插件被 Claude Code 自动升级重建 cache），runtime 会注册两套 hook → 每次 SessionStart / UserPromptSubmit 都触发两份。`install.mjs` 和 `hook-update.mjs` 现在会清理每个 cache 版本目录下的 `hooks.json`；`hook.mjs session-start` 每次启动自愈（通过 `hasInstallManagedHooks` 门控，不影响纯插件模式用户）；`install.mjs status` 会报告 cache 污染状况（自 v2.31.1 / v2.31.2 起）。
 
 ## 平台支持
 
