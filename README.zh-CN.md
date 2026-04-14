@@ -95,6 +95,9 @@
 - **stdin 溢出保护** -- Hook 输入在 256KB 处截断，对超大工具输出使用正则挽救关键信息
 - **跨会话交接** -- 在 `/clear` 或 `/exit` 时捕获会话状态（请求、已完成工作、后续步骤、关键文件），下次会话检测到继续意图时自动注入上下文（支持显式关键词和 FTS5 术语重叠匹配）
 - **插件缓存 hook 自愈** -- Claude Code runtime 从 `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json` 读取插件 hook，而非 marketplace 源。当 `install.mjs` 写入 `settings.json` 的 hooks 与残留 cache `hooks.json` 同时存在（例如曾装过 marketplace 版本，或插件被 Claude Code 自动升级重建 cache），runtime 会注册两套 hook → 每次 SessionStart / UserPromptSubmit 都触发两份。`install.mjs` 和 `hook-update.mjs` 现在会清理每个 cache 版本目录下的 `hooks.json`；`hook.mjs session-start` 每次启动自愈（通过 `hasInstallManagedHooks` 门控，不影响纯插件模式用户）；`install.mjs status` 会报告 cache 污染状况（自 v2.31.1 / v2.31.2 起）。
+- **Git-SHA 延续锚点**（v2.31.0）-- handoff 记录包含 `git_sha_at_handoff` 字段，任何匹配当前 `HEAD` 的 handoff 都视为延续会话，不受 TTL 限制。代码状态比时钟时间更能反映上下文延续。
+- **启动面板**（v2.31.0）-- SessionStart hook 将 `git status` + `~/.claude/tasks/*.json` + `~/.claude/plans/*.md` + 最近 /exit 交接 + 最近事件数聚合为一个结构化块，通过 `hookSpecificOutput.additionalContext` 注入。
+- **活动命名空间**（v2.31.0）-- 为非 memdir 类型（`bugfix` / `lesson` / `bug` / `discovery` / `refactor` / `feature` / `observation` / `decision`）启用独立的 `events` 表 + FTS5，与 observations 表的 `WHAT_NOT_TO_SAVE` 语义解耦。CLI：`claude-mem-lite activity save|search|recent|show`；斜杠命令：`/lesson`、`/bug`。`hook-llm` 通过 `persistHaikuSummary` 路由非 memdir 摘要，observations → events 升级路径是事务原子的。
 
 ## 平台支持
 
@@ -223,6 +226,8 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 /mem timeline <query>      # 围绕匹配结果浏览时间线
 /mem browse                # 分层记忆仪表盘
 /mem <query>               # search 的简写
+/lesson <text>             # 保存非显而易见的经验到 events 表（v2.31.0）
+/bug <text>                # 记录已知 bug + 复现步骤到 events 表（v2.31.0）
 ```
 
 ### 高效搜索工作流
