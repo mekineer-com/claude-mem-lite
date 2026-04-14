@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 22;
+export const CURRENT_SCHEMA_VERSION = 23;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -236,6 +236,55 @@ export function initSchema(db) {
       db.exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`);
     }
   } catch { /* non-critical */ }
+
+  // ─── v2.31 T6: events table + FTS5 (activity namespace) ───────────────────
+  // Independent namespace for bugfix/lesson/bug/discovery/refactor/feature/
+  // observation/decision types. Isolated from observations to avoid polluting
+  // memdir semantics. Additive-only migration — safe to re-run.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS events (
+      id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+      project              TEXT NOT NULL,
+      event_type           TEXT NOT NULL CHECK(event_type IN
+                             ('bugfix','lesson','bug','discovery','refactor','feature','observation','decision')),
+      title                TEXT NOT NULL,
+      body                 TEXT,
+      file_paths           TEXT,
+      git_sha              TEXT,
+      importance           INTEGER NOT NULL DEFAULT 1,
+      created_at_epoch     INTEGER NOT NULL,
+      accessed_count       INTEGER NOT NULL DEFAULT 0,
+      last_accessed_epoch  INTEGER,
+      superseded_at_epoch  INTEGER,
+      superseded_by_id     INTEGER REFERENCES events(id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_project ON events(project);
+    CREATE INDEX IF NOT EXISTS idx_events_type    ON events(event_type);
+    CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at_epoch DESC);
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+      title, body, event_type UNINDEXED, project UNINDEXED,
+      content='events', content_rowid='id',
+      tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
+    );
+
+    CREATE TRIGGER IF NOT EXISTS events_fts_ai AFTER INSERT ON events BEGIN
+      INSERT INTO events_fts(rowid, title, body, event_type, project)
+      VALUES (new.id, COALESCE(new.title,''), COALESCE(new.body,''), new.event_type, new.project);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS events_fts_ad AFTER DELETE ON events BEGIN
+      INSERT INTO events_fts(events_fts, rowid, title, body, event_type, project)
+      VALUES ('delete', old.id, COALESCE(old.title,''), COALESCE(old.body,''), old.event_type, old.project);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE ON events BEGIN
+      INSERT INTO events_fts(events_fts, rowid, title, body, event_type, project)
+      VALUES ('delete', old.id, COALESCE(old.title,''), COALESCE(old.body,''), old.event_type, old.project);
+      INSERT INTO events_fts(rowid, title, body, event_type, project)
+      VALUES (new.id, COALESCE(new.title,''), COALESCE(new.body,''), new.event_type, new.project);
+    END;
+  `);
 
   // Observation files junction table for normalized file lookups (replaces LIKE scans on files_modified JSON)
   db.exec(`
