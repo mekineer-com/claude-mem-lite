@@ -65,4 +65,10 @@ describe('events table (T6)', () => {
     const cols = db.prepare(`PRAGMA table_info(events)`).all();
     expect(cols.length).toBeGreaterThan(0);
   });
+
+  test('idx_events_project_created compound index exists', () => {
+    const db = createTestDb();
+    const idx = db.prepare(`SELECT name FROM sqlite_master WHERE name='idx_events_project_created'`).get();
+    expect(idx).toBeTruthy();
+  });
 });

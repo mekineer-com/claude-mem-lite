@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 23;
+export const CURRENT_SCHEMA_VERSION = 24;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -261,6 +261,9 @@ export function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_events_project ON events(project);
     CREATE INDEX IF NOT EXISTS idx_events_type    ON events(event_type);
     CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at_epoch DESC);
+    -- T7 compound: supports recentEvents() ORDER BY created_at_epoch DESC filtered by project (index-only sort, avoids temp B-tree).
+    CREATE INDEX IF NOT EXISTS idx_events_project_created
+      ON events(project, created_at_epoch DESC);
 
     CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
       title, body, event_type UNINDEXED, project UNINDEXED,
