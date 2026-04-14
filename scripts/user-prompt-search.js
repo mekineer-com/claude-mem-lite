@@ -17,6 +17,24 @@ const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferP
 const MAX_RESULTS = 5;
 const LOOKBACK_MS = 60 * 86400000; // 60 days
 
+// T3 (v2.31): BM25 magnitude threshold. OBS_BM25 (in scoring-sql.mjs) returns the
+// raw bm25() value, which in SQLite FTS5 is always negative — lower = better match.
+// The `relevance` column multiplies that negative bm25 by positive decay / type /
+// importance weights, keeping the sign negative. "Stronger match" therefore means
+// larger magnitude, so we compare against `Math.abs(relevance)`.
+//
+// Empirically (see Task 3 probe in docs/plans/2026-04-14-mem-v2.31-mvp.md):
+//   - OR-fallback single-stem match: |rel| ~ 3e-6
+//   - Multi-term AND match w/ importance+type boost: |rel| ~ 2e-5 .. 5e-5
+// The plan's hinted default (3.5) was a guess that's six orders of magnitude too
+// high for this codebase's scoring expression. 1e-5 suppresses OR-fallback noise
+// while preserving real hits. Env-overridable for tuning without a redeploy.
+const BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN || 1e-5);
+// Raw-character minimum length for the prompt. Additional to the CJK-weighted
+// `shouldSkip()` effective-length gate; catches medium-short Latin prompts that
+// survive `shouldSkip` but carry too few tokens to justify an FTS lookup.
+const PROMPT_MIN_LENGTH = 15;
+
 // ─── DB Query Functions ─────────────────────────────────────────────────────
 
 function searchByFts(db, queryText, project, limit, typeFilter) {
@@ -270,6 +288,11 @@ async function main() {
   // Skip short/confirmation/slash-command/simple-op prompts
   if (shouldSkip(promptText)) return;
 
+  // T3 (v2.31): additional raw-length gate on top of shouldSkip's CJK-weighted
+  // effective-length check. Suppresses medium-short Latin prompts ("run tests",
+  // "fix bug now") that carry too few content tokens for a meaningful FTS lookup.
+  if (promptText.trim().length < PROMPT_MIN_LENGTH) return;
+
   let db;
   try {
     db = ensureDb();
@@ -292,6 +315,16 @@ async function main() {
         ftsRows = searchByFts(db, promptText, project, intent.limit || MAX_RESULTS, null);
       }
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
+
+      // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
+      // magnitude doesn't clear the floor. This targets OR-fallback leakage
+      // where a single-stem match surfaces tangential observations. Only FTS
+      // rows carry a `relevance` column; file-recall rows (searchByFile) have
+      // no relevance and are always kept — file-scoped recall is presumed
+      // intentional and has its own relevance signal (the file name match).
+      ftsRows = ftsRows.filter(r =>
+        typeof r.relevance === 'number' && Math.abs(r.relevance) >= BM25_MIN_SCORE
+      );
 
       // Merge: FTS results first, then file results, deduplicated
       const seen = new Set(ftsRows.map(r => r.id));

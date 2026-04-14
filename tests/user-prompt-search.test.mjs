@@ -715,3 +715,79 @@ describe('result-dedup cooldown', () => {
     expect(shouldSkipByDedup([1,2,3], injectedFile)).toBe(true);
   });
 });
+
+// ─── T3 (v2.31): BM25 threshold + prompt-length gate ───────────────────────
+// Purpose: suppress injection when top BM25 magnitude is below floor, or when
+// prompt is too short to carry meaningful search signal. See Task 3 in
+// docs/plans/2026-04-14-mem-v2.31-mvp.md.
+//
+// Implementation note: `runScript()` (defined above) hardcodes
+// CLAUDE_MEM_DIR = '.tmp-prompt-search-dir'. We mirror that path exactly so the
+// subprocess reads the same DB we seed here, rather than opening a different
+// file. An earlier draft used a separate '.tmp-ups-t3-dir' and every test
+// vacuously saw empty stdout because the subprocess was opening an empty DB.
+describe('user-prompt-search T3: BM25 threshold + prompt-length gate', () => {
+  let db;
+  let testDir;
+
+  beforeEach(() => {
+    cleanupTestFiles();
+    try { if (existsSync(COOLDOWN_FILE)) unlinkSync(COOLDOWN_FILE); } catch {}
+    testDir = resolve(import.meta.dirname, '.tmp-prompt-search-dir');
+    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+    mkdirSync(testDir, { recursive: true });
+    const dbPath = join(testDir, 'claude-mem-lite.db');
+    db = createFileDb(dbPath);
+    insertSession(db, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+
+  afterEach(() => {
+    try { db.close(); } catch {}
+    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+    cleanupTestFiles();
+  });
+
+  it('suppresses injection when top score is below BM25 threshold', async () => {
+    // Seed a loosely-related low-importance observation whose text shares
+    // exactly one stem ("implement") with the test prompt. Without a BM25
+    // threshold this triggers the OR-fallback and produces a tiny-magnitude
+    // match (|rel| ~ 3e-6) that leaks as noise injection. With the gate
+    // (default 1e-5) this must be suppressed.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'implementing user auth',
+      text: 'implement authentication',
+      importance: 1,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript({
+      prompt: 'how do I implement a deployment pipeline in Go',
+    });
+    expect(stdout.trim()).toBe('');
+  });
+
+  it('injects when a high-relevance row exists', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'chose Redis over Memcached for rate limit',
+      text: 'Redis chosen because persistence rate limit TTL 60 seconds cache invalidation',
+      lessonLearned: 'Redis chosen because persistence; rate limit TTL = 60s',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript({
+      prompt: 'why did we pick Redis for rate limiting',
+    });
+    expect(stdout).toMatch(/Redis/i);
+  });
+
+  it('skips when prompt is too short (regression guard for length gate)', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'x', importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript({ prompt: 'a' });
+    expect(stdout.trim()).toBe('');
+  });
+});
