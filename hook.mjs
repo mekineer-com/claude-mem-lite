@@ -32,6 +32,7 @@ import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
+import { clearPluginCacheHooks, hasInstallManagedHooks } from './plugin-cache-guard.mjs';
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
 import { getVocabulary } from './tfidf.mjs';
 
@@ -397,6 +398,21 @@ async function handleStop() {
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
 async function handleSessionStart() {
+  // Plugin cache self-heal: Claude Code auto-updates the marketplace plugin can
+  // re-populate cache/<ver>/hooks/hooks.json, reintroducing duplicate hook
+  // registration alongside install.mjs-managed settings.json entries. Silently
+  // clear — gated by hasInstallManagedHooks to avoid breaking plugin-only users.
+  try {
+    if (hasInstallManagedHooks()) {
+      const cleared = clearPluginCacheHooks({
+        reason: 'Auto-healed by hook.mjs session-start — install.mjs-managed hooks active in settings.json',
+      });
+      if (cleared.length > 0) {
+        debugLog('DEBUG', 'session-start', `auto-healed stale plugin cache hooks.json in version(s): ${cleared.join(', ')}`);
+      }
+    }
+  } catch (e) { debugCatch(e, 'session-start-cache-heal'); }
+
   // Read CC real session_id from hook stdin — used to scope handoff rows so parallel
   // sessions for the same project don't clobber each other (see docs/bug.txt).
   let ccSessionId = null;

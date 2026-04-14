@@ -26,6 +26,7 @@ const PLUGIN_KEY = `claude-mem-lite@${MARKETPLACE_KEY}`;
 const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
 import { RESOURCE_METADATA } from './install-metadata.mjs';
+import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 
 /**
  * Derive invocation_name from resource name when metadata doesn't provide one.
@@ -205,6 +206,7 @@ async function install() {
     'cli.mjs', 'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
     'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
     'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs', 'hook-optimize.mjs',
+    'plugin-cache-guard.mjs',
     'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
     'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
     'registry-retriever.mjs', 'resource-discovery.mjs',
@@ -401,18 +403,43 @@ async function install() {
       }
     } catch (e) { warn(`Marketplace hooks dedup: ${e.message}`); }
 
-    // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection
+    // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection.
+    // ALSO clear cached hooks.json in every version dir — Claude Code runtime reads hooks from
+    // ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json, NOT from the marketplace source.
+    // Clearing only the marketplace source (above) leaves stale cache copies that double-register
+    // hooks alongside install.mjs-written settings.json entries.
     try {
       const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
       if (existsSync(cacheBase)) {
         const srcLaunch = join(PROJECT_DIR, 'scripts', 'launch.mjs');
+        let clearedHooks = 0;
         for (const ver of readdirSync(cacheBase)) {
-          const dest = join(cacheBase, ver, 'scripts', 'launch.mjs');
-          if (existsSync(join(cacheBase, ver, 'scripts'))) {
-            copyFileSync(srcLaunch, dest);
+          const verDir = join(cacheBase, ver);
+
+          // Sync launch.mjs
+          if (existsSync(join(verDir, 'scripts'))) {
+            try { copyFileSync(srcLaunch, join(verDir, 'scripts', 'launch.mjs')); } catch {}
+          }
+
+          // Clear cached hooks.json (runtime reads here, not marketplace source)
+          const cachedHooksPath = join(verDir, 'hooks', 'hooks.json');
+          if (existsSync(cachedHooksPath)) {
+            try {
+              const h = JSON.parse(readFileSync(cachedHooksPath, 'utf8'));
+              if (h.hooks && Object.keys(h.hooks).length > 0) {
+                writeFileSync(cachedHooksPath, JSON.stringify({
+                  description: h.description || 'claude-mem-lite hooks',
+                  _note: `Hooks managed by install.mjs in settings.json — cache hooks.json cleared to prevent duplicate registration (cache ver: ${ver})`,
+                  hooks: {}
+                }, null, 2) + '\n');
+                clearedHooks++;
+              }
+            } catch { /* silent — never block install on one bad cache entry */ }
           }
         }
-        ok('Plugin cache: launch.mjs synced (dev mode MCP routing)');
+        const parts = ['launch.mjs synced (dev mode MCP routing)'];
+        if (clearedHooks > 0) parts.push(`${clearedHooks} stale hooks.json cleared`);
+        ok(`Plugin cache: ${parts.join('; ')}`);
       }
     } catch (e) { warn(`Plugin cache sync: ${e.message}`); }
   }
@@ -960,6 +987,18 @@ async function status() {
     ok('Hooks: not configured');
   } else {
     fail('Hooks: not configured');
+  }
+
+  // Plugin cache pollution: populated hooks.json in cache AND install.mjs-managed
+  // settings.json hooks → runtime registers both → duplicate firing.
+  const polluted = scanPluginCacheHookPollution();
+  if (polluted.length > 0 && hasHooks) {
+    fail(`Plugin cache: stale hooks.json in version(s) ${polluted.join(', ')} — duplicate firing alongside settings.json (run 'install' to auto-clear)`);
+  } else if (polluted.length > 0) {
+    // plugin-only mode (no settings.json hooks) — cache hooks.json is the sole source, expected
+    ok(`Plugin cache: ${polluted.length} version(s) with hooks.json (plugin-only mode)`);
+  } else if (pluginEnabled || hasHooks) {
+    ok('Plugin cache: no stale hooks.json (no duplicate firing)');
   }
 
   // Database

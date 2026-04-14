@@ -278,6 +278,42 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     }
   });
 
+  it('install clears stale hooks.json in every plugin cache version to prevent double firing', () => {
+    // Simulate prior marketplace install: cache dirs contain populated hooks.json
+    // that Claude Code runtime would read, causing hooks to register twice
+    // (once from cache, once from settings.json written by install.mjs).
+    const cacheBase = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+    const marketplaceDir = join(home, '.claude', 'plugins', 'marketplaces', 'sdsrss');
+    mkdirSync(marketplaceDir, { recursive: true });
+
+    const populatedHooks = {
+      description: 'claude-mem-lite memory system hooks',
+      hooks: {
+        UserPromptSubmit: [{
+          matcher: '*',
+          hooks: [
+            { type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-search.js"', timeout: 2 },
+            { type: 'command', command: 'node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" user-prompt', timeout: 5 },
+          ],
+        }],
+      },
+    };
+
+    for (const ver of ['2.28.1', '2.30.0']) {
+      mkdirSync(join(cacheBase, ver, 'hooks'), { recursive: true });
+      mkdirSync(join(cacheBase, ver, 'scripts'), { recursive: true });
+      writeFileSync(join(cacheBase, ver, 'hooks', 'hooks.json'), JSON.stringify(populatedHooks, null, 2) + '\n');
+    }
+
+    runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
+
+    for (const ver of ['2.28.1', '2.30.0']) {
+      const cleared = readJson(join(cacheBase, ver, 'hooks', 'hooks.json'));
+      expect(cleared.hooks).toEqual({});
+      expect(cleared._note).toMatch(/managed by install\.mjs/i);
+    }
+  });
+
   it('status shows MCP registered and hooks configured', () => {
     runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
     const output = runInstall('status', home, [], { PATH: `${binDir}:${process.env.PATH}` });

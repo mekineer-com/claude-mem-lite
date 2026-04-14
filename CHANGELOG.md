@@ -2,6 +2,25 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.31.1] - 2026-04-15
+
+Hotfix — prevent duplicate hook registration when install.mjs-managed `settings.json` entries coexist with a stale plugin cache `hooks.json`. Claude Code runtime reads plugin hooks from `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/hooks/hooks.json`, not from the marketplace source — install.mjs was only clearing the marketplace path, so stale cache entries caused every session start / user prompt hook to fire twice.
+
+### Fixed
+
+- **install.mjs** now clears `hooks.json` in every plugin cache version directory (the loop that already syncs `launch.mjs` was extended to handle the hooks file). New test `install-e2e.test.mjs > install clears stale hooks.json in every plugin cache version to prevent double firing` covers two version dirs with populated hooks.
+- **hook.mjs `session-start`** self-heals on every session: if install.mjs-managed hooks are active in `settings.json` and a populated cache `hooks.json` is detected, it clears the cache entry silently. Prevents recurrence after Claude Code auto-updates the marketplace plugin.
+
+### Added
+
+- `plugin-cache-guard.mjs` — shared module exposing `scanPluginCacheHookPollution`, `clearPluginCacheHooks`, `hasInstallManagedHooks`. Unit tests at `tests/plugin-cache-guard.test.mjs` (10 new tests).
+- `install.mjs status` now reports plugin cache pollution state (`fail` when stale cache coexists with install.mjs hooks; `ok` when clean). Two new integration tests in `tests/install-lifecycle.test.mjs`.
+- `plugin-cache-guard.mjs` added to `SOURCE_FILES` so dev-mode symlinks and copy-mode deploys include it.
+
+### Internal
+
+- 1490 → 1501 tests (+11).
+
 ## [2.31.0] - 2026-04-14
 
 v2.31 MVP — hook quality hardening + activity namespace + SessionStart dashboard. Ten-task slice distilled from the v3.0 / v3.1 refactor proposals (`docs/plans/2026-04-14-mem-v2.31-mvp.md`), delivered additively with zero breaking changes. Schema bumped 22 → 25 via three idempotent additive migrations; 1398 → 1490 tests (+92).

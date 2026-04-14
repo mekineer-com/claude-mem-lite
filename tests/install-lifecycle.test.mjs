@@ -86,6 +86,58 @@ function makeFakeClaudeBin(home) {
 }
 
 describe('install lifecycle checks', () => {
+  it('status reports stale plugin cache hooks.json when install.mjs path is active', () => {
+    const home = makeTmpDir();
+    try {
+      const claudeDir = join(home, '.claude');
+      mkdirSync(claudeDir, { recursive: true });
+      writeFileSync(join(claudeDir, 'settings.json'), JSON.stringify({
+        enabledPlugins: { 'claude-mem-lite@sdsrss': true },
+        hooks: {
+          SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: `node "${home}/.claude-mem-lite/hook.mjs" session-start` }] }],
+        },
+      }, null, 2));
+      const cacheVerDir = join(claudeDir, 'plugins', 'cache', 'sdsrss', 'claude-mem-lite', '2.31.0');
+      mkdirSync(join(cacheVerDir, 'hooks'), { recursive: true });
+      writeFileSync(join(cacheVerDir, 'hooks', 'hooks.json'), JSON.stringify({
+        description: 'test',
+        hooks: {
+          UserPromptSubmit: [{ matcher: '*', hooks: [{ type: 'command', command: 'node foo.js' }] }],
+        },
+      }, null, 2));
+
+      const output = runInstall('status', home);
+      expect(output).toMatch(/Plugin cache.*stale|stale.*cache|cache.*hooks\.json/i);
+      expect(output).toContain('2.31.0');
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('status reports clean plugin cache when hooks.json is empty', () => {
+    const home = makeTmpDir();
+    try {
+      const claudeDir = join(home, '.claude');
+      mkdirSync(claudeDir, { recursive: true });
+      writeFileSync(join(claudeDir, 'settings.json'), JSON.stringify({
+        enabledPlugins: { 'claude-mem-lite@sdsrss': true },
+        hooks: {
+          SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: `node "${home}/.claude-mem-lite/hook.mjs" session-start` }] }],
+        },
+      }, null, 2));
+      const cacheVerDir = join(claudeDir, 'plugins', 'cache', 'sdsrss', 'claude-mem-lite', '2.31.0');
+      mkdirSync(join(cacheVerDir, 'hooks'), { recursive: true });
+      writeFileSync(join(cacheVerDir, 'hooks', 'hooks.json'), JSON.stringify({
+        description: 'test', _note: 'cleared', hooks: {},
+      }, null, 2));
+
+      const output = runInstall('status', home);
+      expect(output).toMatch(/Plugin cache:.*no stale|no duplicate firing/i);
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   it('status reports stale hooks when plugin is disabled', () => {
     const home = makeTmpDir();
     try {
