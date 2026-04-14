@@ -32,7 +32,16 @@ import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
-import { clearPluginCacheHooks, hasInstallManagedHooks } from './plugin-cache-guard.mjs';
+// plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
+// from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
+// crash on static import. Degrade gracefully to no-op when the module is absent.
+let _cacheGuardCache = null;
+async function loadCacheGuard() {
+  if (_cacheGuardCache !== null) return _cacheGuardCache;
+  try { _cacheGuardCache = await import('./plugin-cache-guard.mjs'); }
+  catch { _cacheGuardCache = {}; }
+  return _cacheGuardCache;
+}
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
 import { getVocabulary } from './tfidf.mjs';
 
@@ -402,9 +411,12 @@ async function handleSessionStart() {
   // re-populate cache/<ver>/hooks/hooks.json, reintroducing duplicate hook
   // registration alongside install.mjs-managed settings.json entries. Silently
   // clear — gated by hasInstallManagedHooks to avoid breaking plugin-only users.
+  // Dynamic-import fallback: if plugin-cache-guard.mjs is missing (pre-2.31.2
+  // auto-upgrade install), skip self-heal instead of crashing the entire hook.
   try {
-    if (hasInstallManagedHooks()) {
-      const cleared = clearPluginCacheHooks({
+    const guard = await loadCacheGuard();
+    if (guard.hasInstallManagedHooks && guard.hasInstallManagedHooks()) {
+      const cleared = guard.clearPluginCacheHooks({
         reason: 'Auto-healed by hook.mjs session-start — install.mjs-managed hooks active in settings.json',
       });
       if (cleared.length > 0) {

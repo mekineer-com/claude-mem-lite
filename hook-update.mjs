@@ -196,6 +196,7 @@ const SOURCE_FILES = [
   'cli.mjs', 'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
   'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
   'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
+  'hook-optimize.mjs', 'plugin-cache-guard.mjs',
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
@@ -289,6 +290,13 @@ export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
     // Post-update: prune old plugin cache versions (keep latest 3)
     try { prunePluginCache(); } catch (e) { debugCatch(e, 'prunePluginCache'); }
 
+    // Post-update: clear cache hooks.json in every remaining version. Claude Code
+    // runtime reads plugin hooks from cache, not marketplace source — leaving populated
+    // cache hooks.json alongside install.mjs-written settings.json causes double firing.
+    // Inline impl (no import of plugin-cache-guard.mjs — this module must run even when
+    // the guard module is absent on disk, e.g. auto-upgrading from pre-2.31.2).
+    try { clearCacheHookResidue(); } catch (e) { debugCatch(e, 'clearCacheHookResidue'); }
+
     debugLog('DEBUG', 'hook-update', `Auto-update: switched ${installed.length} paths`);
     return true;
   } catch (err) {
@@ -346,6 +354,33 @@ function copyReleaseIntoStaging(sourceDir, stagingDir) {
   }
 
   debugLog('DEBUG', 'hook-update', `Auto-update staged ${copied} source files`);
+}
+
+// ── Cache hook residue clearing ────────────────────────────
+// Inline (does not import plugin-cache-guard.mjs) so hook-update.mjs keeps working
+// even if plugin-cache-guard.mjs is missing on disk in degraded installs.
+export function clearCacheHookResidue() {
+  const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+  if (!existsSync(cacheBase)) return 0;
+  let cleared = 0;
+  for (const ver of readdirSync(cacheBase)) {
+    const p = join(cacheBase, ver, 'hooks', 'hooks.json');
+    if (!existsSync(p)) continue;
+    try {
+      const h = JSON.parse(readFileSync(p, 'utf8'));
+      if (!h.hooks || Object.keys(h.hooks).length === 0) continue;
+      writeFileSync(p, JSON.stringify({
+        description: h.description || 'claude-mem-lite hooks',
+        _note: `Auto-cleared by hook-update.mjs post-install — prevents double hook registration (cache ver: ${ver})`,
+        hooks: {},
+      }, null, 2) + '\n');
+      cleared++;
+    } catch { /* ignore single bad entry */ }
+  }
+  if (cleared > 0) {
+    debugLog('DEBUG', 'hook-update', `Cache hooks residue cleared in ${cleared} version(s)`);
+  }
+  return cleared;
 }
 
 // ── Plugin Cache Pruning ──────────────────────────────────

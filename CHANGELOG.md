@@ -2,6 +2,37 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.31.2] - 2026-04-15
+
+Hotfix — close the auto-upgrade gap introduced in 2.31.1.
+
+**Problem**: 2.31.1's `hook.mjs` added a *static* `import` of the newly added `plugin-cache-guard.mjs`, but `hook-update.mjs`'s `SOURCE_FILES` list (the list the running update process uses to stage files) was not updated. Users on 2.31.0 auto-upgrading to 2.31.1 got the new `hook.mjs` but **not** `plugin-cache-guard.mjs` — next session-start failed with `ERR_MODULE_NOT_FOUND`, taking all mem hooks (including the update checker itself) offline.
+
+### Fixed
+
+- **`hook.mjs`** now loads `plugin-cache-guard.mjs` via **dynamic import with try/catch fallback**. Degrades gracefully to no-op self-heal when the guard module is absent; hook loading no longer crashes.
+- **`hook-update.mjs`** `SOURCE_FILES` updated to include `plugin-cache-guard.mjs` and `hook-optimize.mjs` (the latter was also missing — silently shipped as a dev-mode-only feature since v2.29.0).
+- **`hook-update.mjs`** post-install now calls `clearCacheHookResidue()` — clears populated `hooks.json` in every remaining cache version after `prunePluginCache`. Layer 1 (cache-clearing) now runs from the auto-update path, not only from manual `install.mjs`.
+
+### Added
+
+- `hook-update.mjs:clearCacheHookResidue` — inline (no import of plugin-cache-guard to keep the update path robust when that module is missing on disk).
+- 2 new unit tests in `tests/hook-update.test.mjs` covering `clearCacheHookResidue`.
+
+### Recovery for users stuck on broken 2.31.1
+
+If mem hooks are silently failing after auto-upgrade (no `<memory-context>` blocks, no `<session-handoff>`), manually rerun:
+
+```bash
+node ~/.claude-mem-lite/install.mjs install
+```
+
+This re-deploys `plugin-cache-guard.mjs` and restores hook loading. Subsequent auto-upgrades will then proceed correctly.
+
+### Internal
+
+- 1501 → 1503 tests (+2).
+
 ## [2.31.1] - 2026-04-15
 
 Hotfix — prevent duplicate hook registration when install.mjs-managed `settings.json` entries coexist with a stale plugin cache `hooks.json`. Claude Code runtime reads plugin hooks from `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/hooks/hooks.json`, not from the marketplace source — install.mjs was only clearing the marketplace path, so stale cache entries caused every session start / user prompt hook to fire twice.

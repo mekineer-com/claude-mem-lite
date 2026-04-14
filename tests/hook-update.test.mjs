@@ -120,6 +120,51 @@ describe('hook update lifecycle', () => {
   });
 });
 
+describe('cache hook residue clearing', () => {
+  it('clears populated hooks.json in every remaining cache version', async () => {
+    const home = makeDir('mem-cache-residue');
+    const cacheBase = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+    for (const v of ['2.28.0', '2.31.0']) {
+      mkdirSync(join(cacheBase, v, 'hooks'), { recursive: true });
+      writeFileSync(join(cacheBase, v, 'hooks', 'hooks.json'), JSON.stringify({
+        description: 'original', hooks: { SessionStart: [{ matcher: '*', hooks: [{ type: 'command', command: 'x' }] }] },
+      }));
+    }
+    // A third version with already-empty hooks.json should be untouched.
+    mkdirSync(join(cacheBase, '2.30.0', 'hooks'), { recursive: true });
+    writeFileSync(join(cacheBase, '2.30.0', 'hooks', 'hooks.json'), JSON.stringify({ description: 'empty', hooks: {} }));
+
+    const origHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { clearCacheHookResidue } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+      expect(clearCacheHookResidue()).toBe(2);
+
+      for (const v of ['2.28.0', '2.31.0']) {
+        const after = JSON.parse(readFileSync(join(cacheBase, v, 'hooks', 'hooks.json'), 'utf8'));
+        expect(after.hooks).toEqual({});
+        expect(after._note).toMatch(/hook-update\.mjs post-install/);
+      }
+      const empty = JSON.parse(readFileSync(join(cacheBase, '2.30.0', 'hooks', 'hooks.json'), 'utf8'));
+      expect(empty._note).toBeUndefined();
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
+
+  it('returns 0 when cache base does not exist', async () => {
+    const home = makeDir('mem-cache-residue-empty');
+    const origHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const { clearCacheHookResidue } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+      expect(clearCacheHookResidue()).toBe(0);
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
+});
+
 describe('plugin cache pruning', () => {
   it('removes old versions and keeps the latest 3', async () => {
     const home = makeDir('mem-prune-home');
