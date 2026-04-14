@@ -215,6 +215,13 @@ async function install() {
     // SOURCE_FILES entries with a subdir prefix require install.mjs to mkdir the
     // parent before symlink/copy — handled in the IS_DEV and else-branch loops.
     'lib/activity.mjs',
+    // v2.31 T10: startup dashboard aggregator + handoff task/git anchoring.
+    // task-reader + plan-reader + git-state are read by lib/startup-dashboard.mjs
+    // on SessionStart (hook.mjs) and by hook-handoff.mjs on /exit + /clear.
+    'lib/task-reader.mjs',
+    'lib/plan-reader.mjs',
+    'lib/git-state.mjs',
+    'lib/startup-dashboard.mjs',
   ];
 
   if (IS_DEV) {

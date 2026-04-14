@@ -6,6 +6,11 @@ import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SI
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
 } from './hook-shared.mjs';
+// T10d: import the whole module (not a named export) so tests can spy on
+// gitStateModule.readGitState via vi.spyOn. Named-import bindings are
+// immutable in ESM and cannot be mocked after the fact.
+import * as gitStateModule from './lib/git-state.mjs';
+import * as taskReaderModule from './lib/task-reader.mjs';
 
 /**
  * Build and save a handoff snapshot to session_handoffs table.
@@ -51,6 +56,24 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       .filter(d => { if (seenDescs.has(d)) return false; seenDescs.add(d); return true; });
     if (pendingDescs.length > 0) unfinished = pendingDescs.join('; ');
   }
+
+  // T10d: TaskList-sourced Unfinished. When no episode pending entries exist,
+  // prefer the structured signal from ~/.claude/tasks/<list>/*.json over the
+  // narrative-only fallback — a user-maintained task list is a stronger signal
+  // than a session with no recent tool activity. When the episode already has
+  // pending entries, those stay (they're fresher than the task file).
+  if (!unfinished) {
+    try {
+      const tasks = taskReaderModule.readProjectTasks({ projectPath: process.cwd() });
+      if (tasks.length > 0) {
+        unfinished = tasks
+          .slice(0, 5)
+          .map(t => `[${t.status}] ${t.title}`)
+          .join('\n');
+      }
+    } catch { /* task reader is best-effort; never block handoff */ }
+  }
+
   // Enrich unfinished with full session edit history from observation narratives.
   // Since handoff is UPSERT (max 2 rows per project), storing more data is free.
   // Always use \n---\n separator so extractUnfinishedSummary can distinguish
@@ -89,11 +112,18 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   const allText = [workingOn, ...completed.map(c => c.title).filter(Boolean), unfinished].join(' ');
   const keywords = extractMatchKeywords(allText, [...fileSet]);
 
+  // T10d: capture HEAD sha so detectContinuationIntent can anchor on it later.
+  // Best-effort — failures (non-git dir, missing binary, timeout) yield null.
+  let gitShaAtHandoff = null;
+  try {
+    gitShaAtHandoff = gitStateModule.readGitState({ cwd: process.cwd() }).headSha || null;
+  } catch { /* swallow — handoff must still persist */ }
+
   // UPSERT keyed on (project, type, session_id) — parallel sessions coexist.
   // Same session re-writing its own handoff (e.g. repeated /clear) updates in place.
   db.prepare(`
-    INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch, git_sha_at_handoff)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(project, type, session_id) DO UPDATE SET
       working_on = excluded.working_on,
       completed = excluded.completed,
@@ -101,7 +131,8 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       key_files = excluded.key_files,
       key_decisions = excluded.key_decisions,
       match_keywords = excluded.match_keywords,
-      created_at_epoch = excluded.created_at_epoch
+      created_at_epoch = excluded.created_at_epoch,
+      git_sha_at_handoff = excluded.git_sha_at_handoff
   `).run(
     project, type, sessionId,
     truncate(workingOn, 1000),
@@ -110,7 +141,8 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     JSON.stringify([...fileSet].slice(0, 20)),
     decisions.map(d => d.title).join('\n'),
     keywords,
-    Date.now()
+    Date.now(),
+    gitShaAtHandoff,
   );
 }
 
@@ -136,6 +168,26 @@ export function detectContinuationIntent(db, promptText, project, currentCcSessi
   // The bug was a single-char 'a' + fresh clear handoff → Stage 0 auto-match.
   if (!promptText || typeof promptText !== 'string') return false;
   if (promptText.trim().length < 2) return false;
+
+  // T10d Stage -1: Git-commit anchor — if ANY handoff (any age) has a
+  // git_sha_at_handoff matching current HEAD, the working tree hasn't moved
+  // since that handoff, so assume continuation regardless of time / prompt.
+  //
+  // Trade-off: after weeks of no commits this fires aggressively. Users can
+  // reset by making a commit or by typing a long unrelated prompt (this
+  // anchor runs BEFORE the Stage 0 long-prompt guard, so that escape hatch
+  // does not apply here). This is an MVP choice — see plan 10d concern.
+  try {
+    const currentSha = gitStateModule.readGitState({ cwd: process.cwd() }).headSha;
+    if (currentSha) {
+      const anchor = db.prepare(`
+        SELECT 1 FROM session_handoffs
+        WHERE project = ? AND git_sha_at_handoff = ?
+        ORDER BY created_at_epoch DESC LIMIT 1
+      `).get(project, currentSha);
+      if (anchor) return true;
+    }
+  } catch { /* git/DB failure must not break the rest of the pipeline */ }
 
   // Stage 0: Non-expired 'clear' handoff — assume continuation unless long unrelated prompt.
   // Session scoping: with currentCcSessionId, only your OWN clear handoff qualifies.

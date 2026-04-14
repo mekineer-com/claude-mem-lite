@@ -716,6 +716,23 @@ async function handleSessionStart() {
       } catch (e) { debugCatch(e, 'session-start-exit-fast-summary'); }
     }
 
+    // T10c: Startup dashboard — aggregate git/tasks/plans/handoff/events into a
+    // structured JSON hookSpecificOutput block. Emitted BEFORE the plain-text
+    // <claude-mem-context> so both surfaces coexist. Empty string → skip.
+    try {
+      const { buildDashboard } = await import('./lib/startup-dashboard.mjs');
+      const dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
+      if (dashboardText) {
+        process.stdout.write(JSON.stringify({
+          suppressOutput: true,
+          hookSpecificOutput: {
+            hookEventName: 'SessionStart',
+            additionalContext: dashboardText,
+          },
+        }) + '\n');
+      }
+    } catch (e) { debugCatch(e, 'session-start-dashboard'); }
+
     // Build the full context body via shared helper (also used by `mem-cli context`).
     // Queries session_summaries, key observations, clear handoff, and the
     // token-budgeted observation pool directly from the DB.
