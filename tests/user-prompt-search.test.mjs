@@ -781,7 +781,27 @@ describe('user-prompt-search T3: BM25 threshold + prompt-length gate', () => {
     expect(stdout).toMatch(/Redis/i);
   });
 
-  it('skips when prompt is too short (regression guard for length gate)', async () => {
+  it('skips medium-short prompts (13 chars) — exercises PROMPT_MIN_LENGTH gate', async () => {
+    // 'fix a bug now' is 13 chars, effectiveLen 13: passes shouldSkip (>= 8)
+    // but fails PROMPT_MIN_LENGTH (< 15). Seed a high-relevance bugfix
+    // observation that WOULD match the prompt stems ("fix", "bug") if the
+    // gate weren't there — so the only thing suppressing injection is the
+    // new length gate itself. This is a true mutation-resistant probe.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'fix bug in authentication flow',
+      text: 'fix bug authentication login crash root cause race condition',
+      lessonLearned: 'fix bug by serializing auth requests',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript({ prompt: 'fix a bug now' });
+    expect(stdout.trim()).toBe('');
+  });
+
+  it('skips extremely short prompts via shouldSkip', async () => {
+    // 'a' is rejected by shouldSkip (effectiveLen 1 < 8) before reaching
+    // PROMPT_MIN_LENGTH. Kept as independent coverage of the older gate.
     insertObs(db, {
       sessionId: 'mem-s1', project: 'test--project', type: 'decision',
       title: 'x', importance: 3,
