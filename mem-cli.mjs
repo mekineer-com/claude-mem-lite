@@ -2205,6 +2205,90 @@ async function cmdDoctor(db, args) {
   process.exitCode = 1;
 }
 
+// ─── Activity (T7 v2.31) ─────────────────────────────────────────────────────
+// Separate namespace from observations. Handlers are thin wrappers over
+// lib/activity.mjs pure functions; imported lazily to match the doctor pattern.
+
+function formatActivityResults(rows) {
+  if (!rows || rows.length === 0) return '(no events)';
+  return rows.map(r => `#${r.id} [${r.event_type}] ${r.title}`).join('\n');
+}
+
+async function cmdActivity(db, args) {
+  const sub = args[0];
+  if (!sub) {
+    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show> ...');
+    return;
+  }
+
+  const { positional, flags } = parseArgs(args.slice(1));
+  const { saveEvent, searchEvents, recentEvents, getEvent } = await import('./lib/activity.mjs');
+  const project = inferProject();
+
+  if (sub === 'save') {
+    const type = flags.type || 'observation';
+    const title = flags.title || positional.join(' ').trim();
+    if (!title) {
+      fail('[mem] activity save: --title or positional text required');
+      return;
+    }
+    const body = flags.body || null;
+    const file = flags.file || null;
+    const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
+    if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
+      fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
+      return;
+    }
+    const id = saveEvent(db, {
+      project,
+      event_type: type,
+      title,
+      body,
+      importance: rawImp,
+      file_paths: file ? [file] : null,
+    });
+    out(JSON.stringify({ ok: true, id }));
+    return;
+  }
+
+  if (sub === 'search') {
+    const q = positional.join(' ');
+    if (!q) {
+      fail('[mem] activity search: query required');
+      return;
+    }
+    const type = flags.type || null;
+    const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : 10;
+    const rows = searchEvents(db, q, { project, type, limit });
+    out(formatActivityResults(rows));
+    return;
+  }
+
+  if (sub === 'recent') {
+    // Accept either `activity recent 5` or `activity recent --limit 5`.
+    const posLimit = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
+    const flagLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
+    const limit = Number.isFinite(posLimit) ? posLimit : (Number.isFinite(flagLimit) ? flagLimit : 20);
+    const type = flags.type || null;
+    const rows = recentEvents(db, { project, type, limit });
+    out(formatActivityResults(rows));
+    return;
+  }
+
+  if (sub === 'show') {
+    const id = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
+    if (!Number.isFinite(id)) {
+      fail('[mem] activity show: numeric id required');
+      return;
+    }
+    const row = getEvent(db, id);
+    out(row ? JSON.stringify(row, null, 2) : 'Not found');
+    return;
+  }
+
+  fail(`[mem] Unknown activity subcommand: ${sub}`);
+}
+
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {
@@ -2254,6 +2338,7 @@ export async function run(argv) {
       case 'import':    await cmdImport(cmdArgs); break;
       case 'enrich':    await cmdEnrich(cmdArgs); break;
       case 'doctor':    await cmdDoctor(db, cmdArgs); break;
+      case 'activity':  await cmdActivity(db, cmdArgs); break;
       default:
         out(`[mem] Unknown command: ${cmd}`);
         out('[mem] Run "claude-mem-lite help" for usage');
