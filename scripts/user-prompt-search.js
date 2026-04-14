@@ -4,10 +4,9 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, isPathConfined, notLowSignalTitleClause } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause } from '../utils.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
 import Database from 'better-sqlite3';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
 
@@ -181,11 +180,14 @@ function formatResults(rows) {
   return lines.join('\n');
 }
 
-// ─── Registry Skill Auto-Load ──────────────────────────────────────────────
+// ─── Registry Skill Pointer (T4 v2.31) ─────────────────────────────────────
+// Formerly "auto-load": we used to read the full SKILL.md body (up to 16KB)
+// and inject it into stdout on keyword match. Now we only emit a short
+// pointer line so Claude can decide to invoke via SkillTool. The cooldown
+// and match mechanics below are unchanged.
 
 const SKILL_COOLDOWN_FILE = join(DB_DIR, 'runtime', `.skill-cooldown-${inferProject()}`);
 const SKILL_COOLDOWN_MS = 300_000; // 5 minutes
-const SKILL_TOKEN_LIMIT = 16000;   // ~4000 tokens
 
 function loadManagedSkillNames() {
   if (!existsSync(REGISTRY_DB_PATH)) return new Set();
@@ -200,48 +202,6 @@ function loadManagedSkillNames() {
       return new Set(rows.map(r => r.name.toLowerCase()));
     } finally { rdb.close(); }
   } catch { return new Set(); }
-}
-
-function toPortablePath(absPath) {
-  const home = homedir();
-  return absPath.startsWith(home) ? '~' + absPath.slice(home.length) : absPath;
-}
-
-function loadSkillContent(skillName) {
-  if (!existsSync(REGISTRY_DB_PATH)) return null;
-  try {
-    const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
-    rdb.pragma('busy_timeout = 500');
-    try {
-      const row = rdb.prepare(`
-        SELECT name, type, local_path FROM resources
-        WHERE status = 'active'
-          AND (name = ? OR invocation_name = ?)
-          AND local_path LIKE '%/.claude-mem-lite/managed/%'
-        LIMIT 1
-      `).get(skillName, skillName);
-
-      if (!row || !row.local_path) return null;
-
-      let path = row.local_path;
-      if (!path.endsWith('.md')) {
-        const candidate = join(path, 'SKILL.md');
-        if (existsSync(candidate)) path = candidate;
-      }
-      // Path confinement check — prevent LIKE bypass via '../' in local_path
-      const managedBase = join(homedir(), '.claude-mem-lite');
-      if (!isPathConfined(path, managedBase)) return null;
-      if (!existsSync(path)) return null;
-
-      const portablePath = toPortablePath(path);
-      const sourceLabel = row.type === 'agent' ? 'managed-agent' : 'managed-skill';
-      const content = readFileSync(path, 'utf8');
-      if (content.length > SKILL_TOKEN_LIMIT) {
-        return `<skill-auto-loaded name="${row.name}" source="${sourceLabel}" path="${portablePath}" truncated="true">\n${content.slice(0, 800)}\n...\n</skill-auto-loaded>\nSkill truncated. Full content: Read("${portablePath}") or mem_use(name="${row.name}")`;
-      }
-      return `<skill-auto-loaded name="${row.name}" source="${sourceLabel}" path="${portablePath}">\n${content}\n</skill-auto-loaded>\nFollow the instructions above. Reload: Read("${portablePath}")`;
-    } finally { rdb.close(); }
-  } catch { return null; }
 }
 
 function getSkillCooldown() {
@@ -359,18 +319,21 @@ async function main() {
       } catch {}
     }
 
-    // ─── L1: Registry skill auto-load ───────────────────────────────────
+    // ─── L1: Registry skill pointer (T4 v2.31) ──────────────────────────
+    // Previously this block injected the full skill body (up to 16KB) on
+    // keyword match, silently inflating every matched prompt. We now emit a
+    // single pointer line so Claude can decide to invoke via SkillTool on
+    // demand — the cooldown and match preconditions stay identical.
     try {
       const skillNames = loadManagedSkillNames();
       const matched = matchRegistrySkillName(promptText, skillNames);
       if (matched) {
         const cooldown = getSkillCooldown();
         if (!cooldown[matched]) {
-          const skillContent = loadSkillContent(matched);
-          if (skillContent) {
-            process.stdout.write('\n' + skillContent + '\n');
-            setSkillCooldown(matched);
-          }
+          process.stdout.write(
+            `\n[mem] Skill "${matched}" may apply — invoke via SkillTool or run: claude-mem-lite registry show ${matched}\n`
+          );
+          setSkillCooldown(matched);
         }
       }
     } catch { /* silent — never block on registry failure */ }

@@ -5,10 +5,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
+import { homedir } from 'os';
 import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
+import { ensureRegistryDb } from '../registry.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { typeIcon, truncate } from '../utils.mjs';
 import {
@@ -809,5 +811,96 @@ describe('user-prompt-search T3: BM25 threshold + prompt-length gate', () => {
     db.pragma('wal_checkpoint(FULL)');
     const { stdout } = await runScript({ prompt: 'a' });
     expect(stdout.trim()).toBe('');
+  });
+});
+
+// ─── T4 (v2.31): Skill pointer (no raw-body injection) ─────────────────────
+// Purpose: the registry-skill auto-load block must NEVER emit the full skill
+// body to stdout (previously up to 16KB). It may emit a single pointer line
+// containing the skill name so Claude can decide to invoke via SkillTool.
+// See Task 4 in docs/plans/2026-04-14-mem-v2.31-mvp.md.
+//
+// Seeding strategy: filesystem + registry DB. `loadSkillContent` (old code)
+// path-confines against `homedir()/.claude-mem-lite/managed/`, so to make
+// the OLD code actually emit the body (i.e. a true RED-phase failing test)
+// we must place a real file under the real homedir managed dir. We use a
+// per-pid/per-timestamp nonce to avoid collision with any genuine user
+// skills, and the afterEach cleanup removes it.
+describe('user-prompt-search T4: registry skill pointer (no body injection)', () => {
+  let db;
+  let testDir;
+  let managedSkillDir;
+  let skillName;
+
+  /**
+   * Seed a registered skill with a large body under the real homedir managed
+   * dir (required by loadSkillContent's path confinement) plus a registry
+   * row pointing at it. Returns the skill name for use in the prompt.
+   */
+  function seedRegistrySkill({ registryDbPath, bodyBytes }) {
+    const nonce = `test-skill-large-${process.pid}-${Date.now()}`;
+    const skillDir = join(homedir(), '.claude-mem-lite', 'managed', nonce);
+    mkdirSync(skillDir, { recursive: true });
+    const skillPath = join(skillDir, 'SKILL.md');
+    writeFileSync(skillPath, 'A'.repeat(bodyBytes));
+
+    const rdb = ensureRegistryDb(registryDbPath);
+    try {
+      rdb.prepare(`
+        INSERT INTO resources (name, type, status, source, local_path, invocation_name)
+        VALUES (?, 'skill', 'active', 'user', ?, ?)
+      `).run(nonce, skillPath, nonce);
+    } finally {
+      rdb.close();
+    }
+    return { skillName: nonce, skillDir };
+  }
+
+  beforeEach(() => {
+    cleanupTestFiles();
+    try { if (existsSync(COOLDOWN_FILE)) unlinkSync(COOLDOWN_FILE); } catch {}
+    testDir = resolve(import.meta.dirname, '.tmp-prompt-search-dir');
+    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+    mkdirSync(testDir, { recursive: true });
+    // runtime/ needed so setSkillCooldown can write (doesn't affect assertion,
+    // but keeps the path clean; write is try/catch-guarded anyway).
+    mkdirSync(join(testDir, 'runtime'), { recursive: true });
+    const dbPath = join(testDir, 'claude-mem-lite.db');
+    db = createFileDb(dbPath);
+    insertSession(db, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+    managedSkillDir = null;
+    skillName = null;
+  });
+
+  afterEach(() => {
+    try { db.close(); } catch {}
+    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+    // Always clean up the homedir-seeded skill fixture
+    if (managedSkillDir) {
+      try { rmSync(managedSkillDir, { recursive: true, force: true }); } catch {}
+    }
+    cleanupTestFiles();
+  });
+
+  it('never emits raw skill bodies — at most a one-line pointer', async () => {
+    const registryDbPath = join(testDir, 'resource-registry.db');
+    const seeded = seedRegistrySkill({ registryDbPath, bodyBytes: 10000 });
+    managedSkillDir = seeded.skillDir;
+    skillName = seeded.skillName;
+    db.pragma('wal_checkpoint(FULL)');
+
+    const prompt = `please use the ${skillName} skill to help me with this task`;
+    const { stdout } = await runScript({ prompt });
+
+    // HARD constraint: the 10KB body must not appear in stdout under any
+    // circumstance. A run of 100+ 'A' characters can only come from the body.
+    expect(stdout).not.toMatch(/A{100,}/);
+
+    // SOFT constraint: if the hook DOES emit something (the pointer line),
+    // it must be short and reference the skill by name so Claude can act.
+    if (stdout.trim()) {
+      expect(stdout.length).toBeLessThan(500);
+      expect(stdout).toContain(skillName);
+    }
   });
 });
