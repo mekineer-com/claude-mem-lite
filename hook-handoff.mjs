@@ -4,7 +4,8 @@
 import { basename } from 'path';
 import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE } from './utils.mjs';
 import {
-  HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
+  HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_ANCHOR_MAX_AGE,
+  HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
 } from './hook-shared.mjs';
 // T10d: import the whole module (not a named export) so tests can spy on
 // gitStateModule.readGitState via vi.spyOn. Named-import bindings are
@@ -169,23 +170,23 @@ export function detectContinuationIntent(db, promptText, project, currentCcSessi
   if (!promptText || typeof promptText !== 'string') return false;
   if (promptText.trim().length < 2) return false;
 
-  // T10d Stage -1: Git-commit anchor — if ANY handoff (any age) has a
-  // git_sha_at_handoff matching current HEAD, the working tree hasn't moved
-  // since that handoff, so assume continuation regardless of time / prompt.
+  // T10d Stage -1: Git-commit anchor — current HEAD == a stored
+  // git_sha_at_handoff ⇒ working tree hasn't moved since the handoff.
   //
-  // Trade-off: after weeks of no commits this fires aggressively. Users can
-  // reset by making a commit or by typing a long unrelated prompt (this
-  // anchor runs BEFORE the Stage 0 long-prompt guard, so that escape hatch
-  // does not apply here). This is an MVP choice — see plan 10d concern.
+  // Age cap (HANDOFF_ANCHOR_MAX_AGE = 72h) prevents stale HEAD from
+  // auto-continuing weeks-old context. For older anchors, the rest of the
+  // pipeline (Stage 0/1/2) still evaluates normally.
   try {
     const currentSha = gitStateModule.readGitState({ cwd: process.cwd() }).headSha;
     if (currentSha) {
       const anchor = db.prepare(`
-        SELECT 1 FROM session_handoffs
+        SELECT created_at_epoch FROM session_handoffs
         WHERE project = ? AND git_sha_at_handoff = ?
         ORDER BY created_at_epoch DESC LIMIT 1
       `).get(project, currentSha);
-      if (anchor) return true;
+      if (anchor && (Date.now() - anchor.created_at_epoch <= HANDOFF_ANCHOR_MAX_AGE)) {
+        return true;
+      }
     }
   } catch { /* git/DB failure must not break the rest of the pipeline */ }
 
@@ -204,14 +205,25 @@ export function detectContinuationIntent(db, promptText, project, currentCcSessi
       `).get(project);
 
   if (clearHandoff && (Date.now() - clearHandoff.created_at_epoch <= HANDOFF_EXPIRY_CLEAR)) {
-    // Short/ambiguous prompts: assume continuation (user may say "ok", "start", etc.)
-    if (promptText.length < 40) return true;
-    // Long prompts: check keyword overlap to confirm same-task intent
-    if (!clearHandoff.match_keywords) return true; // no keywords stored, can't verify
-    const clearPromptTokens = tokenizeHandoff(promptText);
-    const clearHandoffTokens = new Set(tokenizeHandoff(clearHandoff.match_keywords));
-    if (clearPromptTokens.some(t => clearHandoffTokens.has(t))) return true;
-    // Long prompt with zero keyword overlap → likely new task, fall through
+    const pTokens = tokenizeHandoff(promptText);
+    const hTokens = clearHandoff.match_keywords
+      ? new Set(tokenizeHandoff(clearHandoff.match_keywords))
+      : null;
+    const hasOverlap = hTokens && pTokens.some(t => hTokens.has(t));
+    if (promptText.length < 40) {
+      // Short prompts: session-scoped clear = same user/context, auto-continue.
+      // Unscoped (legacy / no session_id in hook input) requires an explicit
+      // continuation keyword or keyword overlap to avoid cross-session noise.
+      if (currentCcSessionId) return true;
+      if (CONTINUE_KEYWORDS.test(promptText)) return true;
+      if (hasOverlap) return true;
+      // Fall through
+    } else {
+      // Long prompts: check keyword overlap to confirm same-task intent
+      if (!clearHandoff.match_keywords) return true; // no keywords stored, can't verify
+      if (hasOverlap) return true;
+      // Long prompt with zero keyword overlap → likely new task, fall through
+    }
   }
 
   // Stage 1: Explicit keyword match — always works, even without handoff

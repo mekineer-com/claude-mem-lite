@@ -857,13 +857,15 @@ async function handleUserPrompt() {
           const injection = renderHandoffInjection(db, project, ccSessionId);
           if (injection) {
             process.stdout.write(injection + '\n');
-            // Consume clear handoff after injection to prevent duplicate injection on prompts 2-3.
-            // Scope the delete to THIS session's clear handoff — do not clobber parallel sessions' rows.
+            // Consume handoff after injection to prevent re-injection on later prompts
+            // (within-session on prompts 2-3, or across new sessions for exit handoffs).
+            // clear: scoped to THIS session (parallel sessions keep their own rows).
+            // exit:  unscoped — any exit handoff in this project is fair game once resumed.
             try {
               if (ccSessionId) {
-                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear' AND session_id = ?").run(project, ccSessionId);
+                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND ((type = 'clear' AND session_id = ?) OR type = 'exit')").run(project, ccSessionId);
               } else {
-                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type = 'clear'").run(project);
+                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type IN ('clear','exit')").run(project);
               }
             } catch {}
           }

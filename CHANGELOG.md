@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.7] - 2026-04-17
+
+Handoff continuation-detection hardening. Three rough edges in `detectContinuationIntent` + `hook.mjs` injection cleanup made stale handoffs (especially `/exit` type, which survive 7 days) re-inject across new sessions even when the new prompt was unrelated. Addressed together so the gating story is coherent.
+
+### Fixed
+
+- **Stage -1 git_sha anchor age cap (`hook-handoff.mjs:172-191`)** — the anchor previously returned `true` for ANY matching `git_sha_at_handoff` regardless of age; after "weeks of no commits" it fired aggressively on unrelated prompts. Now capped at `HANDOFF_ANCHOR_MAX_AGE = 72h` — stale-HEAD handoffs no longer shortcut the rest of the pipeline. Sub-72h behavior unchanged.
+- **Exit handoff not consumed on injection (`hook.mjs:860-870`)** — the post-injection `DELETE` only covered `type='clear'`, so `/exit` handoffs kept matching the first 3 prompts of every new session in the same project until they aged out at 7 days. Now consumes both `clear` and `exit`; the 7-day expiry becomes a "if nobody ever comes back" safety net instead of a re-injection window.
+- **Stage 0 unscoped short-prompt auto-true (`hook-handoff.mjs:194-228`)** — `prompt.length < 40` + fresh clear handoff returned `true` unconditionally. In the session-scoped path (`currentCcSessionId` present), that is fine — same user, same context. In the unscoped/legacy path it produced cross-session noise ("你好" on a fresh unrelated session would resume someone else's `/clear`). Unscoped short prompts now require a `CONTINUE_KEYWORDS` match or keyword overlap with the handoff. Scoped path unchanged.
+
+### Added
+
+- **`tests/handoff.test.mjs`** — four new cases: `anchor within 72h age cap still matches`, `anchor older than 72h does NOT match`, `session-scoped 2-char prompts still auto-continue`, `unscoped 2-char prompts without keyword do NOT auto-continue`. Existing tests adjusted to pin the new contract.
+- **`hook-shared.mjs`** — exported `HANDOFF_ANCHOR_MAX_AGE` constant (72h).
+
+### Internal
+
+- 1584 → 1588 tests (+4 coverage for hardened gates).
+- No contract change for MCP tools, CLI, or hook I/O surface — only continuation-intent behavior.
+
 ## [2.32.6] - 2026-04-17
 
 Handoff injection UX fix. When the `UserPromptSubmit` hook surfaced a prior `/exit` handoff as `additionalContext`, the opening block looked like:

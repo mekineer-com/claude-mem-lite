@@ -222,16 +222,19 @@ describe('Scenario 2: /clear → continue same work', () => {
     expect(output.claudeMd).toContain('tests failed');
   });
 
-  it('short prompt after /clear auto-detects continuation', () => {
+  it('short prompt after /clear auto-detects continuation (session-scoped)', () => {
     const project = 'mem';
     seedSession(db, 'sess-1', project);
     seedPrompt(db, 'sess-1', '修复 dispatch 测试', 1);
     buildAndSaveHandoff(db, 'sess-1', project, 'clear', null);
 
-    // Short prompts → assume continuation
+    // Same-session short prompts → assume continuation
+    expect(detectContinuationIntent(db, '继续', project, 'sess-1')).toBe(true);
+    expect(detectContinuationIntent(db, 'ok', project, 'sess-1')).toBe(true);
+    expect(detectContinuationIntent(db, '开始吧', project, 'sess-1')).toBe(true);
+    // Unscoped (legacy) only keyword or overlap now passes (v2.32.7 tightening)
     expect(detectContinuationIntent(db, '继续', project)).toBe(true);
-    expect(detectContinuationIntent(db, 'ok', project)).toBe(true);
-    expect(detectContinuationIntent(db, '开始吧', project)).toBe(true);
+    expect(detectContinuationIntent(db, 'ok', project)).toBe(false);
   });
 
   it('P2-1: long unrelated prompt after /clear does NOT inject old context', () => {
@@ -551,16 +554,22 @@ describe('Scenario 8: CJK continuation detection', () => {
     expect(detectContinuationIntent(db, '之前的任务怎么样了', project)).toBe(true);
   });
 
-  it('short CJK prompts after /clear assume continuation', () => {
+  it('short CJK prompts after /clear — session-scoped continues, unscoped needs keyword', () => {
     const project = 'test';
     seedSession(db, 'sess-1', project);
     seedPrompt(db, 'sess-1', '修复数据库连接问题', 1);
     buildAndSaveHandoff(db, 'sess-1', project, 'clear', null);
 
-    // Short CJK prompts (< 40 chars) → assume continuation
-    expect(detectContinuationIntent(db, '好的', project)).toBe(true);
-    expect(detectContinuationIntent(db, '开始', project)).toBe(true);
-    expect(detectContinuationIntent(db, '看看效果', project)).toBe(true);
+    // Session-scoped (v2.32.7): short CJK continues regardless of wording
+    expect(detectContinuationIntent(db, '好的', project, 'sess-1')).toBe(true);
+    expect(detectContinuationIntent(db, '开始', project, 'sess-1')).toBe(true);
+    expect(detectContinuationIntent(db, '看看效果', project, 'sess-1')).toBe(true);
+    // Unscoped: neither matches CONTINUE_KEYWORDS nor overlaps with
+    // '修复数据库连接问题' tokens → no longer auto-continues
+    expect(detectContinuationIntent(db, '好的', project)).toBe(false);
+    expect(detectContinuationIntent(db, '开始', project)).toBe(false);
+    // Unscoped + explicit continuation keyword still passes
+    expect(detectContinuationIntent(db, '继续', project)).toBe(true);
   });
 });
 

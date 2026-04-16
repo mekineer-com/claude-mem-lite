@@ -347,12 +347,24 @@ describe('detectContinuationIntent', () => {
       VALUES ('test-proj', 'exit', 's1', 'implement handoff', 'handoff dispatch hook schema intent detection', ?)`).run(Date.now());
   });
 
-  it('Stage 0: returns true for short prompts with non-expired clear handoff', () => {
+  it('Stage 0: returns true for session-scoped short prompts with fresh clear handoff', () => {
     db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
       VALUES ('test-proj', 'clear', 's2', 'handoff dispatch work', ?)`).run(Date.now());
-    // Short prompts (< 40 chars) assume continuation regardless of content
-    expect(detectContinuationIntent(db, 'hello how are you', 'test-proj')).toBe(true);
-    expect(detectContinuationIntent(db, 'build a new REST API', 'test-proj')).toBe(true);
+    // Session-scoped path (currentCcSessionId given) = same user continuing → auto-continue.
+    expect(detectContinuationIntent(db, 'hello how are you', 'test-proj', 's2')).toBe(true);
+    expect(detectContinuationIntent(db, 'build a new REST API', 'test-proj', 's2')).toBe(true);
+  });
+
+  it('Stage 0: unscoped short prompt requires continuation keyword or keyword overlap', () => {
+    db.prepare(`INSERT OR REPLACE INTO session_handoffs (project, type, session_id, match_keywords, created_at_epoch)
+      VALUES ('test-proj', 'clear', 's2', 'handoff dispatch work', ?)`).run(Date.now());
+    // Unscoped: unrelated short prompt no longer auto-triggers (prevents cross-session noise)
+    expect(detectContinuationIntent(db, 'hello how are you', 'test-proj')).toBe(false);
+    expect(detectContinuationIntent(db, 'build a new REST API', 'test-proj')).toBe(false);
+    // Unscoped + continuation keyword = true (Stage 1)
+    expect(detectContinuationIntent(db, '继续', 'test-proj')).toBe(true);
+    // Unscoped + keyword overlap with handoff = true
+    expect(detectContinuationIntent(db, 'dispatch update', 'test-proj')).toBe(true);
   });
 
   it('Stage 0: returns false for long unrelated prompt with clear handoff', () => {
@@ -463,9 +475,17 @@ describe('detectContinuationIntent', () => {
       expect(detectContinuationIntent(tinyDb, '好', 'p')).toBe(false);
     });
 
-    it('still accepts 2-character short prompts (backward compat for "ok", "好的")', () => {
-      expect(detectContinuationIntent(tinyDb, 'ok', 'p')).toBe(true);
-      expect(detectContinuationIntent(tinyDb, '好的', 'p')).toBe(true);
+    it('session-scoped 2-char prompts still auto-continue ("ok", "好的")', () => {
+      expect(detectContinuationIntent(tinyDb, 'ok', 'p', 's-fresh')).toBe(true);
+      expect(detectContinuationIntent(tinyDb, '好的', 'p', 's-fresh')).toBe(true);
+    });
+
+    it('unscoped 2-char prompts without keyword do NOT auto-continue', () => {
+      // Tightened in v2.32.7: unscoped path needs CONTINUE_KEYWORDS or overlap
+      expect(detectContinuationIntent(tinyDb, 'ok', 'p')).toBe(false);
+      expect(detectContinuationIntent(tinyDb, '好的', 'p')).toBe(false);
+      // Explicit CONTINUE_KEYWORDS still work unscoped
+      expect(detectContinuationIntent(tinyDb, '继续', 'p')).toBe(true);
     });
   });
 
@@ -507,11 +527,15 @@ describe('detectContinuationIntent', () => {
       expect(detectContinuationIntent(scopedDb, 'dispatch hook schema intent overlap', 'p', 'cc-B')).toBe(true);
     });
 
-    it('null currentCcSessionId preserves legacy behavior (backward compat)', () => {
-      // Callers that don't pass currentCcSessionId get the old Stage 0 semantics
-      // (short prompt + fresh clear handoff → true), minus the tiny-prompt guard
-      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p')).toBe(true);
-      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p', null)).toBe(true);
+    it('null currentCcSessionId requires keyword or overlap (tightened in v2.32.7)', () => {
+      // Unscoped callers no longer auto-continue on unrelated short prompts —
+      // requires CONTINUE_KEYWORDS match or keyword overlap with handoff.
+      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p')).toBe(false);
+      expect(detectContinuationIntent(scopedDb, 'ok lets go', 'p', null)).toBe(false);
+      // But explicit continuation keyword still passes via Stage 1
+      expect(detectContinuationIntent(scopedDb, '继续', 'p')).toBe(true);
+      // And keyword overlap with the handoff still passes Stage 0 long-prompt branch
+      expect(detectContinuationIntent(scopedDb, 'dispatch intent', 'p')).toBe(true);
     });
   });
 });
@@ -863,5 +887,35 @@ describe('T10d: git-commit anchor in detectContinuationIntent', () => {
 
     const result = detectContinuationIntent(db, 'what time is it in Tokyo please tell me now', 'mem');
     expect(result).toBe(false);
+  });
+
+  it('anchor within 72h age cap still matches (v2.32.7)', () => {
+    // 60h old handoff with matching sha — under 72h cap, should anchor
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch, git_sha_at_handoff)
+                VALUES (?, 'exit', ?, ?, ?)`)
+      .run('mem', 'sX', Date.now() - 60 * 3600000, 'abc123');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'abc123',
+    });
+
+    // Long unrelated prompt — anchor still rescues it within 72h
+    expect(detectContinuationIntent(db, 'what time is it in Tokyo please tell me', 'mem')).toBe(true);
+  });
+
+  it('anchor older than 72h does NOT match — rest of pipeline decides (v2.32.7)', () => {
+    // 80h old handoff with matching sha — over 72h cap, anchor is stale
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, created_at_epoch, git_sha_at_handoff, match_keywords)
+                VALUES (?, 'exit', ?, ?, ?, ?)`)
+      .run('mem', 'sX', Date.now() - 80 * 3600000, 'abc123', 'auth refactor');
+
+    vi.spyOn(gitStateModule, 'readGitState').mockReturnValue({
+      changed: [], stashes: [], branch: 'main', headSha: 'abc123',
+    });
+
+    // Long unrelated prompt + stale anchor → falls through Stage 0/1/2, no match
+    expect(detectContinuationIntent(db, 'what time is it in Tokyo please tell me', 'mem')).toBe(false);
+    // Explicit continuation keyword still wins via Stage 1 regardless of anchor age
+    expect(detectContinuationIntent(db, '继续 please', 'mem')).toBe(true);
   });
 });
