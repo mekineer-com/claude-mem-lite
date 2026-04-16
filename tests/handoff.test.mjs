@@ -288,6 +288,45 @@ describe('buildAndSaveHandoff', () => {
     expect(row.match_keywords).toContain('hook');
   });
 
+  // Regression: handleStop receives CC UUID from stdin but user_prompts was keyed
+  // by mem-internal id in handleUserPrompt. Before the fix, passing a single
+  // sessionId that mismatched user_prompts → prompts.length === 0 → early return
+  // → no handoff row. Fix splits into query key (mem-internal) + scope key (CC UUID).
+  it('scopeSessionId tags the handoff row while querySessionId drives user_prompts lookup', () => {
+    const memInternalId = 'hook-projects--mem-abc123';
+    const ccUuid = '669a3b98-5baf-4c2e-9e50-7d1bef8ddafd';
+    seedSession(db, memInternalId, 'test-proj');
+    seedPrompt(db, memInternalId, 'continue refactor after /exit', 1);
+    seedObservation(db, memInternalId, 'test-proj', 'Edited hook.mjs', 'change', 2, null);
+
+    buildAndSaveHandoff(db, memInternalId, 'test-proj', 'exit', null, ccUuid);
+
+    // Row tagged by scope id (CC UUID) so renderHandoffInjection can scope by it
+    const scoped = db.prepare(
+      `SELECT * FROM session_handoffs WHERE project = 'test-proj' AND type = 'exit' AND session_id = ?`
+    ).get(ccUuid);
+    expect(scoped).toBeTruthy();
+    expect(scoped.working_on).toContain('continue refactor');
+    expect(scoped.completed).toContain('Edited hook.mjs');
+
+    // And NOT tagged by the query id (would break CC-UUID-scoped reads)
+    const wrongScope = db.prepare(
+      `SELECT * FROM session_handoffs WHERE session_id = ?`
+    ).get(memInternalId);
+    expect(wrongScope).toBeUndefined();
+  });
+
+  it('scopeSessionId defaults to sessionId (backward compat)', () => {
+    seedSession(db, 's1', 'test-proj');
+    seedPrompt(db, 's1', 'legacy call without scope arg', 1);
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
+
+    const row = db.prepare(`SELECT * FROM session_handoffs WHERE session_id = 's1'`).get();
+    expect(row).toBeTruthy();
+    expect(row.working_on).toContain('legacy');
+  });
+
   it('does not treat completed bugfixes as unfinished', () => {
     seedSession(db, 's1', 'test-proj');
     seedPrompt(db, 's1', 'fix bugs', 1);

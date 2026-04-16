@@ -16,13 +16,21 @@ import * as taskReaderModule from './lib/task-reader.mjs';
 /**
  * Build and save a handoff snapshot to session_handoffs table.
  * Called synchronously during handleStop (/exit) or handleSessionStart (/clear).
+ *
+ * Dual id: `sessionId` is the mem-internal id that user_prompts / observations
+ * were written with (handleUserPrompt uses getSessionId()) — it drives all
+ * DB lookups. `scopeSessionId` is the CC UUID from hook stdin used to scope
+ * the stored row so parallel CC sessions don't clobber each other. When
+ * `scopeSessionId` is null/undefined, `sessionId` is used for both (legacy).
+ *
  * @param {Database} db Opened main database
- * @param {string} sessionId Session being handed off
+ * @param {string} sessionId Mem-internal session id (query key)
  * @param {string} project Project identifier
  * @param {'clear'|'exit'} type Handoff type
  * @param {object|null} episodeSnapshot Episode buffer captured before flushing
+ * @param {string|null} [scopeSessionId=null] CC UUID for session_handoffs.session_id column
  */
-export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapshot) {
+export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapshot, scopeSessionId = null) {
   // 1. Working objective — from user prompts
   const prompts = db.prepare(`
     SELECT prompt_text FROM user_prompts
@@ -122,6 +130,9 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
 
   // UPSERT keyed on (project, type, session_id) — parallel sessions coexist.
   // Same session re-writing its own handoff (e.g. repeated /clear) updates in place.
+  // `scopeSessionId` (CC UUID) tags the row for parallel scoping; falls back to
+  // the mem-internal `sessionId` when the caller didn't supply one (tests + legacy).
+  const storedSessionId = scopeSessionId || sessionId;
   db.prepare(`
     INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch, git_sha_at_handoff)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -135,7 +146,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       created_at_epoch = excluded.created_at_epoch,
       git_sha_at_handoff = excluded.git_sha_at_handoff
   `).run(
-    project, type, sessionId,
+    project, type, storedSessionId,
     truncate(workingOn, 1000),
     completed.map(c => `[${c.type}] ${c.title}`).join('\n'),
     unfinished.length > 3000 ? unfinished.slice(0, 2999) + '…' : unfinished,

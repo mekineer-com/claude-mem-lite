@@ -2,6 +2,29 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.33.2] - 2026-04-17
+
+Dual-id regression fix. Since `bf121aa` (2026-04-12, v2.32.x line) `handleStop` and `handleSessionStart /clear` used `sessionId = ccSessionId || getSessionId()` as the query key for every DB operation. But `handleUserPrompt` still writes `user_prompts` / `sdk_sessions.content_session_id` / `observations.memory_session_id` with the mem-internal id from `getSessionId()`. When Claude Code provided `session_id` in hook stdin (modern CC), the id passed to DB lookups was a CC UUID that matched zero rows — silently.
+
+### Fixed
+
+- **`hook.mjs:handleStop`** — `sessionId` now always comes from `getSessionId()` (mem-internal); `ccSessionId` is passed separately to `buildAndSaveHandoff` as a scope tag only. Without this, `UPDATE sdk_sessions SET status='completed'` matched 0 rows (sessions stayed `active`), `buildAndSaveHandoff`'s `user_prompts` lookup returned empty and early-returned (no handoff row written), and the fast-summary `firstPrompt` / `recentObs` queries missed every row.
+- **`hook.mjs:handleSessionStart`** — same split applied to the `/clear` handoff path: query key = `prevSessionId` (mem-internal from session file), scope key = `ccSessionId || prevSessionId`.
+- **`hook-handoff.mjs:buildAndSaveHandoff`** — new optional 6th arg `scopeSessionId`. When provided, overrides only the value written into `session_handoffs.session_id`; every internal lookup still uses `sessionId` (arg 2). Default `null` preserves legacy behavior for tests / older callers.
+
+### Added
+
+- **File-level session-id invariant doc** (`hook.mjs:6-20`) — explicit contract: mem-internal id owns `user_prompts` / `sdk_sessions` / `observations`; CC UUID is valid only for `session_handoffs.session_id` scoping. Historical precedent (this regression, 4 days undetected) inlined for future contributors.
+
+### Data migration
+
+- **One-time**: `UPDATE sdk_sessions SET status='abandoned' WHERE status='active' AND started_at_epoch < now - 3600000` — 59 stuck rows across `projects--mem` (38), `projects--code-graph-mcp` (20), `tmp--mem-test-fresh` (1) cleared. 1h cutoff protects currently-running sessions; they'll self-clean on next `/exit` now that the fix is in place.
+
+### Internal
+
+- 1618 → 1620 tests (+2 regression tests in `tests/handoff.test.mjs`: `scopeSessionId` tags the handoff row while `querySessionId` drives `user_prompts` lookup; default-to-`sessionId` backward-compat).
+- No public API / schema change. Hook contract unchanged for callers.
+
 ## [2.33.1] - 2026-04-17
 
 Feedback-loop + signal-density patch. Audit of in-session plugin behavior (4-turn conversation, 1 PreToolUse Edit hit, 0 follow-up UserPromptSubmit injections, type distribution `decision 9 / change 1171`) surfaced four gaps — this release fixes all four and prunes historical noise.

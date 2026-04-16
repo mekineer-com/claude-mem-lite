@@ -3,6 +3,20 @@
 // Selective encoding, episodic batching, error-triggered recall
 // Hooks (fast <100ms): post-tool-use, session-start, stop
 // Background workers (slow): llm-episode, llm-summary
+//
+// ─── Session-id invariant (do not violate — see bf121aa / v2.33.2) ──────────
+// Two session identifiers coexist in this codebase:
+//   • mem-internal id: `hook-<project>-<hash>`, produced by getSessionId().
+//     handleUserPrompt writes it into user_prompts / sdk_sessions.content_session_id
+//     / observations.memory_session_id. Treat as the ONLY valid WHERE / JOIN key
+//     for those three tables.
+//   • CC UUID: `hookData.session_id` from stdin. Use ONLY for
+//     session_handoffs.session_id (parallel-session scoping, per bf121aa).
+// Mixing them silently breaks everything — UPDATE matches 0 rows, SELECT returns
+// empty, buildAndSaveHandoff early-returns, no throw. Precedent: v2.33.1 shipped
+// with the two mixed since 2026-04-12; 48 stale 'active' sessions + 0 handoffs
+// for projects--mem went unnoticed for 4 days. Keep the split or document why
+// you're changing it.
 
 import { randomUUID } from 'crypto';
 import { join } from 'path';
@@ -326,9 +340,12 @@ async function handleStop() {
     }
   } catch { /* stdin unavailable — fall back to local session id */ }
 
-  // Capture session info BEFORE cleanup. Prefer CC session id (parallel-safe);
-  // fall back to file-based id for backward compat.
-  const sessionId = ccSessionId || getSessionId();
+  // Capture session info BEFORE cleanup. All DB lookups use the mem-internal id
+  // (that's what handleUserPrompt wrote into user_prompts / sdk_sessions / observations
+  // via getSessionId()). `ccSessionId` is used only to tag session_handoffs rows
+  // for parallel-session scoping — it must not be used as a query key, otherwise
+  // queries miss and UPDATE sdk_sessions becomes a no-op (v2.33.2 regression fix).
+  const sessionId = getSessionId();
   const project = inferProject();
 
   // Snapshot episode BEFORE flush for handoff extraction
@@ -381,8 +398,11 @@ async function handleStop() {
         UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?
         WHERE content_session_id = ? AND status = 'active'
       `).run(new Date().toISOString(), Date.now(), sessionId);
-      // Save handoff snapshot for cross-session continuity
-      try { buildAndSaveHandoff(db, sessionId, project, 'exit', episodeSnapshot); }
+      // Save handoff snapshot for cross-session continuity.
+      // sessionId = mem-internal (query key); ccSessionId = CC UUID (scope key for
+      // parallel-safe row identity). Without the split, CC UUID-based queries miss
+      // user_prompts and the handoff row is silently skipped (see hook-handoff.mjs).
+      try { buildAndSaveHandoff(db, sessionId, project, 'exit', episodeSnapshot, ccSessionId || sessionId); }
       catch (e) { debugCatch(e, 'handleStop-handoff'); }
 
       // Fast summary baseline — ensures summary exists even if background LLM fails
@@ -664,12 +684,12 @@ async function handleSessionStart() {
 
     if (prevSessionId) {
       // Save handoff for cross-session continuity (/clear or /compact).
-      // Prefer CC session id (stable across /clear within same CC session, and
-      // unique across parallel sessions for the same project) so UserPromptSubmit
-      // can scope by hookData.session_id. Fall back to the mem plugin's file-based
-      // id for legacy/test paths.
-      const handoffSessionId = ccSessionId || prevSessionId;
-      try { buildAndSaveHandoff(db, handoffSessionId, prevProject || project, 'clear', episodeSnapshot); }
+      // prevSessionId is the mem-internal id — use it to look up the finished session's
+      // user_prompts / observations. ccSessionId (same CC session across /clear) scopes
+      // the stored row so UserPromptSubmit can read its own handoff back.
+      // Legacy/test paths (no stdin) fall back to prevSessionId for both.
+      const handoffScopeId = ccSessionId || prevSessionId;
+      try { buildAndSaveHandoff(db, prevSessionId, prevProject || project, 'clear', episodeSnapshot, handoffScopeId); }
       catch (e) { debugCatch(e, 'session-start-handoff'); }
 
       // Read the just-saved handoff for downstream consumers (fast summary remaining, working state).
@@ -677,7 +697,7 @@ async function handleSessionStart() {
       try {
         prevClearHandoff = db.prepare(
           'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ? AND session_id = ?'
-        ).get(prevProject || project, 'clear', handoffSessionId);
+        ).get(prevProject || project, 'clear', handoffScopeId);
       } catch {}
 
       // Generate session summary for previous session (background Haiku — richer version)
