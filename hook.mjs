@@ -113,6 +113,11 @@ if (!event) process.exit(0);
 // Stop / SessionStart callers MUST pass their own event name — CC rejects
 // hook output whose hookEventName doesn't match the triggering event
 // (regression introduced in v2.33.1's structured receipt, fixed in v2.33.3).
+// v2.33.4: CC's Stop-event schema does NOT accept hookSpecificOutput at all —
+// only PreToolUse / UserPromptSubmit / PostToolUse / SessionStart carry
+// additionalContext. On Stop we flush the episode to DB but skip the JSON
+// receipt entirely; emitting it triggers "Invalid input" schema rejection.
+const RECEIPT_EVENTS = new Set(['PostToolUse', 'SessionStart', 'UserPromptSubmit']);
 function flushEpisode(episode, hookEventName = 'PostToolUse') {
   if (!episode || episode.entries.length === 0) return;
 
@@ -157,32 +162,35 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
     // and the legacy error→fix nudge consolidates here. PostToolUse JSON with
     // hookSpecificOutput.additionalContext reliably renders across CC variants;
     // the old plain-text stdout write was invisible on some variants.
-    try {
-      const entries = episode.entries || [];
-      const hasError = entries.some(e => e.isError);
-      const hasEdit = entries.some(e => EDIT_TOOLS.has(e.tool));
-      const toolCounts = {};
-      for (const e of entries) toolCounts[e.tool] = (toolCounts[e.tool] || 0) + 1;
-      const toolSummary = Object.entries(toolCounts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 3)
-        .map(([t, n]) => `${t}×${n}`)
-        .join(', ');
-      const lines = [`[mem] episode flushed: ${entries.length} entries (${toolSummary})`];
-      if (hasError && hasEdit && entries.length >= 3) {
-        const editFiles = entries.filter(e => EDIT_TOOLS.has(e.tool)).flatMap(e => e.files || []);
-        const uniqueFiles = [...new Set(editFiles)].slice(0, 3);
-        const filesHint = uniqueFiles.length > 0 ? ` (${uniqueFiles.join(', ')})` : '';
-        lines.push(`[mem] 💡 error→fix pattern${filesHint} — consider: mem_save(type="bugfix", lesson_learned="<root cause + fix>")`);
-      }
-      process.stdout.write(JSON.stringify({
-        suppressOutput: true,
-        hookSpecificOutput: {
-          hookEventName,
-          additionalContext: lines.join('\n'),
-        },
-      }));
-    } catch { /* never block on receipt */ }
+    // v2.33.4: Stop event rejects hookSpecificOutput entirely — skip receipt.
+    if (RECEIPT_EVENTS.has(hookEventName)) {
+      try {
+        const entries = episode.entries || [];
+        const hasError = entries.some(e => e.isError);
+        const hasEdit = entries.some(e => EDIT_TOOLS.has(e.tool));
+        const toolCounts = {};
+        for (const e of entries) toolCounts[e.tool] = (toolCounts[e.tool] || 0) + 1;
+        const toolSummary = Object.entries(toolCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+          .map(([t, n]) => `${t}×${n}`)
+          .join(', ');
+        const lines = [`[mem] episode flushed: ${entries.length} entries (${toolSummary})`];
+        if (hasError && hasEdit && entries.length >= 3) {
+          const editFiles = entries.filter(e => EDIT_TOOLS.has(e.tool)).flatMap(e => e.files || []);
+          const uniqueFiles = [...new Set(editFiles)].slice(0, 3);
+          const filesHint = uniqueFiles.length > 0 ? ` (${uniqueFiles.join(', ')})` : '';
+          lines.push(`[mem] 💡 error→fix pattern${filesHint} — consider: mem_save(type="bugfix", lesson_learned="<root cause + fix>")`);
+        }
+        process.stdout.write(JSON.stringify({
+          suppressOutput: true,
+          hookSpecificOutput: {
+            hookEventName,
+            additionalContext: lines.join('\n'),
+          },
+        }));
+      } catch { /* never block on receipt */ }
+    }
   } else {
     try { unlinkSync(flushFile); } catch {}
   }

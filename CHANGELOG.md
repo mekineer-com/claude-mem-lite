@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.33.4] - 2026-04-17
+
+Follow-up to v2.33.3. The v2.33.3 patch changed `flushEpisode`'s hard-coded `hookEventName: 'PostToolUse'` into a parameter and taught `handleStop` to pass `'Stop'`. That fixed the "expected 'Stop' but got 'PostToolUse'" error class but not the actual user-visible failure in code-graph-mcp: Claude Code's Stop-event schema **forbids `hookSpecificOutput` entirely** (only `PreToolUse` / `UserPromptSubmit` / `PostToolUse` / `SessionStart` carry `additionalContext`). Tagging the receipt with `hookEventName: 'Stop'` still tripped `Hook JSON output validation failed — (root): Invalid input`.
+
+### Fixed
+
+- **`hook.mjs:flushEpisode`** — introduced `RECEIPT_EVENTS = {PostToolUse, SessionStart, UserPromptSubmit}`. When `hookEventName` is outside that set (currently only `'Stop'`), the episode still flushes to DB and spawns `llm-episode` background enrichment, but the structured JSON receipt is skipped. No stdout is emitted for Stop, which is what CC's schema requires.
+
+### Internal
+
+- Regression test updated in `tests/e2e.test.mjs` (`stop flushes episode and marks session completed`): now asserts `parsed?.hookSpecificOutput` is `undefined` when Stop produces any stdout. Reproduces the code-graph-mcp error on v2.33.3, passes on v2.33.4. Test count unchanged.
+
 ## [2.33.3] - 2026-04-17
 
 Hotfix for a regression in the v2.33.1 structured flush receipt: `hookEventName` was hard-coded to `'PostToolUse'` but `flushEpisode` is shared by three hook entrypoints. When called from Stop or SessionStart, Claude Code rejected the output with `Hook returned incorrect event name: expected 'Stop' but got 'PostToolUse'` and surfaced the error to the user at session close.

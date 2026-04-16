@@ -235,13 +235,13 @@ describe('Suite 1: Full Session Lifecycle', () => {
     const { stdout, exitCode } = runHook('stop', { env: { HOME: tmpHome } });
     expect(exitCode).toBe(0);
 
-    // v2.33.3: flushEpisode's JSON receipt must tag hookEventName='Stop' when
-    // called from the Stop hook. Previously hard-coded 'PostToolUse' → CC
-    // rejected the output with "Hook returned incorrect event name".
+    // v2.33.4: CC's Stop schema forbids hookSpecificOutput entirely (only
+    // PreToolUse/UserPromptSubmit/PostToolUse/SessionStart accept it). The
+    // Stop hook must NOT emit a receipt JSON — prior versions (v2.33.3) just
+    // tagged hookEventName='Stop' and still triggered "Invalid input".
     if (stdout && stdout.trim()) {
       const parsed = JSON.parse(stdout.trim());
-      const ev = parsed?.hookSpecificOutput?.hookEventName;
-      if (ev) expect(ev).toBe('Stop');
+      expect(parsed?.hookSpecificOutput).toBeUndefined();
     }
 
     // Session marked completed
