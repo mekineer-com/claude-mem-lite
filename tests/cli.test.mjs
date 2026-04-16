@@ -1662,6 +1662,22 @@ describe('CLI timeline query-based anchor', () => {
     const output = await captureStdout(() => run(['timeline', '--project', 'test--project']));
     expect(output).toContain('Project timeline obs');
   });
+
+  it('auto-scopes anchor timeline to anchor project when --project omitted', async () => {
+    insertSession(testDb, { id: 's2', project: 'other--project', memoryId: 'mem-s2' });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'AnchorInTest', text: 'anchor payload', epochOffset: -50000,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s2', project: 'other--project', type: 'change',
+      title: 'LeakFromOther', text: 'other project content', epochOffset: -40000,
+    });
+    const anchorId = testDb.prepare("SELECT id FROM observations WHERE title = 'AnchorInTest'").get().id;
+    const output = await captureStdout(() => run(['timeline', '--anchor', String(anchorId)]));
+    expect(output).toContain('AnchorInTest');
+    expect(output).not.toContain('LeakFromOther');
+  });
 });
 
 // ─── fts-check command ──────────────────────────────────────────────────────

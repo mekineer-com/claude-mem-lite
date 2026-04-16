@@ -789,8 +789,11 @@ server.registerTool(
       db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
     } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
-    const projectFilter = args.project ? 'AND project = ?' : '';
-    const baseParams = args.project ? [args.project] : [];
+    // Auto-scope to anchor's project when caller didn't pass one: "timeline around #N"
+    // means same-project context by default; cross-project bleed breaks user mental model.
+    const effectiveProject = args.project || anchorRow.project;
+    const projectFilter = effectiveProject ? 'AND project = ?' : '';
+    const baseParams = effectiveProject ? [effectiveProject] : [];
 
     // Before anchor
     const beforeRows = db.prepare(`

@@ -188,15 +188,19 @@ try {
     const lines = [];
     if (allRows.length > 0) {
       lines.push(`[mem] Lessons for ${fname}:`);
+      // R3-UX: raised from 120 → 240 after measuring 97% of lessons exceed 120 chars
+      // (p50=218, avg=247). Previous limit truncated the actionable "Fix:" tail in 80%
+      // of lessons containing it. 3 × 240 ≈ 180 tokens/Edit — negligible context cost.
+      const LESSON_MAX = 240;
       for (const r of allRows) {
         if (r.lesson_learned) {
-          const lesson = r.lesson_learned.length > 120
-            ? r.lesson_learned.slice(0, 117) + '...'
+          const lesson = r.lesson_learned.length > LESSON_MAX
+            ? r.lesson_learned.slice(0, LESSON_MAX - 3) + '...'
             : r.lesson_learned;
           lines.push(`  #${r.id} [${r.type}] ${lesson}`);
         } else {
-          const title = (r.title || '').length > 120
-            ? r.title.slice(0, 117) + '...'
+          const title = (r.title || '').length > LESSON_MAX
+            ? r.title.slice(0, LESSON_MAX - 3) + '...'
             : (r.title || '');
           lines.push(`  #${r.id} [${r.type}] ${title}`);
         }

@@ -742,8 +742,11 @@ function cmdTimeline(db, args) {
     return;
   }
 
-  const projectFilter = project ? 'AND project = ?' : '';
-  const baseParams = project ? [project] : [];
+  // Auto-scope to anchor's project when --project not explicitly given: users asking
+  // "what happened around #N" expect same-project context, not cross-project time-bleed.
+  const effectiveProject = project || anchorRow.project;
+  const projectFilter = effectiveProject ? 'AND project = ?' : '';
+  const baseParams = effectiveProject ? [effectiveProject] : [];
 
   // Before anchor
   const beforeRows = db.prepare(`
@@ -1721,16 +1724,25 @@ function cmdMaintain(db, args) {
     }
 
     if (ops.includes('dedup') && flags['merge-ids']) {
-      // Parse merge-ids: "keepId:removeId1:removeId2,keepId2:removeId3" format
+      // Parse merge-ids: "keepId:removeId1:removeId2,keepId2:removeId3" format.
+      // Surface malformed segments (non-numeric tokens, single-element pairs) instead of
+      // silently dropping them, so typos like "abc:def" don't hide behind "Merged 0".
       let totalMerged = 0;
+      const invalidSegments = [];
       const mergeStmt = db.prepare('UPDATE observations SET compressed_into = ? WHERE id = ? AND COALESCE(compressed_into, 0) = 0');
-      const groups = flags['merge-ids'].split(',').map(g => g.trim().split(':').map(Number).filter(n => !isNaN(n)));
-      for (const group of groups) {
-        if (group.length < 2) continue;
-        const [keepId, ...removeIds] = group;
+      const rawSegments = flags['merge-ids'].split(',').map(s => s.trim()).filter(Boolean);
+      for (const seg of rawSegments) {
+        const parts = seg.split(':').map(s => s.trim());
+        const nums = parts.map(p => Number(p));
+        const badToken = parts.length < 2 || nums.some(n => !Number.isFinite(n) || n <= 0);
+        if (badToken) { invalidSegments.push(seg); continue; }
+        const [keepId, ...removeIds] = nums;
         for (const removeId of removeIds) {
           totalMerged += mergeStmt.run(keepId, removeId).changes;
         }
+      }
+      if (invalidSegments.length) {
+        results.push(`Warning: ignored ${invalidSegments.length} malformed --merge-ids segment(s): ${invalidSegments.join(', ')} (expected keepId:removeId[:removeId...] with positive integers)`);
       }
       results.push(`Merged ${totalMerged} duplicate observations`);
     }
@@ -2069,6 +2081,16 @@ Commands:
     --merge-ids K:R,... For dedup: keepId:removeId pairs (e.g. 10:11,20:21:22)
     --project P         Filter by project
     --retain-days N     For purge_stale: keep last N days (default 30)
+
+  optimize              LLM-powered memory optimization (preview by default)
+    --run               Execute (default: preview gates)
+    --run-all           Execute bypassing gates
+    --task T            Comma-separated: re-enrich,normalize,cluster-merge,smart-compress
+    --max N             Max items per task (1-100, default 15)
+    --scope S           re-enrich scope: narrow (default) or wide
+
+  doctor                Environment diagnostics and benchmarks
+    --benchmark         Run perf benchmark and emit JSON
 
   fts-check <check|rebuild>  FTS5 index check or rebuild
 

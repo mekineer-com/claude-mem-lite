@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.34.2] - 2026-04-17
+
+Three-round user-perspective audit of all 17 MCP tools (6 core + 11 hidden-but-callable) across both MCP stdio and CLI paths. Four concrete issues found and fixed; each comes with a regression test. 1669 → 1670 tests green (+1 timeline cross-project test, retargeted truncation test from 120 → 240). `git diff --stat`: 5 files, 73+/18-.
+
+**No breaking changes.** Timeline scope change is a bug fix — anchor-supplied-then-leaked-cross-project was never an intentional contract.
+
+### Fixed
+
+- **`mem_timeline` anchor-based calls no longer bleed cross-project observations.** Both `server.mjs:782-793` and `mem-cli.mjs:739-746` selected `anchorRow.project` but never fed it back into the before/after SQL. When `--project` / `project` arg was omitted, sibling projects sharing the same time window appeared in the output — e.g. timeline around a `projects--mem` decision included three `projects--code-graph-mcp` changes inline. Fix: `effectiveProject = args.project || anchorRow.project`. Regression test in `tests/cli.test.mjs` asserts obs from `other--project` stay out when anchor is in `test--project`. Opt-out: if you actually want cross-project context around an anchor, use `mem_search` with `date_from`/`date_to` bounds.
+- **`scripts/pre-tool-recall.js` lesson truncation raised from 120 → 240 chars.** Measured against 29 lesson-bearing observations: avg=247, p50=218, p90=398, max=452. At the old 120 cap, 28/29 (97%) lessons were truncated and 4/5 of those containing a ` Fix:` keyword had the fix guidance past char 117 — the actionable half of the lesson was invisible at the Edit site. Per-Edit cost delta: 3 lessons × 120 extra chars ≈ 180 tokens. Lesson tests in `tests/pre-tool-recall.test.mjs` updated to cover both the new cap and a preserved p50-length lesson.
+- **`mem-cli.mjs` `maintain execute --ops dedup --merge-ids` validates numeric IDs.** The old parser did `.map(Number).filter(n => !isNaN(n))`, so `--merge-ids abc:def` became `[]` and the entire segment was silently skipped, printing `Merged 0 duplicate observations` with no indication the input was malformed. Now each segment is parsed and non-numeric or non-positive tokens trigger a one-line warning listing the ignored segments; valid segments still merge normally.
+- **`claude-mem-lite --help` now lists `optimize` and `doctor` subcommands.** Both were registered in the command switch (`mem-cli.mjs:2446, 2454`) and fully documented in code, but the printed help block stopped at `maintain` and jumped to `fts-check` — users had no way to discover them without reading the source. Added the `optimize` section (--run / --run-all / --task / --max / --scope) and a one-line `doctor --benchmark` entry.
+
 ## [2.34.1] - 2026-04-17
 
 Four-tier audit of every user-facing entrypoint — 17 MCP tools (core + hidden-but-callable) + 5 Claude Code hook events + 3 external hook scripts = **25 surfaces**. Every finding was reproduced live against the MCP server over stdio or via the CLI / hook subprocess, then fixed with a regression test in `tests/audit-fixes.test.mjs` (40 new assertions). Zero feature additions; focus is correctness, CLI/MCP parity, schema completeness, and safety gates on destructive ops.

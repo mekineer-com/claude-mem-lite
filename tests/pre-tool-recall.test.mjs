@@ -180,12 +180,22 @@ describe('pre-tool-recall', () => {
       expect(output).toContain('#1 [bugfix]');
     });
 
-    it('truncates long lessons at 120 chars', () => {
-      const longLesson = 'A'.repeat(200);
-      const truncated = longLesson.length > 120
-        ? longLesson.slice(0, 117) + '...' : longLesson;
-      expect(truncated).toHaveLength(120);
+    it('truncates long lessons at 240 chars', () => {
+      const LESSON_MAX = 240;
+      const longLesson = 'A'.repeat(400);
+      const truncated = longLesson.length > LESSON_MAX
+        ? longLesson.slice(0, LESSON_MAX - 3) + '...' : longLesson;
+      expect(truncated).toHaveLength(LESSON_MAX);
       expect(truncated.endsWith('...')).toBe(true);
+    });
+
+    it('preserves lessons ≤ 240 chars untouched', () => {
+      const LESSON_MAX = 240;
+      const midLesson = 'B'.repeat(218); // matches observed p50 length
+      const result = midLesson.length > LESSON_MAX
+        ? midLesson.slice(0, LESSON_MAX - 3) + '...' : midLesson;
+      expect(result).toBe(midLesson);
+      expect(result.endsWith('...')).toBe(false);
     });
   });
 
