@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.2] - 2026-04-16
+
+Hotfix — resolves [#14](https://github.com/sdsrss/claude-mem-lite/issues/14): npm-installed users crash on first SessionStart with `ERR_MODULE_NOT_FOUND` because 10 files imported by `hook.mjs` / `server.mjs` / `mem-cli.mjs` were never in the npm tarball. Auto-update (copy-file path) was unaffected; only `npm install -g` / `npx` users hit it. Bug originated in v2.29.0 (2026-03), first reported 2026-04-02; v2.31.2's hook-update fix only repaired the auto-update path, not the npm tarball.
+
+### Fixed
+
+- `package.json` `files` array now includes: `hook-optimize.mjs`, `plugin-cache-guard.mjs`, `lib/activity.mjs`, `lib/git-state.mjs`, `lib/task-reader.mjs`, `lib/plan-reader.mjs`, `lib/startup-dashboard.mjs`, `lib/doctor-benchmark.mjs`, `commands/lesson.md`, `commands/bug.md`.
+- Verified via `npm pack --dry-run`: all 10 files now ship (previously the tarball was 62 files; v2.32.2 ships 72).
+
+### Added
+
+- `tests/npm-tarball-completeness.test.mjs` (+2 tests) — regression gate that walks static + dynamic imports from every entry module (`cli.mjs`, `hook.mjs`, `server.mjs`, `mem-cli.mjs`, `install.mjs`) and asserts every reachable local module is listed in `package.json.files`. Also asserts no dangling entry points to a non-existent path. This is the permanent root-cause fix: future `SOURCE_FILES` additions in `install.mjs` that forget the `files` array will trigger a red test on the next PR.
+
 ## [2.32.1] - 2026-04-16
 
 Hotfix — clear a transitive `npm audit` moderate vulnerability so the Release workflow's `npm audit --omit=dev` gate passes and the 2.32 line can reach the npm registry.
