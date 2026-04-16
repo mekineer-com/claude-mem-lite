@@ -2,6 +2,31 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.34.0] - 2026-04-17
+
+**Migration note (user-visible default behavior change).** The MCP server now exposes 6 core tools in `tools/list` (`mem_search` / `mem_recent` / `mem_recall` / `mem_get` / `mem_save` / `mem_timeline`) instead of all 17. The remaining 11 tools (`mem_browse`, `mem_compress`, `mem_delete`, `mem_export`, `mem_fts_check`, `mem_maintain`, `mem_optimize`, `mem_registry`, `mem_stats`, `mem_update`, `mem_use`) stay registered and are still callable by exact name via `tools/call`, so scripts and direct MCP clients continue to work unchanged. Claude Code sessions will no longer see these 11 in their tool list — the supported entry for them is now the `claude-mem-lite <cmd>` CLI (documented in the refreshed README tables and in each adopted project's `memory/plugin_claude_mem_lite.md`).
+
+**Revert path**: set the `CLAUDE_MEM_ALL_TOOLS=1` environment variable in your MCP launch env to restore pre-v2.34.0 behavior (all 17 tools in `tools/list`). Unset it to keep the new default.
+
+**Discoverability signal**: the server prints a one-line banner to stderr on session start that states the current visibility mode and the opt-out env var (suppressed under `MEM_QUIET_HOOKS=1`).
+
+**Why**: per the existing "passive hook first, MCP tools second" design (see memory `feedback_passive_first.md`), 17 tool schemas at session start was larger than needed — the 6 core tools cover every hot path the invited-memory contract promises (recall before Edit, save after bugfix, search/recent/timeline/get for retrieval). The 11 hidden tools are maintenance/admin/browser surface that's already served better by the CLI.
+
+### Changed
+
+- **`tool-schemas.mjs`** — the exported `tools` array now carries `hidden: true` on 11 of the 17 entries. Shape is unchanged for the 6 core tools; consumers reading `tools` directly get one extra boolean field on the hidden entries.
+- **`server.mjs`** — registers all 17 tools unchanged, then overrides the `ListToolsRequestSchema` handler on `server.server` (a Map.set at the protocol layer) to filter hidden names out of the response. `enabled` stays `true` on every tool, so `tools/call <name>` routes exactly as before — setting `enabled: false` would have broken callability (mcp.js:106 throws "tool disabled" on disabled-tool calls, which is why this ships as a filter and not a flag flip).
+- **`adopt-content.mjs`** — `getDetailDoc()` revised: Decision-rules block trimmed to the 3 core-only shortcuts; new "维护 / 管理类工具（走 CLI）" table enumerates the 11 hidden tools with their CLI equivalents. `getIndexLine()` and `CURRENT_SENTINEL_VERSION` unchanged, so existing `claude-mem-lite adopt`ed projects keep their sentinel hash and refresh only the detail doc on next adopt — no `UserEditedError` conflicts.
+- **`README.md` / `README.zh-CN.md`** — MCP Tools table split into a "Core (6)" section and a "Hidden-but-callable (11)" table that lists the exact CLI to reach each. The registry architecture paragraph in `README.md` rewritten so the documentation stops claiming Claude autonomously invokes `mem_registry`.
+- **`CLAUDE.md`** (project) — `server.mjs` row in the Architecture table updated to document the 6+11 split and point at `tool-schemas.mjs` as the source of truth.
+
+### Added
+
+- **`tests/tool-visibility.test.mjs`** — spawns the real server over stdio and drives `initialize` + `tools/list` + `tools/call mem_stats` handshakes. Three cases: (a) default config returns exactly the 6 core names; (b) `CLAUDE_MEM_ALL_TOOLS=1` restores all 17 (revert-path regression guard); (c) `tools/call mem_stats` succeeds despite the tool being filtered from `tools/list`. Sandbox DBs via `CLAUDE_MEM_DIR=<tmpdir>`; zero tmp-dir residue across runs.
+- **`tests/tool-schemas.test.mjs`** — 4 new assertions: total 17 split into exactly 6 core + 11 hidden, the 6 core names match the invited-memory contract, the 11 hidden names match the maintenance/admin/specialized list, and the `hidden` flag is boolean-true (no truthy-string drift).
+
+Tests: 1621 → 1627 pass (60 files, +6 new cases in 2 files: 4 in `tool-schemas.test.mjs`, 3 in the new `tool-visibility.test.mjs` — which include the opt-out regression guard — offset by -1 because one pre-existing assertion was subsumed into a split count check, 0 regressions). Lint: clean on 5 touched files.
+
 ## [2.33.5] - 2026-04-17
 
 Follow-up patch to v2.33.4. Code review of the Stop-schema fix flagged two gaps: the PostToolUse receipt emission path (untouched by v2.33.4 but newly gated by the `RECEIPT_EVENTS` allowlist) had no positive regression test, and the `flushEpisode` header comment carried two eras of explanation (v2.33.3 + v2.33.4) that were confusing to read together. Neither gap was a correctness problem on its own, but both reduce the cost of the next Stop-schema incident if CC ever tightens SessionStart or another event.

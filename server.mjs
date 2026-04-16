@@ -4,6 +4,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
@@ -2084,6 +2085,54 @@ server.registerTool(
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   })
 );
+
+// ─── Hidden tool filter ─────────────────────────────────────────────────────
+// All 17 tools are registered (so `tools/call <name>` still resolves for
+// scripts and direct MCP clients), but only the 6 core tools appear in the
+// `tools/list` response. Hiding the 11 maintenance/admin tools keeps Claude
+// Code's startup context small while preserving the contract that the plugin
+// dogfoods (see CLAUDE.md §Mem usage contract and adopt-content.mjs).
+//
+// Safe because:
+//   - Protocol-layer override: we replace the mcp.js default ListTools
+//     handler on the underlying Server (setRequestHandler is a Map.set).
+//   - `enabled` stays true, so `tools/call` keeps routing normally — per
+//     mcp.js line 106, a `disabled` tool would reject calls too.
+
+const HIDDEN_TOOL_NAMES = new Set(
+  TOOL_DEFS.filter((t) => t.hidden === true).map((t) => t.name),
+);
+
+// Opt-out: setting CLAUDE_MEM_ALL_TOOLS=1 restores pre-v2.34.0 behavior where
+// all 17 tools are visible in `tools/list`. Users who relied on Claude Code
+// autonomously invoking the now-hidden maintenance tools can use this as an
+// immediate escape hatch while adopting the CLI entry points documented in
+// adopt-content.mjs / README.
+const EXPOSE_ALL_TOOLS = process.env.CLAUDE_MEM_ALL_TOOLS === '1';
+
+if (!EXPOSE_ALL_TOOLS) {
+  // Force mcp.js to install its default ListTools/CallTools handlers before
+  // we override; registerTool already did this, but keep the call explicit so
+  // a future reorder of tool registration doesn't break the override.
+  const originalHandler = server.server._requestHandlers.get('tools/list');
+  if (typeof originalHandler !== 'function') {
+    throw new Error('tools/list handler missing — server initialization order changed');
+  }
+  server.server.setRequestHandler(ListToolsRequestSchema, async (req, extra) => {
+    const full = await originalHandler(req, extra);
+    return { ...full, tools: full.tools.filter((t) => !HIDDEN_TOOL_NAMES.has(t.name)) };
+  });
+}
+
+// One-time discoverability banner (stderr only — Claude Code surfaces it on
+// session start). Skipped under MEM_QUIET_HOOKS=1 so CI / tests / hermeticity
+// harnesses stay silent.
+if (!effectiveQuiet()) {
+  const status = EXPOSE_ALL_TOOLS
+    ? 'all 17 tools exposed via CLAUDE_MEM_ALL_TOOLS=1'
+    : `tools/list narrowed to ${TOOL_DEFS.length - HIDDEN_TOOL_NAMES.size} core tools (${HIDDEN_TOOL_NAMES.size} hidden but callable by exact name; unset CLAUDE_MEM_ALL_TOOLS to keep, set =1 to restore all)`;
+  process.stderr.write(`[claude-mem-lite v${PKG_VERSION}] ${status}\n`);
+}
 
 // ─── WAL Checkpoint (periodic) ───────────────────────────────────────────────
 

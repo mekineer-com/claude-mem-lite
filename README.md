@@ -209,6 +209,15 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 
 ### MCP Tools (used automatically by Claude)
 
+As of v2.34.0, the server registers 17 tools in total but only the 6 **core**
+tools appear in `tools/list`. The 11 **hidden** tools remain callable at the
+protocol layer (`tools/call` by exact name still routes normally); they're
+omitted from the list response so Claude Code sessions don't load 11 extra
+tool schemas at startup. Hidden tools are the maintenance / admin / browser
+surface — reach them through the CLI column in the second table.
+
+**Core (6, exposed to Claude Code)**
+
 | Tool | Description |
 |------|-------------|
 | `mem_search` | FTS5 full-text search with BM25 ranking. Filters by type, project, date range, importance level. |
@@ -217,16 +226,22 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 | `mem_timeline` | Browse observations chronologically around an anchor point. |
 | `mem_get` | Retrieve full details for specific observation IDs (includes importance and related_ids). |
 | `mem_save` | Manually save a memory/observation. |
-| `mem_update` | Update an existing observation in-place. Preserves original ID and references. |
-| `mem_stats` | View statistics: counts, type distribution, top projects, daily activity. |
-| `mem_delete` | Delete observations by ID with preview/confirm workflow. FTS5 cleanup is automatic. |
-| `mem_compress` | Compress old low-value observations into weekly summaries to reduce noise. |
-| `mem_maintain` | Memory maintenance: scan for duplicates/stale/broken items, then execute cleanup/dedup/rebuild_vectors operations. |
-| `mem_export` | Export observations as JSON or JSONL for backup or migration. Filters by project, type, date range. |
-| `mem_fts_check` | Check FTS5 index integrity or rebuild indexes. Use when search results seem wrong or after DB recovery. |
-| `mem_browse` | Tier-grouped memory dashboard. Shows observations organized by memory tier (working/active/archive). |
-| `mem_registry` | Manage resource registry: search for skills/agents by need, list resources, view stats, import/remove tools, reindex. Search results differentiate managed (Read path) vs native (Skill full name) invocation. |
-| `mem_use` | Load a skill or agent from the managed registry by name. Returns full content with portable `~` path for reload via `Read()`. |
+
+**Hidden-but-callable (11, CLI-routed)**
+
+| Tool | CLI equivalent | Notes |
+|------|----------------|-------|
+| `mem_update` | `claude-mem-lite update <id>` | Edit an observation in place. |
+| `mem_stats` | `claude-mem-lite stats` | Counts, type distribution, daily activity. |
+| `mem_delete` | `claude-mem-lite delete <id>` | Preview / confirm workflow, FTS5 cleanup. |
+| `mem_compress` | `claude-mem-lite compress --preview` | Roll up old low-value observations. |
+| `mem_maintain` | `claude-mem-lite maintain --action scan` | dedup / decay / cleanup / rebuild_vectors. |
+| `mem_optimize` | `claude-mem-lite optimize --action preview` | LLM-powered re-enrich / normalize / cluster-merge. |
+| `mem_export` | `claude-mem-lite export` | JSON / JSONL dump, filters by project, type, date. |
+| `mem_fts_check` | `claude-mem-lite fts-check [--rebuild]` | FTS5 integrity + rebuild. |
+| `mem_browse` | `claude-mem-lite browse` | Tier-grouped dashboard (working / active / archive). |
+| `mem_registry` | `claude-mem-lite registry <action>` | List / search / import / remove skills + agents. |
+| `mem_use` | _MCP only_ | Load a skill / agent from the registry by name. |
 
 ### Skill Commands (in Claude Code chat)
 
@@ -399,7 +414,7 @@ Stop
 
 ### Resource Registry
 
-The resource registry (`registry.mjs`, `registry-retriever.mjs`) indexes installed skills and agents into a searchable FTS5 database. Unlike the previous proactive dispatch system, the registry is now on-demand — Claude searches it via the `mem_registry` MCP tool when it needs to discover relevant skills or agents.
+The resource registry (`registry.mjs`, `registry-retriever.mjs`) indexes installed skills and agents into a searchable FTS5 database. Unlike the previous proactive dispatch system, the registry is now on-demand — it's reachable via the `claude-mem-lite registry` CLI (primary path for Claude Code since v2.34.0 hides the `mem_registry` MCP tool from `tools/list`) or by direct `tools/call mem_registry` for MCP clients that know the name.
 
 ```
 Registry pipeline:

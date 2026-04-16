@@ -31,6 +31,9 @@ export function getDetailDoc() {
 
 ## 何时调用 MCP 工具
 
+以下 6 个核心 MCP 工具在 \`tools/list\` 中默认暴露，覆盖了契约的热路径：
+\`mem_search\` / \`mem_recent\` / \`mem_recall\` / \`mem_get\` / \`mem_save\` / \`mem_timeline\`。
+
 | 时机 | 工具 | 关键参数 |
 |------|------|----------|
 | Edit / Write 前 | \`mem_recall\` | \`file="<路径>"\` —— 过往 bugfix 与教训 |
@@ -46,12 +49,28 @@ export function getDetailDoc() {
 - "最近做了啥" → \`mem_recent\`
 - "<文件> 有哪些记忆" → \`mem_recall\`
 - "#NN 前后发生了啥" → \`mem_timeline\`
-- "清理过期记忆" → \`mem_maintain\`
-- "FTS 索引健康吗" → \`mem_fts_check\`
-- "按 tier 浏览" → \`mem_browse\`
-- "备份导出" → \`mem_export\`
 
-## CLI 速查
+## 维护 / 管理类工具（走 CLI）
+
+v2.34.0 起，以下 11 个工具从 \`tools/list\` 中隐藏以缩小启动上下文；它们仍注册在
+MCP 层，按名 \`tools/call\` 仍可命中，但对 Claude Code 这类只读 tools/list 的
+调用方只走下面的 CLI 入口：
+
+| 场景 | CLI |
+|------|-----|
+| 清理过期记忆 | \`claude-mem-lite maintain --action scan\` → \`--action execute\` |
+| 深度优化（Haiku） | \`claude-mem-lite optimize --action preview\` |
+| 压缩旧条目 | \`claude-mem-lite compress --preview\` |
+| FTS5 索引检查 / 重建 | \`claude-mem-lite fts-check [--rebuild]\` |
+| tier 分组浏览 | \`claude-mem-lite browse [--tier active]\` |
+| 导出 JSON/JSONL | \`claude-mem-lite export [--format jsonl]\` |
+| 统计总量 / 健康 | \`claude-mem-lite stats [--days 30]\` |
+| 删除某条 | \`claude-mem-lite delete <id>[,<id>]\` |
+| 更新某条 | \`claude-mem-lite update <id> [--title ...]\` |
+| 列 / 搜索 / 导入 skill-agent registry | \`claude-mem-lite registry <list\\|search\\|import>\` |
+| 按 registry 名载入 skill/agent | （MCP only：\`mem_use\`；由用户主动请求时才使用） |
+
+## CLI 速查（常用检索）
 
 | 命令 | 用途 |
 |------|------|

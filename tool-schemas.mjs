@@ -186,6 +186,17 @@ export const memBrowseSchema = {
 // Research note: discouragement-style descriptions reduce over-invocation by
 // 40-60% vs. encouragement-style ("use this to..."). See tests/tool-schemas.test.mjs
 // for the invariants this list must satisfy.
+//
+// Core vs hidden (v2.34.0): only 6 tools are exposed via MCP `tools/list`. The
+// remaining 11 stay registered — and are still callable by name at the MCP
+// protocol level (`tools/call` by exact name) — but are omitted from the list
+// response so they don't bloat every agent's startup context. The core set
+// covers the hot paths the invited-memory contract promises (recall before
+// Edit, save after bugfix, search/recent/timeline/get for retrieval). Hidden
+// tools are either maintenance (compress/maintain/optimize/fts_check),
+// admin/infra (stats/export/update/delete), or specialized browsers
+// (browse/registry/use) — all of which have CLI equivalents documented in
+// `adopt-content.mjs`.
 // ────────────────────────────────────────────────────────────────────────────
 
 export const tools = [
@@ -278,6 +289,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite delete <id>[,<id>,...] [--confirm]',
     inputSchema: memDeleteSchema,
+    hidden: true,
   },
   {
     name: 'mem_save',
@@ -314,6 +326,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite stats [--project X] [--days 30]',
     inputSchema: memStatsSchema,
+    hidden: true,
   },
   {
     name: 'mem_compress',
@@ -332,6 +345,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite compress [--preview] [--age-days 90]',
     inputSchema: memCompressSchema,
+    hidden: true,
   },
   {
     name: 'mem_maintain',
@@ -350,6 +364,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite maintain --action scan --operations dedup,decay',
     inputSchema: memMaintainSchema,
+    hidden: true,
   },
   {
     name: 'mem_optimize',
@@ -368,6 +383,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite optimize [--action preview|run|run_all] [--max-items N]',
     inputSchema: memOptimizeSchema,
+    hidden: true,
   },
   {
     name: 'mem_registry',
@@ -386,6 +402,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite registry <list|search|import|...> [args]',
     inputSchema: memRegistrySchema,
+    hidden: true,
   },
   {
     name: 'mem_use',
@@ -404,6 +421,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: MCP only (no CLI handler — use mem_registry to inspect)',
     inputSchema: memUseSchema,
+    hidden: true,
   },
   {
     name: 'mem_update',
@@ -422,6 +440,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite update <id> [--title ...] [--lesson ...]',
     inputSchema: memUpdateSchema,
+    hidden: true,
   },
   {
     name: 'mem_export',
@@ -440,6 +459,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite export [--format jsonl] [--project X] [--limit 500]',
     inputSchema: memExportSchema,
+    hidden: true,
   },
   {
     name: 'mem_recall',
@@ -476,6 +496,7 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite fts-check [--rebuild]',
     inputSchema: memFtsCheckSchema,
+    hidden: true,
   },
   {
     name: 'mem_browse',
@@ -494,5 +515,6 @@ export const tools = [
       '\n' +
       'Equivalent CLI: claude-mem-lite browse [--tier active] [--project X]',
     inputSchema: memBrowseSchema,
+    hidden: true,
   },
 ];

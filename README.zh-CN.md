@@ -194,7 +194,14 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 
 ## 使用方法
 
-### MCP 工具（由 Claude 自动使用）
+### MCP 工具
+
+v2.34.0 起服务端注册 17 个工具，但 `tools/list` 只暴露 6 个 **核心** 工具；其余
+11 个 **隐藏** 工具仍然注册在 MCP 层（按名 `tools/call` 仍命中），只是不会出现
+在列表响应里，以避免 Claude Code 会话启动时加载 11 份额外的工具 schema。隐藏
+工具走下面表格的 CLI 入口。
+
+**核心（6 个，暴露给 Claude Code）**
 
 | 工具 | 描述 |
 |------|------|
@@ -204,16 +211,22 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 | `mem_timeline` | 围绕锚点按时间顺序浏览观察。 |
 | `mem_get` | 获取指定观察 ID 的完整详情（包含重要度和关联 ID）。 |
 | `mem_save` | 手动保存记忆/观察。 |
-| `mem_update` | 原地更新已有观察，保留原始 ID 和引用关系。 |
-| `mem_stats` | 查看统计：计数、类型分布、热门项目、每日活动。 |
-| `mem_delete` | 按 ID 删除观察，支持预览/确认工作流。FTS5 自动清理。 |
-| `mem_compress` | 压缩旧的低价值观察为每周摘要，减少噪声。 |
-| `mem_maintain` | 记忆维护：扫描重复/过期/损坏条目，执行清理/去重/向量重建操作。 |
-| `mem_export` | 导出观察为 JSON 或 JSONL 格式，支持按项目、类型、日期范围过滤。 |
-| `mem_fts_check` | 检查 FTS5 索引完整性或重建索引。搜索结果异常或数据库恢复后使用。 |
-| `mem_browse` | 分层记忆仪表盘。按记忆层级（working/active/archive）分组展示观察。 |
-| `mem_registry` | 管理资源注册表：按需搜索技能/代理、列表、统计、导入/移除、重索引。搜索结果区分 managed（Read 路径）和 native（Skill 全名）调用方式。 |
-| `mem_use` | 从 managed 注册表加载 skill 或 agent。返回完整内容 + `~` 便携路径供 `Read()` 重载。 |
+
+**隐藏但可按名调用（11 个，走 CLI）**
+
+| 工具 | 对应 CLI | 说明 |
+|------|----------|------|
+| `mem_update` | `claude-mem-lite update <id>` | 原地更新某条观察。 |
+| `mem_stats` | `claude-mem-lite stats` | 计数、类型分布、每日活动。 |
+| `mem_delete` | `claude-mem-lite delete <id>` | 预览 / 确认流程，FTS5 自动清理。 |
+| `mem_compress` | `claude-mem-lite compress --preview` | 压缩旧的低价值观察。 |
+| `mem_maintain` | `claude-mem-lite maintain --action scan` | 去重 / decay / 清理 / 向量重建。 |
+| `mem_optimize` | `claude-mem-lite optimize --action preview` | LLM 深度优化：re-enrich / normalize / cluster-merge。 |
+| `mem_export` | `claude-mem-lite export` | JSON / JSONL 导出，支持项目/类型/日期过滤。 |
+| `mem_fts_check` | `claude-mem-lite fts-check [--rebuild]` | FTS5 完整性检查与重建。 |
+| `mem_browse` | `claude-mem-lite browse` | 分层仪表盘（working / active / archive）。 |
+| `mem_registry` | `claude-mem-lite registry <action>` | 列 / 搜索 / 导入 / 移除 skill / agent。 |
+| `mem_use` | _MCP only_ | 从 registry 按名载入 skill / agent。 |
 
 ### 技能命令（在 Claude Code 聊天中使用）
 
