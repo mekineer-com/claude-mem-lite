@@ -1,0 +1,170 @@
+// Phase A (Invited-Memory plan, T3): MEM_QUIET_HOOKS env switch.
+// Covers:
+//   1. isQuietHooks() reads env freshly, only '1' is truthy.
+//   2. buildServerInstructions(quiet) drops WHEN-TO-USE + Decision rules when quiet.
+//   3. buildSessionContextLines drops File Lessons / Key Context / Recent Activity
+//      fallback sections when quiet=true; Recent (date) table still emitted.
+//
+// See docs/plans/2026-04-16-invited-memory-pattern.md for rationale.
+
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { isQuietHooks } from '../hook-shared.mjs';
+import { buildServerInstructions } from '../server-internals.mjs';
+import { buildSessionContextLines } from '../hook-context.mjs';
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+
+describe('isQuietHooks()', () => {
+  let original;
+  beforeEach(() => { original = process.env.MEM_QUIET_HOOKS; });
+  afterEach(() => {
+    if (original === undefined) delete process.env.MEM_QUIET_HOOKS;
+    else process.env.MEM_QUIET_HOOKS = original;
+  });
+
+  it('returns false when MEM_QUIET_HOOKS is unset', () => {
+    delete process.env.MEM_QUIET_HOOKS;
+    expect(isQuietHooks()).toBe(false);
+  });
+
+  it('returns true when MEM_QUIET_HOOKS="1"', () => {
+    process.env.MEM_QUIET_HOOKS = '1';
+    expect(isQuietHooks()).toBe(true);
+  });
+
+  it('returns false for other truthy-ish values', () => {
+    // Only exact '1' counts; '0', 'true', 'yes', 'on', '' all keep default verbose
+    for (const v of ['0', 'true', 'yes', 'on', '', ' ', 'False', '2']) {
+      process.env.MEM_QUIET_HOOKS = v;
+      expect(isQuietHooks()).toBe(false);
+    }
+  });
+
+  it('reflects env changes between calls (not cached)', () => {
+    delete process.env.MEM_QUIET_HOOKS;
+    expect(isQuietHooks()).toBe(false);
+    process.env.MEM_QUIET_HOOKS = '1';
+    expect(isQuietHooks()).toBe(true);
+    delete process.env.MEM_QUIET_HOOKS;
+    expect(isQuietHooks()).toBe(false);
+  });
+});
+
+describe('buildServerInstructions(quiet)', () => {
+  it('verbose mode (default) contains WHEN TO USE + Decision rules', () => {
+    const out = buildServerInstructions(false);
+    expect(out).toContain('WHEN TO USE');
+    expect(out).toContain('Decision rules');
+    expect(out).toContain('mem_recall');
+    expect(out).toContain('Hook-injected context mentions #ID');
+  });
+
+  it('quiet mode drops WHEN TO USE + Decision rules sections', () => {
+    const out = buildServerInstructions(true);
+    expect(out).not.toContain('WHEN TO USE');
+    expect(out).not.toContain('Decision rules');
+    expect(out).not.toContain('proactive triggers');
+  });
+
+  it('quiet mode still includes base CLI + tool list', () => {
+    const out = buildServerInstructions(true);
+    expect(out).toContain('claude-mem-lite search');
+    expect(out).toContain('MCP tools:');
+    expect(out).toContain('Long-term memory across sessions');
+  });
+
+  it('quiet output is meaningfully shorter than verbose', () => {
+    const verbose = buildServerInstructions(false);
+    const quiet = buildServerInstructions(true);
+    // Verbose adds ~900 chars of WHEN-TO-USE + Decision rules; expect >= 30% drop.
+    expect(quiet.length).toBeLessThan(verbose.length * 0.7);
+  });
+
+  it('default arg (no quiet) is verbose', () => {
+    expect(buildServerInstructions()).toBe(buildServerInstructions(false));
+  });
+});
+
+describe('buildSessionContextLines — QUIET_HOOKS gating', () => {
+  let db;
+  let original;
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+
+    // Seed a bugfix obs WITH lesson + file → triggers File Lessons branch
+    insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'bugfix',
+      title: 'Fix pagination boundary',
+      narrative: 'off-by-one on cursor',
+      importance: 3,
+      lessonLearned: 'always pin cursor to created_at_epoch',
+      filesModified: JSON.stringify(['pagination.mjs']),
+    });
+    // Seed a decision obs WITH lesson, NO file → triggers Key Context branch
+    insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'decision',
+      title: 'Adopted invited memory pattern',
+      narrative: 'n',
+      importance: 3,
+      lessonLearned: 'sentinel + hash guards user edits',
+      filesModified: '[]',
+    });
+
+    original = process.env.MEM_QUIET_HOOKS;
+  });
+
+  afterEach(() => {
+    db.close();
+    if (original === undefined) delete process.env.MEM_QUIET_HOOKS;
+    else process.env.MEM_QUIET_HOOKS = original;
+  });
+
+  it('emits File Lessons + Key Context when MEM_QUIET_HOOKS is unset', () => {
+    delete process.env.MEM_QUIET_HOOKS;
+    const out = buildSessionContextLines(db, 'test', new Date());
+    expect(out).toContain('### File Lessons');
+    expect(out).toContain('### Key Context');
+    expect(out).toContain('always pin cursor');
+    expect(out).toContain('sentinel + hash guards');
+  });
+
+  it('drops File Lessons + Key Context when MEM_QUIET_HOOKS=1', () => {
+    process.env.MEM_QUIET_HOOKS = '1';
+    const out = buildSessionContextLines(db, 'test', new Date());
+    expect(out).not.toContain('### File Lessons');
+    expect(out).not.toContain('### Key Context');
+    expect(out).not.toContain('always pin cursor');
+    expect(out).not.toContain('sentinel + hash guards');
+  });
+
+  it('Recent (date) table still emitted under QUIET — #IDs stay reachable', () => {
+    process.env.MEM_QUIET_HOOKS = '1';
+    const out = buildSessionContextLines(db, 'test', new Date());
+    expect(out).toContain('### Recent');
+    expect(out).toContain('| ID |');
+    expect(out).toMatch(/#\d+/); // at least one row ID
+  });
+
+  it('Recent Activity fallback is skipped under QUIET when no summary exists', () => {
+    // No summary row inserted → with QUIET unset and no keyObs, would emit
+    // "### Recent Activity". Here both keyObs exist, but we also verify the
+    // else-branch behavior by deleting the keyObs pool above and retrying.
+    db.prepare('DELETE FROM observations').run();
+    insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'test',
+      type: 'change',
+      title: 'trivial tweak',
+      importance: 1,
+      filesModified: '[]',
+    });
+    process.env.MEM_QUIET_HOOKS = '1';
+    const out = buildSessionContextLines(db, 'test', new Date());
+    expect(out).not.toContain('### Recent Activity');
+  });
+});

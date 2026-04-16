@@ -8,7 +8,8 @@ import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryT
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup } from './server-internals.mjs';
+import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
+import { effectiveQuiet } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
@@ -105,41 +106,7 @@ const RECENCY_HALF_LIFE_MS = DEFAULT_DECAY_HALF_LIFE_MS;
 
 const server = new McpServer(
   { name: 'claude-mem-lite', version: PKG_VERSION },
-  {
-    instructions: [
-      'Long-term memory across sessions. Hooks auto-inject context; CLI preferred for explicit queries.',
-      '',
-      'CLI (via Bash):',
-      '  claude-mem-lite search "query"              — FTS5 full-text search',
-      '  claude-mem-lite search "err" --type bugfix  — filter by type',
-      '  claude-mem-lite recall "file.mjs"           — file-related memories',
-      '  claude-mem-lite recent 5                    — latest observations',
-      '  claude-mem-lite get 42,43                   — full details by ID',
-      '  claude-mem-lite timeline --anchor 42        — chronological context',
-      '',
-      'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access.',
-      'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
-      'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
-      '',
-      'WHEN TO USE (proactive triggers during coding):',
-      '  • About to Edit/Write a file → mem_recall(file="path") FIRST — past bugfixes & lessons',
-      '  • Test failure or error → mem_search(query="error keywords", obs_type="bugfix")',
-      '  • Before refactoring → mem_search(query="module-name", obs_type="refactor") for past decisions',
-      '  • Starting new feature → mem_search(query="feature area") for prior art & patterns',
-      '  • After fixing a tricky bug → mem_save(type="bugfix", lesson_learned="root cause & fix")',
-      '  • After architecture decision → mem_save(type="decision", lesson_learned="rationale")',
-      '  • Hook-injected context mentions #ID → mem_get(ids=[ID]) for full details',
-      '',
-      'Decision rules (use INSTEAD OF multi-step search):',
-      '  • "what happened recently?" → mem_recent (NOT search with empty query)',
-      '  • "what do we know about file.mjs?" → mem_recall (NOT grep + manual search)',
-      '  • "show me around observation #42" → mem_timeline (NOT mem_get + manual navigation)',
-      '  • "clean up old/duplicate memories" → mem_maintain (NOT manual mem_delete loop)',
-      '  • "is the search index healthy?" → mem_fts_check (NOT manual COUNT queries)',
-      '  • "overview of memory tiers" → mem_browse (NOT mem_search + manual grouping)',
-      '  • "export for backup" → mem_export (NOT manual SELECT queries)',
-    ].join('\n'),
-  },
+  { instructions: buildServerInstructions(effectiveQuiet()) },
 );
 
 // Track MCP request activity for idle-time cleanup (see idle timer below)

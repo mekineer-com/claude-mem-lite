@@ -17,7 +17,7 @@ describe('startup dashboard (T10c)', () => {
         git: { changed: ['M docs/plan.md'], stashes: [], branch: 'main', headSha: 'abc' },
         tasks: [{ id: 't1', title: 'impl T1', status: 'in_progress' }],
         plans: [{ name: '2026-04-14-mem-v2.31-mvp', path: '/x.md', mtime: Date.now() }],
-        handoff: null,
+        handoff: null, adopted: true,
       },
     });
     expect(text).toMatch(/Startup dashboard/);
@@ -27,16 +27,92 @@ describe('startup dashboard (T10c)', () => {
     expect(text.length).toBeLessThan(2000);
   });
 
-  test('returns empty string when all sources empty', () => {
+  test('returns empty string when all sources empty and project is adopted', () => {
     const db = createTestDb();
     const text = buildDashboard({
       db, project: 'mem', projectPath: '/tmp',
       stubs: {
         git: { changed: [], stashes: [], branch: 'main', headSha: '' },
-        tasks: [], plans: [], handoff: null,
+        tasks: [], plans: [], handoff: null, adopted: true,
       },
     });
     expect(text).toBe('');
+  });
+
+  test('empty sources + not adopted → dashboard contains only the adopt hint', () => {
+    const prevNoHint = process.env.MEM_NO_ADOPT_HINT;
+    const prevQuiet = process.env.MEM_QUIET_HOOKS;
+    delete process.env.MEM_NO_ADOPT_HINT;
+    delete process.env.MEM_QUIET_HOOKS;
+    try {
+      const db = createTestDb();
+      const text = buildDashboard({
+        db, project: 'mem', projectPath: '/tmp',
+        stubs: {
+          git: { changed: [], stashes: [], branch: 'main', headSha: '' },
+          tasks: [], plans: [], handoff: null, adopted: false,
+        },
+      });
+      expect(text).toMatch(/Invited-memory 未启用/);
+      expect(text).toMatch(/claude-mem-lite adopt/);
+      expect(text).toMatch(/MEM_NO_ADOPT_HINT=1/);
+    } finally {
+      if (prevNoHint === undefined) delete process.env.MEM_NO_ADOPT_HINT;
+      else process.env.MEM_NO_ADOPT_HINT = prevNoHint;
+      if (prevQuiet === undefined) delete process.env.MEM_QUIET_HOOKS;
+      else process.env.MEM_QUIET_HOOKS = prevQuiet;
+    }
+  });
+
+  test('adopt hint dropped once project is adopted (self-clearing)', () => {
+    const db = createTestDb();
+    const text = buildDashboard({
+      db, project: 'mem', projectPath: '/tmp',
+      stubs: {
+        git: { changed: ['M x'], stashes: [], branch: 'main', headSha: 'abc' },
+        tasks: [], plans: [], handoff: null, adopted: true,
+      },
+    });
+    expect(text).toMatch(/uncommitted/);
+    expect(text).not.toMatch(/Invited-memory 未启用/);
+  });
+
+  test('MEM_NO_ADOPT_HINT=1 silences the hint even when not adopted', () => {
+    const prev = process.env.MEM_NO_ADOPT_HINT;
+    process.env.MEM_NO_ADOPT_HINT = '1';
+    try {
+      const db = createTestDb();
+      const text = buildDashboard({
+        db, project: 'mem', projectPath: '/tmp',
+        stubs: {
+          git: { changed: [], stashes: [], branch: 'main', headSha: '' },
+          tasks: [], plans: [], handoff: null, adopted: false,
+        },
+      });
+      expect(text).toBe('');
+    } finally {
+      if (prev === undefined) delete process.env.MEM_NO_ADOPT_HINT;
+      else process.env.MEM_NO_ADOPT_HINT = prev;
+    }
+  });
+
+  test('MEM_QUIET_HOOKS=1 also silences the hint', () => {
+    const prev = process.env.MEM_QUIET_HOOKS;
+    process.env.MEM_QUIET_HOOKS = '1';
+    try {
+      const db = createTestDb();
+      const text = buildDashboard({
+        db, project: 'mem', projectPath: '/tmp',
+        stubs: {
+          git: { changed: [], stashes: [], branch: 'main', headSha: '' },
+          tasks: [], plans: [], handoff: null, adopted: false,
+        },
+      });
+      expect(text).toBe('');
+    } finally {
+      if (prev === undefined) delete process.env.MEM_QUIET_HOOKS;
+      else process.env.MEM_QUIET_HOOKS = prev;
+    }
   });
 
   test('surfaces handoff working_on when present', () => {

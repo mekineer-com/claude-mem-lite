@@ -5,6 +5,54 @@ import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from 
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { porterStem } from './tfidf.mjs';
 
+// ─── MCP Server Instructions Builder ───────────────────────────────────────
+// Phase A (v2.31.3+): when quiet=true, drops WHEN-TO-USE proactive-trigger and
+// Decision-rules sections; keeps the irreducible CLI/MCP tool list. Intended
+// for users who adopted invited-memory (MEMORY.md sentinel carries the same
+// triggers at higher authority). Default false preserves v2.31.2 behavior.
+
+const INSTRUCTIONS_BASE = [
+  'Long-term memory across sessions. Hooks auto-inject context; CLI preferred for explicit queries.',
+  '',
+  'CLI (via Bash):',
+  '  claude-mem-lite search "query"              — FTS5 full-text search',
+  '  claude-mem-lite search "err" --type bugfix  — filter by type',
+  '  claude-mem-lite recall "file.mjs"           — file-related memories',
+  '  claude-mem-lite recent 5                    — latest observations',
+  '  claude-mem-lite get 42,43                   — full details by ID',
+  '  claude-mem-lite timeline --anchor 42        — chronological context',
+  '',
+  'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access.',
+  'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
+  'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
+];
+
+const INSTRUCTIONS_VERBOSE = [
+  '',
+  'WHEN TO USE (proactive triggers during coding):',
+  '  • About to Edit/Write a file → mem_recall(file="path") FIRST — past bugfixes & lessons',
+  '  • Test failure or error → mem_search(query="error keywords", obs_type="bugfix")',
+  '  • Before refactoring → mem_search(query="module-name", obs_type="refactor") for past decisions',
+  '  • Starting new feature → mem_search(query="feature area") for prior art & patterns',
+  '  • After fixing a tricky bug → mem_save(type="bugfix", lesson_learned="root cause & fix")',
+  '  • After architecture decision → mem_save(type="decision", lesson_learned="rationale")',
+  '  • Hook-injected context mentions #ID → mem_get(ids=[ID]) for full details',
+  '',
+  'Decision rules (use INSTEAD OF multi-step search):',
+  '  • "what happened recently?" → mem_recent (NOT search with empty query)',
+  '  • "what do we know about file.mjs?" → mem_recall (NOT grep + manual search)',
+  '  • "show me around observation #42" → mem_timeline (NOT mem_get + manual navigation)',
+  '  • "clean up old/duplicate memories" → mem_maintain (NOT manual mem_delete loop)',
+  '  • "is the search index healthy?" → mem_fts_check (NOT manual COUNT queries)',
+  '  • "overview of memory tiers" → mem_browse (NOT mem_search + manual grouping)',
+  '  • "export for backup" → mem_export (NOT manual SELECT queries)',
+];
+
+export function buildServerInstructions(quiet = false) {
+  if (quiet) return INSTRUCTIONS_BASE.join('\n');
+  return [...INSTRUCTIONS_BASE, ...INSTRUCTIONS_VERBOSE].join('\n');
+}
+
 // ─── Search Re-ranking Helpers ────────────────────────────────────────────
 
 /**

@@ -251,6 +251,48 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 3. mem_get(ids=[12345, 12346])      -> full details
 ```
 
+### Invited Memory (v2.32+)
+
+Opt-in mechanism that installs a single sentinel-wrapped line into the project's
+memdir (`~/.claude/projects/<encoded>/memory/MEMORY.md`) so Claude Code loads
+the plugin's MCP-tool triggers as **user-memory** — a higher instruction-following
+authority than MCP server instructions (which are framed as tool metadata).
+
+```bash
+claude-mem-lite adopt              # install for current project
+claude-mem-lite adopt --all        # install for every project under ~/.claude/projects/
+claude-mem-lite adopt --status     # list adopted projects + sentinel versions
+claude-mem-lite adopt --dry-run    # preview without writing
+claude-mem-lite unadopt            # remove cleanly
+```
+
+Slash commands `/adopt` and `/unadopt` wrap the same CLI.
+
+**What adoption changes:**
+- A `<!-- claude-mem-lite:begin v1 -->…<!-- claude-mem-lite:end -->` block is
+  added to `MEMORY.md` under a `## 插件契约` header, containing one ≤150-char
+  line pointing at `mem_recall` / `mem_save` with their key arguments.
+- A `plugin_claude_mem_lite.md` detail file is written (not auto-loaded; read
+  on demand when the MEMORY.md pointer surfaces in context).
+- Post-adopt the conservative hook layer auto-trims: MCP server instructions
+  drop the `WHEN TO USE` section, SessionStart injection drops the `File Lessons`
+  / `Key Context` sections. `#ID` references and the `Recent` table still fire
+  so `mem_get` remains reachable.
+
+**Safety:**
+- Hash-guarded: editing the sentinel body yourself blocks automatic rewrites
+  unless you pass `--force`.
+- Budget-gated: refuses to insert when MEMORY.md is already >180 lines, so
+  Claude Code's 200-line MEMORY.md cap won't truncate the block.
+- `install` only auto-adopts when run from the claude-mem-lite source repo
+  itself (detected via git remote match); other users must opt in explicitly.
+- The fallback hook layer is never removed from source — conditional trim is
+  runtime-gated on sentinel presence, so projects without adoption get the
+  full verbose output.
+
+See `docs/plans/2026-04-16-invited-memory-pattern.md` for the full design
+(including the reusable template other plugins can follow).
+
 ## Database Schema
 
 Five core tables with FTS5 virtual tables for search:
@@ -529,6 +571,8 @@ npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% toleranc
 | `CLAUDE_MEM_DIR` | Custom data directory. All databases, runtime files, and managed resources are stored here. | `~/.claude-mem-lite/` |
 | `CLAUDE_MEM_MODEL` | LLM model for background calls (episode extraction, session summaries). Accepts `haiku` or `sonnet`. | `haiku` |
 | `CLAUDE_MEM_DEBUG` | Enable debug logging (`1` to enable). | _(disabled)_ |
+| `MEM_QUIET_HOOKS` | Low-noise hooks. `1` drops the `File Lessons` / `Key Context` sections from SessionStart injection, the lesson suffix from `[mem] Related memories`, and the `WHEN TO USE` / `Decision rules` blocks from MCP server instructions. IDs and the `Recent` table still surface so `mem_get(ids=[…])` remains reachable. Intended for users running the invited-memory adopt path or who otherwise want minimal auto-injection. | _(disabled)_ |
+| `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. The hint self-clears once `adopt` runs; set this env to suppress it without adopting. | _(disabled)_ |
 
 ## License
 

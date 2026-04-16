@@ -224,6 +224,10 @@ async function install() {
     'lib/plan-reader.mjs',
     'lib/git-state.mjs',
     'lib/startup-dashboard.mjs',
+    // v2.32 (invited-memory): memdir primitives + adopt/unadopt CLI.
+    'memdir.mjs',
+    'adopt-content.mjs',
+    'adopt-cli.mjs',
   ];
 
   if (IS_DEV) {
@@ -807,6 +811,25 @@ async function install() {
     log('No existing database — will be created on first use');
   }
 
+  // 7b. Dogfood auto-adopt (invited-memory, Phase C T13).
+  // Only fires when install.mjs is running from the claude-mem-lite source repo
+  // itself (detected via git remote match). In npm/npx flows PROJECT_DIR is a
+  // cache dir with no git metadata, so this is a no-op for end users.
+  // --no-adopt override respected.
+  if (!flags.has('--no-adopt')) {
+    try {
+      const remote = execFileSync('git', ['-C', PROJECT_DIR, 'config', '--get', 'remote.origin.url'], { encoding: 'utf8', stdio: 'pipe' }).trim();
+      const isDogfood = /github\.com[:/]sdsrss\/claude-mem-lite(\.git)?$/i.test(remote);
+      if (isDogfood) {
+        const { cmdAdopt } = await import('./adopt-cli.mjs');
+        cmdAdopt([]);
+        ok('Invited-memory: auto-adopt for claude-mem-lite dogfood repo');
+      }
+    } catch {
+      // Not a git repo, or git missing — silent skip (this is the normal npm path).
+    }
+  }
+
   // 8. Disable old claude-mem plugin
   if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
     settings.enabledPlugins['claude-mem@thedotmack'] = false;
@@ -850,6 +873,10 @@ async function uninstall() {
   // 2. Remove hooks from settings.json (match both npx and git-clone install paths)
   const settings = readSettings();
   cleanupMemHooksFromSettings(settings);
+
+  // 2b. Uninstall does NOT auto-unadopt — an adopted project may be in active use
+  // by the user in other Claude Code sessions. Tell them the command instead.
+  log('Invited-memory: adopt state preserved. Run `claude-mem-lite unadopt --all` to remove sentinel sections.');
 
   // 3. Clean plugin registry entries conservatively (avoid deleting other plugins
   // from the same marketplace publisher)

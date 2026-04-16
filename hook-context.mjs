@@ -8,7 +8,7 @@ import {
   debugLog, debugCatch,
   DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
 } from './utils.mjs';
-import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS } from './hook-shared.mjs';
+import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, effectiveQuiet } from './hook-shared.mjs';
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 
 /**
@@ -315,18 +315,25 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
       keyContext.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
     }
 
-    if (fileLessons.length > 0) {
+    // Phase A (QUIET_HOOKS) + Phase D (adopted sentinel): drop descriptive
+    // File Lessons / Key Context sections when the user has opted into low-noise
+    // hooks OR adopted invited-memory (MEMORY.md sentinel carries the triggers
+    // at higher system-prompt authority). The Recent table still fires so #IDs
+    // remain reachable via mem_get.
+    const quiet = effectiveQuiet();
+    if (fileLessons.length > 0 && !quiet) {
       summaryLines.push('### File Lessons');
       summaryLines.push(...fileLessons.slice(0, 5));
       summaryLines.push('');
     }
-    if (keyContext.length > 0) {
+    if (keyContext.length > 0 && !quiet) {
       summaryLines.push('### Key Context');
       summaryLines.push(...keyContext.slice(0, 5));
       summaryLines.push('');
     }
-  } else if (!latestSummary) {
-    // Fallback: no summary AND no key observations — show recent activity
+  } else if (!latestSummary && !effectiveQuiet()) {
+    // Fallback: no summary AND no key observations — show recent activity.
+    // Skipped under QUIET_HOOKS since the Recent table already carries titles.
     const recentObs = (observations.length >= 3 ? observations : fallbackObs).slice(0, 3);
     if (recentObs.length > 0) {
       summaryLines.push('### Recent Activity');

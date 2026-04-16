@@ -2,6 +2,41 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.0] - 2026-04-16
+
+Invited-memory: opt-in mechanism that installs a sentinel-wrapped line into the project's Claude Code memdir (`~/.claude/projects/<encoded>/memory/MEMORY.md`) so the plugin's MCP-tool triggers are loaded as `user-memory` — a higher instruction-following authority than MCP server instructions (which Claude frames as tool metadata). Post-adopt the conservative hook layer auto-trims: MCP instructions shrink 1677 → 805 bytes (measured), SessionStart drops the `File Lessons` / `Key Context` sections, UserPromptSubmit drops the lesson suffix. Users who never adopt see zero behavior change.
+
+### Added
+
+- **`MEM_QUIET_HOOKS=1` env switch** — drops `File Lessons` / `Key Context` blocks from SessionStart injection, the lesson suffix from `[mem] Related memories`, and the `WHEN TO USE` / `Decision rules` sections from MCP server instructions. IDs and the `Recent` table still surface so `mem_get` remains reachable.
+- **`memdir.mjs`** — primitives for the per-project memdir: `encodeProjectPath` (mirrors Claude Code's non-alphanumeric mangling), `memdirPath`, `readMemoryIndex`, `writePluginSection`, `removePluginSection`, `writePluginDoc`, `removePluginDoc`, `isAdopted`. Hash-guarded via a `.plugin_<slug>_state.json` sidecar; 180-line budget enforces the 200-line `MEMORY.md` cap.
+- **`adopt-content.mjs`** + **`adopt-cli.mjs`** — CLI handlers for the new `adopt` / `unadopt` subcommands with `--all` / `--force` / `--dry-run` / `--status` flags.
+- **`claude-mem-lite adopt` / `unadopt`** CLI subcommands.
+- **`/adopt` / `/unadopt`** slash commands in Claude Code chat.
+- **`install.mjs` dogfood auto-adopt** — runs adopt for the current project only when `install.mjs` is invoked from a git checkout whose `origin` matches `sdsrss/claude-mem-lite`. All other installs (npm, npx, plugin marketplace) are silent. `--no-adopt` override respected.
+- **Runtime conditional trim** — `server.mjs` and `hook-context.mjs` now consult `effectiveQuiet()` which ORs the env switch with `isAdoptedHere()`. Adopted projects automatically get the slim output; projects without adoption (or on older Claude Code versions that don't auto-load `memory/MEMORY.md`) keep the full verbose output unchanged.
+- **Self-clearing adopt hint** — SessionStart startup dashboard now appends a one-line `🧷 Invited-memory 未启用：claude-mem-lite adopt …` hint on every SessionStart until the sentinel is installed. Silence via `MEM_NO_ADOPT_HINT=1` (or `MEM_QUIET_HOOKS=1`).
+- **`docs/plans/2026-04-16-invited-memory-pattern.md`** — the plan document.
+- **`docs/templates/invited-memory-template.md`** — reusable blueprint for other Claude Code plugins that want to follow the same integration pattern.
+- New env vars in README tables: `MEM_QUIET_HOOKS`, `MEM_NO_ADOPT_HINT`.
+- New READMEs section `### Invited Memory` (English + 中文).
+
+### Changed
+
+- `server.mjs` instructions builder extracted to `server-internals.mjs::buildServerInstructions(quiet)` for testability.
+- `lib/doctor-benchmark.mjs` MCP-instructions scanner learned a third form (builder-call reconstruction from `INSTRUCTIONS_BASE` + `INSTRUCTIONS_VERBOSE`) so the byte-count baseline keeps working after the refactor.
+- Uninstall no longer automatically `unadopt`s — an adopted project may still be active in other Claude Code sessions. Uninstall prints the one-liner `claude-mem-lite unadopt --all` instead.
+
+### Internal
+
+- 1516 → 1571 tests (+55 net: +13 quiet-hooks, +29 memdir, +12 adopt-cli, +10 adopted-detection, +4 startup-dashboard adopt-hint, −13 where 1 existing test was modified).
+- Four new test files: `tests/quiet-hooks.test.mjs`, `tests/memdir.test.mjs`, `tests/adopt-cli.test.mjs`, `tests/adopted-detection.test.mjs`.
+- Zero new runtime deps. Zero breaking changes. Backward-compatible schema (none added).
+
+### Compat note
+
+Invited-memory is opt-in. Users on `v2.31.x` who upgrade without running `adopt` see identical behavior — the only delta is the one-line adopt hint on SessionStart (silence: `MEM_NO_ADOPT_HINT=1`). Adopt is per-project; no global state is touched.
+
 ## [2.31.2] - 2026-04-15
 
 Hotfix — close the auto-upgrade gap introduced in 2.31.1.

@@ -8,6 +8,10 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from '
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared } from './haiku-client.mjs';
+// Phase D: invited-memory sentinel detection. memdir.mjs only pulls in fs/path/os/crypto;
+// adopt-content.mjs is pure strings. No circular deps — memdir doesn't import hook-shared.
+import { memdirPath as _memdirPath, isAdopted as _isAdopted } from './memdir.mjs';
+import { PLUGIN_SLUG as _PLUGIN_SLUG } from './adopt-content.mjs';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -23,6 +27,33 @@ export const STALE_LOCK_MS = 30000;                       // 30s
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
 export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
+
+// Phase A (v2.31.3+): MEM_QUIET_HOOKS=1 drops descriptive hook/MCP-instruction
+// bodies (File Lessons / Key Context headers, MCP WHEN-TO-USE & decision rules,
+// related-memory lesson suffix). Intended for users who adopted invited-memory
+// (MEMORY.md sentinel) or who otherwise want minimal hook noise. Function form
+// (not const) so modules importing at load time still respect later env sets
+// in-process, and tests can toggle per-call. See docs/plans/2026-04-16-invited-memory-pattern.md.
+export function isQuietHooks() {
+  return process.env.MEM_QUIET_HOOKS === '1';
+}
+
+// Phase D (v2.32.1+): if the current project has adopted our invited-memory
+// sentinel, MEMORY.md already carries the triggers at system-prompt authority
+// — so hook + MCP-instruction output can also go quiet. isQuietHooks (env)
+// remains an independent, stronger override.
+export function isAdoptedHere(cwd) {
+  try {
+    const resolved = cwd || process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
+    return _isAdopted(_memdirPath(resolved), _PLUGIN_SLUG);
+  } catch {
+    return false;
+  }
+}
+
+export function effectiveQuiet(cwd) {
+  return isQuietHooks() || isAdoptedHere(cwd);
+}
 
 // Handoff system constants
 export const HANDOFF_EXPIRY_CLEAR = 6 * 3600000;                // 6 hours (covers lunch/meeting breaks)

@@ -167,6 +167,10 @@ function readStdin() {
 
 // ─── Format Output ──────────────────────────────────────────────────────────
 
+// Phase A (v2.31.3+): drop lesson suffix when MEM_QUIET_HOOKS=1; users on invited-memory
+// path can mem_get the ID for full detail.
+const QUIET_HOOKS = process.env.MEM_QUIET_HOOKS === '1';
+
 function formatResults(rows) {
   if (!rows || rows.length === 0) return null;
 
@@ -174,7 +178,7 @@ function formatResults(rows) {
   for (const r of rows) {
     const icon = typeIcon(r.type);
     const title = truncate(r.title || '', 70);
-    const lesson = r.lesson_learned ? ` — ${truncate(r.lesson_learned, 50)}` : '';
+    const lesson = !QUIET_HOOKS && r.lesson_learned ? ` — ${truncate(r.lesson_learned, 50)}` : '';
     lines.push(`#${r.id} ${icon} ${title}${lesson}`);
   }
   return lines.join('\n');

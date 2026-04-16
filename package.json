@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.31.2",
+  "version": "2.32.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -35,6 +35,9 @@
     "hook-context.mjs",
     "hook-handoff.mjs",
     "hook-update.mjs",
+    "memdir.mjs",
+    "adopt-content.mjs",
+    "adopt-cli.mjs",
     "haiku-client.mjs",
     "registry.mjs",
     "registry-retriever.mjs",
@@ -66,6 +69,8 @@
     "commands/memory.md",
     "commands/update.md",
     "commands/tools.md",
+    "commands/adopt.md",
+    "commands/unadopt.md",
     "hooks/hooks.json",
     "scripts/launch.mjs",
     "scripts/setup.sh",

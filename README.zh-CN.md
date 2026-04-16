@@ -238,6 +238,44 @@ rm -rf ~/claude-mem-lite/   # v0.5 前的非隐藏目录（如未自动迁移）
 3. mem_get(ids=[12345, 12346])      -> 完整详情
 ```
 
+### Invited Memory（邀请式记忆，v2.32+）
+
+Opt-in 机制——向项目 memdir（`~/.claude/projects/<encoded>/memory/MEMORY.md`）
+注入单行 sentinel 包围的插件契约，Claude Code 会把它作为 **user-memory** 加载
+到系统提示——比 MCP server instructions（被框定为 tool metadata）具有更高的
+instruction-following 权威。
+
+```bash
+claude-mem-lite adopt              # 当前项目注入
+claude-mem-lite adopt --all        # 扫描 ~/.claude/projects/* 全部注入
+claude-mem-lite adopt --status     # 列出所有已 adopt 的项目 + 版本号
+claude-mem-lite adopt --dry-run    # 只打印不写入
+claude-mem-lite unadopt            # 精确移除
+```
+
+Slash 命令 `/adopt` 和 `/unadopt` 是上述 CLI 的包装。
+
+**Adopt 后会发生什么：**
+- `MEMORY.md` 新增一段 `<!-- claude-mem-lite:begin v1 -->…<!-- claude-mem-lite:end -->`
+  包裹的 `## 插件契约`，含一行 ≤150 字符、指向 `mem_recall` / `mem_save` 关键参数
+  的动作锚条目。
+- 生成 `plugin_claude_mem_lite.md` 详情文件（按需读取，不自动加载）。
+- 保守 hook 层自动瘦身：MCP server instructions 去掉 `WHEN TO USE` 段，
+  SessionStart 注入去掉 `File Lessons` / `Key Context`。`#ID` 引用与 `Recent`
+  表保留，`mem_get` 仍可随时展开。
+
+**安全性：**
+- Hash 守护：你手动改了 sentinel 段 → 下一次 adopt 报 `UserEditedError`，
+  除非显式 `--force`。
+- 预算门：MEMORY.md 已 >180 行时拒绝新增（避开 Claude Code 200 行截断）。
+- `install` 只在从 claude-mem-lite 源码仓库运行时 auto-adopt（靠 git remote 判别）；
+  其它用户需显式调用。
+- 保守 hook 层源码永不删——条件瘦身仅基于 sentinel 存在性做 runtime 判断，
+  未 adopt 的项目仍看完整 verbose 输出。
+
+完整设计见 `docs/plans/2026-04-16-invited-memory-pattern.md`（含其它插件
+可复用的模板）。
+
 ## 数据库结构
 
 五张核心表 + FTS5 虚拟表用于搜索：
@@ -506,6 +544,8 @@ npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 | `CLAUDE_MEM_DIR` | 自定义数据目录。所有数据库、运行时文件和托管资源均存储在此。 | `~/.claude-mem-lite/` |
 | `CLAUDE_MEM_MODEL` | 后台 LLM 调用模型（Episode 提取、会话总结、调度）。可选 `haiku` 或 `sonnet`。 | `haiku` |
 | `CLAUDE_MEM_DEBUG` | 启用调试日志（设为 `1` 启用）。 | _(禁用)_ |
+| `MEM_QUIET_HOOKS` | 低噪声 hook。设为 `1` 时，SessionStart 注入去掉 `File Lessons` / `Key Context` 两节，`[mem] Related memories` 去掉 lesson 后缀，MCP server instructions 去掉 `WHEN TO USE` / `Decision rules` 两段。ID 与 `Recent` 表仍保留，`mem_get(ids=[…])` 可继续展开细节。适用于启用了 invited-memory adopt 流程或偏好最小化自动注入的用户。 | _(禁用)_ |
+| `MEM_NO_ADOPT_HINT` | 静音当前项目未 adopt 时 SessionStart 追加的那一行 "Invited-memory 未启用…" 提示。一旦运行 `adopt` 该提示自动消失；此 env 让偏好保守层的用户在不 adopt 的情况下也能静音。 | _(禁用)_ |
 
 ## 许可证
 

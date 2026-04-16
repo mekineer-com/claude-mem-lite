@@ -14,6 +14,7 @@ import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
+import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { basename } from 'path';
 import { readFileSync } from 'fs';
 
@@ -2058,6 +2059,17 @@ Commands:
     --files (plural, comma-split) preferred; --file (singular) kept for back-compat.
     Use /lesson or /bug slash commands for faster capture (T8).
 
+  adopt                 Inject claude-mem-lite sentinel line into this project's
+                        ~/.claude/projects/<encoded>/memory/MEMORY.md so Claude Code
+                        auto-loads it as user-memory (higher instruction authority).
+    --all               Adopt every project under ~/.claude/projects/*/memory/
+    --force             Overwrite a sentinel block that was manually edited
+    --dry-run           Print intended writes without touching disk
+    --status            List adopted projects + version
+
+  unadopt               Precise removal of the sentinel block + plugin_claude_mem_lite.md.
+    --all               Unadopt every project
+
 DB: ${DB_PATH}`);
 }
 
@@ -2335,6 +2347,11 @@ export async function run(argv) {
     cmdHelp();
     return;
   }
+
+  // adopt / unadopt do pure filesystem work on ~/.claude/projects/<encoded>/memory/ —
+  // no DB needed. Route them before ensureDb() so an unbootable DB doesn't block.
+  if (cmd === 'adopt') { cmdAdopt(cmdArgs); return; }
+  if (cmd === 'unadopt') { cmdUnadopt(cmdArgs); return; }
 
   let db;
   try {
