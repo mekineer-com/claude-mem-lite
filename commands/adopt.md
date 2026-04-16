@@ -41,4 +41,20 @@ Code versions. Post-adopt the MCP `WHEN TO USE` section + the `File Lessons` /
 `Key Context` sections auto-trim since the sentinel line already carries the
 triggers at higher authority.
 
+## Restart required for MCP trim to take effect
+
+The MCP server builds its instructions once at server boot and the protocol
+has no way to push updated instructions to an already-connected Claude Code
+session. After running `adopt`:
+
+- The **MEMORY.md sentinel** appears on the **next SessionStart** automatically.
+- Hook-layer trim (`File Lessons` / `Key Context` / lesson suffix) applies
+  on the next SessionStart.
+- MCP-instructions trim (`WHEN TO USE` / `Decision rules` sections) only
+  takes effect after Claude Code itself restarts (or at least re-attaches
+  the mem MCP server). If you still see the verbose MCP instructions after
+  adopt, a `/exit` + fresh session is enough.
+
+Same caveat applies in reverse for `/unadopt`.
+
 !claude-mem-lite adopt $ARGUMENTS

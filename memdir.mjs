@@ -17,6 +17,18 @@ import { createHash } from 'crypto';
 const MEMORY_LINE_BUDGET = 180;
 const SECTION_HEADER = '## 插件契约';
 
+/**
+ * POSIX-accurate line count. `str.split('\n').length` overcounts by 1 when the
+ * file ends with a trailing newline (almost always true for markdown), which
+ * caused an off-by-one budget trip at the 180-line boundary (code review
+ * finding for v2.32.3).
+ */
+function countLines(raw) {
+  if (raw.length === 0) return 0;
+  const nl = (raw.match(/\n/g) || []).length;
+  return nl + (raw.endsWith('\n') ? 0 : 1);
+}
+
 export class UserEditedError extends Error {
   constructor(message) { super(message); this.name = 'UserEditedError'; }
 }
@@ -123,7 +135,7 @@ export function readMemoryIndex(memdir, slug) {
   }
   const raw = readFileSync(path, 'utf8');
   const m = raw.match(sentinelRegex(slug));
-  const lineCount = raw.length === 0 ? 0 : raw.split('\n').length;
+  const lineCount = countLines(raw);
   if (!m) return { exists: true, raw, lineCount, section: null, body: null, version: null };
   return { exists: true, raw, lineCount, section: m[0], body: m[2], version: m[1] };
 }
@@ -159,7 +171,7 @@ export function writePluginSection(memdir, { slug, version, contentLine, force =
 
   if (!match) {
     // Insert: enforce the 180-line budget so we never get truncated at 200.
-    const existingLines = raw.length === 0 ? 0 : raw.split('\n').length;
+    const existingLines = countLines(raw);
     if (existingLines > MEMORY_LINE_BUDGET) {
       throw new BudgetExceededError(
         `MEMORY.md has ${existingLines} lines (> ${MEMORY_LINE_BUDGET}); refuse to add new sentinel section for ${slug}.`,
@@ -223,7 +235,13 @@ export function removePluginSection(memdir, slug) {
   let end = match.index + match[0].length;
   if (raw[end] === '\n') end++;
   if (start > 0 && raw.slice(0, start).endsWith('\n\n')) start--;
-  const next = raw.slice(0, start) + raw.slice(end);
+  let next = raw.slice(0, start) + raw.slice(end);
+  // Edge case (code review v2.32.3): when the sentinel was the first content
+  // (e.g. two invited-memory plugins coexist and we remove the earlier one),
+  // the tail can still start with a stranded blank line / doubled newlines.
+  // Normalize leading whitespace and collapse any ≥3 consecutive newlines
+  // so the remaining content looks hand-authored.
+  next = next.replace(/^\s+/, '').replace(/\n{3,}/g, '\n\n');
   atomicWrite(path, next);
   return { action: 'removed' };
 }

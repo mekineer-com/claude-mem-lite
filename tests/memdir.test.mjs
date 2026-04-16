@@ -190,6 +190,37 @@ describe('sentinel IO (writePluginSection / readMemoryIndex / removePluginSectio
     ).toThrow(BudgetExceededError);
   });
 
+  it('accepts MEMORY.md at exactly the 180-line boundary (v2.32.3: no off-by-one)', () => {
+    // Pre-v2.32.3 bug: split('\n').length overcounted by 1 for files ending in
+    // a newline, so a POSIX-correct 180-line file tripped BudgetExceeded.
+    const content = Array.from({ length: 180 }, (_, i) => `- line ${i}`).join('\n') + '\n';
+    writeFileSync(join(memdir, 'MEMORY.md'), content);
+    expect(() =>
+      writePluginSection(memdir, { slug, version: 'v1', contentLine: 'x' }),
+    ).not.toThrow();
+  });
+
+  it('rejects at exactly 181 lines (the real budget edge)', () => {
+    const content = Array.from({ length: 181 }, (_, i) => `- line ${i}`).join('\n') + '\n';
+    writeFileSync(join(memdir, 'MEMORY.md'), content);
+    expect(() =>
+      writePluginSection(memdir, { slug, version: 'v1', contentLine: 'x' }),
+    ).toThrow(BudgetExceededError);
+  });
+
+  it('removePluginSection normalizes leading whitespace after removing the first sentinel', () => {
+    // Two plugins coexist; remove plugin-A (first) → tail must not start with blank lines.
+    writePluginSection(memdir, { slug: 'claude-mem-lite', version: 'v1', contentLine: 'A' });
+    // Simulate a second plugin appending its own sentinel.
+    const path = join(memdir, 'MEMORY.md');
+    const tail = '\n\n<!-- other-plugin:begin v1 -->\n## 插件契约\nB\n<!-- other-plugin:end -->\n';
+    writeFileSync(path, readFileSync(path, 'utf8') + tail);
+    removePluginSection(memdir, 'claude-mem-lite');
+    const body = readFileSync(path, 'utf8');
+    expect(body.startsWith('\n')).toBe(false);
+    expect(body.startsWith('<!-- other-plugin')).toBe(true);
+  });
+
   it('budget does NOT block updates to an already-present sentinel', () => {
     // 1) initial write at normal size
     writePluginSection(memdir, { slug, version: 'v1', contentLine: 'initial' });

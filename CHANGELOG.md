@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.3] - 2026-04-16
+
+Post-ship code-review fixes for v2.32.0–v2.32.2. No functional regressions; strengthens the 2.32 line.
+
+### Fixed
+
+- **`memdir.mjs::countLines` off-by-one** — `raw.split('\n').length` overcounted by 1 when MEMORY.md ended with a trailing newline (almost always). A POSIX-accurate 180-line file was incorrectly rejected as 181 at the budget edge. Replaced with a newline-count primitive that matches the POSIX line definition. Regression tests: accept at 180, reject at 181.
+- **`memdir.mjs::removePluginSection` leading whitespace** — when removing the first of two coexisting plugin sentinels, the tail used to start with stranded blank lines. Added `^\s+` strip + `\n{3,}` collapse so the result looks hand-authored.
+
+### Added
+
+- **Regression test for slash-command shipping gap** — `tests/npm-tarball-completeness.test.mjs` previously only walked `.mjs` / `.js` imports, so asset-style `commands/*.md` files could slip past the gate (as `commands/lesson.md` + `commands/bug.md` did in v2.32.1). New assertion: every `commands/*.md` on disk must appear in `package.json.files`.
+- **Restart caveat documented** — `commands/adopt.md` + README "Invited Memory" sections now explain that the MCP-instructions trim requires a Claude Code restart (MCP protocol has no way to push updated instructions to a live session). Hook-layer trim and the MEMORY.md sentinel both activate on the next SessionStart automatically.
+
+### Internal
+
+- 1573 → 1577 tests (+4: 180-line boundary × 2, first-sentinel leading-whitespace × 1, commands-md tarball coverage × 1).
+
 ## [2.32.2] - 2026-04-16
 
 Hotfix — resolves [#14](https://github.com/sdsrss/claude-mem-lite/issues/14): npm-installed users crash on first SessionStart with `ERR_MODULE_NOT_FOUND` because 10 files imported by `hook.mjs` / `server.mjs` / `mem-cli.mjs` were never in the npm tarball. Auto-update (copy-file path) was unaffected; only `npm install -g` / `npx` users hit it. Bug originated in v2.29.0 (2026-03), first reported 2026-04-02; v2.31.2's hook-update fix only repaired the auto-update path, not the npm tarball.

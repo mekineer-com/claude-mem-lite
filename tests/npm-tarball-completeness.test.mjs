@@ -13,7 +13,7 @@
 // breaks lazy code paths just as surely (only lazier).
 
 import { test, expect } from 'vitest';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import { dirname, resolve, relative } from 'path';
 
 const ROOT = resolve(new URL('..', import.meta.url).pathname);
@@ -79,4 +79,17 @@ test('no stale entry in package.json files points at a non-existent path', () =>
     if (!existsSync(abs)) dangling.push(f);
   }
   expect(dangling).toEqual([]);
+});
+
+test('every slash command in commands/ ships in the npm tarball (v2.32.3 code-review finding)', () => {
+  // The static-import walker above only follows .mjs/.js files, so asset-style
+  // markdown files (commands/<name>.md, read by Claude Code's slash-command
+  // registry) can slip past the gate. This test catches that blind spot: all
+  // commands/*.md on disk must appear in package.json.files.
+  const commandsDir = resolve(ROOT, 'commands');
+  const onDisk = readdirSync(commandsDir).filter((f) => f.endsWith('.md'));
+  const missing = onDisk
+    .map((f) => `commands/${f}`)
+    .filter((p) => !FILES.has(p));
+  expect(missing, `\npackage.json "files" missing slash commands:\n  ${missing.join('\n  ')}\n`).toEqual([]);
 });

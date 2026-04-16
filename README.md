@@ -279,6 +279,15 @@ Slash commands `/adopt` and `/unadopt` wrap the same CLI.
   / `Key Context` sections. `#ID` references and the `Recent` table still fire
   so `mem_get` remains reachable.
 
+**When does it take effect?**
+- The MEMORY.md sentinel and the hook-layer trim (`File Lessons` / `Key Context` /
+  lesson suffix) apply on the **next SessionStart** (any new Claude Code session
+  in the adopted project).
+- The MCP server instructions are built once at server boot and MCP has no
+  "push" protocol — the `WHEN TO USE` / `Decision rules` trim only applies
+  after Claude Code restarts and re-spawns the mem MCP server. A single
+  `/exit` + fresh session is enough. Same caveat applies to `unadopt`.
+
 **Safety:**
 - Hash-guarded: editing the sentinel body yourself blocks automatic rewrites
   unless you pass `--force`.

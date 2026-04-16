@@ -264,6 +264,14 @@ Slash 命令 `/adopt` 和 `/unadopt` 是上述 CLI 的包装。
   SessionStart 注入去掉 `File Lessons` / `Key Context`。`#ID` 引用与 `Recent`
   表保留，`mem_get` 仍可随时展开。
 
+**什么时候生效？**
+- MEMORY.md sentinel 和 hook 层瘦身（`File Lessons` / `Key Context` / lesson
+  后缀）**下一次 SessionStart** 生效（adopt 的项目下任一新会话）。
+- MCP server instructions 是**服务启动时构建一次**，MCP 协议无 "push" 机制，
+  所以 `WHEN TO USE` / `Decision rules` 两段的瘦身**只在 Claude Code 重启后**
+  才生效（mem MCP 服务被重新 spawn）。`/exit` 一次再开新会话即可。`unadopt`
+  同理。
+
 **安全性：**
 - Hash 守护：你手动改了 sentinel 段 → 下一次 adopt 报 `UserEditedError`，
   除非显式 `--force`。
