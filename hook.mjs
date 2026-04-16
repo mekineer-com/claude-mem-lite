@@ -109,14 +109,14 @@ if (!event) process.exit(0);
 
 // ─── Episode Flush ──────────────────────────────────────────────────────────
 
-// hookEventName defaults to 'PostToolUse' since that's the most common caller.
-// Stop / SessionStart callers MUST pass their own event name — CC rejects
-// hook output whose hookEventName doesn't match the triggering event
-// (regression introduced in v2.33.1's structured receipt, fixed in v2.33.3).
-// v2.33.4: CC's Stop-event schema does NOT accept hookSpecificOutput at all —
-// only PreToolUse / UserPromptSubmit / PostToolUse / SessionStart carry
-// additionalContext. On Stop we flush the episode to DB but skip the JSON
-// receipt entirely; emitting it triggers "Invalid input" schema rejection.
+// hookEventName serves two roles: it is written into the emitted receipt JSON
+// AND it gates emission via RECEIPT_EVENTS. Callers MUST pass their triggering
+// event name so both work — Stop falls outside the allowlist, so its receipt
+// is skipped entirely (CC's Stop schema rejects hookSpecificOutput at the root,
+// not just on event-name mismatch). The episode still flushes to DB and
+// spawns llm-episode background enrichment; only the stdout receipt is gated.
+// Regression chain: v2.33.1 introduced the receipt; v2.33.3 misdiagnosed the
+// Stop rejection as event-name mismatch; v2.33.4 is the root-cause fix.
 const RECEIPT_EVENTS = new Set(['PostToolUse', 'SessionStart', 'UserPromptSubmit']);
 function flushEpisode(episode, hookEventName = 'PostToolUse') {
   if (!episode || episode.entries.length === 0) return;

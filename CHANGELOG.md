@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.33.5] - 2026-04-17
+
+Follow-up patch to v2.33.4. Code review of the Stop-schema fix flagged two gaps: the PostToolUse receipt emission path (untouched by v2.33.4 but newly gated by the `RECEIPT_EVENTS` allowlist) had no positive regression test, and the `flushEpisode` header comment carried two eras of explanation (v2.33.3 + v2.33.4) that were confusing to read together. Neither gap was a correctness problem on its own, but both reduce the cost of the next Stop-schema incident if CC ever tightens SessionStart or another event.
+
+### Added
+
+- **`tests/e2e.test.mjs`** — new test `PostToolUse flush emits receipt JSON with correct event tag`. Fills the episode buffer to 10, then the 11th post-tool-use call triggers `flushEpisode` and the test asserts the stdout receipt has `hookSpecificOutput.hookEventName === 'PostToolUse'` and `additionalContext` matches `/\[mem\] episode flushed: \d+ entries/`. Guards against a future over-broadening of the `RECEIPT_EVENTS` guard accidentally swallowing the happy-path receipt (the failure mode that motivated v2.33.1's introduction of the receipt in the first place).
+
+### Internal
+
+- **`hook.mjs:112-119`** — consolidated the two-era header comment on `RECEIPT_EVENTS` / `flushEpisode`. The new version explains the dual role of `hookEventName` (emit value + gate key), why Stop is excluded, and the v2.33.1 → v2.33.3 → v2.33.4 regression chain in one block.
+
+Tests: 1620 → 1621 pass (59 files, +1 new, 0 regressions).
+
 ## [2.33.4] - 2026-04-17
 
 Follow-up to v2.33.3. The v2.33.3 patch changed `flushEpisode`'s hard-coded `hookEventName: 'PostToolUse'` into a parameter and taught `handleStop` to pass `'Stop'`. That fixed the "expected 'Stop' but got 'PostToolUse'" error class but not the actual user-visible failure in code-graph-mcp: Claude Code's Stop-event schema **forbids `hookSpecificOutput` entirely** (only `PreToolUse` / `UserPromptSubmit` / `PostToolUse` / `SessionStart` carry `additionalContext`). Tagging the receipt with `hookEventName: 'Stop'` still tripped `Hook JSON output validation failed — (root): Invalid input`.

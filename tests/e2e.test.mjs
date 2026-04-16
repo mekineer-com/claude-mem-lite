@@ -320,6 +320,38 @@ describe('Suite 2: Episode Buffer Management', () => {
     }
   });
 
+  it('PostToolUse flush emits receipt JSON with correct event tag', () => {
+    // v2.33.5: positive test for the PostToolUse receipt emission path.
+    // Complements the Stop-must-not-emit assertion above — if a future edit
+    // over-broadens the RECEIPT_EVENTS guard and drops PostToolUse too, this
+    // test fails loudly instead of silently swallowing the happy-path emission.
+    runHook('session-start', { env: { HOME: tmpHome } });
+
+    // EPISODE_BUFFER_SIZE = 10. The bufferFull check runs BEFORE the new
+    // entry is appended, so the 11th call (when episode already holds 10)
+    // is the one that triggers flushEpisode → receipt stdout.
+    let flushStdout = '';
+    for (let i = 0; i < 11; i++) {
+      const { stdout } = runHook('post-tool-use', {
+        stdin: makeToolPayload('Edit', {
+          file_path: '/tmp/src/receipt.js',
+          old_string: `old${i}`,
+          new_string: `new${i}`,
+        }, 'OK — edited file'),
+        env: { HOME: tmpHome },
+      });
+      if (stdout && stdout.includes('episode flushed')) flushStdout = stdout;
+    }
+
+    // The flush-triggering call MUST produce a PostToolUse-tagged receipt.
+    expect(flushStdout).not.toBe('');
+    const parsed = JSON.parse(flushStdout.trim());
+    expect(parsed.suppressOutput).toBe(true);
+    expect(parsed.hookSpecificOutput).toBeDefined();
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('PostToolUse');
+    expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
+  });
+
   it('skipped tools (Read, Glob) do not create entries', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
 
