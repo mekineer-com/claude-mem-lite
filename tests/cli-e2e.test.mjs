@@ -440,17 +440,20 @@ describe('CLI E2E: help and errors', () => {
   });
 
   it('shows help with -h flag', () => {
-    // Note: --help routes to install.mjs (not in CLI_COMMANDS set)
-    // But 'help' command routes to mem-cli.mjs
+    // cli.mjs short-circuits --help / -h to mem-cli.mjs run(['help']).
     const { stdout } = runCli(['help']);
     expect(stdout).toContain('claude-mem-lite CLI');
   });
 
   it('reports unknown command', () => {
-    // Direct CLI commands only — 'unknown_cmd' is not in CLI_COMMANDS set
-    // so it routes to install.mjs which handles it
-    const { stderr } = runCli(['search']); // search without query
-    expect(stderr).toContain('Usage');
+    // Unknown commands hit the final branch in cli.mjs: stderr "Unknown command"
+    // + Levenshtein suggestion + exit 1. (search without a query is a separate
+    // usage-error path inside mem-cli.mjs.)
+    const { stderr: missingQuery } = runCli(['search']);
+    expect(missingQuery).toContain('Usage');
+    const { stderr: unknown, exitCode } = runCli(['not_a_real_cmd_xyzzy']);
+    expect(unknown).toContain('Unknown command');
+    expect(exitCode).toBe(1);
   });
 });
 
