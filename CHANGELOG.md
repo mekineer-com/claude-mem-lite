@@ -2,6 +2,32 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.5] - 2026-04-17
+
+End-to-end install/update audit caught a cross-module drift between `install.mjs` and `hook-update.mjs`: both maintained independent `SOURCE_FILES` lists, and `hook-update.mjs`'s copy had fallen 8 files behind over v2.31–v2.32. Any npx/npm-installed (non-plugin-mode) user auto-updating from v2.30- to v2.32.x would download the new `hook-llm.mjs` without `lib/activity.mjs` → `ERR_MODULE_NOT_FOUND` on the next SessionStart. Rolled into this release: a latent gap where `registry-enricher/-github/-importer.mjs` were imported by `server.mjs` / `mem-cli.mjs` but never copied to `~/.claude-mem-lite/`, plus two UX papercuts around `/plugin marketplace update` messaging and dev-mode `doctor` output.
+
+### Fixed
+
+- **`hook-update.mjs` SOURCE_FILES drift (P0)** — auto-update no longer silently omits `lib/activity.mjs`, `lib/task-reader.mjs`, `lib/plan-reader.mjs`, `lib/git-state.mjs`, `lib/startup-dashboard.mjs`, `lib/doctor-benchmark.mjs`, `memdir.mjs`, `adopt-content.mjs`, `adopt-cli.mjs`. `install.mjs` and `hook-update.mjs` now both `import SOURCE_FILES from './source-files.mjs'`; drift is impossible by construction.
+- **`install.mjs` SOURCE_FILES missing registry helpers (latent P0)** — `registry-enricher.mjs`, `registry-github.mjs`, `registry-importer.mjs` are imported by `server.mjs` (mem_registry tool) and `mem-cli.mjs` (registry CLI) but were never copied to `~/.claude-mem-lite/`. Added to the shared list.
+- **`install.mjs::doctor` dev-mode false warning (P2)** — symlinked (dev) installs correctly skip state-file writes in `hook-update.mjs`, but `doctor` still reported `⚠ Update state: no state file (first run?)`. Now reports `✓ Update state: skipped (dev mode — symlinked install)` when `~/.claude-mem-lite/server.mjs` is a symlink.
+- **`install.mjs::manualUpdate` plugin-mode upgrade instructions (P1)** — when the plugin system defers auto-install, the notification now tells users exactly what to type: `/plugin marketplace update sdsrss` + `/plugin install claude-mem-lite@sdsrss`. Previously it said "reinstall/update the plugin to apply it" without naming the commands, and users left on whatever version they first pulled.
+
+### Added
+
+- **`source-files.mjs`** — single shared `SOURCE_FILES` manifest, imported by `install.mjs` + `hook-update.mjs`.
+- **`tests/source-files-sync.test.mjs`** — 3 regression tests: (1) every `.mjs` statically or dynamically imported by `cli.mjs` / `hook.mjs` / `server.mjs` / `mem-cli.mjs` / `install.mjs` appears in `SOURCE_FILES`; (2) both consumers `import` from the shared module (no inline duplicates creep back); (3) `package.json.files` ships `source-files.mjs` and every SOURCE_FILES entry.
+
+### Changed
+
+- **`CLAUDE.md`** — MCP tool count in the `server.mjs` row corrected from 16 to 17 (missing `mem_use`).
+- **`README.md`** — plugin-mode upgrade notes now lead with the two `/plugin …` commands users must run inside Claude Code; previously the docs said "plugin mode only reports available updates" without telling users how to apply one.
+
+### Internal
+
+- 1580 → 1583 tests (+3 source-files-sync regressions).
+- `tests/e2e.test.mjs` Suite 10 reads SOURCE_FILES by `import` rather than regex-parsing `install.mjs`.
+
 ## [2.32.4] - 2026-04-16
 
 Hotfix — `claude-mem-lite adopt` / `claude-mem-lite unadopt` at the CLI entry point returned `[mem] Unknown command` on v2.32.0–v2.32.3 because `cli.mjs`'s `CLI_COMMANDS` Set was missing both names. The `/adopt` slash command (`!claude-mem-lite adopt $ARGUMENTS`) was broken for installed users. In-process paths (install-time dogfood auto-adopt, direct `import('./adopt-cli.mjs')`) were unaffected.

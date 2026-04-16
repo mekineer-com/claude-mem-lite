@@ -8,6 +8,7 @@ import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { DB_DIR } from './schema.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
+import { SOURCE_FILES } from './source-files.mjs';
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
@@ -191,19 +192,10 @@ export function getCurrentVersion() {
   } catch { return '0.0.0'; }
 }
 
-// ── Source files to copy (must match install.mjs SOURCE_FILES) ──
-const SOURCE_FILES = [
-  'cli.mjs', 'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
-  'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
-  'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs',
-  'hook-optimize.mjs', 'plugin-cache-guard.mjs',
-  'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
-  'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
-  'registry-retriever.mjs', 'resource-discovery.mjs',
-  'install.mjs', 'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
-  'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
-  'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
-];
+// Source files imported from shared ./source-files.mjs so install.mjs and
+// hook-update.mjs can never drift (see tests/source-files-sync.test.mjs).
+// SWITCHABLE_PATHS = everything in SOURCE_FILES plus the recursive dirs that
+// install.mjs copies as whole subtrees (scripts, registry, node_modules).
 const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
 
 // ── Download & Install ─────────────────────────────────────

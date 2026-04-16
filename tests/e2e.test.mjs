@@ -1345,14 +1345,13 @@ describe('Suite 9: Hidden Data Dir Migration', () => {
 // ─── Suite 10: Code Review Fix Validations ──────────────────────────────────
 
 describe('Suite 10: Code Review Fix Validations', () => {
-  it('SOURCE_FILES covers all static imports in server.mjs and hook.mjs', () => {
-    // Validate that install.mjs SOURCE_FILES includes every local .mjs import
-    const installSrc = readFileSync(resolve('install.mjs'), 'utf8');
-    const match = installSrc.match(/const SOURCE_FILES = \[([\s\S]*?)\];/);
-    expect(match).not.toBeNull();
-    const sourceFiles = match[1].match(/'([^']+\.mjs)'/g).map(s => s.replace(/'/g, ''));
+  it('SOURCE_FILES covers all static imports in server.mjs and hook.mjs', async () => {
+    // SOURCE_FILES now lives in source-files.mjs (shared between install.mjs and
+    // hook-update.mjs). tests/source-files-sync.test.mjs does the full walker
+    // check; this quicker spot-check asserts the shared list has not regressed
+    // for the two most critical entry points.
+    const { SOURCE_FILES } = await import('../source-files.mjs');
 
-    // Collect all local .mjs imports from server.mjs and hook.mjs
     const entryFiles = ['server.mjs', 'hook.mjs'];
     const visited = new Set();
     const queue = [...entryFiles];
@@ -1368,9 +1367,8 @@ describe('Suite 10: Code Review Fix Validations', () => {
       }
     }
 
-    // Every visited .mjs file (except the entry points themselves if not in SOURCE_FILES) must be in SOURCE_FILES
     for (const file of visited) {
-      expect(sourceFiles).toContain(file);
+      expect(SOURCE_FILES).toContain(file);
     }
   });
 

@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.32.4",
+  "version": "2.32.5",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -55,6 +55,7 @@
     "registry-importer.mjs",
     "registry-enricher.mjs",
     "resource-discovery.mjs",
+    "source-files.mjs",
     "install.mjs",
     "install-metadata.mjs",
     "skip-tools.mjs",

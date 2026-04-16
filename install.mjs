@@ -2,7 +2,7 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
 import { join, resolve, dirname, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -27,6 +27,7 @@ const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
+import { SOURCE_FILES } from './source-files.mjs';
 
 /**
  * Derive invocation_name from resource name when metadata doesn't provide one.
@@ -184,6 +185,18 @@ function ok(msg) { console.log(`  ✓ ${msg}`); }
 function warn(msg) { console.log(`  ⚠ ${msg}`); }
 function fail(msg) { console.log(`  ✗ ${msg}`); }
 
+// Dev installs symlink server.mjs → the project's source file. Used to suppress
+// misleading "first run" messages since hook-update.mjs skips state-writes in
+// this mode (see hook-update.mjs isDevMode).
+function isDevInstall() {
+  try {
+    const serverPath = join(INSTALL_DIR, 'server.mjs');
+    return existsSync(serverPath) && lstatSync(serverPath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 // ─── Install ────────────────────────────────────────────────────────────────
 
 async function install() {
@@ -201,34 +214,6 @@ async function install() {
   }
 
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-
-  const SOURCE_FILES = [
-    'cli.mjs', 'server.mjs', 'server-internals.mjs', 'tool-schemas.mjs',
-    'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
-    'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs', 'hook-update.mjs', 'hook-optimize.mjs',
-    'plugin-cache-guard.mjs',
-    'haiku-client.mjs', 'utils.mjs', 'schema.mjs', 'package.json', 'package-lock.json', 'skill.md',
-    'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
-    'registry-retriever.mjs', 'resource-discovery.mjs',
-    'install-metadata.mjs', 'mem-cli.mjs', 'tier.mjs', 'tfidf.mjs',
-    'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
-    'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
-    // v2.31 T9: hook-llm now statically imports lib/activity.mjs (events routing).
-    // SOURCE_FILES entries with a subdir prefix require install.mjs to mkdir the
-    // parent before symlink/copy — handled in the IS_DEV and else-branch loops.
-    'lib/activity.mjs',
-    // v2.31 T10: startup dashboard aggregator + handoff task/git anchoring.
-    // task-reader + plan-reader + git-state are read by lib/startup-dashboard.mjs
-    // on SessionStart (hook.mjs) and by hook-handoff.mjs on /exit + /clear.
-    'lib/task-reader.mjs',
-    'lib/plan-reader.mjs',
-    'lib/git-state.mjs',
-    'lib/startup-dashboard.mjs',
-    // v2.32 (invited-memory): memdir primitives + adopt/unadopt CLI.
-    'memdir.mjs',
-    'adopt-content.mjs',
-    'adopt-cli.mjs',
-  ];
 
   if (IS_DEV) {
     log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
@@ -1194,6 +1179,10 @@ async function doctor() {
       if (state.rateLimited) parts.push('rate-limited');
       if (state.lastError) parts.push(`last error: ${state.lastError}`);
       ok(`Update state: ${parts.join(', ') || 'empty'}`);
+    } else if (isDevInstall()) {
+      // Dev installs symlink server.mjs → project source; hook-update.mjs
+      // short-circuits before writing state (see hook-update.mjs isDevMode).
+      ok('Update state: skipped (dev mode — symlinked install)');
     } else {
       warn('Update state: no state file (first run?)');
     }
@@ -1387,7 +1376,10 @@ async function manualUpdate() {
   if (result?.updated) {
     ok(`Updated: v${result.from} → v${result.to}`);
   } else if (result?.updateAvailable && result?.installDeferred) {
-    warn(`v${result.to} available — plugin mode only checks for updates, reinstall/update the plugin to apply it`);
+    warn(`v${result.to} available — plugin mode only checks for updates.`);
+    log('  To upgrade, inside Claude Code run:');
+    log('    /plugin marketplace update sdsrss');
+    log('    /plugin install claude-mem-lite@sdsrss');
   } else if (result?.updateAvailable) {
     warn(`v${result.to} available but install failed — try: node install.mjs install`);
   } else {

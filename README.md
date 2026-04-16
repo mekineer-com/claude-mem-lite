@@ -455,6 +455,12 @@ npx claude-mem-lite doctor            # Diagnose issues
 
 Notes:
 - Plugin mode only reports available updates; it does not self-update plugin files.
+  To upgrade an installed plugin to the latest published version, run **inside Claude Code**:
+  ```
+  /plugin marketplace update sdsrss
+  /plugin install claude-mem-lite@sdsrss
+  ```
+  (The first command refreshes the local marketplace clone; the second reinstalls from it. Without the first command, `/plugin install` reuses the stale local clone and you stay on whichever version you originally pulled.)
 - Direct install / npx mode keeps auto-update enabled and uses staged replacement with rollback on install failure.
 - If you disabled the plugin but still have old mem hooks in `~/.claude/settings.json`, run `node install.mjs cleanup-hooks`.
 
