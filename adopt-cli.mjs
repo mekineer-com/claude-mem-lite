@@ -9,7 +9,7 @@
 // --dry-run = print intent without writing
 // --status = list all adopted projects + versions
 
-import { existsSync, readdirSync, statSync } from 'fs';
+import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import {
@@ -119,6 +119,58 @@ function adoptOne(memdir, { force, dryRun, all }) {
     log(`[adopt] ${memdir} → error: ${e.message}`);
     return { action: 'failed' };
   }
+}
+
+/**
+ * silentAutoAdopt — plugin-mode first-run auto-adopt helper (v2.33.0).
+ *
+ * Preconditions (caller must gate): CLAUDE_PLUGIN_ROOT set, MEM_NO_AUTO_ADOPT!=1,
+ * MEM_QUIET_HOOKS!=1, first-attempt marker absent. This helper does NOT re-check
+ * those — it only does the write + marker persistence.
+ *
+ * Behavior:
+ *   - Writes plugin sentinel + detail doc to the memdir for `cwd`.
+ *   - Writes a per-project first-attempt marker under `markerDir` so a later
+ *     `/unadopt` is respected (no re-adopt loop).
+ *   - Silent: never logs, never throws. Returns structured result.
+ *
+ * Returns { ok, action, reason } — caller uses for telemetry / debugLog only.
+ */
+export function silentAutoAdopt({ cwd, markerDir, markerKey }) {
+  const memdir = memdirPath(cwd);
+  try {
+    if (isAdopted(memdir, PLUGIN_SLUG)) {
+      writeMarker(markerDir, markerKey);
+      return { ok: true, action: 'already-adopted' };
+    }
+    writePluginSection(memdir, {
+      slug: PLUGIN_SLUG,
+      version: CURRENT_SENTINEL_VERSION,
+      contentLine: getIndexLine(),
+      force: false,
+    });
+    writePluginDoc(memdir, PLUGIN_SLUG, getDetailDoc());
+    writeMarker(markerDir, markerKey);
+    return { ok: true, action: 'adopted' };
+  } catch (e) {
+    // Budget exceeded, user-edited conflict, or FS error — write marker so we
+    // don't retry on every SessionStart. User can run /adopt --force manually.
+    try { writeMarker(markerDir, markerKey); } catch { /* marker best-effort */ }
+    const reason = e instanceof UserEditedError ? 'user-edited'
+      : e instanceof BudgetExceededError ? 'budget-exceeded'
+      : 'error';
+    return { ok: false, action: 'skipped', reason, err: e };
+  }
+}
+
+function writeMarker(markerDir, markerKey) {
+  if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
+  const path = join(markerDir, `.auto-adopt-${markerKey}`);
+  writeFileSync(path, JSON.stringify({ firstAttemptAt: new Date().toISOString() }));
+}
+
+export function hasAutoAdoptMarker(markerDir, markerKey) {
+  return existsSync(join(markerDir, `.auto-adopt-${markerKey}`));
 }
 
 function statusAll() {

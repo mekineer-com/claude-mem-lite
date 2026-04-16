@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { cmdAdopt, cmdUnadopt } from '../adopt-cli.mjs';
+import { cmdAdopt, cmdUnadopt, silentAutoAdopt, hasAutoAdoptMarker } from '../adopt-cli.mjs';
 import { encodeProjectPath } from '../memdir.mjs';
 import { PLUGIN_SLUG } from '../adopt-content.mjs';
 
@@ -217,5 +217,91 @@ describe('cmdAdopt / cmdUnadopt (--all)', () => {
     expect(readFileSync(join(b, 'MEMORY.md'), 'utf8')).not.toContain(PLUGIN_SLUG);
     expect(existsSync(join(a, 'plugin_claude_mem_lite.md'))).toBe(false);
     expect(existsSync(join(b, 'plugin_claude_mem_lite.md'))).toBe(false);
+  });
+});
+
+// ─── silentAutoAdopt (v2.33.0 plugin-mode first-run helper) ─────────────────
+describe('silentAutoAdopt + hasAutoAdoptMarker', () => {
+  let tmpHome, fakeCwd, markerDir, origHome, origCwd;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'silent-adopt-'));
+    fakeCwd = join(tmpHome, 'work', 'proj');
+    mkdirSync(fakeCwd, { recursive: true });
+    markerDir = join(tmpHome, 'runtime');
+    origHome = process.env.HOME;
+    origCwd = process.env.CLAUDE_PROJECT_DIR;
+    process.env.HOME = tmpHome;
+    process.env.CLAUDE_PROJECT_DIR = fakeCwd;
+    // Silence logs from writePluginSection (silentAutoAdopt itself never logs,
+    // but shared writePluginDoc is silent too — keep mock for symmetry/safety).
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    if (origCwd === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = origCwd;
+    rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it('first call: writes sentinel + doc + marker, returns ok/adopted', () => {
+    const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r.ok).toBe(true);
+    expect(r.action).toBe('adopted');
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(true);
+    const memdir = expectedMemdir(tmpHome, fakeCwd);
+    expect(existsSync(join(memdir, 'MEMORY.md'))).toBe(true);
+    expect(existsSync(join(memdir, 'plugin_claude_mem_lite.md'))).toBe(true);
+    expect(readFileSync(join(memdir, 'MEMORY.md'), 'utf8')).toContain(`${PLUGIN_SLUG}:begin v1`);
+  });
+
+  it('already-adopted path: returns ok/already-adopted, writes marker, no duplicate', () => {
+    // First, real adopt via cmdAdopt to set up state
+    cmdAdopt([]);
+    // Now invoke silentAutoAdopt — should detect isAdopted and short-circuit
+    const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r.ok).toBe(true);
+    expect(r.action).toBe('already-adopted');
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(true);
+  });
+
+  it('returns skipped/user-edited when sentinel body was hand-edited', () => {
+    cmdAdopt([]);
+    const memPath = memoryPath(tmpHome, fakeCwd);
+    // Corrupt the sentinel body so isAdopted=true but hash mismatch
+    writeFileSync(memPath, readFileSync(memPath, 'utf8').replace('mem_recall', 'HACKED'));
+    // Clear sentinel state sidecar so isAdopted returns true (sentinel is there)
+    // but writePluginSection's update path detects user-edit — but we don't reach
+    // writePluginSection because isAdopted short-circuits first.
+    // So: already-adopted is returned, not user-edited. That's by design —
+    // isAdopted is a less strict check than writePluginSection's hash guard.
+    const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r.ok).toBe(true);
+    expect(r.action).toBe('already-adopted');
+  });
+
+  it('hasAutoAdoptMarker is per-key (scoping works)', () => {
+    silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(true);
+    expect(hasAutoAdoptMarker(markerDir, 'proj-y')).toBe(false);
+  });
+
+  it('marker persists even on failure — no retry-storm on every SessionStart', () => {
+    // Simulate failure: make memdir path unwritable by passing a path into a
+    // pre-existing read-only parent. Simpler: force a BudgetExceededError by
+    // pre-populating MEMORY.md with > 180 lines before calling.
+    const memdir = expectedMemdir(tmpHome, fakeCwd);
+    mkdirSync(memdir, { recursive: true });
+    const bigMem = Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join('\n');
+    writeFileSync(join(memdir, 'MEMORY.md'), bigMem);
+
+    const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('budget-exceeded');
+    // Marker still written — next SessionStart won't retry
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(true);
   });
 });

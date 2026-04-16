@@ -2,6 +2,29 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.33.0] - 2026-04-17
+
+**Default behavior change** (minor bump): plugin-mode installs now auto-adopt the invited-memory sentinel on first SessionStart per project. `/plugin install claude-mem-lite@sdsrss` already represents consent to integration — the prior opt-in step was redundant friction. npm/npx CLI users are unaffected and remain opt-in.
+
+### Migration note
+
+- **If you installed as a Claude Code plugin**: the first SessionStart after upgrading will silently write the `<!-- claude-mem-lite:begin v1 -->` sentinel block into your per-project `~/.claude/projects/<encoded>/memory/MEMORY.md`, plus a `plugin_claude_mem_lite.md` detail file in the same memdir. This is reversible via `/unadopt`. A first-attempt marker is persisted under `~/.claude-mem-lite/runtime/.auto-adopt-<project>` so a subsequent `/unadopt` is respected permanently — no re-adopt loop.
+- **If you prefer the old opt-in behavior**: set `MEM_NO_AUTO_ADOPT=1` globally (e.g. in `~/.claude/settings.json` `env`). `MEM_QUIET_HOOKS=1` also disables auto-adopt (quiet = no side-effects semantics).
+- **If you installed via npm/npx (not as a CC plugin)**: no change — the `CLAUDE_PLUGIN_ROOT` env gate keeps you on the opt-in path.
+
+### Added
+
+- **`silentAutoAdopt()` + `hasAutoAdoptMarker()` in `adopt-cli.mjs`** — helper functions for hook-side silent adopt with per-project marker persistence. Never throws, never logs; structured return for telemetry.
+- **Plugin-mode auto-adopt in `hook.mjs` SessionStart handler** — gated by `CLAUDE_PLUGIN_ROOT`, `!MEM_NO_AUTO_ADOPT`, `!MEM_QUIET_HOOKS`, and absent marker. Runs synchronously early in SessionStart, errors swallowed (marker still written on failure to avoid retry-storm).
+- **5 new integration tests in `tests/e2e.test.mjs` Suite 11** covering all gating paths: plugin-mode first-run adopts, no-plugin-mode does not, `MEM_NO_AUTO_ADOPT=1` opts out, `MEM_QUIET_HOOKS=1` opts out, marker presence respects `/unadopt`.
+- **5 new unit tests in `tests/adopt-cli.test.mjs`** covering `silentAutoAdopt` result shapes: first-run adopts, already-adopted short-circuits, hand-edited sentinel handling, marker scoping per-project, marker persists on failure.
+
+### Internal
+
+- 1600 → 1610 tests (+10: 5 unit + 5 integration).
+- `CLAUDE_MEM_AUTO_ADOPT` env (previously proposed as power-user opt-in) is NOT added — auto-adopt is now the plugin-mode default, so the env would be a no-op. `MEM_NO_AUTO_ADOPT` is the sole opt-out.
+- No public API change for MCP tools, CLI commands, or schema.
+
 ## [2.32.8] - 2026-04-17
 
 Precision improvements to the UserPromptSubmit auto-search hook. Two orthogonal additions: exact-match error-signature recall, and a widened CJK pattern for spoken-language "have we seen this" recall.

@@ -32,6 +32,7 @@ import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
+import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -424,6 +425,35 @@ async function handleSessionStart() {
       }
     }
   } catch (e) { debugCatch(e, 'session-start-cache-heal'); }
+
+  // v2.33.0: plugin-mode first-run auto-adopt. /plugin install IS consent to
+  // integration — writing the MEMORY.md sentinel once per project on first
+  // SessionStart avoids the opt-in friction. Scope is narrow:
+  //   - gated by CLAUDE_PLUGIN_ROOT (npm/npx installs stay opt-in)
+  //   - gated by !MEM_NO_AUTO_ADOPT (explicit escape hatch)
+  //   - gated by !MEM_QUIET_HOOKS (quiet = no side-effects semantics)
+  //   - first-attempt marker persists in RUNTIME_DIR so a subsequent /unadopt
+  //     is respected (no re-adopt loop).
+  // Failures (user-edited sentinel, budget exceeded, FS errors) are swallowed;
+  // the marker is still written so we don't retry on every SessionStart.
+  try {
+    if (
+      process.env.CLAUDE_PLUGIN_ROOT
+      && process.env.MEM_NO_AUTO_ADOPT !== '1'
+      && process.env.MEM_QUIET_HOOKS !== '1'
+    ) {
+      const project = inferProject();
+      if (!hasAutoAdoptMarker(RUNTIME_DIR, project)) {
+        const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+        const r = silentAutoAdopt({ cwd, markerDir: RUNTIME_DIR, markerKey: project });
+        if (r.ok) {
+          debugLog('DEBUG', 'session-start-auto-adopt', `action=${r.action} project=${project}`);
+        } else {
+          debugLog('DEBUG', 'session-start-auto-adopt', `skipped project=${project} reason=${r.reason}`);
+        }
+      }
+    }
+  } catch (e) { debugCatch(e, 'session-start-auto-adopt'); }
 
   // Read CC real session_id from hook stdin — used to scope handoff rows so parallel
   // sessions for the same project don't clobber each other (see docs/bug.txt).

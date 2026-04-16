@@ -1406,3 +1406,98 @@ describe('Suite 10: Code Review Fix Validations', () => {
     try { rmSync(home, { recursive: true, force: true }); } catch {}
   });
 });
+
+// ─── Suite 11: Plugin-mode First-Run Auto-Adopt (v2.33.0) ──────────────────
+
+describe('Suite 11: plugin-mode first-run auto-adopt', () => {
+  function encodedMemdir(home, cwd) {
+    // Mirrors memdir.mjs::encodeProjectPath — all non-alphanumerics → '-'
+    const encoded = String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
+    return join(home, '.claude', 'projects', encoded, 'memory');
+  }
+  function sentinelPresent(home, cwd) {
+    const p = join(encodedMemdir(home, cwd), 'MEMORY.md');
+    return existsSync(p) && readFileSync(p, 'utf8').includes('claude-mem-lite:begin v1');
+  }
+
+  it('CLAUDE_PLUGIN_ROOT + first run → adopts + writes marker', () => {
+    runHook('session-start', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_QUIET_HOOKS: undefined,
+        MEM_NO_AUTO_ADOPT: undefined,
+      },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+    // Marker key is inferProject() output — contains "testproj"
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
+    const markers = readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'));
+    expect(markers.length).toBeGreaterThan(0);
+  });
+
+  it('no CLAUDE_PLUGIN_ROOT → does NOT adopt (opt-in preserved)', () => {
+    runHook('session-start', {
+      env: { HOME: tmpHome, MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
+    const markers = existsSync(runtimeDir)
+      ? readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'))
+      : [];
+    expect(markers.length).toBe(0);
+  });
+
+  it('CLAUDE_PLUGIN_ROOT + MEM_NO_AUTO_ADOPT=1 → does NOT adopt', () => {
+    runHook('session-start', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_NO_AUTO_ADOPT: '1',
+        MEM_QUIET_HOOKS: undefined,
+      },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+  });
+
+  it('CLAUDE_PLUGIN_ROOT + MEM_QUIET_HOOKS=1 → does NOT adopt (quiet semantics)', () => {
+    runHook('session-start', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_QUIET_HOOKS: '1',
+        MEM_NO_AUTO_ADOPT: undefined,
+      },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+  });
+
+  it('marker present → skips adopt on subsequent SessionStart (respects /unadopt)', () => {
+    // First run: adopts + writes marker
+    runHook('session-start', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_QUIET_HOOKS: undefined,
+        MEM_NO_AUTO_ADOPT: undefined,
+      },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+
+    // Manually remove the sentinel (simulating /unadopt) but keep the marker
+    const memPath = join(encodedMemdir(tmpHome, projectDir), 'MEMORY.md');
+    writeFileSync(memPath, '');
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+
+    // Second session: marker still present → must NOT re-adopt
+    runHook('session-start', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_QUIET_HOOKS: undefined,
+        MEM_NO_AUTO_ADOPT: undefined,
+      },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+  });
+});
