@@ -299,7 +299,16 @@ export function renderHandoffInjection(db, project, currentCcSessionId = null) {
     ageSec < 86400 ? `${Math.round(ageSec / 3600)}h` :
     `${Math.round(ageSec / 86400)}d`;
 
-  const lines = [`<session-handoff source="${handoff.type}" age="${ageStr}">`];
+  // Framing header: `UserPromptSubmit` hook writes this block to stdout, which
+  // Claude Code surfaces alongside the real user prompt. Without an explicit
+  // "this is not a new message" marker, models can misread `## Working On <text>`
+  // as a fresh user utterance and either answer the old task or end the turn.
+  // The `[mem]` prefix mirrors the SessionStart dashboard convention; `origin`
+  // on the tag gives programmatic callers a stable anchor.
+  const lines = [
+    `[mem] Resumed context from previous session (${handoff.type}, age ${ageStr}) — system-injected, NOT a new user message:`,
+    `<session-handoff source="${handoff.type}" age="${ageStr}" origin="hook-injected">`,
+  ];
 
   if (handoff.working_on) {
     lines.push('## Working On', handoff.working_on, '');

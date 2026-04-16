@@ -538,6 +538,27 @@ describe('renderHandoffInjection', () => {
     expect(result).toContain('</session-handoff>');
   });
 
+  it('leads with a framing line that marks the injection as system-provided, not a new user message', () => {
+    // Regression: prior renderings opened directly with `<session-handoff …>` +
+    // `## Working On <text>`. When Claude Code surfaced that via the
+    // UserPromptSubmit hook, models sometimes misread the `<text>` as a fresh
+    // user prompt and ended the turn or answered the handoff content instead
+    // of the actual new prompt. Fix: always prepend a `[mem]` framing line that
+    // explicitly labels the block as previous-session context.
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 's1', '先前怎么没有这个问题？', ?)`).run(Date.now() - 60000);
+
+    const result = renderHandoffInjection(db, 'p');
+    const firstLine = result.split('\n', 1)[0];
+    expect(firstLine).toMatch(/^\[mem\]/);
+    expect(firstLine.toLowerCase()).toContain('previous');
+    expect(firstLine.toLowerCase()).toContain('not');
+    // Opening tag should also carry a machine-parseable `origin` attribute so
+    // downstream tooling can distinguish hook-injected handoffs from anything
+    // else that might happen to wrap content in <session-handoff>.
+    expect(result).toMatch(/<session-handoff [^>]*origin="hook-injected"/);
+  });
+
   it('appends session summary when available', () => {
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
       VALUES ('p', 'exit', 's1', 'work', ?)`).run(Date.now());

@@ -2,6 +2,30 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.6] - 2026-04-17
+
+Handoff injection UX fix. When the `UserPromptSubmit` hook surfaced a prior `/exit` handoff as `additionalContext`, the opening block looked like:
+
+```
+<session-handoff source="exit" age="5d">
+## Working On
+<whatever the prior session was about, often a human-language question>
+```
+
+Models sometimes misread that embedded `## Working On` text as a fresh user message — ending the turn, answering the old task, or treating `continue` replies as contradictory. Dogfooding this repo hit it three times in one session before the pattern was identified.
+
+### Fixed
+
+- **`renderHandoffInjection` framing (`hook-handoff.mjs:302`)** — the injection now leads with an explicit `[mem]` framing line: `[mem] Resumed context from previous session (<type>, age <N>) — system-injected, NOT a new user message:` before the `<session-handoff>` tag. The tag also carries a new `origin="hook-injected"` attribute for programmatic callers.
+
+### Added
+
+- **`tests/handoff.test.mjs`** — regression test asserting the injection's first line matches `/^\[mem\]/`, contains "previous" + "not", and the opening tag carries `origin="hook-injected"`. Prevents future reverts that would reintroduce the raw-prompt ambiguity.
+
+### Internal
+
+- 1583 → 1584 tests (+1 framing regression).
+
 ## [2.32.5] - 2026-04-17
 
 End-to-end install/update audit caught a cross-module drift between `install.mjs` and `hook-update.mjs`: both maintained independent `SOURCE_FILES` lists, and `hook-update.mjs`'s copy had fallen 8 files behind over v2.31–v2.32. Any npx/npm-installed (non-plugin-mode) user auto-updating from v2.30- to v2.32.x would download the new `hook-llm.mjs` without `lib/activity.mjs` → `ERR_MODULE_NOT_FOUND` on the next SessionStart. Rolled into this release: a latent gap where `registry-enricher/-github/-importer.mjs` were imported by `server.mjs` / `mem-cli.mjs` but never copied to `~/.claude-mem-lite/`, plus two UX papercuts around `/plugin marketplace update` messaging and dev-mode `doctor` output.
