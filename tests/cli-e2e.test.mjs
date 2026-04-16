@@ -454,6 +454,36 @@ describe('CLI E2E: help and errors', () => {
   });
 });
 
+// Regression: v2.32.3 shipped cli.mjs with 'adopt' and 'unadopt' missing from
+// CLI_COMMANDS, so `claude-mem-lite adopt` fell through to the unknown-command
+// branch and `/adopt` was broken for installed users. Lock this via E2E.
+describe('CLI E2E: adopt / unadopt routing', () => {
+  it('adopt is routed by cli.mjs (not unknown-command)', () => {
+    const { stdout, stderr, exitCode } = runCli(['adopt', '--dry-run'], {
+      env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projectDir },
+    });
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain('Unknown command');
+    expect(stdout).toContain('[adopt --dry-run]');
+  });
+
+  it('unadopt is routed by cli.mjs (not unknown-command)', () => {
+    const { stderr, exitCode } = runCli(['unadopt'], {
+      env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projectDir },
+    });
+    // Never-adopted memdir → benign no-op, exit 0, no routing error
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain('Unknown command');
+  });
+
+  it('help output advertises adopt and unadopt', () => {
+    const { stdout, exitCode } = runCli(['help']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/^\s*adopt\b/m);
+    expect(stdout).toMatch(/^\s*unadopt\b/m);
+  });
+});
+
 describe('CLI E2E: context', () => {
   it('reports empty context for a project with no DB data', () => {
     // Pre-v2.30 this asserted a "No CLAUDE.md" error. Post-v2.30 the command

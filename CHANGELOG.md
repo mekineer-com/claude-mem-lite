@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.4] - 2026-04-16
+
+Hotfix — `claude-mem-lite adopt` / `claude-mem-lite unadopt` at the CLI entry point returned `[mem] Unknown command` on v2.32.0–v2.32.3 because `cli.mjs`'s `CLI_COMMANDS` Set was missing both names. The `/adopt` slash command (`!claude-mem-lite adopt $ARGUMENTS`) was broken for installed users. In-process paths (install-time dogfood auto-adopt, direct `import('./adopt-cli.mjs')`) were unaffected.
+
+### Fixed
+
+- `cli.mjs::CLI_COMMANDS` — added `'adopt'` and `'unadopt'` so both commands route through `mem-cli.mjs` instead of falling through to the unknown-command branch.
+
+### Added
+
+- `tests/cli-e2e.test.mjs` — 3 regression tests at the `cli.mjs` subprocess layer: adopt + unadopt are routed (not unknown-command), help output advertises both. Previous coverage (`tests/adopt-cli.test.mjs`) only exercised `cmdAdopt` / `cmdUnadopt` directly, so the missing-entry bug was invisible to the suite.
+
+### Internal
+
+- 1577 → 1580 tests (+3: adopt routing × 2, help-text advertisement × 1).
+
 ## [2.32.3] - 2026-04-16
 
 Post-ship code-review fixes for v2.32.0–v2.32.2. No functional regressions; strengthens the 2.32 line.
