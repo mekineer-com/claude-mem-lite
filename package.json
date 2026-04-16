@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.32.0",
+  "version": "2.32.1",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -89,6 +89,9 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "better-sqlite3": "^12.6.2",
     "zod": "^4.3.6"
+  },
+  "overrides": {
+    "hono": ">=4.12.14"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

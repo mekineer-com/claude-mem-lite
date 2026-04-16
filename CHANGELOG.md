@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.1] - 2026-04-16
+
+Hotfix — clear a transitive `npm audit` moderate vulnerability so the Release workflow's `npm audit --omit=dev` gate passes and the 2.32 line can reach the npm registry.
+
+### Fixed
+
+- `hono@4.12.12` (transitive via `@modelcontextprotocol/sdk@1.26.0 → @hono/node-server`) had [GHSA-458j-xx4x-4375](https://github.com/advisories/GHSA-458j-xx4x-4375) (improper JSX attribute handling → HTML injection in SSR). Added `overrides: { "hono": ">=4.12.14" }` to `package.json`; fresh `npm install` now resolves `hono@4.12.14`. `npm audit --omit=dev` reports 0 vulnerabilities.
+- 2.32.0 commits + GitHub Release page exist on the sdsrss/claude-mem-lite repo, but the npm-publish leg of the Release workflow never ran (blocked by the same audit gate). 2.32.1 unblocks the pipeline.
+
+### No functional changes
+
+All 1571 tests from 2.32.0 still pass; no source files touched outside `package.json` / `package-lock.json` / version strings / this changelog.
+
 ## [2.32.0] - 2026-04-16
 
 Invited-memory: opt-in mechanism that installs a sentinel-wrapped line into the project's Claude Code memdir (`~/.claude/projects/<encoded>/memory/MEMORY.md`) so the plugin's MCP-tool triggers are loaded as `user-memory` — a higher instruction-following authority than MCP server instructions (which Claude frames as tool metadata). Post-adopt the conservative hook layer auto-trims: MCP instructions shrink 1677 → 805 bytes (measured), SessionStart drops the `File Lessons` / `Key Context` sections, UserPromptSubmit drops the lesson suffix. Users who never adopt see zero behavior change.
