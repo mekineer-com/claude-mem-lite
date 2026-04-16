@@ -8,6 +8,9 @@
 // See docs/plans/2026-04-16-invited-memory-pattern.md for rationale.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { isQuietHooks } from '../hook-shared.mjs';
 import { buildServerInstructions } from '../server-internals.mjs';
 import { buildSessionContextLines } from '../hook-context.mjs';
@@ -86,7 +89,7 @@ describe('buildServerInstructions(quiet)', () => {
 
 describe('buildSessionContextLines — QUIET_HOOKS gating', () => {
   let db;
-  let original;
+  let original, origHome, origCwd, tmpHome;
 
   beforeEach(() => {
     db = createTestDb();
@@ -115,11 +118,27 @@ describe('buildSessionContextLines — QUIET_HOOKS gating', () => {
       filesModified: '[]',
     });
 
+    // buildSessionContextLines routes through effectiveQuiet() which also
+    // returns true when isAdoptedHere(cwd) detects the sentinel in the current
+    // project's memdir. The dogfood repo IS adopted, so without a sandbox the
+    // "unset" branch below sees quiet=true and drops File Lessons / Key Context.
+    // Pin HOME + CLAUDE_PROJECT_DIR to an unadopted tmpdir.
+    tmpHome = mkdtempSync(join(tmpdir(), 'quiet-hooks-'));
+    const fakeCwd = join(tmpHome, 'proj');
+    mkdirSync(fakeCwd, { recursive: true });
+    origHome = process.env.HOME;
+    origCwd = process.env.CLAUDE_PROJECT_DIR;
+    process.env.HOME = tmpHome;
+    process.env.CLAUDE_PROJECT_DIR = fakeCwd;
+
     original = process.env.MEM_QUIET_HOOKS;
   });
 
   afterEach(() => {
     db.close();
+    if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+    if (origCwd === undefined) delete process.env.CLAUDE_PROJECT_DIR; else process.env.CLAUDE_PROJECT_DIR = origCwd;
+    rmSync(tmpHome, { recursive: true, force: true });
     if (original === undefined) delete process.env.MEM_QUIET_HOOKS;
     else process.env.MEM_QUIET_HOOKS = original;
   });
