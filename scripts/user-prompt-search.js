@@ -8,7 +8,7 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, 
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import Database from 'better-sqlite3';
-import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
+import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -29,9 +29,13 @@ const LOOKBACK_MS = 60 * 86400000; // 60 days
 // is TOP_REL_FLOOR below, which drops the whole FTS set when the best match
 // is weak.
 const BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN || 1e-5);
-// Raw-character minimum length for the prompt. Additional to the CJK-weighted
-// `shouldSkip()` effective-length gate; catches medium-short Latin prompts that
-// survive `shouldSkip` but carry too few tokens to justify an FTS lookup.
+// CJK-weighted minimum length for the prompt. Catches medium-short Latin
+// prompts ("run tests", "fix bug now") that survive `shouldSkip`'s weaker 8-unit
+// floor but carry too few tokens to justify an FTS lookup.
+// v2.34.4: applied to `computeEffectiveLen(prompt)`, not raw char count — a
+// 14-char CJK prompt ("优化 hook 性能降低延迟") scores 30 effective units and
+// now reaches FTS, matching shouldSkip's CJK-weighted gate rather than silently
+// failing the raw-char one.
 const PROMPT_MIN_LENGTH = 15;
 
 // v2.33.1: follow-up prompts ("前面那个", "继续 X", "再看看 Y") are short by
@@ -296,7 +300,7 @@ async function main() {
   // short continuations ("前面那个?", "does it work?") depend on prior context.
   const followUp = isFollowUpSession();
   const promptMinLen = followUp ? FOLLOWUP_PROMPT_MIN_LENGTH : PROMPT_MIN_LENGTH;
-  if (promptText.trim().length < promptMinLen) return;
+  if (computeEffectiveLen(promptText.trim()) < promptMinLen) return;
   const bm25Floor = followUp ? FOLLOWUP_BM25_MIN_SCORE : BM25_MIN_SCORE;
 
   let db;

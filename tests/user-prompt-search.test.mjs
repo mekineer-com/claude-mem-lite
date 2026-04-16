@@ -15,6 +15,7 @@ import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { typeIcon, truncate } from '../utils.mjs';
 import {
   shouldSkip,
+  computeEffectiveLen,
   detectIntent,
   shouldSkipByDedup,
   extractFiles,
@@ -72,6 +73,39 @@ describe('shouldSkip', () => {
     expect(shouldSkip('How do I fix the authentication error?')).toBe(false);
     expect(shouldSkip('Refactor the database module')).toBe(false);
     expect(shouldSkip('为什么这个测试一直失败？')).toBe(false);
+  });
+});
+
+// ─── Unit Tests: computeEffectiveLen (v2.34.4) ──────────────────────────────
+// Exported so downstream gates (PROMPT_MIN_LENGTH in user-prompt-search.js)
+// can weight CJK the same way `shouldSkip` does. Latin char = 1 unit,
+// CJK char = 3 units. See `prompt-search-utils.mjs:computeEffectiveLen`.
+
+describe('computeEffectiveLen', () => {
+  it('returns 0 for empty / null / undefined', () => {
+    expect(computeEffectiveLen('')).toBe(0);
+    expect(computeEffectiveLen(null)).toBe(0);
+    expect(computeEffectiveLen(undefined)).toBe(0);
+  });
+
+  it('counts Latin chars at 1 unit each', () => {
+    expect(computeEffectiveLen('fix a bug now')).toBe(13); // 13 chars
+    expect(computeEffectiveLen('hello world')).toBe(11);
+  });
+
+  it('counts CJK chars at 3 units each', () => {
+    expect(computeEffectiveLen('优化')).toBe(6);       // 2 CJK × 3
+    expect(computeEffectiveLen('性能降低延迟')).toBe(18); // 6 CJK × 3
+  });
+
+  it('weights mixed CJK / Latin / whitespace correctly', () => {
+    // "优化 hook 性能降低延迟": 8 CJK + 4 Latin + 2 spaces = 8*3 + 6 = 30
+    expect(computeEffectiveLen('优化 hook 性能降低延迟')).toBe(30);
+  });
+
+  it('covers the CJK extension A block', () => {
+    // U+3400 is in the extension A range; should still count as CJK
+    expect(computeEffectiveLen('\u3400\u3401')).toBe(6);
   });
 });
 
@@ -938,12 +972,12 @@ describe('user-prompt-search T3: BM25 threshold + prompt-length gate', () => {
     expect(stdout).toMatch(/Redis/i);
   });
 
-  it('skips medium-short prompts (13 chars) — exercises PROMPT_MIN_LENGTH gate', async () => {
-    // 'fix a bug now' is 13 chars, effectiveLen 13: passes shouldSkip (>= 8)
-    // but fails PROMPT_MIN_LENGTH (< 15). Seed a high-relevance bugfix
-    // observation that WOULD match the prompt stems ("fix", "bug") if the
-    // gate weren't there — so the only thing suppressing injection is the
-    // new length gate itself. This is a true mutation-resistant probe.
+  it('skips medium-short Latin prompts (13 chars) — exercises PROMPT_MIN_LENGTH gate', async () => {
+    // 'fix a bug now' is 13 chars, effectiveLen 13 (all Latin): passes
+    // shouldSkip (>= 8) but fails PROMPT_MIN_LENGTH (< 15). Seed a
+    // high-relevance bugfix observation that WOULD match the prompt stems
+    // ("fix", "bug") if the gate weren't there — so the only thing
+    // suppressing injection is the length gate itself. Mutation-resistant.
     insertObs(db, {
       sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
       title: 'fix bug in authentication flow',
@@ -954,6 +988,30 @@ describe('user-prompt-search T3: BM25 threshold + prompt-length gate', () => {
     db.pragma('wal_checkpoint(FULL)');
     const { stdout } = await runScript({ prompt: 'fix a bug now' });
     expect(stdout.trim()).toBe('');
+  });
+
+  it('admits CJK-heavy prompts below raw 15 chars — exercises computeEffectiveLen weighting', async () => {
+    // v2.34.4: PROMPT_MIN_LENGTH gate moved from raw char count to
+    // CJK-weighted effectiveLen. "优化 hook 性能降低延迟" is 14 raw chars
+    // (would fail the old `trim().length < 15` gate) but effectiveLen 30
+    // (8 CJK × 3 + 6 Latin/space), so it now reaches FTS.
+    //
+    // Mutation probe: if the gate reverts to raw char count this test fails
+    // because the 14-char prompt would be blocked before FTS runs and stdout
+    // would be empty. The seeded bugfix uses "优化" + "性能" which the CJK
+    // LIKE fallback (nlp.mjs extractCjkLikePatterns) extracts from both the
+    // prompt and the observation text — guaranteeing a retrieval hit when
+    // the gate lets the prompt through.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: '优化 hook 性能降低调用延迟',
+      text: 'hook 性能优化 降低 post-tool-use 的调用延迟 race condition',
+      lessonLearned: '优化 hook 调度减少同步 IO 阻塞，性能延迟下降明显',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript({ prompt: '优化 hook 性能降低延迟' });
+    expect(stdout).toMatch(/优化|性能/);
   });
 
   it('skips extremely short prompts via shouldSkip', async () => {

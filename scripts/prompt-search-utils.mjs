@@ -9,12 +9,23 @@ const CONFIRM_RE = /^(y(es)?|no?|ok|done|go|sure|lgtm|thanks?|ty|继续|确认|�
 const SLASH_CMD_RE = /^\//;
 const PURE_OP_RE = /^(git\s+(commit|push|merge)|npm\s+(publish|deploy))\b/i;
 
+/**
+ * CJK-weighted effective length. CJK characters (CJK Unified Ideographs
+ * main + extension A) carry ~3x the semantic token density of Latin
+ * characters — a 5-char Chinese phrase like "优化数据库" encodes roughly
+ * the same information as a 15-char English equivalent. Used by every
+ * length gate downstream of the prompt hook so Latin-calibrated
+ * thresholds (8 / 15) don't falsely reject substantive CJK prompts.
+ */
+export function computeEffectiveLen(text) {
+  if (!text) return 0;
+  const cjkCount = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
+  return (text.length - cjkCount) + cjkCount * 3;
+}
+
 export function shouldSkip(text) {
   if (!text) return true;
-  // CJK characters carry ~3x semantic weight per char vs Latin
-  const cjkCount = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
-  const effectiveLen = (text.length - cjkCount) + cjkCount * 3;
-  if (effectiveLen < 8) return true;
+  if (computeEffectiveLen(text) < 8) return true;
   const trimmed = text.trim();
   if (CONFIRM_RE.test(trimmed)) return true;
   if (SLASH_CMD_RE.test(trimmed)) return true;

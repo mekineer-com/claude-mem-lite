@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.34.4] - 2026-04-17
+
+CJK-short-prompt recall fix. The T3 raw-length gate (`PROMPT_MIN_LENGTH=15`) in `scripts/user-prompt-search.js` was a raw-character count while the upstream `shouldSkip` already weighted CJK at 3× Latin. A 14-char prompt like "优化 hook 性能降低延迟" (8 CJK + 4 Latin + 2 spaces) passed `shouldSkip`'s 8-unit floor (effectiveLen 30) but fell below the raw-15 gate and never reached FTS. Fix shares one weighting function across both gates. 1673 → 1679 tests green (+6: 5 unit tests for `computeEffectiveLen`, 1 integration test for CJK gate admission).
+
+**No breaking changes.** Latin-only prompts keep identical behavior (`computeEffectiveLen` on pure-Latin text equals the raw char count). Only CJK-containing prompts in the 5..14-raw-char / ≥15-effective-unit band change from blocked to admitted.
+
+### Fixed
+
+- **`scripts/prompt-search-utils.mjs` extracted `computeEffectiveLen(text)`** — CJK Unified Ideographs (main `\u4e00-\u9fff` + extension A `\u3400-\u4dbf`) count as 3 units, everything else as 1. `shouldSkip` now delegates to it instead of computing the weighting inline. Exported so the prompt-hook gate can reuse the same formula.
+- **`scripts/user-prompt-search.js` PROMPT_MIN_LENGTH applied to effective length, not raw length.** `if (promptText.trim().length < promptMinLen) return;` → `if (computeEffectiveLen(promptText.trim()) < promptMinLen) return;`. Thresholds unchanged (first prompt 15, follow-up 8) — the Latin calibration still holds, CJK now clears it proportionally. Matches the CJK-weighted gate `shouldSkip` has used since v2.22 and closes the one-gate-weighted / one-gate-not inconsistency introduced when the T3 raw gate was added in v2.31.
+- **`tests/user-prompt-search.test.mjs` new coverage.** Unit tests for `computeEffectiveLen`: empty/null, Latin counting, CJK 3× weighting, mixed prompts (asserts the user's example "优化 hook 性能降低延迟" → 30), CJK extension A coverage. Integration test in the T3 describe block seeds a `bugfix` observation with "优化" + "性能" terms and asserts the 14-raw-char CJK prompt now produces a non-empty hit (`expect(stdout).toMatch(/优化|性能/)`). Mutation-resistant: reverting to raw `.length` re-blocks the prompt before FTS runs, the test fails with empty stdout.
+
 ## [2.34.3] - 2026-04-17
 
 UserPromptSubmit FTS recall now drops tangential-keyword noise hits via a top-|rel| sanity gate. Triggered by a simulation run where "today's date please help me" surfaced an unrelated v2.34.1 UX audit observation at |rel|=37.8 — clearly in the noise band, but the per-row `BM25_MIN_SCORE` floor at `1e-5` was six orders of magnitude below observed score magnitudes and never fired. 1670 → 1673 tests green (+3 gate tests, +0.18%).
