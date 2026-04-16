@@ -16,18 +16,18 @@ const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferP
 const MAX_RESULTS = 5;
 const LOOKBACK_MS = 60 * 86400000; // 60 days
 
-// T3 (v2.31): BM25 magnitude threshold. OBS_BM25 (in scoring-sql.mjs) returns the
-// raw bm25() value, which in SQLite FTS5 is always negative — lower = better match.
-// The `relevance` column multiplies that negative bm25 by positive decay / type /
-// importance weights, keeping the sign negative. "Stronger match" therefore means
-// larger magnitude, so we compare against `Math.abs(relevance)`.
+// T3 (v2.31): per-row BM25 magnitude floor. OBS_BM25 (in scoring-sql.mjs)
+// returns the raw bm25() value — negative, smaller = better. Multiplied by
+// decay × type-quality × (0.5+0.5·importance), sign stays negative. We
+// compare against Math.abs(relevance).
 //
-// Empirically (see Task 3 probe in docs/plans/2026-04-14-mem-v2.31-mvp.md):
-//   - OR-fallback single-stem match: |rel| ~ 3e-6
-//   - Multi-term AND match w/ importance+type boost: |rel| ~ 2e-5 .. 5e-5
-// The plan's hinted default (3.5) was a guess that's six orders of magnitude too
-// high for this codebase's scoring expression. 1e-5 suppresses OR-fallback noise
-// while preserving real hits. Env-overridable for tuning without a redeploy.
+// v2.34.3 note: the historic comment claimed |rel| falls in 3e-6..5e-5 range.
+// Re-measured against real data (see v2.34.3 CHANGELOG probe), actual scores
+// span ~6..133 across SIGNAL / META / NOISE prompts — the scoring expression
+// was revised in later versions and this constant was never retuned. 1e-5 now
+// acts as a NULL-rel guard, not a real noise filter. The primary noise gate
+// is TOP_REL_FLOOR below, which drops the whole FTS set when the best match
+// is weak.
 const BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN || 1e-5);
 // Raw-character minimum length for the prompt. Additional to the CJK-weighted
 // `shouldSkip()` effective-length gate; catches medium-short Latin prompts that
@@ -40,6 +40,27 @@ const PROMPT_MIN_LENGTH = 15;
 // Detection: INJECTED_IDS_FILE count > 0 within DEDUP_STALE_MS window.
 const FOLLOWUP_PROMPT_MIN_LENGTH = 8;
 const FOLLOWUP_BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN_FOLLOWUP || 5e-6);
+
+// v2.34.3: top-|rel| sanity gate. BM25_MIN_SCORE filters per-row; this floor
+// gates the entire FTS set. Noise prompts ("today's date", "current time")
+// produce OR-fallback leakage where every hit shares one tangential stem and
+// per-row filtering leaves all of them through. When the best match scores
+// below this floor, the whole FTS result set is dropped.
+//
+// Empirical distribution (v2.34.3 probe, 12 prompts):
+//   SIGNAL top-|rel|   60..133
+//   NOISE  top-|rel|   25..48
+//   WEAK-META          6.86..33
+// Default 50 sits in the clean 48→60 gap. Env override for project tuning.
+// Error-signature hits (sigRows) and file-recall (fileRows) bypass this gate —
+// both are precision passes with independent relevance signal.
+//
+// Note: no follow-up halving (unlike PROMPT_MIN_LENGTH / BM25_MIN_SCORE).
+// Those lower the length/per-row bar to let short context-dependent prompts
+// through, but the top-|rel| gap is an absolute distribution separator —
+// lowering it in follow-up mode re-admits the 37..48 noise band that the
+// gate exists to drop.
+const TOP_REL_FLOOR = Number(process.env.CLAUDE_MEM_UPS_TOP_MIN || 50);
 
 function isFollowUpSession() {
   try {
@@ -322,6 +343,16 @@ async function main() {
       ftsRows = ftsRows.filter(r =>
         typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
       );
+
+      // v2.34.3: top-|rel| sanity gate. Per-row filtering above leaves noise
+      // prompts intact when many rows share a weak stem (all in 25..48 range).
+      // If the best remaining FTS match is below the top floor, drop the
+      // whole FTS set — noise prompts should produce no FTS injection.
+      // Query orders by `relevance` ASC; negative values → ftsRows[0] has the
+      // largest magnitude (strongest match) in this scoring expression.
+      if (ftsRows.length > 0 && Math.abs(ftsRows[0].relevance) < TOP_REL_FLOOR) {
+        ftsRows = [];
+      }
 
       // Merge: FTS results first, then file results, deduplicated
       const seen = new Set(ftsRows.map(r => r.id));

@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.34.3] - 2026-04-17
+
+UserPromptSubmit FTS recall now drops tangential-keyword noise hits via a top-|rel| sanity gate. Triggered by a simulation run where "today's date please help me" surfaced an unrelated v2.34.1 UX audit observation at |rel|=37.8 — clearly in the noise band, but the per-row `BM25_MIN_SCORE` floor at `1e-5` was six orders of magnitude below observed score magnitudes and never fired. 1670 → 1673 tests green (+3 gate tests, +0.18%).
+
+**No breaking changes.** Same injection behavior for all FTS matches above the gap; the gate only drops sets where even the top match is weak.
+
+### Fixed
+
+- **`scripts/user-prompt-search.js` top-|rel| sanity gate added (`TOP_REL_FLOOR=50`).** Noise prompts like `today's date please help me`, `what is the current time right now`, `can you please confirm this works okay` were surfacing 3-5 tangential memories each via OR-fallback single-stem matches. Per-row filtering left them through because every row scored ~25-48, which is "above the floor" relative to the stale `1e-5` constant but nowhere near SIGNAL range. **Empirical distribution (12-prompt probe):** SIGNAL top-|rel| 60..133, NOISE top-|rel| 25..48, WEAK-META 6.86..33 — there is a clean 48→60 gap with no observed prompt landing inside. New gate drops the entire FTS result set when `Math.abs(ftsRows[0].relevance) < 50`. Error-signature hits (`sigRows`) and file-recall (`fileRows`) bypass the gate — both are precision passes with independent signal. Env-overridable via `CLAUDE_MEM_UPS_TOP_MIN` for project-specific tuning. Integration tests cover: gate-fires (env 1e9, signal seed, expect empty), gate-off (env 0, signal seed, expect hit), file-recall bypass (env 1e9, filename-match seed, expect hit).
+- **`scripts/user-prompt-search.js` `BM25_MIN_SCORE` comment retuned.** Historic comment claimed |rel| falls in 3e-6..5e-5 and justified `1e-5` as a tight floor. Real data spans ~6..133 — the scoring expression was revised in later versions and the constant was never re-tuned. 1e-5 now acts as a NULL-rel guard only; the new `TOP_REL_FLOOR` is the actual noise filter. Constant kept (no behavior change) to preserve the env override path.
+- **`scripts/user-prompt-search.js` follow-up halving scoped narrowly.** v2.33.1 added `FOLLOWUP_BM25_MIN_SCORE` (half of primary) to loosen per-row filtering for short follow-up prompts. The initial v2.34.3 draft added a parallel `FOLLOWUP_TOP_REL_FLOOR=25` — but the top-|rel| gap is an *absolute* distribution separator, not a relative one. Halving to 25 re-admitted the 37..48 NOISE band the gate exists to drop (caught via live probe: `today's date` injected on second-in-session invocation). Follow-up halving is now scoped to length / per-row BM25 only.
+
 ## [2.34.2] - 2026-04-17
 
 Three-round user-perspective audit of all 17 MCP tools (6 core + 11 hidden-but-callable) across both MCP stdio and CLI paths. Four concrete issues found and fixed; each comes with a regression test. 1669 → 1670 tests green (+1 timeline cross-project test, retargeted truncation test from 120 → 240). `git diff --stat`: 5 files, 73+/18-.

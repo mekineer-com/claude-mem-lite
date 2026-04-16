@@ -476,6 +476,12 @@ function runScript(hookData, extraEnv = {}) {
         CLAUDE_MEM_DIR: testDir,
         CLAUDE_PROJECT_DIR: '/test/project',
         PWD: '/test/project',
+        // v2.34.3: default the top-|rel| gate off for integration tests so
+        // fixtures seeding 1–2 observations (FTS score magnitudes can't reach
+        // production-calibrated floor of 50 on sparse corpora) still exercise
+        // their pre-gate semantics. Tests that exercise the gate itself pass
+        // explicit CLAUDE_MEM_UPS_TOP_MIN overrides.
+        CLAUDE_MEM_UPS_TOP_MIN: '0',
         ...extraEnv,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -617,6 +623,61 @@ describe('user-prompt-search subprocess integration', () => {
     });
     expect(stdout).toContain('Resolved authentication middleware token expiry');
     expect(stdout).not.toContain('Modified authentication.mjs');
+  });
+
+  // v2.34.3: top-|rel| sanity gate. BM25_MIN_SCORE filters per-row; this floor
+  // gates the entire FTS set. Noise prompts produce OR-fallback leakage where
+  // every hit shares one tangential stem — per-row filtering leaves them all.
+  // When the BEST match is weak, the whole prompt is probably noise. Tests
+  // exercise env-var wiring (CLAUDE_MEM_UPS_TOP_MIN); the empirical default
+  // of 50 is justified in CHANGELOG against measured distribution.
+  it('v2.34.3 top-|rel| gate: fires when floor exceeds top relevance', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved authentication middleware token expiry',
+      text: 'authentication middleware token expiry validation refresh bug',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'how do I fix the authentication middleware token expiry validation' },
+      { CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
+    );
+    expect(stdout).toBe('');
+  });
+
+  it('v2.34.3 top-|rel| gate: env override to 0 lets weak matches through', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved authentication middleware token expiry',
+      text: 'authentication middleware token expiry validation refresh bug',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'how do I fix the authentication middleware token expiry validation' },
+      { CLAUDE_MEM_UPS_TOP_MIN: '0' },
+    );
+    expect(stdout).toContain('Resolved authentication middleware token expiry');
+  });
+
+  it('v2.34.3 top-|rel| gate: file-recall bypasses the gate', async () => {
+    // Obs on a specific file — the prompt mentions that file by name,
+    // so searchByFile returns it regardless of FTS score. Gate should not
+    // touch file-recall rows even when set to an absurdly high floor.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Touched auth-config.mjs settings',
+      text: 'auth config path adjustment',
+      importance: 1,
+      filesModified: JSON.stringify(['auth-config.mjs']),
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'what changed in auth-config.mjs recently please explain' },
+      { CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
+    );
+    expect(stdout).toContain('Touched auth-config.mjs settings');
   });
 });
 
