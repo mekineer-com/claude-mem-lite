@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.33.3] - 2026-04-17
+
+Hotfix for a regression in the v2.33.1 structured flush receipt: `hookEventName` was hard-coded to `'PostToolUse'` but `flushEpisode` is shared by three hook entrypoints. When called from Stop or SessionStart, Claude Code rejected the output with `Hook returned incorrect event name: expected 'Stop' but got 'PostToolUse'` and surfaced the error to the user at session close.
+
+### Fixed
+
+- **`hook.mjs:flushEpisode`** — accepts `hookEventName` as the second parameter, defaulting to `'PostToolUse'`. `handleStop` (line 359) now passes `'Stop'`; `handleSessionStart` leftover-episode flush (line 512) passes `'SessionStart'`. Flush receipt JSON payloads now match the triggering hook event and no longer trip Claude Code's event-name validation.
+
+### Internal
+
+- Regression test strengthened in `tests/e2e.test.mjs` (`stop flushes episode and marks session completed`): now asserts that when stdout contains a `hookSpecificOutput.hookEventName` payload, the value is exactly `'Stop'`. Reproduces the bug on old code, passes on new. 1620 tests, no count change.
+
 ## [2.33.2] - 2026-04-17
 
 Dual-id regression fix. Since `bf121aa` (2026-04-12, v2.32.x line) `handleStop` and `handleSessionStart /clear` used `sessionId = ccSessionId || getSessionId()` as the query key for every DB operation. But `handleUserPrompt` still writes `user_prompts` / `sdk_sessions.content_session_id` / `observations.memory_session_id` with the mem-internal id from `getSessionId()`. When Claude Code provided `session_id` in hook stdin (modern CC), the id passed to DB lookups was a CC UUID that matched zero rows — silently.

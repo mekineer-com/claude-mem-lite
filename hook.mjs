@@ -109,7 +109,11 @@ if (!event) process.exit(0);
 
 // ─── Episode Flush ──────────────────────────────────────────────────────────
 
-function flushEpisode(episode) {
+// hookEventName defaults to 'PostToolUse' since that's the most common caller.
+// Stop / SessionStart callers MUST pass their own event name — CC rejects
+// hook output whose hookEventName doesn't match the triggering event
+// (regression introduced in v2.33.1's structured receipt, fixed in v2.33.3).
+function flushEpisode(episode, hookEventName = 'PostToolUse') {
   if (!episode || episode.entries.length === 0) return;
 
   // Collect Read file paths tracked by post-tool-use.sh
@@ -174,7 +178,7 @@ function flushEpisode(episode) {
       process.stdout.write(JSON.stringify({
         suppressOutput: true,
         hookSpecificOutput: {
-          hookEventName: 'PostToolUse',
+          hookEventName,
           additionalContext: lines.join('\n'),
         },
       }));
@@ -356,7 +360,7 @@ async function handleStop() {
     try {
       const episode = readEpisode();
       if (episode) {
-        flushEpisode(episode);
+        flushEpisode(episode, 'Stop');
       }
     } finally {
       releaseLock();
@@ -509,7 +513,7 @@ async function handleSessionStart() {
     try {
       const prevEpisode = readEpisode();
       if (prevEpisode && prevEpisode.entries && prevEpisode.entries.length > 0) {
-        flushEpisode(prevEpisode);
+        flushEpisode(prevEpisode, 'SessionStart');
       }
     } finally {
       releaseLock();

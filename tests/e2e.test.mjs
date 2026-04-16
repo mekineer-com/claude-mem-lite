@@ -232,8 +232,17 @@ describe('Suite 1: Full Session Lifecycle', () => {
       env: { HOME: tmpHome },
     });
 
-    const { exitCode } = runHook('stop', { env: { HOME: tmpHome } });
+    const { stdout, exitCode } = runHook('stop', { env: { HOME: tmpHome } });
     expect(exitCode).toBe(0);
+
+    // v2.33.3: flushEpisode's JSON receipt must tag hookEventName='Stop' when
+    // called from the Stop hook. Previously hard-coded 'PostToolUse' → CC
+    // rejected the output with "Hook returned incorrect event name".
+    if (stdout && stdout.trim()) {
+      const parsed = JSON.parse(stdout.trim());
+      const ev = parsed?.hookSpecificOutput?.hookEventName;
+      if (ev) expect(ev).toBe('Stop');
+    }
 
     // Session marked completed
     const db = openTestDb(tmpHome);
