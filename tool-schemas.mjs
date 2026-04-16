@@ -50,8 +50,8 @@ export const memRecentSchema = {
 };
 
 export const memTimelineSchema = {
-  anchor: coerceInt.pipe(z.number().int()).optional().describe('Observation ID as center point'),
-  query: z.string().optional().describe('FTS5 query to auto-find anchor'),
+  anchor: coerceInt.pipe(z.number().int()).optional().describe('Observation ID as center point. Takes precedence over query when both are provided.'),
+  query: z.string().optional().describe('FTS5 query to auto-find anchor. Ignored when anchor is also given; use one or the other.'),
   before: coerceInt.pipe(z.number().int().min(0).max(50)).optional().describe('Items before anchor (default 5)'),
   after: coerceInt.pipe(z.number().int().min(0).max(50)).optional().describe('Items after anchor (default 5)'),
   project: z.string().optional().describe('Filter by project'),
@@ -96,18 +96,22 @@ export const memOptimizeSchema = {
     .describe('Which optimization tasks to run (default: all)'),
   max_items: coerceInt.pipe(z.number().int().min(1).max(100)).optional().default(15)
     .describe('Maximum LLM calls across all tasks (default: 15)'),
+  scope: z.enum(['narrow', 'wide']).optional().default('narrow')
+    .describe("Re-enrich scope: narrow=narrative-only candidates (default); wide=R-7 backfill (bugfix/refactor/feature/decision with narrative but lesson_learned='none'). CLI parity: --scope wide."),
 };
 
 export const memMaintainSchema = {
   action: z.enum(['scan', 'execute']).describe('scan=analyze candidates, execute=apply changes'),
   operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'purge_stale', 'rebuild_vectors'])).optional()
-    .describe('Operations: dedup=find/merge duplicate observations, decay=reduce importance of old low-value obs, cleanup=remove orphaned records, boost=promote frequently-accessed obs, purge_stale=delete decayed obs (needs confirm via scan first), rebuild_vectors=rebuild TF-IDF vocabulary and all observation vectors'),
+    .describe('Operations: dedup=find/merge duplicate observations, decay=reduce importance of old low-value obs, cleanup=remove orphaned records, boost=promote frequently-accessed obs, purge_stale=DELETE pending-purge obs older than retain_days (requires confirm=true; first call previews), rebuild_vectors=rebuild TF-IDF vocabulary and all observation vectors'),
   merge_ids: z.preprocess(
     (v) => Array.isArray(v) ? v.map(g => Array.isArray(g) ? g.map(x => typeof x === 'string' ? parseInt(x, 10) : x) : g) : v,
     z.array(z.array(z.number().int()).min(2))
   ).optional().describe('For dedup: [[keepId, removeId1, removeId2], ...] — first ID in each group is kept'),
   retain_days: coerceInt.pipe(z.number().int().min(7).max(365)).optional()
     .describe('For purge_stale: keep observations newer than N days (default 30)'),
+  confirm: coerceBool.optional()
+    .describe('Required for destructive ops in `execute` mode (currently: purge_stale). Omit/false → dry-run preview; true → actually delete.'),
   project: z.string().optional().describe('Filter by project'),
 };
 

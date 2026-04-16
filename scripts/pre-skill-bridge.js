@@ -66,13 +66,24 @@ try {
 
     // Read and output
     const content = readFileSync(skillPath, 'utf8');
-    // Token budget: ~4 chars per token, 4000 token limit = 16000 chars
+    // T4-P1-B: JSON hookSpecificOutput parity with pre-tool-recall.js. Some CC variants
+    // (notably sdscc) silently drop plain-text stdout from PreToolUse — the previous
+    // console.log() form would render on stock CC but no-op on those variants.
+    // Token budget: ~4 chars per token, 4000 token limit = 16000 chars.
+    let additionalContext;
     if (content.length > 16000) {
       const summary = content.slice(0, 800);
-      console.log(`<skill-bridge name="${row.name}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Use mem_use(name="${row.name}") to load full content.`);
+      additionalContext = `<skill-bridge name="${row.name}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Use mem_use(name="${row.name}") to load full content.`;
     } else {
-      console.log(`<skill-bridge name="${row.name}" source="managed">\n${content}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`);
+      additionalContext = `<skill-bridge name="${row.name}" source="managed">\n${content}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`;
     }
+    process.stdout.write(JSON.stringify({
+      suppressOutput: true,
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext,
+      },
+    }));
   } catch {
     // Silent failure — never block Skill tool
   } finally {

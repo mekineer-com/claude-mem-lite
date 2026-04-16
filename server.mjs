@@ -159,7 +159,7 @@ function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset, includ
   const mult = multiplier ? ` * ${multiplier}` : '';
   const lowSignalClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
   return `
-    SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
+    SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.created_at_epoch, o.importance,
            o.files_modified,
            ${withSnippet ? "snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet," : ''}
            ${scoreExpr}${mult} as score
@@ -201,7 +201,8 @@ function buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epoch
 function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
   return {
     source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle,
-    project: r.project, date: r.created_at, score: scoreMultiplier ? r.score * scoreMultiplier : r.score,
+    project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch,
+    score: scoreMultiplier ? r.score * scoreMultiplier : r.score,
     files_modified: r.files_modified, importance: r.importance, snippet: snippet ? (r.match_snippet || '') : '',
   };
 }
@@ -312,7 +313,7 @@ function searchObservations(ctx) {
       LIMIT ? OFFSET ?
     `).all(...params);
     for (const r of rows) {
-      results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
+      results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch, files_modified: r.files_modified, importance: r.importance });
     }
   }
 
@@ -371,7 +372,7 @@ function searchSessions(ctx) {
     const now = Date.now();
     const sessionProjectBoost = args.project ? null : currentProject;
     const rows = db.prepare(`
-      SELECT s.id, s.request, s.completed, s.project, s.created_at,
+      SELECT s.id, s.request, s.completed, s.project, s.created_at, s.created_at_epoch,
              ${SESS_BM25}
                * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
                * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
@@ -393,7 +394,7 @@ function searchSessions(ctx) {
       perSourceLimit, perSourceOffset
     );
     for (const r of rows) {
-      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, score: r.score });
+      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
     }
   } else if (!searchType) {
     // Skip sessions in unfiltered no-query mode (too noisy)
@@ -412,7 +413,7 @@ function searchSessions(ctx) {
       LIMIT ? OFFSET ?
     `).all(...params);
     for (const r of rows) {
-      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, dateEpoch: r.created_at_epoch });
+      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch });
     }
   }
 
@@ -425,7 +426,7 @@ function searchPrompts(ctx) {
 
   if (ftsQuery) {
     const rows = db.prepare(`
-      SELECT p.id, p.prompt_text, p.content_session_id, p.created_at,
+      SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch,
              bm25(user_prompts_fts, 1) as score
       FROM user_prompts_fts
       JOIN user_prompts p ON user_prompts_fts.rowid = p.id
@@ -445,7 +446,7 @@ function searchPrompts(ctx) {
       perSourceLimit, perSourceOffset
     );
     for (const r of rows) {
-      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: r.score });
+      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
     }
     // CJK LIKE fallback: FTS5 unicode61 can't tokenize CJK substrings in prompts
     if (rows.length === 0 && args.query) {
@@ -454,7 +455,7 @@ function searchPrompts(ctx) {
         const likeConds = cjkPatterns.map(() => 'p.prompt_text LIKE ?');
         const likeParams = cjkPatterns.map(p => `%${p}%`);
         const fallbackRows = db.prepare(`
-          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at
+          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
           FROM user_prompts p
           JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
           WHERE (${likeConds.join(' OR ')})
@@ -472,7 +473,7 @@ function searchPrompts(ctx) {
           perSourceLimit, perSourceOffset
         );
         for (const r of fallbackRows) {
-          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, score: 0 });
+          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: 0 });
         }
       }
     }
@@ -493,7 +494,7 @@ function searchPrompts(ctx) {
       LIMIT ? OFFSET ?
     `).all(...params);
     for (const r of rows) {
-      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, dateEpoch: r.created_at_epoch });
+      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch });
     }
   }
 
@@ -522,7 +523,10 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
     ? `${paginatedResults.length} of ${totalCount}`
     : `${paginatedResults.length}`;
   const hasMixed = paginatedResults.some(r => r.source === 'session' || r.source === 'prompt');
-  lines.push(`Found ${countLabel} result(s)${args.query ? ` for "${args.query}"` : ''}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
+  // P2-6: empty/omitted query falls through to a "listing recent" path — label it explicitly
+  // so callers don't mistake BM25-less results for relevance-ranked ones.
+  const qLabel = args.query ? ` for "${args.query}"` : ' (no query — listing recent)';
+  lines.push(`Found ${countLabel} result(s)${qLabel}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
 
   for (const r of paginatedResults) {
     if (r.source === 'obs') {
@@ -627,7 +631,7 @@ server.registerTool(
       if (ftsQuery) {
         results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
       } else {
-        results.sort((a, b) => (b.dateEpoch ?? 0) - (a.dateEpoch ?? 0));
+        results.sort((a, b) => (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
       }
     }
 
@@ -832,15 +836,17 @@ server.registerTool(
     const source = args.source || 'obs';
     const placeholders = args.ids.map(() => '?').join(',');
 
-    let rows, allFields, prefix;
+    let rows, allFields, prefix, sourceLabel;
     if (source === 'session') {
       rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
       allFields = ['id', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'files_read', 'files_edited', 'notes', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
       prefix = 'S#';
+      sourceLabel = 'sessions';
     } else if (source === 'prompt') {
       rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
       allFields = ['id', 'prompt_text', 'content_session_id', 'prompt_number', 'created_at'];
       prefix = 'P#';
+      sourceLabel = 'prompts';
     } else {
       // Increment access_count for retrieved observations (batch UPDATE)
       try {
@@ -852,15 +858,43 @@ server.registerTool(
       rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
       allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
       prefix = '#';
+      sourceLabel = 'observations';
+    }
+
+    // P1-3: validate requested fields — throw on all-invalid so callers don't silently get an
+    // empty record (header only). Partial-invalid is tolerated but surfaced as a note.
+    let fieldsNote = '';
+    if (args.fields?.length) {
+      const invalid = args.fields.filter(f => !allFields.includes(f));
+      const valid = args.fields.filter(f => allFields.includes(f));
+      if (valid.length === 0) {
+        throw new Error(`No valid fields. Unknown field(s): ${invalid.join(', ')}. Valid: ${allFields.join(', ')}`);
+      }
+      if (invalid.length > 0) {
+        fieldsNote = `Note: unknown field(s) dropped: ${invalid.join(', ')}. Valid: ${allFields.join(', ')}`;
+      }
     }
 
     if (rows.length === 0) {
-      return { content: [{ type: 'text', text: `No ${source === 'session' ? 'sessions' : source === 'prompt' ? 'prompts' : 'observations'} found for given IDs.` }] };
+      // P2-7: for source=session/prompt, check whether the IDs exist as observations so the
+      // caller can switch source instead of chasing a phantom miss.
+      let hint = '';
+      if (source === 'session' || source === 'prompt') {
+        try {
+          const obsHits = db.prepare(`SELECT id FROM observations WHERE id IN (${placeholders})`).all(...args.ids);
+          if (obsHits.length > 0) {
+            hint = ` These ID(s) exist as observations: ${obsHits.map(r => r.id).join(', ')}. Try source='obs'.`;
+          }
+        } catch { /* best-effort hint */ }
+      }
+      const msg = `No ${sourceLabel} found for given IDs.${hint}`;
+      return { content: [{ type: 'text', text: fieldsNote ? `${msg}\n\n${fieldsNote}` : msg }] };
     }
 
     const fields = args.fields?.length ? args.fields.filter(f => allFields.includes(f)) : allFields;
 
     const parts = [];
+    if (fieldsNote) parts.push(fieldsNote);
     for (const row of rows) {
       const lines = [`── ${prefix}${row.id} ──`];
       for (const f of fields) {
@@ -873,6 +907,13 @@ server.registerTool(
         lines.push(`${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`);
       }
       parts.push(lines.join('\n'));
+    }
+
+    // P1-4: surface IDs that weren't found (mirrors mem_delete's missing-ID note).
+    const foundIds = new Set(rows.map(r => r.id));
+    const missing = args.ids.filter(id => !foundIds.has(id));
+    if (missing.length > 0) {
+      parts.push(`Note: ID(s) ${missing.join(', ')} not found.`);
     }
 
     return { content: [{ type: 'text', text: parts.join('\n\n') }] };
@@ -1366,10 +1407,42 @@ server.registerTool(
     }
 
     if (action === 'execute') {
-      const ops = args.operations || ['cleanup', 'decay', 'boost'];
+      const ops = args.operations && args.operations.length > 0
+        ? args.operations
+        : ['cleanup', 'decay', 'boost'];
+      // T2-P1-A: reject explicit empty array (vs. omitted → defaults above). Empty-array
+      // callers are almost always mistakes; silently running only FTS5 optimize hides the error.
+      if (args.operations && args.operations.length === 0) {
+        return { content: [{ type: 'text', text: 'operations array is empty. Pass a non-empty list (e.g. ["cleanup","decay","boost"]) or omit operations to use the default set.' }], isError: true };
+      }
       const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;
       const OP_ROW_CAP = 1000; // safety cap per operation
+
+      // T2-P0-A: purge_stale is the only DELETE in this handler. Require confirm=true;
+      // a first call without confirm returns a dry-run preview so callers know the blast radius.
+      const purgeRequested = ops.includes('purge_stale');
+      if (purgeRequested && args.confirm !== true) {
+        const retainDays = args.retain_days ?? 30;
+        const retainCutoff = Date.now() - retainDays * 86400000;
+        const previewRow = db.prepare(`
+          SELECT COUNT(*) AS candidates, MIN(created_at_epoch) AS oldest, MAX(created_at_epoch) AS newest
+          FROM observations
+          WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
+        `).get(retainCutoff, ...baseParams);
+        const lines = [
+          'purge_stale preview (confirm=false):',
+          `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`,
+        ];
+        if (previewRow.candidates > 0) {
+          lines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
+          lines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
+        }
+        lines.push('');
+        lines.push('Nothing was deleted. To execute, re-run with confirm=true:');
+        lines.push(`  mem_maintain(action="execute", operations=${JSON.stringify(ops)}, confirm=true${args.retain_days ? `, retain_days=${args.retain_days}` : ''}${args.project ? `, project="${args.project}"` : ''})`);
+        return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
 
       db.transaction(() => {
         if (ops.includes('cleanup')) {
@@ -1541,6 +1614,9 @@ server.registerTool(
       tasks: args.tasks,
       maxItems: args.max_items || 15,
       force,
+      // T2-P0-B: scope parity with CLI (--scope wide). When omitted, optimizeRun defaults
+      // to narrow via its own code; passing through keeps that fallback intact.
+      reenrichScope: args.scope,
     });
 
     const lines = ['🔧 LLM Optimization Results:'];
@@ -1626,15 +1702,18 @@ server.registerTool(
       const typeFilter = args.type;
       const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
       const params = typeFilter ? [typeFilter, 'active'] : ['active'];
+      // T3-P2-A: order by adoption then recommendation (CLI parity), and coalesce NULL counts
+      // so the output shows "adopt:0" rather than the jarring "adopt:null".
       const resources = rdb.prepare(`
         SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
-        FROM resources ${where} ORDER BY type, name
+        FROM resources ${where}
+        ORDER BY COALESCE(adopt_count, 0) DESC, COALESCE(recommend_count, 0) DESC, type, name
       `).all(...params);
 
       if (resources.length === 0) return { content: [{ type: 'text', text: 'No resources found.' }] };
 
       const lines = resources.map(r =>
-        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 80)}`
+        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count ?? 0} adopt:${r.adopt_count ?? 0} — ${truncate(r.capability_summary || '', 80)}`
       );
       return { content: [{ type: 'text', text: `Resources (${resources.length}):\n${lines.join('\n')}` }] };
     }
@@ -1909,19 +1988,29 @@ server.registerTool(
     wheres.push('superseded_at IS NULL');
     if (args.project) { wheres.push('project = ?'); params.push(resolveProject(args.project)); }
     if (args.type) { wheres.push('type = ?'); params.push(args.type); }
+    // T3-P1-A: surface invalid dates instead of silently dropping the filter — mirrors
+    // mem_search, which threw. A dropped filter can quietly expand the export blast radius.
     if (args.date_from) {
       const epoch = new Date(args.date_from).getTime();
-      if (!isNaN(epoch)) { wheres.push('created_at_epoch >= ?'); params.push(epoch); }
+      if (isNaN(epoch)) throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
+      wheres.push('created_at_epoch >= ?');
+      params.push(epoch);
     }
     if (args.date_to) {
       const d = args.date_to.length === 10 ? args.date_to + 'T23:59:59.999Z' : args.date_to;
       const epoch = new Date(d).getTime();
-      if (!isNaN(epoch)) { wheres.push('created_at_epoch <= ?'); params.push(epoch); }
+      if (isNaN(epoch)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
+      wheres.push('created_at_epoch <= ?');
+      params.push(epoch);
     }
 
     const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
     const exportLimit = Math.min(args.limit ?? 200, 1000);
-    const rows = db.prepare(`SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, created_at, created_at_epoch FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`).all(...params, exportLimit);
+    // T3-P2-B: probe limit+1 so we can tell "user hit their own limit with more waiting" from
+    // "user got exactly what existed". Trim to exportLimit before rendering.
+    const probed = db.prepare(`SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, branch, access_count, memory_session_id, created_at, created_at_epoch FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`).all(...params, exportLimit + 1);
+    const rows = probed.slice(0, exportLimit);
+    const moreAvailable = probed.length > exportLimit;
 
     if (rows.length === 0) return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
 
@@ -1929,7 +2018,7 @@ server.registerTool(
       ? rows.map(r => JSON.stringify(r)).join('\n')
       : JSON.stringify(rows, null, 2);
 
-    const cap = rows.length >= exportLimit ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
+    const cap = moreAvailable ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
     return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
   })
 );
@@ -1988,20 +2077,20 @@ server.registerTool(
     inputSchema: memFtsCheckSchema,
   },
   safeHandler(async (args) => {
+    // T3-P2-C: Zod `action: z.enum(['check','rebuild'])` filters any other value before we
+    // reach this handler, so there's no "Unknown action" fallback to write.
     if (args.action === 'check') {
       const result = checkFTSIntegrity(db);
       return { content: [{ type: 'text', text: result.healthy
         ? 'FTS5 indexes are healthy — all integrity checks passed.'
         : `FTS5 issues found:\n${result.details.join('\n')}` }] };
     }
-    if (args.action === 'rebuild') {
-      const result = rebuildFTS(db);
-      const summary = result.errors.length > 0
-        ? `Rebuilt: ${result.rebuilt.join(', ')}. Errors: ${result.errors.join(', ')}`
-        : `Successfully rebuilt: ${result.rebuilt.join(', ')}`;
-      return { content: [{ type: 'text', text: summary }] };
-    }
-    return { content: [{ type: 'text', text: `Unknown action: ${args.action}` }], isError: true };
+    // args.action === 'rebuild'
+    const result = rebuildFTS(db);
+    const summary = result.errors.length > 0
+      ? `Rebuilt: ${result.rebuilt.join(', ')}. Errors: ${result.errors.join(', ')}`
+      : `Successfully rebuilt: ${result.rebuilt.join(', ')}`;
+    return { content: [{ type: 'text', text: summary }] };
   })
 );
 

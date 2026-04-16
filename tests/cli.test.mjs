@@ -1108,15 +1108,31 @@ describe('CLI maintain command', () => {
   });
 
   it('execute runs purge_stale operation', async () => {
-    // Insert observation marked as pending purge (old)
+    // Insert observation marked as pending purge (old). -2 matches COMPRESSED_PENDING_PURGE in utils.mjs.
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
       title: 'Pending purge obs', text: 'purge content',
-      compressedInto: -1, // COMPRESSED_PENDING_PURGE
+      compressedInto: -2,
+      epochOffset: -60 * 86400000,
+    });
+    // T2-P0-A: --confirm is now required for the destructive path.
+    const output = await captureStdout(() => run([
+      'maintain', 'execute', '--ops', 'purge_stale', '--confirm',
+    ]));
+    expect(output).toContain('Purged 1 stale observations');
+  });
+
+  it('execute purge_stale without --confirm previews and does not delete', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Pending purge obs preview', text: 'purge content',
+      compressedInto: -2,
       epochOffset: -60 * 86400000,
     });
     const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'purge_stale']));
-    expect(output).toContain('Purged');
+    expect(output).toContain('purge_stale preview (no --confirm)');
+    const row = testDb.prepare("SELECT id FROM observations WHERE title = 'Pending purge obs preview'").get();
+    expect(row).toBeDefined();
   });
 });
 

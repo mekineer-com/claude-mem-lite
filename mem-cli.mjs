@@ -783,7 +783,7 @@ function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
   const text = positional.join(' ');
   if (!text) {
-    fail('[mem] Usage: mem save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2]');
+    fail('[mem] Usage: mem save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T]');
     return;
   }
 
@@ -805,9 +805,21 @@ function cmdSave(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const saveFiles = flags.files ? flags.files.split(',').map(f => f.trim()).filter(Boolean) : [];
 
+  // Optional lesson_learned — accepts --lesson or --lesson-learned (alias)
+  // Mirrors MCP memSaveSchema.lesson_learned (≤500 chars) and cmdUpdate's flag handling.
+  const rawLesson = flags.lesson !== undefined ? flags.lesson
+    : flags['lesson-learned'] !== undefined ? flags['lesson-learned']
+    : null;
+  if (rawLesson !== null && typeof rawLesson === 'string' && rawLesson.length > 500) {
+    fail(`[mem] --lesson too long (${rawLesson.length} chars, max 500).`);
+    return;
+  }
+
   // Secret scrubbing (aligned with MCP mem_save)
   const safeContent = scrubSecrets(text);
   const safeTitle = scrubSecrets(rawTitle);
+  const safeLesson = (rawLesson !== null && typeof rawLesson === 'string' && rawLesson.length > 0)
+    ? scrubSecrets(rawLesson) : null;
 
   // Dedup: skip if similar title/content saved in last 5 minutes (aligned with MCP mem_save)
   const fiveMinAgo = Date.now() - 5 * 60 * 1000;
@@ -827,8 +839,11 @@ function cmdSave(db, args) {
   }
 
   // MinHash + CJK bigrams (aligned with MCP mem_save)
+  // Include lesson in the FTS-indexed text so the +0.3 lesson-boost actually surfaces
+  // lesson-bearing rows (mirrors MCP mem_save which builds the same indexText).
   const minhashSig = computeMinHash(safeTitle + ' ' + safeContent);
-  const bigramText = cjkBigrams(safeTitle + ' ' + safeContent);
+  const indexText = [safeTitle, safeContent, safeLesson].filter(Boolean).join(' ');
+  const bigramText = cjkBigrams(indexText);
   const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
 
   const now = new Date();
@@ -843,9 +858,9 @@ function cmdSave(db, args) {
   // Atomic: insert observation + observation_files + TF-IDF vector (aligned with MCP mem_save)
   const saveTx = db.transaction(() => {
     const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, branch, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?)
-    `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), importance, minhashSig, getCurrentBranch(), now.toISOString(), now.getTime());
+      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, branch, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?)
+    `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), importance, minhashSig, safeLesson, getCurrentBranch(), now.toISOString(), now.getTime());
     const savedId = Number(result.lastInsertRowid);
 
     // Populate observation_files junction table (aligned with MCP mem_save)
@@ -870,7 +885,8 @@ function cmdSave(db, args) {
   });
   const result = saveTx();
 
-  out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 80)}" (project: ${project})`);
+  const lessonNote = safeLesson ? ' 💡lesson captured' : '';
+  out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 80)}" (project: ${project})${lessonNote}`);
 }
 
 // N-1: Quality-focused stats for R-2 A/B baseline.
@@ -1645,6 +1661,9 @@ function cmdMaintain(db, args) {
   const OP_CAP = 1000;
   const results = [];
 
+  // T2-P1-B: surface the OP_CAP hit so users know to re-run, matching MCP mem_maintain.
+  const capHint = (changes) => (changes >= OP_CAP ? ' (cap reached, re-run for more)' : '');
+
   db.transaction(() => {
     if (ops.includes('cleanup')) {
       const deleted = db.prepare(`
@@ -1655,7 +1674,7 @@ function cmdMaintain(db, args) {
             ${projectFilter} LIMIT ${OP_CAP}
         )
       `).run(...baseParams);
-      results.push(`Cleaned up ${deleted.changes} broken observations`);
+      results.push(`Cleaned up ${deleted.changes} broken observations${capHint(deleted.changes)}`);
     }
 
     if (ops.includes('decay')) {
@@ -1683,7 +1702,8 @@ function cmdMaintain(db, args) {
             ${projectFilter} LIMIT ${OP_CAP}
         )
       `).run(staleAge, ...baseParams);
-      results.push(`Decayed ${decayed.changes} stale observations, marked ${idleMarked.changes} idle as pending-purge`);
+      const decayCap = (decayed.changes >= OP_CAP || idleMarked.changes >= OP_CAP) ? ' (cap reached, re-run for more)' : '';
+      results.push(`Decayed ${decayed.changes} stale observations, marked ${idleMarked.changes} idle as pending-purge${decayCap}`);
     }
 
     if (ops.includes('boost')) {
@@ -1697,7 +1717,7 @@ function cmdMaintain(db, args) {
             ${projectFilter} LIMIT ${OP_CAP}
         )
       `).run(...baseParams);
-      results.push(`Boosted ${boosted.changes} frequently-accessed observations`);
+      results.push(`Boosted ${boosted.changes} frequently-accessed observations${capHint(boosted.changes)}`);
     }
 
     if (ops.includes('dedup') && flags['merge-ids']) {
@@ -1715,17 +1735,41 @@ function cmdMaintain(db, args) {
       results.push(`Merged ${totalMerged} duplicate observations`);
     }
 
+    // T2-P1-B parity with MCP: warn when merge-ids is provided but dedup wasn't requested.
+    if (!ops.includes('dedup') && flags['merge-ids']) {
+      results.push('Warning: --merge-ids provided but "dedup" not in operations — merge-ids ignored');
+    }
+
     if (ops.includes('purge_stale')) {
       const retainDays = parseInt(flags['retain-days'], 10) || 30;
       const retainCutoff = Date.now() - retainDays * 86400000;
-      const purged = db.prepare(`
-        DELETE FROM observations WHERE id IN (
-          SELECT id FROM observations
-          WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ?
-            ${projectFilter} LIMIT ${OP_CAP}
-        )
-      `).run(retainCutoff, ...baseParams);
-      results.push(`Purged ${purged.changes} stale observations`);
+      // T2-P0-A (CLI parity): purge_stale is the only DELETE in this code path — require
+      // --confirm so a mis-typed `maintain execute --ops purge_stale` can't wipe rows silently.
+      const confirmed = flags.confirm === true || flags.confirm === 'true';
+      if (!confirmed) {
+        const previewRow = db.prepare(`
+          SELECT COUNT(*) AS candidates, MIN(created_at_epoch) AS oldest, MAX(created_at_epoch) AS newest
+          FROM observations
+          WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
+        `).get(retainCutoff, ...baseParams);
+        const pushLines = [`purge_stale preview (no --confirm):`,
+          `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`];
+        if (previewRow.candidates > 0) {
+          pushLines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
+          pushLines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
+        }
+        pushLines.push(`  To delete, re-run with --confirm.`);
+        results.push(pushLines.join('\n'));
+      } else {
+        const purged = db.prepare(`
+          DELETE FROM observations WHERE id IN (
+            SELECT id FROM observations
+            WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ?
+              ${projectFilter} LIMIT ${OP_CAP}
+          )
+        `).run(retainCutoff, ...baseParams);
+        results.push(`Purged ${purged.changes} stale observations (retained last ${retainDays} days)${capHint(purged.changes)}`);
+      }
     }
   })();
 
@@ -1993,6 +2037,7 @@ Commands:
     --importance N      1-3 (default: 2)
     --project P         Project name
     --files f1,f2       Comma-separated file paths
+    --lesson T          Lesson learned (≤500 chars; alias: --lesson-learned)
 
   delete <id1,id2,...>  Delete observations by ID
     --confirm           Execute deletion (preview by default)
@@ -2180,10 +2225,32 @@ async function cmdEnrich(argv) {
 async function cmdOptimize(db, args) {
   const run = args.includes('--run');
   const runAll = args.includes('--run-all');
+  // T2-P1-D: --task accepts a single task or a comma-separated list, parity with MCP memOptimizeSchema.tasks.
+  const VALID_TASKS = ['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'];
   const taskIdx = args.indexOf('--task');
-  const tasks = taskIdx >= 0 && args[taskIdx + 1] ? [args[taskIdx + 1]] : undefined;
+  let tasks;
+  if (taskIdx >= 0 && args[taskIdx + 1]) {
+    const parsed = args[taskIdx + 1].split(',').map(s => s.trim()).filter(Boolean);
+    const invalid = parsed.filter(t => !VALID_TASKS.includes(t));
+    if (invalid.length > 0) {
+      fail(`[mem] Unknown task(s): ${invalid.join(', ')}. Valid: ${VALID_TASKS.join(', ')}`);
+      return;
+    }
+    tasks = parsed;
+  }
+  // T2-P1-C: reject --max 0 / --max <non-positive> / --max <non-number> explicitly — the old
+  // `|| 15` fallback silently turned these into the default (15), burning LLM tokens.
   const maxIdx = args.indexOf('--max');
-  const maxItems = maxIdx >= 0 ? parseInt(args[maxIdx + 1], 10) || 15 : 15;
+  let maxItems = 15;
+  if (maxIdx >= 0) {
+    const raw = args[maxIdx + 1];
+    const parsed = parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > 100) {
+      fail(`[mem] Invalid --max "${raw}". Must be an integer between 1 and 100.`);
+      return;
+    }
+    maxItems = parsed;
+  }
   // R-7 micro: --scope wide targets bugfix/refactor/feature/decision with narrative but no
   // lesson_learned (the "Haiku judged 'none'" cases). Default 'narrow' preserves old behavior.
   const scopeIdx = args.indexOf('--scope');

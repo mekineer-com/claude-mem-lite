@@ -417,27 +417,35 @@ async function handleStop() {
       try { buildAndSaveHandoff(db, sessionId, project, 'exit', episodeSnapshot, ccSessionId || sessionId); }
       catch (e) { debugCatch(e, 'handleStop-handoff'); }
 
-      // Fast summary baseline — ensures summary exists even if background LLM fails
+      // Fast summary baseline — ensures summary exists even if background LLM fails.
+      // T4-P2-B: guard against Stop firing twice for the same session (rare but possible;
+      // mirrors handleSessionStart line 795 hasSummary guard). Uses mem-internal sessionId
+      // as the WHERE key per the top-of-file dual-id invariant (#7789).
       try {
-        const firstPrompt = db.prepare(`
-          SELECT prompt_text FROM user_prompts
-          WHERE content_session_id = ?
-          ORDER BY prompt_number ASC LIMIT 1
-        `).get(sessionId);
-        const recentObs = db.prepare(`
-          SELECT title FROM observations
-          WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-          ORDER BY created_at_epoch DESC LIMIT 5
-        `).all(sessionId);
-        const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
-        const fastCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
-        if (fastRequest || fastCompleted) {
-          const now = new Date();
-          db.prepare(`
-            INSERT INTO session_summaries
-            (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-            VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
-          `).run(sessionId, project, fastRequest, truncate(fastCompleted, 300), now.toISOString(), now.getTime());
+        const existingSummary = db.prepare(
+          'SELECT 1 FROM session_summaries WHERE memory_session_id = ? LIMIT 1'
+        ).get(sessionId);
+        if (!existingSummary) {
+          const firstPrompt = db.prepare(`
+            SELECT prompt_text FROM user_prompts
+            WHERE content_session_id = ?
+            ORDER BY prompt_number ASC LIMIT 1
+          `).get(sessionId);
+          const recentObs = db.prepare(`
+            SELECT title FROM observations
+            WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+            ORDER BY created_at_epoch DESC LIMIT 5
+          `).all(sessionId);
+          const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
+          const fastCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
+          if (fastRequest || fastCompleted) {
+            const now = new Date();
+            db.prepare(`
+              INSERT INTO session_summaries
+              (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+              VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
+            `).run(sessionId, project, fastRequest, truncate(fastCompleted, 300), now.toISOString(), now.getTime());
+          }
         }
       } catch (e) { debugCatch(e, 'handleStop-fast-summary'); }
     } finally {
@@ -603,12 +611,14 @@ async function handleSessionStart() {
         const STALE_AGE = Date.now() - 30 * 86400000;
         const OP_CAP = 500;
 
-        // Purge FIRST: delete entries already marked pending-purge from previous cycles (7-day retention)
-        // Must run before decay/idle-mark to avoid same-cycle delete of newly-marked entries
+        // Purge FIRST: delete pending-purge entries. Schema has no marked_at_epoch, so we
+        // anchor retention on created_at_epoch instead: 30d marking gate + 7d grace = 37d.
+        // Older cutoffs (e.g. 7d) were always redundant with the 30d marking filter and
+        // made purge effectively immediate on the next maintenance cycle — fix for T4-P1-A.
         const purged = db.prepare(`
           DELETE FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE}
             AND created_at_epoch < ?
-        `).run(Date.now() - 7 * 86400000);
+        `).run(Date.now() - 37 * 86400000);
         if (purged.changes > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged.changes} stale observations`);
 
         // Cleanup: remove broken observations (no title AND no narrative)
@@ -906,9 +916,13 @@ async function handleUserPrompt() {
       VALUES (?, ?, ?, ?, ?, 'active')
     `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
-    // Increment prompt counter
-    db.prepare('UPDATE sdk_sessions SET prompt_counter = COALESCE(prompt_counter, 0) + 1 WHERE content_session_id = ?').run(sessionId);
-    const counter = db.prepare('SELECT prompt_counter FROM sdk_sessions WHERE content_session_id = ?').get(sessionId);
+    // T4-P2-D: atomic increment+read via UPDATE ... RETURNING (SQLite 3.35+).
+    // Previously UPDATE + SELECT as two statements; parallel prompts could read a stale
+    // counter and emit duplicate prompt_number values. better-sqlite3 ships a modern SQLite.
+    const bumped = db.prepare(
+      'UPDATE sdk_sessions SET prompt_counter = COALESCE(prompt_counter, 0) + 1 WHERE content_session_id = ? RETURNING prompt_counter'
+    ).get(sessionId);
+    const promptNumber = bumped?.prompt_counter || 1;
 
     db.prepare(`
       INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
@@ -916,7 +930,7 @@ async function handleUserPrompt() {
     `).run(
       sessionId,
       scrubSecrets(promptText.slice(0, 10000)),
-      counter?.prompt_counter || 1,
+      promptNumber,
       now.toISOString(), now.getTime()
     );
 
@@ -928,7 +942,7 @@ async function handleUserPrompt() {
     const ccSessionId = typeof hookData.session_id === 'string' && hookData.session_id.length > 0
       ? hookData.session_id
       : null;
-    if (counter?.prompt_counter <= 3) {
+    if (promptNumber <= 3) {
       try {
         if (detectContinuationIntent(db, promptText, project, ccSessionId)) {
           const injection = renderHandoffInjection(db, project, ccSessionId);
