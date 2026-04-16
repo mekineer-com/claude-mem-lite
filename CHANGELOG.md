@@ -2,6 +2,34 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.33.1] - 2026-04-17
+
+Feedback-loop + signal-density patch. Audit of in-session plugin behavior (4-turn conversation, 1 PreToolUse Edit hit, 0 follow-up UserPromptSubmit injections, type distribution `decision 9 / change 1171`) surfaced four gaps — this release fixes all four and prunes historical noise.
+
+### Added
+
+- **Follow-up-aware UserPromptSubmit gate (`scripts/user-prompt-search.js`)** — once a session has injected memory ≥1×, short continuation prompts ("前面那个?", "does it work?") get relaxed thresholds: `PROMPT_MIN_LENGTH` 15→8, `BM25_MIN_SCORE` 1e-5→5e-6. First prompt behavior unchanged. Env overridable via `CLAUDE_MEM_UPS_BM25_MIN_FOLLOWUP`.
+- **Session-scoped PreToolUse cooldown (`scripts/pre-tool-recall.js`)** — same file recalls exactly once per session (was: 5-min global window). File keyed by `event.session_id`; different session gets fresh recall. Legacy path preserved when no session_id present. Session cooldown files GC'd on write when older than 24h.
+- **Structured PostToolUse flush receipt (`hook.mjs:flushEpisode`)** — on episode flush, emits JSON `hookSpecificOutput.additionalContext` with entry count + top-3 tool counts (`[mem] episode flushed: 10 entries (Edit×9, Grep×1)`). The legacy plain-text error→fix nudge now consolidates into the same structured output, reliably rendering across CC variants (sdscc dropped the plain-text variant).
+
+### Changed
+
+- **Expanded low-signal lesson filter (`hook-llm.mjs:handleLLMEpisode`)** — reject list widened from `'none'` alone to `{'none', '', 'n/a', 'null', 'todo', 'tbd', 'na', '-', 'nothing', 'nil'}` plus `length < 12`. For noise-prone types (`change` / `discovery`) with a low-signal lesson, Haiku's importance inflation is capped: `importance = min(ruleImportance, 1)`. `bugfix` / `decision` / `feature` / `refactor` / `discovery-with-lesson` importance is preserved — a real lesson means the downgrade does not apply regardless of type.
+
+### Data migration
+
+- **One-time `UPDATE observations SET importance=0`** for 2012 rows where `type IN ('change','discovery')` AND lesson is low-signal (empty / 'none' / < 12 chars). Rollback: `UPDATE observations SET importance=1 WHERE importance=0 AND type IN ('change','discovery')`. Signal density in local DB went from 3956 → 1948 visible (49%) — hook queries (`importance >= 1`) now skip the rest.
+
+### Internal
+
+- 1610 → 1618 tests (+8: 5 low-signal `it.each`, 1 real-lesson regression, 2 session-scoped cooldown paths).
+- No public API change. MCP tools / CLI commands / schema unchanged.
+
+### Audit notes
+
+- Post-change signal density by type: `bugfix 1109 (100% visible) / refactor 526 (100%) / feature 219 (100%) / decision 22 (100%) / discovery 40 of 759 (5.3%) / change 32 of 1325 (2.4%)`. Consistent with CLAUDE.md's prior finding that `decision` memories have ~72.7% hit rate vs `change` at 16.5%.
+- Skipped during this audit: `#NN` citation-detection follow-up (Stop-hook transcript scan, cost >> benefit). Deferred to future work.
+
 ## [2.33.0] - 2026-04-17
 
 **Default behavior change** (minor bump): plugin-mode installs now auto-adopt the invited-memory sentinel on first SessionStart per project. `/plugin install claude-mem-lite@sdsrss` already represents consent to integration — the prior opt-in step was redundant friction. npm/npx CLI users are unaffected and remain opt-in.

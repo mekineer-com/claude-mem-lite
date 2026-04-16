@@ -281,6 +281,44 @@ describe('pre-tool-recall', () => {
       });
       expect(second).toBe('');
     });
+
+    // v2.33.1 Fix 4: session-scoped cooldown — same file in same session recalls
+    // exactly once; different session gets fresh recall. Session id supplied via
+    // event.session_id (standard Claude Code PreToolUse payload).
+    it('v2.33.1: session-scoped cooldown — same session, same file: second call silent', async () => {
+      const filePath = join(projectDir, 'scope.py');
+      const { stdout: first } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-alpha',
+        tool_input: { file_path: filePath },
+      });
+      expect(JSON.parse(first).hookSpecificOutput.additionalContext).toContain('No prior lessons for scope.py');
+
+      const { stdout: second } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-alpha',
+        tool_input: { file_path: filePath },
+      });
+      expect(second).toBe('');
+    });
+
+    it('v2.33.1: session-scoped cooldown — different session gets fresh recall', async () => {
+      const filePath = join(projectDir, 'fresh.py');
+      const { stdout: first } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-alpha',
+        tool_input: { file_path: filePath },
+      });
+      expect(JSON.parse(first).hookSpecificOutput.additionalContext).toContain('No prior lessons for fresh.py');
+
+      const { stdout: second } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-beta',
+        tool_input: { file_path: filePath },
+      });
+      // Fresh session → recall fires again.
+      expect(JSON.parse(second).hookSpecificOutput.additionalContext).toContain('No prior lessons for fresh.py');
+    });
   });
 
   // T2 (v2.31): sdscc and some other CC variants drop plain-text stdout from PreToolUse;

@@ -3,7 +3,7 @@
 // Lightweight standalone (~30ms): only imports better-sqlite3, fs, path, os
 // Safety: readonly DB, exit 0 always, 3s timeout
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
 
@@ -11,9 +11,20 @@ import { homedir } from 'os';
 // point the hook at an isolated DB + cooldown dir without touching the user's real state.
 const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(homedir(), '.claude-mem-lite', 'claude-mem-lite.db');
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(homedir(), '.claude-mem-lite', 'runtime');
-const COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
-const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
-const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold
+// v2.33.1: cooldown path is session-scoped so same-file-twice within one
+// session never re-injects (was: global file, 5-min window). Cross-session:
+// fresh file, fresh nudges — this is intended. No session_id → fall back to
+// legacy global path so env-less test harnesses still behave.
+const LEGACY_COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
+const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (used only for legacy fallback)
+const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold for legacy file
+const SESSION_COOLDOWN_STALE_MS = 24 * 60 * 60 * 1000; // 24h — drop session cooldown files older than this
+
+function cooldownPathFor(sessionId) {
+  if (!sessionId) return LEGACY_COOLDOWN_PATH;
+  const safe = String(sessionId).replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
+  return join(RUNTIME_DIR, `pre-recall-cooldown-${safe}.json`);
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -27,20 +38,40 @@ function inferProject() {
   return project;
 }
 
-function readCooldown() {
-  try { return JSON.parse(readFileSync(COOLDOWN_PATH, 'utf8')); } catch { return {}; }
+function readCooldown(cooldownPath) {
+  try { return JSON.parse(readFileSync(cooldownPath, 'utf8')); } catch { return {}; }
 }
 
-function writeCooldown(data) {
+function writeCooldown(cooldownPath, data, isSessionScoped) {
   try {
     mkdirSync(RUNTIME_DIR, { recursive: true });
-    // Clean stale entries
+    // Legacy (no session_id): stale entries trimmed to 10m window.
+    // Session-scoped: keep all entries for the session's lifetime — same-file-twice
+    // in one session never re-injects. Old session files GC'd on next write.
     const now = Date.now();
-    const cleaned = {};
-    for (const [k, v] of Object.entries(data)) {
-      if (now - v < STALE_MS) cleaned[k] = v;
+    const cleaned = isSessionScoped ? data : {};
+    if (!isSessionScoped) {
+      for (const [k, v] of Object.entries(data)) {
+        if (now - v < STALE_MS) cleaned[k] = v;
+      }
     }
-    writeFileSync(COOLDOWN_PATH, JSON.stringify(cleaned));
+    writeFileSync(cooldownPath, JSON.stringify(cleaned));
+  } catch { /* silent */ }
+}
+
+// Best-effort GC for session cooldown files older than 24h.
+// Runs at most once per hook invocation, silent on any failure.
+function gcOldSessionCooldowns() {
+  try {
+    const now = Date.now();
+    for (const name of readdirSync(RUNTIME_DIR)) {
+      if (!name.startsWith('pre-recall-cooldown-') || !name.endsWith('.json')) continue;
+      try {
+        const p = join(RUNTIME_DIR, name);
+        const st = statSync(p);
+        if (now - st.mtimeMs > SESSION_COOLDOWN_STALE_MS) unlinkSync(p);
+      } catch { /* silent per-entry */ }
+    }
   } catch { /* silent */ }
 }
 
@@ -59,19 +90,29 @@ try {
 
   // Parse event
   let filePath;
+  let sessionId;
   try {
     const event = JSON.parse(input);
     filePath = event.tool_input?.file_path;
+    sessionId = event.session_id || null;
   } catch { process.exit(0); }
 
   if (!filePath) process.exit(0);
 
-  // Cooldown check (full path as key)
-  const cooldown = readCooldown();
+  // v2.33.1: session-scoped cooldown. Within one session, same file recalls
+  // once; cross-session, each session gets fresh nudges. Legacy 5-min global
+  // cooldown only applies when no session_id is present.
+  const cooldownPath = cooldownPathFor(sessionId);
+  const isSessionScoped = Boolean(sessionId);
+  const cooldown = readCooldown(cooldownPath);
   const now = Date.now();
-  if (cooldown[filePath] && (now - cooldown[filePath]) < COOLDOWN_MS) {
-    process.exit(0);
+  if (isSessionScoped) {
+    if (cooldown[filePath]) process.exit(0); // already recalled this file in-session
+  } else {
+    if (cooldown[filePath] && (now - cooldown[filePath]) < COOLDOWN_MS) process.exit(0);
   }
+  // Best-effort GC of old session cooldown files (cheap, once per invocation)
+  if (isSessionScoped) gcOldSessionCooldowns();
 
   // Open DB readonly
   const Database = (await import('better-sqlite3')).default;
@@ -177,7 +218,7 @@ try {
     }));
     // Cooldown applies to BOTH branches so the reminder doesn't spam every Edit.
     cooldown[filePath] = now;
-    writeCooldown(cooldown);
+    writeCooldown(cooldownPath, cooldown, isSessionScoped);
   } catch {
     // Silent failure — never block editing
   } finally {

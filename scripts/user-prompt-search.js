@@ -34,6 +34,22 @@ const BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN || 1e-5);
 // survive `shouldSkip` but carry too few tokens to justify an FTS lookup.
 const PROMPT_MIN_LENGTH = 15;
 
+// v2.33.1: follow-up prompts ("前面那个", "继续 X", "再看看 Y") are short by
+// nature but semantically depend on prior turns. Once a session has injected
+// memory at least once, relax gates so short follow-ups still get recall.
+// Detection: INJECTED_IDS_FILE count > 0 within DEDUP_STALE_MS window.
+const FOLLOWUP_PROMPT_MIN_LENGTH = 8;
+const FOLLOWUP_BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN_FOLLOWUP || 5e-6);
+
+function isFollowUpSession() {
+  try {
+    const raw = readFileSync(INJECTED_IDS_FILE, 'utf8');
+    const { ts, count = 0 } = JSON.parse(raw);
+    if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
+    return count > 0;
+  } catch { return false; }
+}
+
 // ─── DB Query Functions ─────────────────────────────────────────────────────
 
 function searchByFts(db, queryText, project, limit, typeFilter) {
@@ -255,7 +271,12 @@ async function main() {
   // T3 (v2.31): additional raw-length gate on top of shouldSkip's CJK-weighted
   // effective-length check. Suppresses medium-short Latin prompts ("run tests",
   // "fix bug now") that carry too few content tokens for a meaningful FTS lookup.
-  if (promptText.trim().length < PROMPT_MIN_LENGTH) return;
+  // v2.33.1: follow-up prompts in an already-active session get a lower gate —
+  // short continuations ("前面那个?", "does it work?") depend on prior context.
+  const followUp = isFollowUpSession();
+  const promptMinLen = followUp ? FOLLOWUP_PROMPT_MIN_LENGTH : PROMPT_MIN_LENGTH;
+  if (promptText.trim().length < promptMinLen) return;
+  const bm25Floor = followUp ? FOLLOWUP_BM25_MIN_SCORE : BM25_MIN_SCORE;
 
   let db;
   try {
@@ -275,7 +296,7 @@ async function main() {
     const errSig = extractErrorSignature(promptText);
     const sigRows = errSig
       ? searchByFts(db, errSig.signature, project, 2, 'bugfix').filter(r =>
-          typeof r.relevance === 'number' && Math.abs(r.relevance) >= BM25_MIN_SCORE
+          typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
         )
       : [];
 
@@ -299,7 +320,7 @@ async function main() {
       // no relevance and are always kept — file-scoped recall is presumed
       // intentional and has its own relevance signal (the file name match).
       ftsRows = ftsRows.filter(r =>
-        typeof r.relevance === 'number' && Math.abs(r.relevance) >= BM25_MIN_SCORE
+        typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
       );
 
       // Merge: FTS results first, then file results, deduplicated

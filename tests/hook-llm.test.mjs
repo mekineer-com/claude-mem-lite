@@ -473,6 +473,9 @@ describe('handleLLMEpisode', () => {
       concepts: ['config'],
       facts: [],
       importance: 2,
+      // v2.33.1: supply a real lesson so the low-signal downgrade doesn't trip.
+      // Without this, type='change' + missing lesson → importance capped at 1.
+      lesson_learned: 'Loader extraction clarifies config-path resolution order.',
     }));
 
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
@@ -933,6 +936,96 @@ describe('lesson_learned and search_aliases extraction', () => {
     const obs = db.prepare('SELECT lesson_learned FROM observations WHERE memory_session_id = ?').get('none-cap-sess');
     expect(obs).toBeDefined();
     expect(obs.lesson_learned).toBeNull();
+
+    process.argv[3] = origArgv3;
+    db._realClose();
+  });
+
+  // v2.33.1 Fix 2: extended low-signal filter — 'n/a', 'todo', '-', ultra-short
+  // lessons are normalized to null and noise-prone types get importance capped.
+  it.each([
+    ['n/a', 'n-a'],
+    ['TODO', 'todo'],
+    ['-', 'dash'],
+    ['nil', 'nil'],
+    ['ok', 'too-short'],
+  ])('v2.33.1: lesson_learned %s is normalized to null and importance downgraded for change type', async (lessonText, tag) => {
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'change',
+      title: `Routine change ${tag}`,
+      narrative: 'Nothing notable',
+      concepts: [],
+      facts: [],
+      importance: 2, // Haiku over-rates; should be capped back to 1
+      lesson_learned: lessonText,
+      search_aliases: [],
+    }));
+
+    const db = createTestDb();
+    db._realClose = db.close;
+    db.close = () => {};
+    openDb.mockReturnValue(db);
+
+    const sessId = `low-sig-${tag}`;
+    const tmpFile2 = join(tmpdir(), `hook-llm-lowsig-${tag}-${Date.now()}.json`);
+    const origArgv3 = process.argv[3];
+    process.argv[3] = tmpFile2;
+    process.env.CLAUDE_MEM_NO_DELAY = '1';
+
+    writeFileSync(tmpFile2, JSON.stringify({
+      sessionId: sessId, project: 'test-proj',
+      files: [`file-${tag}.mjs`], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Edit', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    const obs = db.prepare('SELECT lesson_learned, importance FROM observations WHERE memory_session_id = ?').get(sessId);
+    expect(obs).toBeDefined();
+    expect(obs.lesson_learned).toBeNull();
+    expect(obs.importance).toBe(1); // capped from Haiku's inflated 2
+
+    process.argv[3] = origArgv3;
+    db._realClose();
+  });
+
+  it('v2.33.1: real lesson text passes through and importance is preserved', async () => {
+    // Using type='change' (observations path, not events) since we assert on
+    // the observations table. A real lesson means isLessonLowSignal=false,
+    // so the v2.33.1 downgrade does not apply regardless of type.
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'change',
+      title: 'Refactored token refresh',
+      narrative: 'Extracted per-user lock to prevent 401 under concurrent refresh',
+      concepts: [],
+      facts: [],
+      importance: 2,
+      lesson_learned: 'Refresh locks must be per-user, not per-process — mutex collision under load.',
+      search_aliases: [],
+    }));
+
+    const db = createTestDb();
+    db._realClose = db.close;
+    db.close = () => {};
+    openDb.mockReturnValue(db);
+
+    const tmpFile2 = join(tmpdir(), `hook-llm-reallesson-${Date.now()}.json`);
+    const origArgv3 = process.argv[3];
+    process.argv[3] = tmpFile2;
+    process.env.CLAUDE_MEM_NO_DELAY = '1';
+
+    writeFileSync(tmpFile2, JSON.stringify({
+      sessionId: 'real-lesson-sess', project: 'test-proj',
+      files: ['auth.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Refactor refresh', isError: false }],
+    }));
+
+    await handleLLMEpisode();
+
+    const obs = db.prepare('SELECT lesson_learned, importance FROM observations WHERE memory_session_id = ?').get('real-lesson-sess');
+    expect(obs).toBeDefined();
+    expect(obs.lesson_learned).toContain('per-user');
+    expect(obs.importance).toBe(2); // preserved — not downgraded
 
     process.argv[3] = origArgv3;
     db._realClose();

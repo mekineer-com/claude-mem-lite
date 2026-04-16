@@ -559,10 +559,17 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
         return;
       }
 
-      const lessonLearned = typeof parsed.lesson_learned === 'string'
-        && parsed.lesson_learned.toLowerCase() !== 'none'
-        && parsed.lesson_learned.trim().length > 0
-        ? parsed.lesson_learned.slice(0, 500) : null;
+      // v2.33.1: expanded low-signal filter. Historical data showed Haiku
+      // returns 'none'/''/'n/a'/'null'/'-'/'todo'/'tbd' ~95% of the time —
+      // all noise with no retrieval value. Also reject lessons <12 chars
+      // (e.g. "ok", "works", "fixed it") — too short to teach a future session.
+      // When filtered, downgrade importance to 0 so rule-based fallback in
+      // hook.mjs:saveObservation writes the obs but hook queries (which all
+      // require importance >= 1) ignore it.
+      const rawLesson = typeof parsed.lesson_learned === 'string' ? parsed.lesson_learned.trim() : '';
+      const lowSignalLesson = new Set(['none', '', 'n/a', 'null', 'todo', 'tbd', 'na', '-', 'nothing', 'nil']);
+      const isLessonLowSignal = lowSignalLesson.has(rawLesson.toLowerCase()) || rawLesson.length < 12;
+      const lessonLearned = isLessonLowSignal ? null : rawLesson.slice(0, 500);
       const searchAliases = Array.isArray(parsed.search_aliases)
         ? parsed.search_aliases.slice(0, 6).join(' ')
         : null;
@@ -576,7 +583,12 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
         facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
         files: episode.files,
         filesRead: episode.filesRead || [],
-        importance: Math.max(ruleImportance, clampImportance(parsed.importance)),
+        // v2.33.1: when lesson is low-signal, don't trust Haiku's importance
+        // inflation for noise-prone types. rule-based floor still applies so
+        // error-in-test (→3) / config-change (→2) keep their floor.
+        importance: isLessonLowSignal && (parsed.type === 'change' || parsed.type === 'discovery')
+          ? Math.min(ruleImportance, 1)
+          : Math.max(ruleImportance, clampImportance(parsed.importance)),
         lessonLearned,
         searchAliases,
       };
