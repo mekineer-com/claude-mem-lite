@@ -8,7 +8,7 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, 
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import Database from 'better-sqlite3';
-import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
+import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -267,6 +267,18 @@ async function main() {
     const intent = detectIntent(promptText);
     let rows = [];
 
+    // A (v2.32.8): precision pass for named errors. When the prompt contains
+    // a typed exception signature (TypeError/ValueError/ReferenceError/...),
+    // seed results with exact-match bugfix observations before the intent-
+    // based FTS flow runs. These hits are the most directly relevant and
+    // take priority slots in the merged output.
+    const errSig = extractErrorSignature(promptText);
+    const sigRows = errSig
+      ? searchByFts(db, errSig.signature, project, 2, 'bugfix').filter(r =>
+          typeof r.relevance === 'number' && Math.abs(r.relevance) >= BM25_MIN_SCORE
+        )
+      : [];
+
     if (intent?.useRecent) {
       // Recall intent: show recent observations
       rows = searchRecent(db, project, intent.limit);
@@ -300,6 +312,12 @@ async function main() {
         }
       }
       rows = rows.slice(0, MAX_RESULTS);
+    }
+
+    // A (v2.32.8): prepend error-signature hits (higher precision), dedup, cap.
+    if (sigRows.length > 0) {
+      const sigIds = new Set(sigRows.map(r => r.id));
+      rows = [...sigRows, ...rows.filter(r => !sigIds.has(r.id))].slice(0, MAX_RESULTS);
     }
 
     const candidateIds = rows.map(r => r.id);

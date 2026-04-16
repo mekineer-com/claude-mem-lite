@@ -49,8 +49,8 @@ export const INTENTS = [
   // CJK: 开发/编写/创建/构建/做一个/写一个 from real prompts
   { pattern: /implement|feature\b|add\s+(?:a\s+)?new|实现|添加|新功能|新增|开发|编写|创建|构建|做一个|加一个|写一个/i, type: null, limit: 3 },
   // Recall/history intent (catch-all temporal, lowest priority)
-  // CJK: 刚才/历史/回顾 from real prompts
-  { pattern: /before|previously|last time|remember|之前|上次|以前|记得|刚才|历史|回顾/i, type: null, limit: 5, useRecent: true },
+  // CJK: 刚才/历史/回顾 from real prompts; 碰到过|遇到过|见过|同样的问题 from spoken CN
+  { pattern: /before|previously|last time|remember|seen this|same\s+issue|之前|上次|以前|记得|刚才|历史|回顾|碰到过|遇到过|见过|同样的问题|类似的问题/i, type: null, limit: 5, useRecent: true },
 ];
 
 export function detectIntent(text) {
@@ -73,6 +73,44 @@ export function detectIntent(text) {
     if (recallPos < actionPos) return recallMatch;
   }
   return first;
+}
+
+// ─── Error Signature Extraction ─────────────────────────────────────────────
+
+/**
+ * Extract a canonical error signature from prompt text.
+ *
+ * Matches named exception/error classes like:
+ *   - "TypeError: Cannot read properties of undefined (reading 'foo')"
+ *   - "Error [ERR_MODULE_NOT_FOUND]: module X not found"
+ *   - "AssertionError: expected 'a' to equal 'b'"
+ *   - "ValueError: invalid literal for int()"
+ *   - "thread 'main' panicked at ..." (Rust) → captured via Panic class
+ *
+ * Intentionally skips bare "Error: ..." without a typed class, and skips
+ * lowercase matches — those carry too little signal vs. the intent-based
+ * FTS path which already catches them.
+ *
+ * Returns { className, errorCode, message, signature } or null.
+ * `signature` is suitable for direct FTS5 search (sanitizeFtsQuery applies).
+ */
+export function extractErrorSignature(text) {
+  if (!text || typeof text !== 'string') return null;
+  // Pass 1: typed class — "<CapCase>(Error|Exception|Panic)" with optional [ERR_CODE]
+  const TYPED_RE = /\b([A-Z][A-Za-z0-9]+(?:Error|Exception|Panic))(?:\s*\[([A-Z_][A-Z0-9_]*)\])?\s*:\s*([^\n]{3,200})/;
+  // Pass 2: bare "Error|Exception|Panic" followed by required [ERR_CODE] (Node idiom).
+  // Bare class without a code is skipped — too noisy; intent-based path catches those.
+  const BARE_CODED_RE = /\b(Error|Exception|Panic)\s*\[([A-Z_][A-Z0-9_]*)\]\s*:\s*([^\n]{3,200})/;
+  const m = text.match(TYPED_RE) || text.match(BARE_CODED_RE);
+  if (!m) return null;
+  const className = m[1];
+  const errorCode = m[2] || null;
+  const message = m[3].trim().replace(/\s+/g, ' ').replace(/[`'"]+$/, '');
+  const sigMsg = message.slice(0, 80);
+  const signature = errorCode
+    ? `${className} ${errorCode} ${sigMsg}`
+    : `${className} ${sigMsg}`;
+  return { className, errorCode, message, signature };
 }
 
 // ─── Result Dedup ───────────────────────────────────────────────────────────

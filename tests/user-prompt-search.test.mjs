@@ -18,6 +18,7 @@ import {
   detectIntent,
   shouldSkipByDedup,
   extractFiles,
+  extractErrorSignature,
   matchRegistrySkillName,
 } from '../scripts/prompt-search-utils.mjs';
 
@@ -106,6 +107,14 @@ describe('detectIntent', () => {
     // Extended CJK recall coverage
     expect(detectIntent('刚才做了什么')).toHaveProperty('useRecent', true);
     expect(detectIntent('回顾一下历史')).toHaveProperty('useRecent', true);
+    // B (v2.32.8): spoken-CN recall patterns
+    expect(detectIntent('这个问题碰到过没')).toHaveProperty('useRecent', true);
+    expect(detectIntent('这种情况我遇到过')).toHaveProperty('useRecent', true);
+    expect(detectIntent('这段代码见过')).toHaveProperty('useRecent', true);
+    expect(detectIntent('是不是同样的问题')).toHaveProperty('useRecent', true);
+    expect(detectIntent('这是类似的问题吗')).toHaveProperty('useRecent', true);
+    expect(detectIntent('have we seen this before in the repo')).toHaveProperty('useRecent', true);
+    expect(detectIntent('is this the same issue as last week')).toHaveProperty('useRecent', true);
   });
 
   it('detects decision intent from architecture keywords', () => {
@@ -199,6 +208,91 @@ describe('detectIntent', () => {
     // CJK: "为什么" matches decision, "之前" matches recall — decision wins
     const cjkIntent = detectIntent('为什么之前选了这个方案？');
     expect(cjkIntent).toHaveProperty('type', 'decision');
+  });
+});
+
+// ─── Unit Tests: Error Signature Extraction (v2.32.8) ──────────────────────
+
+describe('extractErrorSignature', () => {
+  it('returns null for empty / non-string / text without errors', () => {
+    expect(extractErrorSignature(null)).toBeNull();
+    expect(extractErrorSignature('')).toBeNull();
+    expect(extractErrorSignature('just a plain prompt with no error')).toBeNull();
+  });
+
+  it('extracts TypeError with message', () => {
+    const sig = extractErrorSignature("TypeError: Cannot read properties of undefined (reading 'foo')");
+    expect(sig).not.toBeNull();
+    expect(sig.className).toBe('TypeError');
+    expect(sig.errorCode).toBeNull();
+    expect(sig.message).toContain('Cannot read properties of undefined');
+    expect(sig.signature).toMatch(/^TypeError /);
+  });
+
+  it('extracts Node-style bracketed error code', () => {
+    const sig = extractErrorSignature('Error [ERR_MODULE_NOT_FOUND]: Cannot find module lib/foo.mjs');
+    expect(sig).not.toBeNull();
+    expect(sig.className).toBe('Error');
+    expect(sig.errorCode).toBe('ERR_MODULE_NOT_FOUND');
+    expect(sig.signature).toContain('ERR_MODULE_NOT_FOUND');
+  });
+
+  it('rejects bare "Error: ..." without a typed class or code (noise gate)', () => {
+    // Intent-based FTS path will handle generic "Error:" mentions.
+    // Only typed classes or Error+[CODE] produce a signature.
+    expect(extractErrorSignature('Error: something bad happened')).toBeNull();
+  });
+
+  it('extracts AssertionError', () => {
+    const sig = extractErrorSignature("AssertionError: expected 'a' to equal 'b'");
+    expect(sig.className).toBe('AssertionError');
+    expect(sig.signature).toContain('AssertionError');
+    expect(sig.signature).toContain('expected');
+  });
+
+  it('extracts ValueError (Python)', () => {
+    const sig = extractErrorSignature('ValueError: invalid literal for int() with base 10');
+    expect(sig.className).toBe('ValueError');
+    expect(sig.signature).toContain('invalid literal');
+  });
+
+  it('extracts ReferenceError with variable', () => {
+    const sig = extractErrorSignature('ReferenceError: foo is not defined');
+    expect(sig.className).toBe('ReferenceError');
+    expect(sig.message).toBe('foo is not defined');
+  });
+
+  it('skips lowercase or malformed "error"', () => {
+    // Not a typed exception — intent-based search will catch these
+    expect(extractErrorSignature('there is an error somewhere')).toBeNull();
+    expect(extractErrorSignature('bug in the code')).toBeNull();
+  });
+
+  it('captures first named error when multiple appear', () => {
+    const text = 'Saw TypeError: bad input\nLater also ValueError: wrong type';
+    const sig = extractErrorSignature(text);
+    expect(sig.className).toBe('TypeError');
+  });
+
+  it('truncates long messages to 80 chars in signature', () => {
+    const longMsg = 'x'.repeat(300);
+    const sig = extractErrorSignature(`TypeError: ${longMsg}`);
+    expect(sig).not.toBeNull();
+    // signature = "TypeError " + slice(0,80) → 10 + 80 = 90 chars
+    expect(sig.signature.length).toBeLessThanOrEqual(91);
+    expect(sig.message.length).toBeLessThanOrEqual(200); // message cap
+  });
+
+  it('normalizes whitespace in message', () => {
+    const sig = extractErrorSignature('SyntaxError:  Unexpected   token    here');
+    expect(sig.message).toBe('Unexpected token here');
+  });
+
+  it('includes errorCode when present', () => {
+    const sig = extractErrorSignature('FsError [ERR_NOT_FOUND]: file x missing');
+    expect(sig).not.toBeNull();
+    expect(sig.errorCode).toBe('ERR_NOT_FOUND');
+    expect(sig.signature).toContain('ERR_NOT_FOUND');
   });
 });
 

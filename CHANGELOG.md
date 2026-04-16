@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.32.8] - 2026-04-17
+
+Precision improvements to the UserPromptSubmit auto-search hook. Two orthogonal additions: exact-match error-signature recall, and a widened CJK pattern for spoken-language "have we seen this" recall.
+
+### Added
+
+- **`extractErrorSignature()` in `scripts/prompt-search-utils.mjs`** — extracts typed exception signatures from user prompts (`TypeError: ...`, `ValueError: ...`, `Error [ERR_MODULE_NOT_FOUND]: ...`, `AssertionError: ...`, etc.). Two-pass regex: typed `<CapCase>(Error|Exception|Panic)` first, then bare `Error|Exception|Panic [ERR_CODE]` (Node idiom). Bare "Error: ..." without a typed class or code is intentionally skipped — those stay on the intent-based FTS path.
+- **Error-signature precision pass in `scripts/user-prompt-search.js`** — when a signature is detected, runs an exact-match `type='bugfix'` FTS search before the intent-based flow. Signature hits take priority slots in the merged output (capped at `MAX_RESULTS=5`). A stack-trace-adjacent prompt now surfaces the exact prior `mem_save({type:'bugfix', ...})` observation for that error class, not tangential bugfix matches.
+- **Spoken-CN recall patterns in `INTENTS` (`scripts/prompt-search-utils.mjs:53`)** — recall intent regex extended with `碰到过|遇到过|见过|同样的问题|类似的问题|seen this|same\s+issue`. Prompts like "这个问题碰到过没" / "have we seen this before" now correctly route to recall-mode (shows recent observations) instead of falling through to no-match.
+
+### Internal
+
+- 1588 → 1600 tests (+12: 10 for `extractErrorSignature` shapes, 2 for CJK recall pattern).
+- No contract change for MCP tools, CLI, hook I/O surface, or on-disk schema.
+- `extractErrorSignature` is exported but internal to the hook; not added to any public API boundary.
+
 ## [2.32.7] - 2026-04-17
 
 Handoff continuation-detection hardening. Three rough edges in `detectContinuationIntent` + `hook.mjs` injection cleanup made stale handoffs (especially `/exit` type, which survive 7 days) re-inject across new sessions even when the new prompt was unrelated. Addressed together so the gating story is coherent.
