@@ -22,6 +22,8 @@ const SAMPLES = [
   { t: 'Worked on schema.mjs',                              low: true },
   { t: 'Reviewed 7 files: a.mjs, b.mjs',                    low: true },
   { t: 'Reviewed 12 files: x.mjs',                          low: true },
+  { t: 'Codebase exploration: projects--mem schema, FTS5',  low: true },
+  { t: 'Codebase exploration of session hook generation',   low: true },
   { t: 'Error while working on tests/foo.test.mjs',         low: true },
   { t: 'Error in tests/bar.test.mjs:42',                    low: true },
   { t: 'Error: hook.mjs, hook-episode.mjs: 145|proj|raw',   low: true },

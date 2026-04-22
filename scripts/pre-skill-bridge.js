@@ -70,10 +70,11 @@ try {
     // (notably sdscc) silently drop plain-text stdout from PreToolUse — the previous
     // console.log() form would render on stock CC but no-op on those variants.
     // Token budget: ~4 chars per token, 4000 token limit = 16000 chars.
+    const portablePath = resolvedPath.startsWith(homedir()) ? '~' + resolvedPath.slice(homedir().length) : resolvedPath;
     let additionalContext;
     if (content.length > 16000) {
       const summary = content.slice(0, 800);
-      additionalContext = `<skill-bridge name="${row.name}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Use mem_use(name="${row.name}") to load full content.`;
+      additionalContext = `<skill-bridge name="${row.name}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${portablePath}") to load full content.`;
     } else {
       additionalContext = `<skill-bridge name="${row.name}" source="managed">\n${content}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`;
     }
