@@ -41,6 +41,20 @@ export function insertSession(db, { id, project = 'test', memoryId = null }) {
   `).run(id, memoryId ?? id, project, now.toISOString(), now.getTime());
 }
 
+/**
+ * Insert into user_prompts for tests that need to exercise the
+ * prompts-table fallback path in user-prompt-search.js (v2.34.5+).
+ * Matches the shape produced by hook-episode.mjs at runtime.
+ */
+export function insertPrompt(db, { contentSessionId = 'sess-1', text, promptNumber = 1, epochOffset = 0 }) {
+  const now = Date.now() + epochOffset;
+  const result = db.prepare(`
+    INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(contentSessionId, text, promptNumber, new Date(now).toISOString(), now);
+  return result;
+}
+
 export function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, text = '', narrative = '', importance = 1, relatedIds = '[]', epochOffset = 0, filesModified = '[]', accessCount = 0, compressedInto = null, lessonLearned = null, searchAliases = null, branch = null, supersededAt = null, supersededBy = null, lastAccessedAt = null }) {
   const now = Date.now() + epochOffset;
   const result = db.prepare(`

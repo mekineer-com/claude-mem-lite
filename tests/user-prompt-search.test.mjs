@@ -11,7 +11,7 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { ensureRegistryDb } from '../registry.mjs';
-import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, insertPrompt } from './test-helpers.mjs';
 import { typeIcon, truncate } from '../utils.mjs';
 import {
   shouldSkip,
@@ -712,6 +712,72 @@ describe('user-prompt-search subprocess integration', () => {
       { CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
     );
     expect(stdout).toContain('Touched auth-config.mjs settings');
+  });
+
+  // v2.34.5 Gap 1: prompts-table fallback. When observations FTS returns empty,
+  // fall back to user_prompts_fts — user's own prior similar questions are
+  // often the answer to meta/UX prompts that have no matching code observation.
+  // Keeps primary path untouched (obs hits suppress fallback to avoid noise).
+  it('v2.34.5 prompts-fallback: fires when no observations match but prior prompt matches', async () => {
+    insertPrompt(db, {
+      contentSessionId: 's1',
+      text: 'How should we handle FTS5 boolean operator precedence in sanitization?',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
+    );
+    expect(stdout).toContain('[mem] Past similar questions:');
+    expect(stdout).toMatch(/P#\d+/);
+    expect(stdout).toContain('FTS5 boolean operator');
+  });
+
+  it('v2.34.5 prompts-fallback: suppressed when observations hit (no noise)', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed FTS5 boolean operator sanitization',
+      text: 'FTS5 boolean operator precedence sanitization bug fix',
+      importance: 3,
+    });
+    insertPrompt(db, {
+      contentSessionId: 's1',
+      text: 'How should we handle FTS5 boolean operator precedence?',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
+    );
+    expect(stdout).toContain('[mem] Related memories:');
+    expect(stdout).toContain('Fixed FTS5 boolean operator sanitization');
+    expect(stdout).not.toContain('[mem] Past similar questions:');
+  });
+
+  it('v2.34.5 prompts-fallback: respects project scope', async () => {
+    // Seed prompt under a different project's session → should NOT surface.
+    insertSession(db, { id: 'other-s', project: 'other--project', memoryId: 'mem-other' });
+    insertPrompt(db, {
+      contentSessionId: 'other-s',
+      text: 'FTS5 boolean operator precedence question from other project',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
+    );
+    expect(stdout).toBe('');
+  });
+
+  it('v2.34.5 prompts-fallback: respects time cutoff', async () => {
+    // Prompt older than LOOKBACK_MS (60d) — should NOT surface.
+    insertPrompt(db, {
+      contentSessionId: 's1',
+      text: 'FTS5 boolean operator precedence question from way back',
+      epochOffset: -70 * 86400000,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
+    );
+    expect(stdout).toBe('');
   });
 });
 

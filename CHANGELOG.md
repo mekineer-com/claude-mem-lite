@@ -2,6 +2,27 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.34.5] - 2026-04-22
+
+UserPromptSubmit gains a **prompts-table fallback**. When the observations-based search paths (FTS / file-recall / error-signature / recent) all return empty, the hook now scans `user_prompts_fts` within the same project and the same 60-day window, and injects up to 3 prior user questions under a distinct `[mem] Past similar questions:` block prefixed with `P#<id>`. Addresses the audit finding that meta/UX-style prompts (e.g. "为什么 X 没有用", "以使用者的身份...") match zero observations but often have a near-identical prior prompt whose answer is what the user actually wants surfaced. 1679 → 1683 tests green (+4 integration tests in `tests/user-prompt-search.test.mjs`).
+
+**Scope discipline.** Fallback fires **only** when the primary observation merge is empty — observation hits suppress the fallback so users editing code keep seeing codebase lessons, not prior chatter. Prompt IDs are namespaced as strings (`"P" + id`) in the dedup store so they don't collide with future observation IDs.
+
+**Gap 2 (CJK threshold) measured, not changed.** A 30-day probe against the live `projects--mem` DB measured `91 / 371` prompts (24.5%) blocked by the v2.34.4 `PROMPT_MIN_LENGTH=15` effective-unit gate. The blocked set is genuinely low-signal (confirmations like "方案 C" / "执行方案 B" / "继续写 plan") and follow-up mode's `FOLLOWUP_PROMPT_MIN_LENGTH=8` already admits substantive short follow-ups. No code change.
+
+### Added
+
+- **`scripts/user-prompt-search.js` `searchByUserPrompts(db, queryText, project, limit)`** — mirrors `searchByFts`'s OR-fallback pattern but uses pure BM25 (no decay × type × importance multipliers, since prompts lack those columns). Deliberately no top-|rel| gate: observation BM25 values pass through a scoring expression that multiplies into the 6..133 range while prompt BM25 is raw and lives in a different magnitude band — sharing the floor would fail silently (this is exactly the wedge #7877 warns about). The upstream `shouldSkip` + `PROMPT_MIN_LENGTH` gate still filters low-information prompts at the entrypoint.
+- **`scripts/user-prompt-search.js` `formatPromptResults(rows)`** — distinct `[mem] Past similar questions:` header (not "Related memories:") so Claude can tell these are surface-form user questions, not saved codebase insights. Rows render as `P#<id> 💬 <truncated 80-char prompt>`.
+- **`tests/test-helpers.mjs` `insertPrompt(db, { contentSessionId, text, promptNumber?, epochOffset? })`** — new helper mirroring `insertObs` for tests that exercise the fallback path. Matches the shape produced by `hook-episode.mjs` at runtime.
+- **`tests/user-prompt-search.test.mjs` 4 new integration tests.** (1) fallback fires when obs empty but prompt matches — asserts `[mem] Past similar questions:` header + `P#<digit>` pattern. (2) fallback suppressed when obs hit — asserts the `Related memories:` header and no fallback block. (3) project scope enforced — seeds a prompt under a different project's session and asserts empty output. (4) time cutoff enforced — seeds a prompt 70 days old and asserts empty output.
+
+### Not changed (deliberately)
+
+- No new env vars, no new feature flags. Fallback is always on.
+- No top-|rel| gate on prompts. Prompt FTS magnitudes are much smaller than obs scores; sharing the 50-floor would kill almost all real hits.
+- `PROMPT_MIN_LENGTH` and `FOLLOWUP_PROMPT_MIN_LENGTH` unchanged — the Gap 2 measurement (91/371 blocked, 24.5%) showed current values are well-calibrated; the blocked set is low-signal confirmations.
+
 ## [2.34.4] - 2026-04-17
 
 CJK-short-prompt recall fix. The T3 raw-length gate (`PROMPT_MIN_LENGTH=15`) in `scripts/user-prompt-search.js` was a raw-character count while the upstream `shouldSkip` already weighted CJK at 3× Latin. A 14-char prompt like "优化 hook 性能降低延迟" (8 CJK + 4 Latin + 2 spaces) passed `shouldSkip`'s 8-unit floor (effectiveLen 30) but fell below the raw-15 gate and never reached FTS. Fix shares one weighting function across both gates. 1673 → 1679 tests green (+6: 5 unit tests for `computeEffectiveLen`, 1 integration test for CJK gate admission).

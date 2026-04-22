@@ -163,6 +163,43 @@ function searchByFile(db, files, project, limit) {
   });
 }
 
+// v2.34.5 Gap 1: prompts-table fallback. When observations-based paths
+// (FTS / file-recall / sigRows / recent) all return empty, scan the user's
+// own past prompts — meta/UX/"did we discuss this" questions often match
+// prior prompts even when no observation was saved. Uses a simpler BM25
+// ranking with no scoring multipliers and no top-|rel| gate (prompts are
+// sparser and more surface-form than observations; the gate would rarely
+// fire and mostly kill real hits).
+function searchByUserPrompts(db, queryText, project, limit) {
+  const ftsQuery = sanitizeFtsQuery(queryText);
+  if (!ftsQuery) return [];
+
+  const cutoff = Date.now() - LOOKBACK_MS;
+  const sql = `
+    SELECT up.id, up.prompt_text, up.created_at_epoch,
+           bm25(user_prompts_fts) as relevance
+    FROM user_prompts_fts
+    JOIN user_prompts up ON up.id = user_prompts_fts.rowid
+    JOIN sdk_sessions s ON s.content_session_id = up.content_session_id
+    WHERE user_prompts_fts MATCH ?
+      AND s.project = ?
+      AND up.created_at_epoch > ?
+    ORDER BY relevance
+    LIMIT ?
+  `;
+
+  let rows = db.prepare(sql).all(ftsQuery, project, cutoff, limit);
+
+  if (rows.length === 0) {
+    const orQuery = relaxFtsQueryToOr(ftsQuery);
+    if (orQuery) {
+      try { rows = db.prepare(sql).all(orQuery, project, cutoff, limit); } catch {}
+    }
+  }
+
+  return rows;
+}
+
 function searchRecent(db, project, limit) {
   const cutoff = Date.now() - LOOKBACK_MS;
   // R1: exclude LOW_SIGNAL degraded titles from "recent" recall intent
@@ -221,6 +258,20 @@ function formatResults(rows) {
     const title = truncate(r.title || '', 70);
     const lesson = !QUIET_HOOKS && r.lesson_learned ? ` — ${truncate(r.lesson_learned, 50)}` : '';
     lines.push(`#${r.id} ${icon} ${title}${lesson}`);
+  }
+  return lines.join('\n');
+}
+
+// v2.34.5 Gap 1: distinct header signals to Claude that these are prior
+// *user questions*, not codebase lessons — helps the reader interpret the
+// row correctly (surface-form match, not a saved insight). Truncate to 80
+// chars (slightly longer than obs titles because prompts carry more context).
+function formatPromptResults(rows) {
+  if (!rows || rows.length === 0) return null;
+  const lines = ['[mem] Past similar questions:'];
+  for (const r of rows) {
+    const text = truncate((r.prompt_text || '').replace(/\s+/g, ' '), 80);
+    lines.push(`P#${r.id} 💬 ${text}`);
   }
   return lines.join('\n');
 }
@@ -376,10 +427,24 @@ async function main() {
       rows = [...sigRows, ...rows.filter(r => !sigIds.has(r.id))].slice(0, MAX_RESULTS);
     }
 
-    const candidateIds = rows.map(r => r.id);
+    // v2.34.5 Gap 1: if observations-based search drew a blank, try the
+    // user_prompts corpus. Only fires when `rows` is empty (obs hits
+    // suppress the fallback to avoid noise). Namespace prompt IDs with
+    // a "P" prefix so shouldSkipByDedup's Set comparison doesn't collide
+    // with future observation IDs.
+    let promptRows = [];
+    if (rows.length === 0) {
+      promptRows = searchByUserPrompts(db, promptText, project, 3);
+    }
+
+    const candidateIds = rows.length > 0
+      ? rows.map(r => r.id)
+      : promptRows.map(r => `P${r.id}`);
     const dedupSkip = shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE);
 
-    const output = !dedupSkip ? formatResults(rows) : null;
+    const output = !dedupSkip
+      ? (rows.length > 0 ? formatResults(rows) : formatPromptResults(promptRows))
+      : null;
     if (output) {
       process.stdout.write(output + '\n');
       // Write injected IDs for dedup with hook.mjs handleUserPrompt + self-dedup
