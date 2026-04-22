@@ -2,6 +2,31 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.39.0] - 2026-04-23
+
+**Term-coverage filter for related-memory injection + timeline bare-int fallback.** An in-session retrospective on a 15-command search chain traced the low efficiency to a single root cause: the UserPromptSubmit hook was injecting rows that shared one FTS token with the user's query but none of the query's actual intent — e.g. query "handoff working_on staleness" returned three rows whose only common token was "handoff". This release adds a post-BM25 filter that drops low-coverage candidates, and fixes an unrelated CLI UX trap surfaced in the same review.
+
+### Added
+
+- **`hook-memory.mjs::candidateCoverage(row, queryTerms)`** — computes the fraction of the query's significant terms (after `tokenizeHandoff` + `HANDOFF_STOP_WORDS` filter + `extractCjkKeywords` for CJK) that appear in the candidate's `title + lesson_learned`. ASCII terms use word-boundary match (`\bfoo\b`) to prevent "race" matching "trace"; CJK terms use substring match because there are no ASCII word boundaries.
+- **`MEM_COVERAGE_THRESHOLD` env override** — read per-call via `getCoverageThreshold()`. Default `0.4` (≥40% term coverage); `0` disables the filter entirely for rollback / debugging.
+- **4 new test cases** in `tests/memory-inject.test.mjs::v27 term-coverage filter` covering: sparse-title drop, lesson_learned counted toward coverage, skip-when-<2-significant-terms, env-disable.
+- **CLI `timeline --anchor N` bare-int fallback** (`mem-cli.mjs::cmdTimeline`) — when a plain integer anchor misses observations, probe `user_prompts` then `session_summaries` and resolve to the nearest-in-time observation, same pattern the explicit `P#N` / `S#N` prefixes already use. Header annotates the conversion: `(anchored to #N, closest obs to P#N)`.
+- **2 new test cases** in `tests/cli.test.mjs::CLI timeline anchor prefix routing` covering bare-int → prompt fallback and cross-source not-found message.
+
+### Changed
+
+- **`searchRelevantMemories` post-filter order** — coverage filter runs after the existing BM25+score threshold and before `MAX_MEMORY_INJECTIONS` truncation. Purely read-side; does not touch `injection_count` / `access_count` / noise penalty (so the v2.37.0 noise-ratio signal stays clean).
+- **CLI timeline error wording** — `Observation #N not found` → `Observation, prompt, or session with id N not found` when the bare int matches nothing in any table. "not found" phrase preserved for existing error-matcher compatibility.
+
+### Fixed
+
+- The originating trap: query "handoff working_on staleness" previously injected three rows sharing only "handoff" in their titles; with the 0.4 coverage threshold these drop to 1/3 = 0.33 and get filtered, leaving the injection block empty when no high-coverage rows exist — which is the correct signal to steer callers toward `grep` the code instead of rotating mem synonyms.
+
+### Known followups
+
+- MCP `mem_timeline` anchor routing still accepts only plain integers (no P#/S# prefix, no bare-int fallback). CLI↔MCP parity work is deferred; the CLI fix is the higher-impact of the two since it's where users paste IDs from search output.
+
 ## [2.38.0] - 2026-04-23
 
 **Prefix-aware ID routing in CLI `get` / `timeline`.** `search` output labels records as `#N` (obs), `P#N` (prompt), `S#N` (session), but `get` defaulted to observations and silently returned "No observations found" when IDs were copy-pasted with prefix — a real session logged 10 failed `claude-mem-lite get` calls to recover 2 records that a single `git log` would have produced. Root cause: "display namespace ≠ query namespace." This release closes that gap end-to-end.
