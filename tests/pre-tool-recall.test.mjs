@@ -420,6 +420,68 @@ describe('pre-tool-recall', () => {
       expect(payload.endsWith('...')).toBe(true);
     });
 
+    it('Edit: LOW_SIGNAL title (bugfix/decision without lesson) is filtered out, falls back to nudge', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Real-world noise: hook-llm fallback title for an error episode. Type=bugfix, no lesson.
+      // Pre-v2.34.7 this was surfaced to Edit as low-value context; now filtered out.
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'Error: foo.mjs, bar.mjs: 145|project|raw-log-noise',
+        lessonLearned: null,
+        filesModified: `["${join(projectDir, 'low_signal.mjs')}"]`,
+      });
+      // Also insert a "Modified X" fallback title — same class of noise.
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'Modified low_signal.mjs',
+        lessonLearned: null,
+        filesModified: `["${join(projectDir, 'low_signal.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-low-signal',
+        tool_input: { file_path: join(projectDir, 'low_signal.mjs') },
+      });
+      // Both LOW_SIGNAL candidates filtered → no lessons block, only backfill nudge.
+      const parsed = JSON.parse(stdout);
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(ctx).not.toContain('Error: foo.mjs');
+      expect(ctx).not.toContain('Modified low_signal.mjs');
+      expect(ctx).toContain('[mem] No prior lessons for low_signal.mjs');
+    });
+
+    it('Edit: non-LOW_SIGNAL bugfix title without lesson still surfaces (regression guard)', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Real human-written bugfix title, no lesson_learned — should still be surfaced
+      // to Edit as contextual signal (Edit keeps the wider type-OR fallback).
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'hook-update SOURCE_FILES drift',
+        lessonLearned: null,
+        filesModified: `["${join(projectDir, 'real_bug.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-real-bug',
+        tool_input: { file_path: join(projectDir, 'real_bug.mjs') },
+      });
+      const parsed = JSON.parse(stdout);
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for real_bug.mjs');
+      expect(ctx).toContain('hook-update SOURCE_FILES drift');
+    });
+
     it('v2.34.6 Read→Edit same file same session: Edit deduped by shared cooldown', async () => {
       const filePath = join(projectDir, 'shared.mjs');
       const { stdout: readOut } = await runWithEnv({

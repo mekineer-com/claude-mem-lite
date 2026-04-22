@@ -1,6 +1,8 @@
 // scoring-sql.mjs — SQL constants for BM25 scoring and temporal decay.
 // Extracted from utils.mjs for focused module boundaries.
 
+import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
+
 // ─── Type-Differentiated Recency Decay ──────────────────────────────────────
 
 /** Recency half-life per observation type (in milliseconds) */
@@ -74,25 +76,10 @@ export const TYPE_QUALITY_CASE = `(
  * @param {string} [alias='o'] Table alias for the observations row. Use '' for unqualified.
  * @returns {string} SQL boolean expression (already parenthesized; safe to combine with AND/OR)
  */
+// β refactor (#7877 applied): delegated to lib/low-signal-patterns.mjs.
+// The SQL path (this), the regex path (utils.mjs::LOW_SIGNAL_TITLE), and the
+// pre-tool-recall.js inline SQL now all derive from one authoritative
+// pattern list. Previously hand-mirrored with "keep in sync" comments.
 export function notLowSignalTitleClause(alias = 'o') {
-  const p = alias ? `${alias}.` : '';
-  // Bug #2 fix: replace `title != '(error)'` (exact match only) with
-  // `title NOT LIKE '%(error)'` (suffix match) so titles like
-  // "gh release list ... (error)" — produced when makeEntryDesc tags a failed
-  // tool invocation — are excluded too. The LIKE form subsumes the exact match.
-  // Keep in sync with LOW_SIGNAL_TITLE regex in utils.mjs.
-  return `(
-    ${p}title NOT LIKE 'Modified %'
-    AND ${p}title NOT LIKE 'Worked on %'
-    AND ${p}title NOT LIKE 'Reviewed % files:%'
-    AND ${p}title NOT LIKE 'Error while working%'
-    AND ${p}title NOT LIKE 'Error in %'
-    AND ${p}title NOT LIKE 'Error: %'
-    AND ${p}title NOT LIKE '# %'
-    AND ${p}title NOT LIKE 'node %'
-    AND ${p}title NOT LIKE 'npm %'
-    AND ${p}title NOT LIKE 'npx %'
-    AND ${p}title NOT LIKE '(no description)%'
-    AND ${p}title NOT LIKE '%(error)'
-  )`;
+  return buildNotLowSignalSql(alias);
 }

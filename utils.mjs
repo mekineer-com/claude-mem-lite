@@ -4,6 +4,7 @@
 
 import { basename, dirname, resolve, sep } from 'path';
 import { execSync } from 'child_process';
+import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
 
 // ─── Re-exports from extracted modules ──────────────────────────────────────
 // Backward compatibility: all consumers import from utils.mjs
@@ -94,8 +95,12 @@ export const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 //   2. \(error\)$              — title ends with '(error)' (Bug #2 fix: previously this was
 //      inside the prefix group with a meaningless $, so only the exact title '(error)' matched.
 //      Tool-fragment titles like 'gh release list ... (error)' leaked through.)
-// Keep in sync with notLowSignalTitleClause() in scoring-sql.mjs.
-export const LOW_SIGNAL_TITLE = /^(Error (while working|in)|Error: |Modified |Worked on |Reviewed \d+ files:|# |node |npm |npx |\(no description\))|\(error\)$/;
+//
+// β refactor (#7877 applied): derived from lib/low-signal-patterns.mjs so the
+// regex path (this) and the SQL NOT LIKE path (scoring-sql.mjs::notLowSignalTitleClause)
+// and pre-tool-recall.js inline SQL all share one authoritative pattern list.
+// Previously these were hand-mirrored via "keep in sync" comments.
+export const LOW_SIGNAL_TITLE = buildLowSignalRegex();
 
 export function computeRuleImportance(episode) {
   let importance = 1;

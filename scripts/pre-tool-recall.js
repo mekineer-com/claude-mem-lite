@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // claude-mem-lite: PreToolUse file recall — injects lessons before Edit/Write
-// Lightweight standalone (~30ms): only imports better-sqlite3, fs, path, os
+// Lightweight standalone (~30ms): only imports better-sqlite3, fs, path, os,
+// and the pure-data lib/low-signal-patterns.mjs (zero runtime deps, ~1ms overhead).
 // Safety: readonly DB, exit 0 always, 3s timeout
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
+import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 
 // CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR env overrides allow tests and debug tools to
 // point the hook at an isolated DB + cooldown dir without touching the user's real state.
@@ -149,11 +151,19 @@ try {
     // fallback — decision/bugfix WITHOUT lesson add context noise to passive Reads
     // where the agent isn't committed to a change). Edit/Write keep the wider
     // filter for decision-point context.
+    // LOW_SIGNAL title patterns — auto-generated hook-llm fallback titles carry
+    // no actionable guidance. β refactor (#7877 applied): derived from
+    // lib/low-signal-patterns.mjs so this cold-start script, utils.mjs regex,
+    // and scoring-sql.mjs SQL share one authoritative list.
+    const notLowSignalSql = buildNotLowSignalSql('o');
+    // Edit: bugfix/decision without lesson_learned is admitted only when the
+    // title isn't a LOW_SIGNAL auto-fallback (those carry pipe-delimited raw
+    // output or filename-stubs, no guidance value for the about-to-Edit agent).
     const typeFallback = isRead
       ? 'AND o.lesson_learned IS NOT NULL AND o.lesson_learned != \'\''
       : `AND (
           (o.lesson_learned IS NOT NULL AND o.lesson_learned != '')
-          OR o.type IN ('bugfix', 'decision')
+          OR (o.type IN ('bugfix', 'decision') AND ${notLowSignalSql})
         )`;
     const obsLimit = isRead ? 1 : 2;
     const rows = db.prepare(`
