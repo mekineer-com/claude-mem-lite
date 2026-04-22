@@ -2,7 +2,7 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
-## [Unreleased]
+## [2.36.0] - 2026-04-23
 
 **Write-side signal quality (P0-P4).** Diagnostic on projects--mem 30d data found 52% of observations were LOW_SIGNAL auto-titles (`Modified X`, `Error:`, `Worked on`) with empty facts / null lesson — noise that inflates the FTS index and crowds recall. This release blocks them at insert time.
 
