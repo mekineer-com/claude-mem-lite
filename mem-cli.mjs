@@ -902,132 +902,17 @@ function cmdSave(db, args) {
 // Targets (aspirational, not enforced):
 //   - Lesson rate ≥ 15%      (current baseline ~4.4%)
 //   - LOW_SIGNAL rate ≤ 30%  (current baseline ~49.4%)
-function renderQualityReport(db, { project, days }) {
-  const projectFilter = project ? 'AND project = ?' : '';
-  const baseParams = project ? [project] : [];
-  const now = Date.now();
-  const cutoff = now - days * 86400000;
-
-  // LOW_SIGNAL is the inverse of notLowSignalTitleClause() — inline a SUM(CASE)
-  // that flips the sign so we count titles that DO match the LOW_SIGNAL regex.
-  const lowSignalIsMatchExpr = `NOT ${notLowSignalTitleClause('')}`;
-
-  // Unresolved-bugfix detection: narrative-text proxies for "investigation in progress,
-  // never reached a fix". Heuristic — false positives possible (e.g. a real lesson noting
-  // "the bug persists in legacy clients"), but the directional signal is what we care about.
-  // R-7 micro-experiment surfaced this pollution: ~3/5 of randomly-sampled bugfix narratives
-  // explicitly ended with "root cause not yet identified".
-  const unresolvedNarrativeExpr = `(
-    LOWER(COALESCE(narrative,'')) LIKE '%not yet identified%'
-    OR LOWER(COALESCE(narrative,'')) LIKE '%not yet resolved%'
-    OR LOWER(COALESCE(narrative,'')) LIKE '%not yet fixed%'
-    OR LOWER(COALESCE(narrative,'')) LIKE '%root cause not%'
-    OR LOWER(COALESCE(narrative,'')) LIKE '%still fail%'
-    OR LOWER(COALESCE(narrative,'')) LIKE '%errors persisted%'
-    OR LOWER(COALESCE(narrative,'')) LIKE '%persisted on retry%'
-  )`;
-
-  // In-window aggregates
-  const windowRow = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson,
-      SUM(CASE WHEN ${lowSignalIsMatchExpr} THEN 1 ELSE 0 END) as low_signal,
-      SUM(CASE WHEN type = 'bugfix' THEN 1 ELSE 0 END) as bugfix_total,
-      SUM(CASE WHEN type = 'bugfix' AND ${unresolvedNarrativeExpr} THEN 1 ELSE 0 END) as bugfix_unresolved
-    FROM observations
-    WHERE created_at_epoch >= ? ${projectFilter}
-  `).get(cutoff, ...baseParams);
-
-  // All-time aggregates (context for recent numbers)
-  const allTimeRow = db.prepare(`
-    SELECT
-      COUNT(*) as total,
-      SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson,
-      SUM(CASE WHEN ${lowSignalIsMatchExpr} THEN 1 ELSE 0 END) as low_signal
-    FROM observations
-    WHERE 1=1 ${projectFilter}
-  `).get(...baseParams);
-
-  // Per-type: count, hit rate (access_count > 0), lesson rate
-  const typeRows = db.prepare(`
-    SELECT
-      type,
-      COUNT(*) as total,
-      SUM(CASE WHEN COALESCE(access_count, 0) > 0 THEN 1 ELSE 0 END) as accessed,
-      SUM(CASE WHEN lesson_learned IS NOT NULL AND lesson_learned != '' THEN 1 ELSE 0 END) as with_lesson
-    FROM observations
-    WHERE created_at_epoch >= ? ${projectFilter}
-    GROUP BY type
-    ORDER BY total DESC
-  `).all(cutoff, ...baseParams);
-
-  // Top-5 most-accessed lessons (all-time, this project scope)
-  const topLessons = db.prepare(`
-    SELECT id, type, title, lesson_learned, COALESCE(access_count, 0) as ac
-    FROM observations
-    WHERE lesson_learned IS NOT NULL AND lesson_learned != ''
-      AND COALESCE(access_count, 0) > 0
-      AND COALESCE(compressed_into, 0) = 0
-      ${projectFilter}
-    ORDER BY ac DESC
-    LIMIT 5
-  `).all(...baseParams);
-
-  const pct = (n, d) => d > 0 ? (100 * n / d).toFixed(1) : '0.0';
-  const scope = project ? ` — ${project}` : '';
-  out(`[mem] Quality snapshot${scope} — window: ${days}d`);
-  out('────────────────────────────────────────────────────');
-  out(`  Writes (${days}d):     ${windowRow.total} observations`);
-
-  const lessonPct = pct(windowRow.with_lesson, windowRow.total);
-  const allLessonPct = pct(allTimeRow.with_lesson, allTimeRow.total);
-  out(`  Lesson rate:      ${windowRow.with_lesson} / ${windowRow.total} (${lessonPct}%)    [all-time: ${allTimeRow.with_lesson} / ${allTimeRow.total} = ${allLessonPct}%]`);
-
-  const noisePct = pct(windowRow.low_signal, windowRow.total);
-  const allNoisePct = pct(allTimeRow.low_signal, allTimeRow.total);
-  out(`  LOW_SIGNAL:       ${windowRow.low_signal} / ${windowRow.total} (${noisePct}%)    [all-time: ${allTimeRow.low_signal} / ${allTimeRow.total} = ${allNoisePct}%]`);
-
-  if (windowRow.bugfix_total > 0) {
-    const unresolvedPct = pct(windowRow.bugfix_unresolved, windowRow.bugfix_total);
-    out(`  Unresolved bugfix: ${windowRow.bugfix_unresolved} / ${windowRow.bugfix_total} (${unresolvedPct}%)    [investigation-only narratives — should trend ↓ with R-6 manual-save contract]`);
-  }
-  out('');
-
-  if (typeRows.length > 0) {
-    out(`  Type breakdown (${days}d):`);
-    for (const r of typeRows) {
-      const hit = pct(r.accessed, r.total);
-      const lp = pct(r.with_lesson, r.total);
-      const typeLabel = r.type.padEnd(10);
-      // padStart(5) on count so rows align up to 5-digit totals (99999).
-      out(`    ${typeLabel}${String(r.total).padStart(5)}   hit ${hit.padStart(5)}%   lesson ${lp.padStart(5)}%`);
-    }
-    out('');
-  }
-
-  if (topLessons.length > 0) {
-    out('  Top accessed lessons (all-time):');
-    for (const l of topLessons) {
-      const t = truncate(l.lesson_learned, 80);
-      out(`    #${l.id} [${l.type}] (${l.ac}x) ${t}`);
-    }
-    out('');
-  }
-
-  // R-2 watchdog — explicit targets make progress legible.
-  const lessonNum = parseFloat(lessonPct);
-  const noiseNum = parseFloat(noisePct);
-  const lessonGap = (lessonNum - 15).toFixed(1);
-  const noiseGap = (noiseNum - 30).toFixed(1);
-  const lessonStatus = lessonNum >= 15 ? '✅' : '🔴';
-  const noiseStatus = noiseNum <= 30 ? '✅' : '🔴';
-  out('  Targets (R-2 watchdog):');
-  out(`    ${lessonStatus} Lesson rate ≥ 15%    → currently ${lessonPct}%  (gap ${lessonGap >= 0 ? '+' : ''}${lessonGap}pp)`);
-  out(`    ${noiseStatus} LOW_SIGNAL  ≤ 30%    → currently ${noisePct}%  (gap ${noiseGap >= 0 ? '+' : ''}${noiseGap}pp)`);
+// Batch A CLI↔MCP alignment: CLI `stats --quality` and MCP `mem_stats({quality:true})`
+// share the same computation + formatting via lib/stats-quality.mjs. This wrapper
+// keeps the cmdStats call-site unchanged (stays sync-compatible) by delegating
+// to a dynamic import + sync function chain inside an async caller.
+async function renderQualityReport(db, { project, days }) {
+  const { computeQualityStats, formatQualityReport } = await import('./lib/stats-quality.mjs');
+  out(formatQualityReport(computeQualityStats(db, { project, days })));
 }
 
-function cmdStats(db, args) {
+
+async function cmdStats(db, args) {
   const { flags } = parseArgs(args);
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const days = parseInt(flags.days, 10) || 30;
@@ -1036,7 +921,7 @@ function cmdStats(db, args) {
   // the baseline metric dashboard for the future Haiku prompt A/B test.
   const quality = flags.quality === true || flags.quality === 'true';
   if (quality) {
-    renderQualityReport(db, { project, days });
+    await renderQualityReport(db, { project, days });
     return;
   }
 
@@ -2025,6 +1910,7 @@ Commands:
     --tier T            Filter by tier (working|active|archive, observations only)
     --sort S            Sort: relevance (default), time, importance
     --or                Use OR instead of AND between search terms
+    --include-noise     Include hook-llm fallback titles ("Modified X", raw error logs)
 
   recent [N]            Show N most recent observations (default 10)
     --project P         Filter by project
@@ -2467,7 +2353,7 @@ export async function run(argv) {
       case 'maintain':  cmdMaintain(db, cmdArgs); break;
       case 'optimize':  await cmdOptimize(db, cmdArgs); break;
       case 'fts-check': cmdFtsCheck(db, cmdArgs); break;
-      case 'stats':     cmdStats(db, cmdArgs); break;
+      case 'stats':     await cmdStats(db, cmdArgs); break;
       case 'context':   cmdContext(db, cmdArgs); break;
       case 'browse':    cmdBrowse(db, cmdArgs); break;
       case 'registry':  cmdRegistry(db, cmdArgs); break;

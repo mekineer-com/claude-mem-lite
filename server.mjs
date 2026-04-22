@@ -571,7 +571,13 @@ server.registerTool(
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const limit = args.limit ?? 20;
     const offset = args.offset ?? 0;
-    const ftsQuery = sanitizeFtsQuery(args.query);
+    // args.or (Batch A CLI↔MCP alignment): force OR from start, matching
+    // CLI `search --or`. The default path still does AND with OR-fallback
+    // inside searchObservations when AND returns 0.
+    let ftsQuery = sanitizeFtsQuery(args.query);
+    if (ftsQuery && args.or) {
+      ftsQuery = relaxFtsQueryToOr(ftsQuery) || ftsQuery;
+    }
     const searchType = args.type;
     const currentProject = inferProject();
 
@@ -1096,6 +1102,16 @@ server.registerTool(
   safeHandler(async (args) => {
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const days = args.days ?? 30;
+
+    // Batch A CLI↔MCP alignment: quality:true → quality dashboard (lesson
+    // rate, LOW_SIGNAL rate, per-type hit/lesson %, top lessons, R-2 watchdog).
+    // Same computation + format as CLI `stats --quality` via lib/stats-quality.mjs.
+    if (args.quality) {
+      const { computeQualityStats, formatQualityReport } = await import('./lib/stats-quality.mjs');
+      const data = computeQualityStats(db, { project: args.project, days });
+      return { content: [{ type: 'text', text: formatQualityReport(data) }] };
+    }
+
     const cutoff = Date.now() - days * 86400000;
     const projectFilter = args.project ? 'AND project = ?' : '';
     const baseParams = args.project ? [args.project] : [];

@@ -42,6 +42,7 @@ export const memSearchSchema = {
   offset: coerceInt.pipe(z.number().int().min(0)).optional().describe('Offset for pagination'),
   sort: z.enum(['relevance', 'time', 'importance']).optional().describe('Sort order: relevance (default, BM25), time (newest first), importance (highest first)'),
   include_noise: z.boolean().optional().describe('Include hook-llm fallback titles ("Modified X", "Worked on X", raw error logs) — hidden by default as they have ~3% access rate'),
+  or: coerceBool.optional().describe('Force OR semantics between query terms from the start (default: AND with automatic OR-fallback when AND returns 0). Aligns with CLI --or.'),
 };
 
 export const memRecentSchema = {
@@ -81,6 +82,7 @@ export const memSaveSchema = {
 export const memStatsSchema = {
   project: z.string().optional().describe('Filter by project'),
   days: coerceInt.pipe(z.number().int().min(1).max(365)).optional().describe('Look back N days (default 30)'),
+  quality: coerceBool.optional().describe('Return quality dashboard (lesson rate, LOW_SIGNAL rate, per-type hit/lesson %, top-accessed lessons, R-2 watchdog) instead of default stats. Aligns with CLI --quality.'),
 };
 
 export const memCompressSchema = {

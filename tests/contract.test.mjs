@@ -73,6 +73,19 @@ describe('mem_search schema', () => {
     expect(parseSchema(memSearchSchema, { limit: 100 }).success).toBe(true);
     expect(parseSchema(memSearchSchema, { offset: 0 }).success).toBe(true);
   });
+
+  // Batch A: CLI ↔ MCP alignment — CLI has --or, MCP must accept `or` too.
+  // Zod strips unknown keys silently, so success alone isn't enough — the
+  // field must survive parse (data.or === true) to prove it's in the schema.
+  it('accepts or:true and retains it in parsed output (aligns with CLI --or)', () => {
+    const r1 = parseSchema(memSearchSchema, { query: 'foo bar', or: true });
+    expect(r1.success).toBe(true);
+    expect(r1.data.or).toBe(true);
+
+    const r2 = parseSchema(memSearchSchema, { query: 'foo', or: 'true' });
+    expect(r2.success).toBe(true);
+    expect(r2.data.or).toBe(true);
+  });
 });
 
 // ─── mem_recent schema ──────────────────────────────────────────────────────
@@ -263,6 +276,17 @@ describe('mem_stats schema', () => {
   it('rejects days out of range', () => {
     expect(parseSchema(memStatsSchema, { days: 0 }).success).toBe(false);
     expect(parseSchema(memStatsSchema, { days: 366 }).success).toBe(false);
+  });
+
+  // Batch A: CLI ↔ MCP alignment — CLI has --quality dashboard, MCP must too.
+  it('accepts quality:true and retains it in parsed output (aligns with CLI --quality)', () => {
+    const r1 = parseSchema(memStatsSchema, { quality: true });
+    expect(r1.success).toBe(true);
+    expect(r1.data.quality).toBe(true);
+
+    const r2 = parseSchema(memStatsSchema, { quality: 'true' });
+    expect(r2.success).toBe(true);
+    expect(r2.data.quality).toBe(true);
   });
 });
 
