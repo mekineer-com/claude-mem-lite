@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.39.0",
+  "version": "2.39.1",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {

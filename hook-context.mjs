@@ -369,7 +369,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     }
     if (prevClearHandoff.unfinished) {
       const pendingSummary = extractUnfinishedSummary(prevClearHandoff.unfinished);
-      if (pendingSummary) handoffLines.push(`- Unfinished: ${truncate(pendingSummary, 200)}`);
+      if (pendingSummary) handoffLines.push(`- Recent activity: ${truncate(pendingSummary, 200)}`);
     }
     if (prevClearHandoff.key_files) {
       try {

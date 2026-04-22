@@ -2,7 +2,7 @@
 // Extracted for testability — hook.mjs has module-level side effects
 
 import { basename } from 'path';
-import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE } from './utils.mjs';
+import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE, EDIT_TOOLS } from './utils.mjs';
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_ANCHOR_MAX_AGE,
   HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
@@ -55,12 +55,16 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     ORDER BY created_at_epoch DESC LIMIT 15
   `).all(sessionId);
 
-  // 3. Unfinished — episode snapshot + full session edit history from narratives
+  // 3. Recent activity — episode snapshot + full session edit history from narratives.
+  // Keep only entries that represent in-flight work (file edits) or outright failures
+  // (errors). Successful Bash commands flag isSignificant=true via bash-utils when they
+  // match git/test/build/deploy patterns, but a succeeded `git push` is COMPLETED, not
+  // pending — including it surfaced release-pipeline commands as "Unfinished" on resume.
   let unfinished = '';
   if (episodeSnapshot?.entries) {
     const seenDescs = new Set();
     const pendingDescs = episodeSnapshot.entries
-      .filter(e => e.isSignificant || e.isError)
+      .filter(e => e.isError || EDIT_TOOLS.has(e.tool))
       .map(e => e.desc)
       .filter(d => { if (seenDescs.has(d)) return false; seenDescs.add(d); return true; });
     if (pendingDescs.length > 0) unfinished = pendingDescs.join('; ');
@@ -340,10 +344,13 @@ export function renderHandoffInjection(db, project, currentCcSessionId = null) {
     lines.push('## Completed', ...handoff.completed.split('\n').map(l => `- ${l}`), '');
   }
   if (handoff.unfinished) {
-    // Extract only the pending-work portion (before narrative history separator)
+    // Extract only the pending-work portion (before narrative history separator).
+    // Header: "Recent activity" rather than "Unfinished" — the list mixes in-flight
+    // edits with surfaced errors, and calling a completed edit "unfinished" is a
+    // completeness claim the episode buffer can't support.
     const pending = extractUnfinishedSummary(handoff.unfinished);
     if (pending) {
-      lines.push('## Unfinished', ...pending.split('; ').map(l => `- ${l}`), '');
+      lines.push('## Recent activity', ...pending.split('; ').map(l => `- ${l}`), '');
     }
   }
   if (handoff.key_files) {

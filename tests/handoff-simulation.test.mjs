@@ -79,7 +79,7 @@ function simulateSessionStartOutput(db, project, prevClearHandoff) {
     if (prevClearHandoff.working_on) handoffLines.push(`- Working on: ${truncate(prevClearHandoff.working_on, 200)}`);
     if (prevClearHandoff.unfinished) {
       const pendingSummary = extractUnfinishedSummary(prevClearHandoff.unfinished);
-      if (pendingSummary) handoffLines.push(`- Unfinished: ${truncate(pendingSummary, 200)}`);
+      if (pendingSummary) handoffLines.push(`- Recent activity: ${truncate(pendingSummary, 200)}`);
     }
     handoffLines.push('');
   }
@@ -196,8 +196,8 @@ describe('Scenario 2: /clear → continue same work', () => {
     // Episode snapshot: work in progress when /clear happened
     const episodeSnapshot = {
       entries: [
-        { desc: 'Edit dispatch.mjs: add cooldown timer', isSignificant: true, isError: false },
-        { desc: 'Bash: npx vitest run → 3 tests failed', isSignificant: false, isError: true },
+        { tool: 'Edit', desc: 'Edit dispatch.mjs: add cooldown timer', isSignificant: true, isError: false },
+        { tool: 'Bash', desc: 'Bash: npx vitest run → 3 tests failed', isSignificant: false, isError: true },
       ],
       files: ['/proj/dispatch.mjs', '/proj/dispatch.test.mjs'],
     };
@@ -216,8 +216,8 @@ describe('Scenario 2: /clear → continue same work', () => {
     expect(output.claudeMd).toContain('### Working State (from /clear)');
     expect(output.claudeMd).toContain('优化 dispatch');
 
-    // 2. Unfinished should show actual pending work
-    expect(output.claudeMd).toContain('Unfinished');
+    // 2. Recent activity should show actual pending work
+    expect(output.claudeMd).toContain('Recent activity');
     expect(output.claudeMd).toContain('cooldown timer');
     expect(output.claudeMd).toContain('tests failed');
   });
@@ -294,7 +294,7 @@ describe('Scenario 3: completed bugfixes', () => {
     // Episode has unresolved errors
     const episodeSnapshot = {
       entries: [
-        { desc: 'Bash: vitest run → TypeError: Cannot read undefined', isSignificant: false, isError: true },
+        { tool: 'Bash', desc: 'Bash: vitest run → TypeError: Cannot read undefined', isSignificant: false, isError: true },
       ],
       files: ['/proj/test.mjs'],
     };
@@ -302,8 +302,8 @@ describe('Scenario 3: completed bugfixes', () => {
     buildAndSaveHandoff(db, 'sess-1', project, 'clear', episodeSnapshot);
 
     const injection = renderHandoffInjection(db, project);
-    // Actual errors in episode SHOULD appear as unfinished
-    expect(injection).toContain('## Unfinished');
+    // Actual errors in episode SHOULD appear as recent activity
+    expect(injection).toContain('## Recent activity');
     expect(injection).toContain('TypeError');
   });
 });
@@ -347,7 +347,7 @@ describe('Scenario 4: narrative history separation', () => {
     expect(injection).toContain('Modified dispatch.mjs');
   });
 
-  it('pending work + narratives → only pending shown as Unfinished', () => {
+  it('pending work + narratives → only pending shown as Recent activity', () => {
     const project = 'mem';
     seedSession(db, 'sess-1', project);
     seedPrompt(db, 'sess-1', 'refactor and test dispatch', 1);
@@ -359,8 +359,8 @@ describe('Scenario 4: narrative history separation', () => {
 
     const episodeSnapshot = {
       entries: [
-        { desc: 'Edit dispatch.test.mjs: add scoring tests', isSignificant: true, isError: false },
-        { desc: 'Bash: vitest → 2 tests failed', isSignificant: false, isError: true },
+        { tool: 'Edit', desc: 'Edit dispatch.test.mjs: add scoring tests', isSignificant: true, isError: false },
+        { tool: 'Bash', desc: 'Bash: vitest → 2 tests failed', isSignificant: false, isError: true },
       ],
       files: ['/proj/dispatch.test.mjs'],
     };
@@ -369,8 +369,8 @@ describe('Scenario 4: narrative history separation', () => {
 
     const injection = renderHandoffInjection(db, project);
 
-    // Pending work (episode) should appear as Unfinished
-    expect(injection).toContain('## Unfinished');
+    // Pending work (episode) should appear as Recent activity
+    expect(injection).toContain('## Recent activity');
     expect(injection).toContain('scoring tests');
     expect(injection).toContain('tests failed');
 

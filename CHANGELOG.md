@@ -2,6 +2,27 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.39.1] - 2026-04-23
+
+**Handoff "Unfinished" section no longer mislabels successful release commands as pending.** A resume-session user report flagged three `git push` / `git tag` / `git add` lines from a completed release pipeline showing under `## Unfinished` in the injected `<session-handoff>` block. Root cause: `buildAndSaveHandoff` filtered episode entries with `e.isSignificant || e.isError`, but `isSignificant` has two unrelated origins in `hook.mjs:246` — it is set to true for EDIT_TOOLS invocations (real in-flight work) OR any Bash command that matches `bash-utils.mjs::detectBashSignificance` (git/test/build/deploy), regardless of exit status. A successful `git push` therefore carried `isSignificant=true, isError=false` and was surfaced as pending.
+
+### Fixed
+
+- **`hook-handoff.mjs::buildAndSaveHandoff`** — filter tightened from `e.isSignificant || e.isError` to `e.isError || EDIT_TOOLS.has(e.tool)`. Successful Bash commands (git/test/build/deploy) no longer leak into the pending list; in-flight edits (Edit/Write/NotebookEdit) and surfaced errors still do. Entry shape already carries `tool` in production (`hook.mjs:241`); four pre-existing tests gained explicit `tool: 'Edit'` / `'Bash'` to match.
+
+### Changed
+
+- **Section header rename** — `## Unfinished` → `## Recent activity` in `hook-handoff.mjs::renderHandoffInjection` and inline `- Unfinished:` → `- Recent activity:` in `hook-context.mjs::buildSessionContextLines`. The section mixes in-flight edits with surfaced errors; "Unfinished" was a completeness claim the episode buffer cannot substantiate. Descriptive label removes the mental-model conflict users hit when reading a handoff for a cleanly-`/exit`ed release session.
+
+### Added
+
+- **Regression test** `tests/handoff.test.mjs::buildAndSaveHandoff > successful bash commands (git push, test, build) are NOT pending activity` — snapshot containing only `isSignificant=true, isError=false` Bash entries must not leak `git` / `vitest` descs into the pending portion of `unfinished`.
+
+### Known followups
+
+- `session_handoffs.type='exit'` is written on every Stop hook, not only on real `/exit` — it's the "last Stop snapshot" for the prior CC session, not an exit event. Distinguishing real exit would require wiring CC's `SessionEnd` hook + a schema migration; deferred because current injection semantics (inject the most recent Stop snapshot from a *different* CC session) are what resume actually wants, just under a misleading type tag.
+- `age` on injected handoffs measures time since last Stop write, not since user's actual `/exit`. Technically correct but can feel jarring when a session's tail turn took minutes to generate. No threshold gate proposed — auto-suppressing short-gap handoffs risks dropping legitimate same-day resumes.
+
 ## [2.39.0] - 2026-04-23
 
 **Term-coverage filter for related-memory injection + timeline bare-int fallback.** An in-session retrospective on a 15-command search chain traced the low efficiency to a single root cause: the UserPromptSubmit hook was injecting rows that shared one FTS token with the user's query but none of the query's actual intent — e.g. query "handoff working_on staleness" returned three rows whose only common token was "handoff". This release adds a post-BM25 filter that drops low-coverage candidates, and fixes an unrelated CLI UX trap surfaced in the same review.

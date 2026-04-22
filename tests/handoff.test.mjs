@@ -196,15 +196,15 @@ describe('buildAndSaveHandoff', () => {
     expect(row.completed).toContain('Added error logging');
   });
 
-  it('extracts unfinished from episode snapshot', () => {
+  it('extracts unfinished from episode snapshot (edits + errors only)', () => {
     seedSession(db, 's1', 'test-proj');
     seedPrompt(db, 's1', 'refactor dispatch system', 1);
 
     const snapshot = {
       entries: [
-        { desc: 'Edit hook.mjs: add handoff logic', isSignificant: true, isError: false },
-        { desc: 'Read schema.mjs', isSignificant: false, isError: false },
-        { desc: 'Bash error: test failed', isSignificant: false, isError: true },
+        { tool: 'Edit', desc: 'Edit hook.mjs: add handoff logic', isSignificant: true, isError: false },
+        { tool: 'Read', desc: 'Read schema.mjs', isSignificant: false, isError: false },
+        { tool: 'Bash', desc: 'Bash error: test failed', isSignificant: false, isError: true },
       ],
       files: ['/proj/hook.mjs', '/proj/schema.mjs'],
     };
@@ -215,6 +215,34 @@ describe('buildAndSaveHandoff', () => {
     expect(row.unfinished).toContain('handoff logic');
     expect(row.unfinished).toContain('test failed');
     expect(row.unfinished).not.toContain('Read schema');
+  });
+
+  it('successful bash commands (git push, test, build) are NOT pending activity', () => {
+    // Regression: v2.39.x surfaced successful `git push` / `git tag` as "Unfinished"
+    // because buildAndSaveHandoff filtered on isSignificant, which bash-utils sets to
+    // true for git/test/build/deploy commands regardless of success. Resume sessions
+    // saw completed work labelled as pending. Fix: pending = errors + edit tools only.
+    seedSession(db, 's1', 'test-proj');
+    seedPrompt(db, 's1', 'ship v0.15.1', 1);
+
+    const snapshot = {
+      entries: [
+        { tool: 'Bash', desc: 'git add package.json', isSignificant: true, isError: false },
+        { tool: 'Bash', desc: 'git push origin main', isSignificant: true, isError: false },
+        { tool: 'Bash', desc: 'git tag v0.15.1', isSignificant: true, isError: false },
+        { tool: 'Bash', desc: 'npx vitest run (12 passed)', isSignificant: true, isError: false },
+      ],
+      files: [],
+    };
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', snapshot);
+
+    const row = db.prepare(`SELECT * FROM session_handoffs WHERE project = 'test-proj'`).get();
+    const pending = row.unfinished ? row.unfinished.split('\n---\n')[0] : '';
+    expect(pending).not.toContain('git push');
+    expect(pending).not.toContain('git tag');
+    expect(pending).not.toContain('git add');
+    expect(pending).not.toContain('vitest run');
   });
 
   it('collects key_files from episode + observations', () => {
@@ -792,7 +820,7 @@ describe('T10d: TaskList-sourced Unfinished in buildAndSaveHandoff', () => {
     ]);
 
     buildAndSaveHandoff(db, 's1', 'mem', 'exit', {
-      entries: [{ desc: 'Edit hook.mjs: add dispatch logic', isSignificant: true, isError: false }],
+      entries: [{ tool: 'Edit', desc: 'Edit hook.mjs: add dispatch logic', isSignificant: true, isError: false }],
       files: [],
     });
 
