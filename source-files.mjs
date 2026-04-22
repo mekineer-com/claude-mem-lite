@@ -34,6 +34,9 @@ export const SOURCE_FILES = [
   'lib/git-state.mjs',
   'lib/startup-dashboard.mjs',
   'lib/doctor-benchmark.mjs',
+  'lib/doctor-drift.mjs',
+  'lib/stats-quality.mjs',
+  'lib/low-signal-patterns.mjs',
   // v2.32 invited-memory: memdir primitives + adopt/unadopt CLI
   'memdir.mjs',
   'adopt-content.mjs',

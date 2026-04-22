@@ -87,6 +87,91 @@ describe('buildServerInstructions(quiet)', () => {
   });
 });
 
+describe('server.mjs instructions-mode stderr trace', () => {
+  const serverPath = join(process.cwd(), 'server.mjs');
+
+  async function runServer(env) {
+    const { spawnSync } = await import('child_process');
+    return spawnSync('node', [serverPath], {
+      input: '',
+      env,
+      timeout: 3000,
+      encoding: 'utf8',
+    });
+  }
+
+  it('emits BASE+VERBOSE reason=none when not adopted and MEM_QUIET_HOOKS unset', async () => {
+    const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
+    try {
+      // Minimal env — strip MEM_QUIET_HOOKS + point CLAUDE_PROJECT_DIR at a clean dir
+      // so effectiveQuiet returns false.
+      const env = { HOME: process.env.HOME, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
+      const r = await runServer(env);
+      expect(r.stderr).toContain('[mem] instructions: BASE+VERBOSE reason=none');
+    } finally {
+      try { rmSync(fresh, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('emits BASE reason=env when MEM_QUIET_HOOKS=1', async () => {
+    const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
+    try {
+      const env = {
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+        MEM_QUIET_HOOKS: '1',
+        CLAUDE_PROJECT_DIR: fresh,
+        PWD: fresh,
+      };
+      const r = await runServer(env);
+      expect(r.stderr).toContain('[mem] instructions: BASE reason=env:MEM_QUIET_HOOKS=1');
+    } finally {
+      try { rmSync(fresh, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('emits BASE reason=adopted when project has claude-mem-lite sentinel', async () => {
+    const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
+    try {
+      // Mirror memdirPath encoding: every non-alphanumeric → '-'.
+      const encoded = fresh.replace(/[^a-zA-Z0-9]/g, '-');
+      const mdir = join(process.env.HOME, '.claude', 'projects', encoded, 'memory');
+      mkdirSync(mdir, { recursive: true });
+      const fs = await import('fs');
+      fs.writeFileSync(
+        join(mdir, 'MEMORY.md'),
+        '# Index\n<!-- claude-mem-lite:begin v1 -->\n## 插件契约\n- stub\n<!-- claude-mem-lite:end -->\n',
+      );
+      try {
+        const env = { HOME: process.env.HOME, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
+        const r = await runServer(env);
+        expect(r.stderr).toContain('[mem] instructions: BASE reason=adopted:MEMORY.md-sentinel');
+      } finally {
+        try { rmSync(join(process.env.HOME, '.claude', 'projects', encoded), { recursive: true, force: true }); } catch {}
+      }
+    } finally {
+      try { rmSync(fresh, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('opts out with CLAUDE_MEM_QUIET_TRACE=0 — no trace on stderr', async () => {
+    const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
+    try {
+      const env = {
+        HOME: process.env.HOME,
+        PATH: process.env.PATH,
+        CLAUDE_MEM_QUIET_TRACE: '0',
+        CLAUDE_PROJECT_DIR: fresh,
+        PWD: fresh,
+      };
+      const r = await runServer(env);
+      expect(r.stderr).not.toMatch(/\[mem\] instructions:/);
+    } finally {
+      try { rmSync(fresh, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
 describe('buildSessionContextLines — QUIET_HOOKS gating', () => {
   let db;
   let original, origHome, origCwd, tmpHome;

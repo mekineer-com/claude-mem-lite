@@ -1065,11 +1065,13 @@ async function doctor() {
   }
 
   // Dependencies
-  const bsPath = join(INSTALL_DIR, 'node_modules', 'better-sqlite3');
-  if (existsSync(bsPath)) {
-    ok('better-sqlite3: installed');
-  } else {
-    fail('better-sqlite3: not installed (run install again)');
+  try {
+    const Database = (await import('better-sqlite3')).default;
+    const probe = new Database(':memory:');
+    probe.close();
+    ok('better-sqlite3: verified (import + open OK)');
+  } catch (e) {
+    fail(`better-sqlite3: import/init failed (${e.message})`);
     issues++;
   }
 
@@ -1193,6 +1195,26 @@ async function doctor() {
     warn('Update state: failed to read');
   }
 
+  // Dev drift: in dev-mode installs, all SOURCE_FILES entries should be
+  // symlinks. A plain file means an earlier install (or manual cp) copied it,
+  // so edits in the repo won't propagate to INSTALL_DIR — hook runtime and
+  // test runtime silently diverge.
+  try {
+    const { checkDevDrift } = await import('./lib/doctor-drift.mjs');
+    const r = checkDevDrift(INSTALL_DIR, SOURCE_FILES);
+    if (r.drift) {
+      const names = r.details.join(', ');
+      const suffix = r.plainCount > r.details.length ? ` +${r.plainCount - r.details.length} more` : '';
+      warn(`Dev drift: ${r.plainCount} non-symlink file(s) in dev install: ${names}${suffix} (re-run: node install.mjs install --dev)`);
+      issues++;
+    } else if (r.devMode) {
+      ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain)`);
+    }
+    // Prod (all plain) install: no message — dev-drift is a dev-only concern.
+  } catch (e) {
+    warn('Dev drift: check failed — ' + e.message);
+  }
+
   // Stale temp files
   try {
     const runtimeDir = join(INSTALL_DIR, 'runtime');
@@ -1225,7 +1247,8 @@ async function doctor() {
       const Database = (await import('better-sqlite3')).default;
       const db = new Database(DB_PATH, { readonly: true });
       const obsCount = db.prepare('SELECT COUNT(*) as cnt FROM observations').get()?.cnt || 0;
-      const sessCount = db.prepare('SELECT COUNT(*) as cnt FROM sdk_sessions').get()?.cnt || 0;
+      // Align with stats / MCP mem_stats: session_summaries, not sdk_sessions
+      const sessCount = db.prepare('SELECT COUNT(*) as cnt FROM session_summaries').get()?.cnt || 0;
       db.close();
       ok(`DB stats: ${sizeMB}MB, ${obsCount} observations, ${sessCount} sessions`);
     } catch (e) {

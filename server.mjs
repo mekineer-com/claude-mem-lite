@@ -105,9 +105,22 @@ const RECENCY_HALF_LIFE_MS = DEFAULT_DECAY_HALF_LIFE_MS;
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
+// Emit one-line instructions-mode trace on stderr so debugging the "why did
+// the server send BASE instead of BASE+VERBOSE?" path doesn't require reading
+// three files (server.mjs → hook-shared.mjs → memdir.mjs). CLAUDE_MEM_QUIET_TRACE=0
+// opts out. stderr doesn't pollute the MCP stdio protocol channel.
+const _quiet = effectiveQuiet();
+if (process.env.CLAUDE_MEM_QUIET_TRACE !== '0') {
+  const reason = process.env.MEM_QUIET_HOOKS === '1'
+    ? 'env:MEM_QUIET_HOOKS=1'
+    : _quiet ? 'adopted:MEMORY.md-sentinel' : 'none';
+  const mode = _quiet ? 'BASE' : 'BASE+VERBOSE';
+  process.stderr.write(`[mem] instructions: ${mode} reason=${reason}\n`);
+}
+
 const server = new McpServer(
   { name: 'claude-mem-lite', version: PKG_VERSION },
-  { instructions: buildServerInstructions(effectiveQuiet()) },
+  { instructions: buildServerInstructions(_quiet) },
 );
 
 // Track MCP request activity for idle-time cleanup (see idle timer below)
