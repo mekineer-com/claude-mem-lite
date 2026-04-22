@@ -275,7 +275,9 @@ export const tools = [
       '  - A mem_search hit looks relevant and you need the supporting detail\n' +
       '  - For session (S#) or prompt (P#) hits, pass source="session" or "prompt"\n' +
       '\n' +
-      'Equivalent CLI: claude-mem-lite get <id>[,<id>,...]',
+      'On miss, response includes "Try: …" hint listing other sources the ID lives in.\n' +
+      '\n' +
+      'Equivalent CLI: claude-mem-lite get <id>[,<id>,...] — accepts P#/S#/# prefix.',
     inputSchema: memGetSchema,
   },
   {

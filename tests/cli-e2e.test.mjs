@@ -279,7 +279,7 @@ describe('CLI E2E: get', () => {
 
   it('handles non-existent ID gracefully', () => {
     const { stderr } = runCli(['get', '999999']);
-    expect(stderr).toContain('No observations found');
+    expect(stderr).toMatch(/No records found.*\[obs\]/);
   });
 });
 

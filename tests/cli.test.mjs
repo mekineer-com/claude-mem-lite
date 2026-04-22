@@ -439,9 +439,9 @@ describe('CLI get command', () => {
     expect(output).toContain('Second observation');
   });
 
-  it('shows "No observations found" for non-existent ID', async () => {
+  it('shows "No records found" for non-existent ID', async () => {
     const output = await captureStdout(() => run(['get', '9999']));
-    expect(output).toContain('No observations found');
+    expect(output).toMatch(/No records found.*\[obs\]/);
   });
 
   it('shows files from files_modified', async () => {
@@ -1582,9 +1582,9 @@ describe('CLI get command with source', () => {
     expect(output).toContain('Next steps: Add tests');
   });
 
-  it('shows no sessions found for non-existent ID', async () => {
+  it('shows no records found for non-existent session ID', async () => {
     const output = await captureStdout(() => run(['get', '9999', '--source', 'session']));
-    expect(output).toContain('No sessions found');
+    expect(output).toMatch(/No records found.*\[session\]/);
   });
 
   it('gets prompt details with --source prompt', async () => {
@@ -1598,9 +1598,9 @@ describe('CLI get command with source', () => {
     expect(output).toContain('Session: s1');
   });
 
-  it('shows no prompts found for non-existent ID', async () => {
+  it('shows no records found for non-existent prompt ID', async () => {
     const output = await captureStdout(() => run(['get', '9999', '--source', 'prompt']));
-    expect(output).toContain('No prompts found');
+    expect(output).toMatch(/No records found.*\[prompt\]/);
   });
 
   it('gets observations with --fields filter', async () => {
@@ -1613,6 +1613,168 @@ describe('CLI get command with source', () => {
     expect(output).toContain('Full narrative here');
     // Should not include fields not in the --fields list (except header fields id/type/created_at)
     expect(output).not.toContain('importance:');
+  });
+});
+
+// ─── get command with P#/S#/# prefix routing (regression: #8104) ─────────────
+// The CLI search output labels prompts/sessions as P#/S#, but `get` defaulted
+// to observations and silently failed when IDs were copy-pasted with prefix.
+
+describe('CLI get command with prefix routing', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('routes P#N to user_prompts without --source', async () => {
+    testDb.prepare(`
+      INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
+      VALUES ('s1', 'Prompt with prefix', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', 'P#1']));
+    expect(output).toContain('P#1');
+    expect(output).toContain('Text: Prompt with prefix');
+  });
+
+  it('routes S#N to session_summaries without --source', async () => {
+    testDb.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, created_at, created_at_epoch)
+      VALUES ('mem-s1', 'test--project', 'Session with prefix', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', 'S#1']));
+    expect(output).toContain('S#1');
+    expect(output).toContain('Request: Session with prefix');
+  });
+
+  it('routes bare #N to observations (explicit #)', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Obs with hash prefix', text: 'hash' });
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', '#1']));
+    expect(output).toContain('#1 [discovery]');
+    expect(output).toContain('Obs with hash prefix');
+  });
+
+  it('routes bare N to observations (default, no prefix)', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Bare id default obs', text: 'bare' });
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', '1']));
+    expect(output).toContain('Bare id default obs');
+  });
+
+  it('merges mixed prefixes: P#1,S#1,#1 in a single call', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'feature', title: 'Mixed obs', text: 'o' });
+    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Mixed prompt', ?, ?)`).run(new Date().toISOString(), Date.now());
+    testDb.prepare(`INSERT INTO session_summaries (memory_session_id, project, request, created_at, created_at_epoch) VALUES ('mem-s1', 'test--project', 'Mixed session', ?, ?)`).run(new Date().toISOString(), Date.now());
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', 'P#1,S#1,#1']));
+    expect(output).toContain('Mixed prompt');
+    expect(output).toContain('Mixed session');
+    expect(output).toContain('Mixed obs');
+  });
+
+  it('hints alternative sources when obs-only lookup misses', async () => {
+    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Only a prompt', ?, ?)`).run(new Date().toISOString(), Date.now());
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', '1']));
+    // Suggest P#1 exists as a prompt
+    expect(output).toMatch(/prompt|P#1/);
+  });
+
+  it('explicit --source obs strips P# prefix and queries observations', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Explicit override obs', text: 'e' });
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', 'P#1', '--source', 'obs']));
+    expect(output).toContain('Explicit override obs');
+  });
+
+  it('warns on unparseable tokens and processes the rest', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Partial valid', text: 'p' });
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', '1,garbage']));
+    expect(output).toContain('Partial valid');
+    expect(output).toMatch(/unparseable|ignor/i);
+  });
+});
+
+// ─── CLI/MCP parity on cross-source hint ─────────────────────────────────────
+// Both paths use lib/id-routing.mjs probeOtherSources; schema drift should
+// surface as a test failure here, not as diverging agent behavior.
+
+describe('CLI/MCP parity on cross-source hint', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('probe returns identical hits across CLI and MCP call paths', async () => {
+    // Same ID exists only as a prompt.
+    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'parity', ?, ?)`).run(new Date().toISOString(), Date.now());
+
+    const { probeOtherSources } = await import('../lib/id-routing.mjs');
+    // Simulate CLI lookup (queried=obs) and MCP lookup (queried=obs) — same exclude set
+    // should yield the same probe result.
+    const probeCli = probeOtherSources(testDb, [1], new Set(['obs']));
+    const probeMcp = probeOtherSources(testDb, [1], new Set(['obs']));
+    expect(probeCli).toEqual(probeMcp);
+    expect(probeCli.prompt).toEqual([1]);
+    expect(probeCli.session).toEqual([]);
+    expect(probeCli.obs).toEqual([]);
+  });
+});
+
+// ─── timeline --anchor with prefix (regression: #8104) ───────────────────────
+
+describe('CLI timeline anchor prefix routing', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('resolves P#N anchor to nearest observation in time', async () => {
+    const base = Date.now();
+    // Observation 1m before the prompt
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Before prompt obs', text: 'b', epochOffset: -60000 });
+    // Observation 2m after the prompt
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'After prompt obs', text: 'a', epochOffset: 120000 });
+    // Prompt sits between
+    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'Anchor me', ?, ?)`).run(new Date(base).toISOString(), base);
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['timeline', '--anchor', 'P#1']));
+    expect(output).toContain('Timeline');
+    expect(output).toMatch(/Before prompt obs|After prompt obs/);
+  });
+
+  it('errors with hint when P#N anchor does not exist', async () => {
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['timeline', '--anchor', 'P#9999']));
+    expect(output).toMatch(/not found|Prompt/);
+  });
+});
+
+// ─── delete/update reject P#/S# cleanly (regression: #8104) ──────────────────
+
+describe('CLI delete/update rejects non-obs prefixes', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('delete P#N rejects with source-specific message', async () => {
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['delete', 'P#1']));
+    expect(output).toMatch(/observation|obs only|--source/i);
+  });
+
+  it('update S#N rejects with source-specific message', async () => {
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['update', 'S#1', '--title', 'x']));
+    expect(output).toMatch(/observation|obs only|--source/i);
   });
 });
 

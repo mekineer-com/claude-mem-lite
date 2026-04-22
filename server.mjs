@@ -27,6 +27,7 @@ import { basename, join } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
+import { probeOtherSources as probeIdSources } from './lib/id-routing.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { createRequire } from 'module';
 
@@ -898,17 +899,14 @@ server.registerTool(
     }
 
     if (rows.length === 0) {
-      // P2-7: for source=session/prompt, check whether the IDs exist as observations so the
-      // caller can switch source instead of chasing a phantom miss.
-      let hint = '';
-      if (source === 'session' || source === 'prompt') {
-        try {
-          const obsHits = db.prepare(`SELECT id FROM observations WHERE id IN (${placeholders})`).all(...args.ids);
-          if (obsHits.length > 0) {
-            hint = ` These ID(s) exist as observations: ${obsHits.map(r => r.id).join(', ')}. Try source='obs'.`;
-          }
-        } catch { /* best-effort hint */ }
-      }
+      // Symmetric probe via shared lib/id-routing.mjs so CLI cmdGet and MCP mem_get
+      // stay aligned if a table's ID semantics change.
+      const probe = probeIdSources(db, args.ids, new Set([source]));
+      const hints = [];
+      if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs — use source='obs')`);
+      if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session — use source='session')`);
+      if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt — use source='prompt')`);
+      const hint = hints.length > 0 ? ` Try: ${hints.join('; ')}.` : '';
       const msg = `No ${sourceLabel} found for given IDs.${hint}`;
       return { content: [{ type: 'text', text: fieldsNote ? `${msg}\n\n${fieldsNote}` : msg }] };
     }

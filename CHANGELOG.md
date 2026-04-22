@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.38.0] - 2026-04-23
+
+**Prefix-aware ID routing in CLI `get` / `timeline`.** `search` output labels records as `#N` (obs), `P#N` (prompt), `S#N` (session), but `get` defaulted to observations and silently returned "No observations found" when IDs were copy-pasted with prefix — a real session logged 10 failed `claude-mem-lite get` calls to recover 2 records that a single `git log` would have produced. Root cause: "display namespace ≠ query namespace." This release closes that gap end-to-end.
+
+### Added
+
+- **`lib/id-routing.mjs::probeOtherSources(db, ids, excludeSrcs)`** — shared cross-source probe used by CLI `cmdGet` and MCP `mem_get`. When a lookup misses in one source, the probe checks the other two so the response can hint `Try: #1 (obs); P#5 (prompt)` instead of dead-ending. Single SQL layer keeps CLI and MCP from drifting; formatting stays per-call-site.
+- **CLI `get` prefix routing** (`mem-cli.mjs::parseIdToken`) — `get P#N` / `get S#N` / `get #N` / `get N` each route to the right table. Mixed prefixes in one call (`get P#1,S#1,#1`) split by source and merge output.
+- **CLI `timeline --anchor` prefix routing** — `timeline --anchor P#N` / `S#N` resolve to the nearest-in-time observation (same project when `--project` given); header annotates the conversion: `Timeline around #8103 (anchored to #8103, closest obs to P#5419)`.
+- **CLI `delete` / `update` explicit rejection of P#/S#** — previously `parseInt('P#5419')` returned `NaN` and the token was silently dropped into "No valid IDs." Now the command fails loudly: `delete only works on observations. Rejected: P#5419. Prompts and sessions are append-only — inspect with \`mem get P#N --source prompt\` / \`--source session\`.`
+- **13 new test cases** in `tests/cli.test.mjs` covering prefix routing, multi-source merge, cross-source hint on miss, `--source` override stripping prefixes, unparseable token warnings, timeline P# anchor resolution, delete/update rejection, and a CLI↔MCP parity assertion on `probeOtherSources`.
+
+### Changed
+
+- **MCP `mem_get` symmetric miss-hint** (`server.mjs`) — before, only `source=session/prompt` returning empty would hint `Try source='obs'`. Now symmetric: `source=obs` with an ID that lives in `session_summaries` or `user_prompts` emits the corresponding hint. Both CLI and MCP route through `lib/id-routing.mjs`, so schema drift surfaces as a failing parity test, not as diverging agent behavior.
+- **`mem get --help`** documents the prefix syntax and the `--source` override semantics inline. `mem_get` tool description mentions the `Try: …` hint so LLM callers know to look for it instead of making a second guess.
+- **CLI miss-error wording** — old: `No observations found for given IDs`. New: `No records found in source(s) [obs] for the given ID(s). Try: P#5419 (prompt).` Cites the queried source set so ambiguity about what was actually tried disappears.
+
+### Fixed
+
+- Real-DB repro from the originating session: `get P#5419` → previously `No observations found` (misleading — the prompt exists), now returns the prompt text directly. `get 5419` without prefix → previously `No observations found`, now hints `Try: P#5419 (prompt).` The 10-call failure loop collapses to 2 calls.
+
 ## [2.37.0] - 2026-04-23
 
 **Injection-noise penalty (P0 of integration audit).** Diagnostic on 30d projects--mem transcripts measured inject-recall at 13.6% (116/850 unique injected IDs ever cited) while inject occurrences hit 2561/30d (~48/session) — oversaturation, not "Claude ignores lessons". This release adds a per-observation noise-ratio penalty that deprioritizes obs auto-injected often but rarely opened/cited.

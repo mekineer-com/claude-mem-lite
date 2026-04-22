@@ -15,6 +15,7 @@ import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
+import { probeOtherSources as probeIdSources } from './lib/id-routing.mjs';
 import { basename } from 'path';
 import { readFileSync } from 'fs';
 
@@ -75,6 +76,30 @@ function relativeTime(epochMs) {
 function fmtDateShort(iso) {
   if (!iso) return '';
   return iso.slice(0, 10); // YYYY-MM-DD
+}
+
+// Parse an ID token from a command positional argument.
+// Accepts: `123`, `#123`, `P#123` / `p123` (prompt), `S#123` / `s123` (session).
+// Returns { source: 'obs'|'session'|'prompt'|null, id: number } or null if unparseable.
+// source===null means no explicit prefix — caller picks default (typically 'obs').
+function parseIdToken(raw) {
+  const m = /^([PpSs]?)#?(\d+)$/.exec(String(raw).trim());
+  if (!m) return null;
+  const p = m[1].toUpperCase();
+  const id = parseInt(m[2], 10);
+  if (!Number.isFinite(id) || id <= 0) return null;
+  const source = p === 'P' ? 'prompt' : p === 'S' ? 'session' : null;
+  return { source, id };
+}
+
+// Format the shared `probeIdSources` output as CLI hint strings.
+// Example: ["#5419 (obs)", "P#5417 (prompt)"] — callers join with "; ".
+function formatProbeHints(probe) {
+  const hints = [];
+  if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs)`);
+  if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session)`);
+  if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt)`);
+  return hints;
 }
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -571,57 +596,107 @@ function cmdRecall(db, args) {
   }
 }
 
+const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
+
+function renderObsRows(db, ids, requestedFields) {
+  const placeholders = ids.map(() => '?').join(',');
+  try {
+    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
+    autoBoostIfNeeded(db, ids);
+  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
+
+  const rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  if (rows.length === 0) return null;
+  const fields = requestedFields || OBS_FIELDS;
+  const parts = [];
+  for (const r of rows) {
+    const lines = [`#${r.id} [${r.type}] ${fmtDateShort(r.created_at)}`];
+    for (const f of fields) {
+      if (f === 'id' || f === 'type' || f === 'created_at') continue;
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      if (f === 'text' && r.narrative && typeof val === 'string' && val.startsWith(r.narrative)) continue;
+      const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
+      const display = typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
+      lines.push(`${f}: ${display}`);
+    }
+    parts.push(lines.join('\n'));
+  }
+  return { text: parts.join('\n\n'), count: rows.length };
+}
+
+function renderSessionRows(db, ids) {
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  if (rows.length === 0) return null;
+  const parts = [];
+  for (const r of rows) {
+    const lines = [`S#${r.id} ${fmtDateShort(r.created_at)}`];
+    if (r.request) lines.push(`Request: ${r.request}`);
+    if (r.completed) lines.push(`Completed: ${r.completed}`);
+    if (r.investigated) lines.push(`Investigated: ${r.investigated}`);
+    if (r.learned) lines.push(`Learned: ${r.learned}`);
+    if (r.next_steps) lines.push(`Next steps: ${r.next_steps}`);
+    if (r.project) lines.push(`Project: ${r.project}`);
+    parts.push(lines.join('\n'));
+  }
+  return { text: parts.join('\n\n'), count: rows.length };
+}
+
+function renderPromptRows(db, ids) {
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  if (rows.length === 0) return null;
+  const parts = [];
+  for (const r of rows) {
+    const lines = [`P#${r.id} ${fmtDateShort(r.created_at)}`];
+    if (r.prompt_text) lines.push(`Text: ${r.prompt_text}`);
+    if (r.content_session_id) lines.push(`Session: ${r.content_session_id}`);
+    parts.push(lines.join('\n'));
+  }
+  return { text: parts.join('\n\n'), count: rows.length };
+}
+
 function cmdGet(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    fail('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]');
+    fail('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]\n' +
+         '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session).');
     return;
   }
 
-  const ids = idStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
-  if (ids.length === 0) {
+  const tokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
+  const unparseable = [];
+  const parsed = [];
+  for (const t of tokens) {
+    const p = parseIdToken(t);
+    if (p) parsed.push(p);
+    else unparseable.push(t);
+  }
+  if (unparseable.length > 0) {
+    process.stderr.write(`[mem] Ignoring unparseable ID token(s): ${unparseable.join(', ')}\n`);
+  }
+  if (parsed.length === 0) {
     fail('[mem] No valid IDs provided');
     return;
   }
 
-  const source = flags.source || 'obs';
-  const placeholders = ids.map(() => '?').join(',');
-
-  if (source === 'session') {
-    const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
-    if (rows.length === 0) { fail('[mem] No sessions found for given IDs'); return; }
-    const parts = [];
-    for (const r of rows) {
-      const lines = [`S#${r.id} ${fmtDateShort(r.created_at)}`];
-      if (r.request) lines.push(`Request: ${r.request}`);
-      if (r.completed) lines.push(`Completed: ${r.completed}`);
-      if (r.investigated) lines.push(`Investigated: ${r.investigated}`);
-      if (r.learned) lines.push(`Learned: ${r.learned}`);
-      if (r.next_steps) lines.push(`Next steps: ${r.next_steps}`);
-      if (r.project) lines.push(`Project: ${r.project}`);
-      parts.push(lines.join('\n'));
-    }
-    out(parts.join('\n\n'));
+  // Explicit --source overrides any prefix; otherwise each token's prefix routes individually.
+  const explicit = flags.source;
+  const validSources = new Set(['obs', 'session', 'prompt']);
+  if (explicit && !validSources.has(explicit)) {
+    fail(`[mem] Invalid --source "${explicit}". Use: obs, session, prompt`);
     return;
   }
 
-  if (source === 'prompt') {
-    const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
-    if (rows.length === 0) { fail('[mem] No prompts found for given IDs'); return; }
-    const parts = [];
-    for (const r of rows) {
-      const lines = [`P#${r.id} ${fmtDateShort(r.created_at)}`];
-      if (r.prompt_text) lines.push(`Text: ${r.prompt_text}`);
-      if (r.content_session_id) lines.push(`Session: ${r.content_session_id}`);
-      parts.push(lines.join('\n'));
-    }
-    out(parts.join('\n\n'));
-    return;
+  const bySrc = { obs: [], session: [], prompt: [] };
+  for (const p of parsed) {
+    const src = explicit || p.source || 'obs';
+    bySrc[src].push(p.id);
   }
 
-  // Default: observations (aligned with MCP mem_get)
-  const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
+  // Validate --fields against obs schema (only meaningful for obs rows).
   let requestedFields = null;
   if (flags.fields) {
     const allRequested = flags.fields.split(',').map(s => s.trim());
@@ -636,49 +711,81 @@ function cmdGet(db, args) {
     }
   }
 
-  // Update access_count + auto-boost (aligned with MCP mem_get)
-  try {
-    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
-    autoBoostIfNeeded(db, ids);
-  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
+  const sections = [];
+  let totalFound = 0;
+  if (bySrc.obs.length > 0) {
+    const s = renderObsRows(db, bySrc.obs, requestedFields);
+    if (s) { sections.push(s.text); totalFound += s.count; }
+  }
+  if (bySrc.session.length > 0) {
+    const s = renderSessionRows(db, bySrc.session);
+    if (s) { sections.push(s.text); totalFound += s.count; }
+  }
+  if (bySrc.prompt.length > 0) {
+    const s = renderPromptRows(db, bySrc.prompt);
+    if (s) { sections.push(s.text); totalFound += s.count; }
+  }
 
-  const rows = db.prepare(`
-    SELECT * FROM observations
-    WHERE id IN (${placeholders})
-    ORDER BY created_at_epoch ASC
-  `).all(...ids);
-
-  if (rows.length === 0) {
-    fail('[mem] No observations found for given IDs');
+  if (totalFound === 0) {
+    // Probe the OTHER sources so the caller can retry with the right prefix.
+    const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
+    const allIds = parsed.map(p => p.id);
+    const probe = probeIdSources(db, allIds, queried);
+    const hits = formatProbeHints(probe);
+    const hint = hits.length > 0 ? ` Try: ${hits.join('; ')}.` : '';
+    const queriedList = [...queried].join(', ');
+    fail(`[mem] No records found in source(s) [${queriedList}] for the given ID(s).${hint}`);
     return;
   }
 
-  const fields = requestedFields || OBS_FIELDS;
-  const parts = [];
-  for (const r of rows) {
-    const lines = [`#${r.id} [${r.type}] ${fmtDateShort(r.created_at)}`];
-    for (const f of fields) {
-      if (f === 'id' || f === 'type' || f === 'created_at') continue; // already in header
-      const val = r[f];
-      if (val === null || val === undefined || val === '') continue;
-      // Skip 'text' field when it duplicates narrative (aligned with MCP mem_get)
-      if (f === 'text' && r.narrative && typeof val === 'string' && val.startsWith(r.narrative)) continue;
-      const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
-      const display = typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
-      lines.push(`${f}: ${display}`);
-    }
-    parts.push(lines.join('\n'));
-  }
-
-  out(parts.join('\n\n'));
+  out(sections.join('\n\n'));
 }
 
 function cmdTimeline(db, args) {
   const { positional, flags } = parseArgs(args);
-  let anchorId = parseInt(flags.anchor, 10);
   const before = parseInt(flags.before, 10) || 5;
   const after = parseInt(flags.after, 10) || 5;
   const project = flags.project ? resolveProject(db, flags.project) : null;
+
+  // Parse --anchor, accepting P#/S#/# prefix so callers can paste search-result IDs verbatim.
+  // For prompt/session anchors, resolve to the nearest-in-time observation so timeline semantics
+  // (before/after observations) still apply.
+  let anchorId = null;
+  let anchorNote = null; // hint line for output when anchor was resolved via conversion
+  if (flags.anchor !== undefined && flags.anchor !== true) {
+    const parsed = parseIdToken(flags.anchor);
+    if (!parsed) {
+      fail(`[mem] Invalid --anchor "${flags.anchor}". Expected N, #N, P#N, or S#N.`);
+      return;
+    }
+    if (parsed.source === 'prompt') {
+      const row = db.prepare('SELECT created_at_epoch FROM user_prompts WHERE id = ?').get(parsed.id);
+      if (!row) { fail(`[mem] Prompt P#${parsed.id} not found`); return; }
+      const proj = project;
+      const nearest = db.prepare(`
+        SELECT id FROM observations
+        WHERE COALESCE(compressed_into, 0) = 0 ${proj ? 'AND project = ?' : ''}
+        ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
+      `).get(...(proj ? [proj, row.created_at_epoch] : [row.created_at_epoch]));
+      if (!nearest) { fail(`[mem] No observations near P#${parsed.id}`); return; }
+      anchorId = nearest.id;
+      anchorNote = `(anchored to #${nearest.id}, closest obs to P#${parsed.id})`;
+    } else if (parsed.source === 'session') {
+      const row = db.prepare('SELECT created_at_epoch FROM session_summaries WHERE id = ?').get(parsed.id);
+      if (!row) { fail(`[mem] Session S#${parsed.id} not found`); return; }
+      const proj = project;
+      const nearest = db.prepare(`
+        SELECT id FROM observations
+        WHERE COALESCE(compressed_into, 0) = 0 ${proj ? 'AND project = ?' : ''}
+        ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
+      `).get(...(proj ? [proj, row.created_at_epoch] : [row.created_at_epoch]));
+      if (!nearest) { fail(`[mem] No observations near S#${parsed.id}`); return; }
+      anchorId = nearest.id;
+      anchorNote = `(anchored to #${nearest.id}, closest obs to S#${parsed.id})`;
+    } else {
+      anchorId = parsed.id;
+    }
+  }
 
   // Support query-based anchor: `timeline --query "search terms"` or positional
   // Uses recency-weighted BM25 + project filter (aligned with MCP mem_timeline)
@@ -773,7 +880,7 @@ function cmdTimeline(db, args) {
 
   const all = [...beforeRows.reverse(), anchor, ...afterRows];
 
-  out(`[mem] Timeline around #${anchorId}:`);
+  out(`[mem] Timeline around #${anchorId}${anchorNote ? ' ' + anchorNote : ''}:`);
   for (const r of all) {
     const marker = r.id === anchorId ? ' <--' : '';
     const time = relativeTime(r.created_at_epoch);
@@ -1162,7 +1269,19 @@ function cmdDelete(db, args) {
     return;
   }
 
-  const ids = idStr.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+  // delete operates on observations only. Reject P#/S# explicitly so callers aren't
+  // surprised by silent NaN filtering when they paste search-output IDs.
+  const tokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
+  const nonObs = tokens.filter(t => /^[PpSs]#?\d+$/.test(t));
+  if (nonObs.length > 0) {
+    fail(`[mem] delete only works on observations. Rejected: ${nonObs.join(', ')}. ` +
+         `Prompts and sessions are append-only — inspect with \`mem get P#N --source prompt\` / \`--source session\`.`);
+    return;
+  }
+  const ids = tokens.map(t => {
+    const p = parseIdToken(t);
+    return p && p.source === null ? p.id : NaN;
+  }).filter(n => !isNaN(n));
   if (ids.length === 0) {
     fail('[mem] No valid IDs provided');
     return;
@@ -1215,7 +1334,14 @@ function cmdDelete(db, args) {
 
 function cmdUpdate(db, args) {
   const { positional, flags } = parseArgs(args);
-  const id = parseInt(positional[0], 10);
+  const raw = positional[0];
+  if (raw && /^[PpSs]#?\d+$/.test(String(raw).trim())) {
+    fail(`[mem] update only works on observations. Rejected: ${raw}. ` +
+         `Prompts and sessions are append-only.`);
+    return;
+  }
+  const parsed = raw ? parseIdToken(raw) : null;
+  const id = parsed && parsed.source === null ? parsed.id : parseInt(raw, 10);
   if (!id || isNaN(id)) {
     fail('[mem] Usage: mem update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
     return;
@@ -1919,11 +2045,14 @@ Commands:
     --limit N           Max results (default 10)
 
   get <id1,id2,...>     Get full details by ID
-    --source S          Record type: obs (default), session, prompt
-    --fields f1,f2,...  Select specific fields to return
+    IDs accept search-output prefixes: #123 (obs), P#123 (prompt), S#123 (session).
+    Bare N defaults to obs. Mixed prefixes in one call route each token correctly.
+    --source S          Force record type (obs|session|prompt); overrides prefixes.
+    --fields f1,f2,...  Select specific fields to return (observations only).
 
   timeline              Show observations around an anchor (shows recent if no anchor)
-    --anchor ID         Center on this observation ID
+    --anchor ID         Center on this ID. Accepts N, #N, P#N, or S#N — P#/S# anchors
+                        resolve to the nearest-in-time observation in the same project.
     --query "text"      Find anchor by FTS5 search
     --before N          Show N before anchor (default 5)
     --after N           Show N after anchor (default 5)

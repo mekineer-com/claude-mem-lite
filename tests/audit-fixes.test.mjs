@@ -300,8 +300,9 @@ describe('MCP audit fixes (stdio)', () => {
     const resp = await callTool('mem_get', { ids: [1], source: 'session' });
     const text = resp.result?.content?.[0]?.text || '';
     expect(text).toMatch(/No sessions found/);
-    expect(text).toMatch(/exist as observations: 1/);
-    expect(text).toMatch(/Try source='obs'/);
+    // New symmetric hint format via lib/id-routing.mjs: "Try: #1 (obs — use source='obs')".
+    expect(text).toMatch(/#1.*\(obs/);
+    expect(text).toMatch(/source='obs'/);
   });
 
   it('P2-7: mem_get source=session with a truly missing ID omits the hint', async () => {
@@ -309,7 +310,7 @@ describe('MCP audit fixes (stdio)', () => {
     const resp = await callTool('mem_get', { ids: [999999], source: 'session' });
     const text = resp.result?.content?.[0]?.text || '';
     expect(text).toMatch(/No sessions found/);
-    expect(text).not.toMatch(/Try source='obs'/);
+    expect(text).not.toMatch(/Try:/);
   });
 });
 
