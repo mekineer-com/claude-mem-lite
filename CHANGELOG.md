@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [Unreleased]
+
+**Write-side signal quality (P0-P4).** Diagnostic on projects--mem 30d data found 52% of observations were LOW_SIGNAL auto-titles (`Modified X`, `Error:`, `Worked on`) with empty facts / null lesson — noise that inflates the FTS index and crowds recall. This release blocks them at insert time.
+
+### Added
+
+- **`lib/low-signal-patterns.mjs::isNoiseObservation()`** — write-side filter called from `hook-llm.mjs:saveObservation`. Drops observations where title matches LOW_SIGNAL pattern AND no downstream signal (no lesson, importance<2, empty facts, narrative <40 chars / raw stderr). Expected impact on projects--mem: 30d low-signal drops 164 → ~40-60.
+- **`CLAUDE_MEM_KEEP_LOW_SIGNAL=1`** env var — opt-out flag that preserves pre-v2.36 insert-everything behavior. For users who want to audit hook capture end-to-end without the filter.
+
+### Migration
+
+- Degraded fallback saves (`Modified X`, `Error: X` with no substantive facts/lesson) are now dropped at the hook. Haiku-enriched observations are unaffected. To revert: `export CLAUDE_MEM_KEEP_LOW_SIGNAL=1`.
+
 ## [2.35.0] - 2026-04-23
 
 **CLI↔MCP parity + doctor dev-drift detection + injection quality treatments.** Bundles 5 commits since v2.34.6 across three themes: MCP/CLI feature parity, doctor diagnostics, and injection-side quality filtering.

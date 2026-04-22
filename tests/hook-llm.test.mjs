@@ -267,7 +267,10 @@ describe('handleLLMEpisode', () => {
     expect(ev.length).toBe(1);
   });
 
-  it('uses degraded fallback when LLM slot unavailable', async () => {
+  it('P0: degraded fallback drops pure-noise episode (LOW_SIGNAL title + no signal)', async () => {
+    // v2.36: P0 write-side filter blocks low-signal pre-save/fallback inserts.
+    // A bare Edit episode produces "Modified app.mjs" (LOW_SIGNAL) with no facts
+    // and no lesson — isNoiseObservation() drops it before saveObservation inserts.
     acquireLLMSlot.mockResolvedValueOnce(false);
 
     const episode = {
@@ -280,10 +283,29 @@ describe('handleLLMEpisode', () => {
     await handleLLMEpisode();
 
     const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
-    expect(obs.length).toBe(1);
-    // buildDegradedTitle uses file-centric summary: "Modified app.mjs"
-    expect(obs[0].title).toBe('Modified app.mjs');
-    expect(obs[0].type).toBe('change');
+    expect(obs.length).toBe(0);
+  });
+
+  it('P0 opt-out: CLAUDE_MEM_KEEP_LOW_SIGNAL=1 preserves pre-v2.36 fallback save', async () => {
+    vi.stubEnv('CLAUDE_MEM_KEEP_LOW_SIGNAL', '1');
+    acquireLLMSlot.mockResolvedValueOnce(false);
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['app.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Update configuration', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    try {
+      await handleLLMEpisode();
+      const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all('ep-sess');
+      expect(obs.length).toBe(1);
+      expect(obs[0].title).toBe('Modified app.mjs');
+      expect(obs[0].type).toBe('change');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('infers bugfix type in fallback when entry has error (routes to events)', async () => {
@@ -431,9 +453,11 @@ describe('handleLLMEpisode', () => {
     // Pre-save a rule-based observation (simulating what flushEpisode does).
     // Default mock returns type='feature' → EVENT_TYPE → pre-saved observations
     // row must be DELETED and a fresh event inserted.
+    // v2.36 P0: pre-save uses importance=2 to simulate a rule-signal episode
+    // (e.g. error-in-test / config-change) so isNoiseObservation does NOT block.
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
     const preSavedId = saveObservation(
-      { type: 'change', title: 'Modified auth.mjs', narrative: 'Edit auth.mjs', importance: 1 },
+      { type: 'change', title: 'Modified auth.mjs', narrative: 'Edit auth.mjs', importance: 2 },
       'test-proj', 'ep-sess', db
     );
     expect(preSavedId).toBeGreaterThan(0);
@@ -478,9 +502,10 @@ describe('handleLLMEpisode', () => {
       lesson_learned: 'Loader extraction clarifies config-path resolution order.',
     }));
 
+    // v2.36 P0: importance=2 bypasses isNoiseObservation so pre-save lands.
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
     const preSavedId = saveObservation(
-      { type: 'change', title: 'Modified config.mjs', narrative: 'Edit config', importance: 1 },
+      { type: 'change', title: 'Modified config.mjs', narrative: 'Edit config', importance: 2 },
       'test-proj', 'ep-sess', db
     );
     expect(preSavedId).toBeGreaterThan(0);
@@ -508,9 +533,10 @@ describe('handleLLMEpisode', () => {
   it('keeps pre-saved observation when LLM fails and savedId present', async () => {
     acquireLLMSlot.mockResolvedValueOnce(false);
 
+    // v2.36 P0: importance=2 bypasses isNoiseObservation so pre-save lands.
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
     const preSavedId = saveObservation(
-      { type: 'change', title: 'Modified app.mjs', narrative: 'Quick edit', importance: 1 },
+      { type: 'change', title: 'Modified app.mjs', narrative: 'Quick edit', importance: 2 },
       'test-proj', 'ep-sess', db
     );
 
@@ -526,7 +552,7 @@ describe('handleLLMEpisode', () => {
     // Pre-saved observation should remain unchanged
     const obs = db.prepare('SELECT * FROM observations WHERE id = ?').get(preSavedId);
     expect(obs.title).toBe('Modified app.mjs');
-    expect(obs.importance).toBe(1);
+    expect(obs.importance).toBe(2);
 
     // No duplicate observations
     const allObs = db.prepare('SELECT COUNT(*) as c FROM observations WHERE memory_session_id = ?').get('ep-sess');

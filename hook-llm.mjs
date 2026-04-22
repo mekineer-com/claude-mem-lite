@@ -16,6 +16,7 @@ import {
   sessionFile, getSessionId, openDb, callLLM, sleep,
 } from './hook-shared.mjs';
 import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
+import { isNoiseObservation } from './lib/low-signal-patterns.mjs';
 
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
@@ -68,6 +69,14 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
       VALUES (?, ?, ?, ?, ?, 'active')
     `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+
+    // P0: write-side noise block — LOW_SIGNAL title with no recoverable signal
+    // (no lesson, importance<2, empty facts, thin narrative) is dropped before
+    // dedup/MinHash/vector work. Opt-out: CLAUDE_MEM_KEEP_LOW_SIGNAL=1.
+    if (isNoiseObservation(obs)) {
+      debugLog('saveObservation', `dropped noise: ${truncate(obs.title || '', 60)}`);
+      return null;
+    }
 
     // Three-tier dedup — returns null (not throw) for dedup hits
     // Tier 1 (fast): 5-min Jaccard on titles

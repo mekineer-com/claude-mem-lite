@@ -504,7 +504,8 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
     expect(obs[0].narrative).toContain('Mock narrative');
   });
 
-  it('llm-episode with LLM failure saves degraded observation', () => {
+  it('P0: llm-episode with LLM failure drops low-signal degraded episode', () => {
+    // v2.36: isNoiseObservation() blocks "Modified broken.js" fallback at insert.
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
 
@@ -528,19 +529,58 @@ describe('Suite 3: LLM Episode Processing', { retry: 2 }, () => {
       filesRead: [],
     }));
 
-    // Use a mock that returns garbage (non-existent script → callLLM returns null)
     const { exitCode } = runHook('llm-episode', {
       env: { HOME: tmpHome, CLAUDE_CODE_PATH: '/dev/null', CLAUDE_MEM_NO_DELAY: '1' },
       args: [flushFile],
     });
     expect(exitCode).toBe(0);
 
-    // Degraded observation should still be saved
+    // P0 drops the low-signal fallback — 0 obs for pure-Edit noise episodes.
+    const db = openTestDb(tmpHome);
+    const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all(sessionId);
+    db.close();
+    expect(obs.length).toBe(0);
+  });
+
+  it('P0 opt-out: CLAUDE_MEM_KEEP_LOW_SIGNAL=1 preserves pre-v2.36 degraded save', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+
+    const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
+    const flushFile = join(runtimeDir, `ep-flush-${Date.now()}-bad.json`);
+    writeFileSync(flushFile, JSON.stringify({
+      sessionId,
+      project: 'parent--testproj',
+      startedAt: Date.now() - 5000,
+      lastAt: Date.now(),
+      files: ['/tmp/src/broken.js'],
+      entries: [{
+        tool: 'Edit',
+        desc: 'broken.js: fixed syntax error',
+        files: ['/tmp/src/broken.js'],
+        ts: Date.now(),
+        isError: false,
+        isSignificant: true,
+        bashSig: null,
+      }],
+      filesRead: [],
+    }));
+
+    const { exitCode } = runHook('llm-episode', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_CODE_PATH: '/dev/null',
+        CLAUDE_MEM_NO_DELAY: '1',
+        CLAUDE_MEM_KEEP_LOW_SIGNAL: '1',
+      },
+      args: [flushFile],
+    });
+    expect(exitCode).toBe(0);
+
     const db = openTestDb(tmpHome);
     const obs = db.prepare('SELECT * FROM observations WHERE memory_session_id = ?').all(sessionId);
     db.close();
     expect(obs.length).toBe(1);
-    // Degraded: uses first entry desc as title
     expect(obs[0].title).toContain('broken.js');
     expect(obs[0].type).toBe('change');
   });
