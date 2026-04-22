@@ -224,6 +224,154 @@ describe('handleLLMEpisode', () => {
     vi.clearAllMocks();
   });
 
+  it('P3: bugfix with null lesson retries and merges substantive lesson', async () => {
+    // First pass returns type='bugfix' but lesson_learned=null.
+    // P3 retry fires and recovers a real lesson. Observation saved (to events
+    // table since bugfix is EVENT_TYPE) carries the retry lesson.
+    callLLM
+      .mockReturnValueOnce(JSON.stringify({
+        type: 'bugfix',
+        title: 'Fixed FTS corruption on access_count UPDATE',
+        narrative: 'Wrapped in try/catch to prevent cascade',
+        concepts: ['fts5'],
+        facts: ['observations_au trigger re-inserts FTS row on any UPDATE'],
+        importance: 2,
+        lesson_learned: 'none',
+      }))
+      .mockReturnValueOnce(JSON.stringify({
+        lesson: 'FTS5 trigger fires on ANY column UPDATE including access_count — wrap writes in try/catch so SQLITE_CORRUPT_VTAB does not cascade.',
+      }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['schema.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Wrap FTS update in try/catch', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    // bugfix lands in events (EVENT_TYPE). Body carries the retry lesson.
+    const ev = db.prepare(`SELECT * FROM events WHERE project = ?`).all('test-proj');
+    expect(ev.length).toBe(1);
+    expect(ev[0].event_type).toBe('bugfix');
+    expect(ev[0].body).toContain('FTS5 trigger fires on ANY column UPDATE');
+    // callLLM was called exactly twice (initial + retry)
+    expect(callLLM.mock.calls.length).toBe(2);
+  });
+
+  it('P3: decision with null lesson retries', async () => {
+    callLLM
+      .mockReturnValueOnce(JSON.stringify({
+        type: 'decision',
+        title: 'Rejected schema migration for signal filter',
+        narrative: 'Went with pure-data module + CI sync test instead',
+        concepts: ['schema'],
+        facts: [],
+        importance: 2,
+        lesson_learned: '',
+      }))
+      .mockReturnValueOnce(JSON.stringify({
+        lesson: 'Before schema migration, measure drift points — 1 inline call site, not 4 — pure-data module avoids DB touch.',
+      }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['lib/low-signal.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Add isNoiseObservation helper', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const ev = db.prepare(`SELECT * FROM events WHERE project = ? AND event_type = ?`).all('test-proj', 'decision');
+    expect(ev.length).toBe(1);
+    expect(ev[0].body).toContain('Before schema migration');
+    expect(callLLM.mock.calls.length).toBe(2);
+  });
+
+  it('P3: change type does NOT trigger lesson retry (scoped to bugfix/decision)', async () => {
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change',
+      title: 'Refactored config loading',
+      narrative: 'Extracted env parsing into loader',
+      concepts: ['config'],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'none',
+    }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Refactor config', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    // Only 1 callLLM call — no retry for 'change'
+    expect(callLLM.mock.calls.length).toBe(1);
+  });
+
+  it('P3 opt-out: CLAUDE_MEM_NO_LESSON_RETRY=1 skips retry for bugfix', async () => {
+    vi.stubEnv('CLAUDE_MEM_NO_LESSON_RETRY', '1');
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'bugfix',
+      title: 'Fixed something',
+      narrative: 'Fixed it',
+      concepts: [],
+      facts: [],
+      importance: 2,
+      lesson_learned: 'none',
+    }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['x.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Fix x.mjs', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    try {
+      await handleLLMEpisode();
+      expect(callLLM.mock.calls.length).toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('P3: retry returning "none" leaves lesson null (no false promotion)', async () => {
+    callLLM
+      .mockReturnValueOnce(JSON.stringify({
+        type: 'bugfix',
+        title: 'Routine fix',
+        narrative: 'Mechanical fix',
+        concepts: [],
+        facts: [],
+        importance: 2,
+        lesson_learned: 'none',
+      }))
+      .mockReturnValueOnce(JSON.stringify({ lesson: 'none' }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['y.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Mechanical fix', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const ev = db.prepare(`SELECT * FROM events WHERE project = ? AND event_type = ?`).all('test-proj', 'bugfix');
+    expect(ev.length).toBe(1);
+    // Retry "none" must NOT be promoted to lesson. persistHaikuSummary.body falls
+    // back to narrative when lesson_learned is null — verify body is the narrative.
+    expect(ev[0].body).toBe('Mechanical fix');
+    expect(ev[0].body).not.toContain('none');
+    expect(callLLM.mock.calls.length).toBe(2);
+  });
+
   it('P1: Haiku prompt contains decision-type trigger examples (single-entry)', async () => {
     // v2.36 P1: ensure decision classification guidance reaches the LLM. The
     // trigger string is a prompt-level addition, so the test captures what was

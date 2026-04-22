@@ -473,6 +473,38 @@ export function buildImmediateObservation(episode) {
   };
 }
 
+// ─── Lesson retry prompt (P3) ───────────────────────────────────────────────
+
+/**
+ * Build a lesson-focused retry prompt after Haiku's first pass for
+ * bugfix/decision returned null/empty/'none'. Narrow ask: one non-obvious
+ * insight a future session would benefit from — either root cause (bugfix)
+ * or tradeoff (decision).
+ *
+ * @param {object} episode
+ * @param {object} firstPass — parsed first-pass response (title, type, narrative)
+ * @returns {string} prompt
+ */
+export function buildLessonRetryPrompt(episode, firstPass) {
+  const actionList = episode.entries.map((e, i) =>
+    `${i + 1}. [${e.tool}] ${e.desc}${e.isError ? ' (ERROR)' : ''}`
+  ).join('\n');
+  const typeHint = firstPass.type === 'bugfix'
+    ? 'For this bugfix: what was the root cause + how to spot it next time? Example: "FTS5 trigger fires on any UPDATE — wrap access_count writes in try/catch."'
+    : 'For this decision: what tradeoff was made + why? Example: "Chose single-source module over schema column because 1 drift point, not 4."';
+  return `A ${firstPass.type} episode just completed. First-pass title: "${firstPass.title || 'untitled'}".
+
+Actions:
+${actionList}
+
+${typeHint}
+
+If the work was purely mechanical with no insight worth remembering, reply {"lesson":"none"}.
+Otherwise reply in 12-280 chars.
+
+Reply ONLY valid JSON, no markdown fences: {"lesson":"..."}`;
+}
+
 // ─── Background: LLM Episode Extraction (Tier 2 F) ──────────────────────────
 
 export async function handleLLMEpisode() {
@@ -581,7 +613,31 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
       const rawLesson = typeof parsed.lesson_learned === 'string' ? parsed.lesson_learned.trim() : '';
       const lowSignalLesson = new Set(['none', '', 'n/a', 'null', 'todo', 'tbd', 'na', '-', 'nothing', 'nil']);
       const isLessonLowSignal = lowSignalLesson.has(rawLesson.toLowerCase()) || rawLesson.length < 12;
-      const lessonLearned = isLessonLowSignal ? null : rawLesson.slice(0, 500);
+      let lessonLearned = isLessonLowSignal ? null : rawLesson.slice(0, 500);
+
+      // P3: for bugfix/decision, retry once with a lesson-focused prompt.
+      // These types have the highest reuse value (~72.7% hit-rate vs change
+      // ~16.5%), and Haiku's first pass writes NULL ~70% of the time for
+      // curated observations. Retry budget: 1 extra callLLM per bugfix/decision
+      // episode. Opt-out: CLAUDE_MEM_NO_LESSON_RETRY=1.
+      if (isLessonLowSignal &&
+          (parsed.type === 'bugfix' || parsed.type === 'decision') &&
+          !process.env.CLAUDE_MEM_NO_LESSON_RETRY) {
+        try {
+          const retryPrompt = buildLessonRetryPrompt(episode, parsed);
+          const retryRaw = callLLM(retryPrompt, 10000);
+          if (retryRaw) {
+            const retry = parseJsonFromLLM(retryRaw);
+            const retryLesson = typeof retry?.lesson === 'string' ? retry.lesson.trim() : '';
+            const retryIsLow = lowSignalLesson.has(retryLesson.toLowerCase()) || retryLesson.length < 12;
+            if (!retryIsLow) {
+              lessonLearned = retryLesson.slice(0, 500);
+              debugLog('DEBUG', 'llm-episode', `lesson-retry: recovered ${retryLesson.length}-char lesson for ${parsed.type}`);
+            }
+          }
+        } catch (e) { debugCatch(e, 'lesson-retry'); }
+      }
+
       const searchAliases = Array.isArray(parsed.search_aliases)
         ? parsed.search_aliases.slice(0, 6).join(' ')
         : null;
