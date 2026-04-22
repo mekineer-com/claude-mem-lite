@@ -371,8 +371,9 @@ export function buildDegradedTitle(episode) {
   }
 
   if (files.length > 0) {
-    const names = files.map(f => basename(f)).slice(0, 3).join(', ');
-    const suffix = files.length > 3 ? ` +${files.length - 3} more` : '';
+    const uniqueNames = [...new Set(files.map(f => basename(f)))];
+    const names = uniqueNames.slice(0, 3).join(', ');
+    const suffix = uniqueNames.length > 3 ? ` +${uniqueNames.length - 3} more` : '';
     if (hasError) {
       // Include the triggering command for richer context: "Error: dispatch.mjs — npm test failed"
       const errEntry = episode.entries.find(e => e.isError);
