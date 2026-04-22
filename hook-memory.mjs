@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords } from './utils.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -15,6 +15,43 @@ const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature:
 const BM25_THRESHOLD = { TINY: 0, SMALL: 1.5, MEDIUM: 2.5, LARGE: 3.5 };
 // OR fallback max token count — queries with 3+ tokens that fail AND are likely off-topic
 const OR_FALLBACK_MAX_TOKENS = 2;
+
+// v27: term-coverage post-filter. Drops high-BM25 candidates whose visible
+// fields (title + lesson_learned) cover <N% of the query's significant terms.
+// Catches the failure mode where FTS tokenization reduces a rich query to a
+// sparse token set and rows sharing only one common word get ranked high.
+// Default 0.4 (≥40% term coverage). Env override `MEM_COVERAGE_THRESHOLD` ∈ [0,1];
+// set to 0 to disable entirely.
+const COVERAGE_MIN_QUERY_TERMS = 2;
+function getCoverageThreshold() {
+  const raw = process.env.MEM_COVERAGE_THRESHOLD;
+  if (raw === undefined || raw === '') return 0.4;
+  const n = parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.4;
+}
+function extractQueryTerms(text) {
+  if (!text) return [];
+  const ascii = tokenizeHandoff(text).filter(t => !HANDOFF_STOP_WORDS.has(t));
+  let cjk = [];
+  try { cjk = extractCjkKeywords(text) || []; } catch { /* CJK extraction best-effort */ }
+  return [...new Set([...ascii, ...cjk.map(t => String(t).toLowerCase())])];
+}
+function candidateCoverage(row, queryTerms) {
+  if (queryTerms.length === 0) return 1.0;
+  const hay = `${row.title || ''} ${row.lesson_learned || ''}`.toLowerCase();
+  let hits = 0;
+  for (const t of queryTerms) {
+    if (/[^ -~]/.test(t)) {
+      // Non-ASCII (CJK etc): no word boundary semantics, substring match is correct.
+      if (hay.includes(t)) hits++;
+    } else {
+      // ASCII: require word-boundary match so "race" doesn't match "trace".
+      const re = new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+      if (re.test(hay)) hits++;
+    }
+  }
+  return hits / queryTerms.length;
+}
 
 const FILE_RECALL_LOOKBACK_MS = 60 * 86400000; // 60 days
 const MAX_FILE_RECALL = 2;
@@ -142,13 +179,27 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     const aboveThreshold = scored.filter(r => r.score >= threshold);
     if (aboveThreshold.length === 0) return [];
 
+    // v27: term-coverage filter — drop candidates whose title+lesson_learned
+    // covers <threshold of the query's significant terms. Skipped for
+    // single-term queries (coverage signal is meaningless) and when the env
+    // override disables it.
+    let coverageFiltered = aboveThreshold;
+    const coverageThreshold = getCoverageThreshold();
+    if (coverageThreshold > 0) {
+      const queryTerms = extractQueryTerms(userPrompt);
+      if (queryTerms.length >= COVERAGE_MIN_QUERY_TERMS) {
+        coverageFiltered = aboveThreshold.filter(r => candidateCoverage(r, queryTerms) >= coverageThreshold);
+        if (coverageFiltered.length === 0) return [];
+      }
+    }
+
     // v26 P0: bump injection_count (NOT access_count) for injected rows.
     // Before v26 this was bumping access_count, which conflated auto-injection
     // with real cites/recalls/opens — polluting the noise-ratio signal the
     // penalty clause now depends on. access_count is reserved for explicit
     // access (cmdRecall/cmdGet/cmdTimeline/pre-tool-recall/citation-tracker).
     // Per-row try/catch for FTS trigger safety (project_non_obvious.md).
-    const result = aboveThreshold.slice(0, MAX_MEMORY_INJECTIONS);
+    const result = coverageFiltered.slice(0, MAX_MEMORY_INJECTIONS);
     const now = Date.now();
     const bumpStmt = db.prepare(
       'UPDATE observations SET injection_count = COALESCE(injection_count, 0) + 1, last_injected_at = ? WHERE id = ?'

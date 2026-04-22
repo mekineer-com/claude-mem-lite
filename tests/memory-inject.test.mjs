@@ -378,3 +378,106 @@ describe('OR fallback in searchRelevantMemories', () => {
     expect(results.length).toBe(0);
   });
 });
+
+// ─── v27: term-coverage filter (drops high-BM25 but off-topic matches) ──────
+//
+// Failure mode this addresses: when a query of N significant terms gets reduced
+// by FTS tokenization to a sparse set that matches candidates sharing only one
+// common word, BM25 can still rank them highly. The result is "noisy" injection
+// where the user sees related-memories whose TITLE doesn't actually cover the
+// intent (e.g. query "handoff working_on staleness" matches 3 rows that only
+// have "handoff" in their title). Coverage filter drops any candidate whose
+// title+lesson_learned covers <40% of the query's significant terms.
+
+describe('v27: term-coverage filter', () => {
+  let db;
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-cov', project: 'cov-proj' });
+    for (let i = 900; i <= 920; i++) {
+      insertObs(db, {
+        sessionId: 'sess-cov', project: 'cov-proj', type: 'change',
+        title: `Unrelated noise ${i}`, text: `noise filler content ${i}`,
+        importance: 2,
+      });
+    }
+  });
+  afterEach(() => {
+    delete process.env.MEM_COVERAGE_THRESHOLD;
+    db?.close();
+  });
+
+  it('drops candidates whose title covers <40% of query significant terms', () => {
+    // Sparse candidates: text matches all 3 query terms (FTS AND passes), but
+    // title only contains "dispatch" (1/3 = 0.33 coverage → filtered at 0.4)
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch crash recovery',
+      text: 'dispatch race fixture worker pool leak details',
+      importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch leak debug trace',
+      text: 'dispatch race fixture more content background noise',
+      importance: 3,
+    });
+    // High-coverage candidate: title has all 3 query terms (3/3 coverage → kept)
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'decision',
+      title: 'dispatch race fixture sync fix',
+      text: 'dispatch race fixture sync fix lesson root cause',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'dispatch race fixture', 'cov-proj', []);
+    // Only the high-coverage candidate survives; sparse ones filtered
+    expect(results.length).toBe(1);
+    expect(results[0].title).toBe('dispatch race fixture sync fix');
+  });
+
+  it('counts lesson_learned toward coverage (not just title)', () => {
+    // Title covers 1/3, but lesson_learned covers the other 2 → pass
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch crash fix',
+      text: 'dispatch race fixture background content here',
+      lessonLearned: 'race fixture teardown needs explicit await',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'dispatch race fixture', 'cov-proj', []);
+    expect(results.length).toBe(1);
+  });
+
+  it('skips filter for queries with <2 significant terms (coverage meaningless)', () => {
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'something unrelated in title',
+      text: 'dispatch content with plenty of noise words here',
+      importance: 3,
+    });
+    // Single significant token query — filter must not fire, so the single-term
+    // match passes even though title covers 0/1 query terms.
+    const results = searchRelevantMemories(db, 'dispatch', 'cov-proj', []);
+    expect(results.length).toBe(1);
+  });
+
+  it('disables filter when MEM_COVERAGE_THRESHOLD=0', () => {
+    process.env.MEM_COVERAGE_THRESHOLD = '0';
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch crash recovery',
+      text: 'dispatch race fixture worker pool leak details',
+      importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch leak debug trace',
+      text: 'dispatch race fixture more content background noise',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'dispatch race fixture', 'cov-proj', []);
+    // Threshold disabled → sparse candidates survive (ranked by BM25)
+    expect(results.length).toBeGreaterThanOrEqual(2);
+  });
+});
