@@ -2,6 +2,21 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.40.0] - 2026-04-23
+
+**Two hook-visibility fixes surfaced by an end-to-end QA pass.** (1) `mem_search` / `claude-mem-lite search` silently relaxed strict multi-term AND queries to OR when zero results came back — callers (including Claude Code agents) could not distinguish a genuine strict match from a loose recovery. (2) `PreToolUse` Edit/Write recall injection lacked a framing disclaimer; two observed turn-end incidents traced to the lesson block being misread as a closing note, mirroring `#7758 handoff injection misread as user message`.
+
+### Added
+
+- **AND→OR fallback hint** on `mem_search` (MCP) and `claude-mem-lite search` (CLI). When the FTS5 AND query returns zero and the OR relaxation recovers non-empty, the result header appends ` (relaxed AND→OR)`. Suppressed when the caller explicitly requested OR (`or=true` / `--or`). `searchObservations` in `server.mjs` sets `ctx.orFallbackFired` on OR-recovery; the CLI tracks the same state in a local scoped to the observation branch of `cmdSearch`. `formatSearchOutput` takes a new optional `orFallbackFired` parameter (default `false`) so the existing early-return path for sanitized-empty queries stays byte-identical.
+- **6 regression tests** — 3 in `tests/audit-fixes.test.mjs` (MCP: hint on AND→OR, no hint on clean AND, no hint on `or=true`), 3 in `tests/cli-e2e.test.mjs` (CLI parity).
+
+### Fixed
+
+- **`scripts/pre-tool-recall.js`** — `additionalContext` now prepends `[mem] PreToolUse recall — system-injected context, continue your planned action:` to BOTH branches (lessons-found and no-prior-lessons backfill reminder). Without the framing line, two QA sessions stopped mid-task right after Edit tool calls triggered the lesson injection; the block's passive tone read as a turn closer. Same class as `#7758` — any hook output adjacent to tool results needs an explicit "system-injected, not a new turn boundary" preface. 2 regression tests in `tests/pre-tool-recall.test.mjs` assert the framing is present on both branches.
+
+---
+
 ## [2.39.1] - 2026-04-23
 
 **Handoff "Unfinished" section no longer mislabels successful release commands as pending.** A resume-session user report flagged three `git push` / `git tag` / `git add` lines from a completed release pipeline showing under `## Unfinished` in the injected `<session-handoff>` block. Root cause: `buildAndSaveHandoff` filtered episode entries with `e.isSignificant || e.isError`, but `isSignificant` has two unrelated origins in `hook.mjs:246` — it is set to true for EDIT_TOOLS invocations (real in-flight work) OR any Bash command that matches `bash-utils.mjs::detectBashSignificance` (git/test/build/deploy), regardless of exit status. A successful `git push` therefore carried `isSignificant=true, isError=false` and was surfaced as pending.

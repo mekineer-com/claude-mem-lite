@@ -276,6 +276,43 @@ describe('pre-tool-recall', () => {
       expect(parsed.hookSpecificOutput.additionalContext).not.toContain('No prior lessons');
     });
 
+    // Mirrors #7758 handoff-injection framing: without an explicit "system-injected,
+    // continue your planned action" line, Edit+hook reminders have been observed to
+    // end the assistant turn after lesson injection. The framing line is the signal
+    // that the block is passive context, not a turn-closing note.
+    it('prepends a "system-injected, continue" framing line when lessons are surfaced', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-frame', project: 'parent--frametest',
+        type: 'bugfix', importance: 2,
+        title: 'Some lesson-bearing bug',
+        lessonLearned: 'A lesson body used as framing probe',
+        filesModified: `["${join(projectDir, 'frame.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'frame.mjs') },
+      });
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toMatch(/system-injected/);
+      expect(ctx).toMatch(/continue/i);
+    });
+
+    it('prepends the same framing line when emitting the no-prior-lessons backfill reminder', async () => {
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'pristine.py') },
+      });
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toMatch(/system-injected/);
+      expect(ctx).toMatch(/continue/i);
+      expect(ctx).toContain('[mem] No prior lessons');
+    });
+
     it('honors cooldown — second call within window emits neither lesson nor reminder', async () => {
       const filePath = join(projectDir, 'cool.py');
       const { stdout: first } = await runWithEnv({

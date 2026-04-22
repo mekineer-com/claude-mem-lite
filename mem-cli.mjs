@@ -172,6 +172,9 @@ function cmdSearch(db, args) {
   const effectiveSource = source || ((type || tier || minImportance) ? 'observations' : null);
 
   const results = [];
+  // Tracks whether AND returned 0 and OR recovered non-empty. Mirrors server.mjs
+  // ctx.orFallbackFired so the header can surface a "(relaxed AND→OR)" hint.
+  let orFallbackFired = false;
 
   // Search observations
   if (!effectiveSource || effectiveSource === 'observations') {
@@ -179,7 +182,10 @@ function cmdSearch(db, args) {
     if (obsRows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery) {
-        try { obsRows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: effectiveSource ? offset : 0 }); } catch {}
+        try {
+          obsRows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: effectiveSource ? offset : 0 });
+          if (obsRows.length > 0) orFallbackFired = true;
+        } catch {}
       }
     }
     // Type-list fallback
@@ -388,7 +394,9 @@ function cmdSearch(db, args) {
 
   const showTime = sort === 'time';
   const hasMixed = paged.some(r => r._source === 'session' || r._source === 'prompt');
-  out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}":${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
+  // Suppressed when --or was explicit — user already asked for OR, no "fallback" there.
+  const fallbackHint = orFallbackFired && !useOr ? ' (relaxed AND→OR)' : '';
+  out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
   for (const r of paged) {
     const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
     if (r._source === 'session') {

@@ -164,6 +164,26 @@ describe('CLI E2E: search', () => {
     expect(stdout).toContain('Alpha protocol fix');
   });
 
+  it('OR fallback prints a "relaxed AND→OR" hint so callers know the match is loose', () => {
+    seedObs({ title: 'Alpha protocol fix', text: 'alpha protocol implementation repair' });
+    const { stdout } = runCli(['search', 'alpha zzzzz_nonexistent']);
+    expect(stdout).toMatch(/relaxed AND.{0,3}OR/);
+  });
+
+  it('no fallback hint when AND match succeeds', () => {
+    seedObs({ title: 'Alpha protocol fix', text: 'alpha protocol implementation repair' });
+    const { stdout } = runCli(['search', 'alpha protocol']);
+    expect(stdout).toContain('Alpha protocol fix');
+    expect(stdout).not.toMatch(/relaxed AND.{0,3}OR/);
+  });
+
+  it('no fallback hint when user explicitly passes --or', () => {
+    seedObs({ title: 'Alpha protocol fix', text: 'alpha protocol implementation repair' });
+    const { stdout } = runCli(['search', 'alpha zzzzz_nonexistent', '--or']);
+    expect(stdout).toContain('Alpha protocol fix');
+    expect(stdout).not.toMatch(/relaxed AND.{0,3}OR/);
+  });
+
   it('filters by --from and --to dates', () => {
     const twoDaysAgo = -2 * 86400000;
     seedObs({ title: 'Old discovery', text: 'old discovery text', epochOffset: twoDaysAgo });

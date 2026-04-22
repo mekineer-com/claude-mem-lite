@@ -235,13 +235,17 @@ function searchObservations(ctx) {
       .all(...buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
     for (const r of rows) results.push(ftsRowToResult(r, { snippet: true }));
 
-    // OR fallback: when AND query returns 0 results, retry with OR semantics
+    // OR fallback: when AND query returns 0 results, retry with OR semantics.
+    // Sets ctx.orFallbackFired so the top-level formatter can surface a "relaxed
+    // AND→OR" hint — without it, callers can't distinguish a strict multi-term
+    // match from a partial single-term recovery.
     if (rows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery) {
         try {
           const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.5, withSnippet: true, withOffset: true, includeNoise }))
             .all(...buildObsFtsParams({ now, projectBoost, ftsQuery: orQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
+          if (orRows.length > 0) ctx.orFallbackFired = true;
           for (const r of orRows) results.push(ftsRowToResult(r, { snippet: true }));
         } catch (e) { debugCatch(e, 'searchObservations-or-fallback'); }
       }
@@ -515,7 +519,7 @@ function searchPrompts(ctx) {
   return results;
 }
 
-function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCrossSource) {
+function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCrossSource, orFallbackFired = false) {
   if (paginatedResults.length === 0) {
     const hint = [];
     if (args.query && !ftsQuery) {
@@ -540,7 +544,11 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
   // P2-6: empty/omitted query falls through to a "listing recent" path — label it explicitly
   // so callers don't mistake BM25-less results for relevance-ranked ones.
   const qLabel = args.query ? ` for "${args.query}"` : ' (no query — listing recent)';
-  lines.push(`Found ${countLabel} result(s)${qLabel}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
+  // Surface AND→OR fallback so callers (incl. Claude) know a strict multi-term
+  // query actually matched only a subset of the terms. Suppressed when the caller
+  // explicitly requested OR semantics — there's no "fallback" in that path.
+  const fallbackHint = orFallbackFired && !args.or ? ' (relaxed AND→OR)' : '';
+  lines.push(`Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
 
   for (const r of paginatedResults) {
     if (r.source === 'obs') {
@@ -698,7 +706,7 @@ server.registerTool(
     // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
     const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
 
-    return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, isCrossSource);
+    return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, isCrossSource, ctx.orFallbackFired === true);
   })
 );
 

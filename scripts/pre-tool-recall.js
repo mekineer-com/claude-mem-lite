@@ -228,6 +228,10 @@ try {
     // but the total payload is bounded by the 3-row limit and the cooldown.
     const LESSON_MAX = isRead ? 120 : 240;
     if (allRows.length > 0) {
+      // Framing line mirrors #7758 handoff-injection fix: without an explicit
+      // "system-injected, continue" disclaimer, observed turn-end after Edit+reminder
+      // when the model misreads passive lesson context as a closing note.
+      lines.push(`[mem] PreToolUse recall — system-injected context, continue your planned action:`);
       lines.push(`[mem] Lessons for ${fname}:`);
       for (const r of allRows) {
         if (r.lesson_learned) {
@@ -250,6 +254,7 @@ try {
       // v2.34.6: Read does NOT emit this nudge. Read is passive — the agent
       // isn't necessarily about to solve anything, so /lesson prompts are noise.
       // Empty Reads exit silently, saving ~60 tokens × (every empty-file Read).
+      lines.push(`[mem] PreToolUse recall — system-injected context, continue your planned action:`);
       lines.push(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: /lesson --file ${fname} "<root cause + fix>"`);
     }
 

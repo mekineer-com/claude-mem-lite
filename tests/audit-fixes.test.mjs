@@ -294,6 +294,33 @@ describe('MCP audit fixes (stdio)', () => {
     expect(text).not.toMatch(/no query/);
   });
 
+  // T: mem_search must surface the AND→OR fallback. A silent fallback lets callers
+  // (including Claude) trust a strict multi-term query that actually matched only
+  // one of the terms. The hint is the signal for "treat these results as loose".
+  it('mem_search surfaces a "relaxed AND→OR" hint when AND returns zero and OR recovers', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_search', { query: 'AUDITKW zzzzz_nonexistent', limit: 3 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/AUDITKW entry/);
+    expect(text).toMatch(/relaxed AND.{0,3}OR/);
+  });
+
+  it('mem_search omits the fallback hint on a clean AND match', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_search', { query: 'AUDITKW', limit: 3 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/AUDITKW entry/);
+    expect(text).not.toMatch(/relaxed AND.{0,3}OR/);
+  });
+
+  it('mem_search omits the fallback hint when caller explicitly passed or=true', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_search', { query: 'AUDITKW zzzzz_nonexistent', or: true, limit: 3 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/AUDITKW entry/);
+    expect(text).not.toMatch(/relaxed AND.{0,3}OR/);
+  });
+
   // P2-7: obs ID passed with source=session should hint switching source.
   it('P2-7: mem_get source=session with an obs ID hints to try source=\'obs\'', async () => {
     await initialize(proc);
