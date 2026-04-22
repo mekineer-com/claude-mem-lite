@@ -783,7 +783,32 @@ function cmdTimeline(db, args) {
       anchorId = nearest.id;
       anchorNote = `(anchored to #${nearest.id}, closest obs to S#${parsed.id})`;
     } else {
-      anchorId = parsed.id;
+      // Bare integer (no prefix): try observation first. Fall back to user_prompts
+      // then session_summaries so pasted P#/S# IDs still work when the prefix is
+      // omitted — matches the prefix-aware routing used by search/probe.
+      const obsExists = db.prepare('SELECT 1 FROM observations WHERE id = ?').get(parsed.id);
+      if (obsExists) {
+        anchorId = parsed.id;
+      } else {
+        const promptRow = db.prepare('SELECT created_at_epoch FROM user_prompts WHERE id = ?').get(parsed.id);
+        const sessionRow = promptRow ? null : db.prepare('SELECT created_at_epoch FROM session_summaries WHERE id = ?').get(parsed.id);
+        const hit = promptRow ? { row: promptRow, prefix: 'P', name: 'prompt' }
+                  : sessionRow ? { row: sessionRow, prefix: 'S', name: 'session' }
+                  : null;
+        if (!hit) {
+          fail(`[mem] Observation, prompt, or session with id ${parsed.id} not found`);
+          return;
+        }
+        const proj = project;
+        const nearest = db.prepare(`
+          SELECT id FROM observations
+          WHERE COALESCE(compressed_into, 0) = 0 ${proj ? 'AND project = ?' : ''}
+          ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
+        `).get(...(proj ? [proj, hit.row.created_at_epoch] : [hit.row.created_at_epoch]));
+        if (!nearest) { fail(`[mem] No observations near ${hit.prefix}#${parsed.id} (${hit.name})`); return; }
+        anchorId = nearest.id;
+        anchorNote = `(anchored to #${nearest.id}, closest obs to ${hit.prefix}#${parsed.id})`;
+      }
     }
   }
 

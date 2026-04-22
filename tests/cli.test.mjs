@@ -1754,6 +1754,33 @@ describe('CLI timeline anchor prefix routing', () => {
     const output = await captureStdout(() => run(['timeline', '--anchor', 'P#9999']));
     expect(output).toMatch(/not found|Prompt/);
   });
+
+  // v27: bare-int anchor (no prefix) must fall back to user_prompts/session_summaries
+  // so callers who paste a prompt id without `P#` prefix get the nearest observation
+  // instead of a misleading "Observation #N not found" error.
+  it('bare-int anchor falls back to user_prompts when observation miss', async () => {
+    const base = Date.now();
+    // Observation near the prompt (so nearest-in-time resolves to it)
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Near prompt obs', text: 'near content', epochOffset: 60000,
+    });
+    // Insert a prompt with a specific id that has NO matching observation id
+    testDb.prepare(`INSERT INTO user_prompts (id, content_session_id, prompt_text, created_at, created_at_epoch) VALUES (?, 's1', 'bare-int fallback target', ?, ?)`).run(99999, new Date(base).toISOString(), base);
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['timeline', '--anchor', '99999']));
+    expect(output).toContain('Timeline');
+    expect(output).toContain('Near prompt obs');
+    expect(output).toContain('closest obs to P#99999');
+  });
+
+  it('bare-int anchor errors with cross-source hint when id matches nothing', async () => {
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['timeline', '--anchor', '88888']));
+    // Must not just say "Observation #N not found" — either a cross-source "not found"
+    // error OR a hint mentioning prompt/session sources.
+    expect(output).toMatch(/No observation.*prompt.*session|not found/i);
+  });
 });
 
 // ─── delete/update reject P#/S# cleanly (regression: #8104) ──────────────────
