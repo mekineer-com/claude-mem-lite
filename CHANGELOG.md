@@ -2,6 +2,41 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.35.0] - 2026-04-23
+
+**CLI↔MCP parity + doctor dev-drift detection + injection quality treatments.** Bundles 5 commits since v2.34.6 across three themes: MCP/CLI feature parity, doctor diagnostics, and injection-side quality filtering.
+
+**Data-driven LOW_SIGNAL treatment.** A 30d transcript scan (51 mem-project sessions, 573 injection blocks, 828 unique `#NN` injected, 2408 occurrences) measured cite-precision at 93.3% (335/359 cites matched an injected ID — contract semantics work) but inject-recall at 12.2% (101/828 unique injected IDs ever cited — 88% silent). Root cause was inverted from prior assumption: not "Claude ignores lessons" but "injection picks too many low-relevance IDs". `Codebase exploration:` pattern added to `LOW_SIGNAL_PATTERNS`; 3 deprecated-topic observations (dispatch architecture, E2E timeout analysis, dispatch-fixes migration) superseded in DB. Main injection paths (`hook-memory.mjs`, `pre-tool-recall.js`) were already filtering via `notLowSignalTitleClause` — the measurement ruled out a planned 3-4h Stop-hook measurement infra.
+
+### Added
+
+- **`mem_search` MCP**: `or` parameter for OR-mode search (previously CLI-only).
+- **`mem_stats` MCP**: `mode=quality` exposes lesson-rate / LOW_SIGNAL-ratio / type-breakdown (previously CLI-only).
+- **`lib/stats-quality.mjs`**: shared quality-stats module consumed by both CLI (`mem-cli.mjs`) and MCP (`server.mjs`).
+- **`claude-mem-lite doctor` dev-drift detection**: flags symlink + plain install mix (`lib/doctor-drift.mjs`).
+- **MCP server-side instructions trace**: `[mem] instructions: <mode> reason=<why>` on stderr so client-side trace captures routing decisions.
+- **`lib/low-signal-patterns.mjs`**: single-source module for 13 patterns (β refactor per #8058). `utils.mjs` regex / `scoring-sql.mjs` NOT LIKE / `scripts/pre-tool-recall.js` all derive from one list.
+- New LOW_SIGNAL pattern: `Codebase exploration%` — exploration-type auto-titles bypass the filter no longer.
+
+### Changed
+
+- **`scripts/pre-skill-bridge.js:76`**: truncated-skill prompt uses `Read("<portablePath>")` instead of `mem_use(name=...)`. Decouples skill-bridge from the `mem_use` MCP tool (30d=0 agent calls), preparing for hidden-MCP surface shrink in a follow-up.
+
+### Fixed
+
+- **`scripts/pre-tool-recall.js` Edit-path fallback (Bug 4)**: LOW_SIGNAL title filter now applies to the type-OR fallback too (bugfix/decision-without-lesson fork previously bypassed the filter).
+- **`hook-llm.mjs:buildDegradedTitle`**: dedup basenames before slice — previously when same basename appeared multiple times in `files_modified`, the slice kept duplicates and dropped signal.
+- **`claude-mem-lite doctor` dep checks**: use import probe, not path check — import can fail even when path exists (SDK version drift / transitive-dep corruption invisible to `fs.existsSync`).
+
+### DB side-effect (one-shot)
+
+- `UPDATE observations SET superseded_at = now` on #983 (Dispatch System Architecture — v2.20 removed), #3320 (E2E test timeout analysis — one-shot historical), #5553 (dispatch-fixes.md migration note).
+
+### Measurements
+
+- Full test suite: 1709 / 1709 green across all 5 commits (CI verified at `4637b99` / `0325ec5`).
+- 30d transcript scan script preserved at `/tmp/p14-p15-scan.mjs` (per `#8062` lesson) — reusable for future injection-quality audits.
+
 ## [2.34.6] - 2026-04-22
 
 PreToolUse gains **Read-side recall** with asymmetric quiet-mode. When Claude Reads a file (the exploration phase before deciding what to edit), one top-matching lesson is injected if the file has a lesson-bearing observation — otherwise silent. Edit/Write behavior is unchanged. Addresses the audit finding that lessons appear only AFTER the decision to Edit, missing the planning-Read window where the guidance is most useful.
