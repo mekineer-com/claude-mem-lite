@@ -14,6 +14,7 @@ All notable changes to claude-mem-lite are documented in this file.
 ### Changed
 
 - **Haiku episode prompt (P1)** — added `type:` classifier line with explicit trigger for each type. Concrete decision examples from this project (rejected schema migration, heterogeneous hook events) guide Haiku toward correct `decision` classification. Motivation: 30d `decision` rate was 3.8% (12/315) vs `change` 77% — imbalance attributed to missing classification guidance, not to lack of architectural decisions in the work.
+- **`isNoiseObservation` narrative heuristic (P2)** — extends the P0 filter to detect raw tool-output passthrough in narrative: `cmd → output` arrows, stack traces, `node:internal/` paths, diff blocks, test-runner failure banners, or multi-`; ` joined descs with no sentence prose. 30d audit found 19 `Error:` observations (38% of bugfix type) had long but non-substantive narratives that bypassed the initial P0 check — this pattern drives them to 0.
 
 ### Migration
 

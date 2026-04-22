@@ -149,3 +149,81 @@ describe('isNoiseObservation — P0 write-side filter', () => {
     }, EMPTY_ENV)).toBe(false);
   });
 });
+
+describe('isNoiseObservation — P2 tool-output passthrough detection', () => {
+  // buildImmediateObservation joins entry descs with "; ", each desc is "cmd → output"
+  // from post-tool-use.sh. Such narratives are raw tool output, not curated prose.
+  const longStderr = 'git diff 7caa0dc~1..a01ab45 -- schema.mjs tests/schema.test.mjs → diff --git a/schema.mjs b/schema.mjs\nindex abc..def 100644\n@@ -1,5 +1,7 @@';
+
+  it('blocks narrative with " → " passthrough (buildImmediateObservation format)', () => {
+    expect(isNoiseObservation({
+      title: 'Error: schema.mjs',
+      narrative: longStderr,
+      facts: [],
+      importance: 1,
+    }, {})).toBe(true);
+  });
+
+  it('blocks narrative with stack trace fragments', () => {
+    expect(isNoiseObservation({
+      title: 'Error: app.mjs',
+      narrative: 'ReferenceError: foo is not defined\n    at bar (/app/src/lib.js:42:10)\n    at baz (/app/src/main.js:7:3)',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(true);
+  });
+
+  it('blocks narrative with node:internal/ references', () => {
+    expect(isNoiseObservation({
+      title: 'Error: index.mjs',
+      narrative: 'Uncaught TypeError at something in node:internal/process/task_queues:95:5 — process exited with code 1',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(true);
+  });
+
+  it('blocks narrative with test-runner failure banner', () => {
+    expect(isNoiseObservation({
+      title: 'Error: tests/foo.test.mjs',
+      narrative: ' FAIL  tests/foo.test.mjs > suite > it works\nAssertionError: expected 1 to equal 2 at assertEqual\n  +expected -actual',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(true);
+  });
+
+  it('blocks narrative with raw diff output', () => {
+    expect(isNoiseObservation({
+      title: 'Modified schema.mjs',
+      narrative: 'diff --git a/schema.mjs b/schema.mjs\n@@ -10,5 +10,7 @@ export function\n-  old line\n+  new line 1\n+  new line 2',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(true);
+  });
+
+  it('blocks narrative with multi-"; " join and no sentence prose', () => {
+    expect(isNoiseObservation({
+      title: 'Modified app.mjs',
+      narrative: 'Created app.mjs (1234 chars); Created helper.mjs (432 chars); Modified index.mjs',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(true);
+  });
+
+  it('keeps narrative that is curated prose (Haiku-generated)', () => {
+    expect(isNoiseObservation({
+      title: 'Modified schema.mjs',
+      narrative: 'Refactored schema guard so the migration-check hook runs before DB open. Eliminates race with module-level init that created DB_DIR early. No behavior change for users.',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(false);
+  });
+
+  it('keeps narrative with single "; " and sentence prose', () => {
+    expect(isNoiseObservation({
+      title: 'Modified hook.mjs',
+      narrative: 'Wrapped vector write in try-catch; ensures FTS trigger corruption does not cascade. Prior code could throw during multi-session flushes.',
+      facts: [],
+      importance: 1,
+    }, {})).toBe(false);
+  });
+});
