@@ -50,6 +50,7 @@
     "lib/doctor-drift.mjs",
     "lib/stats-quality.mjs",
     "lib/low-signal-patterns.mjs",
+    "lib/citation-tracker.mjs",
     "registry.mjs",
     "registry-retriever.mjs",
     "registry-indexer.mjs",

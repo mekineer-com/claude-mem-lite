@@ -42,6 +42,7 @@ import {
   spawnBackground,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
+import { extractCitationsFromTranscript, bumpCitationAccess } from './lib/citation-tracker.mjs';
 import { searchRelevantMemories } from './hook-memory.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
@@ -344,11 +345,15 @@ async function handleStop() {
   // This is the stable CC identifier — the mem plugin's file-based getSessionId()
   // collides across parallel sessions for the same project (see docs/bug.txt).
   let ccSessionId = null;
+  let transcriptPath = null;
   try {
     const raw = await readStdin();
     const hookData = JSON.parse(raw.text);
     if (typeof hookData?.session_id === 'string' && hookData.session_id.length > 0) {
       ccSessionId = hookData.session_id;
+    }
+    if (typeof hookData?.transcript_path === 'string' && hookData.transcript_path.length > 0) {
+      transcriptPath = hookData.transcript_path;
     }
   } catch { /* stdin unavailable — fall back to local session id */ }
 
@@ -448,6 +453,19 @@ async function handleStop() {
           }
         }
       } catch (e) { debugCatch(e, 'handleStop-fast-summary'); }
+
+      // P4: scan transcript for `#NN` observation citations in assistant text
+      // and bump access_count for matched rows. Closes the loop on the "cite #NN"
+      // contract — before P4 this was a one-way obligation with no feedback.
+      try {
+        if (transcriptPath && !process.env.CLAUDE_MEM_NO_CITATION_TRACK) {
+          const ids = extractCitationsFromTranscript(transcriptPath);
+          if (ids.size > 0) {
+            const n = bumpCitationAccess(db, ids, project);
+            debugLog('DEBUG', 'handleStop', `citations: ${ids.size} ids scanned, ${n} obs bumped`);
+          }
+        }
+      } catch (e) { debugCatch(e, 'handleStop-citation-track'); }
     } finally {
       db.close();
     }

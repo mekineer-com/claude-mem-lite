@@ -37,6 +37,7 @@ export const SOURCE_FILES = [
   'lib/doctor-drift.mjs',
   'lib/stats-quality.mjs',
   'lib/low-signal-patterns.mjs',
+  'lib/citation-tracker.mjs',
   // v2.32 invited-memory: memdir primitives + adopt/unadopt CLI
   'memdir.mjs',
   'adopt-content.mjs',
