@@ -329,6 +329,116 @@ describe('pre-tool-recall', () => {
       // Fresh session → recall fires again.
       expect(JSON.parse(second).hookSpecificOutput.additionalContext).toContain('No prior lessons for fresh.py');
     });
+
+    // v2.34.6 Gap 3: Read-side recall. Tighter filter (lesson_learned required),
+    // single-row limit, 120-char truncation, zero empty-nudge. Scope discipline:
+    // planning Reads get surfaced; pure-exploration Reads cost near-zero tokens.
+    it('v2.34.6 Read: surfaces top-1 lesson when file has lesson_learned', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Seed TWO lessons — Read should only inject the most recent one.
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'Older bug', lessonLearned: 'Older lesson A',
+        filesModified: `["${join(projectDir, 'readable.mjs')}"]`,
+        epochOffset: -86400000, // 1 day ago
+      });
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'Newer bug', lessonLearned: 'Newer lesson B',
+        filesModified: `["${join(projectDir, 'readable.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'readable.mjs') },
+      });
+      const parsed = JSON.parse(stdout);
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for readable.mjs:');
+      expect(ctx).toContain('Newer lesson B');
+      expect(ctx).not.toContain('Older lesson A');
+    });
+
+    it('v2.34.6 Read: suppresses type-only (bugfix/decision without lesson_learned)', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Edit-path would match this (type=bugfix). Read-path must skip it.
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 3,
+        title: 'Important but no lesson', lessonLearned: null,
+        filesModified: `["${join(projectDir, 'typed.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'typed.mjs') },
+      });
+      // Read-path finds zero lesson-bearing rows → silent exit (no nudge either).
+      expect(stdout).toBe('');
+    });
+
+    it('v2.34.6 Read: silent on empty — no /lesson nudge (unlike Edit)', async () => {
+      const { stdout } = await runWithEnv({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'brand_new.mjs') },
+      });
+      expect(stdout).toBe('');
+    });
+
+    it('v2.34.6 Read: truncates long lessons at 120 chars (tighter than Edit 240)', async () => {
+      const db = new Database(dbPath);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-r4', project: 'parent--r4test',
+        type: 'bugfix', importance: 2,
+        title: 'Long lesson',
+        lessonLearned: 'X'.repeat(300),
+        filesModified: `["${join(projectDir, 'longlesson.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runWithEnv({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'longlesson.mjs') },
+      });
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      // Lesson line = "  #N [bugfix] " + up to 120 chars (with '...' if over).
+      // Find the lesson line and verify the payload post-"[bugfix] " is ≤120 chars and ends in '...'.
+      const line = ctx.split('\n').find(l => l.includes('[bugfix]'));
+      expect(line).toBeDefined();
+      const payload = line.split('[bugfix] ')[1];
+      expect(payload.length).toBeLessThanOrEqual(120);
+      expect(payload.endsWith('...')).toBe(true);
+    });
+
+    it('v2.34.6 Read→Edit same file same session: Edit deduped by shared cooldown', async () => {
+      const filePath = join(projectDir, 'shared.mjs');
+      const { stdout: readOut } = await runWithEnv({
+        tool_name: 'Read',
+        session_id: 'session-gamma',
+        tool_input: { file_path: filePath },
+      });
+      // Read on a lesson-less file: silent (no nudge, no lessons).
+      expect(readOut).toBe('');
+
+      const { stdout: editOut } = await runWithEnv({
+        tool_name: 'Edit',
+        session_id: 'session-gamma',
+        tool_input: { file_path: filePath },
+      });
+      // Even though Edit would normally nudge for no-lesson files, the prior Read
+      // already wrote the session cooldown entry → Edit is skipped.
+      expect(editOut).toBe('');
+    });
   });
 
   // T2 (v2.31): sdscc and some other CC variants drop plain-text stdout from PreToolUse;

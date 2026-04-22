@@ -133,7 +133,7 @@ describe('E2E: Plugin install mode', () => {
     const preToolUse = hooks.hooks.PreToolUse;
     expect(preToolUse).toHaveLength(2);
     const preMatchers = preToolUse.map(h => h.matcher);
-    expect(preMatchers).toContain('Edit|Write|NotebookEdit');
+    expect(preMatchers).toContain('Edit|Write|NotebookEdit|Read');
     expect(preMatchers).toContain('Skill');
 
     // PreToolUse Skill bridge
@@ -232,8 +232,8 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     const preToolUse = settings.hooks.PreToolUse;
     expect(preToolUse.length).toBeGreaterThanOrEqual(2);
 
-    // Edit/Write recall hook
-    const editMatcher = preToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit');
+    // Edit/Write/Read recall hook (v2.34.6 extended Read)
+    const editMatcher = preToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit|Read');
     expect(editMatcher).toBeTruthy();
     expect(editMatcher.hooks[0].command).toContain('pre-tool-recall.js');
 

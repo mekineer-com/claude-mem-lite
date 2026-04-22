@@ -2,6 +2,32 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.34.6] - 2026-04-22
+
+PreToolUse gains **Read-side recall** with asymmetric quiet-mode. When Claude Reads a file (the exploration phase before deciding what to edit), one top-matching lesson is injected if the file has a lesson-bearing observation — otherwise silent. Edit/Write behavior is unchanged. Addresses the audit finding that lessons appear only AFTER the decision to Edit, missing the planning-Read window where the guidance is most useful.
+
+**Data-driven design.** A tree-walk over `projects--mem` measured Read-side hit rate (importance≥2 + lesson_learned REQUIRED) by file category: `core` .mjs 36.2% (17/47), `scripts/` 25.0%, `config` 23.1%, `tests/` 16.1%, `docs/*.md` 4.7% (3/64). Overall 16.9% (36/213) — low enough that exploration Reads of docs/configs rarely trigger, high enough that implementation Reads of core files usefully surface lessons. Estimated net-new load for a typical implementation session: ~3.6 Read injections × ~60 tokens = ~220 tokens (0.02% of a 1M window).
+
+**Asymmetric filter, not a new gate.** Edit/Write keep their existing treatment (top-3, `lesson_learned` OR `bugfix/decision` type, 240-char truncation, `/lesson` nudge on empty). Read tightens: (1) `lesson_learned` REQUIRED — drops type-only rows that add context noise to passive reads, (2) top-1 — single most-actionable hit, (3) 120-char truncation — half the per-row cost, (4) silent on empty — no `/lesson` nudge since Read is passive and the agent isn't necessarily about to solve anything. Rationale: Read events have lower per-event actionability than Edit events; investing less context per Read is proportional. Follows the #7877 "heterogeneous scorings don't share thresholds" principle.
+
+**Cooldown is shared.** The existing v2.33.1 per-filePath session-scoped cooldown applies to BOTH branches — so Read→Edit on the same file in the same session injects exactly once (the Read). This means the **net-new load comes only from files that are Read but never Edited**; Read→Edit sequences just shift the injection moment earlier without doubling it. 1683 → 1688 tests green (+5 integration tests).
+
+### Changed
+
+- **`scripts/pre-tool-recall.js`**: reads `tool_name` from the event; branches on `isRead = toolName === 'Read'`. Read path uses tighter WHERE clause (`AND o.lesson_learned IS NOT NULL AND o.lesson_learned != ''` — drops type-OR fallback), `LIMIT 1`, 120-char truncation, silent-on-empty (skips the `/lesson` nudge). Same-shape change applied to the events-table query (`body IS NOT NULL AND body != ''`, `LIMIT 1`). Cooldown write applies on all paths including silent-Read so subsequent calls on the same file skip.
+- **`install.mjs:492`**: matcher extended from `'Edit|Write|NotebookEdit'` to `'Edit|Write|NotebookEdit|Read'`. Comment block documents the asymmetric quiet-mode.
+- **`hooks/hooks.json:23`**: same matcher update (marketplace-shipped source of truth, even though install.mjs-managed settings.json is authoritative at runtime — per #8).
+
+### Added
+
+- **`tests/pre-tool-recall.test.mjs` 5 new integration tests.** (1) Read + file with lesson → top-1 injection with most-recent-first ordering (ordering regression guard). (2) Read + file with only type=bugfix no-lesson → silent (tighter-filter regression guard — Edit would fire, Read must not). (3) Read + no matching obs → silent (no `/lesson` nudge). (4) Read + long lesson → 120-char truncation (verifies the shorter cap vs Edit's 240). (5) Read→Edit same file same session → Edit deduped by shared cooldown (regression guard for the "shift don't double" property).
+
+### Not changed (deliberately)
+
+- No new env var, no feature flag. Asymmetric mode is always on for the Read matcher.
+- No `*.md` special case. Data measured `docs/*.md` at 4.7% hit rate — the savings from a special case are a few tens of tokens, not worth the code-path complexity.
+- No Glob/Grep matchers. Those tools don't carry `tool_input.file_path` in a recall-meaningful way. Only Read joins the file-scoped recall path.
+
 ## [2.34.5] - 2026-04-22
 
 UserPromptSubmit gains a **prompts-table fallback**. When the observations-based search paths (FTS / file-recall / error-signature / recent) all return empty, the hook now scans `user_prompts_fts` within the same project and the same 60-day window, and injects up to 3 prior user questions under a distinct `[mem] Past similar questions:` block prefixed with `P#<id>`. Addresses the audit finding that meta/UX-style prompts (e.g. "为什么 X 没有用", "以使用者的身份...") match zero observations but often have a near-identical prior prompt whose answer is what the user actually wants surfaced. 1679 → 1683 tests green (+4 integration tests in `tests/user-prompt-search.test.mjs`).

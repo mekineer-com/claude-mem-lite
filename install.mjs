@@ -489,7 +489,10 @@ async function install() {
   };
 
   const memPreToolRecall = {
-    matcher: 'Edit|Write|NotebookEdit',
+    // v2.34.6: Read added to cover planning-Read (pre-Edit exploration).
+    // Read-path uses a tighter filter (lesson_learned required, top-1,
+    // 120-char truncation, silent-on-empty) — see scripts/pre-tool-recall.js.
+    matcher: 'Edit|Write|NotebookEdit|Read',
     hooks: [
       {
         type: 'command',

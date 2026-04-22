@@ -91,13 +91,22 @@ try {
   // Parse event
   let filePath;
   let sessionId;
+  let toolName;
   try {
     const event = JSON.parse(input);
     filePath = event.tool_input?.file_path;
     sessionId = event.session_id || null;
+    toolName = event.tool_name || null;
   } catch { process.exit(0); }
 
   if (!filePath) process.exit(0);
+
+  // v2.34.6 Gap 3: Read-side recall with asymmetric quiet-mode. Reads have
+  // lower per-event information value than Edits (passive observation, may
+  // not lead to action), so inject less per Read. Cooldown is shared with
+  // Edit via per-filePath session state — Read→Edit in the same session is
+  // not double-injected. See CHANGELOG v2.34.6 for the data behind 120/1/no-nudge.
+  const isRead = toolName === 'Read';
 
   // v2.33.1: session-scoped cooldown. Within one session, same file recalls
   // once; cross-session, each session gets fresh nudges. Legacy 5-min global
@@ -135,6 +144,18 @@ try {
     // Priority: 1) observations with lesson_learned (most actionable for preventing repeat bugs)
     //           2) bugfix/decision types with importance>=2 (contextual history)
     // Skip pure change/discovery without lessons — they add noise without actionable value.
+    //
+    // v2.34.6: Read tightens the filter to require lesson_learned (drops type-OR
+    // fallback — decision/bugfix WITHOUT lesson add context noise to passive Reads
+    // where the agent isn't committed to a change). Edit/Write keep the wider
+    // filter for decision-point context.
+    const typeFallback = isRead
+      ? 'AND o.lesson_learned IS NOT NULL AND o.lesson_learned != \'\''
+      : `AND (
+          (o.lesson_learned IS NOT NULL AND o.lesson_learned != '')
+          OR o.type IN ('bugfix', 'decision')
+        )`;
+    const obsLimit = isRead ? 1 : 2;
     const rows = db.prepare(`
       SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
       FROM observations o
@@ -145,14 +166,11 @@ try {
         AND o.superseded_at IS NULL
         AND o.created_at_epoch > ?
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
-        AND (
-          (o.lesson_learned IS NOT NULL AND o.lesson_learned != '')
-          OR o.type IN ('bugfix', 'decision')
-        )
+        ${typeFallback}
       ORDER BY
         CASE WHEN o.lesson_learned IS NOT NULL AND o.lesson_learned != '' THEN 0 ELSE 1 END,
         o.created_at_epoch DESC
-      LIMIT 2
+      LIMIT ${obsLimit}
     `).all(project, cutoff, filePath, likePattern);
 
     // T9: also query the `events` table — after T9, bugfix/lesson/decision/etc.
@@ -163,6 +181,11 @@ try {
     // matching "myfoo.mjs".
     const fnameEscaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
     const filePathEscaped = filePath.replace(/%/g, '\\%').replace(/_/g, '\\_');
+    // v2.34.6: Read also tightens the events query — only rows with a non-empty
+    // body (= lesson equivalent). Edit path keeps the wider net since the agent
+    // is about to change the file and benefits from any contextual signal.
+    const eventsBodyFilter = isRead ? "AND body IS NOT NULL AND body != ''" : '';
+    const eventsLimit = isRead ? 1 : 2;
     let eventRows = [];
     try {
       eventRows = db.prepare(`
@@ -173,25 +196,29 @@ try {
           AND superseded_at_epoch IS NULL
           AND created_at_epoch > ?
           AND (file_paths LIKE ? ESCAPE '\\' OR file_paths LIKE ? ESCAPE '\\')
+          ${eventsBodyFilter}
         ORDER BY created_at_epoch DESC
-        LIMIT 2
+        LIMIT ${eventsLimit}
       `).all(project, cutoff, `%"${fnameEscaped}"%`, `%"${filePathEscaped}"%`);
     } catch { /* events table may not exist on pre-v2.31 DBs — silent */ }
 
-    // Merge: observations first (they carry richer lesson_learned), then events,
-    // capped at 3 total so the injected context stays small per Edit/Write.
-    const allRows = [...rows, ...eventRows].slice(0, 3);
+    // Merge: observations first (they carry richer lesson_learned), then events.
+    // Edit/Write caps at 3 total; Read caps at 1 (single most-actionable hit).
+    const mergeCap = isRead ? 1 : 3;
+    const allRows = [...rows, ...eventRows].slice(0, mergeCap);
 
     // v2.31 T2: emit JSON with hookSpecificOutput.additionalContext so the message
     // reliably renders across CC variants (sdscc drops plain-text stdout from PreToolUse).
     // suppressOutput:true hides it from transcript mode per CC hook docs.
     const lines = [];
+    // v2.34.6: Read mode uses 120-char truncation (Edit mode keeps the 240-char
+    // cap from R3-UX). Rationale: Read is a one-shot nudge with 1 lesson max;
+    // Edit is a 3-lesson decision-support injection where the fuller lesson tail
+    // carries the actionable "Fix:" guidance — short enough per-lesson at 240,
+    // but the total payload is bounded by the 3-row limit and the cooldown.
+    const LESSON_MAX = isRead ? 120 : 240;
     if (allRows.length > 0) {
       lines.push(`[mem] Lessons for ${fname}:`);
-      // R3-UX: raised from 120 → 240 after measuring 97% of lessons exceed 120 chars
-      // (p50=218, avg=247). Previous limit truncated the actionable "Fix:" tail in 80%
-      // of lessons containing it. 3 × 240 ≈ 180 tokens/Edit — negligible context cost.
-      const LESSON_MAX = 240;
       for (const r of allRows) {
         if (r.lesson_learned) {
           const lesson = r.lesson_learned.length > LESSON_MAX
@@ -205,22 +232,29 @@ try {
           lines.push(`  #${r.id} [${r.type}] ${title}`);
         }
       }
-    } else {
-      // R-4: emit a short backfill reminder instead of staying silent.
-      // Two goals: (1) Claude sees that the system actually ran, (2) Claude is
-      // nudged to save a lesson when solving a non-obvious bug. The reminder
-      // is one line to minimize per-Edit context cost.
+    } else if (!isRead) {
+      // R-4: Edit/Write empty → short backfill reminder. Two goals: (1) Claude
+      // sees that the system actually ran, (2) Claude is nudged to save a lesson
+      // after a non-obvious bug. Reminder is one line to keep per-Edit cost low.
+      //
+      // v2.34.6: Read does NOT emit this nudge. Read is passive — the agent
+      // isn't necessarily about to solve anything, so /lesson prompts are noise.
+      // Empty Reads exit silently, saving ~60 tokens × (every empty-file Read).
       lines.push(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: /lesson --file ${fname} "<root cause + fix>"`);
     }
 
-    process.stdout.write(JSON.stringify({
-      suppressOutput: true,
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        additionalContext: lines.join('\n'),
-      },
-    }));
-    // Cooldown applies to BOTH branches so the reminder doesn't spam every Edit.
+    if (lines.length > 0) {
+      process.stdout.write(JSON.stringify({
+        suppressOutput: true,
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          additionalContext: lines.join('\n'),
+        },
+      }));
+    }
+    // Cooldown applies on ALL branches (including silent-Read) so subsequent
+    // calls on the same file in the same session don't re-query — preserving
+    // the per-filePath invariant that underpins Read→Edit dedup.
     cooldown[filePath] = now;
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
   } catch {
