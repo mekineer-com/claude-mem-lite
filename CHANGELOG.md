@@ -11,6 +11,10 @@ All notable changes to claude-mem-lite are documented in this file.
 - **`lib/low-signal-patterns.mjs::isNoiseObservation()`** — write-side filter called from `hook-llm.mjs:saveObservation`. Drops observations where title matches LOW_SIGNAL pattern AND no downstream signal (no lesson, importance<2, empty facts, narrative <40 chars / raw stderr). Expected impact on projects--mem: 30d low-signal drops 164 → ~40-60.
 - **`CLAUDE_MEM_KEEP_LOW_SIGNAL=1`** env var — opt-out flag that preserves pre-v2.36 insert-everything behavior. For users who want to audit hook capture end-to-end without the filter.
 
+### Changed
+
+- **Haiku episode prompt (P1)** — added `type:` classifier line with explicit trigger for each type. Concrete decision examples from this project (rejected schema migration, heterogeneous hook events) guide Haiku toward correct `decision` classification. Motivation: 30d `decision` rate was 3.8% (12/315) vs `change` 77% — imbalance attributed to missing classification guidance, not to lack of architectural decisions in the work.
+
 ### Migration
 
 - Degraded fallback saves (`Modified X`, `Error: X` with no substantive facts/lesson) are now dropped at the hook. Haiku-enriched observations are unaffected. To revert: `export CLAUDE_MEM_KEEP_LOW_SIGNAL=1`.

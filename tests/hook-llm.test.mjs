@@ -224,6 +224,46 @@ describe('handleLLMEpisode', () => {
     vi.clearAllMocks();
   });
 
+  it('P1: Haiku prompt contains decision-type trigger examples (single-entry)', async () => {
+    // v2.36 P1: ensure decision classification guidance reaches the LLM. The
+    // trigger string is a prompt-level addition, so the test captures what was
+    // actually sent to callLLM and checks the guidance survived.
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['auth.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Add JWT middleware', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const calls = callLLM.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastPrompt = calls[calls.length - 1][0];
+    expect(lastPrompt).toContain('decision = explicit tradeoff');
+    expect(lastPrompt).toContain('chose X over Y because Z');
+  });
+
+  it('P1: Haiku prompt contains decision-type trigger examples (multi-entry)', async () => {
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['auth.mjs'], filesRead: [],
+      entries: [
+        { tool: 'Edit', desc: 'Add JWT middleware', isError: false },
+        { tool: 'Edit', desc: 'Update config loader', isError: false },
+      ],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const calls = callLLM.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastPrompt = calls[calls.length - 1][0];
+    expect(lastPrompt).toContain('decision = explicit tradeoff');
+    expect(lastPrompt).toContain('bugfix = prior-failing path');
+  });
+
   it('extracts and saves event from single-entry episode (feature type → events table)', async () => {
     // Default mock returns type='feature' → EVENT_TYPE → routes to events.
     const episode = {
