@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause } from './utils.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -42,9 +42,14 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // R1: notLowSignalTitleClause() excludes hook-llm fallback titles
     // ("Modified X", "Worked on X", "Reviewed N files:", raw error logs, etc.)
     // that almost never get referenced (3.3% access rate) but compete for BM25 rank.
+    // v26 P0: noise_penalty is multiplied AFTER sort-BM25 so the column used
+    // for ORDER BY stays the penalty-adjusted `relevance` applied downstream
+    // in JS (scored.sort). SELECT exposes both raw BM25 (for sort) and the
+    // penalty factor (for the final JS score).
     const selectStmt = db.prepare(`
       SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
-             ${OBS_BM25} as relevance
+             ${OBS_BM25} as relevance,
+             ${noisePenaltyClause('o')} as noise_penalty
       FROM observations_fts
       JOIN observations o ON o.id = observations_fts.rowid
       WHERE observations_fts MATCH ?
@@ -80,7 +85,8 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     try {
       const crossStmt = db.prepare(`
         SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
-               ${OBS_BM25} as relevance
+               ${OBS_BM25} as relevance,
+               ${noisePenaltyClause('o')} as noise_penalty
         FROM observations_fts
         JOIN observations o ON o.id = observations_fts.rowid
         WHERE observations_fts MATCH ?
@@ -105,12 +111,14 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
 
     // Merge and score: same-project full weight, cross-project 0.7x
     // OR-fallback results get 0.4x penalty — they matched individual words, not the full intent
+    // v26 P0: noise_penalty (from SQL) shrinks high-inject/low-cite rows.
     const allRows = [...rows.map(r => ({ ...r, _or: usedOrFallback })), ...crossRows.map(r => ({ ...r, _or: crossUsedOr }))];
     const scored = allRows
       .filter(r => !excludeSet.has(r.id))
       .map(r => {
         const crossProjectPenalty = r.project === project ? 1.0 : 0.7;
         const orFallbackPenalty = r._or ? 0.4 : 1.0;
+        const noisePenalty = typeof r.noise_penalty === 'number' ? r.noise_penalty : 1.0;
         return {
           ...r,
           score: Math.abs(r.relevance)
@@ -118,7 +126,8 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
             * (r.lesson_learned ? 1.5 : 1.0)
             * (r.importance >= 2 ? 1.0 : 0.6)
             * crossProjectPenalty
-            * orFallbackPenalty,
+            * orFallbackPenalty
+            * noisePenalty,
         };
       })
       .sort((a, b) => b.score - a.score);
@@ -133,12 +142,19 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     const aboveThreshold = scored.filter(r => r.score >= threshold);
     if (aboveThreshold.length === 0) return [];
 
-    // Update access_count for injected memories
+    // v26 P0: bump injection_count (NOT access_count) for injected rows.
+    // Before v26 this was bumping access_count, which conflated auto-injection
+    // with real cites/recalls/opens — polluting the noise-ratio signal the
+    // penalty clause now depends on. access_count is reserved for explicit
+    // access (cmdRecall/cmdGet/cmdTimeline/pre-tool-recall/citation-tracker).
+    // Per-row try/catch for FTS trigger safety (project_non_obvious.md).
     const result = aboveThreshold.slice(0, MAX_MEMORY_INJECTIONS);
     const now = Date.now();
-    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
+    const bumpStmt = db.prepare(
+      'UPDATE observations SET injection_count = COALESCE(injection_count, 0) + 1, last_injected_at = ? WHERE id = ?'
+    );
     for (const r of result) {
-      updateStmt.run(now, r.id);
+      try { bumpStmt.run(now, r.id); } catch {}
     }
 
     return result;

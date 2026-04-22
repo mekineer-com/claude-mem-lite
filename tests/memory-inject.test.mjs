@@ -203,7 +203,10 @@ describe('searchRelevantMemories', () => {
     expect(results[0].type).toBe('bugfix');
   });
 
-  it('updates access_count for returned memories', () => {
+  it('updates injection_count (NOT access_count) for returned memories', () => {
+    // v26 P0: auto-injection bumps injection_count, leaving access_count
+    // for explicit access (cite / cmdRecall / cmdGet / cmdTimeline /
+    // pre-tool-recall). This separation powers the noise-ratio penalty.
     const info = insertObs(db, {
       sessionId: 'sess-1', project: 'proj', type: 'bugfix',
       title: 'Fixed dispatch race', narrative: 'Lock contention issue',
@@ -212,8 +215,10 @@ describe('searchRelevantMemories', () => {
     });
     const obsId = Number(info.lastInsertRowid);
     searchRelevantMemories(db, 'dispatch race condition', 'proj', []);
-    const row = db.prepare('SELECT access_count FROM observations WHERE id = ?').get(obsId);
-    expect(row.access_count).toBe(1);
+    const row = db.prepare('SELECT access_count, injection_count, last_injected_at FROM observations WHERE id = ?').get(obsId);
+    expect(row.injection_count).toBe(1);
+    expect(row.access_count).toBe(0);   // preserved — pure auto-inject no longer pollutes
+    expect(row.last_injected_at).toBeGreaterThan(0);
   });
 });
 

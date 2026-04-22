@@ -9,7 +9,7 @@ import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
 // ─── Re-exports from extracted modules ──────────────────────────────────────
 // Backward compatibility: all consumers import from utils.mjs
 
-export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, OBS_FTS_COLUMNS, notLowSignalTitleClause } from './scoring-sql.mjs';
+export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, OBS_FTS_COLUMNS, notLowSignalTitleClause, noisePenaltyClause } from './scoring-sql.mjs';
 export { cjkBigrams, extractCjkSynonymTokens, extractCjkKeywords, extractCjkLikePatterns, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
 export { resolveProject, _resetProjectCache } from './project-utils.mjs';
 export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';

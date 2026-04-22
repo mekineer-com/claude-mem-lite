@@ -4,7 +4,7 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause } from '../utils.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import Database from 'better-sqlite3';
@@ -87,12 +87,16 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
   const now = Date.now();
   // R1: notLowSignalTitleClause() excludes hook-llm degraded titles
   // ("Modified X", "Worked on X", "Reviewed N files:", raw error logs).
+  // v26 P0: noise penalty shrinks relevance magnitude for obs with high
+  // inject:access ratio (auto-injected often, never cited/opened). See
+  // docs/p0-injection-noise-baseline.txt.
   const sql = `
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25}
              * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
              * ${TYPE_QUALITY_CASE}
-             * (0.5 + 0.5 * COALESCE(o.importance, 1)) as relevance
+             * (0.5 + 0.5 * COALESCE(o.importance, 1))
+             * ${noisePenaltyClause('o')} as relevance
     FROM observations_fts
     JOIN observations o ON o.id = observations_fts.rowid
     WHERE observations_fts MATCH ?
@@ -460,6 +464,22 @@ async function main() {
           count: prevCount + 1,
         }));
       } catch {}
+      // v26 P0: bump injection_count for obs-based emits only (prompt-corpus
+      // rows have "P<id>" string IDs; skip those — they live in user_prompts).
+      // Per-row try/catch: observations_au trigger reinserts FTS on any UPDATE
+      // (project_non_obvious.md); an FTS corruption on one row must not abort
+      // counter bumps for other rows.
+      if (rows.length > 0) {
+        try {
+          const now = Date.now();
+          const bumpStmt = db.prepare(
+            'UPDATE observations SET injection_count = COALESCE(injection_count, 0) + 1, last_injected_at = ? WHERE id = ?'
+          );
+          for (const r of rows) {
+            try { bumpStmt.run(now, r.id); } catch {}
+          }
+        } catch {}
+      }
     }
 
     // ─── L1: Registry skill pointer (T4 v2.31) ──────────────────────────

@@ -2,6 +2,25 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.37.0] - 2026-04-23
+
+**Injection-noise penalty (P0 of integration audit).** Diagnostic on 30d projects--mem transcripts measured inject-recall at 13.6% (116/850 unique injected IDs ever cited) while inject occurrences hit 2561/30d (~48/session) — oversaturation, not "Claude ignores lessons". This release adds a per-observation noise-ratio penalty that deprioritizes obs auto-injected often but rarely opened/cited.
+
+### Added
+
+- **`scoring-sql.mjs::noisePenaltyClause(alias)`** — SQL CASE expression that shrinks relevance magnitude based on `injection_count` vs `access_count`. Thresholds calibrated from baseline: `>=20 inject AND ratio>5 → 0.2×`; `>=10 inject AND ratio>3 → 0.5×`; else `1.0×`. Applied in `user-prompt-search.js` FTS query and `hook-memory.mjs::searchRelevantMemories`. Cross-session signal: an ID that keeps getting pushed but never used loses BM25 prominence automatically, while heavy-use obs (#5597 29/10 ratio=2.9) stay at full weight.
+- **`injection_count` + `last_injected_at` columns** on `observations` (schema v26, additive). `injection_count` bumps only on UserPromptSubmit / hook-memory auto-injection; `access_count` reserved for explicit access paths (Stop-hook citation tracker, `cmdRecall` / `cmdGet` / `cmdTimeline`, pre-tool-recall). This separation is what makes the noise-ratio signal clean.
+- **`tests/injection-tracking.test.mjs`** — 12 cases covering migration defaults, penalty at 3 tiers, NULL-safety, accumulation across calls, and demotion ordering in `searchRelevantMemories`.
+- **`scripts/p0-forward-probe.mjs`** — audit helper that seeds `injection_count` from transcript scan data into a DB snapshot and reports tier distribution + per-obs penalty. Used to validate that penalty impact is narrow (3/850 tier-2, 14/850 tier-1 on current data) before shipping.
+
+### Changed
+
+- **`hook-memory.mjs` bump semantic (internal, not user-visible)** — auto-injection now bumps `injection_count` instead of `access_count`. Pre-v26 this code path was polluting `access_count` with inject events, which would have broken the noise-ratio signal. `access_count` now reflects only real access (cite / recall / get / timeline / pre-tool-recall), matching the semantic P4 (citation-tracker) established in v2.36.0.
+
+### Migration
+
+- Schema v25→v26 via two additive `ALTER TABLE` statements (guarded for idempotency). No data migration; existing rows get default 0 / NULL. Pre-v26 observations have `injection_count=0` until they get auto-injected again, at which point the penalty begins to apply. The empirical measurement baseline lives at `docs/p0-injection-noise-baseline.txt` and `docs/p0-forward-probe-baseline.txt` for before/after comparison next cycle.
+
 ## [2.36.0] - 2026-04-23
 
 **Write-side signal quality (P0-P4).** Diagnostic on projects--mem 30d data found 52% of observations were LOW_SIGNAL auto-titles (`Modified X`, `Error:`, `Worked on`) with empty facts / null lesson — noise that inflates the FTS index and crowds recall. This release blocks them at insert time.

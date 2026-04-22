@@ -62,6 +62,44 @@ export const TYPE_QUALITY_CASE = `(
 )`;
 
 /**
+ * Noise-ratio penalty: deprioritizes observations that get auto-injected often
+ * but rarely "used" (cited via Stop-hook citation tracker, or explicitly
+ * recalled/opened via pre-tool-recall / cmdRecall / cmdGet / cmdTimeline).
+ *
+ * Signal sources:
+ *   - injection_count: bumped ONLY on UserPromptSubmit / hook-memory auto-inject
+ *   - access_count: bumped on citation (c039352 P4), explicit recall, get, timeline
+ *
+ * Empirical thresholds (see docs/p0-injection-noise-baseline.txt, 53 transcripts):
+ *   • High-noise legitimate use (#5597 29/10=2.9x): kept at 1.0× (below tier-1)
+ *   • Moderate noise (#4352 44/9=4.89x): drops to 0.5× (tier-1 hit)
+ *   • Pure noise (#4046 14/0=inf): drops to 0.5× (tier-1; count≥10 gate protects
+ *     cold-start obs with legitimately no cites yet)
+ *   • Entrenched noise (≥20 inject, ≥5× ratio): drops to 0.2× (tier-2)
+ *
+ * Applied as: BM25 × time_decay × TYPE_QUALITY × (0.5 + 0.5·importance) × NOISE_PENALTY
+ * Note: multiplicative so ORDER BY relevance ASC (negative scores) still works —
+ * penalty shrinks magnitude, making the row less preferable.
+ *
+ * @param {string} [alias='o'] Table alias for the observations row.
+ * @returns {string} SQL CASE expression (already parenthesized).
+ */
+export function noisePenaltyClause(alias = 'o') {
+  const a = alias ? `${alias}.` : '';
+  return `(
+    CASE
+      WHEN COALESCE(${a}injection_count, 0) >= 20
+        AND COALESCE(${a}injection_count, 0) > COALESCE(${a}access_count, 0) * 5
+        THEN 0.2
+      WHEN COALESCE(${a}injection_count, 0) >= 10
+        AND COALESCE(${a}injection_count, 0) > COALESCE(${a}access_count, 0) * 3
+        THEN 0.5
+      ELSE 1.0
+    END
+  )`;
+}
+
+/**
  * SQL WHERE clause fragment excluding LOW_SIGNAL degraded titles — the fallback
  * titles hook-llm.mjs writes when Haiku summarization is unavailable or skipped
  * (e.g. "Modified X", "Worked on X", "Reviewed N files:", raw "Error: ..." logs).

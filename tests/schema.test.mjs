@@ -97,9 +97,9 @@ describe('session_handoffs.git_sha_at_handoff column (T10d v25)', () => {
     expect(row.git_sha_at_handoff).toBe('abc123def456');
   });
 
-  test('schema version is 25', () => {
+  test('schema version is 26', () => {
     const db = createTestDb();
     const row = db.prepare(`SELECT version FROM schema_version LIMIT 1`).get();
-    expect(row.version).toBe(25);
+    expect(row.version).toBe(26);
   });
 });

@@ -13,7 +13,7 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 25;
+export const CURRENT_SCHEMA_VERSION = 26;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -112,6 +112,13 @@ const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN superseded_by INTEGER DEFAULT NULL',
   'ALTER TABLE observations ADD COLUMN last_accessed_at INTEGER DEFAULT NULL',
   'ALTER TABLE observations ADD COLUMN optimized_at INTEGER DEFAULT NULL',
+  // v26 (P0 injection-noise): per-obs injection tracking for noise-ratio
+  // penalty. injection_count bumps only on UserPromptSubmit / hook-memory
+  // auto-injection (not on explicit recall/get/timeline — those keep bumping
+  // access_count). Pair with access_count to compute noise ratio: high
+  // injection_count + low access_count = low-signal, deprioritize.
+  'ALTER TABLE observations ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE observations ADD COLUMN last_injected_at INTEGER DEFAULT NULL',
 ];
 
 /**
