@@ -55,12 +55,12 @@ export function insertPrompt(db, { contentSessionId = 'sess-1', text, promptNumb
   return result;
 }
 
-export function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, text = '', narrative = '', importance = 1, relatedIds = '[]', epochOffset = 0, filesModified = '[]', accessCount = 0, compressedInto = null, lessonLearned = null, searchAliases = null, branch = null, supersededAt = null, supersededBy = null, lastAccessedAt = null }) {
+export function insertObs(db, { sessionId = 'sess-1', project = 'test', type = 'discovery', title, subtitle = '', text = '', narrative = '', importance = 1, relatedIds = '[]', epochOffset = 0, filesModified = '[]', accessCount = 0, compressedInto = null, lessonLearned = null, searchAliases = null, branch = null, supersededAt = null, supersededBy = null, lastAccessedAt = null }) {
   const now = Date.now() + epochOffset;
   const result = db.prepare(`
     INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, related_ids, access_count, compressed_into, lesson_learned, search_aliases, branch, superseded_at, superseded_by, last_accessed_at, created_at, created_at_epoch)
-    VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(sessionId, project, text, type, title, narrative, filesModified, importance, relatedIds, accessCount, compressedInto, lessonLearned, searchAliases, branch, supersededAt, supersededBy, lastAccessedAt, new Date(now).toISOString(), now);
+    VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(sessionId, project, text, type, title, subtitle, narrative, filesModified, importance, relatedIds, accessCount, compressedInto, lessonLearned, searchAliases, branch, supersededAt, supersededBy, lastAccessedAt, new Date(now).toISOString(), now);
 
   // Also populate observation_files junction table (mirrors saveObservation behavior)
   if (filesModified && filesModified !== '[]') {

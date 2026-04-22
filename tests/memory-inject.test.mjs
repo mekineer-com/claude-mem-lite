@@ -462,6 +462,37 @@ describe('v27: term-coverage filter', () => {
     expect(results.length).toBe(1);
   });
 
+  it('v2.41: null subtitle/narrative in hay does not crash (edge-case guard)', () => {
+    // Regression guard per #2664 — cover null / empty-string combinations in the
+    // expanded hay. Pre-fix `${row.subtitle || ''}` handled null; this locks it in.
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch race fixture sync',
+      // subtitle and narrative omitted → default ''
+      text: 'dispatch race fixture content',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'dispatch race fixture', 'cov-proj', []);
+    expect(results.length).toBe(1);
+  });
+
+  it('v2.41: counts subtitle + narrative prefix toward coverage (not just title + lesson)', () => {
+    // Title covers 1/3 (dispatch). lesson_learned empty. subtitle covers 1/3 (race).
+    // narrative covers 1/3 (fixture). Combined = 3/3 → pass.
+    // Pre-v2.41 (title + lesson only) this would have been 1/3 = 0.33 → filtered.
+    insertObs(db, {
+      sessionId: 'sess-cov', project: 'cov-proj', type: 'bugfix',
+      title: 'dispatch crash fix',
+      subtitle: 'race condition on worker teardown',
+      narrative: 'The fixture setup raced with the shared queue, causing intermittent hangs. Fixed by awaiting a barrier before dispatch.',
+      text: 'dispatch race fixture shared queue hang teardown',
+      importance: 3,
+    });
+    const results = searchRelevantMemories(db, 'dispatch race fixture', 'cov-proj', []);
+    expect(results.length).toBe(1);
+    expect(results[0].title).toBe('dispatch crash fix');
+  });
+
   it('disables filter when MEM_COVERAGE_THRESHOLD=0', () => {
     process.env.MEM_COVERAGE_THRESHOLD = '0';
     insertObs(db, {
@@ -479,5 +510,68 @@ describe('v27: term-coverage filter', () => {
     const results = searchRelevantMemories(db, 'dispatch race fixture', 'cov-proj', []);
     // Threshold disabled → sparse candidates survive (ranked by BM25)
     expect(results.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ─── v2.41: cross-project boost env override ────────────────────────────────
+//
+// Default 0.7 penalty to cross-project hits is baked in at hook-memory.mjs.
+// For single-project users (or users who want stronger cross-project transfer),
+// MEM_CROSS_PROJECT_BOOST ∈ [0,1] overrides the multiplier. 1.0 disables the
+// penalty entirely; 0.0 removes cross-project hits from the merged result set.
+
+describe('v2.41: MEM_CROSS_PROJECT_BOOST env override', () => {
+  let db;
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-main', project: 'main-proj' });
+    insertSession(db, { id: 'sess-other', project: 'other-proj' });
+    // Same-project match — decision, mid BM25
+    insertObs(db, {
+      sessionId: 'sess-main', project: 'main-proj', type: 'decision',
+      title: 'main dispatch routing policy',
+      lessonLearned: 'same-project decision for dispatch routing',
+      text: 'dispatch routing policy main',
+      importance: 3,
+    });
+    // Cross-project match — higher raw BM25 but gated by cross-project penalty
+    insertObs(db, {
+      sessionId: 'sess-other', project: 'other-proj', type: 'decision',
+      title: 'other dispatch routing policy decision',
+      lessonLearned: 'other-project decision on dispatch routing policy',
+      text: 'dispatch routing policy decision insight cross project',
+      importance: 3,
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.MEM_CROSS_PROJECT_BOOST;
+    db?.close();
+  });
+
+  it('default 0.7 penalty applied when env unset', () => {
+    delete process.env.MEM_CROSS_PROJECT_BOOST;
+    const results = searchRelevantMemories(db, 'dispatch routing policy', 'main-proj', []);
+    expect(results.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('MEM_CROSS_PROJECT_BOOST=1.0 disables the cross-project penalty', () => {
+    process.env.MEM_CROSS_PROJECT_BOOST = '1.0';
+    const results = searchRelevantMemories(db, 'dispatch routing policy', 'main-proj', []);
+    // At boost=1.0, cross-project row scores on BM25 alone; its richer text
+    // field means it now ranks at least as high as the same-project row.
+    expect(results.some(r => r.project === 'other-proj')).toBe(true);
+  });
+
+  it('invalid env value falls back to default 0.7', () => {
+    process.env.MEM_CROSS_PROJECT_BOOST = 'not-a-number';
+    // Must not throw; behavior matches unset
+    expect(() => searchRelevantMemories(db, 'dispatch routing policy', 'main-proj', [])).not.toThrow();
+  });
+
+  it('out-of-range env value (>1) falls back to default', () => {
+    process.env.MEM_CROSS_PROJECT_BOOST = '5';
+    expect(() => searchRelevantMemories(db, 'dispatch routing policy', 'main-proj', [])).not.toThrow();
   });
 });

@@ -2,6 +2,8 @@
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
 import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords } from './utils.mjs';
+import { recordMetric } from './lib/metrics.mjs';
+import { DB_DIR } from './schema.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -29,6 +31,17 @@ function getCoverageThreshold() {
   const n = parseFloat(raw);
   return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.4;
 }
+
+// v2.41: cross-project boost (applied to decisions/discoveries from other
+// projects). Default 0.7 = 30% penalty vs same-project hits — tuned for multi-
+// project installs where transferable insights are the minority of matches.
+// Env override `MEM_CROSS_PROJECT_BOOST` ∈ [0, 1]; clamped, invalid → default.
+function getCrossProjectBoost() {
+  const raw = process.env.MEM_CROSS_PROJECT_BOOST;
+  if (raw === undefined || raw === '') return 0.7;
+  const n = parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.7;
+}
 function extractQueryTerms(text) {
   if (!text) return [];
   const ascii = tokenizeHandoff(text).filter(t => !HANDOFF_STOP_WORDS.has(t));
@@ -36,9 +49,18 @@ function extractQueryTerms(text) {
   try { cjk = extractCjkKeywords(text) || []; } catch { /* CJK extraction best-effort */ }
   return [...new Set([...ascii, ...cjk.map(t => String(t).toLowerCase())])];
 }
+// v2.41: hay spans every FTS column whose BM25 weight is >=5 in OBS_BM25
+// (title=10, subtitle=5, narrative=5, lesson_learned=8). Pre-v2.41 was only
+// title + lesson_learned — rows that matched on narrative but happened to
+// omit the term from title/lesson were dropped by the 0.4 threshold even
+// though FTS ranked them strongly. Narrative is clipped to its first 400 chars
+// because coverage is a membership check, not a frequency count; the tail
+// rarely adds new terms and the worst-case string concatenation stays small.
+const COVERAGE_NARRATIVE_PREFIX = 400;
 function candidateCoverage(row, queryTerms) {
   if (queryTerms.length === 0) return 1.0;
-  const hay = `${row.title || ''} ${row.lesson_learned || ''}`.toLowerCase();
+  const narrativeHead = (row.narrative || '').slice(0, COVERAGE_NARRATIVE_PREFIX);
+  const hay = `${row.title || ''} ${row.subtitle || ''} ${row.lesson_learned || ''} ${narrativeHead}`.toLowerCase();
   let hits = 0;
   for (const t of queryTerms) {
     if (/[^ -~]/.test(t)) {
@@ -68,6 +90,23 @@ const MAX_FILE_RECALL = 2;
 export function searchRelevantMemories(db, userPrompt, project, excludeIds = []) {
   if (!db || !userPrompt || userPrompt.length < 5) return [];
 
+  // v2.41 metrics: record timing + candidate/filter/return counts per call.
+  // Gated by CLAUDE_MEM_METRICS=1 — no-op when disabled (zero hot-path cost).
+  const _t0 = Date.now();
+  let _candidates = 0, _aboveThreshold = 0, _returned = 0, _orFired = false;
+  const _emit = () => {
+    try {
+      recordMetric(DB_DIR, {
+        event: 'inject',
+        durationMs: Date.now() - _t0,
+        candidates: _candidates,
+        aboveThreshold: _aboveThreshold,
+        returned: _returned,
+        orFallback: _orFired,
+      });
+    } catch { /* metric record must not crash the caller */ }
+  };
+
   try {
     const ftsQuery = sanitizeFtsQuery(userPrompt);
     if (!ftsQuery) return [];
@@ -84,7 +123,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // in JS (scored.sort). SELECT exposes both raw BM25 (for sort) and the
     // penalty factor (for the final JS score).
     const selectStmt = db.prepare(`
-      SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
+      SELECT o.id, o.type, o.title, o.subtitle, o.narrative, o.importance, o.lesson_learned, o.project,
              ${OBS_BM25} as relevance,
              ${noisePenaltyClause('o')} as noise_penalty
       FROM observations_fts
@@ -121,7 +160,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     let crossUsedOr = false;
     try {
       const crossStmt = db.prepare(`
-        SELECT o.id, o.type, o.title, o.importance, o.lesson_learned, o.project,
+        SELECT o.id, o.type, o.title, o.subtitle, o.narrative, o.importance, o.lesson_learned, o.project,
                ${OBS_BM25} as relevance,
                ${noisePenaltyClause('o')} as noise_penalty
         FROM observations_fts
@@ -146,14 +185,21 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       }
     } catch (e) { debugCatch(e, 'crossProjectSearch'); }
 
-    // Merge and score: same-project full weight, cross-project 0.7x
+    // Merge and score: same-project full weight, cross-project (default 0.7x).
+    // v2.41: cross-project penalty is env-overridable via MEM_CROSS_PROJECT_BOOST
+    // (0..1). Default 0.7 — tuned for typical multi-project installs where
+    // transferable decisions/discoveries are a minority of matches. Set to 1.0
+    // for single-project users (no effective penalty); set lower to tighten
+    // same-project focus in noisy cross-project environments.
+    //
     // OR-fallback results get 0.4x penalty — they matched individual words, not the full intent
     // v26 P0: noise_penalty (from SQL) shrinks high-inject/low-cite rows.
+    const crossPenalty = getCrossProjectBoost();
     const allRows = [...rows.map(r => ({ ...r, _or: usedOrFallback })), ...crossRows.map(r => ({ ...r, _or: crossUsedOr }))];
     const scored = allRows
       .filter(r => !excludeSet.has(r.id))
       .map(r => {
-        const crossProjectPenalty = r.project === project ? 1.0 : 0.7;
+        const crossProjectPenalty = r.project === project ? 1.0 : crossPenalty;
         const orFallbackPenalty = r._or ? 0.4 : 1.0;
         const noisePenalty = typeof r.noise_penalty === 'number' ? r.noise_penalty : 1.0;
         return {
@@ -176,8 +222,11 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     ).get(project)?.c || 0;
     const { TINY, SMALL, MEDIUM, LARGE } = BM25_THRESHOLD;
     const threshold = obsCount < 5 ? TINY : obsCount < 100 ? SMALL : obsCount < 500 ? MEDIUM : LARGE;
+    _candidates = scored.length;
+    _orFired = usedOrFallback || crossUsedOr;
     const aboveThreshold = scored.filter(r => r.score >= threshold);
-    if (aboveThreshold.length === 0) return [];
+    _aboveThreshold = aboveThreshold.length;
+    if (aboveThreshold.length === 0) { _emit(); return []; }
 
     // v27: term-coverage filter — drop candidates whose title+lesson_learned
     // covers <threshold of the query's significant terms. Skipped for
@@ -189,7 +238,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       const queryTerms = extractQueryTerms(userPrompt);
       if (queryTerms.length >= COVERAGE_MIN_QUERY_TERMS) {
         coverageFiltered = aboveThreshold.filter(r => candidateCoverage(r, queryTerms) >= coverageThreshold);
-        if (coverageFiltered.length === 0) return [];
+        if (coverageFiltered.length === 0) { _emit(); return []; }
       }
     }
 
@@ -208,9 +257,12 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       try { bumpStmt.run(now, r.id); } catch {}
     }
 
+    _returned = result.length;
+    _emit();
     return result;
   } catch (e) {
     debugCatch(e, 'searchRelevantMemories');
+    _emit();
     return [];
   }
 }

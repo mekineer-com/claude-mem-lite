@@ -8,7 +8,7 @@ import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
-import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
+import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { effectiveQuiet } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
@@ -2107,6 +2107,8 @@ server.registerTool(
 );
 
 // ─── Tool: mem_fts_check ─────────────────────────────────────────────────────
+// Handler extracted to server/fts-check.mjs (v2.41 split).
+import { handleMemFtsCheck } from './server/fts-check.mjs';
 
 server.registerTool(
   'mem_fts_check',
@@ -2114,22 +2116,7 @@ server.registerTool(
     description: descriptionOf('mem_fts_check'),
     inputSchema: memFtsCheckSchema,
   },
-  safeHandler(async (args) => {
-    // T3-P2-C: Zod `action: z.enum(['check','rebuild'])` filters any other value before we
-    // reach this handler, so there's no "Unknown action" fallback to write.
-    if (args.action === 'check') {
-      const result = checkFTSIntegrity(db);
-      return { content: [{ type: 'text', text: result.healthy
-        ? 'FTS5 indexes are healthy — all integrity checks passed.'
-        : `FTS5 issues found:\n${result.details.join('\n')}` }] };
-    }
-    // args.action === 'rebuild'
-    const result = rebuildFTS(db);
-    const summary = result.errors.length > 0
-      ? `Rebuilt: ${result.rebuilt.join(', ')}. Errors: ${result.errors.join(', ')}`
-      : `Successfully rebuilt: ${result.rebuilt.join(', ')}`;
-    return { content: [{ type: 'text', text: summary }] };
-  })
+  safeHandler(async (args) => handleMemFtsCheck(db, args))
 );
 
 // ─── Tool: mem_browse ────────────────────────────────────────────────────────

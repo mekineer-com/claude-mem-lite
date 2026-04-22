@@ -4,7 +4,7 @@
 //
 // Exit codes: 0 = pass, 1 = regression detected
 
-import { readFileSync } from 'fs';
+import { readFileSync, statSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
@@ -15,14 +15,35 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const toleranceIdx = process.argv.indexOf('--tolerance');
 const tolerance = toleranceIdx !== -1 ? parseFloat(process.argv[toleranceIdx + 1]) : 0.05;
 
+// v2.41: stale baseline warning. Baseline is load-bearing evidence; if it
+// predates significant code changes, the comparison is misleading. 30 days is
+// the soft threshold — matches compress age_days and roughly one release
+// cycle. Does NOT fail the gate — just prints a loud warning that the operator
+// should re-capture (`node benchmark/benchmark.mjs > benchmark/baseline.json`).
+const BASELINE_STALE_AGE_DAYS = 30;
+const DAY_MS = 86400000;
+
 // Load baseline
 const baselinePath = join(__dirname, 'baseline.json');
 let baseline;
+let baselineAgeDays = 0;
 try {
   baseline = JSON.parse(readFileSync(baselinePath, 'utf-8'));
+  // Prefer the timestamp recorded inside the baseline file; fall back to mtime.
+  const baselineMs = baseline?.timestamp ? Date.parse(baseline.timestamp) : NaN;
+  const refMs = Number.isFinite(baselineMs) ? baselineMs : statSync(baselinePath).mtimeMs;
+  baselineAgeDays = Math.floor((Date.now() - refMs) / DAY_MS);
 } catch {
   console.error('No baseline.json found — run benchmark first to create one.');
   process.exit(1);
+}
+
+if (baselineAgeDays >= BASELINE_STALE_AGE_DAYS) {
+  console.warn(
+    `\n  ⚠ STALE BASELINE (${baselineAgeDays}d old, threshold ${BASELINE_STALE_AGE_DAYS}d).\n` +
+    `    Recapture: node benchmark/benchmark.mjs > benchmark/baseline.json\n` +
+    `    Gate continues to run — this is advisory, not a failure.`
+  );
 }
 
 // Run benchmark (JSON on stdout, logs on stderr)

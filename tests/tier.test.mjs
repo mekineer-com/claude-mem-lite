@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fc from 'fast-check';
 import { computeTier, ACTIVE_WINDOWS, TIER_CASE_SQL, tierSqlParams, relativeTime } from '../tier.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { DECAY_HALF_LIFE_BY_TYPE } from '../utils.mjs';
@@ -127,6 +128,75 @@ describe('TIER_CASE_SQL parity with computeTier', () => {
     for (const row of rows) {
       const jsTier = computeTier(row, baseCtx);
       expect(row.tier).toBe(jsTier);
+    }
+  });
+
+  // Property test — drift guard for TIER_CASE_SQL ↔ computeTier duplication.
+  // The two implementations must agree for ANY observation shape, not just the
+  // hand-picked samples above. Generates random rows covering every branch of
+  // the decision tree (compressed / superseded / session / project+importance
+  // / project+recent / type-specific active windows / fallback archive).
+  it('property: SQL and JS tiers agree for arbitrary rows', () => {
+    const typeArb = fc.constantFrom('decision', 'discovery', 'feature', 'bugfix', 'refactor', 'change', null);
+    const sessionArb = fc.constantFrom('sess-current', 'other-sess');
+    const projectArb = fc.constantFrom('test', 'other');
+    // Epoch offset spans past 180 days through a little future (clock skew edge)
+    const epochOffsetArb = fc.integer({ min: -180 * DAY, max: HOUR });
+    const importanceArb = fc.constantFrom(1, 2, 3);
+    const compressedArb = fc.constantFrom(0, -1, -2, 42);
+    const supersededArb = fc.option(fc.constantFrom(NOW - DAY, NOW), { nil: null });
+    const lastAccessedArb = fc.option(fc.integer({ min: NOW - 30 * DAY, max: NOW }), { nil: null });
+
+    const db = createTestDb();
+    try {
+      insertSession(db, { id: 'sess-current' });
+      insertSession(db, { id: 'other-sess' });
+
+      fc.assert(
+        fc.property(
+          fc.record({
+            sessionId: sessionArb,
+            project: projectArb,
+            type: typeArb,
+            importance: importanceArb,
+            compressedInto: compressedArb,
+            supersededAt: supersededArb,
+            lastAccessedAt: lastAccessedArb,
+            epochOffset: epochOffsetArb,
+          }),
+          (spec) => {
+            // Insert one observation matching the generated spec; clear after
+            // the check so each run measures one row in isolation.
+            const typeForInsert = spec.type ?? 'change';
+            const title = `prop-${Math.random().toString(36).slice(2, 8)}`;
+            insertObs(db, {
+              sessionId: spec.sessionId,
+              project: spec.project,
+              type: typeForInsert,
+              title,
+              importance: spec.importance,
+              compressedInto: spec.compressedInto === 0 ? null : spec.compressedInto,
+              supersededAt: spec.supersededAt,
+              lastAccessedAt: spec.lastAccessedAt,
+              epochOffset: spec.epochOffset,
+            });
+            try {
+              const params = tierSqlParams(baseCtx);
+              const row = db.prepare(`
+                SELECT *, ${TIER_CASE_SQL} as tier FROM observations WHERE title = ?
+              `).get(...params, title);
+              if (!row) return true; // insertObs may skip invalid combos
+              const jsTier = computeTier(row, baseCtx);
+              return row.tier === jsTier;
+            } finally {
+              db.prepare(`DELETE FROM observations WHERE title = ?`).run(title);
+            }
+          },
+        ),
+        { numRuns: 100 },
+      );
+    } finally {
+      db.close();
     }
   });
 });

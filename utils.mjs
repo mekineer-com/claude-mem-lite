@@ -235,7 +235,11 @@ export function debugLog(level, context, msg) {
 
 /**
  * Log a caught error at ERROR level (includes stack trace when available).
- * Gated by CLAUDE_MEM_DEBUG. Use in catch blocks for non-fatal errors.
+ * Gated by CLAUDE_MEM_DEBUG for stderr output. Separately, if
+ * `CLAUDE_MEM_CATCH_SAMPLE` (float 0..1) is set, a random fraction of caught
+ * errors get appended to `$DB_DIR/errors/YYYY-MM-DD.jsonl` — observable
+ * residue for otherwise-silent swallowed errors (see lib/err-sampler.mjs).
+ * Use in catch blocks for non-fatal errors.
  * @param {Error|unknown} e The caught error
  * @param {string} context Module or function name for attribution
  */
@@ -243,6 +247,20 @@ export function debugCatch(e, context) {
   if (process.env.CLAUDE_MEM_DEBUG) {
     const ts = new Date().toISOString();
     console.error(`[claude-mem-lite] [${ts}] [ERROR] ${context}:`, e?.stack || e?.message || e);
+  }
+  // Sampled-to-disk surface for post-mortem. Lazy-loaded so fs-less paths
+  // don't pay the module cost; wrapped in try so sampler faults never crash
+  // the caller (debugCatch is the error-handler-of-last-resort path).
+  if (process.env.CLAUDE_MEM_CATCH_SAMPLE) {
+    (async () => {
+      try {
+        const [{ maybeSampleError }, { DB_DIR }] = await Promise.all([
+          import('./lib/err-sampler.mjs'),
+          import('./schema.mjs'),
+        ]);
+        maybeSampleError(e, context, DB_DIR);
+      } catch { /* sampler dynamic-import fault must not propagate */ }
+    })();
   }
 }
 

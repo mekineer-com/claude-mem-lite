@@ -13,7 +13,15 @@ export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
-export const CURRENT_SCHEMA_VERSION = 26;
+//
+// v27 (v2.41): observations_au / session_summaries_au / user_prompts_au
+// triggers scoped to FTS-indexed columns via `AFTER UPDATE OF <cols>`. Before
+// v27 the _au triggers fired on ANY row UPDATE — access_count / injection_count
+// / last_accessed_at bumps (#8100 separation notwithstanding) caused wasted
+// FTS delete+reinsert cycles and amplified SQLITE_CORRUPT_VTAB blast radius
+// (project_non_obvious.md). Migration drops the old triggers once and lets
+// ensureFTS recreate them with the scoped form.
+export const CURRENT_SCHEMA_VERSION = 27;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -127,11 +135,27 @@ const MIGRATIONS = [
  * The DB should have foreign_keys OFF before calling (enabled after dedup migration).
  */
 export function initSchema(db) {
-  // Fast path: skip all migrations if schema is already at current version
+  // Fast path: skip all migrations if schema is already at current version.
+  // Forward-incompat guard: if persisted version is NEWER than this build's
+  // CURRENT_SCHEMA_VERSION, a newer claude-mem-lite wrote it; the current
+  // (older) binary would silently re-apply old migrations over a newer layout.
+  // Throw loudly instead — `claude-mem-lite doctor` / reinstall is the path.
   try {
     const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
-    if (row && row.version === CURRENT_SCHEMA_VERSION) return db;
-  } catch { /* table may not exist yet */ }
+    if (row && typeof row.version === 'number') {
+      if (row.version === CURRENT_SCHEMA_VERSION) return db;
+      if (row.version > CURRENT_SCHEMA_VERSION) {
+        throw new Error(
+          `DB schema is v${row.version} but this claude-mem-lite binary supports up to v${CURRENT_SCHEMA_VERSION}. ` +
+          `A newer version wrote this DB; upgrade claude-mem-lite (npm i -g claude-mem-lite@latest) or point CLAUDE_MEM_DIR to a fresh directory.`
+        );
+      }
+    }
+  } catch (e) {
+    // schema_version table absent = first init — proceed to create it.
+    // Real forward-incompat throw above must propagate.
+    if (e.message?.startsWith('DB schema is v')) throw e;
+  }
 
   // Create core tables
   db.exec(CORE_SCHEMA);
@@ -240,6 +264,25 @@ export function initSchema(db) {
       db.exec(`DROP TABLE IF EXISTS observations_fts`);
     }
   } catch { /* non-critical — ensureFTS will create if missing */ }
+
+  // v27 migration: drop legacy _au triggers that fire on ANY row UPDATE so
+  // ensureFTS reinstates them with `AFTER UPDATE OF <fts_cols>`. Trigger fires
+  // only when FTS-indexed columns change after this migration — access_count
+  // / injection_count / last_accessed_at bumps no longer thrash the FTS index.
+  // Conditional per #7647: only drop when the stored DDL lacks the scoped
+  // `UPDATE OF` clause (handles re-run + fresh-DB cases).
+  for (const [trg, tbl] of [
+    ['observations_au',      'observations'],
+    ['session_summaries_au', 'session_summaries'],
+    ['user_prompts_au',      'user_prompts'],
+  ]) {
+    try {
+      const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?`).get(trg);
+      if (row && row.sql && !/\bAFTER\s+UPDATE\s+OF\s+/i.test(row.sql)) {
+        db.exec(`DROP TRIGGER IF EXISTS ${tbl}_au`);
+      }
+    } catch { /* non-critical — ensureFTS will recreate */ }
+  }
 
   // FTS5 full-text search tables + triggers (idempotent)
   ensureFTS(db, 'observations_fts', 'observations', OBS_FTS_COLUMNS);
@@ -523,10 +566,8 @@ export function checkFTSIntegrity(db) {
 }
 
 export function ensureFTS(db, ftsName, tableName, columns) {
-  const exists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
-  if (exists) return;
-
-  // Validate identifiers to prevent SQL injection
+  // Validate identifiers to prevent SQL injection (done upfront; both
+  // branches below use these identifiers in string-interpolated SQL)
   const idRe = /^[a-z][a-z0-9_]*$/;
   if (!idRe.test(ftsName) || !idRe.test(tableName) || !columns.every(c => idRe.test(c))) {
     throw new Error(`Invalid identifier in ensureFTS: ${ftsName}, ${tableName}`);
@@ -535,18 +576,30 @@ export function ensureFTS(db, ftsName, tableName, columns) {
   const colList = columns.join(', ');
   const newVals = columns.map(c => `new.${c}`).join(', ');
   const oldVals = columns.map(c => `old.${c}`).join(', ');
-  db.exec(`
-    CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id');
 
-    CREATE TRIGGER ${tableName}_ai AFTER INSERT ON ${tableName} BEGIN
+  const ftsExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
+  if (!ftsExists) {
+    db.exec(`CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id')`);
+  }
+
+  // Triggers created / recreated independently of FTS table existence so that
+  // schema migrations (e.g. v27 scope-to-FTS-columns) can drop the old _au
+  // trigger and this function reinstates it with the current template on the
+  // next ensureDb(). Per #7647: keep rebuild conditional — IF NOT EXISTS gates
+  // writes when the current definition already matches.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS ${tableName}_ai AFTER INSERT ON ${tableName} BEGIN
       INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
     END;
 
-    CREATE TRIGGER ${tableName}_ad AFTER DELETE ON ${tableName} BEGIN
+    CREATE TRIGGER IF NOT EXISTS ${tableName}_ad AFTER DELETE ON ${tableName} BEGIN
       INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
     END;
 
-    CREATE TRIGGER ${tableName}_au AFTER UPDATE ON ${tableName} BEGIN
+    -- v27: AFTER UPDATE OF <fts_cols> — trigger fires only when an FTS-indexed
+    -- column changes. Prevents access_count / injection_count / last_accessed_at
+    -- UPDATEs from firing wasteful FTS delete+reinsert (project_non_obvious.md).
+    CREATE TRIGGER IF NOT EXISTS ${tableName}_au AFTER UPDATE OF ${colList} ON ${tableName} BEGIN
       INSERT INTO ${ftsName}(${ftsName}, rowid, ${colList}) VALUES('delete', old.id, ${oldVals});
       INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
     END;

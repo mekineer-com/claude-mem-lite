@@ -39,6 +39,14 @@ export const SOURCE_FILES = [
   'lib/low-signal-patterns.mjs',
   'lib/citation-tracker.mjs',
   'lib/id-routing.mjs',
+  'lib/err-sampler.mjs',
+  'lib/metrics.mjs',
+  // v2.41 god-module split — mem-cli.mjs router + per-cmd handlers under cli/
+  'cli/common.mjs',
+  'cli/fts-check.mjs',
+  'cli/doctor.mjs',
+  'cli/activity.mjs',
+  'server/fts-check.mjs',
   // v2.32 invited-memory: memdir primitives + adopt/unadopt CLI
   'memdir.mjs',
   'adopt-content.mjs',

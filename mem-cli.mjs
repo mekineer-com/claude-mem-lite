@@ -3,7 +3,7 @@
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
 import { homedir } from 'os';
-import { ensureDb, DB_PATH, REGISTRY_DB_PATH, checkFTSIntegrity, rebuildFTS } from './schema.mjs';
+import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
@@ -19,88 +19,10 @@ import { probeOtherSources as probeIdSources } from './lib/id-routing.mjs';
 import { basename } from 'path';
 import { readFileSync } from 'fs';
 
-// OBS_BM25, TYPE_DECAY_CASE imported from utils.mjs
-
-// ─── Argument Parsing ────────────────────────────────────────────────────────
-
-function parseArgs(argv) {
-  const positional = [];
-  const flags = {};
-  let i = 0;
-  while (i < argv.length) {
-    const arg = argv[i];
-    if (arg.startsWith('--')) {
-      const key = arg.slice(2);
-      const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--') && (!next.startsWith('-') || /^-\d/.test(next))) {
-        flags[key] = next;
-        i += 2;
-      } else {
-        flags[key] = true;
-        i++;
-      }
-    } else if (arg === '-h') {
-      flags.help = true;
-      i++;
-    } else {
-      positional.push(arg);
-      i++;
-    }
-  }
-  return { positional, flags };
-}
-
-// ─── Output Helpers ──────────────────────────────────────────────────────────
-
-function out(text) {
-  process.stdout.write(text + '\n');
-}
-
-function fail(text) {
-  process.stderr.write(text + '\n');
-  process.exitCode = 1;
-}
-
-function relativeTime(epochMs) {
-  const diff = Date.now() - epochMs;
-  if (diff < 0) return 'just now';
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-function fmtDateShort(iso) {
-  if (!iso) return '';
-  return iso.slice(0, 10); // YYYY-MM-DD
-}
-
-// Parse an ID token from a command positional argument.
-// Accepts: `123`, `#123`, `P#123` / `p123` (prompt), `S#123` / `s123` (session).
-// Returns { source: 'obs'|'session'|'prompt'|null, id: number } or null if unparseable.
-// source===null means no explicit prefix — caller picks default (typically 'obs').
-function parseIdToken(raw) {
-  const m = /^([PpSs]?)#?(\d+)$/.exec(String(raw).trim());
-  if (!m) return null;
-  const p = m[1].toUpperCase();
-  const id = parseInt(m[2], 10);
-  if (!Number.isFinite(id) || id <= 0) return null;
-  const source = p === 'P' ? 'prompt' : p === 'S' ? 'session' : null;
-  return { source, id };
-}
-
-// Format the shared `probeIdSources` output as CLI hint strings.
-// Example: ["#5419 (obs)", "P#5417 (prompt)"] — callers join with "; ".
-function formatProbeHints(probe) {
-  const hints = [];
-  if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs)`);
-  if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session)`);
-  if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt)`);
-  return hints;
-}
+// v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
+// router + remaining-command bodies during the incremental split. Future work:
+// move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
+import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints } from './cli/common.mjs';
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
@@ -1869,36 +1791,8 @@ function cmdMaintain(db, args) {
   out(`[mem] ${results.join('\n[mem] ')}`);
 }
 
-// ─── FTS Check ───────────────────────────────────────────────────────────────
-
-function cmdFtsCheck(db, args) {
-  const { positional } = parseArgs(args);
-  const action = positional[0];
-  if (!action || !['check', 'rebuild'].includes(action)) {
-    fail('[mem] Usage: mem fts-check <check|rebuild>');
-    return;
-  }
-
-  if (action === 'check') {
-    const result = checkFTSIntegrity(db);
-    if (result.healthy) {
-      out('[mem] FTS5 indexes are healthy — all integrity checks passed.');
-    } else {
-      out(`[mem] FTS5 issues found:`);
-      for (const d of result.details) out(`  ${d}`);
-    }
-    return;
-  }
-
-  if (action === 'rebuild') {
-    const result = rebuildFTS(db);
-    if (result.errors.length > 0) {
-      out(`[mem] Rebuilt: ${result.rebuilt.join(', ')}. Errors: ${result.errors.join(', ')}`);
-    } else {
-      out(`[mem] Successfully rebuilt: ${result.rebuilt.join(', ')}`);
-    }
-  }
-}
+// cmdFtsCheck extracted to cli/fts-check.mjs (v2.41 split).
+import { cmdFtsCheck } from './cli/fts-check.mjs';
 
 // ─── Registry ─────────────────────────────────────────────────────────────────
 
@@ -2352,121 +2246,11 @@ async function cmdOptimize(db, args) {
   if (results.smartCompress) out(`  Smart-compress: ${results.smartCompress.compressed || 0} compressed of ${results.smartCompress.processed || 0} clusters`);
 }
 
-async function cmdDoctor(db, args) {
-  if (args.includes('--benchmark')) {
-    const { runBenchmark } = await import('./lib/doctor-benchmark.mjs');
-    const project = inferProject();
-    const result = runBenchmark(db, { project });
-    out(JSON.stringify(result, null, 2));
-    return;
-  }
-  out('[mem] doctor: supported flags: --benchmark');
-  process.exitCode = 1;
-}
+// cmdDoctor extracted to cli/doctor.mjs (v2.41 split).
+import { cmdDoctor } from './cli/doctor.mjs';
 
-// ─── Activity (T7 v2.31) ─────────────────────────────────────────────────────
-// Separate namespace from observations. Handlers are thin wrappers over
-// lib/activity.mjs pure functions; imported lazily to match the doctor pattern.
-
-function formatActivityResults(rows) {
-  if (!rows || rows.length === 0) return '(no events)';
-  return rows.map(r => `#${r.id} [${r.event_type}] ${r.title}`).join('\n');
-}
-
-async function cmdActivity(db, args) {
-  const sub = args[0];
-  if (!sub) {
-    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show> ...');
-    return;
-  }
-
-  const { positional, flags } = parseArgs(args.slice(1));
-  const { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES } = await import('./lib/activity.mjs');
-  const VALID_EVENT_TYPES = new Set(EVENT_TYPES);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
-
-  if (sub === 'save') {
-    const type = flags.type || 'observation';
-    if (!VALID_EVENT_TYPES.has(type)) {
-      fail(`[mem] activity save: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
-      return;
-    }
-    const title = flags.title || positional.join(' ').trim();
-    if (!title) {
-      fail('[mem] activity save: --title or positional text required');
-      return;
-    }
-    const body = flags.body || null;
-    // Accept both --file (singular, backward compat) and --files (plural,
-    // comma-split, preferred — matches cmdSave). Merge both sources.
-    const filesFromPlural = flags.files && typeof flags.files === 'string'
-      ? flags.files.split(',').map(s => s.trim()).filter(Boolean)
-      : [];
-    const filesFromSingular = flags.file && typeof flags.file === 'string' ? [flags.file] : [];
-    const file_paths_merged = [...filesFromSingular, ...filesFromPlural];
-    const file_paths = file_paths_merged.length > 0 ? file_paths_merged : null;
-    const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
-    if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
-      fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
-      return;
-    }
-    const id = saveEvent(db, {
-      project,
-      event_type: type,
-      title,
-      body,
-      importance: rawImp,
-      file_paths,
-    });
-    out(JSON.stringify({ ok: true, id }));
-    return;
-  }
-
-  if (sub === 'search') {
-    const q = positional.join(' ');
-    if (!q) {
-      fail('[mem] activity search: query required');
-      return;
-    }
-    const type = flags.type || null;
-    if (type !== null && !VALID_EVENT_TYPES.has(type)) {
-      fail(`[mem] activity search: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
-      return;
-    }
-    const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : 10;
-    const rows = searchEvents(db, q, { project, type, limit });
-    out(formatActivityResults(rows));
-    return;
-  }
-
-  if (sub === 'recent') {
-    // Accept either `activity recent 5` or `activity recent --limit 5`.
-    const posLimit = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
-    const flagLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-    const limit = Number.isFinite(posLimit) ? posLimit : (Number.isFinite(flagLimit) ? flagLimit : 20);
-    const type = flags.type || null;
-    if (type !== null && !VALID_EVENT_TYPES.has(type)) {
-      fail(`[mem] activity recent: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
-      return;
-    }
-    const rows = recentEvents(db, { project, type, limit });
-    out(formatActivityResults(rows));
-    return;
-  }
-
-  if (sub === 'show') {
-    const id = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
-    if (!Number.isFinite(id)) {
-      fail('[mem] activity show: numeric id required');
-      return;
-    }
-    const row = getEvent(db, id);
-    out(row ? JSON.stringify(row, null, 2) : 'Not found');
-    return;
-  }
-
-  fail(`[mem] Unknown activity subcommand: ${sub}`);
-}
+// cmdActivity (T7 v2.31) extracted to cli/activity.mjs (v2.41 split).
+import { cmdActivity } from './cli/activity.mjs';
 
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 

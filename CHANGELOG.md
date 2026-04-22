@@ -2,6 +2,51 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.41.0] - 2026-04-23
+
+**Architecture audit follow-up — 8 production-quality improvements + partial god-module split.** A comprehensive review of v2.40.0 against production criteria identified 12 recommendations spanning ranking quality, observability, data integrity, and code structure. This release ships the complete A+B set (7 additive improvements) plus the first slice of the god-module refactor (C). 1709 → 1834 tests green (+125 new regression guards).
+
+### Added
+
+- **Schema forward-incompat guard** (`schema.mjs`) — `initSchema` throws on `version > CURRENT_SCHEMA_VERSION`, preventing an older claude-mem-lite from silently re-running old migrations over a DB written by a newer build. Error names the gap and suggests `npm i -g claude-mem-lite@latest` or a fresh `CLAUDE_MEM_DIR`. 2 tests in `tests/schema.test.mjs`.
+- **`CLAUDE_MEM_CATCH_SAMPLE` env** (`lib/err-sampler.mjs`) — float in [0,1]. When set, a random fraction of `debugCatch` calls append a JSON line to `$DB_DIR/errors/YYYY-MM-DD.jsonl` (ts / ctx / msg / stack head). Closes the "silently-swallowed column-drift" gap that hid `rebuildVector`'s wrong-column-name bug until R-7 (#7556). Default off — hook hot path pays zero when unset. 9 tests in `tests/err-sampler.test.mjs`.
+- **`CLAUDE_MEM_METRICS` env + `lib/metrics.mjs`** — JSONL sink at `$DB_DIR/metrics/YYYY-MM-DD.jsonl`, one row per injection event with `{event, durationMs, candidates, aboveThreshold, returned, orFallback}`. `recordMetric(dbDir, payload)` is the write API, `aggregateMetrics(dbDir, days=7)` computes per-event p50/p95/p99 + error counts. 15 tests in `tests/metrics.test.mjs`. Integrated at `hook-memory.mjs::searchRelevantMemories` (all exit points).
+- **`claude-mem-lite doctor --metrics [--days N] [--json]`** — reads the JSONL sink, aggregates, and prints a one-line-per-event summary (or JSON with `--json`). Read-side has no env gate — you can inspect whatever was recorded even when metrics are currently off. Routed via `cli/doctor.mjs`.
+- **`MEM_CROSS_PROJECT_BOOST` env** (`hook-memory.mjs`) — float in [0,1], default 0.7 (the pre-v2.41 hardcoded cross-project penalty). Single-project users can set to 1.0 to disable the penalty; multi-project users can tune. Invalid / out-of-range values fall back to default. 4 tests.
+- **Benchmark stale-baseline warning** (`benchmark/ci-gate.mjs`) — prints `⚠ STALE BASELINE` on stderr when `benchmark/baseline.json` is older than 30 days (by internal `timestamp` field, falling back to `mtime`). Advisory only — gate continues to run. Current baseline is 71d old; recapture: `node benchmark/benchmark.mjs > benchmark/baseline.json`. 4 tests.
+- **Property test for tier parity** (`tests/tier.test.mjs`) — fast-check generates 100 random observation rows covering every branch of the decision tree, asserts `computeTier(row, ctx) === SQL TIER_CASE_SQL result`. Drift guard for the JS/SQL duplication that prior tests only covered with 7 hand-picked samples.
+
+### Changed
+
+- **FTS5 `_au` trigger scoped to indexed columns** (`schema.mjs`, schema v27) — `observations_au` / `session_summaries_au` / `user_prompts_au` now declare `AFTER UPDATE OF <fts_cols>` instead of `AFTER UPDATE`. Pre-v27 any column UPDATE (including `access_count` / `injection_count` / `last_accessed_at` bumps) triggered a wasted FTS delete+reinsert cycle — amplifying `SQLITE_CORRUPT_VTAB` blast radius (`project_non_obvious.md`). Migration detects the legacy unscoped form via `sqlite_master` DDL regex and drops the trigger so `ensureFTS` recreates it with the scoped template. 3 tests cover fresh-DB, sibling triggers, and the legacy-upgrade path.
+- **Term-coverage hay expanded** (`hook-memory.mjs::candidateCoverage`) — was `title + lesson_learned`; now `title + subtitle + lesson_learned + first 400 chars of narrative`. Aligns with `OBS_BM25` column weights (title=10, subtitle=5, narrative=5, lesson_learned=8): a row whose only query-term mentions live in narrative no longer drops below the 0.4 threshold just because its title is terse. 2 tests (hay-expansion + null/empty-field edge case) added to `tests/memory-inject.test.mjs`.
+- **`tests/test-helpers.mjs::insertObs`** — accepts `subtitle` param (was hardcoded `''`), enabling hay-expansion tests. Default still `''` so existing callers remain byte-identical.
+
+### Refactored (partial god-module split, v2.41 方案 X)
+
+- **`cli/common.mjs`** — shared CLI helpers: `parseArgs`, `out`, `fail`, `relativeTime`, `fmtDateShort`, `parseIdToken`, `formatProbeHints`. Every per-command file under `cli/` imports from here.
+- **`cli/fts-check.mjs`** — `cmdFtsCheck` extracted from `mem-cli.mjs`.
+- **`cli/doctor.mjs`** — `cmdDoctor` (incl. new `--metrics` flag) extracted.
+- **`cli/activity.mjs`** — `cmdActivity` (save/search/recent/show) extracted.
+- **`server/fts-check.mjs`** — `handleMemFtsCheck` MCP handler extracted. `registerTool` body becomes a thin delegate.
+- **`mem-cli.mjs` 2534 → 2318 LOC** (-216, -8.5%); **`server.mjs` 2317 → 2304 LOC**. Remaining 19 CLI commands + 16 MCP handlers stay in the god modules — future sessions continue the pattern established by these 5 files. Extracted modules added to `source-files.mjs` + `package.json` `files` so auto-update + npm release ship them.
+
+### Fixed
+
+- **Unused imports removed** from `mem-cli.mjs` and `server.mjs` (`checkFTSIntegrity`, `rebuildFTS`) — consumers moved to the extracted handler modules.
+
+### Migration
+
+- Schema v26 → v27 via idempotent trigger rebuild. No data migration; FTS content unchanged. Pre-v27 DBs get the scoped trigger on next `ensureDb()`; fresh DBs get it from the start. Rollback would require reinstating the old wide trigger — the v2.41 guard would then reject the rollback DB on a subsequent v2.41+ open, which is the intended behavior.
+
+### Measurements
+
+- Full test suite: **1834 / 1834** green (up from 1709 in v2.40.0: +125 net-new regression guards).
+- Hot-path cost of new env-gated features: **zero** when `CLAUDE_MEM_METRICS` / `CLAUDE_MEM_CATCH_SAMPLE` are unset (early-return before any fs work).
+- god-module reduction: `mem-cli.mjs` -216 LOC, `server.mjs` -13 LOC; pattern for remaining 35 extraction targets documented.
+
+---
+
 ## [2.40.0] - 2026-04-23
 
 **Two hook-visibility fixes surfaced by an end-to-end QA pass.** (1) `mem_search` / `claude-mem-lite search` silently relaxed strict multi-term AND queries to OR when zero results came back — callers (including Claude Code agents) could not distinguish a genuine strict match from a loose recovery. (2) `PreToolUse` Edit/Write recall injection lacked a framing disclaimer; two observed turn-end incidents traced to the lesson block being misread as a closing note, mirroring `#7758 handoff injection misread as user message`.

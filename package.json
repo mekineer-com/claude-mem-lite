@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.40.0",
+  "version": "2.41.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -52,6 +52,13 @@
     "lib/low-signal-patterns.mjs",
     "lib/citation-tracker.mjs",
     "lib/id-routing.mjs",
+    "lib/err-sampler.mjs",
+    "lib/metrics.mjs",
+    "cli/common.mjs",
+    "cli/fts-check.mjs",
+    "cli/doctor.mjs",
+    "cli/activity.mjs",
+    "server/fts-check.mjs",
     "registry.mjs",
     "registry-retriever.mjs",
     "registry-indexer.mjs",
