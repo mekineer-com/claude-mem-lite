@@ -27,7 +27,7 @@ import { basename, join } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { probeOtherSources as probeIdSources, parseIdToken } from './lib/id-routing.mjs';
+import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { createRequire } from 'module';
 
@@ -768,7 +768,10 @@ server.registerTool(
     // from mem_search results expect the same routing as CLI `timeline --anchor`.
     // Prompt/session anchors resolve to the nearest-in-time observation so
     // before/after semantics still apply to the observations timeline.
-    if (typeof anchorId === 'string') {
+    // Also covers bare numeric anchors so compressed-obs routing applies uniformly —
+    // without this, `anchor: 7826` (int) would bypass the compressed check and
+    // silently straddle a dead record.
+    if (typeof anchorId === 'string' || typeof anchorId === 'number') {
       const parsed = parseIdToken(anchorId);
       if (!parsed) {
         return { content: [{ type: 'text', text: `Invalid anchor "${args.anchor}". Expected N, #N, P#N, or S#N.` }] };
@@ -789,9 +792,20 @@ server.registerTool(
         anchorNote = `(anchored to #${nearest.id}, closest obs to ${srcPrefix}${parsed.id})`;
       } else {
         // Bare "#N" or "N" — resolve to obs, falling back to prompt/session like CLI bare-int path.
-        const obsExists = db.prepare('SELECT 1 FROM observations WHERE id = ?').get(parsed.id);
-        if (obsExists) {
-          anchorId = parsed.id;
+        // Route compressed obs to its parent so the before/after window (which filters compressed)
+        // isn't shown around a dead anchor. Negative sentinels (-1 dropped, -2 pending purge) surface
+        // an explicit error — they have no canonical parent.
+        const obsRow = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(parsed.id);
+        if (obsRow) {
+          const ci = obsRow.compressed_into;
+          if (ci && ci > 0) {
+            anchorId = ci;
+            anchorNote = `(anchored to #${ci}, #${parsed.id} was compressed into it)`;
+          } else if (ci && ci < 0) {
+            return { content: [{ type: 'text', text: `Observation #${parsed.id} was compressed and pruned; no canonical anchor available.` }] };
+          } else {
+            anchorId = parsed.id;
+          }
         } else {
           const promptRow = db.prepare('SELECT created_at_epoch FROM user_prompts WHERE id = ?').get(parsed.id);
           const sessionRow = promptRow ? null : db.prepare('SELECT created_at_epoch FROM session_summaries WHERE id = ?').get(parsed.id);
@@ -915,84 +929,123 @@ server.registerTool(
     inputSchema: memGetSchema,
   },
   safeHandler(async (args) => {
-    const source = args.source || 'obs';
-    const placeholders = args.ids.map(() => '?').join(',');
-
-    let rows, allFields, prefix, sourceLabel;
-    if (source === 'session') {
-      rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
-      allFields = ['id', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'files_read', 'files_edited', 'notes', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
-      prefix = 'S#';
-      sourceLabel = 'sessions';
-    } else if (source === 'prompt') {
-      rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
-      allFields = ['id', 'prompt_text', 'content_session_id', 'prompt_number', 'created_at'];
-      prefix = 'P#';
-      sourceLabel = 'prompts';
-    } else {
-      // Increment access_count for retrieved observations (batch UPDATE)
-      try {
-        db.prepare(
-          `UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`
-        ).run(Date.now(), ...args.ids);
-        autoBoostIfNeeded(db, args.ids);
-      } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-      rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...args.ids);
-      allFields = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
-      prefix = '#';
-      sourceLabel = 'observations';
+    // Bucket by per-token prefix (or force all to `args.source` when explicit).
+    // coerceMixedIdTokens has already stringified + regex-validated each token.
+    const { bySrc, invalid } = bucketIdTokens(args.ids, { explicit: args.source || null, defaultSource: 'obs' });
+    if (invalid.length > 0) {
+      // Should not happen — schema regex already rejected bad tokens — but guard defensively.
+      return { content: [{ type: 'text', text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, or S#N.` }] };
+    }
+    const totalRequested = bySrc.obs.length + bySrc.session.length + bySrc.prompt.length;
+    if (totalRequested === 0) {
+      return { content: [{ type: 'text', text: 'No valid IDs provided.' }] };
     }
 
-    // P1-3: validate requested fields — throw on all-invalid so callers don't silently get an
-    // empty record (header only). Partial-invalid is tolerated but surfaced as a note.
+    const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
+
+    // `fields` filter only makes sense for obs rows; session/prompt ignore it.
+    // Validate when obs is queried — throw on all-invalid, note on partial-invalid.
     let fieldsNote = '';
-    if (args.fields?.length) {
-      const invalid = args.fields.filter(f => !allFields.includes(f));
-      const valid = args.fields.filter(f => allFields.includes(f));
-      if (valid.length === 0) {
-        throw new Error(`No valid fields. Unknown field(s): ${invalid.join(', ')}. Valid: ${allFields.join(', ')}`);
+    let obsFieldFilter = null;
+    if (args.fields?.length && bySrc.obs.length > 0) {
+      const invalidFields = args.fields.filter(f => !OBS_FIELDS.includes(f));
+      const validFields = args.fields.filter(f => OBS_FIELDS.includes(f));
+      if (validFields.length === 0) {
+        throw new Error(`No valid fields. Unknown field(s): ${invalidFields.join(', ')}. Valid: ${OBS_FIELDS.join(', ')}`);
       }
-      if (invalid.length > 0) {
-        fieldsNote = `Note: unknown field(s) dropped: ${invalid.join(', ')}. Valid: ${allFields.join(', ')}`;
+      if (invalidFields.length > 0) {
+        fieldsNote = `Note: unknown field(s) dropped: ${invalidFields.join(', ')}. Valid: ${OBS_FIELDS.join(', ')}`;
+      }
+      obsFieldFilter = validFields;
+    }
+
+    // Per-source fetchers — each returns { rows, foundIds:Set, prefix }.
+    const sections = [];
+    const foundBySource = { obs: new Set(), session: new Set(), prompt: new Set() };
+
+    if (bySrc.obs.length > 0) {
+      const ph = bySrc.obs.map(() => '?').join(',');
+      try {
+        db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...bySrc.obs);
+        autoBoostIfNeeded(db, bySrc.obs);
+      } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
+      const rows = db.prepare(`SELECT * FROM observations WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.obs);
+      const renderFields = obsFieldFilter || OBS_FIELDS;
+      for (const row of rows) {
+        foundBySource.obs.add(row.id);
+        const lines = [`── #${row.id} ──`];
+        for (const f of renderFields) {
+          const val = row[f];
+          if (val === null || val === undefined || val === '') continue;
+          if (f === 'text' && row.narrative && typeof val === 'string' && val.startsWith(row.narrative)) continue;
+          const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
+          lines.push(`${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`);
+        }
+        sections.push(lines.join('\n'));
       }
     }
 
-    if (rows.length === 0) {
-      // Symmetric probe via shared lib/id-routing.mjs so CLI cmdGet and MCP mem_get
-      // stay aligned if a table's ID semantics change.
-      const probe = probeIdSources(db, args.ids, new Set([source]));
+    if (bySrc.session.length > 0) {
+      const ph = bySrc.session.map(() => '?').join(',');
+      const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.session);
+      const sessFields = ['id', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'files_read', 'files_edited', 'notes', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
+      for (const row of rows) {
+        foundBySource.session.add(row.id);
+        const lines = [`── S#${row.id} ──`];
+        for (const f of sessFields) {
+          const val = row[f];
+          if (val === null || val === undefined || val === '') continue;
+          const maxLen = 500;
+          lines.push(`${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`);
+        }
+        sections.push(lines.join('\n'));
+      }
+    }
+
+    if (bySrc.prompt.length > 0) {
+      const ph = bySrc.prompt.map(() => '?').join(',');
+      const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.prompt);
+      for (const row of rows) {
+        foundBySource.prompt.add(row.id);
+        const lines = [`── P#${row.id} ──`];
+        if (row.prompt_text) lines.push(`prompt_text: ${row.prompt_text.length > 500 ? row.prompt_text.slice(0, 500) + '…' : row.prompt_text}`);
+        if (row.content_session_id) lines.push(`content_session_id: ${row.content_session_id}`);
+        if (row.prompt_number !== null && row.prompt_number !== undefined) lines.push(`prompt_number: ${row.prompt_number}`);
+        if (row.created_at) lines.push(`created_at: ${row.created_at}`);
+        sections.push(lines.join('\n'));
+      }
+    }
+
+    const totalFound = foundBySource.obs.size + foundBySource.session.size + foundBySource.prompt.size;
+
+    if (totalFound === 0) {
+      // Probe other sources so callers can retry with the right prefix/source override.
+      const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
+      const allNumericIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt];
+      const probe = probeIdSources(db, allNumericIds, queried);
       const hints = [];
-      if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs — use source='obs')`);
-      if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session — use source='session')`);
-      if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt — use source='prompt')`);
+      if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs — use source='obs' or bare #N)`);
+      if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session — use source='session' or S#N)`);
+      if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt — use source='prompt' or P#N)`);
       const hint = hints.length > 0 ? ` Try: ${hints.join('; ')}.` : '';
-      const msg = `No ${sourceLabel} found for given IDs.${hint}`;
+      const queriedList = [...queried].join(', ');
+      const msg = `No records found in source(s) [${queriedList}] for the given ID(s).${hint}`;
       return { content: [{ type: 'text', text: fieldsNote ? `${msg}\n\n${fieldsNote}` : msg }] };
     }
 
-    const fields = args.fields?.length ? args.fields.filter(f => allFields.includes(f)) : allFields;
+    // Missing-ID note per bucket (mirrors mem_delete). Show missing IDs with their bucket prefix
+    // so callers can tell which source returned nothing.
+    const missingHints = [];
+    const miss = (arr, found, prefix) => arr.filter(id => !found.has(id)).map(id => `${prefix}${id}`);
+    missingHints.push(...miss(bySrc.obs, foundBySource.obs, '#'));
+    missingHints.push(...miss(bySrc.session, foundBySource.session, 'S#'));
+    missingHints.push(...miss(bySrc.prompt, foundBySource.prompt, 'P#'));
 
     const parts = [];
     if (fieldsNote) parts.push(fieldsNote);
-    for (const row of rows) {
-      const lines = [`── ${prefix}${row.id} ──`];
-      for (const f of fields) {
-        const val = row[f];
-        if (val === null || val === undefined || val === '') continue;
-        // Skip 'text' field when it duplicates narrative (text = narrative + optional CJK bigrams)
-        if (f === 'text' && row.narrative && typeof val === 'string' && val.startsWith(row.narrative)) continue;
-        // Field-aware truncation: narrative and lesson need more space than metadata
-        const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
-        lines.push(`${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`);
-      }
-      parts.push(lines.join('\n'));
-    }
-
-    // P1-4: surface IDs that weren't found (mirrors mem_delete's missing-ID note).
-    const foundIds = new Set(rows.map(r => r.id));
-    const missing = args.ids.filter(id => !foundIds.has(id));
-    if (missing.length > 0) {
-      parts.push(`Note: ID(s) ${missing.join(', ')} not found.`);
+    parts.push(...sections);
+    if (missingHints.length > 0) {
+      parts.push(`Note: ID(s) ${missingHints.join(', ')} not found.`);
     }
 
     return { content: [{ type: 'text', text: parts.join('\n\n') }] };

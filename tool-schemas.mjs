@@ -28,6 +28,55 @@ const coerceIntArray = z.preprocess(
   z.array(z.number().int())
 );
 
+// Coerce string arrays: accept array, comma-separated string, JSON-array string, or bare string.
+// MCP bridges sometimes JSON-stringify complex args — bare `z.array(z.string())` rejects those
+// with "expected array, received string" and the caller loses the field silently. Parity with
+// coerceIntArray: tolerate the same shapes so files/fields survive client serialization quirks.
+const coerceStringArray = z.preprocess(
+  (v) => {
+    if (Array.isArray(v)) return v.map(x => typeof x === 'string' ? x : String(x));
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (s.startsWith('[') && s.endsWith(']')) {
+        try {
+          const parsed = JSON.parse(s);
+          if (Array.isArray(parsed)) return parsed.map(x => typeof x === 'string' ? x : String(x));
+        } catch { /* fall through to comma-split */ }
+      }
+      return s.split(',').map(x => x.trim()).filter(x => x.length > 0);
+    }
+    return v;
+  },
+  z.array(z.string())
+);
+
+// Coerce mixed ID tokens (#N / P#N / S#N / bare N) for mem_get. Accepts:
+//   - native arrays: [1, "P#2", "#3"]
+//   - single number: 1
+//   - single/comma string: "1,P#2,S#3"
+//   - JSON-array string: '[1,"P#2"]' (MCP bridges that stringify complex args)
+// Piped to a regex-validated string[] so each token stays parseable by lib/id-routing.parseIdToken
+// at the handler. Closes the CLI↔MCP gap noted in #8127.
+const coerceMixedIdTokens = z.preprocess(
+  (v) => {
+    const norm = (x) => typeof x === 'string' ? x.trim() : String(x);
+    if (Array.isArray(v)) return v.map(norm).filter(s => s.length > 0);
+    if (typeof v === 'number') return [String(v)];
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (s.startsWith('[') && s.endsWith(']')) {
+        try {
+          const parsed = JSON.parse(s);
+          if (Array.isArray(parsed)) return parsed.map(norm).filter(x => x.length > 0);
+        } catch { /* fall through to comma-split */ }
+      }
+      return s.split(',').map(x => x.trim()).filter(Boolean);
+    }
+    return v;
+  },
+  z.array(z.string().regex(/^[PpSs]?#?\d+$/, 'Expected N, #N, P#N, or S#N')).min(1).max(20)
+);
+
 export const memSearchSchema = {
   query: z.string().optional().describe('Search query (FTS5 syntax supported)'),
   type: z.enum(['observations', 'sessions', 'prompts']).optional().describe('Limit to one table'),
@@ -78,12 +127,12 @@ export const memTimelineSchema = {
 };
 
 export const memGetSchema = {
-  // TODO(#8126): accept P#/S#/# prefix strings for paste-from-search parity with
-  // CLI cmdGet bucketed routing (~40 LOC handler refactor). mem_timeline already
-  // accepts prefixes via coerceAnchor; this is the matched-pair gap.
-  ids: coerceIntArray.pipe(z.array(z.number().int()).min(1).max(20)).describe('Observation IDs to retrieve'),
-  source: z.enum(['obs', 'session', 'prompt']).optional().describe('Record type: obs (default), session (S# from search), prompt (P# from search)'),
-  fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),
+  // Accepts mixed tokens so pasted search results work verbatim: [1], [1, "P#2"], "1,P#2,S#3",
+  // or the JSON-stringified form ["1","P#2"]. Each token's prefix routes to its source bucket
+  // in server.mjs via lib/id-routing.bucketIdTokens. An explicit `source` override still wins.
+  ids: coerceMixedIdTokens.describe('Mixed observation/prompt/session IDs — accepts N, #N, P#N, S#N; comma-strings and JSON arrays also coerced'),
+  source: z.enum(['obs', 'session', 'prompt']).optional().describe('Force all IDs to this source (overrides per-token prefixes). Omit to let P#/S#/# prefixes route individually.'),
+  fields: coerceStringArray.optional().describe('Specific fields to return (default: all; validated against obs schema — session/prompt sources ignore this filter)'),
 };
 
 export const memDeleteSchema = {
@@ -97,7 +146,7 @@ export const memSaveSchema = {
   type: OBS_TYPE_ENUM.optional().describe('Observation type (default: discovery)'),
   project: z.string().optional().describe('Project name (default: inferred from CWD)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 2 for explicit saves)'),
-  files: z.array(z.string()).optional().describe('File paths associated with this observation'),
+  files: coerceStringArray.optional().describe('File paths associated with this observation'),
   lesson_learned: z.string().max(500).optional().describe('Key lesson or takeaway (for bugfix: root cause & fix; for decision: rationale)'),
 };
 

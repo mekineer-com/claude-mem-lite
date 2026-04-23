@@ -1781,6 +1781,40 @@ describe('CLI timeline anchor prefix routing', () => {
     // error OR a hint mentioning prompt/session sources.
     expect(output).toMatch(/No observation.*prompt.*session|not found/i);
   });
+
+  // Regression for the compressed-anchor fast-path bug (#8127 follow-up):
+  // a bare-int anchor pointing at a compressed obs used to silently straddle a
+  // dead record because the before/after window filters `compressed_into != 0`.
+  // Fix re-anchors to the compression parent and emits an explanatory note.
+  it('bare-int anchor on compressed obs routes to its compressed_into parent', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
+      title: 'Parent summary', text: 'live parent', epochOffset: 1000,
+    });
+    const parentId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Child compressed into parent', text: 'dead child', epochOffset: 0,
+      compressedInto: parentId,
+    });
+    const childId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['timeline', '--anchor', String(childId), '--before', '0', '--after', '0']));
+    expect(output).toContain(`Timeline around #${parentId}`);
+    expect(output).toContain(`#${childId} was compressed into it`);
+    expect(output).not.toContain(`Timeline around #${childId}`);
+  });
+
+  it('bare-int anchor on pruned obs (compressed_into < 0) surfaces explicit error', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Pruned child', text: 'pruned', compressedInto: -2,
+    });
+    const prunedId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['timeline', '--anchor', String(prunedId)]));
+    expect(output).toMatch(/compressed and pruned|no canonical anchor/i);
+  });
 });
 
 // ─── delete/update reject P#/S# cleanly (regression: #8104) ──────────────────
@@ -1802,6 +1836,51 @@ describe('CLI delete/update rejects non-obs prefixes', () => {
     const { run } = await import('../mem-cli.mjs');
     const output = await captureStdout(() => run(['update', 'S#1', '--title', 'x']));
     expect(output).toMatch(/observation|obs only|--source/i);
+  });
+});
+
+// ─── cmdGet mixed-prefix routing via shared bucketIdTokens (#8127 / #8050) ──
+
+describe('CLI get command — mixed-prefix routing', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('routes mixed tokens to their per-prefix source buckets in one call', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Obs target', text: 'obs content' });
+    const obsId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
+    testDb.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch) VALUES ('s1', 'prompt target', ?, ?)`).run(new Date().toISOString(), Date.now());
+    const promptId = testDb.prepare('SELECT MAX(id) AS id FROM user_prompts').get().id;
+
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', `#${obsId},P#${promptId}`]));
+    expect(output).toContain(`#${obsId}`);
+    expect(output).toContain('Obs target');
+    expect(output).toContain(`P#${promptId}`);
+    expect(output).toContain('prompt target');
+  });
+
+  it('explicit --source overrides per-token prefix (locks all to that bucket)', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Obs 1', text: 'x' });
+    const obsId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
+
+    const { run } = await import('../mem-cli.mjs');
+    // P#<obsId> with --source obs should coerce to obs bucket and hit.
+    const output = await captureStdout(() => run(['get', `P#${obsId}`, '--source', 'obs']));
+    expect(output).toContain(`#${obsId}`);
+    expect(output).toContain('Obs 1');
+  });
+
+  it('unparseable token is reported via stderr and other tokens still resolve', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Live obs', text: 'x' });
+    const obsId = testDb.prepare('SELECT MAX(id) AS id FROM observations').get().id;
+
+    const { run } = await import('../mem-cli.mjs');
+    const output = await captureStdout(() => run(['get', `garbage,#${obsId}`]));
+    expect(output).toMatch(/unparseable|Ignoring/i);
+    expect(output).toContain('Live obs');
   });
 });
 

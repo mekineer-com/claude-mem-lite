@@ -2,6 +2,42 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.43.0] - 2026-04-23
+
+**Both known follow-ups from v2.42.0 closed, plus a new bug class surfaced by the user-simulation pass and a Level-2 invariant to keep it closed.** Running `claude-mem-lite` as an end user found two live defects the earlier release had explicitly deferred: (1) `timeline` anchored at a compressed obs produced an asymmetric, unexplained window; (2) `mem_save({ files: [...] })` round-tripped through some MCP bridges as a JSON string and was silently dropped by the strict `z.array(z.string())` schema. Shipping the follow-up from `#8127` in the same release — `mem_get` MCP now accepts the same `P#N` / `S#N` / `#N` prefix tokens as its CLI twin — and adding a round-trip parity harness that locks the Postel's-Law contract for every ID-accepting MCP schema going forward.
+
+### Fixed
+
+- **`mem-cli.mjs:719`, `server.mjs:795`** — `timeline` bare-int `obsExists` fast-path now selects `compressed_into` and routes positive values to the compression parent (`anchored to #P, #N was compressed into it`), negative sentinels (`-1` dropped / `-2` pending purge) surface an explicit "compressed and pruned" error. Pre-fix: `timeline --anchor 7826` (a compressed row) silently anchored on a dead record while the before/after window filters `COALESCE(compressed_into, 0) = 0` — yielding a partial asymmetric window with no note. Post-fix reproduces to `Timeline around #7875 (anchored to #7875, #7826 was compressed into it)`. MCP-side bonus: `server.mjs` widened its `if (typeof anchorId === 'string')` resolution guard to `string | number` so bare-int anchors hit the same compressed check as CLI — previously the numeric MCP path skipped the entire resolution block. Closes the "Known follow-up" #2 from v2.42.0. Lesson `#8131` saved.
+- **`tool-schemas.mjs` `memSaveSchema.files` + `memGetSchema.fields`** — bare `z.array(z.string())` used to reject `files: '["a.mjs","b.mjs"]'` (JSON-string shape emitted by some MCP bridges) with `MCP error -32602: expected array, received string`, which Claude then silently retries without the field — producing a saved observation with empty `files_modified` that only surfaces on later inspection. Both fields now route through a new `coerceStringArray` preprocess that accepts native array, JSON-array string, comma-separated string, or bare string; downstream render confirms `files_modified: ["coerce-test.mjs","tool-schemas.mjs"]` survives end-to-end via stdio. Parallel to the pre-existing `coerceIntArray` / `coerceBool` pattern. Lesson `#8134` saved.
+
+### Added
+
+- **MCP `mem_get` accepts `P#N` / `S#N` / `#N` / mixed prefix tokens** (`tool-schemas.mjs`, `server.mjs:925-1040`) — closes the "Known follow-up" #1 from v2.42.0 (the `TODO(#8126)` marker in `tool-schemas.mjs:80` is removed in this diff). Pre-fix: `mem_get({ ids: ['P#3462'] })` hit `MCP error -32602: expected number, received string`; callers had to manually split per-source and pass `source='prompt'`. Post-fix: `mem_get({ ids: ['#8127','P#3462','S#100'] })` buckets each token via its prefix and renders obs/session/prompt sections in one response. Comma-string (`'1,P#2,S#3'`), JSON-array string (`'[1,"P#2"]'`), and bare ints (back-compat) all coerce the same way. Explicit `source` override still wins over per-token prefixes. Missing-ID note now shows bucket-aware prefixes (`#999999`, `P#12`, `S#7`) so the caller sees which source returned nothing. Reachable via every smoke scenario: mix-prefix, comma-mix, JSON-mix, bare-int back-compat, bad-token rejection, explicit-source override.
+- **`lib/id-routing.bucketIdTokens(tokens, {explicit, defaultSource})`** — extracted single-source-of-truth bucketing so CLI `cmdGet` (`mem-cli.mjs:599-613`) and MCP `mem_get` handler now delegate to the same function. CLI-only lines removed: 15 LOC of inline per-token parse + per-source dispatch loop, replaced by one call. Applies lesson `#8050` (CLI↔MCP logic must live in `lib/`, not inline).
+- **`coerceMixedIdTokens`** (`tool-schemas.mjs`) — preprocess → `z.array(z.string().regex(/^[PpSs]?#?\d+$/))` that accepts array / comma-string / JSON-array-string / single scalar. Keeps each token as a stringified form so the bucketing stage can read its prefix; regex-pipe catches non-renderable garbage at the schema boundary (loud failure, not silent strip).
+- **`tests/schema-roundtrip.test.mjs`** (new, 17 tests) — enumerates every token form the CLI/MCP render sites emit (`#N`, `P#N`, `S#N`, lowercase variants, comma-string, JSON-array string) and asserts every ID-accepting MCP schema parses them. This is the Level-2 invariant: if anyone adds a new rendering site later, this test either already covers it or fails with a clear "extend `RENDERED_TOKEN_FORMS`" signal. `memDeleteSchema` intentionally locked to int-only (non-destructive-on-prompt/session by design — `cli.test.mjs:1795-1806` owns the other side of the same contract).
+- **3 new CLI regression tests** in `tests/cli.test.mjs` covering mixed-prefix routing through `bucketIdTokens`: per-prefix dispatch (`get '#N,P#N'` resolves obs + prompt in one call), explicit `--source` override wins over per-token prefix, unparseable token tolerance (garbage token logged, valid tokens still resolve).
+- **2 new CLI regression tests** for the compressed-anchor path (parent re-anchor emits explanatory note; pruned sentinel surfaces explicit error).
+- **8 new contract tests** for `coerceMixedIdTokens` + `coerceStringArray` (native array, comma-string, JSON-string, bare scalar, regex reject).
+
+### Refactored
+
+- **`mem-cli.mjs cmdGet`** (`mem-cli.mjs:599-613`) now delegates bucketing to `lib/id-routing.bucketIdTokens`. Removed inline `parsed + bySrc` loop. Public behavior unchanged — existing CLI tests all green including the `delete/update rejects P#/S#` contract at `cli.test.mjs:1795-1806`.
+- **`server.mjs mem_get` handler** (`server.mjs:931-1043`) rewritten from single-source SELECT to per-bucket SELECT + render. Each source section emits its prefix header (`── #N ──`, `── S#N ──`, `── P#N ──`); access_count increment remains obs-only. "No records found in source(s) [X]" error generalized to list queried buckets; four `audit-fixes.test.mjs` assertions updated to the new wording.
+- **Intentional contract change** — `memGetSchema.ids` now emits `string[]` (pre: `number[]`). External MCP callers that only *send* args are unaffected; any internal zod-inferred-type consumer sees the new shape. Four pre-existing `contract.test.mjs` assertions updated to reflect the new token contract.
+
+### Measurements
+
+- Full test suite: **1874 / 1874** green (up from 1843 in v2.42.0: +31 net-new — 17 roundtrip + 3 CLI mixed-prefix + 2 CLI compressed-anchor + 3 CLI lifecycle + 8 contract coercion − 2 pre-existing consolidated; 8 assertions updated for new contracts).
+- Lint clean on all 8 changed files after one `eqeqeq` fix.
+- Live prod DB smoke (stdio against `/server.mjs`): 6/6 `mem_get` scenarios pass (mix-prefix, comma-mix, JSON-mix, bare-int back-compat, bad-token rejected at schema, explicit-source override). `mem_timeline` compressed-anchor routing verified on `#7826` (live compressed obs in `projects--mem`).
+- `npm audit --omit=dev`: 0 vulnerabilities.
+
+### Design note — LLM-mediated typed RPC
+
+Running the tool like a real user surfaced a class of failure specific to LLM clients: a strict zod reject produces a *loud* protocol error but a *silent* downstream degradation, because the LLM absorbs the error and retries with fields stripped. The fix pattern — coerce at the boundary, keep tokens in their original shape until the handler, regex-reject only true garbage — is summarized as "tolerant input, strict internal representation" in lesson `#8134`. The `schema-roundtrip.test.mjs` harness is the machine-enforced half of that principle.
+
 ## [2.42.0] - 2026-04-23
 
 **Two bugfixes surfaced by an end-to-end user-simulation pass + parity follow-up for MCP.** A fresh round of "use the tool like a user" testing against the CLI and MCP surfaces exposed two reachable UX gaps: (1) `recent` / `timeline` CLI output emitted `#N` tokens with a leading space when the ID had fewer than 5 digits, breaking copy-paste into `claude-mem-lite get`; (2) MCP `mem_timeline` rejected prefixed anchor tokens (`P#N` / `S#N` / `#N`) that the CLI has accepted since v2.39.0 — a reachable CLI↔MCP parity gap in the exact shape called out by lesson `#8050`.

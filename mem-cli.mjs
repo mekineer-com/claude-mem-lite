@@ -15,7 +15,7 @@ import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
-import { probeOtherSources as probeIdSources } from './lib/id-routing.mjs';
+import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
 import { basename } from 'path';
 import { readFileSync } from 'fs';
 
@@ -597,20 +597,6 @@ function cmdGet(db, args) {
   }
 
   const tokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
-  const unparseable = [];
-  const parsed = [];
-  for (const t of tokens) {
-    const p = parseIdToken(t);
-    if (p) parsed.push(p);
-    else unparseable.push(t);
-  }
-  if (unparseable.length > 0) {
-    process.stderr.write(`[mem] Ignoring unparseable ID token(s): ${unparseable.join(', ')}\n`);
-  }
-  if (parsed.length === 0) {
-    fail('[mem] No valid IDs provided');
-    return;
-  }
 
   // Explicit --source overrides any prefix; otherwise each token's prefix routes individually.
   const explicit = flags.source;
@@ -620,10 +606,14 @@ function cmdGet(db, args) {
     return;
   }
 
-  const bySrc = { obs: [], session: [], prompt: [] };
-  for (const p of parsed) {
-    const src = explicit || p.source || 'obs';
-    bySrc[src].push(p.id);
+  // Shared bucketing with MCP mem_get — single source of truth for P#/S#/# routing (#8050).
+  const { bySrc, invalid: unparseable } = bucketIdTokens(tokens, { explicit, defaultSource: 'obs' });
+  if (unparseable.length > 0) {
+    process.stderr.write(`[mem] Ignoring unparseable ID token(s): ${unparseable.join(', ')}\n`);
+  }
+  if (bySrc.obs.length + bySrc.session.length + bySrc.prompt.length === 0) {
+    fail('[mem] No valid IDs provided');
+    return;
   }
 
   // Validate --fields against obs schema (only meaningful for obs rows).
@@ -659,7 +649,7 @@ function cmdGet(db, args) {
   if (totalFound === 0) {
     // Probe the OTHER sources so the caller can retry with the right prefix.
     const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
-    const allIds = parsed.map(p => p.id);
+    const allIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt];
     const probe = probeIdSources(db, allIds, queried);
     const hits = formatProbeHints(probe);
     const hint = hits.length > 0 ? ` Try: ${hits.join('; ')}.` : '';
@@ -716,9 +706,21 @@ function cmdTimeline(db, args) {
       // Bare integer (no prefix): try observation first. Fall back to user_prompts
       // then session_summaries so pasted P#/S# IDs still work when the prefix is
       // omitted — matches the prefix-aware routing used by search/probe.
-      const obsExists = db.prepare('SELECT 1 FROM observations WHERE id = ?').get(parsed.id);
-      if (obsExists) {
-        anchorId = parsed.id;
+      const obsRow = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(parsed.id);
+      if (obsRow) {
+        const ci = obsRow.compressed_into;
+        if (ci && ci > 0) {
+          // Compressed into a live parent: re-anchor so the window doesn't silently
+          // straddle a dead record. Negative sentinels (-1 dropped, -2 pending purge)
+          // have no canonical parent — surface an explicit error instead.
+          anchorId = ci;
+          anchorNote = `(anchored to #${ci}, #${parsed.id} was compressed into it)`;
+        } else if (ci && ci < 0) {
+          fail(`[mem] Observation #${parsed.id} was compressed and pruned; no canonical anchor available`);
+          return;
+        } else {
+          anchorId = parsed.id;
+        }
       } else {
         const promptRow = db.prepare('SELECT created_at_epoch FROM user_prompts WHERE id = ?').get(parsed.id);
         const sessionRow = promptRow ? null : db.prepare('SELECT created_at_epoch FROM session_summaries WHERE id = ?').get(parsed.id);

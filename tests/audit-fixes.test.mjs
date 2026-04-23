@@ -263,19 +263,23 @@ describe('MCP audit fixes (stdio)', () => {
   });
 
   // P1-4: missing IDs surface in a trailing Note.
+  // Prefix included per #8127 refactor — bucket-aware missing hint (#N, P#N, S#N)
+  // tells the caller which source returned nothing.
   it('P1-4: mem_get appends a Note for missing IDs (mirrors mem_delete)', async () => {
     await initialize(proc);
     const resp = await callTool('mem_get', { ids: [1, 999999] });
     const text = resp.result?.content?.[0]?.text || '';
     expect(text).toMatch(/── #1 ──/);
-    expect(text).toMatch(/Note: ID\(s\) 999999 not found/);
+    expect(text).toMatch(/Note: ID\(s\) #?999999 not found/);
   });
 
-  it('P1-4: mem_get with all missing still returns the "No observations" message', async () => {
+  it('P1-4: mem_get with all missing still returns the "no records found" message', async () => {
     await initialize(proc);
     const resp = await callTool('mem_get', { ids: [888888, 999999] });
     const text = resp.result?.content?.[0]?.text || '';
-    expect(text).toMatch(/No observations found for given IDs/);
+    // Post-#8127: multi-source handler generalizes the error to "No records found in source(s)"
+    // so the caller sees which buckets were queried when using mixed prefixes.
+    expect(text).toMatch(/No records found in source\(s\).*obs/);
   });
 
   // P2-6: empty query gets a distinct label so the caller knows results aren't BM25-ranked.
@@ -322,12 +326,13 @@ describe('MCP audit fixes (stdio)', () => {
   });
 
   // P2-7: obs ID passed with source=session should hint switching source.
+  // Post-#8127: explicit `source` still forces all tokens to that bucket; the "no records
+  // found in source(s) [session]" error is generalized and the probe hint still fires.
   it('P2-7: mem_get source=session with an obs ID hints to try source=\'obs\'', async () => {
     await initialize(proc);
     const resp = await callTool('mem_get', { ids: [1], source: 'session' });
     const text = resp.result?.content?.[0]?.text || '';
-    expect(text).toMatch(/No sessions found/);
-    // New symmetric hint format via lib/id-routing.mjs: "Try: #1 (obs — use source='obs')".
+    expect(text).toMatch(/No records found in source\(s\).*session/);
     expect(text).toMatch(/#1.*\(obs/);
     expect(text).toMatch(/source='obs'/);
   });
@@ -336,7 +341,7 @@ describe('MCP audit fixes (stdio)', () => {
     await initialize(proc);
     const resp = await callTool('mem_get', { ids: [999999], source: 'session' });
     const text = resp.result?.content?.[0]?.text || '';
-    expect(text).toMatch(/No sessions found/);
+    expect(text).toMatch(/No records found in source\(s\).*session/);
     expect(text).not.toMatch(/Try:/);
   });
 });

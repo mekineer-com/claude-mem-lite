@@ -180,6 +180,20 @@ describe('mem_get schema', () => {
     const result = parseSchema(memGetSchema, {});
     expect(result.success).toBe(false);
   });
+
+  // Same coerceStringArray parity as memSave.files — MCP clients that JSON-stringify
+  // complex args must not silently lose the `fields` selector.
+  it('coerces fields as JSON-array string', () => {
+    const r = parseSchema(memGetSchema, { ids: [1], fields: '["title","lesson_learned"]' });
+    expect(r.success).toBe(true);
+    expect(r.data.fields).toEqual(['title', 'lesson_learned']);
+  });
+
+  it('coerces fields as comma-separated string', () => {
+    const r = parseSchema(memGetSchema, { ids: [1], fields: 'title,type' });
+    expect(r.success).toBe(true);
+    expect(r.data.fields).toEqual(['title', 'type']);
+  });
 });
 
 // ─── mem_recall schema ─────────────────────────────────────────────────────
@@ -279,6 +293,27 @@ describe('mem_save schema', () => {
   it('rejects importance out of range', () => {
     expect(parseSchema(memSaveSchema, { content: 'x', importance: 0 }).success).toBe(false);
     expect(parseSchema(memSaveSchema, { content: 'x', importance: 4 }).success).toBe(false);
+  });
+
+  // Regression: MCP bridges sometimes JSON-stringify array args. Bare z.array(z.string())
+  // would reject with "expected array, received string" and the caller would silently lose
+  // the files association. coerceStringArray tolerates array | JSON-string | comma-string.
+  it('coerces files as JSON-array string', () => {
+    const r = parseSchema(memSaveSchema, { content: 'x', files: '["a.mjs","b.mjs"]' });
+    expect(r.success).toBe(true);
+    expect(r.data.files).toEqual(['a.mjs', 'b.mjs']);
+  });
+
+  it('coerces files as comma-separated string', () => {
+    const r = parseSchema(memSaveSchema, { content: 'x', files: 'a.mjs, b.mjs ,c.mjs' });
+    expect(r.success).toBe(true);
+    expect(r.data.files).toEqual(['a.mjs', 'b.mjs', 'c.mjs']);
+  });
+
+  it('accepts files as native array', () => {
+    const r = parseSchema(memSaveSchema, { content: 'x', files: ['a.mjs', 'b.mjs'] });
+    expect(r.success).toBe(true);
+    expect(r.data.files).toEqual(['a.mjs', 'b.mjs']);
   });
 });
 
@@ -538,28 +573,57 @@ describe('LLM string coercion (preprocess)', () => {
     expect(r.data.after).toBe(7);
   });
 
-  it('coerces comma-separated string ids to int array', () => {
+  // memGetSchema.ids now emits string-tokens so P#/S#/# prefix info survives the schema
+  // boundary for per-source routing in server.mjs (coerceMixedIdTokens). Bucketing happens
+  // in the handler via lib/id-routing.bucketIdTokens. Bare-int inputs stringify through
+  // unchanged; downstream handler parses via parseIdToken.
+  it('coerces comma-separated string ids to token array', () => {
     const r = parseSchema(memGetSchema, { ids: '1,2,3' });
     expect(r.success).toBe(true);
-    expect(r.data.ids).toEqual([1, 2, 3]);
+    expect(r.data.ids).toEqual(['1', '2', '3']);
   });
 
   it('coerces single string id to array', () => {
     const r = parseSchema(memGetSchema, { ids: '42' });
     expect(r.success).toBe(true);
-    expect(r.data.ids).toEqual([42]);
+    expect(r.data.ids).toEqual(['42']);
   });
 
   it('coerces single number id to array', () => {
     const r = parseSchema(memGetSchema, { ids: 7 });
     expect(r.success).toBe(true);
-    expect(r.data.ids).toEqual([7]);
+    expect(r.data.ids).toEqual(['7']);
   });
 
   it('coerces array of string ids', () => {
     const r = parseSchema(memGetSchema, { ids: ['1', '2'] });
     expect(r.success).toBe(true);
-    expect(r.data.ids).toEqual([1, 2]);
+    expect(r.data.ids).toEqual(['1', '2']);
+  });
+
+  // New: mixed-prefix tokens (#8127 parity). parseSchema passes them through; bucketing
+  // happens in the handler.
+  it('accepts mixed P#/S#/# prefix tokens', () => {
+    const r = parseSchema(memGetSchema, { ids: ['#1', 'P#2', 'S#3'] });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual(['#1', 'P#2', 'S#3']);
+  });
+
+  it('accepts comma-string with prefixes', () => {
+    const r = parseSchema(memGetSchema, { ids: '1,P#2,S#3' });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual(['1', 'P#2', 'S#3']);
+  });
+
+  it('coerces JSON-array string of mixed tokens', () => {
+    const r = parseSchema(memGetSchema, { ids: '["#1","P#2"]' });
+    expect(r.success).toBe(true);
+    expect(r.data.ids).toEqual(['#1', 'P#2']);
+  });
+
+  it('rejects unparseable tokens via regex pipe', () => {
+    const r = parseSchema(memGetSchema, { ids: ['garbage', 'P#1'] });
+    expect(r.success).toBe(false);
   });
 
   it('coerces "true"/"false" strings to boolean', () => {
