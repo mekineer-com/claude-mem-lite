@@ -5,6 +5,7 @@
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause } from '../utils.mjs';
+import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import Database from 'better-sqlite3';
@@ -242,7 +243,11 @@ function searchByUserPrompts(db, queryText, project, limit) {
     }
   }
 
-  return rows;
+  // CJK precision filter (parity with server.mjs + mem-cli.mjs): unicode61
+  // FTS degrades CJK bigram queries to single-char AND, letting any prose
+  // sharing common chars leak through. Drop rows that miss < 30% of query
+  // bigrams/keywords as contiguous substrings. Non-CJK queries bypass.
+  return rows.filter(r => cjkPrecisionOk(queryText, r.prompt_text));
 }
 
 function searchRecent(db, project, limit) {

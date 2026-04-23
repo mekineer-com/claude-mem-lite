@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
-import { extractCjkLikePatterns } from './nlp.mjs';
+import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
@@ -463,11 +463,15 @@ function searchPrompts(ctx) {
       epochTo, epochTo,
       perSourceLimit, perSourceOffset
     );
-    for (const r of rows) {
+    // CJK precision filter: unicode61 FTS degrades CJK bigram queries to
+    // single-char AND, letting any prose sharing common chars leak through.
+    // Require ≥30% of query's CJK bigrams/keywords as contiguous substrings.
+    const keptRows = args.query ? rows.filter(r => cjkPrecisionOk(args.query, r.prompt_text)) : rows;
+    for (const r of keptRows) {
       results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
     }
     // CJK LIKE fallback: FTS5 unicode61 can't tokenize CJK substrings in prompts
-    if (rows.length === 0 && args.query) {
+    if (keptRows.length === 0 && args.query) {
       const cjkPatterns = extractCjkLikePatterns(args.query);
       if (cjkPatterns.length > 0) {
         const likeConds = cjkPatterns.map(() => 'p.prompt_text LIKE ?');
@@ -490,7 +494,13 @@ function searchPrompts(ctx) {
           epochTo, epochTo,
           perSourceLimit, perSourceOffset
         );
-        for (const r of fallbackRows) {
+        // Parity with mem-cli.mjs: the LIKE fallback is an OR'd bigram
+        // substring scan with no scoring gate. The precision filter must
+        // apply here too — without it, queries whose FTS set is empty
+        // re-admit the full common-char noise band that FTS would have
+        // dropped downstream anyway.
+        const keptFallback = args.query ? fallbackRows.filter(r => cjkPrecisionOk(args.query, r.prompt_text)) : fallbackRows;
+        for (const r of keptFallback) {
           results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: 0 });
         }
       }

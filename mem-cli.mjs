@@ -5,6 +5,7 @@
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
+import { cjkPrecisionOk } from './nlp.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
@@ -240,9 +241,14 @@ function cmdSearch(db, args) {
         ORDER BY score
         LIMIT ? OFFSET ?
       `).all(...promptParams);
-      for (const r of promptRows) results.push({ ...r, _source: 'prompt' });
+      // CJK precision filter (read-path parity with server.mjs): unicode61
+      // degrades bigram queries to single-char AND, letting common-char
+      // Chinese prose leak through. Drop rows that miss < 30% of query
+      // bigrams/keywords as contiguous substrings.
+      const keptPromptRows = promptRows.filter(r => cjkPrecisionOk(query, r.prompt_text));
+      for (const r of keptPromptRows) results.push({ ...r, _source: 'prompt' });
       // CJK LIKE fallback: FTS5 unicode61 can't tokenize CJK substrings in prompts
-      if (promptRows.length === 0) {
+      if (keptPromptRows.length === 0) {
         const cjkPatterns = extractCjkLikePatterns(query);
         if (cjkPatterns.length > 0) {
           const likeConds = cjkPatterns.map(() => 'p.prompt_text LIKE ?');
@@ -263,7 +269,12 @@ function cmdSearch(db, args) {
             ORDER BY p.created_at_epoch DESC
             LIMIT ? OFFSET ?
           `).all(...likeParams);
-          for (const r of fallbackRows) results.push({ ...r, _source: 'prompt', score: 0 });
+          // CJK precision filter applies here too: the LIKE fallback is just
+          // OR'd substring bigrams; without the precision gate it re-admits
+          // the same common-char noise the FTS path dropped (this was the
+          // actual leak source — FTS returned 0, fallback filled 20).
+          const keptFallback = fallbackRows.filter(r => cjkPrecisionOk(query, r.prompt_text));
+          for (const r of keptFallback) results.push({ ...r, _source: 'prompt', score: 0 });
         }
       }
     } catch { /* prompt FTS may not exist in older DBs */ }

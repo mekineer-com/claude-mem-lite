@@ -124,6 +124,51 @@ export function extractCjkLikePatterns(query) {
   return [...new Set([...keywords, ...bigrams])];
 }
 
+/**
+ * Post-FTS precision filter for CJK queries.
+ *
+ * Background: FTS5 unicode61 tokenizer splits every CJK character into its
+ * own token. An application-layer bigram query like "我是" then reduces to
+ * (我 AND 是) at match time — matching any document that happens to contain
+ * both chars anywhere, which is extremely permissive in Chinese prose.
+ *
+ * Precision check: given the raw query and a candidate result's full text,
+ * require that at least `threshold` fraction of the query's CJK bigrams
+ * (or dictionary words, if any matched) appear as contiguous substrings in
+ * the result. Non-CJK queries bypass this filter entirely.
+ *
+ * Applied only to the prompts/user-prompt path — observations have richer
+ * rerank + low-signal filtering that already control noise there. Also,
+ * obs-side synonym expansion ("查询"→"(查询 OR query OR search)") is a
+ * legitimate recall mechanism that this filter would break.
+ *
+ * Threshold default 0.3 is tunable via `CLAUDE_MEM_CJK_PREC_MIN` env var.
+ * Explicit threshold arg still overrides the env value — tests and in-code
+ * callers with domain context stay authoritative.
+ *
+ * @param {string} query Raw query text
+ * @param {string} text Candidate result text
+ * @param {number} [threshold] Fraction of patterns that must match. If
+ *   omitted, reads CLAUDE_MEM_CJK_PREC_MIN (default 0.3).
+ * @returns {boolean}
+ */
+export function cjkPrecisionOk(query, text, threshold) {
+  if (threshold === undefined) {
+    const envVal = process.env.CLAUDE_MEM_CJK_PREC_MIN;
+    const parsed = envVal ? parseFloat(envVal) : NaN;
+    threshold = Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0.3;
+  }
+  if (!query || !text) return true;
+  if (!/[一-鿿㐀-䶿]{2,}/.test(query)) return true;
+  const keywords = extractCjkKeywords(query);
+  const required = keywords.length > 0
+    ? keywords
+    : cjkBigrams(query).split(' ').filter(b => b && !CJK_STOP_WORDS.has(b));
+  if (required.length === 0) return true;
+  const hit = required.filter(w => text.includes(w)).length;
+  return (hit / required.length) >= threshold;
+}
+
 // ─── FTS5 Token Formatting ──────────────────────────────────────────────────
 
 // Format a term for FTS5: quote if it contains spaces, hyphens, or special chars
