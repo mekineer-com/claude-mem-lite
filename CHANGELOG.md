@@ -2,6 +2,30 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.45.0] - 2026-04-23
+
+**`discovery/importance=3` over-weighting fix.** Continuing the end-user quality pass from v2.44.0, a stats-level audit of the observation corpus surfaced 100 `discovery/importance=3` rows where 34 (34%) carried `LOW_SIGNAL` titles ("Worked on X", "Reviewed N files: ...") — auto-generated fallback titles Haiku writes when summarization is unavailable. These should have been capped at imp=1 per existing `buildImmediateObservation` logic, but the cap only fired when `computeRuleImportance` returned ≤2: a rule=3 signal (any file matching `schema.*`, `migration`, `auth.*`, `.env`, `.pem`, `.key`) bypassed the cap and leaked through as imp=3. In broad multi-file episodes (e.g. "Worked on 5 files" where one happens to be `schema.js` read alongside 4 others), this produced false-positive critical-importance rows that then dominated scoring (`0.5 + 0.5·3 = 2.0×` composite multiplier) and injection ranking.
+
+### Fixed
+
+- **`hook-llm.mjs:433-460` — `buildImmediateObservation` cap logic closes the rule=3 leak (lesson to save).** Prior behavior: `isReviewPattern → Math.max(2, rule)`, `isLowSignal && rule<=2 → 1`, else → rule. The `else` branch leaked rule=3 for LOW_SIGNAL titles because the prior condition required rule≤2. New behavior:
+  - `isReviewPattern` → **imp=2** (was `Math.max(2, rule)` → rule=3 leaked as 3). Review titles are auto-generated from file count; can't distinguish "critical file was the focus" from "one of N read".
+  - `isLowSignal && !isReviewPattern` → **rule=3 → 2, rule≤2 → 1** (was: rule=3 → 3, rule≤2 → 1). Rule signals "notable" but title signals Haiku couldn't extract meaning — cap at 2 rather than surface imp=3 without a real title.
+  - `!isLowSignal` → rule (unchanged). Real Haiku-generated titles still honor rule=3 when warranted.
+
+### Added
+
+- **4 new regression tests** in `tests/hook-llm.test.mjs` exercising `buildImmediateObservation` directly (now re-exported via named import): (a) review pattern + schema file caps at 2, (b) LOW_SIGNAL title + schema file (rule=3) caps at 2, (c) LOW_SIGNAL + non-critical file (rule=1) stays at 1, (d) LOW_SIGNAL + test-error (rule=3 from bashSig) caps at 2 — covers the non-file path through `computeRuleImportance`.
+
+### Measurements
+
+- Full test suite: **1886 / 1886** green (up from 1882 in v2.44.0: +4 net-new cap tests).
+- Production corpus baseline (2026-04-23, `projects--mem`): 34/100 `discovery/importance=3` rows had LOW_SIGNAL titles; 7 `change/importance=3` same. Forward fix stops the leak; existing rows are not backfilled by this change — they decay naturally under the 90-day compression/tier-archive pipeline. Targeted cleanup can run via `mem_maintain execute --ops cleanup --project <name>` in a separate session if desired.
+
+### Design note — Coarse heuristics + degraded signals
+
+`computeRuleImportance` uses file-name regex (`schema.*`, `migration`, `auth.*`) as proxies for "this file matters". Useful in well-summarized episodes but lossy when combined with LOW_SIGNAL auto-titles: a broad multi-file episode incidentally touching `schema.js` while Haiku is rate-limited produces `"Worked on 5 files"` + imp=3 — technically true by rule but indistinguishable from real schema work. This release trades off that false-positive rate for a +1-level cap; if Haiku comes back and writes a real title, the regular path runs and rule=3 is honored. Lesson: when combining heuristic signal layers, each layer's confidence is multiplicative — downgrade the combined output to match the weakest layer rather than summing them.
+
 ## [2.44.0] - 2026-04-23
 
 **Hook injection quality pass + carry-over parity fixes.** Running the tool as an end user on an unfamiliar-to-me workflow surfaced a composite-score inflation path: `UserPromptSubmit` hook's OR-fallback branch scores a single-stem match on an `importance=3` bugfix obs past `TOP_REL_FLOOR=50` because the composite multiplier stack (`× decay × type_quality × (0.5+0.5·importance) × noise_penalty`) ≈ 4-6× inflates raw BM25 magnitudes of 19-22 into composite 66-76. Broad multi-topic prompts (e.g. "simulate testing features, find bugs, evaluate coding efficiency") thus surfaced three tangentially-related importance-3 bugfix obs regardless of semantic alignment. New gate ties this closed. Also rolling up three carry-over parity items that had been sitting in the working tree.

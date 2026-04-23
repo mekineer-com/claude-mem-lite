@@ -431,15 +431,30 @@ export function buildImmediateObservation(episode) {
   }
 
   const ruleImportance = computeRuleImportance(episode);
-  // Low-signal degraded titles ("Error in...", "Modified...") should not inflate importance.
-  // Cap at 1 unless rule-based signals indicate genuine importance (error-in-test → 3, config → 2).
+  // Low-signal degraded titles ("Modified X", "Worked on X", "Reviewed N files")
+  // should not inflate importance. computeRuleImportance's file-name heuristics
+  // (schema.*, migration, auth.*, .env, .pem) fire on any matching file in the
+  // episode, so a 5-file review that incidentally reads one schema.js triggers
+  // imp=3 even though schema.js was one of 5 scanned — not the focus. Combined
+  // with a LOW_SIGNAL title (Haiku couldn't extract meaning), we can't justify
+  // imp=3; cap at 2 so rule says "notable" but not "critical".
+  //
+  // Production baseline (2026-04-23, projects--mem): 34/100 discovery/imp=3
+  // obs were LOW_SIGNAL titles; 7 change/imp=3 same. Prior cap `rule<=2 → 1`
+  // only fired when rule was weak, letting rule=3 leak through. New cap:
+  //   isReviewPattern → 2 (was Math.max(2, rule) → rule=3 leaked as 3)
+  //   isLowSignal & !review:
+  //     rule=3 → 2 (was 3)             — the fix
+  //     rule<=2 → 1 (unchanged)        — original cap preserved
   const LOW_SIGNAL = LOW_SIGNAL_TITLE;
   const isLowSignal = LOW_SIGNAL.test(title);
   let importance;
   if (isReviewPattern) {
-    importance = Math.max(2, ruleImportance);
-  } else if (isLowSignal && ruleImportance <= 2) {
-    importance = 1; // Degraded titles stay low unless rule signals critical (imp=3)
+    // Review titles are auto-generated from file count — can't distinguish
+    // "critical file was primary focus" from "one of N files read". Cap at 2.
+    importance = 2;
+  } else if (isLowSignal) {
+    importance = ruleImportance === 3 ? 2 : 1;
   } else {
     importance = ruleImportance;
   }
