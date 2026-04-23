@@ -2,6 +2,36 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.46.0] - 2026-04-23
+
+**Cross-session memory capture hardening — targeted handoff consume + structural §10 extractor.** A production audit on 2026-04-23 (55MB DB, 115 completed sessions in 7d) surfaced that `session_handoffs` held only 2 rows total — the entire cross-session memory contract was near-empty despite 115 upstream writes. Two cascading bugs: `hook.mjs` wildcard `DELETE ... type = 'exit'` wiped every exit handoff for the project on any continuation-intent prompt, not just the one being injected; and `handleLLMSummary` filled `remaining_items` only when Haiku returned content (34/112 = 30% success in the 7d sample), leaving the "Not done" list invisible for the other 70%. This release fixes both paths without a schema migration — the v3 foundation plan that would have introduced new `tasks`/`lessons` tables is parked pending a 2-week fill-rate measurement on the existing columns.
+
+### Fixed
+
+- **`hook.mjs:966-981` — targeted handoff consume.** `handleUserPrompt` now calls `pickHandoffToInject` to identify the exact row that `renderHandoffInjection` will render, then deletes only that `(project, type, session_id)` row. Pre-fix: the `DELETE ... type = 'exit'` predicate was unscoped by session — any continuation-intent prompt wiped every cross-session handoff the project had accumulated. Post-fix: sibling sessions' exit handoffs remain queryable for future resumes.
+- **`hook-llm.mjs:855-868` — Haiku UPDATE preserves structural content.** `handleLLMSummary`'s UPSERT of `session_summaries` changed from raw overwrite to `COALESCE(NULLIF(?, ''), field)` per column. When Haiku returns an empty `remaining_items` / `lessons` / `key_decisions` (a common degraded-return shape), the structural fast-baseline content written earlier in `handleStop` is preserved rather than zeroed.
+
+### Added
+
+- **`lib/summary-extractor.mjs`** — deterministic §10 four-section extractor.
+  - `extractTailAssistantText(transcriptPath)` reads the last assistant text block from the Claude Code JSONL transcript.
+  - `extractStructuredSummary(text)` pulls `done` / `notDone` / `failed` / `uncertain` from line-start markers: EN `Done:` / `Not done:` / `Failed:` / `Uncertain:` and 中文 `剩下的` / `剩余` / `还剩` / `未完成` / `下次(要做|做|继续)` / `待做` / `未做`. Handles bullet continuations across blank lines; terminates on next header or non-bullet paragraph.
+- **`hook.mjs handleStop` fast-baseline wired to the extractor** — before the session_summaries INSERT, the tail assistant message is parsed and the extracted `done` / `notDone` feed `completed` / `remaining_items`; `failed` + `uncertain` join into `notes`. Haiku later enriches narrative fields but, per the UPDATE fix above, cannot erase the deterministic floor.
+- **`hook-handoff.mjs::pickHandoffToInject`** — exported pick function factored out of `renderHandoffInjection` so callers can know which row rendered (for targeted consume). `renderHandoffInjection` remains API-compatible as a thin wrapper.
+- **18 new tests:**
+  - `tests/summary-extractor.test.mjs` (17): EN markers, 中文 markers, blank-line termination, bullet continuation, transcript JSONL parsing, malformed-line resilience, round-trip with real tail text.
+  - `tests/handoff.test.mjs` (+3): `pickHandoffToInject` returns the same row `renderHandoffInjection` renders; null parity; 3-session fixture where targeted DELETE consumes only the picked row.
+  - `tests/hook-llm.test.mjs` (+1): Haiku empty `remaining_items` does not clobber pre-populated structural content.
+
+### Measurements
+
+- Full test suite: **1907 / 1907** green (was 1889 at v2.45.0 head; +18 net-new).
+- Production DB at audit time (projects--mem, 2026-04-23): 2 `session_handoffs` rows vs 115 completed sessions in 7d; 34/112 session_summaries (~30%) had `remaining_items` populated. Post-fix, the write paths are corrected but historical rows are not backfilled — each future `Stop` captures into the existing schema with structural fallbacks. A 2-week re-measurement is the planned input to deciding whether the parked v3 schema (new `tasks` + `lessons` tables) is still needed.
+
+### Parked
+
+- **mem v3 schema foundation** (`docs/superpowers/plans/parked/2026-04-23-mem-v3-schema-foundation.md`) — full plan-eng-review + /autoplan CEO/Eng/DX reviews ran. CEO subagent surfaced a User Challenge: today's structural extractor already writes to existing `session_summaries.completed` / `remaining_items`, so new `done` / `not_done` / `failed` / `uncertain` columns are premature until fill-rate data says otherwise. Decision: ship 2.46 against existing schema, measure for 2 weeks, then re-evaluate.
+
 ## [2.45.0] - 2026-04-23
 
 **`discovery/importance=3` over-weighting fix.** Continuing the end-user quality pass from v2.44.0, a stats-level audit of the observation corpus surfaced 100 `discovery/importance=3` rows where 34 (34%) carried `LOW_SIGNAL` titles ("Worked on X", "Reviewed N files: ...") — auto-generated fallback titles Haiku writes when summarization is unavailable. These should have been capped at imp=1 per existing `buildImmediateObservation` logic, but the cap only fired when `computeRuleImportance` returned ≤2: a rule=3 signal (any file matching `schema.*`, `migration`, `auth.*`, `.env`, `.pem`, `.key`) bypassed the cap and leaked through as imp=3. In broad multi-file episodes (e.g. "Worked on 5 files" where one happens to be `schema.js` read alongside 4 others), this produced false-positive critical-importance rows that then dominated scoring (`0.5 + 0.5·3 = 2.0×` composite multiplier) and injection ranking.

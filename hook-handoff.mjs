@@ -298,7 +298,7 @@ export function detectContinuationIntent(db, promptText, project, currentCcSessi
  * @param {string|null} [currentCcSessionId=null] Claude Code session id for scoping
  * @returns {string|null} Injection text or null if no handoff
  */
-export function renderHandoffInjection(db, project, currentCcSessionId = null) {
+export function pickHandoffToInject(db, project, currentCcSessionId = null) {
   const now = Date.now();
   // Fetch recent handoffs and find the most recent non-expired one.
   // A newer but expired 'clear' handoff must not shadow a still-valid 'exit' handoff.
@@ -313,13 +313,20 @@ export function renderHandoffInjection(db, project, currentCcSessionId = null) {
         SELECT * FROM session_handoffs
         WHERE project = ? ORDER BY created_at_epoch DESC LIMIT 5
       `).all(project);
-  const handoff = handoffs.find(h => {
+  return handoffs.find(h => {
     const age = now - h.created_at_epoch;
     const maxAge = h.type === 'clear' ? HANDOFF_EXPIRY_CLEAR : HANDOFF_EXPIRY_EXIT;
     return age <= maxAge;
-  });
-  if (!handoff) return null;
+  }) || null;
+}
 
+export function renderHandoffInjection(db, project, currentCcSessionId = null) {
+  const handoff = pickHandoffToInject(db, project, currentCcSessionId);
+  if (!handoff) return null;
+  return renderHandoffFromRow(handoff, db, project);
+}
+
+function renderHandoffFromRow(handoff, db, project) {
   const ageSec = Math.round((Date.now() - handoff.created_at_epoch) / 1000);
   const ageStr = ageSec < 60 ? `${ageSec}s` :
     ageSec < 3600 ? `${Math.round(ageSec / 60)}m` :

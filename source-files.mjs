@@ -38,6 +38,7 @@ export const SOURCE_FILES = [
   'lib/stats-quality.mjs',
   'lib/low-signal-patterns.mjs',
   'lib/citation-tracker.mjs',
+  'lib/summary-extractor.mjs',
   'lib/id-routing.mjs',
   'lib/err-sampler.mjs',
   'lib/metrics.mjs',

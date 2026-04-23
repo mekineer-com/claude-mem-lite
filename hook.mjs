@@ -43,8 +43,9 @@ import {
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { extractCitationsFromTranscript, bumpCitationAccess } from './lib/citation-tracker.mjs';
+import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories } from './hook-memory.mjs';
-import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, extractUnfinishedSummary } from './hook-handoff.mjs';
+import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
@@ -442,14 +443,46 @@ async function handleStop() {
             ORDER BY created_at_epoch DESC LIMIT 5
           `).all(sessionId);
           const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
-          const fastCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
-          if (fastRequest || fastCompleted) {
+          const obsCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
+
+          // Structural extraction from the assistant's tail message.
+          // CLAUDE.md §10 mandates Done/Not done/Failed/Uncertain markers, so the
+          // tail is deterministically parseable without Haiku. Prior baseline left
+          // remaining_items=='' for every session whose Haiku pass failed (≈66%
+          // in prod data), losing the user-visible "Not done" list.
+          let structuredCompleted = '';
+          let structuredNotDone = '';
+          let structuredNotes = '';
+          try {
+            const tail = transcriptPath ? extractTailAssistantText(transcriptPath) : null;
+            if (tail) {
+              const s = extractStructuredSummary(tail);
+              structuredCompleted = s.done;
+              structuredNotDone = s.notDone;
+              const notesParts = [];
+              if (s.failed) notesParts.push(`Failed: ${s.failed}`);
+              if (s.uncertain) notesParts.push(`Uncertain: ${s.uncertain}`);
+              structuredNotes = notesParts.join('\n');
+            }
+          } catch (e) { debugCatch(e, 'handleStop-structured-extract'); }
+
+          const finalCompleted = structuredCompleted || obsCompleted;
+          const finalRemaining = structuredNotDone;
+          const finalNotes = structuredNotes || 'fast';
+
+          if (fastRequest || finalCompleted || finalRemaining) {
             const now = new Date();
             db.prepare(`
               INSERT INTO session_summaries
               (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-              VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
-            `).run(sessionId, project, fastRequest, truncate(fastCompleted, 300), now.toISOString(), now.getTime());
+              VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', ?, ?, ?)
+            `).run(
+              sessionId, project, fastRequest,
+              truncate(finalCompleted, 600),
+              truncate(finalRemaining, 600),
+              truncate(finalNotes, 400),
+              now.toISOString(), now.getTime()
+            );
           }
         }
       } catch (e) { debugCatch(e, 'handleStop-fast-summary'); }
@@ -963,19 +996,19 @@ async function handleUserPrompt() {
     if (promptNumber <= 3) {
       try {
         if (detectContinuationIntent(db, promptText, project, ccSessionId)) {
-          const injection = renderHandoffInjection(db, project, ccSessionId);
-          if (injection) {
-            process.stdout.write(injection + '\n');
-            // Consume handoff after injection to prevent re-injection on later prompts
-            // (within-session on prompts 2-3, or across new sessions for exit handoffs).
-            // clear: scoped to THIS session (parallel sessions keep their own rows).
-            // exit:  unscoped — any exit handoff in this project is fair game once resumed.
+          const picked = pickHandoffToInject(db, project, ccSessionId);
+          if (picked) {
+            const injection = renderHandoffInjection(db, project, ccSessionId);
+            if (injection) process.stdout.write(injection + '\n');
+            // Consume ONLY the row we just injected — leave other projects' exit
+            // handoffs intact so future sessions can still resume from them.
+            // Pre-v2.46 wiped every exit handoff for the project on any continuation
+            // intent, which made the DB effectively forgetful: 115 completed sessions
+            // produced 1 persisted handoff.
             try {
-              if (ccSessionId) {
-                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND ((type = 'clear' AND session_id = ?) OR type = 'exit')").run(project, ccSessionId);
-              } else {
-                db.prepare("DELETE FROM session_handoffs WHERE project = ? AND type IN ('clear','exit')").run(project);
-              }
+              db.prepare(
+                'DELETE FROM session_handoffs WHERE project = ? AND type = ? AND session_id = ?'
+              ).run(project, picked.type, picked.session_id);
             } catch {}
           }
         }

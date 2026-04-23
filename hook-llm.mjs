@@ -853,10 +853,24 @@ key_decisions: Only decisions with lasting impact (library choices, architecture
       `).get(sessionId);
 
       if (existingFast) {
+        // Preserve structural-extractor content (completed / remaining_items written
+        // by handleStop fast-baseline from CLAUDE.md §10 markers) when Haiku returns
+        // empty for that field. Without COALESCE, a degraded Haiku pass would erase
+        // the deterministic floor — the exact regression that made 72% of prod
+        // session_summaries ship with empty remaining_items.
         db.prepare(`
           UPDATE session_summaries
-          SET request=?, investigated=?, learned=?, completed=?, next_steps=?, remaining_items=?,
-              lessons=?, key_decisions=?, notes='llm', created_at=?, created_at_epoch=?
+          SET request = COALESCE(NULLIF(?, ''), request),
+              investigated = COALESCE(NULLIF(?, ''), investigated),
+              learned = COALESCE(NULLIF(?, ''), learned),
+              completed = COALESCE(NULLIF(?, ''), completed),
+              next_steps = COALESCE(NULLIF(?, ''), next_steps),
+              remaining_items = COALESCE(NULLIF(?, ''), remaining_items),
+              lessons = COALESCE(?, lessons),
+              key_decisions = COALESCE(?, key_decisions),
+              notes = 'llm',
+              created_at = ?,
+              created_at_epoch = ?
           WHERE id = ?
         `).run(
           llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',

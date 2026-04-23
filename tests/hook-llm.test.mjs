@@ -964,6 +964,39 @@ describe('handleLLMSummary', () => {
     expect(summaries[0].next_steps).toBe('Add refresh token rotation');
   });
 
+  it('preserves structural extractor content when Haiku returns empty for a field', async () => {
+    // Regression: the fast-baseline write now pre-populates remaining_items from
+    // CLAUDE.md §10 Done/Not done markers in the tail assistant message. A later
+    // Haiku pass that returns empty remaining_items must NOT clobber that floor.
+    insertSession(db, { id: 'test-session', project: 'test-proj' });
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+      VALUES (?, ?, 'first prompt', '', '', 'structured-done', '', 'structured-notdone: Gap #3 data backfill', '[]', '[]', 'fast', ?, ?)
+    `).run('test-session', 'test-proj', new Date().toISOString(), Date.now());
+
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'feature', 'obs title', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('test-session', 'test-proj', new Date().toISOString(), Date.now());
+
+    // Haiku returns rich completed but empty remaining_items — common degraded
+    // return shape observed in prod.
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      request: 'Implementing auth system',
+      completed: 'Basic auth flow with login/logout',
+      remaining_items: '',
+      next_steps: 'Add refresh token rotation',
+    }));
+
+    await handleLLMSummary();
+
+    const row = db.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').get('test-session');
+    expect(row.completed).toBe('Basic auth flow with login/logout');  // Haiku richer → overwritten
+    expect(row.remaining_items).toBe('structured-notdone: Gap #3 data backfill');  // Haiku empty → preserved
+    expect(row.next_steps).toBe('Add refresh token rotation');
+    expect(row.notes).toBe('llm');
+  });
+
   it('upgrades existing fast summary instead of creating duplicate', async () => {
     insertSession(db, { id: 'test-session', project: 'test-proj' });
     // Simulate fast summary created by handleStop

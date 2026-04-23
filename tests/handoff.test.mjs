@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
 import { extractMatchKeywords, tokenizeHandoff, isSpecificTerm } from '../utils.mjs';
-import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection } from '../hook-handoff.mjs';
+import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject } from '../hook-handoff.mjs';
 import * as gitStateModule from '../lib/git-state.mjs';
 import * as taskReaderModule from '../lib/task-reader.mjs';
 
@@ -781,6 +781,54 @@ describe('renderHandoffInjection', () => {
       expect(renderHandoffInjection(db, 'p')).toContain('legacy behavior');
       expect(renderHandoffInjection(db, 'p', null)).toContain('legacy behavior');
     });
+  });
+});
+
+// ─── pickHandoffToInject: enables targeted-consume DELETE in handleUserPrompt ──
+
+describe('pickHandoffToInject', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); _seedObsEpochOffset = 0; });
+  afterEach(() => { db.close(); });
+
+  it('returns the same row that renderHandoffInjection would render', () => {
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 'cc-old', 'old session work', ?)`).run(Date.now() - 3600000);
+    const picked = pickHandoffToInject(db, 'p', 'cc-new');
+    expect(picked).not.toBeNull();
+    expect(picked.session_id).toBe('cc-old');
+    expect(picked.type).toBe('exit');
+    const rendered = renderHandoffInjection(db, 'p', 'cc-new');
+    expect(rendered).toContain('old session work');
+  });
+
+  it('returns null when no valid handoff exists (parity with render)', () => {
+    expect(pickHandoffToInject(db, 'p', 'cc-X')).toBeNull();
+    expect(renderHandoffInjection(db, 'p', 'cc-X')).toBeNull();
+  });
+
+  it('regression: targeted DELETE on (type, session_id) preserves other exits', () => {
+    // Three separate prior exit sessions all still within the 7d window.
+    // Pre-fix: any continuation-intent in a new session wiped ALL three.
+    // Post-fix: only the picked row gets deleted, other rows remain for later resumes.
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 'cc-A', 'A work', ?)`).run(Date.now() - 3 * 86400000);
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 'cc-B', 'B work', ?)`).run(Date.now() - 2 * 86400000);
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', 'cc-C', 'C work (most recent)', ?)`).run(Date.now() - 3600000);
+
+    const picked = pickHandoffToInject(db, 'p', 'cc-new');
+    expect(picked.session_id).toBe('cc-C');  // most recent non-expired
+
+    // Simulate the targeted DELETE from hook.mjs handleUserPrompt
+    db.prepare('DELETE FROM session_handoffs WHERE project = ? AND type = ? AND session_id = ?')
+      .run('p', picked.type, picked.session_id);
+
+    const remaining = db.prepare(
+      `SELECT session_id FROM session_handoffs WHERE project = 'p' AND type = 'exit' ORDER BY session_id`
+    ).all().map(r => r.session_id);
+    expect(remaining).toEqual(['cc-A', 'cc-B']);
   });
 });
 
