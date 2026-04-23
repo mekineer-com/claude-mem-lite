@@ -243,7 +243,7 @@ function cmdSearch(db, args) {
       `).all(...promptParams);
       // CJK precision filter (read-path parity with server.mjs): unicode61
       // degrades bigram queries to single-char AND, letting common-char
-      // Chinese prose leak through. Drop rows that miss < 30% of query
+      // Chinese prose leak through. Drop rows that miss < 20% of query
       // bigrams/keywords as contiguous substrings.
       const keptPromptRows = promptRows.filter(r => cjkPrecisionOk(query, r.prompt_text));
       for (const r of keptPromptRows) results.push({ ...r, _source: 'prompt' });

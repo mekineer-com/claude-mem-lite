@@ -245,7 +245,7 @@ function searchByUserPrompts(db, queryText, project, limit) {
 
   // CJK precision filter (parity with server.mjs + mem-cli.mjs): unicode61
   // FTS degrades CJK bigram queries to single-char AND, letting any prose
-  // sharing common chars leak through. Drop rows that miss < 30% of query
+  // sharing common chars leak through. Drop rows that miss < 20% of query
   // bigrams/keywords as contiguous substrings. Non-CJK queries bypass.
   return rows.filter(r => cjkPrecisionOk(queryText, r.prompt_text));
 }

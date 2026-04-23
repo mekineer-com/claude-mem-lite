@@ -74,9 +74,9 @@ describe('cjkPrecisionOk unit behavior', () => {
       expect(cjkPrecisionOk(q, prose)).toBe(false);
       process.env.CLAUDE_MEM_CJK_PREC_MIN = '0.1';
       expect(cjkPrecisionOk(q, prose)).toBe(true);
-      // Invalid env values fall back to the 0.3 default.
+      // Invalid env values fall back to the 0.2 default.
       process.env.CLAUDE_MEM_CJK_PREC_MIN = 'garbage';
-      expect(cjkPrecisionOk(q, prose)).toBe(true); // default 0.3 passes
+      expect(cjkPrecisionOk(q, prose)).toBe(true); // default 0.2 passes (1/3 ≈ 33% ≥ 0.2)
       process.env.CLAUDE_MEM_CJK_PREC_MIN = '2.5';
       expect(cjkPrecisionOk(q, prose)).toBe(true); // out-of-range → default
     } finally {
