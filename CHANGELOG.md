@@ -2,6 +2,55 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.50.0] - 2026-04-24
+
+**CJK precision filter closes the unicode61 single-char-collapse leak in prompt search + MCP protocol test surface + env-tunable threshold, data-tuned to 0.2 after 150-query real-corpus bench.** The root cause lives in FTS5's default `unicode61` tokenizer: every CJK character becomes its own token, so an application-layer bigram query like `"我是"` reduces to `(我 AND 是)` at match time and matches any document sharing those common characters anywhere. Live example: `./cli.mjs search "我是完全随机的字符串啊啊"` returned 20 unrelated prompts pre-fix (FTS + CJK LIKE fallback both leaked). Post-fix: 1 result (a self-referential observation that actually contains the literal string).
+
+### Why the minor bump
+
+Queries that previously returned N (possibly noise-polluted) results now return N−k for some k — observable user-facing behavior change, not a silent internal fix. 150-query bench on the production prompts corpus (3 rounds of 50 queries, stratified by sampling strategy) measured **0 queries fully nuked** (WIPED rate 0/150), **64% unaffected on real programming queries**, aggregate result drop 10.3% on programming-keyword corpus. Heavy drops cluster on imperative / meta prompts (`"全部 commit 并推送"`, `"先做 1+2+3 约 1 小时"`) that had no specific topic match to begin with.
+
+### Added
+
+- **`nlp.mjs::cjkPrecisionOk(query, text, threshold?)`** — post-FTS precision gate. For CJK queries, requires that ≥`threshold` fraction of the query's CJK bigrams (or dictionary keywords when `extractCjkKeywords` finds any) appear as contiguous substrings in the candidate result text. Non-CJK queries bypass entirely. Default threshold 0.2 is tunable via `CLAUDE_MEM_CJK_PREC_MIN` env var; invalid / out-of-range env values fall back to the default.
+- **`tests/cjk-precision.test.mjs` (11 tests)** — unit coverage of the filter (pass/fail matrix, stop-word handling, threshold tunability, env-var override semantics, explicit-arg override) + subprocess integration tests covering both the FTS and the CJK LIKE fallback paths.
+- **`tests/mcp-protocol.test.mjs` (7 tests)** — real stdio JSON-RPC against `server.mjs` via `@modelcontextprotocol/sdk`'s `StdioClientTransport`. Guards the protocol layer that handler-level unit tests miss: core/hidden `tools/list` split, hidden tools callable by exact name, `mem_maintain execute purge_stale` without `confirm` does NOT delete rows (hard row-count assertion, #7843 regression guard), `mem_search sort=time` responds cleanly (#7837 regression guard), unknown tool name surfaces `isError:true` MCP-shape response.
+
+### Changed
+
+- **`scripts/user-prompt-search.js::searchByUserPrompts` — filter applied post-FTS.** The UserPromptSubmit prompts-fallback path now drops rows failing `cjkPrecisionOk` before returning. Stops the "Past similar questions" injection from surfacing Chinese prose that shares only common chars with the current prompt.
+- **`mem-cli.mjs` prompts branch — filter applied to both FTS hits and CJK LIKE fallback rows.** Mid-bundle diagnostic learning: the first iteration only gated the FTS path; e2e verification still showed 20 hits on the noise query because `promptRows.length === 0` triggered the `LIKE %bigram% OR %bigram% OR ...` fallback, which had no scoring gate. The fallback runs on exactly the queries where filtering matters most (sparse/noisy CJK — FTS returns nothing, fallback fills in), so the filter is applied to both paths for read-path parity. See observation `#8162` for the lesson.
+- **`server.mjs::searchPrompts` — same parity across the MCP path.** FTS and LIKE fallback both run through the precision gate.
+- **`CLAUDE_MEM_CJK_PREC_MIN` default tuned from 0.3 → 0.2.** After shipping 0.3 in a prior internal build, a 20-query fixture on the production DB revealed `"同义词扩展"` collapsed 20→1 because neither `"同义词"` nor `"扩展"` is in `CJK_COMPOUNDS`, so `extractCjkKeywords` returned `[]` and the filter fell back to 4 bigrams — single-keyword match only 25% < 30% rejected 19/20 real hits. Threshold sweep (0, 0.15, 0.2, 0.25, 0.3, 0.4) showed 0.2 is the Pareto knee: pure-noise reduction holds ≥85%, semi-noise still drops to 0, SIG-6 recall recovers to 100%. Net tradeoff: +5 noise rows admitted vs +19 legitimate rows recovered on the fixture.
+
+### Scope notes
+
+- **Prompts path only.** The observations path has similar unicode61 mechanics but applying the filter there would break legitimate synonym-expanded recall (`查询` → `(查询 OR query OR search)` — user types Chinese, matches English, filter would reject). Observations also have richer rerank + low-signal filtering that already controls noise. An obs-side precision fix needs a synonym-aware design — deferred until a precision/recall baseline justifies the work.
+- **Latency unchanged.** Per-query Δ stays within ±5 ms noise band (p50 off 74ms → on 76ms on the 20-query fixture). The filter is a post-FTS in-memory substring check; cost is trivial next to SQLite BM25 ranking.
+
+### Measurements
+
+**3-round × 50-query bench** on real user prompts (last 30d, ≥3 CJK chars, len 10–100, excluding `<task-notification>`):
+
+| Bucket | R1 random | R2 length-stratified | R3 programming-keyword |
+|---|---:|---:|---:|
+| WIPED (off>0 → on=0) | **0%** | **0%** | **0%** |
+| HEAVY (>50% drop) | 10% | 8% | **0%** |
+| MODERATE (21–50%) | 20% | 18% | 26% |
+| MILD (1–20%) | 26% | 10% | 10% |
+| UNAFFECTED | 44% | 64% | 64% |
+| Aggregate drop rate | 17.5% | 13.0% | **10.3%** |
+
+Zero queries fully wiped across all 150. Heavy drops cluster on imperative / meta prompts (which had no topic signal to begin with).
+
+**Full-suite test gate**: 74 files, **1950 tests passed**, 0 lint errors.
+
+### References
+
+- `#8139` read-path parity across sibling code branches querying the same table
+- `#8144` OR-fallback BM25 magnitude gate context
+- `#8162` CJK precision filter must gate LIKE fallback too — FTS path was a red herring
+
 ## [2.49.1] - 2026-04-24
 
 **Read-path parity cleanup — 4 defensive fixes, zero behavior change for healthy queries.** All four were silent noise leaks / doc drift surfaced while dogfooding the plugin as an end user. Each path was independently querying the same underlying table (observations / user_prompts / tool catalog) with subtly different filter clauses, so noise that one path already excluded leaked through a sibling path (see lesson #8139 — read-path parity matters).
