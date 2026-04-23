@@ -66,6 +66,34 @@ const FOLLOWUP_BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN_FOLLO
 // gate exists to drop.
 const TOP_REL_FLOOR = Number(process.env.CLAUDE_MEM_UPS_TOP_MIN || 50);
 
+// v2.43.x: OR-fallback raw BM25 magnitude floor. The composite TOP_REL_FLOOR
+// above gates on `bm25 × importance × type_quality × decay × noise_penalty`.
+// For importance=3 bugfix obs, those multipliers compound to ~6×, so a modest
+// BM25 of -17..-22 can clear a composite floor of 50 via inflation alone.
+// When the FTS query relaxes to OR (AND returned 0), a single strongly-
+// matching stem on a big multi-topic prompt leaks through — observed
+// failure mode: broad Chinese prompts surfacing unrelated importance=3
+// bugfix obs whose concepts share exactly one stem with the prompt.
+//
+// Empirical OR-mode distribution (11-prompt probe, 2026-04-23):
+//   real signal      top-|bm25_raw| ≥ 41
+//   broad/meta noise top-|bm25_raw| ≤ 22
+//   below threshold  top-|bm25_raw| < 12
+// Default 30 sits in the clean 22→41 gap. AND mode bypasses this gate —
+// AND's all-stems-must-match constraint is already a precision signal,
+// and there are legitimate AND hits (GOOD-narrow probe: bm25_raw=19.3,
+// rel=81) that we must not drop.
+//
+// CLAUDE_MEM_UPS_TOP_MIN=0 disables this too: on small test corpora (1–2
+// seeded obs) absolute BM25 magnitudes collapse to near-zero (observed
+// |bm25|≈4e-6) because FTS5 IDF normalization needs a real document
+// distribution. The existing TOP_REL_FLOOR knob already encodes the
+// "seed-mode: kill absolute floors" semantic for integration tests, so
+// we piggy-back on it rather than introducing a second override env.
+const OR_TOP_BM25_FLOOR = TOP_REL_FLOOR === 0
+  ? 0
+  : Number(process.env.CLAUDE_MEM_UPS_OR_BM25_MIN || 30);
+
 function isFollowUpSession() {
   try {
     const raw = readFileSync(INJECTED_IDS_FILE, 'utf8');
@@ -77,9 +105,15 @@ function isFollowUpSession() {
 
 // ─── DB Query Functions ─────────────────────────────────────────────────────
 
+// Returns { rows, mode } where mode is 'AND' (initial pass), 'OR' (fallback
+// after AND returned 0), or null (no FTS query / sanitize rejected). Callers
+// use `mode` to apply OR-specific gates — see OR_TOP_BM25_FLOOR rationale.
+// Each row includes `bm25_raw` (pre-multiplier bm25 magnitude) alongside the
+// composite `relevance`, so callers can distinguish raw-match strength from
+// importance/type/decay inflation.
 function searchByFts(db, queryText, project, limit, typeFilter) {
   const ftsQuery = sanitizeFtsQuery(queryText);
-  if (!ftsQuery) return [];
+  if (!ftsQuery) return { rows: [], mode: null };
 
   const cutoff = Date.now() - LOOKBACK_MS;
 
@@ -92,6 +126,7 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
   // docs/p0-injection-noise-baseline.txt.
   const sql = `
     SELECT o.id, o.type, o.title, o.lesson_learned,
+           ${OBS_BM25} as bm25_raw,
            ${OBS_BM25}
              * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
              * ${TYPE_QUALITY_CASE}
@@ -115,6 +150,7 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
   params.push(limit);
 
   let rows = db.prepare(sql).all(...params);
+  let mode = 'AND';
 
   // OR fallback if AND query returned nothing
   if (rows.length === 0) {
@@ -122,10 +158,11 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
     if (orQuery) {
       params[1] = orQuery;
       rows = db.prepare(sql).all(...params);
+      mode = 'OR';
     }
   }
 
-  return rows;
+  return { rows, mode };
 }
 
 function searchByFile(db, files, project, limit) {
@@ -256,7 +293,7 @@ const QUIET_HOOKS = process.env.MEM_QUIET_HOOKS === '1';
 function formatResults(rows) {
   if (!rows || rows.length === 0) return null;
 
-  const lines = ['[mem] Related memories:'];
+  const lines = ['[mem] FYI — Related memories (continue your task):'];
   for (const r of rows) {
     const icon = typeIcon(r.type);
     const title = truncate(r.title || '', 70);
@@ -272,7 +309,7 @@ function formatResults(rows) {
 // chars (slightly longer than obs titles because prompts carry more context).
 function formatPromptResults(rows) {
   if (!rows || rows.length === 0) return null;
-  const lines = ['[mem] Past similar questions:'];
+  const lines = ['[mem] FYI — Past similar questions (continue your task):'];
   for (const r of rows) {
     const text = truncate((r.prompt_text || '').replace(/\s+/g, ' '), 80);
     lines.push(`P#${r.id} 💬 ${text}`);
@@ -375,7 +412,7 @@ async function main() {
     // take priority slots in the merged output.
     const errSig = extractErrorSignature(promptText);
     const sigRows = errSig
-      ? searchByFts(db, errSig.signature, project, 2, 'bugfix').filter(r =>
+      ? searchByFts(db, errSig.signature, project, 2, 'bugfix').rows.filter(r =>
           typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
         )
       : [];
@@ -386,11 +423,13 @@ async function main() {
     } else {
       // FTS search: use the prompt as query, optionally type-filtered
       const files = extractFiles(promptText);
-      let ftsRows = searchByFts(db, promptText, project, intent?.limit || MAX_RESULTS, intent?.type || null);
+      let ftsResult = searchByFts(db, promptText, project, intent?.limit || MAX_RESULTS, intent?.type || null);
       // Fallback: if typed search returned nothing, retry without type filter
-      if (ftsRows.length === 0 && intent?.type) {
-        ftsRows = searchByFts(db, promptText, project, intent.limit || MAX_RESULTS, null);
+      if (ftsResult.rows.length === 0 && intent?.type) {
+        ftsResult = searchByFts(db, promptText, project, intent.limit || MAX_RESULTS, null);
       }
+      let ftsRows = ftsResult.rows;
+      const ftsMode = ftsResult.mode;
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
 
       // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
@@ -402,6 +441,19 @@ async function main() {
       ftsRows = ftsRows.filter(r =>
         typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
       );
+
+      // v2.43.x: OR-mode raw-BM25 floor. In OR-fallback mode the composite
+      // TOP_REL_FLOOR below is inflated by importance × type_quality × decay
+      // multipliers — a weak single-stem hit on an importance=3 bugfix obs
+      // can reach composite rel=66 while raw |bm25|=19. Gate on raw bm25
+      // magnitude for OR mode only; AND mode's all-stems-match constraint
+      // is a precision signal and routinely produces legitimate AND hits
+      // below raw |bm25|=20 that we do not want to drop (see GOOD-narrow
+      // probe). Skip gate when OR_TOP_BM25_FLOOR is set to 0 (test hook).
+      if (ftsMode === 'OR' && OR_TOP_BM25_FLOOR > 0 && ftsRows.length > 0) {
+        const topBm25 = Math.abs(ftsRows[0].bm25_raw || 0);
+        if (topBm25 < OR_TOP_BM25_FLOOR) ftsRows = [];
+      }
 
       // v2.34.3: top-|rel| sanity gate. Per-row filtering above leaves noise
       // prompts intact when many rows share a weak stem (all in 25..48 range).

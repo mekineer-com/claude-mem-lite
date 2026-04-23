@@ -1205,7 +1205,7 @@ async function doctor() {
     if (r.drift) {
       const names = r.details.join(', ');
       const suffix = r.plainCount > r.details.length ? ` +${r.plainCount - r.details.length} more` : '';
-      warn(`Dev drift: ${r.plainCount} non-symlink file(s) in dev install: ${names}${suffix} (re-run: node install.mjs install --dev)`);
+      warn(`Dev drift: ${r.plainCount} non-symlink file(s) in dev install: ${names}${suffix} (re-run: node ${join(PROJECT_DIR, 'install.mjs')} install --dev)`);
       issues++;
     } else if (r.devMode) {
       ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain)`);

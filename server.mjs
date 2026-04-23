@@ -2176,15 +2176,18 @@ server.registerTool(
   safeHandler(async (args) => {
     const filename = basename(args.file);
     const limit = args.limit ?? 10;
+    const includeNoise = args.include_noise === true;
 
     const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
     const likePattern = `%${escaped}`;
+    const noiseClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
     const rows = db.prepare(`
       SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at, o.project
       FROM observations o
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE COALESCE(o.compressed_into, 0) = 0
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+        ${noiseClause}
       ORDER BY o.created_at_epoch DESC
       LIMIT ?
     `).all(filename, likePattern, limit);

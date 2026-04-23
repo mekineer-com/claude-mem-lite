@@ -224,6 +224,12 @@ describe('mem_recall schema', () => {
     expect(result.success).toBe(true);
     expect(result.data.limit).toBe(10);
   });
+
+  it('accepts include_noise flag (parity with mem_search)', () => {
+    const result = parseSchema(memRecallSchema, { file: 'test.mjs', include_noise: true });
+    expect(result.success).toBe(true);
+    expect(result.data.include_noise).toBe(true);
+  });
 });
 
 // ─── mem_delete schema ──────────────────────────────────────────────────────

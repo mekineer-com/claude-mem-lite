@@ -211,6 +211,7 @@ export const memExportSchema = {
 export const memRecallSchema = {
   file: z.string().min(1).describe('File path or filename to recall observations for'),
   limit: coerceInt.pipe(z.number().int().min(1).max(50)).optional().describe('Max results (default 10)'),
+  include_noise: z.boolean().optional().describe('Include hook-llm fallback titles ("Modified X", "Worked on X", raw error logs) — hidden by default for parity with mem_search'),
 };
 
 export const memFtsCheckSchema = {

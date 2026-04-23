@@ -74,6 +74,38 @@ describe('shouldSkip', () => {
     expect(shouldSkip('Refactor the database module')).toBe(false);
     expect(shouldSkip('为什么这个测试一直失败？')).toBe(false);
   });
+
+  it('skips pure continuation directives that pass the length gate', () => {
+    // CONFIRM_RE only catches bare exact words; these have trailing
+    // punctuation / synonyms that slip through but are still semantically empty.
+    expect(shouldSkip('继续！')).toBe(true);
+    expect(shouldSkip('继续做')).toBe(true);
+    expect(shouldSkip('继续做下一步')).toBe(true);
+    expect(shouldSkip('接着做下一步')).toBe(true);
+    expect(shouldSkip('keep going')).toBe(true);
+    expect(shouldSkip('go on please')).toBe(false); // "please" is content — fall through
+    expect(shouldSkip('keep going!')).toBe(true);
+    expect(shouldSkip('continue')).toBe(true);
+    expect(shouldSkip('proceed.')).toBe(true);
+    expect(shouldSkip('more please')).toBe(true);
+  });
+
+  it('skips meta-pause questions ("why did you stop")', () => {
+    expect(shouldSkip('怎么停下来了')).toBe(true);
+    expect(shouldSkip('怎么停下来了，继续')).toBe(true);
+    expect(shouldSkip('为什么停下来了？')).toBe(true);
+    expect(shouldSkip('why did you stop?')).toBe(true);
+    expect(shouldSkip('why did you pause working?')).toBe(true);
+    expect(shouldSkip('why stop here')).toBe(true);
+  });
+
+  it('does NOT skip continuation + new instruction', () => {
+    // Tail content past the directive disqualifies the skip — model still
+    // benefits from memory recall when user adds new direction.
+    expect(shouldSkip('继续，先做 X 再做 Y')).toBe(false);
+    expect(shouldSkip('继续做 hooks 优化')).toBe(false);
+    expect(shouldSkip('next, lets review the schema')).toBe(false);
+  });
 });
 
 // ─── Unit Tests: computeEffectiveLen (v2.34.4) ──────────────────────────────
@@ -413,7 +445,7 @@ describe('matchRegistrySkillName', () => {
 function formatResults(rows) {
   if (!rows || rows.length === 0) return null;
 
-  const lines = ['[mem] Related memories:'];
+  const lines = ['[mem] FYI — Related memories (continue your task):'];
   for (const r of rows) {
     const icon = typeIcon(r.type);
     const title = truncate(r.title || '', 70);
@@ -433,7 +465,7 @@ describe('formatResults', () => {
     const output = formatResults([
       { id: 1, type: 'bugfix', title: 'Fixed login crash', lesson_learned: null },
     ]);
-    expect(output).toContain('[mem] Related memories:');
+    expect(output).toContain('[mem] FYI — Related memories');
   });
 
   it('includes #ID icon and title per row', () => {
@@ -459,7 +491,7 @@ describe('formatResults', () => {
     ]);
     const lines = output.split('\n');
     expect(lines.length).toBe(4); // header + 3 results
-    expect(lines[0]).toBe('[mem] Related memories:');
+    expect(lines[0]).toBe('[mem] FYI — Related memories (continue your task):');
     expect(lines[1]).toContain('#1');
     expect(lines[2]).toContain('#2');
     expect(lines[3]).toContain('#3');
@@ -714,6 +746,69 @@ describe('user-prompt-search subprocess integration', () => {
     expect(stdout).toContain('Touched auth-config.mjs settings');
   });
 
+  // v2.43.x: OR-mode raw-BM25 floor. When AND fallback to OR fires, the
+  // composite TOP_REL_FLOOR can be inflated by importance/type/decay
+  // multipliers on a single-stem match — a broad prompt surfacing
+  // importance=3 bugfix obs whose concepts share one tangential word. The
+  // new OR_TOP_BM25_FLOOR (default 30) gates on raw bm25() magnitude and
+  // fires only when TOP_REL_FLOOR is nonzero (test override semantic).
+  it('v2.43.x OR-bm25 gate: disabled when TOP_REL_FLOOR=0 (test-harness default)', async () => {
+    // runScript defaults CLAUDE_MEM_UPS_TOP_MIN='0' for sparse-corpus tests.
+    // Under that default, the OR-bm25 gate must also be disabled — otherwise
+    // every seed-small fixture that relies on OR fallback would silently stop
+    // emitting. Seed one obs whose text lacks the prompt's intent stem
+    // ("fix"), forcing AND→OR fallback; expect surface.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved OAuth token refresh double-redirect',
+      text: 'OAuth token refresh double-redirect race condition',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'how do I fix the OAuth token refresh double-redirect' },
+    );
+    expect(stdout).toContain('OAuth token refresh');
+  });
+
+  it('v2.43.x OR-bm25 gate: explicit env override to 0 disables the gate', async () => {
+    // Production-like: TOP_REL_FLOOR nonzero but OR-bm25 floor explicitly
+    // disabled. On sparse test corpora |bm25| ≈ 4e-6; both gates must be off
+    // for the row to survive. Proves CLAUDE_MEM_UPS_OR_BM25_MIN=0 works as
+    // an independent kill switch when needed.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved OAuth token refresh double-redirect',
+      text: 'OAuth token refresh double-redirect race condition',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'how do I fix the OAuth token refresh double-redirect' },
+      { CLAUDE_MEM_UPS_TOP_MIN: '0.0000001', CLAUDE_MEM_UPS_OR_BM25_MIN: '0' },
+    );
+    expect(stdout).toContain('OAuth token refresh');
+  });
+
+  it('v2.43.x OR-bm25 gate: fires when TOP_REL_FLOOR nonzero and bm25 below floor', async () => {
+    // Production-like: TOP_REL_FLOOR nonzero (tiny), OR-bm25 floor at default
+    // 30. On sparse corpus |bm25| ≈ 4e-6 << 30 → gate fires, drops FTS set,
+    // prompt-fallback finds nothing → empty stdout. Proves the gate is not
+    // a no-op when its disabling precondition (TOP_REL_FLOOR=0) is absent.
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved OAuth token refresh double-redirect',
+      text: 'OAuth token refresh double-redirect race condition',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'how do I fix the OAuth token refresh double-redirect' },
+      { CLAUDE_MEM_UPS_TOP_MIN: '0.0000001' },
+    );
+    expect(stdout).toBe('');
+  });
+
   // v2.34.5 Gap 1: prompts-table fallback. When observations FTS returns empty,
   // fall back to user_prompts_fts — user's own prior similar questions are
   // often the answer to meta/UX prompts that have no matching code observation.
@@ -727,7 +822,7 @@ describe('user-prompt-search subprocess integration', () => {
     const { stdout } = await runScript(
       { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
     );
-    expect(stdout).toContain('[mem] Past similar questions:');
+    expect(stdout).toContain('[mem] FYI — Past similar questions');
     expect(stdout).toMatch(/P#\d+/);
     expect(stdout).toContain('FTS5 boolean operator');
   });
@@ -747,9 +842,9 @@ describe('user-prompt-search subprocess integration', () => {
     const { stdout } = await runScript(
       { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
     );
-    expect(stdout).toContain('[mem] Related memories:');
+    expect(stdout).toContain('[mem] FYI — Related memories');
     expect(stdout).toContain('Fixed FTS5 boolean operator sanitization');
-    expect(stdout).not.toContain('[mem] Past similar questions:');
+    expect(stdout).not.toContain('[mem] FYI — Past similar questions');
   });
 
   it('v2.34.5 prompts-fallback: respects project scope', async () => {

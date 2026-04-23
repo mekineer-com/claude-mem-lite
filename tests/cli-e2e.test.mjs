@@ -257,6 +257,27 @@ describe('CLI E2E: recall', () => {
     const { stdout } = runCli(['recall', 'nonexistent_file_xyz.ts']);
     expect(stdout).toContain('No history');
   });
+
+  it('hides hook-llm fallback titles by default but surfaces with --include-noise', () => {
+    seedObs({
+      type: 'bugfix', title: 'Real fix for parser regression',
+      filesModified: '["src/parser.mjs"]', lessonLearned: 'Catch trailing-whitespace edge case',
+    });
+    seedObs({
+      type: 'change', title: 'Modified src/parser.mjs',
+      filesModified: '["src/parser.mjs"]',
+    });
+
+    const def = runCli(['recall', 'parser.mjs']);
+    expect(def.exitCode).toBe(0);
+    expect(def.stdout).toContain('Real fix for parser regression');
+    expect(def.stdout).not.toContain('Modified src/parser.mjs');
+
+    const noisy = runCli(['recall', 'parser.mjs', '--include-noise']);
+    expect(noisy.exitCode).toBe(0);
+    expect(noisy.stdout).toContain('Real fix for parser regression');
+    expect(noisy.stdout).toContain('Modified src/parser.mjs');
+  });
 });
 
 describe('CLI E2E: get', () => {

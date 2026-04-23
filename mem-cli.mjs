@@ -484,23 +484,26 @@ function cmdRecall(db, args) {
   const { positional, flags } = parseArgs(args);
   const file = positional.join(' ');
   if (!file) {
-    fail('[mem] Usage: mem recall <file>');
+    fail('[mem] Usage: mem recall <file> [--limit N] [--include-noise]');
     return;
   }
 
   const filename = basename(file);
   const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
   const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 10;
+  const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
 
   // Search via observation_files junction table for indexed filename lookups
   const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
   const likePattern = `%${escaped}`;
+  const noiseClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
   const rows = db.prepare(`
     SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at, o.project
     FROM observations o
     JOIN observation_files of2 ON of2.obs_id = o.id
     WHERE COALESCE(o.compressed_into, 0) = 0
       AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+      ${noiseClause}
     ORDER BY o.created_at_epoch DESC
     LIMIT ?
   `).all(filename, likePattern, limit);
@@ -1972,6 +1975,7 @@ Commands:
 
   recall <file>         Show observations related to a file
     --limit N           Max results (default 10)
+    --include-noise     Include hook-llm fallback titles ("Modified X", raw error logs)
 
   get <id1,id2,...>     Get full details by ID
     IDs accept search-output prefixes: #123 (obs), P#123 (prompt), S#123 (session).
