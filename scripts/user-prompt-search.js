@@ -216,6 +216,9 @@ function searchByUserPrompts(db, queryText, project, limit) {
   if (!ftsQuery) return [];
 
   const cutoff = Date.now() - LOOKBACK_MS;
+  // Exclude <task-notification> internal protocol messages — parity with
+  // server.mjs mem_search + mem-cli.mjs search (see lesson #8139: read-path
+  // parity across paths querying the same table).
   const sql = `
     SELECT up.id, up.prompt_text, up.created_at_epoch,
            bm25(user_prompts_fts) as relevance
@@ -225,6 +228,7 @@ function searchByUserPrompts(db, queryText, project, limit) {
     WHERE user_prompts_fts MATCH ?
       AND s.project = ?
       AND up.created_at_epoch > ?
+      AND up.prompt_text NOT LIKE '<task-notification>%'
     ORDER BY relevance
     LIMIT ?
   `;

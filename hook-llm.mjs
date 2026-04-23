@@ -7,7 +7,7 @@ import {
   jaccardSimilarity, truncate, clampImportance, computeRuleImportance,
   inferProject, parseJsonFromLLM,
   computeMinHash, estimateJaccardFromMinHash, cjkBigrams, EDIT_TOOLS, LOW_SIGNAL_TITLE, debugCatch, debugLog, OBS_BM25,
-  getCurrentBranch,
+  getCurrentBranch, notLowSignalTitleClause,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { getVocabulary, computeVector } from './tfidf.mjs';
@@ -802,10 +802,14 @@ export async function handleLLMSummary() {
     const sessionId = process.argv[3] || getSessionId();
     const project = process.argv[4] || inferProject();
 
+    // Exclude LOW_SIGNAL hook-llm fallback titles ("Error: files +2 more: ...",
+    // "Modified X", "Worked on X", etc.) from the Haiku summary input — they
+    // pollute the `completed` field and mislead session-resume context.
     const recentObs = db.prepare(`
       SELECT id, type, title, narrative
       FROM observations
       WHERE memory_session_id = ?
+        AND ${notLowSignalTitleClause('')}
       ORDER BY created_at_epoch DESC
       LIMIT 30
     `).all(sessionId);

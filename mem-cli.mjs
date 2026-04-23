@@ -450,8 +450,13 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
 
 function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
-  const rawLimit = parseInt(positional[0], 10);
-  const limit = (Number.isInteger(rawLimit) && rawLimit > 0) ? rawLimit : 10;
+  const rawArg = positional[0];
+  const rawLimit = parseInt(rawArg, 10);
+  const isValid = Number.isInteger(rawLimit) && rawLimit > 0;
+  if (rawArg !== undefined && !isValid) {
+    process.stderr.write(`[mem] Invalid count "${rawArg}" (must be a positive integer); using default 10\n`);
+  }
+  const limit = isValid ? rawLimit : 10;
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   const params = [];

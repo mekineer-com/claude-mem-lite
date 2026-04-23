@@ -423,7 +423,7 @@ export const tools = [
       '  - After a major project phase completes and old per-file observations are noise\n' +
       '  - Stats show thousands of low-importance rows dragging search quality\n' +
       '\n' +
-      'Equivalent CLI: claude-mem-lite compress [--preview] [--age-days 90]',
+      'Equivalent CLI: claude-mem-lite compress [--execute] [--age-days 90]  (preview is default)',
     inputSchema: memCompressSchema,
     hidden: true,
   },
@@ -442,7 +442,7 @@ export const tools = [
       '  - After bulk imports or a long offline period\n' +
       '  - User asks for periodic maintenance / cleanup\n' +
       '\n' +
-      'Equivalent CLI: claude-mem-lite maintain --action scan --operations dedup,decay',
+      'Equivalent CLI: claude-mem-lite maintain scan --ops dedup,decay',
     inputSchema: memMaintainSchema,
     hidden: true,
   },
@@ -461,7 +461,7 @@ export const tools = [
       '  - stats show many degraded (title-only, no lesson) observations\n' +
       '  - Start with action="preview" to see candidates before spending tokens\n' +
       '\n' +
-      'Equivalent CLI: claude-mem-lite optimize [--action preview|run|run_all] [--max-items N]',
+      'Equivalent CLI: claude-mem-lite optimize [--run|--run-all] [--task re-enrich,normalize,cluster-merge,smart-compress] [--max N]  (preview is default)',
     inputSchema: memOptimizeSchema,
     hidden: true,
   },

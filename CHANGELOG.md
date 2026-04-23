@@ -2,6 +2,21 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.49.1] - 2026-04-24
+
+**Read-path parity cleanup — 4 defensive fixes, zero behavior change for healthy queries.** All four were silent noise leaks / doc drift surfaced while dogfooding the plugin as an end user. Each path was independently querying the same underlying table (observations / user_prompts / tool catalog) with subtly different filter clauses, so noise that one path already excluded leaked through a sibling path (see lesson #8139 — read-path parity matters).
+
+### Fixed
+
+- **`scripts/user-prompt-search.js` — `searchByUserPrompts` missing `<task-notification>` filter.** UserPromptSubmit's "Past similar questions" injection (v2.34.5 prompts-fallback) selected from `user_prompts_fts` without `NOT LIKE '<task-notification>%'` — the filter that `server.mjs` mem_search and `mem-cli.mjs` search both carry. Result: internal `<task-notification>` protocol rows surfaced as user-visible "past similar questions" injections, confusing the next turn. SQL clause added, parity restored. Regression test in `tests/user-prompt-search.test.mjs`.
+- **`hook-llm.mjs` — `handleLLMSummary` recentObs query did not filter LOW_SIGNAL titles.** The Haiku session-summary prompt fed on every observation in the session regardless of title quality, so degraded hook-llm fallback titles (`Error: files +2 more: ...`, `Modified X`, `Worked on X`) polluted the `completed` field of `session_summaries`, which then surfaced in the SessionStart `<claude-mem-context>` block's "Last Session — Completed:" line. Added `AND notLowSignalTitleClause('')` to the recentObs SELECT + imported the clause builder. Write-side only (LOW_SIGNAL obs still exist in DB, just excluded from LLM input).
+- **`tool-schemas.mjs` — three "Equivalent CLI:" lines referenced flags that don't exist in the CLI parser.** `mem_maintain` described `--action scan --operations dedup,decay` (actual: `maintain scan --ops dedup,decay`); `mem_compress` described `[--preview]` (actual: preview is default, `--execute` flips it); `mem_optimize` described `[--action preview|run|run_all] [--max-items N]` (actual: `[--run|--run-all] [--task ...] [--max N]`). Agents following those docs got silent "unknown flag" errors. Descriptions now match the CLI.
+- **`mem-cli.mjs` — `cmdRecent abc` / `recent -1` / `recent 0` silently fell back to default 10 with no signal.** Now emits `[mem] Invalid count "<arg>" (must be a positive integer); using default 10` to stderr when a non-positive-integer argument is provided. Behavior unchanged for valid input and for the no-arg case.
+
+### Added
+
+- **`tests/mcp-tools-snapshot.test.mjs` — 7-test guard on the MCP tool surface.** Asserts the exposed-vs-hidden split (6 core / 11 hidden), every tool carries DO NOT / USE guidance blocks, every non-`mem_use` tool carries an `Equivalent CLI:` line, and the CLI examples don't re-introduce phantom `--action` / `--operations` / `--max-items` / `[--preview]` flags that this release just removed. Inline snapshot pins the core tool list for review-level catch of silent drift.
+
 ## [2.49.0] - 2026-04-24
 
 **React hook API synonym bridge closes `hard_negative_precision` recall gap + hook-llm test fixture leak fix (zero residue in `~/.claude/tmp/`).** Originally scoped as P2-1 "precision-mode synonym opt-out" based on a misread of benchmark category name — per-query inspection showed `hard_negative_precision` P@10 was already 1.0; the real shortfall was R@10=0.7, driven entirely by `q32 "React hooks"` matching only 2 of 5 relevant observations because `SYNONYM_MAP` had no `react`/`hooks` entries and the AND-joined query `"React hooks"` missed observations that mention only a specific hook API (`useEffect` / `useState` / …). Fix is additive, not opt-out: narrow `hooks ↔ {useState, useEffect, useCallback, useMemo, useRef, useContext}` + `hook ↔ hooks` bridge (7 pairs, kept out of `react ↔ jsx/component` which would pollute q4/q28). Secondary: `tests/hook-llm.test.mjs` was leaking 29 stale `hook-llm-test-*.json` files into `~/.claude/tmp/` per run because `afterEach` used `writeFileSync(tmpFile, '')` (truncated, did not delete) and four inline `tmpFile2` fixtures had no cleanup at all.

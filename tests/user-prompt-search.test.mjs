@@ -827,6 +827,27 @@ describe('user-prompt-search subprocess integration', () => {
     expect(stdout).toContain('FTS5 boolean operator');
   });
 
+  // Read-path parity with server.mjs + mem-cli.mjs: user_prompts_fts results
+  // must exclude <task-notification> internal protocol rows — else they leak
+  // as "past similar questions" and mislead the next turn. (See lesson #8139.)
+  it('prompts-fallback: excludes <task-notification> internal protocol rows', async () => {
+    insertPrompt(db, {
+      contentSessionId: 's1',
+      text: '<task-notification>task-id abc FTS5 boolean operator precedence</task-notification>',
+    });
+    insertPrompt(db, {
+      contentSessionId: 's1',
+      text: 'How should we handle FTS5 boolean operator precedence in sanitization?',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const { stdout } = await runScript(
+      { prompt: 'parsing FTS5 boolean operator precedence in our sanitizer' },
+    );
+    expect(stdout).toContain('[mem] FYI — Past similar questions');
+    expect(stdout).not.toContain('<task-notification>');
+    expect(stdout).toContain('FTS5 boolean operator');
+  });
+
   it('v2.34.5 prompts-fallback: suppressed when observations hit (no noise)', async () => {
     insertObs(db, {
       sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
