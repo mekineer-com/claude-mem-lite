@@ -130,6 +130,26 @@ describe('mem_timeline schema', () => {
     expect(parseSchema(memTimelineSchema, { before: -1 }).success).toBe(false);
     expect(parseSchema(memTimelineSchema, { after: 51 }).success).toBe(false);
   });
+
+  // Parity with CLI `timeline --anchor`: accept prefixed-token strings from search output.
+  it('accepts prefixed anchor strings: "#123", "P#456", "S#789"', () => {
+    expect(parseSchema(memTimelineSchema, { anchor: '#123' }).success).toBe(true);
+    expect(parseSchema(memTimelineSchema, { anchor: 'P#456' }).success).toBe(true);
+    expect(parseSchema(memTimelineSchema, { anchor: 'S#789' }).success).toBe(true);
+    expect(parseSchema(memTimelineSchema, { anchor: 'p123' }).success).toBe(true); // lowercase
+  });
+
+  it('rejects anchor strings with garbage', () => {
+    expect(parseSchema(memTimelineSchema, { anchor: 'X#42' }).success).toBe(false);
+    expect(parseSchema(memTimelineSchema, { anchor: '#abc' }).success).toBe(false);
+    expect(parseSchema(memTimelineSchema, { anchor: '' }).success).toBe(false);
+  });
+
+  it('coerces plain-int strings to number (unchanged legacy path)', () => {
+    const r = parseSchema(memTimelineSchema, { anchor: '42' });
+    expect(r.success).toBe(true);
+    expect(r.data.anchor).toBe(42);
+  });
 });
 
 // ─── mem_get schema ─────────────────────────────────────────────────────────

@@ -476,7 +476,7 @@ function cmdRecent(db, args) {
   for (const r of rows) {
     const time = relativeTime(r.created_at_epoch);
     const title = truncate(r.title || r.subtitle || '(untitled)', 80);
-    out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
+    out(`${('#' + r.id).padEnd(6)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
   }
 }
 
@@ -787,7 +787,7 @@ function cmdTimeline(db, args) {
     for (const r of rows.reverse()) {
       const time = relativeTime(r.created_at_epoch);
       const title = truncate(r.title || r.subtitle || '(untitled)', 80);
-      out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
+      out(`${('#' + r.id).padEnd(6)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}`);
     }
     return;
   }
@@ -840,7 +840,7 @@ function cmdTimeline(db, args) {
     const marker = r.id === anchorId ? ' <--' : '';
     const time = relativeTime(r.created_at_epoch);
     const title = truncate(r.title || r.subtitle || '(untitled)', 80);
-    out(`#${String(r.id).padStart(5)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}${marker}`);
+    out(`${('#' + r.id).padEnd(6)} ${typeIcon(r.type)} ${time.padEnd(8)} ${title}${marker}`);
   }
 }
 

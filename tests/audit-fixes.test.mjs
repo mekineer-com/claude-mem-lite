@@ -983,3 +983,114 @@ describe('MCP T3 audit fixes (stdio)', () => {
     expect(hasBranch).toBe(true);
   });
 });
+
+// ─── T-anchor-prefix: mem_timeline accepts P#/S#/# prefix anchors ───────────
+// Pre-fix symptom: MCP memTimelineSchema.anchor was int-only, so pasting a
+// P#/S# token from mem_search output hit `Input validation error: expected
+// number`. CLI `timeline --anchor` supported prefixes since v2.39.0; this
+// restores CLI↔MCP parity per #8050 and unblocks the paste-from-search flow.
+
+function seedPrefixAnchorDb(dir) {
+  const dbPath = join(dir, 'claude-mem-lite.db');
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = OFF');
+  initSchema(db);
+  insertSession(db, { id: 'anchor-sess', project: 'anchor--probe', memoryId: 'anchor-mem' });
+  // 5 obs spaced 1-day apart; newest = i=0, oldest = i=4.
+  for (let i = 0; i < 5; i++) {
+    insertObs(db, {
+      sessionId: 'anchor-mem',
+      project: 'anchor--probe',
+      type: 'discovery',
+      title: `Anchor obs ${i}`,
+      text: `anchor probe body ${i}`,
+      importance: 2,
+      epochOffset: -i * 86_400_000,
+    });
+  }
+  // One prompt placed exactly at obs #3's epoch → nearest-obs should be #3.
+  const nowMs = Date.now();
+  const obs3Epoch = nowMs - 2 * 86_400_000; // i=2 → id=3 (1-indexed autoincrement)
+  db.prepare(`
+    INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+    VALUES (?, ?, ?, ?, ?)
+  `).run('anchor-sess', 'prompt near obs 3', 1, new Date(obs3Epoch).toISOString(), obs3Epoch);
+  // One session_summary placed at obs #5's epoch → nearest-obs should be #5.
+  const obs5Epoch = nowMs - 4 * 86_400_000;
+  db.prepare(`
+    INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run('anchor-mem', 'anchor--probe', 'summary near obs 5', 'done', new Date(obs5Epoch).toISOString(), obs5Epoch);
+  db.close();
+  return dbPath;
+}
+
+describe('T-anchor-prefix: mem_timeline prefix anchor parity (stdio)', () => {
+  let tmp, proc;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'mem-anchor-'));
+    seedPrefixAnchorDb(tmp);
+    proc = startServer(tmp);
+  });
+
+  afterEach(async () => {
+    try { proc.stdin.end(); } catch { /* already closed */ }
+    try { proc.kill('SIGTERM'); } catch { /* already exited */ }
+    await new Promise((r) => setTimeout(r, 50));
+    try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  function callTool(name, args) {
+    return rpc(proc, Math.floor(Math.random() * 1e9), 'tools/call', { name, arguments: args });
+  }
+
+  it('resolves P#<id> anchor to the nearest-in-time observation', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_timeline', { anchor: 'P#1', before: 1, after: 1 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/anchored to #3, closest obs to P#1/);
+    expect(text).toMatch(/Anchor obs 2/); // nearest obs to prompt = id=3 => "Anchor obs 2"
+  });
+
+  it('resolves S#<id> anchor to the nearest-in-time observation', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_timeline', { anchor: 'S#1', before: 1, after: 1 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/anchored to #5, closest obs to S#1/);
+    expect(text).toMatch(/Anchor obs 4/); // nearest obs to session = id=5 => "Anchor obs 4"
+  });
+
+  it('accepts bare #<id> anchor (obs fast path)', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_timeline', { anchor: '#2', before: 1, after: 1 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/Timeline around #2/);
+    expect(text).not.toMatch(/anchored to/); // no redirect note for obs
+  });
+
+  it('still accepts plain integer anchor (legacy path unchanged)', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_timeline', { anchor: 2, before: 1, after: 1 });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/Timeline around #2/);
+  });
+
+  it('returns not-found message for P#<huge-id>', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_timeline', { anchor: 'P#999999' });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/Prompt P#999999 not found/);
+  });
+
+  it('rejects malformed prefix strings at schema layer', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_timeline', { anchor: 'X#42' });
+    // Lock the error payload shape: schema rejection must set isError=true (not
+    // coincidental "Invalid" in a title). Regex below is secondary evidence.
+    expect(resp.result?.isError).toBe(true);
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/Invalid|Expected N|MCP error|invalid_type|regex/i);
+  });
+});

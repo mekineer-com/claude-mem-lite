@@ -50,8 +50,27 @@ export const memRecentSchema = {
   project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
 };
 
+// Anchor accepts plain int, "123" string-int, or prefixed token from search output:
+// "#123" / "P#123" (prompt) / "S#123" (session). Prompt/session anchors resolve to
+// the nearest-in-time observation so timeline semantics still apply. CLI --anchor
+// parity per #8050 (CLI has supported prefixed tokens since v2.39.0).
+const coerceAnchor = z.preprocess(
+  (v) => {
+    if (typeof v === 'string') {
+      const s = v.trim();
+      if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+      return s;
+    }
+    return v;
+  },
+  z.union([
+    z.number().int(),
+    z.string().regex(/^[PpSs]?#?\d+$/, 'Expected N, #N, P#N, or S#N'),
+  ])
+);
+
 export const memTimelineSchema = {
-  anchor: coerceInt.pipe(z.number().int()).optional().describe('Observation ID as center point. Takes precedence over query when both are provided.'),
+  anchor: coerceAnchor.optional().describe('Anchor as observation ID (int) or prefixed token string: "#123", "P#123" (prompt → nearest obs), "S#123" (session → nearest obs). Takes precedence over query.'),
   query: z.string().optional().describe('FTS5 query to auto-find anchor. Ignored when anchor is also given; use one or the other.'),
   before: coerceInt.pipe(z.number().int().min(0).max(50)).optional().describe('Items before anchor (default 5)'),
   after: coerceInt.pipe(z.number().int().min(0).max(50)).optional().describe('Items after anchor (default 5)'),
@@ -59,6 +78,9 @@ export const memTimelineSchema = {
 };
 
 export const memGetSchema = {
+  // TODO(#8126): accept P#/S#/# prefix strings for paste-from-search parity with
+  // CLI cmdGet bucketed routing (~40 LOC handler refactor). mem_timeline already
+  // accepts prefixes via coerceAnchor; this is the matched-pair gap.
   ids: coerceIntArray.pipe(z.array(z.number().int()).min(1).max(20)).describe('Observation IDs to retrieve'),
   source: z.enum(['obs', 'session', 'prompt']).optional().describe('Record type: obs (default), session (S# from search), prompt (P# from search)'),
   fields: z.array(z.string()).optional().describe('Specific fields to return (default: all)'),

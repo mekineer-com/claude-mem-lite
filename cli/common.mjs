@@ -1,10 +1,11 @@
 // cli/common.mjs — shared helpers used by every per-command file under cli/.
 // Extracted from mem-cli.mjs (v2.41) as first step in the god-module split.
 //
-// Scope: pure utilities only. No DB, no imports from other cli/ files. This
-// module is the single source of truth for stdout/stderr framing, arg parsing,
-// ID-token parsing, and relative-time formatting — every command imports from
-// here so the CLI stays consistent.
+// Scope: pure utilities only. No DB, no imports from other cli/ files; only
+// `lib/` leaf utilities may be re-exported through here (currently:
+// parseIdToken). This module is the single source of truth for stdout/stderr
+// framing, arg parsing, ID-token parsing, and relative-time formatting —
+// every command imports from here so the CLI stays consistent.
 
 // ─── Argument Parsing ────────────────────────────────────────────────────────
 
@@ -75,22 +76,10 @@ export function fmtDateShort(iso) {
 }
 
 // ─── ID Token Parsing ────────────────────────────────────────────────────────
-
-/**
- * Parse an ID token from a command positional argument.
- * Accepts: `123`, `#123`, `P#123` / `p123` (prompt), `S#123` / `s123` (session).
- * @returns {{ source: 'obs'|'session'|'prompt'|null, id: number } | null}
- *   source===null means no explicit prefix — caller picks default (typically 'obs').
- */
-export function parseIdToken(raw) {
-  const m = /^([PpSs]?)#?(\d+)$/.exec(String(raw).trim());
-  if (!m) return null;
-  const p = m[1].toUpperCase();
-  const id = parseInt(m[2], 10);
-  if (!Number.isFinite(id) || id <= 0) return null;
-  const source = p === 'P' ? 'prompt' : p === 'S' ? 'session' : null;
-  return { source, id };
-}
+// Re-exported from lib/id-routing.mjs so CLI and MCP (server.mjs) share a single
+// parser — parity per #8050. Keep this re-export for back-compat with the
+// 5 CLI call sites that already import parseIdToken from cli/common.mjs.
+export { parseIdToken } from '../lib/id-routing.mjs';
 
 /**
  * Format the shared `probeIdSources` output as CLI hint strings.

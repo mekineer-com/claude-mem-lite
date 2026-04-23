@@ -27,7 +27,7 @@ import { basename, join } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { probeOtherSources as probeIdSources } from './lib/id-routing.mjs';
+import { probeOtherSources as probeIdSources, parseIdToken } from './lib/id-routing.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { createRequire } from 'module';
 
@@ -762,6 +762,57 @@ server.registerTool(
     const before = args.before ?? 5;
     const after = args.after ?? 5;
     let anchorId = args.anchor;
+    let anchorNote = null;
+
+    // Resolve prefixed-token anchor (e.g. "P#3462" / "S#53" / "#8121") — users pasting
+    // from mem_search results expect the same routing as CLI `timeline --anchor`.
+    // Prompt/session anchors resolve to the nearest-in-time observation so
+    // before/after semantics still apply to the observations timeline.
+    if (typeof anchorId === 'string') {
+      const parsed = parseIdToken(anchorId);
+      if (!parsed) {
+        return { content: [{ type: 'text', text: `Invalid anchor "${args.anchor}". Expected N, #N, P#N, or S#N.` }] };
+      }
+      if (parsed.source === 'prompt' || parsed.source === 'session') {
+        const srcTable = parsed.source === 'prompt' ? 'user_prompts' : 'session_summaries';
+        const srcPrefix = parsed.source === 'prompt' ? 'P#' : 'S#';
+        const row = db.prepare(`SELECT created_at_epoch FROM ${srcTable} WHERE id = ?`).get(parsed.id);
+        if (!row) return { content: [{ type: 'text', text: `${parsed.source === 'prompt' ? 'Prompt' : 'Session'} ${srcPrefix}${parsed.id} not found.` }] };
+        const projArg = args.project;
+        const nearest = db.prepare(`
+          SELECT id FROM observations
+          WHERE COALESCE(compressed_into, 0) = 0 ${projArg ? 'AND project = ?' : ''}
+          ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
+        `).get(...(projArg ? [projArg, row.created_at_epoch] : [row.created_at_epoch]));
+        if (!nearest) return { content: [{ type: 'text', text: `No observations near ${srcPrefix}${parsed.id}.` }] };
+        anchorId = nearest.id;
+        anchorNote = `(anchored to #${nearest.id}, closest obs to ${srcPrefix}${parsed.id})`;
+      } else {
+        // Bare "#N" or "N" — resolve to obs, falling back to prompt/session like CLI bare-int path.
+        const obsExists = db.prepare('SELECT 1 FROM observations WHERE id = ?').get(parsed.id);
+        if (obsExists) {
+          anchorId = parsed.id;
+        } else {
+          const promptRow = db.prepare('SELECT created_at_epoch FROM user_prompts WHERE id = ?').get(parsed.id);
+          const sessionRow = promptRow ? null : db.prepare('SELECT created_at_epoch FROM session_summaries WHERE id = ?').get(parsed.id);
+          const hit = promptRow ? { row: promptRow, prefix: 'P#', name: 'prompt' }
+                    : sessionRow ? { row: sessionRow, prefix: 'S#', name: 'session' }
+                    : null;
+          if (!hit) {
+            return { content: [{ type: 'text', text: `Observation, prompt, or session with id ${parsed.id} not found.` }] };
+          }
+          const projArg = args.project;
+          const nearest = db.prepare(`
+            SELECT id FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0 ${projArg ? 'AND project = ?' : ''}
+            ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
+          `).get(...(projArg ? [projArg, hit.row.created_at_epoch] : [hit.row.created_at_epoch]));
+          if (!nearest) return { content: [{ type: 'text', text: `No observations near ${hit.prefix}${parsed.id} (${hit.name}).` }] };
+          anchorId = nearest.id;
+          anchorNote = `(anchored to #${nearest.id}, closest obs to ${hit.prefix}${parsed.id})`;
+        }
+      }
+    }
 
     // Auto-find anchor via FTS (with recency decay)
     if (!anchorId && args.query) {
@@ -845,7 +896,7 @@ server.registerTool(
     const anchor = db.prepare('SELECT id, type, title, subtitle, project, created_at FROM observations WHERE id = ?').get(anchorId);
 
     const all = [...beforeRows.reverse(), anchor, ...afterRows];
-    const lines = [`Timeline around #${anchorId}:\n`];
+    const lines = [`Timeline around #${anchorId}${anchorNote ? ' ' + anchorNote : ''}:\n`];
     for (const r of all) {
       const marker = r.id === anchorId ? ' ◀' : '';
       lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}${marker}`);

@@ -2,6 +2,42 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.42.0] - 2026-04-23
+
+**Two bugfixes surfaced by an end-to-end user-simulation pass + parity follow-up for MCP.** A fresh round of "use the tool like a user" testing against the CLI and MCP surfaces exposed two reachable UX gaps: (1) `recent` / `timeline` CLI output emitted `#N` tokens with a leading space when the ID had fewer than 5 digits, breaking copy-paste into `claude-mem-lite get`; (2) MCP `mem_timeline` rejected prefixed anchor tokens (`P#N` / `S#N` / `#N`) that the CLI has accepted since v2.39.0 — a reachable CLI↔MCP parity gap in the exact shape called out by lesson `#8050`.
+
+### Fixed
+
+- **`mem-cli.mjs:479,790,843`** — `recent` / `timeline` (both fallback and anchored paths) replaced `` `#${String(r.id).padStart(5)} ...` `` with `` `${('#' + r.id).padEnd(6)} ...` ``. Pre-fix: 4-digit IDs rendered as `# 8121` (padStart inside the token inserts a space between `#` and digits); `claude-mem-lite get "# 8121"` then failed with `Ignoring unparseable ID token(s): # 8121`. Post-fix: token emits `#8121 ` (pad moved to trailing position), column alignment preserved, `#N` paste-safe into every other CLI command. Matches the pre-existing unpadded format in MCP `server.mjs:745` so CLI / MCP output formats now agree. Lesson `#8123` saved for future-session auditability.
+
+### Added
+
+- **MCP `mem_timeline` accepts `P#N` / `S#N` / `#N` prefix anchors** (`tool-schemas.mjs`, `server.mjs`) — restores parity with CLI `timeline --anchor` which has supported the prefixed form since v2.39.0. Pre-fix reproducer: `mem_timeline({ anchor: 'P#3462' })` returned `MCP error -32602: Input validation error: [{ expected: "number", code: "invalid_type", path: ["anchor"] }]`. Post-fix: same call returns `Timeline around #5327 (anchored to #5327, closest obs to P#3462)` with the full timeline window, mirroring CLI semantics (prompt/session anchors resolve to the nearest-in-time observation via `ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1`, project-scoped when `args.project` is set). Bare `#N` / `N` anchors use the same obs-first + prompt/session fallback path as the CLI's bare-int branch. Header emits `anchored to #M, closest obs to X#N` note so callers see the resolution. Plain integer anchors (`anchor: 8121`) are untouched — legacy callers keep working. Lesson `#8126` saved.
+- **6 stdio regression tests** in a new `T-anchor-prefix` describe block in `tests/audit-fixes.test.mjs` — seeds 5 obs at known epoch offsets plus one `user_prompts` row at obs#3's epoch and one `session_summaries` row at obs#5's epoch, then exercises `mem_timeline({ anchor: 'P#...' | 'S#...' | '#...' | <int> | 'X#...' (malformed) })` via JSON-RPC against a spawned `server.mjs`. The malformed-prefix test asserts both `resp.result.isError === true` and the error-text regex, locking both the error shape and the message content against future MCP-SDK drift.
+- **4 contract tests** in `tests/contract.test.mjs` covering the widened `memTimelineSchema.anchor`: accepts `'#123'` / `'P#456'` / `'S#789'` / `'p123'` (lowercase), rejects `'X#42'` / `'#abc'` / `''`, and preserves the legacy path where plain-int strings (`'42'`) coerce to `number 42`.
+
+### Refactored
+
+- **`parseIdToken` moved from `cli/common.mjs` to `lib/id-routing.mjs`** — applies lesson `#8050` ("extract CLI↔MCP shared business logic to `lib/`; never inline duplicate logic across the two paths"). `cli/common.mjs` now re-exports `parseIdToken` so all 5 CLI call sites (`mem-cli.mjs:25, 603, 686, 1237, 1298`) continue to work unchanged — ESM named re-export preserves live-binding identity, so `===` semantics hold across the module boundary. `server.mjs:30` imports `parseIdToken` directly from `lib/id-routing.mjs` alongside the pre-existing `probeOtherSources`. Re-export scope note in `cli/common.mjs:1-8` updated to explicitly permit `lib/` leaf utilities (previously said "no imports from other cli/ files" which was ambiguous about `lib/`).
+
+### Known follow-ups (explicitly scoped out of this release)
+
+- **`memGetSchema.ids` still rejects `P#N` / `S#N` prefix strings** (`tool-schemas.mjs:80` carries a `TODO(#8126)` marker). CLI `cmdGet` already supports mixed-prefix routing via per-token `parseIdToken` + `bySrc.obs/session/prompt` bucketing (`mem-cli.mjs:599-627`); the MCP handler is single-source and would need a ~40 LOC refactor plus new stdio tests for mixed-bucket render. Intentional deferral — `mem_timeline` and `mem_get` are a workflow pair (the `Workflow:` hint at `server.mjs:747` chains them), so the surprise-gap is visible; the `#8127` follow-up memo records the scope.
+- **`obsExists` fast-path ignores `compressed_into`** (pre-existing, mirrored in both CLI `mem-cli.mjs:719` and `server.mjs:792`) — `SELECT 1 FROM observations WHERE id = ?` has no `COALESCE(compressed_into, 0) = 0` filter, so a compressed obs id silently takes the fast-path while surrounding timeline before/after queries *do* filter out compressed items, producing a partial window with no explanation. Flagged during code review of this release; one-line patch per call site. Not in this diff because it pre-dates the release and the fix carries its own behavior-change evaluation.
+
+### Measurements
+
+- Full test suite: **1843 / 1843** green (up from 1834 in v2.41.0: +9 net-new regression guards — 6 stdio + 4 contract − 1 pre-existing test consolidated).
+- Lint clean on all 7 changed files.
+- Live prod DB round-trip: `anchor='P#3462'` goes from schema-error to `Timeline around #5327` with a full window; `anchor=8121` (int) legacy path byte-identical.
+- `npm audit --omit=dev`: 0 vulnerabilities.
+
+### Verification
+
+- Fixture obs (`#8124`) created during round-trip testing was deleted via `claude-mem-lite delete 8124 --confirm` before release; no test data left in the prod DB. Saved lessons: `#8123` (pad-after-ID), `#8126` (schema widen + handler resolution), `#8127` (mem_get deferred + compressed_into follow-up).
+
+---
+
 ## [2.41.0] - 2026-04-23
 
 **Architecture audit follow-up — 8 production-quality improvements + partial god-module split.** A comprehensive review of v2.40.0 against production criteria identified 12 recommendations spanning ranking quality, observability, data integrity, and code structure. This release ships the complete A+B set (7 additive improvements) plus the first slice of the god-module refactor (C). 1709 → 1834 tests green (+125 new regression guards).
