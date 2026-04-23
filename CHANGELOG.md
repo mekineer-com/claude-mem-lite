@@ -2,6 +2,47 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.49.0] - 2026-04-24
+
+**React hook API synonym bridge closes `hard_negative_precision` recall gap + hook-llm test fixture leak fix (zero residue in `~/.claude/tmp/`).** Originally scoped as P2-1 "precision-mode synonym opt-out" based on a misread of benchmark category name — per-query inspection showed `hard_negative_precision` P@10 was already 1.0; the real shortfall was R@10=0.7, driven entirely by `q32 "React hooks"` matching only 2 of 5 relevant observations because `SYNONYM_MAP` had no `react`/`hooks` entries and the AND-joined query `"React hooks"` missed observations that mention only a specific hook API (`useEffect` / `useState` / …). Fix is additive, not opt-out: narrow `hooks ↔ {useState, useEffect, useCallback, useMemo, useRef, useContext}` + `hook ↔ hooks` bridge (7 pairs, kept out of `react ↔ jsx/component` which would pollute q4/q28). Secondary: `tests/hook-llm.test.mjs` was leaking 29 stale `hook-llm-test-*.json` files into `~/.claude/tmp/` per run because `afterEach` used `writeFileSync(tmpFile, '')` (truncated, did not delete) and four inline `tmpFile2` fixtures had no cleanup at all.
+
+### Why the redirect
+
+The category label `hard_negative_precision` names the query *design intent* (these queries test whether precision holds against near-misses), not the metric that actually fails. Blind trust in the label would have produced a net-negative change (opt-out reduces expansion → lower recall). Per-query `result_ids` vs `relevant_ids` is the only reliable signal for benchmark triage.
+
+### Added
+
+- **`synonyms.mjs` — React hook API bridge (7 new `SYNONYM_PAIRS`):** `['hook','hooks']`, `['hooks','useState']`, `['hooks','useEffect']`, `['hooks','useCallback']`, `['hooks','useMemo']`, `['hooks','useRef']`, `['hooks','useContext']`. Deliberately excludes `react ↔ jsx/component` (broad bridges hurt precision on q4 `"React"` / q28 `"component"`).
+- **3 new tests in `tests/synonyms.test.mjs`** — `hooks ↔ 6 React hook APIs`, `hook ↔ hooks` singular/plural bridge, `expandToken("hooks")` emits OR group containing `useEffect`.
+
+### Changed
+
+- **`tests/hook-llm.test.mjs` — fixture cleanup rewrite.** Each of the two describes that create `~/.claude/tmp/hook-llm-*.json` fixtures now holds a local `filesToCleanup[]` array; `afterEach` drains it via `rmSync({force:true})`. Replaces prior `writeFileSync(tmpFile, '')` (truncate-only) pattern that left zero-byte residue on every run. Four previously uncleaned inline `tmpFile2` fixtures (`hook-llm-test-none-…`, `hook-llm-test-None-…`, `hook-llm-lowsig-…` ×5, `hook-llm-reallesson-…`) now registered for cleanup.
+
+### Measurements
+
+Benchmark delta (`node benchmark/benchmark.mjs`, v2.48.0 head → v2.49.0 head):
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Overall R@10 | 0.8796 | **0.8996** | +2.0 pt |
+| Overall P@10 | 0.9731 | 0.9731 | 0 |
+| Overall nDCG@10 | 0.959 | **0.9739** | +1.5 pt |
+| `hard_negative_precision` R@10 | 0.7 | **1.0** | **+30 pt** |
+| `hard_negative_precision` nDCG@10 | 0.7766 | **1.0** | +22 pt |
+| q32 `"React hooks"` R@10 | 0.4 | **1.0** | **+60 pt** (2 → 5 hits) |
+| `standard` (25q) R@10 / P@10 | 0.8862 / 0.9721 | 0.8862 / 0.9721 | **0** (zero regression) |
+| q4 `"React"` (standard) | — | R=0.5556 P=1 | unchanged (no `hooks` token → bridge not triggered) |
+| q28 `"component"` (standard) | — | R=0.9091 P=1 | unchanged |
+
+User-global residue (`~/.claude/tmp/hook-llm-*`, per full `npx vitest run`):
+
+| | Before | After |
+|---|---|---|
+| New fixtures leaked per run | 29 | **0** |
+
+Full test suite: **1924 / 1924** green (+3 synonyms tests, hook-llm 65/65 after cleanup fix).
+
 ## [2.48.0] - 2026-04-24
 
 **Low-risk install + session-start cleanup — install-time prune of stale modules and zero-byte DBs, session-start short-circuit for completed CLAUDE.md legacy cleanup.** Two P1/P2 items from the 2026-04-24 audit: `install.mjs` accumulated stale top-level files from removed modules (`dispatch.mjs`, `dispatch-feedback.mjs`, `dispatch-inject.mjs`, `dispatch-workflow.mjs` removed in v2.20.0; zero-byte `mem.db`/`memory.db`/`registry.db` from pre-consolidation installs); `cleanupClaudeMdLegacyBlock` ran on every SessionStart for 16 consecutive minor versions (v2.30 → v2.47) re-scanning a file that had been cleaned once. Both silent-drag issues — no correctness impact, pure operational hygiene.

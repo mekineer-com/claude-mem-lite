@@ -71,6 +71,17 @@ export const SYNONYM_PAIRS = [
   ['debug', 'troubleshoot'],
   ['error', 'failure'],
   ['migrate', 'migration'],
+  // ─── React Hook API bridge ───
+  // Without these, `React hooks` AND-query misses obs where only a specific hook API
+  // is mentioned (useEffect/useState/...). Scope kept to the 6 canonical React hook APIs;
+  // deliberately NOT bridging `react` ↔ `jsx`/`component` (too broad — would hurt precision).
+  ['hook', 'hooks'],
+  ['hooks', 'useState'],
+  ['hooks', 'useEffect'],
+  ['hooks', 'useCallback'],
+  ['hooks', 'useMemo'],
+  ['hooks', 'useRef'],
+  ['hooks', 'useContext'],
   // ─── Concurrency & Async ───
   ['promise', 'async'],
   ['callback', 'handler'],

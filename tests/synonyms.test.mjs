@@ -93,6 +93,28 @@ describe('unified synonyms', () => {
     });
   });
 
+  describe('React hook API bridge (recall fix for hard_negative_precision q32)', () => {
+    it('bridges hooks ↔ useEffect, useState, useCallback, useMemo, useRef, useContext', () => {
+      const hooks = SYNONYM_MAP.get('hooks');
+      expect(hooks, 'hooks must exist in SYNONYM_MAP').toBeDefined();
+      for (const api of ['useeffect', 'usestate', 'usecallback', 'usememo', 'useref', 'usecontext']) {
+        expect(hooks, `hooks should bridge to ${api}`).toContain(api);
+      }
+    });
+
+    it('bridges hook ↔ hooks (singular/plural) for tokens like react-hook-form', () => {
+      expect(SYNONYM_MAP.get('hook')).toContain('hooks');
+      expect(SYNONYM_MAP.get('hooks')).toContain('hook');
+    });
+
+    it('expandToken("hooks") yields an OR group containing useEffect', async () => {
+      const { expandToken } = await import('../nlp.mjs');
+      const expanded = expandToken('hooks');
+      expect(expanded.startsWith('(')).toBe(true);
+      expect(expanded).toMatch(/useeffect/i);
+    });
+  });
+
   describe('CJK_COMPOUNDS', () => {
     it('is a Set', () => {
       expect(CJK_COMPOUNDS).toBeInstanceOf(Set);

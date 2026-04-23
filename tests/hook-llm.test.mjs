@@ -1,6 +1,6 @@
 // Tests for hook-llm.mjs — saveObservation, dedup tiers, related linking, LLM episode/summary
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { writeFileSync } from 'fs';
+import { writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTestDb, insertSession } from './test-helpers.mjs';
@@ -193,10 +193,12 @@ describe('saveObservation', () => {
 describe('handleLLMEpisode', () => {
   let db;
   let tmpFile;
+  const filesToCleanup = [];
   const originalArgv3 = process.argv[3];
 
   beforeEach(() => {
     tmpFile = join(tmpdir(), `hook-llm-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    filesToCleanup.push(tmpFile);
     process.argv[3] = tmpFile;
     process.env.CLAUDE_MEM_NO_DELAY = '1';
 
@@ -220,7 +222,9 @@ describe('handleLLMEpisode', () => {
     if (db?._realClose) db._realClose();
     process.argv[3] = originalArgv3;
     delete process.env.CLAUDE_MEM_NO_DELAY;
-    try { writeFileSync(tmpFile, ''); } catch {}
+    while (filesToCleanup.length) {
+      try { rmSync(filesToCleanup.pop(), { force: true }); } catch {}
+    }
     vi.clearAllMocks();
   });
 
@@ -1162,6 +1166,14 @@ describe('session summary structured knowledge', () => {
 // ─── lesson_learned and search_aliases extraction ────────────────────────────
 
 describe('lesson_learned and search_aliases extraction', () => {
+  const filesToCleanup = [];
+
+  afterEach(() => {
+    while (filesToCleanup.length) {
+      try { rmSync(filesToCleanup.pop(), { force: true }); } catch {}
+    }
+  });
+
   it('parses lesson_learned from LLM response', () => {
     const raw = JSON.stringify({
       type: 'bugfix', title: 'Fix race condition in session init',
@@ -1205,6 +1217,7 @@ describe('lesson_learned and search_aliases extraction', () => {
     openDb.mockReturnValue(db);
 
     const tmpFile2 = join(tmpdir(), `hook-llm-test-none-${Date.now()}.json`);
+    filesToCleanup.push(tmpFile2);
     const origArgv3 = process.argv[3];
     process.argv[3] = tmpFile2;
     process.env.CLAUDE_MEM_NO_DELAY = '1';
@@ -1243,6 +1256,7 @@ describe('lesson_learned and search_aliases extraction', () => {
     openDb.mockReturnValue(db);
 
     const tmpFile2 = join(tmpdir(), `hook-llm-test-None-${Date.now()}.json`);
+    filesToCleanup.push(tmpFile2);
     const origArgv3 = process.argv[3];
     process.argv[3] = tmpFile2;
     process.env.CLAUDE_MEM_NO_DELAY = '1';
@@ -1290,6 +1304,7 @@ describe('lesson_learned and search_aliases extraction', () => {
 
     const sessId = `low-sig-${tag}`;
     const tmpFile2 = join(tmpdir(), `hook-llm-lowsig-${tag}-${Date.now()}.json`);
+    filesToCleanup.push(tmpFile2);
     const origArgv3 = process.argv[3];
     process.argv[3] = tmpFile2;
     process.env.CLAUDE_MEM_NO_DELAY = '1';
@@ -1332,6 +1347,7 @@ describe('lesson_learned and search_aliases extraction', () => {
     openDb.mockReturnValue(db);
 
     const tmpFile2 = join(tmpdir(), `hook-llm-reallesson-${Date.now()}.json`);
+    filesToCleanup.push(tmpFile2);
     const origArgv3 = process.argv[3];
     process.argv[3] = tmpFile2;
     process.env.CLAUDE_MEM_NO_DELAY = '1';
