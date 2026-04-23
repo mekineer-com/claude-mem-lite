@@ -793,9 +793,13 @@ describe('handleLLMEpisode', () => {
     acquireLLMSlot.mockResolvedValueOnce(false);
 
     // v2.36 P0: importance=2 bypasses isNoiseObservation so pre-save lands.
+    // v2.47 P0-3: capNoiseImportance now demotes LOW_SIGNAL+no-signal imp=2
+    // down to 1 at write time. Attach a lesson so the cap is bypassed and
+    // importance=2 survives (the pre-save scenario the test exercises).
     insertSession(db, { id: 'ep-sess', project: 'test-proj' });
     const preSavedId = saveObservation(
-      { type: 'change', title: 'Modified app.mjs', narrative: 'Quick edit', importance: 2 },
+      { type: 'change', title: 'Modified app.mjs', narrative: 'Quick edit', importance: 2,
+        lessonLearned: 'Quick edit landed; background LLM fills the enriched fields later.' },
       'test-proj', 'ep-sess', db
     );
 

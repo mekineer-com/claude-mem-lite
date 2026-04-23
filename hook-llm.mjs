@@ -16,7 +16,7 @@ import {
   sessionFile, getSessionId, openDb, callLLM, sleep,
 } from './hook-shared.mjs';
 import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
-import { isNoiseObservation } from './lib/low-signal-patterns.mjs';
+import { isNoiseObservation, capNoiseImportance } from './lib/low-signal-patterns.mjs';
 
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
@@ -76,6 +76,16 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     if (isNoiseObservation(obs)) {
       debugLog('saveObservation', `dropped noise: ${truncate(obs.title || '', 60)}`);
       return null;
+    }
+
+    // v2.47 P0-3: importance cap for LOW_SIGNAL titles that kept the drop gate
+    // open via importance>=2 but carry no lesson/facts signal. 341 rows in live
+    // DB had imp=3 under these conditions (99.4% noise). Cap to 1 so they
+    // enter the 7-day accelerated auto-compress window in hook.mjs.
+    const capped = capNoiseImportance(obs);
+    if (capped !== (obs.importance ?? 1)) {
+      debugLog('saveObservation', `capped imp ${obs.importance}→${capped}: ${truncate(obs.title || '', 60)}`);
+      obs.importance = capped;
     }
 
     // Three-tier dedup — returns null (not throw) for dedup hits

@@ -5,7 +5,7 @@
 // Substantive titles pass unchanged. Env CLAUDE_MEM_KEEP_LOW_SIGNAL=1 opts out.
 
 import { describe, it, expect } from 'vitest';
-import { isNoiseObservation } from '../lib/low-signal-patterns.mjs';
+import { isNoiseObservation, capNoiseImportance } from '../lib/low-signal-patterns.mjs';
 
 const EMPTY_ENV = {};
 
@@ -225,5 +225,72 @@ describe('isNoiseObservation — P2 tool-output passthrough detection', () => {
       facts: [],
       importance: 1,
     }, {})).toBe(false);
+  });
+});
+
+describe('capNoiseImportance — v2.47 P0-3 write-side importance cap', () => {
+  // Live DB diagnosed: 341 LOW_SIGNAL+imp=3 obs where only 1 had a lesson and
+  // 1 had facts (99.4% noise at importance=3). isNoiseObservation does not drop
+  // those because its importance>=2 short-circuit treats the Haiku-assigned
+  // importance as trust. capNoiseImportance keeps the row but forces imp=1,
+  // so auto-compress can GC them on the 7-day accelerated window.
+
+  it('caps LOW_SIGNAL + no lesson + no facts at importance=1 regardless of input', () => {
+    expect(capNoiseImportance({ title: 'Modified install.mjs', facts: [], importance: 3 })).toBe(1);
+    expect(capNoiseImportance({ title: 'Modified install.mjs', facts: [], importance: 2 })).toBe(1);
+    expect(capNoiseImportance({ title: 'Error: hook.mjs', facts: [], importance: 3 })).toBe(1);
+    expect(capNoiseImportance({ title: 'Reviewed 8 files: a.mjs, b.mjs', facts: [], importance: 3 })).toBe(1);
+    expect(capNoiseImportance({ title: 'Worked on schema.mjs', facts: [], importance: 2 })).toBe(1);
+  });
+
+  it('preserves LOW_SIGNAL importance when lesson_learned is substantive', () => {
+    expect(capNoiseImportance({
+      title: 'Modified hook.mjs',
+      facts: [],
+      importance: 3,
+      lesson_learned: 'FTS5 trigger fires on any UPDATE — wrap access_count writes in try/catch',
+    })).toBe(3);
+    // camelCase variant
+    expect(capNoiseImportance({
+      title: 'Modified hook.mjs',
+      facts: [],
+      importance: 2,
+      lessonLearned: 'FTS5 trigger fires on any UPDATE — wrap access_count writes in try/catch',
+    })).toBe(2);
+  });
+
+  it('preserves LOW_SIGNAL importance when facts has >=1 non-empty string', () => {
+    expect(capNoiseImportance({
+      title: 'Modified schema.mjs',
+      facts: ['schema_version bumped 27→28'],
+      importance: 3,
+    })).toBe(3);
+  });
+
+  it('ignores lesson_learned="none" (Haiku default when nothing to learn)', () => {
+    expect(capNoiseImportance({
+      title: 'Modified hook.mjs',
+      facts: [],
+      importance: 3,
+      lesson_learned: 'none',
+    })).toBe(1);
+  });
+
+  it('does not cap substantive titles (non-LOW_SIGNAL) regardless of importance', () => {
+    expect(capNoiseImportance({
+      title: 'FTS5 corruption on concurrent access_count UPDATE',
+      facts: [],
+      importance: 3,
+    })).toBe(3);
+    expect(capNoiseImportance({
+      title: 'Decision: use injection_count separate from access_count',
+      facts: [],
+      importance: 2,
+    })).toBe(2);
+  });
+
+  it('passes through importance=1 and 0 unchanged', () => {
+    expect(capNoiseImportance({ title: 'Modified app.mjs', facts: [], importance: 1 })).toBe(1);
+    expect(capNoiseImportance({ title: 'Modified app.mjs', facts: [], importance: 0 })).toBe(0);
   });
 });

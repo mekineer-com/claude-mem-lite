@@ -2,6 +2,46 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.47.0] - 2026-04-24
+
+**P0 audit-driven cleanup — observation_vectors GC, noise-penalty recalibration, LOW_SIGNAL write-side cap.** A full-project audit on 2026-04-24 (54 MB live DB, 3789 obs across 10 projects) surfaced three unrelated-but-compounding problems: the TF-IDF vector table had 5577/6429 (86.75%) dead rows (2839 orphan + 3282 vocab-stale) because `rebuildVocabulary` never pruned old versions and historic migrations ran with FK off; the injection-noise penalty gates (inj≥10 / inj≥20) had never fired in production because actual max injection_count was 9 across 2 months of data; and 341/3789 (9%) LOW_SIGNAL-titled observations carried Haiku-inflated importance=3 despite 339/341 (99.4%) having no lesson and no facts. This release closes all three on the write path so future DBs don't re-accumulate the same debt.
+
+### Migration note
+
+One-shot cleanup runs on first `ensureDb()` after upgrade — idempotent `DELETE FROM observation_vectors` scrubs orphan + stale rows. Expected live-DB reduction: ~54 MB → ~40 MB (based on observed vector-table bloat). No user action required. Opt-out: `CLAUDE_MEM_KEEP_LOW_SIGNAL=1` still preserves pre-P0-3 write behavior for the LOW_SIGNAL cap.
+
+### Schema
+
+- **`schema.mjs` CURRENT_SCHEMA_VERSION 27 → 28.** One-shot cleanup on ensureDb(): `DELETE FROM observation_vectors WHERE observation_id NOT IN (SELECT id FROM observations)` removes orphans. Idempotent — NOT IN is empty on a clean DB.
+
+### Fixed
+
+- **`tfidf.mjs::rebuildVocabulary`** — transactionally `DELETE FROM observation_vectors WHERE vocab_version != ?` so the new version's corpus replaces (not accumulates with) the old. Pre-v2.47: 3282/6429 (51%) of live vectors had stale versions that vectorSearch filtered at query time but still paid the storage cost on every version rebuild.
+- **`scoring-sql.mjs::noisePenaltyClause`** — tier-1 gate lowered `inj≥10 → inj≥4`, tier-2 `inj≥20 → inj≥8`. Ratio thresholds (>3, >5) unchanged — ratio remains the primary precision signal. Live distribution at audit: max injection_count=9 across all 3789 active obs, so the v26 thresholds never triggered. Recalibration targets the moderate-noise band where data actually lives (#3518 inj=6 acc=1 ratio=6.0 is the first real hit).
+- **`hook-llm.mjs::saveObservation`** — calls new `capNoiseImportance(obs)` before dedup/insert. LOW_SIGNAL title + no lesson + no facts → importance forced to 1 regardless of input. Complements the drop-path (`isNoiseObservation`): drop when narrative is also thin; demote when narrative survives but importance was inflated.
+- **`hook.mjs` auto-compress** — added accelerated 7-day window for LOW_SIGNAL + no-lesson + no-facts imp=1 obs, alongside the existing 30-day window for generic imp=1. Lets the projected ~32.5% corpus reduction materialize within a week on live DBs.
+
+### Added
+
+- **`lib/low-signal-patterns.mjs::capNoiseImportance(obs) → number`.** Write-side importance demotion for LOW_SIGNAL titles that lack lesson + facts. Preserves importance when `lesson_learned` is non-'none' or `facts` has ≥1 non-empty string. Non-LOW_SIGNAL titles pass through unchanged.
+- **8 new tests:**
+  - `tests/tfidf.test.mjs` (+1): rebuildVocabulary deletes stale-version vectors (regression anchor for 3282/6429 stale count).
+  - `tests/schema.test.mjs` (+1): initSchema deletes orphan observation_vectors (regression anchor for 2839/6429 orphan count).
+  - `tests/low-signal-block.test.mjs` (+6): capNoiseImportance contract — caps LOW_SIGNAL+no-signal, preserves lesson/facts signal, handles 'none' lesson, non-LOW_SIGNAL passthrough, imp=0/1 passthrough.
+
+### Changed
+
+- **`tests/injection-tracking.test.mjs`** — threshold-calibration tests rewritten for new tier boundaries (inj=4 tier-1, inj=8 tier-2). Added live-distribution fixtures (#5588 inj=9 acc=10 ratio=0.9 stays 1.0×; #3518 inj=6 acc=1 ratio=6.0 becomes 0.5×).
+- **`tests/hook-llm.test.mjs`** — pre-saved observation fixture now carries a lesson so the new capNoiseImportance gate is bypassed (LOW_SIGNAL+lesson=2 stays imp=2 through enrichment).
+
+### Measurements
+
+- Full test suite: **1915 / 1915** green (was 1907 at v2.46.0 head; +8 net-new; one pre-existing test updated for new cap semantics).
+- Benchmark (`node benchmark/benchmark.mjs`, 30 queries): Recall@10 0.8796 (v2.46.0: 0.8796), Precision@10 0.9731 (0.9731), nDCG@10 0.959 (0.959), MRR@10 0.9667 (0.9667), P95 latency 0.17ms (v2.46.0 baseline: 0.24ms, 30× under the 5ms regression gate).
+- Expected live-DB effects after first ensureDb() + first session-start: 2839 orphan vectors deleted on open, 3282 stale-vocab vectors deleted on next rebuildVocabulary, 341 LOW_SIGNAL/imp=3 rows + future writes capped to imp=1 and GC-eligible after 7 days.
+
+---
+
 ## [2.46.0] - 2026-04-23
 
 **Cross-session memory capture hardening — targeted handoff consume + structural §10 extractor.** A production audit on 2026-04-23 (55MB DB, 115 completed sessions in 7d) surfaced that `session_handoffs` held only 2 rows total — the entire cross-session memory contract was near-empty despite 115 upstream writes. Two cascading bugs: `hook.mjs` wildcard `DELETE ... type = 'exit'` wiped every exit handoff for the project on any continuation-intent prompt, not just the one being injected; and `handleLLMSummary` filled `remaining_items` only when Haiku returned content (34/112 = 30% success in the 7d sample), leaving the "Not done" list invisible for the other 70%. This release fixes both paths without a schema migration — the v3 foundation plan that would have introduced new `tasks`/`lessons` tables is parked pending a 2-week fill-rate measurement on the existing columns.

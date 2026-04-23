@@ -150,6 +150,38 @@ describe('FTS trigger scoping (v27)', () => {
   });
 });
 
+describe('observation_vectors cleanup (v2.47 P0-1)', () => {
+  test('initSchema deletes orphan observation_vectors (observation_id not in observations)', () => {
+    // Live DB had 2839/6429 (44%) orphan vectors even with ON DELETE CASCADE
+    // because historic deletes ran while foreign_keys=OFF during migrations.
+    // initSchema must scrub them once regardless of FK state.
+    const db = createTestDb();
+    db.prepare(`INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch) VALUES ('s', 's', 'p', datetime('now'), ?)`).run(Date.now());
+    const obsInfo = db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, created_at, created_at_epoch) VALUES ('s', 'p', 'discovery', 't', datetime('now'), ?)`).run(Date.now());
+    const liveId = Number(obsInfo.lastInsertRowid);
+    const insertVec = db.prepare(`INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)`);
+    insertVec.run(liveId, Buffer.alloc(8), 'v1', Date.now());
+    // Inject orphans by disabling FK, writing rows with non-existent obs_id, then re-enabling
+    db.pragma('foreign_keys = OFF');
+    insertVec.run(99991, Buffer.alloc(8), 'v1', Date.now());
+    insertVec.run(99992, Buffer.alloc(8), 'v1', Date.now());
+    db.pragma('foreign_keys = ON');
+    // Force non-fast-path migration
+    db.exec('DELETE FROM schema_version');
+    db.exec('INSERT INTO schema_version (version) VALUES (26)');
+    initSchema(db);
+    const orphanCount = db.prepare(`
+      SELECT COUNT(*) AS c FROM observation_vectors ov
+      LEFT JOIN observations o ON ov.observation_id = o.id
+      WHERE o.id IS NULL
+    `).get().c;
+    expect(orphanCount).toBe(0);
+    // Live vector preserved
+    const liveRow = db.prepare(`SELECT observation_id FROM observation_vectors WHERE observation_id = ?`).get(liveId);
+    expect(liveRow?.observation_id).toBe(liveId);
+  });
+});
+
 describe('forward-incompat guard (v2.41)', () => {
   test('initSchema throws when DB schema_version exceeds CURRENT_SCHEMA_VERSION', () => {
     const db = createTestDb();

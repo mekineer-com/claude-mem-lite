@@ -21,7 +21,12 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // FTS delete+reinsert cycles and amplified SQLITE_CORRUPT_VTAB blast radius
 // (project_non_obvious.md). Migration drops the old triggers once and lets
 // ensureFTS recreate them with the scoped form.
-export const CURRENT_SCHEMA_VERSION = 27;
+//
+// v28 (v2.47): observation_vectors orphan + stale-vocab cleanup. Live DBs had
+// 2839/6429 (44%) orphaned rows (historic deletes during FK-OFF migrations)
+// and 3282/6429 (51%) stale-vocab rows (rebuildVocabulary never pruned old
+// versions before v2.47). Idempotent one-shot DELETE on ensureDb.
+export const CURRENT_SCHEMA_VERSION = 28;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -401,6 +406,17 @@ export function initSchema(db) {
   `);
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_vectors_version ON observation_vectors(vocab_version)`);
+
+  // v28 (v2.47) P0-1: one-shot cleanup of orphaned observation_vectors.
+  // Live DBs accumulated 44% orphans even with ON DELETE CASCADE because
+  // early migrations ran with `foreign_keys=OFF` and deletes skipped cascade.
+  // Idempotent (NOT IN is empty on a clean DB), runs once per ensureDb().
+  try {
+    db.prepare(`
+      DELETE FROM observation_vectors
+      WHERE observation_id NOT IN (SELECT id FROM observations)
+    `).run();
+  } catch { /* non-critical — table-missing path handled by earlier CREATE */ }
 
   // Persisted vocabulary for stable TF-IDF vector indexing
   db.exec(`

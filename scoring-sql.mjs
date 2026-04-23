@@ -70,12 +70,17 @@ export const TYPE_QUALITY_CASE = `(
  *   - injection_count: bumped ONLY on UserPromptSubmit / hook-memory auto-inject
  *   - access_count: bumped on citation (c039352 P4), explicit recall, get, timeline
  *
- * Empirical thresholds (see docs/p0-injection-noise-baseline.txt, 53 transcripts):
- *   • High-noise legitimate use (#5597 29/10=2.9x): kept at 1.0× (below tier-1)
- *   • Moderate noise (#4352 44/9=4.89x): drops to 0.5× (tier-1 hit)
- *   • Pure noise (#4046 14/0=inf): drops to 0.5× (tier-1; count≥10 gate protects
- *     cold-start obs with legitimately no cites yet)
- *   • Entrenched noise (≥20 inject, ≥5× ratio): drops to 0.2× (tier-2)
+ * Empirical thresholds (v2.47 recalibration — 2026-04-24 live projects--mem,
+ * 3789 obs, baseline 10/20 never fired because max injection_count=9):
+ *   • Legitimate heavy use (#5588 9/10=0.9, #7549 7/13=0.54): ratio≤3 ⇒ 1.0×
+ *   • Early noise candidate (#3518 6/1=6.0): inj≥4 AND ratio>3 ⇒ 0.5× (tier-1)
+ *   • Entrenched noise (inj≥8 AND ratio>5): 0.2× (tier-2)
+ *
+ * Old thresholds (v26→v2.46, inj≥10/≥20) were chosen as theoretical upper bounds
+ * before injection_count accumulated 2 months of data — live distribution shows
+ * 100% of rows stayed under 10 inject events. The recalibrated gates bite the
+ * moderate-noise tier (first real data band) while still sparing ratio-clean
+ * heavy-use rows (ratio gate is the primary precision signal).
  *
  * Applied as: BM25 × time_decay × TYPE_QUALITY × (0.5 + 0.5·importance) × NOISE_PENALTY
  * Note: multiplicative so ORDER BY relevance ASC (negative scores) still works —
@@ -88,10 +93,10 @@ export function noisePenaltyClause(alias = 'o') {
   const a = alias ? `${alias}.` : '';
   return `(
     CASE
-      WHEN COALESCE(${a}injection_count, 0) >= 20
+      WHEN COALESCE(${a}injection_count, 0) >= 8
         AND COALESCE(${a}injection_count, 0) > COALESCE(${a}access_count, 0) * 5
         THEN 0.2
-      WHEN COALESCE(${a}injection_count, 0) >= 10
+      WHEN COALESCE(${a}injection_count, 0) >= 4
         AND COALESCE(${a}injection_count, 0) > COALESCE(${a}access_count, 0) * 3
         THEN 0.5
       ELSE 1.0

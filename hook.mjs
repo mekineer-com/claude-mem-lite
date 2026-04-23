@@ -648,6 +648,29 @@ async function handleSessionStart() {
       if (compressed.changes > 0) {
         debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
       }
+
+      // v2.47 P0-3: accelerated compress for LOW_SIGNAL + no-signal noise.
+      // 7-day window instead of 30. The write-side capNoiseImportance forces
+      // imp=1 on these already; this just shrinks the GC latency so the
+      // projected 32.5% corpus reduction materializes within a week on live
+      // DBs instead of bleeding into the 30-day tier.
+      const noiseCompressAge = Date.now() - 7 * 86400000;
+      const noiseCompressed = db.prepare(`
+        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
+        WHERE COALESCE(compressed_into, 0) = 0
+          AND importance = 1
+          AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
+          AND (facts IS NULL OR facts = '' OR facts = '[]')
+          AND (
+            title LIKE 'Modified %' OR title LIKE 'Worked on %'
+            OR title LIKE 'Reviewed %' OR title LIKE 'Error%'
+          )
+          AND created_at_epoch < ?
+          AND project = ?
+      `).run(noiseCompressAge, project);
+      if (noiseCompressed.changes > 0) {
+        debugLog('DEBUG', 'session-start', `auto-compressed ${noiseCompressed.changes} LOW_SIGNAL noise (7d window)`);
+      }
     })();
 
     // Auto-maintain: cleanup + decay + boost + purge, gated to once per 24h

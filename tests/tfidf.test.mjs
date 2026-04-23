@@ -306,6 +306,37 @@ describe('persisted vocabulary', () => {
     db.close();
   });
 
+  it('rebuildVocabulary deletes observation_vectors with stale vocab_version', () => {
+    // P0-1: live DB had 3282/6429 (51%) stale-version vectors because rebuildVocabulary
+    // persisted a new version without dropping old-version rows. Regression anchor.
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, { title: 'database schema migration', narrative: 'alter table add column' });
+    insertObs(db, { title: 'database schema fix', narrative: 'schema migration update' });
+    insertObs(db, { title: 'search query optimization', narrative: 'FTS5 BM25 ranking search' });
+    const vocab1 = rebuildVocabulary(db);
+    const obs = db.prepare('SELECT id, title, narrative FROM observations').all();
+    const insertVec = db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)');
+    for (const o of obs) {
+      const vec = computeVector(o.title + ' ' + o.narrative, vocab1);
+      if (vec) insertVec.run(o.id, Buffer.from(vec.buffer), vocab1.version, Date.now());
+    }
+    const beforeCount = db.prepare('SELECT COUNT(*) as c FROM observation_vectors').get().c;
+    expect(beforeCount).toBeGreaterThan(0);
+    // Inject 2 stale-version rows alongside
+    insertVec.run(obs[0].id, Buffer.from(new Float32Array(512).buffer), 'old-version-aaa', Date.now());
+    insertVec.run(obs[1].id, Buffer.from(new Float32Array(512).buffer), 'old-version-bbb', Date.now());
+    // Force new version by inserting more obs with new terms so vocab changes
+    insertObs(db, { title: 'entirely new topic about rust compiler', narrative: 'cargo rust ownership borrow check' });
+    insertObs(db, { title: 'another rust discussion', narrative: 'rust memory ownership' });
+    _resetVocabCache();
+    const vocab2 = rebuildVocabulary(db);
+    expect(vocab2.version).not.toBe(vocab1.version);
+    const staleCount = db.prepare('SELECT COUNT(*) as c FROM observation_vectors WHERE vocab_version != ?').get(vocab2.version).c;
+    expect(staleCount).toBe(0);
+    db.close();
+  });
+
   it('vectors use persisted vocab version and match on search', () => {
     const db = createTestDb();
     insertSession(db, { id: 'sess-1' });

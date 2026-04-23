@@ -252,6 +252,13 @@ export function rebuildVocabulary(db) {
     for (const [term, entry] of vocab.terms) {
       insertStmt.run(term, entry.index, entry.idf, vocab.version, now);
     }
+    // v2.47 P0-1: drop observation_vectors from earlier vocab versions.
+    // Without this, rebuildVocabulary compounded the stale set on every call
+    // (live DB measured 3282/6429 = 51% stale). vectorSearch filters by
+    // vocab_version at query time, so stale rows were dead storage.
+    try {
+      db.prepare('DELETE FROM observation_vectors WHERE vocab_version != ?').run(vocab.version);
+    } catch { /* table missing on legacy DBs — non-critical */ }
   })();
 
   _vocabCache = vocab;

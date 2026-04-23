@@ -76,34 +76,36 @@ describe('noisePenaltyClause SQL', () => {
     return row.p;
   }
 
-  it('returns 1.0 when injection_count below tier-1 gate (count < 10)', () => {
-    expect(penaltyFor(5, 0)).toBeCloseTo(1.0);
-    expect(penaltyFor(9, 0)).toBeCloseTo(1.0);
+  it('returns 1.0 when injection_count below tier-1 gate (count < 4, v2.47)', () => {
+    expect(penaltyFor(3, 0)).toBeCloseTo(1.0);
+    expect(penaltyFor(1, 0)).toBeCloseTo(1.0);
     expect(penaltyFor(0, 0)).toBeCloseTo(1.0);
   });
 
-  it('returns 0.5 at tier-1: count>=10 AND ratio>3', () => {
-    // inj=10, acc=0 → ratio=inf, count≥10 → tier-1
-    expect(penaltyFor(10, 0)).toBeCloseTo(0.5);
-    // inj=14, acc=0 → #4046 profile from baseline
-    expect(penaltyFor(14, 0)).toBeCloseTo(0.5);
-    // inj=19, acc=3 → 19 > 3*3=9 → tier-1 (below count=20 for tier-2)
-    expect(penaltyFor(19, 3)).toBeCloseTo(0.5);
+  it('returns 0.5 at tier-1 (v2.47): count>=4 AND ratio>3', () => {
+    // inj=4, acc=0 → ratio=inf → tier-1 threshold newly calibrated
+    expect(penaltyFor(4, 0)).toBeCloseTo(0.5);
+    // #3518 live row: inj=6, acc=1, ratio=6.0 — real noise hit
+    expect(penaltyFor(6, 1)).toBeCloseTo(0.5);
+    // inj=7, acc=2 → ratio=3.5 → tier-1 (below count=8 for tier-2)
+    expect(penaltyFor(7, 2)).toBeCloseTo(0.5);
   });
 
-  it('returns 0.2 at tier-2: count>=20 AND ratio>5', () => {
-    // inj=20, acc=0 → ratio=inf → tier-2
-    expect(penaltyFor(20, 0)).toBeCloseTo(0.2);
-    // inj=44, acc=9 → #4352 baseline profile, ratio=4.89, NOT tier-2 (ratio<=5)
-    expect(penaltyFor(44, 9)).toBeCloseTo(0.5); // tier-1
+  it('returns 0.2 at tier-2 (v2.47): count>=8 AND ratio>5', () => {
+    // inj=8, acc=0 → ratio=inf → tier-2
+    expect(penaltyFor(8, 0)).toBeCloseTo(0.2);
+    // inj=20, acc=4 → ratio=5.0, NOT tier-2 (ratio<=5)
+    expect(penaltyFor(20, 4)).toBeCloseTo(0.5); // tier-1
     // inj=50, acc=8 → ratio=6.25 → tier-2
     expect(penaltyFor(50, 8)).toBeCloseTo(0.2);
   });
 
-  it('spares legitimate heavy-use obs: #5597 (29 inject, 10 cite, ratio=2.9)', () => {
-    // Baseline data: #5597 is heavily injected but also heavily cited
-    // → ratio 2.9 < tier-1 threshold (3) → no penalty
-    expect(penaltyFor(29, 10)).toBeCloseTo(1.0);
+  it('spares legitimate heavy-use obs (v2.47): ratio-gate is primary precision signal', () => {
+    // Live row #5588 (inj=9, acc=10, ratio=0.9) — heavily used + cited.
+    // Count exceeds both tier-1 and tier-2 gates but ratio below both → 1.0
+    expect(penaltyFor(9, 10)).toBeCloseTo(1.0);
+    // Live row #7549 (inj=7, acc=13, ratio=0.54) — more cited than injected
+    expect(penaltyFor(7, 13)).toBeCloseTo(1.0);
   });
 
   it('NULL-safety COALESCE guards the expression (literal NULL inputs → 1.0)', () => {
@@ -112,8 +114,8 @@ describe('noisePenaltyClause SQL', () => {
     // but we verify the expression handles NULL inputs correctly in isolation.
     const row = db.prepare(`
       SELECT (CASE
-        WHEN COALESCE(NULL, 0) >= 20 AND COALESCE(NULL, 0) > COALESCE(NULL, 0) * 5 THEN 0.2
-        WHEN COALESCE(NULL, 0) >= 10 AND COALESCE(NULL, 0) > COALESCE(NULL, 0) * 3 THEN 0.5
+        WHEN COALESCE(NULL, 0) >= 8 AND COALESCE(NULL, 0) > COALESCE(NULL, 0) * 5 THEN 0.2
+        WHEN COALESCE(NULL, 0) >= 4 AND COALESCE(NULL, 0) > COALESCE(NULL, 0) * 3 THEN 0.5
         ELSE 1.0
       END) as p
     `).get();
