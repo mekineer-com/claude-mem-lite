@@ -289,6 +289,17 @@ async function install() {
     const manifestSrc = join(PROJECT_DIR, 'registry', 'preinstalled.json');
     if (existsSync(manifestSrc)) copyFileSync(manifestSrc, join(registryDir, 'preinstalled.json'));
     ok('Source files copied to ~/.claude-mem-lite/');
+
+    // v2.48 P1-4: prune stale top-level .mjs + 0-byte .db files left behind by
+    // prior upgrades (e.g. dispatch.mjs removed in v2.20.0, zero-byte mem.db /
+    // memory.db / registry.db from pre-consolidation installs). Subdirs +
+    // symlinks + non-empty DBs are always preserved.
+    try {
+      const pruned = pruneStaleInstallFiles(DATA_DIR, SOURCE_FILES);
+      if (pruned.length > 0) {
+        ok(`Pruned ${pruned.length} stale file(s): ${pruned.map(p => p.split('/').pop()).join(', ')}`);
+      }
+    } catch (e) { /* prune is best-effort — never block install */ void e; }
   }
 
   // 2. npm install (skip for --dev: node_modules is symlinked)
@@ -1293,6 +1304,57 @@ function hasMemHooksConfigured(settings) {
   return Object.values(settings.hooks).some(configs =>
     Array.isArray(configs) && configs.some(cfg => isMemHook(cfg))
   );
+}
+
+/**
+ * v2.48 P1-4: prune top-level stale files left behind by removed-module upgrades.
+ *
+ * Strict whitelist: only removes files under `dataDir` (no recursion) that match
+ *   - `*.mjs` whose basename is NOT in SOURCE_FILES (comparing against both the
+ *     bare entry and any `subdir/basename` entry flattened to its basename — the
+ *     prune intentionally skips subdir files; see below)
+ *   - 0-byte `.db` files that are NOT in the protected-db allow-list
+ *
+ * Protections (never touched):
+ *   - subdirectories (managed/, runtime/, scripts/, lib/, cli/, commands/, server/, node_modules/, .claude-plugin/, registry/, etc.)
+ *   - non-empty `.db` files — real data risk, always preserved
+ *   - WAL/SHM (`*-wal`, `*-shm`) transients
+ *   - files not ending in `.mjs` or `.db`
+ *   - the two canonical DBs (`claude-mem-lite.db`, `resource-registry.db`) even when 0-byte (fresh-install transient state)
+ *
+ * @param {string} dataDir Absolute path, typically `~/.claude-mem-lite`
+ * @param {string[]} sourceFiles SOURCE_FILES manifest
+ * @returns {string[]} Absolute paths of files that were deleted (ordered by readdir)
+ */
+export function pruneStaleInstallFiles(dataDir, sourceFiles) {
+  if (!existsSync(dataDir)) return [];
+  // Flatten manifest to just top-level basenames. SOURCE_FILES contains entries
+  // like 'lib/activity.mjs' — those belong to a subdir and prune never touches
+  // subdirs anyway. For top-level entries ('server.mjs'), basename === entry.
+  const topLevelAllowed = new Set(
+    sourceFiles
+      .filter(f => !f.includes('/'))
+      .map(f => f)
+  );
+  const PROTECTED_DBS = new Set(['claude-mem-lite.db', 'resource-registry.db']);
+  const removed = [];
+  let entries;
+  try { entries = readdirSync(dataDir); } catch { return removed; }
+  for (const name of entries) {
+    const full = join(dataDir, name);
+    let st;
+    try { st = lstatSync(full); } catch { continue; }
+    // Skip directories and symlinks (dev mode uses symlinks; treat as intentional).
+    if (!st.isFile()) continue;
+    if (name.endsWith('.mjs') && !topLevelAllowed.has(name)) {
+      try { unlinkSync(full); removed.push(full); } catch { /* best-effort */ }
+      continue;
+    }
+    if (name.endsWith('.db') && !PROTECTED_DBS.has(name) && st.size === 0) {
+      try { unlinkSync(full); removed.push(full); } catch { /* best-effort */ }
+    }
+  }
+  return removed;
 }
 
 export function clearPluginDisabledMarkerForDirectInstall(settings) {

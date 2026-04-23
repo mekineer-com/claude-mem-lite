@@ -481,6 +481,116 @@ describe('E2E: Version consistency across all manifests', () => {
 
 // ─── Migration Paths ────────────────────────────────────────────────────────
 
+describe('E2E: Install prune stale modules and zero-byte DBs (v2.48 P1-4)', () => {
+  it('pruneStaleInstallFiles removes top-level .mjs not in SOURCE_FILES', async () => {
+    const { pruneStaleInstallFiles } = await import('../install.mjs');
+    const { SOURCE_FILES } = await import('../source-files.mjs');
+    const tmpDir = makeTmpDir();
+    try {
+      // Simulate a post-v2.20 install: dispatch-* removed from SOURCE_FILES but
+      // leftover on disk. Mix of real + stale + protected.
+      writeFileSync(join(tmpDir, 'server.mjs'), 'real');        // in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'hook.mjs'), 'real');          // in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'dispatch.mjs'), 'stale');     // NOT in SOURCE_FILES
+      writeFileSync(join(tmpDir, 'dispatch-feedback.mjs'), 'stale');
+      writeFileSync(join(tmpDir, 'dispatch-inject.mjs'), 'stale');
+      writeFileSync(join(tmpDir, 'dispatch-workflow.mjs'), 'stale');
+      writeFileSync(join(tmpDir, 'README.txt'), 'non-mjs');     // not .mjs — don't touch
+      writeFileSync(join(tmpDir, 'package.json'), '{}');        // in SOURCE_FILES
+
+      const removed = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
+      const removedNames = removed.map(r => r.split('/').pop()).sort();
+      expect(removedNames).toEqual([
+        'dispatch-feedback.mjs',
+        'dispatch-inject.mjs',
+        'dispatch-workflow.mjs',
+        'dispatch.mjs',
+      ]);
+
+      // Protected files still present
+      expect(existsSync(join(tmpDir, 'server.mjs'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'hook.mjs'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'README.txt'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'package.json'))).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('pruneStaleInstallFiles removes zero-byte .db files except whitelist', async () => {
+    const { pruneStaleInstallFiles } = await import('../install.mjs');
+    const { SOURCE_FILES } = await import('../source-files.mjs');
+    const tmpDir = makeTmpDir();
+    try {
+      // Whitelist entries (always preserve, even if 0 bytes — WAL/SHM transients)
+      writeFileSync(join(tmpDir, 'claude-mem-lite.db'), '');
+      writeFileSync(join(tmpDir, 'resource-registry.db'), 'non-empty-data');
+      // Stale 0-byte DB files from older versions (mem.db, memory.db, registry.db)
+      writeFileSync(join(tmpDir, 'mem.db'), '');
+      writeFileSync(join(tmpDir, 'memory.db'), '');
+      writeFileSync(join(tmpDir, 'registry.db'), '');
+      // Non-empty stale: preserve — real data risk is unacceptable
+      writeFileSync(join(tmpDir, 'ghost.db'), 'oops-data');
+
+      const removed = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
+      const removedNames = removed.map(r => r.split('/').pop()).sort();
+      expect(removedNames).toEqual(['mem.db', 'memory.db', 'registry.db']);
+
+      // Whitelist intact, non-empty stale preserved
+      expect(existsSync(join(tmpDir, 'claude-mem-lite.db'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'resource-registry.db'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'ghost.db'))).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('pruneStaleInstallFiles does not descend into subdirectories', async () => {
+    const { pruneStaleInstallFiles } = await import('../install.mjs');
+    const { SOURCE_FILES } = await import('../source-files.mjs');
+    const tmpDir = makeTmpDir();
+    try {
+      mkdirSync(join(tmpDir, 'managed'), { recursive: true });
+      mkdirSync(join(tmpDir, 'runtime'), { recursive: true });
+      mkdirSync(join(tmpDir, 'scripts'), { recursive: true });
+      mkdirSync(join(tmpDir, 'lib'), { recursive: true });
+      // Subdir entries that LOOK like stale top-level files but are actually scoped
+      writeFileSync(join(tmpDir, 'managed', 'dispatch.mjs'), 'user-agent-file');
+      writeFileSync(join(tmpDir, 'lib', 'orphan.mjs'), 'subdir-lib-file');
+      writeFileSync(join(tmpDir, 'runtime', 'mem.db'), ''); // 0-byte in runtime — hands off
+      writeFileSync(join(tmpDir, 'scripts', 'old.mjs'), 'script');
+
+      const removed = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
+      expect(removed).toEqual([]);
+
+      // Everything under subdirs preserved
+      expect(existsSync(join(tmpDir, 'managed', 'dispatch.mjs'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'lib', 'orphan.mjs'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'runtime', 'mem.db'))).toBe(true);
+      expect(existsSync(join(tmpDir, 'scripts', 'old.mjs'))).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('pruneStaleInstallFiles is idempotent and no-op on clean dir', async () => {
+    const { pruneStaleInstallFiles } = await import('../install.mjs');
+    const { SOURCE_FILES } = await import('../source-files.mjs');
+    const tmpDir = makeTmpDir();
+    try {
+      writeFileSync(join(tmpDir, 'server.mjs'), 'real');
+      writeFileSync(join(tmpDir, 'hook.mjs'), 'real');
+
+      const r1 = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
+      const r2 = pruneStaleInstallFiles(tmpDir, SOURCE_FILES);
+      expect(r1).toEqual([]);
+      expect(r2).toEqual([]);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('E2E: Migration from older versions', () => {
   it('migrates from old claude-mem directory', () => {
     const home = makeTmpDir();

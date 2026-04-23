@@ -2,6 +2,37 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.48.0] - 2026-04-24
+
+**Low-risk install + session-start cleanup — install-time prune of stale modules and zero-byte DBs, session-start short-circuit for completed CLAUDE.md legacy cleanup.** Two P1/P2 items from the 2026-04-24 audit: `install.mjs` accumulated stale top-level files from removed modules (`dispatch.mjs`, `dispatch-feedback.mjs`, `dispatch-inject.mjs`, `dispatch-workflow.mjs` removed in v2.20.0; zero-byte `mem.db`/`memory.db`/`registry.db` from pre-consolidation installs); `cleanupClaudeMdLegacyBlock` ran on every SessionStart for 16 consecutive minor versions (v2.30 → v2.47) re-scanning a file that had been cleaned once. Both silent-drag issues — no correctness impact, pure operational hygiene.
+
+### Migration note
+
+Run once on next install (either `npx claude-mem-lite install` or plugin auto-update): prune removes old top-level `.mjs` files not in `SOURCE_FILES` + zero-byte `.db` files (`claude-mem-lite.db` / `resource-registry.db` always preserved). No user action required. Opt-out: not applicable — prune is strictly additive cleanup, and non-empty DB files are never touched regardless of name.
+
+Session-start marker lives at `~/.claude-mem-lite/runtime/.legacy-claude-md-cleaned-<project>`. First SessionStart after upgrade runs the legacy cleanup once, drops the marker, and every subsequent session-start short-circuits. Recovery (if a user manually re-introduces the legacy block): delete the marker file and the next session-start sweeps again.
+
+### Added
+
+- **`install.mjs::pruneStaleInstallFiles(dataDir, sourceFiles) → string[]`** — strict whitelist prune, top-level only (never descends into subdirs). Removes `.mjs` files whose basename is not in `SOURCE_FILES` + 0-byte `.db` files (except `claude-mem-lite.db` / `resource-registry.db`). Symlinks preserved (dev-mode safety). Returns absolute paths of deleted files for logging.
+- **`hook-context.mjs::cleanupClaudeMdLegacyBlock`** — idempotent marker in `RUNTIME_DIR/.legacy-claude-md-cleaned-<project>`. First call drops marker on every exit path (found / not-found / CLAUDE.md missing); subsequent calls short-circuit with a single `existsSync` probe.
+- **6 new tests:**
+  - `tests/install-e2e.test.mjs` (+4): pruneStaleInstallFiles removes dispatch-* stale modules; removes 0-byte non-whitelist DBs while preserving canonical DBs and non-empty stale DBs; does not descend into managed/runtime/scripts/lib subdirs; idempotent + no-op on clean dir.
+  - `tests/hook-context.test.mjs` (+2): marker file dropped after first run + short-circuits on second call even when legacy block is re-introduced; marker dropped when CLAUDE.md does not exist (no repeated stat).
+
+### Changed
+
+- **`tests/hook-context.test.mjs`** — beforeEach/afterEach now clear the legacy-cleanup marker so each test exercises the full sweep path.
+- **`install.mjs::install()`** — in non-`--dev` mode, after source-file copy completes, calls `pruneStaleInstallFiles` and emits `ok("Pruned N stale file(s): ...")` when any files were removed. Failures are swallowed (prune is best-effort).
+
+### Measurements
+
+- Full test suite: **1921 / 1921** green (was 1915 at v2.47.0 head; +6 net-new).
+- Benchmark (`node benchmark/benchmark.mjs`, 30 queries): Recall@10 0.8796, Precision@10 0.9731, nDCG@10 0.959, MRR@10 0.9667 — all unchanged from v2.47.0. P95 latency 0.18ms (v2.47.0: 0.17ms) — inside the 5ms regression gate.
+- Expected live-install effect after upgrade: 4 `dispatch-*.mjs` + 3 zero-byte `.db` files pruned from `~/.claude-mem-lite/` on next `install`; session-start marker ends repeated legacy-block regex scan (one-time savings, accrues across every project).
+
+---
+
 ## [2.47.0] - 2026-04-24
 
 **P0 audit-driven cleanup — observation_vectors GC, noise-penalty recalibration, LOW_SIGNAL write-side cap.** A full-project audit on 2026-04-24 (54 MB live DB, 3789 obs across 10 projects) surfaced three unrelated-but-compounding problems: the TF-IDF vector table had 5577/6429 (86.75%) dead rows (2839 orphan + 3282 vocab-stale) because `rebuildVocabulary` never pruned old versions and historic migrations ran with FK off; the injection-noise penalty gates (inj≥10 / inj≥20) had never fired in production because actual max injection_count was 9 across 2 months of data; and 341/3789 (9%) LOW_SIGNAL-titled observations carried Haiku-inflated importance=3 despite 339/341 (99.4%) having no lesson and no facts. This release closes all three on the write path so future DBs don't re-accumulate the same debt.

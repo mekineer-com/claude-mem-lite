@@ -2,13 +2,13 @@
 // Handles adaptive time windows, token-budgeted selection, and legacy CLAUDE.md cleanup.
 
 import { basename, join } from 'path';
-import { readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import {
-  estimateTokens, truncate, typeIcon, fmtTime,
+  estimateTokens, truncate, typeIcon, fmtTime, inferProject,
   debugLog, debugCatch,
   DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
 } from './utils.mjs';
-import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, effectiveQuiet } from './hook-shared.mjs';
+import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet } from './hook-shared.mjs';
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 
 /**
@@ -176,9 +176,26 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
  * at the seam. Uses atomic tmp+rename write.
  */
 export function cleanupClaudeMdLegacyBlock() {
+  // v2.48 P2-4: idempotent marker. First run (whether it finds a block or not,
+  // whether CLAUDE.md exists or not) drops a project-scoped marker in RUNTIME_DIR.
+  // Subsequent SessionStarts short-circuit here — no CLAUDE.md stat, no regex scan.
+  // Recovery path if a user manually re-adds a legacy block: delete the marker
+  // file (`~/.claude-mem-lite/runtime/.legacy-claude-md-cleaned-<project>`) and
+  // the next SessionStart will sweep again.
+  const markerPath = join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`);
+  if (existsSync(markerPath)) return;
+
   const claudeMdPath = join(inferProjectDir(), 'CLAUDE.md');
   let content;
-  try { content = readFileSync(claudeMdPath, 'utf8'); } catch { return; }
+  try { content = readFileSync(claudeMdPath, 'utf8'); } catch {
+    // CLAUDE.md missing — still drop the marker so we don't re-stat every session
+    try { writeFileSync(markerPath, String(Date.now())); } catch {}
+    return;
+  }
+
+  // Helper: drop the marker regardless of exit path (found / not found / write failed).
+  // Kept inline so the early-return sites below stay readable.
+  const dropMarker = () => { try { writeFileSync(markerPath, String(Date.now())); } catch {} };
 
   const startTag = '<claude-mem-context>';
   const endTag = '</claude-mem-context>';
@@ -187,7 +204,10 @@ export function cleanupClaudeMdLegacyBlock() {
   // (e.g. inside a code block in architecture notes) are not accidentally swept.
   const startIdx = content.lastIndexOf(startTag);
   const endIdx = content.lastIndexOf(endTag);
-  if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) return;
+  if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) {
+    dropMarker();
+    return;
+  }
 
   // Extend forward to swallow a trailing newline so we don't leave a stranded blank line.
   let removeEnd = endIdx + endTag.length;
@@ -213,15 +233,17 @@ export function cleanupClaudeMdLegacyBlock() {
   // Collapse any ≥3 consecutive newlines to two, then ensure exactly one trailing newline.
   const normalized = cleaned.replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '\n');
 
-  if (normalized === content) return;
+  if (normalized === content) { dropMarker(); return; }
 
   const tmp = claudeMdPath + '.mem-tmp';
   try {
     writeFileSync(tmp, normalized);
     renameSync(tmp, claudeMdPath);
+    dropMarker();
   } catch (e) {
     try { unlinkSync(tmp); } catch {}
     debugLog('ERROR', 'cleanupClaudeMdLegacyBlock', `CLAUDE.md write failed: ${e.message}`);
+    // Intentionally do NOT drop the marker on write failure — retry next session.
   }
 }
 

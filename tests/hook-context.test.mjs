@@ -286,15 +286,22 @@ describe('cleanupClaudeMdLegacyBlock', () => {
   const testDir = join(process.env.TMPDIR || '/tmp', `hook-ctx-test-${process.pid}`);
   const testClaudeMd = join(testDir, 'CLAUDE.md');
 
-  beforeEach(() => {
+  beforeEach(async () => {
     try { mkdirSync(testDir, { recursive: true }); } catch {}
     vi.stubEnv('CLAUDE_PROJECT_DIR', testDir);
     try { unlinkSync(testClaudeMd); } catch {}
+    // v2.48 P2-4: clear marker so each test exercises the full cleanup path.
+    const { RUNTIME_DIR } = await import('../hook-shared.mjs');
+    const { inferProject } = await import('../utils.mjs');
+    try { unlinkSync(join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`)); } catch {}
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.unstubAllEnvs();
     try { unlinkSync(testClaudeMd); } catch {}
+    const { RUNTIME_DIR } = await import('../hook-shared.mjs');
+    const { inferProject } = await import('../utils.mjs');
+    try { unlinkSync(join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`)); } catch {}
   });
 
   it('is a no-op when CLAUDE.md does not exist', () => {
@@ -363,6 +370,56 @@ describe('cleanupClaudeMdLegacyBlock', () => {
     expect(content).not.toContain('<claude-mem-context>');
     // No excessive trailing blank lines
     expect(/\n{3,}$/.test(content)).toBe(false);
+  });
+
+  // v2.48 P2-4: idempotent marker — skip second invocation entirely so every
+  // SessionStart after the first stops reading CLAUDE.md + regex-scanning for
+  // a block that's already been cleaned (or was never there).
+  it('writes a marker file after first run so subsequent calls short-circuit', async () => {
+    const { RUNTIME_DIR } = await import('../hook-shared.mjs');
+    const { inferProject } = await import('../utils.mjs');
+    const markerPath = join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`);
+    try { unlinkSync(markerPath); } catch {}
+
+    writeFileSync(
+      testClaudeMd,
+      `# Project\n\n<claude-mem-context>\ncontent\n</claude-mem-context>\n`,
+    );
+    cleanupClaudeMdLegacyBlock();
+
+    // Marker dropped after first call regardless of whether block existed
+    expect(existsSync(markerPath)).toBe(true);
+    const afterFirst = readFileSync(testClaudeMd, 'utf8');
+    expect(afterFirst).not.toContain('<claude-mem-context>');
+
+    // Simulate a second invocation where user re-introduced the block by
+    // hand — marker must short-circuit so we do NOT re-write the file.
+    const reintroduced = `# Project\n\n<claude-mem-context>\nre-added\n</claude-mem-context>\n`;
+    writeFileSync(testClaudeMd, reintroduced);
+    cleanupClaudeMdLegacyBlock();
+
+    const afterSecond = readFileSync(testClaudeMd, 'utf8');
+    expect(afterSecond).toBe(reintroduced); // untouched — proves short-circuit fired
+
+    try { unlinkSync(markerPath); } catch {}
+  });
+
+  it('writes marker even when CLAUDE.md does not exist (avoid repeated stat)', async () => {
+    const { RUNTIME_DIR } = await import('../hook-shared.mjs');
+    const { inferProject } = await import('../utils.mjs');
+    const markerPath = join(RUNTIME_DIR, `.legacy-claude-md-cleaned-${inferProject()}`);
+    try { unlinkSync(markerPath); } catch {}
+
+    expect(existsSync(testClaudeMd)).toBe(false);
+    cleanupClaudeMdLegacyBlock();
+
+    // Even with no CLAUDE.md, we drop the marker — future SessionStarts skip
+    // the fs call entirely. If the user later writes CLAUDE.md + re-adds the
+    // legacy block manually, `claude-mem-lite doctor --reset` (or manual
+    // marker delete) is the recovery path.
+    expect(existsSync(markerPath)).toBe(true);
+
+    try { unlinkSync(markerPath); } catch {}
   });
 });
 
