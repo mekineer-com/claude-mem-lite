@@ -2010,7 +2010,11 @@ Commands:
   timeline              Show observations around an anchor (shows recent if no anchor)
     --anchor ID         Center on this ID. Accepts N, #N, P#N, or S#N — P#/S# anchors
                         resolve to the nearest-in-time observation in the same project.
-    --query "text"      Find anchor by FTS5 search
+    --query "text"      Find anchor by FTS5 search. Ranks by BM25 × time-decay,
+                        so multi-term queries surface the BEST topical match
+                        (highest term coverage), not the most recent. For
+                        "recent activity around X", use 'recent' or
+                        'search "X" --sort time' instead.
     --before N          Show N before anchor (default 5)
     --after N           Show N after anchor (default 5)
     --project P         Filter by project

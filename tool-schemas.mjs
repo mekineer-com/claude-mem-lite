@@ -318,11 +318,13 @@ export const tools = [
     name: 'mem_timeline',
     description:
       'Show observations before and after an anchor point (by ID or by FTS query).\n' +
+      'Query-anchor ranks by BM25 × time-decay → BEST topical match, not most recent.\n' +
       '\n' +
       'DO NOT use when:\n' +
       '  - You only want one record (use mem_get)\n' +
       '  - You have no anchor in mind and are just browsing (use mem_recent or mem_browse)\n' +
       '  - The sequence is obvious from commit history (use git log)\n' +
+      '  - You want "recent activity around X" (use mem_recent or mem_search sort="time")\n' +
       '\n' +
       'USE when:\n' +
       '  - Reconstructing what led up to / followed a specific bug or decision\n' +
