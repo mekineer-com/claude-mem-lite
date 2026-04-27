@@ -2,6 +2,37 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.52.0] - 2026-04-28
+
+**Push-side dedup + maintenance watchdogs — closes the structural pull/push imbalance surfaced during a full-tool QA dogfood pass.** Three independent gaps found while testing every CLI/MCP surface against a real 3,791-observation DB: (1) `doctor --benchmark` always reported `prompt_count: 0 / hook_p50_ms: null` because the CLI route never passed prompts to `runBenchmark()`, leaving the user-facing perf command effectively dead; (2) the 24h `auto-maintain` cycle in `hook.mjs` had exact-match auto-dedup (same title within 1h) but no fuzzy path, so reordered-token duplicates like `"Modified A.mjs, B.mjs"` vs `"Modified B.mjs, A.mjs"` accumulated forever in the 0–7d window before noise-compress hid them; (3) `stats --quality` R-2 watchdog reported lesson rate and LOW_SIGNAL but had no signal for the pending-purge backlog, hiding a real DB-state problem (1,008 / 1,468 = 68.7% of compressed records still awaiting deletion on the live corpus).
+
+### Why the minor bump
+
+User-visible behavior change on three surfaces: (a) `doctor --benchmark` output now contains real numbers instead of nulls and accepts `--prompts-limit N`; (b) every SessionStart now silently merges sim≥0.95 near-duplicate observations within the last 30 days (capped at 20/cycle) without manual `maintain execute --ops dedup` — env `CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY=1` opts out; (c) `stats --quality` (CLI) and `mem_stats({quality:true})` (MCP) emit a third watchdog line with status emoji + repair command. Tests grew 1966 → 1971 (+5).
+
+### Added
+
+- **`cli/doctor.mjs`** — `doctor --benchmark` now samples up to 50 recent prompts from `user_prompts JOIN sdk_sessions WHERE project=?` before invoking `runBenchmark()`, so the CLI report has non-null `injection_rate` / `hook_p50_ms` / `hook_p99_ms`. New `--prompts-limit N` flag (1–1000) overrides the default. Lib `runBenchmark(db, {prompts=[]})` API contract preserved — tests still call the lib directly.
+- **`hook.mjs::auto-maintain` fuzzy auto-dedup block** — runs after the existing exact-match dedup. Scans 500 most recent rows with `created_at_epoch > now - 30d`, MinHash pre-filter ≥0.7 cuts the O(N²) Jaccard scan, full Jaccard ≥0.95 picks merge pairs (cap 20/cycle). Loser side gets `superseded_at = Date.now()` + `superseded_by = 'auto-dedup-fuzzy'` (matches existing exact-match dedup mechanism). Env `CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY=1` skips the block. Imports `computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity` from `utils.mjs`.
+- **`lib/stats-quality.mjs::computeQualityStats`** — adds `purgeRow` query: `compressed = COUNT(compressed_into IS NOT NULL AND != 0)`, `pending_purge = COUNT(compressed_into = COMPRESSED_PENDING_PURGE)`. Emitted to both CLI and MCP via the shared lib (per #8050 lib-extraction pattern).
+- **`lib/stats-quality.mjs::formatQualityReport`** — third watchdog line: `Pending purge ≤ 10%`, status `✅ ≤10% / 🟡 ≤30% / 🔴 >30%`, repair hint `claude-mem-lite maintain execute --ops purge_stale --confirm` shown when over target. Line suppressed entirely if no compressed records exist (avoids noise on fresh DBs).
+- **`tests/audit-fixes.test.mjs::Fuzzy auto-dedup` (2 tests)** — (a) supersedes near-identical titles with reordered tokens (`"Modified server.mjs, mem-cli.mjs"` ↔ `"Modified mem-cli.mjs, server.mjs"`) inside the 0–7d window where noise-compress hasn't yet hidden them, leaves an unrelated control row untouched; (b) `CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY=1` short-circuits the block so `superseded_at` stays NULL on candidates.
+- **`tests/cli.test.mjs::CLI stats --quality command` (+3 tests)** — (a) watchdog line absent when no compressed records exist; (b) 🔴 + repair hint when pending/compressed ratio = 50%; (c) ✅ at 0% with no repair hint.
+
+### Changed
+
+- **`cli/doctor.mjs --benchmark` flag surface.** No longer JSON-only-with-nulls; default invocation produces a real performance snapshot. Sample query bounded by `length(prompt_text) >= 15` to avoid biasing latency stats with trivial inputs.
+- **`hook.mjs` import surface.** `utils.mjs` import expanded with `computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity` (previously only used in `mem-cli.mjs::cmdMaintain`).
+- **`.gitignore`.** Adds `.omx/` to skip per-machine omx telemetry state.
+
+### Why fuzzy auto-dedup only catches 0–7d duplicates (not stale ones)
+
+Trade-off captured in observation #8203. SessionStart already runs a `noise-compress` pass at line 658 that sets `compressed_into = COMPRESSED_AUTO` on any `'Modified %' / 'Worked on %' / 'Reviewed %' / 'Error%'` title older than 7 days with importance=1 and no lesson — those are excluded from the fuzzy block's `WHERE COALESCE(compressed_into, 0) = 0` filter. Result: fuzzy dedup is a hot-window deduplicator (catches reorder dupes the same week they're written); stale dupes flow through noise-compress's separate path. Designing a single sweep that handled both would mean either re-fetching compressed rows (loses the noise-compress optimization) or running fuzzy before noise-compress (re-orders an audited sequence — adds a regression surface). Layered defense is the explicit choice; manual `maintain scan` still surfaces stale 0.85–0.95 pairs for human review.
+
+### Why `superseded_at` instead of `compressed_into = keep_id`
+
+Mirrors the existing exact-match dedup at `hook.mjs::auto-maintain` (line 750+). `superseded_at IS NULL` is the universal search filter (CLI + MCP); `compressed_into = positive_id` is the merge-target sentinel used by `mem-cli maintain execute --ops dedup --merge-ids`. The two filters are paired everywhere; using `superseded_at` keeps the dedup-loser cleanup pathway consistent with what `maintain scan` and other auto-paths already produce. Loser rows still flow through the `mark-idle → PENDING_PURGE → purge_stale` pipeline once they age past 30d at importance=1.
+
 ## [2.51.0] - 2026-04-27
 
 **Install hardening — 3 cross-machine install bugs found via real failure logs from a Node v24.11.1 / Linux x64 install.** Fresh installs on machines that had previously used the legacy `claude-mem` plugin produced three independent FATAL paths: (1) `better-sqlite3` prebuilt binary mismatched the running Node ABI but `npm install` exited 0 silently, leaving the launcher to FATAL with "Could not locate the bindings file" on first start; (2) `~/.claude-mem-lite/scripts/pre-tool-recall.js` and `pre-skill-bridge.js` were referenced by `settings.json` hook commands but never copied by the install routine, so every Read/Skill tool call after install logged `Cannot find module` (harness non-blocking, so it didn't crash but flooded stderr); (3) install copied legacy `~/.claude-mem/claude-mem.db` (schema v16, `schema_versions` plural table) into the new path as `claude-mem-lite.db`, but new code expects v28 (`schema_version` singular + `memory_session_id` column on `sdk_sessions`) and `MIGRATIONS[]` has no v16→v28 bridge, causing FATAL `no such column: memory_session_id` on first launch.

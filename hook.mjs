@@ -27,6 +27,7 @@ import {
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog,
   COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, isoWeekKey, OBS_BM25,
+  computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -747,7 +748,8 @@ async function handleSessionStart() {
         `).run();
         if (boosted.changes > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted.changes} frequently-accessed observations`);
 
-        // Auto-dedup: merge near-identical observations (same title, same project, within 1h)
+        // Auto-dedup (exact): merge identical-title observations within 1h.
+        // Catches rapid duplicate writes (same hook firing twice, race conditions).
         const dupPairs = db.prepare(`
           SELECT a.id as keep_id, b.id as remove_id
           FROM observations a
@@ -763,6 +765,55 @@ async function handleSessionStart() {
           const ph = removeIds.map(() => '?').join(',');
           db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph})`).run(Date.now(), ...removeIds);
           debugLog('DEBUG', 'auto-maintain', `auto-deduped ${dupPairs.length} near-identical observations`);
+        }
+
+        // Auto-dedup (fuzzy): catches near-identical titles that exact-match
+        // misses across larger time windows — e.g. episode-batch titles like
+        // "Modified A.mjs, B.mjs" vs "Modified B.mjs, A.mjs" written days apart.
+        // MinHash pre-filter (≥0.7) cuts the O(N²) scan; Jaccard ≥0.95 stays
+        // well clear of legit "two updates same area" pairs (those typically
+        // score 0.7–0.85, surfaced via `maintain scan` for manual review).
+        // Bounded by ${SCAN_LIMIT} recent rows × ${FUZZY_MAX_MERGES}-merge cap.
+        if (!process.env.CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY) {
+          const SCAN_LIMIT = 500;
+          const FUZZY_MAX_MERGES = 20;
+          const FUZZY_THRESHOLD = 0.95;
+          const MINHASH_PREFILTER = 0.7;
+          const recent = db.prepare(`
+            SELECT id, title, importance, created_at_epoch
+            FROM observations
+            WHERE COALESCE(compressed_into, 0) = 0
+              AND superseded_at IS NULL
+              AND created_at_epoch > ?
+              AND title IS NOT NULL AND title != ''
+            ORDER BY created_at_epoch DESC LIMIT ${SCAN_LIMIT}
+          `).all(STALE_AGE);
+          if (recent.length >= 2) {
+            const titles = recent.map(r => r.title.trim());
+            const minhashes = titles.map(t => t ? computeMinHash(t) : null);
+            const fuzzyRemoveIds = [];
+            const removed = new Set();
+            outer: for (let i = 0; i < recent.length; i++) {
+              if (!minhashes[i] || removed.has(recent[i].id)) continue;
+              for (let j = i + 1; j < recent.length; j++) {
+                if (!minhashes[j] || removed.has(recent[j].id)) continue;
+                if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PREFILTER) continue;
+                if (jaccardSimilarity(titles[i], titles[j]) < FUZZY_THRESHOLD) continue;
+                // Keep the higher-importance row; tiebreak by older (lower id wins access history)
+                const keep = (recent[i].importance ?? 1) >= (recent[j].importance ?? 1) ? recent[i] : recent[j];
+                const remove = keep === recent[i] ? recent[j] : recent[i];
+                fuzzyRemoveIds.push(remove.id);
+                removed.add(remove.id);
+                if (fuzzyRemoveIds.length >= FUZZY_MAX_MERGES) break outer;
+              }
+            }
+            if (fuzzyRemoveIds.length > 0) {
+              const ph = fuzzyRemoveIds.map(() => '?').join(',');
+              db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup-fuzzy' WHERE id IN (${ph})`)
+                .run(Date.now(), ...fuzzyRemoveIds);
+              debugLog('DEBUG', 'auto-maintain', `fuzzy auto-deduped ${fuzzyRemoveIds.length} near-identical observations`);
+            }
+          }
         }
 
         // Mark maintenance as done (24h gate) — even though compression runs in background

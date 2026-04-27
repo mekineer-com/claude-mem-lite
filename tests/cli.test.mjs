@@ -1442,6 +1442,32 @@ describe('CLI stats --quality command', () => {
     expect(output).toMatch(/LOW_SIGNAL.*30%/);
   });
 
+  it('omits pending-purge watchdog when no compressed records exist', async () => {
+    // Default seed has zero compressed/pending-purge rows → line should not appear
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).not.toContain('Pending purge ≤');
+  });
+
+  it('renders pending-purge watchdog with 🔴 + repair hint when ratio > 30%', async () => {
+    // Mark some seed rows as compressed to create a denominator, with one PENDING_PURGE
+    // sentinel (-2) to drive the watchdog ratio above the 30% red threshold.
+    testDb.prepare("UPDATE observations SET compressed_into = 99 WHERE title = 'Modified auth.mjs'").run();
+    testDb.prepare("UPDATE observations SET compressed_into = -2 WHERE title = 'Modified server.mjs'").run();
+    // 2 compressed, 1 pending-purge → 50%
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toMatch(/Pending purge ≤ 10%.*currently 50\.0%/);
+    expect(output).toContain('🔴');
+    expect(output).toContain('maintain execute --ops purge_stale --confirm');
+  });
+
+  it('renders pending-purge watchdog with ✅ at low ratio', async () => {
+    testDb.prepare("UPDATE observations SET compressed_into = 99 WHERE title IN ('Modified auth.mjs', 'Modified server.mjs', 'Worked on utils.mjs')").run();
+    // 3 compressed, 0 pending-purge → 0% → ✅
+    const output = await captureStdout(() => run(['stats', '--quality']));
+    expect(output).toMatch(/✅ Pending purge ≤ 10%.*currently 0\.0%/);
+    expect(output).not.toContain('maintain execute --ops purge_stale');
+  });
+
   it('standard `stats` (no --quality) does NOT show quality block', async () => {
     const output = await captureStdout(() => run(['stats']));
     expect(output).not.toContain('Quality snapshot');

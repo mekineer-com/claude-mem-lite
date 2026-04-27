@@ -707,6 +707,111 @@ describe('T4-P1-A: auto-maintain 7-day retention (hook.mjs)', () => {
   });
 });
 
+describe('Fuzzy auto-dedup (hook auto-maintain)', () => {
+  let tmpHome, projDir;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'mem-audit-fuzzy-dedup-'));
+    projDir = join(tmpHome, 'audit', 't4');
+    mkdirSync(projDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('supersedes near-identical titles (Jaccard ≥ 0.95) and leaves unrelated rows untouched', () => {
+    const { db, dbPath } = initHomeDb(tmpHome);
+    const now = Date.now();
+
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES ('fuzzy-sess', 'fuzzy-mem', 'audit--t4', ?, ?, 'active')
+    `).run(new Date().toISOString(), now);
+
+    const insertObsRaw = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+        files_read, files_modified, importance, compressed_into, access_count,
+        created_at, created_at_epoch)
+      VALUES ('fuzzy-mem', 'audit--t4', '', 'change', ?, '', '', '', '', '[]', '[]', 1, NULL, 0, ?, ?)
+    `);
+    // Two near-duplicates with reordered tokens (Jaccard = 1.0).
+    // Ages must stay under 7 days — the SessionStart "noise-compress" pass
+    // (line 658+) hides any 'Modified %' title older than 7d before fuzzy
+    // dedup runs, so the realistic catch window is 0–7d.
+    insertObsRaw.run('Modified server.mjs, mem-cli.mjs', new Date(now - 5 * DAY_MS).toISOString(), now - 5 * DAY_MS);
+    insertObsRaw.run('Modified mem-cli.mjs, server.mjs', new Date(now - 3 * DAY_MS).toISOString(), now - 3 * DAY_MS);
+    // Control row — different content, must survive untouched
+    insertObsRaw.run('Modified hook.mjs', new Date(now - 4 * DAY_MS).toISOString(), now - 4 * DAY_MS);
+    db.close();
+
+    const stdinPayload = JSON.stringify({ session_id: 'cc-fuzzy-uuid' });
+    runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: stdinPayload });
+
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db2.prepare('SELECT title, superseded_at, superseded_by FROM observations ORDER BY created_at_epoch ASC').all();
+      // Exactly one of the two near-duplicates is superseded; the other survives as keeper.
+      const dupRows = rows.filter(r => r.title.startsWith('Modified server.mjs') || r.title.startsWith('Modified mem-cli.mjs'));
+      expect(dupRows.length).toBe(2);
+      const superseded = dupRows.filter(r => r.superseded_at !== null);
+      expect(superseded.length).toBe(1);
+      expect(superseded[0].superseded_by).toBe('auto-dedup-fuzzy');
+      // Control row must be untouched
+      const ctrl = rows.find(r => r.title === 'Modified hook.mjs');
+      expect(ctrl.superseded_at).toBeNull();
+    } finally { db2.close(); }
+  });
+
+  it('respects CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY env opt-out', () => {
+    const { db, dbPath } = initHomeDb(tmpHome);
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES ('fuzzy-skip-sess', 'fuzzy-skip-mem', 'audit--t4', ?, ?, 'active')
+    `).run(new Date().toISOString(), now);
+
+    const insertObsRaw = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+        files_read, files_modified, importance, compressed_into, access_count,
+        created_at, created_at_epoch)
+      VALUES ('fuzzy-skip-mem', 'audit--t4', '', 'change', ?, '', '', '', '', '[]', '[]', 1, NULL, 0, ?, ?)
+    `);
+    insertObsRaw.run('Modified A.mjs, B.mjs', new Date(now - 4 * DAY_MS).toISOString(), now - 4 * DAY_MS);
+    insertObsRaw.run('Modified B.mjs, A.mjs', new Date(now - 3 * DAY_MS).toISOString(), now - 3 * DAY_MS);
+    db.close();
+
+    // Run hook with the skip env set
+    try {
+      execFileSync(process.execPath, [HOOK_PATH, 'session-start'], {
+        input: JSON.stringify({ session_id: 'cc-fuzzy-skip' }),
+        timeout: 10000,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          HOME: tmpHome,
+          CLAUDE_PROJECT_DIR: projDir,
+          CLAUDE_MEM_SKIP_UPDATE: '1',
+          CLAUDE_MEM_SKIP_COMPRESS: '1',
+          CLAUDE_MEM_SKIP_OPTIMIZE: '1',
+          CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY: '1',
+          MEM_NO_AUTO_ADOPT: '1',
+          MEM_QUIET_HOOKS: '1',
+          CLAUDE_MEM_HOOK_RUNNING: undefined,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch { /* ignore non-zero exit; we only assert DB state */ }
+
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db2.prepare('SELECT title, superseded_at FROM observations').all();
+      // Both rows untouched when fuzzy-dedup is skipped
+      expect(rows.every(r => r.superseded_at === null)).toBe(true);
+    } finally { db2.close(); }
+  });
+});
+
 describe('T4-P1-B: pre-skill-bridge emits JSON hookSpecificOutput', () => {
   let tmpHome;
 
