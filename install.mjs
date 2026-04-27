@@ -25,9 +25,114 @@ const MARKETPLACE_KEY = 'sdsrss';
 const PLUGIN_KEY = `claude-mem-lite@${MARKETPLACE_KEY}`;
 const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
+import { createRequire } from 'module';
+
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES } from './source-files.mjs';
+
+/**
+ * Hook scripts that non-dev install must copy into ~/.claude-mem-lite/scripts/
+ * to keep settings.json hook commands resolvable. Single source of truth so
+ * adding a new PreToolUse/PostToolUse hook script can't drift from the install
+ * copy block (which previously hand-listed only 3 of these and silently
+ * dropped pre-tool-recall.js + pre-skill-bridge.js — every fresh install left
+ * settings.json pointing at non-existent files).
+ */
+export const HOOK_SCRIPT_FILES = [
+  'post-tool-use.sh',
+  'user-prompt-search.js',
+  'prompt-search-utils.mjs',
+  'pre-tool-recall.js',
+  'pre-skill-bridge.js',
+];
+
+export function copyHookScripts(srcDir, destDir) {
+  for (const name of HOOK_SCRIPT_FILES) {
+    const src = join(srcDir, name);
+    if (existsSync(src)) copyFileSync(src, join(destDir, name));
+  }
+}
+
+/**
+ * Move legacy `~/.claude-mem/claude-mem.db` (+ -wal/-shm sidecars) to
+ * timestamped `*.legacy-backup-<ms>` files inside `newDir`. The legacy DB
+ * carries v16 schema (schema_versions plural table); the new claude-mem-lite
+ * code expects v28 (schema_version singular + memory_session_id column) and
+ * MIGRATIONS[] has no v16→v28 bridge — so loading the legacy DB FATALs on
+ * first launch. Backing up rather than copying-as-current lets the new
+ * install create a fresh v28 DB while preserving legacy bytes for recovery.
+ *
+ * Returns: {action: 'noop'|'skip'|'backed-up', backupPath?}
+ *   - noop: no legacy DB found
+ *   - skip: working `claude-mem-lite.db` already exists in newDir
+ *   - backed-up: legacy files renamed to `<newDir>/claude-mem-lite.db.legacy-backup-<ts>` etc.
+ */
+export function migrateLegacyClaudeMemData(oldDir, newDir, opts = {}) {
+  const legacyDb = join(oldDir, 'claude-mem.db');
+  const targetDb = join(newDir, 'claude-mem-lite.db');
+  if (!existsSync(legacyDb)) return { action: 'noop' };
+  if (existsSync(targetDb)) return { action: 'skip' };
+
+  if (!existsSync(newDir)) mkdirSync(newDir, { recursive: true });
+  const ts = opts.now ?? Date.now();
+  const backupPath = join(newDir, `claude-mem-lite.db.legacy-backup-${ts}`);
+  renameSync(legacyDb, backupPath);
+  for (const ext of ['-wal', '-shm']) {
+    const src = legacyDb + ext;
+    if (existsSync(src)) renameSync(src, join(newDir, `claude-mem-lite.db${ext}.legacy-backup-${ts}`));
+  }
+  return { action: 'backed-up', backupPath };
+}
+
+/**
+ * Probe better-sqlite3's native binding by importing it from `installDir`'s
+ * node_modules and opening an in-memory DB. Returns {ok, error?}. `npm install`
+ * exits 0 even when the prebuilt .node binary mismatches the running Node ABI
+ * (e.g. NODE_MODULE_VERSION 137 on Node v24), so install must verify before
+ * declaring success — otherwise the next launch FATALs with "Could not locate
+ * the bindings file".
+ */
+export async function probeBetterSqlite3Binding(installDir) {
+  try {
+    const localRequire = createRequire(join(installDir, 'package.json'));
+    const Database = localRequire('better-sqlite3');
+    const db = new Database(':memory:');
+    db.close();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * Verify better-sqlite3 binding works in `installDir`; if not, run
+ * `npm rebuild better-sqlite3` and re-probe. Returns
+ * { ok: true, action: 'verified' | 'rebuilt' } on success or
+ * { ok: false, error } if rebuild can't fix it. The `probe` and `rebuild`
+ * deps are injectable so this can be unit-tested without a real npm
+ * subprocess.
+ */
+export async function ensureBetterSqlite3Working(installDir, deps = {}) {
+  const probe = deps.probe || (() => probeBetterSqlite3Binding(installDir));
+  const rebuild = deps.rebuild || (async () => {
+    execSync('npm rebuild better-sqlite3', { cwd: installDir, stdio: 'pipe' });
+  });
+
+  const first = await probe();
+  if (first.ok) return { ok: true, action: 'verified' };
+
+  try {
+    await rebuild();
+  } catch (e) {
+    return { ok: false, error: `rebuild failed: ${e.message}` };
+  }
+
+  const second = await probe();
+  if (second.ok) return { ok: true, action: 'rebuilt' };
+
+  return { ok: false, error: second.error || first.error };
+}
 
 /**
  * Derive invocation_name from resource name when metadata doesn't provide one.
@@ -265,13 +370,9 @@ async function install() {
         copyFileSync(src, dst);
       }
     }
-    // Copy scripts
-    const postToolSrc = join(PROJECT_DIR, 'scripts', 'post-tool-use.sh');
-    if (existsSync(postToolSrc)) copyFileSync(postToolSrc, join(scriptsDir, 'post-tool-use.sh'));
-    const promptSearchSrc = join(PROJECT_DIR, 'scripts', 'user-prompt-search.js');
-    if (existsSync(promptSearchSrc)) copyFileSync(promptSearchSrc, join(scriptsDir, 'user-prompt-search.js'));
-    const promptSearchUtilsSrc = join(PROJECT_DIR, 'scripts', 'prompt-search-utils.mjs');
-    if (existsSync(promptSearchUtilsSrc)) copyFileSync(promptSearchUtilsSrc, join(scriptsDir, 'prompt-search-utils.mjs'));
+    // Copy hook scripts (settings.json hook commands point at these — must
+    // stay in sync with HOOK_SCRIPT_FILES manifest)
+    copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir);
     // Ensure bash script is executable
     try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
     // Copy commands directory
@@ -312,6 +413,18 @@ async function install() {
       ok('Dependencies installed');
     } catch (e) {
       fail('npm install failed: ' + e.message);
+      process.exit(1);
+    }
+    // npm install exits 0 even when the better-sqlite3 prebuilt .node binary
+    // mismatches the running Node ABI (e.g. NODE_MODULE_VERSION 137 on Node v24).
+    // Probe and auto-rebuild before declaring success — otherwise the next
+    // launch FATALs with "Could not locate the bindings file".
+    const verify = await ensureBetterSqlite3Working(INSTALL_DIR);
+    if (verify.ok) {
+      ok(`better-sqlite3: ${verify.action}`);
+    } else {
+      fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
+      log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --build-from-source');
       process.exit(1);
     }
   }
@@ -542,30 +655,19 @@ async function install() {
   writeSettings(settings);
   ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
 
-  // 5. Migrate from old ~/.claude-mem/ if needed
-  if (existsSync(join(OLD_DATA_DIR, 'claude-mem.db')) && !existsSync(DB_PATH) && !existsSync(join(DATA_DIR, 'claude-mem.db'))) {
-    log('Detected old ~/.claude-mem/ directory, migrating to ~/.claude-mem-lite/...');
-    try {
-      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      // Migrate database and WAL/SHM files (copy as claude-mem-lite.db)
-      const srcDb = join(OLD_DATA_DIR, 'claude-mem.db');
-      if (existsSync(srcDb)) copyFileSync(srcDb, DB_PATH);
-      for (const ext of ['-wal', '-shm']) {
-        const src = join(OLD_DATA_DIR, 'claude-mem.db' + ext);
-        if (existsSync(src)) copyFileSync(src, DB_PATH + ext);
-      }
-      // Migrate runtime directory
-      const oldRuntime = join(OLD_DATA_DIR, 'runtime');
-      const newRuntime = join(DATA_DIR, 'runtime');
-      if (existsSync(oldRuntime) && !existsSync(newRuntime)) {
-        cpSync(oldRuntime, newRuntime, { recursive: true });
-      }
-      ok('Data migrated from ~/.claude-mem/ → ~/.claude-mem-lite/');
-      log('Old ~/.claude-mem/ preserved (remove manually when ready)');
-    } catch (e) {
-      warn('Migration failed: ' + e.message);
-      log('You can copy manually: cp ~/.claude-mem/claude-mem.db ~/.claude-mem-lite/claude-mem-lite.db');
+  // 5. Legacy ~/.claude-mem/ → ~/.claude-mem-lite/ — back up, don't reuse.
+  // The legacy DB is schema v16 (schema_versions plural) and there's no
+  // bridge in MIGRATIONS[] to v28. Reusing it FATALs on first launch with
+  // "no such column: memory_session_id". Rename to a timestamped backup
+  // so the new install creates a fresh v28 DB.
+  try {
+    const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, DATA_DIR);
+    if (r.action === 'backed-up') {
+      ok(`Legacy ~/.claude-mem/ DB backed up to ${r.backupPath}`);
+      log('New v28 DB will be created on first launch (legacy schema is incompatible).');
     }
+  } catch (e) {
+    warn('Legacy DB backup failed: ' + e.message);
   }
 
   // 5b. Rename claude-mem.db → claude-mem-lite.db in same directory

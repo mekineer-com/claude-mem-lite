@@ -2,6 +2,36 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.51.0] - 2026-04-27
+
+**Install hardening — 3 cross-machine install bugs found via real failure logs from a Node v24.11.1 / Linux x64 install.** Fresh installs on machines that had previously used the legacy `claude-mem` plugin produced three independent FATAL paths: (1) `better-sqlite3` prebuilt binary mismatched the running Node ABI but `npm install` exited 0 silently, leaving the launcher to FATAL with "Could not locate the bindings file" on first start; (2) `~/.claude-mem-lite/scripts/pre-tool-recall.js` and `pre-skill-bridge.js` were referenced by `settings.json` hook commands but never copied by the install routine, so every Read/Skill tool call after install logged `Cannot find module` (harness non-blocking, so it didn't crash but flooded stderr); (3) install copied legacy `~/.claude-mem/claude-mem.db` (schema v16, `schema_versions` plural table) into the new path as `claude-mem-lite.db`, but new code expects v28 (`schema_version` singular + `memory_session_id` column on `sdk_sessions`) and `MIGRATIONS[]` has no v16→v28 bridge, causing FATAL `no such column: memory_session_id` on first launch.
+
+### Why the minor bump
+
+Behavior change for any user who runs `install.mjs install` on a fresh machine: `npm install` step now followed by a binding probe that may invoke `npm rebuild better-sqlite3` automatically; legacy `~/.claude-mem/` data is no longer reused as the live DB; install now consistently copies all 5 hook scripts referenced from `settings.json`. Per observation #8154, this is a standalone install-hardening release — no other cleanup bundled.
+
+### Added
+
+- **`install.mjs::probeBetterSqlite3Binding(installDir)`** — exported; uses `createRequire` to import `better-sqlite3` from `<installDir>/node_modules/...` and opens an in-memory DB. Returns `{ok:true}` on success, `{ok:false, error}` on failure. Catches the silent-fail mode where `npm install` exits 0 with a binary that can't load.
+- **`install.mjs::ensureBetterSqlite3Working(installDir, deps?)`** — exported; probe → `npm rebuild better-sqlite3` → re-probe state machine. Returns `{ok:true, action:'verified'|'rebuilt'}` or `{ok:false, error}`. `deps.probe` and `deps.rebuild` injectable for unit tests. Wired into the install flow immediately after `npm install`.
+- **`install.mjs::HOOK_SCRIPT_FILES`** — exported manifest of the 5 hook scripts non-dev install must copy into `~/.claude-mem-lite/scripts/` (`post-tool-use.sh`, `user-prompt-search.js`, `prompt-search-utils.mjs`, `pre-tool-recall.js`, `pre-skill-bridge.js`). Single source of truth so adding a new hook script can't drift from the install copy step.
+- **`install.mjs::copyHookScripts(srcDir, destDir)`** — exported; iterates `HOOK_SCRIPT_FILES` and `copyFileSync`s each entry that exists in `srcDir`. Replaces the previous hand-listed `copyFileSync` block which copied 3 of the 5 scripts.
+- **`install.mjs::migrateLegacyClaudeMemData(oldDir, newDir, opts?)`** — exported; renames legacy `claude-mem.db` (+ `-wal`/`-shm` sidecars) to `<newDir>/claude-mem-lite.db.legacy-backup-<ts>`. Returns `{action:'noop'|'skip'|'backed-up', backupPath?}`. Skips if working `claude-mem-lite.db` already exists in `newDir` to avoid clobbering live data. `opts.now` injectable for deterministic timestamp tests.
+- **`tests/install-bsqlite-probe.test.mjs` (6 tests)** — covers probe success on real project `node_modules`, probe failure on non-existent path, retry state machine: probe-ok skips rebuild, probe-fail-then-ok reports `action:'rebuilt'`, probe-fail-twice surfaces error, rebuild-throws surfaces rebuild error.
+- **`tests/install-hook-scripts.test.mjs` (5 tests)** — locks `HOOK_SCRIPT_FILES` against drift: contains both PreToolUse scripts, contains the 3 previously-copied scripts, every entry exists in real `scripts/` directory, `copyHookScripts` copies all entries, `copyHookScripts` is silent on missing src.
+- **`tests/install-legacy-db-backup.test.mjs` (4 tests)** — main DB renamed to timestamped backup with new DB path NOT created, sidecar `-wal`/`-shm` also renamed, noop when no legacy DB, skip when working DB already exists.
+
+### Changed
+
+- **`install.mjs` non-dev hook script copy.** Old hand-listed `copyFileSync` block (3 calls) replaced with `copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir)`. `pre-tool-recall.js` and `pre-skill-bridge.js` now reach `~/.claude-mem-lite/scripts/` on every fresh install — prior installs left those files missing while `settings.json` PreToolUse entries referenced them.
+- **`install.mjs` post-`npm install` binding verify.** New step calls `ensureBetterSqlite3Working(INSTALL_DIR)` and surfaces `better-sqlite3: verified` or `better-sqlite3: rebuilt` in install output. On rebuild failure, install exits with `--build-from-source` recovery hint instead of completing silently.
+- **`install.mjs` legacy data migration semantics.** Old code `copyFileSync(legacyDb, newDbPath)` + `cpSync(oldRuntime, newRuntime)` removed. New behavior: legacy DB renamed to `<newDir>/claude-mem-lite.db.legacy-backup-<ts>` with timestamp; new install creates a fresh v28 schema on first launch. Legacy bytes preserved for recovery but no longer attempted as live DB.
+- **`tests/install-e2e.test.mjs` "Migration from older versions" test rewritten** to assert the new contract (legacy DB backed up, NOT reused as `claude-mem-lite.db`) instead of the old buggy contract (legacy DB copied as new DB).
+
+### Why no v16→v28 schema bridge
+
+Tradeoff captured in observation #8184. The legacy `claude-mem` codebase used `schema_versions` (plural) with v16 as latest; `claude-mem-lite` uses `schema_version` (singular) with v28 as latest. The plural→singular table rename spans a structural rewrite, and the `memory_session_id` column added in v28 has no upgrade path from any v16 row state. Building a bridge would mean reverse-engineering the v16→…→v27 chain on top of a deprecated schema — high cost, narrow audience (users who actually used legacy `claude-mem` AND want v16 observations preserved). Backup-not-bridge trades data preservation (legacy bytes recoverable from disk if a user really wants them, but unreadable without reverse-engineering) for working install on every machine.
+
 ## [2.50.0] - 2026-04-24
 
 **CJK precision filter closes the unicode61 single-char-collapse leak in prompt search + MCP protocol test surface + env-tunable threshold, data-tuned to 0.2 after 150-query real-corpus bench.** The root cause lives in FTS5's default `unicode61` tokenizer: every CJK character becomes its own token, so an application-layer bigram query like `"我是"` reduces to `(我 AND 是)` at match time and matches any document sharing those common characters anywhere. Live example: `./cli.mjs search "我是完全随机的字符串啊啊"` returned 20 unrelated prompts pre-fix (FTS + CJK LIKE fallback both leaked). Post-fix: 1 result (a self-referential observation that actually contains the literal string).

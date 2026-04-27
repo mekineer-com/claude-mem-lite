@@ -10,7 +10,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -592,26 +592,27 @@ describe('E2E: Install prune stale modules and zero-byte DBs (v2.48 P1-4)', () =
 });
 
 describe('E2E: Migration from older versions', () => {
-  it('migrates from old claude-mem directory', () => {
+  it('backs up legacy ~/.claude-mem/claude-mem.db without reusing it as the new DB', () => {
     const home = makeTmpDir();
     const binDir = makeFakeClaudeBin(home);
     try {
-      // Simulate old claude-mem install
+      // Simulate old claude-mem install (v16 schema, incompatible with v28)
       const oldDir = join(home, '.claude-mem');
       mkdirSync(oldDir, { recursive: true });
-      writeFileSync(join(oldDir, 'claude-mem.db'), 'fake-db');
-      mkdirSync(join(oldDir, 'runtime'), { recursive: true });
-      writeFileSync(join(oldDir, 'runtime', 'session-test'), 'session');
+      writeFileSync(join(oldDir, 'claude-mem.db'), 'fake-legacy-db');
 
       const output = runInstall('install', home, ['--dev', '--skip-repos'], { PATH: `${binDir}:${process.env.PATH}` });
-      expect(output).toContain('migrat');
+      expect(output).toMatch(/backed up|backup/i);
 
-      // New dir has the migrated DB (renamed)
-      const newDb = join(home, '.claude-mem-lite', 'claude-mem-lite.db');
-      expect(existsSync(newDb)).toBe(true);
-
-      // Old dir preserved
-      expect(existsSync(oldDir)).toBe(true);
+      const newDir = join(home, '.claude-mem-lite');
+      // Legacy DB must NOT be reused as the new DB — schema is incompatible.
+      expect(existsSync(join(newDir, 'claude-mem-lite.db'))).toBe(false);
+      // A timestamped backup must exist for recovery.
+      const backups = readdirSync(newDir).filter(f => f.includes('legacy-backup'));
+      expect(backups.length).toBeGreaterThan(0);
+      expect(backups.some(f => /^claude-mem-lite\.db\.legacy-backup-\d+$/.test(f))).toBe(true);
+      // Legacy file moved (renamed), not copied.
+      expect(existsSync(join(oldDir, 'claude-mem.db'))).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
