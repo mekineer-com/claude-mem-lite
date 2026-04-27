@@ -412,6 +412,7 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
       if (queryVec) {
         const vecResults = vectorSearch(db, queryVec, {
           project: project || null,
+          type: type || null,
           vocabVersion: vocab.version,
           limit: VECTOR_SCAN_LIMIT,
         });
@@ -420,9 +421,14 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
           const rowMap = new Map(ftsRows.map(r => [r.id, r]));
           for (const vr of vecResults) {
             if (!rowMap.has(vr.id)) {
-              const obs = db.prepare('SELECT id, type, title, subtitle, created_at, created_at_epoch, lesson_learned, importance, branch, files_modified FROM observations WHERE id = ?').get(vr.id);
+              const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, lesson_learned, importance, branch, files_modified FROM observations WHERE id = ?').get(vr.id);
               if (obs) {
-                // Apply same filters as FTS5 query (aligned with MCP searchObservations)
+                // Apply same filters as FTS5 query (aligned with MCP searchObservations).
+                // Defense-in-depth: vectorSearch already filters type/project, but the
+                // post-filter keeps both gates symmetric so a future vectorSearch refactor
+                // can't silently leak across them (cf. #8162 paired-path lesson).
+                if (type && obs.type !== type) continue;
+                if (project && obs.project !== project) continue;
                 if (dateFrom && obs.created_at_epoch < dateFrom) continue;
                 if (dateTo && obs.created_at_epoch > dateTo) continue;
                 if (minImportance && (obs.importance ?? 1) < minImportance) continue;
@@ -440,9 +446,11 @@ function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minIm
             .slice(0, limit);
         } else if (vecResults.length > 0 && ftsRows.length === 0) {
           return vecResults
-            .map(vr => db.prepare('SELECT id, type, title, subtitle, created_at, created_at_epoch, lesson_learned, importance, branch FROM observations WHERE id = ?').get(vr.id))
+            .map(vr => db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, lesson_learned, importance, branch FROM observations WHERE id = ?').get(vr.id))
             .filter(obs => {
               if (!obs) return false;
+              if (type && obs.type !== type) return false;
+              if (project && obs.project !== project) return false;
               if (dateFrom && obs.created_at_epoch < dateFrom) return false;
               if (dateTo && obs.created_at_epoch > dateTo) return false;
               if (minImportance && (obs.importance ?? 1) < minImportance) return false;

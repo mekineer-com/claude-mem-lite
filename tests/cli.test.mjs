@@ -96,6 +96,7 @@ vi.mock('../utils.mjs', async (importOriginal) => {
 
 // Import run after mocks are set up
 const { run } = await import('../mem-cli.mjs');
+const { buildVocabulary, computeVector, _resetVocabCache } = await import('../tfidf.mjs');
 
 // ─── Argument Parsing ────────────────────────────────────────────────────────
 // parseArgs is not exported, but we can test its behavior through commands
@@ -197,6 +198,58 @@ describe('CLI search command', () => {
     const bugOnly = await captureStdout(() => run(['search', 'parser', '--type', 'bugfix']));
     expect(bugOnly).toContain('Bug in parser');
     expect(bugOnly).not.toContain('Discovered parser pattern');
+  });
+
+  it('--type filter must hold across the vector/RRF hybrid path (regression)', async () => {
+    _resetVocabCache();
+    // Mixed-type corpus with shared vocabulary so vector path engages.
+    // The non-bugfix rows must NOT leak through vector RRF merge.
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Race in worker queue', narrative: 'fixed worker queue race condition crash',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'Worker queue architecture choice', narrative: 'chose redis queue over rabbitmq for worker pool',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Worker pool throughput pattern', narrative: 'worker pool throughput scales with queue depth',
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'feature',
+      title: 'Worker pool autoscale feature', narrative: 'added autoscale to worker pool queue',
+    });
+    // Build vocab + write vectors to engage hybrid path.
+    const vocab = buildVocabulary(testDb);
+    if (vocab) {
+      const rows = testDb.prepare('SELECT id, title, narrative FROM observations').all();
+      for (const r of rows) {
+        const vec = computeVector(`${r.title} ${r.narrative}`, vocab);
+        if (vec) {
+          testDb.prepare(
+            'INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)'
+          ).run(r.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+        }
+      }
+      testDb.prepare(
+        'INSERT INTO vocab_state (term, term_index, idf, version, created_at_epoch) VALUES (?, ?, ?, ?, ?)'
+      );
+      testDb.transaction(() => {
+        testDb.prepare('DELETE FROM vocab_state').run();
+        const ins = testDb.prepare(
+          'INSERT INTO vocab_state (term, term_index, idf, version, created_at_epoch) VALUES (?, ?, ?, ?, ?)'
+        );
+        for (const [term, entry] of vocab.terms) {
+          ins.run(term, entry.index, entry.idf, vocab.version, Date.now());
+        }
+      })();
+    }
+    const out = await captureStdout(() => run(['search', 'worker queue', '--type', 'bugfix']));
+    expect(out).toContain('Race in worker queue');
+    expect(out).not.toContain('architecture choice');
+    expect(out).not.toContain('throughput pattern');
+    expect(out).not.toContain('autoscale feature');
   });
 
   it('respects --limit', async () => {
