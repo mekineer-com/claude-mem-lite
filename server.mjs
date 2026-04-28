@@ -5,11 +5,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
 import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
+import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
+import { searchObservationsHybrid } from './search-engine.mjs';
 import { effectiveQuiet } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
@@ -28,7 +29,7 @@ import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
-import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
+import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -145,241 +146,13 @@ function safeHandler(fn) {
 // TYPE_DECAY_CASE imported from utils.mjs
 
 // Score expression variants for FTS5 queries (see Scoring Model Constants above)
-// TYPE_QUALITY_CASE demotes bugfix (×0.6) and promotes decision/discovery (×1.5/1.3)
-// R-3: lesson_learned presence adds ×1.3 boost — empirical +6.3pp hit-rate lift on bugfix.
-const FULL_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
-  * ${TYPE_QUALITY_CASE}
-  * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-  * (0.5 + 0.5 * COALESCE(o.importance, 1))
-  * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
+// Observation-search core (FTS query/params builders, hybrid pipeline) lives in
+// search-engine.mjs so mem-cli.mjs gets the identical implementation.
 
-const SIMPLE_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
-  * ${TYPE_QUALITY_CASE}
-  * (0.5 + 0.5 * COALESCE(o.importance, 1))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
-
-/**
- * Build an FTS5 observation search query.
- * @param {'full'|'simple'} scoring - full includes project boost + access bonus
- * @param {object} opts - { multiplier, withSnippet, withOffset, includeNoise }
- *   includeNoise=true keeps hook-llm fallback titles ("Modified X", "Worked on X", etc.);
- *   default false mirrors the filter already applied in hook-memory.mjs / user-prompt-search.js.
- */
-function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset, includeNoise } = {}) {
-  const scoreExpr = scoring === 'full' ? FULL_SCORE : SIMPLE_SCORE;
-  const mult = multiplier ? ` * ${multiplier}` : '';
-  const lowSignalClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
-  return `
-    SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.created_at_epoch, o.importance,
-           o.files_modified,
-           ${withSnippet ? "snippet(observations_fts, 2, '»', '«', '…', 10) as match_snippet," : ''}
-           ${scoreExpr}${mult} as score
-    FROM observations_fts
-    JOIN observations o ON observations_fts.rowid = o.id
-    WHERE observations_fts MATCH ?
-      AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
-      AND (? IS NULL OR o.project = ?)
-      AND (? IS NULL OR o.type = ?)
-      AND (? IS NULL OR o.created_at_epoch >= ?)
-      AND (? IS NULL OR o.created_at_epoch <= ?)
-      AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
-      AND (? IS NULL OR o.branch = ?)
-      ${lowSignalClause}
-    ORDER BY score
-    LIMIT ?${withOffset ? ' OFFSET ?' : ''}`;
-}
-
-/** Build params array for an FTS5 observation query. */
-function buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epochTo, limit, offset }) {
-  const params = [now];
-  if (projectBoost !== undefined) params.push(projectBoost, projectBoost); // full scoring only
-  params.push(
-    ftsQuery,
-    args.project ?? null, args.project ?? null,
-    args.obs_type ?? null, args.obs_type ?? null,
-    epochFrom, epochFrom,
-    epochTo, epochTo,
-    args.importance ?? null, args.importance ?? null,
-    args.branch ?? null, args.branch ?? null,
-    limit,
-  );
-  if (offset !== undefined) params.push(offset);
-  return params;
-}
-
-/** Map a raw FTS5 row to a result object. */
-function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
-  return {
-    source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle,
-    project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch,
-    score: scoreMultiplier ? r.score * scoreMultiplier : r.score,
-    files_modified: r.files_modified, importance: r.importance, snippet: snippet ? (r.match_snippet || '') : '',
-  };
-}
-
+// Thin wrapper around the shared engine — keeps the existing call sites
+// (searchObservations(ctx)) without ferrying `db` through every layer.
 function searchObservations(ctx) {
-  const { ftsQuery, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit } = ctx;
-  const results = [];
-  // R-1: hide hook-llm fallback titles unless caller explicitly opts in via include_noise=true.
-  const includeNoise = args.include_noise === true;
-
-  if (ftsQuery) {
-    const now = Date.now();
-    const projectBoost = args.project ? null : currentProject;
-
-    const rows = db.prepare(buildObsFtsQuery('full', { withSnippet: true, withOffset: true, includeNoise }))
-      .all(...buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
-    for (const r of rows) results.push(ftsRowToResult(r, { snippet: true }));
-
-    // OR fallback: when AND query returns 0 results, retry with OR semantics.
-    // Sets ctx.orFallbackFired so the top-level formatter can surface a "relaxed
-    // AND→OR" hint — without it, callers can't distinguish a strict multi-term
-    // match from a partial single-term recovery.
-    if (rows.length === 0) {
-      const orQuery = relaxFtsQueryToOr(ftsQuery);
-      if (orQuery) {
-        try {
-          const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.5, withSnippet: true, withOffset: true, includeNoise }))
-            .all(...buildObsFtsParams({ now, projectBoost, ftsQuery: orQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
-          if (orRows.length > 0) ctx.orFallbackFired = true;
-          for (const r of orRows) results.push(ftsRowToResult(r, { snippet: true }));
-        } catch (e) { debugCatch(e, 'searchObservations-or-fallback'); }
-      }
-    }
-
-    // Two-phase query expansion for sparse results (only when well below limit)
-    if (rows.length > 0 && results.length < Math.ceil(limit / 2)) {
-      const existingIds = new Set(results.map(r => r.id));
-      expandObsByConceptCo(ctx, now, existingIds, results, includeNoise);
-      expandObsByPRF(ctx, now, rows.length, existingIds, results, includeNoise);
-    }
-
-    // Vector search + RRF hybrid merge
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const queryText = ftsQuery.replace(/['"()]/g, ' ');
-        const queryVec = computeVector(queryText, vocab);
-        if (queryVec) {
-          const vecResults = vectorSearch(db, queryVec, {
-            project: args.project ?? null,
-            type: args.obs_type ?? null,
-            vocabVersion: vocab.version,
-          });
-          if (vecResults.length > 0 && results.length > 0) {
-            // RRF merge: combine BM25 ranked results with vector ranked results
-            const rrfRanking = rrfMerge(results, vecResults);
-            const resultMap = new Map(results.map(r => [r.id, r]));
-            // Add vector-only results (found by similarity but not by FTS5)
-            for (const vr of vecResults) {
-              if (!resultMap.has(vr.id)) {
-                const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch FROM observations WHERE id = ?').get(vr.id);
-                if (obs) {
-                  // Apply same filter constraints as FTS5
-                  if (epochFrom !== null && obs.created_at_epoch < epochFrom) continue;
-                  if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
-                  if (args.importance && (obs.importance ?? 1) < args.importance) continue;
-                  if (args.branch && obs.branch !== args.branch) continue;
-                  // R-1: parity with FTS5 WHERE — vector path must also reject LOW_SIGNAL titles
-                  // so RRF cannot re-admit what the SQL clause excluded.
-                  if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
-                  resultMap.set(vr.id, { source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, snippet: '' });
-                }
-              }
-            }
-            // Re-order by RRF score
-            const reordered = rrfRanking
-              .filter(rr => resultMap.has(rr.id))
-              .map(rr => ({ ...resultMap.get(rr.id), score: -rr.rrfScore })); // negative for BM25-compatible sort
-            results.length = 0;
-            results.push(...reordered);
-          } else if (vecResults.length > 0 && results.length === 0) {
-            // FTS5 found nothing but vector found results
-            for (const vr of vecResults) {
-              const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch FROM observations WHERE id = ?').get(vr.id);
-              if (!obs) continue;
-              if (epochFrom !== null && obs.created_at_epoch < epochFrom) continue;
-              if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
-              if (args.importance && (obs.importance ?? 1) < args.importance) continue;
-              if (args.branch && obs.branch !== args.branch) continue;
-              if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
-              results.push({ source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, score: -vr.similarity, snippet: '' });
-            }
-          }
-        }
-      }
-    } catch (e) { debugCatch(e, 'searchObservations-vector'); }
-  } else {
-    const params = [];
-    const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
-    if (args.project) { wheres.push('project = ?'); params.push(args.project); }
-    if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
-    if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-    if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
-    if (args.importance) { wheres.push('COALESCE(importance, 1) >= ?'); params.push(args.importance); }
-    if (args.branch) { wheres.push('branch = ?'); params.push(args.branch); }
-    const where = `WHERE ${wheres.join(' AND ')}`;
-    params.push(perSourceLimit, perSourceOffset);
-    const rows = db.prepare(`
-      SELECT id, type, title, subtitle, project, created_at, created_at_epoch, files_modified, importance
-      FROM observations ${where}
-      ORDER BY created_at_epoch DESC
-      LIMIT ? OFFSET ?
-    `).all(...params);
-    for (const r of rows) {
-      results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch, files_modified: r.files_modified, importance: r.importance });
-    }
-  }
-
-  return results;
-}
-
-function expandObsByConceptCo(ctx, now, existingIds, results, includeNoise = false) {
-  const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
-  if (results.length >= Math.ceil(limit / 2)) return;
-  const expanded = expandQueryByConcepts(db, ftsQuery, args.project);
-  if (expanded.length === 0) return;
-  const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
-  try {
-    const expRows = db.prepare(buildObsFtsQuery('simple', { includeNoise }))
-      .all(...buildObsFtsParams({ now, ftsQuery: expansionFts, args, epochFrom, epochTo, limit }));
-    for (const r of expRows) {
-      if (!existingIds.has(r.id)) {
-        existingIds.add(r.id);
-        results.push(ftsRowToResult(r, { scoreMultiplier: 0.7 }));
-      }
-    }
-  } catch (e) { debugLog('WARN', 'mem_search', `concept expansion error: ${e.message}`); }
-}
-
-function expandObsByPRF(ctx, now, primaryCount, existingIds, results, includeNoise = false) {
-  const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
-  if (primaryCount < 3) return;
-  const topResults = db.prepare(`
-    SELECT o.title, o.narrative FROM observations_fts
-    JOIN observations o ON observations_fts.rowid = o.id
-    WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
-      AND (? IS NULL OR o.project = ?)
-    ORDER BY ${OBS_BM25}
-    LIMIT 8
-  `).all(ftsQuery, args.project ?? null, args.project ?? null);
-  const prfTerms = extractPRFTerms(topResults, ftsQuery);
-  if (prfTerms.length === 0) return;
-  const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
-  try {
-    const prfRows = db.prepare(buildObsFtsQuery('simple', { includeNoise }))
-      .all(...buildObsFtsParams({ now, ftsQuery: prfFts, args, epochFrom, epochTo, limit }));
-    for (const r of prfRows) {
-      if (!existingIds.has(r.id)) {
-        existingIds.add(r.id);
-        results.push(ftsRowToResult(r, { scoreMultiplier: 0.6 }));
-      }
-    }
-  } catch (e) { debugLog('WARN', 'mem_search', `PRF expansion error: ${e.message}`); }
+  return searchObservationsHybrid(db, ctx);
 }
 
 function searchSessions(ctx) {

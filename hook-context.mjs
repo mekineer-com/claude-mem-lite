@@ -369,19 +369,24 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   // 5. Working state from latest /clear handoff.
   // Session scoping: when currentCcSessionId is provided, restrict to this session's
   // own clear handoff so parallel sessions don't see each other's Working State block.
+  // TTL: drop handoffs older than 48h. Without it, `cmdContext` (no session id) would
+  // surface a /clear from days ago as "current Working State" — confusing when the user
+  // has long moved on. 48h covers overnight breaks but excludes truly stale state.
+  const HANDOFF_TTL_MS = 48 * 60 * 60 * 1000;
+  const handoffMinEpoch = Date.now() - HANDOFF_TTL_MS;
   const prevClearHandoff = currentCcSessionId
     ? db.prepare(`
         SELECT working_on, unfinished, key_files
         FROM session_handoffs
-        WHERE project = ? AND type = 'clear' AND session_id = ?
+        WHERE project = ? AND type = 'clear' AND session_id = ? AND created_at_epoch > ?
         ORDER BY created_at_epoch DESC LIMIT 1
-      `).get(project, currentCcSessionId)
+      `).get(project, currentCcSessionId, handoffMinEpoch)
     : db.prepare(`
         SELECT working_on, unfinished, key_files
         FROM session_handoffs
-        WHERE project = ? AND type = 'clear'
+        WHERE project = ? AND type = 'clear' AND created_at_epoch > ?
         ORDER BY created_at_epoch DESC LIMIT 1
-      `).get(project);
+      `).get(project, handoffMinEpoch);
 
   const handoffLines = [];
   if (prevClearHandoff) {

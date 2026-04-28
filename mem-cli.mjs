@@ -4,13 +4,14 @@
 
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch, notLowSignalTitleClause, LOW_SIGNAL_TITLE } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch, notLowSignalTitleClause } from './utils.mjs';
 import { cjkPrecisionOk } from './nlp.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { getVocabulary, computeVector, vectorSearch, rrfMerge, VECTOR_SCAN_LIMIT, rebuildVocabulary, _resetVocabCache } from './tfidf.mjs';
-import { autoBoostIfNeeded, reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
+import { getVocabulary, computeVector, rebuildVocabulary, _resetVocabCache } from './tfidf.mjs';
+import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
+import { searchObservationsHybrid } from './search-engine.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
@@ -72,6 +73,7 @@ function cmdSearch(db, args) {
   // error logs, etc.) which are otherwise filtered from default search. Use for auditing or
   // when explicitly searching for a file/command that produced a degraded title.
   const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
+  const jsonOutput = flags.json === true || flags.json === 'true';
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
     fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
@@ -94,87 +96,42 @@ function cmdSearch(db, args) {
   // When --type/--tier/--importance (obs-only fields) is specified, implicitly restrict to observations
   const effectiveSource = source || ((type || tier || minImportance) ? 'observations' : null);
 
+  // Cross-source mode: each source needs more candidates than the final limit
+  // so the post-merge sort has room to pick the best from each (paired-path with
+  // server.mjs:377 — without this, obs gets systematically squeezed out by sessions).
+  const isCrossSourceMode = !effectiveSource;
+  const perSourceLimit = isCrossSourceMode ? Math.max(limit * 3, offset + limit + 10) : limit;
+  const perSourceOffset = isCrossSourceMode ? 0 : offset;
+
   const results = [];
   // Tracks whether AND returned 0 and OR recovered non-empty. Mirrors server.mjs
   // ctx.orFallbackFired so the header can surface a "(relaxed AND→OR)" hint.
   let orFallbackFired = false;
 
-  // Search observations
+  // Search observations — shared engine with server.mjs (#8198/#8212 paired-path fix)
   if (!effectiveSource || effectiveSource === 'observations') {
-    let obsRows = searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: effectiveSource ? offset : 0 });
-    if (obsRows.length === 0) {
-      const orQuery = relaxFtsQueryToOr(ftsQuery);
-      if (orQuery) {
-        try {
-          obsRows = searchFts(db, orQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: effectiveSource ? offset : 0 });
-          if (obsRows.length > 0) orFallbackFired = true;
-        } catch {}
-      }
-    }
-    // Type-list fallback
-    if (obsRows.length === 0 && type) {
-      const typeWheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL', 'type = ?'];
-      const typeParams = [type];
-      if (project) { typeWheres.push('project = ?'); typeParams.push(project); }
-      if (dateFrom) { typeWheres.push('created_at_epoch >= ?'); typeParams.push(dateFrom); }
-      if (dateTo) { typeWheres.push('created_at_epoch <= ?'); typeParams.push(dateTo); }
-      if (minImportance) { typeWheres.push('COALESCE(importance, 1) >= ?'); typeParams.push(minImportance); }
-      if (branch) { typeWheres.push('branch = ?'); typeParams.push(branch); }
-      typeParams.push(limit);
-      obsRows = db.prepare(`
-        SELECT id, type, title, subtitle, created_at, lesson_learned
-        FROM observations
-        WHERE ${typeWheres.join(' AND ')}
-        ORDER BY created_at_epoch DESC
-        LIMIT ?
-      `).all(...typeParams);
-    }
-    for (const r of obsRows) results.push({ ...r, _source: 'obs', score: r.score ?? 0 });
+    const obsCtx = {
+      ftsQuery,
+      args: {
+        project: project || null,
+        obs_type: type || null,
+        importance: minImportance || null,
+        branch: branch || null,
+        include_noise: includeNoise,
+      },
+      epochFrom: dateFrom,
+      epochTo: dateTo,
+      perSourceLimit,
+      perSourceOffset,
+      currentProject: project ? null : inferProject(),
+      limit,
+      orFallbackFired: false,
+    };
+    const obsResults = searchObservationsHybrid(db, obsCtx);
+    if (obsCtx.orFallbackFired) orFallbackFired = true;
+    for (const r of obsResults) results.push({ ...r, _source: 'obs', score: r.score ?? 0 });
 
-    // Concept co-occurrence + PRF expansion (aligned with MCP searchObservations)
-    if (obsRows.length > 0 && results.filter(r => r._source === 'obs').length < Math.ceil(limit / 2)) {
-      const existingIds = new Set(results.filter(r => r._source === 'obs').map(r => r.id));
-      // Concept co-occurrence expansion
-      const expanded = expandQueryByConcepts(db, ftsQuery, project || null);
-      if (expanded.length > 0) {
-        const expansionFts = expanded.map(c => `"${c.replace(/"/g, '""')}"`).join(' OR ');
-        try {
-          const expRows = searchFts(db, expansionFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: 0 });
-          for (const r of expRows) {
-            if (!existingIds.has(r.id)) {
-              existingIds.add(r.id);
-              results.push({ ...r, _source: 'obs', score: (r.score ?? 0) * 0.7 });
-            }
-          }
-        } catch { /* expansion is best-effort */ }
-      }
-      // PRF expansion (only if ≥3 primary results)
-      if (obsRows.length >= 3) {
-        const topResults = db.prepare(`
-          SELECT o.title, o.narrative FROM observations_fts
-          JOIN observations o ON observations_fts.rowid = o.id
-          WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
-            AND (? IS NULL OR o.project = ?)
-          ORDER BY ${OBS_BM25}
-          LIMIT 8
-        `).all(ftsQuery, project ?? null, project ?? null);
-        const prfTerms = extractPRFTerms(topResults, ftsQuery);
-        if (prfTerms.length > 0) {
-          const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
-          try {
-            const prfRows = searchFts(db, prfFts, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset: 0 });
-            for (const r of prfRows) {
-              if (!existingIds.has(r.id)) {
-                existingIds.add(r.id);
-                results.push({ ...r, _source: 'obs', score: (r.score ?? 0) * 0.6 });
-              }
-            }
-          } catch { /* PRF is best-effort */ }
-        }
-      }
-    }
-
-    // Tier post-filter — applied to ALL obs results (initial + expansion + PRF)
+    // Tier post-filter — applied to ALL obs results from the engine.
     if (tier) {
       const obsInResults = results.filter(r => r._source === 'obs');
       if (obsInResults.length > 0) {
@@ -205,7 +162,7 @@ function cmdSearch(db, args) {
     if (project) { sessWheres.push('s.project = ?'); sessParams.push(project); }
     if (dateFrom) { sessWheres.push('s.created_at_epoch >= ?'); sessParams.push(dateFrom); }
     if (dateTo) { sessWheres.push('s.created_at_epoch <= ?'); sessParams.push(dateTo); }
-    sessParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
+    sessParams.push(perSourceLimit, perSourceOffset);
     try {
       const sessRows = db.prepare(`
         SELECT s.id, s.request, s.completed, s.project, s.created_at, s.created_at_epoch,
@@ -229,7 +186,7 @@ function cmdSearch(db, args) {
     if (project) { promptWheres.push('s.project = ?'); promptParams.push(project); }
     if (dateFrom) { promptWheres.push('p.created_at_epoch >= ?'); promptParams.push(dateFrom); }
     if (dateTo) { promptWheres.push('p.created_at_epoch <= ?'); promptParams.push(dateTo); }
-    promptParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
+    promptParams.push(perSourceLimit, perSourceOffset);
     try {
       const promptRows = db.prepare(`
         SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch,
@@ -256,7 +213,7 @@ function cmdSearch(db, args) {
           if (project) likeParams.push(project);
           if (dateFrom) likeParams.push(dateFrom);
           if (dateTo) likeParams.push(dateTo);
-          likeParams.push(effectiveSource ? limit : limit, effectiveSource ? offset : 0);
+          likeParams.push(perSourceLimit, perSourceOffset);
           const fallbackRows = db.prepare(`
             SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
             FROM user_prompts p
@@ -281,13 +238,18 @@ function cmdSearch(db, args) {
   }
 
   if (results.length === 0) {
-    out(`[mem] No results for "${query}"`);
+    if (jsonOutput) {
+      out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, results: [] }));
+    } else {
+      out(`[mem] No results for "${query}"`);
+    }
     return;
   }
 
-  // Cross-source score normalization (aligned with MCP mem_search)
-  const isCrossSource = !effectiveSource;
-  if (isCrossSource && results.length > 0) {
+  // Cross-source score normalization (paired-path with server.mjs:428).
+  // ftsQuery gate prevents normalization when scores are all 0 (no-FTS path).
+  const isCrossSource = isCrossSourceMode;
+  if (isCrossSource && results.length > 0 && ftsQuery) {
     for (const src of ['obs', 'session', 'prompt']) {
       const srcResults = results.filter(r => r._source === src && r.score !== null && r.score !== undefined);
       if (srcResults.length < 2) continue;
@@ -318,18 +280,63 @@ function cmdSearch(db, args) {
   // else 'relevance' keeps BM25 score order (already sorted)
 
   // Trim to limit with offset
+  const total = results.length;
   const paged = results.slice(offset, offset + limit);
 
   if (paged.length === 0) {
-    out(`[mem] No results for "${query}" at offset ${offset}`);
+    if (jsonOutput) {
+      out(JSON.stringify({ query, total, returned: 0, offset, limit, results: [] }));
+    } else {
+      out(`[mem] No results for "${query}" at offset ${offset}`);
+    }
     return;
   }
 
+  // paired-path with server.mjs formatSearchOutput (#8198): "N of M" total when paged < total.
   const showTime = sort === 'time';
   const hasMixed = paged.some(r => r._source === 'session' || r._source === 'prompt');
   // Suppressed when --or was explicit — user already asked for OR, no "fallback" there.
   const fallbackHint = orFallbackFired && !useOr ? ' (relaxed AND→OR)' : '';
-  out(`[mem] ${paged.length} result${paged.length !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
+
+  if (jsonOutput) {
+    const items = paged.map(r => {
+      const base = {
+        source: r._source,
+        id: r.id,
+        created_at: r.created_at,
+        score: r.score ?? null,
+      };
+      if (r._source === 'session') {
+        return { ...base, request: r.request || null, completed: r.completed || null, project: r.project || null };
+      }
+      if (r._source === 'prompt') {
+        return { ...base, prompt_text: r.prompt_text || null };
+      }
+      return {
+        ...base,
+        type: r.type,
+        title: r.title || r.subtitle || null,
+        lesson_learned: r.lesson_learned || null,
+        importance: r.importance ?? null,
+        superseded: Boolean(r.superseded),
+        files_modified: r.files_modified || null,
+      };
+    });
+    out(JSON.stringify({
+      query,
+      total,
+      returned: paged.length,
+      offset,
+      limit,
+      relaxed_and_to_or: orFallbackFired && !useOr,
+      mixed_sources: hasMixed,
+      results: items,
+    }));
+    return;
+  }
+
+  const countLabel = total > paged.length ? `${paged.length} of ${total}` : `${paged.length}`;
+  out(`[mem] Found ${countLabel} result${paged.length !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
   for (const r of paged) {
     const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
     if (r._source === 'session') {
@@ -348,123 +355,6 @@ function cmdSearch(db, args) {
       }
     }
   }
-}
-
-function searchFts(db, ftsQuery, { type, project, limit, dateFrom, dateTo, minImportance, branch, includeNoise, offset }) {
-  const now = Date.now();
-  // Current project for boost (2× when no explicit project filter)
-  const currentProject = !project ? inferProject() : null;
-
-  // WHERE clause params (positional ? in SQL order)
-  const whereParams = [ftsQuery];
-  const wheres = [
-    'observations_fts MATCH ?',
-    'COALESCE(o.compressed_into, 0) = 0',
-    'o.superseded_at IS NULL',
-  ];
-  if (project) { wheres.push('o.project = ?'); whereParams.push(project); }
-  if (type) { wheres.push('o.type = ?'); whereParams.push(type); }
-  if (dateFrom) { wheres.push('o.created_at_epoch >= ?'); whereParams.push(dateFrom); }
-  if (dateTo) { wheres.push('o.created_at_epoch <= ?'); whereParams.push(dateTo); }
-  if (minImportance) { wheres.push('COALESCE(o.importance, 1) >= ?'); whereParams.push(minImportance); }
-  if (branch) { wheres.push('o.branch = ?'); whereParams.push(branch); }
-  // R-1: exclude hook-llm fallback titles ("Modified X", "Worked on X", raw error logs)
-  // from default search. They compete for BM25 rank but have ~3% access rate. Mirrors the
-  // filter already applied in hook-memory.mjs, hook-context.mjs, and user-prompt-search.js.
-  // Use --include-noise to audit them.
-  if (!includeNoise) wheres.push(notLowSignalTitleClause('o'));
-
-  // Param order: SELECT scoring (now, proj, proj) → WHERE (ftsQuery, filters...) → ORDER BY scoring (now, proj, proj) → LIMIT/OFFSET
-  const scoreParams = [now, currentProject, currentProject];
-  const params = [...scoreParams, ...whereParams, ...scoreParams, limit, offset || 0];
-
-  // Scoring aligned with server.mjs: BM25 × type-decay × type-quality × project_boost × importance × access_bonus × lesson-boost
-  // R-3: lesson_learned presence adds a +0.3 multiplier (empirical: +6.3pp hit-rate lift on bugfix).
-  const ftsRows = db.prepare(`
-    SELECT o.id, o.type, o.title, o.subtitle, o.created_at, o.created_at_epoch, o.lesson_learned,
-           o.files_modified, o.importance,
-           ${OBS_BM25}
-             * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
-             * ${TYPE_QUALITY_CASE}
-             * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-             * (0.5 + 0.5 * COALESCE(o.importance, 1))
-             * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
-             * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL)) as score
-    FROM observations_fts
-    JOIN observations o ON observations_fts.rowid = o.id
-    WHERE ${wheres.join(' AND ')}
-    ORDER BY ${OBS_BM25}
-      * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
-      * ${TYPE_QUALITY_CASE}
-      * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-      * (0.5 + 0.5 * COALESCE(o.importance, 1))
-      * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
-      * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))
-    LIMIT ? OFFSET ?
-  `).all(...params);
-
-  // Hybrid: vector search + RRF merge (best-effort)
-  try {
-    const vocab = getVocabulary(db);
-    if (vocab) {
-      const queryText = ftsQuery.replace(/['"()]/g, ' ');
-      const queryVec = computeVector(queryText, vocab);
-      if (queryVec) {
-        const vecResults = vectorSearch(db, queryVec, {
-          project: project || null,
-          type: type || null,
-          vocabVersion: vocab.version,
-          limit: VECTOR_SCAN_LIMIT,
-        });
-        if (vecResults.length > 0 && ftsRows.length > 0) {
-          const rrfRanking = rrfMerge(ftsRows, vecResults);
-          const rowMap = new Map(ftsRows.map(r => [r.id, r]));
-          for (const vr of vecResults) {
-            if (!rowMap.has(vr.id)) {
-              const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, lesson_learned, importance, branch, files_modified FROM observations WHERE id = ?').get(vr.id);
-              if (obs) {
-                // Apply same filters as FTS5 query (aligned with MCP searchObservations).
-                // Defense-in-depth: vectorSearch already filters type/project, but the
-                // post-filter keeps both gates symmetric so a future vectorSearch refactor
-                // can't silently leak across them (cf. #8162 paired-path lesson).
-                if (type && obs.type !== type) continue;
-                if (project && obs.project !== project) continue;
-                if (dateFrom && obs.created_at_epoch < dateFrom) continue;
-                if (dateTo && obs.created_at_epoch > dateTo) continue;
-                if (minImportance && (obs.importance ?? 1) < minImportance) continue;
-                if (branch && obs.branch !== branch) continue;
-                // R-1: LOW_SIGNAL filter also applies to vector-side additions (the SQL
-                // clause only filtered the FTS5 side) so RRF can't re-admit noise.
-                if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
-                rowMap.set(vr.id, obs);
-              }
-            }
-          }
-          return rrfRanking
-            .filter(rr => rowMap.has(rr.id))
-            .map(rr => rowMap.get(rr.id))
-            .slice(0, limit);
-        } else if (vecResults.length > 0 && ftsRows.length === 0) {
-          return vecResults
-            .map(vr => db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, lesson_learned, importance, branch FROM observations WHERE id = ?').get(vr.id))
-            .filter(obs => {
-              if (!obs) return false;
-              if (type && obs.type !== type) return false;
-              if (project && obs.project !== project) return false;
-              if (dateFrom && obs.created_at_epoch < dateFrom) return false;
-              if (dateTo && obs.created_at_epoch > dateTo) return false;
-              if (minImportance && (obs.importance ?? 1) < minImportance) return false;
-              if (branch && obs.branch !== branch) return false;
-              if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) return false;
-              return true;
-            })
-            .slice(0, limit);
-        }
-      }
-    }
-  } catch { /* vector search is best-effort */ }
-
-  return ftsRows;
 }
 
 function cmdRecent(db, args) {
@@ -1993,6 +1883,7 @@ Commands:
     --sort S            Sort: relevance (default), time, importance
     --or                Use OR instead of AND between search terms
     --include-noise     Include hook-llm fallback titles ("Modified X", raw error logs)
+    --json              Output as JSON: {query,total,returned,offset,limit,results:[…]}
 
   recent [N]            Show N most recent observations (default 10)
     --project P         Filter by project
