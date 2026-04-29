@@ -524,14 +524,19 @@ async function install() {
     try {
       const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
       if (existsSync(cacheBase)) {
-        const srcLaunch = join(PROJECT_DIR, 'scripts', 'launch.mjs');
+        const launchSyncFiles = ['launch.mjs', 'launch-preflight.mjs'];
         let clearedHooks = 0;
         for (const ver of readdirSync(cacheBase)) {
           const verDir = join(cacheBase, ver);
 
-          // Sync launch.mjs
+          // Sync launch.mjs + its preflight companion (issue #15)
           if (existsSync(join(verDir, 'scripts'))) {
-            try { copyFileSync(srcLaunch, join(verDir, 'scripts', 'launch.mjs')); } catch {}
+            for (const f of launchSyncFiles) {
+              const src = join(PROJECT_DIR, 'scripts', f);
+              if (existsSync(src)) {
+                try { copyFileSync(src, join(verDir, 'scripts', f)); } catch { /* keep going */ }
+              }
+            }
           }
 
           // Clear cached hooks.json (runtime reads here, not marketplace source)

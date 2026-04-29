@@ -45,12 +45,31 @@ try {
 // Dev mode: prefer ~/.claude-mem-lite/server.mjs (symlinked to source) over
 // CLAUDE_PLUGIN_ROOT (potentially stale plugin cache). This ensures the MCP
 // server always runs the latest code when installed with `install --dev`.
-const devServer = join(homedir(), '.claude-mem-lite', 'server.mjs');
+const dataDir = join(homedir(), '.claude-mem-lite');
+const devServer = join(dataDir, 'server.mjs');
 let useDevServer = false;
 try { useDevServer = existsSync(devServer) && lstatSync(devServer).isSymbolicLink(); } catch {}
 
 if (useDevServer) {
   await import(pathToFileURL(devServer).href);
 } else {
-  await import(new URL('../server.mjs', import.meta.url).href);
+  // Preflight: detect incomplete primary install (issue #15) — if relative
+  // imports referenced by server.mjs are missing on disk, fall back to the
+  // hook-update.mjs-maintained ~/.claude-mem-lite/ copy when healthy, or exit
+  // with a clear repair command instead of a Node ERR_MODULE_NOT_FOUND stack.
+  const { resolveLaunchEntry } = await import('./launch-preflight.mjs');
+  try {
+    const entry = resolveLaunchEntry({
+      primaryRoot: ROOT,
+      fallbackRoot: dataDir,
+      warn: (msg) => process.stderr.write(msg + '\n'),
+    });
+    await import(pathToFileURL(entry.path).href);
+  } catch (e) {
+    if (e.code === 'INSTALL_INCOMPLETE') {
+      process.stderr.write(e.message + '\n');
+      process.exit(1);
+    }
+    throw e;
+  }
 }
