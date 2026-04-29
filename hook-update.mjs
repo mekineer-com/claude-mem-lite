@@ -3,12 +3,12 @@
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
 import { execSync, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, copyFileSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { DB_DIR } from './schema.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
-import { SOURCE_FILES } from './source-files.mjs';
+import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
@@ -328,14 +328,28 @@ function copyReleaseIntoStaging(sourceDir, stagingDir) {
     copied++;
   }
 
-  for (const dirName of ['scripts', 'registry']) {
-    const srcDir = join(sourceDir, dirName);
-    const destDir = join(stagingDir, dirName);
-    if (!existsSync(srcDir)) continue;
-    mkdirSync(destDir, { recursive: true });
-    for (const entry of readdirSync(srcDir)) {
-      copyFileSync(join(srcDir, entry), join(destDir, entry));
+  // scripts/ is curated to HOOK_SCRIPT_FILES — settings.json hook commands
+  // resolve only to these 5 files, and plugin mode does not consume this
+  // directory at all. Pre-v2.55 used cpSync({recursive:true}) which silently
+  // shipped dev-only files (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…)
+  // from the GitHub Releases tarball into every user's data dir.
+  const stagingScripts = join(stagingDir, 'scripts');
+  const sourceScripts = join(sourceDir, 'scripts');
+  if (existsSync(sourceScripts)) {
+    mkdirSync(stagingScripts, { recursive: true });
+    for (const name of HOOK_SCRIPT_FILES) {
+      const src = join(sourceScripts, name);
+      if (existsSync(src)) copyFileSync(src, join(stagingScripts, name));
     }
+  }
+
+  // registry/ stays recursive — preinstalled.json is the only current entry
+  // but the directory is consumed wholesale by the registry indexer and may
+  // grow subtrees. Pre-v2.55 readdirSync+copyFileSync would EISDIR-throw on
+  // any subdir and silently roll back the entire update.
+  const sourceRegistry = join(sourceDir, 'registry');
+  if (existsSync(sourceRegistry)) {
+    cpSync(sourceRegistry, join(stagingDir, 'registry'), { recursive: true });
   }
 
   const stagedScripts = join(stagingDir, 'scripts');

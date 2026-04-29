@@ -118,6 +118,62 @@ describe('hook update lifecycle', () => {
     expect(existsSync(join(dataDir, 'node_modules', 'old.txt'))).toBe(true);
     expect(readdirSync(dataDir).filter(name => name.startsWith('.update-'))).toHaveLength(0);
   });
+
+  // Regression: scripts/ is curated to HOOK_SCRIPT_FILES only — dev-only
+  // helpers (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…) and
+  // any future subdirectories MUST NOT leak into ~/.claude-mem-lite/scripts/.
+  // Pre-v2.55 hook-update did a recursive copy of the whole scripts/ tree and
+  // shipped every dev-only file from the GitHub Releases tarball.
+  it('staged install curates scripts/ to HOOK_SCRIPT_FILES and skips dev-only files', async () => {
+    const dataDir = makeDataDir();
+    const releaseDir = makeReleaseDir();
+    // Add the rest of HOOK_SCRIPT_FILES so we can assert all five land
+    writeFileSync(join(releaseDir, 'scripts', 'user-prompt-search.js'), '// search');
+    writeFileSync(join(releaseDir, 'scripts', 'prompt-search-utils.mjs'), '// utils');
+    writeFileSync(join(releaseDir, 'scripts', 'pre-tool-recall.js'), '// recall');
+    writeFileSync(join(releaseDir, 'scripts', 'pre-skill-bridge.js'), '// bridge');
+    // Dev-only file + nested helper subdir — neither should land in dataDir
+    writeFileSync(join(releaseDir, 'scripts', 'mock-claude.mjs'), '// dev-only');
+    mkdirSync(join(releaseDir, 'scripts', 'helpers'), { recursive: true });
+    writeFileSync(join(releaseDir, 'scripts', 'helpers', 'tool.mjs'), '// nested');
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install')) {
+        mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true });
+      }
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    // All five curated hook scripts land
+    for (const name of ['post-tool-use.sh', 'user-prompt-search.js', 'prompt-search-utils.mjs', 'pre-tool-recall.js', 'pre-skill-bridge.js']) {
+      expect(existsSync(join(dataDir, 'scripts', name))).toBe(true);
+    }
+    // Dev-only file + nested helper subdir do not land
+    expect(existsSync(join(dataDir, 'scripts', 'mock-claude.mjs'))).toBe(false);
+    expect(existsSync(join(dataDir, 'scripts', 'helpers'))).toBe(false);
+  });
+
+  // Regression: pre-v2.55 readdirSync + copyFileSync threw EISDIR on any
+  // subdirectory under registry/, silently rolling back the entire update.
+  // registry/ stays recursive so future subtrees ship intact.
+  it('staged install recursively copies subdirectories under registry/', async () => {
+    const dataDir = makeDataDir();
+    const releaseDir = makeReleaseDir();
+    mkdirSync(join(releaseDir, 'registry', 'fixtures'), { recursive: true });
+    writeFileSync(join(releaseDir, 'registry', 'fixtures', 'sample.json'), '{}');
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install')) {
+        mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true });
+      }
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    expect(existsSync(join(dataDir, 'registry', 'fixtures', 'sample.json'))).toBe(true);
+    expect(existsSync(join(dataDir, 'registry', 'preinstalled.json'))).toBe(true);
+  });
 });
 
 describe('cache hook residue clearing', () => {

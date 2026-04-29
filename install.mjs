@@ -29,23 +29,13 @@ import { createRequire } from 'module';
 
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
-import { SOURCE_FILES } from './source-files.mjs';
+import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
 
-/**
- * Hook scripts that non-dev install must copy into ~/.claude-mem-lite/scripts/
- * to keep settings.json hook commands resolvable. Single source of truth so
- * adding a new PreToolUse/PostToolUse hook script can't drift from the install
- * copy block (which previously hand-listed only 3 of these and silently
- * dropped pre-tool-recall.js + pre-skill-bridge.js — every fresh install left
- * settings.json pointing at non-existent files).
- */
-export const HOOK_SCRIPT_FILES = [
-  'post-tool-use.sh',
-  'user-prompt-search.js',
-  'prompt-search-utils.mjs',
-  'pre-tool-recall.js',
-  'pre-skill-bridge.js',
-];
+// Re-export for backward compatibility — tests/install-hook-scripts.test.mjs
+// and any external consumers still import HOOK_SCRIPT_FILES from install.mjs.
+// The constant itself moved to source-files.mjs in v2.55 so hook-update.mjs
+// can share it without a static cycle.
+export { HOOK_SCRIPT_FILES };
 
 export function copyHookScripts(srcDir, destDir) {
   for (const name of HOOK_SCRIPT_FILES) {
@@ -349,12 +339,10 @@ async function install() {
     if (existsSync(join(PROJECT_DIR, 'registry'))) {
       symlinkSync(join(PROJECT_DIR, 'registry'), regLink);
     }
-    // Symlink commands/ directory
-    const cmdLink = join(DATA_DIR, 'commands');
-    if (existsSync(cmdLink)) try { rmSync(cmdLink, { recursive: true, force: true }); } catch {}
-    if (existsSync(join(PROJECT_DIR, 'commands'))) {
-      symlinkSync(join(PROJECT_DIR, 'commands'), cmdLink);
-    }
+    // commands/ is intentionally NOT linked: Claude Code reads slash commands
+    // from the plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/commands/)
+    // or user-level ~/.claude/commands/, never from ~/.claude-mem-lite/commands/.
+    // Pre-v2.55 maintained a symlink/copy here that had no consumers.
     ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
   } else {
     log('Installing to ~/.claude-mem-lite/...');
@@ -375,15 +363,7 @@ async function install() {
     copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir);
     // Ensure bash script is executable
     try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
-    // Copy commands directory
-    const commandsDir = join(DATA_DIR, 'commands');
-    if (!existsSync(commandsDir)) mkdirSync(commandsDir, { recursive: true });
-    const commandsSrc = join(PROJECT_DIR, 'commands');
-    if (existsSync(commandsSrc)) {
-      for (const f of readdirSync(commandsSrc).filter(f => f.endsWith('.md'))) {
-        copyFileSync(join(commandsSrc, f), join(commandsDir, f));
-      }
-    }
+    // commands/ is intentionally NOT copied — see dev-mode branch above.
     // Copy registry manifest
     const registryDir = join(DATA_DIR, 'registry');
     if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
@@ -1614,14 +1594,36 @@ function syncVersions() {
     const marketJson = JSON.parse(readFileSync(marketJsonPath, 'utf8'));
     const plugin = marketJson.plugins?.[0];
     if (plugin && plugin.version !== version) {
+      const prev = plugin.version;
       plugin.version = version;
       writeFileSync(marketJsonPath, JSON.stringify(marketJson, null, 2) + '\n');
-      ok(`marketplace.json: ${plugin.version} → ${version}`);
+      ok(`marketplace.json: ${prev} → ${version}`);
     } else if (plugin) {
       ok(`marketplace.json: already ${version}`);
     }
   } else {
     warn('marketplace.json not found');
+  }
+
+  // Sync CLAUDE.md `**Version**: x.y.z` line — install-e2e asserts this
+  // matches package.json so omitting it here would break CI on every release.
+  const claudeMdPath = join(PROJECT_DIR, 'CLAUDE.md');
+  if (existsSync(claudeMdPath)) {
+    const orig = readFileSync(claudeMdPath, 'utf8');
+    const versionLine = /^- \*\*Version\*\*: .+$/m;
+    if (versionLine.test(orig)) {
+      const patched = orig.replace(versionLine, `- **Version**: ${version}`);
+      if (patched !== orig) {
+        writeFileSync(claudeMdPath, patched);
+        ok(`CLAUDE.md: → ${version}`);
+      } else {
+        ok(`CLAUDE.md: already ${version}`);
+      }
+    } else {
+      warn('CLAUDE.md: `**Version**:` line not found — skipped');
+    }
+  } else {
+    warn('CLAUDE.md not found');
   }
 
   console.log('');

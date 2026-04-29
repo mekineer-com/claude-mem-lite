@@ -136,5 +136,53 @@ if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   fi
 fi
 
+# 9. Residue detection (plugin mode only): warn once if legacy direct-install
+#    hooks remain in ~/.claude/settings.json. A user who installed via global
+#    `claude-mem-lite install` and later switched to the marketplace plugin
+#    will run every hook twice (direct settings.json hooks AND plugin hooks)
+#    until they run `claude-mem-lite uninstall` to clear the settings.json
+#    entries. /plugin uninstall does not touch settings.json.
+RESIDUE_MARKER="$DATA_DIR/runtime/.residue-warned-v2.55"
+if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" && ! -f "$RESIDUE_MARKER" ]]; then
+  SETTINGS="$HOME/.claude/settings.json"
+  if [[ -f "$SETTINGS" ]]; then
+    SETTINGS_PATH="$SETTINGS" node -e '
+      const fs = require("fs");
+      try {
+        const raw = fs.readFileSync(process.env.SETTINGS_PATH, "utf8");
+        const data = JSON.parse(raw);
+        const hooks = data.hooks || {};
+        const events = Object.keys(hooks);
+        const found = [];
+        for (const ev of events) {
+          const list = Array.isArray(hooks[ev]) ? hooks[ev] : [];
+          for (const entry of list) {
+            const inner = Array.isArray(entry?.hooks) ? entry.hooks : [];
+            for (const h of inner) {
+              const cmd = String(h?.command || "");
+              if (cmd.includes(".claude-mem-lite/") || cmd.includes("claude-mem-lite/scripts") || cmd.includes("claude-mem-lite/hook.mjs")) {
+                found.push(ev);
+                break;
+              }
+            }
+          }
+        }
+        if (found.length) {
+          process.stderr.write("\n");
+          process.stderr.write("\x1b[33m⚠\x1b[0m Legacy direct-install hooks detected in " + process.env.SETTINGS_PATH + "\n");
+          process.stderr.write("  Events with stale entries: " + [...new Set(found)].join(", ") + "\n");
+          process.stderr.write("  These will fire alongside plugin hooks (each tool call runs twice).\n");
+          process.stderr.write("  Fix: run \x1b[1mclaude-mem-lite uninstall\x1b[0m to clear settings.json,\n");
+          process.stderr.write("       then keep using the plugin install. (One-time warning.)\n\n");
+          process.exit(2);
+        }
+      } catch {}
+    ' || true
+  fi
+  # Mark the warning as shown regardless of result — silence is fine if no
+  # residue, and the warning above is one-shot per data-dir.
+  touch "$RESIDUE_MARKER"
+fi
+
 log_ok "claude-mem-lite ready"
 exit 0

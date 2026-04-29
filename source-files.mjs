@@ -53,3 +53,23 @@ export const SOURCE_FILES = [
   'adopt-content.mjs',
   'adopt-cli.mjs',
 ];
+
+/**
+ * Hook scripts that direct-install (non-plugin) mode must materialize under
+ * ~/.claude-mem-lite/scripts/ — settings.json hook commands resolve to these
+ * absolute paths. Plugin mode does not consume this directory (it runs scripts
+ * from ${CLAUDE_PLUGIN_ROOT} instead).
+ *
+ * Single source of truth for both install.mjs (initial install) and
+ * hook-update.mjs (auto-update): pre-v2.55 hook-update copied the entire
+ * scripts/ tree from the GitHub Releases tarball, which silently shipped
+ * dev-only files (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…)
+ * to every user's data dir on the first auto-update.
+ */
+export const HOOK_SCRIPT_FILES = [
+  'post-tool-use.sh',
+  'user-prompt-search.js',
+  'prompt-search-utils.mjs',
+  'pre-tool-recall.js',
+  'pre-skill-bridge.js',
+];

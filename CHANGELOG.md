@@ -2,6 +2,40 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.55.0] - 2026-04-29
+
+**Install / update / uninstall lifecycle audit — five concrete fixes across the boot, auto-update, and plugin-mode codepaths.** Full-pipeline review of the install/upgrade/uninstall surface (direct install + plugin install + auto-update via GitHub Releases) found one footgun (`hook-update.mjs` non-recursive copy that would EISDIR-throw and silently roll back the entire update on any future subdirectory under `scripts/` or `registry/`), one drift bug (`syncVersions` ignored `CLAUDE.md` so the pre-commit version-sync gate would red-light a release commit until manually re-edited), one dead-code path (`commands/` copied + symlinked into `~/.claude-mem-lite/` even though Claude Code never reads that location), one consistency leak (auto-update's recursive script copy shipped dev-only files like `mock-claude.mjs` / `extract-repos.mjs` / `p0-forward-probe.mjs` from the GitHub Releases tarball into every user's data dir), and one edge case (a user who installs both directly *and* via the marketplace plugin runs every hook twice forever after `/plugin uninstall` because that command doesn't touch `~/.claude/settings.json`). All five fixed; 1990 / 1990 tests pass; lint clean.
+
+### Fixed
+
+- **`hook-update.mjs::copyReleaseIntoStaging` — `registry/` now uses `cpSync({recursive:true})`.** Pre-fix used `readdirSync(...).map(copyFileSync)` which threw `EISDIR` the moment any subdirectory appeared under `registry/`, and the staged-update wrapper silently rolled back via the existing backup mechanism — user would see "no update available" forever despite the GitHub release being newer. Future-proofs the path against the registry indexer's likely subtree layout (fixtures, snapshots, per-source caches). New regression test `tests/hook-update.test.mjs::staged install recursively copies subdirectories under registry/` locks `registry/fixtures/sample.json` survival.
+
+- **`install.mjs::syncVersions` — `CLAUDE.md` `**Version**: x.y.z` line now patched alongside `plugin.json` / `marketplace.json`.** Pre-fix `node install.mjs release` left `CLAUDE.md` at the prior version; the pre-commit hook (which checks all 5 files since v2.53.2) would then block the release commit with a "Version mismatch" until the contributor manually re-edited the line. Same logic + same display format as the existing JSON-file branches. Side-fix: marketplace.json branch now logs `from→to` correctly (pre-fix it emitted `to→to` because the local mutation happened before the log line read it).
+
+### Changed
+
+- **`source-files.mjs` — `HOOK_SCRIPT_FILES` manifest moved here as the single source of truth.** Both `install.mjs` (initial direct install) and `hook-update.mjs` (auto-update) now import the same constant. `install.mjs` re-exports it for backward compatibility (`tests/install-hook-scripts.test.mjs` and any external consumers). Same import-graph pattern as the existing `SOURCE_FILES` manifest.
+
+- **`hook-update.mjs::copyReleaseIntoStaging` — `scripts/` now uses curated copy via `HOOK_SCRIPT_FILES`, not recursive copy.** Pre-fix recursive copy of `scripts/` from the GitHub Releases tarball shipped every dev-only file (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs, …) into `~/.claude-mem-lite/scripts/` on the first auto-update — fresh installs had 5 scripts there, but a single auto-update bumped that to 14. Functionally inert (nothing references those files at runtime) but a leak by any reasonable read of "what should the data dir contain". New regression test `tests/hook-update.test.mjs::staged install curates scripts/ to HOOK_SCRIPT_FILES and skips dev-only files` locks both directions: all 5 curated scripts land, dev-only files + nested helper subdirs do not.
+
+### Removed
+
+- **`install.mjs` — dead `commands/` copy + symlink branches deleted.** Pre-fix copied `commands/*.md` to `~/.claude-mem-lite/commands/` (non-dev) and symlinked the same path (dev) since at least v2.10. Claude Code reads slash commands from the plugin cache (`~/.claude/plugins/cache/<mp>/<plugin>/<ver>/commands/`) for plugin installs and `~/.claude/commands/` for user-level installs — never `~/.claude-mem-lite/commands/`. No consumer found across the codebase. Pruning is left to the v2.30+ `pruneStaleInstallFiles` infra (existing data dirs will retain the orphan directory until next manual cleanup; harmless).
+
+### Added
+
+- **`scripts/setup.sh` (step 9) — plugin-mode residue detection.** Warns once per data-dir if `~/.claude/settings.json` contains hook commands referencing `.claude-mem-lite/` (the legacy direct-install layout). Triggered: a user installs directly via global `claude-mem-lite install`, later switches to the marketplace plugin, then runs `/plugin uninstall` — that command doesn't touch `~/.claude/settings.json`, so every Read / PreToolUse / PostToolUse hook fires twice forever (direct hooks + plugin hooks) until the user manually runs `claude-mem-lite uninstall`. New step prints a one-shot warning naming the affected events and the exact repair command. One-time marker `~/.claude-mem-lite/runtime/.residue-warned-v2.55` prevents repeat noise. Plugin-mode only (gated on `CLAUDE_PLUGIN_ROOT`); direct-install users are unaffected.
+
+### Tests
+
+- 78 files / **1990 / 1990 passed** (was 1988 baseline; +2 from the regression-test split for `scripts/` curation vs `registry/` recursive copy).
+- ESLint clean.
+- `node install.mjs release` end-to-end confirmed all four version files (`package.json` / `plugin.json` / `marketplace.json` / `CLAUDE.md`) sync correctly; pre-commit hook's 5-file check passes without manual intervention.
+
+### Notes
+
+This release is a lifecycle / hygiene audit — no schema change, no behavior change for memory recall or write paths, no tool-API change. Existing direct-install users who upgrade via the auto-updater will get the curated `scripts/` directory on the next staged install (their old dev-only file remnants stay until `pruneStaleInstallFiles` reaps them or they run `claude-mem-lite uninstall` + reinstall).
+
 ## [2.54.0] - 2026-04-30
 
 **Memory-quality audit follow-up — write-side noise gates tightened, auto-maintain optimize widened.** End-to-end audit (2026-04-30) found three concrete quality leaks: bugfix `lesson_learned` coverage was 11.2% (contract requires lessons for every non-trivial bug), `Error: X` rule-fallback titles were leaking into the DB at 64/30d via the `importance>=2` escape hatch in the noise filter, and `mem_optimize` had only ever processed 56 observations across the whole library because the auto-maintain default (`scope: 'narrow'`) almost never matched a candidate. Three targeted fixes; no schema change; benchmark Recall@10 0.8996 (baseline 0.885, +1.5pp).
