@@ -709,7 +709,14 @@ export async function handleLLMOptimize() {
   }
 
   try {
-    const results = await optimizeRun(db);
+    // v2.54.0: auto-maintain default scope is 'wide'. Narrow scope (the prior
+    // default) only matches fully-degraded rows (no concepts AND no facts AND
+    // no lesson AND no aliases) — production diagnostic 2026-04-30 found only
+    // 56 obs ever optimized after months of daily auto-maintain runs. Wide
+    // targets bugfix/refactor/feature/decision rows with substantive narrative
+    // but missing lesson_learned, which is exactly the audit's 11.2% coverage
+    // gap. CLI `mem optimize` keeps narrow as default for explicit invocations.
+    const results = await optimizeRun(db, { reenrichScope: 'wide' });
     const parts = [];
     if (results.reenrich?.processed) parts.push(`re-enriched: ${results.reenrich.processed}`);
     if (results.normalize?.processed) parts.push(`normalized: ${results.normalize.processed}`);

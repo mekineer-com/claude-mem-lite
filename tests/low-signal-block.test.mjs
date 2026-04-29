@@ -226,6 +226,39 @@ describe('isNoiseObservation — P2 tool-output passthrough detection', () => {
       importance: 1,
     }, {})).toBe(false);
   });
+
+  // v2.54.0 regression: rule-based importance can be inflated to 2-3 by filename
+  // heuristics (computeRuleImportance fires on test/schema/migration paths).
+  // Prior behavior: imp>=2 short-circuited and kept the row, letting raw stderr
+  // narratives slip through. 30d audit (2026-04-30) found 64 such 'Error: X'
+  // entries in projects--mem alone. Fix: passthrough check now overrides imp escape.
+  it('blocks Error: X with imp=2 when narrative is raw passthrough (rule-inflated escape)', () => {
+    expect(isNoiseObservation({
+      title: 'Error: tests/foo.test.mjs, schema.mjs',
+      narrative: 'npx vitest run tests/foo.test.mjs → ERROR: SqliteError: no such column: foo at Database.prepare',
+      facts: [],
+      importance: 2,
+    }, {})).toBe(true);
+  });
+
+  it('blocks Modified X with imp=3 when narrative is "; "-joined entry passthrough', () => {
+    expect(isNoiseObservation({
+      title: 'Modified migration/0042_users.sql',
+      narrative: 'Edit /a/foo.mjs; Bash npm test → FAIL; Bash git diff → diff --git a/foo b/foo @@ -1 +1 @@',
+      facts: [],
+      importance: 3,
+    }, {})).toBe(true);
+  });
+
+  it('still keeps imp=2 LOW_SIGNAL when narrative is empty (no passthrough signal)', () => {
+    // imp>=2 escape still applies when narrative does NOT look like raw output.
+    expect(isNoiseObservation({
+      title: 'Modified schema.mjs',
+      narrative: '',
+      facts: [],
+      importance: 2,
+    }, {})).toBe(false);
+  });
 });
 
 describe('capNoiseImportance — v2.47 P0-3 write-side importance cap', () => {

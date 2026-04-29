@@ -208,6 +208,10 @@ describe('handleLLMEpisode', () => {
     db.close = () => {};
 
     openDb.mockReturnValue(db);
+    // v2.54.0: include lesson_learned in default mock so tests that assert
+    // importance=2 pass under the lesson-cap rule (no-lesson feature/refactor/
+    // bugfix is now demoted to imp=1). Tests that specifically exercise the
+    // no-lesson path override this default with their own mock.
     callLLM.mockReturnValue(JSON.stringify({
       type: 'feature',
       title: 'Add user authentication',
@@ -215,6 +219,7 @@ describe('handleLLMEpisode', () => {
       concepts: ['auth', 'jwt'],
       facts: ['Uses RS256 signing'],
       importance: 2,
+      lesson_learned: 'JWT auth flow chose RS256 over HS256 for key rotation support',
     }));
   });
 

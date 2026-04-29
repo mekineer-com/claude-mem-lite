@@ -2,6 +2,25 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.54.0] - 2026-04-30
+
+**Memory-quality audit follow-up — write-side noise gates tightened, auto-maintain optimize widened.** End-to-end audit (2026-04-30) found three concrete quality leaks: bugfix `lesson_learned` coverage was 11.2% (contract requires lessons for every non-trivial bug), `Error: X` rule-fallback titles were leaking into the DB at 64/30d via the `importance>=2` escape hatch in the noise filter, and `mem_optimize` had only ever processed 56 observations across the whole library because the auto-maintain default (`scope: 'narrow'`) almost never matched a candidate. Three targeted fixes; no schema change; benchmark Recall@10 0.8996 (baseline 0.885, +1.5pp).
+
+### Changed
+
+- **`hook-llm.mjs:682-690` — lesson-cap extended from `{change, discovery}` to all types except `decision`.** Prior behavior: when Haiku returned no `lesson_learned` (or `'none'` / `<12 chars`) for a `bugfix` / `refactor` / `feature` episode, the row was still saved at Haiku-claimed importance (often 2-3 from rule-floor `Math.max`). Net effect across 30 days: 765 bugfix rows / only 86 with a lesson (11.2%) — vs 765 × 64.4% retrieval hit-rate, the high-value type whose lesson channel is meant to feed future sessions. New behavior: `isLessonLowSignal && type !== 'decision'` caps importance to `Math.min(ruleImportance, 1)`, putting the row on the 7-day accelerated auto-compress window. `decision` is exempt because it's rare (39 obs all-time / 94.9% hit-rate) and the retry path already gave it a second chance — a no-lesson decision still carries a tradeoff signal worth preserving. Test fixture default `callLLM.mockReturnValue` updated to include a representative lesson so feature-routing tests stay decoupled from the importance-escape semantics.
+- **`lib/low-signal-patterns.mjs::isNoiseObservation` — raw passthrough now overrides the `importance>=2` escape.** Prior order: low-signal title → no lesson → `imp>=2` short-circuit `return false` → keep. This let rule-inflated `Error: tests/foo.test.mjs` rows survive even when their narrative was just `"npx vitest run → ERROR: SqliteError: no such column"` raw stderr — `computeRuleImportance` fires `imp=2` on test/schema/migration filename heuristics regardless of narrative content. New order: `_isLikelyToolOutputPassthrough(narrative) || /^Error[: ]/i.test(narrative)` returns `true` (drop) before checking importance. Three regression tests added (imp=2+passthrough drops, imp=3+`; `-join entry-passthrough drops, imp=2 with empty narrative still keeps so the substantive escape isn't broken). Pairs with the existing `capNoiseImportance` per the #8152 paired-gate model — drop and demote check the same passthrough signal.
+- **`hook-optimize.mjs::handleLLMOptimize` — auto-maintain default scope flipped from `'narrow'` to `'wide'`.** Narrow only matched fully-degraded rows (no concepts AND no facts AND no lesson AND no aliases) — Haiku-enriched observations rarely qualify, so daily auto-maintain found 0 candidates almost every run (production: only 56 rows ever optimized across months). Wide targets `bugfix / refactor / feature / decision` rows with substantive narrative (≥100 chars) but missing `lesson_learned`, excluding LOW_SIGNAL titles — exactly the audit's bugfix-no-lesson back-catalog. Budget unchanged: `distributeBudget(15) → 6/day` LLM re-enrichment calls, bounded by the existing semaphore. CLI `mem optimize` retains `narrow` as the explicit-invocation default so user-driven optimize calls keep their prior contract.
+
+### Tests
+
+- 1988 / 1988 passed (78 files, 12.20s).
+- Benchmark: Recall@10 0.8996 / Precision@10 0.9731 / nDCG@10 0.9739 / MRR@10 0.9667 / P95 latency 0.197ms.
+
+### Notes
+
+This is a write-side behavior change for new observations only — the historical 765 bugfix rows are unaffected by the `hook-llm.mjs` cap, but get gradually rewritten by the wider-scope `mem_optimize` (≈110 days at 6/day to backfill the full bugfix candidate set).
+
 ## [2.53.2] - 2026-04-30
 
 **Install-path audit follow-up — three latent issues from the v2.53.1 post-fix audit closed.** After shipping the v2.53.1 preflight (issue #15), an Explore-agent pass over the install / upgrade / launch code surfaced eight more potential failure modes. Five were either false alarms (the resolveLaunchEntry early-return correctly handles the "fresh install with no `~/.claude-mem-lite/` yet" path; verified empirically) or already-protected (curl/tar failures fall to `debugCatch` and "deferred update", partial tarballs trigger the staging→backup rollback at `hook-update.mjs:297-310`). Three were real and same-class as the bug we just fixed — fixing them now so we don't ship a v2.53.3 next week.

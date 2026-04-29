@@ -677,9 +677,13 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
         files: episode.files,
         filesRead: episode.filesRead || [],
         // v2.33.1: when lesson is low-signal, don't trust Haiku's importance
-        // inflation for noise-prone types. rule-based floor still applies so
-        // error-in-test (→3) / config-change (→2) keep their floor.
-        importance: isLessonLowSignal && (parsed.type === 'change' || parsed.type === 'discovery')
+        // inflation. v2.54.0: extended from {change, discovery} to all types
+        // except `decision` after audit (2026-04-30) showed bugfix lesson
+        // coverage 11.2% / refactor hit-rate 18.1% — Haiku marks bugfix/refactor
+        // imp=2-3 even when lesson is null after retry. Keep `decision` exempt:
+        // it's rare (39 obs / 94.9% hit-rate) and the retry path already gave
+        // it a second chance; a no-lesson decision is still a worthwhile signal.
+        importance: isLessonLowSignal && parsed.type !== 'decision'
           ? Math.min(ruleImportance, 1)
           : Math.max(ruleImportance, clampImportance(parsed.importance)),
         lessonLearned,
