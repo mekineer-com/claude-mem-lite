@@ -34,6 +34,12 @@ export function detectMissingImports(installRoot) {
     return ['server.mjs'];
   }
 
+  // Strip line + block comments so example strings in docblocks (e.g. the very
+  // patterns this regex enumerates) can't false-fire as "missing files".
+  src = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+
   const missing = new Set();
   for (const re of [FROM_RE, IMPORT_RE]) {
     re.lastIndex = 0;

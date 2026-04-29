@@ -2,6 +2,29 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.53.2] - 2026-04-30
+
+**Install-path audit follow-up — three latent issues from the v2.53.1 post-fix audit closed.** After shipping the v2.53.1 preflight (issue #15), an Explore-agent pass over the install / upgrade / launch code surfaced eight more potential failure modes. Five were either false alarms (the resolveLaunchEntry early-return correctly handles the "fresh install with no `~/.claude-mem-lite/` yet" path; verified empirically) or already-protected (curl/tar failures fall to `debugCatch` and "deferred update", partial tarballs trigger the staging→backup rollback at `hook-update.mjs:297-310`). Three were real and same-class as the bug we just fixed — fixing them now so we don't ship a v2.53.3 next week.
+
+### Fixed
+
+- **`scripts/launch.mjs:13-25`** — wrapped the `npm install --omit=dev` call in try/catch. Pre-fix, if MCP server launch hit a read-only plugin cache, a full disk, or a network block, the user saw a Node `ChildProcessError` stack trace. Now they get one line each for: which dir failed, the most likely cause (read-only / disk full / network), and the exact repair command (`cd "<root>" && npm install --omit=dev`). Same UX class as v2.53.1's `ERR_MODULE_NOT_FOUND` cleanup — opaque-stack → actionable-line.
+- **`scripts/pre-commit.sh:8-32`** — version-sync check now covers `package-lock.json` alongside `package.json` / `plugin.json` / `marketplace.json` / `CLAUDE.md`. Pre-fix, the lock file was drifting at 2.51.0 across multiple releases because the four-file check didn't include it (caught and bumped manually in v2.53.1; now caught automatically going forward).
+
+### Added
+
+- **`tests/source-files-sync.test.mjs:67-82` (new test)** — `scripts/launch.mjs and its transitive .mjs imports stay under scripts/`. Walks the import graph from `scripts/launch.mjs`, asserts every relative `.mjs` reachable (a) exists on disk and (b) lives under `scripts/` so the install.mjs / hook-update.mjs whole-directory copy actually picks it up. The previous ENTRY_MODULES list (`cli.mjs / hook.mjs / server.mjs / mem-cli.mjs / install.mjs`) didn't trace `scripts/launch.mjs`, so a future dev adding e.g. `scripts/lib/x.mjs` referenced from launch.mjs could ship a tarball-complete release where the plugin-cache layout was still missing the new file. Same regression class as #8 (tier.mjs) / #14 (hook-optimize.mjs) / #15 (search-engine.mjs) — three of the last five GitHub issues — just one directory layer up. Test fires before they can land.
+- **`tests/launch-preflight.test.mjs` (new case)** — `ignores example strings in line + block comments`. Locks in the strip-comments behavior added to `detectMissingImports` so docblocks containing example imports (`// import './x.mjs'`) can't false-fire as "missing files".
+
+### Changed
+
+- **`scripts/launch-preflight.mjs::detectMissingImports`** — strips `//` line comments and `/* */` block comments before running the import regex. Defensive change so future docblocks with import examples in `server.mjs` (or anywhere else this gets pointed at) don't trip the detector.
+- **`tests/source-files-sync.test.mjs::extractLocalImports`** — same comment-strip applied to the shared walker, so the new `scripts/launch.mjs` invariant test doesn't choke on its own example strings.
+
+### What was checked but didn't need fixing
+
+The audit also flagged: (a) `~/.claude-mem-lite/` not existing on first-time `npm install -g` — verified false alarm (resolveLaunchEntry's early-return on healthy primary skips the fallback check entirely); (b) better-sqlite3 ABI mismatch on Node version upgrade — `install.mjs::ensureBetterSqlite3Working` already probes this in non-dev mode and the launch.mjs MCP-SDK reinstall pattern handles a similar case; (c) `hook-update.mjs::saveState` swallowing errors silently — only affects rate-limit accounting, low-impact; (d) multi-install confusion when both npm-global and marketplace plugin are present — documented behavior, MCP launches from whichever path Claude Code's `.mcp.json` points at, not a code bug. Skipped to keep this release narrow.
+
 ## [2.53.1] - 2026-04-30
 
 **Install-incomplete preflight at MCP launch — graceful fallback + actionable error instead of `ERR_MODULE_NOT_FOUND` (issue #15).** A user reported v2.53.0 starting with `Cannot find module '.../search-engine.mjs' imported from .../server.mjs'` and concluded the file was missing from the published tarball. Direct verification against three sources (npm registry, npmmirror China, GitHub release tarball) confirmed `search-engine.mjs` IS shipped in v2.53.0 — 12642 bytes, identical SHA, 90 files total — so the broken state was on the user side (most likely a partial `npm install`, npm cache corruption, or permission issue blocking new file writes during the v2.52.0 → v2.53.0 upgrade). But a partial install on the user side shouldn't crash with an opaque Node stack — fix the symptom even though the root cause is upstream.

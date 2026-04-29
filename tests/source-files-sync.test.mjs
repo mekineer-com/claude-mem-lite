@@ -29,8 +29,16 @@ const ENTRY_MODULES = [
   'install.mjs',
 ];
 
+function stripComments(src) {
+  // Strip `// ...` line comments and `/* ... */` block comments so the
+  // import regex doesn't false-fire on example strings inside docblocks.
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|\s)\/\/[^\n]*/g, '$1');
+}
+
 function extractLocalImports(sourcePath) {
-  const src = readFileSync(sourcePath, 'utf8');
+  const src = stripComments(readFileSync(sourcePath, 'utf8'));
   const out = new Set();
   for (const m of src.matchAll(/(?:from|import)\s+['"](\.\/[^'"]+)['"]/g)) out.add(m[1]);
   for (const m of src.matchAll(/import\s*\(\s*['"](\.\/[^'"]+)['"]/g)) out.add(m[1]);
@@ -69,6 +77,31 @@ test('install.mjs and hook-update.mjs both reference the shared SOURCE_FILES mod
   const hookUpdateSrc = readFileSync(resolve(ROOT, 'hook-update.mjs'), 'utf8');
   expect(installSrc).toMatch(/from\s+['"]\.\/source-files\.mjs['"]/);
   expect(hookUpdateSrc).toMatch(/from\s+['"]\.\/source-files\.mjs['"]/);
+});
+
+// scripts/launch.mjs is the MCP server's actual entry point. Pre-2.53.0 it was
+// import-free so it didn't need transitive coverage; v2.53.0 added a relative
+// import (./launch-preflight.mjs) and the regression class is now identical to
+// issue #15 — just one directory level up. scripts/ is whole-tree copied by
+// install.mjs / hook-update.mjs (NOT via SOURCE_FILES), so the invariant we
+// assert is different: every relative .mjs reachable from scripts/launch.mjs
+// must (a) exist on disk and (b) live under scripts/, so the directory copy
+// catches it.
+test('scripts/launch.mjs and its transitive .mjs imports stay under scripts/', () => {
+  const visited = walk('scripts/launch.mjs');
+  const errors = [];
+  for (const mod of visited) {
+    if (!/\.mjs$/.test(mod)) continue;
+    const abs = resolve(ROOT, mod);
+    if (!existsSync(abs)) {
+      errors.push(`${mod} — referenced from scripts/launch.mjs but missing on disk`);
+      continue;
+    }
+    if (!mod.startsWith('scripts/')) {
+      errors.push(`${mod} — scripts/launch.mjs imports outside scripts/, breaks plugin-cache install`);
+    }
+  }
+  expect(errors, `\nscripts/launch.mjs companion-file invariant broken:\n  ${errors.join('\n  ')}\n`).toEqual([]);
 });
 
 test('package.json files array ships source-files.mjs and every SOURCE_FILES entry', () => {

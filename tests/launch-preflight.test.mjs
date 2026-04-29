@@ -79,6 +79,18 @@ describe('detectMissingImports', () => {
     expect(detectMissingImports(d)).toEqual([]);
   });
 
+  it('ignores example strings in line + block comments', () => {
+    const d = tmp();
+    writeFileSync(
+      join(d, 'server.mjs'),
+      `// Example: import { x } from './nonexistent.mjs';\n` +
+        `/* import './also-nonexistent.mjs' */\n` +
+        `import { y } from './real.mjs';\n`,
+    );
+    writeFileSync(join(d, 'real.mjs'), '');
+    expect(detectMissingImports(d)).toEqual([]);
+  });
+
   it('deduplicates the same missing file mentioned in static + dynamic imports', () => {
     const d = tmp();
     writeFileSync(

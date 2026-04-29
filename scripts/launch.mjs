@@ -12,12 +12,22 @@ const ROOT = process.env.CLAUDE_PLUGIN_ROOT || join(__dirname, '..');
 
 if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
   process.stderr.write('[claude-mem-lite] Installing dependencies...\n');
-  execSync('npm install --omit=dev', {
-    cwd: ROOT,
-    stdio: ['ignore', 'pipe', 'inherit'], // stdout piped (discard), stderr inherit
-    timeout: 120_000,
-  });
-  process.stderr.write('[claude-mem-lite] Dependencies installed\n');
+  try {
+    execSync('npm install --omit=dev', {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'inherit'], // stdout piped (discard), stderr inherit
+      timeout: 120_000,
+    });
+    process.stderr.write('[claude-mem-lite] Dependencies installed\n');
+  } catch (e) {
+    // Plugin-cache / multi-user / disk-full installs can fail here. Without this
+    // catch the user sees a Node stack trace; with it they get an actionable line.
+    const detail = e.message?.split('\n')[0] || e.code || 'unknown error';
+    process.stderr.write(`[claude-mem-lite] npm install failed in ${ROOT} — ${detail}\n`);
+    process.stderr.write(`[claude-mem-lite] Likely cause: read-only directory, disk full, or network blocked.\n`);
+    process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm install --omit=dev\n`);
+    process.exit(1);
+  }
 }
 
 // Verify MCP SDK is importable (exports mapping intact).
