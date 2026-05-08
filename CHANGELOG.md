@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.59.0] - 2026-05-09
+
+**Drop Node 18 support — `engines.node: ">=20"`.** Node 18 went EOL on 2026-04-30 (12 months ago at this release). vitest 4's bundler `rolldown` already imports `node:util.styleText` (added in Node 20.12+); the v2.58.2 `npm@10` lockfile regen pulled in a newer rolldown that breaks Node 18 startup with `SyntaxError: 'node:util' does not provide an export named 'styleText'`. Rather than pin rolldown back and accumulate downstream tech debt, this release officially drops Node 18.
+
+### Breaking
+
+- **`package.json::engines.node` `>=18` → `>=20`.** `npm install` on Node 18 will print an `engines` warning but still install. Hooks and MCP server require Node 20.12+ at runtime starting this release.
+- **`.github/workflows/ci.yml` matrix `[18, 20, 22, 24]` → `[20, 22, 24]`.** Test coverage now runs on every supported Node version (was: 18 ran `npx vitest run`, 20+ ran `npm run test:coverage`; now uniformly `test:coverage`).
+
+### Migration
+
+If your project uses claude-mem-lite on Node 18: upgrade Node to 20.x or 22.x LTS (Node 22 is the active LTS through April 2027). The CLI / MCP server / hooks have no other version-specific behavior changes — only the engine constraint.
+
 ## [2.58.2] - 2026-05-09
 
 **Hotfix-of-hotfix: regenerate lockfile via npm@10 to seat platform-optional `@emnapi/core` and `@emnapi/runtime` at top level.** v2.58.1 fixed the `npm audit` CVE block but its lockfile was generated locally by npm@11.6 — that version omits top-level entries for `@emnapi/core@1.10.0` and `@emnapi/runtime@1.10.0` (declared as deps of `@oxc-parser/binding-win32-*` bindings, not installed on Linux). CI's bundled npm@10 then refused `npm ci` with EUSAGE: `Missing: @emnapi/core@1.10.0 from lock file`. Tested by running `npx --yes npm@10.9.2 install` locally — the resulting lockfile has both `@emnapi/core` and `@emnapi/runtime` as top-level entries; `npm audit --omit=dev` exits 0; `npm ci` graph constraint is satisfied (verified via lockfile structural check). No source code changes.
