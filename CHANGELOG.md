@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.58.1] - 2026-05-09
+
+**Hotfix: unblock release pipeline.** v2.58.0 (and v2.56.0 / v2.57.0 before it) failed in the publish workflow at the `npm audit --omit=dev` step due to transitive HTTP-stack CVEs from `@modelcontextprotocol/sdk`. The releases never published to npm — npm `latest` had been stuck at 2.55.0 for 9 days. Auto-update users on `releases/latest` were stuck on 2.55.0 as well. This release closes the actual deferred /cso Finding #5 and ships a clean lockfile.
+
+### Fixed
+
+- **`package.json::overrides` extended to actual fixed versions.** Previous override `"hono": ">=4.12.14"` was inside the affected range (vuln spans `<=4.12.15`) so the audit gate continued to fail. Updated to:
+  - `hono: >=4.12.16` (latest 4.12.18, fixes GHSA-9vqf-7f2p-gf9v + GHSA-69xw-7hcm-h432)
+  - `fast-uri: >=3.1.2` (fixes GHSA-q3j6-qgpj-74h6 + GHSA-v39h-62p7-jpjc)
+  - `ip-address: >=10.1.1` (fixes GHSA-v2v4-37r5-5v8g; also clears transitive `express-rate-limit` warning)
+- **`package-lock.json` regenerated** via full `npm install` (not `--package-lock-only` — the latter was the v2.58.0 mistake that left `@emnapi/core@1.10.0` missing from the lockfile, causing CI's `npm ci` to fail with EUSAGE on knip's transitive deps).
+
+### Verification
+
+`npm audit --omit=dev` now exits 0 (was: 4 vulnerabilities, exit 1). `npm ci` would now pass on a clean clone (was: EUSAGE on missing `@emnapi/core`). All 80 test files pass (2064/2064 tests). All v2.58.0 hardening from the prior entry remains in place — the source-code changes were already correct; only the release-time gates were broken.
+
+### Postmortem
+
+The root cause was the gap between cso F#5's reachability analysis ("transitive HTTP CVEs not reachable in stdio mode → audit-only noise") and `publish.yml`'s strict `npm audit --omit=dev` gate ("fail closed on any vuln"). The /cso report flagged F#5 as "open, deferred" — but it was actively blocking releases the whole time. Lesson: when a finding is deferred, verify it isn't a release-pipeline failure mode in disguise. Suggest adding a pre-push check that runs the workflow's exact audit command locally.
+
 ## [2.58.0] - 2026-05-09
 
 **Audit-driven security hardening: pin gh-release SHA, tarball validation, Haiku role separation, knip baseline.** Six fixes from a comprehensive security audit (`/cso comprehensive`) plus health/code-quality baselines (`/health`, `/retro 30d`). Closes 4 of 6 cso findings. All 80 test files pass (2064/2064 tests, +19 new), zero ESLint errors, shellcheck clean. Composite health 9.5 → 10.0.
