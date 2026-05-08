@@ -639,10 +639,14 @@ async function handleSessionStart() {
 
       // Auto-compress: mark old low-importance observations as compressed (30+ days, importance=1)
       // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
+      // v2.56.0 #4: protect injection_count > 0 obs (proven contextually relevant
+      // via hook-memory injection, even if user never explicitly fetched). Same
+      // protection applied symmetrically in auto-maintain decay/mark-idle below.
       const compressed = db.prepare(`
         UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
         WHERE COALESCE(compressed_into, 0) = 0
           AND importance = 1
+          AND COALESCE(injection_count, 0) = 0
           AND created_at_epoch < ?
           AND project = ?
       `).run(autoCompressAge, project);
@@ -708,6 +712,11 @@ async function handleSessionStart() {
         if (cleaned.changes > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned.changes} broken observations`);
 
         // Decay: reduce importance of old, never-accessed observations
+        // v2.56.0 #4: injection_count is a separate engagement signal —
+        // hook-memory.mjs bumps it when the obs is auto-injected into Claude's
+        // context. Pre-v2.56 only checked access_count, so an obs auto-injected
+        // 8x (proven contextually relevant) still got decayed/marked. Adding
+        // `injection_count = 0` treats injection as first-class engagement.
         const decayed = db.prepare(`
           UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
           WHERE id IN (
@@ -715,13 +724,15 @@ async function handleSessionStart() {
             WHERE COALESCE(compressed_into, 0) = 0
               AND COALESCE(importance, 1) > 1
               AND COALESCE(access_count, 0) = 0
+              AND COALESCE(injection_count, 0) = 0
               AND created_at_epoch < ?
             LIMIT ${OP_CAP}
           )
         `).run(STALE_AGE);
         if (decayed.changes > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed.changes} stale observations`);
 
-        // Mark idle: importance=1, never-accessed, old → pending-purge (will be purged next cycle)
+        // Mark idle: importance=1, never-accessed, never-injected, old → pending-purge
+        // (will be purged next cycle). v2.56.0 #4: injection_count protects.
         const idleMarked = db.prepare(`
           UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
           WHERE id IN (
@@ -729,6 +740,7 @@ async function handleSessionStart() {
             WHERE COALESCE(compressed_into, 0) = 0
               AND COALESCE(importance, 1) = 1
               AND COALESCE(access_count, 0) = 0
+              AND COALESCE(injection_count, 0) = 0
               AND created_at_epoch < ?
             LIMIT ${OP_CAP}
           )

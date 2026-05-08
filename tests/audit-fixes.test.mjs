@@ -1204,3 +1204,113 @@ describe('T-anchor-prefix: mem_timeline prefix anchor parity (stdio)', () => {
     expect(text).toMatch(/Invalid|Expected N|MCP error|invalid_type|regex/i);
   });
 });
+
+// ─── v2.56.0 #4: injection_count protects from decay/mark-idle ──────────────
+//
+// Pre-v2.56 auto-maintain (hook.mjs:711-735) and cmdMaintain decay (mem-cli.mjs:1568+)
+// only checked access_count=0 when deciding whether to decay imp or mark
+// pending-purge. injection_count is a SEPARATE counter — bumped by
+// hook-memory.mjs when the obs is auto-injected into Claude's context. An obs
+// auto-injected 8x by the hook is contextually proven valuable (Claude saw it
+// during a search-relevant prompt) even if the user never explicitly fetched
+// it via `mem get`. The pre-v2.56 filter would still mark such obs as
+// pending-purge after 30d, deleting them on the next cycle (~37d).
+//
+// Fix: add `AND COALESCE(injection_count, 0) = 0` to both decay and mark-idle
+// WHERE clauses in hook.mjs auto-maintain + mem-cli.mjs cmdMaintain. Treats
+// injection_count as a first-class engagement signal alongside access_count.
+describe('v2.56.0 #4: injection_count protects from auto-maintain decay/mark-idle', () => {
+  let tmpHome, projDir;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'mem-v256-injection-protect-'));
+    projDir = join(tmpHome, 'audit', 't4');
+    mkdirSync(projDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('preserves obs with injection_count > 0 from being marked pending-purge', () => {
+    const { db, dbPath } = initHomeDb(tmpHome);
+    const now = Date.now();
+
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES ('inj-prot-sess', 'inj-prot-mem', 'audit--t4', ?, ?, 'active')
+    `).run(new Date().toISOString(), now);
+
+    // Three obs, all 35d old (>30d STALE_AGE), all imp=1, all access_count=0:
+    //   A: injection_count=8 → MUST survive (proven via injection)
+    //   B: injection_count=0 → must be marked pending-purge (existing behavior)
+    //   C: injection_count=1 → MUST survive (any injection counts)
+    const insertObs = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+        files_read, files_modified, importance, access_count, injection_count, last_injected_at,
+        created_at, created_at_epoch)
+      VALUES ('inj-prot-mem', 'audit--t4', '', 'change', ?, '', '', '', '', '[]', '[]', 1, 0, ?, ?, ?, ?)
+    `);
+    const oldEpoch = now - 35 * DAY_MS;
+    const oldIso = new Date(oldEpoch).toISOString();
+    insertObs.run('A: injected x8 (must survive)', 8, oldEpoch, oldIso, oldEpoch);
+    insertObs.run('B: never injected (must be marked)', 0, null, oldIso, oldEpoch);
+    insertObs.run('C: injected x1 (must survive)', 1, oldEpoch, oldIso, oldEpoch);
+    db.close();
+
+    runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-inj-uuid' }) });
+
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db2.prepare('SELECT title, compressed_into, importance FROM observations ORDER BY title').all();
+      const byTitle = Object.fromEntries(rows.map(r => [r.title, r]));
+
+      // A and C: must NOT be compressed/marked — injection_count > 0 protects
+      expect(byTitle['A: injected x8 (must survive)'].compressed_into).toBeNull();
+      expect(byTitle['C: injected x1 (must survive)'].compressed_into).toBeNull();
+      // B: gets compressed (auto-compress at hook.mjs:642 catches it first with
+      // COMPRESSED_AUTO=-1 since age>30d + imp=1 + injection=0; if not, the
+      // auto-maintain mark-idle would catch it with PENDING_PURGE=-2). Either
+      // marker is the "removed from active corpus" signal — assert the row is
+      // no longer null, not the specific marker, since order between the two
+      // gates is implementation detail.
+      expect(byTitle['B: never injected (must be marked)'].compressed_into).not.toBeNull();
+    } finally { db2.close(); }
+  });
+
+  it('preserves obs with injection_count > 0 from importance decay', () => {
+    const { db, dbPath } = initHomeDb(tmpHome);
+    const now = Date.now();
+
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES ('inj-decay-sess', 'inj-decay-mem', 'audit--t4', ?, ?, 'active')
+    `).run(new Date().toISOString(), now);
+
+    // Two obs, both 35d old, both imp=2, both access_count=0:
+    //   A: injection_count=5 → MUST stay imp=2 (proven via injection)
+    //   B: injection_count=0 → must decay to imp=1 (existing behavior)
+    const insertObs = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+        files_read, files_modified, importance, access_count, injection_count, last_injected_at,
+        created_at, created_at_epoch)
+      VALUES ('inj-decay-mem', 'audit--t4', '', 'change', ?, '', '', '', '', '[]', '[]', 2, 0, ?, ?, ?, ?)
+    `);
+    const oldEpoch = now - 35 * DAY_MS;
+    const oldIso = new Date(oldEpoch).toISOString();
+    insertObs.run('A-decay: injected x5 (must keep imp=2)', 5, oldEpoch, oldIso, oldEpoch);
+    insertObs.run('B-decay: never injected (must decay to 1)', 0, null, oldIso, oldEpoch);
+    db.close();
+
+    runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-decay-uuid' }) });
+
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const rows = db2.prepare('SELECT title, importance FROM observations ORDER BY title').all();
+      const byTitle = Object.fromEntries(rows.map(r => [r.title, r]));
+
+      expect(byTitle['A-decay: injected x5 (must keep imp=2)'].importance).toBe(2);
+      expect(byTitle['B-decay: never injected (must decay to 1)'].importance).toBe(1);
+    } finally { db2.close(); }
+  });
+});

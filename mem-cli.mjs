@@ -1566,6 +1566,9 @@ function cmdMaintain(db, args) {
     }
 
     if (ops.includes('decay')) {
+      // v2.56.0 #4: parity with hook.mjs auto-maintain — injection_count > 0
+      // protects from decay/mark-idle, treating hook injection as first-class
+      // engagement alongside access_count.
       const decayed = db.prepare(`
         UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
         WHERE id IN (
@@ -1573,12 +1576,13 @@ function cmdMaintain(db, args) {
           WHERE COALESCE(compressed_into, 0) = 0
             AND COALESCE(importance, 1) > 1
             AND COALESCE(access_count, 0) = 0
+            AND COALESCE(injection_count, 0) = 0
             AND created_at_epoch < ?
             ${projectFilter} LIMIT ${OP_CAP}
         )
       `).run(staleAge, ...baseParams);
 
-      // Mark importance=1, never-accessed, old observations as pending-purge (aligned with MCP)
+      // Mark importance=1, never-accessed, never-injected, old → pending-purge.
       const idleMarked = db.prepare(`
         UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
         WHERE id IN (
@@ -1586,6 +1590,7 @@ function cmdMaintain(db, args) {
           WHERE COALESCE(compressed_into, 0) = 0
             AND COALESCE(importance, 1) = 1
             AND COALESCE(access_count, 0) = 0
+            AND COALESCE(injection_count, 0) = 0
             AND created_at_epoch < ?
             ${projectFilter} LIMIT ${OP_CAP}
         )

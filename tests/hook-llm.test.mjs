@@ -323,6 +323,121 @@ describe('handleLLMEpisode', () => {
     expect(callLLM.mock.calls.length).toBe(1);
   });
 
+  // v2.56.0 #1 paired-gate DROP. Catches Haiku-titled change obs with null
+  // lesson + capped importance — the dominant noise band (16.5% hit-rate).
+  // Pairs with capNoiseImportance demote (#8152). End-to-end assertion: obs
+  // lands NOWHERE (not events, not observations), no upgrade, no insert.
+  it('v2.56.0 #1: drops type=change with null lesson and importance=1 (no DB write)', async () => {
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change',
+      title: 'Refactored config loading helper',
+      narrative: 'Extracted env parsing into a single loader function',
+      concepts: ['config'],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'none',
+    }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Refactor config', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const obsRows = db.prepare(`SELECT id FROM observations WHERE project = ?`).all('test-proj');
+    expect(obsRows.length).toBe(0);
+    const evRows = db.prepare(`SELECT id FROM events WHERE project = ?`).all('test-proj');
+    expect(evRows.length).toBe(0);
+  });
+
+  it('v2.56.0 #1: deletes pre-saved obs when Haiku reclassifies as low-yield change', async () => {
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change',
+      title: 'Refactored config loading helper',
+      narrative: 'Extracted env parsing into a single loader function',
+      concepts: [],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'none',
+    }));
+
+    // Pre-save a row to mimic the foreground rule-fallback insert.
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+    const preSavedId = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, type, title, importance, created_at, created_at_epoch, narrative, concepts, facts, files_read, files_modified, text)
+      VALUES (?, ?, 'change', 'Modified config.mjs', 1, ?, ?, '', '', '', '[]', '[]', '')
+    `).run('ep-sess', 'test-proj', new Date().toISOString(), Date.now()).lastInsertRowid;
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj', savedId: preSavedId,
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Refactor config', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const stillExists = db.prepare(`SELECT id FROM observations WHERE id = ?`).get(preSavedId);
+    expect(stillExists).toBeUndefined();
+  });
+
+  it('v2.56.0 #1: KEEPS type=change with substantive lesson', async () => {
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change',
+      title: 'Updated FTS5 query in scoring-sql',
+      narrative: 'Switched from hand-built MATCH to sanitizeFtsQuery helper',
+      concepts: ['fts5'],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'BM25 score sign flipped — lower is better in SQLite FTS5; rank ASC, not DESC.',
+    }));
+
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['scoring-sql.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Update query', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const obsRows = db.prepare(`SELECT title, lesson_learned FROM observations WHERE project = ?`).all('test-proj');
+    expect(obsRows.length).toBe(1);
+    expect(obsRows[0].lesson_learned).toContain('BM25 score sign flipped');
+  });
+
+  it('v2.56.0 #1 opt-out: CLAUDE_MEM_KEEP_LOW_SIGNAL=1 disables drop', async () => {
+    vi.stubEnv('CLAUDE_MEM_KEEP_LOW_SIGNAL', '1');
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change',
+      title: 'Refactored config loading helper',
+      narrative: 'Extracted env parsing into a single loader function',
+      concepts: [],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'none',
+    }));
+
+    insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Refactor config', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const obsRows = db.prepare(`SELECT id FROM observations WHERE project = ?`).all('test-proj');
+    expect(obsRows.length).toBe(1);
+  });
+
   it('P3 opt-out: CLAUDE_MEM_NO_LESSON_RETRY=1 skips retry for bugfix', async () => {
     vi.stubEnv('CLAUDE_MEM_NO_LESSON_RETRY', '1');
     callLLM.mockReturnValueOnce(JSON.stringify({
@@ -634,6 +749,10 @@ describe('handleLLMEpisode', () => {
       title: 'Add authentication validation layer',
       narrative: 'Extended authentication with validation',
       concepts: ['auth'], facts: [], importance: 1,
+      // v2.56.0 #1: substantive lesson required to bypass paired-DROP gate
+      // for type=change + null lesson + imp<2. The test exercises link logic,
+      // not the gate; mock a real lesson so the obs is saved.
+      lesson_learned: 'Authentication middleware must guard validation layer before route handlers — order matters.',
     }));
 
     writeFileSync(tmpFile, JSON.stringify({
@@ -665,6 +784,8 @@ describe('handleLLMEpisode', () => {
       title: 'Completely different title here',
       narrative: 'Unrelated narrative text',
       concepts: [], facts: [], importance: 1,
+      // v2.56.0 #1: bypass paired-DROP gate (see "links related observations by FTS5 title match" comment)
+      lesson_learned: 'Shared module edits must update consumer call sites in the same change to keep type contract aligned.',
     }));
 
     writeFileSync(tmpFile, JSON.stringify({
@@ -702,6 +823,8 @@ describe('handleLLMEpisode', () => {
       title: 'Final performance optimization pass',
       narrative: 'Completed performance optimization work',
       concepts: ['optimization'], facts: [], importance: 1,
+      // v2.56.0 #1: bypass paired-DROP gate
+      lesson_learned: 'Bulk perf passes must respect related_ids cap=5 so historic linkage does not unbounded-grow.',
     }));
 
     writeFileSync(tmpFile, JSON.stringify({
@@ -1204,7 +1327,10 @@ describe('lesson_learned and search_aliases extraction', () => {
     expect(parsed.lesson_learned).toBeNull();
   });
 
-  it('lesson_learned "none" is stored as null in DB', async () => {
+  // v2.56.0 #1: under the paired-DROP gate, type=change + lesson="none" + imp<2
+  // is now DROPPED entirely (not saved with null lesson). The pre-v2.56 normalize
+  // path is preserved at line 638-641 — what changed is the downstream drop.
+  it('lesson_learned "none" causes drop for change type (v2.56.0)', async () => {
     callLLM.mockReturnValue(JSON.stringify({
       type: 'change',
       title: 'Minor config update',
@@ -1236,14 +1362,13 @@ describe('lesson_learned and search_aliases extraction', () => {
     await handleLLMEpisode();
 
     const obs = db.prepare('SELECT lesson_learned FROM observations WHERE memory_session_id = ?').get('none-sess');
-    expect(obs).toBeDefined();
-    expect(obs.lesson_learned).toBeNull();
+    expect(obs).toBeUndefined(); // v2.56.0: dropped, not saved
 
     process.argv[3] = origArgv3;
     db._realClose();
   });
 
-  it('lesson_learned "None" (capitalized) is stored as null in DB', async () => {
+  it('lesson_learned "None" (capitalized) causes drop for change type (v2.56.0)', async () => {
     callLLM.mockReturnValue(JSON.stringify({
       type: 'change',
       title: 'Routine file edit',
@@ -1275,8 +1400,7 @@ describe('lesson_learned and search_aliases extraction', () => {
     await handleLLMEpisode();
 
     const obs = db.prepare('SELECT lesson_learned FROM observations WHERE memory_session_id = ?').get('none-cap-sess');
-    expect(obs).toBeDefined();
-    expect(obs.lesson_learned).toBeNull();
+    expect(obs).toBeUndefined(); // v2.56.0: dropped, not saved
 
     process.argv[3] = origArgv3;
     db._realClose();
@@ -1290,14 +1414,17 @@ describe('lesson_learned and search_aliases extraction', () => {
     ['-', 'dash'],
     ['nil', 'nil'],
     ['ok', 'too-short'],
-  ])('v2.33.1: lesson_learned %s is normalized to null and importance downgraded for change type', async (lessonText, tag) => {
+  ])('v2.56.0: lesson_learned %s causes drop for change type (was: normalized + capped)', async (lessonText, tag) => {
+    // v2.33.1 capped imp=2→1 for low-signal lesson via line 686. v2.56.0 #1
+    // adds the paired DROP gate so this combo (change + low-signal lesson +
+    // capped imp=1) lands NOWHERE — the same noise band, just a stricter exit.
     callLLM.mockReturnValue(JSON.stringify({
       type: 'change',
       title: `Routine change ${tag}`,
       narrative: 'Nothing notable',
       concepts: [],
       facts: [],
-      importance: 2, // Haiku over-rates; should be capped back to 1
+      importance: 2, // Haiku over-rates; capped to 1 by line 686, then dropped by gate
       lesson_learned: lessonText,
       search_aliases: [],
     }));
@@ -1323,9 +1450,7 @@ describe('lesson_learned and search_aliases extraction', () => {
     await handleLLMEpisode();
 
     const obs = db.prepare('SELECT lesson_learned, importance FROM observations WHERE memory_session_id = ?').get(sessId);
-    expect(obs).toBeDefined();
-    expect(obs.lesson_learned).toBeNull();
-    expect(obs.importance).toBe(1); // capped from Haiku's inflated 2
+    expect(obs).toBeUndefined(); // v2.56.0: dropped, not saved
 
     process.argv[3] = origArgv3;
     db._realClose();

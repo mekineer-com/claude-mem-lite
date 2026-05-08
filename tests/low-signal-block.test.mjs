@@ -5,7 +5,7 @@
 // Substantive titles pass unchanged. Env CLAUDE_MEM_KEEP_LOW_SIGNAL=1 opts out.
 
 import { describe, it, expect } from 'vitest';
-import { isNoiseObservation, capNoiseImportance } from '../lib/low-signal-patterns.mjs';
+import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from '../lib/low-signal-patterns.mjs';
 
 const EMPTY_ENV = {};
 
@@ -325,5 +325,128 @@ describe('capNoiseImportance — v2.47 P0-3 write-side importance cap', () => {
   it('passes through importance=1 and 0 unchanged', () => {
     expect(capNoiseImportance({ title: 'Modified app.mjs', facts: [], importance: 1 })).toBe(1);
     expect(capNoiseImportance({ title: 'Modified app.mjs', facts: [], importance: 0 })).toBe(0);
+  });
+});
+
+// v2.56.0 #1: paired-gate DROP for type=change + null-lesson + low-importance.
+// Pairs with capNoiseImportance (DEMOTE) per #8152. Existing isNoiseObservation
+// is title-pattern keyed; this gate is type+lesson keyed and catches Haiku-titled
+// `change` obs with substantive-looking titles but no extractable lesson.
+// Empirical baseline: type=change has 16.5% hit-rate vs decision 72.7%; null-lesson
+// `change` is the dominant noise band (67% of recent obs).
+describe('isLowYieldChangeObs — v2.56.0 #1 paired DROP', () => {
+  it('drops type=change with null lesson and importance=1', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Updated FTS5 query in scoring-sql',
+      lessonLearned: null,
+      importance: 1,
+    })).toBe(true);
+  });
+
+  it('drops type=change with lesson="none" and importance=1', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Refactored cmdSearch helper',
+      lessonLearned: 'none',
+      importance: 1,
+    })).toBe(true);
+  });
+
+  it('drops type=change with lesson<12 chars (short noise like "ok"/"works")', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Edited schema.mjs',
+      lessonLearned: 'fixed it',
+      importance: 1,
+    })).toBe(true);
+  });
+
+  it('drops type=change with lesson="" (empty after trim)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Updated cmdSearch',
+      lessonLearned: '   ',
+      importance: 1,
+    })).toBe(true);
+  });
+
+  it('keeps type=change when lesson_learned is substantive (>=12 chars, not "none")', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Updated FTS5 query in scoring-sql',
+      lessonLearned: 'BM25 score sign flipped — lower is better in SQLite FTS5',
+      importance: 1,
+    })).toBe(false);
+  });
+
+  it('keeps type=change when importance >= 2 (Haiku flagged as notable)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Updated FTS5 query',
+      lessonLearned: null,
+      importance: 2,
+    })).toBe(false);
+  });
+
+  it('keeps type=bugfix even with null lesson (only `change` is gated; bugfix retry path handles its own null)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'bugfix',
+      title: 'Fixed FTS5 trigger crash',
+      lessonLearned: null,
+      importance: 1,
+    })).toBe(false);
+  });
+
+  it('keeps type=decision regardless (decision is high-yield, gate never fires)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'decision',
+      title: 'Use single source-of-truth module',
+      lessonLearned: null,
+      importance: 1,
+    })).toBe(false);
+  });
+
+  it('keeps type=feature/refactor/discovery (not in gate scope)', () => {
+    for (const type of ['feature', 'refactor', 'discovery']) {
+      expect(isLowYieldChangeObs({
+        type,
+        title: 'Some title',
+        lessonLearned: null,
+        importance: 1,
+      })).toBe(false);
+    }
+  });
+
+  it('accepts snake_case lesson_learned field (parity with isNoiseObservation)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Refactored helper',
+      lesson_learned: null,
+      importance: 1,
+    })).toBe(true);
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Refactored helper',
+      lesson_learned: 'BM25 score sign flipped — lower is better in SQLite FTS5',
+      importance: 1,
+    })).toBe(false);
+  });
+
+  it('respects CLAUDE_MEM_KEEP_LOW_SIGNAL=1 opt-out (parity with isNoiseObservation)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Updated cmdSearch',
+      lessonLearned: null,
+      importance: 1,
+    }, { CLAUDE_MEM_KEEP_LOW_SIGNAL: '1' })).toBe(false);
+  });
+
+  it('treats missing importance as 1 (default)', () => {
+    expect(isLowYieldChangeObs({
+      type: 'change',
+      title: 'Updated cmdSearch',
+      lessonLearned: null,
+    })).toBe(true);
   });
 });

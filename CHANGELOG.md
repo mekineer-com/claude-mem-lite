@@ -2,6 +2,39 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.56.0] - 2026-05-08
+
+**Memory-quality Stage 1: write-side type-aware drop + injection-proven protection.** Two targeted changes that lift signal density without increasing per-session context cost. Stage 1 of a 5-step plan; Stage 2 (#2/#3/#5: empirical inject scoring, task-level budget, cross-project lessons) waits 1–2 weeks for clean-corpus baseline data before calibration. All 78 / 78 test files pass (2008 / 2008 tests), zero context overhead added.
+
+### Added
+
+- **`lib/low-signal-patterns.mjs::isLowYieldChangeObs`** — paired-gate DROP for `type='change'` + null/short/`'none'` lesson + `importance<2`. Pairs with the existing `capNoiseImportance` DEMOTE per the #8152 paired-gate model. Existing `isNoiseObservation` is title-pattern keyed (matches `^Modified `/`^Worked on `/etc.) and only catches rule-fallback degraded titles; Haiku-titled `change` observations with substantive-looking titles but null lessons slipped through. New gate is `(type, lesson, importance)` keyed and catches them. Wired into `hook-llm.mjs::handleLLMEpisode` after Haiku response, before `persistHaikuSummary` — drops the obs entirely (deletes pre-saved row if any). Opt-out: `CLAUDE_MEM_KEEP_LOW_SIGNAL=1` (parity with `isNoiseObservation`). 12 new tests in `tests/low-signal-block.test.mjs`, 4 integration tests in `tests/hook-llm.test.mjs`.
+
+  Empirical baseline (live `projects--mem` DB, 3687 obs as of 2026-05-08): `type=change` is 67% of recent 30d obs and has measured 16.5% historical hit-rate vs `decision` 72.7%. The `change + null lesson + imp<2` band is the dominant noise. Existing `change` obs with substantive lessons or `imp>=2` Haiku flags are unaffected.
+
+### Fixed
+
+- **`hook.mjs::auto-maintain` and `hook.mjs::auto-compress` decay/mark-idle/compress paths now respect `injection_count > 0` as engagement signal.** Pre-fix all three queries (auto-compress at line 642, decay at 711, mark-idle at 725) only checked `access_count = 0` when deciding whether to demote/mark/compress an old `imp=1` row. `injection_count` is a separate counter (schema v26+) bumped by `hook-memory.mjs` when an obs is auto-injected into Claude's context — proven contextually relevant via search-relevant prompts, even if the user never explicitly fetched via `mem get`. Pre-fix an obs auto-injected 8x then idle 30d still got marked pending-purge → deleted on next 37d cycle. Now: `AND COALESCE(injection_count, 0) = 0` on all three filters. 152 / 3687 obs in the live DB have `injection_count > 0` (4.1% of corpus); these are now protected from auto-decay regardless of `access_count`.
+
+  Same protection applied symmetrically in `mem-cli.mjs::cmdMaintain` decay branch for CLI/MCP parity (per #8217 single-source-of-truth: filter must match across both call sites). 2 regression tests in `tests/audit-fixes.test.mjs::v2.56.0 #4`.
+
+### Changed
+
+- **`scripts/mock-claude.mjs` returns a substantive `lesson_learned` field.** Previously omitted; under the new paired-DROP gate the mocked `type='change' + imp=1 + no lesson` would land in the noise band and fail e2e tests that assert observation persistence. Realistic mock — Haiku in production usually produces some lesson on first pass; the noise band the gate targets is `lesson_learned: 'none'` after Haiku gave up.
+
+- **`tests/hook-llm.test.mjs` — three related-obs linking tests + seven `v2.33.1` lesson-normalization tests updated for new drop behavior.** Linking tests now mock a substantive `lesson_learned` so the gate doesn't fire (linking logic is the test focus, not the gate). The seven parametric `v2.33.1: lesson_learned X is normalized to null and importance downgraded` tests now assert `obs IS undefined` (dropped) instead of `obs.lesson_learned IS NULL` (saved-with-null) — same noise band, stricter exit. Test names renamed `v2.56.0: lesson_learned X causes drop for change type` to flag the behavior shift to future readers.
+
+### Tests
+
+- 78 files / **2008 / 2008 passed** (was 1990; +18 from new write-side drop tests + #4 injection-protection tests + the v2.33.1 retasked assertions).
+- ESLint clean.
+
+### Notes
+
+This release changes write-path behavior for one specific noise band (`type=change` + null lesson + `imp<2`) and one decay/compress filter (`injection_count > 0` protection). Existing observations are unaffected on disk; only the auto-maintain/auto-compress passes that run on the next SessionStart will see the new filter. No schema change, no MCP tool surface change, no per-session token cost change. Users who want the pre-v2.56 write-path behavior can set `CLAUDE_MEM_KEEP_LOW_SIGNAL=1`.
+
+Stage 2 prerequisites (1–2 weeks of clean-corpus baseline) are tracked but not yet shipped: empirical injection scoring (#2), task-level injection budget by L0/L1/L2/L3 prompt classification (#3), and cross-project lesson sharing for proven-useful obs (#5).
+
 ## [2.55.0] - 2026-04-29
 
 **Install / update / uninstall lifecycle audit — five concrete fixes across the boot, auto-update, and plugin-mode codepaths.** Full-pipeline review of the install/upgrade/uninstall surface (direct install + plugin install + auto-update via GitHub Releases) found one footgun (`hook-update.mjs` non-recursive copy that would EISDIR-throw and silently roll back the entire update on any future subdirectory under `scripts/` or `registry/`), one drift bug (`syncVersions` ignored `CLAUDE.md` so the pre-commit version-sync gate would red-light a release commit until manually re-edited), one dead-code path (`commands/` copied + symlinked into `~/.claude-mem-lite/` even though Claude Code never reads that location), one consistency leak (auto-update's recursive script copy shipped dev-only files like `mock-claude.mjs` / `extract-repos.mjs` / `p0-forward-probe.mjs` from the GitHub Releases tarball into every user's data dir), and one edge case (a user who installs both directly *and* via the marketplace plugin runs every hook twice forever after `/plugin uninstall` because that command doesn't touch `~/.claude/settings.json`). All five fixed; 1990 / 1990 tests pass; lint clean.

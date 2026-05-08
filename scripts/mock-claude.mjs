@@ -21,6 +21,11 @@ process.stdin.on('end', () => {
       concepts: ['mock-concept', 'testing'],
       facts: ['mock fact 1', 'mock fact 2'],
       importance: isError ? 2 : 1,
+      // v2.56.0 #1: paired-DROP gate requires substantive lesson for type=change
+      // + imp<2. Real Haiku usually produces a lesson on first pass; the noise
+      // band the gate targets is `lesson_learned: 'none'` after Haiku gave up.
+      // Mock returns a realistic lesson so e2e tests exercise the save path.
+      lesson_learned: 'Mock lesson — extracted insight that justifies persisting this observation.',
     }));
   } else if (prompt.includes('"request":"what the user was working on"')) {
     // Session summary prompt

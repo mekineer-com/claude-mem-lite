@@ -16,7 +16,7 @@ import {
   sessionFile, getSessionId, openDb, callLLM, sleep,
 } from './hook-shared.mjs';
 import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
-import { isNoiseObservation, capNoiseImportance } from './lib/low-signal-patterns.mjs';
+import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from './lib/low-signal-patterns.mjs';
 
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
@@ -689,6 +689,27 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
         lessonLearned,
         searchAliases,
       };
+
+      // v2.56.0 #1: paired-gate DROP. Haiku-titled `change` obs with null lesson
+      // and capped importance=1 are the dominant noise band (16.5% hit-rate vs
+      // decision 72.7%; 67% of recent corpus). Pairs with capNoiseImportance
+      // demote at line above per #8152 paired-gate model. Existing
+      // isNoiseObservation gate is title-pattern keyed and misses these because
+      // Haiku writes substantive-looking titles. Discard pattern mirrors the
+      // `parsed.importance === 0` block above: delete pre-saved row if any,
+      // unlink tmp, return without insert.
+      if (isLowYieldChangeObs(obs)) {
+        debugLog('DEBUG', 'llm-episode', `dropped low-yield change: "${truncate(obs.title || '', 60)}"`);
+        if (episode.savedId) {
+          const ddb = openDb();
+          if (ddb) {
+            try { ddb.prepare('DELETE FROM observations WHERE id = ?').run(episode.savedId); }
+            finally { ddb.close(); }
+          }
+        }
+        try { unlinkSync(tmpFile); } catch {}
+        return;
+      }
     }
   }
 
