@@ -7,7 +7,7 @@ import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
-import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared } from './haiku-client.mjs';
+import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs only pulls in fs/path/os/crypto;
 // adopt-content.mjs is pure strings. No circular deps — memdir doesn't import hook-shared.
 import { memdirPath as _memdirPath, isAdopted as _isAdopted } from './memdir.mjs';
@@ -101,11 +101,15 @@ export function openDb() {
 
 // ─── LLM via claude CLI ─────────────────────────────────────────────────────
 
+// Accepts either a plain string (legacy) or {system, user} (defense-in-depth
+// against prompt injection from poisoned user_prompts content — cso F#4 fix).
+// CLI mode renders the {system, user} form via flattenForCLI which inserts an
+// explicit data-boundary marker; API mode uses the system role natively.
 export function callLLM(prompt, timeoutMs = 15000) {
   const { cli: modelName } = resolveModelShared();
   try {
     const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName], {
-      input: prompt,
+      input: _flattenForCLI(prompt),
       timeout: timeoutMs,
       encoding: 'utf8',
       env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },

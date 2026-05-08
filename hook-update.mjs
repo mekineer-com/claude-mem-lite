@@ -56,7 +56,7 @@ export async function checkForUpdate(options = {}) {
     if (hasUpdate) {
       debugLog('DEBUG', 'hook-update', `Update available: ${currentVersion} → ${latest.version}`);
       const canInstall = !pluginMode && Boolean(allowInstall);
-      const success = canInstall ? await downloadAndInstall(latest.tarballUrl) : false;
+      const success = canInstall ? await downloadAndInstall(latest.tarballUrl, latest.version) : false;
       const newState = {
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : currentVersion,
@@ -200,7 +200,7 @@ const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'
 
 // ── Download & Install ─────────────────────────────────────
 // Direct file copy instead of running old install.mjs (avoids symlink overwrite in dev)
-async function downloadAndInstall(tarballUrl) {
+async function downloadAndInstall(tarballUrl, expectedVersion) {
   const tmpDir = join(tmpdir(), `claude-mem-lite-update-${Date.now()}`);
   try {
     mkdirSync(tmpDir, { recursive: true });
@@ -217,6 +217,12 @@ async function downloadAndInstall(tarballUrl) {
     execFileSync('tar', ['xzf', tarballPath, '-C', tmpDir, '--strip-components=1'],
       { timeout: 30000, stdio: 'pipe' });
 
+    const validation = validateExtractedTarball(tmpDir, expectedVersion);
+    if (!validation.ok) {
+      debugLog('WARN', 'hook-update', `Tarball validation failed: ${validation.reason}`);
+      return false;
+    }
+
     return installExtractedRelease(tmpDir);
   } catch (err) {
     debugCatch(err, 'downloadAndInstall');
@@ -224,6 +230,45 @@ async function downloadAndInstall(tarballUrl) {
   } finally {
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
+}
+
+// Defense-in-depth check on the extracted GitHub tarball before we hand it to
+// installExtractedRelease (which runs `npm install` in staging). Catches:
+// - tarball whose package.json `name` is not claude-mem-lite (repo rename / squatter)
+// - tarball whose `version` does not match the GitHub tag we resolved (replay /
+//   wrong-version artifact)
+// - tarball missing critical entry points (truncated download / wrong content)
+//
+// This is NOT a full signature check. A motivated attacker who controls the
+// repo can rewrite package.json. Future: GitHub release attestations
+// (`gh attestation verify`) — requires publish.yml to opt into attestations
+// and a sigstore trust anchor.
+export function validateExtractedTarball(sourceDir, expectedVersion, expectedName = 'claude-mem-lite') {
+  const pkgPath = join(sourceDir, 'package.json');
+  if (!existsSync(pkgPath)) return { ok: false, reason: 'package.json missing in extracted tarball' };
+
+  let pkg;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  } catch (e) {
+    return { ok: false, reason: `package.json unparseable: ${e.message}` };
+  }
+
+  if (pkg.name !== expectedName) {
+    return { ok: false, reason: `package.json name "${pkg.name}" !== "${expectedName}"` };
+  }
+
+  if (expectedVersion && pkg.version !== expectedVersion) {
+    return { ok: false, reason: `package.json version "${pkg.version}" !== expected "${expectedVersion}"` };
+  }
+
+  for (const entry of ['cli.mjs', 'server.mjs', 'hook.mjs']) {
+    if (!existsSync(join(sourceDir, entry))) {
+      return { ok: false, reason: `entry-point file missing: ${entry}` };
+    }
+  }
+
+  return { ok: true };
 }
 
 export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {

@@ -27,6 +27,14 @@ import { saveObservation, handleLLMEpisode, handleLLMSummary, buildDegradedTitle
 import { openDb, callLLM } from '../hook-shared.mjs';
 import { acquireLLMSlot } from '../hook-semaphore.mjs';
 
+// v2.58: callLLM now accepts string OR {system, user} (cso F#4 fix). Tests
+// asserting prompt content should normalize both forms before string-matching.
+function promptText(p) {
+  if (typeof p === 'string') return p;
+  if (p && typeof p === 'object') return `${p.system || ''}\n${p.user || ''}`;
+  return String(p ?? '');
+}
+
 // ─── saveObservation ─────────────────────────────────────────────────────────
 
 describe('saveObservation', () => {
@@ -511,7 +519,7 @@ describe('handleLLMEpisode', () => {
 
     const calls = callLLM.mock.calls;
     expect(calls.length).toBeGreaterThan(0);
-    const lastPrompt = calls[calls.length - 1][0];
+    const lastPrompt = promptText(calls[calls.length - 1][0]);
     expect(lastPrompt).toContain('decision = explicit tradeoff');
     expect(lastPrompt).toContain('chose X over Y because Z');
   });
@@ -531,7 +539,7 @@ describe('handleLLMEpisode', () => {
 
     const calls = callLLM.mock.calls;
     expect(calls.length).toBeGreaterThan(0);
-    const lastPrompt = calls[calls.length - 1][0];
+    const lastPrompt = promptText(calls[calls.length - 1][0]);
     expect(lastPrompt).toContain('decision = explicit tradeoff');
     expect(lastPrompt).toContain('bugfix = prior-failing path');
   });
@@ -554,7 +562,7 @@ describe('handleLLMEpisode', () => {
 
     const calls = callLLM.mock.calls;
     expect(calls.length).toBeGreaterThan(0);
-    const lastPrompt = calls[calls.length - 1][0];
+    const lastPrompt = promptText(calls[calls.length - 1][0]);
     expect(lastPrompt).not.toMatch(/['"]none['"]\s+if\s+routine/i);
     expect(lastPrompt).not.toMatch(/write\s+['"]none['"]/i);
     expect(lastPrompt).toContain('output JSON null');
@@ -576,7 +584,7 @@ describe('handleLLMEpisode', () => {
 
     const calls = callLLM.mock.calls;
     expect(calls.length).toBeGreaterThan(0);
-    const lastPrompt = calls[calls.length - 1][0];
+    const lastPrompt = promptText(calls[calls.length - 1][0]);
     expect(lastPrompt).not.toMatch(/['"]none['"]\s+if\s+routine/i);
     expect(lastPrompt).not.toMatch(/write\s+['"]none['"]/i);
     expect(lastPrompt).toContain('output JSON null');

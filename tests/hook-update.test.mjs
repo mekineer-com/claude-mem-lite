@@ -264,3 +264,75 @@ describe('plugin cache pruning', () => {
   });
 });
 
+describe('validateExtractedTarball', () => {
+  function makeTarballDir({ name = 'claude-mem-lite', version = '2.57.0', entries = ['cli.mjs', 'server.mjs', 'hook.mjs'], skipPkg = false } = {}) {
+    const dir = makeDir('mem-tarball-validate');
+    if (!skipPkg) {
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version }));
+    }
+    for (const f of entries) {
+      writeFileSync(join(dir, f), `// ${f}`);
+    }
+    return dir;
+  }
+
+  it('accepts a well-formed tarball when version matches', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ version: '2.57.0' });
+    expect(validateExtractedTarball(dir, '2.57.0')).toEqual({ ok: true });
+  });
+
+  it('rejects when package.json is missing', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ skipPkg: true });
+    const result = validateExtractedTarball(dir, '2.57.0');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/package\.json missing/);
+  });
+
+  it('rejects when package.json is unparseable', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ skipPkg: true });
+    writeFileSync(join(dir, 'package.json'), '{not valid json');
+    const result = validateExtractedTarball(dir, '2.57.0');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/unparseable/);
+  });
+
+  it('rejects when name is wrong (repo squatter / rename)', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ name: 'malicious-clone' });
+    const result = validateExtractedTarball(dir, '2.57.0');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/name "malicious-clone"/);
+  });
+
+  it('rejects when version does not match the resolved tag', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ version: '2.50.0' });
+    const result = validateExtractedTarball(dir, '2.57.0');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/version "2\.50\.0".*"2\.57\.0"/);
+  });
+
+  it('rejects when an entry-point file is missing', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ entries: ['cli.mjs', 'server.mjs'] }); // no hook.mjs
+    const result = validateExtractedTarball(dir, '2.57.0');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/entry-point file missing: hook\.mjs/);
+  });
+
+  it('skips version match when expectedVersion is not provided (release-resolution shortcut)', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ version: '99.99.99' });
+    expect(validateExtractedTarball(dir)).toEqual({ ok: true });
+  });
+
+  it('honors expectedName override (for fork installs)', async () => {
+    const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const dir = makeTarballDir({ name: 'forked-mem-lite', version: '1.0.0' });
+    expect(validateExtractedTarball(dir, '1.0.0', 'forked-mem-lite')).toEqual({ ok: true });
+  });
+});
+

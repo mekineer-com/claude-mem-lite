@@ -26,6 +26,7 @@ fi
 log_ok()   { echo -e "${GREEN}✓${NC} $*" >&2; }
 log_info() { echo -e "${BLUE}ℹ${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}⚠${NC} $*" >&2; }
+# shellcheck disable=SC2317  # kept for API symmetry with log_ok/log_info/log_warn
 log_err()  { echo -e "${RED}✗${NC} $*" >&2; }
 
 # 1. Migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
@@ -71,8 +72,9 @@ mkdir -p "$DATA_DIR/runtime"
 if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   # Fast path: symlink from data dir (instant, no network needed)
   if [[ -d "$DATA_DIR/node_modules/better-sqlite3" ]]; then
-    ln -sfn "$DATA_DIR/node_modules" "$ROOT/node_modules" 2>/dev/null && \
-      log_ok "Dependencies linked from $DATA_DIR" || true
+    if ln -sfn "$DATA_DIR/node_modules" "$ROOT/node_modules" 2>/dev/null; then
+      log_ok "Dependencies linked from $DATA_DIR"
+    fi
   fi
   # Slow path: npm install (first-time only, ~10-20s for native addon)
   if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
@@ -122,11 +124,15 @@ if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   CACHE_DIR="$HOME/.claude/plugins/cache/sdsrss/claude-mem-lite"
   if [[ -d "$CACHE_DIR" ]]; then
     # List version dirs sorted by semver descending, skip top 3
-    # Use while-read instead of mapfile for bash 3.2 (macOS) compatibility
+    # Use glob + while-read for bash 3.2 (macOS) compatibility (no mapfile, no `ls | grep`)
     OLD_VERS=()
+    shopt -s nullglob
+    _all_dirs=("$CACHE_DIR"/[0-9]*)
+    shopt -u nullglob
     while IFS= read -r ver; do
       [[ -n "$ver" ]] && OLD_VERS+=("$ver")
-    done < <(ls -1 "$CACHE_DIR" | grep -E '^[0-9]+\.' | sort -t. -k1,1nr -k2,2nr -k3,3nr | tail -n +4)
+    done < <(for _d in "${_all_dirs[@]}"; do [[ -d "$_d" ]] && echo "${_d##*/}"; done | sort -t. -k1,1nr -k2,2nr -k3,3nr | tail -n +4)
+    unset _all_dirs _d
     if [[ ${#OLD_VERS[@]} -gt 0 ]]; then
       for ver in "${OLD_VERS[@]}"; do
         rm -rf "${CACHE_DIR:?}/$ver" 2>/dev/null || true

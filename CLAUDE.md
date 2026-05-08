@@ -4,13 +4,29 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.57.0
+- **Version**: 2.58.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (61 test files, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs`
 - **DB**: better-sqlite3 + FTS5 full-text search
 - **Node**: >=18, ESM (`"type": "module"`)
+
+## Health Stack
+
+Used by `/health` skill (gstack). Persisted here so detection skips runtime probing.
+
+- typecheck: (skip — pure JS/ESM, no TS in repo)
+- lint: ./node_modules/.bin/eslint .
+- test: ./node_modules/.bin/vitest run
+- deadcode: ./node_modules/.bin/knip
+- shell: shellcheck scripts/post-tool-use.sh scripts/pre-commit.sh scripts/setup.sh
+
+Knip baseline (2026-05-09): 0 unused files, 45 unused exports (mostly v2.21
+utils.mjs split backward-compat re-exports — intentional, do NOT remove without
+audit), 1 duplicate-name export pair (FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS,
+intentional alias). Treat baseline as the floor; flag NEW unused exports as PR
+review signal.
 
 ## Architecture
 

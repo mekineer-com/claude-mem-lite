@@ -1,0 +1,23 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "server.mjs",
+    "hook.mjs",
+    "install.mjs",
+    "benchmark/cite-recall.mjs",
+    "scripts/*.mjs",
+    "scripts/*.js",
+    "tests/**/*.test.mjs"
+  ],
+  "project": [
+    "*.mjs",
+    "lib/**/*.mjs",
+    "cli/**/*.mjs",
+    "scripts/**/*.{mjs,js}",
+    "server/**/*.mjs",
+    "benchmark/**/*.mjs"
+  ],
+  "ignore": [
+    "registry-indexer.mjs"
+  ]
+}

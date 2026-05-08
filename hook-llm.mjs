@@ -558,7 +558,7 @@ export function buildImmediateObservation(episode) {
  *
  * @param {object} episode
  * @param {object} firstPass — parsed first-pass response (title, type, narrative)
- * @returns {string} prompt
+ * @returns {{system: string, user: string}} prompt in split form
  */
 export function buildLessonRetryPrompt(episode, firstPass) {
   const actionList = episode.entries.map((e, i) =>
@@ -567,17 +567,18 @@ export function buildLessonRetryPrompt(episode, firstPass) {
   const typeHint = firstPass.type === 'bugfix'
     ? 'For this bugfix: what was the root cause + how to spot it next time? Example: "FTS5 trigger fires on any UPDATE — wrap access_count writes in try/catch."'
     : 'For this decision: what tradeoff was made + why? Example: "Chose single-source module over schema column because 1 drift point, not 4."';
-  return `A ${firstPass.type} episode just completed. First-pass title: "${firstPass.title || 'untitled'}".
 
-Actions:
-${actionList}
-
-${typeHint}
+  const system = `${typeHint}
 
 If the work was purely mechanical with no insight worth remembering, reply {"lesson":null}.
 Otherwise reply in 12-280 chars. Do NOT invent a fake lesson, do NOT write the string "none".
 
 Reply ONLY valid JSON, no markdown fences: {"lesson":"..."} or {"lesson":null}`;
+  const user = `A ${firstPass.type} episode just completed. First-pass title: "${firstPass.title || 'untitled'}".
+
+Actions:
+${actionList}`;
+  return { system, user };
 }
 
 // ─── Background: LLM Episode Extraction (Tier 2 F) ──────────────────────────
@@ -611,40 +612,43 @@ export async function handleLLMEpisode() {
 
   const fileList = episode.files.map(f => basename(f)).join(', ') || '(multiple)';
 
-  let prompt;
-  if (episode.entries.length === 1) {
-    const e = episode.entries[0];
-    prompt = `Extract a structured observation from this code change. Return ONLY valid JSON, no markdown fences.
-
-Tool: ${e.tool}
-File: ${episode.files.join(', ') || 'unknown'}
-Action: ${e.desc}
-Error: ${e.isError ? 'yes' : 'no'}
-
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
-type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y because Z" / rejected an approach (e.g. "Rejected schema migration — single-source module + sync test instead"; "Heterogeneous hook events → heterogeneous context budgets"). bugfix = prior-failing path fixed with a named root cause. feature = new user-visible capability. refactor = behavior unchanged but structure improved. discovery = learned how a system works (read-heavy, no writes). change = routine edit with no new principle (default if unsure and nothing else fits).
+  // Defense-in-depth (cso F#4): split static instructions (system) from
+  // per-call data (user). Episode descriptions and file paths come from tool
+  // events; treating them as a separate role + boundary marker reduces the
+  // attack surface for memory poisoning via crafted file content.
+  const SHARED_OBS_SCHEMA_TAIL =
+    `type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y because Z" / rejected an approach (e.g. "Rejected schema migration — single-source module + sync test instead"; "Heterogeneous hook events → heterogeneous context budgets"). bugfix = prior-failing path fixed with a named root cause. feature = new user-visible capability. refactor = behavior unchanged but structure improved. discovery = learned how a system works (read-heavy, no writes). change = routine edit with no new principle (default if unsure and nothing else fits).
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
 lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
+
+  let prompt;
+  if (episode.entries.length === 1) {
+    const e = episode.entries[0];
+    const system = `Extract a structured observation from this code change. Return ONLY valid JSON, no markdown fences.
+
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
+${SHARED_OBS_SCHEMA_TAIL}`;
+    const user = `Tool: ${e.tool}
+File: ${episode.files.join(', ') || 'unknown'}
+Action: ${e.desc}
+Error: ${e.isError ? 'yes' : 'no'}`;
+    prompt = { system, user };
   } else {
     const actionList = episode.entries.map((e, i) =>
       `${i + 1}. [${e.tool}] ${e.desc}${e.isError ? ' (ERROR)' : ''}`
     ).join('\n');
 
-    prompt = `Summarize this coding episode as ONE coherent observation. Return ONLY valid JSON, no markdown fences.
-
-Project: ${episode.project}
-Files: ${fileList}
-Actions (${episode.entries.length} total):
-${actionList}
+    const system = `Summarize this coding episode as ONE coherent observation. Return ONLY valid JSON, no markdown fences.
 
 JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
-type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y because Z" / rejected an approach (e.g. "Rejected schema migration — single-source module + sync test instead"; "Heterogeneous hook events → heterogeneous context budgets"). bugfix = prior-failing path fixed with a named root cause. feature = new user-visible capability. refactor = behavior unchanged but structure improved. discovery = learned how a system works (read-heavy, no writes). change = routine edit with no new principle (default if unsure and nothing else fits).
-Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
-importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
-lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
-search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
+${SHARED_OBS_SCHEMA_TAIL}`;
+    const user = `Project: ${episode.project}
+Files: ${fileList}
+Actions (${episode.entries.length} total):
+${actionList}`;
+    prompt = { system, user };
   }
 
   const ruleImportance = computeRuleImportance(episode);
@@ -923,15 +927,18 @@ export async function handleLLMSummary() {
       ? `\nUser requests: ${userPrompts.join(' → ')}\n`
       : '';
 
-    const prompt = `Summarize this coding session. Return ONLY valid JSON, no markdown fences.
-
-Project: ${project}${promptCtx}
-Observations (${recentObs.length} total):
-${obsList}
+    // cso F#4: split system/user. The userPrompts content (line 921) is the
+    // single highest-leakage path for memory poisoning — putting it in the
+    // user role behind an explicit boundary is the main win here.
+    const system = `Summarize this coding session. Return ONLY valid JSON, no markdown fences.
 
 JSON: {"request":"what the user was working on","completed":"specific items accomplished with file names","remaining_items":"specific unfinished items from the original request — compare investigation scope with actual changes to infer what was NOT yet done; be precise with file:issue format, or empty string if all done","next_steps":"suggested follow-up","lessons":["non-obvious insights discovered during this session"],"key_decisions":["important design choices made and WHY"]}
 lessons: Only genuinely non-obvious insights (debugging discoveries, gotchas, architectural reasons). Empty array if routine.
 key_decisions: Only decisions with lasting impact (library choices, architecture, data model). Include reasoning. Empty array if none.`;
+    const user = `Project: ${project}${promptCtx}
+Observations (${recentObs.length} total):
+${obsList}`;
+    const prompt = { system, user };
 
     if (!(await acquireLLMSlot())) {
       debugLog('WARN', 'llm-summary', 'semaphore timeout, skipping summary');
