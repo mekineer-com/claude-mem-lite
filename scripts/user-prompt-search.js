@@ -14,7 +14,14 @@ import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extra
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
-const MAX_RESULTS = 5;
+// Per-prompt UPS cap. Cut from 5 → 3 after the 2026-05-09 per-hook recall
+// scan (#8255): UPS contributed 74% of silent injected IDs (131/177) at 26%
+// recall, vs PreToolUse:Read at 94% recall on a tighter file-keyed set.
+// Hypothesis: fewer candidates → each one more relevant → cite-rate up.
+// useRecent intent path is unaffected (it uses intent.limit=5 directly,
+// gated by explicit "before/previously/记得" prompts where breadth is the
+// point). Env override for projects that want broader recall or to A/B.
+const MAX_RESULTS = Number(process.env.CLAUDE_MEM_UPS_MAX_RESULTS || 3);
 const LOOKBACK_MS = 60 * 86400000; // 60 days
 
 // v2.56.x: Past-similar-questions fallback row cap. Cut from 3 → 1 after

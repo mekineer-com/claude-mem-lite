@@ -1,0 +1,109 @@
+{
+  "_doc": "Baseline for benchmark/cite-recall.mjs — re-run after each minor release and compare per-hook recall. See observation #8255 for methodology.",
+  "version": "2.56.0",
+  "scanned_at": "2026-05-09T17:30:00.000Z",
+  "comparison_reference": {
+    "label": "pre-v2.34.6 (2026-03-23 → 2026-04-22T14:10Z, 25 active sessions, 30d)",
+    "rationale": "Anchor for the v2.34.6 PreToolUse:Read introduction. Future regressions in PreToolUse:Read recall below 80%, or UPS recall slipping below 20%, indicate something broke.",
+    "selection_bias_read_edit_write_per_session": 47.1,
+    "session_cite_rate": 0.760,
+    "per_hook_recall": {
+      "PreToolUse:Edit": { "unique": 69, "occurrences": 773, "cited": 37, "recall": 0.536 },
+      "UserPromptSubmit": { "unique": 191, "occurrences": 476, "cited": 30, "recall": 0.157 },
+      "SessionStart:startup": { "unique": 29, "occurrences": 178, "cited": 7, "recall": 0.241 },
+      "SessionStart:clear": { "unique": 27, "occurrences": 55, "cited": 8, "recall": 0.296 }
+    }
+  },
+  "window": {
+    "start": "2026-04-22T14:10:04.000Z",
+    "end": "2026-05-09T17:30:00.000Z",
+    "days": 17.1
+  },
+  "dir": "/home/sds/.claude/projects/-mnt-data-ssd-dev-projects-mem",
+  "sessions": 29,
+  "selection_bias": {
+    "read_edit_write_per_session": 48.7,
+    "read_per_session": 23.8,
+    "edit_per_session": 23.2,
+    "write_per_session": 1.7,
+    "bash_per_session": 78.2,
+    "asst_turns_per_session": 239.6
+  },
+  "session_cite_rate": {
+    "rate": 0.931,
+    "ci95": [
+      0.78,
+      0.981
+    ],
+    "sessions_with_cite": 27,
+    "total_sessions": 29
+  },
+  "per_hook": [
+    {
+      "hook": "PreToolUse:Edit",
+      "inject_unique": 52,
+      "occurrences": 414,
+      "cited_unique": 49,
+      "recall": 0.9423076923076923,
+      "recall_ci95": [
+        0.844,
+        0.98
+      ]
+    },
+    {
+      "hook": "UserPromptSubmit",
+      "inject_unique": 178,
+      "occurrences": 349,
+      "cited_unique": 46,
+      "recall": 0.25842696629213485,
+      "recall_ci95": [
+        0.2,
+        0.327
+      ]
+    },
+    {
+      "hook": "SessionStart:startup",
+      "inject_unique": 33,
+      "occurrences": 256,
+      "cited_unique": 13,
+      "recall": 0.3939393939393939,
+      "recall_ci95": [
+        0.247,
+        0.563
+      ]
+    },
+    {
+      "hook": "PreToolUse:Read",
+      "inject_unique": 34,
+      "occurrences": 250,
+      "cited_unique": 32,
+      "recall": 0.9411764705882353,
+      "recall_ci95": [
+        0.809,
+        0.984
+      ]
+    },
+    {
+      "hook": "SessionStart:clear",
+      "inject_unique": 28,
+      "occurrences": 103,
+      "cited_unique": 9,
+      "recall": 0.32142857142857145,
+      "recall_ci95": [
+        0.179,
+        0.507
+      ]
+    },
+    {
+      "hook": "PreToolUse:Write",
+      "inject_unique": 1,
+      "occurrences": 2,
+      "cited_unique": 1,
+      "recall": 1,
+      "recall_ci95": [
+        0.207,
+        1
+      ]
+    }
+  ]
+}
