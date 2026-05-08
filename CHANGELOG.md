@@ -2,6 +2,15 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.58.2] - 2026-05-09
+
+**Hotfix-of-hotfix: regenerate lockfile via npm@10 to seat platform-optional `@emnapi/core` and `@emnapi/runtime` at top level.** v2.58.1 fixed the `npm audit` CVE block but its lockfile was generated locally by npm@11.6 — that version omits top-level entries for `@emnapi/core@1.10.0` and `@emnapi/runtime@1.10.0` (declared as deps of `@oxc-parser/binding-win32-*` bindings, not installed on Linux). CI's bundled npm@10 then refused `npm ci` with EUSAGE: `Missing: @emnapi/core@1.10.0 from lock file`. Tested by running `npx --yes npm@10.9.2 install` locally — the resulting lockfile has both `@emnapi/core` and `@emnapi/runtime` as top-level entries; `npm audit --omit=dev` exits 0; `npm ci` graph constraint is satisfied (verified via lockfile structural check). No source code changes.
+
+### Lessons
+
+- npm@11 drops platform-optional transitive deps from the lockfile in cases where npm@10 keeps them. CI bundled with Node 22 ships npm@10. **For this repo, run `npx npm@10 install` (or downgrade local npm) when regenerating `package-lock.json` until either the CI runner upgrades to npm@11 or knip's transitive `oxc-parser` chain stops pulling Win32 bindings unconditionally.**
+- The `--package-lock-only` flag does NOT do a full resolution — it merely refreshes from registry metadata. Use it only for version-bump-only diffs; for new dep trees use `npm install`.
+
 ## [2.58.1] - 2026-05-09
 
 **Hotfix: unblock release pipeline.** v2.58.0 (and v2.56.0 / v2.57.0 before it) failed in the publish workflow at the `npm audit --omit=dev` step due to transitive HTTP-stack CVEs from `@modelcontextprotocol/sdk`. The releases never published to npm — npm `latest` had been stuck at 2.55.0 for 9 days. Auto-update users on `releases/latest` were stuck on 2.55.0 as well. This release closes the actual deferred /cso Finding #5 and ships a clean lockfile.
