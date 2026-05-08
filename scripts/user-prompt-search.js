@@ -4,7 +4,7 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate } from '../utils.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
@@ -16,6 +16,14 @@ import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extra
 const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
 const MAX_RESULTS = 5;
 const LOOKBACK_MS = 60 * 86400000; // 60 days
+
+// v2.56.x: Past-similar-questions fallback row cap. Cut from 3 → 1 after
+// 30d transcript scan (#8062 follow-up, 2026-05-09) showed UPS prompt-fallback
+// path contributing ~24% of session injection budget with near-zero cite-recall.
+// Unlike the obs FTS path (TOP_REL_FLOOR + BM25 gates), prompt-fallback has no
+// quality gate — only BM25 ordering — so additional rows inflate noise without
+// improving signal. Env-overridable for projects that want broader prompt recall.
+const PROMPT_FALLBACK_LIMIT = Number(process.env.CLAUDE_MEM_UPS_PROMPT_FALLBACK_LIMIT || 1);
 
 // T3 (v2.31): per-row BM25 magnitude floor. OBS_BM25 (in scoring-sql.mjs)
 // returns the raw bm25() value — negative, smaller = better. Multiplied by
@@ -385,11 +393,17 @@ async function main() {
   let hookData;
   try { hookData = JSON.parse(raw); } catch { return; }
 
-  const promptText = hookData.prompt || hookData.user_prompt;
-  if (!promptText || typeof promptText !== 'string') return;
+  const rawPrompt = hookData.prompt || hookData.user_prompt;
+  if (!rawPrompt || typeof rawPrompt !== 'string') return;
 
-  // Skip internal protocol messages
-  if (promptText.startsWith('<task-notification>')) return;
+  // Skip internal protocol messages (check on raw text — protocol sentinel
+  // would never legitimately be wrapped in <private>).
+  if (rawPrompt.startsWith('<task-notification>')) return;
+
+  // Strip <private>...</private> blocks before length gates and FTS query
+  // construction — private content must not pad effective length nor leak
+  // into the FTS MATCH query terms. Mirrors hook.mjs handleUserPrompt.
+  const promptText = stripPrivate(rawPrompt);
 
   // Skip short/confirmation/slash-command/simple-op prompts
   if (shouldSkip(promptText)) return;
@@ -499,7 +513,7 @@ async function main() {
     // with future observation IDs.
     let promptRows = [];
     if (rows.length === 0) {
-      promptRows = searchByUserPrompts(db, promptText, project, 3);
+      promptRows = searchByUserPrompts(db, promptText, project, PROMPT_FALLBACK_LIMIT);
     }
 
     const candidateIds = rows.length > 0

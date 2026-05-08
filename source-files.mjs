@@ -37,6 +37,7 @@ export const SOURCE_FILES = [
   'lib/doctor-drift.mjs',
   'lib/stats-quality.mjs',
   'lib/low-signal-patterns.mjs',
+  'lib/private-strip.mjs',
   'lib/citation-tracker.mjs',
   'lib/summary-extractor.mjs',
   'lib/id-routing.mjs',

@@ -53,8 +53,12 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 This project *is* the memory plugin. Dogfood it. The rules below override soft "proactive trigger"
 language in the MCP tool description — when the two conflict, this contract wins.
 
-**Before you Edit/Write any code file**: the PreToolUse hook (`scripts/pre-tool-recall.js`) has
-already run `mem_recall` for that file. If you saw lines like `#NN [bugfix] ...` in your
+**Before you Read, Edit, or Write any code file**: the PreToolUse hook
+(`scripts/pre-tool-recall.js`) has already run `mem_recall` for that file. Read mode is
+asymmetric-quiet (1 lesson, 120-char cap, requires `lesson_learned`); Edit/Write is
+decision-support (up to 3 lessons, 240-char cap, admits high-importance bugfix/decision
+without lesson when title is non-LOW_SIGNAL). Read→Edit on the same file in one session
+shares cooldown — no double injection. If you saw lines like `#NN [bugfix] ...` in your
 tool-result preamble, you **must** cite `#NN` in your response (even a one-liner
 `"per #NN, I avoided re-introducing X"`) so the user can verify you actually consumed the
 lesson. Failure to cite when a lesson was surfaced = contract violation.

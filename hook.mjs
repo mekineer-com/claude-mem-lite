@@ -25,7 +25,7 @@ import { homedir } from 'os';
 import {
   truncate, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
-  makeEntryDesc, scrubSecrets, EDIT_TOOLS, debugCatch, debugLog,
+  makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
   COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, isoWeekKey, OBS_BM25,
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity,
 } from './utils.mjs';
@@ -1032,11 +1032,21 @@ async function handleUserPrompt() {
   let hookData;
   try { hookData = JSON.parse(raw.text); } catch { return; }
 
-  const promptText = hookData.prompt || hookData.user_prompt;
-  if (!promptText || typeof promptText !== 'string') return;
+  const rawPrompt = hookData.prompt || hookData.user_prompt;
+  if (!rawPrompt || typeof rawPrompt !== 'string') return;
 
-  // Skip internal Claude Code protocol messages — not real user input
-  if (promptText.startsWith('<task-notification>')) return;
+  // Skip internal Claude Code protocol messages — not real user input.
+  // Check on raw text BEFORE stripPrivate (the marker is a literal sentinel,
+  // wrapping it in <private> would never make sense, but order matters: a
+  // future <task-notification> with embedded <private> blocks should still
+  // be classified as protocol first.)
+  if (rawPrompt.startsWith('<task-notification>')) return;
+
+  // Strip user-marked <private>...</private> blocks at the input boundary so
+  // every downstream consumer (user_prompts INSERT, FTS query, continuation
+  // detection, semantic-memory injection) sees the redacted text — single
+  // source of truth for the privacy primitive.
+  const promptText = stripPrivate(rawPrompt);
 
   const sessionId = getSessionId();
   const db = openDb();

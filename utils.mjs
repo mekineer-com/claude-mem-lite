@@ -13,6 +13,7 @@ export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM2
 export { cjkBigrams, extractCjkSynonymTokens, extractCjkKeywords, extractCjkLikePatterns, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
 export { resolveProject, _resetProjectCache } from './project-utils.mjs';
 export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
+export { stripPrivate } from './lib/private-strip.mjs';
 export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey } from './format-utils.mjs';
 export { computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity } from './hash-utils.mjs';
 export { detectBashSignificance, extractErrorKeywords, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
