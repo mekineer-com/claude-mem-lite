@@ -105,10 +105,95 @@ for (const f of failures) {
   console.log(`  FAIL  ${f.name}: ${f.curr} < ${f.threshold} (baseline ${f.base}, ${f.diffStr})`);
 }
 
-if (failures.length > 0) {
-  console.log(`\n  ${failures.length} metric(s) regressed beyond tolerance.`);
+// ── Matrix delta regression checks ─────────────────────────────────────────
+// Beyond aggregate metric drift, gate the *layer-by-layer* lift the production
+// scoring system claims to provide. The matrix exposes `bm25_over_recency`
+// (FTS5 contribution) and `hybrid_over_bm25` (multiplier contribution) deltas.
+// Without this section, a future change could silently turn FTS into a no-op
+// (e.g. break OBS_BM25 weights to all 1s) while the aggregate Recall@10 stays
+// roughly flat because `recency` accidentally surfaces similar IDs.
+//
+// Why the asymmetric thresholds:
+//   - `bm25_over_recency` MUST stay positive — if FTS retrieval doesn't beat
+//     "newest first", the whole scoring stack is broken. Hard floor.
+//   - `hybrid_over_bm25` may be 0 on the canonical corpus (it currently is,
+//     per 2026-05-09 audit — only 1/30 queries gain). We don't gate on it
+//     being positive; we only gate on it not REGRESSING materially negative,
+//     which would mean multipliers actively hurt.
+//
+// `--skip-matrix` env var skips this block (e.g. for quick iteration).
+const SKIP_MATRIX = process.argv.includes('--skip-matrix') || process.env.SKIP_MATRIX === '1';
+let matrixFailures = [];
+let matrixPasses = [];
+
+if (!SKIP_MATRIX) {
+  let matrix;
+  try {
+    const stdout = execSync('node benchmark/benchmark.mjs --matrix', {
+      cwd: join(__dirname, '..'),
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    matrix = JSON.parse(stdout);
+  } catch (err) {
+    console.error('Matrix benchmark execution failed:', err.message);
+    process.exit(1);
+  }
+
+  const matrixChecks = [
+    {
+      name: 'bm25_over_recency.recall',
+      value: matrix.deltas.bm25_over_recency.recall_at_10,
+      floor: 0.3,
+      direction: 'positive',
+      rationale: 'FTS5 must beat recency-only by ≥0.3 R@10 — anything less means BM25 weighting is broken',
+    },
+    {
+      name: 'bm25_over_recency.ndcg',
+      value: matrix.deltas.bm25_over_recency.ndcg_at_10,
+      floor: 0.3,
+      direction: 'positive',
+      rationale: 'FTS5 nDCG lift over recency-only',
+    },
+    {
+      name: 'hybrid_over_bm25.recall',
+      value: matrix.deltas.hybrid_over_bm25.recall_at_10,
+      floor: -0.05,
+      direction: 'positive',
+      rationale: 'Multipliers may add 0 lift but must not actively hurt by >0.05 R@10',
+    },
+    {
+      name: 'hybrid_over_bm25.ndcg',
+      value: matrix.deltas.hybrid_over_bm25.ndcg_at_10,
+      floor: -0.05,
+      direction: 'positive',
+      rationale: 'Multipliers nDCG floor (currently ~0; allow modest negative drift)',
+    },
+  ];
+
+  for (const c of matrixChecks) {
+    if (c.value < c.floor) {
+      matrixFailures.push(c);
+    } else {
+      matrixPasses.push(c);
+    }
+  }
+
+  console.log('\n── Matrix Δ Gate ──');
+  for (const p of matrixPasses) {
+    console.log(`  PASS  ${p.name}: Δ=${p.value} (floor ${p.floor})`);
+  }
+  for (const f of matrixFailures) {
+    console.log(`  FAIL  ${f.name}: Δ=${f.value} < ${f.floor}`);
+    console.log(`        ${f.rationale}`);
+  }
+}
+
+const totalFailures = failures.length + matrixFailures.length;
+if (totalFailures > 0) {
+  console.log(`\n  ${totalFailures} metric(s) regressed beyond tolerance.`);
   process.exit(1);
 } else {
-  console.log('\n  All metrics within tolerance.');
+  console.log('\n  All metrics + matrix deltas within tolerance.');
   process.exit(0);
 }

@@ -13,10 +13,14 @@ if (cmd === '--version' || cmd === '-v') {
 } else if (cmd === '--help' || cmd === '-h') {
   const { run } = await import('./mem-cli.mjs');
   await run(['help']);
-} else if (cmd === 'doctor' && (process.argv.slice(3).includes('--benchmark') || process.argv.slice(3).includes('--metrics'))) {
-  // doctor --benchmark / --metrics are DB/metrics inspection tools — routed
-  // through mem-cli (DB layer). Plain `doctor` continues to run the install
-  // health-check below.
+} else if (cmd === 'doctor' && process.argv.slice(3).some(a => a.startsWith('--') && a.length > 2)) {
+  // Per #8217 single-source-of-truth: any flagged `doctor --X` is a DB-layer
+  // inspection tool (--benchmark, --metrics, --session-audit, future flags)
+  // and routes to mem-cli. Plain `doctor` (no flags) keeps running the
+  // install health-check below — adding a new flag in cli/doctor.mjs no
+  // longer requires touching this enumeration. The `length > 2` guard
+  // ignores a bare `--` (POSIX end-of-options separator) so `doctor --`
+  // continues to route to install.mjs, not mem-cli.
   const { run } = await import('./mem-cli.mjs');
   await run(process.argv.slice(2));
 } else if (CLI_COMMANDS.has(cmd)) {

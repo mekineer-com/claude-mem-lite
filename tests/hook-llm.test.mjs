@@ -536,6 +536,52 @@ describe('handleLLMEpisode', () => {
     expect(lastPrompt).toContain('bugfix = prior-failing path');
   });
 
+  it('audit-fix: lesson_learned prompt does not recommend "none" string output (single-entry)', async () => {
+    // Audit finding: previous prompt "non-obvious insight or 'none' if routine"
+    // taught Haiku to write 'none' as a fallback, then downstream lowSignalLesson
+    // gate rejected 'none' as noise — prompt fighting its own gates. Per cite-recall
+    // baseline 67% of `change` obs were dropped post-Haiku. Regression guard: prompt
+    // must (a) not present 'none' as a valid output, (b) tell model to use JSON null
+    // for the no-insight case, (c) explicitly forbid the noise tokens.
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['auth.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Bump version', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const calls = callLLM.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastPrompt = calls[calls.length - 1][0];
+    expect(lastPrompt).not.toMatch(/['"]none['"]\s+if\s+routine/i);
+    expect(lastPrompt).not.toMatch(/write\s+['"]none['"]/i);
+    expect(lastPrompt).toContain('output JSON null');
+    expect(lastPrompt).toMatch(/Do NOT invent a lesson/i);
+  });
+
+  it('audit-fix: lesson_learned prompt does not recommend "none" string output (multi-entry)', async () => {
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['auth.mjs'], filesRead: [],
+      entries: [
+        { tool: 'Edit', desc: 'Bump version', isError: false },
+        { tool: 'Edit', desc: 'Update lock file', isError: false },
+      ],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const calls = callLLM.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    const lastPrompt = calls[calls.length - 1][0];
+    expect(lastPrompt).not.toMatch(/['"]none['"]\s+if\s+routine/i);
+    expect(lastPrompt).not.toMatch(/write\s+['"]none['"]/i);
+    expect(lastPrompt).toContain('output JSON null');
+  });
+
   it('extracts and saves event from single-entry episode (feature type → events table)', async () => {
     // Default mock returns type='feature' → EVENT_TYPE → routes to events.
     const episode = {

@@ -905,6 +905,43 @@ async function cmdStats(db, args) {
     await renderQualityReport(db, { project, days });
     return;
   }
+  // v2.57.x B2: --retry shows the lesson_retry_stats aggregate. Answers
+  // "is the bugfix/decision retry path (1 extra Haiku call per attempt)
+  // paying off?". If recovered/attempts < 0.10 over a long window, the
+  // path is dead weight and should be deleted.
+  const retry = flags.retry === true || flags.retry === 'true';
+  if (retry) {
+    const { readRetryStats } = await import('./hook-llm.mjs');
+    const rows = readRetryStats(db, days);
+    const totalAttempts = rows.reduce((a, r) => a + r.attempts, 0);
+    const totalRecovered = rows.reduce((a, r) => a + r.recovered, 0);
+    const recoveryRate = totalAttempts > 0 ? totalRecovered / totalAttempts : 0;
+    if (flags.json === true || flags.json === 'true') {
+      out(JSON.stringify({
+        days, total_attempts: totalAttempts, total_recovered: totalRecovered,
+        recovery_rate: Number(recoveryRate.toFixed(4)),
+        per_day: rows,
+      }, null, 2));
+      return;
+    }
+    out(`[mem] lesson-retry stats — last ${days}d (UTC date buckets)`);
+    out(`  attempts:  ${totalAttempts}`);
+    out(`  recovered: ${totalRecovered}`);
+    out(`  rate:      ${(recoveryRate * 100).toFixed(1)}% ${totalAttempts === 0 ? '(no data — retry path may be unused this window)' : ''}`);
+    if (totalAttempts >= 50 && recoveryRate < 0.10) {
+      out('  ⚠ recovery rate <10% over ≥50 attempts — retry path likely dead weight, consider deleting');
+    } else if (totalAttempts >= 50 && recoveryRate >= 0.30) {
+      out('  ✓ recovery rate ≥30% — retry path actively saving lessons');
+    }
+    if (rows.length > 0) {
+      out('\n  date         attempts  recovered  rate');
+      for (const r of rows.slice(0, 14)) {
+        const rate = r.attempts > 0 ? (r.recovered / r.attempts * 100).toFixed(1) + '%' : '—';
+        out(`  ${r.date_bucket}  ${String(r.attempts).padStart(8)}  ${String(r.recovered).padStart(9)}  ${rate.padStart(5)}`);
+      }
+    }
+    return;
+  }
 
   const projectFilter = project ? 'AND project = ?' : '';
   const baseParams = project ? [project] : [];

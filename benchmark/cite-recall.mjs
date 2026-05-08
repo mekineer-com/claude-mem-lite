@@ -14,12 +14,26 @@
 //   node benchmark/cite-recall.mjs --start=ISO --end=ISO
 //   node benchmark/cite-recall.mjs --json > out.json
 //   node benchmark/cite-recall.mjs --dir=/path/to/transcripts
+//   node benchmark/cite-recall.mjs --vs-baseline      # diff vs baseline.json
+//   node benchmark/cite-recall.mjs --vs-baseline --fail-on-regression
 //
 // Defaults: dir = ~/.claude/projects/-mnt-data-ssd-dev-projects-mem
 //           end = now, start = end - 30d.
+//
+// --vs-baseline reads benchmark/cite-recall-baseline.json (per-hook recall
+// frozen at v2.56.0) and prints Δ for each hook + 95% CI overlap analysis.
+// Used after deploying P0 fixes to quantify cite-recall improvements: e.g.
+// after the v2.57.x prompt fix + UPS gate, UserPromptSubmit recall is
+// expected to climb from 25.8% (baseline) toward 50%+. Without this flag,
+// the operator has to eyeball two JSON dumps side-by-side.
+//
+// --fail-on-regression exits non-zero if any per-hook recall is materially
+// below baseline (recall drop > 0.05 absolute outside CI overlap). Used in
+// post-deploy CI to catch silent recall regressions.
 
 import { readdirSync, readFileSync, statSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 
 const args = Object.fromEntries(
@@ -226,6 +240,77 @@ const result = {
 
 if (JSON_MODE) {
   console.log(JSON.stringify(result, null, 2));
+  process.exit(0);
+}
+
+// ── Optional baseline diff ─────────────────────────────────────────────────
+if (args['vs-baseline']) {
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const baselinePath = join(__dirname, 'cite-recall-baseline.json');
+  let baseline;
+  try {
+    baseline = JSON.parse(readFileSync(baselinePath, 'utf8'));
+  } catch (err) {
+    console.error(`\nCannot read baseline ${baselinePath}: ${err.message}`);
+    process.exit(2);
+  }
+
+  // Map hook name → baseline entry (use the "current" baseline window, not
+  // the comparison_reference older window — that one is kept for a different
+  // pre/post comparison).
+  const baseHooks = new Map();
+  for (const h of baseline.per_hook || []) baseHooks.set(h.hook, h);
+
+  const REGRESSION_FLOOR = 0.05; // absolute recall drop to count as regression
+  const diffRows = [];
+  let anyRegression = false;
+
+  for (const cur of perHook) {
+    const base = baseHooks.get(cur.hook);
+    if (!base) {
+      diffRows.push({ hook: cur.hook, status: 'new', curRecall: cur.recall });
+      continue;
+    }
+    const delta = cur.recall - base.recall;
+    // Regression test: not just |delta| < 0, but also outside CI overlap.
+    // If [cur_lo, cur_hi] and [base_lo, base_hi] overlap, the change isn't
+    // statistically distinguishable — don't fail on noise.
+    const [curLo, curHi] = cur.recall_ci95;
+    const [baseLo, baseHi] = base.recall_ci95 || [0, 1];
+    const ciOverlap = !(curHi < baseLo || curLo > baseHi);
+    const regressed = delta < -REGRESSION_FLOOR && !ciOverlap;
+    if (regressed) anyRegression = true;
+    diffRows.push({
+      hook: cur.hook,
+      curRecall: cur.recall,
+      baseRecall: base.recall,
+      delta,
+      ciOverlap,
+      regressed,
+      status: regressed ? 'REGRESSION' : (delta > REGRESSION_FLOOR && !ciOverlap ? 'IMPROVEMENT' : 'flat'),
+    });
+  }
+
+  console.log('\n## Cite-recall Δ vs baseline');
+  console.log(`Baseline version: ${baseline.version || 'n/a'}  scanned: ${baseline.scanned_at || 'n/a'}`);
+  console.log('   hook                                  curRecall  baseRecall   delta   status');
+  for (const d of diffRows) {
+    const cap = d.hook.length > 36 ? d.hook.slice(0, 36) : d.hook.padEnd(36);
+    if (d.status === 'new') {
+      console.log(`  ${cap} ${(d.curRecall * 100).toFixed(1).padStart(8)}%       (new)        —    new-hook`);
+      continue;
+    }
+    const cur = (d.curRecall * 100).toFixed(1).padStart(8) + '%';
+    const baseStr = (d.baseRecall * 100).toFixed(1).padStart(7) + '%';
+    const ds = (d.delta >= 0 ? '+' : '') + (d.delta * 100).toFixed(1) + '%';
+    const dsPad = ds.padStart(7);
+    console.log(`  ${cap} ${cur}    ${baseStr}  ${dsPad}   ${d.status}`);
+  }
+
+  if (args['fail-on-regression'] && anyRegression) {
+    console.error('\n  ⚠ Regression detected (recall drop > 5% absolute, CI non-overlapping).');
+    process.exit(1);
+  }
   process.exit(0);
 }
 

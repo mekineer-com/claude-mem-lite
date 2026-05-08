@@ -198,3 +198,203 @@ describe('user-prompt-search.js CJK precision filter (subprocess)', () => {
     expect(stdout).toMatch(/FTS5|查询|搜索/);
   });
 });
+
+// v2.57.x: UPS explicit-signal gate. Per cite-recall baseline (2026-04-22 →
+// 2026-05-09) UserPromptSubmit recall = 25.8% — 74% of injections silently
+// ignored. Gate retreats to "only inject when prompt names something
+// concrete": error signature, file ref, detected intent, or tech identifier.
+// "How is it going?" / "does this work?" → no injection. PreToolUse
+// file-keyed path (94% recall) is independent and unaffected.
+describe('user-prompt-search.js explicit-signal gate (subprocess)', () => {
+  let db;
+  const DB_DIR = `/tmp/ups-signal-test-${process.pid}`;
+
+  beforeEach(async () => {
+    const { mkdirSync, rmSync } = await import('fs');
+    try { rmSync(DB_DIR, { recursive: true }); } catch {}
+    mkdirSync(DB_DIR, { recursive: true });
+    mkdirSync(`${DB_DIR}/runtime`, { recursive: true });
+    const Database = (await import('better-sqlite3')).default;
+    const { initSchema } = await import('../schema.mjs');
+    db = new Database(`${DB_DIR}/claude-mem-lite.db`);
+    initSchema(db);
+    insertSession(db, { id: 'sess-1', project: 'test--project' });
+    // Seed prompts that BM25 will surface — used to verify gate behavior:
+    // when signal present, the matching seed gets injected; when absent,
+    // even with BM25-matching seeds in the corpus, nothing comes out.
+    insertPrompt(db, {
+      contentSessionId: 'sess-1',
+      text: 'how does the MAX_RESULTS variable work in the does_this codebase',
+    });
+    insertPrompt(db, {
+      contentSessionId: 'sess-1',
+      text: 'parseJsonFromLLM helper handles Haiku response parsing',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+  });
+
+  afterEach(async () => {
+    try { db.close(); } catch {}
+    const { rmSync } = await import('fs');
+    try { rmSync(DB_DIR, { recursive: true }); } catch {}
+  });
+
+  function runScript(promptText, extraEnv = {}) {
+    return new Promise((ok) => {
+      const env = {
+        ...process.env,
+        CLAUDE_MEM_DIR: DB_DIR,
+        CLAUDE_PROJECT_DIR: '/test/project',
+        PWD: '/test/project',
+        CLAUDE_MEM_UPS_TOP_MIN: '0',
+        CLAUDE_MEM_HOOK_RUNNING: '',
+        ...extraEnv,
+      };
+      const proc = spawn(process.execPath, [SCRIPT_PATH], { env });
+      let stdout = '';
+      proc.stdout.on('data', d => (stdout += d.toString()));
+      proc.on('close', () => ok(stdout));
+      proc.stdin.write(JSON.stringify({
+        prompt: promptText,
+        hook_event_name: 'UserPromptSubmit',
+        cwd: '/test/project',
+        session_id: 'test-sess-1',
+      }));
+      proc.stdin.end();
+    });
+  }
+
+  it('no-signal prompt yields no injection (gate ON by default)', async () => {
+    // "Does this work?" has no tech identifier (single lowercase words),
+    // no error signature, no file reference, no recall intent, no actionable
+    // intent keyword (test/bug/refactor/etc). Pre-fix: FTS would happily
+    // surface the seeded MAX_RESULTS prompt via stem overlap on "does/work".
+    // Post-fix: gate rejects upstream — no injection.
+    const stdout = await runScript('Does this work fine for me');
+    expect(stdout).not.toContain('[mem] FYI');
+  });
+
+  it('tech-identifier signal triggers injection (gate ON by default)', async () => {
+    // "MAX_RESULTS" matches TECH_IDENTIFIER_RE ([A-Z]{2,}[A-Z0-9_]+) — a
+    // concrete identifier the user is naming. Gate accepts → existing FTS
+    // pipeline finds the seeded prompt and injects it.
+    const stdout = await runScript('what is MAX_RESULTS configured to');
+    expect(stdout).toContain('[mem] FYI — Past similar questions');
+  });
+
+  it('CLAUDE_MEM_UPS_REQUIRE_SIGNAL=0 restores always-search behavior', async () => {
+    // Same no-signal prompt as the first case, but with the env override —
+    // gate disabled, FTS pipeline runs as before, seeded prompt surfaces.
+    // Backwards-compatibility escape hatch for projects that prefer the old
+    // always-search policy (and accept the lower cite-recall).
+    const stdout = await runScript('Does this work fine for me', {
+      CLAUDE_MEM_UPS_REQUIRE_SIGNAL: '0',
+    });
+    expect(stdout).toContain('[mem] FYI — Past similar questions');
+  });
+
+  // Post-review fix Important #1: TECH_IDENTIFIER_RE was too loose. Bare
+  // 3+-letter caps without underscore (IBM, NPM, BSD, THE, FROM) and
+  // single-lowercase-before-cap "iOS"-shaped words slipped through. Tightened
+  // to require underscore for ALL_CAPS arm and ≥2 lowercase before cap for
+  // camelCase arm. These regression cases were named explicitly by reviewer.
+  it('English prose acronyms (IBM, NPM, THE) do NOT trigger gate alone', async () => {
+    const stdout = await runScript('IBM Watson is interesting');
+    expect(stdout).not.toContain('[mem] FYI');
+  });
+
+  it('iOS / eBay -style 1-lowercase-before-cap words do NOT trigger gate alone', async () => {
+    const stdout = await runScript('the iOS port is a bit different');
+    expect(stdout).not.toContain('[mem] FYI');
+  });
+
+  it('snake_case identifier (MAX_RESULTS) DOES trigger', async () => {
+    // CONST_CASE arm now requires underscore (`[A-Z][A-Z0-9]*_[A-Z0-9_]+`).
+    // MAX_RESULTS matches; bare IBM does not.
+    const stdout = await runScript('what is MAX_RESULTS configured to');
+    expect(stdout).toContain('[mem] FYI');
+  });
+
+  it('camelCase identifier (parseJsonFromLLM) DOES trigger', async () => {
+    // Stricter arm `[a-z]{2,}[A-Z][a-zA-Z0-9]+` requires ≥2 lowercase before
+    // the first uppercase — "parseJson" qualifies; "iOS" does not.
+    const stdout = await runScript('look at parseJsonFromLLM behavior');
+    expect(stdout).toContain('[mem] FYI');
+  });
+});
+
+// Post-review fix Important #2: CJK presence channel. Bilingual users
+// (the project's user-memory `feedback_*` calls this out) ask CJK-only
+// debug questions that don't match any English signal channel. CJK is
+// information-dense — an 8-effective-unit prompt rarely encodes
+// "how is it going"-style noise.
+describe('user-prompt-search.js CJK channel (subprocess)', () => {
+  let db;
+  const DB_DIR = `/tmp/ups-cjk-channel-test-${process.pid}`;
+
+  beforeEach(async () => {
+    const { mkdirSync, rmSync } = await import('fs');
+    try { rmSync(DB_DIR, { recursive: true }); } catch {}
+    mkdirSync(DB_DIR, { recursive: true });
+    mkdirSync(`${DB_DIR}/runtime`, { recursive: true });
+    const Database = (await import('better-sqlite3')).default;
+    const { initSchema } = await import('../schema.mjs');
+    db = new Database(`${DB_DIR}/claude-mem-lite.db`);
+    initSchema(db);
+    insertSession(db, { id: 'sess-1', project: 'test--project' });
+    // Seed a Chinese prompt that BM25 will match on shared chars.
+    insertPrompt(db, {
+      contentSessionId: 'sess-1',
+      text: '为什么这里返回 undefined 还是 null',
+    });
+    db.pragma('wal_checkpoint(FULL)');
+  });
+
+  afterEach(async () => {
+    try { db.close(); } catch {}
+    const { rmSync } = await import('fs');
+    try { rmSync(DB_DIR, { recursive: true }); } catch {}
+  });
+
+  function runScript(promptText, extraEnv = {}) {
+    return new Promise((ok) => {
+      const env = {
+        ...process.env,
+        CLAUDE_MEM_DIR: DB_DIR,
+        CLAUDE_PROJECT_DIR: '/test/project',
+        PWD: '/test/project',
+        CLAUDE_MEM_UPS_TOP_MIN: '0',
+        CLAUDE_MEM_HOOK_RUNNING: '',
+        ...extraEnv,
+      };
+      const proc = spawn(process.execPath, [SCRIPT_PATH], { env });
+      let stdout = '';
+      proc.stdout.on('data', d => (stdout += d.toString()));
+      proc.on('close', () => ok(stdout));
+      proc.stdin.write(JSON.stringify({
+        prompt: promptText,
+        hook_event_name: 'UserPromptSubmit',
+        cwd: '/test/project',
+        session_id: 'test-sess-1',
+      }));
+      proc.stdin.end();
+    });
+  }
+
+  // Note: a positive "long CJK prompt → injection happens" subprocess test
+  // is intentionally NOT included here. FTS5's default unicode61 tokenizer
+  // splits CJK into single chars + the cjkPrecisionOk filter further trims;
+  // the existing CJK precision suite contains zero pure-CJK successful-
+  // injection assertions because that path is FTS-tokenizer-dominated, not
+  // gate-dominated. The CJK channel is unit-testable via hasExplicitSignal
+  // export (covered by the "very short CJK does NOT pass" + manual code
+  // inspection of CJK_CHAR_RE / CJK_MIN_EFFECTIVE_LEN).
+
+  it('very short CJK prompt (below 8 effective units) does NOT pass on CJK channel alone', async () => {
+    // 2 CJK chars × 3 = 6 effective units < 8 threshold. Also passes
+    // shouldSkip's effective-length 8-unit gate (just barely doesn't),
+    // but my CJK channel threshold is also 8.
+    const stdout = await runScript('好的');
+    expect(stdout).not.toContain('[mem] FYI');
+  });
+});

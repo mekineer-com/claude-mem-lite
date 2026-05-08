@@ -61,6 +61,35 @@ export async function cmdDoctor(db, args) {
     }
     return;
   }
-  out('[mem] doctor: supported flags: --benchmark, --metrics [--days N] [--json]');
+  if (args.includes('--session-audit')) {
+    // v2.57.x B1: report sdk_sessions invariant violations. The v30 trigger
+    // blocks new UUID-shape mix inserts; this surfaces historical drift.
+    // id_mix_uuid_shape (alarming, drives exit code) is the v2.33.1 fingerprint;
+    // id_mix_other (informational) is fixture-style equality — usually safe.
+    const { auditSessionConsistency } = await import('../schema.mjs');
+    const audit = auditSessionConsistency(db);
+    if (args.includes('--json')) {
+      out(JSON.stringify(audit, null, 2));
+    } else {
+      out(`[mem] session-audit: ${audit.healthy ? 'HEALTHY' : 'ISSUES FOUND'}`);
+      out(`  id_mix_uuid_shape (v2.33.1 fingerprint):           ${audit.id_mix_uuid_shape}`);
+      out(`  id_mix_other (fixture-style equality, info-only):  ${audit.id_mix_other}`);
+      out(`  missing_mem_id (sdk_sessions w/ NULL after 5min):  ${audit.missing_mem_id}`);
+      out(`  orphan_obs (observations w/o matching session):    ${audit.orphan_obs}`);
+      if (audit.id_mix_other > 0 && audit.id_mix_uuid_shape === 0) {
+        out('\n  Notes:');
+        out('    • id_mix_other > 0 with uuid_shape=0 is typically benign — usually means insertSession({id:\'X\'}) test scaffold or pre-v30 data with non-UUID equal values. Does NOT drive failure.');
+      }
+      if (!audit.healthy) {
+        out('\n  Notes:');
+        if (audit.id_mix_uuid_shape > 0) out('    • id_mix_uuid_shape > 0 — production v2.33.1 bug-pattern rows present. Investigate via SQL: SELECT * FROM sdk_sessions WHERE memory_session_id = content_session_id AND length(memory_session_id) = 36;');
+        if (audit.missing_mem_id > 0) out('    • missing_mem_id rows are sessions whose mem-internal ID was never populated — likely SessionStart write that didn\'t reach Stop');
+        if (audit.orphan_obs > 0) out('    • orphan_obs are observations referencing a sdk_sessions row that was deleted (FK CASCADE failed historically before v28)');
+      }
+    }
+    if (!audit.healthy) process.exitCode = 1;
+    return;
+  }
+  out('[mem] doctor: supported flags: --benchmark, --metrics [--days N] [--json], --session-audit');
   process.exitCode = 1;
 }

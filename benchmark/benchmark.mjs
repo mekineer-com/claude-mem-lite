@@ -80,24 +80,42 @@ export function seedDatabase(db, data) {
 }
 
 // ─── Search (mirrors server.mjs BM25 query exactly) ────────────────────────
+//
+// Modes:
+//   'hybrid'    — production scoring: BM25 × time-decay × project-boost ×
+//                 importance × access-bonus. Mirrors server.mjs.
+//   'bm25_only' — strips all multipliers, pure BM25 ranking. Tests whether
+//                 production multipliers add lift over raw FTS5.
+//   'recency'   — no FTS, ORDER BY created_at_epoch DESC. Tests whether FTS
+//                 retrieval adds anything over "newest-first" baseline.
+//   'random'    — deterministic shuffle (seeded by query). Sanity floor —
+//                 anything that doesn't beat random is broken.
 
 function searchObservations(db, query, options = {}) {
-  const ftsQuery = sanitizeFtsQuery(query);
-  if (!ftsQuery) return [];
-
-  const now = Date.now();
+  const mode = options.mode ?? 'hybrid';
   const limit = options.limit ?? 20;
   const project = options.project ?? null;
   const obsType = options.type ?? null;
 
-  const rows = db.prepare(`
+  if (mode === 'random') return searchRandom(db, query, { limit, project, obsType });
+  if (mode === 'recency') return searchRecency(db, { limit, project, obsType });
+
+  const ftsQuery = sanitizeFtsQuery(query);
+  if (!ftsQuery) return [];
+
+  const now = Date.now();
+  const scoreExpr = mode === 'bm25_only'
+    ? 'bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8) as score'
+    : `bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8)
+         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+         * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
+         * (0.5 + 0.5 * COALESCE(o.importance, 1))
+         * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score`;
+
+  const sql = `
     SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
            o.files_modified, o.narrative, o.text,
-           bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8)
-             * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
-             * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-             * (0.5 + 0.5 * COALESCE(o.importance, 1))
-             * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score
+           ${scoreExpr}
     FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE observations_fts MATCH ?
@@ -106,18 +124,56 @@ function searchObservations(db, query, options = {}) {
       AND (? IS NULL OR o.type = ?)
     ORDER BY score
     LIMIT ?
-  `).all(
-    now,
-    project, project,
-    ftsQuery,
-    project, project,
-    obsType, obsType,
-    limit
-  );
+  `;
+  const params = mode === 'bm25_only'
+    ? [ftsQuery, project, project, obsType, obsType, limit]
+    : [now, project, project, ftsQuery, project, project, obsType, obsType, limit];
+  const rows = db.prepare(sql).all(...params);
 
   return rows.map(r => ({
     id: r.id, type: r.type, title: r.title, project: r.project,
     score: r.score, importance: r.importance,
+    tokens: estimateTokens((r.title || '') + ' ' + (r.narrative || ''))
+  }));
+}
+
+function searchRecency(db, { limit, project, obsType }) {
+  const rows = db.prepare(`
+    SELECT o.id, o.type, o.title, o.subtitle, o.project, o.importance, o.narrative
+    FROM observations o
+    WHERE COALESCE(o.compressed_into, 0) = 0
+      AND (? IS NULL OR o.project = ?)
+      AND (? IS NULL OR o.type = ?)
+    ORDER BY o.created_at_epoch DESC
+    LIMIT ?
+  `).all(project, project, obsType, obsType, limit);
+  return rows.map(r => ({
+    id: r.id, type: r.type, title: r.title, project: r.project,
+    score: 0, importance: r.importance,
+    tokens: estimateTokens((r.title || '') + ' ' + (r.narrative || ''))
+  }));
+}
+
+function searchRandom(db, query, { limit, project, obsType }) {
+  const rows = db.prepare(`
+    SELECT o.id, o.type, o.title, o.project, o.importance, o.narrative
+    FROM observations o
+    WHERE COALESCE(o.compressed_into, 0) = 0
+      AND (? IS NULL OR o.project = ?)
+      AND (? IS NULL OR o.type = ?)
+  `).all(project, project, obsType, obsType);
+  // Deterministic shuffle: seed = hash(query) so repeated runs reproduce.
+  let seed = 0;
+  for (let i = 0; i < query.length; i++) seed = (seed * 31 + query.charCodeAt(i)) | 0;
+  const shuffled = rows.slice();
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    const j = seed % (i + 1);
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, limit).map(r => ({
+    id: r.id, type: r.type, title: r.title, project: r.project,
+    score: 0, importance: r.importance,
     tokens: estimateTokens((r.title || '') + ' ' + (r.narrative || ''))
   }));
 }
@@ -169,13 +225,13 @@ export function computeMRR(results, relevantIds) {
   return 0;
 }
 
-export function measureLatencyP95(db, queries) {
+export function measureLatencyP95(db, queries, mode = 'hybrid') {
   const latencies = [];
   // Run each query 3 times to get stable measurements
   for (let run = 0; run < 3; run++) {
     for (const q of queries) {
       const start = performance.now();
-      searchObservations(db, q.query, { project: q.project, type: q.type });
+      searchObservations(db, q.query, { project: q.project, type: q.type, mode });
       const elapsed = performance.now() - start;
       latencies.push(elapsed);
     }
@@ -187,9 +243,10 @@ export function measureLatencyP95(db, queries) {
 
 // ─── Run Benchmark ──────────────────────────────────────────────────────────
 
-export function runBenchmark(db, queries) {
+export function runBenchmark(db, queries, mode = 'hybrid') {
   const results = {
     timestamp: new Date().toISOString(),
+    mode,
     queryCount: queries.length,
     metrics: {
       recall_at_10: 0,
@@ -217,6 +274,7 @@ export function runBenchmark(db, queries) {
       project: q.project,
       type: q.type,
       limit: 10,
+      mode,
     });
 
     const recall = computeRecallAtK(searchResults, q.relevant_ids, 10);
@@ -260,7 +318,7 @@ export function runBenchmark(db, queries) {
   results.metrics.ndcg_at_10 = round(totalNDCG / n);
   results.metrics.mrr_at_10 = round(totalMRR / n);
   results.metrics.avg_tokens_injected = Math.round(totalTokens / n);
-  results.metrics.p95_search_latency_ms = round(measureLatencyP95(db, queries));
+  results.metrics.p95_search_latency_ms = round(measureLatencyP95(db, queries, mode));
 
   // Per-category averages
   for (const [cat, acc] of Object.entries(catAccum)) {
@@ -280,6 +338,104 @@ function round(v) {
   return Math.round(v * 10000) / 10000;
 }
 
+// ─── Baseline Matrix ────────────────────────────────────────────────────────
+//
+// Runs the same query set across all four scoring modes. Surfaces the lift
+// (or absence of lift) each layer adds: hybrid vs bm25_only isolates the
+// contribution of production multipliers; bm25_only vs recency isolates
+// FTS5 retrieval value; recency vs random isolates ordering value.
+//
+// Without this, the audit conclusion "no baseline" stands — every retrieval
+// metric is unfalsifiable. With this, future scoring tuning has an evidence
+// anchor: a tuning that doesn't beat bm25_only is overfitting; one that
+// doesn't beat recency-only is broken.
+
+const BASELINE_MODES = ['hybrid', 'bm25_only', 'recency', 'random'];
+
+export function runBenchmarkMatrix(db, queries) {
+  const matrix = {
+    timestamp: new Date().toISOString(),
+    queryCount: queries.length,
+    modes: {},
+    deltas: {},
+    perQueryDeltas: {},
+  };
+  // Lock the DB to read-only for the matrix run. searchObservations in this
+  // file is currently SELECT-only, but server.mjs's production search bumps
+  // access_count on read — if a future contributor wires that path here,
+  // mode results would silently become order-dependent. `query_only=ON`
+  // converts any accidental write into an error so the divergence surfaces.
+  // Restored after the loop so this function plays nice with shared db.
+  const wasQueryOnly = db.pragma('query_only', { simple: true });
+  db.pragma('query_only = ON');
+  try {
+    for (const mode of BASELINE_MODES) {
+      matrix.modes[mode] = runBenchmark(db, queries, mode);
+    }
+  } finally {
+    db.pragma(`query_only = ${wasQueryOnly ? 'ON' : 'OFF'}`);
+  }
+  // Lift over each lower tier (each delta tells you what that layer is buying).
+  matrix.deltas.hybrid_over_bm25 = diffMetrics(matrix.modes.hybrid, matrix.modes.bm25_only);
+  matrix.deltas.bm25_over_recency = diffMetrics(matrix.modes.bm25_only, matrix.modes.recency);
+  matrix.deltas.recency_over_random = diffMetrics(matrix.modes.recency, matrix.modes.random);
+  // Per-query Δ — surfaces WHICH queries gain from multipliers vs which are
+  // multiplier-neutral. If hybrid_over_bm25 aggregate is 0, this answers
+  // whether (a) all queries are individually 0-lift (multipliers are dead
+  // weight on this corpus) or (b) some queries gain and some lose,
+  // averaging to 0 (multipliers are noisy, possibly directionally wrong).
+  // The delete-or-defend decision needs this granularity.
+  matrix.perQueryDeltas.hybrid_over_bm25 = perQueryDelta(matrix.modes.hybrid, matrix.modes.bm25_only);
+  matrix.perQueryDeltas.bm25_over_recency = perQueryDelta(matrix.modes.bm25_only, matrix.modes.recency);
+  return matrix;
+}
+
+function diffMetrics(a, b) {
+  const out = {};
+  for (const k of ['recall_at_10', 'precision_at_10', 'ndcg_at_10', 'mrr_at_10']) {
+    out[k] = round(a.metrics[k] - b.metrics[k]);
+  }
+  return out;
+}
+
+function perQueryDelta(higher, lower) {
+  // Pair up by query id (perQuery arrays are ordered identically — same
+  // input queries iterated in the same order across modes).
+  const byId = new Map();
+  for (const q of lower.perQuery) byId.set(q.id, q);
+  const out = [];
+  for (const hi of higher.perQuery) {
+    const lo = byId.get(hi.id);
+    if (!lo) continue;
+    out.push({
+      id: hi.id,
+      query: hi.query,
+      ndcg_delta: round(hi.ndcg_at_10 - lo.ndcg_at_10),
+      mrr_delta: round(hi.mrr - lo.mrr),
+      recall_delta: round(hi.recall_at_10 - lo.recall_at_10),
+    });
+  }
+  // Sort by ndcg_delta DESC — biggest lifts first. Ties broken by mrr_delta.
+  out.sort((a, b) => (b.ndcg_delta - a.ndcg_delta) || (b.mrr_delta - a.mrr_delta));
+  return out;
+}
+
+// Summarize per-query delta into bins: how many queries gained, lost, or stayed flat.
+// Default threshold 0.001 sits one decimal above round()'s 0.0001 precision —
+// any 4-decimal-rounded delta of 0.0001/0.0002 falls in `neutral`, which is
+// the right behavior (sub-rounding deltas are noise, not signal). Threshold
+// 0.001 represents "≥0.1% nDCG move" — the smallest difference reliably
+// reproducible across runs on this fixture.
+export function summarizePerQueryDelta(deltas, threshold = 0.001) {
+  const bins = { gained: 0, neutral: 0, lost: 0 };
+  for (const d of deltas) {
+    if (d.ndcg_delta > threshold) bins.gained++;
+    else if (d.ndcg_delta < -threshold) bins.lost++;
+    else bins.neutral++;
+  }
+  return bins;
+}
+
 // ─── CLI Entry Point ────────────────────────────────────────────────────────
 
 function main() {
@@ -296,6 +452,51 @@ function main() {
   const counts = seedDatabase(db, seedData);
   console.error(`  Seeded ${counts.observations} observations, ${counts.sessions} sessions`);
 
+  const args = new Set(process.argv.slice(2));
+  const matrixMode = args.has('--matrix') || args.has('--baselines');
+
+  if (matrixMode) {
+    console.error('Running benchmark matrix (hybrid + 3 baselines)...');
+    const matrix = runBenchmarkMatrix(db, queryData.queries);
+    console.log(JSON.stringify(matrix, null, 2));
+
+    console.error('\n─── Benchmark Matrix ───');
+    const head = `  ${'mode'.padEnd(11)} ${'R@10'.padStart(7)} ${'P@10'.padStart(7)} ${'nDCG'.padStart(7)} ${'MRR'.padStart(7)} ${'p95ms'.padStart(7)}`;
+    console.error(head);
+    console.error(`  ${'-'.repeat(11)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)}`);
+    for (const mode of BASELINE_MODES) {
+      const m = matrix.modes[mode].metrics;
+      console.error(`  ${mode.padEnd(11)} ${String(m.recall_at_10).padStart(7)} ${String(m.precision_at_10).padStart(7)} ${String(m.ndcg_at_10).padStart(7)} ${String(m.mrr_at_10).padStart(7)} ${String(m.p95_search_latency_ms).padStart(7)}`);
+    }
+    console.error('\n─── Lift (Δ recall / Δ precision / Δ nDCG / Δ MRR) ───');
+    const dh = matrix.deltas.hybrid_over_bm25;
+    const db1 = matrix.deltas.bm25_over_recency;
+    const dr = matrix.deltas.recency_over_random;
+    console.error(`  hybrid    over bm25_only: R=${dh.recall_at_10} P=${dh.precision_at_10} nDCG=${dh.ndcg_at_10} MRR=${dh.mrr_at_10}`);
+    console.error(`  bm25_only over recency:   R=${db1.recall_at_10} P=${db1.precision_at_10} nDCG=${db1.ndcg_at_10} MRR=${db1.mrr_at_10}`);
+    console.error(`  recency   over random:    R=${dr.recall_at_10} P=${dr.precision_at_10} nDCG=${dr.ndcg_at_10} MRR=${dr.mrr_at_10}`);
+    console.error('\n  Read: positive Δ on each row = that layer is doing work. ≈0 = layer is dead weight.');
+
+    // Per-query bin summary — answers "is the aggregate 0 because all queries
+    // are 0, or because gains and losses cancel?". If `lost` > 0 anywhere,
+    // multipliers are at least directionally noisy on those queries.
+    const hbBins = summarizePerQueryDelta(matrix.perQueryDeltas.hybrid_over_bm25);
+    const brBins = summarizePerQueryDelta(matrix.perQueryDeltas.bm25_over_recency);
+    console.error('\n─── Per-query Δ bins (n=' + matrix.queryCount + ', threshold=±0.001 nDCG) ───');
+    console.error(`  hybrid    over bm25_only: gained=${hbBins.gained}  neutral=${hbBins.neutral}  lost=${hbBins.lost}`);
+    console.error(`  bm25_only over recency:   gained=${brBins.gained}  neutral=${brBins.neutral}  lost=${brBins.lost}`);
+    if (hbBins.gained === 0 && hbBins.lost === 0) {
+      console.error('  → multipliers (decay/project/importance/access) flat on EVERY query — strong dead-weight signal');
+    } else if (hbBins.lost > hbBins.gained) {
+      console.error(`  → multipliers HURT more queries (${hbBins.lost}) than they helped (${hbBins.gained}) — directionally wrong`);
+    } else if (hbBins.gained > 0) {
+      console.error(`  → multipliers help ${hbBins.gained} query/ies — top lift: "${matrix.perQueryDeltas.hybrid_over_bm25[0].query}" (Δ=${matrix.perQueryDeltas.hybrid_over_bm25[0].ndcg_delta})`);
+    }
+
+    db.close();
+    return;
+  }
+
   console.error('Running benchmark...');
   const results = runBenchmark(db, queryData.queries);
 
@@ -310,6 +511,7 @@ function main() {
   console.error(`  MRR@10:          ${results.metrics.mrr_at_10}`);
   console.error(`  Avg tokens:      ${results.metrics.avg_tokens_injected}`);
   console.error(`  P95 latency:     ${results.metrics.p95_search_latency_ms}ms`);
+  console.error('  (run with --matrix for hybrid vs bm25_only / recency / random comparison)');
 
   // Per-category breakdown
   if (Object.keys(results.byCategory).length > 1) {

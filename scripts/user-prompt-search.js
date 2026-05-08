@@ -119,6 +119,82 @@ function isFollowUpSession() {
   } catch { return false; }
 }
 
+// ─── Explicit-signal gate (v2.57.x) ─────────────────────────────────────────
+//
+// Upstream gate that decides whether the FTS / prompt-fallback paths run at
+// all. Per cite-recall baseline 2026-04-22 → 2026-05-09 (29 sessions),
+// UserPromptSubmit injection cite-recall = 25.8% (132/178 silent injections)
+// vs PreToolUse:Read/Edit at 94.1/94.2%. The gap is the always-search policy
+// burning tokens on prompts the model never refers back to.
+//
+// Retreat: only inject when the prompt carries a signal that names something
+// concrete. Four orthogonal channels:
+//   (1) error-signature  — extractErrorSignature() typed exception match
+//   (2) file-reference   — extractFiles() basename.ext or path separator
+//   (3) detected intent  — detectIntent() catches recall words ("记得", "之前",
+//                          "previously") + actionable keywords (bugfix/test/
+//                          decision/refactor/perf/schema/implement/...)
+//   (4) tech identifier  — CamelCase / snake_case / ALL_CAPS_CONST /
+//                          kebab-case (≥3 segments). Conservative — drops
+//                          single-lowercase-word identifiers ("mem", "fix")
+//                          since those are 99% prose noise.
+//
+// "No signal" prompts ("does this work?", "how is it going") return no
+// injection. PreToolUse file-keyed hook is independent (94% recall track,
+// fires on Edit/Read/Write file paths) — not affected.
+//
+// Env override: CLAUDE_MEM_UPS_REQUIRE_SIGNAL=0 restores always-search.
+// Default ON.
+//
+// Note for OR-fallback gate (#8144) interaction: this gate is upstream of
+// score-quality gates (OR_TOP_BM25_FLOOR / TOP_REL_FLOOR). They compose:
+// presence-gate decides whether to search at all; score-gate trims the
+// returned set. Orthogonal layers — turning REQUIRE_SIGNAL off restores
+// the previous behavior where score-gates alone control noise.
+//
+// Regex post-review (Important #1): bare-acronym ALL_CAPS arm `[A-Z]{2,}…`
+// false-positived on common English prose (IBM, NPM, THE, BSD, ASCII).
+// camelCase arm `[a-z][a-z0-9]*[A-Z]…` false-positived on iOS, eBay.
+// Five-arm tightening:
+//   • snake_case      — requires `_` between lowercase tokens
+//   • CONST_CASE      — requires `_` between uppercase tokens (catches
+//                       MAX_RESULTS, CLAUDE_MEM_DIR, OBS_BM25)
+//   • ACRONYM_w_digit — bare 2+-cap run with at least one digit (catches
+//                       FTS5, MD5, HTML5, OAUTH2, HTTP2; rejects IBM/NPM/
+//                       THE/BSD/ASCII which never carry digits in prose)
+//   • camelCase       — requires ≥2 lowercase before the first cap
+//                       (excludes iOS, eBay; allows getUserById, parseJsonFromLLM)
+//   • kebab-case      — ≥3 segments (pre-tool-use; excludes "easy-to-use")
+// Bare digitless acronyms (URL, JWT, JSON, HTTP) no longer match — they
+// typically appear alongside intent keywords or files anyway, so the gate
+// catches the prompt via those channels rather than the identifier itself.
+const TECH_IDENTIFIER_RE = /\b(?:[a-z][a-z0-9]*_[a-z0-9_]+|[A-Z][A-Z0-9]*_[A-Z0-9_]+|[A-Z]{2,}[0-9][A-Z0-9_]*|[a-z]{2,}[A-Z][a-zA-Z0-9]+|[a-z]+(?:-[a-z]+){2,})\b/;
+
+// CJK presence channel (Important #2): bilingual users (project memory
+// `feedback_*` calls this out explicitly) ask CJK questions that may carry
+// genuine debug intent without containing an English identifier. CJK is
+// information-dense — an 8-effective-unit prompt rarely encodes "how is it
+// going"-style noise. Threshold mirrors shouldSkip's CJK floor.
+const CJK_CHAR_RE = /[一-鿿぀-ヿ]/;
+const CJK_MIN_EFFECTIVE_LEN = 8;
+
+const REQUIRE_EXPLICIT_SIGNAL = process.env.CLAUDE_MEM_UPS_REQUIRE_SIGNAL !== '0';
+
+export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
+  if (!text) return false;
+  if (errSig) return true;
+  if (Array.isArray(files) && files.length > 0) return true;
+  if (intent) return true;
+  // Recompute path — fires only when the caller passes `text` alone (test
+  // entry point); production caller in main() always pre-computes all three.
+  if (errSig === undefined && extractErrorSignature(text)) return true;
+  if (files === undefined && extractFiles(text).length > 0) return true;
+  if (intent === undefined && detectIntent(text)) return true;
+  if (TECH_IDENTIFIER_RE.test(text)) return true;
+  if (CJK_CHAR_RE.test(text) && computeEffectiveLen(text) >= CJK_MIN_EFFECTIVE_LEN) return true;
+  return false;
+}
+
 // ─── DB Query Functions ─────────────────────────────────────────────────────
 
 // Returns { rows, mode } where mode is 'AND' (initial pass), 'OR' (fallback
@@ -447,12 +523,25 @@ async function main() {
         )
       : [];
 
+    // v2.57.x explicit-signal gate. Compute files once for both the gate and
+    // the file-recall path below — extractFiles is regex over the prompt,
+    // safe to call eagerly. errSig + intent already computed above.
+    const filesForGate = extractFiles(promptText);
+    const signalPresent = hasExplicitSignal(promptText, {
+      errSig, files: filesForGate, intent,
+    });
+
     if (intent?.useRecent) {
       // Recall intent: show recent observations
       rows = searchRecent(db, project, intent.limit);
+    } else if (REQUIRE_EXPLICIT_SIGNAL && !signalPresent) {
+      // No explicit signal — skip FTS pipeline + prompt-fallback. sigRows
+      // is already empty (errSig was null else signalPresent would be true).
+      // Registry skill pointer below remains unaffected (its own name match).
+      rows = [];
     } else {
       // FTS search: use the prompt as query, optionally type-filtered
-      const files = extractFiles(promptText);
+      const files = filesForGate;
       let ftsResult = searchByFts(db, promptText, project, intent?.limit || MAX_RESULTS, intent?.type || null);
       // Fallback: if typed search returned nothing, retry without type filter
       if (ftsResult.rows.length === 0 && intent?.type) {
@@ -518,8 +607,13 @@ async function main() {
     // suppress the fallback to avoid noise). Namespace prompt IDs with
     // a "P" prefix so shouldSkipByDedup's Set comparison doesn't collide
     // with future observation IDs.
+    //
+    // v2.57.x: also gated by signalPresent. The prompt-fallback path has
+    // no quality gate (only BM25 ordering — see PROMPT_FALLBACK_LIMIT
+    // rationale at top), so injecting it on no-signal prompts is the
+    // single highest-noise UPS path. Restored when REQUIRE_SIGNAL=0.
     let promptRows = [];
-    if (rows.length === 0) {
+    if (rows.length === 0 && (!REQUIRE_EXPLICIT_SIGNAL || signalPresent)) {
       promptRows = searchByUserPrompts(db, promptText, project, PROMPT_FALLBACK_LIMIT);
     }
 

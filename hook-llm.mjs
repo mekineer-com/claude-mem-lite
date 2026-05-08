@@ -22,6 +22,56 @@ import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from './l
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
 const EVENT_TYPE_SET = new Set(EVENT_TYPES);
 
+// ─── Lesson-retry stats (v29 / B2) ──────────────────────────────────────────
+//
+// Persists the {attempts, recovered} counters per UTC date_bucket. Aggregate
+// table (not per-row) — the question being answered is "is the retry path
+// paying off in aggregate?", per-obs detail isn't needed.
+
+/** Convert a Date (or now) to a YYYY-MM-DD UTC bucket. */
+function dateBucketUtc(date = new Date()) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * UPSERT a single retry-attempt outcome into lesson_retry_stats. attempts
+ * always +1; recovered +1 only when the retry returned a non-low-signal lesson.
+ * @param {Database} db open better-sqlite3 handle
+ * @param {boolean} recovered whether the retry recovered a usable lesson
+ * @param {string} [bucket] optional override (test path); defaults to today UTC
+ */
+export function recordRetryAttempt(db, recovered, bucket = dateBucketUtc()) {
+  // Single-statement atomic UPSERT (post-review fix Important #4). The
+  // previous two-statement form let a concurrent reader observe the
+  // {attempts:0, recovered:0} intermediate state between the INSERT OR
+  // IGNORE and the UPDATE; ON CONFLICT collapses this to one statement
+  // that runs entirely under the writer lock with no observable middle
+  // state. SQLite ≥3.24 supports the syntax (better-sqlite3 ships ≥3.30).
+  db.prepare(`
+    INSERT INTO lesson_retry_stats (date_bucket, attempts, recovered)
+    VALUES (?, 1, ?)
+    ON CONFLICT(date_bucket) DO UPDATE SET
+      attempts = attempts + 1,
+      recovered = recovered + excluded.recovered
+  `).run(bucket, recovered ? 1 : 0);
+}
+
+/**
+ * Read recent retry-stats rows. Returns rows ordered by date_bucket DESC,
+ * limited to the last `days` UTC buckets (using string comparison; safe for
+ * YYYY-MM-DD lexicographic order).
+ */
+export function readRetryStats(db, days = 30) {
+  const cutoff = new Date(Date.now() - days * 86400000);
+  return db.prepare(
+    `SELECT date_bucket, attempts, recovered FROM lesson_retry_stats
+     WHERE date_bucket >= ? ORDER BY date_bucket DESC`
+  ).all(dateBucketUtc(cutoff));
+}
+
 // ─── Save Observation to DB ─────────────────────────────────────────────────
 
 /** Build the FTS5 text field from observation data (concepts + facts + searchAliases + CJK bigrams). */
@@ -524,10 +574,10 @@ ${actionList}
 
 ${typeHint}
 
-If the work was purely mechanical with no insight worth remembering, reply {"lesson":"none"}.
-Otherwise reply in 12-280 chars.
+If the work was purely mechanical with no insight worth remembering, reply {"lesson":null}.
+Otherwise reply in 12-280 chars. Do NOT invent a fake lesson, do NOT write the string "none".
 
-Reply ONLY valid JSON, no markdown fences: {"lesson":"..."}`;
+Reply ONLY valid JSON, no markdown fences: {"lesson":"..."} or {"lesson":null}`;
 }
 
 // ─── Background: LLM Episode Extraction (Tier 2 F) ──────────────────────────
@@ -571,11 +621,11 @@ File: ${episode.files.join(', ') || 'unknown'}
 Action: ${e.desc}
 Error: ${e.isError ? 'yes' : 'no'}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
 type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y because Z" / rejected an approach (e.g. "Rejected schema migration — single-source module + sync test instead"; "Heterogeneous hook events → heterogeneous context budgets"). bugfix = prior-failing path fixed with a named root cause. feature = new user-visible capability. refactor = behavior unchanged but structure improved. discovery = learned how a system works (read-heavy, no writes). change = routine edit with no new principle (default if unsure and nothing else fits).
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
-lesson_learned: REQUIRED field. State what was learned that isn't obvious from reading the code. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". If purely routine with nothing learned, write "none" (not null).
+lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
   } else {
     const actionList = episode.entries.map((e, i) =>
@@ -589,11 +639,11 @@ Files: ${fileList}
 Actions (${episode.entries.length} total):
 ${actionList}
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight or 'none' if routine","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
 type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y because Z" / rejected an approach (e.g. "Rejected schema migration — single-source module + sync test instead"; "Heterogeneous hook events → heterogeneous context budgets"). bugfix = prior-failing path fixed with a named root cause. feature = new user-visible capability. refactor = behavior unchanged but structure improved. discovery = learned how a system works (read-heavy, no writes). change = routine edit with no new principle (default if unsure and nothing else fits).
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
-lesson_learned: REQUIRED field. State what was learned that isn't obvious from reading the code. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". If purely routine with nothing learned, write "none" (not null).
+lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
   }
 
@@ -645,9 +695,12 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
       // ~16.5%), and Haiku's first pass writes NULL ~70% of the time for
       // curated observations. Retry budget: 1 extra callLLM per bugfix/decision
       // episode. Opt-out: CLAUDE_MEM_NO_LESSON_RETRY=1.
+      let retryAttempted = false;
+      let retryRecovered = false;
       if (isLessonLowSignal &&
           (parsed.type === 'bugfix' || parsed.type === 'decision') &&
           !process.env.CLAUDE_MEM_NO_LESSON_RETRY) {
+        retryAttempted = true;
         try {
           const retryPrompt = buildLessonRetryPrompt(episode, parsed);
           const retryRaw = callLLM(retryPrompt, 10000);
@@ -657,10 +710,26 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
             const retryIsLow = lowSignalLesson.has(retryLesson.toLowerCase()) || retryLesson.length < 12;
             if (!retryIsLow) {
               lessonLearned = retryLesson.slice(0, 500);
+              retryRecovered = true;
               debugLog('DEBUG', 'llm-episode', `lesson-retry: recovered ${retryLesson.length}-char lesson for ${parsed.type}`);
             }
           }
         } catch (e) { debugCatch(e, 'lesson-retry'); }
+      }
+      // v2.57.x B2: persist retry outcome counters. The retry path costs
+      // 1 extra Haiku call per bugfix/decision episode; if recovered/attempts
+      // ratio is consistently <10% over a long window, the path should be
+      // deleted to save the LLM cost. `claude-mem-lite stats --retry`
+      // exposes the daily aggregate. Opens a short-lived db handle so the
+      // counter survives even if the main `obs` build below fails (we want
+      // the data point about the retry attempt, not just the success path).
+      if (retryAttempted) {
+        try {
+          const cdb = openDb();
+          if (cdb) {
+            try { recordRetryAttempt(cdb, retryRecovered); } finally { cdb.close(); }
+          }
+        } catch (e) { debugCatch(e, 'retry-stats-write'); }
       }
 
       const searchAliases = Array.isArray(parsed.search_aliases)

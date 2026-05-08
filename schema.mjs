@@ -26,7 +26,21 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // 2839/6429 (44%) orphaned rows (historic deletes during FK-OFF migrations)
 // and 3282/6429 (51%) stale-vocab rows (rebuildVocabulary never pruned old
 // versions before v2.47). Idempotent one-shot DELETE on ensureDb.
-export const CURRENT_SCHEMA_VERSION = 28;
+//
+// v29 (v2.57.x): (1) sdk_sessions_id_invariant trigger guarding the v2.33.1
+// mix pattern (memory_session_id and content_session_id must not be the same
+// non-null value — they're different ID schemes). (2) lesson_retry_stats
+// aggregate table tracking how often hook-llm.mjs retry path actually
+// recovers a lesson (vs being a wasted Haiku call). Both purely additive.
+//
+// v30 (v2.57.x patch): trigger body fix — UUID-shape gate so test fixtures
+// using short literal IDs ('sess-1') don't trigger. Initial v29 trigger
+// fired on any equal non-null pair, breaking 60+ test scaffolds that write
+// the same literal to both columns by helper convention. v30 forces
+// DROP+CREATE so DBs that picked up the strict v29 trigger get the UUID-
+// gated body. Required because `CREATE TRIGGER IF NOT EXISTS` is a no-op
+// when the trigger already exists, even with a different body.
+export const CURRENT_SCHEMA_VERSION = 30;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -471,6 +485,62 @@ export function initSchema(db) {
     }
   } catch { /* non-critical — normalization can retry on next open */ }
 
+  // ─── v29 (v2.57.x): session-id mix invariant + lesson-retry stats ─────────
+  //
+  // (B1) sdk_sessions_id_mix_check trigger — guards the v2.33.1 bug pattern
+  // where memory_session_id and content_session_id were silently the same
+  // value because a caller passed the wrong ID type. The two columns hold
+  // *different* ID schemes (mem-internal `hook-<project>-<hash>` vs Claude
+  // Code UUID); they should never be equal non-null in production.
+  //
+  // Trigger fires only when both values look like CC UUIDs (length 36 +
+  // hyphenated 8-4-4-4-12 LIKE pattern). This is the v2.33.1 fingerprint —
+  // a CC UUID accidentally written into BOTH columns. Test fixtures use
+  // short literal strings ('sess-1') for which neither column holds a UUID,
+  // so the trigger correctly bypasses them; the audit function below reports
+  // any mix regardless for diagnostic completeness.
+  //
+  // DROP+CREATE pattern (not IF NOT EXISTS) so v29 DBs that captured the
+  // initial strict trigger body get the UUID-gated v30 body on next init.
+  // Cheap — triggers are metadata-only DDL; this runs once per schema
+  // version bump (gated by the fast-path schema_version check above).
+  db.exec(`
+    DROP TRIGGER IF EXISTS sdk_sessions_id_mix_check_ai;
+    DROP TRIGGER IF EXISTS sdk_sessions_id_mix_check_au;
+    CREATE TRIGGER sdk_sessions_id_mix_check_ai
+      BEFORE INSERT ON sdk_sessions
+      WHEN NEW.memory_session_id IS NOT NULL
+        AND NEW.memory_session_id = NEW.content_session_id
+        AND length(NEW.memory_session_id) = 36
+        AND NEW.memory_session_id LIKE '________-____-____-____-____________'
+      BEGIN
+        SELECT RAISE(ABORT, 'sdk_sessions invariant: memory_session_id and content_session_id must not hold the same UUID value (v2.33.1 mix pattern)');
+      END;
+    CREATE TRIGGER sdk_sessions_id_mix_check_au
+      BEFORE UPDATE ON sdk_sessions
+      WHEN NEW.memory_session_id IS NOT NULL
+        AND NEW.memory_session_id = NEW.content_session_id
+        AND length(NEW.memory_session_id) = 36
+        AND NEW.memory_session_id LIKE '________-____-____-____-____________'
+      BEGIN
+        SELECT RAISE(ABORT, 'sdk_sessions invariant: memory_session_id and content_session_id must not hold the same UUID value (v2.33.1 mix pattern)');
+      END;
+  `);
+
+  // (B2) lesson_retry_stats — daily aggregate of hook-llm.mjs retry path
+  // outcomes. attempts = times the bugfix/decision retry prompt was issued;
+  // recovered = times the retry actually returned a non-low-signal lesson.
+  // Used by `claude-mem-lite stats --retry` to answer "is the extra Haiku
+  // call paying off?" — if recovered/attempts < 0.1 over a long window,
+  // delete the retry path and save one LLM call per bugfix/decision.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS lesson_retry_stats (
+      date_bucket TEXT PRIMARY KEY,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      recovered INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+
   // Record schema version for fast-path on subsequent calls
   db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)');
   db.transaction(() => {
@@ -479,6 +549,67 @@ export function initSchema(db) {
   })();
 
   return db;
+}
+
+// ─── Session-consistency audit (B1) ─────────────────────────────────────────
+//
+// Used by `claude-mem-lite doctor --session-audit` to surface dangling state
+// that the schema invariant trigger only catches at insert/update time. The
+// trigger is a forward-protection; this function detects historical drift.
+//
+// Returns shape: {
+//   id_mix_uuid_shape:  rows where both columns hold the same UUID-shaped value
+//                       (the v2.33.1 production fingerprint — alarming),
+//   id_mix_other:       rows where both columns equal but NOT UUID-shaped
+//                       (typically test-fixture scaffold convention — informational),
+//   missing_mem_id:     sdk_sessions rows where memory_session_id IS NULL after grace,
+//   orphan_obs:         observations.memory_session_id values not in sdk_sessions,
+//   healthy:            true when id_mix_uuid_shape + missing_mem_id + orphan_obs == 0;
+//                       id_mix_other does NOT drive healthy=false, mirroring the
+//                       trigger's UUID-shape gate so doctor doesn't misfire on DBs
+//                       contaminated with test-fixture-style literal IDs.
+// }
+//
+// Post-review fix (Important #5): split id_mix to avoid false-positive doctor
+// failures on DBs that contain test fixtures or any 'sess-1'-style literal
+// equality. The trigger only fires for UUID-shaped equality (the actual bug
+// fingerprint); the audit now mirrors that policy for the exit-code-driving
+// metric while still surfacing the broader count for diagnostic transparency.
+export function auditSessionConsistency(db, { graceMinutes = 5 } = {}) {
+  const cutoff = Date.now() - graceMinutes * 60_000;
+  // UUID-shape gate mirrors the v30 trigger — same length=36 + LIKE pattern.
+  const UUID_LIKE = '________-____-____-____-____________';
+  const idMixUuidShape = db.prepare(`
+    SELECT COUNT(*) AS c FROM sdk_sessions
+    WHERE memory_session_id IS NOT NULL
+      AND memory_session_id = content_session_id
+      AND length(memory_session_id) = 36
+      AND memory_session_id LIKE ?
+  `).get(UUID_LIKE).c;
+  const idMixOther = db.prepare(`
+    SELECT COUNT(*) AS c FROM sdk_sessions
+    WHERE memory_session_id IS NOT NULL
+      AND memory_session_id = content_session_id
+      AND NOT (length(memory_session_id) = 36 AND memory_session_id LIKE ?)
+  `).get(UUID_LIKE).c;
+  const missingMemId = db.prepare(`
+    SELECT COUNT(*) AS c FROM sdk_sessions
+    WHERE memory_session_id IS NULL
+      AND started_at_epoch < ?
+  `).get(cutoff).c;
+  const orphanObs = db.prepare(`
+    SELECT COUNT(*) AS c FROM observations o
+    WHERE NOT EXISTS (
+      SELECT 1 FROM sdk_sessions s WHERE s.memory_session_id = o.memory_session_id
+    )
+  `).get().c;
+  return {
+    id_mix_uuid_shape: idMixUuidShape,
+    id_mix_other: idMixOther,
+    missing_mem_id: missingMemId,
+    orphan_obs: orphanObs,
+    healthy: idMixUuidShape === 0 && missingMemId === 0 && orphanObs === 0,
+  };
 }
 
 /**
