@@ -280,6 +280,19 @@ function ok(msg) { console.log(`  ✓ ${msg}`); }
 function warn(msg) { console.log(`  ⚠ ${msg}`); }
 function fail(msg) { console.log(`  ✗ ${msg}`); }
 
+// Doctor's final summary line. Pure function so the 4-way contract
+// (clean / warnings-only / issues / mixed) is unit-testable without spinning
+// up the full doctor pipeline. `issues` are ✗-level (action required);
+// `warnings` are ⚠-level (informational, "All checks passed!" must NOT lie
+// about them).
+export function buildDoctorSummary(issues, warnings) {
+  const wPlural = warnings === 1 ? '' : 's';
+  if (issues === 0 && warnings === 0) return 'All checks passed!';
+  if (issues === 0) return `All critical checks passed (${warnings} warning${wPlural}).`;
+  const warnSuffix = warnings > 0 ? ` (+${warnings} warning${wPlural})` : '';
+  return `${issues} issue(s) found.${warnSuffix}`;
+}
+
 // Dev installs symlink server.mjs → the project's source file. Used to suppress
 // misleading "first run" messages since hook-update.mjs skips state-writes in
 // this mode (see hook-update.mjs isDevMode).
@@ -1152,6 +1165,13 @@ async function status() {
 async function doctor() {
   console.log('\nclaude-mem-lite doctor\n');
   let issues = 0;
+  let warnings = 0;
+  // Doctor-local ⚠ helper: visually identical to the file-level `warn`, but
+  // bumps `warnings` so the summary line can distinguish "fully green" from
+  // "warnings present". Used for informational ⚠ checks; the two ⚠ paths
+  // that ALSO bump `issues` (stale procs, dev drift) keep using the file-level
+  // `warn` directly to avoid double-counting.
+  const dwarn = (msg) => { warnings++; console.log(`  ⚠ ${msg}`); };
 
   // Node version
   const nodeVer = process.version;
@@ -1209,7 +1229,7 @@ async function doctor() {
   } else if (hasHooks) {
     ok('Plugin lifecycle: hooks active');
   } else {
-    warn('Plugin lifecycle: hooks not configured');
+    dwarn('Plugin lifecycle: hooks not configured');
   }
 
   // Database
@@ -1232,7 +1252,7 @@ async function doctor() {
             if (healthy) {
               ok('FTS5 integrity: all indexes healthy');
             } else {
-              warn('FTS5 integrity issues detected:');
+              dwarn('FTS5 integrity issues detected:');
               for (const d of details) log(`    ${d}`);
               log('  Attempting FTS5 rebuild...');
               const { rebuilt, errors } = rebuildFTS(rwDb);
@@ -1243,17 +1263,17 @@ async function doctor() {
             rwDb.close();
           }
         } catch (e) {
-          warn('FTS5 integrity check failed: ' + e.message);
+          dwarn('FTS5 integrity check failed: ' + e.message);
         }
       } else {
-        warn('FTS5 index: missing (will be created on server start)');
+        dwarn('FTS5 index: missing (will be created on server start)');
       }
     } catch (e) {
       fail('Database: ' + e.message);
       issues++;
     }
   } else {
-    warn('Database: not found (will be created)');
+    dwarn('Database: not found (will be created)');
   }
 
   // Check for stale processes
@@ -1287,10 +1307,10 @@ async function doctor() {
       // short-circuits before writing state (see hook-update.mjs isDevMode).
       ok('Update state: skipped (dev mode — symlinked install)');
     } else {
-      warn('Update state: no state file (first run?)');
+      dwarn('Update state: no state file (first run?)');
     }
   } catch {
-    warn('Update state: failed to read');
+    dwarn('Update state: failed to read');
   }
 
   // Dev drift: in dev-mode installs, all SOURCE_FILES entries should be
@@ -1310,7 +1330,7 @@ async function doctor() {
     }
     // Prod (all plain) install: no message — dev-drift is a dev-only concern.
   } catch (e) {
-    warn('Dev drift: check failed — ' + e.message);
+    dwarn('Dev drift: check failed — ' + e.message);
   }
 
   // Stale temp files
@@ -1329,12 +1349,12 @@ async function doctor() {
       }
     }
     if (staleCount > 0) {
-      warn(`Stale temp files: ${staleCount} found (run: node install.mjs cleanup)`);
+      dwarn(`Stale temp files: ${staleCount} found (run: node install.mjs cleanup)`);
     } else {
       ok('Stale temp files: none');
     }
   } catch {
-    warn('Stale temp files: check failed');
+    dwarn('Stale temp files: check failed');
   }
 
   // DB stats
@@ -1350,7 +1370,7 @@ async function doctor() {
       db.close();
       ok(`DB stats: ${sizeMB}MB, ${obsCount} observations, ${sessCount} sessions`);
     } catch (e) {
-      warn('DB stats: ' + e.message);
+      dwarn('DB stats: ' + e.message);
     }
   }
 
@@ -1364,14 +1384,14 @@ async function doctor() {
         sizeStr = execFileSync('du', ['-sh', pluginCacheBase], { encoding: 'utf8', timeout: 5000 }).trim().split('\t')[0];
       } catch { sizeStr = '?'; }
       if (versions.length > 3) {
-        warn(`Plugin cache: ${versions.length} versions (${sizeStr}) — run setup.sh or update to auto-prune to 3`);
+        dwarn(`Plugin cache: ${versions.length} versions (${sizeStr}) — run setup.sh or update to auto-prune to 3`);
       } else {
         ok(`Plugin cache: ${versions.length} version(s) (${sizeStr})`);
       }
     } catch {}
   }
 
-  console.log(`\n  ${issues === 0 ? 'All checks passed!' : `${issues} issue(s) found.`}\n`);
+  console.log(`\n  ${buildDoctorSummary(issues, warnings)}\n`);
 }
 
 // ─── Settings helpers ───────────────────────────────────────────────────────

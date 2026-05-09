@@ -7,6 +7,7 @@
 
 import {
   OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE,
+  DEFAULT_DECAY_HALF_LIFE_MS,
   notLowSignalTitleClause, LOW_SIGNAL_TITLE,
   relaxFtsQueryToOr, debugLog, debugCatch,
 } from './utils.mjs';
@@ -141,6 +142,54 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
  *                         perSourceOffset, currentProject, limit, orFallbackFired }
  * @returns {Array} list of result objects (mutated ctx may set orFallbackFired)
  */
+/**
+ * Resolve `timeline --query "..."` / mem_timeline auto-anchor to a single
+ * observation id. Shared between mem-cli.mjs cmdTimeline and server.mjs
+ * mem_timeline so both surfaces use identical AND→OR fallback semantics
+ * (paired-path discipline per #8217).
+ *
+ * Pipeline:
+ *   1. FTS5 MATCH with the sanitized query (AND-by-default), recency-weighted
+ *   2. If AND returns 0 → relaxFtsQueryToOr fallback (mirrors searchObservationsHybrid)
+ *
+ * Returns the matched observation id, or null. Always skips compressed rows.
+ *
+ * @param {Database} db
+ * @param {object} opts
+ * @param {string|null} opts.ftsQuery  pre-sanitized FTS5 query
+ * @param {string|null} [opts.project] restrict to this project (boost-by-membership; null = no filter)
+ * @param {number} [opts.nowT]         Date.now() override (for deterministic tests)
+ * @param {number} [opts.halfLifeMs]   recency half-life (default DEFAULT_DECAY_HALF_LIFE_MS)
+ * @returns {number|null}
+ */
+export function findFtsAnchor(db, { ftsQuery, project = null, nowT = null, halfLifeMs = DEFAULT_DECAY_HALF_LIFE_MS } = {}) {
+  if (!ftsQuery) return null;
+  const now = nowT ?? Date.now();
+  const sql = `
+    SELECT o.id FROM observations_fts
+    JOIN observations o ON observations_fts.rowid = o.id
+    WHERE observations_fts MATCH ?
+      AND (? IS NULL OR o.project = ?)
+      AND COALESCE(o.compressed_into, 0) = 0
+    ORDER BY ${OBS_BM25}
+      * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${halfLifeMs}.0))
+    LIMIT 1
+  `;
+  const stmt = db.prepare(sql);
+  try {
+    const m = stmt.get(ftsQuery, project, project, now);
+    if (m) return m.id;
+  } catch (e) { debugCatch(e, 'findFtsAnchor-and'); }
+  const orQuery = relaxFtsQueryToOr(ftsQuery);
+  if (orQuery && orQuery !== ftsQuery) {
+    try {
+      const m = stmt.get(orQuery, project, project, now);
+      if (m) return m.id;
+    } catch (e) { debugCatch(e, 'findFtsAnchor-or'); }
+  }
+  return null;
+}
+
 export function searchObservationsHybrid(db, ctx) {
   const { ftsQuery, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit } = ctx;
   const results = [];

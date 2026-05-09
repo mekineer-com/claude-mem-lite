@@ -4,14 +4,14 @@
 
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
 import { cjkPrecisionOk } from './nlp.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { getVocabulary, computeVector, rebuildVocabulary, _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
-import { searchObservationsHybrid } from './search-engine.mjs';
+import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
@@ -663,25 +663,16 @@ function cmdTimeline(db, args) {
     }
   }
 
-  // Support query-based anchor: `timeline --query "search terms"` or positional
-  // Uses recency-weighted BM25 + project filter (aligned with MCP mem_timeline)
+  // Support query-based anchor: `timeline --query "search terms"` or positional.
+  // Routes through shared findFtsAnchor (paired-path with MCP mem_timeline)
+  // so AND→OR fallback semantics match `search` — without this, queries like
+  // "ep-flush leak" miss rows whose title is "ep-flush ... leaked" that
+  // search would otherwise find via OR relaxation.
   const queryStr = flags.query || positional.join(' ');
   if ((!anchorId || isNaN(anchorId)) && queryStr) {
     const ftsQuery = sanitizeFtsQuery(queryStr);
-    if (ftsQuery) {
-      const nowT = Date.now();
-      const match = db.prepare(`
-        SELECT o.id FROM observations_fts
-        JOIN observations o ON observations_fts.rowid = o.id
-        WHERE observations_fts MATCH ?
-          AND (? IS NULL OR o.project = ?)
-          AND COALESCE(o.compressed_into, 0) = 0
-        ORDER BY ${OBS_BM25}
-          * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${DEFAULT_DECAY_HALF_LIFE_MS}.0))
-        LIMIT 1
-      `).get(ftsQuery, project ?? null, project ?? null, nowT);
-      if (match) anchorId = match.id;
-    }
+    const found = findFtsAnchor(db, { ftsQuery, project: project ?? null });
+    if (found) anchorId = found;
   }
 
   // No anchor: show most recent observations (aligned with MCP mem_timeline fallback)

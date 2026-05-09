@@ -40,7 +40,7 @@ import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS,
   sessionFile, getSessionId, createSessionId, openDb,
-  spawnBackground,
+  spawnBackground, sweepOrphanEpisodeFiles,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { extractCitationsFromTranscript, bumpCitationAccess, computeCiteRecall } from './lib/citation-tracker.mjs';
@@ -884,6 +884,17 @@ async function handleSessionStart() {
             }
           }
         }
+
+        // Orphan sweep: remove `ep-flush-*` / `pending-*` runtime files older
+        // than 1h. handleLLMEpisode normally unlinks its own tmpFile on every
+        // exit path, but a crashed worker (OOM, host reboot, kill -9) leaves
+        // the file behind, and the doctor "Stale temp files" warning then
+        // accumulates indefinitely. fs-only; runs inside the 24h gate so it
+        // shares cadence with the rest of auto-maintain.
+        try {
+          const swept = sweepOrphanEpisodeFiles(RUNTIME_DIR);
+          if (swept > 0) debugLog('DEBUG', 'auto-maintain', `swept ${swept} orphan ep-flush/pending file(s)`);
+        } catch (e) { debugCatch(e, 'auto-maintain-orphan-sweep'); }
 
         // Mark maintenance as done (24h gate) — even though compression runs in background
         writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));

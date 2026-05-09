@@ -5,12 +5,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
 import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
-import { searchObservationsHybrid } from './search-engine.mjs';
+import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
 import { effectiveQuiet } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
@@ -103,7 +103,7 @@ function resolveProject(name) { return _resolveProjectShared(db, name); }
 //   Importance:    0.5 + 0.5 × importance (range 0.5–2.0)
 //   Access bonus:  1 + 0.1 × ln(1 + access_count)
 
-// OBS_BM25, SESS_BM25, TYPE_DECAY_CASE imported from utils.mjs
+// SESS_BM25, TYPE_DECAY_CASE imported from utils.mjs
 const RECENCY_HALF_LIFE_MS = DEFAULT_DECAY_HALF_LIFE_MS;
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
@@ -612,24 +612,13 @@ server.registerTool(
       }
     }
 
-    // Auto-find anchor via FTS (with recency decay)
+    // Auto-find anchor via FTS (with recency decay). Routes through shared
+    // findFtsAnchor so CLI `timeline --query` and MCP mem_timeline use
+    // identical AND→OR fallback semantics (paired-path per #8217).
     if (!anchorId && args.query) {
       const ftsQuery = sanitizeFtsQuery(args.query);
-      if (ftsQuery) {
-        const nowT = Date.now();
-        const row = db.prepare(`
-          SELECT o.id
-          FROM observations_fts
-          JOIN observations o ON observations_fts.rowid = o.id
-          WHERE observations_fts MATCH ?
-            AND (? IS NULL OR o.project = ?)
-            AND COALESCE(o.compressed_into, 0) = 0
-          ORDER BY ${OBS_BM25}
-            * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-          LIMIT 1
-        `).get(ftsQuery, args.project ?? null, args.project ?? null, nowT);
-        if (row) anchorId = row.id;
-      }
+      const found = findFtsAnchor(db, { ftsQuery, project: args.project ?? null });
+      if (found) anchorId = found;
     }
 
     // No anchor: return most recent

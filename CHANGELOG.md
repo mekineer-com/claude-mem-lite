@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.62.0] - 2026-05-10
+
+**Three-fix maintenance bundle: ep-flush orphan sweep, doctor warnings counter, timeline anchor AND→OR parity.** All three surfaced via dogfooding (simulated normal Claude Code editing sessions against this repo). Schema unchanged. 85 test files / 2138 tests pass (+3 files, +20 tests vs 2.61.0); zero ESLint errors.
+
+### Fixed
+
+- **`hook-shared.mjs::sweepOrphanEpisodeFiles` + SessionStart wiring (`hook.mjs:885`).** `ep-flush-*` and `pending-*` runtime files leaked when `handleLLMEpisode` crashed mid-flight (OOM, kill -9, host reboot). Each `unlinkSync` was correctly placed on every normal exit path, but no orphan-sweep ran on SessionStart, so the doctor "Stale temp files" warning accumulated unboundedly across crashes. New `sweepOrphanEpisodeFiles(runtimeDir, {ageMs, now})` helper takes a 1h default age gate (well above the ~60s `handleLLMEpisode` worst-case round-trip, so concurrent in-flight files are never raced) and runs inside the existing 24h-gated auto-maintain block. 7 new tests in `tests/sweep-orphan-episode.test.mjs` cover missing-dir, no-match, both prefixes, in-flight-protected, prefix-only sweep, and deterministic `now` injection. Lesson #8269.
+
+- **`install.mjs::buildDoctorSummary` + `dwarn` counter shadow.** `doctor()` reporter bug: "All checks passed!" rendered while ⚠ warnings were visible. Root cause: 6+ `warn()` calls in `doctor()` body bumped neither an issue nor warning counter; the summary line used only `issues === 0` to gate the "all passed" string. Fix: extract pure `buildDoctorSummary(issues, warnings)` helper (4-way contract: clean / warnings-only / issues / mixed); shadow `warn` with `dwarn` inside `doctor()` that bumps a local warnings counter; keep the two `warn`-then-`issues++` paths (stale procs, dev drift) using file-level `warn` to avoid double-counting. 6 new tests in `tests/doctor-summary.test.mjs` lock the contract (singular vs plural pluralization, mixed-state suffix, all four state transitions). Lesson #8268.
+
+- **`search-engine.mjs::findFtsAnchor` — paired-path AND→OR fallback for timeline anchor.** `timeline --query "ep-flush leak"` returned "No anchor found" while `search "ep-flush leak"` found the same row via AND→OR relaxation. Root cause: CLI `cmdTimeline` (mem-cli.mjs:670) and MCP `mem_timeline` (server.mjs:615) each ran their own bare `observations_fts MATCH ?` (AND-by-default), missing the OR-relax that `searchObservationsHybrid` applies — exactly the paired-path anti-pattern #8217 warns against. Fix: extracted shared `findFtsAnchor(db, {ftsQuery, project, nowT, halfLifeMs})` as single source of truth in `search-engine.mjs` (AND match → OR-relax on 0 rows → recency-weighted BM25, `LIMIT 1`); both consumers now call it, ~20 lines of duplicated SQL deleted. 7 new tests in `tests/timeline-anchor-or-fallback.test.mjs` cover empty-guard, no-match, AND-direct, OR-fallback (the pre-fix bug), project-filter, compressed-skip, and recency-tiebreak. Lesson #8270.
+
 ## [2.61.0] - 2026-05-10
 
 **Audit-driven 8-fix bundle: prompt caching, prompt-injection hardening, save-logic dedup, benchmark holdout + per-multiplier ablation, active citation feedback, scrub-pattern coverage, hook-path GC migration, hook-latency regression tests.** All eight items came from a comprehensive `/ultrathink` review of architecture / algorithms / Claude Code integration / LLM safety, then implemented in ROI order. Schema unchanged. All 82 test files pass (2118/2118 tests, +54 new), zero ESLint errors.

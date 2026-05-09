@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI } from './haiku-client.mjs';
@@ -61,6 +61,37 @@ export const HANDOFF_EXPIRY_EXIT = 7 * 24 * 60 * 60 * 1000;   // 7 days
 export const HANDOFF_ANCHOR_MAX_AGE = 72 * 3600000;             // 72h cap on git_sha anchor — avoids stale-HEAD false positives
 export const HANDOFF_MATCH_THRESHOLD = 3;                       // min weighted score
 export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚才|\bcontinue\b|\bresume\b|\bwhere[\s-]+we[\s-]+left\b|\bpick[\s-]+up\b|\bcarry[\s-]+on\b/i;
+
+// Orphan-sweep threshold for `ep-flush-*` / `pending-*` runtime artifacts.
+// handleLLMEpisode's worst-case round-trip is ~60s (delay + LLM call + DB
+// write); 1h leaves a wide safety margin against deleting an in-flight file.
+// Older orphans are crashed workers or pre-shutdown buffers that no live
+// caller will ever pick up, so sweeping them on SessionStart is safe.
+export const ORPHAN_EPISODE_AGE_MS = 60 * 60 * 1000;
+
+// Sweep stale `ep-flush-*` and `pending-*` files in `runtimeDir` whose mtime
+// is older than `ageMs` (default 1h). Returns the number of files removed.
+// fs-only — no DB / no network. Used by handleSessionStart auto-maintain to
+// prevent the doctor "Stale temp files" warning from accumulating across
+// crashes; equivalent to the manual path in `node install.mjs cleanup` but
+// age-gated so concurrent in-flight workers are never raced.
+export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE_MS, now = Date.now() } = {}) {
+  let entries;
+  try { entries = readdirSync(runtimeDir); } catch { return 0; }
+  const cutoff = now - ageMs;
+  let count = 0;
+  for (const f of entries) {
+    if (!(f.startsWith('ep-flush-') || f.startsWith('pending-'))) continue;
+    const full = join(runtimeDir, f);
+    try {
+      if (statSync(full).mtimeMs < cutoff) {
+        unlinkSync(full);
+        count++;
+      }
+    } catch { /* concurrent unlink / permission — ignore */ }
+  }
+  return count;
+}
 
 // Ensure runtime directory exists
 try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
