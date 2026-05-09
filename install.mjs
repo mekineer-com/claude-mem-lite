@@ -1295,14 +1295,29 @@ async function doctor() {
     dwarn('Database: not found (will be created)');
   }
 
-  // Check for stale processes
+  // Check for stale processes — extends beyond legacy chroma/worker to
+  // catch MCP launchers / servers from cached old plugin versions. Auto-update
+  // bumps installed_plugins.json but cannot kill the MCP process spawned for
+  // an active session, so v2.60.0/v2.61.0 launchers commonly outlive their
+  // version (recurrent pattern, see #2580 for the gsd analogue). Filtering
+  // strategy: legacy chroma/worker = always stale; cache-path launchers = only
+  // when their version segment ≠ current package.json version; dev-install
+  // paths (no version segment) are never flagged.
   try {
-    const procs = execFileSync('pgrep', ['-af', 'chroma|claude-mem.*worker'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim();
-    // Filter out the pgrep process itself (matches its own pattern)
-    const real = procs.split('\n').filter(l => !l.includes('pgrep'));
-    if (real.length > 0) {
-      warn('Old processes running:\n    ' + real.join('\n    '));
+    const procs = execFileSync('pgrep', ['-af', 'chroma|claude-mem-lite.*(scripts/launch|server)\\.mjs|claude-mem.*worker'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim();
+    const lines = procs.split('\n').filter(l => l && !l.includes('pgrep'));
+    let currentVersion = '';
+    try { currentVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version; } catch { /* fall through with empty version */ }
+    const stale = lines.filter(l => {
+      if (/chroma|claude-mem.*worker/.test(l)) return true;
+      const m = l.match(/claude-mem-lite\/(\d+\.\d+\.\d+)\/(scripts\/launch|server)\.mjs/);
+      return m && currentVersion && m[1] !== currentVersion;
+    });
+    if (stale.length > 0) {
+      warn(`Old processes running${currentVersion ? ` (current: v${currentVersion})` : ''}:\n    ` + stale.join('\n    '));
       issues++;
+    } else {
+      ok('No stale processes');
     }
   } catch {
     ok('No stale processes');
@@ -1333,19 +1348,31 @@ async function doctor() {
   }
 
   // Dev drift: in dev-mode installs, all SOURCE_FILES entries should be
-  // symlinks. A plain file means an earlier install (or manual cp) copied it,
-  // so edits in the repo won't propagate to INSTALL_DIR — hook runtime and
-  // test runtime silently diverge.
+  // symlinks. A plain file means an earlier install (or manual cp) copied it
+  // (edits in the repo won't propagate). A missing entry (neither symlink nor
+  // plain) means an earlier install never wrote the file — same divergence
+  // class. Per #8043: "is this file present ≠ is this install consistent" —
+  // missing is tracked separately by checkDevDrift but the caller MUST surface
+  // it to honour #8268's "gate the all-green string on every counter" rule.
   try {
     const { checkDevDrift } = await import('./lib/doctor-drift.mjs');
     const r = checkDevDrift(INSTALL_DIR, SOURCE_FILES);
-    if (r.drift) {
-      const names = r.details.join(', ');
-      const suffix = r.plainCount > r.details.length ? ` +${r.plainCount - r.details.length} more` : '';
-      warn(`Dev drift: ${r.plainCount} non-symlink file(s) in dev install: ${names}${suffix} (re-run: node ${join(PROJECT_DIR, 'install.mjs')} install --dev)`);
+    if (r.drift || (r.devMode && r.missingCount > 0)) {
+      const parts = [];
+      if (r.plainCount > 0) {
+        const names = r.plainFiles.slice(0, 5).join(', ');
+        const suffix = r.plainCount > 5 ? ` +${r.plainCount - 5} more` : '';
+        parts.push(`${r.plainCount} non-symlink: ${names}${suffix}`);
+      }
+      if (r.missingCount > 0) {
+        const names = r.missingFiles.join(', ');
+        const suffix = r.missingCount > r.missingFiles.length ? ` +${r.missingCount - r.missingFiles.length} more` : '';
+        parts.push(`${r.missingCount} missing: ${names}${suffix}`);
+      }
+      warn(`Dev drift: ${parts.join('; ')} (re-run: node ${join(PROJECT_DIR, 'install.mjs')} install --dev)`);
       issues++;
     } else if (r.devMode) {
-      ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain)`);
+      ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain, 0 missing)`);
     }
     // Prod (all plain) install: no message — dev-drift is a dev-only concern.
   } catch (e) {

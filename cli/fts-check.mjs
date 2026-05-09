@@ -8,7 +8,7 @@ export function cmdFtsCheck(db, args) {
   const { positional } = parseArgs(args);
   const action = positional[0];
   if (!action || !['check', 'rebuild'].includes(action)) {
-    fail('[mem] Usage: mem fts-check <check|rebuild>');
+    fail('[mem] Usage: claude-mem-lite fts-check <check|rebuild>');
     return;
   }
 

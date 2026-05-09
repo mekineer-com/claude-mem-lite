@@ -34,7 +34,7 @@ function cmdSearch(db, args) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    fail('[mem] Usage: mem search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise]');
+    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise]');
     return;
   }
 
@@ -400,7 +400,7 @@ function cmdRecall(db, args) {
   const { positional, flags } = parseArgs(args);
   const file = positional.join(' ');
   if (!file) {
-    fail('[mem] Usage: mem recall <file> [--limit N] [--include-noise]');
+    fail('[mem] Usage: claude-mem-lite recall <file> [--limit N] [--include-noise]');
     return;
   }
 
@@ -530,7 +530,7 @@ function cmdGet(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    fail('[mem] Usage: mem get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]\n' +
+    fail('[mem] Usage: claude-mem-lite get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]\n' +
          '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session).');
     return;
   }
@@ -785,7 +785,7 @@ function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
   const text = positional.join(' ');
   if (!text) {
-    fail('[mem] Usage: mem save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T]');
+    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T]');
     return;
   }
 
@@ -1137,7 +1137,7 @@ function cmdDelete(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    fail('[mem] Usage: mem delete <id1,id2,...> [--confirm]');
+    fail('[mem] Usage: claude-mem-lite delete <id1,id2,...> [--confirm]');
     return;
   }
 
@@ -1147,7 +1147,7 @@ function cmdDelete(db, args) {
   const nonObs = tokens.filter(t => /^[PpSs]#?\d+$/.test(t));
   if (nonObs.length > 0) {
     fail(`[mem] delete only works on observations. Rejected: ${nonObs.join(', ')}. ` +
-         `Prompts and sessions are append-only — inspect with \`mem get P#N --source prompt\` / \`--source session\`.`);
+         `Prompts and sessions are append-only — inspect with \`claude-mem-lite get P#N --source prompt\` / \`--source session\`.`);
     return;
   }
   const ids = tokens.map(t => {
@@ -1215,7 +1215,7 @@ function cmdUpdate(db, args) {
   const parsed = raw ? parseIdToken(raw) : null;
   const id = parsed && parsed.source === null ? parsed.id : parseInt(raw, 10);
   if (!id || isNaN(id)) {
-    fail('[mem] Usage: mem update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
+    fail('[mem] Usage: claude-mem-lite update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
     return;
   }
 
@@ -1442,7 +1442,7 @@ function cmdMaintain(db, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
   if (!action || !['scan', 'execute'].includes(action)) {
-    fail('[mem] Usage: mem maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...]');
+    fail('[mem] Usage: claude-mem-lite maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...]');
     return;
   }
 
@@ -1722,7 +1722,7 @@ function cmdRegistry(_memDb, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
   if (!action || !['list', 'stats', 'search', 'import', 'remove', 'reindex'].includes(action)) {
-    fail('[mem] Usage: mem registry <list|stats|search|import|remove|reindex> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
+    fail('[mem] Usage: claude-mem-lite registry <list|stats|search|import|remove|reindex> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
     return;
   }
 
@@ -1738,7 +1738,7 @@ function cmdRegistry(_memDb, args) {
   try {
     if (action === 'search') {
       const query = flags.query || positional.slice(1).join(' ');
-      if (!query) { fail('[mem] Usage: mem registry search <query> [--type skill|agent] [--category C] [--quality Q]'); return; }
+      if (!query) { fail('[mem] Usage: claude-mem-lite registry search <query> [--type skill|agent] [--category C] [--quality Q]'); return; }
       let results = searchResources(rdb, query, {
         type: flags.type || undefined,
         limit: (flags.category || flags.quality) ? 20 : 10,
@@ -1828,7 +1828,7 @@ function cmdRegistry(_memDb, args) {
     if (action === 'import') {
       const name = flags.name;
       const resourceType = flags['resource-type'];
-      if (!name || !resourceType) { fail('[mem] Usage: mem registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
+      if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
       const fields = { name, type: resourceType, status: 'active', source: flags.source || 'user' };
       for (const f of ['repo-url', 'local-path', 'invocation-name', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
         const camel = f.replace(/-([a-z])/g, (_, c) => '_' + c);
@@ -1849,7 +1849,7 @@ function cmdRegistry(_memDb, args) {
     if (action === 'remove') {
       const name = flags.name;
       const resourceType = flags['resource-type'];
-      if (!name || !resourceType) { fail('[mem] Usage: mem registry remove --name N --resource-type skill|agent'); return; }
+      if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry remove --name N --resource-type skill|agent'); return; }
       const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(resourceType, name);
       out(result.changes > 0 ? `[mem] Removed: ${resourceType}:${name}` : '[mem] Not found.');
       return;
