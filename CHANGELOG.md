@@ -2,6 +2,30 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.60.0] - 2026-05-10
+
+**Three additive memory-injection improvements driven by an external CLAUDE.md/source-prompt comparison report.** Closes the report's three concrete claude-mem-lite findings: missing user-override signal honoring, no drift hint on stale file-bound observations, and no body-structure audit for adopted memdir entries. All changes are non-breaking.
+
+### Added
+
+- **P0 user-explicit "ignore memory" override** (`lib/mem-override.mjs`, wired into `scripts/user-prompt-search.js` + `hook.mjs` `handleUserPrompt`). When a prompt matches `ignore|skip|forget|disable|drop|reject + memor(y|ies)` (EN) or `不要|别|忽略|忽视|跳过|无视|拒绝 + 记忆` (CN), both UPS and `<memory-context>` injection short-circuit with no FTS budget burn, no `.claude-mem-injected-*` state churn, and no surface emission. Mirrors CC's built-in `memoryTypes.ts:215` semantics. Tight regexes — phrases like `memory leak`, `memory usage`, `MEM-1234`, `<memory-context>` (as a code reference), `记忆中的事件`, and `修改记忆模块` pass through unaffected. Verified by 6 unit tests + 1 subprocess integration test.
+
+- **P1 stale-obs verify-before-use hint** (`hook-memory.mjs::formatMemoryLine` + extended `searchRelevantMemories` SELECTs to return `created_at_epoch + files_modified`). When an injected obs is older than 30 days AND has non-empty `files_modified`, the surfaced line gets a trailing ` [verify-before-use]` token so Claude is reminded to grep/Read the referenced code before applying the lesson — code may have moved or been renamed since capture. Pure-decision/architecture obs (no `files_modified`) skip the hint: their drift is text-only and Claude already verifies at consumption time per the existing mem-usage contract. Verified by 9 unit tests covering fresh+files / stale+no-files / stale+files / malformed-JSON / missing-epoch / truncation invariants.
+
+- **P2 `claude-mem-lite memdir-audit` CLI command** (`memdir.mjs::auditMemdir` + `mem-cli.mjs::cmdMemdirAudit`). One-shot governance pass over `~/.claude/projects/<encoded>/memory/feedback_*.md` and `project_*.md` checking for the `**Why:**` + `**How to apply:**` body-structure required by CC's CLAUDE.md memory contract. Skips `MEMORY.md` (the index), `user_*.md` and `reference_*.md` (no Why/How requirement for those types), state sidecars, and non-markdown files. Frontmatter is stripped before scanning so a `description: "**Why:** dummy"` field cannot fake compliance. Output is a 4-section report: Compliant / Missing **Why:** / Missing **How to apply:** / Missing both. Exit code 0 on full compliance, 1 otherwise — gate-able from CI. Flags: `--memdir <path>` (escape hatch) and `--all` (scan every project under `~/.claude/projects/`). Intentionally CLI-only (no Stop hook) — running every session would be noise. Verified by 13 unit tests + 3 CLI integration tests.
+
+### Why
+
+These three changes target failure modes the comparison report flagged in the "memory system science" section, but only the parts demonstrably owned by claude-mem-lite (not spec-layer changes that belong in `~/.claude/CLAUDE.md` or claudemd hooks). The other report findings (PARTIAL boundary, routing rule, dual-system merge) are deliberately not addressed here.
+
+### Internal
+
+- `detectMemOverride` lives under `lib/` (not `scripts/`) because `hook.mjs` imports it directly. An earlier version at `scripts/prompt-search-utils.mjs` collided with the directory `renameSync` in `hook-update.mjs::installExtractedRelease` — when both `scripts/<file>.mjs` and `scripts` appear in `SWITCHABLE_PATHS`, the dir rename clobbers after the file is moved separately. Caught by `tests/hook-update.test.mjs > staged install curates`. The shipping path is `lib/mem-override.mjs` (in `SOURCE_FILES` + `package.json` files); `scripts/prompt-search-utils.mjs` re-exports for test-import symmetry.
+
+### Lessons
+
+- Adding `scripts/<file>.mjs` to `SOURCE_FILES` is unsafe when the `scripts` directory itself is also in the switch loop — the per-file rename leaves the dir half-empty, then the subsequent dir rename hits ENOTEMPTY. Hook-imported helpers must live under `lib/` (or any non-`scripts/` top-level path).
+
 ## [2.59.0] - 2026-05-09
 
 **Drop Node 18 support — `engines.node: ">=20"`.** Node 18 went EOL on 2026-04-30 (12 months ago at this release). vitest 4's bundler `rolldown` already imports `node:util.styleText` (added in Node 20.12+); the v2.58.2 `npm@10` lockfile regen pulled in a newer rolldown that breaks Node 18 startup with `SyntaxError: 'node:util' does not provide an export named 'styleText'`. Rather than pin rolldown back and accumulate downstream tech debt, this release officially drops Node 18.

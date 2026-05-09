@@ -101,6 +101,12 @@ export function detectIntent(text) {
   return first;
 }
 
+// detectMemOverride lives in lib/mem-override.mjs (importable from hook.mjs
+// without dragging the scripts/ tree into SOURCE_FILES). Re-exported here so
+// scripts/user-prompt-search.js and existing tests can keep importing it
+// from the same module as the rest of the prompt-side helpers.
+export { detectMemOverride } from '../lib/mem-override.mjs';
+
 // ─── Error Signature Extraction ─────────────────────────────────────────────
 
 /**

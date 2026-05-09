@@ -9,7 +9,7 @@
 //
 // See docs/plans/2026-04-16-invited-memory-pattern.md for rationale.
 
-import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, mkdirSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { createHash } from 'crypto';
@@ -267,4 +267,68 @@ export function removePluginDoc(memdir, slug) {
   const path = docFile(memdir, slug);
   if (!existsSync(path)) return;
   try { unlinkSync(path); } catch { /* best-effort */ }
+}
+
+// ─── P2: body-structure audit ────────────────────────────────────────────────
+// CC's CLAUDE.md memory contract requires feedback_*.md and project_*.md to
+// carry **Why:** + **How to apply:** lines. user_*.md and reference_*.md
+// have no body-structure requirement (per memoryTypes.ts <body_structure>
+// blocks). MEMORY.md (the index) is excluded too — it lists pointers, not
+// memory content. This is intentionally a CLI-only tool (not a hook): it
+// is a one-shot governance pass, running it on every session would just be
+// noise.
+
+const AUDIT_FILE_RE = /^(feedback|project)_[A-Za-z0-9_-]+\.md$/;
+const WHY_RE = /^\s*\*\*Why:\*\*/m;
+const HOW_RE = /^\s*\*\*How to apply:\*\*/m;
+
+/**
+ * Strip the leading YAML frontmatter block (between `---` fences) so audit
+ * checks run only against body content. Returns input unchanged if no
+ * frontmatter is present.
+ */
+function stripFrontmatter(content) {
+  if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return content;
+  const m = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/);
+  return m ? content.slice(m[0].length) : content;
+}
+
+/**
+ * Scan a memdir for feedback_* and project_* files and bucket them by
+ * body-structure compliance. Pure function — IO is read-only and bounded
+ * to the directory listing + per-file Reads.
+ *
+ * @param {string} memdir Absolute path to memdir
+ * @returns {{
+ *   compliant: string[],
+ *   missingWhy: string[],
+ *   missingHowToApply: string[],
+ *   missingBoth: string[],
+ *   total: number,
+ * }}
+ */
+export function auditMemdir(memdir) {
+  const result = { compliant: [], missingWhy: [], missingHowToApply: [], missingBoth: [], total: 0 };
+  if (!memdir || !existsSync(memdir)) return result;
+
+  let entries;
+  try { entries = readdirSync(memdir); } catch { return result; }
+
+  const targets = entries.filter(n => AUDIT_FILE_RE.test(n)).sort();
+  for (const name of targets) {
+    let body = '';
+    try {
+      const raw = readFileSync(join(memdir, name), 'utf8');
+      body = stripFrontmatter(raw);
+    } catch { /* unreadable — count as missingBoth */ }
+
+    const hasWhy = WHY_RE.test(body);
+    const hasHow = HOW_RE.test(body);
+    if (hasWhy && hasHow) result.compliant.push(name);
+    else if (!hasWhy && !hasHow) result.missingBoth.push(name);
+    else if (!hasWhy) result.missingWhy.push(name);
+    else result.missingHowToApply.push(name);
+  }
+  result.total = targets.length;
+  return result;
 }

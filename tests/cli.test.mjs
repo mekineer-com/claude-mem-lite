@@ -2107,3 +2107,70 @@ describe('CLI registry command', () => {
     expect(output).toContain('Usage');
   });
 });
+
+// ─── P2: memdir-audit CLI ────────────────────────────────────────────────────
+
+describe('CLI memdir-audit command', () => {
+  let tmp;
+  // The unit-level audit logic lives in tests/memdir.test.mjs > auditMemdir.
+  // These tests exercise only the print layer + flag plumbing + exit code.
+
+  beforeEach(async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('fs');
+    const { tmpdir } = await import('os');
+    const { join } = await import('path');
+    tmp = mkdtempSync(join(tmpdir(), 'cli-audit-'));
+    const memdir = join(tmp, 'memory');
+    mkdirSync(memdir, { recursive: true });
+    const front = '---\nname: F\ndescription: d\ntype: feedback\n---\n';
+    writeFileSync(join(memdir, 'feedback_good.md'),
+      front + '**Why:** reason\n**How to apply:** rule\n');
+    writeFileSync(join(memdir, 'feedback_bad.md'), front + 'orphan body\n');
+    writeFileSync(join(memdir, 'project_partial.md'), front + '**Why:** reason\n');
+    process.exitCode = 0;
+  });
+
+  afterEach(async () => {
+    const { rmSync } = await import('fs');
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    process.exitCode = 0;
+  });
+
+  it('prints a 4-section report and sets exit code 1 when non-compliant files exist', async () => {
+    const { join } = await import('path');
+    const memdir = join(tmp, 'memory');
+    const out = await captureStdout(() => run(['memdir-audit', '--memdir', memdir]));
+    expect(out).toContain('memdir audit:');
+    expect(out).toContain('Compliant (1):');
+    expect(out).toContain('feedback_good.md');
+    expect(out).toContain('Missing **How to apply:** (1):');
+    expect(out).toContain('project_partial.md');
+    expect(out).toContain('Missing both (1):');
+    expect(out).toContain('feedback_bad.md');
+    expect(out).toContain('Total: 3 file(s) (1 compliant)');
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('exit code 0 when every memory file is compliant', async () => {
+    const { writeFileSync, unlinkSync } = await import('fs');
+    const { join } = await import('path');
+    const memdir = join(tmp, 'memory');
+    // Make every file compliant.
+    const front = '---\nname: F\ndescription: d\ntype: feedback\n---\n';
+    unlinkSync(join(memdir, 'feedback_bad.md'));
+    unlinkSync(join(memdir, 'project_partial.md'));
+    writeFileSync(join(memdir, 'feedback_good.md'),
+      front + '**Why:** reason\n**How to apply:** rule\n');
+
+    const out = await captureStdout(() => run(['memdir-audit', '--memdir', memdir]));
+    expect(out).toContain('Compliant (1):');
+    expect(out).toContain('Total: 1 file(s) (1 compliant)');
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('reports zero memdirs to scan when --memdir points at a non-existent path', async () => {
+    const out = await captureStdout(() => run(['memdir-audit', '--memdir', '/no/such/path/here']));
+    expect(out).toContain('Total: 0 file(s)');
+    expect(process.exitCode).toBe(0);
+  });
+});

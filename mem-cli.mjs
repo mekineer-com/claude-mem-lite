@@ -17,9 +17,10 @@ import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
+import { auditMemdir, memdirPath } from './memdir.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
-import { basename } from 'path';
-import { readFileSync } from 'fs';
+import { basename, join } from 'path';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
@@ -1905,6 +1906,65 @@ function cmdRegistry(_memDb, args) {
   }
 }
 
+// ─── memdir-audit ────────────────────────────────────────────────────────────
+// Body-structure audit for ~/.claude/projects/<encoded>/memory/feedback_*.md
+// and project_*.md. CLI-only by design — running this every session would be
+// noise; it's a one-shot governance pass. Exit code 0 = 100% compliant,
+// 1 = at least one file is non-compliant (so it can gate CI if a project
+// wants to enforce structure).
+
+function _formatAuditResult(memdir, result) {
+  const lines = [`[mem] memdir audit: ${memdir}`];
+  const fmt = (label, list) =>
+    list.length ? `${label} (${list.length}):\n  - ${list.join('\n  - ')}` : `${label} (0)`;
+  lines.push(fmt('Compliant', result.compliant));
+  lines.push(fmt('Missing **Why:**', result.missingWhy));
+  lines.push(fmt('Missing **How to apply:**', result.missingHowToApply));
+  lines.push(fmt('Missing both', result.missingBoth));
+  lines.push(`Total: ${result.total} file(s) (${result.compliant.length} compliant)`);
+  return lines.join('\n');
+}
+
+function _resolveMemdirsForAudit(flags) {
+  if (typeof flags.memdir === 'string' && flags.memdir.length > 0) {
+    return [flags.memdir];
+  }
+  if (flags.all === true || flags.all === 'true') {
+    const projectsRoot = join(homedir(), '.claude', 'projects');
+    if (!existsSync(projectsRoot)) return [];
+    let entries;
+    try { entries = readdirSync(projectsRoot); } catch { return []; }
+    return entries
+      .map(name => join(projectsRoot, name, 'memory'))
+      .filter(p => existsSync(p))
+      .sort();
+  }
+  return [memdirPath(process.cwd())];
+}
+
+function cmdMemdirAudit(args) {
+  const { flags } = parseArgs(args);
+  const memdirs = _resolveMemdirsForAudit(flags);
+  if (memdirs.length === 0) {
+    out('[mem] No memdirs to audit (use --memdir <path> or run inside a Claude Code project).');
+    return;
+  }
+  let nonCompliant = 0;
+  let totalScanned = 0;
+  for (const md of memdirs) {
+    const result = auditMemdir(md);
+    out(_formatAuditResult(md, result));
+    totalScanned += result.total;
+    nonCompliant +=
+      result.missingWhy.length + result.missingHowToApply.length + result.missingBoth.length;
+    if (memdirs.length > 1) out('');
+  }
+  if (memdirs.length > 1) {
+    out(`[mem] Scanned ${memdirs.length} memdir(s), ${totalScanned} memory file(s), ${nonCompliant} non-compliant.`);
+  }
+  if (nonCompliant > 0) process.exitCode = 1;
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -2045,6 +2105,12 @@ Commands:
 
   unadopt               Precise removal of the sentinel block + plugin_claude_mem_lite.md.
     --all               Unadopt every project
+
+  memdir-audit          Audit memdir feedback_*.md / project_*.md for the
+                        body-structure contract (**Why:** + **How to apply:**).
+                        Exit 0 if every file is compliant, 1 otherwise.
+    --memdir <path>     Audit an explicit memdir path (escape hatch)
+    --all               Audit every project under ~/.claude/projects/*/memory/
 
 DB: ${DB_PATH}`);
 }
@@ -2240,6 +2306,7 @@ export async function run(argv) {
   // no DB needed. Route them before ensureDb() so an unbootable DB doesn't block.
   if (cmd === 'adopt') { cmdAdopt(cmdArgs); return; }
   if (cmd === 'unadopt') { cmdUnadopt(cmdArgs); return; }
+  if (cmd === 'memdir-audit') { cmdMemdirAudit(cmdArgs); return; }
 
   let db;
   try {

@@ -1,6 +1,97 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { searchRelevantMemories, recallForFile } from '../hook-memory.mjs';
+import { searchRelevantMemories, recallForFile, formatMemoryLine } from '../hook-memory.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+
+// ─── P1: formatMemoryLine — stale-obs verify-before-use hint ───────────────
+// A surfaced obs older than 30 days that references file paths has elevated
+// drift risk: code may have moved/been renamed since the obs was captured.
+// We append ` [verify-before-use]` so Claude is reminded to grep/Read before
+// applying the lesson. Fresh obs and obs without file_paths render normally.
+
+describe('formatMemoryLine', () => {
+  const DAY_MS = 86_400_000;
+  const fresh = Date.now() - 1 * DAY_MS;
+  const stale = Date.now() - 45 * DAY_MS;
+
+  it('renders base format for fresh obs without files_modified', () => {
+    const line = formatMemoryLine({
+      id: 42, type: 'bugfix', title: 'Fixed cache eviction',
+      lesson_learned: null, created_at_epoch: fresh, files_modified: '[]',
+    });
+    expect(line).toBe('- [bugfix] Fixed cache eviction (#42)');
+  });
+
+  it('appends lesson tag when lesson_learned is non-empty', () => {
+    const line = formatMemoryLine({
+      id: 7, type: 'decision', title: 'Picked SQLite over Postgres',
+      lesson_learned: 'single-binary deploy outweighs scaling ceiling',
+      created_at_epoch: fresh, files_modified: '[]',
+    });
+    expect(line).toContain(' | Lesson: single-binary deploy');
+    expect(line).not.toContain('[verify-before-use]');
+  });
+
+  it('appends [verify-before-use] for obs older than 30 days WITH files_modified', () => {
+    const line = formatMemoryLine({
+      id: 99, type: 'bugfix', title: 'Fixed dispatch race',
+      lesson_learned: null, created_at_epoch: stale,
+      files_modified: '["hook.mjs","hook-llm.mjs"]',
+    });
+    expect(line).toMatch(/ \[verify-before-use\]$/);
+    expect(line).toContain('(#99)');
+  });
+
+  it('does NOT append hint when obs is older than 30 days but has NO files_modified', () => {
+    const line = formatMemoryLine({
+      id: 100, type: 'decision', title: 'Old purely-architectural decision',
+      lesson_learned: null, created_at_epoch: stale, files_modified: '[]',
+    });
+    expect(line).not.toContain('[verify-before-use]');
+  });
+
+  it('does NOT append hint when files_modified is null/missing', () => {
+    const line = formatMemoryLine({
+      id: 101, type: 'bugfix', title: 'Old bugfix no files',
+      lesson_learned: null, created_at_epoch: stale, files_modified: null,
+    });
+    expect(line).not.toContain('[verify-before-use]');
+  });
+
+  it('does NOT append hint for fresh obs even with files_modified', () => {
+    const line = formatMemoryLine({
+      id: 102, type: 'bugfix', title: 'Recent fix',
+      lesson_learned: null, created_at_epoch: fresh,
+      files_modified: '["hook.mjs"]',
+    });
+    expect(line).not.toContain('[verify-before-use]');
+  });
+
+  it('handles malformed files_modified JSON gracefully (treats as empty)', () => {
+    const line = formatMemoryLine({
+      id: 103, type: 'bugfix', title: 'Old fix with broken JSON',
+      lesson_learned: null, created_at_epoch: stale, files_modified: 'not-json',
+    });
+    expect(line).not.toContain('[verify-before-use]');
+  });
+
+  it('handles missing created_at_epoch gracefully (no hint)', () => {
+    const line = formatMemoryLine({
+      id: 104, type: 'bugfix', title: 'Untimed obs',
+      lesson_learned: null, files_modified: '["a.mjs"]',
+    });
+    expect(line).not.toContain('[verify-before-use]');
+  });
+
+  it('truncates long titles to 80 chars (preserves existing behavior)', () => {
+    const longTitle = 'A'.repeat(120);
+    const line = formatMemoryLine({
+      id: 1, type: 'change', title: longTitle,
+      lesson_learned: null, created_at_epoch: fresh, files_modified: '[]',
+    });
+    // truncate adds ellipsis or marker — just check we cut down meaningfully.
+    expect(line.length).toBeLessThan('- [change] '.length + 90 + ' (#1)'.length);
+  });
+});
 
 describe('searchRelevantMemories', () => {
   let db;

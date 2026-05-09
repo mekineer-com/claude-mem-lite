@@ -21,6 +21,7 @@ import {
   extractFiles,
   extractErrorSignature,
   matchRegistrySkillName,
+  detectMemOverride,
 } from '../scripts/prompt-search-utils.mjs';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
@@ -105,6 +106,68 @@ describe('shouldSkip', () => {
     expect(shouldSkip('继续，先做 X 再做 Y')).toBe(false);
     expect(shouldSkip('继续做 hooks 优化')).toBe(false);
     expect(shouldSkip('next, lets review the schema')).toBe(false);
+  });
+});
+
+// ─── Unit Tests: detectMemOverride (P0) ─────────────────────────────────────
+// User-explicit "ignore memory" / "不要用记忆" override. When true, the UPS
+// hook MUST skip injection (mirrors CC built-in "ignore memory" semantics
+// from memoryTypes.ts:215). Regex must NOT trigger on phrases that mention
+// the word "memory" without an ignore directive (memory leak / memory bug /
+// 我不记得 / 修改记忆模块).
+
+describe('detectMemOverride', () => {
+  it('returns false for empty / null / undefined', () => {
+    expect(detectMemOverride('')).toBe(false);
+    expect(detectMemOverride(null)).toBe(false);
+    expect(detectMemOverride(undefined)).toBe(false);
+  });
+
+  it('matches English ignore directives', () => {
+    expect(detectMemOverride('ignore memory')).toBe(true);
+    expect(detectMemOverride('ignore past memory please')).toBe(true);
+    expect(detectMemOverride('skip memory recall')).toBe(true);
+    expect(detectMemOverride('skip the past memories')).toBe(true);
+    expect(detectMemOverride("don't use memory this turn")).toBe(true);
+    expect(detectMemOverride('do not use memory')).toBe(true);
+    expect(detectMemOverride('disable memory injection')).toBe(true);
+    expect(detectMemOverride('forget any prior memory')).toBe(true);
+    expect(detectMemOverride('drop all injected memory')).toBe(true);
+  });
+
+  it('matches Chinese ignore directives', () => {
+    expect(detectMemOverride('不要用记忆')).toBe(true);
+    expect(detectMemOverride('忽略记忆')).toBe(true);
+    expect(detectMemOverride('忽略所有记忆')).toBe(true);
+    expect(detectMemOverride('别看历史记忆')).toBe(true);
+    expect(detectMemOverride('跳过记忆')).toBe(true);
+    expect(detectMemOverride('不要参考过去的记忆')).toBe(true);
+    expect(detectMemOverride('无视相关记忆')).toBe(true);
+    expect(detectMemOverride('请别用记忆，独立判断一下')).toBe(true);
+  });
+
+  it('does NOT match phrases that just mention "memory" without an override directive', () => {
+    expect(detectMemOverride('memory leak in the cache')).toBe(false);
+    expect(detectMemOverride('memory usage is high')).toBe(false);
+    expect(detectMemOverride('fix the memory bug')).toBe(false);
+    expect(detectMemOverride('how does the memory work')).toBe(false);
+    expect(detectMemOverride('I have no memory of this incident')).toBe(false);
+    expect(detectMemOverride('the memory module needs refactor')).toBe(false);
+  });
+
+  it('does NOT match Chinese phrases that just mention 记忆 without override', () => {
+    expect(detectMemOverride('修改记忆模块')).toBe(false);
+    expect(detectMemOverride('记忆中的事件')).toBe(false);
+    expect(detectMemOverride('我不记得这件事')).toBe(false);
+    expect(detectMemOverride('记忆系统的实现')).toBe(false);
+  });
+
+  it('does NOT match unrelated tokens that look mem-shaped (per #8262 acronym preservation)', () => {
+    // Issue/ticket IDs, code identifiers, and version tags must pass through
+    // — they reference the memory system but are not user overrides.
+    expect(detectMemOverride('check MEM-1234 and the linked PR')).toBe(false);
+    expect(detectMemOverride('see <memory-context> in hook.mjs')).toBe(false);
+    expect(detectMemOverride('claude-mem-lite v2.59.0 release notes')).toBe(false);
   });
 });
 

@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.59.0",
+  "version": "2.60.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "engines": {
@@ -58,6 +58,7 @@
     "lib/id-routing.mjs",
     "lib/err-sampler.mjs",
     "lib/metrics.mjs",
+    "lib/mem-override.mjs",
     "cli/common.mjs",
     "cli/fts-check.mjs",
     "cli/doctor.mjs",

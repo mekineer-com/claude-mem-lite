@@ -9,7 +9,7 @@ import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import Database from 'better-sqlite3';
-import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName } from './prompt-search-utils.mjs';
+import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -490,6 +490,12 @@ async function main() {
 
   // Skip short/confirmation/slash-command/simple-op prompts
   if (shouldSkip(promptText)) return;
+
+  // P0: User-explicit "ignore memory" override (mirrors CC built-in
+  // memoryTypes.ts:215). When the prompt directly tells Claude to skip
+  // memory recall, we short-circuit before FTS — no FTS budget burn,
+  // no .claude-mem-injected-* state churn, no surface emission.
+  if (detectMemOverride(promptText)) return;
 
   // T3 (v2.31): additional raw-length gate on top of shouldSkip's CJK-weighted
   // effective-length check. Suppresses medium-short Latin prompts ("run tests",

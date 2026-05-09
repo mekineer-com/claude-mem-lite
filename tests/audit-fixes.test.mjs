@@ -957,6 +957,80 @@ describe('T4-P2-D: prompt_counter is atomic per prompt', () => {
   });
 });
 
+// ─── P0: detectMemOverride wired into handleUserPrompt ──────────────────────
+// Regex correctness lives in tests/user-prompt-search.test.mjs > detectMemOverride.
+// This integration test only verifies the wiring: a prompt that matches the
+// override regex must produce no <memory-context> emission, even when
+// observations matching the prompt exist in the DB.
+
+describe('P0: handleUserPrompt honors memory-override directive', () => {
+  let tmpHome, projDir;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'mem-p0-override-'));
+    projDir = join(tmpHome, 'audit', 't4');
+    mkdirSync(projDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('emits <memory-context> for a normal prompt and suppresses it on "ignore memory"', () => {
+    const { db } = initHomeDb(tmpHome);
+    insertSession(db, { id: 'cc-p0-override', project: 'audit--t4' });
+    // Seed target FIRST with an older epoch so it falls out of the
+    // handleUserPrompt Key Context top-5 (which excludes its own ids from
+    // searchRelevantMemories, see hook.mjs:1123-1130). The noise rows seed
+    // both BM25 corpus diversity (mirrors memory-inject.test.mjs:14-20) and
+    // the Key Context exclusion slots.
+    insertObs(db, {
+      sessionId: 'cc-p0-override', project: 'audit--t4', type: 'bugfix',
+      title: 'Fixed dispatch race condition',
+      narrative: 'Lock contention in episode flush',
+      text: 'dispatch race condition lock contention episode flush',
+      importance: 3, epochOffset: -3600_000,
+    });
+    for (let i = 900; i <= 920; i++) {
+      insertObs(db, {
+        sessionId: 'cc-p0-override', project: 'audit--t4', type: 'change',
+        title: `Updated config file ${i}`, text: `config yaml settings update number ${i}`,
+        importance: 2,
+      });
+    }
+    db.close();
+
+    const baseStdin = (text) => JSON.stringify({ prompt: text, session_id: 'cc-p0-override' });
+
+    // Positive control: prompt phrased to satisfy the v27 term-coverage gate
+    // against the seeded title ("Fixed dispatch race condition"). Confirms
+    // that memory injection runs in the absence of an override directive.
+    const normal = runHookCmd('user-prompt', {
+      home: tmpHome, cwd: projDir,
+      stdin: baseStdin('dispatch race condition'),
+    });
+    expect(normal.exitCode).toBe(0);
+    expect(normal.stdout).toContain('<memory-context');
+
+    // Override path (EN): same query intent but with explicit ignore directive.
+    // Must produce zero <memory-context> emission.
+    const overrideEn = runHookCmd('user-prompt', {
+      home: tmpHome, cwd: projDir,
+      stdin: baseStdin('ignore memory dispatch race condition'),
+    });
+    expect(overrideEn.exitCode).toBe(0);
+    expect(overrideEn.stdout).not.toContain('<memory-context');
+
+    // Override path (CN): parallel for 中文 directive.
+    const overrideCn = runHookCmd('user-prompt', {
+      home: tmpHome, cwd: projDir,
+      stdin: baseStdin('不要用记忆，dispatch race condition'),
+    });
+    expect(overrideCn.exitCode).toBe(0);
+    expect(overrideCn.stdout).not.toContain('<memory-context');
+  });
+});
+
 describe('T2 schema: memMaintainSchema.confirm', () => {
   it('exposes the confirm field with a descriptive string', () => {
     expect(memMaintainSchema.confirm).toBeDefined();

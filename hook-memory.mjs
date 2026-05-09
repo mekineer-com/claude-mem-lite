@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords } from './utils.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
 
@@ -78,6 +78,44 @@ function candidateCoverage(row, queryTerms) {
 const FILE_RECALL_LOOKBACK_MS = 60 * 86400000; // 60 days
 const MAX_FILE_RECALL = 2;
 
+// P1: stale-obs verify-before-use threshold. An injected obs older than this
+// AND carrying file paths is flagged so Claude is reminded to grep/Read the
+// referenced code before applying the lesson — code may have moved or been
+// renamed since capture. Pure-decision/architecture obs (no file_paths)
+// don't get the hint: their drift is text-only and Claude already verifies
+// at consumption time per the project mem-usage contract.
+const STALE_OBS_THRESHOLD_MS = 30 * 86400000;
+
+/**
+ * Format a single line for the <memory-context> block emitted by
+ * handleUserPrompt. Pure function — exported for unit testing.
+ *
+ * @param {object} obs Row with {id, type, title, lesson_learned,
+ *   created_at_epoch, files_modified}. files_modified is a JSON-encoded
+ *   string array (column shape) or null.
+ * @returns {string} `- [type] title[ | Lesson: X] (#id)[ [verify-before-use]]`
+ */
+export function formatMemoryLine(obs) {
+  const lessonTag = obs.lesson_learned ? ` | Lesson: ${obs.lesson_learned}` : '';
+  let staleHint = '';
+  if (typeof obs.created_at_epoch === 'number'
+    && Date.now() - obs.created_at_epoch > STALE_OBS_THRESHOLD_MS
+    && hasFilePaths(obs.files_modified)) {
+    staleHint = ' [verify-before-use]';
+  }
+  return `- [${obs.type}] ${truncate(obs.title, 80)}${lessonTag} (#${obs.id})${staleHint}`;
+}
+
+function hasFilePaths(filesModified) {
+  if (!filesModified || typeof filesModified !== 'string') return false;
+  try {
+    const arr = JSON.parse(filesModified);
+    return Array.isArray(arr) && arr.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Search for relevant past observations to inject as memory context.
  * Quality gates: importance>=1 (with 0.6x penalty), type-boosted, lesson-boosted, BM25-thresholded (adaptive: 0 for <5 obs, 1.5 otherwise).
@@ -124,6 +162,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // penalty factor (for the final JS score).
     const selectStmt = db.prepare(`
       SELECT o.id, o.type, o.title, o.subtitle, o.narrative, o.importance, o.lesson_learned, o.project,
+             o.created_at_epoch, o.files_modified,
              ${OBS_BM25} as relevance,
              ${noisePenaltyClause('o')} as noise_penalty
       FROM observations_fts

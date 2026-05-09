@@ -53,6 +53,11 @@ export const SOURCE_FILES = [
   'memdir.mjs',
   'adopt-content.mjs',
   'adopt-cli.mjs',
+  // P0 (v2.59.x): user-explicit "ignore memory" override detector. Lives
+  // under lib/ (not scripts/) so hook.mjs can statically import it without
+  // colliding with the scripts/ directory rename in installExtractedRelease
+  // — see the SWITCHABLE_PATHS loop in hook-update.mjs.
+  'lib/mem-override.mjs',
 ];
 
 /**

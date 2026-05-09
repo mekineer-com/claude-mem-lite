@@ -12,6 +12,7 @@ import {
   readMemoryIndex, writePluginSection, removePluginSection,
   writePluginDoc, removePluginDoc,
   isAdopted,
+  auditMemdir,
   UserEditedError, BudgetExceededError,
 } from '../memdir.mjs';
 
@@ -319,5 +320,140 @@ describe('plugin doc IO (writePluginDoc / removePluginDoc)', () => {
 
   it('removePluginDoc is a no-op when absent', () => {
     expect(() => removePluginDoc(memdir, slug)).not.toThrow();
+  });
+});
+
+// ─── P2: auditMemdir — body-structure compliance scan ────────────────────────
+// CC's CLAUDE.md memory contract requires feedback_*.md and project_*.md
+// to carry **Why:** + **How to apply:** lines. user_*.md and reference_*.md
+// have no body-structure requirement and must be excluded from the audit.
+// MEMORY.md (the index) is also excluded.
+
+describe('auditMemdir', () => {
+  let tmp, memdir;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'memdir-audit-'));
+    memdir = join(tmp, 'memory');
+    mkdirSync(memdir, { recursive: true });
+  });
+  afterEach(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const FRONT = ['---', 'name: Foo', 'description: bar', 'type: feedback', '---', ''].join('\n');
+
+  function write(name, body) { writeFileSync(join(memdir, name), FRONT + body); }
+
+  it('returns empty result when memdir does not exist', () => {
+    const fake = join(tmp, 'does-not-exist');
+    const r = auditMemdir(fake);
+    expect(r.total).toBe(0);
+    expect(r.compliant).toEqual([]);
+    expect(r.missingWhy).toEqual([]);
+    expect(r.missingHowToApply).toEqual([]);
+    expect(r.missingBoth).toEqual([]);
+  });
+
+  it('classifies a fully-compliant feedback file as compliant', () => {
+    write('feedback_good.md',
+      'The rule itself.\n\n**Why:** because of past incident X.\n\n**How to apply:** when editing module Y.\n');
+    const r = auditMemdir(memdir);
+    expect(r.compliant).toEqual(['feedback_good.md']);
+    expect(r.missingWhy).toEqual([]);
+    expect(r.missingHowToApply).toEqual([]);
+    expect(r.missingBoth).toEqual([]);
+    expect(r.total).toBe(1);
+  });
+
+  it('classifies a project file with both fields as compliant', () => {
+    write('project_initiative.md',
+      'Decision text.\n**Why:** legal compliance.\n**How to apply:** scope decisions favor compliance.\n');
+    const r = auditMemdir(memdir);
+    expect(r.compliant).toEqual(['project_initiative.md']);
+  });
+
+  it('flags missing **Why:** correctly', () => {
+    write('feedback_no_why.md',
+      'A rule.\n**How to apply:** in CI hooks only.\n');
+    const r = auditMemdir(memdir);
+    expect(r.missingWhy).toEqual(['feedback_no_why.md']);
+    expect(r.missingHowToApply).toEqual([]);
+    expect(r.missingBoth).toEqual([]);
+  });
+
+  it('flags missing **How to apply:** correctly', () => {
+    write('project_no_how.md',
+      'A fact.\n**Why:** stakeholder ask.\n');
+    const r = auditMemdir(memdir);
+    expect(r.missingHowToApply).toEqual(['project_no_how.md']);
+    expect(r.missingWhy).toEqual([]);
+    expect(r.missingBoth).toEqual([]);
+  });
+
+  it('flags files missing both fields under missingBoth (not under either single-miss bucket)', () => {
+    write('feedback_orphan.md', 'Just a stray sentence with no structure.\n');
+    const r = auditMemdir(memdir);
+    expect(r.missingBoth).toEqual(['feedback_orphan.md']);
+    expect(r.missingWhy).toEqual([]);
+    expect(r.missingHowToApply).toEqual([]);
+  });
+
+  it('skips MEMORY.md (the index, not a memory entry)', () => {
+    writeFileSync(join(memdir, 'MEMORY.md'), '# Index\n- [Foo](feedback_x.md) — note\n');
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(0);
+  });
+
+  it('skips user_*.md and reference_*.md (no Why/How requirement for these types)', () => {
+    write('user_role.md', 'no why or how needed here\n');
+    write('reference_url.md', 'pointer to external system\n');
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(0);
+    expect(r.missingBoth).toEqual([]);
+  });
+
+  it('skips state sidecars and dotfiles', () => {
+    writeFileSync(join(memdir, '.plugin_claude_mem_lite_state.json'), '{}');
+    writeFileSync(join(memdir, '.DS_Store'), '');
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(0);
+  });
+
+  it('skips non-markdown files', () => {
+    writeFileSync(join(memdir, 'feedback_bad.txt'), 'not a markdown file');
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(0);
+  });
+
+  it('classifies a mixed memdir into all four buckets in sorted order', () => {
+    write('feedback_b_good.md',
+      '**Why:** reason\n**How to apply:** rule\n');
+    write('feedback_a_no_why.md', '**How to apply:** rule\n');
+    write('project_c_no_how.md', '**Why:** reason\n');
+    write('project_d_orphan.md', 'orphan\n');
+    write('feedback_e_orphan.md', 'also orphan\n');
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(5);
+    expect(r.compliant).toEqual(['feedback_b_good.md']);
+    expect(r.missingWhy).toEqual(['feedback_a_no_why.md']);
+    expect(r.missingHowToApply).toEqual(['project_c_no_how.md']);
+    // Both missing — sorted alphabetically.
+    expect(r.missingBoth).toEqual(['feedback_e_orphan.md', 'project_d_orphan.md']);
+  });
+
+  it('tolerates trailing whitespace and bold-marker variants in the field labels', () => {
+    write('feedback_loose.md',
+      '**Why:**   reason here\n**How to apply:** rule\n');
+    const r = auditMemdir(memdir);
+    expect(r.compliant).toEqual(['feedback_loose.md']);
+  });
+
+  it('does NOT count fields that appear only inside frontmatter', () => {
+    // If a file only has e.g. `description: **Why:** foo` in frontmatter
+    // (no body usage), that is NOT compliant — body-structure means body.
+    writeFileSync(join(memdir, 'feedback_frontmatter_only.md'),
+      ['---', 'name: F', 'description: "**Why:** dummy"', 'type: feedback', '---', '',
+       'Body without the structure.\n'].join('\n'));
+    const r = auditMemdir(memdir);
+    expect(r.missingBoth).toEqual(['feedback_frontmatter_only.md']);
   });
 });

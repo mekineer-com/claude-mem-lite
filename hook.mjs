@@ -45,7 +45,8 @@ import {
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { extractCitationsFromTranscript, bumpCitationAccess } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
-import { searchRelevantMemories } from './hook-memory.mjs';
+import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
+import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
@@ -1111,8 +1112,11 @@ async function handleUserPrompt() {
       } catch (e) { debugCatch(e, 'handleUserPrompt-handoff'); }
     }
 
-    // Semantic memory injection: search past observations for the user's prompt
-    try {
+    // Semantic memory injection: search past observations for the user's prompt.
+    // P0 short-circuit on user-explicit "ignore memory" / "不要用记忆" override
+    // (mirrors CC built-in memoryTypes.ts:215). Skip both Key Context lookup
+    // and the <memory-context> emission for this turn.
+    if (!detectMemOverride(promptText)) try {
       const keyObs = db.prepare(`
         SELECT id FROM observations
         WHERE project = ? AND COALESCE(compressed_into, 0) = 0
@@ -1135,10 +1139,7 @@ async function handleUserPrompt() {
       const memories = searchRelevantMemories(db, promptText, project, keyContextIds);
       if (memories.length > 0) {
         const lines = ['<memory-context relevance="high">'];
-        for (const m of memories) {
-          const lessonTag = m.lesson_learned ? ` | Lesson: ${m.lesson_learned}` : '';
-          lines.push(`- [${m.type}] ${truncate(m.title, 80)}${lessonTag} (#${m.id})`);
-        }
+        for (const m of memories) lines.push(formatMemoryLine(m));
         lines.push('</memory-context>');
         process.stdout.write(lines.join('\n') + '\n');
       }
