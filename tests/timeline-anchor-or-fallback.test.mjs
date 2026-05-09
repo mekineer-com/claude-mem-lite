@@ -36,22 +36,24 @@ describe('findFtsAnchor', () => {
     expect(findFtsAnchor(db, { ftsQuery: fts })).toBeNull();
   });
 
-  it('finds anchor via direct AND match', () => {
+  it('finds anchor via direct AND match — relaxed:false', () => {
     const r = insertObs(db, { title: 'ep-flush orphan files cleanup', type: 'bugfix' });
     const fts = sanitizeFtsQuery('ep-flush orphan');
-    const id = findFtsAnchor(db, { ftsQuery: fts });
-    expect(id).toBe(Number(r.lastInsertRowid));
+    const found = findFtsAnchor(db, { ftsQuery: fts });
+    expect(found).toEqual({ id: Number(r.lastInsertRowid), relaxed: false });
   });
 
   // The bug: this test fails before the fix because timeline-anchor used
   // bare MATCH (AND-by-default), so "ep-flush leak" missed a row whose
   // title is "ep-flush ... leaked" — the second term needs OR-relaxation.
-  it('falls back to OR when AND returns 0 results', () => {
+  // Post-2.63.0 the relaxed flag also propagates so callers can surface the
+  // "(relaxed AND→OR)" hint to mirror search transparency.
+  it('falls back to OR when AND returns 0 results — relaxed:true', () => {
     const r = insertObs(db, { title: 'ep-flush orphan files leaked on worker crash', type: 'bugfix' });
     insertObs(db, { title: 'unrelated discovery about caching', type: 'discovery' });
     const fts = sanitizeFtsQuery('ep-flush leak');
-    const id = findFtsAnchor(db, { ftsQuery: fts });
-    expect(id).toBe(Number(r.lastInsertRowid));
+    const found = findFtsAnchor(db, { ftsQuery: fts });
+    expect(found).toEqual({ id: Number(r.lastInsertRowid), relaxed: true });
   });
 
   it('respects project filter (excludes rows from other projects)', () => {
@@ -60,20 +62,28 @@ describe('findFtsAnchor', () => {
     const own = insertObs(db, { sessionId: 'sess-1', project: 'mine', title: 'ep-flush leak in my project', type: 'bugfix' });
     insertSession(db, { id: 'sess-mine', project: 'mine' });
     const fts = sanitizeFtsQuery('ep-flush leak');
-    expect(findFtsAnchor(db, { ftsQuery: fts, project: 'mine' })).toBe(Number(own.lastInsertRowid));
+    expect(findFtsAnchor(db, { ftsQuery: fts, project: 'mine' })?.id).toBe(Number(own.lastInsertRowid));
   });
 
   it('skips compressed observations (compressed_into > 0)', () => {
     const live = insertObs(db, { title: 'ep-flush live row', type: 'bugfix' });
     insertObs(db, { title: 'ep-flush superseded row', type: 'bugfix', compressedInto: 999 });
     const fts = sanitizeFtsQuery('ep-flush');
-    expect(findFtsAnchor(db, { ftsQuery: fts })).toBe(Number(live.lastInsertRowid));
+    expect(findFtsAnchor(db, { ftsQuery: fts })?.id).toBe(Number(live.lastInsertRowid));
   });
 
   it('prefers more recent row when BM25 is roughly equal (recency-weighted)', () => {
     insertObs(db, { title: 'ep-flush old row', type: 'bugfix', epochOffset: -90 * 24 * 3600 * 1000 });
     const recent = insertObs(db, { title: 'ep-flush recent row', type: 'bugfix', epochOffset: -1 * 60 * 1000 });
     const fts = sanitizeFtsQuery('ep-flush');
-    expect(findFtsAnchor(db, { ftsQuery: fts })).toBe(Number(recent.lastInsertRowid));
+    expect(findFtsAnchor(db, { ftsQuery: fts })?.id).toBe(Number(recent.lastInsertRowid));
+  });
+
+  it('AND-direct match keeps relaxed:false even when the OR-form would also match', () => {
+    // Both "ep-flush AND orphan" and "ep-flush OR orphan" hit this row;
+    // the AND path takes priority so relaxed must stay false.
+    const r = insertObs(db, { title: 'ep-flush orphan worker crash', type: 'bugfix' });
+    const fts = sanitizeFtsQuery('ep-flush orphan');
+    expect(findFtsAnchor(db, { ftsQuery: fts })).toEqual({ id: Number(r.lastInsertRowid), relaxed: false });
   });
 });

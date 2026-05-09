@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.63.0] - 2026-05-10
+
+**Four-fix bundle from dogfood retrospective: npm version pinning (kills 2.58.2/2.62.1 recurrence class), `bumpJsonField` helper (fixes plugin.json "X → X" log glitch), `get` time-field formatter (cross-command UX parity), timeline OR-relaxed hint (cross-surface transparency parity).** Schema unchanged. 87 test files / 2152 tests pass (+2 files, +14 tests vs 2.62.1); zero ESLint errors.
+
+The four fixes came from auditing the previous report's "Not done" / "Uncertain" items rather than letting them drift to the next bundle. Highest-leverage item is **A** (npm pinning) — same lockfile bug bit twice in 2 weeks (v2.58.2 + v2.62.1 hotfixes); root-cause fix is well-known npm pattern (`packageManager` field) plus making the release script the single source of truth for lock regeneration.
+
+### Added
+
+- **`packageManager: "npm@10.9.2"` in `package.json` + `regenerateLockfile()` in `install.mjs::main release` case.** Closes the recurrence class of "lockfile silently drifts when bumped on different npm versions". The `packageManager` field declares the canonical npm version for corepack-aware tooling (Node 16.9+); the release script now always shells out to `npx --yes npm@10.9.2 install` after JSON sync, making "I forgot to use npm@10" physically impossible. Adds `--no-lock` escape hatch for non-release-context uses of `node install.mjs release`. Regression contract pinned by `tests/install-bumpfield.test.mjs::package.json::packageManager pin`. ~5-30s network cost per release; release cadence makes this acceptable.
+
+- **`install.mjs::bumpJsonField(filePath, keyPath, newVal)` — pure JSON-version field bumper.** Single point of truth for the 2 JSON files `syncVersions` rewrites (plugin.json, marketplace.json's nested `plugins[0].version`). Captures `prev` BEFORE mutation so the `"X → Y"` log line is correct — pre-2.63.0 the plugin.json branch logged `"Y → Y"` because it read the field after assignment, while marketplace.json got it right because it captured `prev` first; the asymmetry made the bug invisible until you stared at consecutive release outputs side-by-side. 5 unit tests in `tests/install-bumpfield.test.mjs` cover no-op-when-unchanged, prev-captured-before-mutation (the pre-fix bug), nested-keyPath walk, unreachable-keyPath defense, and 2-space-indent + trailing-newline preservation.
+
+- **`mem-cli.mjs::formatObsFieldValue(field, val)` + `OBS_TIME_FIELDS = ['superseded_at', 'last_accessed_at']`.** The `mem get` command was the lone CLI path printing integer epoch fields as raw ms (e.g., `last_accessed_at: 1778357330957`); `recent` / `timeline` / `recall` all use `relativeTime()` ("Nm ago"). Renderer now emits `<raw> (<relative>)` so audit use-cases keep the raw ms but human readers see staleness at a glance. Pure formatter — null/undefined/non-time pass through unchanged. 6 unit tests in `tests/get-time-format.test.mjs` cover both time fields, non-time integer pass-through, string pass-through, null/undefined defense, and the `OBS_TIME_FIELDS` membership contract.
+
+### Changed
+
+- **`search-engine.mjs::findFtsAnchor` return shape: `id|null` → `{id, relaxed}|null`.** Surfaces whether the OR fallback fired so callers can render a transparency hint matching `search`'s `(relaxed AND→OR)` badge. Both `mem-cli.mjs::cmdTimeline` and `server.mjs::mem_timeline` now append `(query "X" relaxed AND→OR — no row matched all terms)` to the timeline header line when the OR path rescued a 0-row AND. Closes the cross-surface transparency gap noted in the v2.62.0 dogfood report. Existing 7 tests in `tests/timeline-anchor-or-fallback.test.mjs` updated to the new shape; +1 test asserting AND-direct match keeps `relaxed:false` even when the OR-form would also match (the AND path takes priority).
+
 ## [2.62.1] - 2026-05-10
 
 **Hotfix lockfile (npm@10 regen for `@emnapi` top-level — same root cause as 2.58.2).** No source-code changes — pure lockfile regeneration. v2.62.0 CI run [25610907804](https://github.com/sdsrss/claude-mem-lite/actions/runs/25610907804) failed at `npm ci` with `EUSAGE: Missing @emnapi/core@1.10.0 from lock file`. Local lockfile had been regenerated with npm@11.6 (`npm install --package-lock-only`) which strips top-level entries for `@emnapi/core@1.10.0` + `@emnapi/runtime@1.10.0` when those are transitive deps of platform-optional bindings (specifically `@oxc-parser/binding-win32-*` from knip's `oxc-parser` dep). CI's bundled npm@10 (Node 22 default) then refuses `npm ci` because the strict graph check finds those edges unsatisfied. Fix: regenerate via `npx --yes npm@10.9.2 install`. Verified locally: 13 `@emnapi` entries restored, all 2138 tests pass, ESLint clean. The v2.62.0 three-fix bundle (ep-flush sweep, doctor warnings counter, timeline anchor parity) all carry forward.

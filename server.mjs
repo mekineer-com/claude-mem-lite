@@ -614,11 +614,18 @@ server.registerTool(
 
     // Auto-find anchor via FTS (with recency decay). Routes through shared
     // findFtsAnchor so CLI `timeline --query` and MCP mem_timeline use
-    // identical AND→OR fallback semantics (paired-path per #8217).
+    // identical AND→OR fallback semantics (paired-path per #8217). When the
+    // OR fallback fired, surface a hint so the caller knows the match was
+    // not an exact AND coverage of the query — mirrors search transparency.
     if (!anchorId && args.query) {
       const ftsQuery = sanitizeFtsQuery(args.query);
       const found = findFtsAnchor(db, { ftsQuery, project: args.project ?? null });
-      if (found) anchorId = found;
+      if (found) {
+        anchorId = found.id;
+        if (found.relaxed && !anchorNote) {
+          anchorNote = `(query "${args.query}" relaxed AND→OR — no row matched all terms)`;
+        }
+      }
     }
 
     // No anchor: return most recent

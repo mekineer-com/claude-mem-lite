@@ -280,6 +280,25 @@ function ok(msg) { console.log(`  ✓ ${msg}`); }
 function warn(msg) { console.log(`  ⚠ ${msg}`); }
 function fail(msg) { console.log(`  ✗ ${msg}`); }
 
+// Pure JSON-version field bumper for the release pipeline. Reads `filePath`,
+// walks `keyPath` (e.g. `['version']` or `['plugins', 0, 'version']`), and
+// rewrites only when the new value differs. Returns `{ changed, prev }` so
+// callers can log "X → Y" with the captured-before-mutation value — pre-2.63.0
+// the plugin.json branch in syncVersions logged "Y → Y" because it read the
+// field after assignment.
+export function bumpJsonField(filePath, keyPath, newVal) {
+  const json = JSON.parse(readFileSync(filePath, 'utf8'));
+  let parent = json;
+  for (let i = 0; i < keyPath.length - 1; i++) parent = parent?.[keyPath[i]];
+  if (!parent) return { changed: false, prev: undefined };
+  const lastKey = keyPath[keyPath.length - 1];
+  const prev = parent[lastKey];
+  if (prev === newVal) return { changed: false, prev };
+  parent[lastKey] = newVal;
+  writeFileSync(filePath, JSON.stringify(json, null, 2) + '\n');
+  return { changed: true, prev };
+}
+
 // Doctor's final summary line. Pure function so the 4-way contract
 // (clean / warnings-only / issues / mixed) is unit-testable without spinning
 // up the full doctor pipeline. `issues` are ✗-level (action required);
@@ -1593,34 +1612,19 @@ function syncVersions() {
   const version = pkg.version;
   log(`package.json version: ${version}`);
 
-  // Sync plugin.json
   const pluginJsonPath = join(PROJECT_DIR, '.claude-plugin', 'plugin.json');
   if (existsSync(pluginJsonPath)) {
-    const pluginJson = JSON.parse(readFileSync(pluginJsonPath, 'utf8'));
-    if (pluginJson.version !== version) {
-      pluginJson.version = version;
-      writeFileSync(pluginJsonPath, JSON.stringify(pluginJson, null, 2) + '\n');
-      ok(`plugin.json: ${pluginJson.version} → ${version}`);
-    } else {
-      ok(`plugin.json: already ${version}`);
-    }
+    const r = bumpJsonField(pluginJsonPath, ['version'], version);
+    ok(r.changed ? `plugin.json: ${r.prev} → ${version}` : `plugin.json: already ${version}`);
   } else {
     warn('plugin.json not found');
   }
 
-  // Sync marketplace.json
   const marketJsonPath = join(PROJECT_DIR, '.claude-plugin', 'marketplace.json');
   if (existsSync(marketJsonPath)) {
-    const marketJson = JSON.parse(readFileSync(marketJsonPath, 'utf8'));
-    const plugin = marketJson.plugins?.[0];
-    if (plugin && plugin.version !== version) {
-      const prev = plugin.version;
-      plugin.version = version;
-      writeFileSync(marketJsonPath, JSON.stringify(marketJson, null, 2) + '\n');
-      ok(`marketplace.json: ${prev} → ${version}`);
-    } else if (plugin) {
-      ok(`marketplace.json: already ${version}`);
-    }
+    const r = bumpJsonField(marketJsonPath, ['plugins', 0, 'version'], version);
+    if (r.prev === undefined) warn('marketplace.json: plugins[0] not found');
+    else ok(r.changed ? `marketplace.json: ${r.prev} → ${version}` : `marketplace.json: already ${version}`);
   } else {
     warn('marketplace.json not found');
   }
@@ -1647,6 +1651,29 @@ function syncVersions() {
   }
 
   console.log('');
+}
+
+// Regenerate package-lock.json via npm@10.9.2 to guarantee CI parity. The
+// drift this prevents: `npm install --package-lock-only` on npm@11+ silently
+// strips top-level `@emnapi/core` + `@emnapi/runtime` entries when those are
+// transitive deps of platform-optional bindings (e.g. `@oxc-parser/binding-*`
+// from knip), and CI's bundled npm@10 (Node 22 default in GitHub Actions)
+// then refuses `npm ci` with EUSAGE. Same recipe bit twice (#8271 / 2.58.2 /
+// 2.62.1) before this guard. The packageManager field in package.json
+// declares the same version for corepack-aware tooling. Network cost: ~5-30s
+// per release; release cadence makes this acceptable.
+function regenerateLockfile() {
+  console.log('\nclaude-mem-lite release — regenerate lockfile (npm@10.9.2)\n');
+  try {
+    execFileSync('npx', ['--yes', 'npm@10.9.2', 'install'], {
+      stdio: 'inherit',
+      cwd: PROJECT_DIR,
+    });
+    ok('lockfile regenerated');
+  } catch (e) {
+    fail('lockfile regen failed: ' + e.message);
+    throw e;
+  }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -1680,6 +1707,7 @@ export async function main(argv = process.argv.slice(2)) {
       break;
     case 'release':
       syncVersions();
+      if (!flags.has('--no-lock')) regenerateLockfile();
       break;
     default:
       if (IS_NPX) {
@@ -1699,7 +1727,7 @@ Usage:
   node install.mjs cleanup            Remove stale temp/staging files
   node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
   node install.mjs self-update         Check for and install updates
-  node install.mjs release            Sync version to plugin.json + marketplace.json
+  node install.mjs release            Sync versions (plugin/marketplace/CLAUDE.md) + regen lockfile via npm@10.9.2 (use --no-lock to skip lock regen)
 
   npx claude-mem-lite                 Install via npx (one-liner)
 `);

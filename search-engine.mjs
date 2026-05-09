@@ -152,7 +152,7 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
  *   1. FTS5 MATCH with the sanitized query (AND-by-default), recency-weighted
  *   2. If AND returns 0 → relaxFtsQueryToOr fallback (mirrors searchObservationsHybrid)
  *
- * Returns the matched observation id, or null. Always skips compressed rows.
+ * Always skips compressed rows.
  *
  * @param {Database} db
  * @param {object} opts
@@ -160,7 +160,8 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
  * @param {string|null} [opts.project] restrict to this project (boost-by-membership; null = no filter)
  * @param {number} [opts.nowT]         Date.now() override (for deterministic tests)
  * @param {number} [opts.halfLifeMs]   recency half-life (default DEFAULT_DECAY_HALF_LIFE_MS)
- * @returns {number|null}
+ * @returns {{id:number, relaxed:boolean}|null}  `relaxed:true` when AND returned 0 and OR rescued —
+ *   callers should surface a "(relaxed AND→OR)" hint to mirror search transparency.
  */
 export function findFtsAnchor(db, { ftsQuery, project = null, nowT = null, halfLifeMs = DEFAULT_DECAY_HALF_LIFE_MS } = {}) {
   if (!ftsQuery) return null;
@@ -178,13 +179,13 @@ export function findFtsAnchor(db, { ftsQuery, project = null, nowT = null, halfL
   const stmt = db.prepare(sql);
   try {
     const m = stmt.get(ftsQuery, project, project, now);
-    if (m) return m.id;
+    if (m) return { id: m.id, relaxed: false };
   } catch (e) { debugCatch(e, 'findFtsAnchor-and'); }
   const orQuery = relaxFtsQueryToOr(ftsQuery);
   if (orQuery && orQuery !== ftsQuery) {
     try {
       const m = stmt.get(orQuery, project, project, now);
-      if (m) return m.id;
+      if (m) return { id: m.id, relaxed: true };
     } catch (e) { debugCatch(e, 'findFtsAnchor-or'); }
   }
   return null;

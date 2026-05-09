@@ -447,6 +447,25 @@ function cmdRecall(db, args) {
 
 const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
 
+// Integer-typed time-epoch fields on the observations table that the `get`
+// command renders. Callers expect raw ms (audit) AND a relative-time hint
+// (human-scan), so formatObsFieldValue emits both. Other epoch fields like
+// `created_at_epoch` / `optimized_at` / `last_injected_at` aren't in
+// OBS_FIELDS so they don't surface via `get`.
+export const OBS_TIME_FIELDS = ['superseded_at', 'last_accessed_at'];
+
+// Pure formatter — null/undefined/non-time pass through; time fields on
+// integer values render as `<raw> (<relative>)` mirroring the convention
+// already used by `recent` / `timeline` / `recall`. Pre-2.63.0 the get
+// path printed bare ms (e.g. `last_accessed_at: 1778357330957`).
+export function formatObsFieldValue(field, val) {
+  if (val === null || val === undefined) return val;
+  if (OBS_TIME_FIELDS.includes(field) && typeof val === 'number') {
+    return `${val} (${relativeTime(val)})`;
+  }
+  return val;
+}
+
 function renderObsRows(db, ids, requestedFields) {
   const placeholders = ids.map(() => '?').join(',');
   try {
@@ -465,8 +484,9 @@ function renderObsRows(db, ids, requestedFields) {
       const val = r[f];
       if (val === null || val === undefined || val === '') continue;
       if (f === 'text' && r.narrative && typeof val === 'string' && val.startsWith(r.narrative)) continue;
+      const formatted = formatObsFieldValue(f, val);
       const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
-      const display = typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val;
+      const display = typeof formatted === 'string' && formatted.length > maxLen ? formatted.slice(0, maxLen) + '…' : formatted;
       lines.push(`${f}: ${display}`);
     }
     parts.push(lines.join('\n'));
@@ -672,7 +692,12 @@ function cmdTimeline(db, args) {
   if ((!anchorId || isNaN(anchorId)) && queryStr) {
     const ftsQuery = sanitizeFtsQuery(queryStr);
     const found = findFtsAnchor(db, { ftsQuery, project: project ?? null });
-    if (found) anchorId = found;
+    if (found) {
+      anchorId = found.id;
+      if (found.relaxed && !anchorNote) {
+        anchorNote = `(query "${queryStr}" relaxed AND→OR — no row matched all terms)`;
+      }
+    }
   }
 
   // No anchor: show most recent observations (aligned with MCP mem_timeline fallback)
