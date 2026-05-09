@@ -43,7 +43,7 @@ import {
   spawnBackground,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
-import { extractCitationsFromTranscript, bumpCitationAccess } from './lib/citation-tracker.mjs';
+import { extractCitationsFromTranscript, bumpCitationAccess, computeCiteRecall } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
@@ -499,6 +499,18 @@ async function handleStop() {
             const n = bumpCitationAccess(db, ids, project);
             debugLog('DEBUG', 'handleStop', `citations: ${ids.size} ids scanned, ${n} obs bumped`);
           }
+
+          // Persist cite-recall ratio for the next SessionStart to surface as
+          // feedback. We deliberately scan the transcript a second time here
+          // (cheap; the file is already in OS cache) rather than threading the
+          // count through `extractCitationsFromTranscript` so the bump path stays
+          // unchanged.
+          try {
+            const stats = computeCiteRecall(transcriptPath);
+            const payload = { ...stats, project, savedAt: Date.now() };
+            const dest = join(RUNTIME_DIR, `cite-recall-${project.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64)}.json`);
+            writeFileSync(dest, JSON.stringify(payload), { mode: 0o600 });
+          } catch (e) { debugCatch(e, 'handleStop-cite-recall-persist'); }
         }
       } catch (e) { debugCatch(e, 'handleStop-citation-track'); }
     } finally {
@@ -515,7 +527,51 @@ async function handleStop() {
 
 // ─── SessionStart Handler + CLAUDE.md Persistence (Tier 1 A, E) ─────────────
 
+// Build the SessionStart nudge line shown when the prior session's cite-recall
+// fell below threshold. Empty string = no surface (insufficient signal, recall
+// already healthy, or feature opted-out via env). Default threshold 0.6,
+// min injected 5 — both env-overridable for ops tuning + tests.
+function buildCiteRecallNudge(project) {
+  if (process.env.CLAUDE_MEM_NO_CITE_NUDGE === '1') return '';
+  try {
+    const safe = project.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
+    const path = join(RUNTIME_DIR, `cite-recall-${safe}.json`);
+    const raw = readFileSync(path, 'utf8');
+    const data = JSON.parse(raw);
+    const threshold = Number(process.env.CLAUDE_MEM_CITE_NUDGE_THRESHOLD) || 0.6;
+    const minInjected = Number(process.env.CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED) || 5;
+    if (typeof data.injected !== 'number' || typeof data.ratio !== 'number') return '';
+    if (data.injected < minInjected) return '';
+    if (data.ratio >= threshold) return '';
+    const pct = Math.round(data.ratio * 100);
+    return `[mem] Last session cite-recall ${pct}% (${data.recalled}/${data.injected}) — when injected lessons (#NN lines) inform your action, cite #NN explicitly so the contract loop stays observable.`;
+  } catch { return ''; /* no prior file, parse error, or FS error — silent */ }
+}
+
+// GC pre-recall cooldown files older than 24h. Pulled out of pre-tool-recall.js
+// (where it ran on every Edit, costing 15-30 disk stats per call on long-lived
+// projects) and consolidated here — once per SessionStart is enough to keep
+// RUNTIME_DIR from growing unbounded across stale sessions.
+const PRE_RECALL_COOLDOWN_STALE_MS = 24 * 60 * 60 * 1000;
+function gcStalePreRecallCooldowns() {
+  try {
+    const now = Date.now();
+    for (const name of readdirSync(RUNTIME_DIR)) {
+      if (!name.startsWith('pre-recall-cooldown-') || !name.endsWith('.json')) continue;
+      try {
+        const p = join(RUNTIME_DIR, name);
+        const st = statSync(p);
+        if (now - st.mtimeMs > PRE_RECALL_COOLDOWN_STALE_MS) unlinkSync(p);
+      } catch { /* silent per-entry */ }
+    }
+  } catch { /* silent — RUNTIME_DIR may not exist on first run */ }
+}
+
 async function handleSessionStart() {
+  // GC stale per-session cooldown files. Cheap (<5ms typical) and idempotent;
+  // moved here from pre-tool-recall.js's hot path.
+  gcStalePreRecallCooldowns();
+
   // Plugin cache self-heal: Claude Code auto-updates the marketplace plugin can
   // re-populate cache/<ver>/hooks/hooks.json, reintroducing duplicate hook
   // registration alongside install.mjs-managed settings.json entries. Silently
@@ -974,7 +1030,11 @@ async function handleSessionStart() {
     // <claude-mem-context> so both surfaces coexist. Empty string → skip.
     try {
       const { buildDashboard } = await import('./lib/startup-dashboard.mjs');
-      const dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
+      let dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
+      const citeNudge = buildCiteRecallNudge(project);
+      if (citeNudge) {
+        dashboardText = dashboardText ? `${citeNudge}\n${dashboardText}` : citeNudge;
+      }
       if (dashboardText) {
         process.stdout.write(JSON.stringify({
           suppressOutput: true,

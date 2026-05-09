@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, getCurrentBranch, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
+import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
 import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
@@ -29,6 +29,7 @@ import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
+import { saveObservation } from './lib/save-observation.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
 import { createRequire } from 'module';
 
@@ -909,78 +910,23 @@ server.registerTool(
   },
   safeHandler(async (args) => {
     if (args.project) args = { ...args, project: resolveProject(args.project) };
-    const now = new Date();
     const project = args.project || inferProject();
-    const type = args.type || 'discovery';
-    const title = args.title || args.content.slice(0, 100);
-    const sessionId = `manual-${project}`;
+    const result = saveObservation(db, {
+      content: args.content,
+      title: args.title,
+      type: args.type || 'discovery',
+      importance: args.importance,
+      project,
+      files: args.files || [],
+      lesson_learned: args.lesson_learned,
+    });
 
-    // Ensure session exists (INSERT OR IGNORE avoids race condition on concurrent calls)
-    db.prepare(`
-      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-      VALUES (?, ?, ?, ?, ?, 'active')
-    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-
-    // Dedup: skip if a similar title or content was saved recently (5 min window)
-    const fiveMinAgo = now.getTime() - 5 * 60 * 1000;
-    const recent = db.prepare(`
-      SELECT id, title, text FROM observations
-      WHERE project = ? AND created_at_epoch > ?
-      ORDER BY created_at_epoch DESC LIMIT 50
-    `).all(project, fiveMinAgo);
-
-    const dupMatch = title && recent.find(r =>
-      jaccardSimilarity(r.title, title) > 0.7 ||
-      jaccardSimilarity(r.text || '', args.content) > 0.7
-    );
-    if (dupMatch) {
-      return { content: [{ type: 'text', text: `Skipped: similar to existing #${dupMatch.id} in project "${project}". Use mem_get(ids=[${dupMatch.id}]) to review.` }] };
+    if (result.kind === 'duplicate') {
+      return { content: [{ type: 'text', text: `Skipped: similar to existing #${result.existingId} in project "${project}". Use mem_get(ids=[${result.existingId}]) to review.` }] };
     }
 
-    const safeContent = scrubSecrets(args.content);
-    const safeTitle = scrubSecrets(title);
-    const safeLesson = args.lesson_learned ? scrubSecrets(args.lesson_learned) : null;
-    const minhashSig = computeMinHash(safeTitle + ' ' + safeContent);
-    // Append CJK bigrams to text field for FTS5 indexing of Chinese content
-    const indexText = [safeTitle, safeContent, safeLesson].filter(Boolean).join(' ');
-    const bigramText = cjkBigrams(indexText);
-    const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
-
-    // Atomic: insert observation + observation_files + TF-IDF vector in one transaction
-    const saveFiles = args.files || [];
-    const saveTx = db.transaction(() => {
-      const result = db.prepare(`
-        INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, branch, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?)
-      `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), args.importance ?? 2, minhashSig, safeLesson, getCurrentBranch(), now.toISOString(), now.getTime());
-      const savedId = Number(result.lastInsertRowid);
-
-      // Populate observation_files junction table
-      if (savedId && saveFiles.length > 0) {
-        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
-        for (const f of saveFiles) {
-          if (typeof f === 'string' && f.length > 0) insertFile.run(savedId, f);
-        }
-      }
-
-      // Write TF-IDF vector
-      try {
-        const vocab = getVocabulary(db);
-        if (vocab) {
-          const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
-          if (vec) {
-            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-              .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
-          }
-        }
-      } catch (e) { debugCatch(e, 'mem_save-vector'); }
-
-      return result;
-    });
-    const result = saveTx();
-
-    const lessonNote = safeLesson ? ` 💡lesson captured` : '';
-    return { content: [{ type: 'text', text: `Saved as observation #${result.lastInsertRowid} [${type}] in project "${project}".${lessonNote}` }] };
+    const lessonNote = result.lessonCaptured ? ` 💡lesson captured` : '';
+    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}` }] };
   })
 );
 

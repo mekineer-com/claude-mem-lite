@@ -58,6 +58,10 @@ export const SOURCE_FILES = [
   // colliding with the scripts/ directory rename in installExtractedRelease
   // — see the SWITCHABLE_PATHS loop in hook-update.mjs.
   'lib/mem-override.mjs',
+  // v2.61 dedup refactor: shared "save one observation" pipeline used by both
+  // mem-cli.mjs::cmdSave and server.mjs::mem_save. Statically imported from both
+  // entry points; missing it from the manifest broke MCP saves on auto-update.
+  'lib/save-observation.mjs',
 ];
 
 /**

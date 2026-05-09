@@ -10,6 +10,7 @@ import { join } from 'path';
 import {
   extractCitationsFromTranscript,
   bumpCitationAccess,
+  computeCiteRecall,
 } from '../lib/citation-tracker.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
@@ -175,5 +176,73 @@ describe('bumpCitationAccess', () => {
     const id1 = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
     const n = bumpCitationAccess(db, new Set([id1]), 'projects--test');
     expect(n).toBe(1);
+  });
+});
+
+describe('computeCiteRecall', () => {
+  let tmp;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'cite-recall-test-'));
+  });
+
+  afterEach(() => {
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+  });
+
+  function writeTranscript(entries) {
+    const path = join(tmp, 'transcript.jsonl');
+    writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n'));
+    return path;
+  }
+
+  it('returns zeros for missing transcript', () => {
+    expect(computeCiteRecall(join(tmp, 'nope.jsonl'))).toEqual({ injected: 0, cited: 0, recalled: 0, ratio: 0 });
+  });
+
+  it('computes 1.0 ratio when assistant cites every injected #NN', () => {
+    const path = writeTranscript([
+      { type: 'system', content: '[mem] PreToolUse recall: #10 lesson...' },
+      { type: 'system', content: '[mem] #20 another lesson' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Applying #10 and #20 here.' }] } },
+    ]);
+    const stats = computeCiteRecall(path);
+    expect(stats.injected).toBe(2);
+    expect(stats.recalled).toBe(2);
+    expect(stats.ratio).toBe(1);
+  });
+
+  it('computes partial ratio when some IDs ignored', () => {
+    const path = writeTranscript([
+      { type: 'system', content: '#1 #2 #3 #4 #5' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Cited #1 and #2.' }] } },
+    ]);
+    const stats = computeCiteRecall(path);
+    expect(stats.injected).toBe(5);
+    expect(stats.recalled).toBe(2);
+    expect(stats.ratio).toBeCloseTo(0.4);
+  });
+
+  it('ignores cited IDs that were not injected', () => {
+    const path = writeTranscript([
+      { type: 'system', content: '#10' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Cited #10 and unrelated #999.' }] } },
+    ]);
+    const stats = computeCiteRecall(path);
+    // injected = #10, cited = #10+#999, recalled (intersection) = #10 → ratio = 1/1
+    expect(stats.injected).toBe(1);
+    expect(stats.cited).toBe(2);
+    expect(stats.recalled).toBe(1);
+    expect(stats.ratio).toBe(1);
+  });
+
+  it('reads tool_result content blocks (transcript shape variant)', () => {
+    const path = writeTranscript([
+      { type: 'user', message: { content: [{ type: 'tool_result', text: '#5 lesson' }] } },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Per #5, fixed.' }] } },
+    ]);
+    const stats = computeCiteRecall(path);
+    expect(stats.injected).toBe(1);
+    expect(stats.recalled).toBe(1);
   });
 });

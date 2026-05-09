@@ -40,6 +40,14 @@ export const SECRET_PATTERNS = [
   [/\bnpm_[a-zA-Z0-9]{36,}\b/g, '***'],
   // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_)
   [/\b[srp]k_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
+  // JSON-quoted secrets — error payloads / API responses commonly carry creds
+  // as `{"api_key": "..."}`. The base key=value pattern stops at quotes, so
+  // these slip through. Match the value-quoted form explicitly. Length floor
+  // (6) avoids tripping on intentional placeholder shorts ("...", "secret").
+  [/("(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer|refresh[_-]?token|session[_-]?id|sessionid)"\s*:\s*")[^"]{6,}(")/gi, '$1***$2'],
+  // Session cookies in headers / urlencoded bodies (sessionid=, session_id=, JSESSIONID=, PHPSESSID=).
+  // 16+ chars filters out short test fixtures like sessionid=abc.
+  [/\b((?:session[_-]?id|sessionid|jsessionid|phpsessid)\s*[=:]\s*)[^\s,;'"}\]]{16,}/gi, '$1***'],
 ];
 
 /**

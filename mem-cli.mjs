@@ -4,7 +4,7 @@
 
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, getCurrentBranch, notLowSignalTitleClause } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, OBS_BM25, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
 import { cjkPrecisionOk } from './nlp.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
@@ -26,6 +26,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // router + remaining-command bodies during the incremental split. Future work:
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints } from './cli/common.mjs';
+import { saveObservation } from './lib/save-observation.mjs';
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
@@ -779,14 +780,12 @@ function cmdSave(db, args) {
     return;
   }
 
-  const rawTitle = flags.title || text.slice(0, 100);
   // Explicit saves default to importance=2 (notable) — user chose to save
   const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
   if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
     fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
     return;
   }
-  const importance = rawImp;
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const saveFiles = flags.files ? flags.files.split(',').map(f => f.trim()).filter(Boolean) : [];
 
@@ -800,78 +799,23 @@ function cmdSave(db, args) {
     return;
   }
 
-  // Secret scrubbing (aligned with MCP mem_save)
-  const safeContent = scrubSecrets(text);
-  const safeTitle = scrubSecrets(rawTitle);
-  const safeLesson = (rawLesson !== null && typeof rawLesson === 'string' && rawLesson.length > 0)
-    ? scrubSecrets(rawLesson) : null;
+  const result = saveObservation(db, {
+    content: text,
+    title: flags.title,
+    type,
+    importance: rawImp,
+    project,
+    files: saveFiles,
+    lesson_learned: rawLesson,
+  });
 
-  // Dedup: skip if similar title/content saved in last 5 minutes (aligned with MCP mem_save)
-  const fiveMinAgo = Date.now() - 5 * 60 * 1000;
-  const recent = db.prepare(`
-    SELECT id, title, text FROM observations
-    WHERE project = ? AND created_at_epoch > ?
-    ORDER BY created_at_epoch DESC LIMIT 50
-  `).all(project, fiveMinAgo);
-
-  const dupMatch = recent.find(r =>
-    jaccardSimilarity(r.title, safeTitle) > 0.7 ||
-    jaccardSimilarity(r.text || '', safeContent) > 0.7
-  );
-  if (dupMatch) {
-    out(`[mem] Skipped: similar to existing #${dupMatch.id}. Use "claude-mem-lite get ${dupMatch.id}" to review.`);
+  if (result.kind === 'duplicate') {
+    out(`[mem] Skipped: similar to existing #${result.existingId}. Use "claude-mem-lite get ${result.existingId}" to review.`);
     return;
   }
 
-  // MinHash + CJK bigrams (aligned with MCP mem_save)
-  // Include lesson in the FTS-indexed text so the +0.3 lesson-boost actually surfaces
-  // lesson-bearing rows (mirrors MCP mem_save which builds the same indexText).
-  const minhashSig = computeMinHash(safeTitle + ' ' + safeContent);
-  const indexText = [safeTitle, safeContent, safeLesson].filter(Boolean).join(' ');
-  const bigramText = cjkBigrams(indexText);
-  const textField = bigramText ? safeContent + ' ' + bigramText : safeContent;
-
-  const now = new Date();
-  const sessionId = `manual-${project}`;
-
-  // Ensure a session exists for the FK constraint
-  db.prepare(`
-    INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-    VALUES (?, ?, ?, ?, ?, 'active')
-  `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-
-  // Atomic: insert observation + observation_files + TF-IDF vector (aligned with MCP mem_save)
-  const saveTx = db.transaction(() => {
-    const result = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, branch, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, ?, '', '', '[]', ?, ?, ?, ?, ?, ?, ?)
-    `).run(sessionId, project, textField, type, safeTitle, safeContent, JSON.stringify(saveFiles), importance, minhashSig, safeLesson, getCurrentBranch(), now.toISOString(), now.getTime());
-    const savedId = Number(result.lastInsertRowid);
-
-    // Populate observation_files junction table (aligned with MCP mem_save)
-    if (savedId && saveFiles.length > 0) {
-      const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
-      for (const f of saveFiles) insertFile.run(savedId, f);
-    }
-
-    // Write TF-IDF vector
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const vec = computeVector(safeTitle + ' ' + safeContent, vocab);
-        if (vec) {
-          db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-            .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
-        }
-      }
-    } catch { /* non-critical */ }
-
-    return result;
-  });
-  const result = saveTx();
-
-  const lessonNote = safeLesson ? ' 💡lesson captured' : '';
-  out(`[mem] Saved #${result.lastInsertRowid} [${type}] "${truncate(safeTitle, 80)}" (project: ${project})${lessonNote}`);
+  const lessonNote = result.lessonCaptured ? ' 💡lesson captured' : '';
+  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}`);
 }
 
 // N-1: Quality-focused stats for R-2 A/B baseline.

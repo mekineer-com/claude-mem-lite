@@ -4,7 +4,7 @@
 // and the pure-data lib/low-signal-patterns.mjs (zero runtime deps, ~1ms overhead).
 // Safety: readonly DB, exit 0 always, 3s timeout
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
@@ -20,7 +20,9 @@ const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(homedir(), '.clau
 const LEGACY_COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
 const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (used only for legacy fallback)
 const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold for legacy file
-const SESSION_COOLDOWN_STALE_MS = 24 * 60 * 60 * 1000; // 24h — drop session cooldown files older than this
+// Stale-cooldown GC moved to hook.mjs::handleSessionStart — running it on every
+// Edit cost 15-30 disk stats per call. SessionStart fires once at session boot,
+// which is enough to keep RUNTIME_DIR from growing unbounded.
 
 function cooldownPathFor(sessionId) {
   if (!sessionId) return LEGACY_COOLDOWN_PATH;
@@ -58,22 +60,6 @@ function writeCooldown(cooldownPath, data, isSessionScoped) {
       }
     }
     writeFileSync(cooldownPath, JSON.stringify(cleaned));
-  } catch { /* silent */ }
-}
-
-// Best-effort GC for session cooldown files older than 24h.
-// Runs at most once per hook invocation, silent on any failure.
-function gcOldSessionCooldowns() {
-  try {
-    const now = Date.now();
-    for (const name of readdirSync(RUNTIME_DIR)) {
-      if (!name.startsWith('pre-recall-cooldown-') || !name.endsWith('.json')) continue;
-      try {
-        const p = join(RUNTIME_DIR, name);
-        const st = statSync(p);
-        if (now - st.mtimeMs > SESSION_COOLDOWN_STALE_MS) unlinkSync(p);
-      } catch { /* silent per-entry */ }
-    }
   } catch { /* silent */ }
 }
 
@@ -122,8 +108,6 @@ try {
   } else {
     if (cooldown[filePath] && (now - cooldown[filePath]) < COOLDOWN_MS) process.exit(0);
   }
-  // Best-effort GC of old session cooldown files (cheap, once per invocation)
-  if (isSessionScoped) gcOldSessionCooldowns();
 
   // Open DB readonly
   const Database = (await import('better-sqlite3')).default;

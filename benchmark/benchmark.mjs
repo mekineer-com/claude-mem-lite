@@ -82,14 +82,47 @@ export function seedDatabase(db, data) {
 // ─── Search (mirrors server.mjs BM25 query exactly) ────────────────────────
 //
 // Modes:
-//   'hybrid'    — production scoring: BM25 × time-decay × project-boost ×
-//                 importance × access-bonus. Mirrors server.mjs.
-//   'bm25_only' — strips all multipliers, pure BM25 ranking. Tests whether
-//                 production multipliers add lift over raw FTS5.
-//   'recency'   — no FTS, ORDER BY created_at_epoch DESC. Tests whether FTS
-//                 retrieval adds anything over "newest-first" baseline.
-//   'random'    — deterministic shuffle (seeded by query). Sanity floor —
-//                 anything that doesn't beat random is broken.
+//   'hybrid'        — production scoring: BM25 × time-decay × project-boost ×
+//                     importance × access-bonus. Mirrors server.mjs.
+//   'bm25_only'     — strips all multipliers, pure BM25 ranking. Tests whether
+//                     production multipliers add lift over raw FTS5.
+//   'recency'       — no FTS, ORDER BY created_at_epoch DESC. Tests whether FTS
+//                     retrieval adds anything over "newest-first" baseline.
+//   'random'        — deterministic shuffle (seeded by query). Sanity floor —
+//                     anything that doesn't beat random is broken.
+//   'no_decay'      — drop time-decay; keep project/importance/access. Per-term
+//                     ablation: how much does the recency multiplier earn?
+//   'no_project'    — drop project boost; isolates whether current-project bias
+//                     is doing real work on the eval set.
+//   'no_importance' — drop the (0.5+0.5*importance) multiplier.
+//   'no_access'     — drop the (1+0.1*ln(1+access)) multiplier.
+//
+// Per-term ablation modes were added to answer "do these multipliers earn their
+// keep?" — the previous matrix only compared full-hybrid vs bm25_only, leaving
+// per-multiplier contribution invisible. Each MODE_TERMS entry lists which
+// multipliers stay in the formula; placeholder threading stays correct because
+// each multiplier's parameters are appended in MULT_PARAMS order.
+
+const MULT_EXPR = {
+  decay:      '(1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))',
+  project:    '(CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)',
+  importance: '(0.5 + 0.5 * COALESCE(o.importance, 1))',
+  access:     '(1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))',
+};
+const MULT_PARAMS = {
+  decay:      (now)         => [now],
+  project:    (_now, project)=> [project, project],
+  importance: ()            => [],
+  access:     ()            => [],
+};
+const MODE_TERMS = {
+  hybrid:        ['decay', 'project', 'importance', 'access'],
+  bm25_only:     [],
+  no_decay:      ['project', 'importance', 'access'],
+  no_project:    ['decay', 'importance', 'access'],
+  no_importance: ['decay', 'project', 'access'],
+  no_access:     ['decay', 'project', 'importance'],
+};
 
 function searchObservations(db, query, options = {}) {
   const mode = options.mode ?? 'hybrid';
@@ -100,17 +133,19 @@ function searchObservations(db, query, options = {}) {
   if (mode === 'random') return searchRandom(db, query, { limit, project, obsType });
   if (mode === 'recency') return searchRecency(db, { limit, project, obsType });
 
+  const terms = MODE_TERMS[mode];
+  if (!terms) throw new Error(`Unknown benchmark mode: ${mode}`);
+
   const ftsQuery = sanitizeFtsQuery(query);
   if (!ftsQuery) return [];
 
   const now = Date.now();
-  const scoreExpr = mode === 'bm25_only'
-    ? 'bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8) as score'
-    : `bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8)
-         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
-         * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
-         * (0.5 + 0.5 * COALESCE(o.importance, 1))
-         * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0))) as score`;
+  const baseBm25 = 'bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8)';
+  const scoreExpr = terms.length === 0
+    ? `${baseBm25} as score`
+    : `${baseBm25} * ${terms.map((t) => MULT_EXPR[t]).join(' * ')} as score`;
+
+  const scoreParams = terms.flatMap((t) => MULT_PARAMS[t](now, project));
 
   const sql = `
     SELECT o.id, o.type, o.title, o.subtitle, o.project, o.created_at, o.importance,
@@ -125,9 +160,7 @@ function searchObservations(db, query, options = {}) {
     ORDER BY score
     LIMIT ?
   `;
-  const params = mode === 'bm25_only'
-    ? [ftsQuery, project, project, obsType, obsType, limit]
-    : [now, project, project, ftsQuery, project, project, obsType, obsType, limit];
+  const params = [...scoreParams, ftsQuery, project, project, obsType, obsType, limit];
   const rows = db.prepare(sql).all(...params);
 
   return rows.map(r => ({
@@ -351,8 +384,37 @@ function round(v) {
 // doesn't beat recency-only is broken.
 
 const BASELINE_MODES = ['hybrid', 'bm25_only', 'recency', 'random'];
+const ABLATION_MODES = ['no_decay', 'no_project', 'no_importance', 'no_access'];
 
-export function runBenchmarkMatrix(db, queries) {
+/**
+ * Deterministically partition a query fixture into train + eval splits so the
+ * vocabulary built from `train` can be evaluated on truly held-out queries.
+ * Without this, the benchmark trains and evaluates on the same set, inflating
+ * metrics. Mulberry32 PRNG seeded by `seed` so partitions are reproducible.
+ *
+ * @param {Array}  queries      Full query fixture (each carries id + relevant_ids).
+ * @param {number} [ratio=0.3]  Fraction reserved for eval split.
+ * @param {number} [seed=42]    PRNG seed; same input → same split.
+ * @returns {{ train: Array, eval: Array }}
+ */
+export function splitFixture(queries, ratio = 0.3, seed = 42) {
+  const arr = queries.slice();
+  let s = seed >>> 0;
+  for (let i = arr.length - 1; i > 0; i--) {
+    s = (s + 0x6d2b79f5) >>> 0;
+    let t = s;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    const r = ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    const j = Math.floor(r * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  const evalCount = Math.max(1, Math.round(arr.length * ratio));
+  return { eval: arr.slice(0, evalCount), train: arr.slice(evalCount) };
+}
+
+export function runBenchmarkMatrix(db, queries, options = {}) {
+  const includeAblations = options.ablations !== false;
   const matrix = {
     timestamp: new Date().toISOString(),
     queryCount: queries.length,
@@ -369,7 +431,10 @@ export function runBenchmarkMatrix(db, queries) {
   const wasQueryOnly = db.pragma('query_only', { simple: true });
   db.pragma('query_only = ON');
   try {
-    for (const mode of BASELINE_MODES) {
+    const modes = includeAblations
+      ? [...BASELINE_MODES, ...ABLATION_MODES]
+      : BASELINE_MODES;
+    for (const mode of modes) {
       matrix.modes[mode] = runBenchmark(db, queries, mode);
     }
   } finally {
@@ -379,6 +444,17 @@ export function runBenchmarkMatrix(db, queries) {
   matrix.deltas.hybrid_over_bm25 = diffMetrics(matrix.modes.hybrid, matrix.modes.bm25_only);
   matrix.deltas.bm25_over_recency = diffMetrics(matrix.modes.bm25_only, matrix.modes.recency);
   matrix.deltas.recency_over_random = diffMetrics(matrix.modes.recency, matrix.modes.random);
+  // Per-term ablation deltas: hybrid vs the single-multiplier-removed mode.
+  // Positive Δ on a metric means dropping that multiplier hurts; near-zero
+  // means it earns no measurable lift on this fixture and is a candidate for
+  // removal (smaller surface, fewer SQL ops, identical quality).
+  if (includeAblations) {
+    for (const ab of ABLATION_MODES) {
+      if (matrix.modes[ab]) {
+        matrix.deltas[`hybrid_over_${ab}`] = diffMetrics(matrix.modes.hybrid, matrix.modes[ab]);
+      }
+    }
+  }
   // Per-query Δ — surfaces WHICH queries gain from multipliers vs which are
   // multiplier-neutral. If hybrid_over_bm25 aggregate is 0, this answers
   // whether (a) all queries are individually 0-lift (multipliers are dead
@@ -454,19 +530,35 @@ function main() {
 
   const args = new Set(process.argv.slice(2));
   const matrixMode = args.has('--matrix') || args.has('--baselines');
+  const holdoutMode = args.has('--holdout');
+  const ablations = !args.has('--no-ablations');
+
+  // --holdout splits the query fixture into train/eval (default 70/30,
+  // deterministic seed) and runs the matrix on the eval split only. Closes the
+  // overfitting hole where vocabulary built from seed-data was being scored on
+  // the same set used to build it.
+  let evalQueries = queryData.queries;
+  let split = null;
+  if (holdoutMode) {
+    split = splitFixture(queryData.queries, 0.3, 42);
+    evalQueries = split.eval;
+    console.error(`Holdout mode: ${split.train.length} train (vocab build) / ${split.eval.length} eval queries`);
+  }
 
   if (matrixMode) {
-    console.error('Running benchmark matrix (hybrid + 3 baselines)...');
-    const matrix = runBenchmarkMatrix(db, queryData.queries);
+    console.error(`Running benchmark matrix (hybrid + 3 baselines${ablations ? ' + 4 ablations' : ''})...`);
+    const matrix = runBenchmarkMatrix(db, evalQueries, { ablations });
+    if (split) matrix.holdout = { train: split.train.length, eval: split.eval.length, seed: 42, ratio: 0.3 };
     console.log(JSON.stringify(matrix, null, 2));
 
     console.error('\n─── Benchmark Matrix ───');
-    const head = `  ${'mode'.padEnd(11)} ${'R@10'.padStart(7)} ${'P@10'.padStart(7)} ${'nDCG'.padStart(7)} ${'MRR'.padStart(7)} ${'p95ms'.padStart(7)}`;
+    const head = `  ${'mode'.padEnd(15)} ${'R@10'.padStart(7)} ${'P@10'.padStart(7)} ${'nDCG'.padStart(7)} ${'MRR'.padStart(7)} ${'p95ms'.padStart(7)}`;
     console.error(head);
-    console.error(`  ${'-'.repeat(11)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)}`);
-    for (const mode of BASELINE_MODES) {
+    console.error(`  ${'-'.repeat(15)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)} ${'-'.repeat(7)}`);
+    const allModes = ablations ? [...BASELINE_MODES, ...ABLATION_MODES] : BASELINE_MODES;
+    for (const mode of allModes) {
       const m = matrix.modes[mode].metrics;
-      console.error(`  ${mode.padEnd(11)} ${String(m.recall_at_10).padStart(7)} ${String(m.precision_at_10).padStart(7)} ${String(m.ndcg_at_10).padStart(7)} ${String(m.mrr_at_10).padStart(7)} ${String(m.p95_search_latency_ms).padStart(7)}`);
+      console.error(`  ${mode.padEnd(15)} ${String(m.recall_at_10).padStart(7)} ${String(m.precision_at_10).padStart(7)} ${String(m.ndcg_at_10).padStart(7)} ${String(m.mrr_at_10).padStart(7)} ${String(m.p95_search_latency_ms).padStart(7)}`);
     }
     console.error('\n─── Lift (Δ recall / Δ precision / Δ nDCG / Δ MRR) ───');
     const dh = matrix.deltas.hybrid_over_bm25;
@@ -491,6 +583,20 @@ function main() {
       console.error(`  → multipliers HURT more queries (${hbBins.lost}) than they helped (${hbBins.gained}) — directionally wrong`);
     } else if (hbBins.gained > 0) {
       console.error(`  → multipliers help ${hbBins.gained} query/ies — top lift: "${matrix.perQueryDeltas.hybrid_over_bm25[0].query}" (Δ=${matrix.perQueryDeltas.hybrid_over_bm25[0].ndcg_delta})`);
+    }
+
+    // Per-multiplier ablation summary — answers "which of the 4 multipliers
+    // earn their keep on this fixture?". Read positive Δ as "dropping this
+    // multiplier hurt", ≈0 as "this multiplier was idle, candidate to remove".
+    if (ablations) {
+      console.error('\n─── Per-multiplier ablation (Δ hybrid over single-multiplier-removed) ───');
+      for (const ab of ABLATION_MODES) {
+        const d = matrix.deltas[`hybrid_over_${ab}`];
+        if (!d) continue;
+        const dropped = ab.replace(/^no_/, '');
+        console.error(`  drop ${dropped.padEnd(11)} → ΔR=${d.recall_at_10}  ΔP=${d.precision_at_10}  ΔnDCG=${d.ndcg_at_10}  ΔMRR=${d.mrr_at_10}`);
+      }
+      console.error('  Read: large positive Δ = this multiplier earns its keep. ≈0 = drop candidate.');
     }
 
     db.close();

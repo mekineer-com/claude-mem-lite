@@ -52,6 +52,31 @@ describe('secret-scrub.mjs', () => {
     expect(directScrub(null)).toBe('');
     expect(directScrub(undefined)).toBe('');
   });
+
+  it('scrubs JSON-quoted secrets (error payloads)', () => {
+    const input = '{"api_key": "sk-very-long-secret-value", "user": "alice"}';
+    const out = directScrub(input);
+    expect(out).toContain('"api_key": "***"');
+    expect(out).toContain('"user": "alice"'); // non-secret key untouched
+  });
+
+  it('scrubs JSON-quoted refresh tokens and bearer fields', () => {
+    const input = '{"refresh_token": "abc123def456ghi789", "bearer": "longopaquetokenvalue"}';
+    const out = directScrub(input);
+    expect(out).toContain('"refresh_token": "***"');
+    expect(out).toContain('"bearer": "***"');
+  });
+
+  it('scrubs sessionid cookies in URL-encoded form', () => {
+    const out = directScrub('Cookie: sessionid=abcdef0123456789xyzwq; other=value');
+    expect(out).toContain('sessionid=***');
+    expect(out).toContain('other=value');
+  });
+
+  it('does not over-scrub short placeholder values', () => {
+    expect(directScrub('{"api_key": "***"}')).toBe('{"api_key": "***"}');
+    expect(directScrub('sessionid=abc')).toBe('sessionid=abc'); // below 16-char floor
+  });
 });
 
 describe('format-utils.mjs', () => {
