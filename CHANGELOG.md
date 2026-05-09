@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.62.1] - 2026-05-10
+
+**Hotfix lockfile (npm@10 regen for `@emnapi` top-level — same root cause as 2.58.2).** No source-code changes — pure lockfile regeneration. v2.62.0 CI run [25610907804](https://github.com/sdsrss/claude-mem-lite/actions/runs/25610907804) failed at `npm ci` with `EUSAGE: Missing @emnapi/core@1.10.0 from lock file`. Local lockfile had been regenerated with npm@11.6 (`npm install --package-lock-only`) which strips top-level entries for `@emnapi/core@1.10.0` + `@emnapi/runtime@1.10.0` when those are transitive deps of platform-optional bindings (specifically `@oxc-parser/binding-win32-*` from knip's `oxc-parser` dep). CI's bundled npm@10 (Node 22 default) then refuses `npm ci` because the strict graph check finds those edges unsatisfied. Fix: regenerate via `npx --yes npm@10.9.2 install`. Verified locally: 13 `@emnapi` entries restored, all 2138 tests pass, ESLint clean. The v2.62.0 three-fix bundle (ep-flush sweep, doctor warnings counter, timeline anchor parity) all carry forward.
+
 ## [2.62.0] - 2026-05-10
 
 **Three-fix maintenance bundle: ep-flush orphan sweep, doctor warnings counter, timeline anchor AND→OR parity.** All three surfaced via dogfooding (simulated normal Claude Code editing sessions against this repo). Schema unchanged. 85 test files / 2138 tests pass (+3 files, +20 tests vs 2.61.0); zero ESLint errors.
