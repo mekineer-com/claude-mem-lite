@@ -325,6 +325,48 @@ export function isSpecificTerm(token) {
 }
 
 /**
+ * Detect prompts whose content is purely workflow/control language with no
+ * subject substance — "继续", "提交代码", "/exit", "commit and push", etc.
+ *
+ * Rationale: `buildAndSaveHandoff` writes user-prompt text into `working_on`
+ * verbatim. When a session's only prompt is a meta-trigger, the resumed
+ * session sees `Working On: 继续前面的工作` — self-referential garbage. This
+ * detector lets the writer filter such prompts before they pollute the field.
+ *
+ * Strategy: strip a curated set of trigger keywords (zh + en) plus
+ * punctuation; if <4 chars of substantive content remain, the prompt is meta.
+ * Threshold tuned against real `user_prompts` samples — keeps prompts like
+ * "提交代码，发新版本，检查线上有没有错误" (real verification subject) while
+ * dropping bare "/exit" / "继续" / "commit".
+ *
+ * @param {string} text Prompt text
+ * @returns {boolean} true if the prompt is meta-trigger only
+ */
+export function isMetaTriggerPrompt(text) {
+  if (!text || typeof text !== 'string') return true;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return true;
+
+  const stripped = trimmed
+    .replace(/继续(前面|之前|刚才|上次)?(的)?(工作|任务|话题|讨论)?/g, '')
+    .replace(/提交(代码|了|完|过)?(并)?(发布)?/g, '')
+    .replace(/退出/g, '')
+    .replace(/发(布|新版本|个新版本)/g, '')
+    .replace(/新开(了)?(一个)?(会话|session)?/g, '')
+    .replace(/保存(进度|状态|工作|代码)?/g, '')
+    .replace(/接着(干|做|来|继续)?/g, '')
+    .replace(/上次(到哪了|说到哪了)?/g, '')
+    .replace(/总结一下|复盘一下/g, '')
+    .replace(/前面(的)?(工作|话题|讨论|内容)/g, '')
+    .replace(/\/?(clear|exit)\b/gi, '')
+    .replace(/\b(commit|continue|resume|push|save|restart|exit|next)\b/gi, '')
+    .replace(/[，,。.!！?？:：;；()（）【】[\]\s/\\-]+/g, '')
+    .trim();
+
+  return stripped.length < 4;
+}
+
+/**
  * Extract match keywords from text and file paths for handoff intent matching.
  * @param {string} text Combined text from prompts, observations, etc.
  * @param {string[]} files Array of file paths

@@ -407,6 +407,30 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     handoffLines.push('');
   }
 
+  // 5b. Deferred Work — project-level importance≥3 obs that survived prior
+  // session boundaries. Independent of the per-session handoff: even when the
+  // most recent /clear or /exit handoff has stale or meta-only `working_on`,
+  // genuine carry-forward decisions stay surfaced. Capped at 3 to keep the
+  // banner skim-able. Quiet-hooks does NOT suppress: the whole point is
+  // visibility for cross-session continuity.
+  const deferredObs = db.prepare(`
+    SELECT id, type, title FROM observations
+    WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+      AND superseded_at IS NULL
+      AND COALESCE(importance, 1) >= 3
+      AND ${notLowSignalTitleClause('')}
+    ORDER BY created_at_epoch DESC LIMIT 3
+  `).all(project);
+
+  const deferredLines = [];
+  if (deferredObs.length > 0) {
+    deferredLines.push('### Deferred Work');
+    for (const o of deferredObs) {
+      deferredLines.push(`- ${typeIcon(o.type)} [${o.type}] ${truncate(o.title, 140)} (#${o.id})`);
+    }
+    deferredLines.push('');
+  }
+
   // 6. Recent observations table
   const obsLines = [];
   const obsToShow = observations.length >= 3 ? observations : fallbackObs;
@@ -422,7 +446,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     }
   }
 
-  return [...summaryLines, ...handoffLines, ...obsLines].join('\n');
+  return [...summaryLines, ...handoffLines, ...deferredLines, ...obsLines].join('\n');
 }
 
 /**

@@ -403,6 +403,77 @@ describe('buildAndSaveHandoff', () => {
   });
 });
 
+// ─── meta-trigger filter (working_on) ───────────────────────────────────────
+
+describe('buildAndSaveHandoff: meta-trigger filter for working_on', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); seedSession(db, 's1', 'test-proj'); });
+  afterEach(() => { db.close(); });
+
+  it('filters meta-trigger-only prompts when subject prompts coexist', () => {
+    seedPrompt(db, 's1', '继续', 1);
+    seedPrompt(db, 's1', '改 mem-cli.mjs 里 cmdRecent 加 --json', 2);
+    seedPrompt(db, 's1', '/exit', 3);
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
+
+    const row = db.prepare(`SELECT working_on FROM session_handoffs WHERE project = 'test-proj'`).get();
+    expect(row.working_on).toContain('mem-cli.mjs');
+    expect(row.working_on).not.toMatch(/^继续 →/);
+    expect(row.working_on).not.toContain('/exit');
+  });
+
+  it('falls back to project-level importance≥3 obs when ALL prompts are meta', () => {
+    seedSession(db, 's2-other-session', 'test-proj');
+    seedPrompt(db, 's1', '继续前面的工作', 1);
+    seedPrompt(db, 's1', '提交代码', 2);
+    seedObservation(db, 's2-other-session', 'test-proj',
+      'v2.66 carry-forward: Tier 2 --json + Tier 3 activity delete CLI',
+      'decision', 3, '[]', null);
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
+
+    const row = db.prepare(`SELECT working_on FROM session_handoffs WHERE project = 'test-proj'`).get();
+    expect(row.working_on).toContain('carry-forward subject');
+    expect(row.working_on).toContain('v2.66 carry-forward');
+  });
+
+  it('preserves verbatim prompts when meta-only AND no fallback exists', () => {
+    seedPrompt(db, 's1', '继续', 1);
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
+
+    const row = db.prepare(`SELECT working_on FROM session_handoffs WHERE project = 'test-proj'`).get();
+    expect(row.working_on).toBe('继续');
+  });
+
+  it('skips low-signal-titled obs in fallback (no "Modified X" pollution)', () => {
+    seedSession(db, 's2', 'test-proj');
+    seedPrompt(db, 's1', '继续', 1);
+    seedObservation(db, 's2', 'test-proj', 'Modified some-file.mjs', 'change', 3, '[]', null);
+    seedObservation(db, 's2', 'test-proj',
+      'Adopt 5-tier scoring weights for hybrid search', 'decision', 3, '[]', null);
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
+
+    const row = db.prepare(`SELECT working_on FROM session_handoffs WHERE project = 'test-proj'`).get();
+    expect(row.working_on).toContain('5-tier scoring');
+    expect(row.working_on).not.toContain('Modified some-file');
+  });
+
+  it('cross-project obs are NOT used as fallback', () => {
+    seedSession(db, 's2', 'OTHER-proj');
+    seedPrompt(db, 's1', '继续', 1);
+    seedObservation(db, 's2', 'OTHER-proj',
+      'wrong-project decision should not leak', 'decision', 3, '[]', null);
+
+    buildAndSaveHandoff(db, 's1', 'test-proj', 'exit', null);
+
+    const row = db.prepare(`SELECT working_on FROM session_handoffs WHERE project = 'test-proj'`).get();
+    expect(row.working_on).toBe('继续');
+  });
+});
+
 // ─── detectContinuationIntent Tests ─────────────────────────────────────────
 
 describe('detectContinuationIntent', () => {

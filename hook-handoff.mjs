@@ -2,7 +2,7 @@
 // Extracted for testability — hook.mjs has module-level side effects
 
 import { basename } from 'path';
-import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE, EDIT_TOOLS } from './utils.mjs';
+import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE, EDIT_TOOLS, isMetaTriggerPrompt, notLowSignalTitleClause } from './utils.mjs';
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_ANCHOR_MAX_AGE,
   HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
@@ -39,14 +39,38 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   `).all(sessionId);
   if (prompts.length === 0) return;  // Empty session — nothing to hand off
 
+  // Filter prompts whose only content is workflow/control language ("继续",
+  // "提交代码", "/exit", etc.). Storing them verbatim into working_on creates
+  // self-referential handoffs ("Working On: 继续前面的工作") that point at the
+  // trigger instead of the subject. When ALL prompts are meta, fall back to
+  // the project's most recent importance≥3 non-low-signal observation as the
+  // carry-forward anchor — that's the closest durable signal of "what was
+  // being worked on at a higher level than this session".
+  const subjectPrompts = prompts.filter(p => !isMetaTriggerPrompt(p.prompt_text));
+  const sourcePrompts = subjectPrompts.length > 0 ? subjectPrompts : prompts;
+
   const seen = new Set();
-  const uniquePrompts = prompts.filter(p => {
+  const uniquePrompts = sourcePrompts.filter(p => {
     const t = truncate(p.prompt_text, 200);
     if (seen.has(t)) return false;
     seen.add(t);
     return true;
   });
-  const workingOn = uniquePrompts.map(p => truncate(p.prompt_text, 200)).join(' → ');
+  let workingOn = uniquePrompts.map(p => truncate(p.prompt_text, 200)).join(' → ');
+
+  if (subjectPrompts.length === 0) {
+    const fallback = db.prepare(`
+      SELECT title FROM observations
+      WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
+        AND COALESCE(importance, 1) >= 3
+        AND ${notLowSignalTitleClause('')}
+      ORDER BY created_at_epoch DESC LIMIT 1
+    `).get(project);
+    if (fallback?.title) {
+      workingOn = `(carry-forward subject) ${truncate(fallback.title, 180)}`;
+    }
+  }
 
   // 2. Completed — from observations (include narrative for richer handoff)
   const completed = db.prepare(`

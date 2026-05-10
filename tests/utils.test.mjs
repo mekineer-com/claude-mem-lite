@@ -23,6 +23,7 @@ import {
   fmtTime,
   isoWeekKey,
   LOW_SIGNAL_TITLE,
+  isMetaTriggerPrompt,
 } from '../utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
@@ -1340,6 +1341,57 @@ describe('LOW_SIGNAL_TITLE regex', () => {
   for (const [title, label] of shouldNotMatch) {
     it(`does NOT match: ${label}`, () => {
       expect(LOW_SIGNAL_TITLE.test(title)).toBe(false);
+    });
+  }
+});
+
+// ─── isMetaTriggerPrompt ────────────────────────────────────────────────────
+
+describe('isMetaTriggerPrompt', () => {
+  // Real samples from user_prompts table that broke handoff working_on field.
+  const metaSamples = [
+    ['empty', ''],
+    ['whitespace only', '   \n\t '],
+    ['null', null],
+    ['undefined', undefined],
+    ['continue zh', '继续'],
+    ['continue prior work zh', '继续前面的工作'],
+    ['continue past work zh', '继续之前的工作'],
+    ['just commit', '提交代码'],
+    ['commit and release', '提交代码，发新版本'],
+    ['exit zh', '退出'],
+    ['save progress', '保存进度'],
+    ['next session zh', '新开会话'],
+    ['exit slash', '/exit'],
+    ['clear slash', '/clear'],
+    ['exit english', 'exit'],
+    ['continue english', 'continue'],
+    ['resume english', 'resume'],
+    ['commit and push', 'commit and push'],
+    ['next', 'next'],
+    ['summary please zh', '总结一下'],
+    ['retro please zh', '复盘一下'],
+  ];
+
+  for (const [label, sample] of metaSamples) {
+    it(`flags meta: ${label}`, () => {
+      expect(isMetaTriggerPrompt(sample)).toBe(true);
+    });
+  }
+
+  const subjectSamples = [
+    ['real subject after triggers', '提交代码，发新版本，检查线上有没有错误。'],
+    ['gitignore task', 'tasks/这个目录是在本地用的，应该在git提交中加入目录排除，提交代码，我准新开会话断续前面的工作。'],
+    ['ultrathink directive', '深入思考，测出来未修改的有没有高价值的问题，给出科学准确的建议。'],
+    ['file path mention', '改一下 mem-cli.mjs 里的 cmdRecent'],
+    ['english instruction', 'add a flag to the recent command'],
+    ['question about behavior', '为什么 search 在 CLI 和 MCP 之间不一致？'],
+    ['bug report', '/clear 后 banner 里 working_on 显示的是 trigger 文本而不是真主题'],
+  ];
+
+  for (const [label, sample] of subjectSamples) {
+    it(`preserves subject: ${label}`, () => {
+      expect(isMetaTriggerPrompt(sample)).toBe(false);
     });
   }
 });

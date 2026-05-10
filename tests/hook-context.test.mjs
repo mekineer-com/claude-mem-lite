@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { computeAdaptiveWindows, selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines } from '../hook-context.mjs';
+import { computeAdaptiveWindows, selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines, buildSessionContextLines } from '../hook-context.mjs';
 
 // ─── computeAdaptiveWindows ──────────────────────────────────────────────────
 
@@ -461,3 +461,92 @@ describe('buildSummaryLines', () => {
     expect(requestLine.length).toBeLessThan(200);
   });
 });
+
+describe('buildSessionContextLines: Deferred Work block', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-x', project: 'test' });
+  });
+  afterEach(() => { db.close(); });
+
+  it('surfaces project-level importance≥3 obs in Deferred Work block', () => {
+    insertObs(db, {
+      sessionId: 'sess-x', project: 'test',
+      title: 'v2.66 carry-forward: real --json across recent/recall/timeline/stats/browse',
+      type: 'decision', importance: 3,
+    });
+    const out = buildSessionContextLines(db, 'test');
+    expect(out).toContain('### Deferred Work');
+    expect(out).toContain('v2.66 carry-forward');
+    expect(out).toContain('[decision]');
+  });
+
+  it('omits the block when no importance≥3 obs exist', () => {
+    insertObs(db, {
+      sessionId: 'sess-x', project: 'test',
+      title: 'a routine bugfix nothing notable', type: 'bugfix', importance: 2,
+    });
+    const out = buildSessionContextLines(db, 'test');
+    expect(out).not.toContain('### Deferred Work');
+  });
+
+  it('caps the block at 3 entries', () => {
+    for (let i = 0; i < 6; i++) {
+      insertObs(db, {
+        sessionId: 'sess-x', project: 'test',
+        title: `deferred decision ${i} on architecture`,
+        type: 'decision', importance: 3,
+        epochOffset: -(i * 60000),
+      });
+    }
+    const out = buildSessionContextLines(db, 'test');
+    const matches = out.split('\n').filter(l => l.startsWith('- ') && l.includes('[decision]'));
+    expect(matches.length).toBe(3);
+  });
+
+  it('skips low-signal-titled obs (no "Modified X" pollution)', () => {
+    insertObs(db, {
+      sessionId: 'sess-x', project: 'test',
+      title: 'Modified hook-context.mjs', type: 'change', importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-x', project: 'test',
+      title: 'Adopt 5-tier scoring weights for hybrid search',
+      type: 'decision', importance: 3,
+    });
+    const out = buildSessionContextLines(db, 'test');
+    const deferredBlock = extractSection(out, 'Deferred Work');
+    expect(deferredBlock).toContain('5-tier scoring');
+    expect(deferredBlock).not.toContain('Modified hook-context');
+  });
+
+  it('does NOT leak across projects', () => {
+    insertSession(db, { id: 'sess-other', project: 'OTHER' });
+    insertObs(db, {
+      sessionId: 'sess-other', project: 'OTHER',
+      title: 'wrong-project deferred decision should not leak',
+      type: 'decision', importance: 3,
+    });
+    insertObs(db, {
+      sessionId: 'sess-x', project: 'test',
+      title: 'real local deferred decision worth surfacing',
+      type: 'decision', importance: 3,
+    });
+    const out = buildSessionContextLines(db, 'test');
+    const deferredBlock = extractSection(out, 'Deferred Work');
+    expect(deferredBlock).toContain('real local deferred');
+    expect(deferredBlock).not.toContain('wrong-project deferred');
+  });
+});
+
+function extractSection(text, header) {
+  const lines = text.split('\n');
+  const startIdx = lines.findIndex(l => l.startsWith(`### ${header}`));
+  if (startIdx === -1) return '';
+  let endIdx = lines.length;
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    if (lines[i].startsWith('### ')) { endIdx = i; break; }
+  }
+  return lines.slice(startIdx, endIdx).join('\n');
+}
