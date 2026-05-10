@@ -39,7 +39,12 @@ function cmdSearch(db, args) {
   }
 
   const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-  const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 20;
+  // Distinguish missing/non-integer (use default) from non-positive (silently clamping to 1
+  // produced confusing "Found 1 of 44 result" output for --limit 0/-N — warn instead).
+  if (flags.limit !== undefined && (!Number.isInteger(rawLimit) || rawLimit < 1)) {
+    process.stderr.write(`[mem] Invalid --limit "${flags.limit}" (must be a positive integer); using default 20\n`);
+  }
+  const limit = Number.isInteger(rawLimit) && rawLimit >= 1 ? rawLimit : 20;
   const type = flags.type || null;
   const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
   if (type && !validObsTypes.has(type)) {
@@ -53,13 +58,22 @@ function cmdSearch(db, args) {
   if (dateTo && flags.to && /^\d{4}-\d{2}-\d{2}$/.test(flags.to)) dateTo += 86400000 - 1;
   if (flags.from && isNaN(dateFrom)) { fail(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
   if (flags.to && isNaN(dateTo)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
+  // Inverted range silently returns 0 rows; warn so users see the cause, don't error
+  // (a deliberate "search for nothing in this window" is not malformed input).
+  if (dateFrom !== null && dateTo !== null && dateFrom > dateTo) {
+    process.stderr.write(`[mem] Note: --from "${flags.from}" is after --to "${flags.to}"; this range is empty\n`);
+  }
   const minImportance = flags.importance !== undefined ? parseInt(flags.importance, 10) : null;
   if (minImportance !== null && (isNaN(minImportance) || minImportance < 1 || minImportance > 3)) {
     fail(`[mem] Invalid --importance "${flags.importance}". Must be 1, 2, or 3.`);
     return;
   }
   const branch = flags.branch || null;
-  const offset = Math.max(0, parseInt(flags.offset, 10) || 0);
+  const rawOffset = flags.offset !== undefined ? parseInt(flags.offset, 10) : NaN;
+  if (flags.offset !== undefined && (!Number.isInteger(rawOffset) || rawOffset < 0)) {
+    process.stderr.write(`[mem] Invalid --offset "${flags.offset}" (must be a non-negative integer); using 0\n`);
+  }
+  const offset = Number.isInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
   const tier = flags.tier || null;
   if (tier && !['working', 'active', 'archive'].includes(tier)) {
     fail(`[mem] Invalid --tier "${tier}". Use: working, active, archive`);
@@ -338,7 +352,9 @@ function cmdSearch(db, args) {
   }
 
   const countLabel = total > paged.length ? `${paged.length} of ${total}` : `${paged.length}`;
-  out(`[mem] Found ${countLabel} result${paged.length !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
+  // Pluralize on total — "Found 1 of 44 result" reads wrong; the population (44) drives
+  // grammatical number, not the page slice (1).
+  out(`[mem] Found ${countLabel} result${total !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
   for (const r of paged) {
     const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
     if (r._source === 'session') {
@@ -406,7 +422,10 @@ function cmdRecall(db, args) {
 
   const filename = basename(file);
   const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-  const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 10;
+  if (flags.limit !== undefined && (!Number.isInteger(rawLimit) || rawLimit < 1)) {
+    process.stderr.write(`[mem] Invalid --limit "${flags.limit}" (must be a positive integer); using default 10\n`);
+  }
+  const limit = Number.isInteger(rawLimit) && rawLimit >= 1 ? rawLimit : 10;
   const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
 
   // Search via observation_files junction table for indexed filename lookups
@@ -602,8 +621,19 @@ function cmdGet(db, args) {
 
 function cmdTimeline(db, args) {
   const { positional, flags } = parseArgs(args);
-  const before = parseInt(flags.before, 10) || 5;
-  const after = parseInt(flags.after, 10) || 5;
+  // parseInt('-5') === -5 is truthy, so `|| 5` doesn't rescue negative input.
+  // Match cmdSearch's warn-then-default pattern for consistency across CLI flags.
+  const parseWindow = (label, raw) => {
+    if (raw === undefined) return 5;
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 0) {
+      process.stderr.write(`[mem] Invalid --${label} "${raw}" (must be a non-negative integer); using default 5\n`);
+      return 5;
+    }
+    return n;
+  };
+  const before = parseWindow('before', flags.before);
+  const after = parseWindow('after', flags.after);
   const project = flags.project ? resolveProject(db, flags.project) : null;
 
   // Parse --anchor, accepting P#/S#/# prefix so callers can paste search-result IDs verbatim.
@@ -967,6 +997,9 @@ async function cmdStats(db, args) {
   const compressedCount = db.prepare(
     `SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}`
   ).get(...baseParams);
+  const supersededOnlyCount = db.prepare(
+    `SELECT COUNT(*) as c FROM observations WHERE superseded_at IS NOT NULL AND compressed_into IS NULL ${projectFilter}`
+  ).get(...baseParams);
 
   // Tier distribution (aligned with MCP mem_stats)
   const tierCtx = { now, currentProject: project || inferProject(), currentSessionId: '' };
@@ -1005,7 +1038,11 @@ async function cmdStats(db, args) {
   out(`  Compressed: ${compressedCount.c}`);
   if (noiseRatio > 0.6) out('  ⚠️ High noise ratio — consider running mem compress');
   out('');
-  out('Tier distribution:');
+  // Tier counts only live (uncompressed, non-superseded) observations — surface the
+  // full decomposition so live + compressed + superseded = Total adds up cleanly.
+  const tierTotal = (tierMap.working ?? 0) + (tierMap.active ?? 0) + (tierMap.archive ?? 0);
+  const supersededLabel = supersededOnlyCount.c > 0 ? ` + ${supersededOnlyCount.c} superseded` : '';
+  out(`Tier distribution (live ${tierTotal}, excludes ${compressedCount.c} compressed${supersededLabel}):`);
   out(`  🔴 Working: ${tierMap.working ?? 0} | 🟡 Active: ${tierMap.active ?? 0} | 🔵 Archive: ${tierMap.archive ?? 0}`);
 }
 
@@ -1297,16 +1334,21 @@ function cmdExport(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : null;
   if (project) { wheres.push('project = ?'); params.push(project); }
   if (flags.type) { wheres.push('type = ?'); params.push(flags.type); }
+  let exportFromEpoch = null;
+  let exportToEpoch = null;
   if (flags.from) {
-    const epoch = new Date(flags.from).getTime();
-    if (isNaN(epoch)) { fail(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
-    wheres.push('created_at_epoch >= ?'); params.push(epoch);
+    exportFromEpoch = new Date(flags.from).getTime();
+    if (isNaN(exportFromEpoch)) { fail(`[mem] Invalid --from date: "${flags.from}". Use YYYY-MM-DD or ISO 8601.`); return; }
+    wheres.push('created_at_epoch >= ?'); params.push(exportFromEpoch);
   }
   if (flags.to) {
-    let epoch = new Date(flags.to).getTime();
-    if (isNaN(epoch)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
-    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) epoch += 86400000 - 1;
-    wheres.push('created_at_epoch <= ?'); params.push(epoch);
+    exportToEpoch = new Date(flags.to).getTime();
+    if (isNaN(exportToEpoch)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) exportToEpoch += 86400000 - 1;
+    wheres.push('created_at_epoch <= ?'); params.push(exportToEpoch);
+  }
+  if (exportFromEpoch !== null && exportToEpoch !== null && exportFromEpoch > exportToEpoch) {
+    process.stderr.write(`[mem] Note: --from "${flags.from}" is after --to "${flags.to}"; this range is empty\n`);
   }
 
   const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
@@ -1442,7 +1484,7 @@ function cmdMaintain(db, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
   if (!action || !['scan', 'execute'].includes(action)) {
-    fail('[mem] Usage: claude-mem-lite maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...]');
+    fail("[mem] Usage: claude-mem-lite maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...] — 'scan' previews, 'execute' applies.");
     return;
   }
 

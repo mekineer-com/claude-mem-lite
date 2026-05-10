@@ -1005,6 +1005,9 @@ server.registerTool(
     const compressedCount = db.prepare(`
       SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}
     `).get(...baseParams);
+    const supersededOnlyCount = db.prepare(`
+      SELECT COUNT(*) as c FROM observations WHERE superseded_at IS NOT NULL AND compressed_into IS NULL ${projectFilter}
+    `).get(...baseParams);
 
     // Tier distribution
     const tierCtx = { now: Date.now(), currentProject: args.project || inferProject(), currentSessionId: '' };
@@ -1038,7 +1041,9 @@ server.registerTool(
       `  Compressed: ${compressedCount.c}`,
       ...(noiseRatio > 0.6 ? ['  ⚠️ High noise ratio — consider running mem_compress'] : []),
       '',
-      'Tier distribution:',
+      // Tier counts only live (uncompressed, non-superseded) observations — surface
+      // the full decomposition so live + compressed + superseded = Total adds up cleanly.
+      `Tier distribution (live ${(tierMap.working ?? 0) + (tierMap.active ?? 0) + (tierMap.archive ?? 0)}, excludes ${compressedCount.c} compressed${supersededOnlyCount.c > 0 ? ` + ${supersededOnlyCount.c} superseded` : ''}):`,
       `  🔴 Working: ${tierMap.working ?? 0} | 🟡 Active: ${tierMap.active ?? 0} | 🔵 Archive: ${tierMap.archive ?? 0}`,
     ];
 
