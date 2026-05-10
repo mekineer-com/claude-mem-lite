@@ -446,7 +446,10 @@ async function handleStop() {
             WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
             ORDER BY created_at_epoch DESC LIMIT 5
           `).all(sessionId);
-          const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
+          // Raw values flow into scrubRecord below; truncation at .run() site
+          // so secrets straddling the boundary still match scrubSecrets's
+          // length floors.
+          const fastRequestRaw = firstPrompt?.prompt_text || '';
           const obsCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
 
           // Structural extraction from the assistant's tail message.
@@ -474,23 +477,23 @@ async function handleStop() {
           const finalRemaining = structuredNotDone;
           const finalNotes = structuredNotes || 'fast';
 
-          if (fastRequest || finalCompleted || finalRemaining) {
+          if (fastRequestRaw || finalCompleted || finalRemaining) {
             const now = new Date();
             const safe = scrubRecord('session_summaries', {
-              request: fastRequest,
-              completed: truncate(finalCompleted, 600),
-              remaining_items: truncate(finalRemaining, 600),
-              notes: truncate(finalNotes, 400),
+              request: fastRequestRaw,
+              completed: finalCompleted,
+              remaining_items: finalRemaining,
+              notes: finalNotes,
             });
             db.prepare(`
               INSERT INTO session_summaries
               (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
               VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', ?, ?, ?)
             `).run(
-              sessionId, project, safe.request,
-              safe.completed,
-              safe.remaining_items,
-              safe.notes,
+              sessionId, project, truncate(safe.request, 200),
+              truncate(safe.completed, 600),
+              truncate(safe.remaining_items, 600),
+              truncate(safe.notes, 400),
               now.toISOString(), now.getTime()
             );
           }
@@ -954,31 +957,34 @@ async function handleSessionStart() {
           ORDER BY created_at_epoch DESC LIMIT 5
         `).all(prevSessionId);
 
-        const fastRequest = truncate(firstPrompt?.prompt_text || '', 200);
-        const fastCompleted = prevObs.map(o => o.title).filter(Boolean).join('; ');
+        // Raw values flow into scrubRecord; truncation deferred to .run() so
+        // secrets straddling the truncation boundary still match scrubSecrets
+        // regex length floors.
+        const fastRequestRaw = firstPrompt?.prompt_text || '';
+        const fastCompletedRaw = prevObs.map(o => o.title).filter(Boolean).join('; ');
 
         // Infer remaining_items from handoff unfinished (already built above at line 476)
-        let fastRemaining = '';
+        let fastRemainingRaw = '';
         if (prevClearHandoff?.unfinished) {
-          fastRemaining = truncate(extractUnfinishedSummary(prevClearHandoff.unfinished, 0), 200);
+          fastRemainingRaw = extractUnfinishedSummary(prevClearHandoff.unfinished, 0);
         }
         // Fallback: episode errors
-        if (!fastRemaining && episodeSnapshot?.entries) {
+        if (!fastRemainingRaw && episodeSnapshot?.entries) {
           const errors = episodeSnapshot.entries.filter(e => e.isError).map(e => e.desc).filter(Boolean);
-          if (errors.length > 0) fastRemaining = truncate(errors.join('; '), 200);
+          if (errors.length > 0) fastRemainingRaw = errors.join('; ');
         }
 
-        if (fastRequest || fastCompleted) {
+        if (fastRequestRaw || fastCompletedRaw) {
           const safe = scrubRecord('session_summaries', {
-            request: fastRequest,
-            completed: truncate(fastCompleted, 300),
-            remaining_items: fastRemaining,
+            request: fastRequestRaw,
+            completed: fastCompletedRaw,
+            remaining_items: fastRemainingRaw,
           });
           db.prepare(`
             INSERT INTO session_summaries
             (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
             VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', 'fast', ?, ?)
-          `).run(prevSessionId, prevProject || project, safe.request, safe.completed, safe.remaining_items, now.toISOString(), now.getTime());
+          `).run(prevSessionId, prevProject || project, truncate(safe.request, 200), truncate(safe.completed, 300), truncate(safe.remaining_items, 200), now.toISOString(), now.getTime());
         }
       } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
     }
@@ -1035,18 +1041,20 @@ async function handleSessionStart() {
               ORDER BY created_at_epoch DESC LIMIT 5
             `).all(recentSession.content_session_id);
 
-            const fr = truncate(fp?.prompt_text || '', 200);
-            const fc = po.map(o => o.title).filter(Boolean).join('; ');
-            if (fr || fc) {
+            // Raw values into scrubRecord; truncation at .run() preserves
+            // straddling-secret detection (per privacy review).
+            const frRaw = fp?.prompt_text || '';
+            const fcRaw = po.map(o => o.title).filter(Boolean).join('; ');
+            if (frRaw || fcRaw) {
               const safe = scrubRecord('session_summaries', {
-                request: fr,
-                completed: truncate(fc, 300),
+                request: frRaw,
+                completed: fcRaw,
               });
               db.prepare(`
                 INSERT INTO session_summaries
                 (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
                 VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
-              `).run(recentSession.content_session_id, project, safe.request, safe.completed, now.toISOString(), now.getTime());
+              `).run(recentSession.content_session_id, project, truncate(safe.request, 200), truncate(safe.completed, 300), now.toISOString(), now.getTime());
             }
           }
         }

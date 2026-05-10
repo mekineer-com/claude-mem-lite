@@ -2,7 +2,7 @@
 // Extracted for testability — hook.mjs has module-level side effects
 
 import { basename } from 'path';
-import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE, EDIT_TOOLS, isMetaTriggerPrompt, notLowSignalTitleClause } from './utils.mjs';
+import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, scrubSecrets, LOW_SIGNAL_TITLE, EDIT_TOOLS, isMetaTriggerPrompt, notLowSignalTitleClause } from './utils.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_ANCHOR_MAX_AGE,
@@ -164,14 +164,21 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   const storedSessionId = scopeSessionId || sessionId;
   // Defense-in-depth: aggregates are built from already-stored rows + raw
   // session memory; scrub at the persistence boundary regardless of source.
+  // Order matters: scrub raw values BEFORE truncation, so a secret straddling
+  // the truncation boundary doesn't fall below scrubSecrets's regex length
+  // floors. JSON-stringified fields (key_files) are pre-scrubbed at the
+  // element level before stringify — letting scrubSecrets rewrite the JSON
+  // string would risk breaking downstream JSON.parse.
   const safe = scrubRecord('session_handoffs', {
-    working_on: truncate(workingOn, 1000),
+    working_on: workingOn,
     completed: completed.map(c => `[${c.type}] ${c.title}`).join('\n'),
-    unfinished: unfinished.length > 3000 ? unfinished.slice(0, 2999) + '…' : unfinished,
-    key_files: JSON.stringify([...fileSet].slice(0, 20)),
+    unfinished,
     key_decisions: decisions.map(d => d.title).join('\n'),
     match_keywords: keywords,
   });
+  const safeKeyFiles = JSON.stringify(
+    [...fileSet].slice(0, 20).map(f => scrubSecrets(String(f)))
+  );
   db.prepare(`
     INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch, git_sha_at_handoff)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -186,10 +193,10 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       git_sha_at_handoff = excluded.git_sha_at_handoff
   `).run(
     project, type, storedSessionId,
-    safe.working_on,
+    truncate(safe.working_on, 1000),
     safe.completed,
-    safe.unfinished,
-    safe.key_files,
+    safe.unfinished.length > 3000 ? safe.unfinished.slice(0, 2999) + '…' : safe.unfinished,
+    safeKeyFiles,
     safe.key_decisions,
     safe.match_keywords,
     Date.now(),

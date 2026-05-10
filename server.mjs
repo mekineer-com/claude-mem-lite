@@ -11,6 +11,7 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
+import { scrubRecord } from './lib/scrub-record.mjs';
 import { effectiveQuiet } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
@@ -1248,8 +1249,11 @@ server.registerTool(
           VALUES (?, ?, ?, ?, ?, 'active')
         `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
 
+        // Defense-in-depth: source rows already scrubbed at original ingest,
+        // but the new compressed narrative is constructed here and re-persisted.
+        const safe = scrubRecord('observations', { text: narrative, title, narrative });
         const summaryResult = insertSummary.run(
-          sessionId, proj, narrative, dominantType, title, narrative,
+          sessionId, proj, safe.text, dominantType, safe.title, safe.narrative,
           medianDate.toISOString(), medianEpoch
         );
         const summaryId = Number(summaryResult.lastInsertRowid);

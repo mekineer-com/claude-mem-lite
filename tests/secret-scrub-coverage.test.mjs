@@ -76,6 +76,26 @@ describe('scrubRecord — session_handoffs fields', () => {
       expect(out[field]).not.toContain(SECRET);
     }
   });
+
+  it('does NOT scrub JSON-stringified array fields (key_files, match_keywords)', () => {
+    // String-level scrub of a JSON.stringify(array) can rewrite quoted values
+    // and break downstream JSON.parse. Element-level scrub belongs upstream
+    // of the JSON.stringify call. This test guards the contract.
+    const keyFilesJson = JSON.stringify([
+      `src/foo-${SECRET}.mjs`,
+      'src/normal.mjs',
+    ]);
+    const matchKeywordsJson = JSON.stringify([SECRET, 'normal']);
+    const out = scrubRecord('session_handoffs', {
+      key_files: keyFilesJson,
+      match_keywords: matchKeywordsJson,
+    });
+    // scrubRecord must leave these untouched so JSON.parse still works.
+    expect(out.key_files).toBe(keyFilesJson);
+    expect(out.match_keywords).toBe(matchKeywordsJson);
+    expect(() => JSON.parse(out.key_files)).not.toThrow();
+    expect(() => JSON.parse(out.match_keywords)).not.toThrow();
+  });
 });
 
 describe('end-to-end leak check via in-memory DB', () => {
