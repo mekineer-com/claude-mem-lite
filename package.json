@@ -39,6 +39,7 @@
     "hook-handoff.mjs",
     "hook-update.mjs",
     "hook-optimize.mjs",
+    "hook-precompact.mjs",
     "plugin-cache-guard.mjs",
     "memdir.mjs",
     "adopt-content.mjs",

@@ -9,7 +9,7 @@ export const SOURCE_FILES = [
   'cli.mjs', 'server.mjs', 'server-internals.mjs', 'search-engine.mjs', 'tool-schemas.mjs',
   'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
   'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs',
-  'hook-update.mjs', 'hook-optimize.mjs',
+  'hook-update.mjs', 'hook-optimize.mjs', 'hook-precompact.mjs',
   'plugin-cache-guard.mjs',
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs',
   'package.json', 'package-lock.json', 'skill.md',

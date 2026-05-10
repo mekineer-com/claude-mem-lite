@@ -36,6 +36,7 @@ import {
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { cleanupClaudeMdLegacyBlock, buildSessionContextLines } from './hook-context.mjs';
+import { entry as preCompactEntry } from './hook-precompact.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS,
@@ -1127,6 +1128,28 @@ async function handleSessionStart() {
   }
 }
 
+// ─── PreCompact Handler ──────────────────────────────────────────────────────
+// Fires immediately before Claude Code auto-compaction begins. Re-emits the
+// memory context block on stdout so the summarizer sees it during compaction.
+// SessionStart's "compact" matcher fires AFTER compaction — by then the
+// previous-turn injection has already been collapsed. Pure read; no DB writes.
+
+async function handlePreCompactDispatch() {
+  let hookData = {};
+  try {
+    const raw = await readStdin();
+    hookData = JSON.parse(raw.text);
+  } catch { /* stdin unavailable — emit anyway with whatever we can infer */ }
+
+  const db = openDb();
+  if (!db) return;
+  try {
+    await preCompactEntry(db, hookData);
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
 // ─── UserPromptSubmit Handler ────────────────────────────────────────────────
 
 async function handleUserPrompt() {
@@ -1394,6 +1417,7 @@ try {
   switch (event) {
     case 'post-tool-use':    await handlePostToolUse(); break;
     case 'session-start':    await handleSessionStart(); break;
+    case 'pre-compact':      await handlePreCompactDispatch(); break;
     case 'stop':             await handleStop(); break;
     case 'user-prompt':      await handleUserPrompt(); break;
     case 'llm-episode':      await handleLLMEpisode(); break;
