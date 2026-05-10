@@ -2418,6 +2418,9 @@ Commands:
     remove              Remove resource --name N --resource-type T
     reindex             Rebuild FTS5 index
 
+  import-jsonl <file-or-dir>      Import Claude Code JSONL transcripts (cold-start backfill)
+    --project P         Project name (default: inferred from cwd)
+
   activity <action>     Non-memdir event log (v2.31) — bugfix/lesson/bug/discovery/etc.
     save --type T "<title>" [--body "<text>"] [--files f1,f2] [--file path] [--importance 1-3] [--project P]
     search "<query>"    Search events [--type T] [--limit N] [--project P]
@@ -2500,6 +2503,57 @@ async function cmdImport(argv) {
     fail(`[mem] Import failed: ${e.message}`);
   } finally {
     try { rdb.close(); } catch {}
+  }
+}
+
+// ─── Import (Claude Code JSONL transcript — cold-start backfill) ─────────────
+
+async function cmdImportJsonl(db, argv) {
+  const { positional, flags } = parseArgs(argv);
+  const target = positional[0];
+  if (!target) {
+    fail('[mem] Usage: claude-mem-lite import-jsonl <file-or-dir> [--project <name>]');
+    return;
+  }
+
+  const project = flags.project || inferProject();
+  const fs = await import('fs');
+  const { join: pjoin, resolve } = await import('path');
+  const abs = resolve(target);
+
+  let files = [];
+  let st;
+  try { st = fs.statSync(abs); }
+  catch (e) { fail(`[mem] Cannot stat ${abs}: ${e.message}`); return; }
+
+  if (st.isDirectory()) {
+    const walk = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = pjoin(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.isFile() && p.endsWith('.jsonl')) files.push(p);
+      }
+    };
+    walk(abs);
+  } else {
+    files = [abs];
+  }
+
+  if (files.length === 0) { out('[mem] No .jsonl files found.'); return; }
+
+  const { importJsonl } = await import('./lib/import-jsonl.mjs');
+  let totalPrompts = 0, totalObs = 0, totalSkip = 0, totalOrphans = 0;
+  for (const f of files) {
+    const r = await importJsonl(db, f, { project });
+    totalPrompts += r.prompts;
+    totalObs += r.observations;
+    totalSkip += r.skipped;
+    totalOrphans += r.orphans || 0;
+    out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations, ${r.orphans || 0} orphan tool_use, ${r.skipped} skipped`);
+  }
+  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s).`);
+  if (totalPrompts > 0 || totalObs > 0) {
+    out(`[mem] Try: claude-mem-lite recent 5 --project ${project}`);
   }
 }
 
@@ -2686,6 +2740,7 @@ export async function run(argv) {
       case 'browse':    cmdBrowse(db, cmdArgs); break;
       case 'registry':  cmdRegistry(db, cmdArgs); break;
       case 'import':    await cmdImport(cmdArgs); break;
+      case 'import-jsonl': await cmdImportJsonl(db, cmdArgs); break;
       case 'enrich':    await cmdEnrich(cmdArgs); break;
       case 'doctor':    await cmdDoctor(db, cmdArgs); break;
       case 'activity':  await cmdActivity(db, cmdArgs); break;

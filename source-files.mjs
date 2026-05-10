@@ -74,6 +74,11 @@ export const SOURCE_FILES = [
   // INSERT paths. Statically imported by hook-llm, hook-handoff, hook-optimize,
   // hook, mem-cli; reached transitively from server.mjs and cli.mjs.
   'lib/scrub-record.mjs',
+  // v2.71 cold-start backfill: parses ~/.claude/projects/<encoded>/<uuid>.jsonl
+  // transcripts into user_prompts + observations. Dynamic-imported by
+  // mem-cli.mjs::cmdImportJsonl; listed here so source-files-sync.test.mjs
+  // and the npm tarball ship it on every release.
+  'lib/import-jsonl.mjs',
 ];
 
 /**

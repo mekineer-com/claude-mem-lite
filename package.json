@@ -66,6 +66,7 @@
     "lib/deferred-work.mjs",
     "lib/upgrade-banner.mjs",
     "lib/scrub-record.mjs",
+    "lib/import-jsonl.mjs",
     "cli/common.mjs",
     "cli/fts-check.mjs",
     "cli/doctor.mjs",

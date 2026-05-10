@@ -1,0 +1,6 @@
+{"type":"user","sessionId":"sess-fix-1","cwd":"/home/u/proj","message":{"role":"user","content":"Add JWT auth to /api/login"},"timestamp":"2026-04-01T10:00:00Z"}
+{"type":"assistant","sessionId":"sess-fix-1","message":{"role":"assistant","content":[{"type":"text","text":"I'll use jose for edge compat."},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/home/u/proj/src/auth.ts","old_string":"// auth","new_string":"import { SignJWT } from 'jose';"}}]},"timestamp":"2026-04-01T10:00:05Z"}
+{"type":"tool_result","sessionId":"sess-fix-1","tool_use_id":"t1","content":"File updated","timestamp":"2026-04-01T10:00:06Z"}
+{"type":"user","sessionId":"sess-fix-1","cwd":"/home/u/proj","message":{"role":"user","content":"Now add rate limiting"},"timestamp":"2026-04-01T10:05:00Z"}
+{"type":"assistant","sessionId":"sess-fix-1","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"npm install hono-rate-limiter"}}]},"timestamp":"2026-04-01T10:05:02Z"}
+{"type":"tool_result","sessionId":"sess-fix-1","tool_use_id":"t2","content":"added 1 package","timestamp":"2026-04-01T10:05:08Z"}
