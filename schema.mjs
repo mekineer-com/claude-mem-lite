@@ -40,7 +40,12 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // DROP+CREATE so DBs that picked up the strict v29 trigger get the UUID-
 // gated body. Required because `CREATE TRIGGER IF NOT EXISTS` is a no-op
 // when the trigger already exists, even with a different body.
-export const CURRENT_SCHEMA_VERSION = 30;
+// v31 (v2.70.0): deferred_work table — first-class carry-forward surface.
+// Decoupled from observations: different decay semantics (no time decay; older
+// items rank HIGHER as tech debt accumulates), different lifecycle (mutable
+// status open→done|dropped vs immutable obs). Closure tied to obs via
+// closed_by_obs_id FK with ON DELETE SET NULL (audit trail preserved).
+export const CURRENT_SCHEMA_VERSION = 31;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -539,6 +544,33 @@ export function initSchema(db) {
       attempts INTEGER NOT NULL DEFAULT 0,
       recovered INTEGER NOT NULL DEFAULT 0
     )
+  `);
+
+  // ─── v31 (v2.70.0): deferred_work — carry-forward TODOs ─────────────────────
+  // Independent table because decay semantics are inverted (older = higher
+  // priority signal) and lifecycle is mutable (status flips). Project-scoped
+  // queries; no FTS5 (per-project N expected ≪ 100). Idempotent migration.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deferred_work (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      project           TEXT    NOT NULL,
+      title             TEXT    NOT NULL,
+      detail            TEXT,
+      priority          INTEGER NOT NULL DEFAULT 2,
+      status            TEXT    NOT NULL DEFAULT 'open' CHECK(status IN ('open','done','dropped')),
+      created_at_epoch  INTEGER NOT NULL,
+      closed_at_epoch   INTEGER,
+      closed_by_obs_id  INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+      drop_reason       TEXT,
+      source_session_id TEXT,
+      source_prompt_id  INTEGER REFERENCES user_prompts(id) ON DELETE SET NULL,
+      files             TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_deferred_open
+      ON deferred_work(project, priority DESC, created_at_epoch ASC)
+      WHERE status = 'open';
+    CREATE INDEX IF NOT EXISTS idx_deferred_closed_by
+      ON deferred_work(closed_by_obs_id) WHERE closed_by_obs_id IS NOT NULL;
   `);
 
   // Record schema version for fast-path on subsequent calls
