@@ -912,13 +912,7 @@ server.registerTool(
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const project = args.project || inferProject();
 
-    // Pre-resolve closes_deferred BEFORE entering the transaction. resolveDeferredIds
-    // throws on invalid input — surface that as a user error, not a partial save.
     let closesIds = null;
-    if (args.closes_deferred && args.closes_deferred.length > 0) {
-      closesIds = resolveDeferredIds(db, project, args.closes_deferred);
-    }
-
     let result;
     try {
       result = db.transaction(() => {
@@ -931,16 +925,20 @@ server.registerTool(
           files: args.files || [],
           lesson_learned: args.lesson_learned,
         });
-        if (r.kind === 'duplicate') return r; // skip closure on dedup short-circuit
-        if (closesIds) closeDeferredItems(db, closesIds, r.id);
+        if (r.kind === 'duplicate') return r; // dedup short-circuits BEFORE resolver — replay is idempotent
+        // Resolve INSIDE tx + after dedup check so duplicate replays don't throw on
+        // already-closed items. Mirrors mem-cli.mjs cmdSave shape.
+        if (args.closes_deferred && args.closes_deferred.length > 0) {
+          closesIds = resolveDeferredIds(db, project, args.closes_deferred);
+          closeDeferredItems(db, closesIds, r.id);
+        }
         return r;
       })();
     } catch (e) {
-      if (closesIds) {
+      if (args.closes_deferred && args.closes_deferred.length > 0) {
         // Re-throw with a clearer prefix so MCP error response names the
-        // contract failure — only when the caller actually passed
-        // closes_deferred, so unrelated saveObservation failures don't get
-        // mislabeled as a deferred-work bug.
+        // contract failure — gate on caller intent (args.closes_deferred) since
+        // closesIds is closure-scoped and may not have been assigned before throw.
         throw new Error(`mem_save with closes_deferred failed: ${e.message}`, { cause: e });
       }
       throw e;  // unwrapped — preserves original message + stack
