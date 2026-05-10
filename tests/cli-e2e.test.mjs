@@ -471,6 +471,134 @@ describe('CLI E2E: stats', () => {
   });
 });
 
+describe('CLI E2E: --json output for listing commands (Tier 2)', () => {
+  it('recent --json emits parseable shape with project/limit/total/results', () => {
+    seedObs({ title: 'Json recent A', text: 'a', importance: 2 });
+    seedObs({ title: 'Json recent B', text: 'b', importance: 3, epochOffset: -60000 });
+
+    const { stdout, exitCode } = runCli(['recent', '5', '--json']);
+    expect(exitCode).toBe(0);
+    const data = JSON.parse(stdout);
+    expect(data.project).toBe('parent--testproj');
+    expect(data.limit).toBe(5);
+    expect(data.total).toBe(2);
+    expect(data.results).toHaveLength(2);
+    expect(data.results[0]).toHaveProperty('id');
+    expect(data.results[0]).toHaveProperty('type');
+    expect(data.results[0]).toHaveProperty('title');
+    expect(data.results[0]).toHaveProperty('importance');
+    expect(data.results[0]).toHaveProperty('created_at_epoch');
+    expect(typeof data.results[0].created_at_epoch).toBe('number');
+  });
+
+  it('recent --json emits empty form when no observations', () => {
+    const { stdout } = runCli(['recent', '5', '--json'], {
+      env: { CLAUDE_PROJECT_DIR: join(tmpHome, 'other', 'empty') },
+    });
+    const data = JSON.parse(stdout);
+    expect(data.results).toEqual([]);
+    expect(data.total).toBe(0);
+  });
+
+  it('recall --json includes file/include_noise/results with lesson_learned', () => {
+    seedObs({
+      title: 'Json recall hit', text: 'r1',
+      filesModified: '["lib/json-target.mjs"]', lessonLearned: 'lesson body',
+    });
+
+    const { stdout, exitCode } = runCli(['recall', 'json-target.mjs', '--json']);
+    expect(exitCode).toBe(0);
+    const data = JSON.parse(stdout);
+    expect(data.file).toBe('json-target.mjs');
+    expect(data.include_noise).toBe(false);
+    expect(data.total).toBe(1);
+    expect(data.results[0].lesson_learned).toBe('lesson body');
+  });
+
+  it('recall --json empty form for unknown file', () => {
+    const { stdout } = runCli(['recall', 'nonexistent_xyz.ts', '--json']);
+    const data = JSON.parse(stdout);
+    expect(data.total).toBe(0);
+    expect(data.results).toEqual([]);
+  });
+
+  it('timeline --anchor --json emits anchor + before + after', () => {
+    for (let i = 0; i < 5; i++) {
+      seedObs({ title: `TL ${i}`, text: `t${i}`, epochOffset: -((4 - i) * 60000) });
+    }
+    const rows = db.prepare('SELECT id FROM observations ORDER BY created_at_epoch ASC').all();
+    const anchorId = rows[2].id;
+
+    const { stdout, exitCode } = runCli(['timeline', '--anchor', String(anchorId), '--before', '1', '--after', '1', '--json']);
+    expect(exitCode).toBe(0);
+    const data = JSON.parse(stdout);
+    expect(data.anchor.id).toBe(anchorId);
+    expect(data.before).toHaveLength(1);
+    expect(data.after).toHaveLength(1);
+    expect(data.anchor_note).toBeNull();
+  });
+
+  it('timeline --json fallback shape when query has no anchor', () => {
+    seedObs({ title: 'TL fallback', text: 'fb', epochOffset: -60000 });
+    const { stdout } = runCli(['timeline', '--query', 'definitelyNoSuchTermZZZQQQ', '--json']);
+    const data = JSON.parse(stdout);
+    expect(data.anchor).toBeNull();
+    expect(data.fallback).toBe('recent');
+    expect(Array.isArray(data.results)).toBe(true);
+  });
+
+  it('browse --json emits totals + per-tier counts and results', () => {
+    seedObs({ title: 'Browse A', text: 'a' });
+    seedObs({ title: 'Browse B', text: 'b' });
+
+    const { stdout, exitCode } = runCli(['browse', '--json', '--limit', '2']);
+    expect(exitCode).toBe(0);
+    const data = JSON.parse(stdout);
+    expect(data.project).toBe('parent--testproj');
+    expect(data.totals).toHaveProperty('grand_total');
+    expect(data.tiers).toHaveProperty('working');
+    expect(data.tiers).toHaveProperty('active');
+    expect(data.tiers).toHaveProperty('archive');
+    expect(data.tiers.working).toHaveProperty('count');
+    expect(data.tiers.working).toHaveProperty('results');
+  });
+
+  it('browse --tier --json scopes to one tier in the totals + tiers shape', () => {
+    seedObs({ title: 'Working tier obs', text: 'w' });
+    const { stdout } = runCli(['browse', '--tier', 'working', '--json', '--limit', '5']);
+    const data = JSON.parse(stdout);
+    expect(data.tier_filter).toBe('working');
+    expect(data.tiers.working).toBeTruthy();
+    expect(data.tiers.active).toBeUndefined();
+    expect(data.tiers.archive).toBeUndefined();
+  });
+
+  it('stats --json emits the nested-by-section shape', () => {
+    seedObs({ type: 'bugfix', title: 'Bug A', text: 'ba' });
+    seedObs({ type: 'decision', title: 'Dec A', text: 'da' });
+
+    const { stdout, exitCode } = runCli(['stats', '--days', '30', '--json']);
+    expect(exitCode).toBe(0);
+    const data = JSON.parse(stdout);
+    expect(data.days).toBe(30);
+    expect(data.totals).toHaveProperty('observations');
+    expect(data.totals).toHaveProperty('sessions');
+    expect(data.recent).toHaveProperty('observations');
+    expect(data.type_distribution).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'bugfix' }),
+      expect.objectContaining({ type: 'decision' }),
+    ]));
+    expect(data.data_health).toHaveProperty('noise_ratio');
+    expect(data.tier_distribution).toHaveProperty('working');
+  });
+
+  it('JSON_SUPPORTED_CMDS extension: no stderr "not supported" note for the 5 cmds', () => {
+    seedObs({ title: 'No-warning probe', text: 'p' });
+    const { stderr } = runCli(['recent', '1', '--json']);
+    expect(stderr).not.toContain('--json is supported only on');
+  });
+});
+
 describe('CLI E2E: help and errors', () => {
   it('shows help with help command', () => {
     const helpResult = runCli(['help']);

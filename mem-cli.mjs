@@ -380,6 +380,7 @@ function cmdRecent(db, args) {
   }
   const limit = isValid ? rawLimit : 10;
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const jsonOutput = flags.json === true || flags.json === 'true';
 
   const params = [];
   const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
@@ -387,12 +388,29 @@ function cmdRecent(db, args) {
   params.push(limit);
 
   const rows = db.prepare(`
-    SELECT id, type, title, subtitle, created_at_epoch, created_at
+    SELECT id, type, title, subtitle, importance, created_at_epoch, created_at
     FROM observations
     WHERE ${wheres.join(' AND ')}
     ORDER BY created_at_epoch DESC
     LIMIT ?
   `).all(...params);
+
+  if (jsonOutput) {
+    out(JSON.stringify({
+      project: project || null,
+      limit,
+      total: rows.length,
+      results: rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        title: r.title || r.subtitle || null,
+        importance: r.importance ?? null,
+        created_at: r.created_at,
+        created_at_epoch: r.created_at_epoch,
+      })),
+    }));
+    return;
+  }
 
   if (rows.length === 0) {
     out(`[mem] No recent observations${project ? ` (${project})` : ''}`);
@@ -411,20 +429,22 @@ function cmdRecall(db, args) {
   const { positional, flags } = parseArgs(args);
   const file = positional.join(' ');
   if (!file) {
-    fail('[mem] Usage: claude-mem-lite recall <file> [--limit N] [--include-noise]');
+    fail('[mem] Usage: claude-mem-lite recall <file> [--limit N] [--include-noise] [--json]');
     return;
   }
 
   const filename = basename(file);
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 1000 });
   const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
+  const jsonOutput = flags.json === true || flags.json === 'true';
 
   // Search via observation_files junction table for indexed filename lookups
   const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
   const likePattern = `%${escaped}`;
   const noiseClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
   const rows = db.prepare(`
-    SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at, o.project
+    SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.importance,
+                    o.created_at, o.created_at_epoch, o.project
     FROM observations o
     JOIN observation_files of2 ON of2.obs_id = o.id
     WHERE COALESCE(o.compressed_into, 0) = 0
@@ -434,17 +454,39 @@ function cmdRecall(db, args) {
     LIMIT ?
   `).all(filename, likePattern, limit);
 
+  if (rows.length > 0) {
+    // Update access_count for recalled observations (aligned with MCP mem_recall)
+    const recalledIds = rows.map(r => r.id);
+    const recallPh = recalledIds.map(() => '?').join(',');
+    try {
+      db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${recallPh})`).run(Date.now(), ...recalledIds);
+    } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
+  }
+
+  if (jsonOutput) {
+    out(JSON.stringify({
+      file: filename,
+      limit,
+      include_noise: includeNoise,
+      total: rows.length,
+      results: rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        title: r.title || null,
+        lesson_learned: r.lesson_learned || null,
+        importance: r.importance ?? null,
+        project: r.project,
+        created_at: r.created_at,
+        created_at_epoch: r.created_at_epoch,
+      })),
+    }));
+    return;
+  }
+
   if (rows.length === 0) {
     out(`[mem] No history for "${filename}"`);
     return;
   }
-
-  // Update access_count for recalled observations (aligned with MCP mem_recall)
-  const recalledIds = rows.map(r => r.id);
-  const recallPh = recalledIds.map(() => '?').join(',');
-  try {
-    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${recallPh})`).run(Date.now(), ...recalledIds);
-  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
   out(`[mem] History for ${filename} (${rows.length}):`);
   for (const r of rows) {
@@ -626,6 +668,15 @@ function cmdTimeline(db, args) {
   const before = parseWindow('before', flags.before);
   const after = parseWindow('after', flags.after);
   const project = flags.project ? resolveProject(db, flags.project) : null;
+  const jsonOutput = flags.json === true || flags.json === 'true';
+
+  const toRow = r => ({
+    id: r.id,
+    type: r.type,
+    title: r.title || r.subtitle || null,
+    created_at: r.created_at,
+    created_at_epoch: r.created_at_epoch,
+  });
 
   // Parse --anchor, accepting P#/S#/# prefix so callers can paste search-result IDs verbatim.
   // For prompt/session anchors, resolve to the nearest-in-time observation so timeline semantics
@@ -736,6 +787,18 @@ function cmdTimeline(db, args) {
       LIMIT ?
     `).all(...fallbackParams);
 
+    if (jsonOutput) {
+      out(JSON.stringify({
+        anchor: null,
+        anchor_note: queryStr ? `no anchor matched query "${queryStr}"` : null,
+        before: [],
+        after: [],
+        fallback: 'recent',
+        results: rows.map(toRow),
+      }));
+      return;
+    }
+
     if (rows.length === 0) {
       out('[mem] No observations found.');
       return;
@@ -790,6 +853,16 @@ function cmdTimeline(db, args) {
   const anchor = db.prepare(
     'SELECT id, type, title, subtitle, created_at, created_at_epoch FROM observations WHERE id = ?'
   ).get(anchorId);
+
+  if (jsonOutput) {
+    out(JSON.stringify({
+      anchor: toRow(anchor),
+      anchor_note: anchorNote,
+      before: beforeRows.reverse().map(toRow),
+      after: afterRows.map(toRow),
+    }));
+    return;
+  }
 
   const all = [...beforeRows.reverse(), anchor, ...afterRows];
 
@@ -879,11 +952,17 @@ async function cmdStats(db, args) {
   const { flags } = parseArgs(args);
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const days = parseIntFlag(flags.days, { name: '--days', defaultValue: 30, max: 3650 });
+  const jsonOutput = flags.json === true || flags.json === 'true';
   // N-1: --quality routes to a separate quality-focused report (lesson rate,
   // LOW_SIGNAL rate, per-type hit+lesson %, R-2 watchdog targets). Intended as
   // the baseline metric dashboard for the future Haiku prompt A/B test.
   const quality = flags.quality === true || flags.quality === 'true';
   if (quality) {
+    if (jsonOutput) {
+      const { computeQualityStats } = await import('./lib/stats-quality.mjs');
+      out(JSON.stringify(computeQualityStats(db, { project, days })));
+      return;
+    }
     await renderQualityReport(db, { project, days });
     return;
   }
@@ -1003,6 +1082,39 @@ async function cmdStats(db, args) {
   `).all(...tdParams, ...baseParams);
   const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));
 
+  if (jsonOutput) {
+    out(JSON.stringify({
+      project,
+      days,
+      totals: {
+        observations: obsTotal.c,
+        sessions: sessTotal.c,
+        prompts: promptTotal.c,
+      },
+      recent: {
+        observations: obsRecent.c,
+        sessions: sessRecent.c,
+      },
+      type_distribution: types.map(t => ({ type: t.type, count: t.c })),
+      top_projects: projects.map(p => ({ project: p.project, count: p.c })),
+      daily_activity: daily.map(d => ({ day: d.day, count: d.c })),
+      data_health: {
+        estimated_tokens: tokenEst.t ?? 0,
+        avg_importance: Number((avgImp.v ?? 1).toFixed(2)),
+        low_value_count: lowVal.c,
+        noise_ratio: Number(noiseRatio.toFixed(4)),
+        compressed: compressedCount.c,
+        superseded_only: supersededOnlyCount.c,
+      },
+      tier_distribution: {
+        working: tierMap.working ?? 0,
+        active: tierMap.active ?? 0,
+        archive: tierMap.archive ?? 0,
+      },
+    }));
+    return;
+  }
+
   out(`[mem] Stats${project ? ` (${project})` : ''}:`);
   out(`Total: ${obsTotal.c.toLocaleString()} observations | ${sessTotal.c} sessions | ${promptTotal.c} prompts`);
   out(`Last ${days}d: ${obsRecent.c} observations | ${sessRecent.c} sessions`);
@@ -1085,6 +1197,7 @@ function cmdBrowse(db, args) {
     return;
   }
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: tierFilter ? 20 : 5, max: 1000 });
+  const jsonOutput = flags.json === true || flags.json === 'true';
   const now = Date.now();
 
   const ctx = {
@@ -1098,10 +1211,12 @@ function cmdBrowse(db, args) {
   const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
   const showTiers = tierFilter ? [tierFilter] : tiers;
 
-  out(`📊 Memory Dashboard (${project})\n`);
-
-  let grandTotal = 0;
+  // Collect data first (for JSON), then format. The text path also prints
+  // tier headers as it walks; refactored to two passes so the JSON shape can
+  // include row arrays alongside totals.
+  const tierData = {};
   const tierCounts = {};
+  let grandTotal = 0;
 
   for (const tier of showTiers) {
     const countRow = db.prepare(`
@@ -1114,6 +1229,54 @@ function cmdBrowse(db, args) {
     tierCounts[tier] = count;
     grandTotal += count;
 
+    // Archive in unfiltered view: keep count but skip row fetch (matches text path).
+    const skipRows = tier === 'archive' && !tierFilter;
+    if (count === 0 || skipRows) {
+      tierData[tier] = { count, rows: [] };
+      continue;
+    }
+
+    const rows = db.prepare(`
+      SELECT * FROM (
+        SELECT id, type, title, importance, created_at_epoch, created_at, ${TIER_CASE_SQL} as tier
+        FROM observations
+        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
+      ) WHERE tier = ?
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `).all(...params, project, tier, limit);
+    tierData[tier] = { count, rows };
+  }
+
+  if (jsonOutput) {
+    const tiersOut = {};
+    for (const tier of showTiers) {
+      tiersOut[tier] = {
+        count: tierData[tier].count,
+        results: tierData[tier].rows.map(r => ({
+          id: r.id,
+          type: r.type,
+          title: r.title || null,
+          importance: r.importance ?? null,
+          created_at: r.created_at,
+          created_at_epoch: r.created_at_epoch,
+        })),
+      };
+    }
+    out(JSON.stringify({
+      project,
+      limit,
+      tier_filter: tierFilter,
+      totals: { ...tierCounts, grand_total: grandTotal },
+      tiers: tiersOut,
+    }));
+    return;
+  }
+
+  out(`📊 Memory Dashboard (${project})\n`);
+
+  for (const tier of showTiers) {
+    const { count, rows } = tierData[tier];
     out(`${tierLabels[tier]} (${count})`);
 
     if (tier === 'archive' && !tierFilter) {
@@ -1122,16 +1285,6 @@ function cmdBrowse(db, args) {
     }
 
     if (count === 0) { out(''); continue; }
-
-    const rows = db.prepare(`
-      SELECT * FROM (
-        SELECT id, type, title, created_at_epoch, ${TIER_CASE_SQL} as tier
-        FROM observations
-        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-      ) WHERE tier = ?
-      ORDER BY created_at_epoch DESC
-      LIMIT ?
-    `).all(...params, project, tier, limit);
 
     for (const r of rows) {
       out(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${relativeTime(r.created_at_epoch)}`);
@@ -1985,10 +2138,12 @@ Commands:
 
   recent [N]            Show N most recent observations (default 10)
     --project P         Filter by project
+    --json              Output as JSON: {project,limit,total,results:[…]}
 
   recall <file>         Show observations related to a file
     --limit N           Max results (default 10)
     --include-noise     Include hook-llm fallback titles ("Modified X", raw error logs)
+    --json              Output as JSON: {file,limit,include_noise,total,results:[…]}
 
   get <id1,id2,...>     Get full details by ID
     IDs accept search-output prefixes: #123 (obs), P#123 (prompt), S#123 (session).
@@ -2007,6 +2162,8 @@ Commands:
     --before N          Show N before anchor (default 5)
     --after N           Show N after anchor (default 5)
     --project P         Filter by project
+    --json              Output as JSON: {anchor,anchor_note,before:[…],after:[…]}
+                        (or {anchor:null,fallback:"recent",results:[…]} when no anchor)
 
   save "<text>"         Save a new observation
     --type T            Observation type (default: discovery)
@@ -2064,6 +2221,10 @@ Commands:
     --days N            Lookback window (default 30)
     --quality           Quality dashboard: lesson rate, LOW_SIGNAL rate, per-type
                         hit/lesson %, top-accessed lessons, R-2 watchdog targets
+    --json              Output as JSON: nested by section
+                        ({totals,recent,type_distribution,top_projects,
+                          daily_activity,data_health,tier_distribution})
+                        or quality shape when --quality --json combined
 
   context               Show current CLAUDE.md context block
     --json              Output as structured JSON
@@ -2072,6 +2233,9 @@ Commands:
     --tier T            Filter: working|active|archive
     --project P         Filter by project
     --limit N           Max entries per tier (default 5)
+    --json              Output as JSON: {project,limit,tier_filter,
+                          totals:{working,active,archive,grand_total},
+                          tiers:{working:{count,results:[…]}, …}}
 
   registry <action>     Manage tool resource registry
     list                List resources [--type skill|agent] [--limit N] (default 20)
@@ -2320,7 +2484,9 @@ export async function run(argv) {
   // that doesn't honor it. Stdout output and exit code are unchanged so existing
   // text-parsing callers keep working — the note lives in stderr for scripts to
   // detect the gap.
-  const JSON_SUPPORTED_CMDS = new Set(['search', 'context']);
+  const JSON_SUPPORTED_CMDS = new Set([
+    'search', 'context', 'recent', 'recall', 'timeline', 'stats', 'browse', 'export',
+  ]);
   if (cmdArgs.includes('--json') && !JSON_SUPPORTED_CMDS.has(cmd)) {
     process.stderr.write(`[mem] Note: --json is supported only on: ${[...JSON_SUPPORTED_CMDS].join(', ')}. "${cmd}" outputs text.\n`);
   }
