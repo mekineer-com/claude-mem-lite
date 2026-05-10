@@ -11,6 +11,7 @@ import {
 } from './utils.mjs';
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
+import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, cosineSimilarity } from './tfidf.mjs';
 import { DB_DIR } from './schema.mjs';
 
@@ -573,13 +574,24 @@ JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive sum
         VALUES (?,?,?,?,?,'active')`
       ).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
 
+      // Defense-in-depth: title/narrative/etc. are LLM-generated compression
+      // output; scrub at the persistence boundary regardless of upstream trust.
+      const safe = scrubRecord('observations', {
+        text: textField,
+        title,
+        narrative,
+        concepts: conceptsText,
+        facts: factsText,
+        lesson_learned: lessonLearned,
+        search_aliases: searchAliases,
+      });
       const result = db.prepare(`INSERT INTO observations
         (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
          files_read, files_modified, importance, lesson_learned, search_aliases, optimized_at,
          created_at, created_at_epoch)
         VALUES (?,?,?,?,?,'',?,?,?,'[]','[]',2,?,?,?,?,?)`
-      ).run(sessionId, project, textField, 'discovery', title, narrative,
-        conceptsText, factsText, lessonLearned, searchAliases, Date.now(),
+      ).run(sessionId, project, safe.text, 'discovery', safe.title, safe.narrative,
+        safe.concepts, safe.facts, safe.lesson_learned, safe.search_aliases, Date.now(),
         new Date(medianEpoch).toISOString(), medianEpoch);
 
       const sId = Number(result.lastInsertRowid);

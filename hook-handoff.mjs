@@ -3,6 +3,7 @@
 
 import { basename } from 'path';
 import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, LOW_SIGNAL_TITLE, EDIT_TOOLS, isMetaTriggerPrompt, notLowSignalTitleClause } from './utils.mjs';
+import { scrubRecord } from './lib/scrub-record.mjs';
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_ANCHOR_MAX_AGE,
   HANDOFF_MATCH_THRESHOLD, CONTINUE_KEYWORDS,
@@ -161,6 +162,16 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   // `scopeSessionId` (CC UUID) tags the row for parallel scoping; falls back to
   // the mem-internal `sessionId` when the caller didn't supply one (tests + legacy).
   const storedSessionId = scopeSessionId || sessionId;
+  // Defense-in-depth: aggregates are built from already-stored rows + raw
+  // session memory; scrub at the persistence boundary regardless of source.
+  const safe = scrubRecord('session_handoffs', {
+    working_on: truncate(workingOn, 1000),
+    completed: completed.map(c => `[${c.type}] ${c.title}`).join('\n'),
+    unfinished: unfinished.length > 3000 ? unfinished.slice(0, 2999) + '…' : unfinished,
+    key_files: JSON.stringify([...fileSet].slice(0, 20)),
+    key_decisions: decisions.map(d => d.title).join('\n'),
+    match_keywords: keywords,
+  });
   db.prepare(`
     INSERT INTO session_handoffs (project, type, session_id, working_on, completed, unfinished, key_files, key_decisions, match_keywords, created_at_epoch, git_sha_at_handoff)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -175,12 +186,12 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
       git_sha_at_handoff = excluded.git_sha_at_handoff
   `).run(
     project, type, storedSessionId,
-    truncate(workingOn, 1000),
-    completed.map(c => `[${c.type}] ${c.title}`).join('\n'),
-    unfinished.length > 3000 ? unfinished.slice(0, 2999) + '…' : unfinished,
-    JSON.stringify([...fileSet].slice(0, 20)),
-    decisions.map(d => d.title).join('\n'),
-    keywords,
+    safe.working_on,
+    safe.completed,
+    safe.unfinished,
+    safe.key_files,
+    safe.key_decisions,
+    safe.match_keywords,
     Date.now(),
     gitShaAtHandoff,
   );

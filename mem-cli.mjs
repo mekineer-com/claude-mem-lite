@@ -14,6 +14,7 @@ import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-i
 import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
+import { scrubRecord } from './lib/scrub-record.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
@@ -1765,8 +1766,11 @@ function cmdCompress(db, args) {
         VALUES (?, ?, ?, ?, ?, 'active')
       `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
 
+      // Defense-in-depth: source rows already scrubbed at original ingest, but
+      // the new compressed narrative is constructed here and re-persisted.
+      const safe = scrubRecord('observations', { text: narrative, title, narrative });
       const summaryResult = insertSummary.run(
-        sessionId, proj, narrative, dominantType, title, narrative,
+        sessionId, proj, safe.text, dominantType, safe.title, safe.narrative,
         medianDate.toISOString(), medianEpoch
       );
       const summaryId = Number(summaryResult.lastInsertRowid);

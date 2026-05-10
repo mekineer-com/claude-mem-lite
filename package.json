@@ -64,6 +64,7 @@
     "lib/save-observation.mjs",
     "lib/deferred-work.mjs",
     "lib/upgrade-banner.mjs",
+    "lib/scrub-record.mjs",
     "cli/common.mjs",
     "cli/fts-check.mjs",
     "cli/doctor.mjs",

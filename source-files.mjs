@@ -70,6 +70,10 @@ export const SOURCE_FILES = [
   // module-level `process.exit(0)` side effects that abort vitest workers on
   // direct import. Statically imported by hook.mjs SessionStart handler.
   'lib/upgrade-banner.mjs',
+  // v2.71 privacy: per-table scrub helper for defense-in-depth at text-write
+  // INSERT paths. Statically imported by hook-llm, hook-handoff, hook-optimize,
+  // hook, mem-cli; reached transitively from server.mjs and cli.mjs.
+  'lib/scrub-record.mjs',
 ];
 
 /**

@@ -43,6 +43,7 @@ import {
   spawnBackground, sweepOrphanEpisodeFiles,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
+import { scrubRecord } from './lib/scrub-record.mjs';
 import { extractCitationsFromTranscript, bumpCitationAccess, computeCiteRecall } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
@@ -475,15 +476,21 @@ async function handleStop() {
 
           if (fastRequest || finalCompleted || finalRemaining) {
             const now = new Date();
+            const safe = scrubRecord('session_summaries', {
+              request: fastRequest,
+              completed: truncate(finalCompleted, 600),
+              remaining_items: truncate(finalRemaining, 600),
+              notes: truncate(finalNotes, 400),
+            });
             db.prepare(`
               INSERT INTO session_summaries
               (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
               VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', ?, ?, ?)
             `).run(
-              sessionId, project, fastRequest,
-              truncate(finalCompleted, 600),
-              truncate(finalRemaining, 600),
-              truncate(finalNotes, 400),
+              sessionId, project, safe.request,
+              safe.completed,
+              safe.remaining_items,
+              safe.notes,
               now.toISOString(), now.getTime()
             );
           }
@@ -962,11 +969,16 @@ async function handleSessionStart() {
         }
 
         if (fastRequest || fastCompleted) {
+          const safe = scrubRecord('session_summaries', {
+            request: fastRequest,
+            completed: truncate(fastCompleted, 300),
+            remaining_items: fastRemaining,
+          });
           db.prepare(`
             INSERT INTO session_summaries
             (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
             VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', 'fast', ?, ?)
-          `).run(prevSessionId, prevProject || project, fastRequest, truncate(fastCompleted, 300), fastRemaining, now.toISOString(), now.getTime());
+          `).run(prevSessionId, prevProject || project, safe.request, safe.completed, safe.remaining_items, now.toISOString(), now.getTime());
         }
       } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
     }
@@ -1026,11 +1038,15 @@ async function handleSessionStart() {
             const fr = truncate(fp?.prompt_text || '', 200);
             const fc = po.map(o => o.title).filter(Boolean).join('; ');
             if (fr || fc) {
+              const safe = scrubRecord('session_summaries', {
+                request: fr,
+                completed: truncate(fc, 300),
+              });
               db.prepare(`
                 INSERT INTO session_summaries
                 (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
                 VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
-              `).run(recentSession.content_session_id, project, fr, truncate(fc, 300), now.toISOString(), now.getTime());
+              `).run(recentSession.content_session_id, project, safe.request, safe.completed, now.toISOString(), now.getTime());
             }
           }
         }
@@ -1272,11 +1288,15 @@ function handleAutoCompress() {
         (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
         VALUES (?,?,?,?,?,'active')`
       ).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
+      // Defense-in-depth: title/narrative are derived from already-stored
+      // obs.title, but those rows pre-date the central scrub policy in some
+      // cases. Re-scrub at the persistence boundary.
+      const safe = scrubRecord('observations', { text: narrative, title, narrative });
       const summaryResult = db.prepare(`INSERT INTO observations
         (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
          files_read, files_modified, importance, created_at, created_at_epoch)
         VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`
-      ).run(sessionId, proj, narrative, dominantType, title, narrative, new Date(medianEpoch).toISOString(), medianEpoch);
+      ).run(sessionId, proj, safe.text, dominantType, safe.title, safe.narrative, new Date(medianEpoch).toISOString(), medianEpoch);
       const summaryId = Number(summaryResult.lastInsertRowid);
       const obsIds = obs.map(o => o.id);
       db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`)

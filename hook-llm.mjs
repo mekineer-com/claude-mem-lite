@@ -10,6 +10,7 @@ import {
   getCurrentBranch, notLowSignalTitleClause,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
+import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector } from './tfidf.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
@@ -194,6 +195,19 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
 
     const { conceptsText, factsText, textField } = buildFtsTextField(obs);
 
+    // Defense-in-depth: scrub text fields before INSERT. Source is LLM output
+    // (Haiku occasionally regurgitates input verbatim — error logs, hashes).
+    const safe = scrubRecord('observations', {
+      text: textField,
+      title: obs.title || '',
+      subtitle: obs.subtitle || '',
+      narrative: obs.narrative || '',
+      concepts: conceptsText,
+      facts: factsText,
+      lesson_learned: obs.lessonLearned || null,
+      search_aliases: obs.searchAliases || null,
+    });
+
     // Atomic: observation INSERT + observation_files + vector in one transaction
     const savedId = db.transaction(() => {
       const result = db.prepare(`
@@ -201,16 +215,16 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         sessionId, project,
-        textField, obs.type, obs.title, obs.subtitle || '',
-        obs.narrative || '',
-        conceptsText,
-        factsText,
+        safe.text, obs.type, safe.title, safe.subtitle,
+        safe.narrative,
+        safe.concepts,
+        safe.facts,
         JSON.stringify(obs.filesRead || []),
         JSON.stringify(obs.files || []),
         obs.importance ?? 1,
         minhashSig,
-        obs.lessonLearned || null,
-        obs.searchAliases || null,
+        safe.lesson_learned,
+        safe.search_aliases,
         getCurrentBranch(),
         now.toISOString(), now.getTime()
       );
@@ -996,15 +1010,25 @@ ${obsList}`;
           existingFast.id
         );
       } else {
+        const safe = scrubRecord('session_summaries', {
+          request: llmParsed.request || '',
+          investigated: llmParsed.investigated || '',
+          learned: llmParsed.learned || '',
+          completed: llmParsed.completed || '',
+          next_steps: llmParsed.next_steps || '',
+          remaining_items: llmParsed.remaining_items || '',
+          lessons: lessonsJson,
+          key_decisions: decisionsJson,
+        });
         db.prepare(`
           INSERT INTO session_summaries (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, lessons, key_decisions, created_at, created_at_epoch)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', '[]', '', ?, ?, ?, ?)
         `).run(
           sessionId, project,
-          llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
-          llmParsed.completed || '', llmParsed.next_steps || '',
-          llmParsed.remaining_items || '',
-          lessonsJson, decisionsJson,
+          safe.request, safe.investigated, safe.learned,
+          safe.completed, safe.next_steps,
+          safe.remaining_items,
+          safe.lessons, safe.key_decisions,
           now.toISOString(), now.getTime()
         );
       }
@@ -1013,3 +1037,18 @@ ${obsList}`;
     db.close();
   }
 }
+
+// Test-only helper: exercises the same scrubRecord path used by saveObservation
+// without spinning up the full LLM dispatcher. Lets the e2e leak test verify
+// that the observations INSERT path scrubs all configured text fields.
+export const __insertObservationForTest = (db, obs) => {
+  const safe = scrubRecord('observations', obs);
+  db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, branch, created_at, created_at_epoch)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    obs.session_id, obs.project, safe.text, 'change',
+    safe.title, safe.subtitle, safe.narrative,
+    safe.concepts, safe.facts, obs.files_read, obs.files_modified,
+    obs.importance, obs.minhash_sig, safe.lesson_learned, safe.search_aliases,
+    obs.branch, new Date().toISOString(), Date.now(),
+  );
+};
