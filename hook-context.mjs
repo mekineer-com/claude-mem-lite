@@ -407,26 +407,30 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     handoffLines.push('');
   }
 
-  // 5b. Deferred Work — project-level importance≥3 obs that survived prior
-  // session boundaries. Independent of the per-session handoff: even when the
-  // most recent /clear or /exit handoff has stale or meta-only `working_on`,
-  // genuine carry-forward decisions stay surfaced. Capped at 3 to keep the
-  // banner skim-able. Quiet-hooks does NOT suppress: the whole point is
-  // visibility for cross-session continuity.
-  const deferredObs = db.prepare(`
-    SELECT id, type, title FROM observations
-    WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-      AND superseded_at IS NULL
-      AND COALESCE(importance, 1) >= 3
-      AND ${notLowSignalTitleClause('')}
-    ORDER BY created_at_epoch DESC LIMIT 3
+  // 5b. Deferred Work — backed by deferred_work table (v2.70.0).
+  // Replaces the prior importance≥3 obs proxy. Items shown by per-project
+  // ordinal so user can refer to "处理1" / "handle item 1" naturally; D#<id>
+  // is the stable handle for tool-layer references (closes_deferred=[N]).
+  // Quiet-hooks does NOT suppress: cross-session continuity is the whole point.
+  const deferredItems = db.prepare(`
+    SELECT id, title, priority,
+           ROW_NUMBER() OVER (
+             ORDER BY priority DESC, created_at_epoch ASC
+           ) AS ordinal
+    FROM deferred_work
+    WHERE project = ? AND status = 'open'
+    ORDER BY priority DESC, created_at_epoch ASC
+    LIMIT 5
   `).all(project);
 
   const deferredLines = [];
-  if (deferredObs.length > 0) {
+  if (deferredItems.length > 0) {
     deferredLines.push('### Deferred Work');
-    for (const o of deferredObs) {
-      deferredLines.push(`- ${typeIcon(o.type)} [${o.type}] ${truncate(o.title, 140)} (#${o.id})`);
+    for (const d of deferredItems) {
+      const pTag = d.priority === 3 ? '🔴' : d.priority === 1 ? '⚪' : '🟡';
+      deferredLines.push(
+        `${d.ordinal}. ${pTag} [P${d.priority}] ${truncate(d.title, 120)} (D#${d.id})`
+      );
     }
     deferredLines.push('');
   }

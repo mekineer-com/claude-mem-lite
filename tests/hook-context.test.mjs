@@ -4,6 +4,7 @@ import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { computeAdaptiveWindows, selectWithTokenBudget, cleanupClaudeMdLegacyBlock, buildSummaryLines, buildSessionContextLines } from '../hook-context.mjs';
+import { insertDeferred } from '../lib/deferred-work.mjs';
 
 // ─── computeAdaptiveWindows ──────────────────────────────────────────────────
 
@@ -462,7 +463,7 @@ describe('buildSummaryLines', () => {
   });
 });
 
-describe('buildSessionContextLines: Deferred Work block', () => {
+describe('buildSessionContextLines: Deferred Work block (deferred_work-backed)', () => {
   let db;
   beforeEach(() => {
     db = createTestDb();
@@ -470,78 +471,52 @@ describe('buildSessionContextLines: Deferred Work block', () => {
   });
   afterEach(() => { db.close(); });
 
-  it('surfaces project-level importance≥3 obs in Deferred Work block', () => {
-    insertObs(db, {
-      sessionId: 'sess-x', project: 'test',
-      title: 'v2.66 carry-forward: real --json across recent/recall/timeline/stats/browse',
-      type: 'decision', importance: 3,
-    });
-    const out = buildSessionContextLines(db, 'test');
-    expect(out).toContain('### Deferred Work');
-    expect(out).toContain('v2.66 carry-forward');
-    expect(out).toContain('[decision]');
+  it('renders open deferred_work items as numbered list with priority + D#N', () => {
+    insertDeferred(db, { project: 'test', title: 'Round 2 zero-byte', priority: 3 });
+    insertDeferred(db, { project: 'test', title: 'Tier 4a CLI ergonomic', priority: 2 });
+    const lines = buildSessionContextLines(db, 'test');
+    // Expect new format: "<ordinal>. <icon> [P<n>] <title> (D#<id>)"
+    expect(lines).toMatch(/### Deferred Work/);
+    expect(lines).toMatch(/1\..*🔴.*\[P3\].*Round 2 zero-byte.*\(D#\d+\)/);
+    expect(lines).toMatch(/2\..*🟡.*\[P2\].*Tier 4a CLI ergonomic.*\(D#\d+\)/);
   });
 
-  it('omits the block when no importance≥3 obs exist', () => {
-    insertObs(db, {
-      sessionId: 'sess-x', project: 'test',
-      title: 'a routine bugfix nothing notable', type: 'bugfix', importance: 2,
-    });
-    const out = buildSessionContextLines(db, 'test');
-    expect(out).not.toContain('### Deferred Work');
-  });
-
-  it('caps the block at 3 entries', () => {
-    for (let i = 0; i < 6; i++) {
-      insertObs(db, {
-        sessionId: 'sess-x', project: 'test',
-        title: `deferred decision ${i} on architecture`,
-        type: 'decision', importance: 3,
-        epochOffset: -(i * 60000),
-      });
+  it('caps display at 5 items', () => {
+    for (let i = 0; i < 7; i++) {
+      insertDeferred(db, { project: 'test', title: `item ${i}`, priority: 2 });
     }
-    const out = buildSessionContextLines(db, 'test');
-    // Scope to the Deferred Work block only — the Key Context block also
-    // emits "- [decision]" lines and is environment-dependent (suppressed
-    // when MEM_QUIET_HOOKS=1, surfaces otherwise — the #7745 hermeticity
-    // trap that broke this test on CI but not locally).
-    const deferredBlock = extractSection(out, 'Deferred Work');
-    const matches = deferredBlock.split('\n').filter(l => l.startsWith('- ') && l.includes('[decision]'));
-    expect(matches.length).toBe(3);
+    const lines = buildSessionContextLines(db, 'test');
+    // Count specifically inside the Deferred Work section
+    const section = lines.split('### Deferred Work')[1]?.split(/^###\s/m)[0] || '';
+    const deferredLines = (section.match(/^\d+\.\s/gm) || []).length;
+    expect(deferredLines).toBe(5);
   });
 
-  it('skips low-signal-titled obs (no "Modified X" pollution)', () => {
-    insertObs(db, {
-      sessionId: 'sess-x', project: 'test',
-      title: 'Modified hook-context.mjs', type: 'change', importance: 3,
-    });
-    insertObs(db, {
-      sessionId: 'sess-x', project: 'test',
-      title: 'Adopt 5-tier scoring weights for hybrid search',
-      type: 'decision', importance: 3,
-    });
-    const out = buildSessionContextLines(db, 'test');
-    const deferredBlock = extractSection(out, 'Deferred Work');
-    expect(deferredBlock).toContain('5-tier scoring');
-    expect(deferredBlock).not.toContain('Modified hook-context');
+  it('omits block entirely when no open items', () => {
+    const lines = buildSessionContextLines(db, 'test');
+    expect(lines).not.toMatch(/### Deferred Work/);
   });
 
   it('does NOT leak across projects', () => {
-    insertSession(db, { id: 'sess-other', project: 'OTHER' });
-    insertObs(db, {
-      sessionId: 'sess-other', project: 'OTHER',
-      title: 'wrong-project deferred decision should not leak',
-      type: 'decision', importance: 3,
-    });
-    insertObs(db, {
-      sessionId: 'sess-x', project: 'test',
-      title: 'real local deferred decision worth surfacing',
-      type: 'decision', importance: 3,
-    });
+    insertDeferred(db, { project: 'OTHER', title: 'wrong-project deferred should not leak', priority: 3 });
+    insertDeferred(db, { project: 'test', title: 'real local deferred worth surfacing', priority: 2 });
     const out = buildSessionContextLines(db, 'test');
     const deferredBlock = extractSection(out, 'Deferred Work');
     expect(deferredBlock).toContain('real local deferred');
     expect(deferredBlock).not.toContain('wrong-project deferred');
+  });
+
+  it('does NOT surface importance≥3 observations (legacy behavior removed)', () => {
+    // Pre-v2.70: high-importance obs appeared in this block as a workaround.
+    // Now they only appear in the Recent table; this block is dedicated to
+    // the deferred_work table.
+    insertObs(db, {
+      sessionId: 'sess-x', project: 'test',
+      title: 'high-importance decision should not surface here anymore',
+      type: 'decision', importance: 3,
+    });
+    const out = buildSessionContextLines(db, 'test');
+    expect(out).not.toMatch(/### Deferred Work/);
   });
 });
 
