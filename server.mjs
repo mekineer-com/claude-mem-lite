@@ -936,8 +936,14 @@ server.registerTool(
         return r;
       })();
     } catch (e) {
-      // Re-throw with a clearer prefix so MCP error response names the contract failure.
-      throw new Error(`mem_save with closes_deferred failed: ${e.message}`, { cause: e });
+      if (closesIds) {
+        // Re-throw with a clearer prefix so MCP error response names the
+        // contract failure — only when the caller actually passed
+        // closes_deferred, so unrelated saveObservation failures don't get
+        // mislabeled as a deferred-work bug.
+        throw new Error(`mem_save with closes_deferred failed: ${e.message}`, { cause: e });
+      }
+      throw e;  // unwrapped — preserves original message + stack
     }
 
     if (result.kind === 'duplicate') {
