@@ -70,11 +70,11 @@ export const SOURCE_FILES = [
   // module-level `process.exit(0)` side effects that abort vitest workers on
   // direct import. Statically imported by hook.mjs SessionStart handler.
   'lib/upgrade-banner.mjs',
-  // v2.71 privacy: per-table scrub helper for defense-in-depth at text-write
-  // INSERT paths. Statically imported by hook-llm, hook-handoff, hook-optimize,
-  // hook, mem-cli; reached transitively from server.mjs and cli.mjs.
+  // Per-table scrub helper for defense-in-depth at text-write INSERT paths.
+  // Statically imported by hook-llm, hook-handoff, hook-optimize, hook,
+  // mem-cli; reached transitively from server.mjs and cli.mjs.
   'lib/scrub-record.mjs',
-  // v2.71 cold-start backfill: parses ~/.claude/projects/<encoded>/<uuid>.jsonl
+  // Cold-start backfill: parses ~/.claude/projects/<encoded>/<uuid>.jsonl
   // transcripts into user_prompts + observations. Dynamic-imported by
   // mem-cli.mjs::cmdImportJsonl; listed here so source-files-sync.test.mjs
   // and the npm tarball ship it on every release.

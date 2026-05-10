@@ -160,7 +160,7 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       const textField = [conceptsText, factsText, searchAliases || '', bigramText].filter(Boolean).join(' ');
       const minhashSig = computeMinHash((title || '') + ' ' + (narrative || ''));
 
-      // T1.5: scrub LLM-output text fields at the UPDATE boundary. type is an
+      // Scrub LLM-output text fields at the UPDATE boundary. type is an
       // enum, importance is numeric, minhash_sig is hash bytes.
       const safe = scrubRecord('observations', {
         title, narrative,
@@ -288,10 +288,9 @@ export function applyNormalization(db, groups) {
       const existingAliases = row.search_aliases || '';
       const originalTerms = terms.filter(t => aliasMap.has(t.toLowerCase()) && aliasMap.get(t.toLowerCase()) !== t);
       const newAliases = [existingAliases, ...originalTerms].filter(Boolean).join(' ');
-      // T1.5: defense-in-depth scrub. Canonical concept names come from LLM
-      // output (identifySynonymGroups via Sonnet); existing values are
-      // already scrubbed but free LLM tokens can re-introduce secret-shaped
-      // strings.
+      // Defense-in-depth scrub. Canonical concept names come from LLM output
+      // (identifySynonymGroups via Sonnet); existing values are already
+      // scrubbed but free LLM tokens can re-introduce secret-shaped strings.
       const safe = scrubRecord('observations', {
         concepts: uniqueConcepts,
         search_aliases: newAliases,
@@ -416,7 +415,7 @@ Return ONLY valid JSON:
     const minhashSig = computeMinHash((title || '') + ' ' + (narrative || ''));
     const importance = clampImportance(parsed.importance || 2);
 
-    // T1.5: scrub LLM-output cluster-merge text fields at the UPDATE boundary.
+    // Scrub LLM-output cluster-merge text fields at the UPDATE boundary.
     // importance is numeric; minhash_sig is hash bytes.
     const safe = scrubRecord('observations', {
       title, narrative,

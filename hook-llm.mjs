@@ -837,9 +837,9 @@ ${actionList}`;
         // so the enriched FTS text field + minhash + vector are refreshed atomically.
         const { conceptsText, factsText, textField } = buildFtsTextField(obs);
         const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
-        // T1.5: scrub LLM-output text fields at the UPDATE boundary, mirroring
-        // the INSERT path. type is an enum, importance is numeric, files_read
-        // is a JSON array (already scrubbed upstream), minhash_sig is hash bytes.
+        // Scrub LLM-output text fields at the UPDATE boundary, mirroring the
+        // INSERT path. type is an enum, importance is numeric, files_read is a
+        // JSON array (already scrubbed upstream), minhash_sig is hash bytes.
         const safe = scrubRecord('observations', {
           title: truncate(obs.title, 120),
           subtitle: obs.subtitle || '',
@@ -1001,12 +1001,12 @@ ${obsList}`;
         // the deterministic floor — the exact regression that made 72% of prod
         // session_summaries ship with empty remaining_items.
         //
-        // T1.5: scrub LLM-output text fields at the UPDATE boundary. lessons /
+        // Scrub LLM-output text fields at the UPDATE boundary. lessons /
         // key_decisions are JSON.stringify(array<string>); we scrub the JSON
-        // string here to match the sibling INSERT path's T1 decision (line 1013).
-        // scrubSecrets uses opaque placeholders that preserve JSON structure;
-        // element-level pre-scrub remains safer in principle but would diverge
-        // from the merged INSERT contract.
+        // string here to match the sibling INSERT path. scrubSecrets uses
+        // opaque placeholders that preserve JSON structure; element-level
+        // pre-scrub remains safer in principle but would diverge from the
+        // merged INSERT contract.
         const safe = scrubRecord('session_summaries', {
           request: llmParsed.request || '',
           investigated: llmParsed.investigated || '',
@@ -1068,9 +1068,16 @@ ${obsList}`;
   }
 }
 
-// Test-only helper: exercises the same scrubRecord path used by saveObservation
-// without spinning up the full LLM dispatcher. Lets the e2e leak test verify
-// that the observations INSERT path scrubs all configured text fields.
+// Test-only — DO NOT import outside tests/. Underscore prefix is a
+// convention; the plugin has no `main`/`exports` field so external imports
+// are blocked at the package level, but a misguided sibling import inside
+// this repo could drag this into prod by accident. If that ever needs
+// enforcing, move the helper to a tests/_helpers/ module that takes a
+// db-insert callback.
+//
+// Exercises the same scrubRecord path used by saveObservation without
+// spinning up the full LLM dispatcher. Lets the e2e leak test verify that
+// the observations INSERT path scrubs all configured text fields.
 export const __insertObservationForTest = (db, obs) => {
   const safe = scrubRecord('observations', obs);
   db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, branch, created_at, created_at_epoch)

@@ -98,6 +98,40 @@ describe('scrubRecord — session_handoffs fields', () => {
   });
 });
 
+describe('scrubRecord — contract & edge cases', () => {
+  it('returns null unchanged', () => {
+    expect(scrubRecord('observations', null)).toBeNull();
+  });
+
+  it('returns non-object input unchanged', () => {
+    expect(scrubRecord('observations', 'a string')).toBe('a string');
+    expect(scrubRecord('observations', 42)).toBe(42);
+    expect(scrubRecord('observations', undefined)).toBeUndefined();
+  });
+
+  it('does not mutate the input row (returns a copy)', () => {
+    const row = { title: `failed: ${SECRET}` };
+    const out = scrubRecord('observations', row);
+    expect(out).not.toBe(row);                      // different object
+    expect(row.title).toContain(SECRET);            // input untouched
+    expect(out.title).not.toContain(SECRET);        // output scrubbed
+  });
+
+  it('failsafe path skips inherited (prototype-chain) properties', () => {
+    const proto = { inherited: `proto leak: ${SECRET}` };
+    const row = Object.create(proto);
+    row.own = `own leak: ${SECRET}`;
+    const out = scrubRecord('some_unknown_table', row);
+    // Own property scrubbed:
+    expect(out.own).not.toContain(SECRET);
+    // Prototype property NOT in own enumerable keys, so the failsafe loop
+    // skipped it — but it's still readable via prototype lookup. The
+    // contract is "scrubs own string fields"; prototype keys are out of
+    // scope (and copying them into the output would actually leak more).
+    expect(Object.prototype.hasOwnProperty.call(out, 'inherited')).toBe(false);
+  });
+});
+
 describe('end-to-end UPDATE leak check via in-memory DB', () => {
   let db;
   beforeEach(() => { db = createTestDb(); });
