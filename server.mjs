@@ -32,7 +32,7 @@ import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } fro
 import { saveObservation } from './lib/save-observation.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
-  resolveDeferredIds,
+  resolveDeferredIds, closeDeferredItems,
 } from './lib/deferred-work.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
 import { createRequire } from 'module';
@@ -911,22 +911,44 @@ server.registerTool(
   safeHandler(async (args) => {
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const project = args.project || inferProject();
-    const result = saveObservation(db, {
-      content: args.content,
-      title: args.title,
-      type: args.type || 'discovery',
-      importance: args.importance,
-      project,
-      files: args.files || [],
-      lesson_learned: args.lesson_learned,
-    });
+
+    // Pre-resolve closes_deferred BEFORE entering the transaction. resolveDeferredIds
+    // throws on invalid input — surface that as a user error, not a partial save.
+    let closesIds = null;
+    if (args.closes_deferred && args.closes_deferred.length > 0) {
+      closesIds = resolveDeferredIds(db, project, args.closes_deferred);
+    }
+
+    let result;
+    try {
+      result = db.transaction(() => {
+        const r = saveObservation(db, {
+          content: args.content,
+          title: args.title,
+          type: args.type || 'discovery',
+          importance: args.importance,
+          project,
+          files: args.files || [],
+          lesson_learned: args.lesson_learned,
+        });
+        if (r.kind === 'duplicate') return r; // skip closure on dedup short-circuit
+        if (closesIds) closeDeferredItems(db, closesIds, r.id);
+        return r;
+      })();
+    } catch (e) {
+      // Re-throw with a clearer prefix so MCP error response names the contract failure.
+      throw new Error(`mem_save with closes_deferred failed: ${e.message}`, { cause: e });
+    }
 
     if (result.kind === 'duplicate') {
       return { content: [{ type: 'text', text: `Skipped: similar to existing #${result.existingId} in project "${project}". Use mem_get(ids=[${result.existingId}]) to review.` }] };
     }
 
     const lessonNote = result.lessonCaptured ? ` 💡lesson captured` : '';
-    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}` }] };
+    const closedNote = closesIds && closesIds.length > 0
+      ? ` Closed deferred: ${closesIds.map(i => `D#${i}`).join(', ')}.`
+      : '';
+    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}` }] };
   })
 );
 
