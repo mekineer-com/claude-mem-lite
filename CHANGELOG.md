@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.71.1 — import-jsonl real-transcript hotfix
+
+Three independent bugs in v2.71.0's `import-jsonl` that fixture-only tests didn't catch. Production-shape transcripts at `~/.claude/projects/<encoded>/<uuid>.jsonl` exposed all three.
+
+**Fixed**:
+- **`cli.mjs:2`** — `'import-jsonl'` was missing from the `CLI_COMMANDS` allow-list, so `claude-mem-lite import-jsonl …` printed "Unknown command". Tests imported the lib function directly and bypassed the routing layer entirely. The subcommand was effectively unreachable for users.
+- **`lib/import-jsonl.mjs:42`** — wrote the same Claude Code UUID into both `content_session_id` and `memory_session_id`, exact v2.33.1 mix-trigger fingerprint. The schema's `sdk_sessions_id_mix_check` trigger aborted every real-transcript import with `SQLITE_CONSTRAINT_TRIGGER`. Fixture session IDs (`sess-fix-1`, `trunc-1`) weren't 36-char UUID-shaped so the trigger bypassed them and the test pass was misleading. Synthesized `memId(sessionId) = 'import-' + sessionId` for a distinct, traceable internal ID.
+- **`lib/import-jsonl.mjs:204`** — only matched top-level `{"type":"tool_result"}`. Real Claude Code transcripts wrap `tool_result` inside `{"type":"user", message:{content:[{type:"tool_result", tool_use_id, content}]}}`. Result: 100% of real tool_uses orphaned. Added `user`-branch parsing that consumes embedded `tool_result` parts; legacy top-level shape kept for fixture compat.
+
+**Tests**:
+- **+2 regression tests** for the two missing real-shape coverage gaps (UUID-shape session ID; user-wrapped `tool_result`). Suite now 95 files / 2280 tests green.
+- Validated against real corpora: 1-file run = `9 prompts / 117 observations / 0 orphans`; full directory walk on 546 transcripts = `1267 prompts / 20388 observations / 4 orphans`.
+
+**Why this exists**:
+v2.71.0 dogfooding session: ran `claude-mem-lite import-jsonl` against `~/.claude/projects/-mnt-data-ssd-dev-projects-mem/` and watched it crash on the first real file. The fixture format (a single 6-line file with synthetic short session IDs and flat `tool_result` events) didn't reproduce production shape on any of the three axes. Fixture realism is now part of the import-jsonl test contract.
+
 ## v2.71.0 — privacy hardening + long-session robustness + cold-start
 
 **New**:
