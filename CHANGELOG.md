@@ -2,6 +2,38 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.68.0] - 2026-05-10
+
+**v2.66 carry-forward complete: Tier 4a (`--limit` cap + numeric-flag audit), Tier 2 (real `--json` × 5 listing commands), Tier 3 (events data hygiene + `activity delete` CLI).** Schema unchanged. 88 test files / 2221 tests pass (+28 vs 2.67.0); zero ESLint errors.
+
+### Tier 4a — `parseIntFlag` shared helper + max-bound audit
+
+- **New `lib/cli-flags.mjs::parseIntFlag(rawValue, { name, defaultValue, min, max, warn })`** — single source of truth for numeric flag validation, replacing the 5-line `parseInt + Number.isInteger + range check` boilerplate that had drifted across cmd handlers.
+- **5 `--limit` sites refactored** (`search` / `recall` / `recent` / `export` / `registry list`): all now cap at 1000 with warn-then-default. Pre-fix `claude-mem-lite search "x" --limit 99999999` silently dumped the full result set; now warns and falls back to default.
+- **Unsafe `parseInt(flags.days, 10) || 30` replaced** — the bare `||` accepted negative integers (the #8277 truthy-negative trap). Capped at 3650 (10 years).
+- +12 unit tests covering bound semantics (undefined / empty / negative / zero / above-max / exact-bound / Infinity / NaN / floats / per-flag bound).
+
+### Tier 2 — real `--json` output for 5 listing commands
+
+- **`recent` / `recall` / `timeline` / `stats` / `browse` now emit structured JSON when `--json` is set.** Previously the v2.66 B5 fix only stderr-warned that `--json` wasn't supported — automation expecting parseable JSON either piped text into `jq` and broke, or silently consumed text labels as JSON values.
+- Each handler builds row data once (text + JSON share the SQL); empty results emit a parseable empty form (`{ "results": [] }` etc.), never a friendly text fallback. Pattern from `cmdExport` B6 (#8285).
+- Friendly diagnostics (`[mem] No history for X`) go to stderr only; stdout stays structured-only when `--json` is set.
+- All 5 commands added to `JSON_SUPPORTED_CMDS` allow-list so the "--json not supported" stderr warning no longer fires.
+- **New `lib/json-shapes.md`** documents every shape + the MCP-parity invariant: CLI is the source of truth today; future MCP `output_format: 'json'` mode must mirror these one-to-one.
+- `--help` text refreshed to sketch each shape inline.
+- +10 E2E tests (one per shape + empty form + tier-scope + JSON_SUPPORTED_CMDS non-warning probe).
+
+### Tier 3 — events data hygiene + `activity delete` CLI
+
+- **3a (one-shot audit):** 37 corrupted events from old `hook-llm` fallback bug (#8158) deleted under explicit user confirmation per §8.V3 destructive-smoke. 36 `Error:` prefixes + 1 `<claude-mem-context>` leak. `activity recent` no longer surfaces `Error:` titles.
+- **3b (CLI action):** new `claude-mem-lite activity delete <id1,id2,…>` mirrors `cmdDelete` — preview by default, `--confirm` executes; batch IDs comma-separated; missing IDs surface as "skipped" in preview, tolerated on execute. Rejects non-positive / non-integer tokens before any DB read.
+- +6 E2E tests (preview-vs-execute, batch IDs, mixed-valid-and-missing, all-missing exits 1, integer guards).
+
+### Cross-tier housekeeping
+
+- `lib/cli-flags.mjs` registered in `package.json` files[] and `source-files.mjs` SOURCE_FILES so the npm-tarball + sync-test pair stay green.
+- Test hermeticity hotfix (`f38009f`) merged in mid-cycle: the v2.67.0 "caps the block at 3 entries" assertion failed on CI without `MEM_QUIET_HOOKS=1`. Fixed by scoping assertion to its own block via `extractSection()`.
+
 ## [2.67.0] - 2026-05-10
 
 **Cross-session continuity hardening: handoff `working_on` no longer captures meta-trigger prompts verbatim, and SessionStart banner adds a `### Deferred Work` block surfacing project-level importance≥3 carry-forward decisions.** Schema unchanged. 87 test files / 2193 tests pass (+38 vs 2.66.0); zero ESLint errors.
