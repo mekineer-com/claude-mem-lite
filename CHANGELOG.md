@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.71.3 — CLI routing three-surface contract test + missing help docs
+
+**Tests**:
+- **`tests/cli-routing-contract.test.mjs`** (new) — static source-parse contract that locks the `cli.mjs` `CLI_COMMANDS` Set, `mem-cli.mjs` `run()` dispatch (switch + early-return ifs), and `cmdHelp()` documentation in lockstep. Adding a subcommand needs THREE edits (lesson #8414); this test fails fast when any one is forgotten. No DB / no subprocess / ~150ms. Generalises the per-route E2E from `tests/cli-import-jsonl-e2e.test.mjs`.
+- Sanity: temporarily removing `'import-jsonl'` from `CLI_COMMANDS` reproduces v2.71.0's regression with the new error pointing at the unreachable command by name.
+- Suite: 96 files / 2291 tests green.
+
+**Fixed**:
+- **`mem-cli.mjs::cmdHelp()`** — `import <github-url>` (registry import) and `enrich <name>` were routable subcommands but had been silently shipped without entries in `claude-mem-lite help` output. Caught on the contract test's first run. Added two short help blocks restoring documented behavior.
+
 ## v2.71.2 — cold-start schema-init concurrency hotfix
 
 **Fixed**:
