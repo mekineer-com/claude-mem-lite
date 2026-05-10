@@ -2,6 +2,21 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.69.0] - 2026-05-10
+
+**Self-driven dogfood pass on v2.68.0 — 3 rounds × 30+ scenarios — single P2 finding fixed.** Schema unchanged. 88 test files / 2223 tests pass (+2 regression anchors); zero ESLint errors.
+
+### `recent --limit` flag — sibling-parity alias
+
+- **`cmdRecent` now accepts `--limit N` in addition to positional `[N]`.** Pre-fix `claude-mem-lite recent --limit 5` was silently swallowed (parseArgs accepted the flag, cmdRecent only read positional[0], default 10 returned with no warning) — surprising users extrapolating from sibling commands `search` / `recall` / `browse` / `stats`, all of which use `--limit`. Positional `[N]` still wins when both are given, preserving documented backward-compat.
+- Routes through shared `parseIntFlag` helper (lib/cli-flags.mjs from v2.68.0 Tier 4a), so `recent --limit -5` / `--limit abc` / `--limit 99999` all warn-then-default-10 with the same error format as siblings.
+- `--help` updated: `--limit N           Sibling-parity alias for [N] (max 1000)`.
+- +2 regression anchors in `tests/cli.test.mjs::CLI recent command` lock the new contract (flag accepted as alias) and the warn-on-invalid path.
+
+### Round-1–3 verification (no regressions)
+
+Three-round audit confirmed all prior dogfood fixes hold: `#8197` doctor `--benchmark` real metrics; `#8277/5303546` numeric-flag range cap; `#8283` scrubSecrets prose-preserving; `#8284` `--json` works on recent/recall/timeline/stats/browse/context; `#8285` export `--format json/jsonl` empty-set valid stdout; `#8279` doctor exit-code parity. MCP zod schema rejects all 15 boundary inputs (limit/importance/obs_type/content size/ids count). Hook stdin gracefully tolerates empty / malformed / 300KB-overflow input.
+
 ## [2.68.0] - 2026-05-10
 
 **v2.66 carry-forward complete: Tier 4a (`--limit` cap + numeric-flag audit), Tier 2 (real `--json` × 5 listing commands), Tier 3 (events data hygiene + `activity delete` CLI).** Schema unchanged. 88 test files / 2221 tests pass (+28 vs 2.67.0); zero ESLint errors.
