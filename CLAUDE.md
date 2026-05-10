@@ -44,7 +44,7 @@ review signal.
 | `hook-semaphore.mjs` | Concurrency control for hook execution |
 | `hook-update.mjs` | Auto-update via GitHub Releases (24h check, dev-mode skip) |
 | `hook-optimize.mjs` | LLM-powered optimization: re-enrich, normalize, cluster-merge, smart-compress |
-| `server.mjs` | MCP server — 17 tools total: 6 core exposed via `tools/list` (mem_search/mem_recent/mem_recall/mem_get/mem_save/mem_timeline) + 11 hidden-but-callable (mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_optimize/mem_fts_check/mem_stats/mem_registry/mem_use/mem_browse). Hidden tools stay routable by exact-name `tools/call`; Claude Code agents reach them via the `claude-mem-lite <cmd>` CLI. Split flag lives in `tool-schemas.mjs`. |
+| `server.mjs` | MCP server — 20 tools total: 9 core exposed via `tools/list` (mem_search/mem_recent/mem_recall/mem_get/mem_save/mem_timeline + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden-but-callable (mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_optimize/mem_fts_check/mem_stats/mem_registry/mem_use/mem_browse). Hidden tools stay routable by exact-name `tools/call`; Claude Code agents reach them via the `claude-mem-lite <cmd>` CLI. Split flag lives in `tool-schemas.mjs`. |
 | `registry.mjs` | Resource registry DB schema + CRUD |
 | `registry-retriever.mjs` | FTS5 search + BM25 composite scoring + domain filtering |
 | `registry-indexer.mjs` | Resource indexing pipeline |
@@ -89,6 +89,23 @@ if they'd seen the lesson? If yes → save it. If no → it wasn't a real bug fi
 Empirical note: `decision` observations have 72.7% hit rate vs `change` at 16.5% — one good
 decision memory is worth ~20 change memories. Do not inflate this — decision is reserved
 for real tradeoffs, not style choices.
+
+**When deferring work to a future session** (≠ in-flight todo, ≠ this-PR follow-up):
+call `mem_defer({title: '<one-line subject>', priority: <1|2|3>, detail: '<constraint + why deferred>'})`.
+
+Triggers (bilingual):
+- 中文: "下次/下个会话/留给独立 session/不在本轮范围/留给下个会话"
+- en: "next session / defer to next round / out of scope for this PR / pick up later"
+- explicit user wrap-up: "记一下，下次处理 X" / "remember to do Y next time"
+
+When you fix a deferred item, **must** add `closes_deferred=[N]` to the `mem_save`
+call so the carry-forward chain closes properly. `N` is the per-project ordinal
+shown in the SessionStart `### Deferred Work` banner (e.g. `closes_deferred=[1]`),
+or the raw id as `closes_deferred=["D#42"]`. Mixed array is OK.
+
+If the deferred item turned out to not need fixing (flaky test, scope shift),
+use `mem_defer_drop({id: <D#N|ordinal>, reason: '...'})` instead. The reason is
+required and forms the audit trail for "why no fix shipped".
 
 **Do not write `lesson_learned: 'none'` just to satisfy the schema.** Either write a lesson
 that a future session could actually use, or leave the field NULL and accept a low-importance

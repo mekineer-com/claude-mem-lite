@@ -1,6 +1,7 @@
 // Guards the MCP tool surface against silent drift:
-//   - Core set must be exactly the 6 tools promised by the invited-memory
-//     contract; extending it bloats every agent's startup context.
+//   - Core set must be exactly the 9 tools promised by the invited-memory
+//     contract (6 retrieval/save + 3 defer, v2.70+); extending it bloats every
+//     agent's startup context.
 //   - "Equivalent CLI:" lines in descriptions must match the actual CLI
 //     (caught by issue: maintain/compress/optimize doc drift, fixed with
 //     this round's low-risk bundle).

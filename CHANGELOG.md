@@ -2,6 +2,27 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.70.0 — first-class deferred work
+
+**New**:
+- `mem_defer` / `mem_defer_list` / `mem_defer_drop` MCP tools.
+- `claude-mem-lite defer add | list | drop` CLI subcommand.
+- `mem_save({closes_deferred: [...]})` (and CLI `--closes-deferred 1,D#42`) for transactional closure with audit trail (`closed_by_obs_id` FK).
+
+**Changed**:
+- `### Deferred Work` SessionStart block now reads from the new `deferred_work` table. Previously surfaced importance≥3 observations as a workaround (per #8286). High-importance observations still appear in the Recent table — only the dedicated Deferred Work block changed source.
+
+**Migration**:
+- Idempotent SQLite schema migration (CURRENT_SCHEMA_VERSION 30 → 31). No data loss; nothing to run manually.
+- Existing importance=3 carry-forward observations stop appearing in the Deferred Work block. To re-surface a specific obs there, create a real entry: `claude-mem-lite defer add "<title>" --priority 3`.
+- One-shot stderr banner on first SessionStart per project naming the change.
+
+**Opt-out**:
+- Pin to the prior version: `npm install -g claude-mem-lite@2.69.x`. The legacy importance≥3 surfacing remains in 2.69.x.
+
+**Why this exists**:
+A cross-session handoff investigation (this session, 2026-05-10) found three orthogonal causes for "处理1" / "handle item 1" failing in a fresh session: (1) deferred-work signal lived only in mid-session prompts, never promoted to observations; (2) `working_on` fallback selected most-recent importance≥3 obs, orthogonal to "what to pick up next"; (3) the Deferred Work block read the same orthogonal source. obs #8287 traded self-referential meta-text for an importance≥3 fallback but did not close any of the three RCs. v2.70.0 closes all three by giving carry-forward a first-class table + tool surface.
+
 ## [2.69.0] - 2026-05-10
 
 **Self-driven dogfood pass on v2.68.0 — 3 rounds × 30+ scenarios — single P2 finding fixed.** Schema unchanged. 88 test files / 2223 tests pass (+2 regression anchors); zero ESLint errors.

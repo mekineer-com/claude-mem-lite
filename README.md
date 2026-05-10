@@ -209,14 +209,14 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 
 ### MCP Tools (used automatically by Claude)
 
-As of v2.34.0, the server registers 17 tools in total but only the 6 **core**
+As of v2.70.0, the server registers 20 tools in total but only the 9 **core**
 tools appear in `tools/list`. The 11 **hidden** tools remain callable at the
 protocol layer (`tools/call` by exact name still routes normally); they're
 omitted from the list response so Claude Code sessions don't load 11 extra
 tool schemas at startup. Hidden tools are the maintenance / admin / browser
 surface — reach them through the CLI column in the second table.
 
-**Core (6, exposed to Claude Code)**
+**Core (9, exposed to Claude Code)**
 
 | Tool | Description |
 |------|-------------|
@@ -225,7 +225,10 @@ surface — reach them through the CLI column in the second table.
 | `mem_recall` | Recall observations related to a file. Use before editing to surface past bugfixes and context. |
 | `mem_timeline` | Browse observations chronologically around an anchor point. |
 | `mem_get` | Retrieve full details for specific observation IDs (includes importance and related_ids). |
-| `mem_save` | Manually save a memory/observation. |
+| `mem_save` | Manually save a memory/observation. Accepts `closes_deferred` array for transactional closure of deferred work. |
+| `mem_defer` | Mark work for a future session (v2.70+). First-class carry-forward signal, surfaced in SessionStart `### Deferred Work` block. |
+| `mem_defer_list` | List open deferred items for the current project. |
+| `mem_defer_drop` | Drop a deferred item without fixing it; requires a `reason` for the audit trail. |
 
 **Hidden-but-callable (11, CLI-routed)**
 

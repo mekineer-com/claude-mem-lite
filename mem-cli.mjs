@@ -2328,6 +2328,19 @@ Commands:
     --project P         Project name
     --files f1,f2       Comma-separated file paths
     --lesson T          Lesson learned (≤500 chars; alias: --lesson-learned)
+    --closes-deferred 1,D#42  Close deferred items in same transaction
+
+  defer <action>        First-class deferred work (v2.70+)
+    add "<title>"       Mark deferred work for next session
+      --priority N      1-3 (default 2)
+      --detail T        Constraint + why deferred
+      --files f1,f2     Comma-separated file paths
+      --project P       Project name
+    list                List open deferred items
+      --limit N         Max results (default 10)
+      --project P       Filter by project
+    drop <D#N|ordinal>  Drop a deferred item (no fix needed)
+      --reason "..."    Required audit trail
 
   delete <id1,id2,...>  Delete observations by ID
     --confirm           Execute deletion (preview by default)

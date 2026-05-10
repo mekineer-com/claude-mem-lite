@@ -1,4 +1,5 @@
-// v2.34.0 tool-visibility split: only 6 core tools appear in tools/list; the
+// v2.34.0 tool-visibility split (expanded v2.70.0): only 9 core tools appear
+// in tools/list (the original 6 + mem_defer/mem_defer_list/mem_defer_drop); the
 // 11 hidden maintenance/admin tools stay callable by exact name. This test
 // spawns the real server over stdio and drives the MCP handshake so it
 // catches regressions in both the filter and the registration wiring.

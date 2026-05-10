@@ -313,14 +313,16 @@ export const memDeferDropSchema = {
 // 40-60% vs. encouragement-style ("use this to..."). See tests/tool-schemas.test.mjs
 // for the invariants this list must satisfy.
 //
-// Core vs hidden (v2.34.0): only 6 tools are exposed via MCP `tools/list`. The
+// Core vs hidden (v2.34.0, expanded v2.70.0): only 9 tools are exposed via MCP
+// `tools/list` (the original 6 + mem_defer/mem_defer_list/mem_defer_drop). The
 // remaining 11 stay registered — and are still callable by name at the MCP
 // protocol level (`tools/call` by exact name) — but are omitted from the list
 // response so they don't bloat every agent's startup context. The core set
 // covers the hot paths the invited-memory contract promises (recall before
-// Edit, save after bugfix, search/recent/timeline/get for retrieval). Hidden
-// tools are either maintenance (compress/maintain/optimize/fts_check),
-// admin/infra (stats/export/update/delete), or specialized browsers
+// Edit, save after bugfix, search/recent/timeline/get for retrieval, defer
+// for cross-session carry-forward). Hidden tools are either maintenance
+// (compress/maintain/optimize/fts_check), admin/infra
+// (stats/export/update/delete), or specialized browsers
 // (browse/registry/use) — all of which have CLI equivalents documented in
 // `adopt-content.mjs`.
 // ────────────────────────────────────────────────────────────────────────────
