@@ -1080,7 +1080,7 @@ function cmdDeferDrop(db, args) {
     out(`[mem] D#${realId} was not in 'open' status — drop is a no-op.`);
     return;
   }
-  out(`[mem] Dropped D#${realId} — reason: ${reason.trim()}`);
+  out(`[mem] Dropped D#${realId} in project "${project}". Reason: ${reason.trim()}`);
 }
 
 // N-1: Quality-focused stats for R-2 A/B baseline.
