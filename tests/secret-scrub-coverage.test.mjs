@@ -98,6 +98,33 @@ describe('scrubRecord — session_handoffs fields', () => {
   });
 });
 
+describe('end-to-end UPDATE leak check via in-memory DB', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+
+  it('UPDATE on observations does not persist secrets via direct prepare', () => {
+    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+                VALUES (?, ?, ?, ?, ?, 'active')`)
+      .run('s1', 's1', 'p1', new Date().toISOString(), Date.now());
+    const ins = db.prepare(`INSERT INTO observations (memory_session_id, project, text, type, title, narrative, importance, created_at, created_at_epoch)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run('s1', 'p1', 'clean', 'change', 'Clean title', '', 1, new Date().toISOString(), Date.now());
+    const id = ins.lastInsertRowid;
+
+    const safe = scrubRecord('observations', {
+      title: `failed: ${SECRET}`, narrative: POISONED,
+      concepts: POISONED, facts: POISONED,
+    });
+    db.prepare(`UPDATE observations SET title=?, narrative=?, concepts=?, facts=? WHERE id=?`)
+      .run(safe.title, safe.narrative, safe.concepts, safe.facts, id);
+
+    const row = db.prepare('SELECT * FROM observations WHERE id=?').get(id);
+    for (const k of ['title', 'narrative', 'concepts', 'facts']) {
+      expect(row[k], `${k} leaked via UPDATE`).not.toContain(SECRET);
+    }
+  });
+});
+
 describe('end-to-end leak check via in-memory DB', () => {
   let db;
   beforeEach(() => { db = createTestDb(); });

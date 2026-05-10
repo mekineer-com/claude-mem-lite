@@ -837,19 +837,32 @@ ${actionList}`;
         // so the enriched FTS text field + minhash + vector are refreshed atomically.
         const { conceptsText, factsText, textField } = buildFtsTextField(obs);
         const minhashSig = computeMinHash((obs.title || '') + ' ' + (obs.narrative || ''));
+        // T1.5: scrub LLM-output text fields at the UPDATE boundary, mirroring
+        // the INSERT path. type is an enum, importance is numeric, files_read
+        // is a JSON array (already scrubbed upstream), minhash_sig is hash bytes.
+        const safe = scrubRecord('observations', {
+          title: truncate(obs.title, 120),
+          subtitle: obs.subtitle || '',
+          narrative: truncate(obs.narrative || '', 500),
+          concepts: conceptsText,
+          facts: factsText,
+          text: textField,
+          lesson_learned: obs.lessonLearned || null,
+          search_aliases: obs.searchAliases || null,
+        });
         db.prepare(`
           UPDATE observations SET type=?, title=?, subtitle=?, narrative=?, concepts=?, facts=?,
             text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?
           WHERE id = ?
         `).run(
-          obs.type, truncate(obs.title, 120), obs.subtitle || '',
-          truncate(obs.narrative || '', 500),
-          conceptsText, factsText, textField,
+          obs.type, safe.title, safe.subtitle,
+          safe.narrative,
+          safe.concepts, safe.facts, safe.text,
           obs.importance,
           JSON.stringify(obs.filesRead || []),
           minhashSig,
-          obs.lessonLearned || null,
-          obs.searchAliases || null,
+          safe.lesson_learned,
+          safe.search_aliases,
           episode.savedId
         );
         savedId = episode.savedId;
@@ -987,6 +1000,23 @@ ${obsList}`;
         // empty for that field. Without COALESCE, a degraded Haiku pass would erase
         // the deterministic floor — the exact regression that made 72% of prod
         // session_summaries ship with empty remaining_items.
+        //
+        // T1.5: scrub LLM-output text fields at the UPDATE boundary. lessons /
+        // key_decisions are JSON.stringify(array<string>); we scrub the JSON
+        // string here to match the sibling INSERT path's T1 decision (line 1013).
+        // scrubSecrets uses opaque placeholders that preserve JSON structure;
+        // element-level pre-scrub remains safer in principle but would diverge
+        // from the merged INSERT contract.
+        const safe = scrubRecord('session_summaries', {
+          request: llmParsed.request || '',
+          investigated: llmParsed.investigated || '',
+          learned: llmParsed.learned || '',
+          completed: llmParsed.completed || '',
+          next_steps: llmParsed.next_steps || '',
+          remaining_items: llmParsed.remaining_items || '',
+          lessons: lessonsJson,
+          key_decisions: decisionsJson,
+        });
         db.prepare(`
           UPDATE session_summaries
           SET request = COALESCE(NULLIF(?, ''), request),
@@ -1002,10 +1032,10 @@ ${obsList}`;
               created_at_epoch = ?
           WHERE id = ?
         `).run(
-          llmParsed.request || '', llmParsed.investigated || '', llmParsed.learned || '',
-          llmParsed.completed || '', llmParsed.next_steps || '',
-          llmParsed.remaining_items || '',
-          lessonsJson, decisionsJson,
+          safe.request, safe.investigated, safe.learned,
+          safe.completed, safe.next_steps,
+          safe.remaining_items,
+          safe.lessons, safe.key_decisions,
           now.toISOString(), now.getTime(),
           existingFast.id
         );

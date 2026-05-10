@@ -160,12 +160,22 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       const textField = [conceptsText, factsText, searchAliases || '', bigramText].filter(Boolean).join(' ');
       const minhashSig = computeMinHash((title || '') + ' ' + (narrative || ''));
 
+      // T1.5: scrub LLM-output text fields at the UPDATE boundary. type is an
+      // enum, importance is numeric, minhash_sig is hash bytes.
+      const safe = scrubRecord('observations', {
+        title, narrative,
+        concepts: conceptsText,
+        facts: factsText,
+        text: textField,
+        lesson_learned: lessonLearned,
+        search_aliases: searchAliases,
+      });
       db.prepare(`
         UPDATE observations SET type=?, title=?, narrative=?, concepts=?, facts=?,
           text=?, importance=?, lesson_learned=?, search_aliases=?, minhash_sig=?, optimized_at=?
         WHERE id = ?
-      `).run(type, title, narrative, conceptsText, factsText, textField,
-        importance, lessonLearned, searchAliases, minhashSig, Date.now(), cand.id);
+      `).run(type, safe.title, safe.narrative, safe.concepts, safe.facts, safe.text,
+        importance, safe.lesson_learned, safe.search_aliases, minhashSig, Date.now(), cand.id);
 
       rebuildVector(db, cand.id, [title, narrative, conceptsText]);
 
@@ -278,7 +288,15 @@ export function applyNormalization(db, groups) {
       const existingAliases = row.search_aliases || '';
       const originalTerms = terms.filter(t => aliasMap.has(t.toLowerCase()) && aliasMap.get(t.toLowerCase()) !== t);
       const newAliases = [existingAliases, ...originalTerms].filter(Boolean).join(' ');
-      updateStmt.run(uniqueConcepts, newAliases, Date.now(), row.id);
+      // T1.5: defense-in-depth scrub. Canonical concept names come from LLM
+      // output (identifySynonymGroups via Sonnet); existing values are
+      // already scrubbed but free LLM tokens can re-introduce secret-shaped
+      // strings.
+      const safe = scrubRecord('observations', {
+        concepts: uniqueConcepts,
+        search_aliases: newAliases,
+      });
+      updateStmt.run(safe.concepts, safe.search_aliases, Date.now(), row.id);
       updated++;
     }
   }
@@ -398,13 +416,22 @@ Return ONLY valid JSON:
     const minhashSig = computeMinHash((title || '') + ' ' + (narrative || ''));
     const importance = clampImportance(parsed.importance || 2);
 
+    // T1.5: scrub LLM-output cluster-merge text fields at the UPDATE boundary.
+    // importance is numeric; minhash_sig is hash bytes.
+    const safe = scrubRecord('observations', {
+      title, narrative,
+      concepts: conceptsText,
+      facts: factsText,
+      text: textField,
+      lesson_learned: lessonLearned,
+    });
     db.transaction(() => {
       db.prepare(`
         UPDATE observations SET title=?, narrative=?, concepts=?, facts=?, text=?,
           importance=?, lesson_learned=?, minhash_sig=?, optimized_at=?
         WHERE id = ?
-      `).run(title, narrative, conceptsText, factsText, textField,
-        importance, lessonLearned, minhashSig, Date.now(), keeper.id);
+      `).run(safe.title, safe.narrative, safe.concepts, safe.facts, safe.text,
+        importance, safe.lesson_learned, minhashSig, Date.now(), keeper.id);
 
       const otherIds = others.map(o => o.id);
       const ph = otherIds.map(() => '?').join(',');
