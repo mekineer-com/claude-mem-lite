@@ -7,7 +7,19 @@ export const SECRET_PATTERNS = [
   // Key-value assignments: password=xxx, token=xxx, api_key=xxx, secret=xxx, etc.
   // Excludes code-like values: null, undefined, true, false, None, empty, function calls (word()),
   // and short values (<6 chars) that are typically variable names not secrets.
-  [/(\b(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  //
+  // Split into two patterns so prose mentions don't get scrubbed:
+  //   1. Bare credential nouns (password|passwd|token|bearer) commonly appear in
+  //      English prose — "Marker token: xyzpdq", "the bearer: alice". We require
+  //      the keyword NOT to be preceded by an English-word + horizontal-space
+  //      (the prose mention shape). Code/config has the keyword at start-of-line,
+  //      after a separator, or in object-literal context — none of which match
+  //      "letter-then-space" preceding the keyword.
+  //   2. Structured keys (api_key, auth_token, …) keep the original behavior —
+  //      a separator/compound key is unambiguous config syntax even when
+  //      preceded by prose ("see auth_token: shhhhhh").
+  [/((?<![A-Za-z][ \t])\b(?:password|passwd|token|bearer)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  [/(\b(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // AWS access keys (AKIA...)
   [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
   // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold

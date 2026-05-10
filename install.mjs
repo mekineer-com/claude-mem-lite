@@ -1438,6 +1438,11 @@ async function doctor() {
   }
 
   console.log(`\n  ${buildDoctorSummary(issues, warnings)}\n`);
+  // Diagnostic-tool exit-code contract: any ✗-level finding must propagate non-zero
+  // so CI / wrapper scripts (`claude-mem-lite doctor || alert`) actually trip. Keeps
+  // ⚠-only states at exit 0 (#8268 already established the visual ⚠ vs counted-issue
+  // separation; this propagates that count to the shell).
+  if (issues > 0) process.exitCode = 1;
 }
 
 // ─── Settings helpers ───────────────────────────────────────────────────────

@@ -1001,6 +1001,20 @@ describe('CLI export command', () => {
     const output = await captureStdout(() => run(['export', '--type', 'bugfix']));
     expect(output).toContain('No observations found');
   });
+
+  it('emits valid empty JSON array on empty result for --format json', async () => {
+    // Round-5 dogfood regression: empty export sent friendly text to stdout,
+    // breaking `... | jq`. Stdout must stay parseable; the friendly note moved
+    // to stderr.
+    const stdout = await captureStdoutOnly(() => run(['export', '--type', 'bugfix', '--format', 'json']));
+    expect(stdout.trim()).toBe('[]');
+    expect(JSON.parse(stdout)).toEqual([]);
+  });
+
+  it('emits zero stdout bytes on empty result for --format jsonl', async () => {
+    const stdout = await captureStdoutOnly(() => run(['export', '--type', 'bugfix', '--format', 'jsonl']));
+    expect(stdout).toBe('');
+  });
 });
 
 // ─── compress command ───────────────────────────────────────────────────────

@@ -117,10 +117,17 @@ export function extractCjkKeywords(text) {
 export function extractCjkLikePatterns(query) {
   if (!query || !/[\u4e00-\u9fff\u3400-\u4dbf]{2,}/.test(query)) return [];
   const keywords = extractCjkKeywords(query);
-  // Bigrams for unmatched CJK portions
+  // Bigrams for unmatched CJK portions \u2014 but only from pure-CJK whitespace tokens.
+  // Mixed-script tokens (e.g. "xyzAbc\u4e0d\u5b58\u5728neverhit") behave as identifier-like
+  // literals; LIKE-OR'ing the CJK-suffix bigrams matches unrelated docs containing
+  // common fragments. Mirrors the FTS-side guard in sanitizeFtsQuery.
   let remainder = query;
   for (const w of keywords) remainder = remainder.split(w).join(' ');
-  const bigrams = cjkBigrams(remainder).split(' ').filter(Boolean);
+  const pureCjkOnly = remainder
+    .split(/\s+/)
+    .filter(t => /[\u4e00-\u9fff\u3400-\u4dbf]/.test(t) && !/[A-Za-z0-9]/.test(t))
+    .join(' ');
+  const bigrams = pureCjkOnly ? cjkBigrams(pureCjkOnly).split(' ').filter(Boolean) : [];
   return [...new Set([...keywords, ...bigrams])];
 }
 
@@ -255,7 +262,16 @@ export function sanitizeFtsQuery(query) {
   // Individual CJK chars ("系","统") are too noisy; bigrams ("系统") capture compound words.
   // Skip bigrams when CJK synonym extraction already produced meaningful tokens —
   // bigrams joined with AND would make the query too restrictive.
-  const bigrams = cjkExtracted ? null : cjkBigrams(cleaned);
+  // Also skip for mixed-script tokens (e.g. "xyzAbc不存在neverhit"): the latin portion
+  // is already a strong literal anchor; bigramming the CJK suffix lets short fragments
+  // like "存在" match alone after AND→OR fallback, exploding recall onto unrelated docs.
+  let bigrams = null;
+  if (!cjkExtracted) {
+    const pureCjkTokens = tokens.filter(t =>
+      /[一-鿿㐀-䶿]/.test(t) && !/[A-Za-z0-9]/.test(t)
+    );
+    if (pureCjkTokens.length > 0) bigrams = cjkBigrams(pureCjkTokens.join(' '));
+  }
   const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(b => b && !CJK_STOP_WORDS.has(b)) : []);
   const hasBigrams = bigramSet.size > 0;
   const finalTokens = [];

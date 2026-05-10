@@ -1366,7 +1366,13 @@ function cmdExport(db, args) {
   `).all(...params, limit);
 
   if (rows.length === 0) {
-    out('[mem] No observations found matching criteria');
+    // Empty result must respect the requested format so `export … | jq` works:
+    //   json  → "[]" (valid empty array)
+    //   jsonl → 0 lines (valid empty file)
+    // The friendly note goes to stderr so it doesn't poison stdout for callers
+    // piping to a parser.
+    if (format === 'json') out('[]');
+    process.stderr.write('[mem] No observations found matching criteria\n');
     return;
   }
 
@@ -2318,6 +2324,17 @@ export async function run(argv) {
     out(`[mem] DB path: ${DB_PATH}`);
     process.exitCode = 1;
     return;
+  }
+
+  // --json contract surfacing: only `search` and `context` actually emit JSON;
+  // historically `recent --json | jq` etc. silently produced text, breaking
+  // automation. Emit a one-line stderr note when --json is passed to a command
+  // that doesn't honor it. Stdout output and exit code are unchanged so existing
+  // text-parsing callers keep working — the note lives in stderr for scripts to
+  // detect the gap.
+  const JSON_SUPPORTED_CMDS = new Set(['search', 'context']);
+  if (cmdArgs.includes('--json') && !JSON_SUPPORTED_CMDS.has(cmd)) {
+    process.stderr.write(`[mem] Note: --json is supported only on: ${[...JSON_SUPPORTED_CMDS].join(', ')}. "${cmd}" outputs text.\n`);
   }
 
   try {

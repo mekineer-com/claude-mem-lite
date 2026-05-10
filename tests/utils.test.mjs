@@ -1070,6 +1070,20 @@ describe('scrubSecrets', () => {
     expect(result).toContain('user=john');  // not a secret key
   });
 
+  it('does not scrub prose mentions of bare credential words (token/password/bearer)', () => {
+    // Round-3 dogfood regression: "Marker token: xyzpdq-round3" was scrubbed at write time
+    // because the bare-word `token: VALUE` pattern matched conversational English.
+    // Bare keys preceded by an English word + horizontal whitespace are prose, not config.
+    expect(scrubSecrets('Marker token: xyzpdq-round3.')).toBe('Marker token: xyzpdq-round3.');
+    expect(scrubSecrets('Note: see token: someValue123 in the log')).toBe('Note: see token: someValue123 in the log');
+    expect(scrubSecrets('the bearer: alice@example was rotated')).toBe('the bearer: alice@example was rotated');
+    // But structured keys (with separator) still scrub even after prose:
+    expect(scrubSecrets('Marker auth_token: bearer123abc')).toBe('Marker auth_token: ***');
+    // Indented / start-of-line config still scrubs:
+    expect(scrubSecrets('  password: hunter2')).toBe('  password: ***');
+    expect(scrubSecrets('\tpassword=hunter2')).toBe('\tpassword=***');
+  });
+
   it('does not scrub code-like values (null, undefined, function calls)', () => {
     expect(scrubSecrets('token = null')).toBe('token = null');
     expect(scrubSecrets('password = undefined')).toBe('password = undefined');
