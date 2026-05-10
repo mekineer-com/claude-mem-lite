@@ -16,3 +16,6 @@
 /.claude/
 .omx/
 .gstack/
+
+# Local working notes / carry-forward task lists — not part of release artifacts
+tasks/
