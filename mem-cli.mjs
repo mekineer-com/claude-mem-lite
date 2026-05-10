@@ -2250,6 +2250,7 @@ Commands:
     search "<query>"    Search events [--type T] [--limit N] [--project P]
     recent [N]          Most recent events [--type T] [--project P]
     show <id>           Show full event row by id
+    delete <id1,id2,…>  Delete events by ID (preview by default; use --confirm to execute)
 
     Valid types: bugfix, lesson, bug, discovery, refactor, feature, observation, decision
     --files (plural, comma-split) preferred; --file (singular) kept for back-compat.

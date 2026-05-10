@@ -191,4 +191,99 @@ describe('cmdActivity CLI: --type validation', () => {
       teardownDir();
     }
   });
+
+  test('activity delete previews by default and refuses to delete without --confirm', () => {
+    setupDir();
+    try {
+      const save = runCli(['activity', 'save', '--type', 'bugfix', 'about to be deleted']);
+      const { id } = JSON.parse(save.stdout.trim());
+
+      // preview path
+      const preview = runCli(['activity', 'delete', String(id)]);
+      expect(preview.exitCode).toBe(0);
+      expect(preview.stdout).toContain('Preview');
+      expect(preview.stdout).toContain(`#${id}`);
+      expect(preview.stdout).toContain('Run with --confirm');
+
+      // row is still there
+      const show1 = runCli(['activity', 'show', String(id)]);
+      expect(show1.exitCode).toBe(0);
+      expect(show1.stdout).toContain('about to be deleted');
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity delete --confirm executes and removes the row', () => {
+    setupDir();
+    try {
+      const save = runCli(['activity', 'save', '--type', 'bugfix', 'will be deleted']);
+      const { id } = JSON.parse(save.stdout.trim());
+
+      const del = runCli(['activity', 'delete', String(id), '--confirm']);
+      expect(del.exitCode).toBe(0);
+      expect(del.stdout).toContain('Deleted 1 event');
+
+      const show = runCli(['activity', 'show', String(id)]);
+      expect(show.stdout).toContain('Not found');
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity delete supports comma-separated batch IDs', () => {
+    setupDir();
+    try {
+      const a = JSON.parse(runCli(['activity', 'save', '--type', 'bugfix', 'batch a']).stdout.trim()).id;
+      const b = JSON.parse(runCli(['activity', 'save', '--type', 'bugfix', 'batch b']).stdout.trim()).id;
+      const c = JSON.parse(runCli(['activity', 'save', '--type', 'bugfix', 'batch c']).stdout.trim()).id;
+
+      const del = runCli(['activity', 'delete', `${a},${b},${c}`, '--confirm']);
+      expect(del.exitCode).toBe(0);
+      expect(del.stdout).toContain('Deleted 3 event');
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity delete: missing IDs in mixed list are listed in preview but skipped on execute', () => {
+    setupDir();
+    try {
+      const a = JSON.parse(runCli(['activity', 'save', '--type', 'bugfix', 'mixed valid']).stdout.trim()).id;
+      const bogusId = 999999;
+
+      const preview = runCli(['activity', 'delete', `${a},${bogusId}`]);
+      expect(preview.exitCode).toBe(0);
+      expect(preview.stdout).toContain(`#${a}`);
+      expect(preview.stdout).toContain(`not found and will be skipped: ${bogusId}`);
+
+      const del = runCli(['activity', 'delete', `${a},${bogusId}`, '--confirm']);
+      expect(del.exitCode).toBe(0);
+      expect(del.stdout).toContain('Deleted 1 event');
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity delete: all missing IDs fails with EXIT=1', () => {
+    setupDir();
+    try {
+      const { stderr, exitCode } = runCli(['activity', 'delete', '111111,222222', '--confirm']);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('no events found');
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity delete: rejects non-positive / non-integer IDs', () => {
+    setupDir();
+    try {
+      const r = runCli(['activity', 'delete', 'abc,-5,0']);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain('no valid IDs');
+    } finally {
+      teardownDir();
+    }
+  });
 });

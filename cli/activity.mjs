@@ -109,5 +109,52 @@ export async function cmdActivity(db, args) {
     return;
   }
 
+  if (sub === 'delete') {
+    // Mirrors cmdDelete (mem-cli.mjs:1316): preview by default, --confirm
+    // executes. Per Tier 3b in tasks/v2.66-carry-forward.md the events table
+    // accumulates corrupted titles from old hook-llm fallback bugs (#8158).
+    // This command lets users prune them by ID without dropping to raw SQL.
+    const idStr = positional.join(',').trim();
+    if (!idStr) {
+      fail('[mem] Usage: claude-mem-lite activity delete <id1,id2,...> [--confirm]');
+      return;
+    }
+    const ids = idStr.split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(s => parseInt(s, 10))
+      .filter(n => Number.isInteger(n) && n > 0);
+    if (ids.length === 0) {
+      fail('[mem] activity delete: no valid IDs provided (must be positive integers)');
+      return;
+    }
+
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT id, event_type, title FROM events WHERE id IN (${placeholders})`).all(...ids);
+    if (rows.length === 0) {
+      fail(`[mem] activity delete: no events found for ID(s) ${ids.join(', ')}`);
+      return;
+    }
+
+    const confirm = flags.confirm === true || flags.confirm === 'true';
+    if (!confirm) {
+      out(`[mem] Preview: ${rows.length} event(s) will be deleted:`);
+      for (const r of rows) {
+        const titleStr = (r.title || '').slice(0, 100);
+        out(`  #${r.id} [${r.event_type}] ${titleStr}`);
+      }
+      const missingIds = ids.filter(i => !rows.some(r => r.id === i));
+      if (missingIds.length > 0) {
+        out(`[mem] Note: ${missingIds.length} ID(s) not found and will be skipped: ${missingIds.join(', ')}`);
+      }
+      out('[mem] Run with --confirm to execute deletion.');
+      return;
+    }
+
+    const result = db.prepare(`DELETE FROM events WHERE id IN (${placeholders})`).run(...ids);
+    out(`[mem] Deleted ${result.changes} event(s).`);
+    return;
+  }
+
   fail(`[mem] Unknown activity subcommand: ${sub}`);
 }
