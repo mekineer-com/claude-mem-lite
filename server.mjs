@@ -13,7 +13,7 @@ import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, b
 import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
 import { effectiveQuiet } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
+import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
 // Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
 // (discouragement-style, Task 5). This keeps server.mjs from drifting.
@@ -30,6 +30,10 @@ import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import {
+  insertDeferred, listOpenWithOrdinal, dropDeferred,
+  resolveDeferredIds,
+} from './lib/deferred-work.mjs';
 import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
 import { createRequire } from 'module';
 
@@ -923,6 +927,79 @@ server.registerTool(
 
     const lessonNote = result.lessonCaptured ? ` 💡lesson captured` : '';
     return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}` }] };
+  })
+);
+
+// ─── Tool: mem_defer ────────────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_defer',
+  {
+    description: descriptionOf('mem_defer'),
+    inputSchema: memDeferSchema,
+  },
+  safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    const project = args.project || inferProject();
+    const r = insertDeferred(db, {
+      project,
+      title: args.title,
+      priority: args.priority ?? 2,
+      detail: args.detail ?? null,
+      files: args.files ?? null,
+    });
+    // Compute the ordinal for the freshly-inserted row so the response is
+    // immediately actionable ("ok, I deferred this as item 1").
+    const open = listOpenWithOrdinal(db, project, 50);
+    const ord = open.find(o => o.id === r.id)?.ordinal ?? null;
+    return { content: [{ type: 'text', text:
+      `Deferred as D#${r.id} (item ${ord ?? '?'}) in project "${project}" — surfaces in next SessionStart banner.` }] };
+  })
+);
+
+// ─── Tool: mem_defer_list ───────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_defer_list',
+  {
+    description: descriptionOf('mem_defer_list'),
+    inputSchema: memDeferListSchema,
+  },
+  safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    const project = args.project || inferProject();
+    const list = listOpenWithOrdinal(db, project, args.limit ?? 10);
+    if (list.length === 0) {
+      return { content: [{ type: 'text', text: `No open deferred items in project "${project}".` }] };
+    }
+    const lines = [`Open deferred items (project "${project}"):`];
+    for (const r of list) {
+      const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
+      lines.push(`${r.ordinal}. ${pTag} [P${r.priority}] ${r.title} (D#${r.id})`);
+    }
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  })
+);
+
+// ─── Tool: mem_defer_drop ───────────────────────────────────────────────────
+
+server.registerTool(
+  'mem_defer_drop',
+  {
+    description: descriptionOf('mem_defer_drop'),
+    inputSchema: memDeferDropSchema,
+  },
+  safeHandler(async (args) => {
+    if (args.project) args = { ...args, project: resolveProject(args.project) };
+    const project = args.project || inferProject();
+    // Resolve id (accept D#N or ordinal int) via resolveDeferredIds with a
+    // single-element array — reuses the same project + status validation.
+    const [realId] = resolveDeferredIds(db, project, [args.id]);
+    const r = dropDeferred(db, realId, args.reason);
+    if (r.changed === 0) {
+      return { content: [{ type: 'text', text: `D#${realId} was not in 'open' status — drop is a no-op.` }] };
+    }
+    return { content: [{ type: 'text', text: `Dropped D#${realId} in project "${project}". Reason: ${args.reason}` }] };
   })
 );
 
@@ -2038,11 +2115,15 @@ server.registerTool(
 );
 
 // ─── Hidden tool filter ─────────────────────────────────────────────────────
-// All 17 tools are registered (so `tools/call <name>` still resolves for
-// scripts and direct MCP clients), but only the 6 core tools appear in the
-// `tools/list` response. Hiding the 11 maintenance/admin tools keeps Claude
-// Code's startup context small while preserving the contract that the plugin
-// dogfoods (see CLAUDE.md §Mem usage contract and adopt-content.mjs).
+// All tools are registered (so `tools/call <name>` still resolves for scripts
+// and direct MCP clients), but only the core tools appear in the `tools/list`
+// response. Hiding the maintenance/admin tools keeps Claude Code's startup
+// context small while preserving the contract that the plugin dogfoods (see
+// CLAUDE.md §Mem usage contract and adopt-content.mjs).
+// Surface counts as of v2.70.0: 9 core (mem_search/recent/timeline/get/save/
+// recall + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden (maintenance/
+// admin/specialized) = 20 registered; tests/tool-schemas.test.mjs is the
+// authoritative count.
 //
 // Safe because:
 //   - Protocol-layer override: we replace the mcp.js default ListTools
@@ -2055,9 +2136,9 @@ const HIDDEN_TOOL_NAMES = new Set(
 );
 
 // Opt-out: setting CLAUDE_MEM_ALL_TOOLS=1 restores pre-v2.34.0 behavior where
-// all 17 tools are visible in `tools/list`. Users who relied on Claude Code
-// autonomously invoking the now-hidden maintenance tools can use this as an
-// immediate escape hatch while adopting the CLI entry points documented in
+// every registered tool is visible in `tools/list`. Users who relied on Claude
+// Code autonomously invoking the now-hidden maintenance tools can use this as
+// an immediate escape hatch while adopting the CLI entry points documented in
 // adopt-content.mjs / README.
 const EXPOSE_ALL_TOOLS = process.env.CLAUDE_MEM_ALL_TOOLS === '1';
 
@@ -2080,7 +2161,7 @@ if (!EXPOSE_ALL_TOOLS) {
 // harnesses stay silent.
 if (!effectiveQuiet()) {
   const status = EXPOSE_ALL_TOOLS
-    ? 'all 17 tools exposed via CLAUDE_MEM_ALL_TOOLS=1'
+    ? `all ${TOOL_DEFS.length} tools exposed via CLAUDE_MEM_ALL_TOOLS=1`
     : `tools/list narrowed to ${TOOL_DEFS.length - HIDDEN_TOOL_NAMES.size} core tools (${HIDDEN_TOOL_NAMES.size} hidden but callable by exact name; unset CLAUDE_MEM_ALL_TOOLS to keep, set =1 to restore all)`;
   process.stderr.write(`[claude-mem-lite v${PKG_VERSION}] ${status}\n`);
 }

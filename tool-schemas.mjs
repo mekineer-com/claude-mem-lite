@@ -140,6 +140,31 @@ export const memDeleteSchema = {
   confirm: coerceBool.describe('false=preview what will be deleted, true=execute deletion'),
 };
 
+// Coerce closes_deferred input — accepts mixed array of integers (ordinals) and
+// "D#<n>" strings (raw ids). Numeric strings are coerced to numbers (so MCP
+// bridges that JSON-stringify ints don't drop them); D#-prefixed strings stay
+// strings for the resolver. Other string shapes reject early at schema layer.
+const coerceDeferredTokens = z.preprocess(
+  (v) => {
+    if (Array.isArray(v)) {
+      return v.map(x => {
+        if (typeof x === 'number') return x;
+        if (typeof x === 'string') {
+          const s = x.trim();
+          if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+          return s;
+        }
+        return x;
+      });
+    }
+    return v;
+  },
+  z.array(z.union([
+    z.number().int().positive(),
+    z.string().regex(/^D#\d+$/, 'expected D#N (raw id) or positive integer (ordinal)'),
+  ])).min(1).max(20)
+);
+
 export const memSaveSchema = {
   content: z.string().min(1).max(50000).describe('Memory content to save'),
   title: z.string().optional().describe('Short title'),
@@ -148,6 +173,7 @@ export const memSaveSchema = {
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 2 for explicit saves)'),
   files: coerceStringArray.optional().describe('File paths associated with this observation'),
   lesson_learned: z.string().max(500).optional().describe('Key lesson or takeaway (for bugfix: root cause & fix; for decision: rationale)'),
+  closes_deferred: coerceDeferredTokens.optional().describe('Close one or more deferred_work items in the same project. Mixed array: bare integer = ordinal-within-project, "D#<n>" string = raw id. Transactional with the obs insert — a single invalid id rolls back the whole save.'),
 };
 
 export const memStatsSchema = {
@@ -250,6 +276,28 @@ export const memBrowseSchema = {
   project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
   tier: z.enum(['working', 'active', 'archive']).optional().describe('Show only this tier'),
   limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max entries per tier (default 5, or 20 when filtering by tier)'),
+};
+
+export const memDeferSchema = {
+  title: z.string().min(1).max(200).describe('One-line subject of the deferred item'),
+  priority: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('1=low, 2=normal, 3=urgent (default: 2)'),
+  detail: z.string().max(2000).optional().describe('Optional longer description / constraint / why deferred'),
+  files: coerceStringArray.optional().describe('Optional file paths this deferred item concerns'),
+  project: z.string().optional().describe('Project name (default: inferred from CWD)'),
+};
+
+export const memDeferListSchema = {
+  project: z.string().optional().describe('Project name (default: inferred from CWD)'),
+  limit: coerceInt.pipe(z.number().int().min(1).max(50)).optional().describe('Max results (default 10)'),
+};
+
+export const memDeferDropSchema = {
+  id: z.union([
+    coerceInt.pipe(z.number().int().positive()),
+    z.string().regex(/^D#\d+$/, 'expected D#N or positive integer'),
+  ]).describe('Deferred item id — accepts D#N (raw id) or positive integer (ordinal-within-project)'),
+  reason: z.string().min(1).max(500).describe('Why this item is being dropped (required for audit trail)'),
+  project: z.string().optional().describe('Project name (default: inferred from CWD)'),
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -598,5 +646,58 @@ export const tools = [
       'Equivalent CLI: claude-mem-lite browse [--tier active] [--project X]',
     inputSchema: memBrowseSchema,
     hidden: true,
+  },
+  {
+    name: 'mem_defer',
+    description:
+      'Save a future-session TODO to the project carry-forward list. Surfaces in the next SessionStart `### Deferred Work` banner with an ordinal (e.g. "1") so user can say "处理1" / "handle item 1".\n' +
+      '\n' +
+      'DO NOT use when:\n' +
+      '  - Work is in-flight this session (just do it; do not defer mid-task)\n' +
+      '  - This-PR follow-up cleanup (file in tasks/, not deferred_work)\n' +
+      '  - Already saved a bugfix obs for it (use mem_save closes_deferred instead)\n' +
+      '\n' +
+      'USE when:\n' +
+      '  - User says "下次/next session/留给下个会话/defer to next round"\n' +
+      '  - Wrap-up phase enumerates follow-up items for the next session\n' +
+      '  - Bug surfaces but root cause is out of this session\'s scope\n' +
+      '\n' +
+      'Equivalent CLI: claude-mem-lite defer add "<title>" [--priority 1|2|3] [--detail "..."] [--files a.mjs,b.mjs]',
+    inputSchema: memDeferSchema,
+  },
+  {
+    name: 'mem_defer_list',
+    description:
+      'List open deferred_work items for a project, ordered by priority DESC then age. Each item carries a per-project ordinal (1, 2, 3...) for "处理1"-style reference.\n' +
+      '\n' +
+      'DO NOT use when:\n' +
+      '  - The SessionStart `### Deferred Work` block already shows the items (reuse that — same data)\n' +
+      '  - You only need one item by id (use mem_get on the obs that closed it, or look up the row directly)\n' +
+      '\n' +
+      'USE when:\n' +
+      '  - User asks "what was on the deferred list" / "what did I leave for next time"\n' +
+      '  - About to refer to "item N" and need to confirm what N points to\n' +
+      '  - Auditing carry-forward state across multiple sessions\n' +
+      '\n' +
+      'Equivalent CLI: claude-mem-lite defer list [--project X] [--limit 10]',
+    inputSchema: memDeferListSchema,
+  },
+  {
+    name: 'mem_defer_drop',
+    description:
+      'Mark a deferred_work item as dropped (no fix, no longer relevant) with a required reason. For real fixes, prefer mem_save({type:"bugfix", closes_deferred:[N]}) — establishes audit trail.\n' +
+      '\n' +
+      'DO NOT use when:\n' +
+      '  - The item was actually fixed (use mem_save closes_deferred — audit linkage)\n' +
+      '  - You want to delete the row (drops are soft — status flips, row stays)\n' +
+      '  - The reason is trivial — drop reason is the only audit trail for "why no fix"\n' +
+      '\n' +
+      'USE when:\n' +
+      '  - Originally-deferred item turns out to be a flaky test, not a real bug\n' +
+      '  - Scope changed and the work is no longer needed\n' +
+      '  - User explicitly says "drop the deferred X, never mind"\n' +
+      '\n' +
+      'Equivalent CLI: claude-mem-lite defer drop <D#N|ordinal> --reason "..."',
+    inputSchema: memDeferDropSchema,
   },
 ];

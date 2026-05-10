@@ -9,10 +9,13 @@
 import { describe, it, expect } from 'vitest';
 import { tools } from '../tool-schemas.mjs';
 
-const CORE_TOOLS = ['mem_search', 'mem_recent', 'mem_timeline', 'mem_get', 'mem_save', 'mem_recall'];
+const CORE_TOOLS = [
+  'mem_search', 'mem_recent', 'mem_timeline', 'mem_get', 'mem_save', 'mem_recall',
+  'mem_defer', 'mem_defer_list', 'mem_defer_drop',
+];
 
 describe('MCP tools surface', () => {
-  it('exposes exactly 6 core tools via tools/list', () => {
+  it('exposes exactly 9 core tools via tools/list', () => {
     const exposed = tools.filter(t => !t.hidden).map(t => t.name).sort();
     expect(exposed).toEqual([...CORE_TOOLS].sort());
   });
@@ -78,6 +81,9 @@ describe('MCP tools surface', () => {
         "mem_get",
         "mem_save",
         "mem_recall",
+        "mem_defer",
+        "mem_defer_list",
+        "mem_defer_drop",
       ]
     `);
   });

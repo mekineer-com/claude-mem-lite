@@ -7,21 +7,23 @@ import { describe, test, expect } from 'vitest';
 import { tools } from '../tool-schemas.mjs';
 
 describe('MCP tool descriptions use discouragement style', () => {
-  test('there are exactly 17 tools (6 core + 11 hidden)', () => {
-    expect(tools).toHaveLength(17);
+  test('there are exactly 20 tools (9 core + 11 hidden)', () => {
+    expect(tools).toHaveLength(20);
     const core = tools.filter((t) => !t.hidden);
     const hidden = tools.filter((t) => t.hidden === true);
-    expect(core, 'core count').toHaveLength(6);
+    expect(core, 'core count').toHaveLength(9);
     expect(hidden, 'hidden count').toHaveLength(11);
   });
 
-  test('core (unhidden) names are the contract-critical six', () => {
+  test('core (unhidden) names are the contract-critical nine', () => {
     const coreNames = tools.filter((t) => !t.hidden).map((t) => t.name).sort();
-    // These six back the claude-mem-lite invited-memory contract and the
-    // hottest retrieval paths. Changing this list is an MCP surface-area
-    // change — update adopt-content.mjs and CLAUDE.md in the same PR.
+    // The original six back the claude-mem-lite invited-memory contract; the
+    // three mem_defer_* tools (v2.70) are first-class carry-forward primitives.
+    // Changing this list is an MCP surface-area change — update adopt-content.mjs
+    // and CLAUDE.md in the same PR.
     expect(coreNames).toEqual(
-      ['mem_get', 'mem_recall', 'mem_recent', 'mem_save', 'mem_search', 'mem_timeline'],
+      ['mem_defer', 'mem_defer_drop', 'mem_defer_list',
+       'mem_get', 'mem_recall', 'mem_recent', 'mem_save', 'mem_search', 'mem_timeline'],
     );
   });
 
@@ -59,6 +61,7 @@ describe('MCP tool descriptions use discouragement style', () => {
       'mem_save', 'mem_stats', 'mem_compress', 'mem_maintain', 'mem_optimize',
       'mem_registry', 'mem_use', 'mem_update', 'mem_export', 'mem_recall',
       'mem_fts_check', 'mem_browse',
+      'mem_defer', 'mem_defer_list', 'mem_defer_drop',
     ].map((n) => [n])
   )('%s description has DO NOT / USE when markers and <800 chars', (name) => {
     const tool = tools.find((t) => t.name === name);

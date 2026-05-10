@@ -62,6 +62,7 @@
     "lib/metrics.mjs",
     "lib/mem-override.mjs",
     "lib/save-observation.mjs",
+    "lib/deferred-work.mjs",
     "cli/common.mjs",
     "cli/fts-check.mjs",
     "cli/doctor.mjs",

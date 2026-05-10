@@ -63,6 +63,9 @@ export const SOURCE_FILES = [
   // mem-cli.mjs::cmdSave and server.mjs::mem_save. Statically imported from both
   // entry points; missing it from the manifest broke MCP saves on auto-update.
   'lib/save-observation.mjs',
+  // v2.70 deferred-work: carry-forward TODO primitives. Statically imported by
+  // server.mjs (mem_defer family) and mem-cli.mjs (defer subcommand).
+  'lib/deferred-work.mjs',
 ];
 
 /**
