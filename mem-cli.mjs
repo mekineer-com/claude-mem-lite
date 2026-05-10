@@ -2421,6 +2421,13 @@ Commands:
   import-jsonl <file-or-dir>      Import Claude Code JSONL transcripts (cold-start backfill)
     --project P         Project name (default: inferred from cwd)
 
+  import <github-url>   Import skills/agents into the resource registry from a GitHub repo
+    --enrich            Auto-enrich each imported resource with a Haiku capability summary
+
+  enrich <name>         Re-enrich a single registry resource (Haiku capability summary)
+    --all               Enrich every active resource missing or failed enrichment
+    --batch             Skip the inter-call delay (use only with low rate-limit risk)
+
   activity <action>     Non-memdir event log (v2.31) — bugfix/lesson/bug/discovery/etc.
     save --type T "<title>" [--body "<text>"] [--files f1,f2] [--file path] [--importance 1-3] [--project P]
     search "<query>"    Search events [--type T] [--limit N] [--project P]
