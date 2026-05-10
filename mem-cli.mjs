@@ -28,6 +28,10 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import {
+  insertDeferred, listOpenWithOrdinal, dropDeferred,
+  resolveDeferredIds, closeDeferredItems,
+} from './lib/deferred-work.mjs';
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
@@ -884,7 +888,7 @@ function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
   const text = positional.join(' ');
   if (!text) {
-    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T]');
+    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T] [--closes-deferred 1,D#42]');
     return;
   }
 
@@ -914,15 +918,60 @@ function cmdSave(db, args) {
     return;
   }
 
-  const result = saveObservation(db, {
-    content: text,
-    title: flags.title,
-    type,
-    importance: rawImp,
-    project,
-    files: saveFiles,
-    lesson_learned: rawLesson,
-  });
+  // --closes-deferred parsing: accepts comma-separated mixed tokens
+  // ("1,D#42,3") with bare integers treated as ordinals and "D#N" as raw ids.
+  // We pre-parse tokens here (cheap, syntax-only) but defer resolveDeferredIds
+  // INTO the transaction, AFTER the dedup check. Resolving outside the
+  // transaction would throw on the duplicate-replay path: the previously-
+  // closed deferred row is no longer 'open', so ordinal/id resolution would
+  // crash even though the duplicate short-circuit makes closure a no-op.
+  // Resolving inside the dedup-gated branch keeps "save the same content
+  // twice" idempotent (mirrors server.mjs:934 dedup-skip-closure intent).
+  let closesTokens = null;
+  if (flags['closes-deferred'] !== undefined && flags['closes-deferred'] !== false) {
+    const raw = String(flags['closes-deferred']);
+    closesTokens = raw.split(',').map(t => t.trim()).filter(Boolean).map(t => {
+      return /^\d+$/.test(t) ? parseInt(t, 10) : t;
+    });
+    if (closesTokens.length === 0) {
+      fail('[mem] --closes-deferred requires at least one token (integer ordinal or D#N)');
+      return;
+    }
+  }
+
+  let result;
+  let closesIds = null;
+  try {
+    result = db.transaction(() => {
+      const r = saveObservation(db, {
+        content: text,
+        title: flags.title,
+        type,
+        importance: rawImp,
+        project,
+        files: saveFiles,
+        lesson_learned: rawLesson,
+      });
+      // Skip closure on dedup short-circuit — the obs row already exists, so
+      // the deferred item should NOT be re-closed by a duplicate save call.
+      // Resolving deferred ids only on the non-duplicate path keeps repeated
+      // save commands (with the same --closes-deferred) idempotent even after
+      // the deferred row has transitioned out of 'open'.
+      if (r.kind === 'duplicate') return r;
+      if (closesTokens) {
+        closesIds = resolveDeferredIds(db, project, closesTokens);
+        closeDeferredItems(db, closesIds, r.id);
+      }
+      return r;
+    })();
+  } catch (e) {
+    if (closesTokens) {
+      fail(`[mem] save with --closes-deferred failed: ${e.message}`);
+    } else {
+      fail(`[mem] save failed: ${e.message}`);
+    }
+    return;
+  }
 
   if (result.kind === 'duplicate') {
     out(`[mem] Skipped: similar to existing #${result.existingId}. Use "claude-mem-lite get ${result.existingId}" to review.`);
@@ -930,7 +979,108 @@ function cmdSave(db, args) {
   }
 
   const lessonNote = result.lessonCaptured ? ' 💡lesson captured' : '';
-  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}`);
+  const closedNote = closesIds && closesIds.length > 0
+    ? ` Closed: ${closesIds.map(i => `D#${i}`).join(', ')}.`
+    : '';
+  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}`);
+}
+
+// ─── cmdDefer (sub-dispatch: add | list | drop) ──────────────────────────────
+
+function cmdDefer(db, args) {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'add':  cmdDeferAdd(db, rest); break;
+    case 'list': cmdDeferList(db, rest); break;
+    case 'drop': cmdDeferDrop(db, rest); break;
+    default:
+      fail('[mem] Usage: claude-mem-lite defer <add|list|drop> ...');
+      fail('[mem]   defer add "<title>" [--priority 1|2|3] [--detail T] [--files f1,f2] [--project P]');
+      fail('[mem]   defer list [--project P] [--limit N]');
+      fail('[mem]   defer drop <id-or-D#N> --reason "<reason>" [--project P]');
+  }
+}
+
+function cmdDeferAdd(db, args) {
+  const { positional, flags } = parseArgs(args);
+  const title = positional.join(' ').trim();
+  if (!title) {
+    fail('[mem] Usage: claude-mem-lite defer add "<title>" [--priority 1|2|3] [--detail T] [--files f1,f2] [--project P]');
+    return;
+  }
+  const priority = flags.priority !== undefined ? parseInt(flags.priority, 10) : 2;
+  if (![1, 2, 3].includes(priority)) {
+    fail(`[mem] Invalid --priority "${flags.priority}". Must be 1 (low), 2 (normal), or 3 (urgent).`);
+    return;
+  }
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const detail = typeof flags.detail === 'string' ? flags.detail : null;
+  const files = flags.files
+    ? flags.files.split(',').map(f => f.trim()).filter(Boolean)
+    : null;
+
+  let r;
+  try {
+    r = insertDeferred(db, { project, title, priority, detail, files });
+  } catch (e) {
+    fail(`[mem] defer add failed: ${e.message}`);
+    return;
+  }
+  // Compute the freshly-inserted row's ordinal for an immediately-actionable
+  // response ("ok, deferred this as item N"). Mirrors server.mjs:980.
+  const open = listOpenWithOrdinal(db, project, 50);
+  const ord = open.find(o => o.id === r.id)?.ordinal ?? '?';
+  out(`[mem] Deferred as D#${r.id} (item ${ord}) in project "${project}".`);
+}
+
+function cmdDeferList(db, args) {
+  const { flags } = parseArgs(args);
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 100 });
+  const list = listOpenWithOrdinal(db, project, limit);
+  if (list.length === 0) {
+    out(`[mem] No open deferred items in project "${project}".`);
+    return;
+  }
+  out(`[mem] Open deferred items (project "${project}"):`);
+  for (const r of list) {
+    const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
+    out(`  ${r.ordinal}. ${pTag} [P${r.priority}] ${r.title} (D#${r.id})`);
+  }
+}
+
+function cmdDeferDrop(db, args) {
+  const { positional, flags } = parseArgs(args);
+  if (positional.length === 0) {
+    fail('[mem] Usage: claude-mem-lite defer drop <id-or-D#N> --reason "<reason>" [--project P]');
+    return;
+  }
+  const reason = flags.reason;
+  if (!reason || typeof reason !== 'string' || reason.trim().length === 0) {
+    fail('[mem] defer drop requires --reason "<non-empty string>"');
+    return;
+  }
+  const rawTok = positional[0];
+  // Accept both bare integer (ordinal) and "D#N" string. Mirrors the MCP
+  // mem_defer_drop input contract (server.mjs:1025) by using the same
+  // single-element resolveDeferredIds call.
+  const token = /^\d+$/.test(rawTok) ? parseInt(rawTok, 10) : rawTok;
+  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+
+  let realId;
+  try {
+    [realId] = resolveDeferredIds(db, project, [token]);
+  } catch (e) {
+    fail(`[mem] defer drop: ${e.message}`);
+    return;
+  }
+  const r = dropDeferred(db, realId, reason);
+  if (r.changed === 0) {
+    out(`[mem] D#${realId} was not in 'open' status — drop is a no-op.`);
+    return;
+  }
+  out(`[mem] Dropped D#${realId} — reason: ${reason.trim()}`);
 }
 
 // N-1: Quality-focused stats for R-2 A/B baseline.
@@ -2506,6 +2656,7 @@ export async function run(argv) {
       case 'get':       cmdGet(db, cmdArgs); break;
       case 'timeline':  cmdTimeline(db, cmdArgs); break;
       case 'save':      cmdSave(db, cmdArgs); break;
+      case 'defer':     cmdDefer(db, cmdArgs); break;
       case 'delete':    cmdDelete(db, cmdArgs); break;
       case 'update':    cmdUpdate(db, cmdArgs); break;
       case 'export':    cmdExport(db, cmdArgs); break;
