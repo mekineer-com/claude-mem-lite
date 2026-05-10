@@ -656,6 +656,35 @@ describe('CLI E2E: adopt / unadopt routing', () => {
   });
 });
 
+// Regression: v2.71.0 shipped cli.mjs without 'import-jsonl' in CLI_COMMANDS,
+// so `claude-mem-lite import-jsonl …` fell through to the unknown-command
+// branch even though help and the mem-cli switch case both existed (#8414).
+// tests/import-jsonl.test.mjs invokes importJsonl() directly and missed it.
+// Lock CLI routing here.
+describe('CLI E2E: import-jsonl routing', () => {
+  it('import-jsonl is routed by cli.mjs (not unknown-command)', () => {
+    const emptyDir = join(tmpHome, 'empty-jsonl-dir');
+    mkdirSync(emptyDir, { recursive: true });
+    const { stdout, stderr, exitCode } = runCli(['import-jsonl', emptyDir]);
+    expect(stderr).not.toContain('Unknown command');
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('No .jsonl files found');
+  });
+
+  it('import-jsonl without args prints Usage (not Unknown command)', () => {
+    const { stderr, exitCode } = runCli(['import-jsonl']);
+    expect(stderr).not.toContain('Unknown command');
+    expect(stderr).toContain('Usage');
+    expect(exitCode).toBe(1);
+  });
+
+  it('help output advertises import-jsonl', () => {
+    const { stdout, exitCode } = runCli(['help']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/^\s*import-jsonl\b/m);
+  });
+});
+
 describe('CLI E2E: context', () => {
   it('reports empty context for a project with no DB data', () => {
     // Pre-v2.30 this asserted a "No CLAUDE.md" error. Post-v2.30 the command
