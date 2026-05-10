@@ -45,6 +45,7 @@
     "adopt-cli.mjs",
     "haiku-client.mjs",
     "lib/activity.mjs",
+    "lib/cli-flags.mjs",
     "lib/git-state.mjs",
     "lib/task-reader.mjs",
     "lib/plan-reader.mjs",

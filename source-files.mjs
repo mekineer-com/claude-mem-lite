@@ -29,6 +29,7 @@ export const SOURCE_FILES = [
   // lib/ — statically imported by hook-llm.mjs (activity) + hook-handoff.mjs (git-state, task-reader);
   // dynamically imported by hook.mjs (startup-dashboard) + mem-cli.mjs (doctor-benchmark, plan-reader).
   'lib/activity.mjs',
+  'lib/cli-flags.mjs',
   'lib/task-reader.mjs',
   'lib/plan-reader.mjs',
   'lib/git-state.mjs',

@@ -17,6 +17,7 @@ import { searchResources } from './registry-retriever.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
+import { parseIntFlag } from './lib/cli-flags.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
 import { basename, join } from 'path';
@@ -38,13 +39,7 @@ function cmdSearch(db, args) {
     return;
   }
 
-  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-  // Distinguish missing/non-integer (use default) from non-positive (silently clamping to 1
-  // produced confusing "Found 1 of 44 result" output for --limit 0/-N — warn instead).
-  if (flags.limit !== undefined && (!Number.isInteger(rawLimit) || rawLimit < 1)) {
-    process.stderr.write(`[mem] Invalid --limit "${flags.limit}" (must be a positive integer); using default 20\n`);
-  }
-  const limit = Number.isInteger(rawLimit) && rawLimit >= 1 ? rawLimit : 20;
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
   const type = flags.type || null;
   const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
   if (type && !validObsTypes.has(type)) {
@@ -421,11 +416,7 @@ function cmdRecall(db, args) {
   }
 
   const filename = basename(file);
-  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-  if (flags.limit !== undefined && (!Number.isInteger(rawLimit) || rawLimit < 1)) {
-    process.stderr.write(`[mem] Invalid --limit "${flags.limit}" (must be a positive integer); using default 10\n`);
-  }
-  const limit = Number.isInteger(rawLimit) && rawLimit >= 1 ? rawLimit : 10;
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 1000 });
   const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
 
   // Search via observation_files junction table for indexed filename lookups
@@ -887,7 +878,7 @@ async function renderQualityReport(db, { project, days }) {
 async function cmdStats(db, args) {
   const { flags } = parseArgs(args);
   const project = flags.project ? resolveProject(db, flags.project) : null;
-  const days = parseInt(flags.days, 10) || 30;
+  const days = parseIntFlag(flags.days, { name: '--days', defaultValue: 30, max: 3650 });
   // N-1: --quality routes to a separate quality-focused report (lesson rate,
   // LOW_SIGNAL rate, per-type hit+lesson %, R-2 watchdog targets). Intended as
   // the baseline metric dashboard for the future Haiku prompt A/B test.
@@ -1093,8 +1084,7 @@ function cmdBrowse(db, args) {
     fail(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
     return;
   }
-  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-  const limit = Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : (tierFilter ? 20 : 5);
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: tierFilter ? 20 : 5, max: 1000 });
   const now = Date.now();
 
   const ctx = {
@@ -1351,8 +1341,7 @@ function cmdExport(db, args) {
     process.stderr.write(`[mem] Note: --from "${flags.from}" is after --to "${flags.to}"; this range is empty\n`);
   }
 
-  const rawLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-  const limit = Math.min(Number.isInteger(rawLimit) ? Math.max(1, rawLimit) : 200, 1000);
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 200, max: 1000 });
   const format = flags.format || 'json';
   if (!['json', 'jsonl'].includes(format)) {
     fail(`[mem] Invalid format "${format}". Use: json or jsonl`);
@@ -1829,8 +1818,7 @@ function cmdRegistry(_memDb, args) {
 
     if (action === 'list') {
       const typeFilter = flags.type;
-      const rawLimit = parseInt(flags.limit, 10);
-      const listLimit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : 20;
+      const listLimit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
       const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
       const params = typeFilter ? [typeFilter, 'active'] : ['active'];
       const allResources = rdb.prepare(`
