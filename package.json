@@ -63,6 +63,7 @@
     "lib/mem-override.mjs",
     "lib/save-observation.mjs",
     "lib/deferred-work.mjs",
+    "lib/upgrade-banner.mjs",
     "cli/common.mjs",
     "cli/fts-check.mjs",
     "cli/doctor.mjs",

@@ -66,6 +66,10 @@ export const SOURCE_FILES = [
   // v2.70 deferred-work: carry-forward TODO primitives. Statically imported by
   // server.mjs (mem_defer family) and mem-cli.mjs (defer subcommand).
   'lib/deferred-work.mjs',
+  // v2.70 one-shot upgrade banner. Split out of hook.mjs because hook.mjs has
+  // module-level `process.exit(0)` side effects that abort vitest workers on
+  // direct import. Statically imported by hook.mjs SessionStart handler.
+  'lib/upgrade-banner.mjs',
 ];
 
 /**

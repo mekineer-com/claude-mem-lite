@@ -51,6 +51,7 @@ import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, 
 import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
+import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -1072,6 +1073,13 @@ async function handleSessionStart() {
     // One-time migration: remove any stale <claude-mem-context> block left in
     // CLAUDE.md by pre-v2.30 installs. Idempotent no-op afterwards.
     cleanupClaudeMdLegacyBlock();
+
+    // v2.70.0 one-shot upgrade banner: notify users on first SessionStart per
+    // project that the `### Deferred Work` block now reads from the
+    // deferred_work table (was: high-importance observations in v2.69.x).
+    // Idempotent via marker file; subsequent SessionStarts are silent.
+    try { emitV270UpgradeBanner({ project, runtimeDir: RUNTIME_DIR }); }
+    catch (e) { debugCatch(e, 'session-start-v270-banner'); }
 
     // Pre-load TF-IDF vocabulary cache for this session (from DB, ~1ms)
     try { getVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }
