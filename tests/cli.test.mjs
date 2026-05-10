@@ -1142,6 +1142,18 @@ describe('CLI maintain command', () => {
     expect(output).toContain('Pending purge');
   });
 
+  // Regression: SUM(CASE WHEN ... ELSE 0 END) returns NULL on empty sets;
+  // user-facing output then read "Stale: null", "Broken: null", "Boostable: null".
+  // Fix wraps each SUM in COALESCE(..., 0). Covers maintain scan + the parallel
+  // server.mjs mem_maintain query + lib/stats-quality.mjs aggregates.
+  it('scan returns 0 (not null) when project has no observations', async () => {
+    const output = await captureStdout(() => run(['maintain', 'scan', '--project', 'empty--project']));
+    expect(output).not.toContain('null');
+    expect(output).toContain('Stale (>30d, imp=1, no access): 0');
+    expect(output).toContain('Broken (no title/narrative): 0');
+    expect(output).toContain('Boostable (accessed>3, imp<3): 0');
+  });
+
   it('scan detects near-duplicates', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
@@ -1489,6 +1501,16 @@ describe('CLI stats --quality command', () => {
     // Default seed has zero compressed/pending-purge rows → line should not appear
     const output = await captureStdout(() => run(['stats', '--quality']));
     expect(output).not.toContain('Pending purge ≤');
+  });
+
+  // Regression: SUM(CASE WHEN ... ELSE 0 END) returns NULL on empty sets — used to
+  // render "Lesson rate: null / 0 (0.0%)" for projects with zero observations.
+  // Fix wraps each SUM in COALESCE(..., 0) in lib/stats-quality.mjs.
+  it('reports 0 (not null) for an empty project', async () => {
+    const output = await captureStdout(() => run(['stats', '--quality', '--project', 'empty--project']));
+    expect(output).not.toContain('null');
+    expect(output).toMatch(/Lesson rate:\s*0\s*\/\s*0/);
+    expect(output).toMatch(/LOW_SIGNAL:\s*0\s*\/\s*0/);
   });
 
   it('renders pending-purge watchdog with 🔴 + repair hint when ratio > 30%', async () => {

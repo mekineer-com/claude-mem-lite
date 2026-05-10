@@ -1329,12 +1329,12 @@ server.registerTool(
       const stats = db.prepare(`
         SELECT
           COUNT(*) as total,
-          SUM(CASE WHEN COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
-                        AND created_at_epoch < ? THEN 1 ELSE 0 END) as stale,
-          SUM(CASE WHEN (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
-                   THEN 1 ELSE 0 END) as broken,
-          SUM(CASE WHEN COALESCE(access_count, 0) > 3 AND COALESCE(importance, 1) < 3
-                   THEN 1 ELSE 0 END) as boostable
+          COALESCE(SUM(CASE WHEN COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
+                        AND created_at_epoch < ? THEN 1 ELSE 0 END), 0) as stale,
+          COALESCE(SUM(CASE WHEN (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
+                   THEN 1 ELSE 0 END), 0) as broken,
+          COALESCE(SUM(CASE WHEN COALESCE(access_count, 0) > 3 AND COALESCE(importance, 1) < 3
+                   THEN 1 ELSE 0 END), 0) as boostable
         FROM observations
         WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
       `).get(staleAge, ...baseParams);
