@@ -2,6 +2,21 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## [2.67.0] - 2026-05-10
+
+**Cross-session continuity hardening: handoff `working_on` no longer captures meta-trigger prompts verbatim, and SessionStart banner adds a `### Deferred Work` block surfacing project-level importance≥3 carry-forward decisions.** Schema unchanged. 87 test files / 2193 tests pass (+38 vs 2.66.0); zero ESLint errors.
+
+The pre-fix failure mode: a session whose only user prompt was a control instruction ("继续", "提交代码", "/exit") wrote that prompt verbatim into `session_handoffs.working_on`, so the next session resumed with self-referential garbage ("Working On: 继续前面的工作") instead of the actual subject. Project-level deferred decisions (importance=3 observations explicitly saved as carry-forward anchors) were buried as truncated rows in the Recent table with no semantic distinction.
+
+Two-layer fix:
+
+- **Write side (`utils.mjs::isMetaTriggerPrompt` + `hook-handoff.mjs::buildAndSaveHandoff`):** new detector strips trigger keywords (zh + en) and tests for <4 chars of substantive content remaining. `buildAndSaveHandoff` filters meta-trigger prompts; when ALL prompts are meta, falls back to the project's most recent importance≥3 non-low-signal observation as `(carry-forward subject) <title>`. Cross-project leakage prevented by `project=` filter.
+- **Read side (`hook-context.mjs::buildSessionContextLines`):** new `### Deferred Work` block independent of the per-session clear/exit handoff. Top 3 importance≥3 non-low-signal observations, full 140-char titles (vs 60-char truncation in Recent table). Quiet-hooks does NOT suppress — visibility is the whole point.
+
+Verified end-to-end via `claude-mem-lite context`: the v2.66 carry-forward decision (#8286) now surfaces as Deferred Work line #1 with full title, where it was previously row #2 in the Recent table truncated to "shippe…".
+
+Tests: +28 `isMetaTriggerPrompt` unit (zh + en + edge cases), +5 `buildAndSaveHandoff` meta-filter integration, +5 `buildSessionContextLines` Deferred Work block.
+
 ## [2.66.0] - 2026-05-10
 
 **Five-fix dogfood bundle: CJK bigram OR-fan-out on mixed-script queries, `doctor` exit-code propagation, `scrubSecrets` prose false-positive, `--json` contract-surfacing warning, `export` empty-result format respect.** Schema unchanged. 87 test files / 2155 tests pass (+3 new tests vs 2.65.0); zero ESLint errors.
