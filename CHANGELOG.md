@@ -2,6 +2,31 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.71.0 — privacy hardening + long-session robustness + cold-start
+
+**New**:
+- **`PreCompact` hook subscription** (`hook-precompact.mjs`). Claude Code emits `PreCompact` immediately before auto-compact runs the summarizer; we re-emit a fresh `<claude-mem-context>` block so memory survives the compaction step itself. Existing `SessionStart`-with-`compact` matcher fires AFTER compaction — by then prior-turn injection is already collapsed.
+- **`claude-mem-lite import-jsonl <file-or-dir>`** — cold-start backfill from Claude Code's per-session JSONL transcripts at `~/.claude/projects/<encoded>/<uuid>.jsonl`. Maps user prompts → `user_prompts`, tool_use+tool_result pairs → `observations` via existing scrub pipeline. Idempotent (SHA-256 dedup on `sessionId+timestamp+full-text`). Recursive directory walk. Truncated-transcript orphan tool_use gets a fallback observation marked `[tool_use without result — transcript truncated]`. New users / new machines no longer wait weeks for memory to accumulate.
+- **`lib/scrub-record.mjs`** — per-table text-field scrubber. Single source of truth for which columns of `observations` / `session_summaries` / `session_handoffs` are LLM-output-typed. Failsafe default: unknown tables scrub all string fields (over-scrub > under-scrub).
+
+**Changed**:
+- **`scrubRecord` now wraps every LLM-output text-write path** — 9 INSERT sites (T1) + 5 UPDATE sites (T1.5). Includes `hook-llm.mjs:215,841,991,1014`, `hook-handoff.mjs:165`, `hook.mjs:479,972,1041,1288`, `hook-optimize.mjs:164,264,403,577`, `mem-cli.mjs:1766`, `server.mjs:1252`. Without UPDATE coverage, `hook-optimize` (which fires automatically after every observation) silently undid the INSERT-time scrub — the audit's "every text-write path" claim now holds end-to-end.
+- **Truncate-after-scrub ordering** fixed at 4 sites (`hook-handoff.mjs`, `hook.mjs:479,972,1041`). Previously `truncate(rawText, N)` ran before `scrubSecrets`, letting a secret straddling the truncation boundary fall below `secret-scrub.mjs`'s `{8,}` regex length floor and escape. Order is now scrub → truncate.
+- **`session_handoffs.key_files`** now uses element-level scrub (`.map(scrubSecrets)` before `JSON.stringify`) instead of string-level. Scrubbing the JSON string risked rewriting quoted file paths and breaking downstream `JSON.parse`.
+
+**Tests**:
+- **+21 net** (2257 → 2278 across 95 files). Includes per-table scrubRecord unit tests, end-to-end leak checks for INSERT and UPDATE paths, JSON-stringified array contract test, 4 contract edge cases (null / non-object / mutation safety / prototype-chain), JSONL parser + idempotency + orphan + secret-scrub + 6-event fixture, PreCompact stdout emission tests.
+
+**Migration**:
+- No schema change. `CURRENT_SCHEMA_VERSION` unchanged at 31 (v2.70.0 baseline).
+- `hooks/hooks.json` adds a `PreCompact` event registration. Existing installs pick it up on plugin reload; opt-out by removing the `PreCompact` block locally.
+
+**Opt-out**:
+- Pin to prior version: `npm install -g claude-mem-lite@2.70.x`.
+
+**Why this exists**:
+Comparative review of `rohitg00/agentmemory` (this session, 2026-05-10) surfaced four high-value gaps in claude-mem-lite: privacy filter on the LLM-output write side, memory survival across auto-compact, cold-start backfill via Claude Code transcripts, and optional neural embeddings. The first three landed; the fourth (`@xenova/transformers` local embeddings) was attempted as a spike branch and reverted at the install-size gate (+137MB > 50MB ceiling, on a benchmark corpus where TF-IDF + FTS already hit 90% R@10). Spike report retained locally; main carries the three shipped features.
+
 ## v2.70.0 — first-class deferred work
 
 **New**:
