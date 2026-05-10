@@ -9,10 +9,12 @@ import { basename, join } from 'path';
 import { homedir } from 'os';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 
-// CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR env overrides allow tests and debug tools to
-// point the hook at an isolated DB + cooldown dir without touching the user's real state.
-const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(homedir(), '.claude-mem-lite', 'claude-mem-lite.db');
-const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(homedir(), '.claude-mem-lite', 'runtime');
+// CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
+// whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
+// per-component overrides for tests that mix isolated + real paths.
+const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(DATA_DIR, 'claude-mem-lite.db');
+const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
 // v2.33.1: cooldown path is session-scoped so same-file-twice within one
 // session never re-injects (was: global file, 5-min window). Cross-session:
 // fresh file, fresh nudges — this is intended. No session_id → fall back to

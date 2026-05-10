@@ -793,4 +793,100 @@ describe('pre-tool-recall', () => {
       expect(parsed.hookSpecificOutput.additionalContext).toContain('No prior lessons for stale.mjs');
     });
   });
+
+  // Regression: pre-tool-recall used to honor only CLAUDE_MEM_DB_PATH /
+  // CLAUDE_MEM_RUNTIME_DIR, while schema.mjs / main CLI honor CLAUDE_MEM_DIR.
+  // A user / test setting only CLAUDE_MEM_DIR for sandbox isolation got the
+  // CLI redirected but cooldown writes still leaked to ~/.claude-mem-lite/runtime/.
+  // The hook now derives both paths from CLAUDE_MEM_DIR by default; the
+  // narrower per-component overrides remain for tests that need to mix.
+  describe('CLAUDE_MEM_DIR alignment with main CLI', () => {
+    let tmpRoot;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = join(tmpdir(), `pre-recall-memdir-${process.pid}-${Date.now()}`);
+      mkdirSync(tmpRoot, { recursive: true });
+      projectDir = join(tmpRoot, 'parent', 'memdirtest');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-memdir', project: 'parent--memdirtest', memoryId: 'mem-memdir' });
+      insertObs(db, {
+        sessionId: 'mem-memdir', project: 'parent--memdirtest',
+        type: 'bugfix', importance: 2,
+        title: 'memdir alignment lesson',
+        lessonLearned: 'A specific lesson visible only when DB is correctly sandboxed',
+        filesModified: `["${join(projectDir, 'target.mjs')}"]`,
+      });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    it('CLAUDE_MEM_DIR alone redirects DB read', async () => {
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'target.mjs') },
+        session_id: 'sess-memdir-1',
+      }, {
+        CLAUDE_MEM_DIR: tmpRoot,
+        CLAUDE_PROJECT_DIR: projectDir,
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('A specific lesson visible only when DB is correctly sandboxed');
+    });
+
+    it('CLAUDE_MEM_DIR alone redirects cooldown writes (no leak to ~/.claude-mem-lite/runtime)', async () => {
+      // First call seeds cooldown; second call should be silent.
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'target.mjs') },
+        session_id: 'sess-memdir-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const { existsSync } = await import('fs');
+      expect(existsSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-memdir-2.json'))).toBe(true);
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'target.mjs') },
+        session_id: 'sess-memdir-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      expect(stdout).toBe('');
+    });
+
+    it('CLAUDE_MEM_DB_PATH still overrides when set (per-component override preserved)', async () => {
+      const altDb = join(tmpRoot, 'alt.db');
+      const db = new Database(altDb);
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-alt', project: 'parent--memdirtest', memoryId: 'mem-alt' });
+      insertObs(db, {
+        sessionId: 'mem-alt', project: 'parent--memdirtest',
+        type: 'bugfix', importance: 2,
+        title: 'override marker',
+        lessonLearned: 'Sourced from CLAUDE_MEM_DB_PATH override, not CLAUDE_MEM_DIR default',
+        filesModified: `["${join(projectDir, 'target.mjs')}"]`,
+      });
+      db.close();
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'target.mjs') },
+        session_id: 'sess-memdir-3',
+      }, {
+        CLAUDE_MEM_DIR: tmpRoot,
+        CLAUDE_MEM_DB_PATH: altDb,
+        CLAUDE_PROJECT_DIR: projectDir,
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('Sourced from CLAUDE_MEM_DB_PATH override');
+      expect(parsed.hookSpecificOutput.additionalContext).not.toContain('A specific lesson visible only when DB is correctly sandboxed');
+    });
+  });
 });
