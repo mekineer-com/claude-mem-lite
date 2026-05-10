@@ -412,6 +412,35 @@ describe('CLI recent command', () => {
     expect(output).not.toContain('Compressed obs');
     expect(output).toContain('Active obs');
   });
+
+  // Regression anchor: --limit flag parity with sibling commands (search/recall/browse/stats).
+  // Pre-fix `recent --limit N` was silently ignored — only positional [N] worked, surprising
+  // users who reasonably extrapolated from sibling CLI conventions. Positional still wins
+  // when both are given, preserving backward-compat with documented `recent N` form.
+  it('respects --limit flag as alias for positional count', async () => {
+    for (let i = 0; i < 5; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+      });
+    }
+    const output = await captureStdout(() => run(['recent', '--limit', '3']));
+    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    expect(resultLines.length).toBe(3);
+  });
+
+  it('--limit invalid value warns and falls back to default 10', async () => {
+    for (let i = 0; i < 12; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+      });
+    }
+    const output = await captureStdout(() => run(['recent', '--limit', '-5']));
+    expect(output).toContain('Invalid --limit');
+    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    expect(resultLines.length).toBe(10);
+  });
 });
 
 // ─── recall command ──────────────────────────────────────────────────────────

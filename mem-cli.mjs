@@ -378,7 +378,12 @@ function cmdRecent(db, args) {
   if (rawArg !== undefined && !isValid) {
     process.stderr.write(`[mem] Invalid count "${rawArg}" (must be a positive integer); using default 10\n`);
   }
-  const limit = isValid ? rawLimit : 10;
+  // Positional [N] wins for backward-compat; --limit is sibling-parity alias
+  // (search/recall/browse/stats all accept --limit). Pre-2.69 `recent --limit N`
+  // was silently ignored — surprising users extrapolating from siblings.
+  const limit = isValid
+    ? rawLimit
+    : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 1000 });
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const jsonOutput = flags.json === true || flags.json === 'true';
 
@@ -2137,6 +2142,7 @@ Commands:
     --json              Output as JSON: {query,total,returned,offset,limit,results:[…]}
 
   recent [N]            Show N most recent observations (default 10)
+    --limit N           Sibling-parity alias for [N] (max 1000)
     --project P         Filter by project
     --json              Output as JSON: {project,limit,total,results:[…]}
 
