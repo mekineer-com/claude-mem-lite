@@ -2,6 +2,15 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.71.2 — cold-start schema-init concurrency hotfix
+
+**Fixed**:
+- **`schema.mjs:178`** — `initSchema` raced when N concurrent processes hit a fresh DB simultaneously. The `sdk_sessions_id_mix_check_{ai,au}` migration deliberately uses `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER` (no `IF NOT EXISTS`) to update the v29→v30 trigger body, but assumed serial execution. Cold-start fan-out reproduced at 10% loss rate with N=3 concurrent `claude-mem-lite save` against `CLAUDE_MEM_DIR=$(mktemp -d)`: failing saves printed `Cannot open database: trigger sdk_sessions_id_mix_check_ai already exists` and exited 1 — silent data loss for hooks. Fixed by wrapping the migration body in `BEGIN IMMEDIATE` (uses the existing `busy_timeout=3000` so peers wait), re-checking `schema_version` under the lock so a peer that just completed init returns early, and moving `PRAGMA foreign_keys = ON` to after `COMMIT` (it's a no-op inside a transaction). Steady-state writes were already safe — this only affects DB cold-start and version-bump migration paths.
+
+**Tests**:
+- Suite: 95 files / 2288 tests green.
+- Repro: cold-start N=3 × 10 runs went `3/30 → 0/30`; stress N=30 × 5 runs `0/150` failed, `observations`/`observations_fts` parity 30/30 every run.
+
 ## v2.71.1 — import-jsonl real-transcript hotfix
 
 Three independent bugs in v2.71.0's `import-jsonl` that fixture-only tests didn't catch. Production-shape transcripts at `~/.claude/projects/<encoded>/<uuid>.jsonl` exposed all three.

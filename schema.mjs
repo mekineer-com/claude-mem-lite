@@ -181,6 +181,21 @@ export function initSchema(db) {
     if (e.message?.startsWith('DB schema is v')) throw e;
   }
 
+  // Concurrent-init guard: serialize schema setup against peer processes via
+  // BEGIN IMMEDIATE (busy_timeout=3000 from ensureDb makes peers wait). Required
+  // because the sdk_sessions_id_mix_check_{ai,au} migration uses DROP+CREATE
+  // without IF NOT EXISTS to update the trigger body, which races at cold-start.
+  // Re-check schema_version under the lock — a peer may have completed init
+  // while we were blocked. Connection close auto-rollbacks if body throws.
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const underlock = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+    if (underlock && underlock.version === CURRENT_SCHEMA_VERSION) {
+      db.exec('COMMIT');
+      return db;
+    }
+  } catch { /* table absent — proceed */ }
+
   // Create core tables
   db.exec(CORE_SCHEMA);
 
@@ -264,7 +279,6 @@ export function initSchema(db) {
     });
     dedupAndIndex();
   }
-  db.pragma('foreign_keys = ON');
 
   // Performance indexes
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_epoch_project ON observations(created_at_epoch DESC, project)`);
@@ -579,6 +593,10 @@ export function initSchema(db) {
     db.exec('DELETE FROM schema_version');
     db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(CURRENT_SCHEMA_VERSION);
   })();
+
+  db.exec('COMMIT');
+  // PRAGMA foreign_keys must run OUTSIDE the transaction (no-op inside).
+  db.pragma('foreign_keys = ON');
 
   return db;
 }
