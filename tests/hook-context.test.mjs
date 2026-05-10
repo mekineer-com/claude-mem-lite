@@ -501,7 +501,12 @@ describe('buildSessionContextLines: Deferred Work block', () => {
       });
     }
     const out = buildSessionContextLines(db, 'test');
-    const matches = out.split('\n').filter(l => l.startsWith('- ') && l.includes('[decision]'));
+    // Scope to the Deferred Work block only — the Key Context block also
+    // emits "- [decision]" lines and is environment-dependent (suppressed
+    // when MEM_QUIET_HOOKS=1, surfaces otherwise — the #7745 hermeticity
+    // trap that broke this test on CI but not locally).
+    const deferredBlock = extractSection(out, 'Deferred Work');
+    const matches = deferredBlock.split('\n').filter(l => l.startsWith('- ') && l.includes('[decision]'));
     expect(matches.length).toBe(3);
   });
 
