@@ -2,6 +2,70 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.73.0 — 9-round CLI dogfood: validation hardening + JSON outputs + concurrent stability
+
+A multi-round end-to-end dogfood pass surfaced 14 distinct issues across CLI, MCP, install, hook, and concurrency surfaces. Mix of behavior-tightening fixes (silent fall-throughs that hid typos) and additive features (`--json` / `--dry-run` / `--type` on commands users naturally extrapolated from siblings). Net `+583/-78` across 12 files; `+20` tests (2307 → 2327).
+
+**Fixed (data-integrity / crash class)**:
+
+- **`mem-cli.mjs::cmdUpdate` — `--title ""`** silently overwrote the observation's title with the empty string, leaving it as `(untitled)` in every listing with no recovery path. `flags.title !== undefined` is not enough — shell-stripped args pass that check. Now rejects empty or whitespace-only with `[mem] --title cannot be empty. Pass a non-empty string or omit the flag to leave the title unchanged.` Mirrors the same trap fixed on `--lesson` below (Round 1).
+
+- **`mem-cli.mjs::cmdUpdate` — `--lesson <501-char>`** silently accepted, bypassing the 500-char MCP `memSaveSchema` cap that `cmdSave` already enforced. Schema-mirror asymmetry: single-path enforcement leaks. Now `cmdUpdate` mirrors the cap on both `--lesson` and `--lesson-learned` (Round 8).
+
+- **`mem-cli.mjs::run()` — `SQLITE_BUSY` family unhandled**: ≥5 parallel mutating ops triggered `SQLITE_BUSY_SNAPSHOT` / `SQLITE_BUSY_RECOVERY` / `SQLITE_LOCKED_SHAREDCACHE` which a strict `=== 'SQLITE_BUSY'` catch missed. Stack trace leaked, ops silently lost. Now prefix-matches `SQLITE_BUSY_*` / `SQLITE_LOCKED_*` and prints `[mem] Database busy — retry shortly`. Also bumped CLI `busy_timeout` from 3000ms → 5000ms (`schema.mjs`) to match server.mjs under realistic FTS-rebuild contention (Round 4).
+
+- **`mem-cli.mjs::cmdImportJsonl`** — one EACCES / unreadable file crashed the whole batch with an unhandled `readFileSync` exception and a node stack trace; earlier successes looked uncommitted from the user's perspective. Per-file try/catch now isolates failures, prints `[mem] <path>: import failed — <message>`, continues with the next file, and surfaces `1 file(s) errored` in the total line (Round 3).
+
+- **`adopt-cli.mjs::cmdUnadopt --status`** ran the destructive default because `cmdUnadopt` didn't recognize `--status` — the flag was silently dropped and the sentinel block was removed even though the user just wanted a read-only probe. Now `--status` mirrors `cmdAdopt::statusAll()` (read-only). Also added `--dry-run` so the destructive path can be previewed (Round 3).
+
+**Fixed (validation / typo-traps)**:
+
+- **`cmdSearch` — `--branch X` leaked sessions/prompts**: `branch` is an observations-only column, so cross-source mode returned unfiltered session/prompt rows for any branch query. Now `--branch` joins `--type` / `--tier` / `--importance` in the auto-restrict-to-observations gate, and the obs-only warning lists `--branch` when `--source` is non-obs (Round 2).
+
+- **`cmdOptimize --scope <typo>`** silently coerced to `narrow` via `args[i+1] === 'wide' ? 'wide' : 'narrow'` — burned LLM tokens on a `--scope wlde` typo. Now explicit enum validation rejects unknown values (Round 2).
+
+- **`cmdCompress --age-days <bad>`** silently fell back to default 30 on NaN/<1 via `|| 30`. Now `Number.isFinite + ≥1` validation rejects `-5` / `0` / `abc` upfront (Round 2).
+
+- **`cmdExport --type <bogus>`** returned `[]` for unknown types (looked like "no data" instead of a typo). Now validates against the obs-type enum and surfaces the valid set (Round 2).
+
+- **`cmdRegistry --type / --resource-type <bogus>`** silently returned "No resources found." Now both flags validate against `skill | agent` at the dispatcher entry, applying to search / list / import / remove uniformly (Round 3).
+
+- **`cli/activity.mjs::cmdActivity`** — usage error omitted the `delete` subcommand from its `<save|search|recent|show>` list; `activity show <missing>` printed bare `Not found` without the `[mem]` prefix or the id. Both aligned with the rest of the CLI (Round 1).
+
+- **`cli/fts-check.mjs`** — invalid action (e.g. `fts-check frobnicate`) dumped the usage block without naming the offending token. Now `[mem] Invalid action "frobnicate". Use: check, rebuild` (Round 5).
+
+- **`install.mjs::main`** — unknown command (e.g. `install frobnicate`) fell through to the default-case usage dump silently, looking identical to a zero-arg invocation. Now `[install] Unknown command: "frobnicate"` to stderr + exit 1 + usage still rendered for context (Round 6).
+
+**Added**:
+
+- **`recent --type T`** — natural sibling extrapolation of `search --type T`. Pre-fix `recent --type bugfix` silently parsed the flag as a no-op and returned all types. Now filters in-SQL with the same enum validation as `cmdSearch`; JSON shape gains a `type` key (Round 2).
+
+- **`defer drop <id>[,<id>...]`** accepts comma-separated batch. Pre-fix only a single token was accepted, forcing N shell invocations for N items, while `save --closes-deferred "1,D#42"` already supported the batch form — sibling-command asymmetry. Now resolves all tokens atomically (one bad token → no partial drops) (Round 4).
+
+- **`defer add` — 200-char title cap** mirrors MCP `memDeferSchema.title` (`z.string().min(1).max(200)`). Pre-fix CLI accepted 1000-char titles that wrapped into multi-line garbage in `defer list` (Round 4).
+
+- **`install status --json`** — structured output `{ mcp, plugin, hooks, plugin_cache, database, cli }` each with `{ level, message, ...extras }`. Lets CI / setup scripts probe install state without scraping text. Text mode wording untouched (Round 8).
+
+- **`install doctor --json`** — `{ issues, warnings, summary, checks: [{ level, message }, ...] }`. Implementation strategy: shadow `ok` / `warn` / `fail` helpers inside `doctor()` so all 39 existing call sites auto-capture into the structured array without rewriting the check bodies. Exit code 1 still propagates for `issues > 0` (Round 9).
+
+- **`install cleanup --dry-run`** — preview header advertises dry-run, prints `Would remove: <path>` for each candidate, exits without touching disk. Doctor's "Stale temp files: N found" line points users here, but pre-fix `--dry-run` was silently ignored and the destructive default ran (Round 7).
+
+- **`unadopt --dry-run`** — preview shows `→ would-remove` per memdir without touching MEMORY.md / plugin doc. Mirrors `adopt --dry-run` (Round 3).
+
+**Improved (UX)**:
+
+- **`--importance` / `--priority` help text** now spells out direction: `1=routine, 2=notable, 3=critical` for importance, `1=low, 2=normal, 3=urgent` for priority. Pre-fix the bare `1-3` hint forced users to guess which end was high (Round 4).
+
+- **`doctor --benchmark --json`** — the dispatcher-level `[mem] "<cmd>" outputs text` note no longer fires when `doctor` is combined with `--benchmark`, since that subpath already emits JSON. Pre-fix the misleading stderr note polluted automation expecting clean JSON on stdout (Round 5).
+
+- **`cmdDeferDrop`** drop summary now lists every dropped id (`Dropped D#1, D#2, D#3`) instead of one-per-call. No-op'd ids (already not in `'open'` status) surface in a separate line so the user can tell partial-state cleanup apart from a fully-successful batch.
+
+**Tests**: +20 across 6 files. Vitest: 98 files / 2327 tests. ESLint clean. Manual e2e dogfood verified all 14 issue paths.
+
+**Lessons captured** (mem #8470 / #8472 / #8473 / #8532 / #8542 / #8560): the recurring failure mode this round was *silent fall-through on unrecognized inputs* — empty strings, unknown enum values, sibling-flag extrapolation, schema mirror gaps. Fix template: explicit allow-list validation that names the offending token, schema caps enforced symmetrically across save/update paths, sibling commands mirror at minimum the read-only escape flags (`--status` / `--dry-run`).
+
+**Known limitation (deferred)**: CJK pipeline regex in `nlp.mjs` covers Han `一-鿿` only. Japanese katakana / hiragana / Korean hangul fall through the FTS5 tokenizer as monolithic tokens; `search "バグ"` won't match obs containing "バグ修正". L3-scope (touches multiple bigram / synonym / precision paths), deferred for a focused i18n round.
+
 ## v2.72.0 — optimize --project filter + --verbose preview cluster details
 
 Two additive hygiene features for the LLM-powered `optimize` pipeline. Both opt-in; default behavior unchanged (per #8005 — measure signal-content before tuning a knob; cross-project default isn't broken, it's just sometimes too broad).

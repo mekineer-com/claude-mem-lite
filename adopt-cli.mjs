@@ -192,9 +192,22 @@ function statusAll() {
 /**
  * cmdUnadopt — precise removal of sentinel section + plugin doc.
  * Exit code stays 0: unadopt is idempotent; "absent" isn't an error.
+ *
+ * Flags:
+ *   --all       Operate on every memdir under ~/.claude/projects/*\/memory/
+ *   --status    Read-only: list currently-adopted memdirs (mirrors `adopt --status`).
+ *   --dry-run   Preview what would be removed; no filesystem writes.
+ *
+ * Pre-fix history: unrecognized flags (e.g. `--status` extrapolated from `adopt --status`,
+ * or `--dry-run` extrapolated from `adopt --dry-run`) were silently ignored and the
+ * destructive default ran anyway, removing the sentinel block when the user expected
+ * a read-only probe.
  */
 export function cmdUnadopt(args = []) {
+  if (hasFlag(args, '--status')) return statusAll();
+
   const all = hasFlag(args, '--all');
+  const dryRun = hasFlag(args, '--dry-run');
   const targets = all
     ? listAllMemdirs().map((m) => m.memdir)
     : [memdirPath(detectCwd())];
@@ -206,6 +219,13 @@ export function cmdUnadopt(args = []) {
 
   let removed = 0, absent = 0;
   for (const memdir of targets) {
+    if (dryRun) {
+      const adopted = isAdopted(memdir, PLUGIN_SLUG);
+      const action = adopted ? 'would-remove' : 'absent';
+      log(`[unadopt --dry-run] ${memdir} → ${action}`);
+      if (adopted) removed++; else absent++;
+      continue;
+    }
     const r = removePluginSection(memdir, PLUGIN_SLUG);
     removePluginDoc(memdir, PLUGIN_SLUG);
     if (r.action === 'removed') removed++;
@@ -214,5 +234,6 @@ export function cmdUnadopt(args = []) {
   }
 
   log('');
-  log(`[unadopt] ${targets.length} target(s): ${removed} removed, ${absent} absent`);
+  const verb = dryRun ? 'would remove' : 'removed';
+  log(`[unadopt${dryRun ? ' --dry-run' : ''}] ${targets.length} target(s): ${removed} ${verb}, ${absent} absent`);
 }

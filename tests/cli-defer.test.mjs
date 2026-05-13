@@ -139,6 +139,41 @@ describe('claude-mem-lite defer CLI', () => {
   });
 
   // ── Folded from Task 5 review (M-1): duplicate path skips closure ──────────
+  // Dogfood-4 regression: `defer add` with > 200-char titles silently accepted them,
+  // wrapping into multi-line garbage in `defer list`. CLI now matches MCP memDeferSchema
+  // (z.string().min(1).max(200)).
+  it('defer add rejects titles longer than 200 chars (parity with MCP schema)', () => {
+    const longTitle = 'Z'.repeat(250);
+    // `fail()` writes to stderr — check there, not stdout.
+    const { stderr, exitCode } = runCli(['defer', 'add', longTitle]);
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toMatch(/title too long/);
+    expect(stderr).toMatch(/max 200/);
+  });
+
+  // Dogfood-4 regression: `save --closes-deferred` accepted comma-separated batches but
+  // `defer drop` only took a single token, forcing N shell invocations for N items.
+  // Sibling-command symmetry — drop now mirrors closes-deferred's batch form.
+  it('defer drop accepts comma-separated batch ordinals', () => {
+    runCli(['defer', 'add', 'batch-A', '--priority', '2']);
+    runCli(['defer', 'add', 'batch-B', '--priority', '2']);
+    const { stdout, exitCode } = runCli(['defer', 'drop', '1,2', '--reason', 'batch test']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/Dropped D#\d+, D#\d+/);
+    const list = runCli(['defer', 'list']);
+    expect(list.stdout).toMatch(/No open deferred items/);
+  });
+
+  // Atomicity: an unresolvable token in the batch fails the entire call. No partial
+  // drops, no orphan rows. Mirrors the resolveDeferredIds throw-on-bad-token contract.
+  it('defer drop with one bogus ordinal fails atomically (keeps all rows open)', () => {
+    runCli(['defer', 'add', 'still-open', '--priority', '2']);
+    const drop = runCli(['defer', 'drop', '1,99', '--reason', 'mixed batch']);
+    expect(drop.exitCode).not.toBe(0);
+    const list = runCli(['defer', 'list']);
+    expect(list.stdout).toMatch(/still-open/);
+  });
+
   it('duplicate save with --closes-deferred does NOT close the deferred item', () => {
     runCli(['defer', 'add', 'fix dedup leak', '--priority', '2']);
 

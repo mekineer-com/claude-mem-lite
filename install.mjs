@@ -1057,18 +1057,21 @@ async function cleanupHooks() {
 // ─── Status ─────────────────────────────────────────────────────────────────
 
 async function status() {
-  console.log('\nclaude-mem-lite status\n');
+  // Dogfood-8: support --json so CI / setup scripts can probe install state
+  // without scraping text. Collect each check as a structured record first,
+  // then print text OR JSON. Text path keeps identical wording so existing
+  // users / docs / screenshots stay correct.
+  const json = flags.has('--json');
+  const checks = [];
+  const push = (level, key, message, extra = {}) => checks.push({ level, key, message, ...extra });
 
   // MCP
   try {
     const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8' });
-    if (list.includes('mem:') || list.includes('mem ')) {
-      ok('MCP server: registered');
-    } else {
-      fail('MCP server: not registered');
-    }
+    const registered = list.includes('mem:') || list.includes('mem ');
+    push(registered ? 'ok' : 'fail', 'mcp', registered ? 'MCP server: registered' : 'MCP server: not registered', { registered });
   } catch {
-    warn('Could not check MCP status');
+    push('warn', 'mcp', 'Could not check MCP status', { registered: null });
   }
 
   // Hooks
@@ -1077,34 +1080,29 @@ async function status() {
   const pluginDisabled = isPluginExplicitlyDisabled(settings);
   const pluginEnabled = settings.enabledPlugins?.[PLUGIN_KEY] === true;
 
-  if (pluginEnabled) {
-    ok('Plugin: enabled in settings');
-  } else if (pluginDisabled) {
-    warn('Plugin: disabled in settings');
-  } else {
-    warn('Plugin: not present in enabledPlugins');
-  }
+  if (pluginEnabled) push('ok', 'plugin', 'Plugin: enabled in settings', { enabled: true, disabled: false });
+  else if (pluginDisabled) push('warn', 'plugin', 'Plugin: disabled in settings', { enabled: false, disabled: true });
+  else push('warn', 'plugin', 'Plugin: not present in enabledPlugins', { enabled: false, disabled: false });
 
   if (hasHooks && pluginDisabled) {
-    warn('Hooks: still configured in settings.json while plugin is disabled (runtime ignores them; run cleanup-hooks or uninstall to clean up)');
+    push('warn', 'hooks', 'Hooks: still configured in settings.json while plugin is disabled (runtime ignores them; run cleanup-hooks or uninstall to clean up)', { configured: true });
   } else if (hasHooks) {
-    ok('Hooks: configured');
+    push('ok', 'hooks', 'Hooks: configured', { configured: true });
   } else if (pluginDisabled) {
-    ok('Hooks: not configured');
+    push('ok', 'hooks', 'Hooks: not configured', { configured: false });
   } else {
-    fail('Hooks: not configured');
+    push('fail', 'hooks', 'Hooks: not configured', { configured: false });
   }
 
   // Plugin cache pollution: populated hooks.json in cache AND install.mjs-managed
   // settings.json hooks → runtime registers both → duplicate firing.
   const polluted = scanPluginCacheHookPollution();
   if (polluted.length > 0 && hasHooks) {
-    fail(`Plugin cache: stale hooks.json in version(s) ${polluted.join(', ')} — duplicate firing alongside settings.json (run 'install' to auto-clear)`);
+    push('fail', 'plugin_cache', `Plugin cache: stale hooks.json in version(s) ${polluted.join(', ')} — duplicate firing alongside settings.json (run 'install' to auto-clear)`, { polluted_versions: polluted });
   } else if (polluted.length > 0) {
-    // plugin-only mode (no settings.json hooks) — cache hooks.json is the sole source, expected
-    ok(`Plugin cache: ${polluted.length} version(s) with hooks.json (plugin-only mode)`);
+    push('ok', 'plugin_cache', `Plugin cache: ${polluted.length} version(s) with hooks.json (plugin-only mode)`, { polluted_versions: polluted });
   } else if (pluginEnabled || hasHooks) {
-    ok('Plugin cache: no stale hooks.json (no duplicate firing)');
+    push('ok', 'plugin_cache', 'Plugin cache: no stale hooks.json (no duplicate firing)', { polluted_versions: [] });
   }
 
   // Database
@@ -1115,35 +1113,67 @@ async function status() {
       const obs = db.prepare('SELECT COUNT(*) as c FROM observations').get();
       const sess = db.prepare('SELECT COUNT(*) as c FROM session_summaries').get();
       db.close();
-      ok(`Database: ${obs.c} observations, ${sess.c} sessions`);
+      push('ok', 'database', `Database: ${obs.c} observations, ${sess.c} sessions`, { exists: true, observations: obs.c, sessions: sess.c });
     } catch (e) {
-      warn('Database: exists but check failed — ' + e.message);
+      push('warn', 'database', 'Database: exists but check failed — ' + e.message, { exists: true, error: e.message });
     }
   } else {
-    warn('Database: not found');
+    push('warn', 'database', 'Database: not found', { exists: false });
   }
 
   // CLI
   try {
     execFileSync('claude-mem-lite', ['--help'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
-    ok('CLI: claude-mem-lite command available');
+    push('ok', 'cli', 'CLI: claude-mem-lite command available', { available: true });
   } catch {
-    warn('CLI: command not on PATH — run install again to create symlink');
+    push('warn', 'cli', 'CLI: command not on PATH — run install again to create symlink', { available: false });
   }
 
   // Old system
   const vectorDb = join(OLD_DATA_DIR, 'vector-db');
   if (existsSync(vectorDb)) {
-    warn('Old vector-db still exists (can be removed)');
+    push('warn', 'old_data', 'Old vector-db still exists (can be removed)', { vector_db_exists: true });
   }
 
+  if (json) {
+    const out = {};
+    for (const c of checks) {
+      const { level, key, message, ...extra } = c;
+      out[key] = { level, message, ...extra };
+    }
+    console.log(JSON.stringify(out, null, 2));
+    return;
+  }
+
+  console.log('\nclaude-mem-lite status\n');
+  for (const c of checks) {
+    if (c.level === 'ok') ok(c.message);
+    else if (c.level === 'warn') warn(c.message);
+    else fail(c.message);
+  }
   console.log('');
 }
 
 // ─── Doctor ─────────────────────────────────────────────────────────────────
 
 async function doctor() {
-  console.log('\nclaude-mem-lite doctor\n');
+  // Dogfood-9: structured --json output for CI / wrapper scripts that want to
+  // act on individual checks (e.g. "fail my deploy if FTS5 integrity not ok").
+  // Implementation strategy: shadow ok/warn/fail/log inside doctor() so every
+  // existing call site automatically captures into `checks`, and route final
+  // output to JSON or text. Mirror install.mjs::status() shape — { key: {...} }
+  // would lose ordering, so use a flat array of { level, message } objects
+  // (doctor checks are ordered by significance: deps → server → DB → drift).
+  const json = flags.has('--json');
+  const checks = [];
+  if (!json) console.log('\nclaude-mem-lite doctor\n');
+
+  // Shadow file-level helpers so every call site auto-records.
+  const ok   = (msg) => { checks.push({ level: 'ok',   message: msg }); if (!json) console.log(`  ✓ ${msg}`); };
+  const warn = (msg) => { checks.push({ level: 'warn', message: msg }); if (!json) console.log(`  ⚠ ${msg}`); };
+  const fail = (msg) => { checks.push({ level: 'fail', message: msg }); if (!json) console.log(`  ✗ ${msg}`); };
+  const log  = (msg) => { if (!json) console.log(`  ${msg}`); };
+
   let issues = 0;
   let warnings = 0;
   // Doctor-local ⚠ helper: visually identical to the file-level `warn`, but
@@ -1151,7 +1181,7 @@ async function doctor() {
   // "warnings present". Used for informational ⚠ checks; the two ⚠ paths
   // that ALSO bump `issues` (stale procs, dev drift) keep using the file-level
   // `warn` directly to avoid double-counting.
-  const dwarn = (msg) => { warnings++; console.log(`  ⚠ ${msg}`); };
+  const dwarn = (msg) => { warnings++; warn(msg); };
 
   // Node version
   const nodeVer = process.version;
@@ -1398,7 +1428,16 @@ async function doctor() {
     } catch {}
   }
 
-  console.log(`\n  ${buildDoctorSummary(issues, warnings)}\n`);
+  if (json) {
+    console.log(JSON.stringify({
+      issues,
+      warnings,
+      summary: buildDoctorSummary(issues, warnings),
+      checks,
+    }, null, 2));
+  } else {
+    console.log(`\n  ${buildDoctorSummary(issues, warnings)}\n`);
+  }
   // Diagnostic-tool exit-code contract: any ✗-level finding must propagate non-zero
   // so CI / wrapper scripts (`claude-mem-lite doctor || alert`) actually trip. Keeps
   // ⚠-only states at exit 0 (#8268 already established the visual ⚠ vs counted-issue
@@ -1532,7 +1571,12 @@ function writeSettings(settings) {
 // ─── Cleanup Stale Files ─────────────────────────────────────────────────────
 
 function cleanup() {
-  console.log('\nclaude-mem-lite cleanup\n');
+  // Dogfood-7 addition: --dry-run lists which files would be removed without
+  // touching disk. Useful before running cleanup on a remote/CI machine where
+  // accidentally pruning the wrong file would be costly. Doctor reports stale
+  // file counts and points users here; --dry-run lets them confirm the list.
+  const dryRun = flags.has('--dry-run');
+  console.log(`\nclaude-mem-lite cleanup${dryRun ? ' (--dry-run)' : ''}\n`);
   let removed = 0;
 
   // Clean .update-staging-* / .update-backup-* in INSTALL_DIR
@@ -1540,6 +1584,11 @@ function cleanup() {
   if (existsSync(INSTALL_DIR)) {
     for (const f of readdirSync(INSTALL_DIR)) {
       if (stalePatterns.some(p => f.startsWith(p))) {
+        if (dryRun) {
+          ok(`Would remove: ${f}`);
+          removed++;
+          continue;
+        }
         try {
           rmSync(join(INSTALL_DIR, f), { recursive: true, force: true });
           ok(`Removed: ${f}`);
@@ -1556,6 +1605,11 @@ function cleanup() {
   if (existsSync(runtimeDir)) {
     for (const f of readdirSync(runtimeDir)) {
       if (f.startsWith('pending-') || f.startsWith('ep-flush-')) {
+        if (dryRun) {
+          ok(`Would remove: runtime/${f}`);
+          removed++;
+          continue;
+        }
         try {
           rmSync(join(runtimeDir, f), { force: true });
           ok(`Removed: runtime/${f}`);
@@ -1567,7 +1621,8 @@ function cleanup() {
     }
   }
 
-  console.log(`\n  ${removed === 0 ? 'No stale files found.' : `Removed ${removed} stale file(s).`}\n`);
+  const verb = dryRun ? 'would be removed' : 'removed';
+  console.log(`\n  ${removed === 0 ? 'No stale files found.' : `${removed} stale file(s) ${verb}.`}\n`);
 }
 
 // ─── Manual Update ───────────────────────────────────────────────────────────
@@ -1707,6 +1762,13 @@ export async function main(argv = process.argv.slice(2)) {
         // npx claude-mem-lite (no args) → auto install
         await install();
       } else {
+        // Name the unknown token before the usage block. Pre-fix `install frobnicate`
+        // dumped usage silently, which read like the user had typed nothing — they had
+        // no idea their command was rejected.
+        if (cmd) {
+          console.error(`[install] Unknown command: "${cmd}"`);
+          process.exitCode = 1;
+        }
         console.log(`
 claude-mem-lite — Lightweight memory system for Claude Code
 
@@ -1715,9 +1777,9 @@ Usage:
   node install.mjs install --dev      Install dev mode (symlinks to dev dir)
   node install.mjs uninstall          Remove (keep data)
   node install.mjs uninstall --purge  Remove and delete all data
-  node install.mjs status             Show current status
-  node install.mjs doctor             Diagnose issues
-  node install.mjs cleanup            Remove stale temp/staging files
+  node install.mjs status             Show current status (use --json for structured output)
+  node install.mjs doctor             Diagnose issues (use --json for structured output)
+  node install.mjs cleanup            Remove stale temp/staging files (use --dry-run to preview)
   node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
   node install.mjs self-update         Check for and install updates
   node install.mjs release            Sync versions (plugin/marketplace/CLAUDE.md) + regen lockfile via npm@10.9.2 (use --no-lock to skip lock regen)

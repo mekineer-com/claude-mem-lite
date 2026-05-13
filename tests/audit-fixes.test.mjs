@@ -555,6 +555,22 @@ describe('T2 CLI fixes', () => {
     expect(output).toMatch(/Valid: re-enrich, normalize, cluster-merge, smart-compress/);
   });
 
+  // Dogfood-2: --scope previously did `args[i+1] === 'wide' ? 'wide' : 'narrow'`, silently
+  // treating typos like `--scope wlde` as narrow. Validate explicitly so wasted LLM tokens
+  // don't hide behind a falsey-coerced default.
+  it('optimize --scope rejects unknown scope values', async () => {
+    const output = await captureStdout(() => run(['optimize', '--scope', 'bogus']));
+    expect(output).toMatch(/Invalid --scope/);
+    expect(output).toMatch(/narrow, wide/);
+  });
+
+  it('optimize --scope accepts narrow and wide', async () => {
+    for (const scope of ['narrow', 'wide']) {
+      const output = await captureStdout(() => run(['optimize', '--scope', scope]));
+      expect(output).toMatch(/Optimization Preview/);
+    }
+  });
+
   // T2-P1-B: purge_stale preview (shares code path with OP_CAP hint helper).
   it('T2-P0-A CLI parity: maintain purge_stale without --confirm previews only', async () => {
     // Seed a pending-purge row.

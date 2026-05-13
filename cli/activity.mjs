@@ -20,7 +20,7 @@ function formatActivityResults(rows) {
 export async function cmdActivity(db, args) {
   const sub = args[0];
   if (!sub) {
-    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show> ...');
+    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show|delete> ...');
     return;
   }
 
@@ -105,7 +105,11 @@ export async function cmdActivity(db, args) {
       return;
     }
     const row = getEvent(db, id);
-    out(row ? JSON.stringify(row, null, 2) : 'Not found');
+    if (row) {
+      out(JSON.stringify(row, null, 2));
+    } else {
+      out(`[mem] activity show: event #${id} Not found`);
+    }
     return;
   }
 

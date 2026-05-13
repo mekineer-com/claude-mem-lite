@@ -124,6 +124,33 @@ describe('cmdAdopt / cmdUnadopt (current project)', () => {
     expect(process.exitCode).toBe(0);
     expect(logs.some((l) => l.includes('absent'))).toBe(true);
   });
+
+  // Dogfood-3 regression: `unadopt --status` previously had no special handling
+  // for --status, so the flag was silently dropped and the destructive default
+  // ran — users probing "what's adopted?" lost their sentinel. Now --status
+  // routes through statusAll (read-only) like cmdAdopt's path.
+  it('unadopt --status is read-only and does NOT remove the sentinel', () => {
+    cmdAdopt([]);
+    const mem = memoryPath(tmpHome, fakeCwd);
+    const before = readFileSync(mem, 'utf8');
+    cmdUnadopt(['--status']);
+    const after = readFileSync(mem, 'utf8');
+    expect(after).toBe(before);
+    expect(existsSync(docPath(tmpHome, fakeCwd))).toBe(true);
+    // Output should look like the adopt --status format
+    expect(logs.some((l) => l.includes('[adopt --status]'))).toBe(true);
+  });
+
+  it('unadopt --dry-run previews but does NOT remove the sentinel', () => {
+    cmdAdopt([]);
+    const mem = memoryPath(tmpHome, fakeCwd);
+    const before = readFileSync(mem, 'utf8');
+    cmdUnadopt(['--dry-run']);
+    const after = readFileSync(mem, 'utf8');
+    expect(after).toBe(before);
+    expect(existsSync(docPath(tmpHome, fakeCwd))).toBe(true);
+    expect(logs.some((l) => l.includes('would-remove') || l.includes('would remove'))).toBe(true);
+  });
 });
 
 describe('cmdAdopt / cmdUnadopt (--all)', () => {

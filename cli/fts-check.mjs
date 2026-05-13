@@ -7,8 +7,14 @@ import { parseArgs, out, fail } from './common.mjs';
 export function cmdFtsCheck(db, args) {
   const { positional } = parseArgs(args);
   const action = positional[0];
-  if (!action || !['check', 'rebuild'].includes(action)) {
+  if (!action) {
     fail('[mem] Usage: claude-mem-lite fts-check <check|rebuild>');
+    return;
+  }
+  if (!['check', 'rebuild'].includes(action)) {
+    // Tell the user what was wrong rather than dumping the usage — they passed
+    // something concrete, the error should name the invalid token.
+    fail(`[mem] Invalid action "${action}". Use: check, rebuild`);
     return;
   }
 

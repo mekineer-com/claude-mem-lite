@@ -286,4 +286,33 @@ describe('cmdActivity CLI: --type validation', () => {
       teardownDir();
     }
   });
+
+  test('activity (no subcommand) usage lists every subcommand including delete', () => {
+    setupDir();
+    try {
+      const r = runCli(['activity']);
+      expect(r.exitCode).not.toBe(0);
+      // All five subcommands must appear so users know `delete` exists from the
+      // usage line alone (without re-running `--help`).
+      for (const sub of ['save', 'search', 'recent', 'show', 'delete']) {
+        expect(r.stderr).toContain(sub);
+      }
+    } finally {
+      teardownDir();
+    }
+  });
+
+  test('activity show <missing-id> uses [mem] prefix and names the id', () => {
+    setupDir();
+    try {
+      const r = runCli(['activity', 'show', '99999']);
+      // Bare `Not found` was inconsistent with the rest of the CLI which always
+      // prefixes user-facing messages with `[mem]`.
+      expect(r.stdout).toContain('[mem]');
+      expect(r.stdout).toContain('99999');
+      expect(r.stdout).toContain('Not found');
+    } finally {
+      teardownDir();
+    }
+  });
 });

@@ -441,6 +441,25 @@ describe('CLI recent command', () => {
     const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
     expect(resultLines.length).toBe(10);
   });
+
+  // `recent --type bugfix` previously parsed as a silent no-op — the flag was unrecognized
+  // and returned every obs type. Mirrors the validation cmdSearch already had.
+  it('--type filter narrows to a single observation type', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Bug A', text: 'a' });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'discovery', title: 'Disc B', text: 'b' });
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Bug C', text: 'c' });
+    const output = await captureStdout(() => run(['recent', '--type', 'bugfix']));
+    expect(output).toContain('Bug A');
+    expect(output).toContain('Bug C');
+    expect(output).not.toContain('Disc B');
+  });
+
+  it('--type rejects unknown obs types', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', type: 'bugfix', title: 'Bug', text: 'x' });
+    const output = await captureStdout(() => run(['recent', '--type', 'WRONG']));
+    expect(output).toContain('Invalid --type');
+    expect(output).toContain('WRONG');
+  });
 });
 
 // ─── recall command ──────────────────────────────────────────────────────────
@@ -866,6 +885,54 @@ describe('CLI update command', () => {
     expect(row.title).toBe('Updated title');
   });
 
+  it('rejects empty --title to prevent silent data corruption', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Original title', text: 'content',
+    });
+    const output = await captureStdout(() => run(['update', '1', '--title', '']));
+    expect(output).toContain('--title cannot be empty');
+    const row = testDb.prepare('SELECT title FROM observations WHERE id = 1').get();
+    expect(row.title).toBe('Original title'); // unchanged
+  });
+
+  it('rejects whitespace-only --title', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Original title', text: 'content',
+    });
+    const output = await captureStdout(() => run(['update', '1', '--title', '   ']));
+    expect(output).toContain('--title cannot be empty');
+    const row = testDb.prepare('SELECT title FROM observations WHERE id = 1').get();
+    expect(row.title).toBe('Original title');
+  });
+
+  // Dogfood-8: --lesson cap is enforced on cmdSave but pre-fix not on cmdUpdate, so a
+  // user-typed 501-char lesson got past the gate when supplied via update. Parity now
+  // matches save's 500-char cap (and the MCP memSaveSchema upper bound).
+  it('rejects --lesson longer than 500 chars (parity with cmdSave + MCP schema)', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Lesson cap test', text: 'content', lessonLearned: 'before',
+    });
+    const longLesson = 'L'.repeat(501);
+    const output = await captureStdout(() => run(['update', '1', '--lesson', longLesson]));
+    expect(output).toContain('--lesson too long');
+    expect(output).toContain('501 chars');
+    const row = testDb.prepare('SELECT lesson_learned FROM observations WHERE id = 1').get();
+    expect(row.lesson_learned).toBe('before'); // unchanged
+  });
+
+  it('--lesson-learned alias on update also enforces the 500-char cap', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Lesson alias cap', text: 'content',
+    });
+    const longLesson = 'X'.repeat(501);
+    const output = await captureStdout(() => run(['update', '1', '--lesson-learned', longLesson]));
+    expect(output).toContain('--lesson too long');
+  });
+
   it('updates type', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
@@ -1044,6 +1111,14 @@ describe('CLI export command', () => {
     const stdout = await captureStdoutOnly(() => run(['export', '--type', 'bugfix', '--format', 'jsonl']));
     expect(stdout).toBe('');
   });
+
+  // `--type bogus` previously hit the DB with the unknown type and returned `[]`,
+  // hiding the typo. Mirrors the validation in cmdSearch / cmdRecent / cmdSave.
+  it('rejects unknown --type with the valid list', async () => {
+    const output = await captureStdout(() => run(['export', '--type', 'WRONG']));
+    expect(output).toContain('Invalid --type');
+    expect(output).toContain('WRONG');
+  });
 });
 
 // ─── compress command ───────────────────────────────────────────────────────
@@ -1077,6 +1152,16 @@ describe('CLI compress command', () => {
     });
     const output = await captureStdout(() => run(['compress']));
     expect(output).toContain('No candidates');
+  });
+
+  // `--age-days abc` / `-5` / `0` previously fell back to the 30-day default with no warning,
+  // hiding typos and accepting non-sensical inputs. cmdCompress now rejects them up-front.
+  it('rejects invalid --age-days values (negative, zero, non-numeric)', async () => {
+    for (const bad of ['-5', '0', 'abc']) {
+      const output = await captureStdout(() => run(['compress', '--age-days', bad]));
+      expect(output).toContain('Invalid --age-days');
+      expect(output).toContain(bad);
+    }
   });
 
   it('executes compression with --execute', async () => {
@@ -1675,6 +1760,25 @@ describe('CLI search cross-source', () => {
     expect(output).toBeDefined();
   });
 
+  // Dogfood-2 regression: --branch only applies to observations (sessions/prompts have no
+  // branch column). Previously the cross-source search returned session/prompt rows that
+  // bypassed the branch filter — users passing `--branch X` got unrelated rows mixed in.
+  // Fix: --branch implicitly restricts to observations, like --type/--tier/--importance.
+  it('--branch implicitly restricts to observations only', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Obs with no branch', text: 'cross source target',
+    });
+    testDb.prepare(`
+      INSERT INTO user_prompts (content_session_id, prompt_text, created_at, created_at_epoch)
+      VALUES ('s1', 'cross source target text', ?, ?)
+    `).run(new Date().toISOString(), Date.now());
+    // With --branch set to a value that won't match any obs, the prompt row would
+    // historically leak through (it has no branch column to filter on). Now it's excluded.
+    const output = await captureStdout(() => run(['search', 'cross source target', '--branch', 'definitely-nonexistent-branch']));
+    expect(output).not.toContain('cross source target text'); // prompt content excluded
+  });
+
   it('searches with --from and --to date filters', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
@@ -2105,9 +2209,13 @@ describe('CLI fts-check command', () => {
     expect(output).toContain('Usage');
   });
 
-  it('shows usage for invalid action', async () => {
+  it('rejects invalid action by name (not by usage)', async () => {
+    // Dogfood-5: an invalid action prints "Invalid action <name>. Use: check, rebuild"
+    // — naming the offending token instead of dumping a generic usage line.
     const output = await captureStdout(() => run(['fts-check', 'invalid']));
-    expect(output).toContain('Usage');
+    expect(output).toContain('Invalid action');
+    expect(output).toContain('invalid');
+    expect(output).toContain('check, rebuild');
   });
 
   it('checks FTS integrity', async () => {

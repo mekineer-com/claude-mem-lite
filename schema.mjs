@@ -696,7 +696,10 @@ export function ensureDb() {
   const db = new Database(DB_PATH);
   try { chmodSync(DB_PATH, 0o600); } catch {}
   db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
+  // 5000ms matches the MCP server (server.mjs) — 3000ms wasn't enough under realistic
+  // concurrency (parallel CLI saves + a long-running FTS rebuild can push individual
+  // transactions past 3s, triggering SQLITE_BUSY on the third caller).
+  db.pragma('busy_timeout = 5000');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = OFF'); // Enabled after dedup migration
 

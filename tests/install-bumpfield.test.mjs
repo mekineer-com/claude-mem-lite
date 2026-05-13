@@ -80,3 +80,77 @@ describe('buildDoctorSummary (regression after install.mjs refactor)', () => {
     expect(buildDoctorSummary(0, 0)).toBe('All checks passed!');
   });
 });
+
+// Dogfood-6 regression: `node install.mjs frobnicate` previously fell through to the
+// default-case usage dump with no indication that the user's command was unknown — the
+// usage block looked the same as `node install.mjs` (no args). Now the dispatcher names
+// the offending token + exits 1 before printing usage.
+describe('install.mjs unknown-command handling', () => {
+  it('names the unknown command and exits non-zero', async () => {
+    const { execFileSync } = await import('child_process');
+    const { resolve } = await import('path');
+    let stderr = '', stdout = '', exitCode = 0;
+    // npm_command=exec / npm_lifecycle_event leak in via `npx vitest run` — install.mjs's
+    // IS_NPX detection (`process.env.npm_command === 'exec'`) would then enter the auto-install
+    // branch instead of the unknown-command branch. Scrub them so the test exercises the
+    // CLI-invocation path a human user would hit.
+    const env = { ...process.env };
+    delete env.npm_command;
+    delete env.npm_lifecycle_event;
+    delete env.npm_lifecycle_script;
+    try {
+      execFileSync(process.execPath, [resolve('install.mjs'), 'frobnicate'], {
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000, env,
+      });
+    } catch (e) {
+      stdout = e.stdout?.toString() || '';
+      stderr = e.stderr?.toString() || '';
+      exitCode = e.status ?? 1;
+    }
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain('Unknown command');
+    expect(stderr).toContain('frobnicate');
+    // Usage is still printed so the user sees their options inline with the rejection.
+    expect(stdout).toContain('Usage');
+  });
+});
+
+// Dogfood-7 regression: `install cleanup --dry-run` previously silently ignored the
+// flag and ran the destructive default. Doctor reports stale-file counts and points
+// users at cleanup; --dry-run lets them confirm the file list before committing.
+describe('install.mjs cleanup --dry-run', () => {
+  it('preview header advertises dry-run mode and does not delete files', async () => {
+    const { execFileSync } = await import('child_process');
+    const { resolve, join } = await import('path');
+    const { mkdtempSync, writeFileSync, mkdirSync, existsSync, rmSync } = await import('fs');
+    const { tmpdir } = await import('os');
+
+    // Sandboxed HOME so we don't touch the real ~/.claude-mem-lite/.
+    const home = mkdtempSync(join(tmpdir(), 'cleanup-dryrun-'));
+    const installDir = join(home, '.claude-mem-lite');
+    const stale = join(installDir, '.update-staging-fake-dryrun');
+    mkdirSync(stale, { recursive: true });
+    writeFileSync(join(stale, 'marker.txt'), 'placeholder');
+
+    let stdout;
+    let exitCode = 0;
+    try {
+      stdout = execFileSync(process.execPath, [resolve('install.mjs'), 'cleanup', '--dry-run'], {
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000,
+        env: { ...process.env, HOME: home },
+      });
+    } catch (e) {
+      stdout = e.stdout?.toString() || '';
+      exitCode = e.status ?? 1;
+    }
+
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('--dry-run');
+    expect(stdout).toContain('Would remove');
+    expect(stdout).toContain('.update-staging-fake-dryrun');
+    // The stale dir must still exist after a dry-run pass.
+    expect(existsSync(stale)).toBe(true);
+
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+});

@@ -104,13 +104,16 @@ function cmdSearch(db, args) {
   }
 
   // Warn if obs-only filters used with non-observation source
-  if (source && source !== 'observations' && (type || tier || minImportance)) {
-    const ignored = [type && '--type', tier && '--tier', minImportance && '--importance'].filter(Boolean);
+  if (source && source !== 'observations' && (type || tier || minImportance || branch)) {
+    const ignored = [type && '--type', tier && '--tier', minImportance && '--importance', branch && '--branch'].filter(Boolean);
     process.stderr.write(`[mem] Note: ${ignored.join(', ')} only apply to observations, ignored for --source ${source}\n`);
   }
 
-  // When --type/--tier/--importance (obs-only fields) is specified, implicitly restrict to observations
-  const effectiveSource = source || ((type || tier || minImportance) ? 'observations' : null);
+  // When --type/--tier/--importance/--branch (obs-only fields) is specified, implicitly restrict to observations.
+  // --branch was previously cross-source: sessions/prompts have no branch column, so a query like
+  // `search "cache" --branch main` would include unrelated session/prompt rows, surprising users
+  // who passed --branch expecting a branch-scoped result.
+  const effectiveSource = source || ((type || tier || minImportance || branch) ? 'observations' : null);
 
   // Cross-source mode: each source needs more candidates than the final limit
   // so the post-merge sort has room to pick the best from each (paired-path with
@@ -392,9 +395,21 @@ function cmdRecent(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const jsonOutput = flags.json === true || flags.json === 'true';
 
+  // `recent --type bugfix` previously parsed as a silent no-op — users naturally
+  // try this for "show recent bugfixes". Mirror cmdSearch's enum validation.
+  const type = flags.type || null;
+  if (type) {
+    const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+    if (!validObsTypes.has(type)) {
+      fail(`[mem] Invalid --type "${type}". Valid: ${[...validObsTypes].join(', ')}`);
+      return;
+    }
+  }
+
   const params = [];
   const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
   if (project) { wheres.push('project = ?'); params.push(project); }
+  if (type) { wheres.push('type = ?'); params.push(type); }
   params.push(limit);
 
   const rows = db.prepare(`
@@ -409,6 +424,7 @@ function cmdRecent(db, args) {
     out(JSON.stringify({
       project: project || null,
       limit,
+      type: type || null,
       total: rows.length,
       results: rows.map(r => ({
         id: r.id,
@@ -1010,6 +1026,13 @@ function cmdDeferAdd(db, args) {
     fail('[mem] Usage: claude-mem-lite defer add "<title>" [--priority 1|2|3] [--detail T] [--files f1,f2] [--project P]');
     return;
   }
+  // Mirror MCP memDeferSchema.title (z.string().min(1).max(200)). CLI used to
+  // accept multi-line / 1000-char titles, then `defer list` would render them
+  // as one wrapped row that pushed every other item off-screen.
+  if (title.length > 200) {
+    fail(`[mem] defer add: title too long (${title.length} chars, max 200). Move detail to --detail "<text>".`);
+    return;
+  }
   const priority = flags.priority !== undefined ? parseInt(flags.priority, 10) : 2;
   if (![1, 2, 3].includes(priority)) {
     fail(`[mem] Invalid --priority "${flags.priority}". Must be 1 (low), 2 (normal), or 3 (urgent).`);
@@ -1054,7 +1077,7 @@ function cmdDeferList(db, args) {
 function cmdDeferDrop(db, args) {
   const { positional, flags } = parseArgs(args);
   if (positional.length === 0) {
-    fail('[mem] Usage: claude-mem-lite defer drop <id-or-D#N> --reason "<reason>" [--project P]');
+    fail('[mem] Usage: claude-mem-lite defer drop <id-or-D#N>[,id2,...] --reason "<reason>" [--project P]');
     return;
   }
   const reason = flags.reason;
@@ -1062,26 +1085,34 @@ function cmdDeferDrop(db, args) {
     fail('[mem] defer drop requires --reason "<non-empty string>"');
     return;
   }
-  const rawTok = positional[0];
-  // Accept both bare integer (ordinal) and "D#N" string. Mirrors the MCP
-  // mem_defer_drop input contract (server.mjs:1025) by using the same
-  // single-element resolveDeferredIds call.
-  const token = /^\d+$/.test(rawTok) ? parseInt(rawTok, 10) : rawTok;
+  // Accept either a single token or a comma-separated batch. `save --closes-deferred`
+  // already accepts the batch form (cmdSave uses resolveDeferredIds on a split list);
+  // drop now mirrors that ergonomic so users can prune multiple items in one call
+  // without N shell invocations.
+  const rawTokens = positional.join(' ').split(',').map(s => s.trim()).filter(Boolean);
+  const tokens = rawTokens.map(t => /^\d+$/.test(t) ? parseInt(t, 10) : t);
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
-  let realId;
+  let realIds;
   try {
-    [realId] = resolveDeferredIds(db, project, [token]);
+    realIds = resolveDeferredIds(db, project, tokens);
   } catch (e) {
     fail(`[mem] defer drop: ${e.message}`);
     return;
   }
-  const r = dropDeferred(db, realId, reason);
-  if (r.changed === 0) {
-    out(`[mem] D#${realId} was not in 'open' status — drop is a no-op.`);
-    return;
+  const dropped = [];
+  const noop = [];
+  for (const realId of realIds) {
+    const r = dropDeferred(db, realId, reason);
+    if (r.changed === 0) noop.push(realId);
+    else dropped.push(realId);
   }
-  out(`[mem] Dropped D#${realId} in project "${project}". Reason: ${reason.trim()}`);
+  if (dropped.length > 0) {
+    out(`[mem] Dropped ${dropped.map(id => `D#${id}`).join(', ')} in project "${project}". Reason: ${reason.trim()}`);
+  }
+  if (noop.length > 0) {
+    out(`[mem] No-op (not in 'open' status): ${noop.map(id => `D#${id}`).join(', ')}`);
+  }
 }
 
 // N-1: Quality-focused stats for R-2 A/B baseline.
@@ -1563,7 +1594,15 @@ function cmdUpdate(db, args) {
 
   const updates = [];
   const params = [];
-  if (flags.title !== undefined) { updates.push('title = ?'); params.push(scrubSecrets(flags.title)); }
+  if (flags.title !== undefined) {
+    // Reject empty title — clears the observation's identifier and would render it
+    // as `(untitled)` in every listing. Almost always an accidental shell-stripped arg.
+    if (typeof flags.title === 'string' && flags.title.trim() === '') {
+      fail('[mem] --title cannot be empty. Pass a non-empty string or omit the flag to leave the title unchanged.');
+      return;
+    }
+    updates.push('title = ?'); params.push(scrubSecrets(flags.title));
+  }
   if (flags.narrative !== undefined) { updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative)); }
   if (flags.type) {
     const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
@@ -1581,7 +1620,18 @@ function cmdUpdate(db, args) {
     }
     updates.push('importance = ?'); params.push(imp);
   }
-  if (flags.lesson !== undefined || flags['lesson-learned'] !== undefined) { updates.push('lesson_learned = ?'); params.push(scrubSecrets(flags.lesson ?? flags['lesson-learned'] ?? '')); }
+  if (flags.lesson !== undefined || flags['lesson-learned'] !== undefined) {
+    const rawLesson = flags.lesson ?? flags['lesson-learned'] ?? '';
+    // Mirror cmdSave's 500-char cap — pre-fix `update --lesson <501-char>` was silently
+    // accepted, letting overlong lessons leak into the DB through the update path
+    // even though save's path rejected them. MCP memSaveSchema also caps at 500.
+    if (typeof rawLesson === 'string' && rawLesson.length > 500) {
+      fail(`[mem] --lesson too long (${rawLesson.length} chars, max 500).`);
+      return;
+    }
+    updates.push('lesson_learned = ?');
+    params.push(scrubSecrets(rawLesson));
+  }
   if (flags.concepts !== undefined) { updates.push('concepts = ?'); params.push(flags.concepts); }
 
   if (updates.length === 0) {
@@ -1632,7 +1682,16 @@ function cmdExport(db, args) {
 
   const project = flags.project ? resolveProject(db, flags.project) : null;
   if (project) { wheres.push('project = ?'); params.push(project); }
-  if (flags.type) { wheres.push('type = ?'); params.push(flags.type); }
+  if (flags.type) {
+    // Reject unknown types — silently returning [] for `--type bogus` looked like a
+    // legitimate empty filter result, hiding the typo. Mirrors cmdSearch / cmdSave / cmdUpdate.
+    const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+    if (!validObsTypes.has(flags.type)) {
+      fail(`[mem] Invalid --type "${flags.type}". Valid: ${[...validObsTypes].join(', ')}`);
+      return;
+    }
+    wheres.push('type = ?'); params.push(flags.type);
+  }
   let exportFromEpoch = null;
   let exportToEpoch = null;
   if (flags.from) {
@@ -1690,8 +1749,18 @@ function cmdExport(db, args) {
 function cmdCompress(db, args) {
   const { flags } = parseArgs(args);
   const preview = flags.execute !== true && flags.execute !== 'true';
-  const ageDaysRaw = parseInt(flags['age-days'], 10);
-  const ageDays = Number.isFinite(ageDaysRaw) && ageDaysRaw >= 1 ? ageDaysRaw : 30;
+  // Reject malformed --age-days explicitly. The prior fallback (`|| 30`) silently used
+  // the default whenever the value parsed as NaN or <1, so users typing `--age-days abc`
+  // got the 30-day cutoff without knowing their input was discarded.
+  let ageDays = 30;
+  if (flags['age-days'] !== undefined) {
+    const parsed = parseInt(flags['age-days'], 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      fail(`[mem] Invalid --age-days "${flags['age-days']}". Must be a positive integer.`);
+      return;
+    }
+    ageDays = parsed;
+  }
   const cutoff = Date.now() - ageDays * 86400000;
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const projectFilter = project ? 'AND project = ?' : '';
@@ -2084,6 +2153,20 @@ function cmdRegistry(_memDb, args) {
     return;
   }
 
+  // `--type` and `--resource-type` are both constrained to skill|agent across
+  // registry sub-actions. Validating once here means search/list/import/remove
+  // all reject typos like `--type sklil` instead of silently returning
+  // "No resources found." (which looked like the registry was empty for that
+  // type, not like a typo).
+  if (flags.type !== undefined && flags.type !== 'skill' && flags.type !== 'agent') {
+    fail(`[mem] Invalid --type "${flags.type}". Use: skill, agent`);
+    return;
+  }
+  if (flags['resource-type'] !== undefined && flags['resource-type'] !== 'skill' && flags['resource-type'] !== 'agent') {
+    fail(`[mem] Invalid --resource-type "${flags['resource-type']}". Use: skill, agent`);
+    return;
+  }
+
   try {
     if (action === 'search') {
       const query = flags.query || positional.slice(1).join(' ');
@@ -2199,7 +2282,9 @@ function cmdRegistry(_memDb, args) {
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry remove --name N --resource-type skill|agent'); return; }
       const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(resourceType, name);
-      out(result.changes > 0 ? `[mem] Removed: ${resourceType}:${name}` : '[mem] Not found.');
+      out(result.changes > 0
+        ? `[mem] Removed: ${resourceType}:${name}`
+        : `[mem] Not found: ${resourceType}:${name}`);
       return;
     }
 
@@ -2286,7 +2371,7 @@ Commands:
     --project P         Filter by project
     --from DATE         Start date (YYYY-MM-DD or ISO 8601)
     --to DATE           End date (YYYY-MM-DD or ISO 8601)
-    --importance N      Minimum importance (1-3)
+    --importance N      Minimum importance (1=routine, 2=notable, 3=critical)
     --branch B          Filter by git branch
     --offset N          Skip first N results (pagination)
     --tier T            Filter by tier (working|active|archive, observations only)
@@ -2298,7 +2383,8 @@ Commands:
   recent [N]            Show N most recent observations (default 10)
     --limit N           Sibling-parity alias for [N] (max 1000)
     --project P         Filter by project
-    --json              Output as JSON: {project,limit,total,results:[…]}
+    --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
+    --json              Output as JSON: {project,limit,type,total,results:[…]}
 
   recall <file>         Show observations related to a file
     --limit N           Max results (default 10)
@@ -2328,22 +2414,22 @@ Commands:
   save "<text>"         Save a new observation
     --type T            Observation type (default: discovery)
     --title T           Title (auto-generated if omitted)
-    --importance N      1-3 (default: 2)
+    --importance N      1=routine, 2=notable, 3=critical (default: 2)
     --project P         Project name
     --files f1,f2       Comma-separated file paths
     --lesson T          Lesson learned (≤500 chars; alias: --lesson-learned)
     --closes-deferred 1,D#42  Close deferred items in same transaction
 
   defer <action>        First-class deferred work (v2.70+)
-    add "<title>"       Mark deferred work for next session
-      --priority N      1-3 (default 2)
+    add "<title>"       Mark deferred work for next session (≤200 chars)
+      --priority N      1=low, 2=normal, 3=urgent (default: 2)
       --detail T        Constraint + why deferred
       --files f1,f2     Comma-separated file paths
       --project P       Project name
     list                List open deferred items
       --limit N         Max results (default 10)
       --project P       Filter by project
-    drop <D#N|ordinal>  Drop a deferred item (no fix needed)
+    drop <D#N|ordinal>[,...]  Drop one or more deferred items (no fix needed)
       --reason "..."    Required audit trail
 
   delete <id1,id2,...>  Delete observations by ID
@@ -2352,7 +2438,7 @@ Commands:
   update <id>           Update an existing observation
     --title T           New title
     --type T            New type
-    --importance N      New importance (1-3)
+    --importance N      New importance (1=routine, 2=notable, 3=critical)
     --lesson T          Add/update lesson learned (alias: --lesson-learned)
     --narrative T       New narrative
     --concepts T        Space-separated concept tags
@@ -2451,6 +2537,8 @@ Commands:
 
   unadopt               Precise removal of the sentinel block + plugin_claude_mem_lite.md.
     --all               Unadopt every project
+    --status            Read-only: list adopted projects (same as adopt --status)
+    --dry-run           Preview what would be removed; no filesystem writes
 
   memdir-audit          Audit memdir feedback_*.md / project_*.md for the
                         body-structure contract (**Why:** + **How to apply:**).
@@ -2551,16 +2639,30 @@ async function cmdImportJsonl(db, argv) {
   if (files.length === 0) { out('[mem] No .jsonl files found.'); return; }
 
   const { importJsonl } = await import('./lib/import-jsonl.mjs');
-  let totalPrompts = 0, totalObs = 0, totalSkip = 0, totalOrphans = 0;
+  let totalPrompts = 0, totalObs = 0, totalSkip = 0, totalOrphans = 0, errorCount = 0;
   for (const f of files) {
-    const r = await importJsonl(db, f, { project });
+    // Per-file isolation: one unreadable file (EACCES, EBUSY, mid-batch IO error)
+    // shouldn't crash the whole import — readFileSync inside importJsonl would
+    // otherwise throw an unhandled exception with a node stack trace, leaving
+    // earlier successes uncommitted-looking from the user's perspective.
+    let r;
+    try {
+      r = await importJsonl(db, f, { project });
+    } catch (e) {
+      errorCount++;
+      // e.message for node fs errors already begins with the code (e.g. "EACCES: permission denied, ...");
+      // don't double-prefix.
+      process.stderr.write(`[mem] ${f}: import failed — ${e.message}\n`);
+      continue;
+    }
     totalPrompts += r.prompts;
     totalObs += r.observations;
     totalSkip += r.skipped;
     totalOrphans += r.orphans || 0;
     out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations, ${r.orphans || 0} orphan tool_use, ${r.skipped} skipped`);
   }
-  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s).`);
+  const errorTail = errorCount > 0 ? `, ${errorCount} file(s) errored` : '';
+  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
   if (totalPrompts > 0 || totalObs > 0) {
     out(`[mem] Try: claude-mem-lite recent 5 --project ${project}`);
   }
@@ -2648,8 +2750,17 @@ async function cmdOptimize(db, args) {
   }
   // R-7 micro: --scope wide targets bugfix/refactor/feature/decision with narrative but no
   // lesson_learned (the "Haiku judged 'none'" cases). Default 'narrow' preserves old behavior.
+  // Validate explicitly so `--scope wlde` (typo) doesn't silently become narrow and waste an LLM run.
   const scopeIdx = args.indexOf('--scope');
-  const reenrichScope = scopeIdx >= 0 && args[scopeIdx + 1] === 'wide' ? 'wide' : 'narrow';
+  let reenrichScope = 'narrow';
+  if (scopeIdx >= 0 && args[scopeIdx + 1] !== undefined) {
+    const raw = args[scopeIdx + 1];
+    if (raw !== 'narrow' && raw !== 'wide') {
+      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide`);
+      return;
+    }
+    reenrichScope = raw;
+  }
   // --project <name> filters all 4 tasks to one project. Opt-in; absence
   // preserves prior cross-project default. `.` or `current` auto-resolve via
   // inferProject() so users don't need to remember the exact name.
@@ -2758,7 +2869,11 @@ export async function run(argv) {
   const JSON_SUPPORTED_CMDS = new Set([
     'search', 'context', 'recent', 'recall', 'timeline', 'stats', 'browse', 'export',
   ]);
-  if (cmdArgs.includes('--json') && !JSON_SUPPORTED_CMDS.has(cmd)) {
+  // `doctor --benchmark` already emits JSON on its own — don't print the misleading
+  // "doctor outputs text" note for that subpath. Without --benchmark, doctor is text
+  // and the note is still useful.
+  const doctorBenchmark = cmd === 'doctor' && cmdArgs.includes('--benchmark');
+  if (cmdArgs.includes('--json') && !JSON_SUPPORTED_CMDS.has(cmd) && !doctorBenchmark) {
     process.stderr.write(`[mem] Note: --json is supported only on: ${[...JSON_SUPPORTED_CMDS].join(', ')}. "${cmd}" outputs text.\n`);
   }
 
@@ -2792,6 +2907,19 @@ export async function run(argv) {
         out('[mem] Run "claude-mem-lite help" for usage');
         process.exitCode = 1;
     }
+  } catch (e) {
+    // SQLITE_BUSY / SQLITE_LOCKED + extended variants (SQLITE_BUSY_SNAPSHOT,
+    // SQLITE_BUSY_RECOVERY, SQLITE_LOCKED_SHAREDCACHE…). All mean the same thing
+    // to the user: writer contention past the 5s busy_timeout. Pre-fix this
+    // raised an unhandled SqliteError with a node stack trace.
+    const code = e && typeof e.code === 'string' ? e.code : '';
+    if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' ||
+        code.startsWith('SQLITE_BUSY_') || code.startsWith('SQLITE_LOCKED_')) {
+      process.stderr.write(`[mem] Database busy — another process held the writer past the 5s timeout. Retry shortly.\n`);
+      process.exitCode = 1;
+      return;
+    }
+    throw e;
   } finally {
     try { db.close(); } catch {}
   }
