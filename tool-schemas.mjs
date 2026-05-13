@@ -197,6 +197,8 @@ export const memOptimizeSchema = {
     .describe('Maximum LLM calls across all tasks (default: 15)'),
   scope: z.enum(['narrow', 'wide']).optional().default('narrow')
     .describe("Re-enrich scope: narrow=narrative-only candidates (default); wide=R-7 backfill (bugfix/refactor/feature/decision with narrative but lesson_learned='none'). CLI parity: --scope wide."),
+  project: z.string().optional().describe('Filter all 4 tasks to a single project. Default: scan all projects.'),
+  detail: coerceBool.optional().describe('preview action only — include cluster contents + re-enrich/compress sample arrays alongside aggregate counts.'),
 };
 
 export const memMaintainSchema = {

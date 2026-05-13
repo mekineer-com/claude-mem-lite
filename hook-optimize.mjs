@@ -74,12 +74,13 @@ export function rebuildVector(db, obsId, textParts) {
  *
  * @param {object} db better-sqlite3 database handle
  * @param {number} limit max candidates to return
- * @param {{ scope?: 'narrow' | 'wide' }} [opts]
+ * @param {{ scope?: 'narrow' | 'wide', project?: string }} [opts] Optional project filter (e.g. inferProject()-resolved name) narrows candidates to a single project — opt-in to preserve prior cross-project default.
  */
-export function findReenrichCandidates(db, limit = 10, { scope = 'narrow' } = {}) {
+export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', project } = {}) {
+  const projectClause = project ? 'AND project = ?' : '';
   if (scope === 'wide') {
-    return db.prepare(`
-      SELECT id, title, narrative, type, subtitle, concepts, facts
+    const stmt = db.prepare(`
+      SELECT id, title, narrative, type, subtitle, concepts, facts, project
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0
         AND superseded_at IS NULL
@@ -88,14 +89,16 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow' } = {}
         AND (lesson_learned IS NULL OR lesson_learned = '')
         AND LENGTH(COALESCE(narrative, '')) > 100
         AND ${notLowSignalTitleClause('')}
+        ${projectClause}
       ORDER BY
         CASE type WHEN 'decision' THEN 0 WHEN 'bugfix' THEN 1 WHEN 'refactor' THEN 2 ELSE 3 END,
         created_at_epoch DESC
       LIMIT ?
-    `).all(limit);
+    `);
+    return project ? stmt.all(project, limit) : stmt.all(limit);
   }
-  return db.prepare(`
-    SELECT id, title, narrative, type, subtitle
+  const stmt = db.prepare(`
+    SELECT id, title, narrative, type, subtitle, project
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND (concepts IS NULL OR concepts = '')
@@ -103,13 +106,15 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow' } = {}
       AND lesson_learned IS NULL
       AND search_aliases IS NULL
       AND optimized_at IS NULL
+      ${projectClause}
     ORDER BY created_at_epoch DESC
     LIMIT ?
-  `).all(limit);
+  `);
+  return project ? stmt.all(project, limit) : stmt.all(limit);
 }
 
-export async function executeReenrich(db, limit = 10, { scope = 'narrow' } = {}) {
-  const candidates = findReenrichCandidates(db, limit, { scope });
+export async function executeReenrich(db, limit = 10, { scope = 'narrow', project } = {}) {
+  const candidates = findReenrichCandidates(db, limit, { scope, project });
   if (candidates.length === 0) return { processed: 0, skipped: 0 };
 
   let processed = 0, skipped = 0;
@@ -206,14 +211,17 @@ export function shouldRunNormalize() {
   }
 }
 
-export function extractUniqueConcepts(db, limit = 500) {
-  const rows = db.prepare(`
+export function extractUniqueConcepts(db, limit = 500, { project } = {}) {
+  const projectClause = project ? 'AND project = ?' : '';
+  const stmt = db.prepare(`
     SELECT concepts FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND concepts IS NOT NULL AND concepts != ''
+      ${projectClause}
     ORDER BY created_at_epoch DESC
     LIMIT 2000
-  `).all();
+  `);
+  const rows = project ? stmt.all(project) : stmt.all();
 
   const conceptSet = new Set();
   for (const row of rows) {
@@ -304,10 +312,10 @@ export function applyNormalization(db, groups) {
   return { updated };
 }
 
-export async function executeNormalize(db, force = false) {
+export async function executeNormalize(db, force = false, { project } = {}) {
   if (!force && !shouldRunNormalize()) return { skipped: true, reason: 'gate' };
 
-  const concepts = extractUniqueConcepts(db);
+  const concepts = extractUniqueConcepts(db, 500, { project });
   if (concepts.length < 5) return { skipped: true, reason: 'too few concepts' };
 
   const groups = await identifySynonymGroups(concepts);
@@ -326,18 +334,21 @@ const MERGE_TIME_WINDOW_MS = 30 * 86400000;
 const MERGE_JACCARD_LOW = 0.4;
 const MERGE_JACCARD_HIGH = 0.85;
 
-export function findMergeCandidates(db, maxClusters = 5) {
+export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const cutoff = Date.now() - MERGE_TIME_WINDOW_MS;
-  const rows = db.prepare(`
-    SELECT id, title, narrative, project, access_count, created_at_epoch, minhash_sig
+  const projectClause = project ? 'AND project = ?' : '';
+  const stmt = db.prepare(`
+    SELECT id, title, narrative, project, type, access_count, created_at_epoch, minhash_sig
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND optimized_at IS NULL
       AND title IS NOT NULL AND title != ''
       AND created_at_epoch > ?
+      ${projectClause}
     ORDER BY created_at_epoch DESC
     LIMIT 200
-  `).all(cutoff);
+  `);
+  const rows = project ? stmt.all(cutoff, project) : stmt.all(cutoff);
 
   const used = new Set();
   const clusters = [];
@@ -450,8 +461,8 @@ Return ONLY valid JSON:
   }
 }
 
-export async function executeClusterMerge(db, maxClusters = 5) {
-  const clusters = findMergeCandidates(db, maxClusters);
+export async function executeClusterMerge(db, maxClusters = 5, { project } = {}) {
+  const clusters = findMergeCandidates(db, maxClusters, { project });
   if (clusters.length === 0) return { processed: 0, merged: 0 };
 
   let merged = 0;
@@ -468,17 +479,20 @@ export async function executeClusterMerge(db, maxClusters = 5) {
 const COMPRESS_TIME_SPLIT_MS = 14 * 86400000;
 const COMPRESS_COSINE_THRESHOLD = 0.3;
 
-export function findSmartCompressCandidates(db, ageDays = 30) {
+export function findSmartCompressCandidates(db, ageDays = 30, { project } = {}) {
   const cutoff = Date.now() - ageDays * 86400000;
-  return db.prepare(`
+  const projectClause = project ? 'AND project = ?' : '';
+  const stmt = db.prepare(`
     SELECT id, title, narrative, lesson_learned, project, type, created_at_epoch
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND COALESCE(importance, 1) = 1
       AND COALESCE(access_count, 0) = 0
       AND created_at_epoch < ?
+      ${projectClause}
     ORDER BY project, created_at_epoch
-  `).all(cutoff);
+  `);
+  return project ? stmt.all(cutoff, project) : stmt.all(cutoff);
 }
 
 export function clusterForCompression(candidates, db) {
@@ -642,8 +656,8 @@ JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive sum
   }
 }
 
-export async function executeSmartCompress(db, maxClusters = 5) {
-  const candidates = findSmartCompressCandidates(db);
+export async function executeSmartCompress(db, maxClusters = 5, { project } = {}) {
+  const candidates = findSmartCompressCandidates(db, 30, { project });
   if (candidates.length < 3) return { processed: 0, compressed: 0 };
 
   const clusters = clusterForCompression(candidates, db);
@@ -661,23 +675,34 @@ export async function executeSmartCompress(db, maxClusters = 5) {
 
 // ─── Pipeline Orchestrator ──────────────────────────────────────────────────
 
-export function optimizePreview(db) {
-  const reenrich = findReenrichCandidates(db, 1000).length;
+/**
+ * @param {object} db better-sqlite3 database handle
+ * @param {{ project?: string, detail?: boolean }} [opts]
+ *   project: scope all candidate finders to a single project (opt-in; default scans all).
+ *   detail: when true, also return `mergeClusters` / `reenrichSamples` / `compressSamples`
+ *     arrays alongside the aggregate counts so callers (CLI --verbose, MCP detail mode)
+ *     can render auditable previews without re-running the finders. The candidate-count
+ *     arms still call the finders with high limits — detail mode does NOT widen scope,
+ *     it surfaces the same rows the counts already crossed.
+ */
+export function optimizePreview(db, { project, detail = false } = {}) {
+  const reenrichCandidates = findReenrichCandidates(db, 1000, { project });
+  const reenrich = reenrichCandidates.length;
   // R-7: also report the widened-scope candidate count so users can see how many
   // bugfix/refactor/feature/decision observations are eligible for lesson backfill.
-  const reenrichWide = findReenrichCandidates(db, 5000, { scope: 'wide' }).length;
+  const reenrichWide = findReenrichCandidates(db, 5000, { scope: 'wide', project }).length;
 
-  const concepts = extractUniqueConcepts(db);
+  const concepts = extractUniqueConcepts(db, 500, { project });
   const normalizeReady = shouldRunNormalize() && concepts.length >= 5;
 
-  const mergeClusters = findMergeCandidates(db, 50);
+  const mergeClusters = findMergeCandidates(db, 50, { project });
   const clusterMerge = mergeClusters.length;
 
-  const compressCandidates = findSmartCompressCandidates(db);
+  const compressCandidates = findSmartCompressCandidates(db, 30, { project });
   const compressClusters = clusterForCompression(compressCandidates, db);
   const smartCompress = compressClusters.length;
 
-  return {
+  const result = {
     reenrich,
     reenrichWide,
     normalize: normalizeReady ? concepts.length : 0,
@@ -686,6 +711,15 @@ export function optimizePreview(db) {
     smartCompress,
     total: reenrich + (normalizeReady ? 1 : 0) + clusterMerge + smartCompress,
   };
+  if (detail) {
+    // Caps avoid dumping arbitrarily large arrays into CLI/MCP output — 20 picks
+    // a sample size big enough to be auditable but small enough to fit a terminal
+    // page. Callers that need more can drop --verbose and run the finders directly.
+    result.mergeClusters = mergeClusters;
+    result.reenrichSamples = reenrichCandidates.slice(0, 20);
+    result.compressSamples = compressClusters.slice(0, 5);
+  }
+  return result;
 }
 
 /**
@@ -701,8 +735,10 @@ export function optimizePreview(db) {
  * @param {boolean} [opts.force=false] Bypass time-based gates (e.g. normalize interval).
  * @param {'narrow'|'wide'} [opts.reenrichScope='narrow'] Scope for the re-enrich task.
  *   'wide' targets bugfix/refactor/feature/decision with narrative but no lesson (R-7).
+ * @param {string} [opts.project] Filter all tasks to a single project. Opt-in;
+ *   absence preserves the prior all-projects default.
  */
-export async function optimizeRun(db, { tasks, maxItems = 15, force = false, reenrichScope = 'narrow' } = {}) {
+export async function optimizeRun(db, { tasks, maxItems = 15, force = false, reenrichScope = 'narrow', project } = {}) {
   const allTasks = ['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'];
   const selectedTasks = tasks && tasks.length > 0 ? tasks : allTasks;
   // Single-task mode: give that task the full budget. Distribution only makes sense
@@ -716,16 +752,16 @@ export async function optimizeRun(db, { tasks, maxItems = 15, force = false, ree
     try {
       switch (task) {
         case 're-enrich':
-          results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope });
+          results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope, project });
           break;
         case 'normalize':
-          results.normalize = await executeNormalize(db, force);
+          results.normalize = await executeNormalize(db, force, { project });
           break;
         case 'cluster-merge':
-          results.clusterMerge = await executeClusterMerge(db, budget.clusterMerge);
+          results.clusterMerge = await executeClusterMerge(db, budget.clusterMerge, { project });
           break;
         case 'smart-compress':
-          results.smartCompress = await executeSmartCompress(db, budget.smartCompress);
+          results.smartCompress = await executeSmartCompress(db, budget.smartCompress, { project });
           break;
       }
     } catch (e) {

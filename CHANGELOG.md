@@ -2,6 +2,34 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.72.0 — optimize --project filter + --verbose preview cluster details
+
+Two additive hygiene features for the LLM-powered `optimize` pipeline. Both opt-in; default behavior unchanged (per #8005 — measure signal-content before tuning a knob; cross-project default isn't broken, it's just sometimes too broad).
+
+**Added**:
+
+- **`optimize --project <name|.|current>`** — opt-in filter that scopes all 4 tasks (re-enrich, normalize, cluster-merge, smart-compress) to a single project. Default (no flag) preserves prior cross-project behavior. Special tokens `.` and `current` auto-resolve via `inferProject()` so users don't need to remember the exact stored project name. Motivation: a 2026-05 cluster-merge audit found 2 of 2 candidate clusters came from a project the user wasn't actively working on — running `optimize --run` burned LLM tokens on out-of-scope noise. Now: `claude-mem-lite optimize --project current` for the common "only clean what I'm working on" path. Lesson #8462.
+
+- **`optimize --verbose` / `-v`** — preview now also dumps cluster contents and re-enrich samples instead of just aggregate counts. Cluster-merge preview shows each cluster's obs ids + types + titles + project; re-enrich samples lists up to 20 candidate observations; smart-compress shows up to 5 cluster summaries. Caps avoid dumping arbitrarily large arrays — users wanting more drop `--verbose` and inspect the DB directly. Motivation: the audit found preview's `Cluster-merge: 2 clusters` line forced the user to write a 20-line Node script to see what was actually inside before `--run`. Now: `claude-mem-lite optimize --verbose` is auditable preview.
+
+**MCP parity** (#8450 — single source-of-truth for cross-surface flag sync):
+
+- `memOptimizeSchema` gained `project: string` and `detail: boolean`. Server handler propagates both to `optimizePreview` / `optimizeRun`. CLI and MCP now apply project filter identically.
+
+**Plumbing**:
+
+- 5 candidate finders / runners gained opt-in `{ project }`: `findReenrichCandidates`, `findMergeCandidates`, `findSmartCompressCandidates`, `extractUniqueConcepts`, plus all 4 `execute*` functions. SQL WHERE clauses use a conditional `${projectClause}` interpolation; binding params shift to `project ? stmt.all(project, …) : stmt.all(…)`. Default (no project) preserves prior query plans exactly.
+- `optimizePreview(db, { project, detail })` returns the same aggregate-counts shape as before when `detail` is falsy; only adds `mergeClusters` / `reenrichSamples` / `compressSamples` arrays when `detail: true`. Backward-compat preserved for any external caller depending on the count-only shape.
+
+**Tests**:
+
+- **`tests/hook-optimize-project-filter.test.mjs`** (new) — 8 fixtures locking three invariants: (1) default = no filter returns clusters from all projects; (2) `{ project: name }` returns only that project's rows / clusters; (3) unknown project returns 0; (4) `{ detail: true }` returns arrays alongside counts; (5) `{ detail: false }` (default) returns counts only — no leaked detail keys. Seed titles tuned to land in `[0.4, 0.85)` Jaccard band so `findMergeCandidates` actually forms clusters.
+- Suite: 98 files / 2307 tests green (+1 file, +8 tests over v2.71.4 baseline).
+
+**Why this exists**:
+
+User audit of `bug.txt` (2026-05-14) surfaced both gaps: cross-project noise wasting LLM tokens during cluster-merge, and `Cluster-merge: 2 clusters` opacity forcing manual DB inspection. Both fixes are additive — bundled per the "small low-risk hygiene release, separate from behavior-changing fixes" rule (#8154).
+
 ## v2.71.4 — launch.mjs ABI self-heal + bash-utils 0-fail false-positive
 
 Two production-shape bugs surfaced during a 2026-05-14 audit of `bug.txt` transcripts. Both have minimal, targeted fixes with regression tests.

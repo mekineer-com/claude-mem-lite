@@ -1576,15 +1576,33 @@ server.registerTool(
     const action = args.action || 'preview';
 
     if (action === 'preview') {
-      const preview = optimizePreview(db);
+      const preview = optimizePreview(db, { project: args.project, detail: args.detail === true });
       const lines = [
         `🔍 LLM Optimization Preview:`,
+      ];
+      if (args.project) lines.push(`  Project filter: ${args.project}`);
+      lines.push(
         `  Re-enrich candidates: ${preview.reenrich}`,
         `  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`,
         `  Cluster-merge candidates: ${preview.clusterMerge} clusters`,
         `  Smart-compress candidates: ${preview.smartCompress} clusters`,
         `  Total: ${preview.total} items`,
-      ];
+      );
+      if (args.detail === true) {
+        if (preview.mergeClusters && preview.mergeClusters.length > 0) {
+          lines.push('', '─── Cluster-merge details ───');
+          for (const [i, cluster] of preview.mergeClusters.entries()) {
+            lines.push(`  Cluster ${i + 1} (${cluster.length} obs, project=${cluster[0]?.project || '?'}):`);
+            for (const obs of cluster) lines.push(`    #${obs.id} [${obs.type || 'change'}] ${truncate(obs.title || '(untitled)', 100)}`);
+          }
+        }
+        if (preview.reenrichSamples && preview.reenrichSamples.length > 0) {
+          lines.push('', '─── Re-enrich sample (first 20) ───');
+          for (const obs of preview.reenrichSamples) {
+            lines.push(`  #${obs.id} [${obs.type || 'change'}] (project=${obs.project || '?'}) ${truncate(obs.title || '(untitled)', 100)}`);
+          }
+        }
+      }
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
@@ -1596,6 +1614,7 @@ server.registerTool(
       // T2-P0-B: scope parity with CLI (--scope wide). When omitted, optimizeRun defaults
       // to narrow via its own code; passing through keeps that fallback intact.
       reenrichScope: args.scope,
+      project: args.project,
     });
 
     const lines = ['🔧 LLM Optimization Results:'];

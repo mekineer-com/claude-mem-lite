@@ -2383,6 +2383,8 @@ Commands:
     --task T            Comma-separated: re-enrich,normalize,cluster-merge,smart-compress
     --max N             Max items per task (1-100, default 15)
     --scope S           re-enrich scope: narrow (default) or wide
+    --project P         Limit to a single project (.|current = inferProject())
+    --verbose / -v      Preview also dumps cluster contents + re-enrich samples
 
   doctor                Environment diagnostics and benchmarks
     --benchmark         Run perf benchmark and emit JSON
@@ -2617,6 +2619,7 @@ async function cmdEnrich(argv) {
 async function cmdOptimize(db, args) {
   const run = args.includes('--run');
   const runAll = args.includes('--run-all');
+  const verbose = args.includes('--verbose') || args.includes('-v');
   // T2-P1-D: --task accepts a single task or a comma-separated list, parity with MCP memOptimizeSchema.tasks.
   const VALID_TASKS = ['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'];
   const taskIdx = args.indexOf('--task');
@@ -2647,23 +2650,56 @@ async function cmdOptimize(db, args) {
   // lesson_learned (the "Haiku judged 'none'" cases). Default 'narrow' preserves old behavior.
   const scopeIdx = args.indexOf('--scope');
   const reenrichScope = scopeIdx >= 0 && args[scopeIdx + 1] === 'wide' ? 'wide' : 'narrow';
+  // --project <name> filters all 4 tasks to one project. Opt-in; absence
+  // preserves prior cross-project default. `.` or `current` auto-resolve via
+  // inferProject() so users don't need to remember the exact name.
+  const projectIdx = args.indexOf('--project');
+  let project;
+  if (projectIdx >= 0 && args[projectIdx + 1]) {
+    const raw = args[projectIdx + 1];
+    project = (raw === '.' || raw === 'current') ? inferProject() : raw;
+  }
 
   if (!run && !runAll) {
-    const preview = optimizePreview(db);
+    const preview = optimizePreview(db, { project, detail: verbose });
     out('[mem] 🔍 LLM Optimization Preview:');
+    if (project) out(`  Project filter: ${project}`);
     out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}`);
     out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
     out(`  Cluster-merge: ${preview.clusterMerge} clusters`);
     out(`  Smart-compress: ${preview.smartCompress} clusters`);
     out(`  Total: ${preview.total} items`);
+    if (verbose) {
+      out('');
+      if (preview.mergeClusters && preview.mergeClusters.length > 0) {
+        out('─── Cluster-merge details ───');
+        for (const [i, cluster] of preview.mergeClusters.entries()) {
+          out(`  Cluster ${i + 1} (${cluster.length} obs, project=${cluster[0]?.project || '?'}):`);
+          for (const obs of cluster) out(`    #${obs.id} [${obs.type || 'change'}] ${truncate(obs.title || '(untitled)', 100)}`);
+        }
+      }
+      if (preview.reenrichSamples && preview.reenrichSamples.length > 0) {
+        out('─── Re-enrich sample (first 20) ───');
+        for (const obs of preview.reenrichSamples) {
+          out(`  #${obs.id} [${obs.type || 'change'}] (project=${obs.project || '?'}) ${truncate(obs.title || '(untitled)', 100)}`);
+        }
+      }
+      if (preview.compressSamples && preview.compressSamples.length > 0) {
+        out('─── Smart-compress sample (first 5 clusters) ───');
+        for (const [i, cluster] of preview.compressSamples.entries()) {
+          out(`  Cluster ${i + 1} (${cluster.observations?.length || 0} obs, project=${cluster.project || '?'})`);
+        }
+      }
+    }
     out('');
     out('Run with --run to execute, --run-all to bypass gates.');
     out('For R-7 backfill: --run --task re-enrich --scope wide --max N');
+    out('Scope: --project <name|.|current> to limit; --verbose for cluster details.');
     return;
   }
 
-  out(`[mem] Running LLM optimization${reenrichScope === 'wide' ? ' (scope: wide)' : ''}...`);
-  const results = await optimizeRun(db, { tasks, maxItems, force: runAll, reenrichScope });
+  out(`[mem] Running LLM optimization${reenrichScope === 'wide' ? ' (scope: wide)' : ''}${project ? ` (project: ${project})` : ''}...`);
+  const results = await optimizeRun(db, { tasks, maxItems, force: runAll, reenrichScope, project });
 
   if (results.reenrich) out(`  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`);
   if (results.normalize) {
