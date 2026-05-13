@@ -25,17 +25,22 @@ const MARKETPLACE_KEY = 'sdsrss';
 const PLUGIN_KEY = `claude-mem-lite@${MARKETPLACE_KEY}`;
 const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
-import { createRequire } from 'module';
-
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
+import { probeBetterSqlite3Binding, ensureBetterSqlite3Working } from './lib/binding-probe.mjs';
 
 // Re-export for backward compatibility — tests/install-hook-scripts.test.mjs
 // and any external consumers still import HOOK_SCRIPT_FILES from install.mjs.
 // The constant itself moved to source-files.mjs in v2.55 so hook-update.mjs
 // can share it without a static cycle.
 export { HOOK_SCRIPT_FILES };
+
+// Re-export for backward compatibility — tests/install-bsqlite-probe.test.mjs
+// imports these from install.mjs. The implementation moved to lib/binding-probe.mjs
+// so scripts/launch.mjs can share the probe without importing install.mjs (which
+// pulls heavy install-only deps).
+export { probeBetterSqlite3Binding, ensureBetterSqlite3Working };
 
 export function copyHookScripts(srcDir, destDir) {
   for (const name of HOOK_SCRIPT_FILES) {
@@ -73,55 +78,6 @@ export function migrateLegacyClaudeMemData(oldDir, newDir, opts = {}) {
     if (existsSync(src)) renameSync(src, join(newDir, `claude-mem-lite.db${ext}.legacy-backup-${ts}`));
   }
   return { action: 'backed-up', backupPath };
-}
-
-/**
- * Probe better-sqlite3's native binding by importing it from `installDir`'s
- * node_modules and opening an in-memory DB. Returns {ok, error?}. `npm install`
- * exits 0 even when the prebuilt .node binary mismatches the running Node ABI
- * (e.g. NODE_MODULE_VERSION 137 on Node v24), so install must verify before
- * declaring success — otherwise the next launch FATALs with "Could not locate
- * the bindings file".
- */
-export async function probeBetterSqlite3Binding(installDir) {
-  try {
-    const localRequire = createRequire(join(installDir, 'package.json'));
-    const Database = localRequire('better-sqlite3');
-    const db = new Database(':memory:');
-    db.close();
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
-
-/**
- * Verify better-sqlite3 binding works in `installDir`; if not, run
- * `npm rebuild better-sqlite3` and re-probe. Returns
- * { ok: true, action: 'verified' | 'rebuilt' } on success or
- * { ok: false, error } if rebuild can't fix it. The `probe` and `rebuild`
- * deps are injectable so this can be unit-tested without a real npm
- * subprocess.
- */
-export async function ensureBetterSqlite3Working(installDir, deps = {}) {
-  const probe = deps.probe || (() => probeBetterSqlite3Binding(installDir));
-  const rebuild = deps.rebuild || (async () => {
-    execSync('npm rebuild better-sqlite3', { cwd: installDir, stdio: 'pipe' });
-  });
-
-  const first = await probe();
-  if (first.ok) return { ok: true, action: 'verified' };
-
-  try {
-    await rebuild();
-  } catch (e) {
-    return { ok: false, error: `rebuild failed: ${e.message}` };
-  }
-
-  const second = await probe();
-  if (second.ok) return { ok: true, action: 'rebuilt' };
-
-  return { ok: false, error: second.error || first.error };
 }
 
 /**
@@ -421,7 +377,12 @@ async function install() {
   } else {
     log('Ensuring dependencies installed...');
     try {
-      execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: 'pipe' });
+      // stderr inherited so users see real-time progress (network slowness,
+      // node-gyp compile spinner, prebuild-install fallback messages). With
+      // `stdio: 'pipe'` the install appeared to hang under the 5-min Bash
+      // timeout when better-sqlite3 had no Node v24 prebuild and had to
+      // compile from source — see bug audit 2026-05.
+      execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: ['ignore', 'pipe', 'inherit'] });
       ok('Dependencies installed');
     } catch (e) {
       fail('npm install failed: ' + e.message);

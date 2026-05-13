@@ -15,9 +15,25 @@ export function detectBashSignificance(input, response) {
   // Skip error keyword matching when the command is a read/search operation
   // (grep output naturally contains matched keywords like "error")
   const isSearchCmd = /\b(grep|rg|ag|ack|cat|head|tail|less|more|find|locate|wc|file|which|type)\b/i.test(cmd);
-  const isError = !isSearchCmd
+  const looksLikeError = !isSearchCmd
     && /\berror\b|\bERR!|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
     && response.length > 15;
+  // Green test summary exemption — "0 fail/failed/failures" in test-runner
+  // output (bun/jest/pytest) gets matched by the broad `fail(ed|ure)?` token
+  // above, driving episode.isError=true for passing runs. A live cluster-merge
+  // audit found 5 noise observations with "Error: <test>.ts ... 0 fail" titles
+  // from this path. Flip back to non-error iff a "0 fail" marker is present
+  // AND no hard-error signal (panic / ENOENT / AssertionError / TypeError /
+  // explicit FAIL banner / npm ERR!) coexists in the output.
+  const hasGreenTestSummary = looksLikeError
+    && /\b0\s+(fail|failed|failures)\b/i.test(response);
+  // NOTE: do not add `\bFAIL\s` here — with /i flag it would re-match the
+  // very `0 fail\n` token green-summary is trying to exempt. A real test
+  // failure produces "N fail" (N≥1) which never triggers hasGreenTestSummary,
+  // so a uppercase-FAIL fingerprint isn't needed for correctness.
+  const hasHardErrorSignal = hasGreenTestSummary
+    && /\bERR!|panic|traceback|enoent|command not found|exception|AssertionError|TypeError:|SyntaxError:/i.test(response);
+  const isError = looksLikeError && !(hasGreenTestSummary && !hasHardErrorSignal);
   // Match actual test runner invocations, not commands that merely reference "test" as a keyword
   const isTest = /\b(npm\s+test|npm\s+run\s+test|yarn\s+test|pnpm\s+test|pnpm\s+run\s+test|bun\s+test|go\s+test|cargo\s+test)\b/i.test(cmd)
     || /\b(jest|pytest|vitest|mocha|cypress|playwright)\b/i.test(cmd);

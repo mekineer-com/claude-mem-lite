@@ -44,6 +44,11 @@ export const SOURCE_FILES = [
   'lib/id-routing.mjs',
   'lib/err-sampler.mjs',
   'lib/metrics.mjs',
+  // v2.71.x: better-sqlite3 ABI probe + auto-rebuild. Shared by install.mjs
+  // (post-`npm install` verify) and scripts/launch.mjs (pre-server-launch
+  // self-heal after Node ABI changes). Missing from manifest → auto-update
+  // ships a stale install that FATALs on first DB open after Node upgrade.
+  'lib/binding-probe.mjs',
   // v2.41 god-module split — mem-cli.mjs router + per-cmd handlers under cli/
   'cli/common.mjs',
   'cli/fts-check.mjs',

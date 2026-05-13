@@ -30,6 +30,28 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
   }
 }
 
+// Verify better-sqlite3 native binding matches the current Node ABI. The
+// directory-presence check above is necessary but not sufficient: a Node
+// version change (e.g. v22 → v24, ABI v127 → v137) leaves node_modules
+// intact but the .node binary stale → server FATALs with "Could not locate
+// the bindings file" on first DB open. Probe + auto-rebuild before launching.
+try {
+  const { ensureBetterSqlite3Working } = await import('../lib/binding-probe.mjs');
+  const verify = await ensureBetterSqlite3Working(ROOT);
+  if (!verify.ok) {
+    process.stderr.write(`[claude-mem-lite] better-sqlite3 binding unusable: ${verify.error}\n`);
+    process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm rebuild better-sqlite3 --build-from-source\n`);
+    process.exit(1);
+  }
+  if (verify.action === 'rebuilt') {
+    process.stderr.write('[claude-mem-lite] Rebuilt better-sqlite3 binding for current Node ABI\n');
+  }
+} catch (e) {
+  // Probe module itself failed to load — fall through to server import and let
+  // the native FATAL surface as before. Don't block launch on a probe regression.
+  process.stderr.write(`[claude-mem-lite] binding probe skipped: ${e.message}\n`);
+}
+
 // Verify MCP SDK is importable (exports mapping intact).
 // Incomplete installs can leave the directory present but package.json missing,
 // causing Node.js to fail resolving subpath exports like /server/mcp.js.

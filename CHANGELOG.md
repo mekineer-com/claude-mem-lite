@@ -2,6 +2,34 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.71.4 — launch.mjs ABI self-heal + bash-utils 0-fail false-positive
+
+Two production-shape bugs surfaced during a 2026-05-14 audit of `bug.txt` transcripts. Both have minimal, targeted fixes with regression tests.
+
+**Fixed**:
+
+- **`scripts/launch.mjs:13`** — the directory-presence check (`existsSync('node_modules/better-sqlite3')`) only validated that the package directory existed, not that the prebuilt `.node` binary matched the running Node ABI. A Node upgrade (e.g. v22→v24, ABI v127→v137) left the directory intact but the binary stale → MCP server FATALed with `Could not locate the bindings file` on first DB open. `install.mjs` already had a probe+rebuild path at L434 but it only ran during explicit `install` invocations, so a passive auto-update / `/mcp` reconnect hit the gap. Fix: extracted `probeBetterSqlite3Binding` + `ensureBetterSqlite3Working` from `install.mjs` into shared `lib/binding-probe.mjs` and wired `scripts/launch.mjs` to call `ensureBetterSqlite3Working(ROOT)` before launching the server. On ABI mismatch the launch path now self-heals via `npm rebuild better-sqlite3` and prints `Rebuilt better-sqlite3 binding for current Node ABI` instead of crashing. Re-export kept on `install.mjs` for backward compat (lesson #8460).
+
+- **`bash-utils.mjs:18`** — `detectBashSignificance` regex `fail(ed|ure)?` matched the bare `fail` token in green test-runner summaries (`bun test ... 5 pass 0 fail`, `jest ... 0 failed, 12 passed`, `pytest ... 0 failures`), driving `episode.isError=true` for PASSING test runs. Downstream `hook-llm.mjs::buildDegradedTitle` generated `Error: <test>.ts ... 0 fail` titles, polluting memory with noise observations that survived the LOW_SIGNAL gate via attached `lesson_learned` / `importance≥2`. Live cluster-merge audit found 5 such observations in one user's recent memory. Fix: green-test-summary exemption — if response has `\b0\s+(fail|failed|failures)\b` AND no hard-error signal (`panic|traceback|ENOENT|AssertionError|TypeError:|SyntaxError:|ERR!`), `isError` flips back to false. Critical detail: `\bFAIL\s` deliberately omitted from the hard-error pattern because the `/i` flag would re-match the very `0 fail\n` token the exemption is trying to permit (lesson #8461).
+
+- **`install.mjs:425`** — `execSync(NPM_INSTALL_CMD, { stdio: 'pipe' })` hid all install progress under Claude Code's 5min Bash timeout, so users seeing slow native compile (Node v24 prebuild fallback) couldn't tell whether the install was working or stuck. Changed to `stdio: ['ignore', 'pipe', 'inherit']` so stderr (network errors, node-gyp progress, prebuild-install fallback messages) reaches the terminal. Matches `scripts/launch.mjs:18` pattern.
+
+**Refactored**:
+
+- **`probeBetterSqlite3Binding` + `ensureBetterSqlite3Working`** — moved 47 lines from `install.mjs:79-125` to new `lib/binding-probe.mjs`. The function bodies are identical; the move enables `scripts/launch.mjs` to import the probe without pulling install-only deps. `install.mjs` re-exports both for backward compat with `tests/install-bsqlite-probe.test.mjs`. Test surface unchanged: 6/6 probe tests green via re-export.
+
+**Tests**:
+
+- **`tests/bash-utils-signif.test.mjs`** (new) — 8 fixtures covering bun "0 fail" / jest "0 failed" / pytest "0 failures" (green exemption), "5 fail" / `TypeError` / `AssertionError` / `npm ERR!` (real errors), and grep-output sanity. RED state was 3/8 fail (the three "0 fail/failed/failures") before fix; GREEN 8/8 after.
+
+- Manifest sync: `source-files.mjs` + `package.json` files array gained `lib/binding-probe.mjs`. `tests/source-files-sync.test.mjs` confirms both manifests stay in lockstep — auto-update was previously shipping the move without the new file and would have FATAL'd on first launch.
+
+- Suite: 97 files / 2299 tests green.
+
+**Why this exists**:
+
+User-reported scenario in 2026-05-14 audit: Node upgrade broke the plugin transparently, the existing install.mjs probe path was never invoked from the recovery path (`/mcp` reconnect → `scripts/launch.mjs`), and the user had to manually `npm rebuild better-sqlite3` after diagnosing the FATAL line. bug.txt also surfaced the noise-pollution side of `0 fail` in unrelated cluster-merge output. Both have the same root pattern: a fast-path that worked under earlier assumptions stopped working under a state shift (Node ABI; test-runner summary format).
+
 ## v2.71.3 — CLI routing three-surface contract test + missing help docs
 
 **Tests**:
