@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.73.2 — lockfile drift fix (v2.73.1 follow-up)
+
+CI on v2.73.1 went red at `npm ci`: `Missing: @emnapi/core@1.10.0 from lock file / Missing: @emnapi/runtime@1.10.0 from lock file`. Same recipe install.mjs:1704 documented for #8271 / 2.58.2 / 2.62.1 — npm@11's `--package-lock-only` strips top-level entries for transitive deps of platform-optional bindings (`@oxc-parser/binding-wasm32-wasi`, `@rolldown/binding-wasm32-wasi`), but CI's bundled npm@10 refuses `npm ci` when those top-level entries are absent. The v2.73.1 release tarball is unaffected (auto-update + install both call `npm install`, not `npm ci`, so they self-heal), but CI must stay green.
+
+**Fix**: regenerated `package-lock.json` via `npx --yes npm@10.9.2 install` (matches `packageManager` field). `@emnapi/core` + `@emnapi/runtime` top-level entries restored; total packages 332 → 337. No code changes vs v2.73.1.
+
+**Followup**: `release.sh` /`install.mjs release` already chains `regenerateLockfile()` automatically — used `npm install --package-lock-only` by hand here and slipped this guard. Future `claude-mem-lite` bumps should go through `node install.mjs release`.
+
 ## v2.73.1 — auto-update path preserves cli.mjs +x bit
 
 Cross-machine bug: on a second computer, `claude-mem-lite get 482` and `claude-mem-lite search …` died with `/home/$USER/.local/bin/claude-mem-lite: Permission denied`. The symlink `~/.local/bin/claude-mem-lite → ~/.claude-mem-lite/cli.mjs` was intact, but the target had lost its executable bit.
