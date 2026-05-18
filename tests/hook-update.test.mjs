@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { execSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -37,6 +37,7 @@ function makeReleaseDir(version = '1.1.0') {
   writeFileSync(join(dir, 'package-lock.json'), JSON.stringify({ name: 'claude-mem-lite', lockfileVersion: 3 }, null, 2));
   writeFileSync(join(dir, 'hook.mjs'), '// new hook');
   writeFileSync(join(dir, 'server.mjs'), '// new server');
+  writeFileSync(join(dir, 'cli.mjs'), '#!/usr/bin/env node\n// new cli\n');
   writeFileSync(join(dir, 'scripts', 'post-tool-use.sh'), '#!/usr/bin/env bash\necho ok\n');
   writeFileSync(join(dir, 'registry', 'preinstalled.json'), '{"resources":[]}');
   return dir;
@@ -102,6 +103,29 @@ describe('hook update lifecycle', () => {
     expect(readFileSync(join(dataDir, 'package-lock.json'), 'utf8')).toContain('lockfileVersion');
     expect(existsSync(join(dataDir, 'node_modules', 'new.txt'))).toBe(true);
     expect(existsSync(join(dataDir, 'node_modules', 'old.txt'))).toBe(false);
+  });
+
+  // Regression v2.73.1: copyFileSync preserves source mode and git stores
+  // cli.mjs as 100644 — without the chmod inside copyReleaseIntoStaging the
+  // ~/.local/bin/claude-mem-lite → cli.mjs symlink target loses its +x bit
+  // after every auto-update, dying with "Permission denied" on next CLI call.
+  // POSIX-only: Windows has no chmod semantics, so the assertion is skipped.
+  it.skipIf(process.platform === 'win32')('staged install marks cli.mjs executable after auto-update', async () => {
+    const dataDir = makeDataDir();
+    const releaseDir = makeReleaseDir();
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install')) {
+        mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true });
+      }
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    const installedCli = join(dataDir, 'cli.mjs');
+    expect(existsSync(installedCli)).toBe(true);
+    // Any of owner/group/other execute bits proves chmod ran (POSIX mode mask)
+    expect(statSync(installedCli).mode & 0o111).not.toBe(0);
   });
 
   it('staged install restores prior files when npm install fails', async () => {

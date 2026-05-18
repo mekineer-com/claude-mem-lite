@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.73.1 — auto-update path preserves cli.mjs +x bit
+
+Cross-machine bug: on a second computer, `claude-mem-lite get 482` and `claude-mem-lite search …` died with `/home/$USER/.local/bin/claude-mem-lite: Permission denied`. The symlink `~/.local/bin/claude-mem-lite → ~/.claude-mem-lite/cli.mjs` was intact, but the target had lost its executable bit.
+
+**Root cause**: `cli.mjs` is stored in git as `100644` (non-executable). `install.mjs:408` explicitly runs `chmod +x cli.mjs` after copying, so fresh installs are fine. But `hook-update.mjs::copyReleaseIntoStaging` only chmod'd `*.sh` files in `scripts/` — `cli.mjs` was copied via `copyFileSync` (which preserves source mode `644`) and `renameSync`'d into place with no chmod. Every auto-update silently stripped the `+x` set by the original install, breaking the next CLI invocation.
+
+**Fix**: `hook-update.mjs::copyReleaseIntoStaging` now `chmodSync(stagedCli, 0o755)` for `cli.mjs` immediately after staging, mirroring `install.mjs:408`. Switched the `.sh` loop from `execFileSync('chmod', …)` to `chmodSync` too — same outcome, testable through mocked `node:child_process`, and now logs failures via `debugCatch` instead of swallowing them.
+
+**Test**: `tests/hook-update.test.mjs` gains `staged install marks cli.mjs executable after auto-update`, which writes `cli.mjs` into the release fixture and asserts `statSync(installedCli).mode & 0o111 !== 0`. POSIX-only — skipped on Windows. Suite: 2327 → 2328.
+
+**Workaround for affected installs** (run once on the broken machine; the next auto-update will heal itself with this fix):
+
+```bash
+chmod +x ~/.claude-mem-lite/cli.mjs
+```
+
 ## v2.73.0 — 9-round CLI dogfood: validation hardening + JSON outputs + concurrent stability
 
 A multi-round end-to-end dogfood pass surfaced 14 distinct issues across CLI, MCP, install, hook, and concurrency surfaces. Mix of behavior-tightening fixes (silent fall-throughs that hid typos) and additive features (`--json` / `--dry-run` / `--type` on commands users naturally extrapolated from siblings). Net `+583/-78` across 12 files; `+20` tests (2307 → 2327).

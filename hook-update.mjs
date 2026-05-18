@@ -3,7 +3,7 @@
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
 import { execSync, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { DB_DIR } from './schema.mjs';
@@ -400,8 +400,17 @@ function copyReleaseIntoStaging(sourceDir, stagingDir) {
   const stagedScripts = join(stagingDir, 'scripts');
   if (existsSync(stagedScripts)) {
     for (const sf of readdirSync(stagedScripts).filter(n => n.endsWith('.sh'))) {
-      try { execFileSync('chmod', ['+x', join(stagedScripts, sf)], { stdio: 'pipe' }); } catch {}
+      try { chmodSync(join(stagedScripts, sf), 0o755); } catch (e) { debugCatch(e, 'chmod-script'); }
     }
+  }
+
+  // cli.mjs is invoked via the ~/.local/bin/claude-mem-lite symlink, which needs
+  // the target executable. copyFileSync preserves the source mode and git stores
+  // cli.mjs as 100644 — without this chmod, auto-update strips the +x bit set by
+  // install.mjs:408 and the next CLI invocation dies with "Permission denied".
+  const stagedCli = join(stagingDir, 'cli.mjs');
+  if (existsSync(stagedCli)) {
+    try { chmodSync(stagedCli, 0o755); } catch (e) { debugCatch(e, 'chmod-cli'); }
   }
 
   debugLog('DEBUG', 'hook-update', `Auto-update staged ${copied} source files`);
