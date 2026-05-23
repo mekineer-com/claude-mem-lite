@@ -2272,6 +2272,12 @@ process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'
 // server in one Claude Code session). Two records with close timestamps and
 // the same ppid is the smoking gun. Never throws — telemetry must not block
 // startup. Disable with MEM_DISABLE_SPAWN_LOG=1.
+//
+// File mode: no explicit chmod. Payload is `{ts, pid, ppid, argv1, version}` —
+// no secrets, no project content. Pre-v2.79.1 passed `{mode: 0o600}` to
+// appendFileSync but that only applies on file creation (umask-default after
+// the first append), so the "0600" claim was misleading honesty-wise. Honest
+// comment > misleading code.
 if (process.env.MEM_DISABLE_SPAWN_LOG !== '1') {
   try {
     if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -2282,7 +2288,7 @@ if (process.env.MEM_DISABLE_SPAWN_LOG !== '1') {
       argv1: process.argv[1] || '',
       version: PKG_VERSION,
     }) + '\n';
-    appendFileSync(join(RUNTIME_DIR, 'mcp-spawns.log'), line, { mode: 0o600 });
+    appendFileSync(join(RUNTIME_DIR, 'mcp-spawns.log'), line);
   } catch { /* never block startup on telemetry failure */ }
 }
 

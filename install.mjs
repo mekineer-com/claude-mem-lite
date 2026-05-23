@@ -1086,8 +1086,12 @@ async function status() {
     // Accept either the current "mem-lite" registration or the legacy "mem"
     // name (pre-v2.78) so a user mid-upgrade still sees a green status until
     // setup.sh / install.mjs purges the legacy entry on next run.
-    const registered = list.includes('mem-lite:') || list.includes('mem-lite ')
-      || list.includes('mem:') || /\bmem\b\s/.test(list);
+    // v2.79.1: dropped a `/\bmem\b\s/` fallback regex — the `\b` word boundary
+    // also matched "mem-lite" (because `-` is a non-word char), so the regex
+    // was always-true noise (benign only because the mem-lite checks short-
+    // circuited first). `claude mcp list` formats as `<name>: <command>`, so
+    // the two colon-form checks below cover every shape.
+    const registered = list.includes('mem-lite:') || list.includes('mem:');
     push(registered ? 'ok' : 'fail', 'mcp', registered ? 'MCP server: registered' : 'MCP server: not registered', { registered });
   } catch {
     push('warn', 'mcp', 'Could not check MCP status', { registered: null });
@@ -1270,7 +1274,7 @@ async function doctor() {
   // even when the user skipped the README.
   const orphanPaths = collectOrphanHookPaths(settings);
   if (orphanPaths.length > 0) {
-    fail(`Orphan hooks: ${orphanPaths.length} settings.json entr${orphanPaths.length === 1 ? 'y references a' : 'ies reference'} missing file(s)`);
+    fail(`Orphan hooks: ${orphanPaths.length} settings.json entr${orphanPaths.length === 1 ? 'y references a missing file' : 'ies reference missing files'}`);
     for (const p of orphanPaths.slice(0, 5)) log(`    missing: ${p}`);
     if (orphanPaths.length > 5) log(`    ... +${orphanPaths.length - 5} more`);
     log(`    Repair: node ${join(PROJECT_DIR, 'install.mjs')} uninstall    # removes the dead hook entries`);

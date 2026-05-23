@@ -83,13 +83,20 @@ mkdir -p "$DATA_DIR/runtime" 2>/dev/null || true
 mark_deps_broken() {
   local reason="$1"
   # Embed reason + repair command so hook.mjs renders a complete error without
-  # having to re-derive them. Single-line JSON for trivial parse.
-  printf '{"ts":"%s","reason":%s,"root":%s,"repair":%s}\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "\"$reason\"" \
-    "\"$ROOT\"" \
-    "\"cd '$ROOT' && npm install --omit=dev\"" \
-    > "$DEPS_FLAG" 2>/dev/null || true
+  # having to re-derive them. Delegate JSON serialization to node so embedded
+  # quotes / shell metachars in $ROOT or $reason can't produce an invalid file
+  # (bash `printf '"..%s.."'` cannot escape arbitrary strings safely; v2.79 fix).
+  MARK_REASON="$reason" MARK_ROOT="$ROOT" MARK_FLAG="$DEPS_FLAG" node -e '
+    const fs = require("fs");
+    const reason = process.env.MARK_REASON || "unknown";
+    const root = process.env.MARK_ROOT || "";
+    fs.writeFileSync(process.env.MARK_FLAG, JSON.stringify({
+      ts: new Date().toISOString(),
+      reason,
+      root,
+      repair: `cd ${JSON.stringify(root)} && npm install --omit=dev`,
+    }) + "\n");
+  ' 2>/dev/null || true
 }
 
 mark_deps_ok() {
@@ -120,18 +127,20 @@ else
   mark_deps_ok
 fi
 
-# 7. MCP cleanup: idempotently clean stale registrations from older installs.
-#    This runs on every plugin SessionStart because old global entries may still
-#    exist even after an earlier migration marker was written.
+# 7. MCP cleanup: one-shot purge of stale global MCP registrations.
 #    - Pre-2.10: direct installs left a global "mem" MCP alongside plugin MCP.
 #    - Pre-2.78: plugin and global registrations used the generic name "mem";
 #      v2.78 renamed to "mem-lite" — any stale global "mem" must be purged so
 #      Claude Code doesn't surface duplicate (old "mem" + new "mem-lite") tool
 #      prefixes side-by-side.
 #    Root .mcp.json in the installed plugin cache is required for Claude Code to
-#    register plugin MCP; only stale global/marketplace copies should be removed.
+#    register plugin MCP; only stale global/marketplace copies are removed.
+#    v2.79.1: marker file now actually gates entry (was touched but never read
+#    pre-v2.79.1 — extra node spawn + JSON parse on every SessionStart for a
+#    near-always no-op). Bump MCP_MIGRATION name to re-run cleanup in future
+#    versions; same shape as the .deps-broken self-heal pattern.
 MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.78"
-if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" && ! -f "$MCP_MIGRATION" ]]; then
   CLAUDE_JSON="$HOME/.claude.json" node -e '
     const fs = require("fs");
     let changed = false;

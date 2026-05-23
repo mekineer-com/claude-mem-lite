@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.79.1 — post-2.79 review fixes (no behavior change)
+
+Patch release rolling in fixes for four `Important` issues flagged by code review of v2.78+v2.79. All internal correctness / honesty fixes — no user-visible behavior change on the happy path.
+
+- **`scripts/setup.sh:83-100` — `mark_deps_broken` is now JSON-injection-safe.** Pre-v2.79.1 used bash `printf '{"reason":%s,...}'` to assemble the deps-broken flag, which cannot escape arbitrary strings — a `"` in `$ROOT` or `$reason` produced invalid JSON, and `hook.mjs` fell into its corrupt-flag catch branch (`Reason: unknown`, no repair line shown). v2.79.1 delegates serialization to `node -e` via env-passed values + `JSON.stringify`, which is the only correct way to emit JSON from arbitrary input. Realistic risk was low (plugin cache paths don't contain quotes), but structural fragility had zero migration cost to fix.
+
+- **`scripts/setup.sh:134` — `MCP_MIGRATION` marker now actually gates entry.** The `.mcp-dedup-v2.78` marker was `touch`'d at the end of cleanup but never read, so every plugin SessionStart re-spawned `node -e` + parsed `~/.claude.json` even when no migration was pending (99% of users). v2.79.1 adds `[[ ! -f "$MCP_MIGRATION" ]]` to the entry guard. A user who deliberately runs `claude mcp add mem ...` after the marker exists is now intentionally left alone (next marker-name bump re-triggers the purge). Regression test added: `tests/install-lifecycle.test.mjs` "plugin setup skips MCP cleanup once current marker exists (v2.79.1 gate)".
+
+- **`server.mjs:2275-2294` — spawn-log mode claim corrected.** `appendFileSync(path, line, {mode: 0o600})` only applies `mode` on file creation, so after the first spawn the log was umask-default (usually 0644). v2.79.1 drops the `mode` arg and the misleading CHANGELOG/comment claim. Payload is `{ts, pid, ppid, argv1, version}` — no secrets, no project content — so no explicit chmod is needed; honest comment > misleading code.
+
+- **`install.mjs:status() — MCP register detection** dropped a `/\bmem\b\s/` fallback regex. The `\b` word boundary also matched `"mem-lite "` (because `-` is non-word), so the regex was always-true noise (benign only because the `mem-lite` checks short-circuited first). `claude mcp list` formats as `<name>: <command>`, so the two colon-form checks below cover every shape correctly without the regex.
+
+- **Cosmetic** — `install.mjs:1273` orphan-hooks `fail()` message dropped the leftover `(s)` parenthetical (`"...a missing file(s)"` when count=1). Now grammatical singular/plural by length.
+
+**Test coverage**: +1 regression test in `tests/install-lifecycle.test.mjs`. Suite 2419 → 2420 tests pass; 110 files / 0 red regressions; eslint clean.
+
+**Action for users**: none. Plugin-mode auto-updates; global-mode `claude-mem-lite install` no-ops if already on 2.79.1.
+
 ## v2.79.0 — install ergonomics: /adopt nudge + deps-broken surface + orphan-hook doctor
 
 Single-theme follow-up on the v2.78 audit's "What's friction for new users?" list. Three changes, all serving the one question: **does a fresh install actually do the thing the user expected, and does the user know if it didn't?**

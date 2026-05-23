@@ -336,6 +336,42 @@ describe('install lifecycle checks', () => {
     }
   });
 
+  it('plugin setup skips MCP cleanup once current marker exists (v2.79.1 gate)', () => {
+    // Regression guard: pre-v2.79.1 the MCP_MIGRATION marker was touched but
+    // never read, so cleanup re-ran `node -e ... parse ~/.claude.json ...` on
+    // every SessionStart even when nothing had changed. v2.79.1 gates entry on
+    // marker absence — a present marker means "already migrated, leave it".
+    // If a user later runs `claude mcp add mem ...` themselves, the gate
+    // intentionally lets it stand (next version-marker bump re-triggers).
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+      mkdirSync(pluginRoot, { recursive: true });
+      symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
+
+      // Marker for the CURRENT migration version already exists
+      writeFileSync(join(dataDir, 'runtime', '.mcp-dedup-v2.78'), 'done\n');
+      // User has a global "mem" entry — gate should NOT auto-purge it
+      writeFileSync(join(home, '.claude.json'), JSON.stringify({
+        mcpServers: { mem: { command: 'node', args: ['user-added.mjs'] } }
+      }, null, 2));
+
+      execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      const claudeJson = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
+      // The user's intentionally-added entry survives — gate trusted the marker
+      expect(claudeJson.mcpServers?.mem).toEqual({ command: 'node', args: ['user-added.mjs'] });
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   it('plugin setup prunes old cache versions keeping latest 3', () => {
     const home = makeTmpDir();
     try {
