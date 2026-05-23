@@ -2358,6 +2358,77 @@ function cmdMemdirAudit(args) {
   if (nonCompliant > 0) process.exitCode = 1;
 }
 
+/**
+ * `citation-stats` — visualize the citation-decay feedback loop:
+ * per-project cite rate + active decay queue + recently promoted.
+ * Read-only over observations.
+ *
+ * Flags:
+ *   --json      machine-readable output
+ *   --days N    project cite-rate window (default 7)
+ */
+export function cmdCitationStats(db, args) {
+  const { flags } = parseArgs(args);
+  const json = flags.json === true || flags.json === 'true';
+  const days = parseIntFlag(flags.days, { name: '--days', defaultValue: 7, max: 365 });
+
+  const cutoff = Date.now() - days * 86400 * 1000;
+  const perProject = db.prepare(`
+    SELECT project,
+           COALESCE(SUM(cited_count), 0) AS cited,
+           COALESCE(SUM(injection_count), 0) AS injected,
+           SUM(CASE WHEN uncited_streak >= 2 THEN 1 ELSE 0 END) AS at_risk
+      FROM observations
+     WHERE created_at_epoch >= ?
+       AND COALESCE(compressed_into, 0) = 0
+       AND superseded_at IS NULL
+  GROUP BY project
+  ORDER BY injected DESC
+  `).all(cutoff);
+
+  const decayQueue = db.prepare(`
+    SELECT id, project, type, title, importance, uncited_streak, cited_count
+      FROM observations
+     WHERE uncited_streak >= 2
+       AND COALESCE(compressed_into, 0) = 0
+       AND superseded_at IS NULL
+  ORDER BY uncited_streak DESC, importance ASC
+     LIMIT 20
+  `).all();
+
+  const promoted = db.prepare(`
+    SELECT id, project, type, title, importance, cited_count
+      FROM observations
+     WHERE importance >= 3 AND cited_count >= 1
+       AND COALESCE(compressed_into, 0) = 0
+  ORDER BY cited_count DESC
+     LIMIT 10
+  `).all();
+
+  if (json) {
+    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted }, null, 2));
+    return;
+  }
+
+  out(`Cite rate by project (last ${days}d):`);
+  for (const r of perProject) {
+    const rate = r.injected > 0 ? (r.cited * 100 / r.injected).toFixed(1) + '%' : '—';
+    out(`  ${r.project.padEnd(34)} ${String(rate).padStart(6)}   cited:${r.cited}/${r.injected}   at_risk:${r.at_risk}`);
+  }
+  out('');
+  out('Active decay queue (uncited_streak >= 2, next miss → demote):');
+  if (decayQueue.length === 0) out('  (none)');
+  for (const r of decayQueue) {
+    out(`  #${r.id} [${r.type}] ${(r.title || '').slice(0, 60)}   imp=${r.importance} streak=${r.uncited_streak}`);
+  }
+  out('');
+  out('Recently promoted (importance=3, cited_count >= 1):');
+  if (promoted.length === 0) out('  (none)');
+  for (const r of promoted) {
+    out(`  #${r.id} [${r.type}] ${(r.title || '').slice(0, 60)}   cited ${r.cited_count}x`);
+  }
+}
+
 // ─── Help ────────────────────────────────────────────────────────────────────
 
 function cmdHelp() {
@@ -2497,6 +2568,10 @@ Commands:
     --json              Output as JSON: {project,limit,tier_filter,
                           totals:{working,active,archive,grand_total},
                           tiers:{working:{count,results:[…]}, …}}
+
+  citation-stats        Citation-decay feedback loop telemetry
+    --days N            Cite-rate window in days (default 7)
+    --json              Output as JSON: {window_days,per_project:[],decay_queue:[],promoted:[]}
 
   registry <action>     Manage tool resource registry
     list                List resources [--type skill|agent] [--limit N] (default 20)
@@ -2867,7 +2942,7 @@ export async function run(argv) {
   // text-parsing callers keep working — the note lives in stderr for scripts to
   // detect the gap.
   const JSON_SUPPORTED_CMDS = new Set([
-    'search', 'context', 'recent', 'recall', 'timeline', 'stats', 'browse', 'export',
+    'search', 'context', 'recent', 'recall', 'timeline', 'stats', 'browse', 'export', 'citation-stats',
   ]);
   // `doctor --benchmark` already emits JSON on its own — don't print the misleading
   // "doctor outputs text" note for that subpath. Without --benchmark, doctor is text
@@ -2896,6 +2971,7 @@ export async function run(argv) {
       case 'stats':     await cmdStats(db, cmdArgs); break;
       case 'context':   cmdContext(db, cmdArgs); break;
       case 'browse':    cmdBrowse(db, cmdArgs); break;
+      case 'citation-stats': cmdCitationStats(db, cmdArgs); break;
       case 'registry':  cmdRegistry(db, cmdArgs); break;
       case 'import':    await cmdImport(cmdArgs); break;
       case 'import-jsonl': await cmdImportJsonl(db, cmdArgs); break;
