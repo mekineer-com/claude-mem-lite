@@ -61,7 +61,7 @@ import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
-import { loadCiteBackForEpisode } from './lib/cite-back-hint.mjs';
+import { loadCiteBackForEpisode, buildUnsavedBugfixHint } from './lib/cite-back-hint.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -181,8 +181,6 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
     if (RECEIPT_EVENTS.has(hookEventName)) {
       try {
         const entries = episode.entries || [];
-        const hasError = entries.some(e => e.isError);
-        const hasEdit = entries.some(e => EDIT_TOOLS.has(e.tool));
         const toolCounts = {};
         for (const e of entries) toolCounts[e.tool] = (toolCounts[e.tool] || 0) + 1;
         const toolSummary = Object.entries(toolCounts)
@@ -191,16 +189,14 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
           .map(([t, n]) => `${t}×${n}`)
           .join(', ');
         const lines = [`[mem] episode flushed: ${entries.length} entries (${toolSummary})`];
-        if (hasError && hasEdit && entries.length >= 3) {
-          const editFiles = entries.filter(e => EDIT_TOOLS.has(e.tool)).flatMap(e => e.files || []);
-          const uniqueFiles = [...new Set(editFiles)].slice(0, 3);
-          const filesHint = uniqueFiles.length > 0 ? ` (${uniqueFiles.join(', ')})` : '';
-          lines.push(`[mem] 💡 error→fix pattern${filesHint} — consider: mem_save(type="bugfix", lesson_learned="<root cause + fix>")`);
-        }
+        // v2.83: error→fix nudge lifted to lib/cite-back-hint.mjs::buildUnsavedBugfixHint
+        // so the wording (count + "Save now" verb) stays in sync with cite-back.
+        const bugfixHint = buildUnsavedBugfixHint(episode);
+        if (bugfixHint) lines.push(bugfixHint);
         // v2.81: cite-back hint — fires when this episode edits a file that
         // PreToolUse:Read/Edit nudged earlier in the same session. Precision
         // signal (we know the file was warned about); orthogonal to the
-        // error→fix pattern above and may co-fire.
+        // bugfix-shape nudge above and may co-fire.
         const citeBack = loadCiteBackForEpisode(episode, RUNTIME_DIR);
         if (citeBack) lines.push(citeBack);
         process.stdout.write(JSON.stringify({

@@ -126,3 +126,52 @@ export function noisePenaltyClause(alias = 'o') {
 export function notLowSignalTitleClause(alias = 'o') {
   return buildNotLowSignalSql(alias);
 }
+
+// ─── Cite-history factor (A1, v2.83) ────────────────────────────────────────
+//
+// Closes the citation-decay → ranking loop. The Stop hook citation-decay
+// already maintains cited_count (Promote on cite) and uncited_streak (bump on
+// uncited; reset on cite or demote-at-3). Before A1, both columns affected
+// only the importance ±1 dial — through `(0.5 + 0.5·importance)` that's a
+// ≤2× swing and saturates fast. This factor lets ranking respond directly to
+// observed agent behavior on the obs itself.
+//
+// Formula: clamp(0.4, 3.0, 1 + 0.2·cited_count − 0.25·uncited_streak)
+// Distribution:
+//   cited=0, streak=0  → 1.0  (fresh obs, neutral)
+//   cited=5, streak=0  → 2.0
+//   cited≥10, streak=0 → 3.0  (capped — one viral obs can't dominate)
+//   cited=0, streak=2  → 0.5
+//   cited=0, streak=3+ → 0.4  (floored; citation-decay resets streak at 3
+//                              after demoting importance, so steady-state
+//                              streak is bounded by [0,2])
+//
+// Disjoint from noisePenaltyClause: noise penalty uses
+// `injection_count vs access_count` (passive inject vs any access);
+// cite_factor uses `cited_count vs uncited_streak` — same-source signal
+// maintained only by the citation-decay loop. Both apply multiplicatively;
+// order doesn't affect ORDER BY relevance ASC.
+export const CITE_FACTOR_MIN = 0.4;
+export const CITE_FACTOR_MAX = 3.0;
+export const CITE_FACTOR_PER_CITE = 0.2;
+export const CITE_FACTOR_PER_STREAK = 0.25;
+
+export function citeFactorClause(alias = 'o') {
+  const a = alias ? `${alias}.` : '';
+  return `(
+    MAX(${CITE_FACTOR_MIN},
+      MIN(${CITE_FACTOR_MAX},
+        1.0
+          + ${CITE_FACTOR_PER_CITE} * COALESCE(${a}cited_count, 0)
+          - ${CITE_FACTOR_PER_STREAK} * COALESCE(${a}uncited_streak, 0)
+      )
+    )
+  )`;
+}
+
+export function citeFactorJs(row) {
+  const cited = (row && typeof row.cited_count === 'number') ? row.cited_count : 0;
+  const streak = (row && typeof row.uncited_streak === 'number') ? row.uncited_streak : 0;
+  const raw = 1.0 + CITE_FACTOR_PER_CITE * cited - CITE_FACTOR_PER_STREAK * streak;
+  return Math.max(CITE_FACTOR_MIN, Math.min(CITE_FACTOR_MAX, raw));
+}

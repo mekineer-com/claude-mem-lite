@@ -983,4 +983,104 @@ describe('pre-tool-recall', () => {
       expect(stdout).toBe('');
     });
   });
+
+  // ─── A3 (v2.83): cross-hook ID dedup ──────────────────────────────────────
+  // UPS writes `INJECTED_IDS_FILE` at `<DB_DIR>/runtime/.claude-mem-injected-<project>`
+  // with `{ids, ts, count}`. Pre-tool-recall reads it; if a lesson row was
+  // already injected by UPS within the DEDUP_STALE_MS window, drop it from
+  // PreToolUse output (the agent already has the citation in context).
+  describe('cross-hook ID dedup with UPS (A3)', () => {
+    let tmpRoot;
+    let projectDir;
+    let lessonObsId;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-a3-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'a3test');
+      mkdirSync(projectDir, { recursive: true });
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-a3', project: 'parent--a3test', memoryId: 'mem-a3' });
+      const info = insertObs(db, {
+        sessionId: 'mem-a3', project: 'parent--a3test',
+        type: 'bugfix', importance: 2,
+        title: 'lesson that UPS already showed',
+        lessonLearned: 'Body the agent already has from prompt-time inject',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+      });
+      lessonObsId = Number(info?.lastInsertRowid ?? info);
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function seedUpsInjected(ids, ageMs = 0) {
+      // Path mirrors user-prompt-search.js INJECTED_IDS_FILE construction.
+      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test`);
+      writeFileSync(file, JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1 }));
+      return file;
+    }
+
+    it('drops a lesson row whose ID was just injected by UPS', async () => {
+      seedUpsInjected([lessonObsId]);
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a3-1',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      // Lesson dropped → either empty stdout (no other rows) or the no-prior
+      // backfill reminder fires. Either way, `#<lessonObsId>` must not appear.
+      if (stdout) {
+        const parsed = JSON.parse(stdout);
+        const ctx = parsed.hookSpecificOutput?.additionalContext || '';
+        expect(ctx).not.toContain(`#${lessonObsId}`);
+      }
+    });
+
+    it('keeps the lesson when UPS state is older than DEDUP_STALE_MS', async () => {
+      // 10 minutes old — stale, should be ignored. Lesson should surface.
+      seedUpsInjected([lessonObsId], 10 * 60_000);
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a3-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain(`#${lessonObsId}`);
+    });
+
+    it('keeps the lesson when UPS state file is absent', async () => {
+      // No UPS file at all — pre-tool-recall must not crash and must emit normally.
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a3-3',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain(`#${lessonObsId}`);
+    });
+
+    it('records emitted IDs back so subsequent UPS reads see them', async () => {
+      // Simulates PreToolUse emitting → UPS next prompt — UPS dedup logic at
+      // 80%-overlap rule should see this id in the file. We assert presence.
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a3-4',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test`);
+      const state = JSON.parse(readFileSync(file, 'utf8'));
+      const idStrings = (state.ids || []).map(String);
+      expect(idStrings).toContain(String(lessonObsId));
+    });
+  });
 });

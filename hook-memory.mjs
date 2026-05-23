@@ -2,6 +2,7 @@
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
 import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords } from './utils.mjs';
+import { citeFactorJs } from './scoring-sql.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
 
@@ -163,6 +164,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     const selectStmt = db.prepare(`
       SELECT o.id, o.type, o.title, o.subtitle, o.narrative, o.importance, o.lesson_learned, o.project,
              o.created_at_epoch, o.files_modified,
+             o.cited_count, o.uncited_streak,
              ${OBS_BM25} as relevance,
              ${noisePenaltyClause('o')} as noise_penalty
       FROM observations_fts
@@ -200,6 +202,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     try {
       const crossStmt = db.prepare(`
         SELECT o.id, o.type, o.title, o.subtitle, o.narrative, o.importance, o.lesson_learned, o.project,
+               o.cited_count, o.uncited_streak,
                ${OBS_BM25} as relevance,
                ${noisePenaltyClause('o')} as noise_penalty
         FROM observations_fts
@@ -241,6 +244,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         const crossProjectPenalty = r.project === project ? 1.0 : crossPenalty;
         const orFallbackPenalty = r._or ? 0.4 : 1.0;
         const noisePenalty = typeof r.noise_penalty === 'number' ? r.noise_penalty : 1.0;
+        const citeFactor = citeFactorJs(r);
         return {
           ...r,
           score: Math.abs(r.relevance)
@@ -249,7 +253,8 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
             * (r.importance >= 2 ? 1.0 : 0.6)
             * crossProjectPenalty
             * orFallbackPenalty
-            * noisePenalty,
+            * noisePenalty
+            * citeFactor,
         };
       })
       .sort((a, b) => b.score - a.score);

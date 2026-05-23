@@ -2,6 +2,23 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.83.0 — smarter passive injection + louder `/lesson` prompts (A1+A3+B1)
+
+Three closures on the cite-recall feedback loop identified by 30-day per-hook benchmark (`benchmark/cite-recall.mjs`): PreToolUse:Read at 85% recall, UserPromptSubmit stuck at 25% recall across 115 injections/30d. The architectural fact: file-keyed injection wins because the agent has already committed to action; prompt-keyed loses because content quality alone is a weak action prior. v2.83 routes already-observed agent behavior (cite history, uncited streak, cross-hook overlap) back into ranking + nudge text.
+
+- **A1 cite_factor in ranking** (`scoring-sql.mjs::citeFactorClause` + `citeFactorJs`; wired into `hook-memory.mjs::searchRelevantMemories` JS scoring and `scripts/user-prompt-search.js::searchByFts` SQL `relevance`). Formula `clamp(0.4, 3.0, 1 + 0.2·cited_count − 0.25·uncited_streak)`: fresh obs neutral at 1.0; cited≥10× capped at 3.0; uncited streak ≥3 floored at 0.4. Closes the Stop-hook `applyCitationDecay` → ranking loop — before v2.83 those columns only nudged `importance ±1` (≤2× swing through `0.5+0.5·importance`); now they directly multiply the score. Disjoint from `noisePenaltyClause` (which uses injection_count vs access_count) — different signal, composes multiplicatively.
+- **B1 cite-back hint upgrade** (`lib/cite-back-hint.mjs::buildCiteBackHint` text + new `buildUnsavedBugfixHint`, wired into `hook.mjs::flushEpisode`). Leader line now carries explicit counts (`"edited N file(s) with M prior lesson(s)"`) and a directive verb (`"Save now"` vs prior `"if you fixed it"`). The error→fix nudge previously inlined in `hook.mjs:194` lifted into the lib so both hints share wording rules — quantification harder to dismiss than a hedge.
+- **A3 cross-hook ID dedup** (`scripts/pre-tool-recall.js::readCrossHookInjected` + `mergeCrossHookInjected`). PreToolUse:Read/Edit now reads UPS's `runtime/.claude-mem-injected-<project>` file inside the 5-min window; ids UPS already injected this prompt are dropped from PreToolUse output (the agent already has them in context). After emit, merges the just-emitted ids back so the next UPS read sees them. Conservative — file-cooldown unchanged (same file can re-warrant a different lesson next session).
+
+**Test coverage**: 2483 tests / 112 files pass (+32 net: cite-factor 19, cite-back +9 new, pre-tool-recall A3 +4). ESLint clean. Benchmark `node benchmark/cite-recall.mjs --vs-baseline` shows all hooks flat-within-CI vs v2.56.0 baseline (no regression — A1/A3 affect *future* inject behavior, historical replay can't measure it; B1 changes hint text, not ranking).
+
+**Observability**: re-run `cite-recall.mjs --vs-baseline` after ~30 days of v2.83 to quantify the UPS recall lift. Expected direction: ↑ on UPS (cited obs surface more), flat-or-↑ on PreToolUse:Read (less redundant inject means freed slots), and unchanged session-level cite-rate (~85%). Regression-guard: `--fail-on-regression` exits non-zero on any per-hook drop >5% absolute outside CI overlap.
+
+**Action for users**: none. Behavior change is automatic on upgrade. Opt-outs:
+- Disable cite_factor: not env-gated (the formula is neutral at the fresh-obs default; revert by reverting the commit).
+- Disable cross-hook dedup: remove the `readCrossHookInjected` call in `scripts/pre-tool-recall.js` (file-cooldown unaffected).
+- Disable bugfix-shape hint: returns `null` when episode lacks error+edit+≥3 entries; no env flag needed.
+
 ## v2.82.1 — auto-adopt: drop `CLAUDE_PLUGIN_ROOT` gate (npm/manual installs also adopt)
 
 v2.82.0 was supposed to make auto-adopt fire for users who had set `MEM_QUIET_HOOKS=1`. Live verification on a freshly-tested project (`daagu`) revealed the marker directory was still empty — and the same was true machine-wide: **zero `.auto-adopt-*` markers from v2.33.0 ship date to v2.82.0**. The other gate, inherited from v2.33.0's "/plugin install IS consent" framing, required `CLAUDE_PLUGIN_ROOT` to be set in the hook environment. But `install.mjs`-written hooks (the common path for npm/manual installs) hardcode an absolute path with **no `${CLAUDE_PLUGIN_ROOT}` template** — so Claude Code never injects that env var, and the gate was a no-op for everyone. v2.33.0 shipped a dead feature; v2.82.0 fixed a secondary gate but missed the primary one.

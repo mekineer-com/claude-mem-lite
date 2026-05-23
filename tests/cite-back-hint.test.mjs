@@ -13,10 +13,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildCiteBackHint, loadCiteBackForEpisode } from '../lib/cite-back-hint.mjs';
+import { buildCiteBackHint, loadCiteBackForEpisode, buildUnsavedBugfixHint } from '../lib/cite-back-hint.mjs';
 
 const editEntry = (file, tool = 'Edit') => ({ tool, files: [file], isError: false });
 const readEntry = (file) => ({ tool: 'Read', files: [file], isError: false });
+const bashErr = () => ({ tool: 'Bash', files: [], isError: true });
+const bashOk = () => ({ tool: 'Bash', files: [], isError: false });
 
 describe('buildCiteBackHint', () => {
   it('returns a hint when an edited file has prior lessons in cooldown', () => {
@@ -29,6 +31,28 @@ describe('buildCiteBackHint', () => {
     expect(hint).toContain('foo.mjs');
     expect(hint).toContain('#8447');
     expect(hint).toContain('/lesson --file');
+  });
+
+  // B1 (v2.83): leader line carries explicit counts ("N file(s), M lesson(s)")
+  // so the agent sees a quantified signal rather than a vague nudge. §10
+  // Specificity binds: hedged hint text ("if you fixed it") is easier to
+  // dismiss than a numeric framing.
+  it('leader line cites the file count and total lesson count', () => {
+    const cooldown = {
+      '/p/foo.mjs': { ts: Date.now(), lessonIds: [101, 102] },
+      '/p/bar.mjs': { ts: Date.now(), lessonIds: [203] },
+    };
+    const episode = { entries: [editEntry('/p/foo.mjs'), editEntry('/p/bar.mjs')] };
+    const hint = buildCiteBackHint(episode, cooldown);
+    expect(hint).toMatch(/2 file\(s\)/);
+    expect(hint).toMatch(/3 .*lesson/);
+  });
+
+  it('leader line uses a directive verb (Save now), not a hedge (if you)', () => {
+    const cooldown = { '/p/foo.mjs': { ts: Date.now(), lessonIds: [1] } };
+    const hint = buildCiteBackHint({ entries: [editEntry('/p/foo.mjs')] }, cooldown);
+    expect(hint).toMatch(/Save now/i);
+    expect(hint).not.toMatch(/if you fixed it/i);
   });
 
   it('returns null when no edited file is present in cooldown', () => {
@@ -122,6 +146,77 @@ describe('buildCiteBackHint', () => {
     expect(buildCiteBackHint(null, {})).toBeNull();
     expect(buildCiteBackHint({ entries: [editEntry('/p/foo.mjs')] }, null)).toBeNull();
     expect(buildCiteBackHint(null, null)).toBeNull();
+  });
+});
+
+// ─── buildUnsavedBugfixHint (B1 v2.83) ──────────────────────────────────────
+// Lifts the error→fix episode nudge out of hook.mjs:194 into a pure builder
+// so the lib has one home for save-prompt hints, and the message gets the
+// same "Save now" + count treatment as the cite-back text.
+
+describe('buildUnsavedBugfixHint', () => {
+  it('fires when episode has error + edit + ≥3 entries', () => {
+    const episode = {
+      entries: [editEntry('/p/foo.mjs'), bashErr(), editEntry('/p/foo.mjs'), bashOk()],
+    };
+    const hint = buildUnsavedBugfixHint(episode);
+    expect(hint).not.toBeNull();
+    expect(hint).toContain('foo.mjs');
+    expect(hint).toContain('/lesson --file');
+    // Directive verb, not advisory hedge
+    expect(hint).toMatch(/Save now/i);
+    expect(hint).not.toMatch(/consider:/i);
+  });
+
+  it('carries the unique edited-file count', () => {
+    const episode = {
+      entries: [
+        editEntry('/p/a.mjs'), bashErr(),
+        editEntry('/p/b.mjs'), bashOk(),
+      ],
+    };
+    const hint = buildUnsavedBugfixHint(episode);
+    expect(hint).toMatch(/2 file\(s\)/);
+    expect(hint).toContain('a.mjs');
+    expect(hint).toContain('b.mjs');
+  });
+
+  it('returns null on no-error episodes', () => {
+    const episode = { entries: [editEntry('/p/foo.mjs'), bashOk(), editEntry('/p/foo.mjs')] };
+    expect(buildUnsavedBugfixHint(episode)).toBeNull();
+  });
+
+  it('returns null on no-edit episodes', () => {
+    const episode = { entries: [bashOk(), bashErr(), bashOk()] };
+    expect(buildUnsavedBugfixHint(episode)).toBeNull();
+  });
+
+  it('returns null when entry count is below threshold', () => {
+    const episode = { entries: [editEntry('/p/foo.mjs'), bashErr()] };
+    expect(buildUnsavedBugfixHint(episode)).toBeNull();
+  });
+
+  it('returns null on empty / null inputs', () => {
+    expect(buildUnsavedBugfixHint(null)).toBeNull();
+    expect(buildUnsavedBugfixHint({})).toBeNull();
+    expect(buildUnsavedBugfixHint({ entries: [] })).toBeNull();
+    expect(buildUnsavedBugfixHint({ entries: null })).toBeNull();
+  });
+
+  it('caps the displayed file list at 3 names', () => {
+    const episode = {
+      entries: [
+        editEntry('/p/a.mjs'), editEntry('/p/b.mjs'),
+        editEntry('/p/c.mjs'), editEntry('/p/d.mjs'),
+        bashErr(),
+      ],
+    };
+    const hint = buildUnsavedBugfixHint(episode);
+    expect(hint).toContain('a.mjs');
+    expect(hint).toContain('b.mjs');
+    expect(hint).toContain('c.mjs');
+    expect(hint).not.toContain('d.mjs');
+    expect(hint).toMatch(/4 file\(s\)/);
   });
 });
 

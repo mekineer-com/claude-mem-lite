@@ -5,6 +5,7 @@
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate } from '../utils.mjs';
+import { citeFactorClause } from '../scoring-sql.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
@@ -216,6 +217,11 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
   // v26 P0: noise penalty shrinks relevance magnitude for obs with high
   // inject:access ratio (auto-injected often, never cited/opened). See
   // docs/p0-injection-noise-baseline.txt.
+  // A1 (v2.83): cite_factor closes the citation-decay → ranking loop. Obs the
+  // assistant cited in past sessions (cited_count > 0) get boosted; obs with
+  // accumulating uncited_streak get dampened upstream of importance-decay.
+  // Disjoint signal from noise_penalty (which uses injection_count vs
+  // access_count) — see scoring-sql.mjs::citeFactorClause for the math.
   const sql = `
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25} as bm25_raw,
@@ -223,7 +229,8 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
              * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
              * ${TYPE_QUALITY_CASE}
              * (0.5 + 0.5 * COALESCE(o.importance, 1))
-             * ${noisePenaltyClause('o')} as relevance
+             * ${noisePenaltyClause('o')}
+             * ${citeFactorClause('o')} as relevance
     FROM observations_fts
     JOIN observations o ON o.id = observations_fts.rowid
     WHERE observations_fts MATCH ?

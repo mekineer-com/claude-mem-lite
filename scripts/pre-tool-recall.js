@@ -16,6 +16,12 @@ import { recordHookError } from '../lib/hook-telemetry.mjs';
 const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(DATA_DIR, 'claude-mem-lite.db');
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
+// A3 (v2.83): cross-hook dedup window — must mirror DEDUP_STALE_MS in
+// scripts/prompt-search-utils.mjs. UPS writes
+// `runtime/.claude-mem-injected-<project>` after each inject; we read it to
+// drop IDs the agent already saw in this 5-min window. Standalone fast-path
+// (#8447) so we inline the constant rather than importing the helper.
+const CROSS_HOOK_DEDUP_MS = 5 * 60 * 1000;
 // v2.33.1: cooldown path is session-scoped so same-file-twice within one
 // session never re-injects (was: global file, 5-min window). Cross-session:
 // fresh file, fresh nudges — this is intended. No session_id → fall back to
@@ -56,6 +62,50 @@ function entryTimestamp(v) {
   if (typeof v === 'number') return v;
   if (v && typeof v === 'object' && typeof v.ts === 'number') return v.ts;
   return 0;
+}
+
+// A3 (v2.83): cross-hook injected-IDs store. UPS writes
+// `runtime/.claude-mem-injected-<project>` with {ids, ts, count}. We read
+// inside the staleness window, filter overlaps from PreToolUse output, then
+// merge back so the next UPS sees what we emitted too.
+function crossHookInjectedFile(project) {
+  return join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
+}
+
+function readCrossHookInjected(project) {
+  try {
+    const raw = readFileSync(crossHookInjectedFile(project), 'utf8');
+    const { ids, ts } = JSON.parse(raw);
+    if (!ts || Date.now() - ts > CROSS_HOOK_DEDUP_MS) return new Set();
+    if (!Array.isArray(ids)) return new Set();
+    return new Set(ids.map(String));
+  } catch { return new Set(); }
+}
+
+function mergeCrossHookInjected(project, newIds) {
+  if (!newIds || newIds.length === 0) return;
+  try {
+    mkdirSync(RUNTIME_DIR, { recursive: true });
+    const file = crossHookInjectedFile(project);
+    let prev = { ids: [], ts: 0, count: 0 };
+    try {
+      const raw = readFileSync(file, 'utf8');
+      const parsed = JSON.parse(raw);
+      // Within the staleness window: union. Outside: replace (fresh session).
+      if (parsed.ts && Date.now() - parsed.ts < CROSS_HOOK_DEDUP_MS) {
+        prev = parsed;
+      }
+    } catch { /* fresh file */ }
+    const ids = [...new Set([
+      ...(Array.isArray(prev.ids) ? prev.ids.map(String) : []),
+      ...newIds.map(String),
+    ])];
+    writeFileSync(file, JSON.stringify({
+      ids,
+      ts: Date.now(),
+      count: (prev.count || 0) + 1,
+    }));
+  } catch { /* silent — dedup is best-effort */ }
 }
 
 function writeCooldown(cooldownPath, data, isSessionScoped) {
@@ -228,10 +278,20 @@ try {
       `).all(project, cutoff, `%"${fnameEscaped}"%`, `%"${filePathEscaped}"%`);
     } catch { /* events table may not exist on pre-v2.31 DBs — silent */ }
 
+    // A3 (v2.83): cross-hook dedup. UPS may have already injected some of
+    // these obs ids this prompt — re-emitting wastes the PreToolUse slot
+    // (and inflates context). Drop ids found in the cross-hook injected file
+    // inside the staleness window; keep file-cooldown unchanged (the same
+    // file might also re-warrant a different lesson next session).
+    const crossHookSeen = readCrossHookInjected(project);
+    const dedupedRows = crossHookSeen.size > 0
+      ? [...rows, ...eventRows].filter(r => !crossHookSeen.has(String(r.id)))
+      : [...rows, ...eventRows];
+
     // Merge: observations first (they carry richer lesson_learned), then events.
     // Edit/Write caps at 3 total; Read caps at 1 (single most-actionable hit).
     const mergeCap = isRead ? 1 : 3;
-    const allRows = [...rows, ...eventRows].slice(0, mergeCap);
+    const allRows = dedupedRows.slice(0, mergeCap);
 
     // v2.31 T2: emit JSON with hookSpecificOutput.additionalContext so the message
     // reliably renders across CC variants (sdscc drops plain-text stdout from PreToolUse).
@@ -291,6 +351,11 @@ try {
     // file. Empty array on no-lesson branches keeps the schema uniform.
     cooldown[filePath] = { ts: now, lessonIds: allRows.map(r => r.id) };
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
+    // A3 (v2.83): merge our newly-emitted IDs into the cross-hook injected
+    // file so the next UPS prompt skips them too. Always write, even on
+    // empty allRows, so the file's ts stays fresh for the no-op case where
+    // we'd otherwise drift outside the dedup window.
+    mergeCrossHookInjected(project, allRows.map(r => r.id));
   } catch (e) {
     // Silent failure — never block editing, but record for self-observation.
     recordHookError('pre-recall:query', e, RUNTIME_DIR, { filePath });
