@@ -1517,10 +1517,20 @@ function hasMemHooksConfigured(settings) {
  *   node "/home/sds/.claude-mem-lite/hook.mjs" session-start
  *   bash "/home/sds/.claude-mem-lite/scripts/post-tool-use.sh"
  *   node "/home/sds/.claude-mem-lite/scripts/pre-tool-recall.js"
- * We pick the first quoted absolute path; if there is no quoted token we fall
- * back to the first whitespace-delimited absolute-looking token after the
- * interpreter. ${CLAUDE_PLUGIN_ROOT}-templated commands are ignored — those
- * are plugin-owned hooks resolved by Claude Code at runtime, not by us.
+ *
+ * Scan order (v2.80+): walk EVERY quoted token via matchAll, prefer ones that
+ * look like a hook path (absolute + ends in a known hook-runtime extension).
+ * If no quoted token qualifies, fall back to the first path-shaped token from
+ * a whitespace-split of the command. If both miss, skip the entry entirely —
+ * deliberate bias toward **under-reporting over false-flagging**: a wrapper
+ * like `bash -c "inline" "/real/path.sh"` should report the real path, not
+ * the inline string. ${CLAUDE_PLUGIN_ROOT}-templated commands are ignored —
+ * those are plugin-owned hooks resolved by Claude Code at runtime, not by us.
+ *
+ * Extension list (HOOK_PATH_EXTS) is hardcoded for the runtimes this plugin
+ * actually registers (node/bash). Extend if Claude Code ever supports new
+ * hook runtimes (e.g. python/.py). Currently safe because isMemHook() filters
+ * to claude-mem-lite-owned hooks only — foreign runtimes can't reach here.
  */
 const HOOK_PATH_EXTS = ['.mjs', '.js', '.cjs', '.sh'];
 

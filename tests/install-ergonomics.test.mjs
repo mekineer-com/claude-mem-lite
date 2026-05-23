@@ -159,6 +159,9 @@ describe('collectOrphanHookPaths (v2.79)', () => {
     // pre-v2.80 picked "do stuff", existsSync()'d false, and false-flagged
     // the wrapper as an orphan. v2.80 scans all quoted tokens and prefers
     // ones that look like a hook path; falls back to unquoted only if none qualify.
+    // NOTE: the command string below is contrived to exercise the path-extractor
+    // parser, NOT realistic hook execution (real `bash -c "..." "/...sh"` passes
+    // the trailing arg as $0 to the inline script). The parser is what we test.
     const settings = {
       hooks: {
         SessionStart: [{

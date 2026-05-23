@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.80.1 — post-2.80 review nits (comment/docstring only)
+
+Tiny patch addressing 4 `Minor` findings from the v2.80.0 code review. Pure comment / docstring / test-readability — zero code-behavior change.
+
+- **`install.mjs:1516-1531`** — `collectOrphanHookPaths` docstring re-synced to the v2.80 scan-all-quoted-prefer-path-shaped implementation (was still describing the pre-v2.80 "first quoted absolute path" behavior). Also lifted the under-report-vs-false-flag tradeoff and the `HOOK_PATH_EXTS` future-extension note into the docstring so the next reader doesn't have to reconstruct them from the body comments.
+- **`scripts/setup.sh:88`** — version label `v2.79 fix` → `v2.79.1 fix` (the JSON-safety rewrite landed in 2.79.1; v2.79.0 still had the bash-printf shape).
+- **`tests/install-ergonomics.test.mjs:163`** — added a one-line note that the `bash -c "..." "/...sh"` test command is a parser-level fixture, not realistic hook execution (real bash would pass the trailing arg as `$0` to the inline script). The test exercises `collectOrphanHookPaths`'s token-extractor, which is what we want.
+- **`install.mjs:1516-1531`** (same docstring change as item 1) — also documents the `HOOK_PATH_EXTS = ['.mjs','.js','.cjs','.sh']` hardcoded extension list, noting why it's safe today (`isMemHook` filters to plugin-owned hooks; we only register node/bash runtimes) and when to extend it (Claude Code adding new hook runtimes).
+
+**Test coverage**: unchanged (no new behavior). Suite 2421 tests / 110 files pass; eslint clean.
+
+**Action for users**: none.
+
 ## v2.80.0 — post-2.79 polish: transcript perf + test hygiene + doc accuracy
 
 Minor-version polish bundle clearing the 5 `Minor` items from v2.78/v2.79 code review. All non-behavior changes — perf, test hardening, doc sync, footgun guards.

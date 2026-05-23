@@ -85,7 +85,7 @@ mark_deps_broken() {
   # Embed reason + repair command so hook.mjs renders a complete error without
   # having to re-derive them. Delegate JSON serialization to node so embedded
   # quotes / shell metachars in $ROOT or $reason can't produce an invalid file
-  # (bash `printf '"..%s.."'` cannot escape arbitrary strings safely; v2.79 fix).
+  # (bash `printf '"..%s.."'` cannot escape arbitrary strings safely; v2.79.1 fix).
   MARK_REASON="$reason" MARK_ROOT="$ROOT" MARK_FLAG="$DEPS_FLAG" node -e '
     const fs = require("fs");
     const reason = process.env.MARK_REASON || "unknown";
