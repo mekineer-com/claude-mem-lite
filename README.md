@@ -138,7 +138,7 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 
 Plugin mode manages its own hooks/runtime. On session start it only **checks and reports** new claude-mem-lite versions; it does **not** self-overwrite plugin files in place. Update plugin-mode installs through Claude's plugin workflow.
 
-> **First session per project: run `/adopt` once.** Plugin install gives you the MCP server + hooks + slash commands, but the **invited-memory sentinel** (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) is opt-in and project-scoped. Without it the hooks still record observations and inject context, but Claude is far less likely to call the MCP tools on its own. One-time per project: `/adopt`. Remove with `/unadopt`.
+> **Auto-adopt fires on the first SessionStart per project (v2.82.1+).** The plugin automatically writes the **invited-memory sentinel** (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) into the project's memdir — **no manual `/adopt` needed**, regardless of install path (npm, npx, `/plugin`, manual). Per-project opt-out: `claude-mem-lite adopt --disable` (`--enable` to re-arm). Global opt-out: `export MEM_NO_AUTO_ADOPT=1`. Manual `/adopt` remains available for re-applying after edits and for the `--all` batch path.
 
 ### Method 2: npx (one-liner)
 
@@ -281,9 +281,11 @@ authority than MCP server instructions (which are framed as tool metadata).
 ```bash
 claude-mem-lite adopt              # install for current project
 claude-mem-lite adopt --all        # install for every project under ~/.claude/projects/
-claude-mem-lite adopt --status     # list adopted projects + sentinel versions
+claude-mem-lite adopt --status     # list adopted/disabled projects + current gating snapshot
 claude-mem-lite adopt --dry-run    # preview without writing
-claude-mem-lite unadopt            # remove cleanly
+claude-mem-lite adopt --disable    # opt out of auto-adopt for current project (writes .mem-no-auto-adopt sentinel)
+claude-mem-lite adopt --enable     # re-arm auto-adopt for current project (deletes the sentinel)
+claude-mem-lite unadopt            # remove sentinel + doc (runtime marker stays to honor the explicit removal)
 ```
 
 Slash commands `/adopt` and `/unadopt` wrap the same CLI.
@@ -313,8 +315,12 @@ Slash commands `/adopt` and `/unadopt` wrap the same CLI.
   unless you pass `--force`.
 - Budget-gated: refuses to insert when MEMORY.md is already >180 lines, so
   Claude Code's 200-line MEMORY.md cap won't truncate the block.
-- `install` only auto-adopts when run from the claude-mem-lite source repo
-  itself (detected via git remote match); other users must opt in explicitly.
+- **Auto-adopt fires on the first SessionStart per project for any install
+  path (v2.82.1+).** Per-project opt-out: `claude-mem-lite adopt --disable`
+  (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker
+  deletion / plugin reinstalls). Global opt-out: `MEM_NO_AUTO_ADOPT=1`.
+  Pre-v2.82.1 the `CLAUDE_PLUGIN_ROOT` gate left auto-adopt unreachable for
+  every `install.mjs`-written hook (the common path) — see CHANGELOG v2.82.1.
 - The fallback hook layer is never removed from source — conditional trim is
   runtime-gated on sentinel presence, so projects without adoption get the
   full verbose output.
@@ -614,8 +620,9 @@ npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% toleranc
 | `CLAUDE_MEM_DIR` | Custom data directory. All databases, runtime files, and managed resources are stored here. | `~/.claude-mem-lite/` |
 | `CLAUDE_MEM_MODEL` | LLM model for background calls (episode extraction, session summaries). Accepts `haiku` or `sonnet`. | `haiku` |
 | `CLAUDE_MEM_DEBUG` | Enable debug logging (`1` to enable). | _(disabled)_ |
-| `MEM_QUIET_HOOKS` | Low-noise hooks. `1` drops the `File Lessons` / `Key Context` sections from SessionStart injection, the lesson suffix from `[mem] Related memories`, and the `WHEN TO USE` / `Decision rules` blocks from MCP server instructions. IDs and the `Recent` table still surface so `mem_get(ids=[…])` remains reachable. Intended for users running the invited-memory adopt path or who otherwise want minimal auto-injection. | _(disabled)_ |
-| `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. The hint self-clears once `adopt` runs; set this env to suppress it without adopting. | _(disabled)_ |
+| `MEM_QUIET_HOOKS` | Low-noise hooks. `1` drops the `File Lessons` / `Key Context` sections from SessionStart injection, the lesson suffix from `[mem] Related memories`, and the `WHEN TO USE` / `Decision rules` blocks from MCP server instructions. IDs and the `Recent` table still surface so `mem_get(ids=[…])` remains reachable. Intended for users running the invited-memory adopt path or who otherwise want minimal auto-injection. **Since v2.82.0 this env no longer gates auto-adopt — use `MEM_NO_AUTO_ADOPT=1` for that.** | _(disabled)_ |
+| `MEM_NO_AUTO_ADOPT` | Global opt-out for auto-adopt (v2.82.0+). `1` prevents the first-SessionStart auto-write of the invited-memory sentinel across **all** projects. For per-project opt-out use `claude-mem-lite adopt --disable` instead (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion). | _(disabled)_ |
+| `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. Since v2.82.1 auto-adopt fires on first SessionStart for any install path, so this hint typically surfaces only when you've explicitly opted out (`MEM_NO_AUTO_ADOPT=1` or `claude-mem-lite adopt --disable`). | _(disabled)_ |
 
 ## License
 

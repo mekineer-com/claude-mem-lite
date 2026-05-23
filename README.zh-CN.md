@@ -148,7 +148,7 @@ node install.mjs install
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
 2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 20 个工具（9 个核心通过 `tools/list` 暴露 + 11 个隐藏但可调；完整表见 Usage 段）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
 
-> **每个项目第一次使用，跑一次 `/adopt`。** Plugin 安装给你 MCP server + hooks + slash commands，但**邀请式 memory 哨兵**（一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针）是按项目 opt-in 的。不跑 `/adopt` 时 hooks 仍记录观察、注入上下文，但 Claude 不太会主动调 MCP 工具。一次性、按项目：`/adopt`；撤销 `/unadopt`。
+> **首次 SessionStart 自动 adopt（v2.82.1+）。** 插件会自动向该项目 memdir 写入**邀请式 memory 哨兵**（一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针），**任何安装路径都生效**（npm、npx、`/plugin`、手动），**无需再手动跑 `/adopt`**。项目级关闭：`claude-mem-lite adopt --disable`（重新启用用 `--enable`）。全局关闭：`export MEM_NO_AUTO_ADOPT=1`。手动 `/adopt` 仍保留用于编辑后重写或 `--all` 批量场景。
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
@@ -263,9 +263,11 @@ instruction-following 权威。
 ```bash
 claude-mem-lite adopt              # 当前项目注入
 claude-mem-lite adopt --all        # 扫描 ~/.claude/projects/* 全部注入
-claude-mem-lite adopt --status     # 列出所有已 adopt 的项目 + 版本号
+claude-mem-lite adopt --status     # 列出已 adopt / 已禁用项目 + 当前 gate 快照
 claude-mem-lite adopt --dry-run    # 只打印不写入
-claude-mem-lite unadopt            # 精确移除
+claude-mem-lite adopt --disable    # 当前项目关闭 auto-adopt（写 .mem-no-auto-adopt 哨兵）
+claude-mem-lite adopt --enable     # 当前项目重新启用 auto-adopt（删哨兵）
+claude-mem-lite unadopt            # 精确移除 sentinel + 详情文档（runtime marker 保留以尊重显式撤销）
 ```
 
 Slash 命令 `/adopt` 和 `/unadopt` 是上述 CLI 的包装。
@@ -291,8 +293,11 @@ Slash 命令 `/adopt` 和 `/unadopt` 是上述 CLI 的包装。
 - Hash 守护：你手动改了 sentinel 段 → 下一次 adopt 报 `UserEditedError`，
   除非显式 `--force`。
 - 预算门：MEMORY.md 已 >180 行时拒绝新增（避开 Claude Code 200 行截断）。
-- `install` 只在从 claude-mem-lite 源码仓库运行时 auto-adopt（靠 git remote 判别）；
-  其它用户需显式调用。
+- **任何安装路径首次 SessionStart 自动 adopt（v2.82.1+）。** 项目级关闭：
+  `claude-mem-lite adopt --disable`（写 `<memdir>/.mem-no-auto-adopt` 哨兵，
+  存活于 marker 删除 / 插件重装）。全局关闭：`export MEM_NO_AUTO_ADOPT=1`。
+  v2.82.1 前因 `CLAUDE_PLUGIN_ROOT` gate 与 `install.mjs` 写出的 hook 命令
+  不匹配，auto-adopt 实质 5 周零触发——见 CHANGELOG v2.82.1。
 - 保守 hook 层源码永不删——条件瘦身仅基于 sentinel 存在性做 runtime 判断，
   未 adopt 的项目仍看完整 verbose 输出。
 
@@ -575,8 +580,9 @@ npm run benchmark:gate    # CI 门控：指标回退超过 5% 容差时失败
 | `CLAUDE_MEM_DIR` | 自定义数据目录。所有数据库、运行时文件和托管资源均存储在此。 | `~/.claude-mem-lite/` |
 | `CLAUDE_MEM_MODEL` | 后台 LLM 调用模型（Episode 提取、会话总结、调度）。可选 `haiku` 或 `sonnet`。 | `haiku` |
 | `CLAUDE_MEM_DEBUG` | 启用调试日志（设为 `1` 启用）。 | _(禁用)_ |
-| `MEM_QUIET_HOOKS` | 低噪声 hook。设为 `1` 时，SessionStart 注入去掉 `File Lessons` / `Key Context` 两节，`[mem] Related memories` 去掉 lesson 后缀，MCP server instructions 去掉 `WHEN TO USE` / `Decision rules` 两段。ID 与 `Recent` 表仍保留，`mem_get(ids=[…])` 可继续展开细节。适用于启用了 invited-memory adopt 流程或偏好最小化自动注入的用户。 | _(禁用)_ |
-| `MEM_NO_ADOPT_HINT` | 静音当前项目未 adopt 时 SessionStart 追加的那一行 "Invited-memory 未启用…" 提示。一旦运行 `adopt` 该提示自动消失；此 env 让偏好保守层的用户在不 adopt 的情况下也能静音。 | _(禁用)_ |
+| `MEM_QUIET_HOOKS` | 低噪声 hook。设为 `1` 时，SessionStart 注入去掉 `File Lessons` / `Key Context` 两节，`[mem] Related memories` 去掉 lesson 后缀，MCP server instructions 去掉 `WHEN TO USE` / `Decision rules` 两段。ID 与 `Recent` 表仍保留，`mem_get(ids=[…])` 可继续展开细节。适用于启用了 invited-memory adopt 流程或偏好最小化自动注入的用户。**v2.82.0 起此 env 不再阻挡 auto-adopt——如需关闭 auto-adopt 用 `MEM_NO_AUTO_ADOPT=1`。** | _(禁用)_ |
+| `MEM_NO_AUTO_ADOPT` | auto-adopt 全局关闭开关（v2.82.0+）。设为 `1` 阻止首次 SessionStart 在**所有**项目自动写入邀请式 memory 哨兵。项目级关闭走 `claude-mem-lite adopt --disable`（写 `<memdir>/.mem-no-auto-adopt` 哨兵，存活于 marker 删除）。 | _(禁用)_ |
+| `MEM_NO_ADOPT_HINT` | 静音当前项目未 adopt 时 SessionStart 追加的那一行 "Invited-memory 未启用…" 提示。v2.82.1 起任何安装路径首次 SessionStart 都自动 adopt，所以该提示一般只在你显式 opt out（`MEM_NO_AUTO_ADOPT=1` 或 `claude-mem-lite adopt --disable`）的项目才会出现。 | _(禁用)_ |
 
 ## 许可证
 
