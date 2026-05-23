@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { extractInjectedFromPreToolUse, extractCitationsFromTranscript } from '../lib/citation-tracker.mjs';
+import { extractInjectedFromPreToolUse, extractCitationsFromTranscript, applyCitationDecay } from '../lib/citation-tracker.mjs';
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('extractInjectedFromPreToolUse', () => {
   let tmp;
@@ -127,5 +128,141 @@ describe('extractCitationsFromTranscript — mainOnly option', () => {
     ]);
     const ids = extractCitationsFromTranscript(path, { mainOnly: true });
     expect(ids.has(300)).toBe(true);
+  });
+});
+
+describe('applyCitationDecay', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'p' });
+  });
+  afterEach(() => { try { db.close(); } catch {} });
+
+  function makeObs(overrides = {}) {
+    const id = insertObs(db, {
+      sessionId: 'sess-1',
+      project: 'p',
+      type: 'bugfix',
+      title: 't',
+      importance: 2,
+      ...overrides,
+    }).lastInsertRowid;
+    // Post-INSERT updates for citation-decay columns (not in insertObs yet)
+    if (overrides.uncited_streak !== undefined || overrides.cited_count !== undefined || overrides.last_decided_session_id !== undefined) {
+      db.prepare(`
+        UPDATE observations
+        SET uncited_streak = ?, cited_count = ?, last_decided_session_id = ?
+        WHERE id = ?
+      `).run(
+        overrides.uncited_streak ?? 0,
+        overrides.cited_count ?? 0,
+        overrides.last_decided_session_id ?? null,
+        id
+      );
+    }
+    return id;
+  }
+
+  it('cited obs gets +1 importance and cited_count += 1, streak reset to 0', () => {
+    const id = makeObs({ importance: 2, uncited_streak: 1, cited_count: 0 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');
+    const row = db.prepare('SELECT importance, cited_count, uncited_streak, last_decided_session_id FROM observations WHERE id=?').get(id);
+    expect(row.importance).toBe(3);
+    expect(row.cited_count).toBe(1);
+    expect(row.uncited_streak).toBe(0);
+    expect(row.last_decided_session_id).toBe('sess-1');
+  });
+
+  it('importance cap: cited at importance=3 stays at 3', () => {
+    const id = makeObs({ importance: 3 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');
+    expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(id).importance).toBe(3);
+  });
+
+  it('uncited streak increment without demotion when streak < 3', () => {
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    const r = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    expect(r.importance).toBe(2);
+    expect(r.uncited_streak).toBe(1);
+  });
+
+  it('uncited at streak=2 → demotion (importance -1) and streak reset to 0', () => {
+    const id = makeObs({ importance: 2, uncited_streak: 2 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    const r = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    expect(r.importance).toBe(1);
+    expect(r.uncited_streak).toBe(0);
+  });
+
+  it('importance floor: uncited at importance=0 stays at 0, streak still resets', () => {
+    const id = makeObs({ importance: 0, uncited_streak: 2 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    const r = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    expect(r.importance).toBe(0);
+    expect(r.uncited_streak).toBe(0);
+  });
+
+  it('partial cite: of injected {100, 200}, cited={100} → 100 promoted, 200 streak++', () => {
+    const id100 = makeObs({ importance: 2, uncited_streak: 0 });
+    const id200 = makeObs({ importance: 2, uncited_streak: 0 });
+    applyCitationDecay(db, 'p', new Set([id100, id200]), new Set([id100]), 'sess-1');
+    const a = db.prepare('SELECT importance, cited_count, uncited_streak FROM observations WHERE id=?').get(id100);
+    const b = db.prepare('SELECT importance, cited_count, uncited_streak FROM observations WHERE id=?').get(id200);
+    expect(a.importance).toBe(3);  expect(a.cited_count).toBe(1);  expect(a.uncited_streak).toBe(0);
+    expect(b.importance).toBe(2);  expect(b.cited_count).toBe(0);  expect(b.uncited_streak).toBe(1);
+  });
+
+  it('idempotency: running twice for same session is a no-op the second time', () => {
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    const after1 = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    const after2 = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    expect(after2.importance).toBe(after1.importance);
+    expect(after2.uncited_streak).toBe(after1.uncited_streak);
+  });
+
+  it('cross-project IDs silently ignored (no rows touched)', () => {
+    insertSession(db, { id: 'sess-2', project: 'other' });
+    const id = insertObs(db, { sessionId: 'sess-2', project: 'other', type: 'bugfix', title: 't', importance: 2 }).lastInsertRowid;
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    expect(db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id).importance).toBe(2);
+  });
+
+  it('returns summary { promoted, demoted, touched } for telemetry', () => {
+    const a = makeObs({ importance: 2 });
+    const b = makeObs({ importance: 2, uncited_streak: 2 });  // will demote
+    const result = applyCitationDecay(db, 'p', new Set([a, b]), new Set([a]), 'sess-1');
+    expect(result).toEqual({ promoted: 1, demoted: 1, touched: 2 });
+  });
+
+  it('escape hatch: MEM_DISABLE_CITATION_DECAY=1 → no writes, returns zeros', () => {
+    const id = makeObs({ importance: 2 });
+    process.env.MEM_DISABLE_CITATION_DECAY = '1';
+    try {
+      const result = applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');
+      expect(result).toEqual({ promoted: 0, demoted: 0, touched: 0 });
+      expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(id).importance).toBe(2);
+    } finally { delete process.env.MEM_DISABLE_CITATION_DECAY; }
+  });
+
+  it('null/empty injected set → no-op', () => {
+    const id = makeObs({ importance: 2 });
+    applyCitationDecay(db, 'p', new Set(), new Set([id]), 'sess-1');
+    expect(db.prepare('SELECT importance, last_decided_session_id FROM observations WHERE id=?').get(id).importance).toBe(2);
+  });
+
+  it('session dedup: same obs injected twice in one session resolves once', () => {
+    // Mirrors spec Test #1: Read→Edit both inject #100 in one session.
+    // The caller assembles ONE injected set per session — passing it twice
+    // mimics the Stop hook firing twice (idempotent skip on second call).
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    expect(db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
+    // Second invocation (whether from another Stop fire or a duplicate scan) — no change.
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    expect(db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
   });
 });
