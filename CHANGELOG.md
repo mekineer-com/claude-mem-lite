@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.75.0 — citation-decay polish: real cite-rate + demoted telemetry + self-heal
+
+Follow-up batch on v2.74.0's citation-decay loop, driven by close-out of 5 deferred items found during release verification.
+
+**`Cite rate` denominator is now meaningful** (schema v34): the v2.74.0 ratio divided `cited_count` (bumped by Stop hook) by `injection_count` (bumped by UserPromptSubmit / hook-memory — a completely different injection channel), so the number was a meaningless mix. New `observations.decay_seen_count` column gets bumped on every `applyCitationDecay` resolution (promote / streak-only / demote), and the per-project ratio becomes `cited_count / decay_seen_count` — both sides come from the same loop. The CLI label is now `"Cite rate by project (last Nd, cited / decay-resolutions)"`. Existing observations get `0` and accumulate forward; no historical data loss but pre-v2.75 ratios will look low until enough new resolutions accrue.
+
+**"Recently demoted" CLI section** (schema v33): the v2.74.0 release shipped only "Recently promoted" but the spec called for both. `applyCitationDecay`'s demote branch now sets `demoted_at = Date.now()`, and `citation-stats` lists the most recent 10 demotes inside `--days` window with an "Nd ago" hint. `--json` output gains a `demoted` array. Single-shot per obs (only the most recent demote is preserved); use a separate decay-log table if historical trend is ever wanted.
+
+**`initSchema` self-heal** (fixes v2.74.0 release-side bug): during v2.74.0 verification, the dev DB ended up with `schema_version = 32` but the 3 new v32 columns missing — `citation-stats` crashed with `no such column: cited_count`. Real upgrade path from v31 was verified clean (simulated against a fresh clone), so users in the wild weren't affected, but a half-migrated state shouldn't crash. Fix: `LATEST_MIGRATION_COLUMN` sentinel + `hasLatestMigrationColumn()` PRAGMA spot-check in both fast-path branches (no-lock and under-lock). When version matches but the sentinel column is missing, fall through to migration apply — duplicate-column-name errors are caught in the existing loop, so re-apply is idempotent. Update the sentinel constant whenever a new migration batch lands.
+
+**Env-var scope clarification** (`hook.mjs`): `CLAUDE_MEM_NO_CITATION_TRACK=1` disables both the P4 access_count bump and the v32 decay loop (they share the outer transcript-scan guard). To disable just the decay loop and keep access_count bumps, use `MEM_DISABLE_CITATION_DECAY=1` — `applyCitationDecay` checks it independently.
+
+**Regression coverage** (`tests/citation-decay.test.mjs`): two defensive paths that final review flagged but lacked tests — `extractInjectedFromPreToolUse` raw-text stdout fallback (legacy non-JSON format), and `applyCitationDecay` silent-skip when injected IDs aren't in `observations` (e.g. when pre-tool-recall surfaces events-table `lesson` rows). Both behaviors were correct; tests lock the contracts in.
+
+15 new test cases across 4 files; 2354 → 2369 tests pass. No breaking changes; schema migrations are additive (idempotent ALTER TABLE) and v34 → v35 will keep the same self-heal pattern.
+
 ## v2.74.0 — citation-driven importance decay
 
 The pre-tool-recall feedback loop now self-tunes. Measured over the trailing 7 days of real sessions: 27.5% citation rate on the 69 PreToolUse fires that surfaced #IDs (50/69 uncited). Root cause analysis: 97% of post-Read assistant turns are pure tool_use chains with no text — citations cluster at +2 to +5 turns later, when the agent finally writes back to the user. The old MEMORY.md contract ("must cite #NN immediately") was structurally impossible.
