@@ -147,6 +147,8 @@ node install.mjs install
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
 2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 15 个工具（search、recent、recall、timeline、get、save、update、stats、delete、compress、maintain、export、fts_check、browse、registry）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
+
+> **每个项目第一次使用，跑一次 `/adopt`。** Plugin 安装给你 MCP server + hooks + slash commands，但**邀请式 memory 哨兵**（一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针）是按项目 opt-in 的。不跑 `/adopt` 时 hooks 仍记录观察、注入上下文，但 Claude 不太会主动调 MCP 工具。一次性、按项目：`/adopt`；撤销 `/unadopt`。
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
@@ -473,6 +475,14 @@ npx claude-mem-lite uninstall --purge
 ```bash
 rm -rf ~/.claude-mem-lite/
 ```
+
+### 混装残留（用过多种安装方式的话务必看一下）
+
+`/plugin uninstall` 只删 plugin manifest，**不会动 `~/.claude/settings.json`**。如果你曾经跑过 `claude-mem-lite install`（npx 或 git-clone 路径），指向 `~/.claude-mem-lite/hook.mjs` 的 hook 条目就被写进了你的 user-global settings；`/plugin uninstall` 之后它们还在每会话触发。如果 `~/.claude-mem-lite/hook.mjs` 还在 → 与 plugin 双触发；如果你又 `rm -rf ~/.claude-mem-lite/` → 每次会话报错。
+
+**正确顺序**：先 `claude-mem-lite uninstall`（清 settings.json 的 hook + 全局 MCP 注册），再 `/plugin uninstall claude-mem-lite`，最后可选 `rm -rf ~/.claude-mem-lite/`。
+
+顺序搞错了的话，`claude-mem-lite doctor` 会在 `Orphan hooks:` 一节标出残留并给清理命令。
 
 ## 项目结构
 

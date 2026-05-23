@@ -138,6 +138,8 @@ The original sends **everything to the LLM and hopes it filters well**. claude-m
 
 Plugin mode manages its own hooks/runtime. On session start it only **checks and reports** new claude-mem-lite versions; it does **not** self-overwrite plugin files in place. Update plugin-mode installs through Claude's plugin workflow.
 
+> **First session per project: run `/adopt` once.** Plugin install gives you the MCP server + hooks + slash commands, but the **invited-memory sentinel** (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) is opt-in and project-scoped. Without it the hooks still record observations and inject context, but Claude is far less likely to call the MCP tools on its own. One-time per project: `/adopt`. Remove with `/unadopt`.
+
 ### Method 2: npx (one-liner)
 
 ```bash
@@ -510,6 +512,14 @@ Data in `~/.claude-mem-lite/` is preserved by default. Delete manually if needed
 ```bash
 rm -rf ~/.claude-mem-lite/
 ```
+
+### Mixed-install residue (read this if you've used multiple install methods)
+
+`/plugin uninstall` only removes the plugin manifest — it **does not touch `~/.claude/settings.json`**. If you've ever run `claude-mem-lite install` (npx or git-clone path), hook entries pointing at `~/.claude-mem-lite/hook.mjs` were written into your user-global settings, and they keep firing after `/plugin uninstall`. If `~/.claude-mem-lite/hook.mjs` still exists they double-fire alongside the plugin; if you also ran `rm -rf ~/.claude-mem-lite/` they error every session.
+
+**The safe sequence is**: run `claude-mem-lite uninstall` first (which cleans the settings.json hooks plus the global MCP registration), then `/plugin uninstall claude-mem-lite`, then optionally `rm -rf ~/.claude-mem-lite/`.
+
+If you already uninstalled in the wrong order, `claude-mem-lite doctor` flags orphan hooks under `Orphan hooks:` with the exact cleanup command.
 
 ## Project Structure
 

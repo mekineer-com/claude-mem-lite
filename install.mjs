@@ -1261,6 +1261,24 @@ async function doctor() {
     dwarn('Plugin lifecycle: hooks not configured');
   }
 
+  // Orphan hooks: settings.json entries referencing hook files that no longer
+  // exist on disk. Trips when a user runs `/plugin uninstall` and/or
+  // `rm -rf ~/.claude-mem-lite/` without first running `claude-mem-lite uninstall`
+  // (which clears the settings.json entries). The hooks keep firing and exit
+  // with require-error noise every session. README's Uninstall section warns
+  // about the right ordering; this check flags the broken state so it surfaces
+  // even when the user skipped the README.
+  const orphanPaths = collectOrphanHookPaths(settings);
+  if (orphanPaths.length > 0) {
+    fail(`Orphan hooks: ${orphanPaths.length} settings.json entr${orphanPaths.length === 1 ? 'y references a' : 'ies reference'} missing file(s)`);
+    for (const p of orphanPaths.slice(0, 5)) log(`    missing: ${p}`);
+    if (orphanPaths.length > 5) log(`    ... +${orphanPaths.length - 5} more`);
+    log(`    Repair: node ${join(PROJECT_DIR, 'install.mjs')} uninstall    # removes the dead hook entries`);
+    issues++;
+  } else if (hasHooks) {
+    ok('Orphan hooks: none (all hook targets present)');
+  }
+
   // Database
   if (existsSync(DB_PATH)) {
     try {
@@ -1481,6 +1499,48 @@ function hasMemHooksConfigured(settings) {
   return Object.values(settings.hooks).some(configs =>
     Array.isArray(configs) && configs.some(cfg => isMemHook(cfg))
   );
+}
+
+/**
+ * Walk every mem-hook command in settings.json and collect any absolute file
+ * paths that don't currently exist on disk. Used by doctor() to surface
+ * post-uninstall residue ("/plugin uninstall claude-mem-lite" leaves
+ * settings.json hooks pointing at ~/.claude-mem-lite/hook.mjs; if the user
+ * then deleted that directory, every session start dispatches to a missing
+ * file).
+ *
+ * Path extraction: command strings look like:
+ *   node "/home/sds/.claude-mem-lite/hook.mjs" session-start
+ *   bash "/home/sds/.claude-mem-lite/scripts/post-tool-use.sh"
+ *   node "/home/sds/.claude-mem-lite/scripts/pre-tool-recall.js"
+ * We pick the first quoted absolute path; if there is no quoted token we fall
+ * back to the first whitespace-delimited absolute-looking token after the
+ * interpreter. ${CLAUDE_PLUGIN_ROOT}-templated commands are ignored — those
+ * are plugin-owned hooks resolved by Claude Code at runtime, not by us.
+ */
+export function collectOrphanHookPaths(settings) {
+  if (!settings?.hooks) return [];
+  const out = [];
+  for (const configs of Object.values(settings.hooks)) {
+    if (!Array.isArray(configs)) continue;
+    for (const cfg of configs) {
+      if (!isMemHook(cfg)) continue;
+      for (const h of cfg.hooks || []) {
+        const cmd = h.command || '';
+        if (cmd.includes('${CLAUDE_PLUGIN_ROOT}')) continue;
+        const quoted = cmd.match(/"([^"]+)"/);
+        let path = quoted ? quoted[1] : null;
+        if (!path) {
+          // unquoted: split on whitespace, take the first arg that looks like an absolute path
+          const parts = cmd.split(/\s+/);
+          path = parts.find(p => p.startsWith('/') && (p.endsWith('.mjs') || p.endsWith('.js') || p.endsWith('.sh'))) || null;
+        }
+        if (!path) continue;
+        if (!existsSync(path) && !out.includes(path)) out.push(path);
+      }
+    }
+  }
+  return out;
 }
 
 /**

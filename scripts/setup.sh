@@ -69,11 +69,39 @@ mkdir -p "$DATA_DIR/runtime"
 
 # 6. Ensure native dependencies available for hooks (ESM import needs node_modules in resolution chain)
 #    Plugin cache doesn't include node_modules — symlink from data dir or npm install on first run
+#
+# Visibility contract: `npm install` failure here used to be a stderr-only log_warn,
+# invisible to the Claude session unless the operator was watching the terminal.
+# When it fails (no toolchain, blocked network, read-only FS) every hook silently
+# degrades — pre-tool-recall, post-tool-use, session-start all import better-sqlite3
+# and exit on the require() error. v2.79: write a JSON flag to runtime/.deps-broken
+# and hook.mjs SessionStart surfaces it in the Claude context as a HIGH-VISIBILITY
+# block; success branches remove the flag so a self-heal stays visible too.
+DEPS_FLAG="$DATA_DIR/runtime/.deps-broken"
+mkdir -p "$DATA_DIR/runtime" 2>/dev/null || true
+
+mark_deps_broken() {
+  local reason="$1"
+  # Embed reason + repair command so hook.mjs renders a complete error without
+  # having to re-derive them. Single-line JSON for trivial parse.
+  printf '{"ts":"%s","reason":%s,"root":%s,"repair":%s}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "\"$reason\"" \
+    "\"$ROOT\"" \
+    "\"cd '$ROOT' && npm install --omit=dev\"" \
+    > "$DEPS_FLAG" 2>/dev/null || true
+}
+
+mark_deps_ok() {
+  rm -f "$DEPS_FLAG" 2>/dev/null || true
+}
+
 if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   # Fast path: symlink from data dir (instant, no network needed)
   if [[ -d "$DATA_DIR/node_modules/better-sqlite3" ]]; then
     if ln -sfn "$DATA_DIR/node_modules" "$ROOT/node_modules" 2>/dev/null; then
       log_ok "Dependencies linked from $DATA_DIR"
+      mark_deps_ok
     fi
   fi
   # Slow path: npm install (first-time only, ~10-20s for native addon)
@@ -81,10 +109,15 @@ if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
     log_info "Installing dependencies (first-time setup)..."
     if (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund 2>&1) >&2; then
       log_ok "Dependencies installed"
+      mark_deps_ok
     else
-      log_warn "Dependency install failed — hooks may have limited functionality"
+      log_warn "Dependency install failed — hooks may have limited functionality (flag: $DEPS_FLAG)"
+      mark_deps_broken "npm install --omit=dev failed in plugin cache root"
     fi
   fi
+else
+  # Deps already present — make sure we don't keep stale broken flag around
+  mark_deps_ok
 fi
 
 # 7. MCP cleanup: idempotently clean stale registrations from older installs.

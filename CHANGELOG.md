@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.79.0 — install ergonomics: /adopt nudge + deps-broken surface + orphan-hook doctor
+
+Single-theme follow-up on the v2.78 audit's "What's friction for new users?" list. Three changes, all serving the one question: **does a fresh install actually do the thing the user expected, and does the user know if it didn't?**
+
+**`/adopt` discoverability** (`README.md`, `README.zh-CN.md`). The plugin install flow gives MCP server + hooks + slash commands automatically, but the `invited-memory sentinel` (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) is opt-in and project-scoped. Without it, hooks still record observations and inject context, but Claude rarely calls the MCP tools on its own — i.e. exactly the failure mode the v2.78 audit flagged. README's Plugin Marketplace section now ends with a blockquote callout telling first-session-per-project users to run `/adopt` once. Cheap, accurate, no behavior change.
+
+**Dependency-install failure surface** (`scripts/setup.sh`, `hook.mjs:1124-1145`). `setup.sh` runs `npm install --omit=dev` on first SessionStart to compile `better-sqlite3`. Pre-v2.79 this was a stderr-only `log_warn` — invisible to the Claude session, so when it failed (no toolchain / blocked network / read-only FS) every PreToolUse / PostToolUse / SessionStart hook silently degraded with require-error noise and the user had no visible signal. Now `setup.sh` writes `${RUNTIME_DIR}/.deps-broken` (JSON: ts / reason / root / repair) on failure; `hook.mjs handleSessionStart` reads it and prepends a high-visibility `⚠️ [claude-mem-lite] Hook dependencies failed...` block to the SessionStart `additionalContext` (same channel as the dashboard). Every success branch in setup.sh (already-installed, symlink-from-data-dir, npm-install-succeeded) removes the flag so self-heal becomes visible too.
+
+**Orphan-hook doctor check** (`install.mjs:collectOrphanHookPaths` + doctor surface). `/plugin uninstall claude-mem-lite` does not touch `~/.claude/settings.json`. If a user installed via npx or git-clone (`claude-mem-lite install`) and later switched to plugin mode, settings.json holds hook entries pointing at `~/.claude-mem-lite/hook.mjs`. Plugin uninstall leaves those entries; they keep firing. If the user also `rm -rf ~/.claude-mem-lite/`, every session errors. Doctor now walks every mem hook in settings.json, extracts the target path (skipping `${CLAUDE_PLUGIN_ROOT}`-templated commands — those are plugin-owned, runtime-resolved), and flags missing files under a new `Orphan hooks:` check with the exact repair command (`node .../install.mjs uninstall` to clear the dead entries). README Uninstall section gains a "Mixed-install residue" subsection documenting the correct uninstall ordering for users who never noticed.
+
+**Action for users**: none on the happy path. Operators: `claude-mem-lite doctor` now surfaces orphan-hook residue (was invisible); SessionStart now surfaces a deps-broken banner (was invisible); first-session-per-project should run `/adopt` (documented now, was tribal knowledge).
+
+**Test coverage**: +9 cases in new `tests/install-ergonomics.test.mjs` (deps-broken flag round-trip on both symlink and already-installed paths; `collectOrphanHookPaths` pure-fn coverage for absent / non-mem / mem / `${CLAUDE_PLUGIN_ROOT}` / extant / duplicate paths; doctor end-to-end emits "Orphan hooks:" with repair hint). Suite 2410 → 2419 tests pass; 110 files / 0 red regressions; eslint clean; shellcheck clean (the one SC2016 info on `setup.sh:135` is pre-existing intentional — `node -e '...'` body needs literal `$` for JS template strings).
+
+**What to watch in the next 7 days**: (1) any user reporting `⚠️ [claude-mem-lite] Hook dependencies failed...` in their session context — actionable signal we never had; (2) `claude-mem-lite doctor` orphan-hook hits — measures the size of the "uninstall ordering" gap in the user base; (3) cite-rate on adopted projects vs un-adopted (controllable now via the README nudge — confirms whether the gap was discoverability or something deeper).
+
 ## v2.78.0 — MCP namespace hygiene + citation-decay text-floor + spawn telemetry
 
 Three-pack: a breaking-but-trivially-migrated MCP server rename, a citation-decay correctness fix, and the diagnostic surface that informed both.

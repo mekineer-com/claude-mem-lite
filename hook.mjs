@@ -20,7 +20,7 @@
 
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import {
   truncate, inferProject, detectBashSignificance,
@@ -1115,6 +1115,33 @@ async function handleSessionStart() {
       if (citeNudge) {
         dashboardText = dashboardText ? `${citeNudge}\n${dashboardText}` : citeNudge;
       }
+      // v2.79: surface setup.sh dependency-install failure as a high-visibility
+      // line at the very top of the dashboard. setup.sh writes runtime/.deps-broken
+      // (JSON: ts/reason/root/repair) on failure and removes it on success — so
+      // a stale flag self-heals on the next clean SessionStart. Without this
+      // surface, hook degradation looks identical to "nothing happening" until
+      // the user notices missing context days later.
+      try {
+        const depsFlag = join(RUNTIME_DIR, '.deps-broken');
+        if (existsSync(depsFlag)) {
+          let detail = 'unknown';
+          let repair = '';
+          try {
+            const raw = readFileSync(depsFlag, 'utf8').trim();
+            const parsed = JSON.parse(raw);
+            detail = parsed.reason || detail;
+            repair = parsed.repair || '';
+          } catch { /* corrupt flag — surface the fact only */ }
+          const nudgeLines = [
+            '⚠️ [claude-mem-lite] Hook dependencies failed to install on the last SessionStart.',
+            `   Reason: ${detail}`,
+          ];
+          if (repair) nudgeLines.push(`   Repair: ${repair}`);
+          nudgeLines.push('   Until fixed, PreToolUse / PostToolUse / memory injection are degraded.');
+          const nudge = nudgeLines.join('\n');
+          dashboardText = dashboardText ? `${nudge}\n${dashboardText}` : nudge;
+        }
+      } catch (e) { debugCatch(e, 'session-start-deps-flag'); }
       if (dashboardText) {
         process.stdout.write(JSON.stringify({
           suppressOutput: true,
