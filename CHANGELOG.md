@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.74.0 — citation-driven importance decay
+
+The pre-tool-recall feedback loop now self-tunes. Measured over the trailing 7 days of real sessions: 27.5% citation rate on the 69 PreToolUse fires that surfaced #IDs (50/69 uncited). Root cause analysis: 97% of post-Read assistant turns are pure tool_use chains with no text — citations cluster at +2 to +5 turns later, when the agent finally writes back to the user. The old MEMORY.md contract ("must cite #NN immediately") was structurally impossible.
+
+**Mechanism**: `applyCitationDecay(db, project, injected, cited, sessionId)` resolves each session's injected IDs at Stop time. Cited → `importance += 1` (cap 3) + `cited_count++`. Uncited (3 consecutive sessions) → `importance -= 1` (floor 0). Per-session idempotent via `last_decided_session_id`. The pre-tool-recall query (`WHERE importance >= 2`) is unchanged — lessons that consistently fail to earn citations naturally exit the injection pool. Sidechain (subagent) text doesn't count toward main-thread citation; subagents run in isolated contexts. `MEM_DISABLE_CITATION_DECAY=1` for ops.
+
+**Schema v32**: additive — `uncited_streak` / `cited_count` / `last_decided_session_id` on `observations`. Existing rows get defaults 0/0/NULL; migration is idempotent and rollback-safe (DROP COLUMN).
+
+**Visibility**: `claude-mem-lite citation-stats [--json] [--days N]` surfaces per-project cite rate, the active decay queue (lessons at streak=2, next miss demotes), and recently promoted lessons.
+
+**Contract change** (`CLAUDE.md` mem-contract): cite `#NN` the NEXT time you produce user-facing text, not immediately. Citing is feedback that promotes the lesson; ignoring it lets the lesson auto-decay. The system learns from behavior — citing shifts from a compliance ritual to a tuning signal.
+
+**Layers** (P4 → v32 evolution): P4 already bumped `access_count` for cited rows; v32 extends to `importance` evolution with bidirectional streak tracking. Both layers coexist; P4 is unchanged.
+
+24 new test cases (`tests/citation-decay.test.mjs`, `tests/citation-stats-cli.test.mjs`, `tests/schema-migration-v32.test.mjs`). 2358/2358 tests pass.
+
 ## v2.73.2 — lockfile drift fix (v2.73.1 follow-up)
 
 CI on v2.73.1 went red at `npm ci`: `Missing: @emnapi/core@1.10.0 from lock file / Missing: @emnapi/runtime@1.10.0 from lock file`. Same recipe install.mjs:1704 documented for #8271 / 2.58.2 / 2.62.1 — npm@11's `--package-lock-only` strips top-level entries for transitive deps of platform-optional bindings (`@oxc-parser/binding-wasm32-wasi`, `@rolldown/binding-wasm32-wasi`), but CI's bundled npm@10 refuses `npm ci` when those top-level entries are absent. The v2.73.1 release tarball is unaffected (auto-update + install both call `npm install`, not `npm ci`, so they self-heal), but CI must stay green.
