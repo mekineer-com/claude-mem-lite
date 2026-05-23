@@ -41,6 +41,6 @@ export default [
   },
   // Ignore non-source files
   {
-    ignores: ['node_modules/**', 'coverage/**', 'benchmark/**', 'scripts/**', '.tmp/**', 'docs/**'],
+    ignores: ['node_modules/**', 'coverage/**', 'benchmark/**', 'scripts/**', '.tmp/**', 'tmp/**', 'docs/**'],
   },
 ];
