@@ -51,6 +51,23 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // (cap 3). last_decided_session_id makes Stop idempotent across multi-fire.
 export const CURRENT_SCHEMA_VERSION = 32;
 
+// Sentinel column for the LATEST migration set. The fast-path uses this to
+// self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
+// back (observed once in dev during v2.74.0). Update both the column AND
+// (if needed) the table when adding a new migration batch.
+const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'uncited_streak' };
+
+function hasLatestMigrationColumn(db) {
+  try {
+    const row = db.prepare(
+      `SELECT 1 AS present FROM pragma_table_info(?) WHERE name = ?`
+    ).get(LATEST_MIGRATION_COLUMN.table, LATEST_MIGRATION_COLUMN.column);
+    return Boolean(row);
+  } catch {
+    return false; // table itself missing → caller falls through to CORE_SCHEMA
+  }
+}
+
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,7 +196,10 @@ export function initSchema(db) {
   try {
     const row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
     if (row && typeof row.version === 'number') {
-      if (row.version === CURRENT_SCHEMA_VERSION) return db;
+      // Self-heal: version-row says CURRENT but latest migration column may be
+      // absent (rolled back / never applied). Fall through to migration apply
+      // when the sentinel is missing — duplicates are caught in the loop.
+      if (row.version === CURRENT_SCHEMA_VERSION && hasLatestMigrationColumn(db)) return db;
       if (row.version > CURRENT_SCHEMA_VERSION) {
         throw new Error(
           `DB schema is v${row.version} but this claude-mem-lite binary supports up to v${CURRENT_SCHEMA_VERSION}. ` +
@@ -202,7 +222,7 @@ export function initSchema(db) {
   db.exec('BEGIN IMMEDIATE');
   try {
     const underlock = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
-    if (underlock && underlock.version === CURRENT_SCHEMA_VERSION) {
+    if (underlock && underlock.version === CURRENT_SCHEMA_VERSION && hasLatestMigrationColumn(db)) {
       db.exec('COMMIT');
       return db;
     }
