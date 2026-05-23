@@ -2376,14 +2376,14 @@ function cmdCitationStats(db, args) {
   const perProject = db.prepare(`
     SELECT project,
            COALESCE(SUM(cited_count), 0) AS cited,
-           COALESCE(SUM(injection_count), 0) AS injected,
+           COALESCE(SUM(decay_seen_count), 0) AS resolved,
            SUM(CASE WHEN uncited_streak >= 2 THEN 1 ELSE 0 END) AS at_risk
       FROM observations
      WHERE created_at_epoch >= ?
        AND COALESCE(compressed_into, 0) = 0
        AND superseded_at IS NULL
   GROUP BY project
-  ORDER BY injected DESC
+  ORDER BY resolved DESC
   `).all(cutoff);
 
   const decayQueue = db.prepare(`
@@ -2422,10 +2422,10 @@ function cmdCitationStats(db, args) {
     return;
   }
 
-  out(`Cite rate by project (last ${days}d):`);
+  out(`Cite rate by project (last ${days}d, cited / decay-resolutions):`);
   for (const r of perProject) {
-    const rate = r.injected > 0 ? (r.cited * 100 / r.injected).toFixed(1) + '%' : '—';
-    out(`  ${r.project.padEnd(34)} ${String(rate).padStart(6)}   cited:${r.cited}/${r.injected}   at_risk:${r.at_risk}`);
+    const rate = r.resolved > 0 ? (r.cited * 100 / r.resolved).toFixed(1) + '%' : '—';
+    out(`  ${r.project.padEnd(34)} ${String(rate).padStart(6)}   cited:${r.cited}/${r.resolved}   at_risk:${r.at_risk}`);
   }
   out('');
   out('Active decay queue (uncited_streak >= 2, next miss → demote):');

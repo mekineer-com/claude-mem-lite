@@ -8,17 +8,17 @@ describe('initSchema self-heal — version-vs-columns mismatch (D#22)', () => {
     initSchema(db); // clean init — DB at CURRENT_SCHEMA_VERSION with all columns
     // Simulate the half-migrated state observed in dev during v2.74.0 release:
     // version row reads CURRENT but the latest migration's column is missing.
-    db.exec('ALTER TABLE observations DROP COLUMN demoted_at');
+    db.exec('ALTER TABLE observations DROP COLUMN decay_seen_count');
     expect(
-      db.prepare("SELECT name FROM pragma_table_info('observations') WHERE name='demoted_at'").all()
+      db.prepare("SELECT name FROM pragma_table_info('observations') WHERE name='decay_seen_count'").all()
     ).toEqual([]);
     expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(CURRENT_SCHEMA_VERSION);
 
     initSchema(db); // expected: detects missing column, re-runs migrations idempotently
 
     expect(
-      db.prepare("SELECT name FROM pragma_table_info('observations') WHERE name='demoted_at'").get()
-    ).toEqual({ name: 'demoted_at' });
+      db.prepare("SELECT name FROM pragma_table_info('observations') WHERE name='decay_seen_count'").get()
+    ).toEqual({ name: 'decay_seen_count' });
     db.close();
   });
 
@@ -28,8 +28,8 @@ describe('initSchema self-heal — version-vs-columns mismatch (D#22)', () => {
     initSchema(db); // second call — should be cheap, no errors
     // Column still intact, version still pinned.
     expect(
-      db.prepare("SELECT name FROM pragma_table_info('observations') WHERE name='demoted_at'").get()
-    ).toEqual({ name: 'demoted_at' });
+      db.prepare("SELECT name FROM pragma_table_info('observations') WHERE name='decay_seen_count'").get()
+    ).toEqual({ name: 'decay_seen_count' });
     expect(db.prepare('SELECT version FROM schema_version').get().version).toBe(CURRENT_SCHEMA_VERSION);
     db.close();
   });

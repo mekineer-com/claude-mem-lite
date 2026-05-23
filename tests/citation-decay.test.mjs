@@ -167,11 +167,26 @@ describe('applyCitationDecay', () => {
   it('cited obs gets +1 importance and cited_count += 1, streak reset to 0', () => {
     const id = makeObs({ importance: 2, uncited_streak: 1, cited_count: 0 });
     applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');
-    const row = db.prepare('SELECT importance, cited_count, uncited_streak, last_decided_session_id FROM observations WHERE id=?').get(id);
+    const row = db.prepare('SELECT importance, cited_count, uncited_streak, last_decided_session_id, decay_seen_count FROM observations WHERE id=?').get(id);
     expect(row.importance).toBe(3);
     expect(row.cited_count).toBe(1);
     expect(row.uncited_streak).toBe(0);
     expect(row.last_decided_session_id).toBe('sess-1');
+    // v34: every resolution branch bumps decay_seen_count
+    expect(row.decay_seen_count).toBe(1);
+  });
+
+  it('decay_seen_count bumps on all 3 branches (promote, streak-only, demote)', () => {
+    const p = makeObs({ importance: 2 }); // promote path
+    const s = makeObs({ importance: 2, uncited_streak: 0 }); // streak-only path
+    const d = makeObs({ importance: 2, uncited_streak: 2 }); // demote path
+    applyCitationDecay(db, 'p', new Set([p, s, d]), new Set([p]), 'sess-1');
+    const pSeen = db.prepare('SELECT decay_seen_count FROM observations WHERE id=?').get(p).decay_seen_count;
+    const sSeen = db.prepare('SELECT decay_seen_count FROM observations WHERE id=?').get(s).decay_seen_count;
+    const dSeen = db.prepare('SELECT decay_seen_count FROM observations WHERE id=?').get(d).decay_seen_count;
+    expect(pSeen).toBe(1);
+    expect(sSeen).toBe(1);
+    expect(dSeen).toBe(1);
   });
 
   it('importance cap: cited at importance=3 stays at 3', () => {

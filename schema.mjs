@@ -49,13 +49,13 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // cited_count, last_decided_session_id. Stop hook resolves injected obs as
 // cited|uncited; 3 consecutive uncited → importance -1 (floor 0); 1 cited → +1
 // (cap 3). last_decided_session_id makes Stop idempotent across multi-fire.
-export const CURRENT_SCHEMA_VERSION = 33;
+export const CURRENT_SCHEMA_VERSION = 34;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
 // back (observed once in dev during v2.74.0). Update both the column AND
 // (if needed) the table when adding a new migration batch.
-const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'demoted_at' };
+const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'decay_seen_count' };
 
 function hasLatestMigrationColumn(db) {
   try {
@@ -186,6 +186,13 @@ const MIGRATIONS = [
   // Single-shot (only the latest demote is preserved); use a decay_log table
   // if historical trend is ever needed.
   'ALTER TABLE observations ADD COLUMN demoted_at INTEGER DEFAULT NULL',
+  // v34 (citation-decay denominator fix): per-obs counter of decay-loop
+  // resolutions (cited + uncited paths). Used by citation-stats as the
+  // denominator for "cite rate" — bumped only by applyCitationDecay, so it
+  // doesn't get polluted by UserPromptSubmit / hook-memory injections that
+  // share the unrelated injection_count column. Same-source numerator
+  // (cited_count) + same-source denominator = meaningful ratio.
+  'ALTER TABLE observations ADD COLUMN decay_seen_count INTEGER NOT NULL DEFAULT 0',
 ];
 
 /**
