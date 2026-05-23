@@ -40,6 +40,7 @@ export const SOURCE_FILES = [
   'lib/low-signal-patterns.mjs',
   'lib/private-strip.mjs',
   'lib/citation-tracker.mjs',
+  'lib/cite-back-hint.mjs',
   'lib/summary-extractor.mjs',
   'lib/id-routing.mjs',
   'lib/err-sampler.mjs',

@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.80.1",
+  "version": "2.81.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "packageManager": "npm@10.9.2",
@@ -57,6 +57,7 @@
     "lib/low-signal-patterns.mjs",
     "lib/private-strip.mjs",
     "lib/citation-tracker.mjs",
+    "lib/cite-back-hint.mjs",
     "lib/summary-extractor.mjs",
     "lib/id-routing.mjs",
     "lib/err-sampler.mjs",

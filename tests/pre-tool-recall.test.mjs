@@ -899,4 +899,88 @@ describe('pre-tool-recall', () => {
       expect(parsed.hookSpecificOutput.additionalContext).not.toContain('A specific lesson visible only when DB is correctly sandboxed');
     });
   });
+
+  // v2.81: cooldown entries record the lesson IDs that were emitted, so the
+  // PostToolUse cite-back hint (lib/cite-back-hint.mjs) can name them when the
+  // user actually edits the file. Reads must tolerate both the new
+  // object-schema and the legacy number-schema written by older versions.
+  describe('cooldown lessonIds (v2.81 cite-back support)', () => {
+    let tmpRoot;
+    let projectDir;
+    let lessonObsId;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-citeback-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'citeback');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-cb', project: 'parent--citeback', memoryId: 'mem-cb' });
+      const info = insertObs(db, {
+        sessionId: 'mem-cb', project: 'parent--citeback',
+        type: 'bugfix', importance: 2,
+        title: 'cite-back lesson',
+        lessonLearned: 'A lesson that should be cited back',
+        filesModified: `["${join(projectDir, 'foo.mjs')}"]`,
+      });
+      lessonObsId = info?.lastInsertRowid ?? info; // helper return shape varies
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    it('writes {ts, lessonIds} object schema when lessons are emitted', async () => {
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'foo.mjs') },
+        session_id: 'sess-cb-1',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const cooldown = JSON.parse(readFileSync(
+        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-1.json'), 'utf8',
+      ));
+      const entry = cooldown[join(projectDir, 'foo.mjs')];
+      expect(entry).toBeTypeOf('object');
+      expect(typeof entry.ts).toBe('number');
+      expect(Array.isArray(entry.lessonIds)).toBe(true);
+      expect(entry.lessonIds.length).toBeGreaterThan(0);
+      expect(entry.lessonIds).toContain(Number(lessonObsId));
+    });
+
+    it('writes {ts, lessonIds: []} when no lessons were emitted (empty Edit)', async () => {
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'no-lessons.mjs') },
+        session_id: 'sess-cb-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const cooldown = JSON.parse(readFileSync(
+        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-2.json'), 'utf8',
+      ));
+      const entry = cooldown[join(projectDir, 'no-lessons.mjs')];
+      expect(entry).toBeTypeOf('object');
+      expect(entry.lessonIds).toEqual([]);
+    });
+
+    it('honors legacy number-schema cooldown on read path (back-compat)', async () => {
+      // Seed the cooldown file with legacy `<path>: <number>` schema.
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+      const cooldownPath = join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-legacy.json');
+      const targetFile = join(projectDir, 'foo.mjs');
+      writeFileSync(cooldownPath, JSON.stringify({ [targetFile]: Date.now() }));
+
+      // Re-running Edit on the same file should be silent (already cooled down
+      // in this session) even though the entry is a bare number.
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: targetFile },
+        session_id: 'sess-cb-legacy',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+      expect(stdout).toBe('');
+    });
+  });
 });

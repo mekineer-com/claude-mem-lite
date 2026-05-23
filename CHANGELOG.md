@@ -2,6 +2,21 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.81.0 — PostToolUse cite-back hint: closes the inject→cite→save loop
+
+New PostToolUse hint that fires when a flushed episode edits a file that PreToolUse:Read/Edit nudged earlier in the same session — the canonical "you fixed something we warned about, save the lesson?" moment. Targets the structural weakness called out by `feedback_passive_first.md` and the v2.34.6 cite-recall scan (#8255): `mem_save` is the lowest-recall hook because Claude Code's natural workflow never auto-includes a "check memory" step. Cite-back uses the existing PreToolUse cooldown as a precision signal — if we KNOW we nudged a lesson about file X and you then edited X, the next save prompt names exactly what you fixed.
+
+- **`lib/cite-back-hint.mjs` (new)** — pure `buildCiteBackHint(episode, cooldown)` + disk-bridge `loadCiteBackForEpisode(episode, runtimeDir)`. Reads the session-scoped pre-recall cooldown file, joins it against the episode's edited files (EDIT_TOOLS only; Reads don't qualify), and emits a per-file bullet line carrying the cited lesson IDs and a ready-to-paste `/lesson --file <name>` template. Caps at 2 files per flush to keep the receipt scannable. Pure-function tested with 13 cases (dedup, multi-id, legacy-tolerance, null-input); disk-bridge tested with 5 cases including a path-scheme lock-in that pins the sessionId sanitization to match `scripts/pre-tool-recall.js`.
+- **`scripts/pre-tool-recall.js`** — cooldown JSON entries upgraded from `{ "<path>": <number> }` to `{ "<path>": { ts: <number>, lessonIds: [#NN, ...] } }`. Read paths handle both schemas via a new `entryTimestamp(v)` helper; the session-scoped path was already shape-agnostic (truthy check) and stays unchanged. Write path always records lessonIds (empty array on no-lesson branches so the schema is uniform). Legacy pre-v2.81 cooldown files keep cooling down correctly until the first PreToolUse fire overwrites them.
+- **`hook.mjs:flushEpisode`** — one-line `loadCiteBackForEpisode(episode, RUNTIME_DIR)` after the existing P3 error→fix hint, pushed into the same `lines` array of the PostToolUse JSON receipt. Orthogonal to error→fix and may co-fire when both signals are present.
+- **`source-files.mjs` + `package.json` files array** — registered the new lib module (pinned by `tests/source-files-sync.test.mjs` + `tests/npm-tarball-completeness.test.mjs`).
+
+**Why cite-back over generalized P3 broadening**: a generalized "any 3+ edits → hint" trigger fires on every multi-file refactor; cite-back fires only when there's a session-local audit trail tying an edit to a prior nudge. Estimated noise floor ~0; estimated upper bound bounded by PreToolUse:Read/Edit's 94% recall window (#8255).
+
+**Test coverage**: 2442 tests / 111 files pass (+21 new: 18 in `tests/cite-back-hint.test.mjs`, 3 in `tests/pre-tool-recall.test.mjs` for the schema change); eslint clean. No baseline cite-recall comparison yet — this is a new code path, first measurement window starts post-release.
+
+**Action for users**: none — the hint is additive and renders in the existing PostToolUse receipt envelope. Pre-existing cooldown files are auto-migrated on next PreToolUse fire.
+
 ## v2.80.1 — post-2.80 review nits (comment/docstring only)
 
 Tiny patch addressing 4 `Minor` findings from the v2.80.0 code review. Pure comment / docstring / test-readability — zero code-behavior change.

@@ -49,6 +49,15 @@ function readCooldown(cooldownPath) {
   try { return JSON.parse(readFileSync(cooldownPath, 'utf8')); } catch { return {}; }
 }
 
+// v2.81: cooldown entries are {ts, lessonIds} objects so the PostToolUse
+// cite-back hint can name the lessons that were nudged. Legacy entries
+// (pre-v2.81) are bare numbers — entryTimestamp() reads both shapes.
+function entryTimestamp(v) {
+  if (typeof v === 'number') return v;
+  if (v && typeof v === 'object' && typeof v.ts === 'number') return v.ts;
+  return 0;
+}
+
 function writeCooldown(cooldownPath, data, isSessionScoped) {
   try {
     mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -59,7 +68,8 @@ function writeCooldown(cooldownPath, data, isSessionScoped) {
     const cleaned = isSessionScoped ? data : {};
     if (!isSessionScoped) {
       for (const [k, v] of Object.entries(data)) {
-        if (now - v < STALE_MS) cleaned[k] = v;
+        const ts = entryTimestamp(v);
+        if (ts && now - ts < STALE_MS) cleaned[k] = v;
       }
     }
     writeFileSync(cooldownPath, JSON.stringify(cleaned));
@@ -124,7 +134,8 @@ try {
   if (isSessionScoped) {
     if (cooldown[filePath]) process.exit(0); // already recalled this file in-session
   } else {
-    if (cooldown[filePath] && (now - cooldown[filePath]) < COOLDOWN_MS) process.exit(0);
+    const ts = entryTimestamp(cooldown[filePath]);
+    if (ts && (now - ts) < COOLDOWN_MS) process.exit(0);
   }
 
   // Open DB readonly
@@ -275,7 +286,10 @@ try {
     // Cooldown applies on ALL branches (including silent-Read) so subsequent
     // calls on the same file in the same session don't re-query — preserving
     // the per-filePath invariant that underpins Read→Edit dedup.
-    cooldown[filePath] = now;
+    // v2.81: record the emitted lesson IDs so flushEpisode (hook.mjs) can
+    // build the PostToolUse cite-back hint when the user actually edits the
+    // file. Empty array on no-lesson branches keeps the schema uniform.
+    cooldown[filePath] = { ts: now, lessonIds: allRows.map(r => r.id) };
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
   } catch (e) {
     // Silent failure — never block editing, but record for self-observation.
