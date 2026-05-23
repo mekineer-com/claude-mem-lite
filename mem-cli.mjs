@@ -2401,6 +2401,7 @@ export function cmdCitationStats(db, args) {
       FROM observations
      WHERE importance >= 3 AND cited_count >= 1
        AND COALESCE(compressed_into, 0) = 0
+       AND superseded_at IS NULL
   ORDER BY cited_count DESC
      LIMIT 10
   `).all();

@@ -157,4 +157,11 @@ describe('citation-stats CLI', () => {
     // But it should be counted in the per-project cite rate
     expect(output).toContain('Cite rate by project');
   });
+
+  it('excludes superseded rows from all sections', async () => {
+    const id = obs({ title: 'superseded promoted', importance: 3, cited_count: 5 });
+    testDb.prepare('UPDATE observations SET superseded_at = ? WHERE id = ?').run(Date.now(), id);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).not.toContain('superseded promoted');
+  });
 });
