@@ -45,7 +45,11 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // items rank HIGHER as tech debt accumulates), different lifecycle (mutable
 // status open→done|dropped vs immutable obs). Closure tied to obs via
 // closed_by_obs_id FK with ON DELETE SET NULL (audit trail preserved).
-export const CURRENT_SCHEMA_VERSION = 31;
+// v32 (v2.73.2): citation-decay columns on observations — uncited_streak,
+// cited_count, last_decided_session_id. Stop hook resolves injected obs as
+// cited|uncited; 3 consecutive uncited → importance -1 (floor 0); 1 cited → +1
+// (cap 3). last_decided_session_id makes Stop idempotent across multi-fire.
+export const CURRENT_SCHEMA_VERSION = 32;
 
 const CORE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS sdk_sessions (
@@ -151,6 +155,14 @@ const MIGRATIONS = [
   // injection_count + low access_count = low-signal, deprioritize.
   'ALTER TABLE observations ADD COLUMN injection_count INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE observations ADD COLUMN last_injected_at INTEGER DEFAULT NULL',
+  // v32 (citation-decay): per-obs feedback loop for pre-tool-recall injection
+  // pool. Stop hook resolves each session's injected IDs as cited|uncited.
+  // 3 consecutive uncited sessions → importance -1 (floor 0). 1 cited session →
+  // importance +1 (cap 3). last_decided_session_id makes Stop idempotent across
+  // multi-fire scenarios (Claude may fire Stop more than once per session).
+  'ALTER TABLE observations ADD COLUMN uncited_streak INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE observations ADD COLUMN cited_count INTEGER NOT NULL DEFAULT 0',
+  'ALTER TABLE observations ADD COLUMN last_decided_session_id TEXT DEFAULT NULL',
 ];
 
 /**
