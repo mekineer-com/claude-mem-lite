@@ -1488,9 +1488,9 @@ describe('Suite 10: Code Review Fix Validations', () => {
   });
 });
 
-// ─── Suite 11: Plugin-mode First-Run Auto-Adopt (v2.33.0) ──────────────────
+// ─── Suite 11: First-Run Auto-Adopt (v2.33.0 plugin-mode → v2.82.1 any install) ──
 
-describe('Suite 11: plugin-mode first-run auto-adopt', () => {
+describe('Suite 11: first-run auto-adopt', () => {
   function encodedMemdir(home, cwd) {
     // Mirrors memdir.mjs::encodeProjectPath — all non-alphanumerics → '-'
     const encoded = String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
@@ -1517,16 +1517,29 @@ describe('Suite 11: plugin-mode first-run auto-adopt', () => {
     expect(markers.length).toBeGreaterThan(0);
   });
 
-  it('no CLAUDE_PLUGIN_ROOT → does NOT adopt (opt-in preserved)', () => {
+  // v2.82.1: npm/manual installs (no CLAUDE_PLUGIN_ROOT in hook env) MUST also
+  // auto-adopt. Pre-v2.82.1 this test asserted the opposite — and that
+  // assertion was the cause of v2.33.0's auto-adopt firing zero times in
+  // practice for every user installed via install.mjs (the common path).
+  // Regression-locking the npm-mode case here is part of the #4948 promise to
+  // catch this on the next install/upgrade.
+  it('no CLAUDE_PLUGIN_ROOT (npm/manual install) → DOES adopt', () => {
     runHook('session-start', {
       env: { HOME: tmpHome, MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
-    const markers = existsSync(runtimeDir)
-      ? readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'))
-      : [];
-    expect(markers.length).toBe(0);
+    const markers = readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'));
+    expect(markers.length).toBeGreaterThan(0);
+  });
+
+  // Only MEM_NO_AUTO_ADOPT=1 should block adoption now (CLAUDE_PLUGIN_ROOT
+  // gate removed in v2.82.1).
+  it('no CLAUDE_PLUGIN_ROOT + MEM_NO_AUTO_ADOPT=1 → does NOT adopt', () => {
+    runHook('session-start', {
+      env: { HOME: tmpHome, MEM_NO_AUTO_ADOPT: '1', MEM_QUIET_HOOKS: undefined },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
   });
 
   it('CLAUDE_PLUGIN_ROOT + MEM_NO_AUTO_ADOPT=1 → does NOT adopt', () => {
@@ -1541,12 +1554,31 @@ describe('Suite 11: plugin-mode first-run auto-adopt', () => {
     expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
   });
 
-  it('CLAUDE_PLUGIN_ROOT + MEM_QUIET_HOOKS=1 → does NOT adopt (quiet semantics)', () => {
+  // v2.82.0: MEM_QUIET_HOOKS no longer gates auto-adopt. It's a stdout
+  // suppression knob, not a side-effect kill-switch (PostToolUse still
+  // writes the DB under it). Auto-adopt should fire just the same.
+  it('CLAUDE_PLUGIN_ROOT + MEM_QUIET_HOOKS=1 → DOES adopt (quiet is stdout-only)', () => {
     runHook('session-start', {
       env: {
         HOME: tmpHome,
         CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
         MEM_QUIET_HOOKS: '1',
+        MEM_NO_AUTO_ADOPT: undefined,
+      },
+    });
+    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+  });
+
+  // v2.82.0: per-project opt-out via .mem-no-auto-adopt sentinel.
+  it('CLAUDE_PLUGIN_ROOT + .mem-no-auto-adopt sentinel → does NOT adopt', () => {
+    const memdir = encodedMemdir(tmpHome, projectDir);
+    mkdirSync(memdir, { recursive: true });
+    writeFileSync(join(memdir, '.mem-no-auto-adopt'), '{}');
+    runHook('session-start', {
+      env: {
+        HOME: tmpHome,
+        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
+        MEM_QUIET_HOOKS: undefined,
         MEM_NO_AUTO_ADOPT: undefined,
       },
     });

@@ -652,22 +652,27 @@ async function handleSessionStart() {
     }
   } catch (e) { debugCatch(e, 'session-start-cache-heal'); }
 
-  // v2.33.0: plugin-mode first-run auto-adopt. /plugin install IS consent to
-  // integration — writing the MEMORY.md sentinel once per project on first
-  // SessionStart avoids the opt-in friction. Scope is narrow:
-  //   - gated by CLAUDE_PLUGIN_ROOT (npm/npx installs stay opt-in)
-  //   - gated by !MEM_NO_AUTO_ADOPT (explicit escape hatch)
-  //   - gated by !MEM_QUIET_HOOKS (quiet = no side-effects semantics)
+  // First-run auto-adopt (v2.33.0 plugin-mode → v2.82.1 install-mode-agnostic).
+  // ANY install path — `/plugin install`, `npm install -g`, `npx`, manual — is
+  // consent to integration. Writing the MEMORY.md sentinel once per project on
+  // first SessionStart avoids the opt-in friction that left ~zero users on
+  // auto-adopt (runtime-marker directory was empty machine-wide despite v2.33
+  // shipping ~5 weeks earlier — `install.mjs`-written hooks don't propagate
+  // ${CLAUDE_PLUGIN_ROOT}, so the v2.33.0 gate was a no-op for npm/manual
+  // installs, which is most of them). Scope is now:
+  //   - gated by !MEM_NO_AUTO_ADOPT (explicit global escape hatch)
+  //   - per-project opt-out via `<memdir>/.mem-no-auto-adopt` sentinel
+  //     (managed by `claude-mem-lite adopt --disable / --enable`); checked
+  //     inside silentAutoAdopt so the helper is safe to call directly too.
   //   - first-attempt marker persists in RUNTIME_DIR so a subsequent /unadopt
   //     is respected (no re-adopt loop).
+  // Note v2.82.0: removed MEM_QUIET_HOOKS gate. That env var suppresses stdout
+  // noise; it must NOT also disable side-effect work (PostToolUse writes the
+  // DB unconditionally — auto-adopt should follow the same rule).
   // Failures (user-edited sentinel, budget exceeded, FS errors) are swallowed;
   // the marker is still written so we don't retry on every SessionStart.
   try {
-    if (
-      process.env.CLAUDE_PLUGIN_ROOT
-      && process.env.MEM_NO_AUTO_ADOPT !== '1'
-      && process.env.MEM_QUIET_HOOKS !== '1'
-    ) {
+    if (process.env.MEM_NO_AUTO_ADOPT !== '1') {
       const project = inferProject();
       if (!hasAutoAdoptMarker(RUNTIME_DIR, project)) {
         const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();

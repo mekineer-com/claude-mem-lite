@@ -2,6 +2,38 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.82.1 — auto-adopt: drop `CLAUDE_PLUGIN_ROOT` gate (npm/manual installs also adopt)
+
+v2.82.0 was supposed to make auto-adopt fire for users who had set `MEM_QUIET_HOOKS=1`. Live verification on a freshly-tested project (`daagu`) revealed the marker directory was still empty — and the same was true machine-wide: **zero `.auto-adopt-*` markers from v2.33.0 ship date to v2.82.0**. The other gate, inherited from v2.33.0's "/plugin install IS consent" framing, required `CLAUDE_PLUGIN_ROOT` to be set in the hook environment. But `install.mjs`-written hooks (the common path for npm/manual installs) hardcode an absolute path with **no `${CLAUDE_PLUGIN_ROOT}` template** — so Claude Code never injects that env var, and the gate was a no-op for everyone. v2.33.0 shipped a dead feature; v2.82.0 fixed a secondary gate but missed the primary one.
+
+- **`hook.mjs:665-680`** — removed `process.env.CLAUDE_PLUGIN_ROOT` from the auto-adopt gate. `npm install` / `npx claude-mem-lite-install` / `/plugin install` / manual install — they're all explicit consent. The only remaining gate is `MEM_NO_AUTO_ADOPT !== '1'` (plus per-project `.mem-no-auto-adopt` sentinel and first-attempt marker, unchanged from v2.82.0).
+- **`tests/e2e.test.mjs`** — flipped the "no `CLAUDE_PLUGIN_ROOT` → does NOT adopt" assertion to "**DOES** adopt" with a regression-lock comment naming the pre-v2.82.1 failure mode. Added a new "no `CLAUDE_PLUGIN_ROOT` + `MEM_NO_AUTO_ADOPT=1` → does NOT adopt" test so the remaining gate stays exercised. Suite name dropped the `plugin-mode` qualifier.
+
+**Why this slipped past v2.33.0 → v2.82.0**: the gate logic and the install-script's hook command were written by different concerns and never cross-checked. v2.33.0 had unit tests for `silentAutoAdopt` and e2e tests that **explicitly set `CLAUDE_PLUGIN_ROOT=/tmp/fake-plugin-root`** — which is exactly the env shape `install.mjs` does NOT produce. The integration was tested against synthetic conditions only. Regression-lock: the new "npm-mode adopts" e2e test fails the suite if anyone re-introduces the `CLAUDE_PLUGIN_ROOT` gate.
+
+**Test coverage**: 2451 tests / 111 files pass (net +1 vs v2.82.0: flipped 1 + new 1 - 0). ESLint clean.
+
+**Action for users**: if you were relying on `CLAUDE_PLUGIN_ROOT` being unset to opt out of auto-adopt — switch to `MEM_NO_AUTO_ADOPT=1` (global) or `claude-mem-lite adopt --disable` (per-project). Note: this opt-in path was effectively unreachable before v2.82.1, so almost no one was relying on it.
+
+## v2.82.0 — auto-adopt: drop `MEM_QUIET_HOOKS` gate, add `--disable` / `--enable` opt-out
+
+Reaches the project goal stated in v2.33.0 (plugin-mode first-run auto-adopt for higher main-thread tool-invocation rate) for users who have `MEM_QUIET_HOOKS=1` in their global settings. Empirical motivation: on this developer's machine, 6 of 9 active Claude Code projects never had auto-adopt fire — runtime-marker directory was empty — because `MEM_QUIET_HOOKS=1` was set in `~/.claude/settings.json` for stdout-quiet reasons and v2.33.0's gating treated that as "no side-effects, skip the write." Same machine's measured main-thread `mem_save(type=bugfix/decision)` rate on adopted projects was 72-74% vs 0-14% on unadopted ones (30-day window, 86 sessions sampled).
+
+- **`hook.mjs:660-682`** — auto-adopt gate no longer checks `MEM_QUIET_HOOKS`. The env var's original purpose is suppressing hook stdout/stderr; it must NOT also disable side-effect writes (PostToolUse writes the DB under it — auto-adopt should follow the same rule). Gates now collapse to `CLAUDE_PLUGIN_ROOT set` ∧ `MEM_NO_AUTO_ADOPT != '1'` ∧ first-attempt marker absent (∧ per-project disable sentinel absent, checked inside the helper).
+- **`adopt-cli.mjs`** — new per-project opt-out: `<memdir>/.mem-no-auto-adopt` sentinel file. Managed via:
+  - `claude-mem-lite adopt --disable [--all]` — writes the sentinel (idempotent). Does NOT remove an existing contract — pair with `unadopt` if you want both.
+  - `claude-mem-lite adopt --enable [--all]` — removes the sentinel (idempotent). Doesn't trigger an immediate adopt; run plain `adopt` for that.
+  - `silentAutoAdopt` checks the sentinel at entry and returns `{ ok: true, action: 'disabled' }` **without writing the runtime marker** — that's what makes `--enable` re-armable on the very next SessionStart. Existing marker semantics (post-`/unadopt` re-adopt prevention) are unchanged.
+- **`adopt-cli.mjs:statusAll`** — `--status` output now flags disabled projects (`✓ proj (v1) [auto-adopt disabled]` for adopted+disabled; `✗ proj (auto-adopt disabled, no sentinel)` for the disable-only case) and prints a gating snapshot footer (`CLAUDE_PLUGIN_ROOT`, `MEM_NO_AUTO_ADOPT`) so users can diagnose "why didn't auto-adopt fire on project X?" without grepping source.
+
+**Why two distinct opt-outs (`unadopt` vs `--disable`)**: `unadopt` is "remove the contract now" (the runtime marker still blocks re-adopt by design). `--disable` is the durable, project-scoped "and don't auto-write it back if the marker gets cleared" — survives `rm ~/.claude-mem-lite/runtime/.auto-adopt-*`, plugin reinstalls, and home-dir migrations. The split matches the sibling-command-flag-symmetry pattern from #8473 (adopt's `--status` / `--dry-run` mirror unadopt's — now `--disable` / `--enable` form a new symmetric pair).
+
+**Test coverage**: 2450 tests / 111 files pass (+8 new: 6 in `tests/adopt-cli.test.mjs` for `--disable`/`--enable` roundtrip + disable-sentinel-skips-silentAutoAdopt + status flagging; 1 flipped in `tests/e2e.test.mjs` to assert the new "MEM_QUIET_HOOKS=1 → does adopt" contract; 1 new e2e covering `.mem-no-auto-adopt` blocking auto-adopt end-to-end). Was 2442/110 in v2.81.0. ESLint clean.
+
+**Action for users**:
+- If you were relying on `MEM_QUIET_HOOKS=1` to keep auto-adopt off: switch to `MEM_NO_AUTO_ADOPT=1` (global) or `claude-mem-lite adopt --disable` (per-project).
+- If you want the v2.33.0 behavior to finally take effect on projects that never adopted because of this gate: nothing to do — the next SessionStart in each plugin-mode project will auto-adopt (writes one sentinel block + one `plugin_claude_mem_lite.md` to `~/.claude/projects/<encoded>/memory/`; `unadopt` reverses it).
+
 ## v2.81.0 — PostToolUse cite-back hint: closes the inject→cite→save loop
 
 New PostToolUse hint that fires when a flushed episode edits a file that PreToolUse:Read/Edit nudged earlier in the same session — the canonical "you fixed something we warned about, save the lesson?" moment. Targets the structural weakness called out by `feedback_passive_first.md` and the v2.34.6 cite-recall scan (#8255): `mem_save` is the lowest-recall hook because Claude Code's natural workflow never auto-includes a "check memory" step. Cite-back uses the existing PreToolUse cooldown as a precision signal — if we KNOW we nudged a lesson about file X and you then edited X, the next save prompt names exactly what you fixed.

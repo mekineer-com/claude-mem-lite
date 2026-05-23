@@ -9,7 +9,7 @@
 // --dry-run = print intent without writing
 // --status = list all adopted projects + versions
 
-import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import {
@@ -49,6 +49,24 @@ function listAllMemdirs() {
 
 function hasFlag(args, flag) { return Array.isArray(args) && args.includes(flag); }
 
+// ─── Per-project auto-adopt opt-out sentinel ─────────────────────────────────
+// `<memdir>/.mem-no-auto-adopt` is the durable, project-scoped escape hatch.
+// Survives marker deletion, sentinel removal, and plugin reinstalls — that's
+// the point: "user said no for this project" should not be reversible by
+// `rm ~/.claude-mem-lite/runtime/.auto-adopt-*`. Managed via
+// `claude-mem-lite adopt --disable` / `--enable`. silentAutoAdopt checks it
+// at entry and skips WITHOUT writing the runtime marker, so toggling
+// `--enable` re-arms auto-adopt on the next SessionStart.
+const DISABLE_SENTINEL_BASENAME = '.mem-no-auto-adopt';
+
+export function disableSentinelPath(memdir) {
+  return join(memdir, DISABLE_SENTINEL_BASENAME);
+}
+
+export function isAutoAdoptDisabled(memdir) {
+  return existsSync(disableSentinelPath(memdir));
+}
+
 /**
  * cmdAdopt — write sentinel section + plugin doc to memdir.
  * Exit code 1 on any hard failure; skipped (--all + UserEditedError) doesn't
@@ -56,6 +74,8 @@ function hasFlag(args, flag) { return Array.isArray(args) && args.includes(flag)
  */
 export function cmdAdopt(args = []) {
   if (hasFlag(args, '--status')) return statusAll();
+  if (hasFlag(args, '--disable')) return cmdDisable(args);
+  if (hasFlag(args, '--enable')) return cmdEnable(args);
 
   const all = hasFlag(args, '--all');
   const force = hasFlag(args, '--force');
@@ -122,14 +142,18 @@ function adoptOne(memdir, { force, dryRun, all }) {
 }
 
 /**
- * silentAutoAdopt — plugin-mode first-run auto-adopt helper (v2.33.0).
+ * silentAutoAdopt — plugin-mode first-run auto-adopt helper (v2.33.0+).
  *
  * Preconditions (caller must gate): CLAUDE_PLUGIN_ROOT set, MEM_NO_AUTO_ADOPT!=1,
- * MEM_QUIET_HOOKS!=1, first-attempt marker absent. This helper does NOT re-check
- * those — it only does the write + marker persistence.
+ * first-attempt marker absent. This helper does NOT re-check those — it only
+ * does the write + marker persistence. (v2.82.0: dropped MEM_QUIET_HOOKS gate;
+ * quiet is a stdout control, not a side-effect control.)
  *
  * Behavior:
- *   - Writes plugin sentinel + detail doc to the memdir for `cwd`.
+ *   - If `<memdir>/.mem-no-auto-adopt` exists: skip silently, do NOT write the
+ *     runtime marker. This keeps `--enable` re-armable: deleting the disable
+ *     sentinel lets the next SessionStart try again.
+ *   - Else: writes plugin sentinel + detail doc to the memdir for `cwd`.
  *   - Writes a per-project first-attempt marker under `markerDir` so a later
  *     `/unadopt` is respected (no re-adopt loop).
  *   - Silent: never logs, never throws. Returns structured result.
@@ -139,6 +163,9 @@ function adoptOne(memdir, { force, dryRun, all }) {
 export function silentAutoAdopt({ cwd, markerDir, markerKey }) {
   const memdir = memdirPath(cwd);
   try {
+    if (isAutoAdoptDisabled(memdir)) {
+      return { ok: true, action: 'disabled', reason: 'disabled-by-sentinel' };
+    }
     if (isAdopted(memdir, PLUGIN_SLUG)) {
       writeMarker(markerDir, markerKey);
       return { ok: true, action: 'already-adopted' };
@@ -173,20 +200,110 @@ export function hasAutoAdoptMarker(markerDir, markerKey) {
   return existsSync(join(markerDir, `.auto-adopt-${markerKey}`));
 }
 
+/**
+ * cmdDisable — `claude-mem-lite adopt --disable [--all]`.
+ *
+ * Writes `<memdir>/.mem-no-auto-adopt` so SessionStart auto-adopt skips this
+ * project permanently. Idempotent: re-running on an already-disabled memdir is
+ * a no-op. Does NOT remove an existing sentinel — pair with `unadopt` if you
+ * want both. The two operations are deliberately separate:
+ *   - `unadopt`      = "remove the contract now"
+ *   - `adopt --disable` = "and don't auto-write it back"
+ */
+function cmdDisable(args) {
+  const all = hasFlag(args, '--all');
+  const targets = all
+    ? listAllMemdirs().map((m) => m.memdir)
+    : [memdirPath(detectCwd())];
+
+  if (targets.length === 0) {
+    log('[adopt --disable] no memdirs found');
+    return;
+  }
+
+  let disabled = 0, already = 0;
+  for (const memdir of targets) {
+    if (!existsSync(memdir)) mkdirSync(memdir, { recursive: true });
+    const path = disableSentinelPath(memdir);
+    if (existsSync(path)) {
+      log(`[adopt --disable] ${memdir} → already-disabled`);
+      already++;
+      continue;
+    }
+    writeFileSync(path, JSON.stringify({ disabledAt: new Date().toISOString() }) + '\n');
+    log(`[adopt --disable] ${memdir} → disabled`);
+    disabled++;
+  }
+
+  log('');
+  log(`[adopt --disable] ${targets.length} target(s): ${disabled} newly disabled, ${already} already disabled`);
+}
+
+/**
+ * cmdEnable — `claude-mem-lite adopt --enable [--all]`.
+ *
+ * Removes the `<memdir>/.mem-no-auto-adopt` sentinel so the next SessionStart
+ * can auto-adopt again. Idempotent. Does NOT trigger an immediate adoption —
+ * run plain `claude-mem-lite adopt` if you want that now.
+ */
+function cmdEnable(args) {
+  const all = hasFlag(args, '--all');
+  const targets = all
+    ? listAllMemdirs().map((m) => m.memdir)
+    : [memdirPath(detectCwd())];
+
+  if (targets.length === 0) {
+    log('[adopt --enable] no memdirs found');
+    return;
+  }
+
+  let enabled = 0, absent = 0;
+  for (const memdir of targets) {
+    const path = disableSentinelPath(memdir);
+    if (!existsSync(path)) {
+      log(`[adopt --enable] ${memdir} → absent`);
+      absent++;
+      continue;
+    }
+    try { unlinkSync(path); } catch { /* best-effort */ }
+    log(`[adopt --enable] ${memdir} → enabled`);
+    enabled++;
+  }
+
+  log('');
+  log(`[adopt --enable] ${targets.length} target(s): ${enabled} re-enabled, ${absent} not-disabled`);
+}
+
 function statusAll() {
   const dirs = listAllMemdirs();
   log('[adopt --status] scanning ~/.claude/projects/*/memory/');
   if (dirs.length === 0) { log('  (no memdirs found)'); return; }
-  let adopted = 0;
+  let adopted = 0, disabled = 0;
   for (const { projectSlug, memdir } of dirs) {
-    if (isAdopted(memdir, PLUGIN_SLUG)) {
+    const isAdoptedHere = isAdopted(memdir, PLUGIN_SLUG);
+    const isDisabledHere = isAutoAdoptDisabled(memdir);
+    if (isAdoptedHere) {
       const idx = readMemoryIndex(memdir, PLUGIN_SLUG);
-      log(`  ✓ ${projectSlug} (${idx.version})`);
+      const suffix = isDisabledHere ? ' [auto-adopt disabled]' : '';
+      log(`  ✓ ${projectSlug} (${idx.version})${suffix}`);
       adopted++;
+      if (isDisabledHere) disabled++;
+    } else if (isDisabledHere) {
+      log(`  ✗ ${projectSlug} (auto-adopt disabled, no sentinel)`);
+      disabled++;
     }
   }
   log('');
-  log(`[adopt --status] ${adopted}/${dirs.length} adopted`);
+  log(`[adopt --status] ${adopted}/${dirs.length} adopted${disabled > 0 ? `, ${disabled} disabled` : ''}`);
+
+  // Gating snapshot — helps debug "why didn't auto-adopt fire?"
+  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT ? 'set' : 'unset';
+  const noAutoAdopt = process.env.MEM_NO_AUTO_ADOPT === '1' ? '1 (opt-out)' : 'unset';
+  log('');
+  log('Auto-adopt gates (next SessionStart will fire only if both pass):');
+  log(`  CLAUDE_PLUGIN_ROOT  = ${pluginRoot}  (plugin-mode install required; npx stays opt-in)`);
+  log(`  MEM_NO_AUTO_ADOPT   = ${noAutoAdopt}  (global escape hatch)`);
+  log('Per-project opt-out: `claude-mem-lite adopt --disable` (run --enable to re-arm).');
 }
 
 /**

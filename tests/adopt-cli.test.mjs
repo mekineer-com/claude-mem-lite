@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { cmdAdopt, cmdUnadopt, silentAutoAdopt, hasAutoAdoptMarker } from '../adopt-cli.mjs';
+import { cmdAdopt, cmdUnadopt, silentAutoAdopt, hasAutoAdoptMarker, disableSentinelPath, isAutoAdoptDisabled } from '../adopt-cli.mjs';
 import { encodeProjectPath } from '../memdir.mjs';
 import { PLUGIN_SLUG } from '../adopt-content.mjs';
 
@@ -330,5 +330,112 @@ describe('silentAutoAdopt + hasAutoAdoptMarker', () => {
     expect(r.reason).toBe('budget-exceeded');
     // Marker still written — next SessionStart won't retry
     expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(true);
+  });
+
+  // v2.82.0: per-project opt-out via .mem-no-auto-adopt sentinel.
+  it('skips with action=disabled when .mem-no-auto-adopt sentinel exists', () => {
+    const memdir = expectedMemdir(tmpHome, fakeCwd);
+    mkdirSync(memdir, { recursive: true });
+    writeFileSync(disableSentinelPath(memdir), '{}');
+    const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r.ok).toBe(true);
+    expect(r.action).toBe('disabled');
+    expect(r.reason).toBe('disabled-by-sentinel');
+    // Critically: NO marker written, so --enable can re-arm by deleting the sentinel.
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(false);
+    // No sentinel written either.
+    expect(existsSync(join(memdir, 'MEMORY.md'))).toBe(false);
+  });
+});
+
+// ─── v2.82.0: --disable / --enable per-project opt-out ──────────────────────
+describe('cmdAdopt --disable / --enable', () => {
+  let tmpHome, fakeCwd, markerDir, origHome, origCwd;
+  let logs;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'adopt-disable-'));
+    fakeCwd = join(tmpHome, 'work', 'proj');
+    mkdirSync(fakeCwd, { recursive: true });
+    markerDir = join(tmpHome, 'runtime');
+    origHome = process.env.HOME;
+    origCwd = process.env.CLAUDE_PROJECT_DIR;
+    process.env.HOME = tmpHome;
+    process.env.CLAUDE_PROJECT_DIR = fakeCwd;
+    logs = [];
+    vi.spyOn(console, 'log').mockImplementation((msg) => { logs.push(String(msg)); });
+    process.exitCode = 0;
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+    if (origCwd === undefined) delete process.env.CLAUDE_PROJECT_DIR;
+    else process.env.CLAUDE_PROJECT_DIR = origCwd;
+    rmSync(tmpHome, { recursive: true, force: true });
+    process.exitCode = 0;
+  });
+
+  it('--disable writes .mem-no-auto-adopt; --enable removes it (roundtrip)', () => {
+    cmdAdopt(['--disable']);
+    const memdir = expectedMemdir(tmpHome, fakeCwd);
+    expect(isAutoAdoptDisabled(memdir)).toBe(true);
+    expect(existsSync(disableSentinelPath(memdir))).toBe(true);
+    expect(logs.some((l) => l.includes('disabled'))).toBe(true);
+
+    cmdAdopt(['--enable']);
+    expect(isAutoAdoptDisabled(memdir)).toBe(false);
+    expect(existsSync(disableSentinelPath(memdir))).toBe(false);
+    expect(logs.some((l) => l.includes('enabled'))).toBe(true);
+  });
+
+  it('--disable is idempotent (already-disabled reported, not error)', () => {
+    cmdAdopt(['--disable']);
+    logs.length = 0;
+    cmdAdopt(['--disable']);
+    expect(logs.some((l) => l.includes('already-disabled'))).toBe(true);
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('--enable on never-disabled memdir is a benign no-op', () => {
+    cmdAdopt(['--enable']);
+    expect(logs.some((l) => l.includes('absent') || l.includes('not-disabled'))).toBe(true);
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('--disable does NOT remove an existing sentinel (separate from unadopt)', () => {
+    cmdAdopt([]); // adopt first
+    const memdir = expectedMemdir(tmpHome, fakeCwd);
+    expect(existsSync(join(memdir, 'MEMORY.md'))).toBe(true);
+    cmdAdopt(['--disable']);
+    // Sentinel and detail doc still present after --disable.
+    expect(readFileSync(join(memdir, 'MEMORY.md'), 'utf8')).toContain(`${PLUGIN_SLUG}:begin v1`);
+    expect(existsSync(join(memdir, 'plugin_claude_mem_lite.md'))).toBe(true);
+    expect(isAutoAdoptDisabled(memdir)).toBe(true);
+  });
+
+  it('end-to-end: --disable blocks silentAutoAdopt; --enable re-arms it', () => {
+    // Start: never adopted, never disabled
+    cmdAdopt(['--disable']);
+    const r1 = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r1.action).toBe('disabled');
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(false);
+
+    // --enable: delete sentinel → silentAutoAdopt now proceeds
+    cmdAdopt(['--enable']);
+    const r2 = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
+    expect(r2.action).toBe('adopted');
+    expect(hasAutoAdoptMarker(markerDir, 'proj-x')).toBe(true);
+  });
+
+  it('--status reports a disabled-but-not-adopted project distinctly', () => {
+    cmdAdopt(['--disable']);
+    logs.length = 0;
+    // Need a memdir under ~/.claude/projects/ for statusAll to find it. The
+    // CLAUDE_PROJECT_DIR-derived memdir isn't there yet (cmdAdopt --disable
+    // mkdir'd it under tmpHome/.claude/projects/<encoded>/memory), so list it.
+    cmdAdopt(['--status']);
+    expect(logs.some((l) => l.includes('auto-adopt disabled, no sentinel'))).toBe(true);
+    expect(logs.some((l) => l.includes('Auto-adopt gates'))).toBe(true);
   });
 });
