@@ -6,7 +6,11 @@
 import { existsSync, readFileSync } from 'fs';
 import { join, resolve, sep } from 'path';
 import { homedir } from 'os';
+import { recordHookError } from '../lib/hook-telemetry.mjs';
 
+// CLAUDE_MEM_DIR mirrors pre-tool-recall.js — one env var sandboxes everything.
+const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
 const REGISTRY_DB_PATH = join(homedir(), '.claude-mem-lite', 'resource-registry.db');
 const MANAGED_BASE = join(homedir(), '.claude-mem-lite');
 const MANAGED_MARKER = '/.claude-mem-lite/managed/';
@@ -24,7 +28,10 @@ try {
   try {
     const event = JSON.parse(input);
     skillName = event.tool_input?.skill;
-  } catch { process.exit(0); }
+  } catch (e) {
+    recordHookError('skill-bridge:json', e, RUNTIME_DIR, { inputLen: input.length });
+    process.exit(0);
+  }
 
   if (!skillName || typeof skillName !== 'string') process.exit(0);
 
@@ -37,7 +44,10 @@ try {
   try {
     db = new Database(REGISTRY_DB_PATH, { readonly: true });
     db.pragma('busy_timeout = 1000');
-  } catch { process.exit(0); }
+  } catch (e) {
+    recordHookError('skill-bridge:db-open', e, RUNTIME_DIR);
+    process.exit(0);
+  }
 
   try {
     // Query: find by name or invocation_name, ONLY if managed path
@@ -85,11 +95,13 @@ try {
         additionalContext,
       },
     }));
-  } catch {
-    // Silent failure — never block Skill tool
+  } catch (e) {
+    // Silent failure — never block Skill tool, but record for self-observation.
+    recordHookError('skill-bridge:query', e, RUNTIME_DIR, { skillName });
   } finally {
     try { db.close(); } catch {}
   }
-} catch {
-  // Top-level catch — exit 0 no matter what
+} catch (e) {
+  // Top-level catch — exit 0 no matter what, but record what slipped past.
+  try { recordHookError('skill-bridge:top', e, RUNTIME_DIR); } catch {}
 }

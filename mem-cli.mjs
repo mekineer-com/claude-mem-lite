@@ -3,7 +3,7 @@
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
 import { homedir } from 'os';
-import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
+import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, jaccardSimilarity, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, isoWeekKey, COMPRESSED_PENDING_PURGE, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
 import { cjkPrecisionOk } from './nlp.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
@@ -29,6 +29,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
@@ -1258,6 +1259,12 @@ async function cmdStats(db, args) {
     `SELECT COUNT(*) as c FROM observations WHERE superseded_at IS NOT NULL AND compressed_into IS NULL ${projectFilter}`
   ).get(...baseParams);
 
+  // Hook self-observation: count PreToolUse / Skill-bridge script failures
+  // recorded in the last 24h. Surfaces silent breakage (DB corruption,
+  // CC upstream field rename) that would otherwise stay invisible — the
+  // failure mode that left code-graph's matcher bug undetected for 10 sessions.
+  const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - 86400000);
+
   // Tier distribution (aligned with MCP mem_stats)
   const tierCtx = { now, currentProject: project || inferProject(), currentSessionId: '' };
   const tdParams = tierSqlParams(tierCtx);
@@ -1292,6 +1299,7 @@ async function cmdStats(db, args) {
         noise_ratio: Number(noiseRatio.toFixed(4)),
         compressed: compressedCount.c,
         superseded_only: supersededOnlyCount.c,
+        hook_errors_24h: hookErrors24h,
       },
       tier_distribution: {
         working: tierMap.working ?? 0,
@@ -1326,6 +1334,7 @@ async function cmdStats(db, args) {
   out(`  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`);
   out(`  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`);
   out(`  Compressed: ${compressedCount.c}`);
+  out(`  Hook errors (last 24h): ${hookErrors24h}${hookErrors24h > 0 ? `  ← tail ${join(DB_DIR, 'runtime/hook-errors')}` : ''}`);
   if (noiseRatio > 0.6) out('  ⚠️ High noise ratio — consider running mem compress');
   out('');
   // Tier counts only live (uncompressed, non-superseded) observations — surface the

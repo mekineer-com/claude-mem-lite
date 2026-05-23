@@ -43,6 +43,11 @@ export const SOURCE_FILES = [
   'lib/summary-extractor.mjs',
   'lib/id-routing.mjs',
   'lib/err-sampler.mjs',
+  // v2.76.x: unsampled hook-script failure log. Imported by
+  // scripts/pre-tool-recall.js + scripts/pre-skill-bridge.js (recorder)
+  // and mem-cli.mjs (countRecentHookErrors for `stats`). Missing from
+  // manifest → tarball ships hooks that ERR_MODULE_NOT_FOUND on every fire.
+  'lib/hook-telemetry.mjs',
   'lib/metrics.mjs',
   // v2.71.x: better-sqlite3 ABI probe + auto-rebuild. Shared by install.mjs
   // (post-`npm install` verify) and scripts/launch.mjs (pre-server-launch

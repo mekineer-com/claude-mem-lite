@@ -8,6 +8,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { homedir } from 'os';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
+import { recordHookError } from '../lib/hook-telemetry.mjs';
 
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
@@ -87,9 +88,24 @@ try {
     filePath = event.tool_input?.file_path;
     sessionId = event.session_id || null;
     toolName = event.tool_name || null;
-  } catch { process.exit(0); }
+  } catch (e) {
+    recordHookError('pre-recall:json', e, RUNTIME_DIR, { inputLen: input.length });
+    process.exit(0);
+  }
 
-  if (!filePath) process.exit(0);
+  // Upstream-shape probe: hook ran but neither field nor input shape matches the
+  // contract we encode (event.tool_input.file_path, event.tool_name in
+  // Edit|Write|NotebookEdit|Read). Distinguishes "Claude Code renamed the field"
+  // from "event genuinely has no file_path" — without this trace, a CC upstream
+  // rename silently zeroes injection like code-graph's matcher bug.
+  if (!filePath) {
+    if (toolName && !['Edit', 'Write', 'NotebookEdit', 'Read'].includes(toolName)) {
+      recordHookError('pre-recall:unknown-tool', new Error(`tool_name=${toolName}`), RUNTIME_DIR, { toolName });
+    } else if (!toolName) {
+      recordHookError('pre-recall:no-toolname', new Error('event missing tool_name'), RUNTIME_DIR);
+    }
+    process.exit(0);
+  }
 
   // v2.34.6 Gap 3: Read-side recall with asymmetric quiet-mode. Reads have
   // lower per-event information value than Edits (passive observation, may
@@ -117,7 +133,10 @@ try {
   try {
     db = new Database(DB_PATH, { readonly: true });
     db.pragma('busy_timeout = 1000');
-  } catch { process.exit(0); }
+  } catch (e) {
+    recordHookError('pre-recall:db-open', e, RUNTIME_DIR);
+    process.exit(0);
+  }
 
   try {
     const project = inferProject();
@@ -258,11 +277,13 @@ try {
     // the per-filePath invariant that underpins Read→Edit dedup.
     cooldown[filePath] = now;
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
-  } catch {
-    // Silent failure — never block editing
+  } catch (e) {
+    // Silent failure — never block editing, but record for self-observation.
+    recordHookError('pre-recall:query', e, RUNTIME_DIR, { filePath });
   } finally {
     try { db.close(); } catch {}
   }
-} catch {
-  // Top-level catch — exit 0 no matter what
+} catch (e) {
+  // Top-level catch — exit 0 no matter what, but record what slipped past.
+  try { recordHookError('pre-recall:top', e, RUNTIME_DIR); } catch {}
 }

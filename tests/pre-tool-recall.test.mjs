@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
-import { writeFileSync, mkdirSync, rmSync, readFileSync } from 'fs';
+import { writeFileSync, mkdirSync, rmSync, readFileSync, mkdtempSync } from 'fs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
 import Database from 'better-sqlite3';
@@ -9,11 +9,21 @@ import { tmpdir } from 'os';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js');
 
+// Default sandbox for tests that don't override CLAUDE_MEM_DIR. Without it,
+// negative-path tests (invalid JSON, missing file_path) write hook-error
+// telemetry to the real ~/.claude-mem-lite/runtime/hook-errors/ — cite #8447:
+// fast-path scripts must mirror schema.mjs env-var convention, and tests must
+// honor it too.
+const DEFAULT_SANDBOX = mkdtempSync(join(tmpdir(), 'pre-recall-sandbox-'));
+
 // Helper: run script with piped stdin (spawn handles for-await stdin correctly)
 function runScriptRaw(inputStr, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('node', [SCRIPT_PATH], {
-      env: { ...process.env, ...env },
+      // Order matters: process.env first, then DEFAULT_SANDBOX overrides any
+      // dev-shell CLAUDE_MEM_DIR, then explicit `env` overrides the sandbox
+      // for tests that need their own RUNTIME_DIR.
+      env: { ...process.env, CLAUDE_MEM_DIR: DEFAULT_SANDBOX, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';

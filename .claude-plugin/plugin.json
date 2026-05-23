@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.76.0",
+  "version": "2.77.0",
   "description": "Lightweight persistent memory system for Claude Code — FTS5 search, episode batching, error-triggered recall",
   "author": {
     "name": "sdsrss"
