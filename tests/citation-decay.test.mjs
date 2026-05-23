@@ -266,3 +266,94 @@ describe('applyCitationDecay', () => {
     expect(db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
   });
 });
+
+describe('Stop hook integration — fixture transcript composition', () => {
+  let db, tmp;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-int', project: 'p' });
+    tmp = mkdtempSync(join(tmpdir(), 'cite-int-'));
+  });
+  afterEach(() => {
+    try { db.close(); } catch {}
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+  });
+
+  function makeObs(overrides = {}) {
+    const result = insertObs(db, {
+      sessionId: 'sess-int', project: 'p', type: 'bugfix', title: 't', importance: 2,
+      ...overrides,
+    });
+    const id = result.lastInsertRowid;
+    // Apply the citation-decay defaults via raw update (test-helpers doesn't know about new columns).
+    if (overrides.uncited_streak !== undefined || overrides.cited_count !== undefined || overrides.last_decided_session_id !== undefined) {
+      db.prepare(`
+        UPDATE observations
+        SET uncited_streak = ?, cited_count = ?, last_decided_session_id = ?
+        WHERE id = ?
+      `).run(
+        overrides.uncited_streak ?? 0,
+        overrides.cited_count ?? 0,
+        overrides.last_decided_session_id ?? null,
+        id
+      );
+    }
+    return id;
+  }
+
+  it('fixture transcript with one injected #ID and a citation → promotion', () => {
+    const id = makeObs({ importance: 2 });
+    const path = join(tmp, 'transcript.jsonl');
+    writeFileSync(path, [
+      // PreToolUse mem injection
+      JSON.stringify({
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success', hookName: 'PreToolUse:Read',
+          command: 'pre-tool-recall.js',
+          stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: `  #${id} [bugfix] sample` } }),
+          stderr: '', exitCode: 0,
+        },
+      }),
+      // Assistant cites it (main thread)
+      JSON.stringify({
+        type: 'assistant', isSidechain: false,
+        message: { content: [{ type: 'text', text: `applied #${id}, all good` }] },
+      }),
+    ].join('\n'));
+
+    const injected = extractInjectedFromPreToolUse(path);
+    const cited = extractCitationsFromTranscript(path, { mainOnly: true });
+    const result = applyCitationDecay(db, 'p', injected, cited, 'sess-int');
+    expect(result).toEqual({ promoted: 1, demoted: 0, touched: 1 });
+    expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(id).importance).toBe(3);
+  });
+
+  it('fixture transcript: injection from sidechain agent does NOT promote main', () => {
+    const id = makeObs({ importance: 2 });
+    const path = join(tmp, 'transcript.jsonl');
+    writeFileSync(path, [
+      JSON.stringify({
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success', hookName: 'PreToolUse:Read',
+          command: 'pre-tool-recall.js',
+          stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: `  #${id} [bugfix] sample` } }),
+          stderr: '', exitCode: 0,
+        },
+      }),
+      // Only the sub-agent cites it — main thread silent
+      JSON.stringify({
+        type: 'assistant', isSidechain: true,
+        message: { content: [{ type: 'text', text: `sub-agent used #${id}` }] },
+      }),
+    ].join('\n'));
+
+    const injected = extractInjectedFromPreToolUse(path);
+    const cited = extractCitationsFromTranscript(path, { mainOnly: true });
+    const result = applyCitationDecay(db, 'p', injected, cited, 'sess-int');
+    expect(result.touched).toBe(1);
+    expect(result.promoted).toBe(0);
+    expect(db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
+  });
+});

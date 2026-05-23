@@ -45,7 +45,13 @@ import {
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
-import { extractCitationsFromTranscript, bumpCitationAccess, computeCiteRecall } from './lib/citation-tracker.mjs';
+import {
+  extractCitationsFromTranscript,
+  extractInjectedFromPreToolUse,
+  bumpCitationAccess,
+  computeCiteRecall,
+  applyCitationDecay,
+} from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
@@ -511,6 +517,19 @@ async function handleStop() {
             const n = bumpCitationAccess(db, ids, project);
             debugLog('DEBUG', 'handleStop', `citations: ${ids.size} ids scanned, ${n} obs bumped`);
           }
+
+          // v32 citation-decay: tighter feedback loop on top of P4. Re-scan
+          // transcript with main-thread filter, extract injected IDs from
+          // pre-tool-recall attachments only, then mutate importance/streak per
+          // applyCitationDecay's contract. Cheap (file still in OS cache).
+          try {
+            const injected = extractInjectedFromPreToolUse(transcriptPath);
+            if (injected.size > 0) {
+              const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
+              const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
+              debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
+            }
+          } catch (e) { debugCatch(e, 'handleStop-citation-decay'); }
 
           // Persist cite-recall ratio for the next SessionStart to surface as
           // feedback. We deliberately scan the transcript a second time here
