@@ -74,10 +74,12 @@ language in the MCP tool description — when the two conflict, this contract wi
 asymmetric-quiet (1 lesson, 120-char cap, requires `lesson_learned`); Edit/Write is
 decision-support (up to 3 lessons, 240-char cap, admits high-importance bugfix/decision
 without lesson when title is non-LOW_SIGNAL). Read→Edit on the same file in one session
-shares cooldown — no double injection. If you saw lines like `#NN [bugfix] ...` in your
-tool-result preamble, you **must** cite `#NN` in your response (even a one-liner
-`"per #NN, I avoided re-introducing X"`) so the user can verify you actually consumed the
-lesson. Failure to cite when a lesson was surfaced = contract violation.
+shares cooldown — no double injection. If you saw lines like `#NN [bugfix] ...`, cite `#NN`
+the NEXT time you produce user-facing text — tool-only follow-up turns don't satisfy this;
+carry the IDs in working memory and cite when you write back. The plugin tracks citation
+outcomes per session: un-cited lessons auto-decay (importance −1 after 3 consecutive uncited
+sessions; floor 0) and cited lessons auto-promote (importance +1, capped at 3). The injection
+pool self-tunes from your behavior — citing is feedback to the system, not a compliance ritual.
 
 **After solving a non-trivial bug** (≠ typo fix, ≠ rename): you **must** call
 `mem_save(type='bugfix', lesson_learned='<one-line root cause + one-line fix>',
