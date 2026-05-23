@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.80.0 — post-2.79 polish: transcript perf + test hygiene + doc accuracy
+
+Minor-version polish bundle clearing the 5 `Minor` items from v2.78/v2.79 code review. All non-behavior changes — perf, test hardening, doc sync, footgun guards.
+
+- **`lib/citation-tracker.mjs:hasMainThreadAssistantText` now reverse-scans the transcript with early exit.** Pre-v2.80 it walked every line forward even when the most-recent assistant turn (the common-case answer) lived at the tail. Reverse iteration returns on the first text-bearing block — typical case is O(1) line parses instead of O(N). `readFileSync` still holds the file in memory (sync API constraint of the hook caller), but the wall-time saving on long sessions is real. Pathological case (no text anywhere) still walks all entries, but that's the degenerate state we want false for anyway.
+
+- **`install.mjs:collectOrphanHookPaths` now picks the path-shaped quoted token, not the first quoted token.** Pre-v2.80 footgun: wrapper commands like `bash -c "some inline" "/real/path.sh"` would pick `some inline`, `existsSync('some inline') → false`, and the wrapper got false-flagged as an orphan. v2.80 scans all quoted tokens via `matchAll(/"([^"]+)"/g)`, prefers ones ending in `.mjs` / `.js` / `.cjs` / `.sh`; falls through to the unquoted scanner only if no quoted token qualifies; under-reports rather than false-flagging if both miss. New test pinned in `tests/install-ergonomics.test.mjs` "picks the path-shaped quoted token even when an earlier non-path quoted token comes first (v2.80)".
+
+- **`tests/install-ergonomics.test.mjs` symlink-path tests now hard-assert `existsSync(REPO_NODE_MODULES)` before exercising the symlink branch.** Pre-v2.80 a missing repo `node_modules` (test-only Docker stages, fresh clones with `npm install` not yet run) caused the symlink to dangle and `setup.sh` silently fell into the slow npm-install branch — a different test entirely, but reported as the symlink test passing. Now an explicit assert fails loudly with a clear message.
+
+- **`tests/install-ergonomics.test.mjs` doctor e2e now strips `CLAUDE_PLUGIN_ROOT` from the child env.** Pre-v2.80 inherited `process.env` whole; if the test ever runs inside a plugin-mode harness (the env var is set), `doctor`'s plugin-detection branch would take a different path and assertions about `Orphan hooks:` could shift. New `envWithoutPluginRoot()` helper centralizes the strip for any future doctor-style tests.
+
+- **`README.md` + `README.zh-CN.md` MCP tool count synced to CLAUDE.md authoritative source (`tool-schemas.mjs:332`).** Pre-v2.80 English README said "16 tools", Chinese README said "15 tools", CLAUDE.md said "20 tools total: 9 core + 11 hidden". Actual count in `tool-schemas.mjs export const tools` array: 20. v2.80 syncs both READMEs to "20 tools (9 core via `tools/list` + 11 hidden-but-callable)" matching CLAUDE.md and source-of-truth.
+
+**Test coverage**: +1 case in `tests/install-ergonomics.test.mjs` (smart-quoted-token regression). Suite 2420 → 2421 tests pass; 110 files / 0 red regressions; eslint clean.
+
+**Action for users**: none — perf + hygiene + docs. Plugin auto-updates; global installs no-op if already current.
+
 ## v2.79.1 — post-2.79 review fixes (no behavior change)
 
 Patch release rolling in fixes for four `Important` issues flagged by code review of v2.78+v2.79. All internal correctness / honesty fixes — no user-visible behavior change on the happy path.

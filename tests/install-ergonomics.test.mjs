@@ -13,6 +13,7 @@ import { collectOrphanHookPaths } from '../install.mjs';
 
 const INSTALL_PATH = resolve('install.mjs');
 const SETUP_PATH = resolve('scripts/setup.sh');
+const REPO_NODE_MODULES = resolve('node_modules');
 
 function makeTmpDir() {
   const dir = join(tmpdir(), `mem-ergon-${randomUUID().slice(0, 8)}`);
@@ -20,8 +21,23 @@ function makeTmpDir() {
   return dir;
 }
 
+// v2.80 test hygiene: doctor-style tests inherit user env by default; an
+// outer CLAUDE_PLUGIN_ROOT (e.g. running tests inside a plugin-mode harness)
+// would change doctor's plugin-detection branch and break assumptions.
+// Strip it explicitly per call so the test environment is hermetic.
+function envWithoutPluginRoot(extra = {}) {
+  const { CLAUDE_PLUGIN_ROOT: _stripped, ...rest } = process.env;
+  return { ...rest, ...extra };
+}
+
 describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
+  // v2.80: each test asserts existsSync(REPO_NODE_MODULES) at entry so the
+  // symlink-from-data-dir path can't silently fall back to the slow
+  // npm-install branch when the test runner lacks node_modules (test-only
+  // Docker stage, etc.). A dangling symlink would otherwise exercise the
+  // wrong code path and report a false pass.
   it('clears stale .deps-broken when node_modules/better-sqlite3 is already present (symlink path)', () => {
+    expect(existsSync(REPO_NODE_MODULES)).toBe(true);
     const home = makeTmpDir();
     try {
       const dataDir = join(home, '.claude-mem-lite');
@@ -35,7 +51,7 @@ describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
       expect(existsSync(flag)).toBe(true);
 
       // Symlink path: deps live in DATA_DIR/node_modules, setup.sh symlinks into pluginRoot
-      symlinkSync(resolve('node_modules'), join(dataDir, 'node_modules'));
+      symlinkSync(REPO_NODE_MODULES, join(dataDir, 'node_modules'));
 
       execFileSync('bash', [SETUP_PATH], {
         encoding: 'utf8',
@@ -50,6 +66,7 @@ describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
   });
 
   it('clears stale .deps-broken when node_modules already exists at pluginRoot (no-op path)', () => {
+    expect(existsSync(REPO_NODE_MODULES)).toBe(true);
     const home = makeTmpDir();
     try {
       const dataDir = join(home, '.claude-mem-lite');
@@ -57,7 +74,7 @@ describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
       mkdirSync(join(dataDir, 'runtime'), { recursive: true });
       mkdirSync(pluginRoot, { recursive: true });
       // Place better-sqlite3 directly in pluginRoot so the entire setup #6 block short-circuits
-      symlinkSync(resolve('node_modules'), join(pluginRoot, 'node_modules'));
+      symlinkSync(REPO_NODE_MODULES, join(pluginRoot, 'node_modules'));
 
       const flag = join(dataDir, 'runtime', '.deps-broken');
       writeFileSync(flag, '{"ts":"old","reason":"prev"}\n');
@@ -137,6 +154,27 @@ describe('collectOrphanHookPaths (v2.79)', () => {
     expect(collectOrphanHookPaths(settings)).toEqual([]);
   });
 
+  it('picks the path-shaped quoted token even when an earlier non-path quoted token comes first (v2.80)', () => {
+    // Footgun guard: wrapper commands like `bash -c "do stuff" "/real/path.sh"`
+    // pre-v2.80 picked "do stuff", existsSync()'d false, and false-flagged
+    // the wrapper as an orphan. v2.80 scans all quoted tokens and prefers
+    // ones that look like a hook path; falls back to unquoted only if none qualify.
+    const settings = {
+      hooks: {
+        SessionStart: [{
+          matcher: '*',
+          hooks: [{
+            type: 'command',
+            command: 'bash -c "claude-mem-lite tracer; exec bash" "/tmp/nonexistent-claude-mem-lite/scripts/wrapped.sh"',
+          }],
+        }],
+      },
+    };
+    const orphans = collectOrphanHookPaths(settings);
+    expect(orphans).toEqual(['/tmp/nonexistent-claude-mem-lite/scripts/wrapped.sh']);
+    expect(orphans).not.toContain('claude-mem-lite tracer; exec bash');
+  });
+
   it('deduplicates repeated missing paths across hook events', () => {
     const settings = {
       hooks: {
@@ -177,7 +215,7 @@ describe('doctor surfaces orphan hooks (v2.79)', () => {
       try {
         output = execFileSync(process.execPath, [INSTALL_PATH, 'doctor'], {
           encoding: 'utf8',
-          env: { ...process.env, HOME: home },
+          env: envWithoutPluginRoot({ HOME: home }),
           stdio: ['pipe', 'pipe', 'pipe'],
         });
       } catch (e) {

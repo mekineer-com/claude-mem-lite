@@ -146,7 +146,7 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 15 个工具（search、recent、recall、timeline、get、save、update、stats、delete、compress、maintain、export、fts_check、browse、registry）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
+2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 20 个工具（9 个核心通过 `tools/list` 暴露 + 11 个隐藏但可调；完整表见 Usage 段）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
 
 > **每个项目第一次使用，跑一次 `/adopt`。** Plugin 安装给你 MCP server + hooks + slash commands，但**邀请式 memory 哨兵**（一条提升 Claude 主动调用 `mem_recall` / `mem_save` 的 system-authority 指针）是按项目 opt-in 的。不跑 `/adopt` 时 hooks 仍记录观察、注入上下文，但 Claude 不太会主动调 MCP 工具。一次性、按项目：`/adopt`；撤销 `/unadopt`。
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子

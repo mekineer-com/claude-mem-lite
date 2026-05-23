@@ -1522,6 +1522,13 @@ function hasMemHooksConfigured(settings) {
  * interpreter. ${CLAUDE_PLUGIN_ROOT}-templated commands are ignored — those
  * are plugin-owned hooks resolved by Claude Code at runtime, not by us.
  */
+const HOOK_PATH_EXTS = ['.mjs', '.js', '.cjs', '.sh'];
+
+function looksLikeHookPath(p) {
+  if (!p || !p.startsWith('/')) return false;
+  return HOOK_PATH_EXTS.some(ext => p.endsWith(ext));
+}
+
 export function collectOrphanHookPaths(settings) {
   if (!settings?.hooks) return [];
   const out = [];
@@ -1532,12 +1539,19 @@ export function collectOrphanHookPaths(settings) {
       for (const h of cfg.hooks || []) {
         const cmd = h.command || '';
         if (cmd.includes('${CLAUDE_PLUGIN_ROOT}')) continue;
-        const quoted = cmd.match(/"([^"]+)"/);
-        let path = quoted ? quoted[1] : null;
+        // v2.80: scan ALL quoted tokens (was: only the first), prefer ones
+        // that look like a hook path. Fixes a footgun where a wrapper command
+        // like `bash -c "some inline" "/real/path.sh"` would pick "some inline"
+        // and flag a false orphan. If no quoted token looks like a path, fall
+        // through to the unquoted scanner; if that also misses, skip the
+        // entry — we'd rather under-report than false-flag.
+        let path = null;
+        for (const m of cmd.matchAll(/"([^"]+)"/g)) {
+          if (looksLikeHookPath(m[1])) { path = m[1]; break; }
+        }
         if (!path) {
-          // unquoted: split on whitespace, take the first arg that looks like an absolute path
           const parts = cmd.split(/\s+/);
-          path = parts.find(p => p.startsWith('/') && (p.endsWith('.mjs') || p.endsWith('.js') || p.endsWith('.sh'))) || null;
+          path = parts.find(p => looksLikeHookPath(p)) || null;
         }
         if (!path) continue;
         if (!existsSync(path) && !out.includes(path)) out.push(path);
