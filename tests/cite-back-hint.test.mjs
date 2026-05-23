@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildCiteBackHint, loadCiteBackForEpisode, buildUnsavedBugfixHint } from '../lib/cite-back-hint.mjs';
+import { buildCiteBackHint, loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge } from '../lib/cite-back-hint.mjs';
 
 const editEntry = (file, tool = 'Edit') => ({ tool, files: [file], isError: false });
 const readEntry = (file) => ({ tool: 'Read', files: [file], isError: false });
@@ -217,6 +217,238 @@ describe('buildUnsavedBugfixHint', () => {
     expect(hint).toContain('c.mjs');
     expect(hint).not.toContain('d.mjs');
     expect(hint).toMatch(/4 file\(s\)/);
+  });
+});
+
+// ─── countUnsavedBugfixShape (B2 v2.83.1) ───────────────────────────────────
+// Scans a transcript.jsonl and returns {nudged, saved, unsaved} where:
+//   • nudged = count of attachments whose stdout contains the
+//     `[mem] ⚠ Unsaved bugfix-shape` literal (one per fired hint)
+//   • saved  = count of lesson/bugfix-save signals in the same window
+//     (Bash `activity save --type lesson|bugfix`, OR mem_save tool_use with
+//     type in {bugfix, lesson})
+//   • unsaved = max(0, nudged - saved) — the headline number SessionStart
+//     surfaces to make the gap socially visible.
+describe('countUnsavedBugfixShape', () => {
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'unsaved-bugfix-')); });
+  afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch {} });
+
+  function writeTranscript(entries) {
+    const path = join(tmp, 't.jsonl');
+    writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n'));
+    return path;
+  }
+
+  function bugfixShapeAttachment(fileList = 'foo.mjs') {
+    return {
+      type: 'attachment',
+      attachment: {
+        type: 'hook_success',
+        hookName: 'PostToolUse',
+        command: 'hook.mjs post-tool-use',
+        stdout: JSON.stringify({
+          suppressOutput: true,
+          hookSpecificOutput: {
+            hookEventName: 'PostToolUse',
+            additionalContext: `[mem] episode flushed: 5 entries\n[mem] ⚠ Unsaved bugfix-shape: error+edit across 1 file(s) in 5 entries (${fileList}). Save now if it was a real fix: /lesson --file ${fileList} "<root cause + fix>"`,
+          },
+        }),
+        stderr: '',
+        exitCode: 0,
+      },
+    };
+  }
+
+  function memSaveToolUse(type) {
+    return {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'mcp__claude_mem_lite__mem_save', input: { type, title: 't', lesson_learned: 'x' } },
+        ],
+      },
+    };
+  }
+
+  function bashLessonSave() {
+    return {
+      type: 'assistant',
+      message: {
+        content: [
+          { type: 'tool_use', name: 'Bash', input: { command: 'claude-mem-lite activity save --type lesson --title "fix" --body "<root cause>"' } },
+        ],
+      },
+    };
+  }
+
+  it('returns zeros on missing/empty transcript', () => {
+    expect(countUnsavedBugfixShape(null)).toEqual({ nudged: 0, saved: 0, unsaved: 0 });
+    expect(countUnsavedBugfixShape('/nope.jsonl')).toEqual({ nudged: 0, saved: 0, unsaved: 0 });
+    expect(countUnsavedBugfixShape(writeTranscript([]))).toEqual({ nudged: 0, saved: 0, unsaved: 0 });
+  });
+
+  it('counts each Unsaved-bugfix-shape attachment once', () => {
+    const path = writeTranscript([
+      bugfixShapeAttachment('a.mjs'),
+      bugfixShapeAttachment('b.mjs'),
+      bugfixShapeAttachment('c.mjs'),
+    ]);
+    const r = countUnsavedBugfixShape(path);
+    expect(r.nudged).toBe(3);
+    expect(r.saved).toBe(0);
+    expect(r.unsaved).toBe(3);
+  });
+
+  it('credits mem_save tool_use with type=bugfix as a save', () => {
+    const path = writeTranscript([
+      bugfixShapeAttachment(),
+      memSaveToolUse('bugfix'),
+    ]);
+    const r = countUnsavedBugfixShape(path);
+    expect(r.nudged).toBe(1);
+    expect(r.saved).toBe(1);
+    expect(r.unsaved).toBe(0);
+  });
+
+  it('credits mem_save tool_use with type=lesson as a save', () => {
+    const path = writeTranscript([
+      bugfixShapeAttachment(),
+      memSaveToolUse('lesson'),
+    ]);
+    expect(countUnsavedBugfixShape(path).saved).toBe(1);
+  });
+
+  it('does NOT credit mem_save with non-lesson/bugfix type', () => {
+    const path = writeTranscript([
+      bugfixShapeAttachment(),
+      memSaveToolUse('change'),
+    ]);
+    expect(countUnsavedBugfixShape(path).saved).toBe(0);
+  });
+
+  it('credits Bash `activity save --type lesson` as a save', () => {
+    const path = writeTranscript([
+      bugfixShapeAttachment(),
+      bashLessonSave(),
+    ]);
+    expect(countUnsavedBugfixShape(path).saved).toBe(1);
+  });
+
+  it('unsaved is clamped at 0 (more saves than nudges)', () => {
+    const path = writeTranscript([
+      bugfixShapeAttachment(),
+      memSaveToolUse('bugfix'),
+      memSaveToolUse('bugfix'),
+      memSaveToolUse('lesson'),
+    ]);
+    const r = countUnsavedBugfixShape(path);
+    expect(r.nudged).toBe(1);
+    expect(r.saved).toBe(3);
+    expect(r.unsaved).toBe(0);
+  });
+
+  it('ignores attachments that lack the Unsaved-bugfix-shape literal', () => {
+    const path = writeTranscript([
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success',
+          hookName: 'PostToolUse',
+          command: 'hook.mjs post-tool-use',
+          stdout: JSON.stringify({ hookSpecificOutput: { additionalContext: '[mem] episode flushed: 2 entries' } }),
+          stderr: '', exitCode: 0,
+        },
+      },
+    ]);
+    expect(countUnsavedBugfixShape(path).nudged).toBe(0);
+  });
+});
+
+// ─── buildCiteRecallNudge (B2, v2.83.1) ─────────────────────────────────────
+// SessionStart surface. Reads `runtime/cite-recall-<project>.json` written by
+// handleStop. Two independent gates: cite-recall ratio (default <0.6, min 5
+// injected) and unsaved-bugfix-shape count (>0). Empty string when both pass.
+
+describe('buildCiteRecallNudge', () => {
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'cite-nudge-')); });
+  afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch {} });
+
+  function seed(project, data) {
+    const safe = project.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
+    writeFileSync(join(tmp, `cite-recall-${safe}.json`), JSON.stringify(data));
+  }
+
+  it('returns empty string when no prior cite-recall file exists', () => {
+    expect(buildCiteRecallNudge('nope', tmp, {})).toBe('');
+  });
+
+  it('surfaces ratio nudge when recall < 0.6 and injected >= 5', () => {
+    seed('p1', { injected: 10, recalled: 4, ratio: 0.4 });
+    const out = buildCiteRecallNudge('p1', tmp, {});
+    expect(out).toContain('cite-recall 40%');
+    expect(out).toContain('(4/10)');
+  });
+
+  it('suppresses ratio nudge when recall >= 0.6', () => {
+    seed('p2', { injected: 10, recalled: 7, ratio: 0.7 });
+    expect(buildCiteRecallNudge('p2', tmp, {})).toBe('');
+  });
+
+  it('suppresses ratio nudge when injected < min-floor', () => {
+    seed('p3', { injected: 3, recalled: 0, ratio: 0 });
+    expect(buildCiteRecallNudge('p3', tmp, {})).toBe('');
+  });
+
+  it('surfaces unsaved-bugfix line independently when unsaved > 0', () => {
+    seed('p4', { injected: 0, recalled: 0, ratio: 0, unsaved: 2 });
+    const out = buildCiteRecallNudge('p4', tmp, {});
+    expect(out).toContain('2 unsaved bugfix-shape');
+    expect(out).toContain('/lesson --file');
+    // Ratio surface skipped — injected = 0
+    expect(out).not.toContain('cite-recall');
+  });
+
+  it('surfaces BOTH lines when both gates fire', () => {
+    seed('p5', { injected: 10, recalled: 2, ratio: 0.2, unsaved: 1 });
+    const out = buildCiteRecallNudge('p5', tmp, {});
+    expect(out).toContain('cite-recall 20%');
+    expect(out).toContain('1 unsaved bugfix-shape');
+    // Two distinct lines
+    expect(out.split('\n').length).toBe(2);
+  });
+
+  it('respects CLAUDE_MEM_NO_CITE_NUDGE=1 (full silence)', () => {
+    seed('p6', { injected: 10, recalled: 0, ratio: 0, unsaved: 5 });
+    expect(buildCiteRecallNudge('p6', tmp, { CLAUDE_MEM_NO_CITE_NUDGE: '1' })).toBe('');
+  });
+
+  it('treats unsaved=0 as no nudge', () => {
+    seed('p7', { injected: 0, recalled: 0, ratio: 0, unsaved: 0 });
+    expect(buildCiteRecallNudge('p7', tmp, {})).toBe('');
+  });
+
+  it('treats missing `unsaved` field as no nudge (back-compat with pre-v2.83.1 files)', () => {
+    seed('p8', { injected: 10, recalled: 8, ratio: 0.8 }); // no unsaved key
+    expect(buildCiteRecallNudge('p8', tmp, {})).toBe('');
+  });
+
+  it('honors env override thresholds', () => {
+    seed('p9', { injected: 4, recalled: 3, ratio: 0.75 });
+    // Default: injected < 5 → silent. Override min-injected to 3 → fires.
+    expect(buildCiteRecallNudge('p9', tmp, {})).toBe('');
+    const out = buildCiteRecallNudge('p9', tmp, {
+      CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED: '3',
+      CLAUDE_MEM_CITE_NUDGE_THRESHOLD: '0.8',
+    });
+    expect(out).toContain('cite-recall 75%');
+  });
+
+  it('sanitizes project name into safe filename', () => {
+    seed('weird/proj:name@chars', { injected: 0, recalled: 0, ratio: 0, unsaved: 1 });
+    const out = buildCiteRecallNudge('weird/proj:name@chars', tmp, {});
+    expect(out).toContain('1 unsaved bugfix-shape');
   });
 });
 

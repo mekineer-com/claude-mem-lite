@@ -61,7 +61,7 @@ import { checkForUpdate } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
-import { loadCiteBackForEpisode, buildUnsavedBugfixHint } from './lib/cite-back-hint.mjs';
+import { loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge } from './lib/cite-back-hint.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -565,7 +565,12 @@ async function handleStop() {
           // unchanged.
           try {
             const stats = computeCiteRecall(transcriptPath);
-            const payload = { ...stats, project, savedAt: Date.now() };
+            // B2 (v2.83.1): also persist the bugfix-shape nudge/save delta so
+            // the next SessionStart can surface "N unsaved bugfix-shape edits"
+            // alongside cite-recall. Same scan target (transcript already in OS
+            // cache); same persistence file; one extra line in buildCiteRecallNudge.
+            const bugfixStats = countUnsavedBugfixShape(transcriptPath);
+            const payload = { ...stats, ...bugfixStats, project, savedAt: Date.now() };
             const dest = join(RUNTIME_DIR, `cite-recall-${project.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64)}.json`);
             writeFileSync(dest, JSON.stringify(payload), { mode: 0o600 });
           } catch (e) { debugCatch(e, 'handleStop-cite-recall-persist'); }
@@ -589,21 +594,10 @@ async function handleStop() {
 // fell below threshold. Empty string = no surface (insufficient signal, recall
 // already healthy, or feature opted-out via env). Default threshold 0.6,
 // min injected 5 — both env-overridable for ops tuning + tests.
+// Thin wrapper: lib/cite-back-hint.mjs owns the logic so it stays unit-tested.
+// Passing module-level RUNTIME_DIR keeps the call site identical to pre-v2.83.1.
 function buildCiteRecallNudge(project) {
-  if (process.env.CLAUDE_MEM_NO_CITE_NUDGE === '1') return '';
-  try {
-    const safe = project.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
-    const path = join(RUNTIME_DIR, `cite-recall-${safe}.json`);
-    const raw = readFileSync(path, 'utf8');
-    const data = JSON.parse(raw);
-    const threshold = Number(process.env.CLAUDE_MEM_CITE_NUDGE_THRESHOLD) || 0.6;
-    const minInjected = Number(process.env.CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED) || 5;
-    if (typeof data.injected !== 'number' || typeof data.ratio !== 'number') return '';
-    if (data.injected < minInjected) return '';
-    if (data.ratio >= threshold) return '';
-    const pct = Math.round(data.ratio * 100);
-    return `[mem] Last session cite-recall ${pct}% (${data.recalled}/${data.injected}) — when injected lessons (#NN lines) inform your action, cite #NN explicitly so the contract loop stays observable.`;
-  } catch { return ''; /* no prior file, parse error, or FS error — silent */ }
+  return libBuildCiteRecallNudge(project, RUNTIME_DIR);
 }
 
 // GC pre-recall cooldown files older than 24h. Pulled out of pre-tool-recall.js

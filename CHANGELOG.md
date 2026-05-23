@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.83.1 — B2: unsaved bugfix-shape count leaks to next SessionStart
+
+Turns the per-episode `buildUnsavedBugfixHint` (v2.83.0 B1) into a cross-session pressure signal. The same hint that fires once during a flush now has its emissions counted at Stop time and surfaced at next SessionStart — making the gap between "tricky fix happened" and "/lesson was saved" visible to the human user too, not just buried in transcript history. v2.83.0 + B2 = the full closed loop on the "lesson not saved" failure mode that motivated the proposal.
+
+- **`lib/cite-back-hint.mjs::countUnsavedBugfixShape`** — scans a transcript.jsonl and returns `{nudged, saved, unsaved}`. `nudged` counts attachments containing the `Unsaved bugfix-shape` literal (one per fired hint); `saved` counts mem_save tool_use with `type ∈ {bugfix, lesson}` plus Bash `activity save --type lesson|bugfix` invocations; `unsaved = max(0, nudged - saved)`.
+- **`hook.mjs::handleStop`** — persistence payload extended from `{...stats, project, savedAt}` to `{...stats, ...bugfixStats, project, savedAt}`. Same scan target (transcript already in OS cache from `computeCiteRecall`), same `runtime/cite-recall-<project>.json` file, one extra line of payload.
+- **`lib/cite-back-hint.mjs::buildCiteRecallNudge`** — extracted from `hook.mjs` so it's unit-testable. Two independent gates compose now: the existing cite-recall ratio gate (default `<0.6` with `injected ≥ 5` floor) and the new unsaved-bugfix gate (`unsaved > 0`, no floor — the heuristic itself requires `≥3` entries with error+edit). Either can fire alone; both off → empty. `hook.mjs::buildCiteRecallNudge` collapsed to a thin wrapper passing module-level `RUNTIME_DIR`.
+- **Env opt-outs unchanged**: `CLAUDE_MEM_NO_CITE_NUDGE=1` silences both gates; `CLAUDE_MEM_CITE_NUDGE_THRESHOLD` / `CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED` tune the ratio gate. No new env knob for the bugfix-shape gate — it inherits the umbrella opt-out.
+- **Back-compat**: cite-recall json files written by v2.83.0 lack the `unsaved` field; `buildCiteRecallNudge` treats missing field as "no surface" (pinned by test `treats missing 'unsaved' field as no nudge`). No migration needed.
+
+**Test coverage**: 2502 tests / 112 files pass (+19 net vs v2.83.0: 8 for `countUnsavedBugfixShape`, 11 for `buildCiteRecallNudge`). ESLint clean.
+
+**Why a separate patch release**: B2 is a behavior change on a released-artifact (per §2 spec) — same shape as the v2.83.0 entries. Ships standalone so the 30-day cite-recall benchmark can attribute B2's social-pressure effect distinctly from A1/A3/B1's ranking + hint effects.
+
+**Action for users**: none — automatic on upgrade. Next SessionStart after upgrading will start collecting the `unsaved` field; the new surface appears the SessionStart AFTER that (one Stop must persist the field first).
+
 ## v2.83.0 — smarter passive injection + louder `/lesson` prompts (A1+A3+B1)
 
 Three closures on the cite-recall feedback loop identified by 30-day per-hook benchmark (`benchmark/cite-recall.mjs`): PreToolUse:Read at 85% recall, UserPromptSubmit stuck at 25% recall across 115 injections/30d. The architectural fact: file-keyed injection wins because the agent has already committed to action; prompt-keyed loses because content quality alone is a weak action prior. v2.83 routes already-observed agent behavior (cite history, uncited streak, cross-hook overlap) back into ranking + nudge text.
