@@ -357,3 +357,47 @@ describe('Stop hook integration — fixture transcript composition', () => {
     expect(db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
   });
 });
+
+describe('regression: extractor + decay defensive paths (D#21)', () => {
+  let tmp, db;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'cite-reg-'));
+    db = createTestDb();
+    insertSession(db, { id: 'sess-r', project: 'p' });
+  });
+  afterEach(() => {
+    try { db.close(); } catch {}
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
+  });
+
+  it('extractInjectedFromPreToolUse: falls back to raw-text scan when stdout is not JSON', () => {
+    const path = join(tmp, 't.jsonl');
+    writeFileSync(path, JSON.stringify({
+      type: 'attachment',
+      attachment: {
+        type: 'hook_success',
+        hookName: 'PreToolUse:Read',
+        command: 'pre-tool-recall.js',
+        stdout: '[mem] Lessons for foo.js:\n  #404 [bugfix] raw-text fallback path',
+        stderr: '',
+        exitCode: 0,
+      },
+    }));
+    const ids = extractInjectedFromPreToolUse(path);
+    expect(ids.has(404)).toBe(true);
+    expect(ids.size).toBe(1);
+  });
+
+  it('applyCitationDecay: silently skips IDs that are not in observations (events-table ID case)', () => {
+    const realId = insertObs(db, { sessionId: 'sess-r', project: 'p', type: 'bugfix', title: 't', importance: 2 }).lastInsertRowid;
+    const ghostId = 99999999;
+    const result = applyCitationDecay(db, 'p', new Set([realId, ghostId]), new Set(), 'sess-r');
+    expect(result.touched).toBe(1);
+    expect(result.demoted).toBe(0);
+    expect(result.promoted).toBe(0);
+    const realRow = db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(realId);
+    expect(realRow.uncited_streak).toBe(1);
+    const ghost = db.prepare('SELECT id FROM observations WHERE id=?').get(ghostId);
+    expect(ghost).toBeUndefined();
+  });
+});
