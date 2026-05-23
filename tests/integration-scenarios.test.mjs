@@ -501,7 +501,7 @@ describe('Scenario 5: Low-Value Tool Skip — PostToolUse Filtering', () => {
     { tool: 'TodoWrite', reason: 'internal task tracking' },
     { tool: 'TaskList', reason: 'meta-tool operation' },
     { tool: 'AskUserQuestion', reason: 'user interaction noise' },
-    { tool: 'mcp__plugin_claude-mem-lite_mem__mem_search', reason: 'self-referential tool' },
+    { tool: 'mcp__plugin_claude-mem-lite_mem-lite__mem_search', reason: 'self-referential tool' },
     { tool: 'mcp__sequential_thinking', reason: 'thinking frame noise' },
     { tool: 'mcp__plugin_context7_context7__query-docs', reason: 'external API call' },
   ];

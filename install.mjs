@@ -428,10 +428,12 @@ async function install() {
   }
 
   // 3. Register MCP server (skip if plugin system already handles it)
-  // Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem.
-  // Duplicate mem registrations in practice come from old global install.mjs state
+  // Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem-lite.
+  // Duplicate registrations in practice come from old global install.mjs state
   // (claude mcp add) or stale marketplace copies, not from the cache root itself.
-  // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem__* server.
+  // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem-lite__* server.
+  // The legacy generic name "mem" (pre-v2.78) is also purged so a user who installed in
+  // either era ends up with a single canonical "mem-lite" registration.
   // Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
   const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
   let pluginHandlesMcp = false;
@@ -442,18 +444,26 @@ async function install() {
 
   if (pluginHandlesMcp) {
     log('MCP server: plugin system handles registration (skipping global)');
-    // Clean up stale global registration if it exists (from older install.mjs versions)
-    try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); ok('Removed stale global MCP registration'); } catch {}
+    // Clean up stale global registrations (both legacy "mem" and current "mem-lite")
+    for (const name of ['mem', 'mem-lite']) {
+      try {
+        execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
+        ok(`Removed stale global MCP "${name}"`);
+      } catch {}
+    }
   } else {
     log('Registering MCP server...');
     try {
-      try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' }); } catch {}
-      execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
-      try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', 'mem'], { stdio: 'pipe' }); } catch {}
-      ok('MCP server registered: mem');
+      // Purge legacy "mem" and any pre-existing "mem-lite" before re-registering
+      for (const name of ['mem', 'mem-lite']) {
+        try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' }); } catch {}
+        try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', name], { stdio: 'pipe' }); } catch {}
+      }
+      execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem-lite', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
+      ok('MCP server registered: mem-lite');
     } catch (e) {
       fail('MCP registration failed: ' + e.message);
-      warn('Try manually: claude mcp add -s user -t stdio mem -- node ' + SERVER_PATH);
+      warn('Try manually: claude mcp add -s user -t stdio mem-lite -- node ' + SERVER_PATH);
     }
   }
 
@@ -933,13 +943,18 @@ async function install() {
 async function uninstall() {
   console.log('\nclaude-mem-lite uninstaller\n');
 
-  // 1. Remove MCP (legacy hook-based install)
-  try {
-    execFileSync('claude', ['mcp', 'remove', '-s', 'user', 'mem'], { stdio: 'pipe' });
-    ok('MCP server removed');
-  } catch {
-    warn('MCP server not found or already removed');
+  // 1. Remove MCP (legacy hook-based install).
+  // Try both the legacy "mem" (pre-v2.78) and current "mem-lite" names so a user
+  // who installed in either era ends up clean.
+  let removedAny = false;
+  for (const name of ['mem', 'mem-lite']) {
+    try {
+      execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
+      ok(`MCP server removed: ${name}`);
+      removedAny = true;
+    } catch {}
   }
+  if (!removedAny) warn('MCP server not found or already removed');
 
   // 1b. Remove CLI symlink
   for (const binDir of [join(homedir(), '.local', 'bin'), '/usr/local/bin']) {
@@ -1068,7 +1083,11 @@ async function status() {
   // MCP
   try {
     const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8' });
-    const registered = list.includes('mem:') || list.includes('mem ');
+    // Accept either the current "mem-lite" registration or the legacy "mem"
+    // name (pre-v2.78) so a user mid-upgrade still sees a green status until
+    // setup.sh / install.mjs purges the legacy entry on next run.
+    const registered = list.includes('mem-lite:') || list.includes('mem-lite ')
+      || list.includes('mem:') || /\bmem\b\s/.test(list);
     push(registered ? 'ok' : 'fail', 'mcp', registered ? 'MCP server: registered' : 'MCP server: not registered', { registered });
   } catch {
     push('warn', 'mcp', 'Could not check MCP status', { registered: null });

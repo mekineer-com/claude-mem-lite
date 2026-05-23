@@ -114,7 +114,7 @@ describe('E2E: Plugin install mode', () => {
 
   it('.mcp.json registers MCP server via plugin launcher', () => {
     const mcp = readJson('.mcp.json');
-    expect(mcp.mcpServers.mem).toEqual({
+    expect(mcp.mcpServers['mem-lite']).toEqual({
       command: 'node',
       args: ['${CLAUDE_PLUGIN_ROOT}/scripts/launch.mjs'],
     });

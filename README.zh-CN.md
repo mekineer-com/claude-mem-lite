@@ -146,7 +146,7 @@ node install.mjs install
 ### 安装过程
 
 1. **安装依赖** -- `npm install --omit=dev`（编译原生 `better-sqlite3`）
-2. **注册 MCP 服务器** -- `mem` 服务器，包含 15 个工具（search、recent、recall、timeline、get、save、update、stats、delete、compress、maintain、export、fts_check、browse、registry）
+2. **注册 MCP 服务器** -- `mem-lite` 服务器，包含 15 个工具（search、recent、recall、timeline、get、save、update、stats、delete、compress、maintain、export、fts_check、browse、registry）。v2.78 前服务器名为通用的 `mem`，现已改名为 `mem-lite` 避免与用户其它 `.mcp.json` 冲突；工具名（`mem_search`/`mem_recall` 等）保持不变。
 3. **配置钩子** -- `PostToolUse`、`PreToolUse`、`SessionStart`、`Stop`、`UserPromptSubmit` 生命周期钩子
 4. **创建数据目录** -- `~/.claude-mem-lite/`（隐藏目录），存放数据库、运行时和托管资源文件
 5. **自动迁移** -- 自动检测 `~/.claude-mem/`（原版 claude-mem）或 `~/claude-mem-lite/`（v0.5 前的非隐藏目录），将数据库和运行时文件迁移到 `~/.claude-mem-lite/`，原目录保持不变
@@ -282,7 +282,7 @@ Slash 命令 `/adopt` 和 `/unadopt` 是上述 CLI 的包装。
   后缀）**下一次 SessionStart** 生效（adopt 的项目下任一新会话）。
 - MCP server instructions 是**服务启动时构建一次**，MCP 协议无 "push" 机制，
   所以 `WHEN TO USE` / `Decision rules` 两段的瘦身**只在 Claude Code 重启后**
-  才生效（mem MCP 服务被重新 spawn）。`/exit` 一次再开新会话即可。`unadopt`
+  才生效（mem-lite MCP 服务被重新 spawn）。`/exit` 一次再开新会话即可。`unadopt`
   同理。
 
 **安全性：**

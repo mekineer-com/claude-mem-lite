@@ -299,7 +299,7 @@ describe('install lifecycle checks', () => {
       const marketplaceMcp = JSON.parse(readFileSync(join(marketplaceDir, '.mcp.json'), 'utf8'));
       expect(marketplaceMcp.mcpServers?.mem).toBeDefined();
 
-      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10.4'))).toBe(true);
+      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.78'))).toBe(true);
       expect(existsSync(join(dataDir, 'runtime'))).toBe(true);
     } finally {
       try { rmSync(home, { recursive: true, force: true }); } catch {}
@@ -330,7 +330,7 @@ describe('install lifecycle checks', () => {
       const claudeJson = JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8'));
       expect(claudeJson.mcpServers?.mem).toBeUndefined();
       expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10'))).toBe(true);
-      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.10.4'))).toBe(true);
+      expect(existsSync(join(dataDir, 'runtime', '.mcp-dedup-v2.78'))).toBe(true);
     } finally {
       try { rmSync(home, { recursive: true, force: true }); } catch {}
     }

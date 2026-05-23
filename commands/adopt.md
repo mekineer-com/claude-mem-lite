@@ -52,7 +52,7 @@ session. After running `adopt`:
   on the next SessionStart.
 - MCP-instructions trim (`WHEN TO USE` / `Decision rules` sections) only
   takes effect after Claude Code itself restarts (or at least re-attaches
-  the mem MCP server). If you still see the verbose MCP instructions after
+  the mem-lite MCP server). If you still see the verbose MCP instructions after
   adopt, a `/exit` + fresh session is enough.
 
 Same caveat applies in reverse for `/unadopt`.

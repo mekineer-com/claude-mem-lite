@@ -311,16 +311,23 @@ export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
     rmSync(stagingDir, { recursive: true, force: true });
     rmSync(backupDir, { recursive: true, force: true });
 
-    // Post-update migration: clean stale global MCP if plugin handles it
+    // Post-update migration: clean stale global MCPs if plugin handles it.
+    // Both "mem" (legacy, pre-v2.78) and "mem-lite" (current) are purged so a
+    // user who manually ran `claude mcp add` in either era doesn't end up with
+    // duplicate global + plugin registrations after the rename.
     try {
       if (isPluginMode()) {
         const claudeJsonPath = join(homedir(), '.claude.json');
         const cfg = JSON.parse(readFileSync(claudeJsonPath, 'utf8'));
-        if (cfg.mcpServers?.mem) {
-          delete cfg.mcpServers.mem;
-          writeFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n');
-          debugLog('DEBUG', 'hook-update', 'Post-update: removed stale global MCP "mem"');
+        let changed = false;
+        for (const k of ['mem', 'mem-lite']) {
+          if (cfg.mcpServers?.[k]) {
+            delete cfg.mcpServers[k];
+            changed = true;
+            debugLog('DEBUG', 'hook-update', `Post-update: removed stale global MCP "${k}"`);
+          }
         }
+        if (changed) writeFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n');
       }
     } catch (e) { debugCatch(e, 'post-update-mcp-dedup'); }
 

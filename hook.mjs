@@ -51,6 +51,7 @@ import {
   bumpCitationAccess,
   computeCiteRecall,
   applyCitationDecay,
+  hasMainThreadAssistantText,
 } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
@@ -537,9 +538,20 @@ async function handleStop() {
           try {
             const injected = extractAllInjected(transcriptPath);
             if (injected.size > 0) {
-              const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
-              const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
-              debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
+              // Text-floor gate: skip decay on tool-only Stops. Without this,
+              // a turn that ends on tool_use locks every injected obs as
+              // uncited (last_decided_session_id set), so a later turn that
+              // cites correctly can't undo the verdict. Per CLAUDE.md the
+              // contract is "NEXT time you produce user-facing text," so a
+              // session with zero main-thread text gets a free pass — the
+              // next Stop in the same session will re-evaluate.
+              if (!hasMainThreadAssistantText(transcriptPath)) {
+                debugLog('DEBUG', 'handleStop', `citation-decay: skipped (no main-thread assistant text yet, injected=${injected.size})`);
+              } else {
+                const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
+                const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
+                debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
+              }
             }
           } catch (e) { debugCatch(e, 'handleStop-citation-decay'); }
 

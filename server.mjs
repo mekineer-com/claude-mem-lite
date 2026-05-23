@@ -12,7 +12,7 @@ import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
-import { effectiveQuiet } from './hook-shared.mjs';
+import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
@@ -43,7 +43,7 @@ const { version: PKG_VERSION } = require('./package.json');
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-import { rmSync, existsSync, readFileSync } from 'fs';
+import { rmSync, existsSync, readFileSync, appendFileSync, mkdirSync } from 'fs';
 
 let db;
 try {
@@ -127,7 +127,7 @@ if (process.env.CLAUDE_MEM_QUIET_TRACE !== '0') {
 }
 
 const server = new McpServer(
-  { name: 'claude-mem-lite', version: PKG_VERSION },
+  { name: 'mem-lite', version: PKG_VERSION },
   { instructions: buildServerInstructions(_quiet) },
 );
 
@@ -2266,6 +2266,25 @@ process.on('uncaughtException', (err) => { debugCatch(err, 'uncaughtException');
 process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'); shutdown(1); });
 
 // ─── Start Server ───────────────────────────────────────────────────────────
+
+// Spawn telemetry — appends one JSON line per process start so we can diagnose
+// dual-registration (plugin namespace + local .mcp.json could both spawn the
+// server in one Claude Code session). Two records with close timestamps and
+// the same ppid is the smoking gun. Never throws — telemetry must not block
+// startup. Disable with MEM_DISABLE_SPAWN_LOG=1.
+if (process.env.MEM_DISABLE_SPAWN_LOG !== '1') {
+  try {
+    if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true });
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      pid: process.pid,
+      ppid: process.ppid,
+      argv1: process.argv[1] || '',
+      version: PKG_VERSION,
+    }) + '\n';
+    appendFileSync(join(RUNTIME_DIR, 'mcp-spawns.log'), line, { mode: 0o600 });
+  } catch { /* never block startup on telemetry failure */ }
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

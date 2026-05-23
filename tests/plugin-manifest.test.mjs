@@ -9,10 +9,12 @@ describe('plugin manifests', () => {
   it('declares plugin-mode MCP launcher in root .mcp.json', () => {
     const manifest = readJson('.mcp.json');
     expect(manifest.mcpServers).toBeTruthy();
-    expect(manifest.mcpServers.mem).toEqual({
+    expect(manifest.mcpServers['mem-lite']).toEqual({
       command: 'node',
       args: ['${CLAUDE_PLUGIN_ROOT}/scripts/launch.mjs'],
     });
+    // Guard: the pre-v2.78 generic name "mem" must not coexist with the new name.
+    expect(manifest.mcpServers.mem).toBeUndefined();
   });
 
   it('keeps MCP manifest at plugin root and not under plugin metadata directories', () => {

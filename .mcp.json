@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "mem": {
+    "mem-lite": {
       "command": "node",
       "args": [
         "${CLAUDE_PLUGIN_ROOT}/scripts/launch.mjs"

@@ -87,29 +87,36 @@ if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   fi
 fi
 
-# 7. MCP cleanup: idempotently clean stale registrations from pre-2.10 direct installs.
-#    This runs on every plugin SessionStart because old global mem entries may still
+# 7. MCP cleanup: idempotently clean stale registrations from older installs.
+#    This runs on every plugin SessionStart because old global entries may still
 #    exist even after an earlier migration marker was written.
-#    Before 2.10: old direct installs left a global mem MCP alongside plugin MCP.
-#    - Global mcpServers.mem in ~/.claude.json (from old install.mjs)
-#    - Possibly stale marketplace root .mcp.json (from old git clone)
+#    - Pre-2.10: direct installs left a global "mem" MCP alongside plugin MCP.
+#    - Pre-2.78: plugin and global registrations used the generic name "mem";
+#      v2.78 renamed to "mem-lite" — any stale global "mem" must be purged so
+#      Claude Code doesn't surface duplicate (old "mem" + new "mem-lite") tool
+#      prefixes side-by-side.
 #    Root .mcp.json in the installed plugin cache is required for Claude Code to
 #    register plugin MCP; only stale global/marketplace copies should be removed.
-MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.10.4"
+MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.78"
 if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
   CLAUDE_JSON="$HOME/.claude.json" node -e '
     const fs = require("fs");
     let changed = false;
-    // Remove stale global MCP registration (plugin .mcp.json handles it)
+    // Remove stale global MCP registrations (plugin .mcp.json handles it).
+    // Both "mem" (legacy, pre-v2.78) and "mem-lite" (current) are purged from
+    // user-global scope when running inside the plugin — the plugin manifest
+    // is the single source of truth.
     try {
       const p = process.env.CLAUDE_JSON;
       const d = JSON.parse(fs.readFileSync(p, "utf8"));
-      if (d.mcpServers?.mem) {
-        delete d.mcpServers.mem;
-        fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
-        process.stderr.write("✓ Removed stale global MCP \"mem\" (plugin handles it)\n");
-        changed = true;
+      for (const k of ["mem", "mem-lite"]) {
+        if (d.mcpServers?.[k]) {
+          delete d.mcpServers[k];
+          process.stderr.write(`✓ Removed stale global MCP "${k}" (plugin handles it)\n`);
+          changed = true;
+        }
       }
+      if (changed) fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
     } catch {}
     // NOTE: Do NOT touch marketplace .mcp.json — Claude Code copies it from
     // marketplace → plugin cache on updates. Clearing it causes the cache
