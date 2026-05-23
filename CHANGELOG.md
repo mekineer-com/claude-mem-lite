@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.76.0 — citation-decay loop closes UserPromptSubmit gap
+
+The v2.74–v2.75 citation-decay machinery was real but starved: only the pre-tool-recall (PreToolUse:Edit/Read) injection surface fed the loop. `hook.mjs handleUserPrompt`'s `<memory-context>` block (the higher-volume FTS surface, including 100% of decision-type recall) emitted `- [type] title (#NN)` — `(#NN)` in trailing parens, never matched by `INJECTED_RE` (anchored on `#NN [type]`). Audit on 2026-05-23: 21 decision obs in trailing 30d, all 21 with `injection_count > 0` via `hook-memory.mjs`, **all 21 with `decay_seen_count = 0`**. Every UserPromptSubmit injection bypassed `applyCitationDecay` entirely.
+
+**Fix** (`lib/citation-tracker.mjs`): new `extractInjectedFromUserPromptSubmit` does line-scan with a `- [` prefix gate so a back-reference inside a lesson body (e.g. "fix similar to (#999)") does NOT pollute the injected set — anchor is the LAST `(#NN)` per line, since `formatMemoryLine` guarantees the obs id sits in trailing parens (possibly followed by ` [verify-before-use]`). New `extractAllInjected` wrapper unions PTR + UPS as the single integration point. `hook.mjs:532` Stop handler is a one-line switch from `extractInjectedFromPreToolUse` to `extractAllInjected` so the contract test in `tests/citation-tracker-userprompt.test.mjs` covers the wiring.
+
+**Telemetry note** (`mem-cli.mjs citation-stats`): pre-v34 backfill had seeded `cited_count` from `access_count` on 5 obs without populating `decay_seen_count`, producing the invariant violation `cited_count > decay_seen_count`. Without explanation that made per-project cite rates show >100% (this repo: 207.7%) with no diagnostic. The CLI now prepends `Note: N obs have cited_count > decay_seen_count (pre-v34 backfill — invariant holds for new data)` and adds `data_pollution_note` to the JSON output. Invariant holds for every resolution `applyCitationDecay` performs going forward; old rows age out via compress/supersede.
+
+**Action for users**: none — additive change, no API broken. `MEM_DISABLE_CITATION_DECAY=1` still opts out of the whole loop. External tooling calling `extractInjectedFromPreToolUse` directly: that function is still exported and unchanged; prefer `extractAllInjected` for new code so future injection surfaces are auto-unioned.
+
+**Test coverage**: +15 new cases (11 in `tests/citation-tracker-userprompt.test.mjs` covering the new extractor + union wrapper; 4 in `tests/citation-decay-userprompt-e2e.test.mjs` covering promote + 3-strike demote paths via the contract function). Existing 43 citation tests unchanged. 2369 → 2384 tests pass.
+
+**What to watch in the next 7 days**: `SELECT type, SUM(decay_seen_count), SUM(cited_count), SUM(CASE WHEN demoted_at IS NOT NULL THEN 1 ELSE 0 END) FROM observations WHERE created_at > '2026-05-24' GROUP BY type` — `decision`-type rows should now show `decay_seen_count > 0`, and bench-warmers (high `injection_count`, never cited) should start appearing in the demoted section. If `decision` still sits at 0 across multiple projects after a week, a recall-side fix in `scripts/pre-tool-recall.js` (decision-recency fallback when file-JOIN < 2 hits) is the next lever.
+
 ## v2.75.0 — citation-decay polish: real cite-rate + demoted telemetry + self-heal
 
 Follow-up batch on v2.74.0's citation-decay loop, driven by close-out of 5 deferred items found during release verification.
