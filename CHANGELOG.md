@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.83.2 — A1.5: cite_factor tie-break in PreToolUse:Read/Edit (file-keyed path)
+
+Extends v2.83.0 A1's `cite_factor` signal to the fourth and final query point — `scripts/pre-tool-recall.js`'s inline SQL over `observations`. Before v2.83.2, when multiple historical lessons matched the same file, the tie-break was raw recency (`ORDER BY created_at_epoch DESC`). After v2.83.2, lessons with proven cite history outrank merely-most-recent ones at the same `has_lesson` tier. Same dial as A1, applied to the 85%-recall path.
+
+- **`scripts/pre-tool-recall.js`** — `import { citeFactorClause } from '../scoring-sql.mjs'` added; observations `ORDER BY` extended from `(has_lesson, created_at_epoch DESC)` to `(has_lesson, citeFactorClause DESC, created_at_epoch DESC)`. Events-table query unchanged — `events` schema lacks `cited_count` / `uncited_streak` columns (those live only on `observations` per schema.mjs:180-181).
+- **Cold-start cost**: 48ms measured on a cache-cold run (was 30-45ms range pre-v2.83.2). `scoring-sql.mjs` import adds ~3-5ms; well under the 30-50ms cold-start budget the standalone fast-path discipline (#8447) targets.
+- **Behavior on single-match files**: unchanged. The `obsLimit` is 1 (Read) or 2 (Edit); the new sort key only changes outcomes when 2+ lessons match the same file, which is the precise tie-break case A1.5 targets.
+
+**Test coverage**: 2505 tests / 112 files pass (+3 net: 3 A1.5 ordering tests — cited-old > fresh-new on Edit, Read drops the fresh one entirely under obsLimit=1, streak-2 demoted below fresh sibling). ESLint clean.
+
+**Why standalone patch**: same justification as v2.83.1 (B2) — keeps the 30-day cite-recall benchmark able to attribute A1's tie-break extension distinctly from A1 / A3 / B1 / B2. A1.5 specifically affects PreToolUse:Read/Edit (already at 85% recall); expected direction: marginal recall lift on multi-match files, no change on single-match (which dominate the volume).
+
+**Action for users**: none — automatic on upgrade.
+
 ## v2.83.1 — B2: unsaved bugfix-shape count leaks to next SessionStart
 
 Turns the per-episode `buildUnsavedBugfixHint` (v2.83.0 B1) into a cross-session pressure signal. The same hint that fires once during a flush now has its emissions counted at Stop time and surfaced at next SessionStart — making the gap between "tricky fix happened" and "/lesson was saved" visible to the human user too, not just buried in transcript history. v2.83.0 + B2 = the full closed loop on the "lesson not saved" failure mode that motivated the proposal.

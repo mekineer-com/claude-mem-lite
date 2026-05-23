@@ -9,6 +9,7 @@ import { basename, join } from 'path';
 import { homedir } from 'os';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
+import { citeFactorClause } from '../scoring-sql.mjs';
 
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
@@ -232,6 +233,11 @@ try {
           OR (o.type IN ('bugfix', 'decision') AND ${notLowSignalSql})
         )`;
     const obsLimit = isRead ? 1 : 2;
+    // A1.5 (v2.83.2): cite_factor as a tertiary sort key. When multiple file-
+    // matching lessons exist, the one with proven cite history outranks the
+    // merely-most-recent one. Single-match files unchanged (obsLimit=1 Read /
+    // 2 Edit). Composes with v2.83.0 A1 to extend the citation-decay feedback
+    // loop to the 85%-recall PreToolUse:Read/Edit path.
     const rows = db.prepare(`
       SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
       FROM observations o
@@ -245,6 +251,7 @@ try {
         ${typeFallback}
       ORDER BY
         CASE WHEN o.lesson_learned IS NOT NULL AND o.lesson_learned != '' THEN 0 ELSE 1 END,
+        ${citeFactorClause('o')} DESC,
         o.created_at_epoch DESC
       LIMIT ${obsLimit}
     `).all(project, cutoff, filePath, likePattern);

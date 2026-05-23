@@ -984,6 +984,147 @@ describe('pre-tool-recall', () => {
     });
   });
 
+  // ─── A1.5 (v2.83.2): cite_factor in pre-tool-recall tie-break ────────────
+  // When multiple lessons match the same file, prefer the one with proven
+  // cite history over the merely-most-recent one. Single-match files are
+  // unaffected (obsLimit=1 for Read, 2 for Edit).
+  describe('cite_factor tie-break across multiple file-matching lessons (A1.5)', () => {
+    let tmpRoot;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-a15-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'a15test');
+      mkdirSync(projectDir, { recursive: true });
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-a15', project: 'parent--a15test', memoryId: 'mem-a15' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    it('Edit: prefers the heavily-cited older lesson over the never-cited newer one', async () => {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Older (60d ago) but cited 5 times — proven helpful.
+      insertObs(db, {
+        sessionId: 'mem-a15', project: 'parent--a15test',
+        type: 'bugfix', importance: 2,
+        title: 'OLD-CITED lesson',
+        lessonLearned: 'this body was cited five times across sessions',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+        epochOffset: -50 * 86400000,
+        citedCount: 5,
+      });
+      // Newer (today) but never cited.
+      insertObs(db, {
+        sessionId: 'mem-a15', project: 'parent--a15test',
+        type: 'bugfix', importance: 2,
+        title: 'NEW-FRESH lesson',
+        lessonLearned: 'fresh body never cited',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+        epochOffset: 0,
+        citedCount: 0,
+      });
+      db.close();
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a15-1',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      // Edit caps at 2 rows total — both surface, but the cited one MUST come first.
+      const oldIdx = ctx.indexOf('cited five times');
+      const newIdx = ctx.indexOf('fresh body never cited');
+      expect(oldIdx).toBeGreaterThanOrEqual(0);
+      expect(newIdx).toBeGreaterThanOrEqual(0);
+      expect(oldIdx).toBeLessThan(newIdx);
+    });
+
+    it('Read (obsLimit=1): surfaces the cited lesson, drops the never-cited fresh one', async () => {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-a15', project: 'parent--a15test',
+        type: 'bugfix', importance: 2,
+        title: 'OLD-CITED lesson',
+        lessonLearned: 'this body was cited five times across sessions',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+        epochOffset: -50 * 86400000,
+        citedCount: 5,
+      });
+      insertObs(db, {
+        sessionId: 'mem-a15', project: 'parent--a15test',
+        type: 'bugfix', importance: 2,
+        title: 'NEW-FRESH lesson',
+        lessonLearned: 'fresh body never cited',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+        epochOffset: 0,
+        citedCount: 0,
+      });
+      db.close();
+
+      const { stdout } = await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a15-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('cited five times');
+      expect(ctx).not.toContain('fresh body never cited');
+    });
+
+    it('Edit: demotes the uncited-streak lesson below the fresh one', async () => {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      // Newer but accumulating uncited streak — agent has been declining it.
+      insertObs(db, {
+        sessionId: 'mem-a15', project: 'parent--a15test',
+        type: 'bugfix', importance: 2,
+        title: 'STREAKED lesson',
+        lessonLearned: 'body with streak of 2 uncited sessions',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+        epochOffset: 0,
+        uncitedStreak: 2,
+      });
+      // Older and neutral (cited=0, streak=0).
+      insertObs(db, {
+        sessionId: 'mem-a15', project: 'parent--a15test',
+        type: 'bugfix', importance: 2,
+        title: 'NEUTRAL lesson',
+        lessonLearned: 'older body neutral state',
+        filesModified: `["${join(projectDir, 'shared.mjs')}"]`,
+        epochOffset: -3 * 86400000,
+      });
+      db.close();
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a15-3',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      const neutralIdx = ctx.indexOf('older body neutral state');
+      const streakedIdx = ctx.indexOf('body with streak of 2');
+      expect(neutralIdx).toBeGreaterThanOrEqual(0);
+      expect(streakedIdx).toBeGreaterThanOrEqual(0);
+      expect(neutralIdx).toBeLessThan(streakedIdx);
+    });
+  });
+
   // ─── A3 (v2.83): cross-hook ID dedup ──────────────────────────────────────
   // UPS writes `INJECTED_IDS_FILE` at `<DB_DIR>/runtime/.claude-mem-injected-<project>`
   // with `{ids, ts, count}`. Pre-tool-recall reads it; if a lesson row was
