@@ -510,6 +510,12 @@ async function handleStop() {
       // P4: scan transcript for `#NN` observation citations in assistant text
       // and bump access_count for matched rows. Closes the loop on the "cite #NN"
       // contract — before P4 this was a one-way obligation with no feedback.
+      //
+      // CLAUDE_MEM_NO_CITATION_TRACK=1 disables BOTH the P4 access_count bump
+      // AND the v32 citation-decay loop nested below — anything that needs the
+      // transcript scan lives inside this guard. To disable just the decay
+      // loop (keep access_count bumps), use MEM_DISABLE_CITATION_DECAY=1 which
+      // applyCitationDecay checks separately.
       try {
         if (transcriptPath && !process.env.CLAUDE_MEM_NO_CITATION_TRACK) {
           const ids = extractCitationsFromTranscript(transcriptPath);
