@@ -47,7 +47,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import {
   extractCitationsFromTranscript,
-  extractInjectedFromPreToolUse,
+  extractAllInjected,
   bumpCitationAccess,
   computeCiteRecall,
   applyCitationDecay,
@@ -525,11 +525,17 @@ async function handleStop() {
           }
 
           // v32 citation-decay: tighter feedback loop on top of P4. Re-scan
-          // transcript with main-thread filter, extract injected IDs from
-          // pre-tool-recall attachments only, then mutate importance/streak per
-          // applyCitationDecay's contract. Cheap (file still in OS cache).
+          // transcript with main-thread filter, extract injected IDs from BOTH
+          // surfaces (PTR + UserPromptSubmit <memory-context>) via extractAllInjected,
+          // then mutate importance/streak per applyCitationDecay's contract.
+          // Cheap (file still in OS cache).
+          //
+          // v34.x: pre-v34 this only saw pre-tool-recall injections, leaving the
+          // UPS surface (highest-volume — all decision-type FTS hits) starved.
+          // Union closed by extractAllInjected — one integration point so the
+          // contract test in tests/citation-tracker-userprompt.test.mjs covers it.
           try {
-            const injected = extractInjectedFromPreToolUse(transcriptPath);
+            const injected = extractAllInjected(transcriptPath);
             if (injected.size > 0) {
               const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
               const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
