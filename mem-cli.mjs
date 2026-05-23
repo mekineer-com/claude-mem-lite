@@ -2367,7 +2367,7 @@ function cmdMemdirAudit(args) {
  *   --json      machine-readable output
  *   --days N    project cite-rate window (default 7)
  */
-export function cmdCitationStats(db, args) {
+function cmdCitationStats(db, args) {
   const { flags } = parseArgs(args);
   const json = flags.json === true || flags.json === 'true';
   const days = parseIntFlag(flags.days, { name: '--days', defaultValue: 7, max: 365 });
