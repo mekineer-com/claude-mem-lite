@@ -2417,11 +2417,29 @@ function cmdCitationStats(db, args) {
      LIMIT 10
   `).all(cutoff);
 
+  // v34.x: surface pre-v34 data pollution. applyCitationDecay bumps cited_count
+  // and decay_seen_count atomically (same UPDATE statement), so the invariant
+  // cited_count <= decay_seen_count holds for every resolution this codepath
+  // performs. Yet a small set of obs violate it — these are pre-v34 rows
+  // where a backfill seeded cited_count without populating decay_seen_count.
+  // Without this note, those rows make per-project cite_pct >100% with no
+  // explanation. Cite rate stays unbiased for obs created after this commit.
+  const pollutedRows = db.prepare(`
+    SELECT COUNT(*) AS n FROM observations
+     WHERE cited_count > decay_seen_count
+       AND COALESCE(compressed_into, 0) = 0
+       AND superseded_at IS NULL
+  `).get();
+  const dataPollutionNote = pollutedRows.n > 0
+    ? `${pollutedRows.n} obs have cited_count > decay_seen_count (pre-v34 backfill — invariant holds for new data).`
+    : null;
+
   if (json) {
-    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted }, null, 2));
+    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote }, null, 2));
     return;
   }
 
+  if (dataPollutionNote) out(`Note: ${dataPollutionNote}\n`);
   out(`Cite rate by project (last ${days}d, cited / decay-resolutions):`);
   for (const r of perProject) {
     const rate = r.resolved > 0 ? (r.cited * 100 / r.resolved).toFixed(1) + '%' : '—';
