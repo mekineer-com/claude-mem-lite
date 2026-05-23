@@ -2406,8 +2406,19 @@ function cmdCitationStats(db, args) {
      LIMIT 10
   `).all();
 
+  const demoted = db.prepare(`
+    SELECT id, project, type, title, importance, demoted_at
+      FROM observations
+     WHERE demoted_at IS NOT NULL
+       AND demoted_at >= ?
+       AND COALESCE(compressed_into, 0) = 0
+       AND superseded_at IS NULL
+  ORDER BY demoted_at DESC
+     LIMIT 10
+  `).all(cutoff);
+
   if (json) {
-    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted }, null, 2));
+    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted }, null, 2));
     return;
   }
 
@@ -2427,6 +2438,13 @@ function cmdCitationStats(db, args) {
   if (promoted.length === 0) out('  (none)');
   for (const r of promoted) {
     out(`  #${r.id} [${r.type}] ${(r.title || '').slice(0, 60)}   cited ${r.cited_count}x`);
+  }
+  out('');
+  out(`Recently demoted (last ${days}d, importance ↓):`);
+  if (demoted.length === 0) out('  (none)');
+  for (const r of demoted) {
+    const ago = Math.round((Date.now() - r.demoted_at) / 86400000);
+    out(`  #${r.id} [${r.type}] ${(r.title || '').slice(0, 60)}   imp=${r.importance}   ${ago}d ago`);
   }
 }
 

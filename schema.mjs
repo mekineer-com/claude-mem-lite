@@ -49,13 +49,13 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // cited_count, last_decided_session_id. Stop hook resolves injected obs as
 // cited|uncited; 3 consecutive uncited → importance -1 (floor 0); 1 cited → +1
 // (cap 3). last_decided_session_id makes Stop idempotent across multi-fire.
-export const CURRENT_SCHEMA_VERSION = 32;
+export const CURRENT_SCHEMA_VERSION = 33;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
 // back (observed once in dev during v2.74.0). Update both the column AND
 // (if needed) the table when adding a new migration batch.
-const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'uncited_streak' };
+const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'demoted_at' };
 
 function hasLatestMigrationColumn(db) {
   try {
@@ -180,6 +180,12 @@ const MIGRATIONS = [
   'ALTER TABLE observations ADD COLUMN uncited_streak INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE observations ADD COLUMN cited_count INTEGER NOT NULL DEFAULT 0',
   'ALTER TABLE observations ADD COLUMN last_decided_session_id TEXT DEFAULT NULL',
+  // v33 (citation-decay telemetry): timestamp of the most recent demote event.
+  // Powers `claude-mem-lite citation-stats`'s "Recently demoted" section.
+  // Set in applyCitationDecay's demote branch when streak hits threshold.
+  // Single-shot (only the latest demote is preserved); use a decay_log table
+  // if historical trend is ever needed.
+  'ALTER TABLE observations ADD COLUMN demoted_at INTEGER DEFAULT NULL',
 ];
 
 /**

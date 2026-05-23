@@ -164,4 +164,25 @@ describe('citation-stats CLI', () => {
     const output = await captureStdout(() => run(['citation-stats']));
     expect(output).not.toContain('superseded promoted');
   });
+
+  it('reports recently-demoted (demoted_at within window)', async () => {
+    const fresh = obs({ title: 'just demoted', importance: 1 });
+    testDb.prepare('UPDATE observations SET demoted_at = ? WHERE id = ?').run(Date.now(), fresh);
+    const stale = obs({ title: 'stale demoted', importance: 0 });
+    testDb.prepare('UPDATE observations SET demoted_at = ? WHERE id = ?')
+      .run(Date.now() - 60 * 86400 * 1000, stale); // 60d ago, outside default 7d window
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/Recently demoted/);
+    expect(output).toContain('just demoted');
+    expect(output).not.toContain('stale demoted');
+  });
+
+  it('--json includes demoted array', async () => {
+    const id = obs({ title: 'd-json', importance: 0 });
+    testDb.prepare('UPDATE observations SET demoted_at = ? WHERE id = ?').run(Date.now(), id);
+    const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
+    const parsed = JSON.parse(output);
+    expect(Array.isArray(parsed.demoted)).toBe(true);
+    expect(parsed.demoted[0].title).toBe('d-json');
+  });
 });

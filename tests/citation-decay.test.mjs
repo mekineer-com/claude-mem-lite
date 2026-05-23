@@ -190,10 +190,14 @@ describe('applyCitationDecay', () => {
 
   it('uncited at streak=2 → demotion (importance -1) and streak reset to 0', () => {
     const id = makeObs({ importance: 2, uncited_streak: 2 });
+    const before = Date.now();
     applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
-    const r = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    const r = db.prepare('SELECT importance, uncited_streak, demoted_at FROM observations WHERE id=?').get(id);
     expect(r.importance).toBe(1);
     expect(r.uncited_streak).toBe(0);
+    // v33: demoted_at gets a real timestamp on the demote branch
+    expect(r.demoted_at).toBeGreaterThanOrEqual(before);
+    expect(r.demoted_at).toBeLessThanOrEqual(Date.now());
   });
 
   it('importance floor: uncited at importance=0 stays at 0, streak still resets', () => {
