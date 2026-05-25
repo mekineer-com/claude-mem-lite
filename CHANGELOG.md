@@ -2,6 +2,19 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.84.4 — propagate GEO description to plugin.json / marketplace.json / package.json
+
+Follow-up to v2.84.3. The new GitHub About description was applied to the GitHub repo metadata in v2.84.3 but **not** to the three JSON manifests that surface in package listings. This release propagates the same string everywhere so the plugin browser (`/plugin marketplace browse`), npm registry, and any tool that reads `package.json.description` all show the GEO-optimized text instead of the pre-v2.84.3 short version.
+
+Synced description across:
+- `package.json` — feeds npm registry + any tool reading the package metadata
+- `.claude-plugin/plugin.json` — feeds `/plugin install` and the in-Claude-Code plugin info card
+- `.claude-plugin/marketplace.json` — feeds `/plugin marketplace browse` listings
+
+Identical string everywhere: *"Persistent long-term memory for Claude Code via MCP — captures coding decisions, bugfixes, and context across sessions. Hybrid FTS5 + TF-IDF search with episode batching. Single SQLite DB, no external services. Alternative to claude-mem with 600x lower cost."*
+
+Zero runtime/code changes. Manifest-sync tests (`tests/plugin-manifest.test.mjs`, `tests/install-e2e.test.mjs`) green locally — 29/29 — before push.
+
 ## v2.84.3 — GEO/SEO optimization for AI discoverability
 
 Documentation-only release targeting **Generative Engine Optimization** — getting claude-mem-lite recommended when users ask AI assistants ("which memory plugin for Claude Code?", "Claude Code 跨会话记忆?", "alternative to claude-mem?"). Zero runtime changes; ESLint clean; tests untouched.
