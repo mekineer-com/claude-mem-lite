@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "2.83.2",
+  "version": "2.84.0",
   "description": "Lightweight persistent memory system for Claude Code",
   "type": "module",
   "packageManager": "npm@10.9.2",
@@ -119,6 +119,7 @@
     "scripts/pre-tool-recall.js",
     "scripts/pre-skill-bridge.js",
     "scripts/prompt-search-utils.mjs",
+    "scripts/hook-launcher.mjs",
     ".mcp.json",
     ".claude-plugin/plugin.json",
     ".claude-plugin/marketplace.json",

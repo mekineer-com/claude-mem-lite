@@ -2,6 +2,30 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.84.0 — auto-update self-bootstrap fix + repair command + hook-launcher self-heal
+
+Fixes a latent bug in the auto-updater that bricked every install crossing a release boundary that added a new file under `lib/` (most recently v2.80.x → v2.81.0, which added `lib/cite-back-hint.mjs` and left every auto-updated machine with `hook.mjs` ERR_MODULE_NOT_FOUND on first SessionStart — including the next auto-update that would have healed it). Adds two layers of defense so this class of drift cannot recur silently.
+
+- **`hook-update.mjs::installExtractedRelease` (root cause)** — pre-fix, `copyReleaseIntoStaging` and `SWITCHABLE_PATHS` iterated `SOURCE_FILES` *imported from the currently-installed source-files.mjs*. Any entry added in the release we're installing was invisible to the running update; the new file was skipped, the new `hook.mjs` (already in the previous manifest) was copied, and the resulting import mismatch killed the hook chain. v2.84 introduces `loadReleaseManifest(sourceDir)`, which dynamic-imports the *extracted tarball's own* `source-files.mjs` (cache-busted) and feeds the resulting `SOURCE_FILES` / `HOOK_SCRIPT_FILES` into both the staging copy and the switchable-paths atomic move. Falls back to the locally-imported manifest only when the tarball's module is missing or unparseable. `installExtractedRelease` is now `async` — `downloadAndInstall` awaits explicitly; the five legacy in-test call sites updated to `await installExtractedRelease(...)`.
+- **`install.mjs repair` (recovery command)** — new self-contained CLI entry: downloads the latest GitHub release tarball, extracts it, and spawns `node <tarball>/install.mjs install`. Always runs *the freshly-downloaded* installer, so the recovery path works even when the local `install.mjs` / `hook-update.mjs` are themselves buggy. Wired into `cli.mjs` (`claude-mem-lite repair`) and the install.mjs help text.
+- **`scripts/hook-launcher.mjs` (self-heal layer)** — new Node wrapper that all `node`-based hook entries now route through (`hooks/hooks.json` for plugin mode, `install.mjs` settings.json template for direct-install mode, `scripts/post-tool-use.sh`'s inner `node` invocation). Try-imports the target; on `ERR_MODULE_NOT_FOUND` whose URL points under the install dir, runs `install.mjs repair` (rate-limited via a 6h marker file at `runtime/hook-launcher-lastheal`) and retries the import once with a cache-busted URL (Node ESM caches both successful AND rejected resolutions per URL — without the buster the retry returns the cached rejection and the heal looks like a no-op). Pure `node:` imports only — never depends on anything under `lib/`, since the whole point is to survive a corrupt install.
+
+**Recovery for already-broken machines** (anyone stuck on the v2.80.x → v2.81.0 hop and similar):
+```bash
+# Option A — single missing file:
+mkdir -p ~/.claude-mem-lite/lib && \
+  curl -sL https://raw.githubusercontent.com/sdsrss/claude-mem-lite/main/lib/cite-back-hint.mjs \
+       -o ~/.claude-mem-lite/lib/cite-back-hint.mjs
+
+# Option B — full re-sync via the new repair command (preferred):
+#   first install v2.84+ source from a fresh clone, then:
+node ~/.claude-mem-lite/install.mjs repair
+```
+
+**Test coverage**: 2512 tests / 113 files pass (+7 net vs v2.83.2: 6 hook-launcher integration + 1 hook-update stale-manifest RED regression). ESLint clean. The new RED test (`hook-update.test.mjs::"honors the tarball-bundled source-files manifest, not the installed one"`) seeds a tarball whose `source-files.mjs` lists a path not in the local manifest and asserts the file lands in staging — fails on pre-v2.84 code, passes on v2.84.
+
+**Action for users**: automatic on upgrade for anyone whose install can still run the auto-updater. Anyone stuck on a broken install runs the recovery one-liner once; subsequent updates are immune.
+
 ## v2.83.2 — A1.5: cite_factor tie-break in PreToolUse:Read/Edit (file-keyed path)
 
 Extends v2.83.0 A1's `cite_factor` signal to the fourth and final query point — `scripts/pre-tool-recall.js`'s inline SQL over `observations`. Before v2.83.2, when multiple historical lessons matched the same file, the tie-break was raw recency (`ORDER BY created_at_epoch DESC`). After v2.83.2, lessons with proven cite history outrank merely-most-recent ones at the same `has_lesson` tier. Same dial as A1, applied to the 85%-recall path.

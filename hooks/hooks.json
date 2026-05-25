@@ -12,7 +12,7 @@
           },
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hook.mjs\" session-start",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" hook.mjs session-start",
             "timeout": 15
           }
         ]
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hook.mjs\" pre-compact",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" hook.mjs pre-compact",
             "timeout": 5
           }
         ]
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-recall.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" scripts/pre-tool-recall.js",
             "timeout": 3
           }
         ]
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-skill-bridge.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" scripts/pre-skill-bridge.js",
             "timeout": 3
           }
         ]
@@ -70,7 +70,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hook.mjs\" stop",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" hook.mjs stop",
             "timeout": 5
           }
         ]
@@ -82,12 +82,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-search.js\"",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" scripts/user-prompt-search.js",
             "timeout": 2
           },
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hook.mjs\" user-prompt",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" hook.mjs user-prompt",
             "timeout": 5
           }
         ]

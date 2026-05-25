@@ -127,7 +127,8 @@ describe('E2E: Plugin install mode', () => {
     // SessionStart
     const sessionStart = hooks.hooks.SessionStart?.[0]?.hooks?.map(h => h.command) || [];
     expect(sessionStart).toContain('bash "${CLAUDE_PLUGIN_ROOT}/scripts/setup.sh"');
-    expect(sessionStart).toContain('node "${CLAUDE_PLUGIN_ROOT}/hook.mjs" session-start');
+    // v2.84: Node hook entries routed through hook-launcher.mjs for self-heal.
+    expect(sessionStart).toContain('node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs" hook.mjs session-start');
 
     // PreToolUse — two matchers
     const preToolUse = hooks.hooks.PreToolUse;

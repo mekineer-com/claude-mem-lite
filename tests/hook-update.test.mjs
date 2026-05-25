@@ -98,7 +98,7 @@ describe('hook update lifecycle', () => {
     });
     const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
 
-    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
     expect(readFileSync(join(dataDir, 'hook.mjs'), 'utf8')).toContain('new hook');
     expect(readFileSync(join(dataDir, 'package-lock.json'), 'utf8')).toContain('lockfileVersion');
     expect(existsSync(join(dataDir, 'node_modules', 'new.txt'))).toBe(true);
@@ -121,7 +121,7 @@ describe('hook update lifecycle', () => {
     });
     const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
 
-    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
     const installedCli = join(dataDir, 'cli.mjs');
     expect(existsSync(installedCli)).toBe(true);
     // Any of owner/group/other execute bits proves chmod ran (POSIX mode mask)
@@ -137,7 +137,7 @@ describe('hook update lifecycle', () => {
     });
     const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
 
-    expect(installExtractedRelease(releaseDir, dataDir)).toBe(false);
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(false);
     expect(readFileSync(join(dataDir, 'hook.mjs'), 'utf8')).toContain('old hook');
     expect(existsSync(join(dataDir, 'node_modules', 'old.txt'))).toBe(true);
     expect(readdirSync(dataDir).filter(name => name.startsWith('.update-'))).toHaveLength(0);
@@ -168,7 +168,7 @@ describe('hook update lifecycle', () => {
     });
     const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
 
-    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
     // All five curated hook scripts land
     for (const name of ['post-tool-use.sh', 'user-prompt-search.js', 'prompt-search-utils.mjs', 'pre-tool-recall.js', 'pre-skill-bridge.js']) {
       expect(existsSync(join(dataDir, 'scripts', name))).toBe(true);
@@ -176,6 +176,44 @@ describe('hook update lifecycle', () => {
     // Dev-only file + nested helper subdir do not land
     expect(existsSync(join(dataDir, 'scripts', 'mock-claude.mjs'))).toBe(false);
     expect(existsSync(join(dataDir, 'scripts', 'helpers'))).toBe(false);
+  });
+
+  // Regression v2.84: pre-fix, copyReleaseIntoStaging + SWITCHABLE_PATHS used
+  // SOURCE_FILES imported from the *currently-installed* source-files.mjs (i.e.
+  // the local module), so any file added to the manifest in a newer release got
+  // silently dropped during the very auto-update that introduced it. Concrete
+  // hit: v2.80.x → v2.81.0 auto-update copied the new hook.mjs (it was already
+  // in the v2.80 manifest) but skipped lib/cite-back-hint.mjs (added in v2.81)
+  // → hook.mjs ERR_MODULE_NOT_FOUND on first SessionStart, hook chain dead,
+  // self-update can no longer run to repair itself. Fix: read the tarball's
+  // own source-files.mjs and use its SOURCE_FILES / HOOK_SCRIPT_FILES.
+  it('staged install honors the tarball-bundled source-files manifest, not the installed one', async () => {
+    const dataDir = makeDataDir();
+    const releaseDir = makeReleaseDir();
+
+    // A file the *installed* source-files.mjs has no knowledge of, but which
+    // the *tarball* manifest declares ships with the release.
+    const newRelPath = 'lib/added-after-installed.mjs';
+    mkdirSync(join(releaseDir, 'lib'), { recursive: true });
+    writeFileSync(join(releaseDir, newRelPath), '// added in newer release\n');
+    writeFileSync(
+      join(releaseDir, 'source-files.mjs'),
+      "export const SOURCE_FILES = ['hook.mjs', 'server.mjs', 'cli.mjs', 'package.json', 'package-lock.json', 'source-files.mjs', '" +
+        newRelPath +
+        "'];\nexport const HOOK_SCRIPT_FILES = ['post-tool-use.sh'];\n",
+    );
+
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install')) {
+        mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true });
+      }
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    expect(existsSync(join(dataDir, newRelPath))).toBe(true);
+    expect(readFileSync(join(dataDir, newRelPath), 'utf8')).toContain('added in newer release');
   });
 
   // Regression: pre-v2.55 readdirSync + copyFileSync threw EISDIR on any
@@ -194,7 +232,7 @@ describe('hook update lifecycle', () => {
     });
     const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
 
-    expect(installExtractedRelease(releaseDir, dataDir)).toBe(true);
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
     expect(existsSync(join(dataDir, 'registry', 'fixtures', 'sample.json'))).toBe(true);
     expect(existsSync(join(dataDir, 'registry', 'preinstalled.json'))).toBe(true);
   });

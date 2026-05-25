@@ -4,7 +4,7 @@
 import { execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
 import { join, resolve, dirname, isAbsolute } from 'path';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
@@ -553,7 +553,13 @@ async function install() {
   }
   settings.hooks = settings.hooks || {};
 
-  const PREFILTER_PATH = join(INSTALL_DIR, 'scripts', 'post-tool-use.sh');
+  const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
+  const PREFILTER_PATH = join(SCRIPTS_PATH, 'post-tool-use.sh');
+  // v2.84: every Node hook invocation routes through hook-launcher.mjs so an
+  // ERR_MODULE_NOT_FOUND from a partial-install drift auto-heals via
+  // install.mjs repair instead of permanently bricking the hook chain.
+  const LAUNCHER_PATH = join(SCRIPTS_PATH, 'hook-launcher.mjs');
+  const nodeHook = (entry, ...args) => `node "${LAUNCHER_PATH}" ${entry} ${args.join(' ')}`.trim();
 
   const memPostToolUse = {
     matcher: '*',
@@ -568,7 +574,7 @@ async function install() {
     matcher: 'startup|clear|compact',
     hooks: [{
       type: 'command',
-      command: `node "${HOOK_PATH}" session-start`,
+      command: nodeHook('hook.mjs', 'session-start'),
       timeout: 10
     }]
   };
@@ -577,24 +583,22 @@ async function install() {
     matcher: '*',
     hooks: [{
       type: 'command',
-      command: `node "${HOOK_PATH}" stop`,
+      command: nodeHook('hook.mjs', 'stop'),
       timeout: 5
     }]
   };
-
-  const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
 
   const memUserPrompt = {
     matcher: '*',
     hooks: [
       {
         type: 'command',
-        command: `node "${join(SCRIPTS_PATH, 'user-prompt-search.js')}"`,
+        command: nodeHook('scripts/user-prompt-search.js'),
         timeout: 2
       },
       {
         type: 'command',
-        command: `node "${HOOK_PATH}" user-prompt`,
+        command: nodeHook('hook.mjs', 'user-prompt'),
         timeout: 5
       }
     ]
@@ -608,7 +612,7 @@ async function install() {
     hooks: [
       {
         type: 'command',
-        command: `node "${join(SCRIPTS_PATH, 'pre-tool-recall.js')}"`,
+        command: nodeHook('scripts/pre-tool-recall.js'),
         timeout: 3
       }
     ]
@@ -619,7 +623,7 @@ async function install() {
     hooks: [
       {
         type: 'command',
-        command: `node "${join(SCRIPTS_PATH, 'pre-skill-bridge.js')}"`,
+        command: nodeHook('scripts/pre-skill-bridge.js'),
         timeout: 3
       }
     ]
@@ -1758,6 +1762,45 @@ async function manualUpdate() {
   console.log('');
 }
 
+// ─── Repair: Re-sync from latest GitHub Release ─────────────────────────────
+// Recovery path for installs broken by a partial auto-update (most often the
+// stale-manifest bug fixed in v2.84.0: hook-update.mjs copied the new hook.mjs
+// but skipped a new lib/* entry, leaving an ERR_MODULE_NOT_FOUND that
+// permanently disables the hook chain — including the next auto-update that
+// would have healed it). Self-contained: downloads a fresh tarball and spawns
+// the tarball's own install.mjs install, so the recovery path always runs the
+// latest code even when local install.mjs / hook-update.mjs are themselves
+// buggy on disk.
+async function repair() {
+  console.log('\nclaude-mem-lite repair — re-syncing from latest GitHub release\n');
+  const stagingDir = join(tmpdir(), `claude-mem-lite-repair-${Date.now()}`);
+  mkdirSync(stagingDir, { recursive: true });
+  try {
+    const tarballUrl = 'https://api.github.com/repos/sdsrss/claude-mem-lite/tarball';
+    const tarballPath = join(stagingDir, 'release.tgz');
+    log('Downloading latest release tarball...');
+    execFileSync('curl', ['-sL', '-f', '-H', 'Accept: application/vnd.github+json', tarballUrl, '-o', tarballPath],
+      { timeout: 60000, stdio: ['ignore', 'pipe', 'inherit'] });
+    log('Extracting...');
+    execFileSync('tar', ['xzf', tarballPath, '-C', stagingDir, '--strip-components=1'],
+      { timeout: 30000, stdio: ['ignore', 'pipe', 'inherit'] });
+    const tarballInstaller = join(stagingDir, 'install.mjs');
+    if (!existsSync(tarballInstaller)) {
+      fail('Tarball missing install.mjs — repair aborted');
+      process.exit(1);
+    }
+    log('Re-running install from freshly-downloaded sources...');
+    execFileSync(process.execPath, [tarballInstaller, 'install'],
+      { stdio: 'inherit', timeout: 300000 });
+    ok('Repair complete — broken install resynced from latest release');
+  } catch (e) {
+    fail(`Repair failed: ${e.message}`);
+    process.exit(1);
+  } finally {
+    try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 // ─── Release: Sync Versions ─────────────────────────────────────────────────
 
 function syncVersions() {
@@ -1860,6 +1903,9 @@ export async function main(argv = process.argv.slice(2)) {
     case 'update':
       await manualUpdate();
       break;
+    case 'repair':
+      await repair();
+      break;
     case 'release':
       syncVersions();
       if (!flags.has('--no-lock')) regenerateLockfile();
@@ -1889,6 +1935,7 @@ Usage:
   node install.mjs cleanup            Remove stale temp/staging files (use --dry-run to preview)
   node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
   node install.mjs self-update         Check for and install updates
+  node install.mjs repair             Recover a broken install: download latest tarball, re-run install
   node install.mjs release            Sync versions (plugin/marketplace/CLAUDE.md) + regen lockfile via npm@10.9.2 (use --no-lock to skip lock regen)
 
   npx claude-mem-lite                 Install via npx (one-liner)

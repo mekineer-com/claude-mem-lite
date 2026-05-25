@@ -5,10 +5,14 @@
 import { execSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 import { DB_DIR } from './schema.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
-import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
+// Local manifest is fallback only — the active manifest is loaded from the
+// extracted tarball's own source-files.mjs inside installExtractedRelease.
+// See loadReleaseManifest below.
+import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES } from './source-files.mjs';
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
@@ -192,11 +196,42 @@ export function getCurrentVersion() {
   } catch { return '0.0.0'; }
 }
 
-// Source files imported from shared ./source-files.mjs so install.mjs and
-// hook-update.mjs can never drift (see tests/source-files-sync.test.mjs).
 // SWITCHABLE_PATHS = everything in SOURCE_FILES plus the recursive dirs that
-// install.mjs copies as whole subtrees (scripts, registry, node_modules).
-const SWITCHABLE_PATHS = [...SOURCE_FILES, 'scripts', 'registry', 'node_modules'];
+// install.mjs copies as whole subtrees (scripts, registry, node_modules). It's
+// built per-call from the *tarball's* manifest, not the locally-imported one —
+// see loadReleaseManifest comment for why.
+function buildSwitchablePaths(sourceFiles) {
+  return [...sourceFiles, 'scripts', 'registry', 'node_modules'];
+}
+
+// Load the SOURCE_FILES / HOOK_SCRIPT_FILES manifest from the *extracted
+// tarball's* own source-files.mjs. Critical: the locally-imported
+// LOCAL_SOURCE_FILES is frozen at install time, so any entry added in the
+// release we're installing is invisible to the running update. Pre-fix
+// (≤ v2.83.2) used LOCAL_SOURCE_FILES for both copyReleaseIntoStaging and
+// SWITCHABLE_PATHS — v2.80.x → v2.81.0 auto-update copied the new hook.mjs
+// (in the v2.80 manifest) but skipped lib/cite-back-hint.mjs (added in v2.81),
+// breaking SessionStart on every machine that auto-updated and killing the
+// hook chain that would otherwise self-heal on the next round.
+async function loadReleaseManifest(sourceDir) {
+  const manifestPath = join(sourceDir, 'source-files.mjs');
+  if (!existsSync(manifestPath)) {
+    return { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES, source: 'fallback-missing' };
+  }
+  try {
+    const mod = await import(pathToFileURL(manifestPath).href + `?t=${Date.now()}`);
+    if (!Array.isArray(mod.SOURCE_FILES) || mod.SOURCE_FILES.length === 0) {
+      throw new Error('SOURCE_FILES missing or empty');
+    }
+    if (!Array.isArray(mod.HOOK_SCRIPT_FILES)) {
+      throw new Error('HOOK_SCRIPT_FILES missing');
+    }
+    return { SOURCE_FILES: mod.SOURCE_FILES, HOOK_SCRIPT_FILES: mod.HOOK_SCRIPT_FILES, source: 'tarball' };
+  } catch (e) {
+    debugCatch(e, 'loadReleaseManifest');
+    return { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES, source: 'fallback-error' };
+  }
+}
 
 // ── Download & Install ─────────────────────────────────────
 // Direct file copy instead of running old install.mjs (avoids symlink overwrite in dev)
@@ -223,7 +258,7 @@ async function downloadAndInstall(tarballUrl, expectedVersion) {
       return false;
     }
 
-    return installExtractedRelease(tmpDir);
+    return await installExtractedRelease(tmpDir);
   } catch (err) {
     debugCatch(err, 'downloadAndInstall');
     return false;
@@ -271,25 +306,28 @@ export function validateExtractedTarball(sourceDir, expectedVersion, expectedNam
   return { ok: true };
 }
 
-export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
+export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
   const ts = `${Date.now()}-${process.pid}`;
   const stagingDir = join(targetDir, `.update-staging-${ts}`);
   const backupDir = join(targetDir, `.update-backup-${ts}`);
   const backedUp = [];
   const installed = [];
 
+  const manifest = await loadReleaseManifest(sourceDir);
+  const switchablePaths = buildSwitchablePaths(manifest.SOURCE_FILES);
+
   try {
     mkdirSync(stagingDir, { recursive: true });
     mkdirSync(backupDir, { recursive: true });
 
-    copyReleaseIntoStaging(sourceDir, stagingDir);
+    copyReleaseIntoStaging(sourceDir, stagingDir, manifest);
     execSync(NPM_INSTALL_CMD, {
       cwd: stagingDir,
       timeout: 60000,
       stdio: 'pipe',
     });
 
-    for (const relPath of SWITCHABLE_PATHS) {
+    for (const relPath of switchablePaths) {
       const stagedPath = join(stagingDir, relPath);
       if (!existsSync(stagedPath)) continue;
 
@@ -368,10 +406,10 @@ export function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
   }
 }
 
-function copyReleaseIntoStaging(sourceDir, stagingDir) {
+function copyReleaseIntoStaging(sourceDir, stagingDir, manifest = { SOURCE_FILES: LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES: LOCAL_HOOK_SCRIPT_FILES }) {
   let copied = 0;
 
-  for (const f of SOURCE_FILES) {
+  for (const f of manifest.SOURCE_FILES) {
     const src = join(sourceDir, f);
     const dest = join(stagingDir, f);
     if (!existsSync(src)) continue;
@@ -389,7 +427,7 @@ function copyReleaseIntoStaging(sourceDir, stagingDir) {
   const sourceScripts = join(sourceDir, 'scripts');
   if (existsSync(sourceScripts)) {
     mkdirSync(stagingScripts, { recursive: true });
-    for (const name of HOOK_SCRIPT_FILES) {
+    for (const name of manifest.HOOK_SCRIPT_FILES) {
       const src = join(sourceScripts, name);
       if (existsSync(src)) copyFileSync(src, join(stagingScripts, name));
     }

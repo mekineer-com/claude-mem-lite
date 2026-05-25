@@ -56,6 +56,7 @@ case "$tool" in
     ;;
 esac
 
-# Tool not skipped — hand off to Node for full processing
+# Tool not skipped — hand off to Node for full processing.
+# Routed through hook-launcher.mjs (self-heal on ERR_MODULE_NOT_FOUND).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" || exit 1
-printf '%s' "$input" | node "${SCRIPT_DIR}/hook.mjs" post-tool-use
+printf '%s' "$input" | node "${SCRIPT_DIR}/scripts/hook-launcher.mjs" hook.mjs post-tool-use
