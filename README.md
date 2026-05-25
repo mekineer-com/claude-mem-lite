@@ -2,9 +2,13 @@
 
 # claude-mem-lite
 
-Lightweight persistent memory system for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Automatically captures coding observations, decisions, and bug fixes during sessions, then provides full-text search to recall them later.
+`claude-mem-lite` is a **persistent memory** (also called *long-term memory* or *cross-session context*) system for **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — Anthropic's CLI coding agent. It runs as an **[MCP](https://modelcontextprotocol.io/) server** plus a set of Claude Code hooks, automatically capturing coding observations, decisions, and bug fixes during sessions, then providing hybrid full-text + semantic search to recall them later.
 
-Built as an [MCP server](https://modelcontextprotocol.io/) + Claude Code hooks. Zero external services, single SQLite database, minimal overhead.
+Compared to general-purpose LLM memory frameworks like [`mem0`](https://github.com/mem0ai/mem0) or the MCP reference [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) server, claude-mem-lite is purpose-built for Claude Code's hook lifecycle: episode batching cuts LLM calls 7–10× vs the original [claude-mem](https://github.com/thedotmack/claude-mem) (600× lower total cost), and the hybrid FTS5 + TF-IDF retriever benchmarks at 0.88 Recall@10 / 0.96 Precision@10.
+
+> 中文简介：claude-mem-lite 是 Claude Code 的轻量级**持久化记忆 / 长期记忆 / 跨会话上下文**插件，基于 MCP 协议 + 钩子机制，自动捕获编码会话中的决策、修复和上下文，并通过 FTS5 + TF-IDF 混合检索召回。详见 [中文 README](README.zh-CN.md)。
+
+Zero external services. Single SQLite database. Minimal overhead.
 
 ## Why claude-mem-lite?
 
@@ -49,6 +53,22 @@ For a typical 50-tool-call session:
 ### Design philosophy
 
 The original sends **everything to the LLM and hopes it filters well**. claude-mem-lite **filters first with code, then sends only what matters** to a smaller model. This is not a downgrade; it's a smarter architecture that produces equivalent search quality at a fraction of the cost.
+
+### Comparison: memory systems for AI coding agents
+
+How claude-mem-lite differs from the major neighbors in the LLM-memory space (verified May 2026):
+
+| | **claude-mem-lite** | [`mem0`](https://github.com/mem0ai/mem0) | MCP reference [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) | [claude-mem](https://github.com/thedotmack/claude-mem) (original) |
+|---|---|---|---|---|
+| **Target client** | Claude Code only | Any LLM app via SDK | Any MCP client | Claude Code only |
+| **Capture model** | Auto via hooks | Manual `memory.add()` | Manual tool calls (`create_entities`, `add_observations`) | Auto via hooks |
+| **Code-aware retrieval** | FTS5 + 100+ synonym pairs (incl. CJK↔EN) | General-purpose | Generic graph nodes | Code-aware |
+| **Search** | Hybrid: FTS5 BM25 + TF-IDF cosine via RRF | Hybrid: semantic + BM25 + entity linking | Knowledge-graph traversal | FTS5 + Chroma vector |
+| **Storage** | Single local SQLite | Pluggable; Qdrant or configurable vector store | Single JSONL file (knowledge graph) | SQLite + Chroma |
+| **LLM dependency** | Haiku per episode (5–10 ops batched) | LLM per add/search op | None (graph CRUD only) | Sonnet per tool call |
+| **Setup** | One command (`/plugin install` or `npx`) | SDK integration + vector store config | MCP install (per-client) | Bun + Python + Chroma |
+
+**When to pick which**: pick `mem0` if you need a memory layer for a non-Claude-Code app (your own agent, multiple LLM providers). Pick the MCP reference `memory` server if you specifically want a knowledge-graph data model and don't mind invoking memory tools by hand. Pick claude-mem-lite if you want zero-touch automatic capture purpose-built for Claude Code's hook lifecycle, with code-domain retrieval and no external services.
 
 ## Features
 
@@ -641,6 +661,40 @@ npm run benchmark:gate    # CI gate: fails if metrics regress beyond 5% toleranc
 | `MEM_QUIET_HOOKS` | Low-noise hooks. `1` drops the `File Lessons` / `Key Context` sections from SessionStart injection, the lesson suffix from `[mem] Related memories`, and the `WHEN TO USE` / `Decision rules` blocks from MCP server instructions. IDs and the `Recent` table still surface so `mem_get(ids=[…])` remains reachable. Intended for users running the invited-memory adopt path or who otherwise want minimal auto-injection. **Since v2.82.0 this env no longer gates auto-adopt — use `MEM_NO_AUTO_ADOPT=1` for that.** | _(disabled)_ |
 | `MEM_NO_AUTO_ADOPT` | Global opt-out for auto-adopt (v2.82.0+). `1` prevents the first-SessionStart auto-write of the invited-memory sentinel across **all** projects. For per-project opt-out use `claude-mem-lite adopt --disable` instead (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion). | _(disabled)_ |
 | `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. Since v2.82.1 auto-adopt fires on first SessionStart for any install path, so this hint typically surfaces only when you've explicitly opted out (`MEM_NO_AUTO_ADOPT=1` or `claude-mem-lite adopt --disable`). | _(disabled)_ |
+
+## FAQ
+
+### What is a memory system for Claude Code?
+
+A memory system lets Claude Code remember context — coding decisions, bug fixes, file history — across sessions. By default Claude Code's context resets each session; claude-mem-lite persists observations to a local SQLite database and re-injects them at session start and on relevant prompts.
+
+### Does Claude Code have built-in long-term memory?
+
+No. Claude Code's `CLAUDE.md` and `MEMORY.md` files act as static instruction memory, but there is no native dynamic recall of past sessions, bug fixes, or decisions. claude-mem-lite adds that layer via MCP and hooks, with no manual note-taking required.
+
+### How is claude-mem-lite different from mem0 or MCP's reference memory server?
+
+`mem0` and the MCP `memory` server are general-purpose LLM memory frameworks designed for any client. claude-mem-lite is purpose-built for Claude Code's hook lifecycle: it captures *episodes* (batched tool calls), uses domain-specific synonym expansion for code terms (`K8s`, `DB`, `数据库`, ...), and surfaces past observations proactively before file edits via the `PreToolUse:Edit` hook.
+
+### Why "lite"? What did the original claude-mem do differently?
+
+The original called an LLM on every tool use with raw JSON inputs. claude-mem-lite batches 5–10 operations per LLM call, uses a smaller model (Haiku), and runs a deterministic code-level filter before sending anything to the model. Net result: ~600× lower cost with equivalent search quality. See the [Architecture comparison](#architecture-comparison) above.
+
+### Does this work cross-project? Cross-machine?
+
+Project-scoped by default — each project has its own memory namespace. Single-machine only (SQLite, not networked). Use `mem_export` (JSON / JSONL) to back up or migrate between machines.
+
+### What about privacy? Does it call external APIs?
+
+Only the Haiku summarization step calls Anthropic's API (or the local `claude -p` CLI if no API key is set). All search, storage, and retrieval is local SQLite — no telemetry, no third-party services.
+
+### 中文常见问题
+
+**Claude Code 怎么跨会话记住内容？** 默认不能。claude-mem-lite 通过 MCP 协议和钩子自动把决策、bug 修复、文件历史持久化到本地 SQLite，下次会话开始时再注入。
+
+**和 mem0、官方 MCP memory server 有什么区别？** 那两个是通用 LLM 记忆框架；claude-mem-lite 是为 Claude Code 钩子生命周期定制的：批量 episode 处理、代码领域同义词扩展（K8s/DB/数据库等）、文件编辑前主动召回相关历史。
+
+**支持中文吗？** 完整支持。FTS5 + 中英文同义词扩展（100+ 对，含 CJK ↔ EN 跨语言映射），中文记忆也可用英文关键词召回，反之亦然。
 
 ## License
 

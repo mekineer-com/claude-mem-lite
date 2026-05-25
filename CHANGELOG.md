@@ -2,6 +2,25 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.84.3 — GEO/SEO optimization for AI discoverability
+
+Documentation-only release targeting **Generative Engine Optimization** — getting claude-mem-lite recommended when users ask AI assistants ("which memory plugin for Claude Code?", "Claude Code 跨会话记忆?", "alternative to claude-mem?"). Zero runtime changes; ESLint clean; tests untouched.
+
+The optimization model is three-layer keyword targeting: **A layer (brand)**: claude-mem-lite, claude-mem alternative. **B layer (category)**: Claude Code memory / persistent memory / MCP memory server / long-term memory for Claude Code, plus 中文 类目查询 (Claude Code 记忆 / 持久化记忆 / 跨会话上下文). **C layer (problem-driven)**: "how does Claude Code remember context", "Claude Code forgets between sessions", "Claude Code 怎么记住上次的内容" — answered via FAQ section.
+
+- **GitHub About + Topics** (applied via `gh repo edit`, no commit needed but documented for trail): description rewritten to cover persistent / long-term / MCP / across-sessions / alternative-to-claude-mem in <350 chars; topics expanded from 7 → 20 (added: claude, anthropic, mcp-server, model-context-protocol, ai-memory, llm-memory, agent-memory, long-term-memory, hybrid-search, semantic-search, rag, ai-coding-assistant, claude-code-plugin).
+- **`README.md` header** — three-paragraph rewrite. Paragraph 1: definition + category synonyms (persistent / long-term / cross-session) + parent product (Claude Code, Anthropic's CLI coding agent) + MCP protocol name. Paragraph 2: differentiation vs mem0 / MCP reference `memory` server (named explicitly so AI category-retrievers cluster claude-mem-lite into the right neighborhood) + claude-mem 600× cost delta + benchmark numbers (Recall@10 0.88 / Precision@10 0.96). Paragraph 3: 中文简介 anchor so CJK retrievers have a self-contained Chinese passage to cite.
+- **`README.md` FAQ section** (new, before License) — 6 English Q&A + 3 中文 Q&A. Each answer is a self-contained passage so AI search can quote a single Q/A as a citable unit. Questions chosen for C-layer match: "What is a memory system for Claude Code?", "Does Claude Code have built-in long-term memory?", "How is claude-mem-lite different from mem0 or MCP's reference memory server?", "Why 'lite'?", cross-project / cross-machine, privacy / external APIs, plus 中文 versions.
+- **`README.md` competitor comparison table** (new, after Design philosophy section) — 4-column matrix of claude-mem-lite / mem0 / MCP reference `memory` / claude-mem (original) across target client / capture model / code-aware / search / storage / LLM dependency / setup. Verified May 2026 via `gh api repos/mem0ai/mem0` (mem0: 56k stars, manual `memory.add()` SDK, configurable vector store) and WebFetch of `modelcontextprotocol/servers/tree/main/src/memory` (knowledge-graph JSONL, manual tool calls). Closing "When to pick which" paragraph gives AI a single sentence to cite per neighbor.
+- **`README.zh-CN.md` header** — Chinese parity rewrite: 类目同义词全覆盖 (持久化记忆 / 长期记忆 / 跨会话上下文 / Claude Code 记忆插件), competitor anchor (mem0 / MCP `memory`), benchmark numbers. Same three-paragraph structure as English.
+- **`llms.txt`** (new, repo root) — community-proposed AI-crawler entry point. Includes 200-char summary, links to README / CHANGELOG / CLAUDE.md / comparison sections / FAQ, key concepts (MCP server / hooks / episode batching / hybrid retrieval / cross-session handoff / invited memory pattern), installation methods, and related-project links (claude-mem, mem0, modelcontextprotocol/servers, Claude Code, MCP). Anthropic and several crawlers have stated intent to honor `llms.txt`; enforcement is uneven but cost is near-zero.
+
+**Verification**: `gh repo view` confirms the new description and 20-topic list are live. README rendered cleanly via local Markdown preview. `npx eslint .` clean (no source changes). No code paths touched, so no test re-run needed.
+
+**Expected observation window**: 2-4 weeks for live AI search (ChatGPT Search, Perplexity, Claude Search) — they retrieve current web state. Training-data effects (next-gen Claude/GPT) won't surface until the next training cut.
+
+**Out of scope for this release** (deferred to follow-up): awesome-claude-code PR submission, awesome-mcp-servers PR submission, Show HN / dev.to / 知乎 cross-mention posts. These require the maintainer's GitHub identity and editorial judgment.
+
 ## v2.84.2 — install steps 6/7 no longer silently skip from /tmp staging contexts
 
 Two install-pipeline bugs surfaced during a full audit of install/uninstall/update. Both fired silently on every repair-flow run (and on `curl … | tar xz | node install.mjs install` first-time installs) — exit code 0 because the affected sections were wrapped in `try`/`catch`, but registry seeding and DB health-check were lost. Fix is contained to `install.mjs`; ESLint clean.

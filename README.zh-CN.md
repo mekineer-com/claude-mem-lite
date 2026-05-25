@@ -2,9 +2,11 @@
 
 # claude-mem-lite
 
-[Claude Code](https://docs.anthropic.com/en/docs/claude-code) 的轻量级持久化记忆系统。自动捕获编码过程中的观察、决策和问题修复，通过全文搜索随时回溯。
+`claude-mem-lite` 是 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**（Anthropic 官方 CLI 编程代理）的 **持久化记忆系统**（也称 **长期记忆 / 跨会话上下文 / Claude Code 记忆插件**）。它以 **[MCP](https://modelcontextprotocol.io/) 服务器** + Claude Code 钩子（hooks）的形式运行，在编码会话中自动捕获观察记录、决策、bug 修复，并通过 FTS5 全文检索 + TF-IDF 向量的混合检索召回历史上下文。
 
-基于 [MCP 服务器](https://modelcontextprotocol.io/) + Claude Code 钩子构建。无需外部服务，单一 SQLite 数据库，开销极低。
+与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本下降 600 倍），FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.88 / Precision@10 = 0.96**。
+
+无需外部服务。单一 SQLite 数据库。开销极低。
 
 ## 为什么选择 claude-mem-lite？
 
