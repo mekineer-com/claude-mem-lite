@@ -5,7 +5,8 @@ import { execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
 import { join, resolve, dirname, isAbsolute } from 'path';
 import { homedir, tmpdir } from 'os';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { createRequire } from 'node:module';
 
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
@@ -186,9 +187,19 @@ function registerVirtualResources(rdb) {
       );
       count += changes;
 
-      // Backfill FTS5 fields for existing resources
+      // Backfill FTS5 fields for existing resources.
+      // ?N numbered placeholders REQUIRE object-form binding in better-sqlite3 —
+      // positional .run(v1, v2, …) always throws "Too many parameter values"
+      // regardless of arg count. Pre-fix this swallow-warned on every install
+      // (masked by install.mjs:785 import failure before the v2.84.2 path fix).
       if (changes === 0) {
-        updateFts.run(meta.keywords || '', meta.tech_stack || '', meta.use_cases || '', type, name);
+        updateFts.run({
+          1: meta.keywords || '',
+          2: meta.tech_stack || '',
+          3: meta.use_cases || '',
+          4: type,
+          5: name,
+        });
       }
     }
 
@@ -284,6 +295,16 @@ function isDevInstall() {
 
 async function install() {
   console.log('\nclaude-mem-lite installer\n');
+
+  // Resolve dynamic imports against the installed copy at INSTALL_DIR rather
+  // than install.mjs's own directory. Lets install.mjs run correctly from a
+  // /tmp staging dir (repair flow, `curl … | tar xz | node install.mjs install`)
+  // where PROJECT_DIR has no node_modules but INSTALL_DIR does — step 2 below
+  // ran `npm install --cwd INSTALL_DIR`. Pre-fix, steps 6/7 fired
+  // "Cannot find package 'better-sqlite3' imported from /tmp/…/registry.mjs"
+  // and silently skipped registry-DB seeding + DB health check on every repair.
+  const importFromInstall = (rel) => import(pathToFileURL(join(INSTALL_DIR, rel)).href);
+  const requireFromInstall = createRequire(pathToFileURL(join(INSTALL_DIR, 'package.json')).href);
 
   // 1. Install source files to ~/.claude-mem-lite/
   const IS_DEV = flags.has('--dev');
@@ -782,7 +803,7 @@ async function install() {
            (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : ''));
 
         // 6b. Init registry DB and record preinstalled entries
-        const { ensureRegistryDb } = await import('./registry.mjs');
+        const { ensureRegistryDb } = await importFromInstall('registry.mjs');
         const regDbPath = join(DATA_DIR, 'resource-registry.db');
         const rdb = ensureRegistryDb(regDbPath);
 
@@ -830,7 +851,7 @@ async function install() {
 
         // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
         log('  Scanning resources...');
-        const { scanAllResources, diffResources } = await import('./registry-scanner.mjs');
+        const { scanAllResources, diffResources } = await importFromInstall('registry-scanner.mjs');
         const scanned = scanAllResources({ dataDir: DATA_DIR });
 
         // Attach star counts and repo URLs
@@ -846,7 +867,7 @@ async function install() {
         if (toIndex.length > 0) {
           // Use fallback indexing at install time (no Haiku calls)
           // Full Haiku indexing happens on first SessionStart
-          const { upsertResource } = await import('./registry.mjs');
+          const { upsertResource } = await importFromInstall('registry.mjs');
           for (const res of toIndex) {
             try {
               const metaKey = `${res.type}:${res.name}`;
@@ -892,7 +913,7 @@ async function install() {
   // 7. Verify database
   if (existsSync(DB_PATH)) {
     try {
-      const Database = (await import('better-sqlite3')).default;
+      const Database = requireFromInstall('better-sqlite3');
       const db = new Database(DB_PATH, { readonly: true });
       const count = db.prepare('SELECT COUNT(*) as c FROM observations').get();
       db.close();
@@ -914,7 +935,7 @@ async function install() {
       const remote = execFileSync('git', ['-C', PROJECT_DIR, 'config', '--get', 'remote.origin.url'], { encoding: 'utf8', stdio: 'pipe' }).trim();
       const isDogfood = /github\.com[:/]sdsrss\/claude-mem-lite(\.git)?$/i.test(remote);
       if (isDogfood) {
-        const { cmdAdopt } = await import('./adopt-cli.mjs');
+        const { cmdAdopt } = await importFromInstall('adopt-cli.mjs');
         cmdAdopt([]);
         ok('Invited-memory: auto-adopt for claude-mem-lite dogfood repo');
       }

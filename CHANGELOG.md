@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.84.2 — install steps 6/7 no longer silently skip from /tmp staging contexts
+
+Two install-pipeline bugs surfaced during a full audit of install/uninstall/update. Both fired silently on every repair-flow run (and on `curl … | tar xz | node install.mjs install` first-time installs) — exit code 0 because the affected sections were wrapped in `try`/`catch`, but registry seeding and DB health-check were lost. Fix is contained to `install.mjs`; ESLint clean.
+
+- **`install.mjs` steps 6+7 dynamic-import path** — `await import('./registry.mjs')`, `await import('./registry-scanner.mjs')`, `await import('./adopt-cli.mjs')`, `await import('better-sqlite3')` resolved against `PROJECT_DIR` (install.mjs's own dir). When install.mjs runs from a `/tmp` staging dir (the `repair` flow at install.mjs:1786, npx cache, the README curl-pipe one-liner), step 2's `npm install --cwd INSTALL_DIR` puts `node_modules` under `~/.claude-mem-lite/`, NOT next to the running install.mjs — so every dynamic import fired `⚠ Cannot find package 'better-sqlite3' imported from /tmp/…/registry.mjs` and the surrounding section was skipped. Added two helpers at the top of `install()` — `importFromInstall(rel) = import(pathToFileURL(join(INSTALL_DIR, rel)).href)` and `requireFromInstall = createRequire(pathToFileURL(join(INSTALL_DIR, 'package.json')).href)` — and routed the 5 call sites through them. New imports: `pathToFileURL` (from `url`), `createRequire` (from `node:module`).
+- **`install.mjs::registerVirtualResources` `?N` placeholder bind** — the `updateFts` prepared statement uses numbered placeholders `?1`–`?5` but was called with positional spread `.run(v1, v2, v3, v4, v5)`. better-sqlite3 numbered `?N` placeholders REQUIRE object-form binding `{1: v, 2: v, ...}`; positional always throws `RangeError: Too many parameter values were provided` regardless of arg count. This bug existed for the entire history of the file but was hidden by bug #1 — the first failing import short-circuited before reaching this code path. Fixed by switching to object binding. Side effect: 179 "Plugin resources virtual entries" that were silently skipped at every install now register correctly.
+
+**Reproduction (pre-fix)** — full install run from a staging dir surfaced three `⚠` lines:
+```
+⚠ Resource setup: Cannot find package 'better-sqlite3' imported from /tmp/cml-stage.XXXXXX/registry.mjs
+⚠ Database check failed: Cannot find package 'better-sqlite3' imported from /tmp/cml-stage.XXXXXX/install.mjs
+⚠ Resource setup: Too many parameter values were provided    (stack: install.mjs:192 → registerVirtualResources → install.mjs:890)
+```
+
+**Post-fix** — same scenario reports all green: `Repos: 15 cloned`, `Registry DB initialized (186 preinstalled entries)`, `Stars fetched (13/15 repos)`, `Resources registered: 391 indexed`, `Resource metadata curated (FTS5 reindexed)`, `Plugin resources registered: 179 virtual entries`, `Database accessible: N observations`. 0 warnings, 0 errors.
+
+**Test coverage**: existing suite passes (no new tests — the bugs only surface in staging-dir invocation, which the unit suite doesn't exercise; staging behavior is covered by end-to-end sandbox repro documented above and in the audit conversation).
+
+**Action for users**: automatic on upgrade. Anyone who ran `claude-mem-lite repair` since v2.84.0 has a registry DB missing its 179 virtual plugin-resource entries — re-running the upgraded `install.mjs install` (or letting the next session's auto-update fire) populates them.
+
 ## v2.84.1 — recovery guidance in every broken-state error path
 
 Cosmetic UX patch on top of v2.84.0's auto-update self-bootstrap fix. When `install.mjs repair` itself fails (network glitch, malformed tarball, exotic permission state) or `scripts/hook-launcher.mjs` exhausts its self-heal options (6h cooldown, missing local `install.mjs`, retry-after-heal still drifting), the stderr/stdout message now ends with a copy-pasteable tarball one-liner that pulls a fresh release and runs *its* installer — so a stuck user always sees the exit path, not just the error code.
