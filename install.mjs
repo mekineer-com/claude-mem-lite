@@ -1795,6 +1795,11 @@ async function repair() {
     ok('Repair complete — broken install resynced from latest release');
   } catch (e) {
     fail(`Repair failed: ${e.message}`);
+    console.log('');
+    console.log('  Manual fallback — run this in any shell:');
+    console.log('');
+    console.log('  T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install');
+    console.log('');
     process.exit(1);
   } finally {
     try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}

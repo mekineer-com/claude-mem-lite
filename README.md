@@ -498,6 +498,24 @@ Checks Node.js version, dependencies, server/hook files, database integrity, FTS
 
 Shows MCP registration, hook configuration, plugin disabled state, and database stats (observation/session counts).
 
+### Recovery (stuck install / hook errors)
+
+If you see `ERR_MODULE_NOT_FOUND` on PreToolUse:Read/Edit/Skill hooks, or `claude-mem-lite` commands crash with import errors, you're likely hit by a partial auto-update — the updater copied new scripts but missed a sibling `lib/*` file, breaking the hook chain (and the next auto-update that would have healed it).
+
+**v2.84.0+** ships a `repair` subcommand that re-syncs from the latest GitHub release:
+
+```bash
+claude-mem-lite repair
+```
+
+**If `repair` itself fails** (the bin is older than v2.84.0, or the bin is also broken), run this one-liner — it pulls a fresh tarball into a temp dir and runs *that* tarball's `install.mjs`, bypassing every file on your disk:
+
+```bash
+T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install
+```
+
+After it finishes, `~/.claude-mem-lite/` is back in sync with the latest release and `claude-mem-lite repair` is available for next time.
+
 ## Uninstall
 
 ```bash

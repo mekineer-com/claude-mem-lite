@@ -460,6 +460,24 @@ npx claude-mem-lite doctor            # 诊断问题
 
 显示 MCP 注册状态、钩子配置、插件禁用状态和数据库统计（观察/会话数量）。
 
+### 故障恢复（安装卡死 / hook 报错）
+
+如果你看到 PreToolUse:Read/Edit/Skill hook 报 `ERR_MODULE_NOT_FOUND`，或者 `claude-mem-lite` 命令本身因为 import 错误崩溃，多半是被部分自动更新坑了——更新器复制了新脚本但漏了配套的 `lib/*` 文件，hook 链就此断掉（连下一次本可自愈的自动更新也跑不了）。
+
+**v2.84.0+** 提供 `repair` 子命令，从 GitHub 最新 release 重新同步：
+
+```bash
+claude-mem-lite repair
+```
+
+**如果 `repair` 自己也跑不起来**（bin 比 v2.84.0 旧，或 bin 也坏了），用这条单行命令——它把最新 tarball 拉到临时目录、跑 *那份* tarball 里的 `install.mjs`，完全不依赖你磁盘上的任何文件：
+
+```bash
+T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install
+```
+
+跑完之后，`~/.claude-mem-lite/` 就和最新 release 对齐，`claude-mem-lite repair` 下次再遇到类似问题也能直接用了。
+
 ## 卸载
 
 ```bash

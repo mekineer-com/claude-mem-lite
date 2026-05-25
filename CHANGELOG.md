@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.84.1 — recovery guidance in every broken-state error path
+
+Cosmetic UX patch on top of v2.84.0's auto-update self-bootstrap fix. When `install.mjs repair` itself fails (network glitch, malformed tarball, exotic permission state) or `scripts/hook-launcher.mjs` exhausts its self-heal options (6h cooldown, missing local `install.mjs`, retry-after-heal still drifting), the stderr/stdout message now ends with a copy-pasteable tarball one-liner that pulls a fresh release and runs *its* installer — so a stuck user always sees the exit path, not just the error code.
+
+- **`install.mjs::repair` catch (install.mjs:1796-1804)** — failure path now prints the manual tarball one-liner after `Repair failed: <msg>`. Reaches users whose `claude-mem-lite repair` ran but bombed mid-flight (curl/tar/spawn error).
+- **`scripts/hook-launcher.mjs` (3 error paths)** — new `TARBALL_FALLBACK` constant (pure string literal; no new imports, preserves the launcher's hard `node:`-only constraint). Cooldown-skip branch, `install.mjs missing` branch, and retry-after-heal-still-failing branch all append the tarball command. The launcher's whole job is to survive a broken install — printing recovery in the one place users actually see when launcher itself can't heal is the missing piece.
+- **`README.md` + `README.zh-CN.md` (new `### Recovery` / `### 故障恢复` subsection)** — documents the symptom (PreToolUse:Read/Edit/Skill `ERR_MODULE_NOT_FOUND`), the v2.84.0+ `claude-mem-lite repair` path, and the tarball fallback for users whose bin is older than v2.84.0 (the v2.83.x crowd hit by the original bug — `repair` doesn't exist there and `claude-mem-lite help` itself crashes on the missing-import).
+
+**Test coverage**: 2512 tests / 113 files pass (unchanged — error-string change, no behavioral test). ESLint clean. Smoke-tested hook-launcher cooldown-skip path manually: stderr now emits both `claude-mem-lite repair` and the tarball one-liner.
+
+**Action for users**: automatic on upgrade. The new error messages reach only *future* broken states — users currently stuck on v2.83.x still need to copy the tarball command from README once. After they recover to v2.84.1, every subsequent self-heal failure tells them how to recover without leaving the terminal.
+
 ## v2.84.0 — auto-update self-bootstrap fix + repair command + hook-launcher self-heal
 
 Fixes a latent bug in the auto-updater that bricked every install crossing a release boundary that added a new file under `lib/` (most recently v2.80.x → v2.81.0, which added `lib/cite-back-hint.mjs` and left every auto-updated machine with `hook.mjs` ERR_MODULE_NOT_FOUND on first SessionStart — including the next auto-update that would have healed it). Adds two layers of defense so this class of drift cannot recur silently.

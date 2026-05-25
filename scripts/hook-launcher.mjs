@@ -32,6 +32,13 @@ const RUNTIME_DIR = process.env.CLAUDE_MEM_DIR
 const HEAL_MARKER = join(RUNTIME_DIR, 'hook-launcher-lastheal');
 const HEAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
+// Last-resort recovery string for users whose `claude-mem-lite repair` path
+// itself failed (install.mjs missing / repair errored / retry still drifting).
+// Duplicated in install.mjs::repair() catch; both are reachable when local
+// scripts are broken, so neither can import a shared constant.
+const TARBALL_FALLBACK =
+  'T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install';
+
 const [, , entryArg, ...rest] = process.argv;
 if (!entryArg) {
   process.stderr.write('[claude-mem-lite] hook-launcher: missing entry argument\n');
@@ -74,7 +81,9 @@ function recordHealAttempt() {
 async function attemptHeal(reason) {
   if (recentHealAttempt()) {
     process.stderr.write(
-      `[claude-mem-lite] Self-heal skipped (last attempt < 6h ago). Manual recovery: claude-mem-lite repair\n`,
+      `[claude-mem-lite] Self-heal skipped (last attempt < 6h ago).\n` +
+      `[claude-mem-lite] Manual recovery: claude-mem-lite repair\n` +
+      `[claude-mem-lite] If that fails, run: ${TARBALL_FALLBACK}\n`,
     );
     return false;
   }
@@ -82,7 +91,10 @@ async function attemptHeal(reason) {
   process.stderr.write(`[claude-mem-lite] Detected broken install (${reason}) — running self-heal\n`);
   const installer = join(INSTALL_DIR, 'install.mjs');
   if (!existsSync(installer)) {
-    process.stderr.write(`[claude-mem-lite] install.mjs missing at ${installer} — cannot self-heal\n`);
+    process.stderr.write(
+      `[claude-mem-lite] install.mjs missing at ${installer} — cannot self-heal\n` +
+      `[claude-mem-lite] Manual recovery: ${TARBALL_FALLBACK}\n`,
+    );
     return false;
   }
   const result = spawnSync(process.execPath, [installer, 'repair'], {
@@ -102,7 +114,10 @@ try {
   try {
     await runEntry({ bustCache: true });
   } catch (retryErr) {
-    process.stderr.write(`[claude-mem-lite] Hook still failing after self-heal: ${retryErr.message}\n`);
+    process.stderr.write(
+      `[claude-mem-lite] Hook still failing after self-heal: ${retryErr.message}\n` +
+      `[claude-mem-lite] Manual recovery: ${TARBALL_FALLBACK}\n`,
+    );
     process.exit(1);
   }
 }
