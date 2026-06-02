@@ -7,7 +7,7 @@ import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
-import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI } from './haiku-client.mjs';
+import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs only pulls in fs/path/os/crypto;
 // adopt-content.mjs is pure strings. No circular deps — memdir doesn't import hook-shared.
 import { memdirPath as _memdirPath, isAdopted as _isAdopted } from './memdir.mjs';
@@ -130,13 +130,26 @@ export function openDb() {
   }
 }
 
-// ─── LLM via claude CLI ─────────────────────────────────────────────────────
+// ─── LLM (provider-routed: Anthropic API → OpenRouter → claude CLI) ─────────
 
 // Accepts either a plain string (legacy) or {system, user} (defense-in-depth
 // against prompt injection from poisoned user_prompts content — cso F#4 fix).
-// CLI mode renders the {system, user} form via flattenForCLI which inserts an
-// explicit data-boundary marker; API mode uses the system role natively.
-export function callLLM(prompt, timeoutMs = 15000) {
+// Provider priority mirrors haiku-client (ANTHROPIC_API_KEY > OPENROUTER_API_KEY
+// > CLI): when a key is present, delegate to callHaiku — it owns the Anthropic
+// Messages / OpenRouter chat-completions request shapes, uses the system role
+// natively, AND degrades to the `claude -p` CLI internally if the keyed provider
+// fails (so a region-blocked / out-of-credit key still yields a summary). The
+// keyless case shells out to `claude -p` directly here, where flattenForCLI
+// renders {system, user} with an explicit data-boundary marker. Returns the raw
+// response string (callers run parseJsonFromLLM themselves) or null.
+// maxTokens is sized for session-summary / episode JSON (larger than the
+// registry/optimize callers' budgets).
+export async function callLLM(prompt, timeoutMs = 15000) {
+  if (detectLLMMode() !== 'cli') {
+    const result = await callHaiku(prompt, { timeout: timeoutMs, maxTokens: 2000 });
+    return result?.text ?? null;
+  }
+
   const { cli: modelName } = resolveModelShared();
   try {
     const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName], {

@@ -54,6 +54,13 @@ function runHook(event, { stdin, env = {}, args = [] } = {}) {
     HOME: env.HOME || process.env.HOME,
     CLAUDE_PROJECT_DIR: env.CLAUDE_PROJECT_DIR || projectDir,
     CLAUDE_CODE_PATH: env.CLAUDE_CODE_PATH || MOCK_CLAUDE,
+    // These e2e tests drive the LLM through MOCK_CLAUDE (cli mode). The dev/CI
+    // shell may export real ANTHROPIC_API_KEY / OPENROUTER_API_KEY, which would
+    // flip detectMode() to api/openrouter and bypass the mock with a live
+    // network call. Clear both by default (deleted below); a test that wants an
+    // API path can still set them via the `env` arg, which is spread last.
+    ANTHROPIC_API_KEY: undefined,
+    OPENROUTER_API_KEY: undefined,
     CLAUDE_MEM_HOOK_RUNNING: undefined, // Don't inherit — let hooks run
     CLAUDE_MEM_DEBUG: '1',
     CLAUDE_MEM_SKIP_UPDATE: '1', // Skip auto-update network calls in tests

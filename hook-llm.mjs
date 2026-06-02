@@ -674,7 +674,7 @@ ${actionList}`;
   if (gotSlot) {
     let raw, parsed;
     try {
-      raw = callLLM(prompt);
+      raw = await callLLM(prompt);
       parsed = parseJsonFromLLM(raw);
     } finally {
       releaseLLMSlot();
@@ -721,7 +721,7 @@ ${actionList}`;
         retryAttempted = true;
         try {
           const retryPrompt = buildLessonRetryPrompt(episode, parsed);
-          const retryRaw = callLLM(retryPrompt, 10000);
+          const retryRaw = await callLLM(retryPrompt, 10000);
           if (retryRaw) {
             const retry = parseJsonFromLLM(retryRaw);
             const retryLesson = typeof retry?.lesson === 'string' ? retry.lesson.trim() : '';
@@ -974,7 +974,7 @@ ${obsList}`;
 
     let raw, llmParsed;
     try {
-      raw = callLLM(prompt, 20000);
+      raw = await callLLM(prompt, 20000);
       llmParsed = parseJsonFromLLM(raw);
     } finally {
       releaseLLMSlot();

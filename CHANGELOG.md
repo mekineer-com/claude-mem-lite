@@ -2,6 +2,32 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.86.0 — OpenRouter provider support + LLM provider failure fallback
+
+**feat: OpenRouter as a second API provider for all background LLM calls.** Provider priority
+is now `ANTHROPIC_API_KEY` (direct Anthropic Messages API) → `OPENROUTER_API_KEY` (OpenRouter's
+OpenAI-compatible chat-completions API) → `claude -p` CLI. `detectMode()` in `haiku-client.mjs`
+became 3-way; `callOpenRouterAPI` builds the OpenAI request shape (Bearer auth, system-role
+message, reply at `choices[0].message.content`) — Anthropic's `cache_control` has no OpenAI
+equivalent and is omitted. Model tiering is preserved: `CLAUDE_MEM_MODEL=haiku|sonnet` maps to
+`anthropic/claude-haiku-4.5` / `anthropic/claude-sonnet-4.5`, and `OPENROUTER_MODEL` overrides
+the slug entirely (point it at any OpenRouter model, e.g. `openai/gpt-4o-mini`).
+
+**feat: unified the two LLM subsystems.** `hook-shared.callLLM` — the core session-summary /
+title / episode path, previously CLI-only and synchronous — now routes through the same provider
+priority (it became `async`; the three call sites in `hook-llm.mjs` gained `await`). Note: users
+with `ANTHROPIC_API_KEY` set previously had core summaries go through the `claude` CLI; they now
+use the Anthropic API directly.
+
+**feat: keyed-provider failure falls back to the CLI.** When the Anthropic / OpenRouter call
+fails (HTTP error, network throw, or empty response), `callHaiku` / `callLLMWithModel` degrade to
+`claude -p` instead of dropping the call. CLI is terminal (no loop, no cross-provider retry), so a
+region-blocked or out-of-credit key still produces summaries. Live-verified end-to-end against a
+region-blocked OpenRouter account (HTTP 403 → CLI fallback → real output).
+
+Docs: `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` documented in both READMEs'
+environment-variable tables.
+
 ## v2.85.0 — cross-project effectiveness audit: fix the citation-decay feedback loop + injection hygiene
 
 A cross-project audit (analyzing how the plugin behaved across daagu / code-graph-mcp /

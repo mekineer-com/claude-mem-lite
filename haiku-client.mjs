@@ -1,7 +1,9 @@
 // claude-mem-lite: Unified LLM call wrapper
 // Shared by memory (hook.mjs) and dispatch modules
-// Auto-detects API key for direct calls, falls back to claude CLI
-// Model configurable via CLAUDE_MEM_MODEL env var (default: haiku)
+// Provider priority: ANTHROPIC_API_KEY (direct Anthropic API) →
+// OPENROUTER_API_KEY (OpenRouter, OpenAI-compatible) → claude CLI fallback
+// Model configurable via CLAUDE_MEM_MODEL (haiku|sonnet); OpenRouter slug
+// overridable via OPENROUTER_MODEL
 
 import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
@@ -30,18 +32,47 @@ export function resolveModel() {
   return { cli, api };
 }
 
+// OpenRouter uses its own slug namespace (OpenAI-compatible API). Map the
+// project's haiku/sonnet tiers to the matching anthropic/* slugs so the quality
+// tiering is preserved when routing through OpenRouter. Slugs verified against
+// openrouter.ai (2026-06): claude-haiku-4.5 / claude-sonnet-4.5 mirror the
+// native MODEL_MAP IDs above.
+const OPENROUTER_MODEL_MAP = {
+  haiku: 'anthropic/claude-haiku-4.5',
+  sonnet: 'anthropic/claude-sonnet-4.5',
+};
+
+/**
+ * Resolve the OpenRouter model slug for a given tier.
+ * OPENROUTER_MODEL (if set, non-blank) overrides every tier with an explicit
+ * slug — this is how users point claude-mem-lite at any OpenRouter model
+ * (e.g. openai/gpt-4o-mini, qwen/...). Otherwise the tier maps to its default
+ * anthropic/* slug, falling back to the haiku slug for unknown tiers.
+ * @param {string} tier 'haiku' | 'sonnet'
+ * @returns {string} OpenRouter model slug
+ */
+export function resolveOpenRouterModel(tier) {
+  const override = (process.env.OPENROUTER_MODEL || '').trim();
+  if (override) return override;
+  return OPENROUTER_MODEL_MAP[tier] || OPENROUTER_MODEL_MAP.haiku;
+}
+
 // ─── Mode Detection ──────────────────────────────────────────────────────────
 
 let _mode = null;
 
 /**
- * Detect whether to use direct API or CLI for LLM calls.
- * Cached after first call.
- * @returns {'api'|'cli'} The detected mode
+ * Detect which provider to use for LLM calls. Priority (per user contract):
+ * ANTHROPIC_API_KEY → direct Anthropic API ('api', native, supports prompt
+ * caching), else OPENROUTER_API_KEY → OpenRouter ('openrouter', OpenAI-compat),
+ * else fall back to the `claude` CLI ('cli'). Cached after first call.
+ * @returns {'api'|'openrouter'|'cli'} The detected mode
  */
 export function detectMode() {
   if (_mode) return _mode;
-  _mode = process.env.ANTHROPIC_API_KEY ? 'api' : 'cli';
+  if (process.env.ANTHROPIC_API_KEY) _mode = 'api';
+  else if (process.env.OPENROUTER_API_KEY) _mode = 'openrouter';
+  else _mode = 'cli';
   const { cli } = resolveModel();
   debugLog('DEBUG', 'haiku-client', `mode: ${_mode}, model: ${cli}`);
   return _mode;
@@ -102,8 +133,9 @@ export function flattenForCLI(input) {
 
 /**
  * Call Haiku model with a prompt. Returns parsed text or null on failure.
- * Uses direct API when ANTHROPIC_API_KEY is available, otherwise falls back to CLI.
- * Never throws — returns null on any error.
+ * Provider priority ANTHROPIC_API_KEY → OPENROUTER_API_KEY → CLI; if the keyed
+ * provider call fails (HTTP error / network throw / empty), degrades to the
+ * `claude -p` CLI. Never throws — returns null only when every path fails.
  *
  * @param {string|{system?: string, user: string}} prompt Prompt text, or split form
  * @param {object} [opts] Options
@@ -116,15 +148,28 @@ export async function callHaiku(prompt, { timeout = 10000, maxTokens = 500 } = {
 
   const mode = detectMode();
 
-  try {
-    if (mode === 'api') {
-      return await callHaikuAPI(prompt, { timeout, maxTokens });
-    }
-    return callHaikuCLI(prompt, { timeout });
-  } catch (e) {
-    debugCatch(e, 'callHaiku');
-    return null;
+  // CLI is terminal — no provider to fall back to.
+  if (mode === 'cli') {
+    try { return callHaikuCLI(prompt, { timeout }); }
+    catch (e) { debugCatch(e, 'callHaiku'); return null; }
   }
+
+  // Keyed provider (api/openrouter): attempt it, then degrade to the CLI on any
+  // failure (HTTP error → null, or network/timeout throw). A region-blocked or
+  // out-of-credit key must not silently drop background summaries.
+  let primary = null;
+  try {
+    primary = mode === 'api'
+      ? await callHaikuAPI(prompt, { timeout, maxTokens })
+      : await callOpenRouterAPI(prompt, resolveModel().cli, { timeout, maxTokens });
+  } catch (e) {
+    debugCatch(e, `callHaiku:${mode}`);
+  }
+  if (primary) return primary;
+
+  debugLog('WARN', 'haiku-client', `${mode} call failed, falling back to claude CLI`);
+  try { return callHaikuCLI(prompt, { timeout }); }
+  catch (e) { debugCatch(e, 'callHaiku:cli-fallback'); return null; }
 }
 
 /**
@@ -143,8 +188,8 @@ export async function callHaikuJSON(prompt, opts) {
 
 /**
  * Call LLM with explicit model selection. Supports 'haiku' and 'sonnet'.
- * Reuses existing API/CLI dual-mode infrastructure.
- * Never throws — returns null on any error.
+ * Same provider priority + failure fallback to CLI as callHaiku.
+ * Never throws — returns null only when every path fails.
  *
  * @param {string} prompt The prompt text
  * @param {'haiku'|'sonnet'} model Model to use (default: 'haiku')
@@ -158,15 +203,27 @@ export async function callLLMWithModel(prompt, model = 'haiku', { timeout = 1500
   const resolvedModel = MODEL_MAP[model] ? model : 'haiku';
   const mode = detectMode();
 
-  try {
-    if (mode === 'api') {
-      return await callModelAPI(prompt, resolvedModel, { timeout, maxTokens });
-    }
-    return callModelCLI(prompt, resolvedModel, { timeout });
-  } catch (e) {
-    debugCatch(e, `callLLMWithModel:${resolvedModel}`);
-    return null;
+  // CLI is terminal — no provider to fall back to.
+  if (mode === 'cli') {
+    try { return callModelCLI(prompt, resolvedModel, { timeout }); }
+    catch (e) { debugCatch(e, `callLLMWithModel:${resolvedModel}`); return null; }
   }
+
+  // Keyed provider (api/openrouter): attempt it, then degrade to the CLI on any
+  // failure so a region-blocked / out-of-credit key still produces output.
+  let primary = null;
+  try {
+    primary = mode === 'api'
+      ? await callModelAPI(prompt, resolvedModel, { timeout, maxTokens })
+      : await callOpenRouterAPI(prompt, resolvedModel, { timeout, maxTokens });
+  } catch (e) {
+    debugCatch(e, `callLLMWithModel:${mode}:${resolvedModel}`);
+  }
+  if (primary) return primary;
+
+  debugLog('WARN', 'haiku-client', `${mode} call failed, falling back to claude CLI (${resolvedModel})`);
+  try { return callModelCLI(prompt, resolvedModel, { timeout }); }
+  catch (e) { debugCatch(e, `callLLMWithModel:cli-fallback:${resolvedModel}`); return null; }
 }
 
 /**
@@ -293,6 +350,54 @@ async function callHaikuAPI(prompt, { timeout, maxTokens }) {
 
     const data = await res.json();
     const text = data.content?.[0]?.text;
+    return text ? { text } : null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ─── OpenRouter Mode ─────────────────────────────────────────────────────────
+
+// OpenRouter exposes an OpenAI-compatible chat-completions API (NOT the
+// Anthropic Messages format), so the request/response shapes differ from
+// callHaikuAPI/callModelAPI: Bearer auth, `messages` with a system-role entry,
+// and the reply lives at choices[0].message.content. Anthropic's prompt-cache
+// `cache_control` field has no OpenAI-format equivalent and is omitted.
+// `tier` is the resolved model tier ('haiku'|'sonnet'); OPENROUTER_MODEL can
+// override the resulting slug entirely (see resolveOpenRouterModel).
+async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens }) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return null;
+
+  const model = resolveOpenRouterModel(tier);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const { system, user } = splitPrompt(prompt);
+    const messages = [];
+    if (system) messages.push({ role: 'system', content: system });
+    messages.push({ role: 'user', content: user });
+
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        // Optional OpenRouter attribution headers (ignored by the API if absent).
+        'X-Title': 'claude-mem-lite',
+      },
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      debugLog('WARN', `${tier}-openrouter`, `HTTP ${res.status}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content;
     return text ? { text } : null;
   } finally {
     clearTimeout(timer);
