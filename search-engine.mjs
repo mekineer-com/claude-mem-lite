@@ -257,11 +257,12 @@ export function searchObservationsHybrid(db, ctx) {
       project: args.project ?? null,
       type: args.obs_type ?? null,
       vocabVersion: vocab.version,
+      minCosine: ctx.minCosine,   // undefined → MIN_COSINE_SIMILARITY (benchmark sweep override)
     });
     if (vecResults.length === 0) return results;
 
     if (results.length > 0) {
-      const rrfRanking = rrfMerge(results, vecResults);
+      const rrfRanking = rrfMerge(results, vecResults, ctx.rrfK);  // undefined → RRF_K
       const resultMap = new Map(results.map(r => [r.id, r]));
       for (const vr of vecResults) {
         if (!resultMap.has(vr.id)) {

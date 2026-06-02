@@ -20,6 +20,14 @@ const MODEL_MAP = {
   sonnet: 'claude-sonnet-4-5-20250929',
 };
 
+// Every background LLM call here is fixed-schema extraction / classification
+// (episode→JSON, type/merge classification, synonym + metadata extraction) whose
+// output is consumed deterministically (JSON.parse, MinHash dedup). Pin temperature
+// to 0 so the provider default (~1.0) doesn't inject wording variance that breaks
+// JSON parsing or defeats the wording-sensitive MinHash near-duplicate detector.
+// A call that genuinely needs sampling can pass opts.temperature to override.
+const DEFAULT_LLM_TEMPERATURE = 0;
+
 /**
  * Resolve the LLM model to use for background calls.
  * Reads CLAUDE_MEM_MODEL env var, defaults to 'haiku'.
@@ -143,7 +151,7 @@ export function flattenForCLI(input) {
  * @param {number} [opts.maxTokens=500] Max tokens in response
  * @returns {Promise<{text: string}|null>} Response or null on failure
  */
-export async function callHaiku(prompt, { timeout = 10000, maxTokens = 500 } = {}) {
+export async function callHaiku(prompt, { timeout = 10000, maxTokens = 500, temperature = DEFAULT_LLM_TEMPERATURE } = {}) {
   if (!prompt) return null;
 
   const mode = detectMode();
@@ -160,8 +168,8 @@ export async function callHaiku(prompt, { timeout = 10000, maxTokens = 500 } = {
   let primary = null;
   try {
     primary = mode === 'api'
-      ? await callHaikuAPI(prompt, { timeout, maxTokens })
-      : await callOpenRouterAPI(prompt, resolveModel().cli, { timeout, maxTokens });
+      ? await callHaikuAPI(prompt, { timeout, maxTokens, temperature })
+      : await callOpenRouterAPI(prompt, resolveModel().cli, { timeout, maxTokens, temperature });
   } catch (e) {
     debugCatch(e, `callHaiku:${mode}`);
   }
@@ -198,7 +206,7 @@ export async function callHaikuJSON(prompt, opts) {
  * @param {number} [opts.maxTokens=1000] Max tokens in response
  * @returns {Promise<{text: string}|null>} Response or null on failure
  */
-export async function callLLMWithModel(prompt, model = 'haiku', { timeout = 15000, maxTokens = 1000 } = {}) {
+export async function callLLMWithModel(prompt, model = 'haiku', { timeout = 15000, maxTokens = 1000, temperature = DEFAULT_LLM_TEMPERATURE } = {}) {
   if (!prompt) return null;
   const resolvedModel = MODEL_MAP[model] ? model : 'haiku';
   const mode = detectMode();
@@ -214,8 +222,8 @@ export async function callLLMWithModel(prompt, model = 'haiku', { timeout = 1500
   let primary = null;
   try {
     primary = mode === 'api'
-      ? await callModelAPI(prompt, resolvedModel, { timeout, maxTokens })
-      : await callOpenRouterAPI(prompt, resolvedModel, { timeout, maxTokens });
+      ? await callModelAPI(prompt, resolvedModel, { timeout, maxTokens, temperature })
+      : await callOpenRouterAPI(prompt, resolvedModel, { timeout, maxTokens, temperature });
   } catch (e) {
     debugCatch(e, `callLLMWithModel:${mode}:${resolvedModel}`);
   }
@@ -239,7 +247,7 @@ export async function callModelJSON(prompt, model = 'haiku', opts) {
   return parseJsonFromLLM(result.text);
 }
 
-async function callModelAPI(prompt, model, { timeout, maxTokens }) {
+async function callModelAPI(prompt, model, { timeout, maxTokens, temperature = DEFAULT_LLM_TEMPERATURE }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
 
@@ -252,6 +260,7 @@ async function callModelAPI(prompt, model, { timeout, maxTokens }) {
     const body = {
       model: modelId,
       max_tokens: maxTokens,
+      temperature,
       messages: [{ role: 'user', content: user }],
     };
     // System slot is constant per call type (instructions, schema, type taxonomy)
@@ -312,7 +321,7 @@ function callModelCLI(prompt, model, { timeout }) {
 
 // ─── API Mode ────────────────────────────────────────────────────────────────
 
-async function callHaikuAPI(prompt, { timeout, maxTokens }) {
+async function callHaikuAPI(prompt, { timeout, maxTokens, temperature = DEFAULT_LLM_TEMPERATURE }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
 
@@ -325,6 +334,7 @@ async function callHaikuAPI(prompt, { timeout, maxTokens }) {
     const body = {
       model: modelId,
       max_tokens: maxTokens,
+      temperature,
       messages: [{ role: 'user', content: user }],
     };
     // See callModelAPI: cache_control on the constant system slot.
@@ -365,7 +375,7 @@ async function callHaikuAPI(prompt, { timeout, maxTokens }) {
 // `cache_control` field has no OpenAI-format equivalent and is omitted.
 // `tier` is the resolved model tier ('haiku'|'sonnet'); OPENROUTER_MODEL can
 // override the resulting slug entirely (see resolveOpenRouterModel).
-async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens }) {
+async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens, temperature = DEFAULT_LLM_TEMPERATURE }) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return null;
 
@@ -387,7 +397,7 @@ async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens }) {
         // Optional OpenRouter attribution headers (ignored by the API if absent).
         'X-Title': 'claude-mem-lite',
       },
-      body: JSON.stringify({ model, max_tokens: maxTokens, messages }),
+      body: JSON.stringify({ model, max_tokens: maxTokens, temperature, messages }),
       signal: controller.signal,
     });
 

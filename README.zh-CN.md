@@ -4,7 +4,7 @@
 
 `claude-mem-lite` 是 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**（Anthropic 官方 CLI 编程代理）的 **持久化记忆系统**（也称 **长期记忆 / 跨会话上下文 / Claude Code 记忆插件**）。它以 **[MCP](https://modelcontextprotocol.io/) 服务器** + Claude Code 钩子（hooks）的形式运行，在编码会话中自动捕获观察记录、决策、bug 修复，并通过 FTS5 全文检索 + TF-IDF 向量的混合检索召回历史上下文。
 
-与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本下降 600 倍），FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.88 / Precision@10 = 0.96**。
+与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.88 / Precision@10 = 0.96**。
 
 无需外部服务。单一 SQLite 数据库。开销极低。
 
@@ -27,15 +27,15 @@
 
 ### Token 与成本效率
 
-以典型的 50 次工具调用的会话为例：
+以典型的 50 次工具调用的会话为例（成本模型示意 —— 下列比率由批大小、token 量与模型定价**估算**得出，并非端到端实测）：
 
-| | claude-mem | claude-mem-lite | 比率 |
+| | claude-mem | claude-mem-lite | 比率（估算） |
 |---|---|---|---|
-| LLM 调用次数 | ~50（每次工具使用） | ~5-8（按 episode） | **减少 7-10 倍** |
-| 每次调用 token | 1,000-5,000（原始 JSON + 历史） | 200-500（仅摘要） | **减少 5-10 倍** |
-| 总 token 量 | ~100K-250K | ~1K-4K | **减少 50-100 倍** |
-| 模型成本 | Sonnet ($3/$15 每百万) | Haiku ($0.25/$1.25 每百万) | **便宜 12 倍** |
-| 综合节省 | | | **成本降低 600 倍+** |
+| LLM 调用次数 | ~50（每次工具使用） | ~5-8（按 episode） | **约减少 7-10 倍** |
+| 每次调用 token | 1,000-5,000（原始 JSON + 历史） | 200-500（仅摘要） | **约减少 5-10 倍** |
+| 总 token 量 | ~100K-250K | ~1K-4K | **约减少 50-100 倍** |
+| 模型成本 | Sonnet ($3/$15 每百万) | Haiku ($0.25/$1.25 每百万) | **约便宜 12 倍** |
+| 综合节省 | | | **成本降低约 600 倍（估算）** |
 
 ### 质量对比
 

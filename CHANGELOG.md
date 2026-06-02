@@ -2,6 +2,47 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.89.0 — audit bundle (P4–P10): citation-decay value signals, compress vector parity, FTS trigger scoping
+
+**fix: `events_fts_au` trigger narrowed to `AFTER UPDATE OF title, body` (schema v36).** The
+events-table FTS triggers were hand-written inline in v2.31 and inherited the pre-v27 broad
+`AFTER UPDATE ON events` form, so every non-indexed write (importance / accessed_count /
+citation-decay bumps) thrashed `events_fts` with a delete+reinsert cycle and re-introduced the
+`SQLITE_CORRUPT_VTAB` blast radius v27 had fixed for the other FTS tables. Scoped to the two
+indexed columns; a v36 conditional-drop migration replaces the legacy trigger on existing DBs.
+
+**fix: the deterministic compress path now writes `observation_vectors` in-transaction.**
+`compressGroup` (the single core behind CLI / MCP / hook compaction) inserted the weekly-summary
+observation but skipped its TF-IDF vector, so FTS-miss queries that fall back to vector recall
+(CJK / concept / paraphrase) could never reach compressed summaries — the LLM smart-compress path
+already did this, so the deterministic path was the lone gap. Fixed once in `lib/compress-core.mjs`.
+
+**feat: citation-decay gains a behavioral cite-back signal and a project adoption-rate gate.**
+Previously "cited" meant only a literal `#NN` in main-thread text, and demotion ran even in
+projects that never adopted the `#NN` convention. Now editing a file a prior lesson warned about
+counts as a behavioral citation (promotes it), and demotion is suppressed when a project's
+cite-rate is near zero over enough resolutions (`computeCitationAdoption`; env
+`CLAUDE_MEM_CITATION_ADOPTION_THRESHOLD`). Promotion is never gated, so one citation re-enables decay.
+
+**feat: all background LLM extraction/classification calls pinned to `temperature: 0`.** Every
+call here is fixed-schema extraction feeding deterministic consumers (`JSON.parse`, wording-sensitive
+MinHash dedup); the provider default (~1.0) added variance for no benefit. Overridable per call.
+
+**feat: the benchmark now exercises the real hybrid search path.** A new `production_hybrid`
+scenario seeds vectors and drives the production `searchObservationsHybrid` (FTS + TF-IDF + RRF) so
+`k=60` / `MIN_COSINE=0.05` / `VOCAB_DIM=512` are measured on the real path for the first time, plus a
+`--vector-sweep` that pins those constants. `vectorSearch`/`buildVocabulary` gained backward-compatible
+`minCosine`/`dim` knobs (production defaults unchanged).
+
+**refactor: dedup / vector magic constants converged into named exports.** The duplicated `0.7`/`0.85`
+Jaccard thresholds and the RRF `k` are now single-sourced (`lib/dedup-constants.mjs`, `RRF_K` in
+`tfidf.mjs`) with empirical-rationale comments. Behavior-preserving.
+
+**docs: softened the unmeasured "600× lower cost" marketing claim.** The figure is a stacked
+architecture estimate, not a measured benchmark, yet it appeared verbatim in the LLM-visible package /
+plugin / marketplace descriptions and `llms.txt`. Reworded to a directional, explicitly-estimated
+statement across those surfaces and the README cost tables (en/zh).
+
 ## v2.88.0 — mem_maintain decay parity fix + compress/maintain single-source cores
 
 **fix: `mem_maintain` (MCP) now protects injected memories from decay/purge, matching the

@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildCiteBackHint, loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge, nextCiteLowStreak, CITE_NUDGE_SILENCE_AFTER } from '../lib/cite-back-hint.mjs';
+import { buildCiteBackHint, loadCiteBackForEpisode, extractCiteBackSignals, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge, nextCiteLowStreak, CITE_NUDGE_SILENCE_AFTER } from '../lib/cite-back-hint.mjs';
 
 const editEntry = (file, tool = 'Edit') => ({ tool, files: [file], isError: false });
 const readEntry = (file) => ({ tool: 'Read', files: [file], isError: false });
@@ -568,5 +568,56 @@ describe('loadCiteBackForEpisode', () => {
       entries: [{ tool: 'Edit', files: ['/p/foo.mjs'], isError: false }],
     };
     expect(loadCiteBackForEpisode(episode, runtimeDir)).toContain('#42');
+  });
+});
+
+describe('extractCiteBackSignals (P5 ① — Stop-time positive signal)', () => {
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'citeback-sig-')); });
+  afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch {} });
+
+  // Mirror how hook.mjs flushEpisode emits the hint: PostToolUse JSON wrapping
+  // additionalContext, recorded in the transcript as a hook_success attachment.
+  function citeBackAttachment(hintText) {
+    return {
+      type: 'attachment',
+      attachment: {
+        type: 'hook_success',
+        hookName: 'PostToolUse',
+        command: 'node /home/u/.claude-mem-lite/hook.mjs post-tool-use',
+        stdout: JSON.stringify({ suppressOutput: true, hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: hintText } }),
+        stderr: '', exitCode: 0,
+      },
+    };
+  }
+
+  function writeTranscript(entries) {
+    const path = join(tmp, 't.jsonl');
+    writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n'));
+    return path;
+  }
+
+  it('extracts the #NN lesson ids from a real cite-back hint emission', () => {
+    const hint = buildCiteBackHint(
+      { entries: [{ tool: 'Edit', files: ['/p/src/foo.mjs'], isError: false }] },
+      { '/p/src/foo.mjs': { ts: Date.now(), lessonIds: [8447, 9012] } }
+    );
+    const ids = extractCiteBackSignals(writeTranscript([citeBackAttachment(hint)]));
+    expect(ids.has(8447)).toBe(true);
+    expect(ids.has(9012)).toBe(true);
+    expect(ids.size).toBe(2);
+  });
+
+  it('ignores attachments without the cite-back leader (e.g. plain mem context)', () => {
+    const other = {
+      type: 'attachment',
+      attachment: { type: 'hook_success', hookName: 'PostToolUse', command: 'x', stdout: 'just #777 in some other output', stderr: '', exitCode: 0 },
+    };
+    expect(extractCiteBackSignals(writeTranscript([other])).size).toBe(0);
+  });
+
+  it('returns an empty set on missing / null transcript', () => {
+    expect(extractCiteBackSignals('/no/such/file').size).toBe(0);
+    expect(extractCiteBackSignals(null).size).toBe(0);
   });
 });

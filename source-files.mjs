@@ -86,6 +86,11 @@ export const SOURCE_FILES = [
   // Statically imported by mem-cli.mjs (cmdMaintain), server.mjs (mem_maintain),
   // and hook.mjs (handleAutoMaintain) — missing it would break maintain on auto-update.
   'lib/maintain-core.mjs',
+  // P10 dedup/merge threshold constants — single source of truth for the Jaccard
+  // dedup/merge cutoffs. Statically imported by hook.mjs, hook-llm.mjs,
+  // hook-optimize.mjs, mem-cli.mjs, server.mjs, and the save/maintain cores;
+  // missing it from the manifest would break those paths on auto-update.
+  'lib/dedup-constants.mjs',
   // v2.70 deferred-work: carry-forward TODO primitives. Statically imported by
   // server.mjs (mem_defer family) and mem-cli.mjs (defer subcommand).
   'lib/deferred-work.mjs',

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { extractInjectedFromPreToolUse, extractCitationsFromTranscript, applyCitationDecay } from '../lib/citation-tracker.mjs';
+import { extractInjectedFromPreToolUse, extractCitationsFromTranscript, applyCitationDecay, computeCitationAdoption } from '../lib/citation-tracker.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('extractInjectedFromPreToolUse', () => {
@@ -348,6 +348,46 @@ describe('Stop hook integration — fixture transcript composition', () => {
     expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(id).importance).toBe(3);
   });
 
+  it('cite-back signal promotes an injected obs the agent edited but never cited (P5 ①)', async () => {
+    const { extractCiteBackSignals } = await import('../lib/cite-back-hint.mjs');
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    const path = join(tmp, 'transcript.jsonl');
+    const hint = `[mem] ⚠ Cite-back: edited 1 file(s) with 1 prior lesson(s) this session. Save now if any was the root cause:\n  • foo.mjs ← #${id} — /lesson --file foo.mjs "<root cause + fix>"`;
+    writeFileSync(path, [
+      // PreToolUse injected the lesson…
+      JSON.stringify({
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success', hookName: 'PreToolUse:Edit', command: 'pre-tool-recall.js',
+          stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: `  #${id} [bugfix] sample` } }),
+          stderr: '', exitCode: 0,
+        },
+      }),
+      // …PostToolUse cite-back hint fired (agent edited the warned file)…
+      JSON.stringify({
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success', hookName: 'PostToolUse', command: 'hook.mjs post-tool-use',
+          stdout: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: hint } }),
+          stderr: '', exitCode: 0,
+        },
+      }),
+      // …but the assistant produced text WITHOUT citing #NN.
+      JSON.stringify({ type: 'assistant', isSidechain: false, message: { content: [{ type: 'text', text: 'fixed the bug, no explicit cite' }] } }),
+    ].join('\n'));
+
+    // Replicate the Stop handler union.
+    const injected = extractInjectedFromPreToolUse(path);
+    const citeBack = extractCiteBackSignals(path);
+    for (const cid of citeBack) injected.add(cid);
+    const cited = extractCitationsFromTranscript(path, { mainOnly: true });
+    for (const cid of citeBack) cited.add(cid);
+
+    const result = applyCitationDecay(db, 'p', injected, cited, 'sess-int');
+    expect(result.promoted).toBe(1);
+    expect(db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id).importance).toBe(3);
+  });
+
   it('fixture transcript: injection from sidechain agent does NOT promote main', () => {
     const id = makeObs({ importance: 2 });
     const path = join(tmp, 'transcript.jsonl');
@@ -374,6 +414,77 @@ describe('Stop hook integration — fixture transcript composition', () => {
     expect(result.touched).toBe(1);
     expect(result.promoted).toBe(0);
     expect(db.prepare('SELECT uncited_streak FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
+  });
+});
+
+describe('applyCitationDecay — project adoption-rate gate (P5 ②)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'p' });
+  });
+  afterEach(() => { try { db.close(); } catch {} });
+
+  // makeObs + raw set of the citation-decay history columns (incl. decay_seen_count,
+  // which insertObs doesn't know about) so we can simulate a project's prior
+  // citation history.
+  function makeObs({ importance = 2, uncited_streak = 0, cited_count = 0, decay_seen_count = 0 } = {}) {
+    const id = insertObs(db, { sessionId: 'sess-1', project: 'p', type: 'bugfix', title: 't', importance }).lastInsertRowid;
+    db.prepare(`UPDATE observations SET uncited_streak = ?, cited_count = ?, decay_seen_count = ? WHERE id = ?`)
+      .run(uncited_streak, cited_count, decay_seen_count, id);
+    return id;
+  }
+
+  it('computeCitationAdoption returns cite-rate over the project resolution history', () => {
+    makeObs({ cited_count: 3, decay_seen_count: 10 });
+    makeObs({ cited_count: 0, decay_seen_count: 10 });
+    const a = computeCitationAdoption(db, 'p');
+    expect(a.cited).toBe(3);
+    expect(a.seen).toBe(20);
+    expect(a.rate).toBeCloseTo(0.15, 5);
+  });
+
+  it('suppresses demotion for a non-adopting project (≥min-seen, 0% cite-rate)', () => {
+    // Target at streak=2 would normally demote, but the project has 20 prior
+    // resolutions and never cited anything → suppress the importance drop.
+    const target = makeObs({ importance: 2, uncited_streak: 2, decay_seen_count: 20, cited_count: 0 });
+    const r = applyCitationDecay(db, 'p', new Set([target]), new Set(), 'sess-1');
+    const row = db.prepare('SELECT importance, uncited_streak, demoted_at FROM observations WHERE id=?').get(target);
+    expect(row.importance).toBe(2);          // NOT demoted
+    expect(row.demoted_at).toBeNull();        // demote branch never ran
+    expect(row.uncited_streak).toBe(3);       // streak still advances (idempotent bookkeeping)
+    expect(r.demoted).toBe(0);
+    expect(r.touched).toBe(1);
+  });
+
+  it('allows demotion once the project cites enough to clear the threshold', () => {
+    const target = makeObs({ importance: 2, uncited_streak: 2, decay_seen_count: 20, cited_count: 5 });
+    applyCitationDecay(db, 'p', new Set([target]), new Set(), 'sess-1');
+    const row = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(target);
+    expect(row.importance).toBe(1);           // demoted normally
+    expect(row.uncited_streak).toBe(0);
+  });
+
+  it('does not engage on low-data projects (<min-seen) — existing behavior preserved', () => {
+    const target = makeObs({ importance: 2, uncited_streak: 2, decay_seen_count: 2, cited_count: 0 });
+    applyCitationDecay(db, 'p', new Set([target]), new Set(), 'sess-1');
+    expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(target).importance).toBe(1);
+  });
+
+  it('env override CLAUDE_MEM_CITATION_ADOPTION_THRESHOLD widens the suppression band', () => {
+    // 15% cite-rate normally clears the 2% default, but a 0.5 override suppresses it.
+    const target = makeObs({ importance: 2, uncited_streak: 2, decay_seen_count: 20, cited_count: 3 });
+    process.env.CLAUDE_MEM_CITATION_ADOPTION_THRESHOLD = '0.5';
+    try {
+      applyCitationDecay(db, 'p', new Set([target]), new Set(), 'sess-1');
+      expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(target).importance).toBe(2);
+    } finally { delete process.env.CLAUDE_MEM_CITATION_ADOPTION_THRESHOLD; }
+  });
+
+  it('promotion is never gated — a cited obs still promotes in a non-adopting project', () => {
+    const target = makeObs({ importance: 2, uncited_streak: 0, decay_seen_count: 20, cited_count: 0 });
+    applyCitationDecay(db, 'p', new Set([target]), new Set([target]), 'sess-1');
+    expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(target).importance).toBe(3);
   });
 });
 

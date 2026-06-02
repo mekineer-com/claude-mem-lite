@@ -12,6 +12,7 @@ import {
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector } from './tfidf.mjs';
+import { DEDUP_JACCARD_THRESHOLD, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
   sessionFile, getSessionId, openDb, callLLM, sleep,
@@ -148,7 +149,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       ORDER BY created_at_epoch DESC LIMIT 10
     `).all(project, fiveMinAgo);
 
-    if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > 0.7)) {
+    if (obs.title && recent.some(r => jaccardSimilarity(r.title, obs.title) > DEDUP_JACCARD_THRESHOLD)) {
       return null; // dedup: Jaccard title match
     }
 
@@ -173,8 +174,8 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
         WHERE project = ? AND created_at_epoch > ? AND created_at_epoch <= ?
         ORDER BY created_at_epoch DESC LIMIT 60
       `).all(project, threeDaysAgo, fiveMinAgo);
-      if (extRecent.some(r => jaccardSimilarity(r.title, obs.title) > 0.85)) {
-        return null; // dedup: low-signal Jaccard match
+      if (extRecent.some(r => jaccardSimilarity(r.title, obs.title) > AUTO_MERGE_THRESHOLD)) {
+        return null; // dedup: low-signal Jaccard match (stricter cutoff for degraded titles)
       }
     }
 

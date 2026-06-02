@@ -4,7 +4,7 @@
 
 `claude-mem-lite` is a **persistent memory** (also called *long-term memory* or *cross-session context*) system for **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — Anthropic's CLI coding agent. It runs as an **[MCP](https://modelcontextprotocol.io/) server** plus a set of Claude Code hooks, automatically capturing coding observations, decisions, and bug fixes during sessions, then providing hybrid full-text + semantic search to recall them later.
 
-Compared to general-purpose LLM memory frameworks like [`mem0`](https://github.com/mem0ai/mem0) or the MCP reference [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) server, claude-mem-lite is purpose-built for Claude Code's hook lifecycle: episode batching cuts LLM calls 7–10× vs the original [claude-mem](https://github.com/thedotmack/claude-mem) (600× lower total cost), and the hybrid FTS5 + TF-IDF retriever benchmarks at 0.88 Recall@10 / 0.96 Precision@10.
+Compared to general-purpose LLM memory frameworks like [`mem0`](https://github.com/mem0ai/mem0) or the MCP reference [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) server, claude-mem-lite is purpose-built for Claude Code's hook lifecycle: episode batching cuts LLM calls 7–10× vs the original [claude-mem](https://github.com/thedotmack/claude-mem) (an estimated ~600× lower total cost — see the cost model below; this is an architecture estimate, not a measured benchmark), while the hybrid FTS5 + TF-IDF retriever benchmarks at 0.88 Recall@10 / 0.96 Precision@10.
 
 > 中文简介：claude-mem-lite 是 Claude Code 的轻量级**持久化记忆 / 长期记忆 / 跨会话上下文**插件，基于 MCP 协议 + 钩子机制，自动捕获编码会话中的决策、修复和上下文，并通过 FTS5 + TF-IDF 混合检索召回。详见 [中文 README](README.zh-CN.md)。
 
@@ -29,15 +29,17 @@ A ground-up redesign of [claude-mem](https://github.com/thedotmack/claude-mem), 
 
 ### Token & cost efficiency
 
-For a typical 50-tool-call session:
+For a typical 50-tool-call session (illustrative cost model — the ratios below are
+architecture estimates derived from batch size, token counts, and model pricing, **not**
+a measured end-to-end benchmark):
 
-| | claude-mem | claude-mem-lite | Ratio |
+| | claude-mem | claude-mem-lite | Ratio (estimated) |
 |---|---|---|---|
-| LLM calls | ~50 (every tool use) | ~5-8 (per episode) | **7-10x fewer** |
-| Tokens per call | 1,000-5,000 (raw JSON + history) | 200-500 (summaries only) | **5-10x smaller** |
-| Total tokens | ~100K-250K | ~1K-4K | **50-100x less** |
-| Model cost | Sonnet ($3/$15 per M) | Haiku ($0.25/$1.25 per M) | **12x cheaper** |
-| Combined savings | | | **600x+ lower cost** |
+| LLM calls | ~50 (every tool use) | ~5-8 (per episode) | **~7-10x fewer** |
+| Tokens per call | 1,000-5,000 (raw JSON + history) | 200-500 (summaries only) | **~5-10x smaller** |
+| Total tokens | ~100K-250K | ~1K-4K | **~50-100x less** |
+| Model cost | Sonnet ($3/$15 per M) | Haiku ($0.25/$1.25 per M) | **~12x cheaper** |
+| Combined savings | | | **~600x lower cost (estimated)** |
 
 ### Quality comparison
 
@@ -681,7 +683,7 @@ No. Claude Code's `CLAUDE.md` and `MEMORY.md` files act as static instruction me
 
 ### Why "lite"? What did the original claude-mem do differently?
 
-The original called an LLM on every tool use with raw JSON inputs. claude-mem-lite batches 5–10 operations per LLM call, uses a smaller model (Haiku), and runs a deterministic code-level filter before sending anything to the model. Net result: ~600× lower cost with equivalent search quality. See the [Architecture comparison](#architecture-comparison) above.
+The original called an LLM on every tool use with raw JSON inputs. claude-mem-lite batches 5–10 operations per LLM call, uses a smaller model (Haiku), and runs a deterministic code-level filter before sending anything to the model. Net result: an estimated ~600× lower cost (an architecture estimate from the cost model above, not a measured benchmark) with equivalent search quality. See the [Architecture comparison](#architecture-comparison) above.
 
 ### Does this work cross-project? Cross-machine?
 

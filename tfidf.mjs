@@ -10,6 +10,10 @@ import { createHash } from 'crypto';
 export const VOCAB_DIM = 512;
 export const MIN_COSINE_SIMILARITY = 0.05;
 export const VECTOR_SCAN_LIMIT = 500;
+// Reciprocal Rank Fusion constant. Higher k flattens the rank-position weighting
+// (BM25 and vector lists contribute more equally); lower k lets the top few ranks
+// dominate. 60 is the de-facto RRF default and balances the two retrievers here.
+export const RRF_K = 60;
 
 const VOCAB_STOP_WORDS = new Set([
   ...BASE_STOP_WORDS,
@@ -192,7 +196,7 @@ export function _resetVocabCache() { _vocabCache = null; }
  * @param {object} db - better-sqlite3 database
  * @returns {{ terms: Map<string, {index: number, idf: number}>, version: string, dim: number } | null}
  */
-export function buildVocabulary(db) {
+export function buildVocabulary(db, { dim = VOCAB_DIM } = {}) {
   const rows = db.prepare(`
     SELECT title, narrative, concepts FROM observations
     WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
@@ -217,7 +221,7 @@ export function buildVocabulary(db) {
     .filter(([term, freq]) => !isNoiseTerm(term) && freq >= 2)
     .map(([term, freq]) => ({ term, df: freq, idf: idf(freq), ig: freq * idf(freq) }))
     .sort((a, b) => b.ig - a.ig)
-    .slice(0, VOCAB_DIM);
+    .slice(0, dim);
 
   // Build terms map with index and IDF
   const terms = new Map();
@@ -229,7 +233,7 @@ export function buildVocabulary(db) {
   const termList = sortedTerms.map(e => e.term).join(',');
   const version = createHash('md5').update(termList).digest('hex').slice(0, 12);
 
-  const vocab = { terms, version, dim: VOCAB_DIM };
+  const vocab = { terms, version, dim };
   _vocabCache = vocab;
   return vocab;
 }
@@ -239,8 +243,8 @@ export function buildVocabulary(db) {
  * @param {object} db - better-sqlite3 database
  * @returns {object|null} The new vocabulary
  */
-export function rebuildVocabulary(db) {
-  const vocab = buildVocabulary(db);
+export function rebuildVocabulary(db, opts) {
+  const vocab = buildVocabulary(db, opts);
   if (!vocab) return null;
 
   const insertStmt = db.prepare(
@@ -358,7 +362,7 @@ export function cosineSimilarity(a, b) {
 const VECTOR_TIME_WINDOW_MS = 90 * 24 * 60 * 60 * 1000; // 90 days
 const VECTOR_MIN_RESULTS = 50; // fallback to full scan if time-window yields fewer
 
-export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit = VECTOR_SCAN_LIMIT }) {
+export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit = VECTOR_SCAN_LIMIT, minCosine = MIN_COSINE_SIMILARITY }) {
   if (!queryVec) return [];
 
   const now = Date.now();
@@ -403,7 +407,7 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
   for (const row of rows) {
     const vec = new Float32Array(row.vector.buffer.slice(row.vector.byteOffset, row.vector.byteOffset + row.vector.byteLength));
     const sim = cosineSimilarity(queryVec, vec);
-    if (sim > MIN_COSINE_SIMILARITY) results.push({ id: row.observation_id, similarity: sim });
+    if (sim > minCosine) results.push({ id: row.observation_id, similarity: sim });
   }
   results.sort((a, b) => b.similarity - a.similarity);
   return results.slice(0, 20);
@@ -418,7 +422,7 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
  * @param {number} k - RRF constant (default 60)
  * @returns {{ id: number, rrfScore: number }[]}
  */
-export function rrfMerge(bm25Results, vectorResults, k = 60) {
+export function rrfMerge(bm25Results, vectorResults, k = RRF_K) {
   const scores = new Map();
   bm25Results.forEach((r, i) => {
     scores.set(r.id, (scores.get(r.id) ?? 0) + 1 / (k + i + 1));

@@ -54,7 +54,14 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // re-runs the v28 observation_vectors cleanup) to clear the backlog leaked while
 // the warm-start fast-path left foreign_keys OFF. LATEST_MIGRATION_COLUMN is
 // unchanged (no new column) — decay_seen_count still exists at v35.
-export const CURRENT_SCHEMA_VERSION = 35;
+// v36 (v2.89.0): no DDL — narrows events_fts_au to `AFTER UPDATE OF title, body`.
+// The events FTS triggers (v2.31) were hand-written inline and inherited the
+// pre-v27 broad `AFTER UPDATE ON events` form, so every importance / accessed_count
+// / citation-decay bump thrashed events_fts (delete+reinsert) and reintroduced the
+// SQLITE_CORRUPT_VTAB blast radius v27 fixed for the other FTS tables. Version
+// bumped to force one migration pass; the conditional drop below replaces the
+// legacy trigger on existing DBs. LATEST_MIGRATION_COLUMN unchanged (no new column).
+export const CURRENT_SCHEMA_VERSION = 36;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
@@ -399,6 +406,20 @@ export function initSchema(db) {
     }
   } catch { /* non-critical */ }
 
+  // v36 migration: narrow events_fts_au like the v27 fix above. The events FTS
+  // triggers were hand-written inline (below) rather than via ensureFTS, so
+  // events_fts_au inherited the broad `AFTER UPDATE ON events` form and fires on
+  // every non-indexed bump (importance / accessed_count / citation-decay). Drop
+  // the legacy trigger when its stored DDL lacks the scoped `UPDATE OF` clause so
+  // the CREATE TRIGGER IF NOT EXISTS below reinstates the scoped form (handles
+  // re-run + fresh-DB: undefined row on a fresh DB is a no-op).
+  try {
+    const row = db.prepare(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name='events_fts_au'`).get();
+    if (row && row.sql && !/\bAFTER\s+UPDATE\s+OF\s+/i.test(row.sql)) {
+      db.exec(`DROP TRIGGER IF EXISTS events_fts_au`);
+    }
+  } catch { /* non-critical — recreated below */ }
+
   // ─── v2.31 T6: events table + FTS5 (activity namespace) ───────────────────
   // Independent namespace for bugfix/lesson/bug/discovery/refactor/feature/
   // observation/decision types. Isolated from observations to avoid polluting
@@ -443,7 +464,9 @@ export function initSchema(db) {
       VALUES ('delete', old.id, COALESCE(old.title,''), COALESCE(old.body,''), old.event_type, old.project);
     END;
 
-    CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE ON events BEGIN
+    -- v36: scoped to title, body (the FTS-indexed columns) so non-indexed bumps
+    -- (importance / accessed_count / citation-decay) no longer thrash events_fts.
+    CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE OF title, body ON events BEGIN
       INSERT INTO events_fts(events_fts, rowid, title, body, event_type, project)
       VALUES ('delete', old.id, COALESCE(old.title,''), COALESCE(old.body,''), old.event_type, old.project);
       INSERT INTO events_fts(rowid, title, body, event_type, project)

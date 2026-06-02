@@ -63,7 +63,8 @@ import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
-import { loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
+import { loadCiteBackForEpisode, extractCiteBackSignals, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
+import { MINHASH_PREFILTER, FUZZY_DEDUP_THRESHOLD } from './lib/dedup-constants.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -542,6 +543,12 @@ async function handleStop() {
           // contract test in tests/citation-tracker-userprompt.test.mjs covers it.
           try {
             const injected = extractAllInjected(transcriptPath);
+            // P5 ①: cite-back signals — observations whose warned file the agent
+            // edited this session. Union into injected so they're resolved (they
+            // were injected via pre-tool-recall) and, below, into cited so the
+            // edit promotes them even without a literal #NN in text.
+            const citeBackIds = extractCiteBackSignals(transcriptPath);
+            for (const id of citeBackIds) injected.add(id);
             if (injected.size > 0) {
               // Text-floor gate: skip decay on tool-only Stops. Without this,
               // a turn that ends on tool_use locks every injected obs as
@@ -554,6 +561,7 @@ async function handleStop() {
                 debugLog('DEBUG', 'handleStop', `citation-decay: skipped (no main-thread assistant text yet, injected=${injected.size})`);
               } else {
                 const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
+                for (const id of citeBackIds) citedMain.add(id);
                 const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
                 debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
               }
@@ -864,8 +872,6 @@ async function handleSessionStart() {
         if (!process.env.CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY) {
           const SCAN_LIMIT = 500;
           const FUZZY_MAX_MERGES = 20;
-          const FUZZY_THRESHOLD = 0.95;
-          const MINHASH_PREFILTER = 0.7;
           const recent = db.prepare(`
             SELECT id, title, importance, created_at_epoch
             FROM observations
@@ -885,7 +891,7 @@ async function handleSessionStart() {
               for (let j = i + 1; j < recent.length; j++) {
                 if (!minhashes[j] || removed.has(recent[j].id)) continue;
                 if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PREFILTER) continue;
-                if (jaccardSimilarity(titles[i], titles[j]) < FUZZY_THRESHOLD) continue;
+                if (jaccardSimilarity(titles[i], titles[j]) < FUZZY_DEDUP_THRESHOLD) continue;
                 // Keep the higher-importance row; tiebreak by older (lower id wins access history)
                 const keep = (recent[i].importance ?? 1) >= (recent[j].importance ?? 1) ? recent[i] : recent[j];
                 const remove = keep === recent[i] ? recent[j] : recent[i];

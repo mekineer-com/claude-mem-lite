@@ -655,6 +655,56 @@ describe('haiku-client.mjs', () => {
     });
   });
 
+  // ─── Deterministic temperature ───────────────────────────────────────────
+  // Every LLM call in claude-mem-lite is fixed-schema extraction / classification
+  // feeding deterministic downstream consumers (JSON.parse, MinHash dedup). The
+  // request bodies pin temperature: 0 so the provider default (~1.0) does not
+  // inject wording variance that defeats dedup or destabilizes JSON parsing.
+  describe('temperature (deterministic extraction)', () => {
+    it('callHaiku (Anthropic API) sends temperature: 0', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-ant');
+      _resetMode();
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ content: [{ text: 'ok' }] }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await callHaiku('p');
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.temperature).toBe(0);
+    });
+
+    it('callLLMWithModel (Anthropic API) sends temperature: 0', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-ant');
+      _resetMode();
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ content: [{ text: 'ok' }] }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await callLLMWithModel('p', 'sonnet');
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.temperature).toBe(0);
+    });
+
+    it('callHaiku (OpenRouter) sends temperature: 0', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      vi.stubEnv('OPENROUTER_API_KEY', 'sk-or-key');
+      _resetMode();
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ choices: [{ message: { content: 'ok' } }] }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await callHaiku('p');
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      expect(body.temperature).toBe(0);
+    });
+  });
+
   // ─── Provider failure → CLI fallback ─────────────────────────────────────
   // When the keyed provider (Anthropic API or OpenRouter) fails — HTTP error,
   // network throw, or empty response — degrade to the `claude -p` CLI instead

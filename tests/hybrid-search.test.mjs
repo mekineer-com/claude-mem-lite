@@ -69,6 +69,32 @@ describe('vector write helper', () => {
   });
 });
 
+describe('buildVocabulary — dim override (P7 sweep knob)', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1' }); _resetVocabCache(); });
+  afterEach(() => { db.close(); });
+
+  it('caps the vocabulary at a custom dim and reports it', () => {
+    // Enough shared terms (df>=2) that the unbounded vocab would exceed 3.
+    const docs = [
+      'authentication token refresh login session',
+      'authentication token refresh logout session',
+      'database migration schema column index',
+      'database migration schema column table',
+    ];
+    docs.forEach((narrative, i) => insertObs(db, { title: `obs ${i}`, narrative }));
+
+    const small = buildVocabulary(db, { dim: 3 });
+    expect(small.dim).toBe(3);
+    expect(small.terms.size).toBeLessThanOrEqual(3);
+
+    _resetVocabCache();
+    const full = buildVocabulary(db);          // default VOCAB_DIM
+    expect(full.dim).toBe(VOCAB_DIM);
+    expect(full.terms.size).toBeGreaterThan(small.terms.size);
+  });
+});
+
 describe('rrfMerge', () => {
   it('merges two ranked lists with correct RRF formula', () => {
     const bm25 = [{ id: 1 }, { id: 2 }, { id: 3 }];
@@ -121,6 +147,27 @@ describe('vectorSearch', () => {
     const dbObs = allObs.find(o => o.title.includes('database'));
     const authResults = results.filter(r => r.id !== dbObs.id);
     expect(authResults.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('honors a custom minCosine floor (P7 sweep knob)', () => {
+    insertObs(db, { title: 'auth token refresh', narrative: 'fix the authentication token expiry bug in login' });
+    insertObs(db, { title: 'database migration script', narrative: 'update database schema for new user table columns' });
+    insertObs(db, { title: 'auth session fix', narrative: 'the authentication session was broken after logout' });
+
+    const vocab = buildVocabulary(db);
+    for (const o of db.prepare('SELECT id, title, narrative FROM observations').all()) {
+      const vec = computeVector(o.title + ' ' + o.narrative, vocab);
+      if (vec) {
+        db.prepare('INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+          .run(o.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+      }
+    }
+    const queryVec = computeVector('authentication problem', vocab);
+    const lax = vectorSearch(db, queryVec, { vocabVersion: vocab.version });            // default 0.05
+    const strict = vectorSearch(db, queryVec, { vocabVersion: vocab.version, minCosine: 0.999 });
+    expect(lax.length).toBeGreaterThan(0);
+    // None of these short auth docs hit 0.999 cosine, so a near-1 floor prunes them all.
+    expect(strict.length).toBeLessThan(lax.length);
   });
 
   it('excludes compressed observations', () => {

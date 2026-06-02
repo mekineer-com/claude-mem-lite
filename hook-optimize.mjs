@@ -13,6 +13,7 @@ import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, cosineSimilarity } from './tfidf.mjs';
+import { MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { DB_DIR } from './schema.mjs';
 
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
@@ -331,8 +332,9 @@ export async function executeNormalize(db, force = false, { project } = {}) {
 // ─── Task 3: Cluster-merge ─────────────────────────────────────────────────
 
 const MERGE_TIME_WINDOW_MS = 30 * 86400000;
-const MERGE_JACCARD_LOW = 0.4;
-const MERGE_JACCARD_HIGH = 0.85;
+// Merge-review band [MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD): titles in this
+// Jaccard range are LLM-reviewed for merge; at/above AUTO_MERGE_THRESHOLD they'd
+// already auto-merge elsewhere, below MERGE_JACCARD_LOW they're too dissimilar.
 
 export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const cutoff = Date.now() - MERGE_TIME_WINDOW_MS;
@@ -363,12 +365,14 @@ export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
       if (Math.abs(rows[i].created_at_epoch - rows[j].created_at_epoch) > MERGE_TIME_WINDOW_MS) continue;
 
       if (rows[i].minhash_sig && rows[j].minhash_sig) {
+        // 0.8 slack: the MinHash estimate is noisy, so pre-filter a band below
+        // MERGE_JACCARD_LOW rather than at it, to avoid dropping true candidates.
         const est = estimateJaccardFromMinHash(rows[i].minhash_sig, rows[j].minhash_sig);
         if (est < MERGE_JACCARD_LOW * 0.8) continue;
       }
 
       const titleSim = jaccardSimilarity(rows[i].title, rows[j].title);
-      if (titleSim >= MERGE_JACCARD_LOW && titleSim < MERGE_JACCARD_HIGH) {
+      if (titleSim >= MERGE_JACCARD_LOW && titleSim < AUTO_MERGE_THRESHOLD) {
         cluster.push(rows[j]);
         used.add(rows[j].id);
       }

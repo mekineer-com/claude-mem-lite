@@ -36,6 +36,7 @@ import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
@@ -1250,7 +1251,6 @@ server.registerTool(
         `  Pending purge (idle-marked): ${stats.pendingPurge}`,
       ];
       if (duplicates.length > 0) {
-        const AUTO_MERGE_THRESHOLD = 0.85;
         const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
         const manualReview = duplicates.filter(d => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);
 

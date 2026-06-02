@@ -34,6 +34,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
@@ -1845,7 +1846,6 @@ function cmdMaintain(db, args) {
     out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — run: maintain execute --ops demote_pinned`);
     out(`  Pending purge: ${stats.pendingPurge} (compressed originals awaiting cleanup)`);
     if (duplicates.length > 0) {
-      const AUTO_MERGE_THRESHOLD = 0.85;
       const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
       const manualReview = duplicates.filter(d => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);
 
