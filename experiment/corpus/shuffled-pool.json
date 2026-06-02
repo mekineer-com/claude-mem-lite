@@ -1,0 +1,6 @@
+[
+  { "type": "discovery", "title": "CSS grid gap collapses with negative margins", "content": "Negative margins on grid children interact with gap unexpectedly; prefer padding on the track.", "importance": 1, "files": ["styles.css"] },
+  { "type": "change", "title": "Bumped webpack splitChunks minSize to 30kb", "content": "Tuning cacheGroups.minSize reduced the vendor chunk count on the marketing site.", "importance": 1, "files": ["webpack.config.js"] },
+  { "type": "bugfix", "title": "Timezone off-by-one in date picker", "content": "Parsing ISO dates without an explicit zone shifted the displayed day in UTC-negative locales; pin to UTC.", "importance": 2, "files": ["date-picker.tsx"] },
+  { "type": "decision", "title": "Chose Redis over in-memory cache for session store", "content": "Multi-instance deploy needed shared sessions; Redis TTL semantics fit the logout flow.", "importance": 2, "files": ["session-store.ts"] }
+]

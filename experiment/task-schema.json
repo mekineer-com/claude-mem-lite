@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Value A/B task spec",
+  "description": "One recurrence-prone coding task: a bug/decision was previously captured as a memory, and a later task touches the same file/subsystem. The experiment runs this task with (treatment) and without (control) that memory injected, and measures whether the captured bug recurs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "startCommit", "project", "prompt", "capturedMemory", "regressionCheck"],
+  "properties": {
+    "id": { "type": "string", "description": "Stable kebab-case identifier." },
+    "repo": { "type": "string", "description": "Git URL or local path. Defaults to the claude-mem-lite repo root." },
+    "startCommit": { "type": "string", "description": "SHA to check out the sandbox at — the state BEFORE the captured bug was fixed." },
+    "project": { "type": "string", "description": "Project key the captured memory belongs to (must match how the host session infers it, so recall fires)." },
+    "prompt": { "type": "string", "description": "The coding task handed to `claude -p`." },
+    "files": { "type": "array", "items": { "type": "string" }, "description": "Files the captured memory attaches to (drives PreToolUse recall)." },
+    "capturedMemory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "content"],
+      "description": "The memory a prior session would have saved. Seeded into the treatment arm's DB via the production saveObservation pipeline.",
+      "properties": {
+        "type": { "type": "string", "enum": ["decision", "bugfix", "feature", "refactor", "discovery", "change"] },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "lesson_learned": { "type": ["string", "null"] },
+        "importance": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "files": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "regressionCheck": { "type": "string", "description": "Shell command run in the sandbox AFTER the task. MUST exit 0 when the captured bug is ABSENT; non-zero exit means it recurred." },
+    "stale": { "type": "boolean", "description": "True if capturedMemory references now-deleted/renamed code — used for the staleness probe (does stale injection waste turns?)." }
+  }
+}

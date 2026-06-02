@@ -1,0 +1,18 @@
+{
+  "id": "fk-cascade",
+  "startCommit": "026cd2b",
+  "project": "projects--mem",
+  "prompt": "In schema.mjs, ensureDb() opens the database with foreign_keys=OFF for migrations. Make sure ON DELETE CASCADE actually fires on the common warm-start path (when the DB is already at the current schema version). Add a regression test.",
+  "files": ["schema.mjs"],
+  "capturedMemory": {
+    "type": "bugfix",
+    "title": "Warm-start fast-path left foreign_keys OFF — CASCADE never fired",
+    "content": "ensureDb() opens with foreign_keys=OFF; initSchema's warm-start fast-path returns early without re-enabling it, so ON DELETE CASCADE silently never fired on the common open path and junction rows leaked.",
+    "lesson_learned": "Set pragma foreign_keys=ON before every initSchema return path; when a pragma is set per code path, every exit must restore the invariant.",
+    "importance": 2,
+    "files": ["schema.mjs"]
+  },
+  "regressionCheck": "node --input-type=module -e \"import('./schema.mjs').then(async m => { const D = (await import('better-sqlite3')).default; const db = new D(':memory:'); db.pragma('foreign_keys=OFF'); m.initSchema(db); db.pragma('foreign_keys=OFF'); m.initSchema(db); process.exit(db.pragma('foreign_keys',{simple:true}) === 1 ? 0 : 1); }).catch(() => process.exit(1))\"",
+  "stale": false,
+  "_note": "Illustrative task using this very bug. startCommit 026cd2b is v2.86.0 (pre-fix). The regressionCheck simulates a warm-start (init, then re-init on an already-current DB) and asserts foreign_keys enforcement is ON — exit 0 only if the agent fixed it. Treatment seeds capturedMemory; control sees nothing; shuffled sees corpus/shuffled-pool.json."
+}
