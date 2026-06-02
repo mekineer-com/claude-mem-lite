@@ -26,7 +26,7 @@ import {
   truncate, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
-  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, isoWeekKey, OBS_BM25,
+  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25,
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity,
 } from './utils.mjs';
 import {
@@ -45,6 +45,8 @@ import {
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
+import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed } from './lib/maintain-core.mjs';
 import {
   extractCitationsFromTranscript,
   extractAllInjected,
@@ -819,65 +821,19 @@ async function handleSessionStart() {
         `).run(Date.now() - 37 * 86400000);
         if (purged.changes > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged.changes} stale observations`);
 
-        // Cleanup: remove broken observations (no title AND no narrative)
-        const cleaned = db.prepare(`
-          DELETE FROM observations WHERE id IN (
-            SELECT id FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
-            LIMIT ${OP_CAP}
-          )
-        `).run();
-        if (cleaned.changes > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned.changes} broken observations`);
+        // cleanup / decay+mark-idle / boost via maintain-core (shared with CLI + MCP).
+        // injection_count>0 protection lives in decayAndMarkIdle. Whole-DB, cap 500.
+        const mctx = { projectFilter: '', baseParams: [], staleAge: STALE_AGE, opCap: OP_CAP };
 
-        // Decay: reduce importance of old, never-accessed observations
-        // v2.56.0 #4: injection_count is a separate engagement signal —
-        // hook-memory.mjs bumps it when the obs is auto-injected into Claude's
-        // context. Pre-v2.56 only checked access_count, so an obs auto-injected
-        // 8x (proven contextually relevant) still got decayed/marked. Adding
-        // `injection_count = 0` treats injection as first-class engagement.
-        const decayed = db.prepare(`
-          UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
-          WHERE id IN (
-            SELECT id FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND COALESCE(importance, 1) > 1
-              AND COALESCE(access_count, 0) = 0
-              AND COALESCE(injection_count, 0) = 0
-              AND created_at_epoch < ?
-            LIMIT ${OP_CAP}
-          )
-        `).run(STALE_AGE);
-        if (decayed.changes > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed.changes} stale observations`);
+        const cleaned = cleanupBroken(db, mctx);
+        if (cleaned > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned} broken observations`);
 
-        // Mark idle: importance=1, never-accessed, never-injected, old → pending-purge
-        // (will be purged next cycle). v2.56.0 #4: injection_count protects.
-        const idleMarked = db.prepare(`
-          UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
-          WHERE id IN (
-            SELECT id FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND COALESCE(importance, 1) = 1
-              AND COALESCE(access_count, 0) = 0
-              AND COALESCE(injection_count, 0) = 0
-              AND created_at_epoch < ?
-            LIMIT ${OP_CAP}
-          )
-        `).run(STALE_AGE);
-        if (idleMarked.changes > 0) debugLog('DEBUG', 'auto-maintain', `marked ${idleMarked.changes} idle as pending-purge`);
+        const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
+        if (decayed > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed} stale observations`);
+        if (idleMarked > 0) debugLog('DEBUG', 'auto-maintain', `marked ${idleMarked} idle as pending-purge`);
 
-        // Boost: increase importance of frequently-accessed observations
-        const boosted = db.prepare(`
-          UPDATE observations SET importance = MIN(3, COALESCE(importance, 1) + 1)
-          WHERE id IN (
-            SELECT id FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND COALESCE(access_count, 0) > 3
-              AND COALESCE(importance, 1) < 3
-            LIMIT ${OP_CAP}
-          )
-        `).run();
-        if (boosted.changes > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted.changes} frequently-accessed observations`);
+        const boosted = boostAccessed(db, mctx);
+        if (boosted > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted} frequently-accessed observations`);
 
         // Auto-dedup (exact): merge identical-title observations within 1h.
         // Catches rapid duplicate writes (same hook firing twice, race conditions).
@@ -1361,57 +1317,16 @@ function handleAutoCompress() {
 
   try {
     const compressCutoff = Date.now() - 60 * 86400000; // 60 days
-    const compressCandidates = db.prepare(`
-      SELECT id, project, type, title, created_at_epoch
-      FROM observations
-      WHERE COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
-        AND created_at_epoch < ?
-        AND (compressed_into IS NULL OR compressed_into = ${COMPRESSED_AUTO})
-      ORDER BY project, created_at_epoch
-    `).all(compressCutoff);
+    const compressCandidates = selectCompressionCandidates(db, { cutoff: compressCutoff, includeAutoMarked: true });
     if (compressCandidates.length < 3) return;
 
-    const groups = new Map();
-    for (const c of compressCandidates) {
-      const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(c);
-    }
-    // Transact each group to prevent orphan summaries on crash
-    const compressGroup = db.transaction((proj, obs) => {
-      const types = {};
-      for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
-      const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
-      const title = `Weekly summary: ${obs.length} ${dominantType} observations`;
-      const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
-      const sortedEpochs = obs.map(o => o.created_at_epoch).sort((a, b) => a - b);
-      const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
-      const sessionId = `compress-${proj}`;
-      const now = new Date();
-      db.prepare(`INSERT OR IGNORE INTO sdk_sessions
-        (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-        VALUES (?,?,?,?,?,'active')`
-      ).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
-      // Defense-in-depth: title/narrative are derived from already-stored
-      // obs.title, but those rows pre-date the central scrub policy in some
-      // cases. Re-scrub at the persistence boundary.
-      const safe = scrubRecord('observations', { text: narrative, title, narrative });
-      const summaryResult = db.prepare(`INSERT INTO observations
-        (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
-         files_read, files_modified, importance, created_at, created_at_epoch)
-        VALUES (?,?,?,?,?,'',?,'','','[]','[]',2,?,?)`
-      ).run(sessionId, proj, safe.text, dominantType, safe.title, safe.narrative, new Date(medianEpoch).toISOString(), medianEpoch);
-      const summaryId = Number(summaryResult.lastInsertRowid);
-      const obsIds = obs.map(o => o.id);
-      db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsIds.map(() => '?').join(',')})`)
-        .run(summaryId, ...obsIds);
-      return obs.length;
-    });
+    const groups = groupByProjectWeek(compressCandidates);
+    // Transact each group to prevent orphan summaries on crash (CLI/MCP wrap all groups in one).
+    const compressGroupTxn = db.transaction((proj, obs) => compressGroup(db, proj, obs).compressed);
     let totalCompressed = 0;
     for (const [key, obs] of groups) {
-      if (obs.length < 3) continue;
       const [proj] = key.split('::');
-      totalCompressed += compressGroup(proj, obs);
+      totalCompressed += compressGroupTxn(proj, obs);
     }
     if (totalCompressed > 0) {
       debugLog('DEBUG', 'auto-compress', `auto-compressed ${totalCompressed} observations into weekly summaries`);

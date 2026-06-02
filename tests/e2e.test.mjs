@@ -5,7 +5,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, unlinkSync } from 'fs';
-import { join, resolve } from 'path';
+import { join, resolve, dirname } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
@@ -1451,7 +1451,11 @@ describe('Suite 10: Code Review Fix Validations', () => {
       const src = readFileSync(resolve(file), 'utf8');
       const imports = [...src.matchAll(/from\s+'\.\/([^']+\.mjs)'/g)].map(m => m[1]);
       for (const imp of imports) {
-        if (!visited.has(imp)) queue.push(imp);
+        // Resolve './' imports relative to the importing file's dir so a lib/ module's
+        // sibling import (lib/compress-core.mjs -> './scrub-record.mjs') maps to
+        // lib/scrub-record.mjs, not the repo root.
+        const resolved = join(dirname(file), imp);
+        if (!visited.has(resolved)) queue.push(resolved);
       }
     }
 

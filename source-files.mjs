@@ -77,6 +77,15 @@ export const SOURCE_FILES = [
   // mem-cli.mjs::cmdSave and server.mjs::mem_save. Statically imported from both
   // entry points; missing it from the manifest broke MCP saves on auto-update.
   'lib/save-observation.mjs',
+  // Shared "compress old low-value observations into weekly summaries" core.
+  // Statically imported by mem-cli.mjs (cmdCompress), server.mjs (mem_compress),
+  // and hook.mjs (handleAutoCompress) — same single-source-of-truth pattern as
+  // save-observation.mjs; missing it from the manifest would break compress on auto-update.
+  'lib/compress-core.mjs',
+  // Shared maintenance ops (decay/cleanup/boost/demote/dedup/purge/vacuum/rebuild).
+  // Statically imported by mem-cli.mjs (cmdMaintain), server.mjs (mem_maintain),
+  // and hook.mjs (handleAutoMaintain) — missing it would break maintain on auto-update.
+  'lib/maintain-core.mjs',
   // v2.70 deferred-work: carry-forward TODO primitives. Statically imported by
   // server.mjs (mem_defer family) and mem-cli.mjs (defer subcommand).
   'lib/deferred-work.mjs',

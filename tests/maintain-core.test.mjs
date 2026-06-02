@@ -1,0 +1,92 @@
+// Characterization tests for lib/maintain-core.mjs — the shared maintenance ops
+// extracted from cmdMaintain (CLI), mem_maintain (MCP), and handleAutoMaintain
+// (hook). Headline: decayAndMarkIdle protects injection_count>0, the clause that
+// had drifted out of the MCP copy (mem_maintain used to decay/purge injected
+// memories the CLI + hook preserve). The rest pin each op's exact mutation.
+
+import { describe, test, expect } from 'vitest';
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
+import {
+  cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
+  mergeDuplicates, purgeStale, purgeStalePreview,
+} from '../lib/maintain-core.mjs';
+
+const DAY = 86400000;
+const OLD = -40 * DAY; // past the 30-day stale gate
+const ctx = (staleAge) => ({ projectFilter: '', baseParams: [], staleAge, opCap: 1000 });
+const get = (db, id, col) => db.prepare(`SELECT ${col} AS v FROM observations WHERE id = ?`).get(id).v;
+const add = (db, o) => Number(insertObs(db, { sessionId: 'sess-1', project: 'proj-a', epochOffset: OLD, ...o }).lastInsertRowid);
+
+function freshDb() {
+  const db = createTestDb();
+  insertSession(db, { id: 'sess-1', project: 'proj-a' });
+  return db;
+}
+
+describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
+  test('protects injected rows; decays/marks only never-injected stale rows', () => {
+    const db = freshDb();
+    const A = add(db, { title: 'injected imp2', importance: 2, injectionCount: 8 }); // protected from decay
+    const B = add(db, { title: 'stale imp3', importance: 3, injectionCount: 0 });    // decays 3->2
+    const C = add(db, { title: 'injected imp1', importance: 1, injectionCount: 8 }); // protected from mark-idle
+    const D = add(db, { title: 'idle imp1', importance: 1, injectionCount: 0 });     // marked pending-purge
+
+    const { decayed, idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+
+    expect(decayed).toBe(1);
+    expect(idleMarked).toBe(1);
+    expect(get(db, A, 'importance')).toBe(2);                  // injection protected
+    expect(get(db, B, 'importance')).toBe(2);                  // decayed 3->2
+    expect(get(db, C, 'compressed_into')).toBeNull();          // injection protected
+    expect(get(db, D, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+  });
+});
+
+describe('execute ops', () => {
+  test('cleanupBroken deletes only no-title/no-narrative rows', () => {
+    const db = freshDb();
+    const broken = add(db, { title: '', narrative: '' });
+    const ok = add(db, { title: 'has title', narrative: '' });
+    const deleted = cleanupBroken(db, ctx(0));
+    expect(deleted).toBe(1);
+    expect(db.prepare('SELECT COUNT(*) AS c FROM observations WHERE id = ?').get(broken).c).toBe(0);
+    expect(db.prepare('SELECT COUNT(*) AS c FROM observations WHERE id = ?').get(ok).c).toBe(1);
+  });
+
+  test('boostAccessed raises importance of frequently-accessed rows', () => {
+    const db = freshDb();
+    const hot = add(db, { title: 'hot', importance: 1, accessCount: 5 });
+    const cold = add(db, { title: 'cold', importance: 1, accessCount: 1 });
+    expect(boostAccessed(db, ctx(0))).toBe(1);
+    expect(get(db, hot, 'importance')).toBe(2);
+    expect(get(db, cold, 'importance')).toBe(1);
+  });
+
+  test('demotePinned drops heavy-injection zero-citation rows to importance 1', () => {
+    const db = freshDb();
+    const pinned = add(db, { title: 'pinned noise', importance: 3, injectionCount: 8, citedCount: 0 });
+    const cited = add(db, { title: 'earns it', importance: 3, injectionCount: 8, citedCount: 2 });
+    expect(demotePinned(db, ctx(0))).toBe(1);
+    expect(get(db, pinned, 'importance')).toBe(1);
+    expect(get(db, cited, 'importance')).toBe(3);
+  });
+
+  test('mergeDuplicates marks removeIds compressed into keepId', () => {
+    const db = freshDb();
+    const keep = add(db, { title: 'canonical' });
+    const dup = add(db, { title: 'dup' });
+    expect(mergeDuplicates(db, [[keep, dup]])).toBe(1);
+    expect(get(db, dup, 'compressed_into')).toBe(keep);
+    expect(get(db, keep, 'compressed_into')).toBeNull();
+  });
+
+  test('purgeStale deletes pending-purge rows older than the cutoff; preview counts them', () => {
+    const db = freshDb();
+    const stale = add(db, { title: 'to purge', compressedInto: COMPRESSED_PENDING_PURGE });
+    const cutoff = Date.now() - 30 * DAY;
+    expect(purgeStalePreview(db, ctx(0), cutoff).candidates).toBe(1);
+    expect(purgeStale(db, ctx(0), cutoff)).toBe(1);
+    expect(db.prepare('SELECT COUNT(*) AS c FROM observations WHERE id = ?').get(stale).c).toBe(0);
+  });
+});

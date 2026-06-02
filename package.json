@@ -67,6 +67,8 @@
     "lib/binding-probe.mjs",
     "lib/mem-override.mjs",
     "lib/save-observation.mjs",
+    "lib/compress-core.mjs",
+    "lib/maintain-core.mjs",
     "lib/deferred-work.mjs",
     "lib/upgrade-banner.mjs",
     "lib/scrub-record.mjs",

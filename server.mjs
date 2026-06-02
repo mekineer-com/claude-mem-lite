@@ -5,13 +5,18 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { jaccardSimilarity, truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, computeMinHash, estimateJaccardFromMinHash, scrubSecrets, cjkBigrams, fmtDate, isoWeekKey, debugLog, debugCatch, COMPRESSED_PENDING_PURGE, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
+import { truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, scrubSecrets, cjkBigrams, fmtDate, debugLog, debugCatch, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
 import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
-import { scrubRecord } from './lib/scrub-record.mjs';
+import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
+import {
+  cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
+  purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
+  OP_CAP, STALE_AGE_MS,
+} from './lib/maintain-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
@@ -35,7 +40,7 @@ import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
 } from './lib/deferred-work.mjs';
-import { getVocabulary, rebuildVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
+import { getVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -1168,35 +1173,13 @@ server.registerTool(
     const preview = args.preview !== false;
     const ageDays = args.age_days ?? 30;
     const cutoff = Date.now() - ageDays * 86400000;
-    const projectFilter = args.project ? 'AND project = ?' : '';
-    const baseParams = args.project ? [args.project] : [];
-
-    // Find low-value candidates: importance=1, never accessed, old, not already compressed
-    const candidates = db.prepare(`
-      SELECT id, project, type, title, created_at, created_at_epoch
-      FROM observations
-      WHERE COALESCE(importance, 1) = 1
-        AND COALESCE(access_count, 0) = 0
-        AND created_at_epoch < ?
-        AND compressed_into IS NULL
-        ${projectFilter}
-      ORDER BY project, created_at_epoch
-    `).all(cutoff, ...baseParams);
+    const candidates = selectCompressionCandidates(db, { cutoff, project: args.project || null });
 
     if (candidates.length === 0) {
       return { content: [{ type: 'text', text: 'No candidates for compression.' }] };
     }
 
-    // Group by project + ISO week
-    const groups = new Map();
-    for (const c of candidates) {
-      const key = `${c.project}::${isoWeekKey(c.created_at_epoch)}`;
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(c);
-    }
-
-    // Filter groups with < 3 observations (not worth compressing)
-    const compressableGroups = [...groups.entries()].filter(([, obs]) => obs.length >= 3);
+    const compressableGroups = groupByProjectWeek(candidates);
 
     if (preview) {
       const totalCandidates = compressableGroups.reduce((s, [, obs]) => s + obs.length, 0);
@@ -1220,49 +1203,12 @@ server.registerTool(
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // Execute compression
+    // Execute compression — one transaction over all groups (the hook transacts per group).
     let totalCompressed = 0;
-    const insertSummary = db.prepare(`
-      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?, '', ?, '', '', '[]', '[]', 2, ?, ?)
-    `);
     const compress = db.transaction(() => {
       for (const [key, obs] of compressableGroups) {
         const [proj] = key.split('::');
-        const types = {};
-        for (const o of obs) types[o.type] = (types[o.type] || 0) + 1;
-        const dominantType = Object.entries(types).sort((a, b) => b[1] - a[1])[0][0];
-        const title = `Weekly summary: ${obs.length} ${dominantType} observations`;
-        const narrative = obs.map(o => `- ${o.title || '(untitled)'}`).join('\n');
-        const sessionId = obs[0].project ? `compress-${obs[0].project}` : 'compress-manual';
-
-        // Use median timestamp of compressed observations instead of now,
-        // so the summary appears at the correct position in timeline/recency scoring.
-        const sortedEpochs = obs.map(o => o.created_at_epoch).sort((a, b) => a - b);
-        const medianEpoch = sortedEpochs[Math.floor(sortedEpochs.length / 2)];
-        const medianDate = new Date(medianEpoch);
-
-        // Ensure session exists (INSERT OR IGNORE avoids race condition)
-        const now = new Date();
-        db.prepare(`
-          INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-          VALUES (?, ?, ?, ?, ?, 'active')
-        `).run(sessionId, sessionId, proj, now.toISOString(), now.getTime());
-
-        // Defense-in-depth: source rows already scrubbed at original ingest,
-        // but the new compressed narrative is constructed here and re-persisted.
-        const safe = scrubRecord('observations', { text: narrative, title, narrative });
-        const summaryResult = insertSummary.run(
-          sessionId, proj, safe.text, dominantType, safe.title, safe.narrative,
-          medianDate.toISOString(), medianEpoch
-        );
-        const summaryId = Number(summaryResult.lastInsertRowid);
-
-        // Batch UPDATE instead of per-row loop
-        const obsIds = obs.map(o => o.id);
-        const obsPh = obsIds.map(() => '?').join(',');
-        db.prepare(`UPDATE observations SET compressed_into = ? WHERE id IN (${obsPh})`).run(summaryId, ...obsIds);
-        totalCompressed += obs.length;
+        totalCompressed += compressGroup(db, proj, obs).compressed;
       }
     });
     compress();
@@ -1281,10 +1227,6 @@ server.registerTool(
   },
   safeHandler(async (args) => {
     if (args.project) args = { ...args, project: resolveProject(args.project) };
-    const STALE_AGE_MS = 30 * 86400000;
-    const SIMILARITY_THRESHOLD = 0.7;
-    const SCAN_LIMIT = 500;
-    const DUPLICATE_LIMIT = 50;
     const DUPLICATE_DISPLAY = 15;
 
     const action = args.action;
@@ -1293,56 +1235,10 @@ server.registerTool(
     const baseParams = project ? [project] : [];
 
     if (action === 'scan') {
-      // 1. Find near-duplicate titles (MinHash pre-filter → exact Jaccard on candidates)
-      const recent = db.prepare(`
-        SELECT id, title, project, importance, access_count, created_at_epoch
-        FROM observations
-        WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
-        ORDER BY created_at_epoch DESC
-        LIMIT ${SCAN_LIMIT}
-      `).all(...baseParams);
-
-      const titles = recent.map(r => (r.title || '').trim());
-      const minhashes = titles.map(t => t ? computeMinHash(t) : null);
-      const MINHASH_PRE_THRESHOLD = 0.5; // loose pre-filter to catch candidates
-      const duplicates = [];
-      for (let i = 0; i < recent.length && duplicates.length < DUPLICATE_LIMIT; i++) {
-        if (!titles[i] || !minhashes[i]) continue;
-        for (let j = i + 1; j < recent.length; j++) {
-          if (!titles[j] || !minhashes[j]) continue;
-          // Fast MinHash estimate to skip obvious non-matches
-          if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PRE_THRESHOLD) continue;
-          const sim = jaccardSimilarity(titles[i], titles[j]);
-          if (sim > SIMILARITY_THRESHOLD) {
-            duplicates.push({
-              a: { id: recent[i].id, title: recent[i].title, importance: recent[i].importance },
-              b: { id: recent[j].id, title: recent[j].title, importance: recent[j].importance },
-              similarity: sim.toFixed(2),
-            });
-          }
-          if (duplicates.length >= DUPLICATE_LIMIT) break;
-        }
-      }
-
-      // 2. Consolidated stats query (single table scan instead of 4 separate COUNTs)
       const staleAge = Date.now() - STALE_AGE_MS;
-      const stats = db.prepare(`
-        SELECT
-          COUNT(*) as total,
-          COALESCE(SUM(CASE WHEN COALESCE(importance, 1) = 1 AND COALESCE(access_count, 0) = 0
-                        AND created_at_epoch < ? THEN 1 ELSE 0 END), 0) as stale,
-          COALESCE(SUM(CASE WHEN (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
-                   THEN 1 ELSE 0 END), 0) as broken,
-          COALESCE(SUM(CASE WHEN COALESCE(access_count, 0) > 3 AND COALESCE(importance, 1) < 3
-                   THEN 1 ELSE 0 END), 0) as boostable
-        FROM observations
-        WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
-      `).get(staleAge, ...baseParams);
-
-      // Count pending-purge items (marked by idle cleanup)
-      const pendingPurge = db.prepare(`
-        SELECT COUNT(*) as count FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} ${projectFilter}
-      `).get(...baseParams);
+      const mctx = { projectFilter, baseParams, staleAge };
+      const duplicates = findDuplicates(db, mctx);
+      const stats = maintenanceStats(db, mctx);
 
       const lines = [
         `Memory maintenance scan:`,
@@ -1351,7 +1247,7 @@ server.registerTool(
         `  Stale (>30d, imp=1, no access): ${stats.stale}`,
         `  Broken (no title/narrative): ${stats.broken}`,
         `  Boostable (accessed>3, imp<3): ${stats.boostable}`,
-        `  Pending purge (idle-marked): ${pendingPurge.count}`,
+        `  Pending purge (idle-marked): ${stats.pendingPurge}`,
       ];
       if (duplicates.length > 0) {
         const AUTO_MERGE_THRESHOLD = 0.85;
@@ -1396,7 +1292,7 @@ server.registerTool(
       }
       const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;
-      const OP_ROW_CAP = 1000; // safety cap per operation
+      const mctx = { projectFilter, baseParams, staleAge, opCap: OP_CAP };
 
       // T2-P0-A: purge_stale is the only DELETE in this handler. Require confirm=true;
       // a first call without confirm returns a dry-run preview so callers know the blast radius.
@@ -1404,11 +1300,7 @@ server.registerTool(
       if (purgeRequested && args.confirm !== true) {
         const retainDays = args.retain_days ?? 30;
         const retainCutoff = Date.now() - retainDays * 86400000;
-        const previewRow = db.prepare(`
-          SELECT COUNT(*) AS candidates, MIN(created_at_epoch) AS oldest, MAX(created_at_epoch) AS newest
-          FROM observations
-          WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
-        `).get(retainCutoff, ...baseParams);
+        const previewRow = purgeStalePreview(db, mctx, retainCutoff);
         const lines = [
           'purge_stale preview (confirm=false):',
           `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`,
@@ -1425,99 +1317,29 @@ server.registerTool(
 
       db.transaction(() => {
         if (ops.includes('cleanup')) {
-          const deleted = db.prepare(`
-            DELETE FROM observations
-            WHERE id IN (
-              SELECT id FROM observations
-              WHERE COALESCE(compressed_into, 0) = 0
-                AND (title IS NULL OR title = '')
-                AND (narrative IS NULL OR narrative = '')
-                ${projectFilter}
-              LIMIT ${OP_ROW_CAP}
-            )
-          `).run(...baseParams);
-          results.push(`Cleaned up ${deleted.changes} broken observations` + (deleted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
+          const deleted = cleanupBroken(db, mctx);
+          results.push(`Cleaned up ${deleted} broken observations` + (deleted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('decay')) {
-          const decayed = db.prepare(`
-            UPDATE observations SET importance = MAX(1, COALESCE(importance, 1) - 1)
-            WHERE id IN (
-              SELECT id FROM observations
-              WHERE COALESCE(compressed_into, 0) = 0
-                AND COALESCE(importance, 1) > 1
-                AND COALESCE(access_count, 0) = 0
-                AND created_at_epoch < ?
-                ${projectFilter}
-              LIMIT ${OP_ROW_CAP}
-            )
-          `).run(staleAge, ...baseParams);
-
-          // Mark importance=1, never-accessed, old observations as pending-purge
-          const idleMarked = db.prepare(`
-            UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}
-            WHERE id IN (
-              SELECT id FROM observations
-              WHERE COALESCE(compressed_into, 0) = 0
-                AND COALESCE(importance, 1) = 1
-                AND COALESCE(access_count, 0) = 0
-                AND created_at_epoch < ?
-                ${projectFilter}
-              LIMIT ${OP_ROW_CAP}
-            )
-          `).run(staleAge, ...baseParams);
-          results.push(`Decayed ${decayed.changes} stale observations, marked ${idleMarked.changes} idle as pending-purge` + ((decayed.changes >= OP_ROW_CAP || idleMarked.changes >= OP_ROW_CAP) ? ' (cap reached, re-run for more)' : ''));
+          // injection_count>0 protected (maintain-core; unifies with CLI + hook —
+          // the MCP copy previously lacked this clause and decayed/purged injected memories).
+          const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
+          results.push(`Decayed ${decayed} stale observations, marked ${idleMarked} idle as pending-purge` + ((decayed >= OP_CAP || idleMarked >= OP_CAP) ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('boost')) {
-          const boosted = db.prepare(`
-            UPDATE observations SET importance = MIN(3, COALESCE(importance, 1) + 1)
-            WHERE id IN (
-              SELECT id FROM observations
-              WHERE COALESCE(compressed_into, 0) = 0
-                AND COALESCE(access_count, 0) > 3
-                AND COALESCE(importance, 1) < 3
-                ${projectFilter}
-              LIMIT ${OP_ROW_CAP}
-            )
-          `).run(...baseParams);
-          results.push(`Boosted ${boosted.changes} frequently-accessed observations` + (boosted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
+          const boosted = boostAccessed(db, mctx);
+          results.push(`Boosted ${boosted} frequently-accessed observations` + (boosted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('demote_pinned')) {
-          // CLI-parity (cmdMaintain): repair the citation-decay blind spot. The
-          // `decay` op protects injection_count > 0, so a memory injected many
-          // times but never cited stays pinned at max importance and keeps
-          // dominating injection. Target heavy-injection + zero-citation and
-          // drop importance to 1 in one pass — injection priority is binary
-          // (importance>=2), so a 3→2 step would not de-rank it. Floor 1 (not
-          // purge). PINNED_INJ_THRESHOLD=8.
-          const demoted = db.prepare(`
-            UPDATE observations SET importance = 1
-            WHERE id IN (
-              SELECT id FROM observations
-              WHERE COALESCE(compressed_into, 0) = 0
-                AND COALESCE(injection_count, 0) >= 8
-                AND COALESCE(cited_count, 0) = 0
-                AND COALESCE(importance, 1) > 1
-                ${projectFilter}
-              LIMIT ${OP_ROW_CAP}
-            )
-          `).run(...baseParams);
-          results.push(`Demoted ${demoted.changes} pinned-but-uncited observations to importance 1 (inj>=8, cited=0)` + (demoted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
+          const demoted = demotePinned(db, mctx);
+          results.push(`Demoted ${demoted} pinned-but-uncited observations to importance 1 (inj>=8, cited=0)` + (demoted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('dedup') && args.merge_ids) {
-          let totalMerged = 0;
-          const mergeStmt = db.prepare('UPDATE observations SET compressed_into = ? WHERE id = ? AND COALESCE(compressed_into, 0) = 0');
-          for (const group of args.merge_ids) {
-            if (group.length < 2) continue;
-            const [keepId, ...removeIds] = group;
-            for (const removeId of removeIds) {
-              const result = mergeStmt.run(keepId, removeId);
-              totalMerged += result.changes;
-            }
-          }
+          const totalMerged = mergeDuplicates(db, args.merge_ids);
           results.push(`Merged ${totalMerged} duplicate observations`);
         }
 
@@ -1526,19 +1348,10 @@ server.registerTool(
         }
 
         if (ops.includes('purge_stale')) {
-          // Delete observations previously marked as pending-purge by idle cleanup.
-          // Requires user confirmation via /mem:update or /mem:mem.
           const retainDays = args.retain_days ?? 30;
           const retainCutoff = Date.now() - retainDays * 86400000;
-          const purged = db.prepare(`
-            DELETE FROM observations
-            WHERE id IN (
-              SELECT id FROM observations
-              WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ? ${projectFilter}
-              LIMIT ${OP_ROW_CAP}
-            )
-          `).run(retainCutoff, ...baseParams);
-          results.push(`Purged ${purged.changes} stale observations (retained last ${retainDays} days)` + (purged.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
+          const purged = purgeStale(db, mctx, retainCutoff);
+          results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)` + (purged >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
       })();
 
@@ -1546,50 +1359,25 @@ server.registerTool(
       db.exec("INSERT INTO observations_fts(observations_fts) VALUES('optimize')");
       results.push('FTS5 index optimized');
 
-      // rebuild_vectors: outside main transaction (creates its own internal transaction)
+      // rebuild_vectors: outside main transaction (maintain-core, shared with CLI).
       if (ops.includes('rebuild_vectors')) {
         try {
-          _resetVocabCache();
-          const vocab = rebuildVocabulary(db);
-          if (!vocab) {
-            results.push('Vectors: no observations to build vocabulary from');
-          } else {
-            const allObs = db.prepare(`
-              SELECT id, title, narrative, concepts FROM observations
-              WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-            `).all();
-            let updated = 0;
-            const insertStmt = db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)');
-            const now = Date.now();
-            db.transaction(() => {
-              db.prepare('DELETE FROM observation_vectors').run();
-              for (const obs of allObs) {
-                const text = [obs.title || '', obs.narrative || '', obs.concepts || ''].filter(Boolean).join(' ');
-                const vec = computeVector(text, vocab);
-                if (vec) {
-                  insertStmt.run(obs.id, Buffer.from(vec.buffer), vocab.version, now);
-                  updated++;
-                }
-              }
-            })();
-            results.push(`Vectors: rebuilt vocabulary (${vocab.terms.size} terms), updated ${updated}/${allObs.length} vectors`);
-          }
+          const r = rebuildVectors(db);
+          results.push(r.ok
+            ? `Vectors: rebuilt vocabulary (${r.terms} terms), updated ${r.updated}/${r.total} vectors`
+            : `Vectors: ${r.reason}`);
         } catch (e) {
           debugCatch(e, 'rebuild_vectors');
           results.push(`Vectors: rebuild failed — ${e.message}`);
         }
       }
 
-      // vacuum: reclaim freelist dead space left by DELETEs. CLI-parity
-      // (cmdMaintain). Must run OUTSIDE any transaction; whole-DB.
+      // vacuum: reclaim freelist dead space left by DELETEs. Whole-DB, outside any
+      // transaction. maintain-core, shared with CLI.
       if (ops.includes('vacuum')) {
         try {
-          const pageSize = db.pragma('page_size', { simple: true });
-          const freeBefore = db.pragma('freelist_count', { simple: true });
-          db.exec('VACUUM');
-          const freeAfter = db.pragma('freelist_count', { simple: true });
-          const reclaimedMB = ((Math.max(0, freeBefore - freeAfter) * pageSize) / 1048576).toFixed(1);
-          results.push(`VACUUM: reclaimed ~${reclaimedMB}MB (freelist ${freeBefore} → ${freeAfter} pages)`);
+          const v = vacuum(db);
+          results.push(`VACUUM: reclaimed ~${v.reclaimedMB}MB (freelist ${v.freeBefore} → ${v.freeAfter} pages)`);
         } catch (e) {
           debugCatch(e, 'vacuum');
           results.push(`VACUUM failed — ${e.message}`);
