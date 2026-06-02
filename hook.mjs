@@ -57,11 +57,11 @@ import { extractTailAssistantText, extractStructuredSummary } from './lib/summar
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
-import { checkForUpdate } from './hook-update.mjs';
+import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
-import { loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge } from './lib/cite-back-hint.mjs';
+import { loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -570,8 +570,13 @@ async function handleStop() {
             // alongside cite-recall. Same scan target (transcript already in OS
             // cache); same persistence file; one extra line in buildCiteRecallNudge.
             const bugfixStats = countUnsavedBugfixShape(transcriptPath);
-            const payload = { ...stats, ...bugfixStats, project, savedAt: Date.now() };
             const dest = join(RUNTIME_DIR, `cite-recall-${project.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64)}.json`);
+            // Carry the consecutive-low-cite streak forward so the SessionStart
+            // nag can self-silence after the project has ignored it N times.
+            let priorStreak = 0;
+            try { priorStreak = JSON.parse(readFileSync(dest, 'utf8')).lowStreak || 0; } catch {}
+            const lowStreak = nextCiteLowStreak(priorStreak, stats);
+            const payload = { ...stats, ...bugfixStats, lowStreak, project, savedAt: Date.now() };
             writeFileSync(dest, JSON.stringify(payload), { mode: 0o600 });
           } catch (e) { debugCatch(e, 'handleStop-cite-recall-persist'); }
         }
@@ -1181,18 +1186,14 @@ async function handleSessionStart() {
     // Pre-load TF-IDF vocabulary cache for this session (from DB, ~1ms)
     try { getVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }
 
-    // Auto-update check (24h throttle, 3s timeout, silent on failure)
-    // Awaited so process.exit(0) doesn't kill the promise before notification
+    // Auto-update check (audit P3d): NON-BLOCKING. Emit the banner from cached
+    // state (zero network) and, if the 24h check is due, refresh in a detached
+    // background worker so SessionStart never blocks on a GitHub fetch (was an
+    // inline `await checkForUpdate()` that could stall the session 3-6s).
     try {
-      const updateResult = await checkForUpdate();
-      if (updateResult?.updated) {
-        process.stdout.write(`\n🔄 claude-mem-lite: v${updateResult.from} → v${updateResult.to} updated\n`);
-      } else if (updateResult?.updateAvailable) {
-        const hint = updateResult.installDeferred
-          ? ' — plugin mode only checks for updates; reinstall/update the plugin to apply it'
-          : '';
-        process.stdout.write(`\n📦 claude-mem-lite: v${updateResult.to} available (current: v${updateResult.from})${hint}\n`);
-      }
+      const banner = getCachedUpdateBanner();
+      if (banner) process.stdout.write(banner);
+      if (isUpdateCheckDue()) spawnBackground('update-check');
     } catch (e) { debugCatch(e, 'session-start-update'); }
 
   } finally {
@@ -1496,6 +1497,10 @@ try {
     case 'llm-summary':      await handleLLMSummary(); break;
     case 'auto-compress':    handleAutoCompress(); break;
     case 'llm-optimize':   await handleLLMOptimize(); break;
+    // Detached update refresh spawned by handleSessionStart (audit P3d) — does the
+    // GitHub fetch + (non-plugin) install off the SessionStart critical path,
+    // writing update-state.json so the NEXT session's cached banner is fresh.
+    case 'update-check':     await checkForUpdate(); break;
   }
 } catch (err) {
   // Always log fatal errors (ungated) with structured format

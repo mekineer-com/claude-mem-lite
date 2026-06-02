@@ -2,6 +2,59 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.85.0 — cross-project effectiveness audit: fix the citation-decay feedback loop + injection hygiene
+
+A cross-project audit (analyzing how the plugin behaved across daagu / code-graph-mcp /
+claudemd and the global memory DB) found the self-tuning citation loop was effectively dead
+everywhere except the `mem` project, plus several injection-noise and disk-residue issues.
+
+**fix: citation-decay was blind to its highest-volume injection surfaces.** The
+UserPromptSubmit extractor matched the literal `hook.mjs user-prompt`, but Claude Code records
+the hook command with the path quote-wrapped (`node "…/hook.mjs" user-prompt`), so
+`.includes()` never matched in any real install — only PreToolUse survived (its gate matches
+the `pre-tool-recall` filename substring). The PostToolUse error-recall and `user-prompt-search.js`
+FYI surfaces had no extractor at all. Net: ~85% of injected observations never reached
+`applyCitationDecay`, so uncited high-importance "noise" re-injected forever (e.g. one
+claudemd bugfix injected 41×, never evaluated). Fixed by quote-normalizing the command match
+and adding extractors for the error-recall + FYI surfaces (`lib/citation-tracker.mjs`).
+Regression test now pins the production-shape quoted command (previous fixtures were all
+unquoted, which is why the bug shipped).
+
+**feat: `demote_pinned` maintain op** — clears the pinned-noise pool the existing `decay` op
+cannot reach (decay protects `injection_count > 0`). Targets `injection_count >= 8 AND
+cited_count = 0 AND importance > 1` and drops importance straight to 1 (injection priority is
+binary at `importance >= 2`, so a 3→2 step would not de-rank it). CLI + MCP `mem_maintain` +
+schema.
+
+**feat: `vacuum` maintain op** — reclaims SQLite freelist dead space left by DELETEs
+(`purge_stale`/`cleanup`/`dedup`); `auto_vacuum` was off and no `VACUUM` existed anywhere, so
+the DB grew monotonically (was 38% free pages).
+
+**fix: test-fixture residue (§8.V4).** Interrupted/killed vitest runs leaked `mkdtempSync`
+sandboxes (mem-e2e-* / mem-audit-* / cite-*) into temp — hundreds of MB. New
+`lib/tmp-fixture-sweep.mjs` reaps them: a vitest `globalSetup` self-heals at the next run's
+start (survives SIGKILL), and `install.mjs cleanup` sweeps them too. Conservative
+mem-namespaced allowlist — never touches other tools' temp dirs.
+
+**change: injection-noise reduction (all default-on, env-reversible):**
+- Cross-project memory injection penalty `MEM_CROSS_PROJECT_BOOST` 0.7 → 0.4 (off-topic
+  decisions were still winning slots in unrelated projects).
+- SessionStart cite-recall nag self-silences after 3 consecutive low-cite sessions
+  (`CLAUDE_MEM_CITE_NUDGE_SILENCE_AFTER`) — stop nagging projects that ignore it.
+- The PreToolUse "No prior lessons for X" reminder is now opt-in
+  (`CLAUDE_MEM_PRETOOL_NUDGE=1`); it fired on ~70% of Edit/Write recalls with no effect.
+  Save-nudging still happens at Stop.
+
+**perf: SessionStart no longer blocks on the update check.** Was an inline
+`await checkForUpdate()` that could stall the session 3–6s on a GitHub fetch once per 24h. Now
+emits the banner from cached state and refreshes in a detached background worker
+(`getCachedUpdateBanner` / `isUpdateCheckDue` + `update-check` bg event).
+
+**docs:** refreshed the stale `decision` vs `change` hit-rate figure in `CLAUDE.md` (the
+`72.7%/16.5%/~20:1` snapshot no longer holds; ~3:1 in current telemetry — re-measure with
+`stats`). Also fixed a calendar-dependent test in `session-invariant` that rotted as real
+time advanced past its hardcoded dates.
+
 ## v2.84.4 — propagate GEO description to plugin.json / marketplace.json / package.json
 
 Follow-up to v2.84.3. The new GitHub About description was applied to the GitHub repo metadata in v2.84.3 but **not** to the three JSON manifests that surface in package listings. This release propagates the same string everywhere so the plugin browser (`/plugin marketplace browse`), npm registry, and any tool that reads `package.json.description` all show the GEO-optimized text instead of the pre-v2.84.3 short version.

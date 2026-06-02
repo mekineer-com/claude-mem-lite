@@ -1484,6 +1484,29 @@ server.registerTool(
           results.push(`Boosted ${boosted.changes} frequently-accessed observations` + (boosted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
+        if (ops.includes('demote_pinned')) {
+          // CLI-parity (cmdMaintain): repair the citation-decay blind spot. The
+          // `decay` op protects injection_count > 0, so a memory injected many
+          // times but never cited stays pinned at max importance and keeps
+          // dominating injection. Target heavy-injection + zero-citation and
+          // drop importance to 1 in one pass — injection priority is binary
+          // (importance>=2), so a 3→2 step would not de-rank it. Floor 1 (not
+          // purge). PINNED_INJ_THRESHOLD=8.
+          const demoted = db.prepare(`
+            UPDATE observations SET importance = 1
+            WHERE id IN (
+              SELECT id FROM observations
+              WHERE COALESCE(compressed_into, 0) = 0
+                AND COALESCE(injection_count, 0) >= 8
+                AND COALESCE(cited_count, 0) = 0
+                AND COALESCE(importance, 1) > 1
+                ${projectFilter}
+              LIMIT ${OP_ROW_CAP}
+            )
+          `).run(...baseParams);
+          results.push(`Demoted ${demoted.changes} pinned-but-uncited observations to importance 1 (inj>=8, cited=0)` + (demoted.changes >= OP_ROW_CAP ? ' (cap reached, re-run for more)' : ''));
+        }
+
         if (ops.includes('dedup') && args.merge_ids) {
           let totalMerged = 0;
           const mergeStmt = db.prepare('UPDATE observations SET compressed_into = ? WHERE id = ? AND COALESCE(compressed_into, 0) = 0');
@@ -1554,6 +1577,22 @@ server.registerTool(
         } catch (e) {
           debugCatch(e, 'rebuild_vectors');
           results.push(`Vectors: rebuild failed — ${e.message}`);
+        }
+      }
+
+      // vacuum: reclaim freelist dead space left by DELETEs. CLI-parity
+      // (cmdMaintain). Must run OUTSIDE any transaction; whole-DB.
+      if (ops.includes('vacuum')) {
+        try {
+          const pageSize = db.pragma('page_size', { simple: true });
+          const freeBefore = db.pragma('freelist_count', { simple: true });
+          db.exec('VACUUM');
+          const freeAfter = db.pragma('freelist_count', { simple: true });
+          const reclaimedMB = ((Math.max(0, freeBefore - freeAfter) * pageSize) / 1048576).toFixed(1);
+          results.push(`VACUUM: reclaimed ~${reclaimedMB}MB (freelist ${freeBefore} → ${freeAfter} pages)`);
+        } catch (e) {
+          debugCatch(e, 'vacuum');
+          results.push(`VACUUM failed — ${e.message}`);
         }
       }
 

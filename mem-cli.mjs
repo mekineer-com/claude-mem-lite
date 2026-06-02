@@ -1869,7 +1869,7 @@ function cmdMaintain(db, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
   if (!action || !['scan', 'execute'].includes(action)) {
-    fail("[mem] Usage: claude-mem-lite maintain <scan|execute> [--ops cleanup,decay,boost,dedup,purge_stale,rebuild_vectors] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...] — 'scan' previews, 'execute' applies.");
+    fail("[mem] Usage: claude-mem-lite maintain <scan|execute> [--ops cleanup,decay,boost,demote_pinned,dedup,purge_stale,rebuild_vectors,vacuum] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...] — 'scan' previews, 'execute' applies.");
     return;
   }
 
@@ -1879,6 +1879,10 @@ function cmdMaintain(db, args) {
   const STALE_AGE_MS = 30 * 86400000;
   const SCAN_LIMIT = 500;
   const SIMILARITY_THRESHOLD = 0.7;
+  // demote_pinned threshold: a memory injected this many times with zero
+  // citations is "pinned noise" the regular `decay` op can't touch (decay
+  // protects injection_count > 0). 8 aligns with the noise-penalty tier-2 cut.
+  const PINNED_INJ_THRESHOLD = 8;
 
   if (action === 'scan') {
     const staleAge = Date.now() - STALE_AGE_MS;
@@ -1915,7 +1919,10 @@ function cmdMaintain(db, args) {
         COALESCE(SUM(CASE WHEN (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
                  THEN 1 ELSE 0 END), 0) as broken,
         COALESCE(SUM(CASE WHEN COALESCE(access_count, 0) > 3 AND COALESCE(importance, 1) < 3
-                 THEN 1 ELSE 0 END), 0) as boostable
+                 THEN 1 ELSE 0 END), 0) as boostable,
+        COALESCE(SUM(CASE WHEN COALESCE(injection_count, 0) >= ${PINNED_INJ_THRESHOLD}
+                      AND COALESCE(cited_count, 0) = 0 AND COALESCE(importance, 1) > 1
+                 THEN 1 ELSE 0 END), 0) as pinned
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}
     `).get(staleAge, ...baseParams);
@@ -1930,6 +1937,7 @@ function cmdMaintain(db, args) {
     out(`  Stale (>30d, imp=1, no access): ${stats.stale}`);
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
+    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — run: maintain execute --ops demote_pinned`);
     out(`  Pending purge: ${pendingPurge.count} (compressed originals awaiting cleanup)`);
     if (duplicates.length > 0) {
       const AUTO_MERGE_THRESHOLD = 0.85;
@@ -1962,7 +1970,7 @@ function cmdMaintain(db, args) {
   }
 
   // Execute
-  const VALID_OPS = ['cleanup', 'decay', 'boost', 'dedup', 'purge_stale', 'rebuild_vectors'];
+  const VALID_OPS = ['cleanup', 'decay', 'boost', 'demote_pinned', 'dedup', 'purge_stale', 'rebuild_vectors', 'vacuum'];
   const opsStr = flags.ops || 'cleanup,decay,boost';
   const ops = opsStr.split(',').map(s => s.trim());
   const invalidOps = ops.filter(op => !VALID_OPS.includes(op));
@@ -2022,6 +2030,31 @@ function cmdMaintain(db, args) {
       `).run(staleAge, ...baseParams);
       const decayCap = (decayed.changes >= OP_CAP || idleMarked.changes >= OP_CAP) ? ' (cap reached, re-run for more)' : '';
       results.push(`Decayed ${decayed.changes} stale observations, marked ${idleMarked.changes} idle as pending-purge${decayCap}`);
+    }
+
+    if (ops.includes('demote_pinned')) {
+      // Repair the citation-decay blind spot: the `decay` op above PROTECTS
+      // injection_count > 0 rows, so a memory injected many times but never
+      // cited stays pinned at max importance and keeps dominating injection
+      // forever (the entrenched-noise pool the extractor bug let accumulate).
+      // Target the inverse signal — heavy injection, zero citations — and drop
+      // importance to 1 in a SINGLE pass. Injection priority is binary
+      // (importance >= 2 → full weight; hook-memory.mjs), so a gentle 3→2 step
+      // would leave the obs dominating injection just the same; only reaching 1
+      // actually de-ranks it. Floors at 1 (not 0/purge) so a later boost (access)
+      // or a genuine cite can still rescue a useful entry.
+      const demoted = db.prepare(`
+        UPDATE observations SET importance = 1
+        WHERE id IN (
+          SELECT id FROM observations
+          WHERE COALESCE(compressed_into, 0) = 0
+            AND COALESCE(injection_count, 0) >= ${PINNED_INJ_THRESHOLD}
+            AND COALESCE(cited_count, 0) = 0
+            AND COALESCE(importance, 1) > 1
+            ${projectFilter} LIMIT ${OP_CAP}
+        )
+      `).run(...baseParams);
+      results.push(`Demoted ${demoted.changes} pinned-but-uncited observations to importance 1 (inj>=${PINNED_INJ_THRESHOLD}, cited=0)${capHint(demoted.changes)}`);
     }
 
     if (ops.includes('boost')) {
@@ -2134,6 +2167,24 @@ function cmdMaintain(db, args) {
       }
     } catch (e) {
       results.push(`Vectors: rebuild failed — ${e.message}`);
+    }
+  }
+
+  // vacuum: reclaim freelist pages left behind by DELETEs (purge_stale / cleanup
+  // / dedup). DELETE only grows the freelist; the file never shrinks without
+  // VACUUM, which is absent everywhere else (auto_vacuum=0). Must run OUTSIDE any
+  // transaction. Whole-DB regardless of --project. Reports freelist before/after
+  // as the §7 reclaim metric.
+  if (ops.includes('vacuum')) {
+    try {
+      const pageSize = db.pragma('page_size', { simple: true });
+      const freeBefore = db.pragma('freelist_count', { simple: true });
+      db.exec('VACUUM');
+      const freeAfter = db.pragma('freelist_count', { simple: true });
+      const reclaimedMB = ((Math.max(0, freeBefore - freeAfter) * pageSize) / 1048576).toFixed(1);
+      results.push(`VACUUM: reclaimed ~${reclaimedMB}MB (freelist ${freeBefore} → ${freeAfter} pages)`);
+    } catch (e) {
+      results.push(`VACUUM failed — ${e.message}`);
     }
   }
 
@@ -2575,10 +2626,12 @@ Commands:
     --project P         Filter by project
 
   maintain <scan|execute>  Memory maintenance
-    --ops O             Comma-separated: cleanup,decay,boost,dedup,purge_stale,rebuild_vectors
+    --ops O             Comma-separated: cleanup,decay,boost,demote_pinned,dedup,purge_stale,rebuild_vectors,vacuum
     --merge-ids K:R,... For dedup: keepId:removeId pairs (e.g. 10:11,20:21:22)
     --project P         Filter by project
     --retain-days N     For purge_stale: keep last N days (default 30)
+                        demote_pinned: importance→1 for inj>=8 & cited=0 (clears pinned noise)
+                        vacuum: reclaim freelist dead space (whole-DB, ignores --project)
 
   optimize              LLM-powered memory optimization (preview by default)
     --run               Execute (default: preview gates)

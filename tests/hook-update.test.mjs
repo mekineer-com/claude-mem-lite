@@ -398,3 +398,45 @@ describe('validateExtractedTarball', () => {
   });
 });
 
+describe('non-blocking SessionStart helpers (P3d)', () => {
+  function seedState(dataDir, state) {
+    writeFileSync(join(dataDir, 'runtime', 'update-state.json'), JSON.stringify(state, null, 2));
+  }
+
+  it('getCachedUpdateBanner returns the available banner from cached state — no network', async () => {
+    const dataDir = makeDataDir('1.0.0');
+    seedState(dataDir, { lastCheck: new Date().toISOString(), installedVersion: '1.0.0', latestVersion: '1.2.0', updateAvailable: true });
+    globalThis.fetch = vi.fn(); // must NOT be called
+    const { getCachedUpdateBanner } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root' });
+    const banner = getCachedUpdateBanner();
+    expect(banner).toContain('v1.2.0 available');
+    expect(banner).toContain('current: v1.0.0');
+    expect(banner).toContain('plugin mode'); // plugin-mode hint
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('getCachedUpdateBanner returns null when no update is cached', async () => {
+    const dataDir = makeDataDir('1.0.0');
+    seedState(dataDir, { lastCheck: new Date().toISOString(), installedVersion: '1.0.0', updateAvailable: false });
+    const { getCachedUpdateBanner } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    expect(getCachedUpdateBanner()).toBeNull();
+  });
+
+  it('isUpdateCheckDue is true with no prior check and false right after one', async () => {
+    const dataDir = makeDataDir('1.0.0');
+    const { isUpdateCheckDue } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    expect(isUpdateCheckDue()).toBe(true); // no state file → never checked
+    seedState(dataDir, { lastCheck: new Date().toISOString(), installedVersion: '1.0.0', updateAvailable: false });
+    const { isUpdateCheckDue: due2 } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    expect(due2()).toBe(false); // just checked → throttled
+  });
+
+  it('isUpdateCheckDue is false when CLAUDE_MEM_SKIP_UPDATE is set', async () => {
+    const dataDir = makeDataDir('1.0.0');
+    const mod = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    process.env.CLAUDE_MEM_SKIP_UPDATE = '1';
+    expect(mod.isUpdateCheckDue()).toBe(false);
+    expect(mod.getCachedUpdateBanner()).toBeNull();
+  });
+});
+

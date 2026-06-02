@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.84.4
+- **Version**: 2.85.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (61 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -88,9 +88,11 @@ if they'd seen the lesson? If yes → save it. If no → it wasn't a real bug fi
 
 **After making a non-obvious architectural decision** (≠ renaming, ≠ moving code): call
 `mem_save(type='decision', lesson_learned='<constraint + why this choice + what it trades off>')`.
-Empirical note: `decision` observations have 72.7% hit rate vs `change` at 16.5% — one good
-decision memory is worth ~20 change memories. Do not inflate this — decision is reserved
-for real tradeoffs, not style choices.
+Empirical note: `decision` observations retrieve at a materially higher cite-rate than
+`change` (~3:1 in current telemetry; an older 2026-05 snapshot read ~20:1 but that magnitude
+no longer holds — re-measure with `claude-mem-lite stats` rather than trusting a fixed
+number). The direction is robust: a good decision memory is worth several change memories.
+Do not inflate this — decision is reserved for real tradeoffs, not style choices.
 
 **When deferring work to a future session** (≠ in-flight todo, ≠ this-PR follow-up):
 call `mem_defer({title: '<one-line subject>', priority: <1|2|3>, detail: '<constraint + why deferred>'})`.

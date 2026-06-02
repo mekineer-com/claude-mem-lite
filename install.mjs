@@ -30,6 +30,7 @@ import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
 import { probeBetterSqlite3Binding, ensureBetterSqlite3Working } from './lib/binding-probe.mjs';
+import { sweepStaleTestFixtures } from './lib/tmp-fixture-sweep.mjs';
 
 // Re-export for backward compatibility — tests/install-hook-scripts.test.mjs
 // and any external consumers still import HOOK_SCRIPT_FILES from install.mjs.
@@ -1752,6 +1753,16 @@ function cleanup() {
       }
     }
   }
+
+  // Reap leaked test-fixture sandboxes from temp (mem-e2e-* / mem-audit-* / cite-*
+  // etc.) left by interrupted vitest runs — the §8.V4 disposal gap the audit found
+  // (~795MB). 24h age here (vs 1h in the test reaper) is conservative for a manual
+  // cleanup. Scans os.tmpdir() and the Claude Code temp root, depth-1, mem-prefixes
+  // only — never touches other tools' temp dirs.
+  const fixtureRoots = [tmpdir(), join(homedir(), '.claude', 'tmp')];
+  const swept = sweepStaleTestFixtures({ dirs: fixtureRoots, ageMs: 24 * 60 * 60 * 1000, dryRun });
+  for (const p of swept.names) ok(`${dryRun ? 'Would remove' : 'Removed'}: ${p}`);
+  removed += swept.removed;
 
   const verb = dryRun ? 'would be removed' : 'removed';
   console.log(`\n  ${removed === 0 ? 'No stale files found.' : `${removed} stale file(s) ${verb}.`}\n`);

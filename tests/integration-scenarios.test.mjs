@@ -399,20 +399,29 @@ describe('Scenario 3: File Edit Pre-Recall — PreToolUse', () => {
     // Note: may be empty if cooldown is active — that's also valid behavior
   });
 
-  it('emits backfill reminder for file with no past observations (R-4)', () => {
+  it('emits backfill reminder for file with no past observations (R-4, opt-in)', () => {
     const payload = JSON.stringify({
       tool_name: 'Edit',
       tool_input: { file_path: '/tmp/brand-new-file.js' },
     });
-    const { stdout, exitCode } = runScript(PRE_RECALL_PATH, { stdin: payload });
+    // The backfill reminder is opt-in (default off) since the cross-project audit
+    // found it was ~70% no-value noise; CLAUDE_MEM_PRETOOL_NUDGE=1 restores it.
+    const { stdout, exitCode } = runScript(PRE_RECALL_PATH, { stdin: payload, env: { CLAUDE_MEM_PRETOOL_NUDGE: '1' } });
     expect(exitCode).toBe(0);
-    // R-4: previously silent; now emits a one-line reminder so Claude knows the hook ran
-    // and gets nudged to save a lesson after solving a non-obvious bug.
-    // v2.31 T2: output is JSON; parse first. Reminder now points at /lesson (added in Task 8).
     const parsed = JSON.parse(stdout);
     const ctx = parsed.hookSpecificOutput.additionalContext;
     expect(ctx).toContain('[mem] No prior lessons for brand-new-file.js');
     expect(ctx).toContain('/lesson');
+  });
+
+  it('is silent by default for a file with no past observations (R-4 default off)', () => {
+    const payload = JSON.stringify({
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/brand-new-file-2.js' },
+    });
+    const { stdout, exitCode } = runScript(PRE_RECALL_PATH, { stdin: payload });
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe('');
   });
 
   it('recallForFile finds observations by filename match', () => {

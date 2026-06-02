@@ -606,7 +606,7 @@ describe('v27: term-coverage filter', () => {
 
 // ─── v2.41: cross-project boost env override ────────────────────────────────
 //
-// Default 0.7 penalty to cross-project hits is baked in at hook-memory.mjs.
+// Default 0.4 multiplier (60% penalty) to cross-project hits is baked in at hook-memory.mjs.
 // For single-project users (or users who want stronger cross-project transfer),
 // MEM_CROSS_PROJECT_BOOST ∈ [0,1] overrides the multiplier. 1.0 disables the
 // penalty entirely; 0.0 removes cross-project hits from the merged result set.

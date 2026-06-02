@@ -240,13 +240,26 @@ describe('pre-tool-recall', () => {
       try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
     });
 
-    function runWithEnv(input) {
+    function runWithEnv(input, extraEnv = {}) {
       return runScript(input, {
         CLAUDE_MEM_DB_PATH: dbPath,
         CLAUDE_MEM_RUNTIME_DIR: runtimeDir,
         CLAUDE_PROJECT_DIR: projectDir,
+        // The no-prior-lessons backfill reminder is opt-in (default off) since the
+        // cross-project audit. These tests exercise that reminder + the cooldown
+        // mechanism it doubles as a probe for, so enable it here.
+        CLAUDE_MEM_PRETOOL_NUDGE: '1',
+        ...extraEnv,
       });
     }
+
+    it('does NOT emit the backfill reminder by default (opt-in only)', async () => {
+      const { stdout } = await runWithEnv({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'no-nudge.py') },
+      }, { CLAUDE_MEM_PRETOOL_NUDGE: '' });
+      expect(stdout).toBe('');
+    });
 
     it('emits backfill reminder when no lessons match for the file', async () => {
       // No observations for this file → no lessons to surface.
@@ -583,6 +596,8 @@ describe('pre-tool-recall', () => {
         CLAUDE_MEM_DB_PATH: dbPath,
         CLAUDE_MEM_RUNTIME_DIR: runtimeDir,
         CLAUDE_PROJECT_DIR: projectDir,
+        // Backfill reminder is opt-in (default off) post-audit; these blocks test it.
+        CLAUDE_MEM_PRETOOL_NUDGE: '1',
       });
     }
 
@@ -658,6 +673,8 @@ describe('pre-tool-recall', () => {
         CLAUDE_MEM_DB_PATH: dbPath,
         CLAUDE_MEM_RUNTIME_DIR: runtimeDir,
         CLAUDE_PROJECT_DIR: projectDir,
+        // Backfill reminder is opt-in (default off) post-audit; these blocks test it.
+        CLAUDE_MEM_PRETOOL_NUDGE: '1',
       });
     }
 

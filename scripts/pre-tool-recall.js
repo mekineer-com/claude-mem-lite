@@ -329,14 +329,18 @@ try {
           lines.push(`  #${r.id} [${r.type}] ${title}`);
         }
       }
-    } else if (!isRead) {
-      // R-4: Edit/Write empty → short backfill reminder. Two goals: (1) Claude
-      // sees that the system actually ran, (2) Claude is nudged to save a lesson
-      // after a non-obvious bug. Reminder is one line to keep per-Edit cost low.
+    } else if (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1') {
+      // R-4: Edit/Write empty → short backfill reminder. OPT-IN (default off) as
+      // of the cross-project audit: this "no prior lessons, remember to /lesson"
+      // reminder fired on ~70% of Edit/Write recalls and drove zero observed
+      // /lesson calls — pure context noise, mostly on brand-new files that by
+      // definition can't have a lesson. Save-nudging now lives at Stop time
+      // (buildCiteRecallNudge's unsaved-bugfix line + the cite-back hint), which
+      // has the full episode to judge whether a real fix happened. Set
+      // CLAUDE_MEM_PRETOOL_NUDGE=1 to restore the per-Edit reminder.
       //
-      // v2.34.6: Read does NOT emit this nudge. Read is passive — the agent
-      // isn't necessarily about to solve anything, so /lesson prompts are noise.
-      // Empty Reads exit silently, saving ~60 tokens × (every empty-file Read).
+      // Read never emitted this (passive). The cooldown write below still runs on
+      // every branch, so Read→Edit dedup + cite-back lessonId tracking are intact.
       lines.push(`[mem] PreToolUse recall — system-injected context, continue your planned action:`);
       lines.push(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: /lesson --file ${fname} "<root cause + fix>"`);
     }

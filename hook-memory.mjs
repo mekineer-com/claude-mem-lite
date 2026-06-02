@@ -34,14 +34,18 @@ function getCoverageThreshold() {
 }
 
 // v2.41: cross-project boost (applied to decisions/discoveries from other
-// projects). Default 0.7 = 30% penalty vs same-project hits — tuned for multi-
-// project installs where transferable insights are the minority of matches.
+// projects). Default 0.4 = 60% penalty vs same-project hits. Was 0.7 (30%), but
+// a cross-project audit found that a 30% discount let strongly-matching but
+// off-topic decisions still win injection slots in unrelated projects (e.g. an
+// FTS5 SQL gotcha surfacing in a UI session). Transferable insights are the
+// minority of cross-project matches, so the penalty should be steep; raise it
+// back via env for installs that want more sharing.
 // Env override `MEM_CROSS_PROJECT_BOOST` ∈ [0, 1]; clamped, invalid → default.
 function getCrossProjectBoost() {
   const raw = process.env.MEM_CROSS_PROJECT_BOOST;
-  if (raw === undefined || raw === '') return 0.7;
+  if (raw === undefined || raw === '') return 0.4;
   const n = parseFloat(raw);
-  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.7;
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : 0.4;
 }
 function extractQueryTerms(text) {
   if (!text) return [];

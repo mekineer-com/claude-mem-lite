@@ -41,6 +41,9 @@ export const SOURCE_FILES = [
   'lib/private-strip.mjs',
   'lib/citation-tracker.mjs',
   'lib/cite-back-hint.mjs',
+  // v2.85: stale test-fixture sweeper. Imported by install.mjs (cleanup) + cli.mjs.
+  // Missing from manifest → tarball ships install.mjs that ERR_MODULE_NOT_FOUND on cleanup.
+  'lib/tmp-fixture-sweep.mjs',
   'lib/summary-extractor.mjs',
   'lib/id-routing.mjs',
   'lib/err-sampler.mjs',

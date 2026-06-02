@@ -101,6 +101,38 @@ export async function checkForUpdate(options = {}) {
   }
 }
 
+// ── Non-blocking SessionStart helpers (audit P3d) ──────────────────────────
+// Previously handleSessionStart `await checkForUpdate()` inline, blocking the
+// session up to ~3-6s on a GitHub fetch once per 24h. These two helpers split
+// that: emit the banner from CACHED state (zero network) and let the network
+// refresh run in a detached background worker, so SessionStart never blocks.
+
+// Banner string from cached update-state (≤24h stale), or null. No network I/O.
+export function getCachedUpdateBanner() {
+  try {
+    if (isDevMode() || process.env.CLAUDE_MEM_SKIP_UPDATE) return null;
+    const state = readState();
+    if (state.updateAvailable && state.latestVersion) {
+      // Cached "available" state only persists for deferred installs (plugin mode
+      // / allowInstall=false); a successful auto-install clears updateAvailable.
+      const hint = isPluginMode()
+        ? ' — plugin mode only checks for updates; reinstall/update the plugin to apply it'
+        : '';
+      return `\n📦 claude-mem-lite: v${state.latestVersion} available (current: v${state.installedVersion})${hint}\n`;
+    }
+    return null;
+  } catch { return null; }
+}
+
+// True when a network refresh is due (24h throttle) and updates aren't disabled.
+// Caller spawns the refresh in the background so this session doesn't wait.
+export function isUpdateCheckDue() {
+  try {
+    if (isDevMode() || process.env.CLAUDE_MEM_SKIP_UPDATE) return false;
+    return shouldCheck(readState());
+  } catch { return false; }
+}
+
 function isPluginMode() {
   return Boolean(process.env.CLAUDE_PLUGIN_ROOT);
 }

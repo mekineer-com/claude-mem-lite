@@ -3,6 +3,10 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     testTimeout: 20000,
+    // Reap test-fixture dirs leaked by prior interrupted/SIGKILL'd runs (afterEach
+    // never reached). Runs once before the suite; 1h age guard never touches the
+    // current run. See lib/tmp-fixture-sweep.mjs.
+    globalSetup: ['./tests/global-setup.mjs'],
     coverage: {
       provider: 'v8',
       include: [

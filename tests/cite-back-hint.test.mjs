@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { buildCiteBackHint, loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge } from '../lib/cite-back-hint.mjs';
+import { buildCiteBackHint, loadCiteBackForEpisode, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge, nextCiteLowStreak, CITE_NUDGE_SILENCE_AFTER } from '../lib/cite-back-hint.mjs';
 
 const editEntry = (file, tool = 'Edit') => ({ tool, files: [file], isError: false });
 const readEntry = (file) => ({ tool: 'Read', files: [file], isError: false });
@@ -449,6 +449,48 @@ describe('buildCiteRecallNudge', () => {
     seed('weird/proj:name@chars', { injected: 0, recalled: 0, ratio: 0, unsaved: 1 });
     const out = buildCiteRecallNudge('weird/proj:name@chars', tmp, {});
     expect(out).toContain('1 unsaved bugfix-shape');
+  });
+
+  it('self-silences the ratio nag after lowStreak reaches the threshold', () => {
+    // Same low-cite stats that WOULD fire, but the project has ignored it
+    // CITE_NUDGE_SILENCE_AFTER times running → suppress the ratio line.
+    seed('p-silence', { injected: 10, recalled: 0, ratio: 0, lowStreak: CITE_NUDGE_SILENCE_AFTER });
+    expect(buildCiteRecallNudge('p-silence', tmp, {})).toBe('');
+  });
+
+  it('still nags while lowStreak is below the threshold', () => {
+    seed('p-loud', { injected: 10, recalled: 0, ratio: 0, lowStreak: CITE_NUDGE_SILENCE_AFTER - 1 });
+    expect(buildCiteRecallNudge('p-loud', tmp, {})).toContain('cite-recall 0%');
+  });
+
+  it('still surfaces unsaved-bugfix line even when the ratio nag is silenced', () => {
+    seed('p-mix', { injected: 10, recalled: 0, ratio: 0, lowStreak: CITE_NUDGE_SILENCE_AFTER, unsaved: 2 });
+    const out = buildCiteRecallNudge('p-mix', tmp, {});
+    expect(out).not.toContain('cite-recall');
+    expect(out).toContain('2 unsaved bugfix-shape');
+  });
+
+  it('CLAUDE_MEM_CITE_NUDGE_SILENCE_AFTER=0 never silences', () => {
+    seed('p-never', { injected: 10, recalled: 0, ratio: 0, lowStreak: 99 });
+    expect(buildCiteRecallNudge('p-never', tmp, { CLAUDE_MEM_CITE_NUDGE_SILENCE_AFTER: '0' })).toContain('cite-recall 0%');
+  });
+});
+
+describe('nextCiteLowStreak', () => {
+  it('increments when the ratio gate fires (low recall, enough volume)', () => {
+    expect(nextCiteLowStreak(2, { injected: 10, ratio: 0.2 })).toBe(3);
+  });
+
+  it('resets to 0 when cite-recall recovers above threshold', () => {
+    expect(nextCiteLowStreak(5, { injected: 10, ratio: 0.8 })).toBe(0);
+  });
+
+  it('resets to 0 when injection volume is below the floor (no signal)', () => {
+    expect(nextCiteLowStreak(5, { injected: 2, ratio: 0 })).toBe(0);
+  });
+
+  it('treats a non-numeric prior streak as 0', () => {
+    expect(nextCiteLowStreak(undefined, { injected: 10, ratio: 0 })).toBe(1);
   });
 });
 

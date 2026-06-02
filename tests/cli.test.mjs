@@ -1285,6 +1285,52 @@ describe('CLI maintain command', () => {
     expect(output).toContain('Decayed');
   });
 
+  it('execute runs demote_pinned: drops importance for heavily-injected, never-cited obs only', async () => {
+    // The pinned-noise the regular `decay` op can't reach (it protects injection_count>0).
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Pinned noise', text: 'injected often, never cited',
+      importance: 3, injectionCount: 41, citedCount: 0,
+    });
+    // Cited → protected (must NOT demote).
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'Earned its keep', text: 'cited',
+      importance: 3, injectionCount: 12, citedCount: 4,
+    });
+    // Low injection → below threshold (must NOT demote).
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Rarely injected', text: 'few injections',
+      importance: 3, injectionCount: 2, citedCount: 0,
+    });
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'demote_pinned']));
+    expect(output).toContain('Demoted 1 pinned-but-uncited');
+    // Dropped to 1 in one pass (below the binary importance>=2 injection-priority tier).
+    expect(testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Pinned noise').importance).toBe(1);
+    expect(testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Earned its keep').importance).toBe(3);
+    expect(testDb.prepare('SELECT importance FROM observations WHERE title = ?').get('Rarely injected').importance).toBe(3);
+  });
+
+  it('execute runs vacuum and reports freelist reclaim', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Some obs', text: 'content',
+    });
+    const output = await captureStdout(() => run(['maintain', 'execute', '--ops', 'vacuum']));
+    expect(output).toContain('VACUUM: reclaimed');
+    expect(output).toContain('freelist');
+  });
+
+  it('scan reports pinned-but-uncited count', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Pinned noise', text: 'x', importance: 3, injectionCount: 10, citedCount: 0,
+    });
+    const output = await captureStdout(() => run(['maintain', 'scan']));
+    expect(output).toContain('Pinned-but-uncited (inj>=8, cited=0, imp>1): 1');
+  });
+
   it('execute runs dedup with --merge-ids', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',

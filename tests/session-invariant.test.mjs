@@ -208,11 +208,15 @@ describe('lesson_retry_stats (v29 / B2)', () => {
 
   it('readRetryStats orders DESC and respects the days window', async () => {
     const { recordRetryAttempt, readRetryStats } = await import('../hook-llm.mjs');
-    recordRetryAttempt(db, true, '2026-05-01');
-    recordRetryAttempt(db, false, '2026-05-08');
-    recordRetryAttempt(db, true, '2026-05-09');
-    // Default days=30 should include all three.
+    // Calendar-independent: buckets relative to now, so the 30-day window
+    // assertion doesn't rot as real time advances past hardcoded dates (the
+    // previous fixed 2026-05-0x dates silently fell outside the window).
+    const bucket = (daysAgo) => new Date(Date.now() - daysAgo * 86400000).toISOString().slice(0, 10);
+    recordRetryAttempt(db, true, bucket(40));  // outside the 30-day window → excluded
+    recordRetryAttempt(db, false, bucket(8));
+    recordRetryAttempt(db, true, bucket(1));
     const rows = readRetryStats(db, 30);
-    expect(rows.map(r => r.date_bucket)).toEqual(['2026-05-09', '2026-05-08', '2026-05-01']);
+    // DESC order, and the 40-days-ago bucket is filtered out by the window.
+    expect(rows.map(r => r.date_bucket)).toEqual([bucket(1), bucket(8)]);
   });
 });

@@ -203,8 +203,8 @@ export const memOptimizeSchema = {
 
 export const memMaintainSchema = {
   action: z.enum(['scan', 'execute']).describe('scan=analyze candidates, execute=apply changes'),
-  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'purge_stale', 'rebuild_vectors'])).optional()
-    .describe('Operations: dedup=find/merge duplicate observations, decay=reduce importance of old low-value obs, cleanup=remove orphaned records, boost=promote frequently-accessed obs, purge_stale=DELETE pending-purge obs older than retain_days (requires confirm=true; first call previews), rebuild_vectors=rebuild TF-IDF vocabulary and all observation vectors'),
+  operations: z.array(z.enum(['dedup', 'decay', 'cleanup', 'boost', 'demote_pinned', 'purge_stale', 'rebuild_vectors', 'vacuum'])).optional()
+    .describe('Operations: dedup=find/merge duplicate observations, decay=reduce importance of old low-value obs, cleanup=remove orphaned records, boost=promote frequently-accessed obs, demote_pinned=importance→1 for obs injected>=8 times but never cited (clears pinned noise the decay op cannot reach), purge_stale=DELETE pending-purge obs older than retain_days (requires confirm=true; first call previews), rebuild_vectors=rebuild TF-IDF vocabulary and all observation vectors, vacuum=reclaim freelist dead space (whole-DB)'),
   merge_ids: z.preprocess(
     (v) => Array.isArray(v) ? v.map(g => Array.isArray(g) ? g.map(x => typeof x === 'string' ? parseInt(x, 10) : x) : g) : v,
     z.array(z.array(z.number().int()).min(2))
