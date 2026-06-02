@@ -2,6 +2,31 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.88.0 — mem_maintain decay parity fix + compress/maintain single-source cores
+
+**fix: `mem_maintain` (MCP) now protects injected memories from decay/purge, matching the
+CLI and hook.** The `decay` + `mark-idle` operations were duplicated across `cmdMaintain`
+(CLI), `mem_maintain` (MCP), and the hook auto-maintain, kept in sync by hand-written
+"parity" comments — and they had drifted. v2.56.0 added an `injection_count > 0` guard (a
+memory Claude was auto-injected 8× is contextually proven and must survive) to the CLI and
+hook, but the MCP copy never got it, so `mem_maintain(action="execute",
+operations=["decay"])` decayed importance and idle-marked-for-purge observations the other
+two paths preserve. Consolidating the maintenance ops into one source of truth carries the
+guard once, so all three paths behave identically.
+
+**refactor: compress + maintain operations extracted to `lib/compress-core.mjs` and
+`lib/maintain-core.mjs`.** ~600 lines that were triplicated across CLI / MCP / hook and
+synchronized by "parity" comments — the mechanism behind both the decay drift above and an
+earlier compression-vector drift — now live once; the call sites are thin adapters that keep
+only what legitimately differs (rendering, candidate windows, transaction granularity, input
+parsing). Behavior-preserving apart from the decay fix; full suite is 2602 tests green, with
+new characterization tests pinning each shared operation.
+
+**dev: `experiment/` — a runnable value A/B harness** (not shipped to npm) to measure whether
+memory injection reduces repeat-bug recurrence at non-positive net token cost. Control /
+treatment / shuffled arms, deterministic bootstrap CIs, and a falsifiable decision rule;
+dry-run validates the whole pipeline without a live `claude`.
+
 ## v2.87.0 — fix warm-start FK enforcement + v35 orphan-junction cleanup
 
 **fix: restore `foreign_keys` enforcement on the warm-start DB-open path.** `ensureDb()` opens the
