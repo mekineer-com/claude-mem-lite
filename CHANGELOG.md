@@ -2,6 +2,33 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.87.0 — fix warm-start FK enforcement + v35 orphan-junction cleanup
+
+**fix: restore `foreign_keys` enforcement on the warm-start DB-open path.** `ensureDb()` opens the
+connection with `foreign_keys = OFF` so early migrations can run without cascade, expecting
+`initSchema()` to re-enable it. The full migration path did (at its tail), but the two early-return
+paths — the warm-start fast-path (the common case once a DB is already at the current schema
+version) and the under-lock concurrent-init return — returned the handle without re-enabling it. So
+on virtually every real open, `DELETE`s ran with enforcement off and `ON DELETE CASCADE` silently
+never fired, leaking junction rows (live DBs reached 6440/9569 = 67% orphaned `observation_files`).
+Fix: set `foreign_keys = ON` before both early returns in `initSchema` (the under-lock one after
+`COMMIT` closes the transaction, since `PRAGMA foreign_keys` is a no-op inside one). This is the
+root cause the v28 `observation_vectors` cleanup had only patched downstream.
+
+**schema v35: one-shot cleanup of the orphan backlog.** The FK fix is forward-only — it stops new
+orphans but leaves rows already leaked. v35 bumps the schema version purely to force one full
+migration pass on existing DBs, which runs a new `observation_files` cleanup
+(`DELETE … WHERE obs_id NOT IN (SELECT id FROM observations)`, mirroring the v28
+`observation_vectors` cleanup) and re-runs the v28 vectors cleanup on the same pass. No DDL, no new
+column, `LATEST_MIGRATION_COLUMN` unchanged. Idempotent (the predicate is empty on a clean DB) and
+structurally non-destructive (it only matches rows whose parent observation no longer exists). On
+the maintainer's live DB it cleared 6440 `observation_files` + 143 `observation_vectors` orphans
+with valid rows untouched.
+
+**tests:** `tests/schema-fk-warmstart.test.mjs` — warm-start handle enforces FK; deleting an
+observation cascades to `observation_files`; re-migration clears both orphan classes and keeps
+valid rows.
+
 ## v2.86.0 — OpenRouter provider support + LLM provider failure fallback
 
 **feat: OpenRouter as a second API provider for all background LLM calls.** Provider priority

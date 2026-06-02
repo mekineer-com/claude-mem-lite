@@ -307,6 +307,9 @@ describe('pre-tool-recall', () => {
       const db = new Database(dbPath);
       db.pragma('foreign_keys = OFF');
       initSchema(db);
+      // Parent session for the FK on observations.memory_session_id — the warm-start
+      // reopen now correctly enforces ON DELETE CASCADE, so an orphan obs is rejected.
+      insertSession(db, { id: 'sess-frame', project: 'parent--frametest', memoryId: 'mem-frame' });
       insertObs(db, {
         sessionId: 'mem-frame', project: 'parent--frametest',
         type: 'bugfix', importance: 2,

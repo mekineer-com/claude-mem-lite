@@ -49,7 +49,12 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // cited_count, last_decided_session_id. Stop hook resolves injected obs as
 // cited|uncited; 3 consecutive uncited → importance -1 (floor 0); 1 cited → +1
 // (cap 3). last_decided_session_id makes Stop idempotent across multi-fire.
-export const CURRENT_SCHEMA_VERSION = 34;
+// v35 (v2.87.0): no DDL — version bumped only to force one full migration pass on
+// existing DBs, which runs the one-shot observation_files orphan cleanup (and
+// re-runs the v28 observation_vectors cleanup) to clear the backlog leaked while
+// the warm-start fast-path left foreign_keys OFF. LATEST_MIGRATION_COLUMN is
+// unchanged (no new column) — decay_seen_count still exists at v35.
+export const CURRENT_SCHEMA_VERSION = 35;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
@@ -212,7 +217,16 @@ export function initSchema(db) {
       // Self-heal: version-row says CURRENT but latest migration column may be
       // absent (rolled back / never applied). Fall through to migration apply
       // when the sentinel is missing — duplicates are caught in the loop.
-      if (row.version === CURRENT_SCHEMA_VERSION && hasLatestMigrationColumn(db)) return db;
+      if (row.version === CURRENT_SCHEMA_VERSION && hasLatestMigrationColumn(db)) {
+        // Warm-start post-condition: ensureDb() opened this handle with
+        // foreign_keys=OFF (early migrations require cascade disabled). The full
+        // migration path re-enables it at the end; this fast-path return must
+        // match that post-condition, else every DELETE on the returned handle
+        // skips ON DELETE CASCADE and silently orphans junction rows. Safe here:
+        // no transaction is open yet (BEGIN IMMEDIATE is below).
+        db.pragma('foreign_keys = ON');
+        return db;
+      }
       if (row.version > CURRENT_SCHEMA_VERSION) {
         throw new Error(
           `DB schema is v${row.version} but this claude-mem-lite binary supports up to v${CURRENT_SCHEMA_VERSION}. ` +
@@ -237,6 +251,10 @@ export function initSchema(db) {
     const underlock = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
     if (underlock && underlock.version === CURRENT_SCHEMA_VERSION && hasLatestMigrationColumn(db)) {
       db.exec('COMMIT');
+      // COMMIT closed the transaction, so this PRAGMA takes effect (no-op inside a txn).
+      // Same FK post-condition as the fast-path above: a peer completed init while we
+      // were blocked, so we skip migrations and must still restore cascade enforcement.
+      db.pragma('foreign_keys = ON');
       return db;
     }
   } catch { /* table absent — proceed */ }
@@ -471,6 +489,19 @@ export function initSchema(db) {
       }
     }
   } catch { /* non-critical — migration can retry on next open */ }
+
+  // v35 (v2.87.0) P1: one-shot cleanup of orphaned observation_files. Same root
+  // cause as the v28 observation_vectors cleanup below — until the warm-start
+  // fast-path FK fix (initSchema early returns now restore foreign_keys=ON),
+  // ensureDb() handles ran with FK OFF, so ON DELETE CASCADE never fired and
+  // junction rows leaked (live DB: 6440/9569 = 67% orphans). Idempotent (NOT IN
+  // is empty on a clean DB); runs once per version bump via the fast-path gate.
+  try {
+    db.prepare(`
+      DELETE FROM observation_files
+      WHERE obs_id NOT IN (SELECT id FROM observations)
+    `).run();
+  } catch { /* non-critical — table-missing path handled by earlier CREATE */ }
 
   // Observation vectors table for TF-IDF vector search
   db.exec(`
