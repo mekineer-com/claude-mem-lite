@@ -8,7 +8,7 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, 
 import { citeFactorClause } from '../scoring-sql.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
-import { join } from 'path';
+import { join, sep } from 'path';
 import Database from 'better-sqlite3';
 import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
 
@@ -439,10 +439,18 @@ function loadManagedSkillNames() {
     const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
     rdb.pragma('busy_timeout = 500');
     try {
+      // D#29: derive the managed marker from the env-aware data dir, not a hardcoded
+      // homedir literal — under CLAUDE_MEM_DIR relocation the stored local_path lives at
+      // DB_DIR/managed, so the old literal matched nothing and dropped every managed skill
+      // from injection. Coarse LIKE prefilter; resource names are re-validated downstream.
+      // D#29: derive the managed marker from the env-aware data dir, not a hardcoded
+      // homedir literal — under CLAUDE_MEM_DIR relocation the stored local_path lives at
+      // DB_DIR/managed, so the old literal matched nothing and dropped every managed skill
+      // from injection. Coarse LIKE prefilter; resource names are re-validated downstream.
       const rows = rdb.prepare(`
         SELECT name FROM resources
-        WHERE status = 'active' AND local_path LIKE '%/.claude-mem-lite/managed/%'
-      `).all();
+        WHERE status = 'active' AND local_path LIKE ?
+      `).all(`%${join(DB_DIR, 'managed') + sep}%`);
       return new Set(rows.map(r => r.name.toLowerCase()));
     } finally { rdb.close(); }
   } catch { return new Set(); }

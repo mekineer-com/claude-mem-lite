@@ -4,6 +4,7 @@ import { createRegistryTestDb } from './test-helpers.mjs';
 import { mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 
 const MOCK_TREE = {
   tree: [
@@ -219,5 +220,49 @@ describe('importFromGitHub', () => {
     expect(row.repo_forks).toBe(3);
     expect(row.repo_updated_at).toBe('2026-03-01T00:00:00Z');
     expect(row.quality_tier).toBe('community');
+  });
+});
+
+// D#29: the default managed dir (used by the production callers mem-cli/server, which
+// pass NO managedDir override) hardcoded join(homedir(),'.claude-mem-lite','managed'),
+// ignoring CLAUDE_MEM_DIR. Under relocation that wrote imported skills to the homedir
+// while the registry DB + scanner live in the relocated data dir → imported skills
+// silently invisible. The default must follow DB_DIR.
+describe('importFromGitHub data-dir relocation (D#29)', () => {
+  const origHome = process.env.HOME;
+  const origMemDir = process.env.CLAUDE_MEM_DIR;
+  const tracked = [];
+  afterEach(() => {
+    process.env.HOME = origHome;
+    if (origMemDir === undefined) delete process.env.CLAUDE_MEM_DIR;
+    else process.env.CLAUDE_MEM_DIR = origMemDir;
+    for (const d of tracked) rmSync(d, { recursive: true, force: true });
+    tracked.length = 0;
+    vi.resetModules();
+  });
+
+  it('default managed dir honors CLAUDE_MEM_DIR (writes to the relocated data dir, not homedir)', async () => {
+    const homeTmp = join(tmpdir(), 'imp-home-' + randomUUID().slice(0, 8));
+    const ccDir = join(tmpdir(), 'imp-cc-' + randomUUID().slice(0, 8));
+    mkdirSync(homeTmp, { recursive: true });
+    mkdirSync(ccDir, { recursive: true });
+    tracked.push(homeTmp, ccDir);
+    process.env.HOME = homeTmp;          // pre-fix would write here; keeps the test off the real FS
+    process.env.CLAUDE_MEM_DIR = ccDir;  // post-fix the default managed dir follows this
+    vi.resetModules();
+    const { importFromGitHub: relocatedImport } = await import('../registry-importer.mjs');
+    const db = createRegistryTestDb();
+    const mockFetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ stargazers_count: 1 }) })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ tree: [{ path: 'SKILL.md', type: 'blob' }] }) })
+      .mockResolvedValueOnce({ ok: true, text: () => Promise.resolve('---\nname: reloc-skill\ndescription: x\n---\n# R') });
+
+    // NO managedDir override → exercises the module default (the production path).
+    const results = await relocatedImport(db, 'https://github.com/user/repo', { fetchFn: mockFetch });
+    expect(results.length).toBe(1);
+    const row = db.prepare("SELECT local_path FROM resources WHERE name = 'reloc-skill'").get();
+    expect(row.local_path.startsWith(join(ccDir, 'managed'))).toBe(true);  // relocated data dir
+    expect(row.local_path.startsWith(homeTmp)).toBe(false);                // NOT the homedir
+    db.close();
   });
 });

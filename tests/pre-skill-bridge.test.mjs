@@ -1,7 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { spawn } from 'child_process';
-import { resolve } from 'path';
+import { resolve, join } from 'path';
+import { mkdirSync, writeFileSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
 import { createRegistryTestDb } from './test-helpers.mjs';
+import { ensureRegistryDb } from '../registry.mjs';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-skill-bridge.js');
 
@@ -75,6 +79,42 @@ describe('pre-skill-bridge', () => {
       expect(row).toBeTruthy();
       expect(row.name).toBe('my-humanizer');
       db.close();
+    });
+  });
+
+  // D#29: line 12 (DATA_DIR) already honored CLAUDE_MEM_DIR, but REGISTRY_DB_PATH (the DB
+  // opened), MANAGED_BASE (the confinement base), and MANAGED_MARKER (the LIKE prefilter)
+  // hardcoded the homedir — self-inconsistent. Under relocation the script opened the wrong
+  // (homedir) registry DB and the marker couldn't match the relocated local_path, so managed
+  // skills were unreachable. All four must follow the env.
+  describe('relocation (D#29)', () => {
+    it('finds a managed skill under a relocated CLAUDE_MEM_DIR (DB + marker + confinement honor the env)', async () => {
+      const ccDir = join(tmpdir(), 'psb-cc-' + randomUUID().slice(0, 8));
+      const emptyHome = join(tmpdir(), 'psb-home-' + randomUUID().slice(0, 8));
+      const skillDir = join(ccDir, 'managed', 'skills', 'reloc-skill');
+      mkdirSync(skillDir, { recursive: true });
+      mkdirSync(emptyHome, { recursive: true });
+      const skillPath = join(skillDir, 'SKILL.md');
+      writeFileSync(skillPath, '# Reloc Skill\nRELOCATED_CONTENT_MARKER');
+      const rdb = ensureRegistryDb(join(ccDir, 'resource-registry.db'));
+      rdb.prepare(`
+        INSERT INTO resources (name, type, source, file_hash, status, local_path, invocation_name, capability_summary, trigger_patterns, keywords, intent_tags, use_cases, domain_tags, tech_stack)
+        VALUES ('reloc-skill', 'skill', 'github', 'h', 'active', ?, 'reloc-skill', '', '', '', '', '', '', '')
+      `).run(skillPath);
+      rdb.close();
+      try {
+        // emptyHome ensures the pre-fix homedir-based REGISTRY_DB_PATH points at a nonexistent DB
+        // (clean RED, no real-FS read); CLAUDE_MEM_DIR is where the script must actually look.
+        const { stdout } = await runScript(
+          JSON.stringify({ tool_name: 'Skill', tool_input: { skill: 'reloc-skill' } }),
+          { CLAUDE_MEM_DIR: ccDir, HOME: emptyHome },
+        );
+        expect(stdout).toContain('skill-bridge');
+        expect(stdout).toContain('RELOCATED_CONTENT_MARKER');
+      } finally {
+        rmSync(ccDir, { recursive: true, force: true });
+        rmSync(emptyHome, { recursive: true, force: true });
+      }
     });
   });
 });

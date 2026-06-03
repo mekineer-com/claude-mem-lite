@@ -8,9 +8,12 @@ import { debugLog, isPathConfined } from './utils.mjs';
 import { createHash } from 'crypto';
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { DB_DIR } from './schema.mjs';
 
-const MANAGED_DIR = join(homedir(), '.claude-mem-lite', 'managed');
+// DATA artifact — managed resources live under the env-aware data dir (DB_DIR),
+// NOT a hardcoded homedir, so GitHub imports land where install.mjs + registry-scanner
+// read them under CLAUDE_MEM_DIR relocation (D#29). Equals homedir when the env is unset.
+const MANAGED_DIR = join(DB_DIR, 'managed');
 
 // ─── Tree Discovery ─────────────────────────────────────────────────────────
 

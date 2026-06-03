@@ -32,7 +32,10 @@ if (cmd === '--version' || cmd === '-v') {
   // No command: show CLI help if installed, install help if not
   const { existsSync } = await import('fs');
   const { join } = await import('path');
-  const dbPath = join(process.env.HOME || '', '.claude-mem-lite', 'claude-mem-lite.db');
+  // D#29: honor CLAUDE_MEM_DIR so the install-vs-CLI help routing is correct on
+  // relocated installs (matches schema.mjs DB_DIR; HOME fallback when env unset).
+  const dataDir = process.env.CLAUDE_MEM_DIR || join(process.env.HOME || '', '.claude-mem-lite');
+  const dbPath = join(dataDir, 'claude-mem-lite.db');
   if (existsSync(dbPath)) {
     const { run } = await import('./mem-cli.mjs');
     await run(['help']);

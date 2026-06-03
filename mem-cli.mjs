@@ -26,7 +26,7 @@ import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
-import { basename, join } from 'path';
+import { basename, join, sep } from 'path';
 import { readFileSync, existsSync, readdirSync } from 'fs';
 
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
@@ -2180,7 +2180,7 @@ function cmdRegistry(_memDb, args) {
       for (const r of results) {
         const badge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
         const categoryLabel = r.category ? ` [${r.category}]` : '';
-        const isManaged = r.local_path && r.local_path.includes('/.claude-mem-lite/managed/');
+        const isManaged = r.local_path && r.local_path.includes(join(DB_DIR, 'managed') + sep);
         const portablePath = isManaged && r.local_path.startsWith(home) ? '~' + r.local_path.slice(home.length) : (r.local_path || '');
         let howToUse;
         if (isManaged) {

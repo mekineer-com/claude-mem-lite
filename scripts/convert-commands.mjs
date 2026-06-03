@@ -6,7 +6,8 @@ import { readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync
 import { join, basename } from 'path';
 import { homedir } from 'os';
 
-const MANAGED_DIR = join(homedir(), '.claude-mem-lite', 'managed');
+// D#29: honor CLAUDE_MEM_DIR (equals homedir when the env is unset).
+const MANAGED_DIR = join(process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite'), 'managed');
 const AGENTS_DIR = join(MANAGED_DIR, 'agents');
 
 const DRY_RUN = process.argv.includes('--dry-run');

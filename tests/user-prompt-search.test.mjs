@@ -5,7 +5,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
-import { homedir } from 'os';
 import { unlinkSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
@@ -1278,12 +1277,11 @@ describe('user-prompt-search T3: BM25 threshold + prompt-length gate', () => {
 // containing the skill name so Claude can decide to invoke via SkillTool.
 // See Task 4 in docs/plans/2026-04-14-mem-v2.31-mvp.md.
 //
-// Seeding strategy: filesystem + registry DB. `loadSkillContent` (old code)
-// path-confines against `homedir()/.claude-mem-lite/managed/`, so to make
-// the OLD code actually emit the body (i.e. a true RED-phase failing test)
-// we must place a real file under the real homedir managed dir. We use a
-// per-pid/per-timestamp nonce to avoid collision with any genuine user
-// skills, and the afterEach cleanup removes it.
+// Seeding strategy: filesystem + registry DB. Managed-skill detection confines to the
+// env-aware data dir (DB_DIR = CLAUDE_MEM_DIR || homedir), and runScript sets
+// CLAUDE_MEM_DIR=testDir, so we place the skill under testDir/managed/<nonce>. This matches
+// production after D#29 and keeps the whole fixture inside the temp dir — pre-D#29 this had
+// to write under the REAL homedir (the relocation fix removed that requirement).
 describe('user-prompt-search T4: registry skill pointer (no body injection)', () => {
   let db;
   let testDir;
@@ -1291,13 +1289,13 @@ describe('user-prompt-search T4: registry skill pointer (no body injection)', ()
   let skillName;
 
   /**
-   * Seed a registered skill with a large body under the real homedir managed
-   * dir (required by loadSkillContent's path confinement) plus a registry
-   * row pointing at it. Returns the skill name for use in the prompt.
+   * Seed a registered skill with a body under testDir/managed (= CLAUDE_MEM_DIR/managed,
+   * where managed-skill detection confines after D#29) plus a registry row pointing at it.
+   * Returns the skill name for use in the prompt.
    */
   function seedRegistrySkill({ registryDbPath, bodyBytes }) {
     const nonce = `test-skill-large-${process.pid}-${Date.now()}`;
-    const skillDir = join(homedir(), '.claude-mem-lite', 'managed', nonce);
+    const skillDir = join(testDir, 'managed', nonce);
     mkdirSync(skillDir, { recursive: true });
     const skillPath = join(skillDir, 'SKILL.md');
     writeFileSync(skillPath, 'A'.repeat(bodyBytes));
@@ -1360,5 +1358,22 @@ describe('user-prompt-search T4: registry skill pointer (no body injection)', ()
       expect(stdout.length).toBeLessThan(500);
       expect(stdout).toContain(skillName);
     }
+  });
+
+  // D#29: the managed-skill detection LIKE marker used a hardcoded homedir literal, so under
+  // CLAUDE_MEM_DIR relocation (runScript sets CLAUDE_MEM_DIR=testDir) it matched nothing and
+  // dropped every managed skill from injection. The marker must follow DB_DIR/managed.
+  it('detects a managed skill under the relocated CLAUDE_MEM_DIR and emits its pointer (D#29)', async () => {
+    const registryDbPath = join(testDir, 'resource-registry.db');
+    const seeded = seedRegistrySkill({ registryDbPath, bodyBytes: 200 });
+    managedSkillDir = seeded.skillDir;
+    skillName = seeded.skillName;
+    db.pragma('wal_checkpoint(FULL)');
+
+    const prompt = `please use the ${skillName} skill to help me`;
+    const { stdout } = await runScript({ prompt });
+    // Pre-fix: marker = homedir literal → no match against the testDir/managed local_path →
+    // skill dropped → pointer absent. The env-derived marker must find it.
+    expect(stdout).toContain(skillName);
   });
 });

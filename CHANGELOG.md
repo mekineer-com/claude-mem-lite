@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.90.1 — CLAUDE_MEM_DIR relocation hardening: managed resources follow the data dir (D#29)
+
+**fix: managed skills/agents, the registry DB, and their path-confinement now honor `CLAUDE_MEM_DIR` everywhere (D#29).** v2.90.0 relocated the data layer but left *managed-resource* path resolution hardcoded to `~/.claude-mem-lite` across 9 files. Under relocation that silently broke three ways: GitHub-imported skills landed in the homedir while the registry DB lived in the relocated dir (imports invisible); `mem_use` enrich/read confinement denied legitimate relocated paths (fail-closed); and the `user-prompt-search` UserPromptSubmit hook's `LIKE '%/.claude-mem-lite/managed/%'` matched nothing, dropping every managed skill from injection. All managed markers now derive from `join(DB_DIR, 'managed')` and the confinement base is `DB_DIR` — identical to the old homedir path when `CLAUDE_MEM_DIR` is unset, so non-relocated installs are byte-for-byte unchanged and confinement is not weakened. Writers (registry-importer), readers (pre-skill-bridge, user-prompt-search, server/CLI catalog rendering), and the offline indexer / dev tools now all resolve to the same location. Three of the nine sites used a hardcoded string literal rather than a `homedir()` join and were caught by an adversarial reader-vs-writer verification pass.
+
 ## v2.90.0 — CLAUDE_MEM_DIR data relocation, full-fidelity restore, parallel-session handoff scoping + CLI/FTS hardening
 
 **feat: `CLAUDE_MEM_DIR` relocates the data layer (DB, managed resources, registry DB, `runtime/`) off `~/.claude-mem-lite` (D#24).** `install.mjs` now splits the always-homedir CODE/install dir (server.mjs, hooks — Claude Code bakes absolute paths there, so code must NOT follow the env var) from an env-overridable `MEM_DATA_DIR`, and writes data where the runtime/data layer reads it. Fixes preinstalled skills silently vanishing and `doctor` reading the wrong DB under relocation.

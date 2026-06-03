@@ -8,7 +8,7 @@ import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, scrubSecrets, cjkBigrams, fmtDate, debugLog, debugCatch, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
 import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
-import { ensureDb, DB_PATH, REGISTRY_DB_PATH } from './schema.mjs';
+import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -30,7 +30,7 @@ function descriptionOf(name) {
   return d;
 }
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
-import { basename, join } from 'path';
+import { basename, join, sep } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
@@ -1506,7 +1506,7 @@ server.registerTool(
       const lines = results.map(r => {
         const qualityBadge = r.quality_tier === 'installed' ? '[✓]' : r.quality_tier === 'verified' ? '[★]' : '[○]';
         const categoryLabel = r.category ? ` [${r.category}]` : '';
-        const isManaged = r.local_path && r.local_path.includes('/.claude-mem-lite/managed/');
+        const isManaged = r.local_path && r.local_path.includes(join(DB_DIR, 'managed') + sep);
         const portablePath = isManaged ? toPortable(r.local_path) : '';
         let howToUse;
         if (isManaged) {
@@ -1651,7 +1651,9 @@ server.registerTool(
       if (!row.local_path) {
         return { content: [{ type: 'text', text: `No local_path for ${args.name}` }], isError: true };
       }
-      const enrichBase = join(homedir(), '.claude-mem-lite');
+      // Confine to the env-aware data dir (managed/ relocates with CLAUDE_MEM_DIR, D#29);
+      // === homedir when the env is unset, so non-relocated confinement is unchanged.
+      const enrichBase = DB_DIR;
       if (!isPathConfined(row.local_path, enrichBase)) {
         return { content: [{ type: 'text', text: `Access denied: path outside managed directory` }], isError: true };
       }
@@ -1719,8 +1721,10 @@ server.registerTool(
       }
     }
 
-    // 4. Path confinement check — prevent reading arbitrary files via crafted local_path
-    const managedBase = join(homedir(), '.claude-mem-lite');
+    // 4. Path confinement check — prevent reading arbitrary files via crafted local_path.
+    // Base is the env-aware data dir (D#29): managed/ relocates with CLAUDE_MEM_DIR and
+    // equals homedir when unset, so this does not weaken the non-relocated confinement.
+    const managedBase = DB_DIR;
     if (skillPath && !isPathConfined(skillPath, managedBase)) {
       return { content: [{ type: 'text', text: `Access denied: path "${skillPath}" is outside managed directory` }], isError: true };
     }

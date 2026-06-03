@@ -11,9 +11,15 @@ import { recordHookError } from '../lib/hook-telemetry.mjs';
 // CLAUDE_MEM_DIR mirrors pre-tool-recall.js — one env var sandboxes everything.
 const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
-const REGISTRY_DB_PATH = join(homedir(), '.claude-mem-lite', 'resource-registry.db');
-const MANAGED_BASE = join(homedir(), '.claude-mem-lite');
-const MANAGED_MARKER = '/.claude-mem-lite/managed/';
+// D#29: all data artifacts follow DATA_DIR (CLAUDE_MEM_DIR-aware), not a hardcoded
+// homedir — previously REGISTRY_DB_PATH/MANAGED_BASE/MARKER pinned homedir while line 12
+// honored the env, so relocated installs opened the wrong DB and the marker never matched
+// the relocated local_path. MANAGED_MARKER is only a coarse LIKE prefilter; the exact
+// MANAGED_BASE prefix check below is the real confinement gate (so LIKE-wildcard chars in
+// a relocated path can at worst over-admit to that gate, never bypass it).
+const REGISTRY_DB_PATH = join(DATA_DIR, 'resource-registry.db');
+const MANAGED_BASE = DATA_DIR;
+const MANAGED_MARKER = join(DATA_DIR, 'managed') + sep;
 
 try {
   // Skip if recursive hook
