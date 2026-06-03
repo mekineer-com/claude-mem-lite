@@ -218,6 +218,12 @@ export const FTS_STOP_WORDS = new Set([...BASE_STOP_WORDS]);
 export function sanitizeFtsQuery(query) {
   if (!query) return null;
   const cleaned = query
+    // Strip ASCII control chars / NUL FIRST. A NUL survives tokenization (it's not
+    // \s), gets phrase-quoted by expandToken, and then terminates SQLite's C string
+    // mid-phrase → FTS5 "unterminated string" throw, breaking the documented
+    // "never throws on MATCH" invariant. The metachar class below doesn't cover them.
+    // eslint-disable-next-line no-control-regex -- intentional: stripping control chars IS the fix
+    .replace(/[\x00-\x1f\x7f]/g, ' ')
     .replace(/[{}()[\]^~*:"\\]/g, ' ')
     .replace(/(^|\s)-/g, '$1')
     .trim();

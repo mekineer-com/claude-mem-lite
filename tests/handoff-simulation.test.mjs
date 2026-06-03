@@ -654,3 +654,130 @@ describe('Scenario 9: parallel sessions bleed prevention (docs/bug.txt)', () => 
     expect(injection).toContain('investigate feature Y');
   });
 });
+
+// D#26: getSessionId() is project-scoped, so parallel (and within-12h-TTL sequential)
+// CC sessions in one project share ONE content_session_id. Pre-fix, buildAndSaveHandoff's
+// working_on query pulled every session's prompts, merging them. With a CC scope it must
+// return only that CC session's prompts. The standard seed helpers conflate content+cc
+// ids (1:1), so they never reproduce the production split — seed it explicitly here.
+describe('D#26 parallel-session handoff content scoping', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  function seedCcPrompt(db, contentId, ccId, text, num) {
+    db.prepare(`INSERT INTO user_prompts (content_session_id, cc_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, datetime('now'), ?)`).run(contentId, ccId, text, num, Date.now() + num);
+  }
+
+  it('working_on contains only the scoped CC session prompts, not concurrent ones', () => {
+    const project = 'parallel-app';
+    seedSession(db, 'sess-shared', project);
+    seedCcPrompt(db, 'sess-shared', 'cc-A', 'refactor the authentication token flow', 1);
+    seedCcPrompt(db, 'sess-shared', 'cc-B', 'rewrite the cache invalidation layer', 2);
+
+    buildAndSaveHandoff(db, 'sess-shared', project, 'exit', null, 'cc-A');
+    const row = db.prepare('SELECT working_on FROM session_handoffs WHERE session_id = ?').get('cc-A');
+    expect(row.working_on).toMatch(/authentication token/);
+    expect(row.working_on).not.toMatch(/cache invalidation/); // session B must NOT bleed in
+  });
+
+  it('legacy rows with NULL cc_session_id still appear under a CC scope', () => {
+    const project = 'legacy-app';
+    seedSession(db, 'sess-legacy', project);
+    seedPrompt(db, 'sess-legacy', 'investigate the slow startup path', 1); // cc_session_id NULL
+    buildAndSaveHandoff(db, 'sess-legacy', project, 'exit', null, 'cc-X');
+    const row = db.prepare('SELECT working_on FROM session_handoffs WHERE session_id = ?').get('cc-X');
+    expect(row.working_on).toMatch(/slow startup/);
+  });
+
+  it('no CC scope (legacy/test path) keeps the unfiltered merge behavior', () => {
+    const project = 'merge-app';
+    seedSession(db, 'sess-m', project);
+    seedCcPrompt(db, 'sess-m', 'cc-A', 'optimize the alpha query planner', 1);
+    seedCcPrompt(db, 'sess-m', 'cc-B', 'profile the beta index builder', 2);
+    buildAndSaveHandoff(db, 'sess-m', project, 'exit', null); // no scope → legacy unfiltered
+    const row = db.prepare('SELECT working_on FROM session_handoffs WHERE session_id = ?').get('sess-m');
+    expect(row.working_on).toMatch(/alpha/);
+    expect(row.working_on).toMatch(/beta/); // both present — unfiltered (pre-D#26 behavior preserved)
+  });
+});
+
+// D#28 (completes D#26): observations carry the project-scoped memory_session_id, which
+// parallel/sequential CC sessions in one project share. working_on was cc-scoped in phase 1,
+// but Completed / Key Files / Key Decisions still queried WHERE memory_session_id=? alone, so
+// a prior same-project session's observations bled into the new session's handoff. Option D:
+// lower-bound those three queries to THIS CC session's start (earliest prompt epoch for the
+// cc_session_id), mirroring working_on's query-layer scoping. No new column. Residual: truly
+// concurrent same-project sessions whose windows overlap can still co-attribute a few rows.
+describe('D#28 parallel-session observation scoping', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+  afterEach(() => { db.close(); });
+
+  function seedCcPrompt(db, contentId, ccId, text, num, epoch) {
+    db.prepare(`INSERT INTO user_prompts (content_session_id, cc_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, datetime('now'), ?)`).run(contentId, ccId, text, num, epoch);
+  }
+  function seedObsAt(db, memId, project, { title, type = 'change', importance = 1, files = null }, epoch) {
+    db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, importance, files_modified, narrative, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, datetime('now'), ?)`).run(memId, project, type, title, importance, files, epoch);
+  }
+
+  // Two CC sessions share ONE memory_session_id. cc-old worked at epoch ~1000; cc-new starts
+  // at epoch ~5000. Building cc-new's handoff must scope Completed to cc-new's window (>= its
+  // first prompt epoch), excluding cc-old's observations.
+  it('Completed excludes a prior same-project session\'s observations under a CC scope', () => {
+    const project = 'parallel-obs';
+    seedSession(db, 'sess-shared', project);
+    seedCcPrompt(db, 'sess-shared', 'cc-old', 'old: tune the ranker', 1, 1000);
+    seedObsAt(db, 'sess-shared', project, { title: 'OLD-SESSION ranker tuning done', importance: 2 }, 1100);
+    seedCcPrompt(db, 'sess-shared', 'cc-new', 'new: add restore command', 2, 5000);
+    seedObsAt(db, 'sess-shared', project, { title: 'NEW-SESSION restore command added', importance: 2 }, 5100);
+
+    buildAndSaveHandoff(db, 'sess-shared', project, 'exit', null, 'cc-new');
+    const row = db.prepare('SELECT completed FROM session_handoffs WHERE session_id = ?').get('cc-new');
+    expect(row.completed).toMatch(/NEW-SESSION restore command/);
+    expect(row.completed).not.toMatch(/OLD-SESSION ranker tuning/); // prior session must NOT bleed
+  });
+
+  it('Key Files and Key Decisions are scoped to the CC session window too', () => {
+    const project = 'parallel-files';
+    seedSession(db, 'sess-shared', project);
+    seedCcPrompt(db, 'sess-shared', 'cc-old', 'old work', 1, 1000);
+    seedObsAt(db, 'sess-shared', project, { title: 'chose legacy ranker design', importance: 3, files: '["old/legacy.mjs"]' }, 1100);
+    seedCcPrompt(db, 'sess-shared', 'cc-new', 'new work', 2, 5000);
+    seedObsAt(db, 'sess-shared', project, { title: 'chose restore-command design', importance: 3, files: '["new/feature.mjs"]' }, 5100);
+
+    buildAndSaveHandoff(db, 'sess-shared', project, 'exit', null, 'cc-new');
+    const row = db.prepare('SELECT key_files, key_decisions FROM session_handoffs WHERE session_id = ?').get('cc-new');
+    expect(row.key_decisions).toMatch(/restore-command design/);
+    expect(row.key_decisions).not.toMatch(/legacy ranker design/);
+    expect(row.key_files).toMatch(/feature\.mjs/);
+    expect(row.key_files).not.toMatch(/legacy\.mjs/);
+  });
+
+  it('no CC scope keeps the unfiltered merge (legacy/test path)', () => {
+    const project = 'merge-obs';
+    seedSession(db, 'sess-m', project);
+    seedPrompt(db, 'sess-m', 'do the work', 1);
+    seedObsAt(db, 'sess-m', project, { title: 'first thing done', importance: 2 }, 1000);
+    seedObsAt(db, 'sess-m', project, { title: 'second thing done', importance: 2 }, 2000);
+    buildAndSaveHandoff(db, 'sess-m', project, 'exit', null); // no scope → unscoped
+    const row = db.prepare('SELECT completed FROM session_handoffs WHERE session_id = ?').get('sess-m');
+    expect(row.completed).toMatch(/first thing/);
+    expect(row.completed).toMatch(/second thing/);
+  });
+
+  it('falls back to unscoped when the CC scope has no matching prompts (MIN epoch null guard)', () => {
+    // ccScope set but THIS cc session has no cc_session_id prompts (legacy NULL rows) →
+    // window start is null → do not exclude everything; show the legacy observation.
+    const project = 'legacy-obs';
+    seedSession(db, 'sess-legacy', project);
+    seedPrompt(db, 'sess-legacy', 'investigate slow path', 1); // cc_session_id NULL
+    seedObsAt(db, 'sess-legacy', project, { title: 'legacy finding recorded', importance: 2 }, 1000);
+    buildAndSaveHandoff(db, 'sess-legacy', project, 'exit', null, 'cc-X'); // scope cc-X has no prompts
+    const row = db.prepare('SELECT completed FROM session_handoffs WHERE session_id = ?').get('cc-X');
+    expect(row.completed).toMatch(/legacy finding/);
+  });
+});

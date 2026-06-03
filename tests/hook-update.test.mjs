@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 vi.mock('node:child_process', () => ({ execSync: vi.fn() }));
 const mockedExecSync = vi.mocked(execSync);
 const originalFetch = globalThis.fetch;
+const originalHome = process.env.HOME;
 const trackedDirs = new Set();
 
 function makeDir(prefix) {
@@ -29,6 +30,19 @@ function makeDataDir(version = '1.0.0') {
   return dir;
 }
 
+// Code/install dir is ALWAYS homedir-rooted (~/.claude-mem-lite), independent of
+// CLAUDE_MEM_DIR relocation — Claude Code bakes absolute paths to server.mjs/hooks
+// there. os.homedir() honors $HOME on POSIX, so HOME steers CODE_DIR in tests.
+// A regular-file server.mjs (not a symlink) keeps isDevMode() false.
+function makeCodeHome(version = '1.0.0') {
+  const home = makeDir('mem-update-home');
+  const codeDir = join(home, '.claude-mem-lite');
+  mkdirSync(codeDir, { recursive: true });
+  writeFileSync(join(codeDir, 'package.json'), JSON.stringify({ version }, null, 2));
+  writeFileSync(join(codeDir, 'server.mjs'), '// code server');
+  return { home, codeDir };
+}
+
 function makeReleaseDir(version = '1.1.0') {
   const dir = makeDir('mem-update-release');
   mkdirSync(join(dir, 'scripts'), { recursive: true });
@@ -48,6 +62,7 @@ async function loadModule(env = {}) {
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
   process.env.CLAUDE_MEM_DIR = env.CLAUDE_MEM_DIR;
+  if (env.HOME) process.env.HOME = env.HOME;
   if (env.CLAUDE_PLUGIN_ROOT) process.env.CLAUDE_PLUGIN_ROOT = env.CLAUDE_PLUGIN_ROOT;
   return await import('../hook-update.mjs');
 }
@@ -58,15 +73,17 @@ afterEach(() => {
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
   delete process.env.CLAUDE_MEM_DIR;
+  process.env.HOME = originalHome;
   for (const dir of trackedDirs) rmSync(dir, { recursive: true, force: true });
   trackedDirs.clear();
 });
 
 describe('hook update lifecycle', () => {
   it('plugin mode only reports available updates and never installs them', async () => {
+    const { home } = makeCodeHome('1.0.0');
     const dataDir = makeDataDir();
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ tag_name: 'v1.1.0', tarball_url: 'https://example.com/release.tgz' }) });
-    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root' });
+    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root', HOME: home });
 
     const result = await checkForUpdate({ force: true });
     expect(result).toMatchObject({ updateAvailable: true, updated: false, installDeferred: true, to: '1.1.0' });
@@ -75,10 +92,11 @@ describe('hook update lifecycle', () => {
   });
 
   it('manual force check bypasses the throttle window', async () => {
+    const { home } = makeCodeHome('1.0.0');
     const dataDir = makeDataDir();
     writeFileSync(join(dataDir, 'runtime', 'update-state.json'), JSON.stringify({ lastCheck: new Date().toISOString(), installedVersion: '1.0.0', updateAvailable: false }, null, 2));
     globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ tag_name: 'v1.1.0', tarball_url: 'https://example.com/release.tgz' }) });
-    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
 
     expect(await checkForUpdate()).toBeNull();
     const result = await checkForUpdate({ force: true, allowInstall: false });
@@ -235,6 +253,56 @@ describe('hook update lifecycle', () => {
     expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
     expect(existsSync(join(dataDir, 'registry', 'fixtures', 'sample.json'))).toBe(true);
     expect(existsSync(join(dataDir, 'registry', 'preinstalled.json'))).toBe(true);
+  });
+});
+
+// Regression D#27: hook-update.mjs:19 set INSTALL_DIR = DB_DIR, conflating the
+// plugin CODE location (server.mjs / package.json / install target — always
+// homedir-rooted because Claude Code bakes absolute paths there) with the DATA
+// location (runtime/update-state — env-aware via CLAUDE_MEM_DIR). Under
+// relocation (CLAUDE_MEM_DIR set ≠ homedir) auto-update read the version from
+// and switched files into the *data* dir, so it never found/updated the real
+// server.mjs. State, by contrast, correctly belongs in the data dir (install.mjs
+// doctor reads MEM_DATA_DIR/runtime/update-state.json). Fix: INSTALL_DIR = CODE_DIR
+// (homedir), STATE_DIR = DB_DIR (data).
+describe('code/data dir separation under relocation (D#27)', () => {
+  it('getCurrentVersion reads the homedir code dir, not the relocated CLAUDE_MEM_DIR data dir', async () => {
+    const { home } = makeCodeHome('2.0.0');          // real code install → 2.0.0
+    const dataDir = makeDataDir('1.0.0');            // relocated data dir holds a 1.0.0 decoy package.json
+    const { getCurrentVersion } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
+    // Pre-fix INSTALL_DIR = DB_DIR = dataDir → would read the 1.0.0 decoy.
+    expect(getCurrentVersion()).toBe('2.0.0');
+  });
+
+  it('installExtractedRelease defaults its target to the homedir code dir, not CLAUDE_MEM_DIR', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    writeFileSync(join(codeDir, 'hook.mjs'), '// old hook');
+    mkdirSync(join(codeDir, 'node_modules'), { recursive: true });
+    const dataDir = makeDataDir('1.0.0');            // data dir keeps its own hook.mjs that must stay untouched
+    const releaseDir = makeReleaseDir('1.1.0');
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install')) mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true });
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
+
+    // No explicit targetDir → must default to the code dir, not the relocated data dir.
+    expect(await installExtractedRelease(releaseDir)).toBe(true);
+    expect(readFileSync(join(codeDir, 'hook.mjs'), 'utf8')).toContain('new hook');   // code dir updated
+    expect(readFileSync(join(dataDir, 'hook.mjs'), 'utf8')).toContain('old hook');   // data dir untouched
+  });
+
+  it('update state still lands in the CLAUDE_MEM_DIR data dir, not the code dir', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    const dataDir = makeDataDir('1.0.0');
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ tag_name: 'v1.1.0', tarball_url: 'https://example.com/release.tgz' }) });
+    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root', HOME: home });
+
+    await checkForUpdate({ force: true });
+    // State path mirrors hook-shared RUNTIME_DIR (= DB_DIR/runtime) and install.mjs
+    // doctor's MEM_DATA_DIR/runtime/update-state.json — it must NOT follow the code dir.
+    expect(existsSync(join(dataDir, 'runtime', 'update-state.json'))).toBe(true);
+    expect(existsSync(join(codeDir, 'runtime', 'update-state.json'))).toBe(false);
   });
 });
 
@@ -404,10 +472,11 @@ describe('non-blocking SessionStart helpers (P3d)', () => {
   }
 
   it('getCachedUpdateBanner returns the available banner from cached state — no network', async () => {
+    const { home } = makeCodeHome('1.0.0'); // non-symlink server.mjs → isDevMode() false
     const dataDir = makeDataDir('1.0.0');
     seedState(dataDir, { lastCheck: new Date().toISOString(), installedVersion: '1.0.0', latestVersion: '1.2.0', updateAvailable: true });
     globalThis.fetch = vi.fn(); // must NOT be called
-    const { getCachedUpdateBanner } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root' });
+    const { getCachedUpdateBanner } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root', HOME: home });
     const banner = getCachedUpdateBanner();
     expect(banner).toContain('v1.2.0 available');
     expect(banner).toContain('current: v1.0.0');
@@ -416,24 +485,27 @@ describe('non-blocking SessionStart helpers (P3d)', () => {
   });
 
   it('getCachedUpdateBanner returns null when no update is cached', async () => {
+    const { home } = makeCodeHome('1.0.0'); // non-symlink server.mjs → isDevMode() false
     const dataDir = makeDataDir('1.0.0');
     seedState(dataDir, { lastCheck: new Date().toISOString(), installedVersion: '1.0.0', updateAvailable: false });
-    const { getCachedUpdateBanner } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    const { getCachedUpdateBanner } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
     expect(getCachedUpdateBanner()).toBeNull();
   });
 
   it('isUpdateCheckDue is true with no prior check and false right after one', async () => {
+    const { home } = makeCodeHome('1.0.0'); // non-symlink server.mjs → isDevMode() false
     const dataDir = makeDataDir('1.0.0');
-    const { isUpdateCheckDue } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    const { isUpdateCheckDue } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
     expect(isUpdateCheckDue()).toBe(true); // no state file → never checked
     seedState(dataDir, { lastCheck: new Date().toISOString(), installedVersion: '1.0.0', updateAvailable: false });
-    const { isUpdateCheckDue: due2 } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    const { isUpdateCheckDue: due2 } = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
     expect(due2()).toBe(false); // just checked → throttled
   });
 
   it('isUpdateCheckDue is false when CLAUDE_MEM_SKIP_UPDATE is set', async () => {
+    const { home } = makeCodeHome('1.0.0'); // non-symlink server.mjs → isDevMode() false
     const dataDir = makeDataDir('1.0.0');
-    const mod = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+    const mod = await loadModule({ CLAUDE_MEM_DIR: dataDir, HOME: home });
     process.env.CLAUDE_MEM_SKIP_UPDATE = '1';
     expect(mod.isUpdateCheckDue()).toBe(false);
     expect(mod.getCachedUpdateBanner()).toBeNull();

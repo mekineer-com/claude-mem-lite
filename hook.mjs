@@ -1208,7 +1208,12 @@ async function handleUserPrompt() {
   // every downstream consumer (user_prompts INSERT, FTS query, continuation
   // detection, semantic-memory injection) sees the redacted text — single
   // source of truth for the privacy primitive.
-  const promptText = stripPrivate(rawPrompt);
+  // Strip NUL / C0 control chars (keep \t \n \r) before any downstream use: an
+  // embedded NUL terminates SQLite's C string, silently truncating the stored
+  // prompt_text at the first NUL (and breaking FTS). Single source of truth, so the
+  // user_prompts INSERT, FTS query, and continuation detection all see clean text.
+  // eslint-disable-next-line no-control-regex -- intentional: NUL/C0 strip prevents SQLite C-string truncation
+  const promptText = stripPrivate(rawPrompt).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
 
   const sessionId = getSessionId();
   const db = openDb();
@@ -1233,24 +1238,27 @@ async function handleUserPrompt() {
     ).get(sessionId);
     const promptNumber = bumped?.prompt_counter || 1;
 
+    // Claude Code's real session_id (CC UUID) from hook stdin. Persisted on the
+    // prompt row (cc_session_id) so buildAndSaveHandoff can scope working_on to ONE
+    // CC session — getSessionId() is project-scoped (no CC-UUID), so without this
+    // concurrent/within-TTL same-project sessions merge each other's prompts (D#26).
+    // Also scopes handoff-row injection below. Null (legacy) when stdin lacks session_id.
+    const ccSessionId = typeof hookData.session_id === 'string' && hookData.session_id.length > 0
+      ? hookData.session_id
+      : null;
+
     db.prepare(`
-      INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, cc_session_id, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?)
     `).run(
       sessionId,
       scrubSecrets(promptText.slice(0, 10000)),
       promptNumber,
+      ccSessionId,
       now.toISOString(), now.getTime()
     );
 
     // Cross-session handoff injection (first 3 prompts window, before semantic memory).
-    // Use Claude Code's real session_id from hook stdin to scope handoffs to this CC
-    // session — prevents cross-session bleed when running parallel sessions for the
-    // same project (see docs/bug.txt). Falls back to null (legacy behavior) if the
-    // hook input does not carry session_id.
-    const ccSessionId = typeof hookData.session_id === 'string' && hookData.session_id.length > 0
-      ? hookData.session_id
-      : null;
     if (promptNumber <= 3) {
       try {
         if (detectContinuationIntent(db, promptText, project, ccSessionId)) {

@@ -11,6 +11,7 @@
 import { inferProject } from '../utils.mjs';
 import { resolveProject } from '../project-utils.mjs';
 import { parseArgs, out, fail } from './common.mjs';
+import { parseIntFlag } from '../lib/cli-flags.mjs';
 
 function formatActivityResults(rows) {
   if (!rows || rows.length === 0) return '(no events)';
@@ -77,17 +78,20 @@ export async function cmdActivity(db, args) {
       fail(`[mem] activity search: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
       return;
     }
-    const limit = flags.limit !== undefined ? parseInt(flags.limit, 10) : 10;
+    const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 1000 });
     const rows = searchEvents(db, q, { project, type, limit });
     out(formatActivityResults(rows));
     return;
   }
 
   if (sub === 'recent') {
-    // Accept either `activity recent 5` or `activity recent --limit 5`.
-    const posLimit = positional.length > 0 ? parseInt(positional[0], 10) : NaN;
-    const flagLimit = flags.limit !== undefined ? parseInt(flags.limit, 10) : NaN;
-    const limit = Number.isFinite(posLimit) ? posLimit : (Number.isFinite(flagLimit) ? flagLimit : 20);
+    // Accept either `activity recent 5` or `activity recent --limit 5`. Both routed
+    // through parseIntFlag so garbage ("2abc"), negatives (SQLite LIMIT -1 = UNLIMITED
+    // full-table dump), and uncapped huge values warn + clamp to default/max, matching
+    // the search/recent/browse siblings.
+    const limit = positional.length > 0
+      ? parseIntFlag(positional[0], { name: 'count', defaultValue: 20, max: 1000 })
+      : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
     const type = flags.type || null;
     if (type !== null && !VALID_EVENT_TYPES.has(type)) {
       fail(`[mem] activity recent: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);

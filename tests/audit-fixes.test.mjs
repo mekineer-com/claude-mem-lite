@@ -242,6 +242,20 @@ describe('MCP audit fixes (stdio)', () => {
     expect(JSON.stringify(relIds)).not.toBe(JSON.stringify(timeIds));
   });
 
+  // Round3-P1: the tier post-filter classified tiers using the CWD-inferred project
+  // instead of the explicit args.project. The seed project ('audit--probe') differs
+  // from the server's CWD-inferred project, so pre-fix tier=working dropped the
+  // freshly-created obs (id=1, epochOffset=0 → "working") that mem_browse showed.
+  it('Round3-P1: mem_search tier=working honors explicit args.project (parity with browse)', async () => {
+    await initialize(proc);
+    const noTier = await callTool('mem_search', { query: 'AUDITKW', project: 'audit--probe', limit: 5 });
+    expect(noTier.result?.content?.[0]?.text || '').toMatch(/AUDITKW/); // sanity: findable without tier
+    const withTier = await callTool('mem_search', { query: 'AUDITKW', tier: 'working', project: 'audit--probe', limit: 5 });
+    const text = withTier.result?.content?.[0]?.text || '';
+    expect(text).not.toMatch(/No results/);
+    expect(text).toMatch(/#1\b/); // id=1 (created now → working tier) is returned
+  });
+
   // P1-3: all-invalid fields → error, partial-invalid → note + rendering.
   it('P1-3: mem_get with all-invalid fields returns an error', async () => {
     await initialize(proc);

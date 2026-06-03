@@ -7,7 +7,7 @@ import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsS
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
-import { DB_DIR } from './schema.mjs';
+import { DB_DIR, CODE_DIR } from './schema.mjs';
 import { debugCatch, debugLog } from './utils.mjs';
 // Local manifest is fallback only — the active manifest is loaded from the
 // extracted tarball's own source-files.mjs inside installExtractedRelease.
@@ -16,8 +16,15 @@ import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCR
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
-const INSTALL_DIR = DB_DIR;  // ~/.claude-mem-lite/
-const STATE_FILE = join(INSTALL_DIR, 'runtime', 'update-state.json');
+// Plugin CODE location (server.mjs / package.json / install target) — always
+// homedir-rooted, NEVER follows CLAUDE_MEM_DIR (see schema.mjs CODE_DIR). Used
+// for dev-mode detection, current-version read, and the install target dir.
+const INSTALL_DIR = CODE_DIR;  // ~/.claude-mem-lite/ (code)
+// DATA/state location — runtime/update-state.json lives with the data (env-aware
+// DB_DIR), matching hook-shared RUNTIME_DIR and install.mjs doctor's read path.
+// Equal to INSTALL_DIR unless CLAUDE_MEM_DIR relocates the data dir.
+const STATE_DIR = DB_DIR;
+const STATE_FILE = join(STATE_DIR, 'runtime', 'update-state.json');
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;       // 24 hours
 const FETCH_TIMEOUT_MS = 3000;                         // 3s network timeout
 const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h if rate-limited
@@ -558,7 +565,7 @@ function readState() {
 
 function saveState(state) {
   try {
-    const dir = join(INSTALL_DIR, 'runtime');
+    const dir = join(STATE_DIR, 'runtime');
     mkdirSync(dir, { recursive: true });
     const tmpFile = STATE_FILE + `.tmp-${process.pid}`;
     writeFileSync(tmpFile, JSON.stringify(state, null, 2));

@@ -32,12 +32,26 @@ import * as taskReaderModule from './lib/task-reader.mjs';
  * @param {string|null} [scopeSessionId=null] CC UUID for session_handoffs.session_id column
  */
 export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapshot, scopeSessionId = null) {
-  // 1. Working objective — from user prompts
-  const prompts = db.prepare(`
-    SELECT prompt_text FROM user_prompts
-    WHERE content_session_id = ?
-    ORDER BY prompt_number ASC LIMIT 5
-  `).all(sessionId);
+  // 1. Working objective — from user prompts.
+  // D#26: getSessionId() is project-scoped, so multiple CC sessions in one project
+  // share `content_session_id`. When a genuine CC scope is passed (scopeSessionId is
+  // the CC UUID, i.e. differs from the mem-internal sessionId), filter to THIS CC
+  // session's prompts so working_on doesn't merge concurrent/sequential sessions.
+  // `OR cc_session_id IS NULL` keeps legacy rows + non-CC/no-stdin invocations. When
+  // scopeSessionId is absent or == sessionId (legacy/test/no-stdin), fall back to the
+  // unfiltered query (identical to pre-D#26 behavior).
+  const ccScope = scopeSessionId && scopeSessionId !== sessionId ? scopeSessionId : null;
+  const prompts = ccScope
+    ? db.prepare(`
+        SELECT prompt_text FROM user_prompts
+        WHERE content_session_id = ? AND (cc_session_id = ? OR cc_session_id IS NULL)
+        ORDER BY prompt_number ASC LIMIT 5
+      `).all(sessionId, ccScope)
+    : db.prepare(`
+        SELECT prompt_text FROM user_prompts
+        WHERE content_session_id = ?
+        ORDER BY prompt_number ASC LIMIT 5
+      `).all(sessionId);
   if (prompts.length === 0) return;  // Empty session — nothing to hand off
 
   // Filter prompts whose only content is workflow/control language ("继续",
@@ -73,12 +87,30 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     }
   }
 
+  // D#28 (completes D#26): observations carry the project-scoped memory_session_id, shared by
+  // parallel/sequential same-project CC sessions. Lower-bound the observation queries below to
+  // THIS CC session's start (earliest prompt epoch for ccScope) so Completed / Key Files / Key
+  // Decisions stop merging a prior session's work — the observation-side complement of
+  // working_on's cc-scoping. When ccScope is absent or its session has no prompts (MIN→null),
+  // ccWindowStart stays null and the queries run unscoped (pre-D#28 behavior). Residual: truly
+  // concurrent same-project sessions whose windows overlap can still co-attribute a few rows.
+  let ccWindowStart = null;
+  if (ccScope) {
+    const w = db.prepare(`
+      SELECT MIN(created_at_epoch) AS startEpoch FROM user_prompts
+      WHERE content_session_id = ? AND cc_session_id = ?
+    `).get(sessionId, ccScope);
+    if (typeof w?.startEpoch === 'number') ccWindowStart = w.startEpoch;
+  }
+  const obsWindowClause = ccWindowStart !== null ? 'AND created_at_epoch >= ?' : '';
+  const obsWindowParams = ccWindowStart !== null ? [ccWindowStart] : [];
+
   // 2. Completed — from observations (include narrative for richer handoff)
   const completed = db.prepare(`
     SELECT title, type, narrative FROM observations
-    WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+    WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0 ${obsWindowClause}
     ORDER BY created_at_epoch DESC LIMIT 15
-  `).all(sessionId);
+  `).all(sessionId, ...obsWindowParams);
 
   // 3. Recent activity — episode snapshot + full session edit history from narratives.
   // Keep only entries that represent in-flight work (file edits) or outright failures
@@ -131,9 +163,9 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   if (episodeSnapshot?.files) episodeSnapshot.files.filter(isValidFile).forEach(f => fileSet.add(f));
   const obsFiles = db.prepare(`
     SELECT files_modified FROM observations
-    WHERE memory_session_id = ? AND files_modified IS NOT NULL
+    WHERE memory_session_id = ? AND files_modified IS NOT NULL ${obsWindowClause}
     ORDER BY created_at_epoch DESC LIMIT 10
-  `).all(sessionId);
+  `).all(sessionId, ...obsWindowParams);
   for (const row of obsFiles) {
     try { JSON.parse(row.files_modified).filter(isValidFile).forEach(f => fileSet.add(f)); } catch {}
   }
@@ -142,9 +174,9 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
   const decisions = db.prepare(`
     SELECT title FROM observations
     WHERE memory_session_id = ? AND COALESCE(importance, 1) >= 2
-      AND COALESCE(compressed_into, 0) = 0
+      AND COALESCE(compressed_into, 0) = 0 ${obsWindowClause}
     ORDER BY created_at_epoch DESC LIMIT 10
-  `).all(sessionId).filter(d => d.title && !LOW_SIGNAL_TITLE.test(d.title)).slice(0, 5);
+  `).all(sessionId, ...obsWindowParams).filter(d => d.title && !LOW_SIGNAL_TITLE.test(d.title)).slice(0, 5);
 
   // 6. Match keywords
   const allText = [workingOn, ...completed.map(c => c.title).filter(Boolean), unfinished].join(' ');

@@ -23,7 +23,7 @@ import {
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
-import { parseIntFlag } from './lib/cli-flags.mjs';
+import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
 import { basename, join } from 'path';
@@ -71,16 +71,16 @@ function cmdSearch(db, args) {
     process.stderr.write(`[mem] Note: --from "${flags.from}" is after --to "${flags.to}"; this range is empty\n`);
   }
   const minImportance = flags.importance !== undefined ? parseInt(flags.importance, 10) : null;
-  if (minImportance !== null && (isNaN(minImportance) || minImportance < 1 || minImportance > 3)) {
+  // isNumericToken first: "2abc"→2 / "1e2"→1 would pass the range check and silently
+  // filter at a value the user never typed. Reject garbage like out-of-range does.
+  if (minImportance !== null && (!isNumericToken(flags.importance) || isNaN(minImportance) || minImportance < 1 || minImportance > 3)) {
     fail(`[mem] Invalid --importance "${flags.importance}". Must be 1, 2, or 3.`);
     return;
   }
   const branch = flags.branch || null;
-  const rawOffset = flags.offset !== undefined ? parseInt(flags.offset, 10) : NaN;
-  if (flags.offset !== undefined && (!Number.isInteger(rawOffset) || rawOffset < 0)) {
-    process.stderr.write(`[mem] Invalid --offset "${flags.offset}" (must be a non-negative integer); using 0\n`);
-  }
-  const offset = Number.isInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  // parseIntFlag (min=0) rejects garbage ("2abc"→2, "1e2"→1) the old isInteger check let
+  // through, warns once, and falls back to 0 — same WARN-style contract, now garbage-proof.
+  const offset = parseIntFlag(flags.offset, { name: '--offset', defaultValue: 0, min: 0 });
   const tier = flags.tier || null;
   if (tier && !['working', 'active', 'archive'].includes(tier)) {
     fail(`[mem] Invalid --tier "${tier}". Use: working, active, archive`);
@@ -126,8 +126,14 @@ function cmdSearch(db, args) {
   // so the post-merge sort has room to pick the best from each (paired-path with
   // server.mjs:377 — without this, obs gets systematically squeezed out by sessions).
   const isCrossSourceMode = !effectiveSource;
-  const perSourceLimit = isCrossSourceMode ? Math.max(limit * 3, offset + limit + 10) : limit;
-  const perSourceOffset = isCrossSourceMode ? 0 : offset;
+  // Over-fetch from offset 0 and apply --offset ONCE at the final slice (below) in
+  // ALL modes — mirrors server.mjs. Pushing OFFSET into the obs hybrid path was
+  // unreliable: its AND→OR fallback / vector / concept-cooccurrence stages re-add
+  // rows the SQL OFFSET already skipped, so engine-side paging dropped (or
+  // duplicated) rows on the --type/--tier/--importance/--branch path (a page that
+  // MCP returned came back empty).
+  const perSourceLimit = Math.max(limit * 3, offset + limit + 10);
+  const perSourceOffset = 0;
 
   const results = [];
   // Tracks whether AND returned 0 and OR recovered non-empty. Mirrors server.mjs
@@ -305,7 +311,10 @@ function cmdSearch(db, args) {
   }
   // else 'relevance' keeps BM25 score order (already sorted)
 
-  // Trim to limit with offset
+  // Trim to limit with offset. The engine always received perSourceOffset=0 and
+  // over-fetched (see above), so the merged+reranked `results` start at row 0 and
+  // the offset is applied exactly ONCE here — for every mode. `total` is the full
+  // match count (capped at perSourceLimit), enabling the "N of M" display.
   const total = results.length;
   const paged = results.slice(offset, offset + limit);
 
@@ -389,7 +398,9 @@ function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
   const rawArg = positional[0];
   const rawLimit = parseInt(rawArg, 10);
-  const isValid = Number.isInteger(rawLimit) && rawLimit > 0;
+  // isNumericToken first: "2abc"→2 / "1e2"→1 are positive integers that the bare check
+  // accepted silently; the positional path must reject garbage like the --limit flag does.
+  const isValid = rawArg !== undefined && isNumericToken(rawArg) && Number.isInteger(rawLimit) && rawLimit > 0;
   if (rawArg !== undefined && !isValid) {
     process.stderr.write(`[mem] Invalid count "${rawArg}" (must be a positive integer); using default 10\n`);
   }
@@ -692,7 +703,9 @@ function cmdTimeline(db, args) {
   const parseWindow = (label, raw) => {
     if (raw === undefined) return 5;
     const n = parseInt(raw, 10);
-    if (!Number.isInteger(n) || n < 0) {
+    // isNumericToken first: "2abc"→2 / "1e2"→1 are non-negative integers the bare check
+    // accepted silently; reject garbage tokens like the negative path already does.
+    if (!isNumericToken(raw) || !Number.isInteger(n) || n < 0) {
       process.stderr.write(`[mem] Invalid --${label} "${raw}" (must be a non-negative integer); using default 5\n`);
       return 5;
     }
@@ -925,7 +938,9 @@ function cmdSave(db, args) {
 
   // Explicit saves default to importance=2 (notable) — user chose to save
   const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
-  if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
+  // isNumericToken first: bare parseInt would coerce "2abc"→2 / "1e2"→1 and persist a
+  // wrong importance that silently skews ranking/decay. Float literals still truncate (#8277).
+  if (flags.importance !== undefined && (!isNumericToken(flags.importance) || isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
     fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
     return;
   }
@@ -1041,6 +1056,12 @@ function cmdDeferAdd(db, args) {
     return;
   }
   const priority = flags.priority !== undefined ? parseInt(flags.priority, 10) : 2;
+  // isNumericToken first: bare parseInt would coerce "3xyz"→3 and silently escalate a
+  // deferred item's urgency. Float literals still truncate (#8277).
+  if (flags.priority !== undefined && !isNumericToken(flags.priority)) {
+    fail(`[mem] Invalid --priority "${flags.priority}". Must be 1 (low), 2 (normal), or 3 (urgent).`);
+    return;
+  }
   if (![1, 2, 3].includes(priority)) {
     fail(`[mem] Invalid --priority "${flags.priority}". Must be 1 (low), 2 (normal), or 3 (urgent).`);
     return;
@@ -1255,6 +1276,7 @@ async function cmdStats(db, args) {
   const lowVal = db.prepare(`
     SELECT COUNT(*) as c FROM observations
     WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+      AND COALESCE(compressed_into, 0) = 0
       AND created_at_epoch < ? ${projectFilter}
   `).get(thirtyDaysAgo, ...baseParams);
   const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
@@ -1607,6 +1629,19 @@ function cmdUpdate(db, args) {
     return;
   }
 
+  // A value-less `--flag` (last arg, or immediately followed by another --flag)
+  // parses to boolean `true` (cli/common.mjs parseArgs). For string-valued fields
+  // that boolean would slip past the string-only empty guards below and reach the
+  // SQLite bind, surfacing a raw "TypeError: SQLite3 can only bind ..." stacktrace
+  // — the same accidental shell-strip class the empty-title guard (#8470) catches.
+  // Reject it cleanly for every string-valued update flag.
+  for (const key of ['title', 'narrative', 'lesson', 'lesson-learned', 'concepts']) {
+    if (flags[key] === true) {
+      fail(`[mem] --${key} requires a value (received a bare flag with no value).`);
+      return;
+    }
+  }
+
   const updates = [];
   const params = [];
   if (flags.title !== undefined) {
@@ -1629,7 +1664,9 @@ function cmdUpdate(db, args) {
   }
   if (flags.importance) {
     const imp = parseInt(flags.importance, 10);
-    if (isNaN(imp) || imp < 1 || imp > 3) {
+    // isNumericToken first: bare parseInt would coerce "2abc"→2 and UPDATE the row to a
+    // wrong importance. Float literals still truncate (#8277).
+    if (!isNumericToken(flags.importance) || isNaN(imp) || imp < 1 || imp > 3) {
       fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
       return;
     }
@@ -1731,8 +1768,16 @@ function cmdExport(db, args) {
     return;
   }
 
+  // Full round-trippable column set so `restore` rebuilds observations faithfully —
+  // content + value-signals (access/cited/uncited/injection/decay) + branch + timing.
+  // Additive vs the pre-v2.90 13-col shape; existing `export | jq '.[].title'` consumers
+  // are unaffected. id + memory_session_id are informational (restore remaps id and
+  // buckets under a restore session).
   const rows = db.prepare(`
-    SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, created_at, created_at_epoch
+    SELECT id, memory_session_id, project, type, title, subtitle, narrative, concepts, facts,
+           files_read, files_modified, lesson_learned, importance, branch,
+           access_count, cited_count, uncited_streak, injection_count, decay_seen_count,
+           last_accessed_at, created_at, created_at_epoch
     FROM observations WHERE ${wheres.join(' AND ')}
     ORDER BY created_at_epoch DESC LIMIT ?
   `).all(...params, limit);
@@ -1757,6 +1802,83 @@ function cmdExport(db, args) {
   if (rows.length >= limit) {
     process.stderr.write(`[mem] Note: Results capped at ${limit}. Use --from/--to or --limit to export more.\n`);
   }
+}
+
+// ─── Restore ───────────────────────────────────────────────────────────────
+// Inverse of `export` — the backup/restore half README:690 promises. Reuses
+// lib/save-observation.mjs so FK / FTS / TF-IDF vector / minhash / files-junction
+// stay consistent with cmdSave, then a targeted UPDATE re-applies the value-signals
+// (access/cited/uncited/injection/decay), branch, and concepts/facts/files_read that
+// saveObservation derives or zeros — so a restored backup keeps its citation-decay
+// history and original timing (created_at via the `now` param). Source ids are
+// discarded (local AUTOINCREMENT; export omits related_ids); session provenance
+// collapses to saveObservation's manual-<project> bucket (documented MVP tradeoff).
+function cmdRestore(db, argv) {
+  const { positional, flags } = parseArgs(argv);
+  const file = positional[0];
+  if (!file) { fail('[mem] Usage: claude-mem-lite restore <file> [--project P] [--dry-run]'); return; }
+  let raw;
+  try { raw = readFileSync(file, 'utf8'); }
+  catch (e) { fail(`[mem] Cannot read "${file}": ${e.message}`); return; }
+  const trimmed = raw.trim();
+  if (!trimmed) { out('[mem] Empty file — nothing to restore.'); return; }
+  let rows;
+  try {
+    rows = trimmed[0] === '['
+      ? JSON.parse(trimmed)
+      : trimmed.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
+  } catch (e) { fail(`[mem] "${file}" is not valid export JSON/JSONL: ${e.message}`); return; }
+  if (!Array.isArray(rows) || rows.length === 0) { out('[mem] No observations in file.'); return; }
+
+  const projOverride = flags.project ? resolveProject(db, flags.project) : null;
+  const dryRun = flags['dry-run'] === true || flags['dry-run'] === 'true';
+  const num = (v) => Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 0;
+
+  const dupCheck = db.prepare('SELECT id FROM observations WHERE project = ? AND title = ? AND created_at_epoch = ? LIMIT 1');
+  const signalUpdate = db.prepare(`UPDATE observations SET
+      subtitle = ?, concepts = ?, facts = ?, files_read = ?, branch = COALESCE(?, branch),
+      access_count = ?, cited_count = ?, uncited_streak = ?, injection_count = ?,
+      decay_seen_count = ?, last_accessed_at = ?
+    WHERE id = ?`);
+
+  let restored = 0, skipped = 0, malformed = 0;
+  for (const r of rows) {
+    if (!r || typeof r !== 'object' || !r.type || !r.title) { malformed++; continue; }
+    const project = projOverride || r.project || inferProject();
+    const createdEpoch = Number.isFinite(Number(r.created_at_epoch)) ? Number(r.created_at_epoch) : Date.now();
+    // Durable exact-dup guard — saveObservation's 5-min Jaccard window can't catch a
+    // re-restore of an old-timestamped backup, so gate on project+title+created_at.
+    if (dupCheck.get(project, r.title, createdEpoch)) { skipped++; continue; }
+    if (dryRun) { restored++; continue; }
+    try {
+      let files = [];
+      try { const fm = JSON.parse(r.files_modified || '[]'); if (Array.isArray(fm)) files = fm; } catch { /* leave [] */ }
+      const imp = num(r.importance);
+      const res = saveObservation(db, {
+        content: r.narrative || r.title,
+        title: r.title,
+        type: r.type,
+        importance: imp >= 1 && imp <= 3 ? imp : 1,
+        project,
+        files,
+        lesson_learned: r.lesson_learned || null,
+        now: new Date(createdEpoch),
+      });
+      if (res.kind !== 'saved') { skipped++; continue; } // saveObservation Jaccard dedup
+      // Re-apply the fields saveObservation zeros/derives so the backup is faithful.
+      signalUpdate.run(
+        r.subtitle || '', r.concepts || '', r.facts || '', r.files_read || '[]', r.branch ?? null,
+        num(r.access_count), num(r.cited_count), num(r.uncited_streak), num(r.injection_count),
+        num(r.decay_seen_count), r.last_accessed_at ?? null,
+        res.id,
+      );
+      restored++;
+    } catch (e) {
+      malformed++;
+      if (process.env.CLAUDE_MEM_DEBUG) process.stderr.write(`[mem] restore row failed: ${e.message}\n`);
+    }
+  }
+  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped, ${malformed} malformed/failed from ${rows.length} row(s).`);
 }
 
 // ─── Compress ────────────────────────────────────────────────────────────────
@@ -1876,7 +1998,11 @@ function cmdMaintain(db, args) {
 
   // Execute
   const VALID_OPS = ['cleanup', 'decay', 'boost', 'demote_pinned', 'dedup', 'purge_stale', 'rebuild_vectors', 'vacuum'];
-  const opsStr = flags.ops || 'cleanup,decay,boost';
+  // Distinguish flag-absent (use default op set) from flag-present-but-empty
+  // (`--ops ""`, e.g. an unset shell var). The latter previously coerced via `||`
+  // to the destructive default cleanup,decay,boost and EXECUTED it; route it to the
+  // VALID_OPS check below instead so it's rejected like `--ops " "` / `--ops "decay,"`.
+  const opsStr = flags.ops === undefined ? 'cleanup,decay,boost' : String(flags.ops);
   const ops = opsStr.split(',').map(s => s.trim());
   const invalidOps = ops.filter(op => !VALID_OPS.includes(op));
   if (invalidOps.length > 0) {
@@ -2119,6 +2245,12 @@ function cmdRegistry(_memDb, args) {
     }
 
     if (action === 'import') {
+      // A bare value-less flag parses to boolean `true` (parseArgs); for these string
+      // fields that boolean reaches the SQLite bind in upsertResource and throws a raw
+      // TypeError — same class as the `update` guard above (#8470). Reject up front.
+      for (const key of ['name', 'resource-type', 'invocation-name', 'source', 'repo-url', 'local-path', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
+        if (flags[key] === true) { fail(`[mem] --${key} requires a value (received a bare flag with no value).`); return; }
+      }
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
@@ -2140,6 +2272,11 @@ function cmdRegistry(_memDb, args) {
     }
 
     if (action === 'remove') {
+      // Bare value-less --name / --resource-type → boolean true → SQLite-bind crash
+      // on the DELETE below; reject like the import branch and the `update` guard.
+      for (const key of ['name', 'resource-type']) {
+        if (flags[key] === true) { fail(`[mem] --${key} requires a value (received a bare flag with no value).`); return; }
+      }
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry remove --name N --resource-type skill|agent'); return; }
@@ -2414,6 +2551,7 @@ Commands:
     --concepts T        Space-separated concept tags
 
   export                Export observations as JSON/JSONL
+  restore <file>        Restore observations from an export file (JSON/JSONL); --dry-run to preview
     --project P         Filter by project
     --type T            Filter by type
     --format F          json (default) or jsonl
@@ -2641,6 +2779,13 @@ async function cmdImportJsonl(db, argv) {
   out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
   if (totalPrompts > 0 || totalObs > 0) {
     out(`[mem] Try: claude-mem-lite recent 5 --project ${project}`);
+  } else if (totalSkip > 0 && errorCount === 0) {
+    // Nothing imported but every line was skipped — almost always the wrong file
+    // format (import-jsonl ingests Claude Code transcript JSONL, not `export` output,
+    // which is observation-shaped). Pre-fix this exited 0 with no signal, so pointing
+    // it at the wrong file looked like success. Make the no-op explicit (stdout, like
+    // the summary lines above).
+    out(`[mem] Warning: 0 imported, ${totalSkip} line(s) skipped — none matched the expected Claude Code transcript JSONL shape (user/assistant/tool_result). 'export' output is NOT re-importable via import-jsonl.`);
   }
 }
 
@@ -2865,6 +3010,7 @@ export async function run(argv) {
       case 'delete':    cmdDelete(db, cmdArgs); break;
       case 'update':    cmdUpdate(db, cmdArgs); break;
       case 'export':    cmdExport(db, cmdArgs); break;
+      case 'restore':   cmdRestore(db, cmdArgs); break;
       case 'compress':  cmdCompress(db, cmdArgs); break;
       case 'maintain':  cmdMaintain(db, cmdArgs); break;
       case 'optimize':  await cmdOptimize(db, cmdArgs); break;

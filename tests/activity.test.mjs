@@ -181,6 +181,25 @@ describe('cmdActivity CLI: --type validation', () => {
     }
   });
 
+  // Round3-P1/P2: activity --limit used bare parseInt — "2abc" coerced to 2, "-1"
+  // became SQLite LIMIT -1 (unlimited full-table dump), huge values uncapped. Now
+  // routed through parseIntFlag (default 20, max 1000). Behavioral assertion because
+  // the runCli harness drops stderr on exit 0.
+  test('activity recent --limit routes through parseIntFlag (garbage → default, not coerced)', () => {
+    setupDir();
+    try {
+      for (let i = 0; i < 3; i++) runCli(['activity', 'save', '--type', 'discovery', `evt ${i}`]);
+      const valid = runCli(['activity', 'recent', '--limit', '1']);
+      expect(valid.stdout.match(/#\d+/g)?.length).toBe(1); // valid limit respected
+      // pre-fix "2abc" coerced to 2 (→2 rows); post-fix garbage → default 20 → all 3 rows
+      const garbage = runCli(['activity', 'recent', '--limit', '2abc']);
+      expect(garbage.exitCode).toBe(0);
+      expect(garbage.stdout.match(/#\d+/g)?.length).toBe(3);
+    } finally {
+      teardownDir();
+    }
+  });
+
   test('activity search --type bogus rejects before DB access', () => {
     setupDir();
     try {

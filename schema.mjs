@@ -8,9 +8,17 @@ import { join } from 'path';
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, chmodSync } from 'fs';
 import { OBS_FTS_COLUMNS } from './utils.mjs';
 
+// DATA location — DB, managed resources, registry DB, runtime/. Honors
+// CLAUDE_MEM_DIR so users can relocate state to a larger/faster volume.
 export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
+// CODE / install location — server.mjs, hook.mjs, cli.mjs, package.json live
+// here. ALWAYS homedir-rooted: Claude Code's settings.json + MCP registration
+// bake ABSOLUTE paths to server.mjs/hooks, so the code must NOT follow the
+// CLAUDE_MEM_DIR relocation env var (mirrors install.mjs INSTALL_DIR). Equals
+// DB_DIR when CLAUDE_MEM_DIR is unset — the common, non-relocated case.
+export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 
 // Increment when schema changes (tables, columns, indexes, FTS, migrations)
 //
@@ -61,13 +69,15 @@ export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // SQLITE_CORRUPT_VTAB blast radius v27 fixed for the other FTS tables. Version
 // bumped to force one migration pass; the conditional drop below replaces the
 // legacy trigger on existing DBs. LATEST_MIGRATION_COLUMN unchanged (no new column).
-export const CURRENT_SCHEMA_VERSION = 36;
+// v37 (D#26): adds user_prompts.cc_session_id (additive, nullable). LATEST_MIGRATION_COLUMN
+// MOVES to it so the half-migrated-DB self-heal fast-path covers the new column.
+export const CURRENT_SCHEMA_VERSION = 37;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
 // back (observed once in dev during v2.74.0). Update both the column AND
 // (if needed) the table when adding a new migration batch.
-const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'decay_seen_count' };
+const LATEST_MIGRATION_COLUMN = { table: 'user_prompts', column: 'cc_session_id' };
 
 function hasLatestMigrationColumn(db) {
   try {
@@ -205,6 +215,14 @@ const MIGRATIONS = [
   // share the unrelated injection_count column. Same-source numerator
   // (cited_count) + same-source denominator = meaningful ratio.
   'ALTER TABLE observations ADD COLUMN decay_seen_count INTEGER NOT NULL DEFAULT 0',
+  // v37 (D#26 — parallel-session handoff content scoping): the Claude-Code session
+  // UUID per user prompt. handleUserPrompt writes hookData.session_id here so
+  // buildAndSaveHandoff can scope working_on to ONE CC session — concurrent (and
+  // within-12h-TTL sequential) same-project sessions previously merged each other's
+  // prompts because getSessionId() is project-scoped (no CC-UUID component). Nullable:
+  // legacy rows + non-CC/no-stdin invocations read back NULL and the handoff falls
+  // back to its legacy unfiltered query.
+  'ALTER TABLE user_prompts ADD COLUMN cc_session_id TEXT DEFAULT NULL',
 ];
 
 /**
@@ -355,6 +373,7 @@ export function initSchema(db) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sess_sum_epoch ON session_summaries(created_at_epoch DESC, project)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_project_epoch_minhash ON observations(project, created_at_epoch DESC) WHERE minhash_sig IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_user_prompts_session ON user_prompts(content_session_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_user_prompts_cc ON user_prompts(cc_session_id) WHERE cc_session_id IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_superseded ON observations(superseded_at) WHERE superseded_at IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_branch ON observations(branch) WHERE branch IS NOT NULL`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project ON sdk_sessions(project)`);

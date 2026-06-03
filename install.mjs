@@ -10,8 +10,18 @@ import { createRequire } from 'node:module';
 
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
+// Plugin CODE / install location — ALWAYS homedir-rooted. Claude Code's
+// settings.json + MCP registration bake ABSOLUTE paths to server.mjs / hooks here,
+// and env vars are per-shell (the MCP launcher won't reliably inherit
+// CLAUDE_MEM_DIR), so code must NOT follow the relocation env var.
 const DATA_DIR = join(homedir(), '.claude-mem-lite');
-const DB_PATH = join(DATA_DIR, 'claude-mem-lite.db');
+// User DATA location — DB, managed resources, registry DB, runtime/. Honors
+// CLAUDE_MEM_DIR exactly like schema.mjs DB_DIR so the installer WRITES data where
+// the runtime/data layer READS it (pre-fix: installer wrote homedir, runtime read
+// the relocated dir → preinstalled skills silently vanished, doctor read the wrong
+// DB). Equals DATA_DIR when CLAUDE_MEM_DIR is unset (the common case).
+const MEM_DATA_DIR = process.env.CLAUDE_MEM_DIR || DATA_DIR;
+const DB_PATH = join(MEM_DATA_DIR, 'claude-mem-lite.db');
 const OLD_DATA_DIR = join(homedir(), '.claude-mem');
 
 // Detect ephemeral context (npx) — files won't persist after exit
@@ -319,6 +329,8 @@ async function install() {
   }
 
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  // Under relocation the DB/managed/runtime live here, not in the code dir — create it too.
+  if (!existsSync(MEM_DATA_DIR)) mkdirSync(MEM_DATA_DIR, { recursive: true });
 
   if (IS_DEV) {
     log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
@@ -675,7 +687,7 @@ async function install() {
   // "no such column: memory_session_id". Rename to a timestamped backup
   // so the new install creates a fresh v28 DB.
   try {
-    const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, DATA_DIR);
+    const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, MEM_DATA_DIR);
     if (r.action === 'backed-up') {
       ok(`Legacy ~/.claude-mem/ DB backed up to ${r.backupPath}`);
       log('New v28 DB will be created on first launch (legacy schema is incompatible).');
@@ -685,7 +697,7 @@ async function install() {
   }
 
   // 5b. Rename claude-mem.db → claude-mem-lite.db in same directory
-  const oldDbInDir = join(DATA_DIR, 'claude-mem.db');
+  const oldDbInDir = join(MEM_DATA_DIR, 'claude-mem.db');
   if (existsSync(oldDbInDir) && !existsSync(DB_PATH)) {
     renameSync(oldDbInDir, DB_PATH);
     for (const ext of ['-wal', '-shm']) {
@@ -714,7 +726,7 @@ async function install() {
       const resources = manifest.resources || [];
 
       if (resources.length > 0) {
-        const managedDir = join(DATA_DIR, 'managed');
+        const managedDir = join(MEM_DATA_DIR, 'managed');
 
         // 6a. Git shallow clone unique repos
         const repos = new Map();
@@ -805,7 +817,7 @@ async function install() {
 
         // 6b. Init registry DB and record preinstalled entries
         const { ensureRegistryDb } = await importFromInstall('registry.mjs');
-        const regDbPath = join(DATA_DIR, 'resource-registry.db');
+        const regDbPath = join(MEM_DATA_DIR, 'resource-registry.db');
         const rdb = ensureRegistryDb(regDbPath);
 
         const insertPre = rdb.prepare(`
@@ -853,7 +865,7 @@ async function install() {
         // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
         log('  Scanning resources...');
         const { scanAllResources, diffResources } = await importFromInstall('registry-scanner.mjs');
-        const scanned = scanAllResources({ dataDir: DATA_DIR });
+        const scanned = scanAllResources({ dataDir: MEM_DATA_DIR });
 
         // Attach star counts and repo URLs
         for (const s of scanned) {
@@ -1063,15 +1075,26 @@ async function uninstall() {
 
   // 6. Purge data if requested
   if (flags.has('--purge')) {
-    const expectedPurgePath = join(homedir(), '.claude-mem-lite');
-    if (existsSync(DATA_DIR) && DATA_DIR === expectedPurgePath) {
+    const homeDir = join(homedir(), '.claude-mem-lite');
+    // Always remove the homedir code/install dir (guarded to the canonical path).
+    if (existsSync(DATA_DIR) && DATA_DIR === homeDir) {
       rmSync(DATA_DIR, { recursive: true, force: true });
       ok('Data purged (~/.claude-mem-lite/)');
     } else if (existsSync(DATA_DIR)) {
       fail('DATA_DIR path mismatch, refusing to purge for safety: ' + DATA_DIR);
     }
+    // Also remove the relocated data dir — but ONLY if it's genuinely our data dir
+    // (contains claude-mem-lite.db), so a mistyped CLAUDE_MEM_DIR is never rm'd.
+    if (MEM_DATA_DIR !== homeDir) {
+      if (existsSync(join(MEM_DATA_DIR, 'claude-mem-lite.db'))) {
+        rmSync(MEM_DATA_DIR, { recursive: true, force: true });
+        ok(`Relocated data purged (${MEM_DATA_DIR})`);
+      } else if (existsSync(MEM_DATA_DIR)) {
+        warn(`CLAUDE_MEM_DIR (${MEM_DATA_DIR}) has no claude-mem-lite.db — left untouched. Remove manually if intended.`);
+      }
+    }
   } else {
-    log('Data preserved in ~/.claude-mem-lite/ (use --purge to remove)');
+    log('Data preserved (use --purge to remove)');
   }
 
   console.log('\n  Done!\n');
@@ -1383,7 +1406,7 @@ async function doctor() {
 
   // Update state
   try {
-    const stateFile = join(INSTALL_DIR, 'runtime', 'update-state.json');
+    const stateFile = join(MEM_DATA_DIR, 'runtime', 'update-state.json');
     if (existsSync(stateFile)) {
       const state = JSON.parse(readFileSync(stateFile, 'utf8'));
       const parts = [];
@@ -1439,11 +1462,14 @@ async function doctor() {
 
   // Stale temp files
   try {
-    const runtimeDir = join(INSTALL_DIR, 'runtime');
+    // hook-update + the episode workers write runtime/ + staging under DB_DIR
+    // (= MEM_DATA_DIR, env-aware), NOT the homedir code dir — scan there so doctor
+    // sees the real residue under relocation.
+    const runtimeDir = join(MEM_DATA_DIR, 'runtime');
     let staleCount = 0;
     const stalePatterns = ['.update-staging-', '.update-backup-'];
-    if (existsSync(INSTALL_DIR)) {
-      for (const f of readdirSync(INSTALL_DIR)) {
+    if (existsSync(MEM_DATA_DIR)) {
+      for (const f of readdirSync(MEM_DATA_DIR)) {
         if (stalePatterns.some(p => f.startsWith(p))) staleCount++;
       }
     }
@@ -1712,10 +1738,11 @@ function cleanup() {
   console.log(`\nclaude-mem-lite cleanup${dryRun ? ' (--dry-run)' : ''}\n`);
   let removed = 0;
 
-  // Clean .update-staging-* / .update-backup-* in INSTALL_DIR
+  // Clean .update-staging-* / .update-backup-* — hook-update writes these under
+  // DB_DIR (= MEM_DATA_DIR, env-aware), so scan the data dir, not the homedir code dir.
   const stalePatterns = ['.update-staging-', '.update-backup-'];
-  if (existsSync(INSTALL_DIR)) {
-    for (const f of readdirSync(INSTALL_DIR)) {
+  if (existsSync(MEM_DATA_DIR)) {
+    for (const f of readdirSync(MEM_DATA_DIR)) {
       if (stalePatterns.some(p => f.startsWith(p))) {
         if (dryRun) {
           ok(`Would remove: ${f}`);
@@ -1723,7 +1750,7 @@ function cleanup() {
           continue;
         }
         try {
-          rmSync(join(INSTALL_DIR, f), { recursive: true, force: true });
+          rmSync(join(MEM_DATA_DIR, f), { recursive: true, force: true });
           ok(`Removed: ${f}`);
           removed++;
         } catch (e) {
@@ -1733,8 +1760,8 @@ function cleanup() {
     }
   }
 
-  // Clean pending-* / ep-flush-* in runtime/
-  const runtimeDir = join(INSTALL_DIR, 'runtime');
+  // Clean pending-* / ep-flush-* in runtime/ (under the env-aware data dir)
+  const runtimeDir = join(MEM_DATA_DIR, 'runtime');
   if (existsSync(runtimeDir)) {
     for (const f of readdirSync(runtimeDir)) {
       if (f.startsWith('pending-') || f.startsWith('ep-flush-')) {

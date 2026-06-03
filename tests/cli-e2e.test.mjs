@@ -726,3 +726,54 @@ Stale file-derived data that MUST NOT appear
     expect(stdout).not.toContain('Stale file-derived data');
   });
 });
+
+// ─── Round 2 audit regressions ───────────────────────────────────────────────
+
+describe('registry bare value-less flag (Round2-P1)', () => {
+  // Pre-fix: a bare `--name` parsed to boolean true, slipped past `if (!name||...)`,
+  // and reached the SQLite bind → raw "TypeError: SQLite3 can only bind..." stacktrace.
+  it('registry import rejects bare --name instead of crashing on SQLite bind', () => {
+    const { stderr, exitCode } = runCli(['registry', 'import', '--name', '--resource-type', 'skill']);
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain('requires a value');
+    expect(stderr).not.toContain('TypeError');
+  });
+
+  it('registry remove rejects bare --name instead of crashing on SQLite bind', () => {
+    const { stderr, exitCode } = runCli(['registry', 'remove', '--name', '--resource-type', 'skill']);
+    expect(exitCode).not.toBe(0);
+    expect(stderr).toContain('requires a value');
+    expect(stderr).not.toContain('TypeError');
+  });
+});
+
+describe('doctor --json routing (Round2-P1)', () => {
+  // Pre-fix: cli.mjs forwarded ANY flagged `doctor --X` to the DB-layer cmdDoctor,
+  // which rejected plain --json ("supported flags") — shadowing install.mjs's
+  // documented health-check JSON. HOME override keeps install.mjs in the temp dir.
+  it('doctor --json emits the install health JSON, not the "supported flags" error', () => {
+    const { stdout } = runCli(['doctor', '--json'], { env: { HOME: tmpHome } });
+    expect(stdout).not.toContain('supported flags');
+    expect(stdout).toMatch(/"(checks|summary|issues)"/);
+    // The emitted JSON must actually parse.
+    expect(() => JSON.parse(stdout.trim())).not.toThrow();
+  });
+
+  it('doctor --benchmark still routes to the DB-layer handler', () => {
+    const { stdout } = runCli(['doctor', '--benchmark']);
+    expect(stdout).not.toContain('supported flags');
+  });
+});
+
+describe('import-jsonl all-skipped warning (Round2-P2)', () => {
+  // Pre-fix: pointing import-jsonl at a non-transcript file (e.g. `export` output)
+  // skipped every line and exited 0 with no signal — a silent no-op that read as success.
+  it('warns when every line is skipped (wrong file format)', () => {
+    const badPath = join(tmpHome, 'not-a-transcript.jsonl');
+    writeFileSync(badPath, '{"id":1,"type":"bugfix","title":"x"}\n{"id":2,"type":"decision","title":"y"}\n');
+    const { stdout, exitCode } = runCli(['import-jsonl', badPath, '--project', 'p']);
+    expect(exitCode).toBe(0); // graceful, not a crash
+    expect(stdout).toMatch(/0 imported/);
+    expect(stdout).toMatch(/none matched/i);
+  });
+});

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { parseIntFlag } from '../lib/cli-flags.mjs';
+import { parseIntFlag, isNumericToken } from '../lib/cli-flags.mjs';
 
 describe('parseIntFlag', () => {
   it('returns defaultValue when input is undefined / null / empty', () => {
@@ -24,6 +24,22 @@ describe('parseIntFlag', () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('Invalid --limit "abc"');
     expect(warn.mock.calls[0][0]).toContain('using default 20');
+  });
+
+  // Round1-P2: bare parseInt silently coerced trailing-garbage / hex / scientific
+  // tokens ("2abc"→2, "3xyz"→3, "0x10"→0, "1e2"→1) whose numeric prefix landed in
+  // range, slipping past the Number.isInteger gate and violating the warn+default
+  // contract. Strict shape validation now rejects pure garbage. NOTE: float literals
+  // ("3.7"→3) stay accepted by design (#8277) — see the 'rejects floats' case above;
+  // this fix deliberately does NOT touch that documented behavior.
+  it('rejects prefix-numeric garbage that parseInt would silently coerce', () => {
+    for (const bad of ['2abc', '3xyz', '0x10', '1e2']) {
+      const warn = vi.fn();
+      const result = parseIntFlag(bad, { name: '--limit', defaultValue: 20, warn });
+      expect(result, `"${bad}" should fall back to default`).toBe(20);
+      expect(warn, `"${bad}" should emit a warning`).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toContain(`Invalid --limit "${bad}"`);
+    }
   });
 
   it('rejects below-min input (negative integers, the #8277 trap)', () => {
@@ -90,5 +106,18 @@ describe('parseIntFlag', () => {
     expect(parseIntFlag('5', { name: '--importance', defaultValue: 1, min: 1, max: 3, warn })).toBe(1);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toContain('between 1 and 3');
+  });
+});
+
+// Round2-P2: shared strict-shape gate used by parseIntFlag and the reject-style
+// numeric flags (save/update --importance, defer --priority).
+describe('isNumericToken', () => {
+  it('accepts integers and float literals, rejects garbage / hex / scientific / empty', () => {
+    for (const ok of ['2', '-3', '0', '2.9', ' 5 ', '100']) {
+      expect(isNumericToken(ok), `"${ok}" should be accepted`).toBe(true);
+    }
+    for (const bad of ['2abc', '3xyz', '0x10', '1e2', 'abc', '', '   ', 'NaN', 'Infinity']) {
+      expect(isNumericToken(bad), `"${bad}" should be rejected`).toBe(false);
+    }
   });
 });

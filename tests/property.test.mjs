@@ -1,5 +1,5 @@
 // Property-based tests using fast-check
-import { describe, it } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import fc from 'fast-check';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
@@ -37,6 +37,28 @@ describe('sanitizeFtsQuery properties', () => {
       { numRuns: 200 },
     );
 
+    db.close();
+  });
+
+  // Round3-P1: fc.string only emits up to charCode 126, so the fuzz above never
+  // reaches NUL / C0 control chars. A NUL survived tokenization, got phrase-quoted,
+  // and terminated SQLite's C string mid-phrase → FTS5 "unterminated string" throw,
+  // breaking the "never throws on MATCH" invariant (and silently zeroing recall).
+  it('never throws on MATCH for NUL / control chars (fc.string cannot reach these)', () => {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = OFF');
+    initSchema(db);
+    const NUL = String.fromCharCode(0);
+    const inputs = [`fix${NUL}bug${NUL}crash search`, 'a\x01b\x07c term', `${NUL}`, 'x\x1fy', '\x00\x00\x00'];
+    for (const input of inputs) {
+      const result = sanitizeFtsQuery(input);
+      if (result === null) continue;
+      expect(
+        () => db.prepare('SELECT rowid FROM observations_fts WHERE observations_fts MATCH ?').all(result),
+        `NUL/control input ${JSON.stringify(input)} must not throw on MATCH`,
+      ).not.toThrow();
+    }
     db.close();
   });
 

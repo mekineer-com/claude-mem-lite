@@ -4,7 +4,9 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
+import Database from 'better-sqlite3';
 import { clearPluginDisabledMarkerForDirectInstall, hasOtherMarketplacePlugins } from '../install.mjs';
+import { initSchema } from '../schema.mjs';
 
 const INSTALL_PATH = resolve('install.mjs');
 const SETUP_PATH = resolve('scripts/setup.sh');
@@ -400,6 +402,49 @@ describe('install lifecycle checks', () => {
       expect(remaining).not.toContain('1.0.0');
       expect(remaining).not.toContain('2.0.0');
       expect(remaining).toContain('2.21.0');
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+// ─── D#24: install layer honors CLAUDE_MEM_DIR for DATA ───────────────────────
+// Pre-fix install.mjs hardcoded DATA_DIR=homedir for everything while the runtime
+// (schema.mjs DB_DIR) honored CLAUDE_MEM_DIR — so under relocation the installer
+// wrote the DB/managed/registry to homedir but the runtime read the relocated dir
+// (preinstalled skills vanished, doctor read the wrong DB). Now DB/managed/registry/
+// runtime follow MEM_DATA_DIR (env-aware) while plugin CODE stays at homedir.
+describe('D#24 install layer honors CLAUDE_MEM_DIR for data', () => {
+  function captureInstall(command, home, extraEnv = {}) {
+    try {
+      return runInstall(command, home, [], extraEnv);
+    } catch (e) {
+      // doctor exits non-zero when it finds issues (not installed in a fresh fake HOME)
+      return (e.stdout?.toString() || '') + (e.stderr?.toString() || '');
+    }
+  }
+
+  it('doctor reads the relocated DB (CLAUDE_MEM_DIR ≠ HOME), not the homedir code dir', () => {
+    const home = makeTmpDir();
+    const dataDir = join(makeTmpDir(), 'relocated-mem');
+    mkdirSync(dataDir, { recursive: true });
+    const db = new Database(join(dataDir, 'claude-mem-lite.db'));
+    initSchema(db); // creates observations_fts → doctor reports "FTS5 index: present"
+    db.close();
+    try {
+      const out = captureInstall('doctor', home, { CLAUDE_MEM_DIR: dataDir });
+      expect(out).toMatch(/FTS5 index: present/); // read the relocated DB's FTS table
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+      try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('control: with no CLAUDE_MEM_DIR and an empty HOME, doctor finds no DB', () => {
+    const home = makeTmpDir();
+    try {
+      const out = captureInstall('doctor', home);
+      expect(out).not.toMatch(/FTS5 index: present/); // no DB seeded at the homedir code dir
     } finally {
       try { rmSync(home, { recursive: true, force: true }); } catch {}
     }

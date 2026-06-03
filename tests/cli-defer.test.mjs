@@ -209,4 +209,22 @@ describe('claude-mem-lite defer CLI', () => {
     expect(row.status).toBe('done');
     expect(row.closed_by_obs_id).toBe(firstObsId);
   });
+
+  // Round2-P2: bare parseInt coerced "3xyz"→3 / "2abc"→2 past the [1,2,3] guard and
+  // silently set/escalated a deferred item's urgency. Strict-token gate rejects garbage;
+  // float literals still truncate (#8277).
+  it('defer add rejects garbage-token --priority instead of coercing via parseInt', () => {
+    for (const bad of ['2abc', '3xyz', '1e2']) {
+      const { stderr, exitCode } = runCli(['defer', 'add', `prio ${bad}`, '--priority', bad]);
+      expect(exitCode, `--priority "${bad}" should exit 1`).not.toBe(0);
+      expect(stderr).toMatch(/Invalid --priority/);
+    }
+    // none of the garbage attempts persisted
+    expect(runCli(['defer', 'list']).stdout).toMatch(/No open deferred items/);
+    // float literal still truncates + adds (deliberate #8277 parity)
+    const ok = runCli(['defer', 'add', 'prio float', '--priority', '2.9']);
+    expect(ok.exitCode).toBe(0);
+    const prio = db.prepare(`SELECT priority FROM deferred_work ORDER BY id DESC LIMIT 1`).get().priority;
+    expect(prio).toBe(2);
+  });
 });

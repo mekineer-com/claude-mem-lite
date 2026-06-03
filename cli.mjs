@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'browse', 'citation-stats', 'delete', 'update', 'export', 'compress', 'maintain', 'optimize', 'fts-check', 'registry', 'import', 'import-jsonl', 'enrich', 'activity', 'adopt', 'unadopt', 'memdir-audit', 'defer', 'help']);
+const CLI_COMMANDS = new Set(['search', 'recent', 'recall', 'get', 'timeline', 'save', 'stats', 'context', 'browse', 'citation-stats', 'delete', 'update', 'export', 'restore', 'compress', 'maintain', 'optimize', 'fts-check', 'registry', 'import', 'import-jsonl', 'enrich', 'activity', 'adopt', 'unadopt', 'memdir-audit', 'defer', 'help']);
 const INSTALL_COMMANDS = new Set(['install', 'uninstall', 'status', 'doctor', 'cleanup', 'cleanup-hooks', 'self-update', 'repair', 'release']);
 
 const cmd = process.argv[2];
@@ -13,14 +13,16 @@ if (cmd === '--version' || cmd === '-v') {
 } else if (cmd === '--help' || cmd === '-h') {
   const { run } = await import('./mem-cli.mjs');
   await run(['help']);
-} else if (cmd === 'doctor' && process.argv.slice(3).some(a => a.startsWith('--') && a.length > 2)) {
-  // Per #8217 single-source-of-truth: any flagged `doctor --X` is a DB-layer
-  // inspection tool (--benchmark, --metrics, --session-audit, future flags)
-  // and routes to mem-cli. Plain `doctor` (no flags) keeps running the
-  // install health-check below — adding a new flag in cli/doctor.mjs no
-  // longer requires touching this enumeration. The `length > 2` guard
-  // ignores a bare `--` (POSIX end-of-options separator) so `doctor --`
-  // continues to route to install.mjs, not mem-cli.
+} else if (cmd === 'doctor' && process.argv.slice(3).some(a => a === '--benchmark' || a === '--metrics' || a === '--session-audit')) {
+  // Per #8217: the DB-layer doctor modes (--benchmark / --metrics / --session-audit,
+  // each implemented in cli/doctor.mjs) route to mem-cli. Everything else — plain
+  // `doctor`, `doctor --` (POSIX end-of-options), and `doctor --json` — stays with
+  // install.mjs's health-check, which OWNS --json (install.mjs doctor() line ~1216).
+  // Pre-fix the router forwarded ANY flagged `doctor --X` to mem-cli, so the documented
+  // `doctor --json` (install health JSON, advertised in install.mjs usage) was shadowed
+  // and rejected by cli/doctor.mjs. Gating on the three DB-layer flags keeps --json
+  // (and any future install-doctor flag) on the install path. Adding a NEW DB-layer
+  // mode requires extending this list — a deliberate trade for a working --json.
   const { run } = await import('./mem-cli.mjs');
   await run(process.argv.slice(2));
 } else if (CLI_COMMANDS.has(cmd)) {

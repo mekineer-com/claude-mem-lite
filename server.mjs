@@ -475,7 +475,12 @@ server.registerTool(
           `SELECT id, compressed_into, superseded_at, memory_session_id, project, importance, last_accessed_at, created_at_epoch, type FROM observations WHERE id IN (${placeholders})`
         ).all(...obsIds);
         const rowMap = new Map(fullRows.map(r => [r.id, r]));
-        const tierCtx = { now: Date.now(), currentProject: currentProject, currentSessionId: '' };
+        // Use the explicitly-requested project for tier classification, not the
+        // CWD-inferred one — else computeTier's "obs.project === currentProject"
+        // (working/active rules) fails for cross-project searches and the tier=
+        // filter silently drops valid rows. mem_stats/mem_browse already resolve
+        // args.project first; this restores parity.
+        const tierCtx = { now: Date.now(), currentProject: args.project || currentProject, currentSessionId: '' };
         const filtered = results.filter(r => {
           if (r.source !== 'obs') return true;
           const full = rowMap.get(r.id);
@@ -1108,6 +1113,7 @@ server.registerTool(
     const lowVal = db.prepare(`
       SELECT COUNT(*) as c FROM observations
       WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+        AND COALESCE(compressed_into, 0) = 0
         AND created_at_epoch < ? ${projectFilter}
     `).get(thirtyDaysAgo, ...baseParams);
 

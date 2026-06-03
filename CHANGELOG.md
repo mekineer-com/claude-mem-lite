@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.90.0 — CLAUDE_MEM_DIR data relocation, full-fidelity restore, parallel-session handoff scoping + CLI/FTS hardening
+
+**feat: `CLAUDE_MEM_DIR` relocates the data layer (DB, managed resources, registry DB, `runtime/`) off `~/.claude-mem-lite` (D#24).** `install.mjs` now splits the always-homedir CODE/install dir (server.mjs, hooks — Claude Code bakes absolute paths there, so code must NOT follow the env var) from an env-overridable `MEM_DATA_DIR`, and writes data where the runtime/data layer reads it. Fixes preinstalled skills silently vanishing and `doctor` reading the wrong DB under relocation.
+
+**feat: `claude-mem-lite restore <file>` — the full-fidelity inverse of `export` (D#25).** Reconstructs observations (FK / FTS / vector / minhash / files) preserving `created_at` and restoring value-signals (access / cited / uncited / injection / decay), branch, and concepts/facts/files_read. `export` widened to 22 columns; adds id remap (no PK collision into a populated DB), project+title+created_at dedup (idempotent, not a 5-min window), `--dry-run`, and JSON + JSONL formats.
+
+**feat: schema v37 — `user_prompts.cc_session_id` (additive, nullable, indexed).** Tags each prompt with the Claude Code session UUID so handoffs can scope to a single CC session.
+
+**fix: handoff stops merging parallel/sequential same-project sessions (D#26 + D#28).** `getSessionId()` is project-scoped with a 12h reuse window, so concurrent or back-to-back CC sessions in one project shared a session id and bled into each other's handoff. `working_on` now filters to the CC session's own prompts (`cc_session_id`); Completed / Key Files / Key Decisions are lower-bounded to the CC session's first-prompt epoch. Residual: truly concurrent overlap can still co-attribute a few rows (escalation path documented in `hook-handoff.mjs`).
+
+**fix: auto-update resolves CODE from the homedir install dir, not the relocated data dir (D#27).** `hook-update.mjs` had aliased `INSTALL_DIR = DB_DIR`, so under `CLAUDE_MEM_DIR` relocation it read the version, checked dev-mode, and installed against the data dir — never touching the real code. Split into a homedir `INSTALL_DIR` (via new `schema.mjs` `CODE_DIR`) and a data-dir `STATE_DIR` for `runtime/update-state.json` (which still matches `install.mjs` doctor + hook-shared `RUNTIME_DIR`).
+
+**fix: CLI flags reject malformed input instead of crashing or silently coercing.** Bare value-less string flags (`--name`, `--flag` with no argument) no longer crash on the SQLite bind path; numeric flags reject trailing-garbage / hex / scientific tokens (`2abc`, `0x10`, `1e2`) that bare `parseInt` would coerce, via the shared `isNumericToken` shape check in `lib/cli-flags.mjs`. REJECT-style flags (`--importance`, `--priority`, `--ops`) fail loudly; WARN-style flags (`--limit`, `--offset`, `--before`, positional counts, `activity recent/search`) warn and fall back to the default, guarding the SQLite `LIMIT -1` = unbounded-dump footgun.
+
+**fix: FTS5 search never throws on `MATCH` for NUL / ASCII control chars.** `sanitizeFtsQuery` now strips `\x00-\x1f\x7f` before tokenization — a NUL survived tokenization, got phrase-quoted, and terminated SQLite's C string mid-phrase (`unterminated string`), violating the documented never-throws-on-MATCH invariant.
+
+**fix: `doctor --json` routing + misc.** `doctor --json` emits the install-health JSON (not the DB-layer payload); `--benchmark` still routes to the DB handler; `import-jsonl` warns when every line is skipped (wrong file format); `mem_search tier=working` honors an explicit `args.project` (browse parity); the low-value noise count excludes already-compressed rows.
+
 ## v2.89.0 — audit bundle (P4–P10): citation-decay value signals, compress vector parity, FTS trigger scoping
 
 **fix: `events_fts_au` trigger narrowed to `AFTER UPDATE OF title, body` (schema v36).** The

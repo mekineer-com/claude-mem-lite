@@ -687,6 +687,22 @@ describe('CLI save command', () => {
     expect(row.importance).toBe(1);
   });
 
+  // Round2-P2: bare parseInt coerced garbage tokens ("2abc"→2, "1e2"→1) past the
+  // range guard and PERSISTED a wrong importance (skews ranking/decay). Strict-token
+  // gate now rejects them like "5"/"0". Float literals still truncate (#8277).
+  it('rejects garbage-token --importance (no silent parseInt coercion/persist)', async () => {
+    for (const bad of ['2abc', '3xyz', '1e2']) {
+      const out = await captureStdout(() => run(['save', `imp ${bad}`, '--importance', bad]));
+      expect(out, `--importance "${bad}" should be rejected`).toContain('Invalid importance');
+      expect(process.exitCode).toBe(1);
+      process.exitCode = undefined;
+    }
+    expect(testDb.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(0); // nothing persisted
+    // Float literal still truncates + saves (deliberate #8277 parity with parseIntFlag).
+    await captureStdout(() => run(['save', 'imp float two-point-nine', '--importance', '2.9']));
+    expect(testDb.prepare('SELECT importance FROM observations ORDER BY id DESC LIMIT 1').get().importance).toBe(2);
+  });
+
   it('rejects invalid type', async () => {
     const output = await captureStdout(() => run(['save', 'test content', '--type', 'invalid']));
     expect(output).toContain('Invalid type');
@@ -743,6 +759,28 @@ describe('CLI stats command', () => {
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('[mem] Stats');
     expect(output).toContain('Total: 0 observations');
+  });
+
+  // Round1-P2: the low-value ("noise") count pre-fix omitted `compressed_into IS NULL`,
+  // so rows that `compress` had already folded away kept inflating the "% noise" metric
+  // and the "consider running mem compress" advice — a futile no-op loop (re-running
+  // compress finds nothing). An already-compressed low-value row must NOT count as noise.
+  it('excludes already-compressed rows from the low-value noise count', async () => {
+    const old = 40 * 86400000; // >30d so both rows clear the staleness threshold
+    insertObs(testDb, { // live low-value row → counts as noise
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Live low value', text: 'live', importance: 1, accessCount: 0,
+      epochOffset: -old, compressedInto: null,
+    });
+    insertObs(testDb, { // already-compressed low-value row → must be excluded
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Compressed low value', text: 'compressed', importance: 1, accessCount: 0,
+      epochOffset: -old, compressedInto: 999,
+    });
+    const output = await captureStdoutOnly(() => run(['stats', '--json']));
+    const stats = JSON.parse(output);
+    expect(stats.data_health.low_value_count).toBe(1); // only the live row, not the compressed one
+    expect(stats.data_health.compressed).toBe(1);
   });
 });
 
@@ -905,6 +943,44 @@ describe('CLI update command', () => {
     expect(output).toContain('--title cannot be empty');
     const row = testDb.prepare('SELECT title FROM observations WHERE id = 1').get();
     expect(row.title).toBe('Original title');
+  });
+
+  // Round1-P1: a value-less `--flag` (e.g. `update 1 --title` with NO following arg)
+  // parses to boolean `true` (parseArgs). Pre-fix this slipped past the string-only
+  // empty guards and bound the boolean to SQLite, surfacing a raw
+  // "TypeError: SQLite3 can only bind ..." stacktrace. Must reject cleanly for every
+  // string-valued update flag (--title/--narrative/--lesson/--concepts) and leave the
+  // row unchanged — same accidental shell-strip class as the #8470 empty-title guard.
+  it('rejects value-less string flags (bare --flag) instead of crashing on SQLite bind', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Original title', narrative: 'orig narrative', text: 'content',
+    });
+    for (const flag of ['--title', '--narrative', '--lesson', '--concepts']) {
+      const output = await captureStdout(() => run(['update', '1', flag]));
+      expect(output, `${flag} should be rejected`).toContain('requires a value');
+      expect(output, `${flag} must not surface a raw stacktrace`).not.toContain('TypeError');
+    }
+    const row = testDb.prepare('SELECT title, narrative FROM observations WHERE id = 1').get();
+    expect(row.title).toBe('Original title');
+    expect(row.narrative).toBe('orig narrative');
+  });
+
+  // Round2-P2: update --importance shared the bare-parseInt defect — "2abc"→2 was
+  // silently UPDATE'd onto the row. Strict-token gate now rejects garbage; float
+  // literals still truncate (#8277).
+  it('rejects garbage-token --importance (does not coerce/persist via UPDATE)', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'orig', text: 'content', importance: 1,
+    });
+    for (const bad of ['2abc', '3xyz', '1e2']) {
+      const out = await captureStdout(() => run(['update', '1', '--importance', bad]));
+      expect(out, `--importance "${bad}" should be rejected`).toContain('Invalid importance');
+    }
+    expect(testDb.prepare('SELECT importance FROM observations WHERE id=1').get().importance).toBe(1); // unchanged
+    await captureStdout(() => run(['update', '1', '--importance', '2.9'])); // float truncates (#8277)
+    expect(testDb.prepare('SELECT importance FROM observations WHERE id=1').get().importance).toBe(2);
   });
 
   // Dogfood-8: --lesson cap is enforced on cmdSave but pre-fix not on cmdUpdate, so a
@@ -1791,6 +1867,24 @@ describe('CLI search cross-source', () => {
     expect(output).toBeDefined();
   });
 
+  // Round2-P1: on the obs-type-filtered (single-source) path, --type set
+  // effectiveSource='observations' so the engine applied SQL OFFSET, then
+  // results.slice(offset,…) applied it a SECOND time → the page was dropped
+  // ('No results ... at offset 1'). MCP offsets once; CLI must too.
+  it('applies --offset exactly once on the obs-type-filtered path (no double-offset drop)', async () => {
+    for (let i = 0; i < 3; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+        title: `Offset bug ${i}`, text: `offsetcase fix entry ${i}`,
+      });
+    }
+    const all = await captureStdout(() => run(['search', 'offsetcase', '--type', 'bugfix', '--limit', '5']));
+    expect(all).toMatch(/Found 3 results/);
+    const paged = await captureStdout(() => run(['search', 'offsetcase', '--type', 'bugfix', '--limit', '5', '--offset', '1']));
+    expect(paged).not.toContain('No results'); // pre-fix: "No results for ... at offset 1"
+    expect(paged).toMatch(/Found 2 of 3 results/); // offset 1 of 3 matches → 2 returned, total 3
+  });
+
   it('searches with --branch filter', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
@@ -2391,5 +2485,54 @@ describe('CLI memdir-audit command', () => {
     const out = await captureStdout(() => run(['memdir-audit', '--memdir', '/no/such/path/here']));
     expect(out).toContain('Total: 0 file(s)');
     expect(process.exitCode).toBe(0);
+  });
+});
+
+// ─── Round 3 audit: read-only numeric-flag validation + maintain --ops ────────
+// Pre-fix these raw-parseInt sites silently coerced trailing-garbage/scientific
+// tokens ("2abc"→2, "1e2"→1) past their range/positivity checks; --ops "" coerced
+// to the destructive default. Each now rejects (REJECT-style) or warns+defaults
+// (WARN-style). captureStdout captures both stdout and stderr (warnings).
+describe('CLI Round3 numeric-flag + ops validation', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+    for (let i = 0; i < 3; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `numflag obs ${i}`, text: `numflagcase entry ${i}`, importance: 2,
+      });
+    }
+  });
+  afterEach(() => { testDb.close(); process.exitCode = undefined; });
+
+  it('search --importance rejects garbage tokens (REJECT-style, not parseInt-coerced)', async () => {
+    for (const bad of ['2abc', '1e2', '3xyz']) {
+      const out = await captureStdout(() => run(['search', 'numflagcase', '--importance', bad]));
+      expect(out, `--importance "${bad}" should be rejected`).toContain('Invalid --importance');
+      process.exitCode = undefined;
+    }
+  });
+
+  it('search --offset warns + defaults to 0 on garbage (WARN-style)', async () => {
+    const out = await captureStdout(() => run(['search', 'numflagcase', '--offset', '2abc']));
+    expect(out).toContain('Invalid --offset "2abc"');
+  });
+
+  it('recent <N> positional warns + defaults on garbage', async () => {
+    const out = await captureStdout(() => run(['recent', '2abc']));
+    expect(out).toContain('Invalid count "2abc"');
+  });
+
+  it('timeline --before warns + defaults on garbage', async () => {
+    const out = await captureStdout(() => run(['timeline', '--anchor', '1', '--before', '2abc']));
+    expect(out).toContain('Invalid --before "2abc"');
+  });
+
+  it('maintain execute --ops "" (empty) is rejected, not coerced to the destructive default', async () => {
+    const out = await captureStdout(() => run(['maintain', 'execute', '--ops', '']));
+    expect(out).toContain('Unknown operation(s)');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
   });
 });
