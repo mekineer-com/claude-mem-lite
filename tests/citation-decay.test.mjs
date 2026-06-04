@@ -189,6 +189,27 @@ describe('applyCitationDecay', () => {
     expect(dSeen).toBe(1);
   });
 
+  it('suppressed (non-adopting) project caps uncited_streak instead of growing unbounded', () => {
+    // Force suppression: the project has decay history (seen>=8) but ~0 cite-rate,
+    // so applyCitationDecay never demotes. Pre-fix the streak-only path grew the
+    // streak without bound, sinking citeFactorClause to its 0.4 floor permanently.
+    const noise = makeObs({ importance: 1 });
+    db.prepare('UPDATE observations SET decay_seen_count = 20, cited_count = 0 WHERE id = ?').run(noise);
+    const adoption = computeCitationAdoption(db, 'p');
+    expect(adoption.seen).toBeGreaterThanOrEqual(8);
+    expect(adoption.rate).toBeLessThan(0.02); // => suppressDemotion = true
+
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    // Inject-but-never-cite across many distinct sessions (distinct sessionId bypasses
+    // the idempotent skip). Streak must plateau at UNCITED_STREAK_THRESHOLD-1, not climb.
+    for (let i = 1; i <= 6; i++) {
+      applyCitationDecay(db, 'p', new Set([id]), new Set(), `s-${i}`);
+    }
+    const row = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
+    expect(row.uncited_streak).toBe(2); // capped (threshold-1), pre-fix would be 6
+    expect(row.importance).toBe(2);     // never demoted under suppression
+  });
+
   it('importance cap: cited at importance=3 stays at 3', () => {
     const id = makeObs({ importance: 3 });
     applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');
@@ -452,7 +473,8 @@ describe('applyCitationDecay — project adoption-rate gate (P5 ②)', () => {
     const row = db.prepare('SELECT importance, uncited_streak, demoted_at FROM observations WHERE id=?').get(target);
     expect(row.importance).toBe(2);          // NOT demoted
     expect(row.demoted_at).toBeNull();        // demote branch never ran
-    expect(row.uncited_streak).toBe(3);       // streak still advances (idempotent bookkeeping)
+    expect(row.uncited_streak).toBe(2);       // CAPPED at threshold-1 under suppression —
+                                              // not advanced unbounded (would sink cite_factor to floor)
     expect(r.demoted).toBe(0);
     expect(r.touched).toBe(1);
   });

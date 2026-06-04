@@ -96,6 +96,49 @@ describe('execute ops', () => {
     expect(get(db, dup, 'compressed_into')).toBe(keep);
   });
 
+  // --- transitive-merge orphan prevention (data-loss bug class beyond direct self-merge) ---
+  // The 1-line `removeId===keepId` guard only catches the DIRECT case. Chained, mutual,
+  // and already-compressed-target merges still point a row at a HIDDEN keeper, which
+  // vanishes from every compressed_into=0 view. The tool's own mem_maintain "dedup"
+  // auto-suggests pairs that can form these chains, so this is reachable in normal use.
+  // Invariant under test: no live row may end up compressed_into a non-live row.
+  test('mergeDuplicates chain [[A,B],[B,C]] does not orphan C', () => {
+    const db = freshDb();
+    const A = add(db, { title: 'A keeper' });
+    const B = add(db, { title: 'B dup of A' });
+    const C = add(db, { title: 'C dup of B' });
+    mergeDuplicates(db, [[A, B], [B, C]]);
+    // A survives live; B and C collapse DIRECTLY onto the single live keeper A.
+    // Pre-fix C->B (the hidden middle): if B is later purgeStale-deleted, C's keeper
+    // vanishes and C is unrecoverable. Direct C->A keeps C safe under later purges.
+    expect(get(db, A, 'compressed_into')).toBeNull();
+    expect(get(db, B, 'compressed_into')).toBe(A);
+    expect(get(db, C, 'compressed_into')).toBe(A); // pre-fix: C->B (hidden middle)
+  });
+
+  test('mergeDuplicates mutual [[A,B],[B,A]] keeps exactly one live (no total loss)', () => {
+    const db = freshDb();
+    const A = add(db, { title: 'A' });
+    const B = add(db, { title: 'B' });
+    mergeDuplicates(db, [[A, B], [B, A]]);
+    const aLive = get(db, A, 'compressed_into') === null;
+    const bLive = get(db, B, 'compressed_into') === null;
+    expect(aLive !== bLive, 'exactly one of A/B must remain live').toBe(true); // pre-fix: BOTH hidden
+    // the hidden one points at the live one
+    if (aLive) expect(get(db, B, 'compressed_into')).toBe(A);
+    else expect(get(db, A, 'compressed_into')).toBe(B);
+  });
+
+  test('mergeDuplicates does not merge into an already-compressed keeper (cross-call)', () => {
+    const db = freshDb();
+    const D = add(db, { title: 'D keeper' });
+    const E = add(db, { title: 'E dup of D' });
+    const F = add(db, { title: 'F dup of E' });
+    mergeDuplicates(db, [[D, E]]);          // E now hidden into D
+    mergeDuplicates(db, [[E, F]]);          // keeper E is hidden -> must NOT orphan F
+    expect(get(db, F, 'compressed_into')).toBeNull(); // F stays live (pre-fix: F->E hidden)
+  });
+
   test('purgeStale deletes pending-purge rows older than the cutoff; preview counts them', () => {
     const db = freshDb();
     const stale = add(db, { title: 'to purge', compressedInto: COMPRESSED_PENDING_PURGE });

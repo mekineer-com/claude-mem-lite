@@ -22,11 +22,15 @@ Used by `/health` skill (gstack). Persisted here so detection skips runtime prob
 - deadcode: ./node_modules/.bin/knip
 - shell: shellcheck scripts/post-tool-use.sh scripts/pre-commit.sh scripts/setup.sh
 
-Knip baseline (2026-05-09): 0 unused files, 45 unused exports (mostly v2.21
-utils.mjs split backward-compat re-exports — intentional, do NOT remove without
-audit), 1 duplicate-name export pair (FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS,
-intentional alias). Treat baseline as the floor; flag NEW unused exports as PR
-review signal.
+Knip baseline (2026-06-05): 0 unused files, 51 unused exports. Two categories:
+(a) intentional — v2.21 utils.mjs split backward-compat re-exports + test-only
+exports (search-engine.mjs FTS/count helpers, ftsRowToResult) used internally and
+by tests; do NOT remove without audit. (b) NOT intentional — the v3 dispatch/
+invocation-feedback CRUD in registry.mjs was confirmed dead (0 refs) and DELETED
+in 2026-06; if invocation-stats functions reappear in this list they are rot from a
+reverted feature, not back-compat. Plus 1 duplicate-name export pair
+(FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS, intentional alias). Treat baseline
+as the floor; flag NEW unused exports as PR review signal.
 
 ## Architecture
 

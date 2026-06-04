@@ -366,6 +366,15 @@ export function searchObservationsHybrid(db, ctx) {
     if (vecResults.length === 0) return results;
 
     if (results.length > 0) {
+      // RRF fuses by RANK (array index), so the BM25 side must already be in
+      // composite-score order. `results` here is [full-FTS sorted, …concept ×0.7,
+      // …PRF ×0.6] with augmentation rows APPENDED, so its index order is only
+      // BM25-rank for the first block — a downweighted PRF row at the tail would be
+      // handed to RRF as a worse rank than its score warrants, and a strong one as
+      // better. Sort by the calibrated composite score (negative = more relevant)
+      // first so index == composite rank and the type-quality/decay/cite multipliers
+      // actually shape the fused ranking instead of being discarded by insertion order.
+      results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
       const rrfRanking = rrfMerge(results, vecResults, ctx.rrfK);  // undefined → RRF_K
       const resultMap = new Map(results.map(r => [r.id, r]));
       for (const vr of vecResults) {
