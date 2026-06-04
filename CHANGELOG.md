@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.92.0 — maintain data-loss class closed (transitive merge + purge orphan) + RRF score-order + citation streak cap
+
+A follow-up audit of the search and maintain paths. All changes are behavior corrections or internal refactors — no new features, no schema change.
+
+**fix: `mem_maintain` dedup no longer orphans rows on transitive merges.** The v2.91.0 self-merge guard (`removeId === keepId`) only caught the DIRECT `5:5` case. Chained `[[A,B],[B,C]]`, mutual `[[A,B],[B,A]]` (both rows lost), and already-compressed-keeper merges still pointed a row at a hidden keeper — invisible to every `compressed_into=0` view. Reachable in normal use because the dedup op auto-suggests importance-ordered pairs that form chains. `mergeDuplicates` now resolves the whole batch first, collapses chains/cycles to one live keeper (cycle → smallest id), and only writes a merge when the keeper is currently live.
+
+**fix: hard-delete (`purgeStale` / `cleanupBroken`) recovers a deleted keeper's children instead of orphaning them.** `compressed_into` has no FK, so deleting a keeper that absorbed dups left its children dangling behind a missing parent — hidden and unrecoverable, with no safety net. Both paths now un-hide (`compressed_into=NULL`) any row merged into a doomed id before deleting, so content resurfaces as live rather than vanishing.
+
+**fix: hybrid search RRF fuses the true composite rank.** On the FTS+vector path, `rrfMerge` ranked by array position, but `results` was `[full-FTS sorted, …concept ×0.7, …PRF ×0.6]` with augmentation rows appended — so the calibrated type-quality/decay/cite multipliers were discarded in favour of insertion order. `results` is now sorted by composite score before the merge. Benchmark-neutral (R@10 0.8996 unchanged), no regression.
+
+**fix: citation streak no longer starves non-citing projects.** Under demotion suppression (`adoption < 2%`) `uncited_streak` grew unbounded, sinking every memory's `cite_factor` to its 0.4 floor with no recovery. It is now capped at `UNCITED_STREAK_THRESHOLD-1`, holding the `[0,2]` steady state the scoring layer assumes.
+
+**refactor: single-source observations write surface.** Manual `mem_save` (16-col) and LLM auto-ingest (18-col) hand-wrote divergent `observations` INSERTs — the column-drift hazard the compress/maintain cores were extracted to kill. Both now share `lib/observation-write` (`insertObservationRow/Files/Vector`); the column list lives in one place. Behavior-preserving.
+
+**chore: drop dead v3 dispatch CRUD.** Removed 9 unreferenced invocation/stats exports from `registry.mjs` (−132 lines, knip-confirmed) and corrected the knip baseline note.
+
+**verified: search pagination (D#30) is stable.** Empirically confirmed that v2.91.0's offset-0 fetch + single final slice makes pages disjoint and stably ordered across `--offset` (50-obs boundary stress); added a guard test. No code change needed.
+
 ## v2.91.0 — search total/pagination correctness + maintain self-merge data-loss guard
 
 A correctness audit of the search and maintain paths, found by end-to-end dogfooding of the MCP surface (Claude's primary interface) against the CLI. All five fixes are behavior corrections — no new features, no schema change.
