@@ -36,6 +36,30 @@ if [ "$MISMATCH" -eq 1 ]; then
 fi
 echo "[pre-commit] Versions synced: $PKG_VER"
 
+# ── Lockfile @emnapi integrity check ────────────────────────────────────────
+# A single-platform `npm install` prunes cross-platform @emnapi optional-native
+# entries from package-lock.json, which breaks the CI runner's `npm ci`
+# ("Missing: @emnapi/core@... from lock file"). This has recurred multiple times
+# (mem P#6031 / #8644). Block any commit that REDUCES the @emnapi entry count vs
+# the committed lock — that's the prune signature. Legit increases pass through.
+if git diff --cached --name-only | grep -qx 'package-lock.json'; then
+  STAGED_EMNAPI=$(git show :package-lock.json 2>/dev/null | grep -c '@emnapi' || true)
+  HEAD_EMNAPI=$(git show HEAD:package-lock.json 2>/dev/null | grep -c '@emnapi' || true)
+  if [ "${HEAD_EMNAPI:-0}" -gt 0 ] && [ "${STAGED_EMNAPI:-0}" -lt "${HEAD_EMNAPI:-0}" ]; then
+    if [ "${DISABLE_EMNAPI_GUARD:-0}" = "1" ]; then
+      echo "[pre-commit] ⚠ @emnapi entries dropped $HEAD_EMNAPI -> $STAGED_EMNAPI (DISABLE_EMNAPI_GUARD=1, allowing)"
+    else
+      echo "[pre-commit] ❌ package-lock.json @emnapi entries dropped: $HEAD_EMNAPI -> $STAGED_EMNAPI"
+      echo "[pre-commit]    A single-platform 'npm install' pruned cross-platform optional native"
+      echo "[pre-commit]    deps the CI runner's 'npm ci' needs (recurring — mem P#6031 / #8644)."
+      echo "[pre-commit]    Fix: restore the committed lock + surgically patch only the changed dep"
+      echo "[pre-commit]    (version+resolved+integrity), or regenerate preserving optionals."
+      echo "[pre-commit]    Override (rare, intentional drop): DISABLE_EMNAPI_GUARD=1 git commit ..."
+      exit 1
+    fi
+  fi
+fi
+
 # ── Lint ─────────────────────────────────────────────────────────────────────
 echo "[pre-commit] Running eslint..."
 npx eslint . || {
