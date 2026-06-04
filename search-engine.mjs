@@ -72,6 +72,110 @@ export function buildObsFtsParams({ now, projectBoost, ftsQuery, args, epochFrom
   return params;
 }
 
+// --- True match-count helpers (limit/offset-invariant search totals) ----------
+// The search path over-fetches per source — perSourceLimit = max(limit*3,
+// offset+limit+10) — and historically reported `total = results.length`. That made
+// "Found N of M" and the JSON `total` field grow with --limit/--offset, breaking
+// the documented pagination contract (a query's population must not change when you
+// page through it). These COUNT(*) helpers mirror each source's MATCH + filters
+// exactly, so `total` reflects the real population independent of paging. Shared by
+// CLI and MCP per the paired-path single-source-of-truth rule (#8217).
+//
+// Known approximation: post-SQL filters that DROP rows after the query (CJK
+// precision gate on prompts, --tier on obs) are not reflected here, so those niche
+// queries may overcount. Callers clamp total to >= page size, so it never
+// understates the rows actually shown.
+export function countObsFtsMatches(db, { ftsQuery, args = {}, epochFrom = null, epochTo = null, includeNoise = false }) {
+  if (!ftsQuery) return 0;
+  const lowSignalClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
+  try {
+    const row = db.prepare(`
+      SELECT COUNT(*) as c
+      FROM observations_fts
+      JOIN observations o ON observations_fts.rowid = o.id
+      WHERE observations_fts MATCH ?
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
+        AND (? IS NULL OR o.project = ?)
+        AND (? IS NULL OR o.type = ?)
+        AND (? IS NULL OR o.created_at_epoch >= ?)
+        AND (? IS NULL OR o.created_at_epoch <= ?)
+        AND (? IS NULL OR COALESCE(o.importance, 1) >= ?)
+        AND (? IS NULL OR o.branch = ?)
+        ${lowSignalClause}
+    `).get(
+      ftsQuery,
+      args.project ?? null, args.project ?? null,
+      args.obs_type ?? null, args.obs_type ?? null,
+      epochFrom, epochFrom,
+      epochTo, epochTo,
+      args.importance ?? null, args.importance ?? null,
+      args.branch ?? null, args.branch ?? null,
+    );
+    return row?.c ?? 0;
+  } catch { return 0; }
+}
+
+export function countSessionFtsMatches(db, { ftsQuery, project = null, epochFrom = null, epochTo = null }) {
+  if (!ftsQuery) return 0;
+  try {
+    const wheres = ['session_summaries_fts MATCH ?'];
+    const params = [ftsQuery];
+    if (project) { wheres.push('s.project = ?'); params.push(project); }
+    if (epochFrom) { wheres.push('s.created_at_epoch >= ?'); params.push(epochFrom); }
+    if (epochTo) { wheres.push('s.created_at_epoch <= ?'); params.push(epochTo); }
+    const row = db.prepare(`
+      SELECT COUNT(*) as c
+      FROM session_summaries_fts
+      JOIN session_summaries s ON session_summaries_fts.rowid = s.id
+      WHERE ${wheres.join(' AND ')}
+    `).get(...params);
+    return row?.c ?? 0;
+  } catch { return 0; }
+}
+
+export function countPromptFtsMatches(db, { ftsQuery, project = null, epochFrom = null, epochTo = null }) {
+  if (!ftsQuery) return 0;
+  try {
+    const wheres = ['user_prompts_fts MATCH ?', "p.prompt_text NOT LIKE '<task-notification>%'"];
+    const params = [ftsQuery];
+    if (project) { wheres.push('s.project = ?'); params.push(project); }
+    if (epochFrom) { wheres.push('p.created_at_epoch >= ?'); params.push(epochFrom); }
+    if (epochTo) { wheres.push('p.created_at_epoch <= ?'); params.push(epochTo); }
+    const row = db.prepare(`
+      SELECT COUNT(*) as c
+      FROM user_prompts_fts
+      JOIN user_prompts p ON user_prompts_fts.rowid = p.id
+      JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
+      WHERE ${wheres.join(' AND ')}
+    `).get(...params);
+    return row?.c ?? 0;
+  } catch { return 0; }
+}
+
+/**
+ * Sum true match counts across the sources that contribute to a cross-source (or
+ * source-restricted) search. `obsFtsQuery` lets callers pass the OR-relaxed query
+ * when obs AND→OR fallback fired (the displayed obs rows came from the OR query).
+ * @returns {number} population count, limit/offset-invariant
+ */
+export function countSearchTotal(db, {
+  effectiveSource = null, ftsQuery, obsFtsQuery = null,
+  args = {}, project = null, epochFrom = null, epochTo = null, includeNoise = false,
+}) {
+  let total = 0;
+  if (!effectiveSource || effectiveSource === 'observations') {
+    total += countObsFtsMatches(db, { ftsQuery: obsFtsQuery || ftsQuery, args, epochFrom, epochTo, includeNoise });
+  }
+  if (!effectiveSource || effectiveSource === 'sessions') {
+    total += countSessionFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
+  }
+  if (!effectiveSource || effectiveSource === 'prompts') {
+    total += countPromptFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
+  }
+  return total;
+}
+
 export function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
   return {
     source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle,

@@ -10,7 +10,7 @@ import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
-import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
+import { searchObservationsHybrid, findFtsAnchor, countSearchTotal } from './search-engine.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
@@ -314,7 +314,7 @@ function searchPrompts(ctx) {
   return results;
 }
 
-function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCrossSource, orFallbackFired = false) {
+function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFallbackFired = false) {
   if (paginatedResults.length === 0) {
     const hint = [];
     if (args.query && !ftsQuery) {
@@ -332,7 +332,13 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, isCros
   }
 
   const lines = [];
-  const countLabel = isCrossSource && totalCount > paginatedResults.length
+  // "N of M" whenever the population exceeds the page — NOT gated on isCrossSource.
+  // totalCount is the true limit/offset-invariant population (countSearchTotal), so
+  // single-source searches (obs_type / type / importance filters) must surface it too.
+  // The old isCrossSource gate predated countSearchTotal: back then single-source
+  // totalCount was just results.length, so suppressing "of M" hid nothing. Now it hid
+  // the real total, diverging from the CLI (mem-cli.mjs has no such gate). (#8217)
+  const countLabel = totalCount > paginatedResults.length
     ? `${paginatedResults.length} of ${totalCount}`
     : `${paginatedResults.length}`;
   const hasMixed = paginatedResults.some(r => r.source === 'session' || r.source === 'prompt');
@@ -385,9 +391,15 @@ server.registerTool(
     const searchType = args.type;
     const currentProject = inferProject();
 
-    const isCrossSourceRaw = !searchType;
-    const perSourceLimit = isCrossSourceRaw ? Math.max(limit * 3, offset + limit + 10) : limit;
-    const perSourceOffset = isCrossSourceRaw ? 0 : offset;
+    // Over-fetch from offset 0 for EVERY mode, then apply `offset` exactly once at
+    // the merge slice below — identical to the CLI (mem-cli.mjs perSourceOffset=0).
+    // The old single-source branch (perSourceLimit=limit, perSourceOffset=offset)
+    // double-applied offset: it pushed offset into the per-source SQL AND re-sliced
+    // by offset at merge, so explicit `type=observations` paging overlapped (page 0
+    // == page 1) and gapped (oldest rows unreachable). It also fetched only `limit`
+    // rows — fewer than offset+limit — so there was nothing to page into. (#8217)
+    const perSourceLimit = Math.max(limit * 3, offset + limit + 10);
+    const perSourceOffset = 0;
 
     // Parse date bounds to epoch (with validation)
     // date_to with date-only format (YYYY-MM-DD) extends to end-of-day (23:59:59.999Z)
@@ -401,7 +413,7 @@ server.registerTool(
 
     // Early return when query was provided but sanitized to nothing (all FTS5 keywords/special chars)
     if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance) {
-      return formatSearchOutput([], args, ftsQuery, 0, false);
+      return formatSearchOutput([], args, ftsQuery, 0);
     }
 
     // When obs_type is specified, implicitly restrict to observations only
@@ -502,11 +514,25 @@ server.registerTool(
     }
     // else 'relevance' keeps BM25 score order (already sorted)
 
-    const totalBeforePagination = results.length;
+    // `total` must be the TRUE population, invariant to limit/offset. In cross-source
+    // mode results is over-fetched (perSourceLimit scales with limit+offset), so
+    // results.length is NOT the population — count the real MATCH set instead. Clamp
+    // to >= results.length so vector/concept-augmented obs rows are never undercounted.
+    // (paired-path with mem-cli.mjs via shared countSearchTotal — #8217)
+    const trueTotal = countSearchTotal(db, {
+      effectiveSource: effectiveType || null,
+      ftsQuery,
+      obsFtsQuery: ctx.orFallbackFired === true ? (relaxFtsQueryToOr(ftsQuery) || ftsQuery) : ftsQuery,
+      args: { project: args.project || null, obs_type: args.obs_type || null, importance: args.importance || null, branch: args.branch || null },
+      project: args.project || null,
+      epochFrom, epochTo,
+      includeNoise: args.include_noise === true,
+    });
+    const totalBeforePagination = Math.max(trueTotal, results.length);
     // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
     const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
 
-    return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, isCrossSource, ctx.orFallbackFired === true);
+    return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, ctx.orFallbackFired === true);
   })
 );
 

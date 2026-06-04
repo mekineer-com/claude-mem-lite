@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.91.0 — search total/pagination correctness + maintain self-merge data-loss guard
+
+A correctness audit of the search and maintain paths, found by end-to-end dogfooding of the MCP surface (Claude's primary interface) against the CLI. All five fixes are behavior corrections — no new features, no schema change.
+
+**fix: `mem_search` reports the TRUE population in single-source mode (`obs_type` / `type` / `importance` filters).** `formatSearchOutput` gated the "N of M" suffix on `isCrossSource`, so a type-filtered MCP search showing 2 of 6 rendered `Found 2 result(s)` — hiding that more pages existed, so Claude could not page intelligently. The CLI never had this gate. `countSearchTotal` already computed the real limit/offset-invariant population (v2.90 groundwork); the gate is dropped so the population always reaches the header, identical to the CLI. Also closes the earlier CLI-side leak where `total = results.length` grew with `--limit`/`--offset` past the over-fetch cap.
+
+**fix: explicit single-source pagination (`type=observations|sessions|prompts` + `offset`) no longer overlaps or gaps.** The server pushed `offset` into the per-source SQL (`perSourceOffset=offset`) AND re-sliced by `offset` at the merge step — a double-offset — while `perSourceLimit=limit` fetched fewer than `offset+limit` rows, so paging was impossible: page 0 and page 1 returned identical rows and the oldest rows were unreachable (12 matches, only 9 ever shown). Now every mode over-fetches from offset 0 and applies `offset` exactly once at the merge slice, identical to the CLI.
+
+**fix: `maintain --merge-ids` self-merge (`N:N`) no longer destroys the observation.** `mergeDuplicates` ran `UPDATE SET compressed_into = keepId WHERE id = removeId` without checking `removeId === keepId`, so a typo like `--merge-ids 5:5` set `compressed_into` to the row itself — hiding it from every `compressed_into=0` view (recent / search / browse) = silent data loss. Self-references are now skipped in the shared core (covers CLI + MCP).
+
+**fix: whitespace-only saves are rejected at the shared core.** The CLI's `!text` check and MCP's `z.string().min(1)` both let `"   "` through (length ≥ 1 and truthy), creating junk observations with blank title/text. `saveObservation` now rejects empty/whitespace-only content so both call sites are covered at once.
+
 ## v2.90.1 — CLAUDE_MEM_DIR relocation hardening: managed resources follow the data dir (D#29)
 
 **fix: managed skills/agents, the registry DB, and their path-confinement now honor `CLAUDE_MEM_DIR` everywhere (D#29).** v2.90.0 relocated the data layer but left *managed-resource* path resolution hardcoded to `~/.claude-mem-lite` across 9 files. Under relocation that silently broke three ways: GitHub-imported skills landed in the homedir while the registry DB lived in the relocated dir (imports invisible); `mem_use` enrich/read confinement denied legitimate relocated paths (fail-closed); and the `user-prompt-search` UserPromptSubmit hook's `LIKE '%/.claude-mem-lite/managed/%'` matched nothing, dropping every managed skill from injection. All managed markers now derive from `join(DB_DIR, 'managed')` and the confinement base is `DB_DIR` — identical to the old homedir path when `CLAUDE_MEM_DIR` is unset, so non-relocated installs are byte-for-byte unchanged and confinement is not weakened. Writers (registry-importer), readers (pre-skill-bridge, user-prompt-search, server/CLI catalog rendering), and the offline indexer / dev tools now all resolve to the same location. Three of the nine sites used a hardcoded string literal rather than a `homedir()` join and were caught by an adversarial reader-vs-writer verification pass.

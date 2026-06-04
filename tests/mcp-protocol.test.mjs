@@ -150,4 +150,67 @@ describe('MCP protocol surface', () => {
     expect(res.isError).toBe(true);
     expect(textOf(res)).toMatch(/not found|unknown/i);
   });
+
+  // Regression guard: single-source mem_search (obs_type / type / importance
+  // filter) must report the TRUE total ("N of M"), not just the page size.
+  // Pre-fix, formatSearchOutput gated the "of M" suffix on isCrossSource, so a
+  // type-filtered search showing 2 of 6 rendered "Found 2 result(s)" — hiding
+  // that more pages exist. The CLI never had this gate (mem-cli.mjs "N of M"),
+  // so the two paths diverged on Claude's primary interface. countSearchTotal
+  // already computes the true population; this asserts it reaches the header.
+  it('mem_search with obs_type filter reports the true total, not the page size', async () => {
+    // Seed 6 distinct bugfix observations sharing one search term. Distinct
+    // content avoids saveObservation's 5-min Jaccard dedup window.
+    for (let i = 0; i < 6; i++) {
+      await client.callTool({
+        name: 'mem_save',
+        arguments: {
+          content: `paginationmarker bugfix root cause number ${i} distinct-detail-${i}-${i * 7 + 3}`,
+          title: `paginationmarker fix ${i}`,
+          type: 'bugfix',
+          importance: 2,
+        },
+      });
+    }
+    const res = await client.callTool({
+      name: 'mem_search',
+      arguments: { query: 'paginationmarker', obs_type: 'bugfix', limit: 2 },
+    });
+    const text = textOf(res);
+    // Must surface the full population, not just the 2 shown on this page.
+    expect(text).toMatch(/2 of 6 result/);
+  });
+
+  // Regression guard: explicit single-source pagination (type='observations')
+  // must not overlap or gap. Pre-fix the server pushed `offset` into the SQL
+  // (perSourceOffset=offset) AND re-sliced by offset at the merge step — a
+  // double-offset — while perSourceLimit=limit fetched too few rows to page at
+  // all. Result: offset 0 and offset 3 returned identical rows and the oldest
+  // rows were never reachable. The CLI never had this (it over-fetches from
+  // offset 0 and slices once); this asserts the server matches that contract.
+  it('mem_search type=observations paginates without overlap or gaps', async () => {
+    for (let i = 0; i < 9; i++) {
+      await client.callTool({
+        name: 'mem_save',
+        arguments: {
+          content: `explicitpagemarker observation sequence ${i} unique-body-${i}-${i * 5 + 2}`,
+          title: `explicitpagemarker seq ${i}`,
+          type: 'discovery',
+          importance: 1,
+        },
+      });
+    }
+    const seen = [];
+    for (const offset of [0, 3, 6]) {
+      const res = await client.callTool({
+        name: 'mem_search',
+        arguments: { query: 'explicitpagemarker', type: 'observations', sort: 'time', limit: 3, offset },
+      });
+      const ids = [...textOf(res).matchAll(/#(\d+) /g)].map(m => m[1]);
+      seen.push(...ids);
+    }
+    // 3 pages × 3 = 9 ids, all distinct (no overlap), covering all 9 (no gap).
+    expect(seen.length).toBe(9);
+    expect(new Set(seen).size).toBe(9);
+  });
 });

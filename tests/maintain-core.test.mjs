@@ -81,6 +81,21 @@ describe('execute ops', () => {
     expect(get(db, keep, 'compressed_into')).toBeNull();
   });
 
+  test('mergeDuplicates ignores self-merge (keepId===removeId) — must not orphan the row', () => {
+    // A typo like `--merge-ids 5:5` previously set compressed_into=self, which hides
+    // the row from every compressed_into=0 view (recent/search/browse) — silent data loss.
+    const db = freshDb();
+    const solo = add(db, { title: 'must survive self-merge' });
+    expect(mergeDuplicates(db, [[solo, solo]])).toBe(0); // no-op, nothing merged
+    expect(get(db, solo, 'compressed_into')).toBeNull(); // row stays live
+    // Mixed group: self-ref skipped, real dup still merged.
+    const keep = add(db, { title: 'keep' });
+    const dup = add(db, { title: 'dup' });
+    expect(mergeDuplicates(db, [[keep, keep, dup]])).toBe(1);
+    expect(get(db, keep, 'compressed_into')).toBeNull();
+    expect(get(db, dup, 'compressed_into')).toBe(keep);
+  });
+
   test('purgeStale deletes pending-purge rows older than the cutoff; preview counts them', () => {
     const db = freshDb();
     const stale = add(db, { title: 'to purge', compressedInto: COMPRESSED_PENDING_PURGE });

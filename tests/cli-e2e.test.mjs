@@ -157,6 +157,21 @@ describe('CLI E2E: search', () => {
     expect(stdout).toContain('No results');
   });
 
+  it('reports a total that is invariant to --limit and --offset (regression: over-fetched count leaked into total)', () => {
+    // Seed more matches than the small-limit over-fetch cap (perSourceLimit =
+    // max(limit*3, offset+limit+10)) so the OLD total=results.length would have
+    // been capped well below the true population.
+    for (let i = 0; i < 30; i++) {
+      seedObs({ title: `Widget gizmo ${i}`, text: `gizmo widget unique content ${i}` });
+    }
+    const totalOf = (args) => JSON.parse(runCli(['search', 'gizmo', '--json', ...args]).stdout).total;
+    const base = totalOf(['--limit', '3']);
+    expect(base).toBe(30); // true population, not the ~13-row over-fetch cap
+    expect(totalOf(['--limit', '25'])).toBe(base);   // larger limit must not grow total
+    expect(totalOf(['--limit', '3', '--offset', '5'])).toBe(base); // paging must not grow total
+    expect(totalOf(['--limit', '3', '--offset', '20'])).toBe(base);
+  });
+
   it('OR fallback finds partial matches', () => {
     seedObs({ title: 'Alpha protocol fix', text: 'alpha protocol implementation repair' });
     // "alpha zzzzz_nonexistent" AND returns nothing, OR should find "alpha"
@@ -436,6 +451,17 @@ describe('CLI E2E: save', () => {
     const { stderr, exitCode } = runCli(['save', 'test content', '--type', 'invalid_type']);
     expect(stderr).toContain('Invalid type');
     expect(exitCode).toBe(1); // validation error sets exit code 1
+  });
+
+  it('rejects whitespace-only content (regression: junk blank-title rows)', () => {
+    const before = db.prepare('SELECT COUNT(*) c FROM observations').get().c;
+    for (const blank of ['   ', '\t', ' \n ']) {
+      const { exitCode } = runCli(['save', blank]);
+      expect(exitCode).toBe(1);
+    }
+    // No junk row persisted.
+    const after = db.prepare('SELECT COUNT(*) c FROM observations').get().c;
+    expect(after).toBe(before);
   });
 });
 

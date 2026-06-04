@@ -11,7 +11,7 @@ import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { getVocabulary, computeVector, _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
-import { searchObservationsHybrid, findFtsAnchor } from './search-engine.mjs';
+import { searchObservationsHybrid, findFtsAnchor, countSearchTotal } from './search-engine.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -313,9 +313,24 @@ function cmdSearch(db, args) {
 
   // Trim to limit with offset. The engine always received perSourceOffset=0 and
   // over-fetched (see above), so the merged+reranked `results` start at row 0 and
-  // the offset is applied exactly ONCE here — for every mode. `total` is the full
-  // match count (capped at perSourceLimit), enabling the "N of M" display.
-  const total = results.length;
+  // the offset is applied exactly ONCE here — for every mode.
+  //
+  // `total` must be the TRUE population, independent of --limit/--offset (else the
+  // over-fetched candidate count grew with the page and broke the "N of M" /
+  // pagination contract). countSearchTotal mirrors each source's MATCH+filters;
+  // clamp to >= results.length so it never understates the rows actually shown
+  // (vector/concept augmentation can add obs rows beyond the FTS count).
+  const trueTotal = countSearchTotal(db, {
+    effectiveSource,
+    ftsQuery,
+    obsFtsQuery: orFallbackFired ? (relaxFtsQueryToOr(ftsQuery) || ftsQuery) : ftsQuery,
+    args: { project: project || null, obs_type: type || null, importance: minImportance || null, branch: branch || null },
+    project: project || null,
+    epochFrom: dateFrom,
+    epochTo: dateTo,
+    includeNoise,
+  });
+  const total = Math.max(trueTotal, results.length);
   const paged = results.slice(offset, offset + limit);
 
   if (paged.length === 0) {
@@ -924,7 +939,7 @@ function cmdTimeline(db, args) {
 function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
   const text = positional.join(' ');
-  if (!text) {
+  if (!text.trim()) {
     fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T] [--closes-deferred 1,D#42]');
     return;
   }
