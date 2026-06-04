@@ -12,6 +12,7 @@ import {
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector } from './tfidf.mjs';
+import { insertObservationRow, insertObservationFiles, insertObservationVector } from './lib/observation-write.mjs';
 import { DEDUP_JACCARD_THRESHOLD, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
@@ -209,48 +210,23 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       search_aliases: obs.searchAliases || null,
     });
 
-    // Atomic: observation INSERT + observation_files + vector in one transaction
+    // Atomic: observation INSERT + observation_files + vector in one transaction.
+    // Column list single-sourced in lib/observation-write (shared with manual mem_save).
     const savedId = db.transaction(() => {
-      const result = db.prepare(`
-        INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, minhash_sig, lesson_learned, search_aliases, branch, created_at, created_at_epoch)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        sessionId, project,
-        safe.text, obs.type, safe.title, safe.subtitle,
-        safe.narrative,
-        safe.concepts,
-        safe.facts,
-        JSON.stringify(obs.filesRead || []),
-        JSON.stringify(obs.files || []),
-        obs.importance ?? 1,
-        minhashSig,
-        safe.lesson_learned,
-        safe.search_aliases,
-        getCurrentBranch(),
-        now.toISOString(), now.getTime()
-      );
-      const id = Number(result.lastInsertRowid);
+      const id = insertObservationRow(db, {
+        memory_session_id: sessionId, project, text: safe.text, type: obs.type,
+        title: safe.title, subtitle: safe.subtitle, narrative: safe.narrative,
+        concepts: safe.concepts, facts: safe.facts,
+        files_read: JSON.stringify(obs.filesRead || []),
+        files_modified: JSON.stringify(obs.files || []),
+        importance: obs.importance ?? 1, minhash_sig: minhashSig,
+        lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases,
+        branch: getCurrentBranch(), created_at: now.toISOString(), created_at_epoch: now.getTime(),
+      });
 
-      // Populate observation_files junction table
-      if (id && obs.files && obs.files.length > 0) {
-        const insertFile = db.prepare('INSERT OR IGNORE INTO observation_files (obs_id, filename) VALUES (?, ?)');
-        for (const f of obs.files) {
-          if (typeof f === 'string' && f.length > 0) insertFile.run(id, f);
-        }
-      }
-
-      // Write TF-IDF vector (non-critical — catch inside transaction to avoid rollback)
-      try {
-        const vocab = getVocabulary(db);
-        if (vocab) {
-          const vecText = [obs.title || '', obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
-          const vec = computeVector(vecText, vocab);
-          if (vec) {
-            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-              .run(id, Buffer.from(vec.buffer), vocab.version, Date.now());
-          }
-        }
-      } catch (e) { debugCatch(e, 'saveObservation-vector'); }
+      insertObservationFiles(db, id, obs.files);
+      const vecText = [obs.title || '', obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
+      insertObservationVector(db, id, vecText);
 
       return id;
     })();

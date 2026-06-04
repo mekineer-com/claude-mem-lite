@@ -77,6 +77,11 @@ export const SOURCE_FILES = [
   // mem-cli.mjs::cmdSave and server.mjs::mem_save. Statically imported from both
   // entry points; missing it from the manifest broke MCP saves on auto-update.
   'lib/save-observation.mjs',
+  // Single-source observations-table write primitives (insertObservationRow/Files/
+  // Vector). Statically imported by lib/save-observation.mjs and hook-llm.mjs (both
+  // entry-point-reachable); missing it from the manifest would break ALL saves on
+  // auto-update. Same single-source-of-truth pattern (see #8217).
+  'lib/observation-write.mjs',
   // Shared "compress old low-value observations into weekly summaries" core.
   // Statically imported by mem-cli.mjs (cmdCompress), server.mjs (mem_compress),
   // and hook.mjs (handleAutoCompress) — same single-source-of-truth pattern as

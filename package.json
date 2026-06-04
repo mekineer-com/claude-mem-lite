@@ -67,6 +67,7 @@
     "lib/binding-probe.mjs",
     "lib/mem-override.mjs",
     "lib/save-observation.mjs",
+    "lib/observation-write.mjs",
     "lib/compress-core.mjs",
     "lib/maintain-core.mjs",
     "lib/dedup-constants.mjs",
