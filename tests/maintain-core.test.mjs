@@ -147,4 +147,28 @@ describe('execute ops', () => {
     expect(purgeStale(db, ctx(0), cutoff)).toBe(1);
     expect(db.prepare('SELECT COUNT(*) AS c FROM observations WHERE id = ?').get(stale).c).toBe(0);
   });
+
+  // --- hard-delete must not orphan a deleted keeper's children (compressed_into has no FK) ---
+  const exists = (db, id) => db.prepare('SELECT COUNT(*) AS c FROM observations WHERE id = ?').get(id).c;
+
+  test('purgeStale recovers children of a purged keeper instead of orphaning them', () => {
+    const db = freshDb();
+    // A keeper that absorbed a dup, later marked idle (compressed_into=PENDING_PURGE).
+    const keeper = add(db, { title: 'idle keeper marked for purge', compressedInto: COMPRESSED_PENDING_PURGE });
+    const child = add(db, { title: 'dup merged into the keeper', compressedInto: keeper });
+    expect(purgeStale(db, ctx(0), Date.now() - 30 * DAY)).toBe(1); // keeper deleted
+    expect(exists(db, keeper)).toBe(0);
+    expect(exists(db, child)).toBe(1);                  // child survives (pre-fix: orphaned)
+    expect(get(db, child, 'compressed_into')).toBeNull(); // recovered: un-hidden, reachable again
+  });
+
+  test('cleanupBroken recovers children of a deleted empty keeper', () => {
+    const db = freshDb();
+    const emptyKeeper = add(db, { title: '', narrative: '' }); // empty-content but a cluster keeper
+    const child = add(db, { title: 'dup merged into empty keeper', compressedInto: emptyKeeper });
+    expect(cleanupBroken(db, ctx(0))).toBe(1);          // empty keeper deleted
+    expect(exists(db, emptyKeeper)).toBe(0);
+    expect(exists(db, child)).toBe(1);                  // child survives (pre-fix: orphaned)
+    expect(get(db, child, 'compressed_into')).toBeNull();
+  });
 });
