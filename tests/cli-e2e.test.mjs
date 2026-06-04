@@ -172,6 +172,25 @@ describe('CLI E2E: search', () => {
     expect(totalOf(['--limit', '3', '--offset', '20'])).toBe(base);
   });
 
+  it('pages are disjoint and stably ordered across --offset (D#30 candidate-pool stability)', () => {
+    // Seed enough near-identical matches that the hybrid (FTS + vector + RRF) path is
+    // active and the candidate pool spans several pages. Paging through must reconstruct
+    // the single-query ordering exactly — no overlap, no gap, no re-rank between pages.
+    // 50 > the deep-page over-fetch pool (perSourceLimit = max(limit*3, offset+limit+10)),
+    // so deep pages include FTS-tail rows absent from shallow pools — the exact dual-hit
+    // (FTS-tail + vector) boundary case where RRF could re-rank between pages.
+    for (let i = 0; i < 50; i++) {
+      seedObs({ title: `Sprocket module ${i}`, text: `sprocket module unique payload ${i}` });
+    }
+    const idsOf = (args) => JSON.parse(runCli(['search', 'sprocket', '--json', ...args]).stdout).results.map(r => r.id);
+    const full = idsOf(['--limit', '50']);
+    expect(full.length).toBeGreaterThanOrEqual(40); // hybrid path returned a real population
+    const paged = [];
+    for (let off = 0; off < full.length; off += 5) paged.push(...idsOf(['--limit', '5', '--offset', String(off)]));
+    expect(paged).toEqual(full);                 // identical order => disjoint + stable
+    expect(new Set(paged).size).toBe(paged.length); // no id appears on two pages
+  });
+
   it('OR fallback finds partial matches', () => {
     seedObs({ title: 'Alpha protocol fix', text: 'alpha protocol implementation repair' });
     // "alpha zzzzz_nonexistent" AND returns nothing, OR should find "alpha"
