@@ -336,10 +336,15 @@ export async function importFromGitHub(db, url, opts = {}) {
         indexed_at: new Date().toISOString(),
       });
 
-      // 5g. Update repo_forks and repo_updated_at (not in upsert SQL)
+      // 5g. Update repo_forks and repo_updated_at (not in upsert SQL).
+      // Do NOT touch quality_tier here: UPSERT_SQL never writes it, so a first insert
+      // gets the column DEFAULT 'community' and a re-import preserves whatever tier the
+      // row reached. Re-stamping 'community' downgraded enrichment-promoted tiers
+      // (verified/installed → community) on every content re-import, silently lowering
+      // the resource's BM25 composite rank (tier is a 1.0/2.0/3.0 multiplier).
       db.prepare(
-        'UPDATE resources SET repo_forks = ?, repo_updated_at = ?, quality_tier = ? WHERE id = ?'
-      ).run(repoForks, repoUpdatedAt, 'community', resourceId);
+        'UPDATE resources SET repo_forks = ?, repo_updated_at = ? WHERE id = ?'
+      ).run(repoForks, repoUpdatedAt, resourceId);
 
       results.push({ name, type: item.type, id: resourceId });
       debugLog('INFO', 'importer', `Imported ${item.type}:${name} (id=${resourceId})`);

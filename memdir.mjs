@@ -219,31 +219,56 @@ export function writePluginSection(memdir, { slug, version, contentLine, force =
 /**
  * Remove the plugin's sentinel block plus its state sidecar. External content
  * in MEMORY.md is preserved.
- * @returns {{action: 'removed'|'absent'}}
+ *
+ * Foreign-content guard (symmetric with writePluginSection): a sentinel block with
+ * NO state sidecar is content we cannot prove the plugin authored — the user may have
+ * pasted plugin docs or quoted a sentinel example. Without `force`, such a block is
+ * LEFT IN PLACE (action 'skipped-foreign') instead of being silently deleted. The
+ * adopt side already throws UserEditedError on the same condition; unadopt lacked the
+ * mirror, so it could delete user-authored text that merely resembled the sentinel.
+ *
+ * @param {string} memdir
+ * @param {string} slug
+ * @param {{force?: boolean}} [opts] force=true removes even a no-state (foreign) block.
+ * @returns {{action: 'removed'|'absent'|'skipped-foreign'}}
  */
-export function removePluginSection(memdir, slug) {
-  clearState(memdir, slug);
+export function removePluginSection(memdir, slug, { force = false } = {}) {
   const path = memoryFile(memdir);
-  if (!existsSync(path)) return { action: 'absent' };
+  if (!existsSync(path)) { clearState(memdir, slug); return { action: 'absent' }; }
   const raw = readFileSync(path, 'utf8');
   const match = raw.match(sentinelRegex(slug));
-  if (!match) return { action: 'absent' };
+  if (!match) { clearState(memdir, slug); return { action: 'absent' }; }
+
+  // Only remove a block we have a state sidecar for (proof we wrote it), unless forced.
+  if (!readState(memdir, slug) && !force) {
+    return { action: 'skipped-foreign' };
+  }
+  clearState(memdir, slug);
 
   // Delete the match plus a trailing newline + a preceding blank line so we
   // don't leave a stranded paragraph gap.
+  const blockAtStart = match.index === 0;
   let start = match.index;
   let end = match.index + match[0].length;
   if (raw[end] === '\n') end++;
   if (start > 0 && raw.slice(0, start).endsWith('\n\n')) start--;
   let next = raw.slice(0, start) + raw.slice(end);
-  // Edge case (code review v2.32.3): when the sentinel was the first content
-  // (e.g. two invited-memory plugins coexist and we remove the earlier one),
-  // the tail can still start with a stranded blank line / doubled newlines.
-  // Normalize leading whitespace and collapse any ≥3 consecutive newlines
-  // so the remaining content looks hand-authored.
-  next = next.replace(/^\s+/, '').replace(/\n{3,}/g, '\n\n');
+  // Collapse any ≥3 consecutive newlines left at the removal seam so the remaining
+  // content looks hand-authored. Only strip leading whitespace when OUR block was the
+  // file's first content — otherwise an unconditional `/^\s+/` deleted user-authored
+  // leading blank lines / structure that sat far above our (end-of-file) block.
+  next = next.replace(/\n{3,}/g, '\n\n');
+  if (blockAtStart) next = next.replace(/^\s+/, '');
   atomicWrite(path, next);
   return { action: 'removed' };
+}
+
+/**
+ * Whether a plugin state sidecar exists for this memdir — i.e. the plugin can prove it
+ * wrote the sentinel. Used by unadopt's dry-run to predict the foreign-content skip.
+ */
+export function hasPluginState(memdir, slug) {
+  return readState(memdir, slug) !== null;
 }
 
 /**

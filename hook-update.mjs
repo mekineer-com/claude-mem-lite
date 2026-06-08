@@ -27,7 +27,10 @@ const STATE_DIR = DB_DIR;
 const STATE_FILE = join(STATE_DIR, 'runtime', 'update-state.json');
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;       // 24 hours
 const FETCH_TIMEOUT_MS = 3000;                         // 3s network timeout
-const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h if rate-limited
+// When rate-limited we got NO release data, so re-check sooner than the normal 24h
+// cadence (GitHub's unauthenticated rate-limit window resets within the hour). 6h × ≤2
+// requests = 4 polls/day, far under the 60/hr limit, so this is a faster retry, not a hammer.
+const RATE_LIMIT_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 6h retry when rate-limited
 const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 
 // ── Main Entry ─────────────────────────────────────────────
@@ -57,7 +60,12 @@ export async function checkForUpdate(options = {}) {
 
     const latest = await fetchLatestRelease();
     if (!latest) {
-      saveState({ ...state, lastCheck: new Date().toISOString() });
+      // Re-read from disk: a 403 inside fetchWithTimeout just persisted rateLimited:true.
+      // Spreading the stale in-memory `state` (captured above with rateLimited:false) would
+      // clobber that flag back to false, so shouldCheck never honors the backoff and the
+      // rate-limit mechanism is dead. Re-reading preserves the freshly-written flag.
+      const fresh = readState();
+      saveState({ ...fresh, lastCheck: new Date().toISOString() });
       return null;
     }
 
@@ -174,7 +182,10 @@ async function fetchLatestRelease() {
     headers,
   );
   if (result === 'rate-limited') return null;
-  if (result) {
+  // Guard tag_name: a 200-OK with a malformed body ({} / {tag_name:null}) would throw
+  // `Cannot read properties of undefined (reading 'replace')`. Caught upstream, but it
+  // poisons lastError and blocks the tags fallback below — fall through instead.
+  if (result && typeof result.tag_name === 'string') {
     return {
       version: result.tag_name.replace(/^v/, ''),
       tarballUrl: result.tarball_url,
@@ -188,7 +199,7 @@ async function fetchLatestRelease() {
     headers,
   );
   if (tags === 'rate-limited') return null;
-  if (Array.isArray(tags) && tags.length > 0) {
+  if (Array.isArray(tags) && tags.length > 0 && typeof tags[0]?.name === 'string') {
     const tag = tags[0];
     return {
       version: tag.name.replace(/^v/, ''),
@@ -208,7 +219,7 @@ async function fetchWithTimeout(url, headers) {
     if (res.status === 403) {
       const state = readState();
       saveState({ ...state, rateLimited: true });
-      debugLog('DEBUG', 'hook-update', 'GitHub API rate limited, extending interval');
+      debugLog('DEBUG', 'hook-update', 'GitHub API rate limited; will retry on the 6h rate-limit cadence');
       return 'rate-limited';
     }
     if (!res.ok) return null;

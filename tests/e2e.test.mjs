@@ -359,6 +359,33 @@ describe('Suite 2: Episode Buffer Management', () => {
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
   });
 
+  it('SessionStart flush receipt + dashboard stay newline-delimited (no }{ collision)', () => {
+    // Regression: when a leftover significant episode flushes at SessionStart (common
+    // after /clear or /compact), flushEpisode wrote its hookSpecificOutput receipt with
+    // NO trailing newline, then the startup dashboard wrote a second one — landing as
+    // `}{` on one line. Claude Code's line-based JSON parser then dropped both, losing
+    // the episode-flush / cite-back context exactly at the session boundary.
+    runHook('session-start', { env: { HOME: tmpHome } });
+    // Build a leftover episode (below the 10-entry auto-flush threshold).
+    for (let i = 0; i < 2; i++) {
+      runHook('post-tool-use', {
+        stdin: makeToolPayload('Edit', {
+          file_path: '/tmp/src/carry.js', old_string: `o${i}`, new_string: `n${i}`,
+        }, 'OK — edited file'),
+        env: { HOME: tmpHome },
+      });
+    }
+    // SessionStart (clear) flushes the leftover episode AND prints the dashboard.
+    const { stdout } = runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env: { HOME: tmpHome } });
+    expect(stdout).not.toContain('}{');
+    // Every emitted JSON line must parse independently.
+    for (const line of stdout.split('\n')) {
+      const t = line.trim();
+      if (!t.startsWith('{')) continue;
+      expect(() => JSON.parse(t)).not.toThrow();
+    }
+  });
+
   it('skipped tools (Read, Glob) do not create entries', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
 

@@ -244,7 +244,10 @@ describe('cmdActivity CLI: --type validation', () => {
       expect(del.stdout).toContain('Deleted 1 event');
 
       const show = runCli(['activity', 'show', String(id)]);
-      expect(show.stdout).toContain('Not found');
+      // Deleted row is gone → not-found contract: stderr + non-zero exit (see the
+      // dedicated 'activity show <missing-id>' test for the rationale).
+      expect(show.exitCode).not.toBe(0);
+      expect(show.stderr).toContain('not found');
     } finally {
       teardownDir();
     }
@@ -321,15 +324,17 @@ describe('cmdActivity CLI: --type validation', () => {
     }
   });
 
-  test('activity show <missing-id> uses [mem] prefix and names the id', () => {
+  test('activity show <missing-id> fails (stderr + non-zero exit) and names the id', () => {
     setupDir();
     try {
       const r = runCli(['activity', 'show', '99999']);
-      // Bare `Not found` was inconsistent with the rest of the CLI which always
-      // prefixes user-facing messages with `[mem]`.
-      expect(r.stdout).toContain('[mem]');
-      expect(r.stdout).toContain('99999');
-      expect(r.stdout).toContain('Not found');
+      // Not-found must use the fail() contract (stderr + exit 1) like sibling commands
+      // (`get`, `activity delete`, `update`) — previously stdout + exit 0, so scripts
+      // couldn't detect a missing event from the exit code. Message keeps the [mem] prefix.
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain('[mem]');
+      expect(r.stderr).toContain('99999');
+      expect(r.stderr).toContain('not found');
     } finally {
       teardownDir();
     }

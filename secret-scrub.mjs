@@ -18,8 +18,17 @@ export const SECRET_PATTERNS = [
   //   2. Structured keys (api_key, auth_token, …) keep the original behavior —
   //      a separator/compound key is unambiguous config syntax even when
   //      preceded by prose ("see auth_token: shhhhhh").
-  [/((?<![A-Za-z][ \t])\b(?:password|passwd|token|bearer)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
-  [/(\b(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  // `(?:\b|_)` before the keyword: a plain word-boundary misses the single most
+  // common credential shape — underscore-cased env vars (DB_PASSWORD, GH_TOKEN,
+  // MY_AUTH_TOKEN) — because `_` is a \w char, so there is NO \b between it and the
+  // keyword. Allowing a leading `_` catches those while the prose lookbehind still
+  // excludes "Marker token: …". `secret` added so a bare SECRET=… with a mixed-alnum
+  // value is covered (the hex-only assignment pattern below misses non-hex values).
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  // access_token / refresh_token are the canonical OAuth2 field names — they were
+  // missing from this KV list (drift vs the JSON list below). `(?:\b|_)` for the same
+  // underscore-prefix reason.
+  [/((?:\b|_)(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // AWS access keys (AKIA...)
   [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
   // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold
@@ -56,7 +65,7 @@ export const SECRET_PATTERNS = [
   // as `{"api_key": "..."}`. The base key=value pattern stops at quotes, so
   // these slip through. Match the value-quoted form explicitly. Length floor
   // (6) avoids tripping on intentional placeholder shorts ("...", "secret").
-  [/("(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer|refresh[_-]?token|session[_-]?id|sessionid)"\s*:\s*")[^"]{6,}(")/gi, '$1***$2'],
+  [/("(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|access[_-]?token|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer|refresh[_-]?token|session[_-]?id|sessionid)"\s*:\s*")[^"]{6,}(")/gi, '$1***$2'],
   // Session cookies in headers / urlencoded bodies (sessionid=, session_id=, JSESSIONID=, PHPSESSID=).
   // 16+ chars filters out short test fixtures like sessionid=abc.
   [/\b((?:session[_-]?id|sessionid|jsessionid|phpsessid)\s*[=:]\s*)[^\s,;'"}\]]{16,}/gi, '$1***'],

@@ -306,6 +306,37 @@ describe('code/data dir separation under relocation (D#27)', () => {
   });
 });
 
+describe('rate-limit handling + malformed-response robustness', () => {
+  it('persists rateLimited=true on a 403 instead of clobbering it (regression)', async () => {
+    const { home } = makeCodeHome('1.0.0');
+    const dataDir = makeDataDir('1.0.0');
+    const statePath = join(dataDir, 'runtime', 'update-state.json');
+    writeFileSync(statePath, JSON.stringify({ lastCheck: new Date(0).toISOString(), rateLimited: false }));
+    // GitHub 403 → fetchWithTimeout writes rateLimited:true; the !latest branch must not
+    // clobber it back to false with a stale in-memory snapshot.
+    globalThis.fetch = vi.fn().mockResolvedValue({ ok: false, status: 403, json: async () => ({}) });
+    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root', HOME: home });
+
+    const result = await checkForUpdate({ force: true });
+    expect(result).toBeNull();
+    const state = JSON.parse(readFileSync(statePath, 'utf8'));
+    expect(state.rateLimited).toBe(true);
+  });
+
+  it('falls through to the tags API when releases/latest returns 200 with no tag_name (no crash)', async () => {
+    const { home } = makeCodeHome('1.0.0');
+    const dataDir = makeDataDir('1.0.0');
+    // 1st call (releases/latest): 200 OK but malformed body {}. 2nd call (tags): valid.
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({}) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ([{ name: 'v1.1.0' }]) });
+    const { checkForUpdate } = await loadModule({ CLAUDE_MEM_DIR: dataDir, CLAUDE_PLUGIN_ROOT: '/plugin/root', HOME: home });
+
+    const result = await checkForUpdate({ force: true });
+    expect(result).toMatchObject({ updateAvailable: true, to: '1.1.0' });
+  });
+});
+
 describe('cache hook residue clearing', () => {
   it('clears populated hooks.json in every remaining cache version', async () => {
     const home = makeDir('mem-cache-residue');

@@ -262,7 +262,7 @@ Rules:
   }
 }
 
-export function applyNormalization(db, groups) {
+export function applyNormalization(db, groups, { project = null } = {}) {
   if (!groups || groups.length === 0) return { updated: 0 };
 
   const aliasMap = new Map();
@@ -272,11 +272,17 @@ export function applyNormalization(db, groups) {
     }
   }
 
+  // Scope the mutation to `project` when normalize was scoped (v2.72.0 --project).
+  // Without this, synonym groups derived from ONE project's concepts rewrote the
+  // concepts/search_aliases of EVERY project's observations — the exact cross-project
+  // contamination the --project flag was added to prevent. NULL → all projects (legacy
+  // unscoped run), matching the search-engine `(? IS NULL OR project = ?)` idiom.
   const rows = db.prepare(`
     SELECT id, concepts, search_aliases FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND concepts IS NOT NULL AND concepts != ''
-  `).all();
+      AND (? IS NULL OR project = ?)
+  `).all(project, project);
 
   let updated = 0;
   const updateStmt = db.prepare(`
@@ -322,7 +328,7 @@ export async function executeNormalize(db, force = false, { project } = {}) {
   const groups = await identifySynonymGroups(concepts);
   if (groups.length === 0) return { processed: 0, groups: 0 };
 
-  const result = applyNormalization(db, groups);
+  const result = applyNormalization(db, groups, { project });
 
   try { writeFileSync(NORMALIZE_GATE_FILE, JSON.stringify({ epoch: Date.now() })); } catch {}
 
@@ -340,7 +346,7 @@ export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const cutoff = Date.now() - MERGE_TIME_WINDOW_MS;
   const projectClause = project ? 'AND project = ?' : '';
   const stmt = db.prepare(`
-    SELECT id, title, narrative, project, type, access_count, created_at_epoch, minhash_sig
+    SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND optimized_at IS NULL
@@ -410,10 +416,19 @@ Return ONLY valid JSON:
     const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
     if (!parsed || !parsed.should_merge) return { merged: false };
 
-    const keeper = cluster.reduce((best, o) =>
-      (o.access_count || 0) > (best.access_count || 0) ? o : best
-    , cluster[0]);
+    // Keeper = highest importance, then highest access_count. Previously access_count
+    // alone, so a critical (importance=3) but never-accessed observation lost the keeper
+    // role to a trivial (importance=1) accessed one and was compressed away.
+    const keeper = cluster.reduce((best, o) => {
+      const oi = o.importance || 1, bi = best.importance || 1;
+      if (oi !== bi) return oi > bi ? o : best;
+      return (o.access_count || 0) > (best.access_count || 0) ? o : best;
+    }, cluster[0]);
     const others = cluster.filter(o => o.id !== keeper.id);
+    // Floor the merged importance at the cluster max — merging must never silently
+    // downgrade the ranking of the most-important member (the LLM default is 2). The keeper
+    // is selected by importance-first, so keeper.importance IS the cluster max by construction.
+    const maxClusterImportance = keeper.importance || 1;
 
     const concepts = Array.isArray(parsed.merged_concepts) ? parsed.merged_concepts.slice(0, 10) : [];
     const facts = Array.isArray(parsed.merged_facts) ? parsed.merged_facts.slice(0, 10) : [];
@@ -428,7 +443,7 @@ Return ONLY valid JSON:
     const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
     const textField = [conceptsText, factsText, bigramText].filter(Boolean).join(' ');
     const minhashSig = computeMinHash((title || '') + ' ' + (narrative || ''));
-    const importance = clampImportance(parsed.importance || 2);
+    const importance = Math.max(clampImportance(parsed.importance || 2), maxClusterImportance);
 
     // Scrub LLM-output cluster-merge text fields at the UPDATE boundary.
     // importance is numeric; minhash_sig is hash bytes.

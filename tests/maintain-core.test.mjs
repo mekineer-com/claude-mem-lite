@@ -9,7 +9,7 @@ import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
-  mergeDuplicates, purgeStale, purgeStalePreview,
+  mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf,
 } from '../lib/maintain-core.mjs';
 
 const DAY = 86400000;
@@ -23,6 +23,43 @@ function freshDb() {
   insertSession(db, { id: 'sess-1', project: 'proj-a' });
   return db;
 }
+
+describe('recoverChildrenOf (shared hard-delete guard — CLI + MCP + maintain)', () => {
+  test('resets compressed_into to NULL for rows pointing at the doomed keepers', () => {
+    const db = freshDb();
+    const keeper = add(db, { title: 'keeper' });
+    const childA = add(db, { title: 'child A', compressedInto: keeper });
+    const childB = add(db, { title: 'child B', compressedInto: keeper });
+    const unrelated = add(db, { title: 'unrelated', compressedInto: 99999 });
+
+    const recovered = recoverChildrenOf(db, [keeper]);
+
+    expect(recovered).toBe(2);
+    expect(get(db, childA, 'compressed_into')).toBeNull(); // resurfaced as live
+    expect(get(db, childB, 'compressed_into')).toBeNull();
+    expect(get(db, unrelated, 'compressed_into')).toBe(99999); // untouched
+  });
+
+  test('no-op (returns 0) when the id list is empty', () => {
+    const db = freshDb();
+    expect(recoverChildrenOf(db, [])).toBe(0);
+  });
+
+  test('does not recover (or count) a child that is itself in the delete set', () => {
+    // `delete 1,2` where #2 was merged INTO #1: #2 must NOT be reported as recovered-to-live
+    // because it is deleted in the same call. Only children that actually survive count.
+    const db = freshDb();
+    const keeper = add(db, { title: 'keeper' });
+    const childInSet = add(db, { title: 'child also deleted', compressedInto: keeper });
+    const childKept = add(db, { title: 'child that survives', compressedInto: keeper });
+
+    // Recover for a delete of BOTH keeper and childInSet.
+    const recovered = recoverChildrenOf(db, [keeper, childInSet]);
+    expect(recovered).toBe(1); // only childKept, not childInSet
+    expect(get(db, childKept, 'compressed_into')).toBeNull();
+    expect(get(db, childInSet, 'compressed_into')).toBe(keeper); // untouched (it's being deleted)
+  });
+});
 
 describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
   test('protects injected rows; decays/marks only never-injected stale rows', () => {

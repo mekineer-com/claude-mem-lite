@@ -446,13 +446,31 @@ function renderHandoffFromRow(handoff, db, project) {
 
   lines.push('</session-handoff>');
 
-  // Append session summary if available (long-gap enrichment)
+  // Append session summary if available (long-gap enrichment).
+  // session_summaries is keyed by the mem-internal memory_session_id, but in production
+  // session_handoffs.session_id holds the Claude Code UUID (the scope tag) — the two id
+  // namespaces never match, so the exact lookup returned nothing and this block was always
+  // dropped on a real resume. There is no bridge column (the CC-UUID lives on user_prompts,
+  // not on sdk_sessions/session_summaries), so: try the exact id match first (correct when
+  // ids align — legacy rows + tests), then fall back to the most-recent summary for the
+  // project, which at resume time is the summary from the session that wrote this handoff.
   try {
-    const summary = db.prepare(`
+    let summary = db.prepare(`
       SELECT completed, next_steps, remaining_items FROM session_summaries
       WHERE memory_session_id = ? AND project = ?
       ORDER BY created_at_epoch DESC LIMIT 1
     `).get(handoff.session_id, project);
+    if (!summary) {
+      // Pick the project summary CLOSEST IN TIME to this handoff, not merely the newest:
+      // a handoff and its own session's summary are written within ms of each other at
+      // session end, so nearest-timestamp recovers the right session even when a different
+      // session later wrote a newer summary for the same project (concurrent/interleaved use).
+      summary = db.prepare(`
+        SELECT completed, next_steps, remaining_items FROM session_summaries
+        WHERE project = ?
+        ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
+      `).get(project, handoff.created_at_epoch ?? 0);
+    }
     if (summary && (summary.completed || summary.next_steps || summary.remaining_items)) {
       lines.push('');
       lines.push('<session-summary source="haiku">');

@@ -183,6 +183,38 @@ describe('sentinel IO (writePluginSection / readMemoryIndex / removePluginSectio
     expect(readFileSync(path, 'utf8')).toBe('# preexisting\n');
   });
 
+  it('removePluginSection refuses to delete a sentinel block with no state sidecar (foreign content)', () => {
+    // User pasted a sentinel-shaped block the plugin never wrote (no state file).
+    // Symmetric with writePluginSection's foreign-content guard — must NOT delete it.
+    const path = join(memdir, 'MEMORY.md');
+    const userContent = `# Notes\n\nExample:\n<!-- ${slug}:begin v1 -->\n## user section\n- I wrote this myself\n<!-- ${slug}:end -->\n\n## keep me\n`;
+    writeFileSync(path, userContent);
+    const r = removePluginSection(memdir, slug);
+    expect(r.action).toBe('skipped-foreign');
+    expect(readFileSync(path, 'utf8')).toBe(userContent); // byte-identical, nothing removed
+  });
+
+  it('removePluginSection with force=true removes even a no-state (foreign) block', () => {
+    const path = join(memdir, 'MEMORY.md');
+    writeFileSync(path, `intro\n<!-- ${slug}:begin v1 -->\n## x\n- y\n<!-- ${slug}:end -->\n`);
+    const r = removePluginSection(memdir, slug, { force: true });
+    expect(r.action).toBe('removed');
+    expect(readFileSync(path, 'utf8')).not.toContain(slug);
+  });
+
+  it('adopt→remove round-trip preserves leading blank lines and trailing-newline shape', () => {
+    // The sentinel is appended at end-of-file, so removal must not touch the file's
+    // leading whitespace. Pre-fix, an unconditional /^\s+/ strip deleted user-authored
+    // leading blank lines on every unadopt.
+    const path = join(memdir, 'MEMORY.md');
+    const original = '\n\n# My Index\n- alpha\n';
+    writeFileSync(path, original);
+    writePluginSection(memdir, { slug, version: 'v1', contentLine: 'line' });
+    const r = removePluginSection(memdir, slug);
+    expect(r.action).toBe('removed');
+    expect(readFileSync(path, 'utf8')).toBe(original); // byte-identical round-trip
+  });
+
   it('throws BudgetExceededError when inserting into >180 line MEMORY.md', () => {
     const big = Array.from({ length: 200 }, (_, i) => `- line ${i}`).join('\n') + '\n';
     writeFileSync(join(memdir, 'MEMORY.md'), big);

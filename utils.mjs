@@ -77,8 +77,11 @@ export function estimateTokens(text) {
  * @returns {number} Clamped integer importance (1, 2, or 3)
  */
 export function clampImportance(val) {
-  if (typeof val !== 'number' || isNaN(val)) return 1;
-  return Math.max(1, Math.min(3, Math.round(val)));
+  // Coerce numeric strings: an LLM emitting "importance":"2" (quoted) would otherwise
+  // collapse to 1, silently dropping its signal. Non-numeric strings → NaN → 1.
+  const n = typeof val === 'number' ? val : (typeof val === 'string' ? Number(val) : NaN);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(1, Math.min(3, Math.round(n)));
 }
 
 /**
@@ -268,8 +271,38 @@ export function debugCatch(e, context) {
 // ─── JSON Parsing ────────────────────────────────────────────────────────────
 
 /**
+ * Extract the first brace-balanced JSON object substring from text, honoring strings
+ * and escapes so braces inside string values don't throw off the depth count. Returns
+ * null when there's no `{` or no balanced close. Used to recover a valid leading object
+ * when the LLM wrapped it in prose that ALSO contains braces — the greedy `{[\s\S]*}`
+ * fallback spans first-`{` to last-`}` and is defeated by an unrelated trailing `{…}`.
+ */
+function firstBalancedJsonObject(text) {
+  // Anchor on whichever structural opener comes first — `{` (object) or `[` (array) —
+  // so a prose-wrapped top-level array isn't truncated to its first inner object.
+  const braceAt = text.indexOf('{');
+  const brackAt = text.indexOf('[');
+  let start, open, close;
+  if (braceAt === -1 && brackAt === -1) return null;
+  if (brackAt !== -1 && (braceAt === -1 || brackAt < braceAt)) { start = brackAt; open = '['; close = ']'; }
+  else { start = braceAt; open = '{'; close = '}'; }
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === open) depth++;
+    else if (c === close && --depth === 0) return text.slice(start, i + 1);
+  }
+  return null;
+}
+
+/**
  * Parse JSON from LLM output, handling markdown fences and embedded objects.
- * Tries: direct parse → fenced code block → regex object extraction.
+ * Tries: direct parse → fenced code block → first balanced object → greedy regex.
  * @param {string} text Raw LLM output text
  * @returns {object|null} Parsed JSON object or null on failure
  */
@@ -278,6 +311,10 @@ export function parseJsonFromLLM(text) {
   try { return JSON.parse(text); } catch {}
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (fenced) try { return JSON.parse(fenced[1]); } catch {}
+  // First balanced object — survives unfenced output wrapped in brace-containing prose.
+  const balanced = firstBalancedJsonObject(text);
+  if (balanced) try { return JSON.parse(balanced); } catch {}
+  // Last-resort greedy span (handles a payload that isn't the FIRST balanced object).
   const obj = text.match(/\{[\s\S]*\}/);
   if (obj) try { return JSON.parse(obj[0]); } catch {}
   return null;

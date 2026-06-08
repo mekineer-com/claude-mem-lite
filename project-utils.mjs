@@ -14,6 +14,12 @@ const _cache = new Map();
  */
 export function resolveProject(db, name) {
   if (!name) return name;
+  // Defense-in-depth: a bare `--project` CLI flag parses to boolean `true` (and a
+  // malformed MCP/hook caller could pass any non-string). `true.includes('--')` below
+  // throws a raw TypeError that crashed search/recent/timeline/stats/export/defer-list.
+  // Treat any non-string as "no project filter" (null) — the degradation every caller
+  // already handles for an absent --project — instead of crashing at the root helper.
+  if (typeof name !== 'string') return null;
   if (_cache.has(name)) return _cache.get(name);
   // Already a canonical name (contains "--")? Use as-is.
   if (name.includes('--')) { _cache.set(name, name); return name; }

@@ -88,6 +88,37 @@ describe('findReenrichCandidates — project filter', () => {
   });
 });
 
+describe('applyNormalization — project filter (cross-project contamination guard)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-A', project: 'project-A' });
+    insertSession(db, { id: 'sess-B', project: 'project-B' });
+    // Both projects carry the same alias term that a synonym group will rewrite.
+    insertObs(db, { sessionId: 'sess-A', project: 'project-A', title: 'A obs' });
+    insertObs(db, { sessionId: 'sess-B', project: 'project-B', title: 'B obs' });
+    db.prepare("UPDATE observations SET concepts = 'mutex lock concurrency' WHERE project IN ('project-A','project-B')").run();
+  });
+  afterEach(() => { db.close(); });
+
+  it('only rewrites concepts in the scoped project, never sibling projects', async () => {
+    const { applyNormalization } = await import('../hook-optimize.mjs');
+    const groups = [{ canonical: 'mutex', aliases: ['lock'] }];
+    const res = applyNormalization(db, groups, { project: 'project-A' });
+    expect(res.updated).toBe(1); // only project-A's row
+    const a = db.prepare("SELECT concepts FROM observations WHERE project = 'project-A'").get();
+    const b = db.prepare("SELECT concepts FROM observations WHERE project = 'project-B'").get();
+    expect(a.concepts).not.toContain('lock');     // rewritten: lock → mutex (deduped)
+    expect(b.concepts).toBe('mutex lock concurrency'); // sibling project untouched
+  });
+
+  it('rewrites all projects when no project scope is given (legacy unscoped run)', async () => {
+    const { applyNormalization } = await import('../hook-optimize.mjs');
+    const res = applyNormalization(db, [{ canonical: 'mutex', aliases: ['lock'] }]);
+    expect(res.updated).toBe(2); // both projects
+  });
+});
+
 describe('optimizePreview — project filter + detail mode', () => {
   let db;
   beforeEach(() => { db = createTestDb(); seedTwoProjects(db); });

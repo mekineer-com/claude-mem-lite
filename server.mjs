@@ -15,6 +15,7 @@ import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from '
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
+  recoverChildrenOf,
   OP_CAP, STALE_AGE_MS,
 } from './lib/maintain-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
@@ -926,13 +927,20 @@ server.registerTool(
           db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
         }
       }
+      // Resurface rows merged/compressed INTO the doomed keepers before deleting, else
+      // they dangle behind a now-missing parent (compressed_into has no FK) — invisible
+      // to every COALESCE(compressed_into,0)=0 view and unrecoverable. Mirrors the CLI
+      // delete path + the maintain hard-delete guard (recoverChildrenOf).
+      const recovered = recoverChildrenOf(db, args.ids);
       // Execute deletion (FTS5 cleanup handled by observations_ad trigger)
-      return db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...args.ids);
+      const deleted = db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...args.ids);
+      return { changes: deleted.changes, recovered };
     });
     const result = deleteTx();
 
     const missing = args.ids.filter(id => !rows.some(r => r.id === id));
     const msg = [`Deleted ${result.changes} observation(s).`];
+    if (result.recovered > 0) msg.push(`Recovered ${result.recovered} merged/compressed child observation(s) to live.`);
     if (missing.length > 0) msg.push(`Note: ID(s) ${missing.join(', ')} not found.`);
     return { content: [{ type: 'text', text: msg.join(' ') }] };
   })

@@ -15,7 +15,7 @@ import { join } from 'path';
 import {
   memdirPath, writePluginSection, removePluginSection,
   writePluginDoc, removePluginDoc,
-  isAdopted, readMemoryIndex,
+  isAdopted, hasPluginState, readMemoryIndex,
   UserEditedError, BudgetExceededError,
 } from './memdir.mjs';
 import {
@@ -325,6 +325,7 @@ export function cmdUnadopt(args = []) {
 
   const all = hasFlag(args, '--all');
   const dryRun = hasFlag(args, '--dry-run');
+  const force = hasFlag(args, '--force');
   const targets = all
     ? listAllMemdirs().map((m) => m.memdir)
     : [memdirPath(detectCwd())];
@@ -334,23 +335,32 @@ export function cmdUnadopt(args = []) {
     return;
   }
 
-  let removed = 0, absent = 0;
+  let removed = 0, absent = 0, skipped = 0;
   for (const memdir of targets) {
     if (dryRun) {
-      const adopted = isAdopted(memdir, PLUGIN_SLUG);
-      const action = adopted ? 'would-remove' : 'absent';
+      // Mirror the live foreign-content guard: a sentinel with no state sidecar would be
+      // skipped (not removed) unless --force, so dry-run must report it the same way.
+      const action = !isAdopted(memdir, PLUGIN_SLUG) ? 'absent'
+        : (hasPluginState(memdir, PLUGIN_SLUG) || force) ? 'would-remove'
+          : 'would-skip-foreign';
       log(`[unadopt --dry-run] ${memdir} → ${action}`);
-      if (adopted) removed++; else absent++;
+      if (action === 'would-remove') removed++;
+      else if (action === 'would-skip-foreign') skipped++;
+      else absent++;
       continue;
     }
-    const r = removePluginSection(memdir, PLUGIN_SLUG);
-    removePluginDoc(memdir, PLUGIN_SLUG);
-    if (r.action === 'removed') removed++;
+    const r = removePluginSection(memdir, PLUGIN_SLUG, { force });
+    if (r.action === 'removed') { removePluginDoc(memdir, PLUGIN_SLUG); removed++; }
+    else if (r.action === 'skipped-foreign') skipped++;
     else absent++;
     log(`[unadopt] ${memdir} → ${r.action}`);
   }
 
+  if (skipped > 0) {
+    log('[unadopt] skipped-foreign = a sentinel block with no plugin state file (not proven plugin-written).');
+    log('[unadopt] pass --force to remove it anyway.');
+  }
   log('');
   const verb = dryRun ? 'would remove' : 'removed';
-  log(`[unadopt${dryRun ? ' --dry-run' : ''}] ${targets.length} target(s): ${removed} ${verb}, ${absent} absent`);
+  log(`[unadopt${dryRun ? ' --dry-run' : ''}] ${targets.length} target(s): ${removed} ${verb}, ${skipped} skipped-foreign, ${absent} absent`);
 }

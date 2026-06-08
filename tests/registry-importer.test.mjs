@@ -133,6 +133,30 @@ describe('importFromGitHub', () => {
     expect(row.status).toBe('active');
   });
 
+  it('preserves an enrichment-promoted quality_tier across a content re-import', async () => {
+    // Regression: the post-upsert UPDATE hardcoded quality_tier='community', so a
+    // re-import (changed upstream content → new file_hash) downgraded any tier that
+    // enrichment had promoted (verified/installed → community), silently lowering the
+    // resource's BM25 composite rank (tier is a 1.0/2.0/3.0 multiplier).
+    const importOnce = (content, stars) => importFromGitHub(db, 'https://github.com/user/repo', {
+      managedDir: TMP,
+      fetchFn: vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ stargazers_count: stars, forks_count: 1, updated_at: '2026-01-01' }) })
+        .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ tree: [{ path: 'SKILL.md', type: 'blob' }] }) })
+        .mockResolvedValueOnce({ ok: true, text: () => Promise.resolve(content) }),
+    });
+
+    await importOnce('---\nname: tiered-skill\ndescription: v1\n---\n# v1', 10);
+    // Simulate enrichment promoting the tier.
+    db.prepare("UPDATE resources SET quality_tier = 'verified' WHERE name = 'tiered-skill'").run();
+
+    // Upstream content changes → re-import (new file_hash, so it does NOT short-circuit).
+    await importOnce('---\nname: tiered-skill\ndescription: v2 changed\n---\n# v2 changed body', 11);
+
+    const row = db.prepare("SELECT quality_tier FROM resources WHERE name = 'tiered-skill'").get();
+    expect(row.quality_tier).toBe('verified'); // preserved, not reset to 'community'
+  });
+
   it('uses repo name for root SKILL.md', async () => {
     const mockFetch = vi.fn()
       .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ stargazers_count: 0 }) })

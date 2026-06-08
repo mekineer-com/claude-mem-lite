@@ -3,6 +3,38 @@
 
 import { basename } from 'path';
 
+// Read/search commands whose output legitimately contains "error"-like keywords without
+// being a failure. Matched against the PRIMARY command (see isReadOnlyCommand).
+const SEARCH_VERBS = new Set([
+  'grep', 'rg', 'ag', 'ack', 'cat', 'head', 'tail', 'less', 'more', 'find', 'locate', 'wc', 'file', 'which', 'type',
+]);
+// Command prefixes that wrap the real command (env-assignments handled separately).
+const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'time', 'command', 'nice', 'nohup', 'stdbuf', 'xargs']);
+// git read subcommands whose output contains commit/log/match text, not failures.
+const GIT_READ_SUBCMDS = new Set(['grep', 'log', 'show', 'diff', 'blame', 'ls-files', 'cat-file', 'whatchanged', 'shortlog', 'reflog', 'status']);
+
+// True when the command's PRIMARY operation (left of the first pipe, past any
+// env-assignments / wrapper like `sudo`/`env`/`time`) is a read/search — including
+// `git grep`/`git log`. Anchoring on the primary command (not "search verb appears
+// anywhere") is what lets `npm run build 2>&1 | tail` stay an error while `sudo grep`,
+// `git grep`, `cat f | head` are correctly exempt.
+function isReadOnlyCommand(cmd) {
+  const primary = cmd.split('|')[0];
+  const toks = primary.trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < toks.length && (/^\w+=/.test(toks[i]) || CMD_WRAPPERS.has(toks[i]))) i++;
+  const first = toks[i];
+  if (!first) return false;
+  if (SEARCH_VERBS.has(first)) return true;
+  return first === 'git' && GIT_READ_SUBCMDS.has(toks[i + 1]);
+}
+
+// Paths excluded from observation capture (ephemeral / virtual filesystems) — applied
+// uniformly to both command-parsed paths and direct file_path/path/filePath fields.
+function isExcludedPath(p) {
+  return p.startsWith('/dev/') || p.startsWith('/proc/') || p.startsWith('/tmp/');
+}
+
 /**
  * Detect significance signals in a Bash command and its response.
  * Checks for errors, test runs, builds, git operations, and deployments.
@@ -12,9 +44,12 @@ import { basename } from 'path';
  */
 export function detectBashSignificance(input, response) {
   const cmd = (input.command || '').toLowerCase();
-  // Skip error keyword matching when the command is a read/search operation
-  // (grep output naturally contains matched keywords like "error")
-  const isSearchCmd = /\b(grep|rg|ag|ack|cat|head|tail|less|more|find|locate|wc|file|which|type)\b/i.test(cmd);
+  // Skip error keyword matching only when the PRIMARY command is a read/search op (its
+  // output naturally contains "error"-like keywords that aren't failures). Anchored on the
+  // primary command — NOT "search verb appears anywhere" — so `npm run build 2>&1 | tail`
+  // stays a real failure while `sudo grep`, `git grep`, `git log --grep`, `cat f | head`
+  // remain exempt and `run-cat-tests` doesn't trip a substring match.
+  const isSearchCmd = isReadOnlyCommand(cmd);
   const looksLikeError = !isSearchCmd
     && /\berror\b|\bERR!|fail(ed|ure)?|exception|panic|traceback|errno|enoent|command not found/i.test(response)
     && response.length > 15;
@@ -38,7 +73,9 @@ export function detectBashSignificance(input, response) {
   const isTest = /\b(npm\s+test|npm\s+run\s+test|yarn\s+test|pnpm\s+test|pnpm\s+run\s+test|bun\s+test|go\s+test|cargo\s+test)\b/i.test(cmd)
     || /\b(jest|pytest|vitest|mocha|cypress|playwright)\b/i.test(cmd);
   const isBuild = /\b(build|compile|tsc|webpack|vite|rollup|esbuild|make|cargo)\b/i.test(cmd);
-  const isGit = /\bgit\s+(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);
+  // Allow intervening global git options (`-C <path>`, `-c k=v`, `--no-pager`, …) between
+  // `git` and the subcommand — `git -C /repo push` is the standard multi-repo/scripted form.
+  const isGit = /\bgit\s+(?:(?:-[cC]\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);
   const isDeploy = /\b(deploy|docker|kubectl|terraform)\b/i.test(cmd);
   return {
     isError, isTest, isBuild, isGit, isDeploy,
@@ -92,6 +129,9 @@ export function extractErrorKeywords(cmd, response) {
  */
 export function extractFilePaths(input) {
   const paths = [];
+  // Direct fields (Edit/Write file_path) are kept unconditionally — an explicit edit to a
+  // /tmp path is real work the user chose to make, unlike a /tmp path that merely appears as
+  // a transient argument inside a Bash command (excluded as noise in the command branch below).
   if (input.file_path) paths.push(input.file_path);
   if (input.path) paths.push(input.path);
   if (input.filePath) paths.push(input.filePath);
@@ -101,7 +141,7 @@ export function extractFilePaths(input) {
     if (match) {
       for (const m of match) {
         const p = m.trim();
-        if (!p.startsWith('/dev/') && !p.startsWith('/proc/') && !p.startsWith('/tmp/')
+        if (!isExcludedPath(p)
           // Skip single-component paths like /exit, /clear — likely slash commands, not files
           && (p.indexOf('/', 1) !== -1 || /\.\w+$/.test(p))) {
           paths.push(p);

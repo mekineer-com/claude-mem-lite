@@ -284,6 +284,10 @@ export function filterByProjectDomain(results, projectDomains) {
 //
 // Composite ranking formula:
 //   40% BM25 text relevance
+//   Quality-tier bonus: bounded additive (installed -0.15, verified -0.075). Was a
+//     MULTIPLIER on the BM25 term, which scaled the magnitude of a variable, unbounded,
+//     NEGATIVE signal — letting a weakly-matching installed resource (×3) outrank a
+//     strongly-matching community one. Additive keeps tier a promotion, not an override.
 //   15% Star popularity (saturation normalization — diminishing returns after ~500 stars)
 //   15% Success rate (Laplace smoothing — Beta prior α=1, β=1 for small-sample robustness)
 //   10% Adoption rate (Laplace smoothing)
@@ -301,10 +305,10 @@ export function filterByProjectDomain(results, projectDomains) {
 // Sign convention: more negative = better. BM25 is negative, behavioral signals are subtracted.
 const COMPOSITE_EXPR = `(
     bm25(resources_fts, 3.0, 3.0, 3.0, 2.0, 2.0, 1.0, 1.0, 1.0) * 0.4
-    * CASE COALESCE(r.quality_tier, 'community')
-        WHEN 'installed' THEN 3.0
-        WHEN 'verified' THEN 2.0
-        ELSE 1.0
+    - CASE COALESCE(r.quality_tier, 'community')
+        WHEN 'installed' THEN 0.15
+        WHEN 'verified' THEN 0.075
+        ELSE 0
       END
     - COALESCE(r.repo_stars * 1.0 / (r.repo_stars + 100.0), 0) * 0.15
     - (
@@ -347,7 +351,7 @@ const SEARCH_SQL = `
     WHERE resources_fts MATCH ?
       AND r.status = 'active'
   ) sub
-  ORDER BY composite_score ASC
+  ORDER BY composite_score ASC, id ASC
   LIMIT ?
 `;
 
@@ -362,7 +366,7 @@ const SEARCH_BY_TYPE_SQL = `
       AND r.status = 'active'
       AND r.type = ?
   ) sub
-  ORDER BY composite_score ASC
+  ORDER BY composite_score ASC, id ASC
   LIMIT ?
 `;
 

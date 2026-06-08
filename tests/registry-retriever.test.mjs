@@ -186,6 +186,27 @@ describe('retrieveResources', () => {
     const results = retrieveResources(db, 'AND OR ())(');
     expect(Array.isArray(results)).toBe(true);
   });
+
+  it('quality_tier is a bounded bonus, not a multiplier — a weak installed match does not outrank a strong community match', () => {
+    // Regression: tier was a MULTIPLIER on the (negative, unbounded) BM25 term, so an
+    // installed resource (×3) could outrank a far stronger community match. Build a corpus
+    // where the query term is DENSE in a community resource and SPARSE in an installed one,
+    // with filler docs lacking the term so BM25 discriminates by frequency.
+    const insert = (name, qtier, keywords) => {
+      insertResource(db, { name, keywords });
+      db.prepare('UPDATE resources SET quality_tier = ? WHERE name = ?').run(qtier, name);
+    };
+    // Filler docs (no "widgetscan" term) → raise the term's IDF so BM25 separates the two.
+    for (let i = 0; i < 6; i++) insert(`filler-${i}`, 'community', `alpha beta gamma delta topic${i}`);
+    insert('weak-installed', 'installed', 'general helper that can also widgetscan among many other unrelated capabilities here');
+    insert('strong-community', 'community', 'widgetscan widgetscan widgetscan widgetscan dedicated tool');
+
+    const results = retrieveResources(db, 'widgetscan', { limit: 5 }).map(r => r.name);
+    const iStrong = results.indexOf('strong-community');
+    const iWeak = results.indexOf('weak-installed');
+    expect(iStrong).toBeGreaterThanOrEqual(0);
+    expect(iStrong).toBeLessThan(iWeak === -1 ? Infinity : iWeak); // strong community ranks above weak installed
+  });
 });
 
 // ─── searchResources ────────────────────────────────────────────────────────

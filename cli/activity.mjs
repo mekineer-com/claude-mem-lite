@@ -10,8 +10,8 @@
 
 import { inferProject } from '../utils.mjs';
 import { resolveProject } from '../project-utils.mjs';
-import { parseArgs, out, fail } from './common.mjs';
-import { parseIntFlag } from '../lib/cli-flags.mjs';
+import { parseArgs, out, fail, rejectBareStringFlags } from './common.mjs';
+import { parseIntFlag, isNumericToken } from '../lib/cli-flags.mjs';
 
 function formatActivityResults(rows) {
   if (!rows || rows.length === 0) return '(no events)';
@@ -31,6 +31,9 @@ export async function cmdActivity(db, args) {
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
   if (sub === 'save') {
+    // Reject value-less string flags before they reach saveEvent as a boolean `true`
+    // (#8470): bare --body / --title crashed with a raw "SQLite3 can only bind ..." error.
+    if (rejectBareStringFlags(flags, ['type', 'title', 'body', 'files', 'file', 'project'])) return;
     const type = flags.type || 'observation';
     if (!VALID_EVENT_TYPES.has(type)) {
       fail(`[mem] activity save: invalid --type "${type}". Valid: ${[...VALID_EVENT_TYPES].join(', ')}`);
@@ -51,7 +54,9 @@ export async function cmdActivity(db, args) {
     const file_paths_merged = [...filesFromSingular, ...filesFromPlural];
     const file_paths = file_paths_merged.length > 0 ? file_paths_merged : null;
     const rawImp = flags.importance !== undefined ? parseInt(flags.importance, 10) : 2;
-    if (flags.importance !== undefined && (isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
+    // isNumericToken first (mirrors cmdSave): bare parseInt coerces "3xyz"→3 and would
+    // persist a wrong importance that silently skews ranking. Float literals truncate (#8277).
+    if (flags.importance !== undefined && (!isNumericToken(flags.importance) || isNaN(rawImp) || rawImp < 1 || rawImp > 3)) {
       fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
       return;
     }
@@ -112,7 +117,10 @@ export async function cmdActivity(db, args) {
     if (row) {
       out(JSON.stringify(row, null, 2));
     } else {
-      out(`[mem] activity show: event #${id} Not found`);
+      // fail() (stderr + exit 1), matching the not-found contract of sibling commands
+      // (`get`, `activity delete`, `update`); previously stdout + exit 0, so scripts
+      // couldn't detect a missing event from the exit code.
+      fail(`[mem] activity show: event #${id} not found`);
     }
     return;
   }

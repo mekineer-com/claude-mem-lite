@@ -735,6 +735,24 @@ describe('renderHandoffInjection', () => {
     expect(result).toContain('</session-summary>');
   });
 
+  it('enriches with the project summary even when handoff.session_id is a CC-UUID (prod id mismatch)', () => {
+    // Regression: in production session_handoffs.session_id is the Claude Code UUID, but
+    // session_summaries is keyed by the mem-internal memory_session_id — the exact match
+    // failed and the <session-summary> block was always dropped on real resumes. The fallback
+    // attaches the most-recent project summary instead.
+    const ccUuid = '550e8400-e29b-41d4-a716-446655440000';
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+      VALUES ('p', 'exit', ?, 'budget refactor', ?)`).run(ccUuid, Date.now());
+    seedSession(db, 'hook-p-abc12345', 'p'); // mem-internal id, different namespace
+    db.prepare(`INSERT INTO session_summaries (memory_session_id, project, request, completed, next_steps, created_at, created_at_epoch)
+      VALUES ('hook-p-abc12345', 'p', 'req', 'completed the budget refactor', 'wire up the UI', datetime('now'), ?)`).run(Date.now());
+
+    const result = renderHandoffInjection(db, 'p', 'some-other-cc-session');
+    expect(result).toContain('<session-summary');
+    expect(result).toContain('completed the budget refactor');
+    expect(result).toContain('wire up the UI');
+  });
+
   it('renders remaining_items from session summary', () => {
     db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
       VALUES ('p', 'exit', 's1', 'code review', ?)`).run(Date.now());

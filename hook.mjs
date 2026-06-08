@@ -202,13 +202,20 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
         // bugfix-shape nudge above and may co-fire.
         const citeBack = loadCiteBackForEpisode(episode, RUNTIME_DIR);
         if (citeBack) lines.push(citeBack);
+        // Trailing newline is REQUIRED: when this receipt flushes at SessionStart
+        // (leftover episode after /clear or /compact), the startup dashboard writes a
+        // second hookSpecificOutput object right after. Without the '\n' the two land
+        // back-to-back as `}{` on one line and Claude Code's line-based JSON parser
+        // drops both — losing the episode-flush / cite-back context exactly at the
+        // session boundary. Every other hookSpecificOutput write appends '\n'; this
+        // was the lone exception.
         process.stdout.write(JSON.stringify({
           suppressOutput: true,
           hookSpecificOutput: {
             hookEventName,
             additionalContext: lines.join('\n'),
           },
-        }));
+        }) + '\n');
       } catch { /* never block on receipt */ }
     }
   } else {

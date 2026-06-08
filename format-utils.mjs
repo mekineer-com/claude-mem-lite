@@ -9,8 +9,19 @@
  */
 export function truncate(str, max = 80) {
   if (!str) return '';
+  // Defense-in-depth: a non-string (e.g. an LLM that returned title as an array/number)
+  // would throw `str.replace is not a function` and abort the caller. Coerce to '' rather
+  // than crash; the real type-guarding happens at the call site.
+  if (typeof str !== 'string') return '';
   str = str.replace(/\n/g, ' ').trim();
-  return str.length > max ? str.slice(0, max - 1) + '\u2026' : str;
+  if (str.length <= max) return str;
+  // Never split a UTF-16 surrogate pair: slicing between the high and low half emits a
+  // lone surrogate (invalid UTF-16) that then gets persisted to the DB. If the last kept
+  // code unit is a high surrogate, drop it so we cut on a code-point boundary.
+  let end = max - 1;
+  const last = str.charCodeAt(end - 1);
+  if (last >= 0xD800 && last <= 0xDBFF) end--;
+  return str.slice(0, end) + '\u2026';
 }
 
 /**

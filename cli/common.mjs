@@ -54,6 +54,29 @@ export function fail(text) {
   process.exitCode = 1;
 }
 
+/**
+ * Reject value-less `--flag` for string-valued flags. A bare trailing flag (or one
+ * immediately followed by another `--flag`) parses to boolean `true` (parseArgs above);
+ * that `true` then slips into code expecting a string and surfaces a raw
+ * `flags.x.split is not a function` / `SQLite3 can only bind ...` stacktrace (#8470).
+ * Returns true (and emits a clean `fail()`) when any listed key is a bare flag — the
+ * caller should `return` on true. Single source of the guard the update/registry paths
+ * previously inlined, so new string-flag commands stay consistent.
+ *
+ * @param {object} flags Parsed flags from parseArgs.
+ * @param {string[]} keys String-valued flag names to guard (without leading dashes).
+ * @returns {boolean} true if a bare flag was found and rejected.
+ */
+export function rejectBareStringFlags(flags, keys) {
+  for (const key of keys) {
+    if (flags[key] === true) {
+      fail(`[mem] --${key} requires a value (received a bare flag with no value).`);
+      return true;
+    }
+  }
+  return false;
+}
+
 // ─── Time Formatting ─────────────────────────────────────────────────────────
 
 /** "just now" / "5m ago" / "3h ago" / "2d ago" relative to now. */

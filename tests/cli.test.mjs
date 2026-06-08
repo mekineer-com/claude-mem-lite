@@ -314,6 +314,23 @@ describe('CLI search command', () => {
     expect(output).toContain('Modified auth.mjs');
   });
 
+  it('obs results carry created_at in --json (parity with recent/recall, sessions/prompts)', async () => {
+    // Regression: ftsRowToResult keyed the date as `date`, but cmdSearch read `r.created_at`
+    // — so obs rows in search --json had a null created_at and the human date column was
+    // blank, while interleaved session/prompt rows (raw SQL) carried it. The key was aligned.
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Cache uniquegammatoken invalidation fix', text: 'uniquegammatoken root cause',
+    });
+    const output = await captureStdoutOnly(() => run(['search', 'uniquegammatoken', '--json']));
+    const parsed = JSON.parse(output);
+    expect(parsed.results.length).toBeGreaterThan(0);
+    const obs = parsed.results.find(r => r.source === 'obs');
+    expect(obs).toBeDefined();
+    expect(obs.created_at).toBeTruthy();
+    expect(() => new Date(obs.created_at).toISOString()).not.toThrow();
+  });
+
   // R-3: lesson_learned presence lifts rank vs identical obs without lesson.
   // Empirical basis: bugfix with lesson has +6.3pp hit rate over bugfix without.
   // The multiplier is intentionally small (×1.3) — this is a gentle rerank, not a bucket.
@@ -880,6 +897,26 @@ describe('CLI delete command', () => {
     await captureStdout(() => run(['delete', '1', '--confirm']));
     const row = testDb.prepare('SELECT related_ids FROM observations WHERE id = 2').get();
     expect(JSON.parse(row.related_ids)).toEqual([]);
+  });
+
+  it('recovers merged/compressed children when their keeper is deleted (data-loss guard)', async () => {
+    // #1 is a keeper; #2 was merged/compressed INTO it (compressed_into = 1). Deleting
+    // the keeper without recovery would leave #2 dangling behind a missing parent —
+    // hidden from every COALESCE(compressed_into,0)=0 view and unrecoverable. The delete
+    // path must reset #2.compressed_into to NULL first (same guard as maintain).
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Keeper', text: 'keeper content', importance: 3,
+    });
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Merged child', text: 'child content', compressedInto: 1,
+    });
+    const output = await captureStdout(() => run(['delete', '1', '--confirm']));
+    expect(output).toContain('Recovered 1');
+    const child = testDb.prepare('SELECT compressed_into FROM observations WHERE id = 2').get();
+    expect(child).toBeDefined();              // child row survived
+    expect(child.compressed_into).toBeNull(); // and was resurfaced as live
   });
 });
 

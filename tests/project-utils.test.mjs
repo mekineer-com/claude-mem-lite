@@ -67,4 +67,13 @@ describe('resolveProject', () => {
     // Re-open for afterEach cleanup
     db = createTestDb();
   });
+
+  it('returns null for non-string input instead of crashing (bare --project flag)', () => {
+    // A bare `--project` CLI flag parses to boolean true; `true.includes("--")` used to
+    // throw a raw TypeError that crashed search/recent/timeline/stats/export/defer-list.
+    // Non-string truthy → null (= no project filter, the absent-flag degradation).
+    expect(resolveProject(db, true)).toBeNull();
+    expect(resolveProject(db, 123)).toBeNull();
+    expect(resolveProject(db, {})).toBeNull();
+  });
 });

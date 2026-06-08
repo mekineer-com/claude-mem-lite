@@ -382,6 +382,7 @@ export function initSchema(db) {
 
   // FTS5 migration: recreate observations_fts when columns are missing (one-time)
   // Detect old FTS5 table missing lesson_learned or search_aliases and recreate with full column set
+  let obsFtsRecreated = false;
   try {
     const ftsDdl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='observations_fts'`).get();
     if (ftsDdl && (!ftsDdl.sql.includes('lesson_learned') || !ftsDdl.sql.includes('search_aliases'))) {
@@ -389,6 +390,7 @@ export function initSchema(db) {
       db.exec(`DROP TRIGGER IF EXISTS observations_ad`);
       db.exec(`DROP TRIGGER IF EXISTS observations_au`);
       db.exec(`DROP TABLE IF EXISTS observations_fts`);
+      obsFtsRecreated = true;
     }
   } catch { /* non-critical — ensureFTS will create if missing */ }
 
@@ -416,14 +418,19 @@ export function initSchema(db) {
   ensureFTS(db, 'session_summaries_fts', 'session_summaries', ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes', 'remaining_items']);
   ensureFTS(db, 'user_prompts_fts', 'user_prompts', ['prompt_text']);
 
-  // Rebuild FTS5 if we just recreated it (migration populates from content table)
-  try {
-    const needsRebuild = db.prepare(`SELECT COUNT(*) as cnt FROM observations`).get();
-    const ftsCount = db.prepare(`SELECT COUNT(*) as cnt FROM observations_fts`).get();
-    if (needsRebuild.cnt > 0 && ftsCount.cnt === 0) {
-      db.exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`);
-    }
-  } catch { /* non-critical */ }
+  // Rebuild FTS5 if we just recreated it above (the new index is empty and must be
+  // populated from the content table). The old emptiness probe — `SELECT COUNT(*) FROM
+  // observations_fts` — was DEAD: for an external-content FTS5 table, COUNT reads the
+  // CONTENT table (observations), not the index, so `ftsCount === 0` was only ever true
+  // on an empty DB (where needsRebuild>0 is false). The rebuild therefore never fired and
+  // full-text search silently returned 0 rows after the column-mismatch migration. Gate
+  // on the recreation flag instead, which is the only path that leaves the index empty.
+  if (obsFtsRecreated) {
+    try {
+      const cnt = db.prepare(`SELECT COUNT(*) as cnt FROM observations`).get();
+      if (cnt.cnt > 0) db.exec(`INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`);
+    } catch { /* non-critical */ }
+  }
 
   // v36 migration: narrow events_fts_au like the v27 fix above. The events FTS
   // triggers were hand-written inline (below) rather than via ensureFTS, so

@@ -426,6 +426,31 @@ describe('cluster-merge', () => {
     const result = await executeMergeCluster(db, obs);
     expect(result.merged).toBe(false);
   });
+
+  it('keeps the highest-importance member and never downgrades importance on merge', async () => {
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    // #1: critical (importance=3) but never accessed.  #2: trivial (importance=1) but
+    // accessed often. Pre-fix the keeper was chosen by access_count alone, so the critical
+    // observation was compressed away and the merged importance fell to the LLM default (2).
+    insertObs(db, { title: 'Critical FTS bug A', narrative: 'data-loss root cause', importance: 3, accessCount: 0 });
+    insertObs(db, { title: 'Critical FTS bug B', narrative: 'trivial follow-up', importance: 1, accessCount: 9 });
+    const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
+    const criticalId = obs.find(o => o.importance === 3).id;
+
+    callModelJSON.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Critical FTS bug (merged)',
+      merged_narrative: 'merged narrative',
+      merged_concepts: ['fts'], merged_facts: ['fact'],
+      merged_lesson: 'lesson', importance: 2, // LLM proposes 2 — must be floored up to 3
+    });
+
+    const result = await executeMergeCluster(db, obs);
+    expect(result.merged).toBe(true);
+    expect(result.keeperId).toBe(criticalId); // critical member kept as the survivor
+    const keeper = db.prepare('SELECT importance FROM observations WHERE id = ?').get(criticalId);
+    expect(keeper.importance).toBe(3); // max(LLM 2, cluster-max 3) — not downgraded
+  });
 });
 
 describe('smart-compress', () => {

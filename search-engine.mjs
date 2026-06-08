@@ -179,7 +179,11 @@ export function countSearchTotal(db, {
 export function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
   return {
     source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle,
-    project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch,
+    // `date` is the legacy key the MCP paired-search path reads; `created_at` aligns the
+    // obs row shape with the session/prompt rows the CLI interleaves in the same results
+    // array (cmdSearch reads r.created_at uniformly) and with recent/recall output. Both
+    // hold the same ISO string — keep both so neither consumer breaks.
+    project: r.project, date: r.created_at, created_at: r.created_at, created_at_epoch: r.created_at_epoch,
     score: scoreMultiplier ? r.score * scoreMultiplier : r.score,
     files_modified: r.files_modified, importance: r.importance, lesson_learned: r.lesson_learned,
     snippet: snippet ? (r.match_snippet || '') : '',

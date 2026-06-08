@@ -657,7 +657,12 @@ ${actionList}`;
       releaseLLMSlot();
     }
 
-    if (parsed && parsed.title) {
+    // Require a STRING title: a truthy non-string (LLM returned title as an array/number/
+    // object) would pass a bare `parsed.title` check, then crash truncate() downstream,
+    // aborting the worker before tmpFile cleanup (leak) and leaving the obs degraded.
+    if (parsed && typeof parsed.title === 'string' && parsed.title) {
+      // Normalize narrative to a string too — same non-string crash risk in truncate().
+      if (typeof parsed.narrative !== 'string') parsed.narrative = '';
       // Discard if LLM judges observation has no learning value
       if (parsed.importance === 0 || parsed.importance === '0') {
         debugLog('DEBUG', 'llm-episode', `Discarded low-value observation: ${parsed.title}`);

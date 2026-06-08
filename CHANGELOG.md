@@ -2,6 +2,52 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.93.0 — five-round dogfooding sweep: secret-scrub leaks + delete/optimize data integrity + scoring + hook-pipeline correctness
+
+A sustained end-to-end audit of the whole surface (CLI, MCP, hooks, registry, install, secret-scrub), each finding reproduced before fix and covered by a regression test, then the full diff re-checked by an independent multi-agent review. ~30 behavior corrections — no new features, no schema change. Highlights by area:
+
+### Security
+
+**fix: `scrubSecrets` no longer leaks the most common real credential shapes.** Underscore-cased env vars (`DB_PASSWORD`, `GH_TOKEN`, `MY_AUTH_TOKEN`) leaked because `\b` never fires between `_` and the keyword — both are word chars; the anchor is now `(?:\b|_)`. `access_token`/`refresh_token` (canonical OAuth2 fields) had drifted out of the KV keyword list while staying in the JSON list — re-synced, with a cross-list parity test to prevent re-drift. Bare `SECRET=<mixed-alnum>` (non-hex value) now matches. The prose-exclusion lookbehind and all previously-scrubbed cases are preserved.
+
+### Data integrity
+
+**fix: interactive `delete` / `mem_delete` recover merged-or-compressed children instead of orphaning them.** `compressed_into` has no FK, so hard-deleting a keeper that absorbed dups left its children dangling behind a missing parent — hidden from every `compressed_into=0` view and unrecoverable. The maintain paths already guarded this (v2.92.0); the two user-facing delete paths did not. Both now un-hide a doomed keeper's children (excluding any child also being deleted in the same call) before the DELETE, and report the recovery count.
+
+**fix: `optimize` normalize no longer rewrites concepts across projects.** `executeNormalize({project})` scoped the concept *finder* but called `applyNormalization` with no project, so a synonym group derived from one project rewrote `concepts`/`search_aliases` on EVERY project's observations. The mutation now takes the same `--project` scope.
+
+**fix: `optimize` cluster-merge keeps the highest-importance member and never downgrades importance.** The keeper was chosen by `access_count` alone (the SELECT omitted `importance`), so a critical never-accessed observation lost the keeper role to a trivial accessed one and was compressed away; the merged importance then fell to the LLM default. Keeper is now importance-first (access_count tiebreak) and the merged importance is floored at the cluster max.
+
+### Search & scoring
+
+**fix: registry `quality_tier` is a bounded bonus, not a BM25 multiplier.** Tier was multiplied onto the (negative, unbounded) `bm25()` term — scaling the magnitude of a relevance signal — so a weakly-matching `installed` resource (×3) could outrank a strongly-matching `community` one, and since all preinstalled resources are `installed` this was the common case. It is now a bounded additive promotion (`installed −0.15`, `verified −0.075`), and a secondary `id ASC` makes tied results deterministic at the LIMIT boundary.
+
+**fix: `search` observation results carry `created_at` again.** `ftsRowToResult` keyed the date as `date` but the CLI read `r.created_at` uniformly across interleaved session/prompt rows, so obs rows had a null `created_at` in `--json` and a blank date column. The key is aligned (the legacy `date` is retained for the MCP path).
+
+**fix: CJK precision gate no longer rejects every result for an all-particle query.** A query of only particles (`的了是`) produced bigrams tested against the single-char stop-word set, so `required` was non-empty and every candidate was filtered. Bigrams whose both characters are stop words are now treated as grammatical noise; single-particle compounds (`有效`, `目的`) are untouched.
+
+### Hook pipeline
+
+**fix: SessionStart no longer emits two JSON objects as `}{` on one line.** When a leftover episode flushed at session start (after `/clear` or `/compact`), the flush receipt lacked the trailing newline every other `hookSpecificOutput` write has, so it collided with the dashboard object and Claude Code's line parser dropped both — losing episode-flush / cite-back context at the session boundary.
+
+**fix: the `<session-summary>` handoff enrichment appears on real resumes.** The query keyed `session_summaries.memory_session_id` by `handoff.session_id`, but in production those are different id namespaces (CC-UUID vs mem-internal), so the block was always dropped. With no bridge column available, it now falls back to the project summary closest in time to the handoff.
+
+**fix: PostToolUse error detection survives pipes and wrapped reads.** The search-command exemption matched a search verb anywhere in the command, so `npm run build 2>&1 | tail` never flagged a real failure and `run-cat-tests` tripped `\bcat\b`. It now anchors on the primary command (left of the first pipe, past `sudo`/`env`/… wrappers) and recognizes `git` read subcommands. `isGit` also recognizes subcommands behind global flags (`git -C <path> push`, `--no-pager`, `-c k=v`).
+
+**fix: auto-update rate-limit handling actually engages.** On a 403, `checkForUpdate` re-read stale in-memory state and clobbered the `rateLimited` flag `fetchWithTimeout` had just persisted. A 200-OK release response with no `tag_name` now falls through to the tags API instead of throwing.
+
+**fix: observation full-text search survives the FTS column-mismatch migration.** The post-recreation rebuild gated on `SELECT COUNT(*) FROM observations_fts`, which on an external-content FTS5 table counts the content table (not the index) — so the rebuild never fired and search silently returned zero rows after the migration. It now rebuilds whenever the table was recreated.
+
+### Robustness
+
+**fix: LLM-output and CLI edge inputs no longer crash or corrupt.** `truncate` no longer splits a UTF-16 surrogate pair (lone-surrogate persisted to the DB) and tolerates non-string input; a non-string LLM `title`/`narrative` is type-guarded before it crashes `handleLLMEpisode` (which leaked the episode tmpfile and left the obs degraded); `parseJsonFromLLM` extracts the first brace-balanced object/array so unfenced output wrapped in brace-containing prose still parses; `clampImportance("2")` coerces instead of collapsing to 1; `computeTier` aligns its active-window boundary (`<=`) with the SQL classifier.
+
+**fix: value-less CLI string flags fail cleanly instead of crashing.** A bare `--fields`/`--files`/`--title`/`--body`/`--query`/`--detail` parsed to boolean `true` and surfaced a raw `.split`/SQLite-bind stacktrace. A shared `rejectBareStringFlags` guard (adopted across `get`/`save`/`defer`/`activity`/`registry`/`timeline`/`update`) now rejects them with a clear message. A bare `--project` is absorbed at the root (`resolveProject` returns null for non-string instead of `true.includes()` crashing). `activity save --importance` rejects trailing-garbage tokens, and `activity show <missing>` uses the stderr+non-zero not-found contract.
+
+**fix: `unadopt` no longer deletes user content that merely resembles the sentinel.** `removePluginSection` deleted any sentinel-shaped block without the state-sidecar proof that the plugin wrote it (asymmetric with the adopt-side `UserEditedError` guard) — pasted docs or quoted examples in MEMORY.md were silently removed. A no-state block is now left in place (`skipped-foreign`) unless `--force`, and the leading-whitespace normalization only runs when the removed block was the file's first content, so an adopt→unadopt round-trip preserves user formatting.
+
+**fix: registry re-import preserves an enrichment-promoted `quality_tier`.** The post-upsert UPDATE re-stamped `quality_tier='community'` on every content re-import, reverting `verified`/`installed` tiers and lowering the resource's rank.
+
 ## v2.92.0 — maintain data-loss class closed (transitive merge + purge orphan) + RRF score-order + citation streak cap
 
 A follow-up audit of the search and maintain paths. All changes are behavior corrections or internal refactors — no new features, no schema change.

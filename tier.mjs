@@ -44,9 +44,12 @@ export function computeTier(obs, ctx) {
     return 'working';
   }
 
-  // Rule 5: Active if within type-specific window
+  // Rule 5: Active if within type-specific window. Use `<=` so the exact-millisecond
+  // window edge matches TIER_CASE_SQL (`created_at_epoch >= now - window`, i.e. inclusive).
+  // The strict `<` here disagreed with the SQL classifier by one tier at the boundary,
+  // despite both being documented as the same classifier.
   const activeWindow = ACTIVE_WINDOWS[obs.type] ?? DEFAULT_ACTIVE_WINDOW_MS;
-  if (now - obs.created_at_epoch < activeWindow) return 'active';
+  if (now - obs.created_at_epoch <= activeWindow) return 'active';
 
   // Rule 6: Archive (fallback)
   return 'archive';

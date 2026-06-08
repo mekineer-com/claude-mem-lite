@@ -11,6 +11,23 @@ export { SYNONYM_MAP, CJK_COMPOUNDS };
 
 const FTS5_KEYWORDS = new Set(['AND', 'OR', 'NOT', 'NEAR']);
 
+/**
+ * True if a CJK bigram is pure grammatical noise that should not enter an FTS query
+ * or the precision gate's `required` set. CJK_STOP_WORDS holds single-char particles
+ * (的/了/是…) plus a few whole multi-char fillers (什么/怎么…); callers used to test a
+ * 2-char bigram with a bare `CJK_STOP_WORDS.has(bg)`, which only caught the whole-filler
+ * case — so a particle-pair bigram like `的了` / `了是` slipped through and (a) forced an
+ * unsatisfiable AND term and (b) made an all-particle query's `required` set non-empty,
+ * wrongly rejecting every candidate. We reject a bigram when it IS a known filler OR when
+ * BOTH characters are single-char stop words. A bigram with only ONE stop char (有效, 目的)
+ * is deliberately kept — those are real compounds, and distinguishing a boundary-straddle
+ * (的全) from a genuine compound needs a dictionary/recall benchmark (deferred).
+ */
+function isCjkNoiseBigram(bg) {
+  if (CJK_STOP_WORDS.has(bg)) return true;
+  return bg.length === 2 && CJK_STOP_WORDS.has(bg[0]) && CJK_STOP_WORDS.has(bg[1]);
+}
+
 // Sort by length descending for greedy matching
 const CJK_SORTED = [...CJK_COMPOUNDS].sort((a, b) => b.length - a.length);
 
@@ -177,7 +194,7 @@ export function cjkPrecisionOk(query, text, threshold) {
   const keywords = extractCjkKeywords(query);
   const required = keywords.length > 0
     ? keywords
-    : cjkBigrams(query).split(' ').filter(b => b && !CJK_STOP_WORDS.has(b));
+    : cjkBigrams(query).split(' ').filter(b => b && !isCjkNoiseBigram(b));
   if (required.length === 0) return true;
   const hit = required.filter(w => text.includes(w)).length;
   return (hit / required.length) >= threshold;
@@ -254,7 +271,7 @@ export function sanitizeFtsQuery(query) {
         const gapBigrams = cjkBigrams(remainder);
         if (gapBigrams) {
           for (const bg of gapBigrams.split(' ')) {
-            if (bg && !CJK_STOP_WORDS.has(bg) && !matched.has(bg)) expandedTokens.push(bg);
+            if (bg && !isCjkNoiseBigram(bg) && !matched.has(bg)) expandedTokens.push(bg);
           }
         }
         continue;
@@ -278,7 +295,7 @@ export function sanitizeFtsQuery(query) {
     );
     if (pureCjkTokens.length > 0) bigrams = cjkBigrams(pureCjkTokens.join(' '));
   }
-  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(b => b && !CJK_STOP_WORDS.has(b)) : []);
+  const bigramSet = new Set(bigrams ? bigrams.split(' ').filter(b => b && !isCjkNoiseBigram(b)) : []);
   const hasBigrams = bigramSet.size > 0;
   const finalTokens = [];
   const seen = new Set();

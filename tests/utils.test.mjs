@@ -92,6 +92,23 @@ describe('truncate', () => {
     const result = truncate(long);
     expect(result.length).toBe(80);
   });
+
+  it('never splits a UTF-16 surrogate pair (no lone surrogate persisted)', () => {
+    // emoji (astral plane = 2 code units) straddling the truncation boundary used to
+    // be cut in half, emitting a lone high surrogate (invalid UTF-16) into the DB.
+    const s = 'a'.repeat(118) + '😀' + 'tail';
+    const r = truncate(s, 120);
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(r)).toBe(false);
+    expect(r.endsWith('…')).toBe(true);
+  });
+
+  it('returns empty string for non-string input instead of throwing', () => {
+    // A non-string (e.g. an LLM that returned title as an array/number) previously
+    // crashed `.replace is not a function`, aborting the caller.
+    expect(truncate(['a', 'b'], 10)).toBe('');
+    expect(truncate(42, 10)).toBe('');
+    expect(truncate({}, 10)).toBe('');
+  });
 });
 
 // ─── typeIcon ───────────────────────────────────────────────────────────────
@@ -365,6 +382,15 @@ describe('clampImportance', () => {
     expect(clampImportance(1.4)).toBe(1);
     expect(clampImportance(1.6)).toBe(2);
     expect(clampImportance(2.5)).toBe(3);
+  });
+
+  it('coerces numeric strings instead of collapsing them to 1', () => {
+    // An LLM emitting "importance":"2" (quoted) used to lose the value (→1).
+    expect(clampImportance('2')).toBe(2);
+    expect(clampImportance('3')).toBe(3);
+    expect(clampImportance('1')).toBe(1);
+    expect(clampImportance('5')).toBe(3); // clamped
+    expect(clampImportance('abc')).toBe(1); // genuinely non-numeric still → 1
   });
 });
 
@@ -822,6 +848,20 @@ describe('parseJsonFromLLM', () => {
     expect(parseJsonFromLLM(JSON.stringify(obj))).toEqual(obj);
   });
 
+  it('recovers a leading object when unfenced prose contains a later brace', () => {
+    // Regression: the greedy {[\s\S]*} fallback spans first-{ to LAST-}, so an unrelated
+    // trailing {…} in prose defeated it and the valid leading object was lost.
+    expect(parseJsonFromLLM('{"title":"ok"}\nNote: also touched config {timeout}'))
+      .toEqual({ title: 'ok' });
+    expect(parseJsonFromLLM('The change: {"title":"fix parser","importance":2}. Next, update config {key}.'))
+      .toEqual({ title: 'fix parser', importance: 2 });
+  });
+
+  it('does not miscount braces that appear inside string values', () => {
+    expect(parseJsonFromLLM('prefix {"title":"has } brace","n":1} suffix'))
+      .toEqual({ title: 'has } brace', n: 1 });
+  });
+
   it('handles JSON with arrays', () => {
     const obj = { concepts: ['auth', 'jwt'], facts: ['uses bcrypt'] };
     expect(parseJsonFromLLM(JSON.stringify(obj))).toEqual(obj);
@@ -1025,6 +1065,48 @@ describe('scrubSecrets', () => {
   it('scrubs key: value style assignments', () => {
     expect(scrubSecrets('password: hunter2')).toBe('password: ***');
     expect(scrubSecrets('auth_token: bearer123')).toBe('auth_token: ***');
+  });
+
+  it('scrubs underscore-prefixed env-var credentials (the common .env shape)', () => {
+    // Regression: \b doesn't fire between `_` and the keyword (both \w chars), so
+    // DB_PASSWORD/GH_TOKEN/MY_AUTH_TOKEN leaked in plaintext. (?:\b|_) now covers them.
+    expect(scrubSecrets('DB_PASSWORD=supersecret123')).toBe('DB_PASSWORD=***');
+    expect(scrubSecrets('MYSQL_PASSWORD=hunter2hunter2')).toBe('MYSQL_PASSWORD=***');
+    expect(scrubSecrets('GH_TOKEN=ghtokenvalue12345')).toBe('GH_TOKEN=***');
+    expect(scrubSecrets('MY_AUTH_TOKEN=authtokenvalue123')).toBe('MY_AUTH_TOKEN=***');
+  });
+
+  it('scrubs access_token / refresh_token in KV and JSON form (OAuth2 fields)', () => {
+    expect(scrubSecrets('access_token=ya29.realtoken1234567890')).toBe('access_token=***');
+    expect(scrubSecrets('refresh_token=1//realtoken1234567890')).toBe('refresh_token=***');
+    expect(scrubSecrets('{"access_token": "ya29.A0ARrdaM-realtoken1234567890"}')).toBe('{"access_token": "***"}');
+  });
+
+  it('scrubs a bare SECRET= with a mixed-alnum (non-hex) value', () => {
+    expect(scrubSecrets('SECRET=abcdef1234secretvalue')).toBe('SECRET=***');
+  });
+
+  it('does not over-redact prose mentions or non-credential words', () => {
+    expect(scrubSecrets('the token: somemarkervalue')).toBe('the token: somemarkervalue');
+    expect(scrubSecrets('this is a normal sentence about a secret meeting')).toBe('this is a normal sentence about a secret meeting');
+    expect(scrubSecrets('topsecret=foobar123')).toBe('topsecret=foobar123');
+  });
+
+  it('does not over-redact identifiers whose name merely ends in a keyword (token_count etc.)', () => {
+    // The keyword must be adjacent to the = / : — a field like access_token_count is a
+    // metric, not a secret, and must survive.
+    expect(scrubSecrets('access_token_count: 1234567')).toBe('access_token_count: 1234567');
+    expect(scrubSecrets('refresh_token_limit=9999999')).toBe('refresh_token_limit=9999999');
+  });
+
+  it('keeps structured credential keys covered in BOTH the KV and JSON forms (cross-list parity)', () => {
+    // Drift guard: access_token/refresh_token once fell out of the KV list while staying in
+    // the JSON list. Every structured key must redact in both shapes so neither list drifts.
+    const STRUCTURED_KEYS = ['api_key', 'api_secret', 'secret_key', 'access_key', 'access_token', 'private_key', 'client_secret', 'auth_token', 'refresh_token'];
+    for (const k of STRUCTURED_KEYS) {
+      expect(scrubSecrets(`${k}=supersecretvalue123`), `KV form: ${k}`).toBe(`${k}=***`);
+      expect(scrubSecrets(`{"${k}": "supersecretvalue123"}`), `JSON form: ${k}`).toBe(`{"${k}": "***"}`);
+    }
   });
 
   it('scrubs AWS access keys', () => {

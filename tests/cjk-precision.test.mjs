@@ -42,6 +42,22 @@ describe('cjkPrecisionOk unit behavior', () => {
     expect(cjkPrecisionOk(noise, prose)).toBe(false);
   });
 
+  it('bypasses an all-particle query (every bigram is grammatical glue)', () => {
+    // Regression: a query made only of particles (的了是) produced bigrams 的了 / 了是.
+    // The old filter tested each 2-char bigram against the single-char CJK_STOP_WORDS
+    // set, so neither was filtered → `required` was non-empty → every candidate was
+    // wrongly rejected. Now isCjkNoiseBigram drops bigrams whose BOTH chars are stop
+    // words, so `required` empties and the gate bypasses (returns true).
+    expect(cjkPrecisionOk('的了是', 'this document has no chinese at all')).toBe(true);
+  });
+
+  it('still keeps single-particle compounds (有效/目的) — no over-rejection', () => {
+    // A bigram with only ONE stop char is a real compound, not glue. The query keeps a
+    // meaningful required term so genuinely-matching prose passes and unrelated fails.
+    expect(cjkPrecisionOk('有效的方法', '这是一个有效的方法说明')).toBe(true);
+    expect(cjkPrecisionOk('有效的方法', 'totally unrelated english prose here')).toBe(false);
+  });
+
   it('rejects prose when it shares zero query keywords', () => {
     // "中文查询测试不存在" → dict keywords [中文, 查询, 测试]
     // Prose shares none (weather small-talk) → 0/3 = 0% < 30% → rejected.

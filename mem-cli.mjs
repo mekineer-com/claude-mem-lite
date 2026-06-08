@@ -18,6 +18,7 @@ import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from '
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
+  recoverChildrenOf,
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
 } from './lib/maintain-core.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
@@ -32,7 +33,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
-import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints } from './cli/common.mjs';
+import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
@@ -667,6 +668,7 @@ function cmdGet(db, args) {
   }
 
   // Validate --fields against obs schema (only meaningful for obs rows).
+  if (rejectBareStringFlags(flags, ['fields', 'source'])) return;
   let requestedFields = null;
   if (flags.fields) {
     const allRequested = flags.fields.split(',').map(s => s.trim());
@@ -713,6 +715,10 @@ function cmdGet(db, args) {
 
 function cmdTimeline(db, args) {
   const { positional, flags } = parseArgs(args);
+  // Bare `--query` parses to boolean true and crashed downstream in sanitizeFtsQuery
+  // (nlp.mjs string ops on a boolean). No sensible default for a search anchor — reject
+  // cleanly (#8470). (`--project` bare is absorbed by resolveProject's non-string guard.)
+  if (rejectBareStringFlags(flags, ['query'])) return;
   // parseInt('-5') === -5 is truthy, so `|| 5` doesn't rescue negative input.
   // Match cmdSearch's warn-then-default pattern for consistency across CLI flags.
   const parseWindow = (label, raw) => {
@@ -944,6 +950,10 @@ function cmdSave(db, args) {
     return;
   }
 
+  // Reject value-less string flags before they reach .split()/saveObservation as a
+  // boolean `true` (#8470): bare --files/--title/--lesson crashed with a raw stacktrace.
+  if (rejectBareStringFlags(flags, ['title', 'files', 'lesson', 'lesson-learned', 'project', 'type'])) return;
+
   const type = flags.type || 'discovery';
   const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
   if (!validTypes.has(type)) {
@@ -1070,6 +1080,8 @@ function cmdDeferAdd(db, args) {
     fail(`[mem] defer add: title too long (${title.length} chars, max 200). Move detail to --detail "<text>".`);
     return;
   }
+  // Reject bare --files/--detail/--project before .split()/bind sees a boolean true (#8470).
+  if (rejectBareStringFlags(flags, ['files', 'detail', 'project'])) return;
   const priority = flags.priority !== undefined ? parseInt(flags.priority, 10) : 2;
   // isNumericToken first: bare parseInt would coerce "3xyz"→3 and silently escalate a
   // deferred item's urgency. Float literals still truncate (#8277).
@@ -1614,11 +1626,19 @@ function cmdDelete(db, args) {
         db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
       }
     }
-    return db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...ids);
+    // Resurface any rows merged/compressed INTO the doomed keepers before deleting,
+    // else they dangle behind a missing parent (compressed_into has no FK) — invisible
+    // to every COALESCE(compressed_into,0)=0 view and unrecoverable. Same guard the
+    // maintain hard-delete paths use (recoverChildrenOf); the interactive delete path
+    // was missing it. Returned in the result so the user sees the recovery count.
+    const recovered = recoverChildrenOf(db, ids);
+    const deleted = db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...ids);
+    return { changes: deleted.changes, recovered };
   });
   const result = deleteTx();
   const missing = ids.filter(id => !rows.some(r => r.id === id));
-  out(`[mem] Deleted ${result.changes} observation(s).${missing.length > 0 ? ` Note: ID(s) ${missing.join(', ')} not found.` : ''}`);
+  const recoveredNote = result.recovered > 0 ? ` Recovered ${result.recovered} merged/compressed child observation(s) to live.` : '';
+  out(`[mem] Deleted ${result.changes} observation(s).${recoveredNote}${missing.length > 0 ? ` Note: ID(s) ${missing.join(', ')} not found.` : ''}`);
 }
 
 // ─── Update ──────────────────────────────────────────────────────────────────
@@ -1644,18 +1664,10 @@ function cmdUpdate(db, args) {
     return;
   }
 
-  // A value-less `--flag` (last arg, or immediately followed by another --flag)
-  // parses to boolean `true` (cli/common.mjs parseArgs). For string-valued fields
-  // that boolean would slip past the string-only empty guards below and reach the
-  // SQLite bind, surfacing a raw "TypeError: SQLite3 can only bind ..." stacktrace
-  // — the same accidental shell-strip class the empty-title guard (#8470) catches.
-  // Reject it cleanly for every string-valued update flag.
-  for (const key of ['title', 'narrative', 'lesson', 'lesson-learned', 'concepts']) {
-    if (flags[key] === true) {
-      fail(`[mem] --${key} requires a value (received a bare flag with no value).`);
-      return;
-    }
-  }
+  // A value-less `--flag` parses to boolean `true` (cli/common.mjs parseArgs); for string
+  // fields that would reach the SQLite bind as a raw "TypeError: SQLite3 can only bind ..."
+  // (#8470). Reject cleanly via the shared guard — single source with the other commands.
+  if (rejectBareStringFlags(flags, ['title', 'narrative', 'lesson', 'lesson-learned', 'concepts'])) return;
 
   const updates = [];
   const params = [];
@@ -2172,6 +2184,9 @@ function cmdRegistry(_memDb, args) {
 
   try {
     if (action === 'search') {
+      // Bare `--query` parses to boolean true; `true || ...` would search for the literal
+      // string "true". Reject it cleanly (#8470) before it becomes a confusing no-match.
+      if (rejectBareStringFlags(flags, ['query', 'category', 'quality'])) return;
       const query = flags.query || positional.slice(1).join(' ');
       if (!query) { fail('[mem] Usage: claude-mem-lite registry search <query> [--type skill|agent] [--category C] [--quality Q]'); return; }
       let results = searchResources(rdb, query, {
@@ -2260,12 +2275,9 @@ function cmdRegistry(_memDb, args) {
     }
 
     if (action === 'import') {
-      // A bare value-less flag parses to boolean `true` (parseArgs); for these string
-      // fields that boolean reaches the SQLite bind in upsertResource and throws a raw
-      // TypeError — same class as the `update` guard above (#8470). Reject up front.
-      for (const key of ['name', 'resource-type', 'invocation-name', 'source', 'repo-url', 'local-path', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
-        if (flags[key] === true) { fail(`[mem] --${key} requires a value (received a bare flag with no value).`); return; }
-      }
+      // Bare value-less flags → boolean true → SQLite-bind crash in upsertResource (#8470).
+      // Shared guard — single source with update/remove/the other commands.
+      if (rejectBareStringFlags(flags, ['name', 'resource-type', 'invocation-name', 'source', 'repo-url', 'local-path', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases'])) return;
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
@@ -2287,11 +2299,9 @@ function cmdRegistry(_memDb, args) {
     }
 
     if (action === 'remove') {
-      // Bare value-less --name / --resource-type → boolean true → SQLite-bind crash
-      // on the DELETE below; reject like the import branch and the `update` guard.
-      for (const key of ['name', 'resource-type']) {
-        if (flags[key] === true) { fail(`[mem] --${key} requires a value (received a bare flag with no value).`); return; }
-      }
+      // Bare value-less --name / --resource-type → boolean true → SQLite-bind crash on
+      // the DELETE below; shared guard, single source with import/update.
+      if (rejectBareStringFlags(flags, ['name', 'resource-type'])) return;
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry remove --name N --resource-type skill|agent'); return; }

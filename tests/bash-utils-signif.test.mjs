@@ -76,4 +76,35 @@ describe('detectBashSignificance — green test summary exemption', () => {
     );
     expect(sig.isError).toBe(false);
   });
+
+  it('DOES flag a real failure piped to a pager (search verb after a pipe must not exempt)', () => {
+    // Regression: the exemption matched a search verb ANYWHERE in the command, so
+    // `... | tail` / `... | grep` suppressed error detection on real build/test failures.
+    const out = 'src/index.ts:42 - error TS2322\nnpm ERR! code 1\nnpm ERR! build failed';
+    expect(detectBashSignificance({ command: 'npm run build 2>&1 | tail -n 30' }, out).isError).toBe(true);
+    expect(detectBashSignificance({ command: 'make 2>&1 | grep -i error' }, out).isError).toBe(true);
+    // A hyphenated token must not trip \bcat\b / \btype\b as a primary search verb.
+    expect(detectBashSignificance({ command: 'node run-cat-tests.js' }, out).isError).toBe(true);
+  });
+
+  it('keeps the search-exemption for wrapped read commands (sudo/env/time + git read subcommands)', () => {
+    // The primary-command anchor must still exempt a search verb behind a wrapper or
+    // env-assignment, and git read subcommands (grep/log) whose output contains "error".
+    const readOut = 'config.log:42: throw new Error(x)\n  // error handler here too';
+    expect(detectBashSignificance({ command: 'sudo grep -i error /var/log/syslog' }, readOut).isError).toBe(false);
+    expect(detectBashSignificance({ command: 'git grep error src/' }, readOut).isError).toBe(false);
+    expect(detectBashSignificance({ command: 'git log --grep=fix' }, readOut).isError).toBe(false);
+    expect(detectBashSignificance({ command: 'time tail -n 5 build.log' }, readOut).isError).toBe(false);
+    expect(detectBashSignificance({ command: 'cat config.json | head' }, readOut).isError).toBe(false);
+  });
+
+  it('recognizes git subcommands behind global flags (-C, -c, --no-pager)', () => {
+    const out = 'x'.repeat(20);
+    expect(detectBashSignificance({ command: 'git -C /repo push origin main' }, out).isGit).toBe(true);
+    expect(detectBashSignificance({ command: 'git --no-pager commit -m x' }, out).isGit).toBe(true);
+    expect(detectBashSignificance({ command: 'git -c user.name=x commit -m y' }, out).isGit).toBe(true);
+    expect(detectBashSignificance({ command: 'git commit -m x' }, out).isGit).toBe(true);
+    // Must not false-positive on a read command that merely contains "commit" as an arg.
+    expect(detectBashSignificance({ command: 'git log --grep=commit' }, out).isGit).toBe(false);
+  });
 });
