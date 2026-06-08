@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
 import { scrubRecord } from '../lib/scrub-record.mjs';
+import { scrubSecrets } from '../secret-scrub.mjs';
 
 const SECRET = 'sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const POISONED = `error from upstream: token=${SECRET} not found`;
@@ -183,5 +184,51 @@ describe('end-to-end leak check via in-memory DB', () => {
     for (const k of ['title','narrative','text','concepts','facts','lesson_learned']) {
       expect(row[k], `${k} leaked`).not.toContain(SECRET);
     }
+  });
+});
+
+// D#32 safe subset: prefix-anchored provider credentials. Two-sided battery —
+// positives MUST scrub, and this repo's own hash-shaped data MUST survive
+// (the whole reason the bare-high-entropy pattern was deliberately NOT added).
+describe('scrubSecrets — provider-prefixed credentials (D#32 safe subset)', () => {
+  // 32-hex / 22-/43-char bodies are fixed-length sentinels, not real keys.
+  const HEX32 = '0123456789abcdef0123456789abcdef';     // 32 hex
+  const SENDGRID = `SG.${'aBcDeFgHiJkLmNoPqRsTuV'}.${'0123456789012345678901234567890123456789012'}`; // SG.<22>.<43>
+
+  it('scrubs SendGrid SG.<22>.<43> keys', () => {
+    expect(SENDGRID.length).toBe(3 + 22 + 1 + 43); // structural guard on the fixture
+    expect(scrubSecrets(`key: ${SENDGRID} end`)).not.toContain(SENDGRID);
+    expect(scrubSecrets(SENDGRID)).toBe('***');
+  });
+
+  it('scrubs Twilio Account SID (AC…) and API Key SID (SK…)', () => {
+    expect(scrubSecrets(`AC${HEX32}`)).toBe('***');
+    expect(scrubSecrets(`SK${HEX32}`)).toBe('***');
+    expect(scrubSecrets(`twilio sid AC${HEX32} configured`)).not.toContain(HEX32);
+  });
+
+  it('scrubs Mailgun private key (key-<32hex>)', () => {
+    expect(scrubSecrets(`key-${HEX32}`)).toBe('***');
+  });
+
+  // The asymmetric-loss negatives: a bare-hex pattern would have eaten all of
+  // these. Each is a real shape this repo stores/emits and must pass through.
+  it('does NOT scrub this repo\'s own hash-shaped data (no bare-token pattern)', () => {
+    const gitSha40   = '0123456789abcdef0123456789abcdef01234567';                       // 40-hex git SHA
+    const md5        = '5d41402abc4b2a76b9719d911017c592';                               // 32-hex MD5
+    const sha256     = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'; // 64-hex
+    const uuid       = '550e8400-e29b-41d4-a716-446655440000';
+    const shortSha   = '434c32d';
+    const minhashSig = '12,8841,290,77123,4,99021,1532,66,40021,3'; // comma-joined ints
+    for (const v of [gitSha40, md5, sha256, uuid, shortSha, minhashSig]) {
+      expect(scrubSecrets(`commit ${v} landed`), `over-scrubbed ${v}`).toContain(v);
+    }
+  });
+
+  // Regression guard for #8664 (already fixed): underscore-cased env vars must
+  // still scrub — confirms the deferred note's "underscore env" item is closed.
+  it('still scrubs underscore-cased env-var assignments (#8664)', () => {
+    expect(scrubSecrets('DB_PASSWORD=hunter2supersecret')).not.toContain('hunter2supersecret');
+    expect(scrubSecrets('GH_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toContain('***');
   });
 });

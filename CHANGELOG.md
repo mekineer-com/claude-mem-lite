@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.94.0 — secret-scrub provider coverage + CJK dictionary expansion (two deferred items, evidence-gated)
+
+Closes two deferred-work items (D#31, D#32), each resolved against a measurement instead of intuition.
+
+### Security
+
+**feat: `scrubSecrets` covers SendGrid, Twilio, and Mailgun credentials.** Added prefix-anchored patterns — SendGrid `SG.<22>.<43>`, Twilio Account/API Key SIDs (`AC`/`SK` + 32 hex), Mailgun `key-<32 hex>`. All are structurally specific, so false-positive risk is near-zero. Each ships with a two-sided fixture battery: positives scrub **and** the repo's own hash-shaped data (40-hex git SHAs, 32-hex MD5s, 64-hex SHA256s, UUIDs, comma-joined minhash signatures) is asserted to pass through untouched.
+
+**decision: bare high-entropy / "raw N-char" token scrubbing deliberately NOT added.** A generic 40-char-hex or entropy-gated pattern would silently `***` over this codebase's own git SHAs, MD5s, and stored `minhash_sig` values — high-frequency data corruption in a hash-heavy repo, and entropy gating cannot distinguish a secret from a SHA. The labelled-credential forms (`token=…`, `Authorization: Bearer …`, `"api_key":"…"`) already cover the dangerous shapes. A `DELIBERATELY NOT COVERED` comment block in `secret-scrub.mjs` documents the rejection so it isn't re-introduced.
+
+### CJK retrieval
+
+**feat: CJK_COMPOUNDS gains 16 high-frequency task/dev words.** A read-only prevalence probe (`benchmark/cjk-straddle-prevalence.mjs`) over 4017 real prompts showed 15.4% of CJK queries had zero dictionary-keyword match and fell through to all-bigram noise — driven not by the deferred "straddle-bigram filter" (which the probe showed is low-leverage, diluted in long queries) but by the dictionary lacking ubiquitous words (工作/用户/完成/计划/命令/工具/插件/实施/处理/清理/显示/本地/改动/确认/直接/开始). Adding them cut the zero-keyword noise slice from 533 to 377 prompts (−29% relative) with the curated retrieval benchmark identical before/after (R@10=0.8996, P@10=0.9731) and the full 2734-test suite green. Adding real words is monotonically safe — greedy longest-match only improves and real compounds cannot create straddle bigrams.
+
 ## v2.93.0 — five-round dogfooding sweep: secret-scrub leaks + delete/optimize data integrity + scoring + hook-pipeline correctness
 
 A sustained end-to-end audit of the whole surface (CLI, MCP, hooks, registry, install, secret-scrub), each finding reproduced before fix and covered by a regression test, then the full diff re-checked by an independent multi-agent review. ~30 behavior corrections — no new features, no schema change. Highlights by area:

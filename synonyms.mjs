@@ -265,6 +265,13 @@ export const CJK_COMPOUNDS = new Set([
   // architecture
   '架构', '设计', '方案', '规划', '文档', '注释', '版本', '分支', '依赖',
   '性能', '安全', '漏洞', '补丁', '系统', '算法',
+  // common task/dev vocab — mined from the zero-dict-keyword prompt slice
+  // (benchmark/cjk-straddle-prevalence.mjs). These ubiquitous words were absent
+  // from the dictionary, so ~15% of real CJK queries fell through to all-bigram
+  // noise. Adding real words is monotonically safe: greedy longest-match only
+  // improves, and real compounds cannot create boundary-straddle bigrams.
+  '工作', '用户', '完成', '计划', '命令', '工具', '插件', '实施', '处理',
+  '清理', '显示', '本地', '改动', '确认', '直接', '开始',
 ]);
 
 // ─── Dispatch Synonyms (unidirectional, broader groupings) ──────────────────

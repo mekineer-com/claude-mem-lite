@@ -61,6 +61,18 @@ export const SECRET_PATTERNS = [
   [/\bnpm_[a-zA-Z0-9]{36,}\b/g, '***'],
   // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_)
   [/\b[srp]k_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
+  // SendGrid API keys: SG.<22>.<43> — two dots at fixed offsets make this
+  // structurally unmistakable; near-zero false-positive risk.
+  [/\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b/g, '***'],
+  // Twilio identifiers: Account SID (AC…) + API Key SID (SK…), each = prefix
+  // + exactly 32 hex. The 2-letter prefix + 32-hex shape is specific: an MD5
+  // is 32 hex (no AC/SK prefix → no match) and a 40-hex git SHA has no internal
+  // \b so the trailing \b can't land mid-string. We deliberately do NOT scrub
+  // the bare-hex Twilio *auth token* — see comment block at end re: SHA collision.
+  [/\b(?:AC|SK)[0-9a-f]{32}\b/g, '***'],
+  // Mailgun private API keys: key-<32 hex>. Prefix-anchored for the same reason;
+  // bare 32-hex (no `key-`) is intentionally left alone to avoid hashing FPs.
+  [/\bkey-[0-9a-f]{32}\b/g, '***'],
   // JSON-quoted secrets — error payloads / API responses commonly carry creds
   // as `{"api_key": "..."}`. The base key=value pattern stops at quotes, so
   // these slip through. Match the value-quoted form explicitly. Length floor
@@ -69,6 +81,15 @@ export const SECRET_PATTERNS = [
   // Session cookies in headers / urlencoded bodies (sessionid=, session_id=, JSESSIONID=, PHPSESSID=).
   // 16+ chars filters out short test fixtures like sessionid=abc.
   [/\b((?:session[_-]?id|sessionid|jsessionid|phpsessid)\s*[=:]\s*)[^\s,;'"}\]]{16,}/gi, '$1***'],
+  // ── DELIBERATELY NOT COVERED: bare high-entropy / "raw N-char" tokens ──────
+  // A generic `[A-Fa-f0-9]{40}` / high-entropy regex would scrub this repo's own
+  // legitimate data: 40-hex git SHAs, 32-hex MD5s, 64-hex SHA256s, and stored
+  // `minhash_sig` values. In a hash-heavy codebase the false-positive cost
+  // (silent `***` over real content, lost recall) exceeds the marginal catch —
+  // and an entropy gate doesn't help because git SHAs are themselves high-entropy.
+  // The contextual forms (token=…, Authorization: Bearer …, "api_key":"…") above
+  // already cover the dangerous *labelled* shapes. If you are tempted to add a
+  // bare-token pattern here: don't — anchor it to a provider prefix instead.
 ];
 
 /**
