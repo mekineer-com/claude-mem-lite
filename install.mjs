@@ -302,6 +302,43 @@ function isDevInstall() {
   }
 }
 
+// Decide what to check out of a registry repo. We only ever copy the manifest's
+// `entry.path` subdirs into managed/skills|agents, so the working tree never
+// needs the rest of the repo — a partial+sparse clone fetches just those subtrees
+// (e.g. davila7/claude-code-templates: 197MB whole repo → a few MB of 3 paths).
+// Returns { full, paths }: `full` forces a normal checkout when any entry maps to
+// the repo root ('.') — sparse buys nothing there. Unsafe paths ('..'/absolute)
+// are dropped here exactly as the copy loop drops them, so they never reach
+// `sparse-checkout set`. Pure + exported for unit testing.
+export function planRepoSparsePaths(entries) {
+  let needsFull = false;
+  const paths = [];
+  for (const e of entries || []) {
+    const p = e && e.path;
+    if (!p || p === '.' || p === './') { needsFull = true; continue; }
+    if (isAbsolute(p) || String(p).includes('..')) continue; // unsafe — skipped at copy too
+    const norm = String(p).replace(/^\.\//, '').replace(/\/+$/, '');
+    if (norm && !paths.includes(norm)) paths.push(norm);
+  }
+  // No usable sparse paths (all root or all unsafe) → a full checkout is the only
+  // thing that can produce content; sparse would be an empty, pointless tree.
+  return { full: needsFull || paths.length === 0, paths };
+}
+
+// True only for a clone this code produced (partial-clone promisor + sparse-checkout
+// both on). A legacy full clone returns false → caller re-clones it slim. Detection
+// erring false only costs a one-time re-clone (the dir is a rebuildable cache), so
+// over-eager migration is safe; under-eager just keeps a fat clone one more cycle.
+function isPartialSparseClone(clonePath) {
+  const cfg = (key) => {
+    try {
+      return execFileSync('git', ['-C', clonePath, 'config', '--get', key],
+        { encoding: 'utf8', stdio: 'pipe' }).trim();
+    } catch { return ''; } // missing key → git exits non-zero → treat as unset
+  };
+  return cfg('remote.origin.promisor') === 'true' && cfg('core.sparseCheckout') === 'true';
+}
+
 // ─── Install ────────────────────────────────────────────────────────────────
 
 async function install() {
@@ -748,11 +785,39 @@ async function install() {
           const clonePath = join(managedDir, 'repos', repoName);
           let repoReady = false;
 
+          const plan = planRepoSparsePaths(entries);
+          const cloneUrl = `${repoUrl.replace(/\.git$/, '')}.git`;
+          // Clone only what we extract: a partial (blob:none) + sparse clone fetches
+          // just the manifest subpaths' subtrees instead of the whole repo. Falls
+          // back to a plain shallow clone if partial-clone/sparse-checkout is
+          // unsupported (old git/server) — identical to the prior behavior.
+          const cloneSlim = () => {
+            if (plan.full) {
+              execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
+              return;
+            }
+            try {
+              execFileSync('git', ['clone', '--depth', '1', '--filter=blob:none', '--no-checkout', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
+              execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 });
+              execFileSync('git', ['-C', clonePath, 'checkout'], { stdio: 'pipe', timeout: 30000 });
+            } catch {
+              try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
+              execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
+            }
+          };
+
+          // Migrate a legacy full clone: drop it so the fresh-clone path below
+          // rebuilds it slim. managed/repos is a rebuildable cache, so this loses
+          // nothing and reclaims the bulk of its footprint on the next install run.
+          if (!plan.full && existsSync(clonePath) && !isPartialSparseClone(clonePath)) {
+            try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
+          }
+
           if (!existsSync(clonePath)) {
-            // Fresh clone
+            // Fresh clone (also the rebuild path for a just-migrated legacy clone)
             try {
               mkdirSync(join(managedDir, 'repos'), { recursive: true });
-              execFileSync('git', ['clone', '--depth', '1', `${repoUrl.replace(/\.git$/, '')}.git`, clonePath], { stdio: 'pipe', timeout: 30000 });
+              cloneSlim();
               cloned++;
               repoReady = true;
             } catch (err) {
@@ -767,6 +832,11 @@ async function install() {
           } else {
             // Update existing: fetch latest and fast-forward
             try {
+              // Re-assert the sparse set so a newer manifest that adds a subpath to
+              // an already-slim clone checks it out (idempotent; no-op for full clones).
+              if (!plan.full && isPartialSparseClone(clonePath)) {
+                try { execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 }); } catch {}
+              }
               const localHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
               execFileSync('git', ['-C', clonePath, 'fetch', '--depth', '1', 'origin'], { stdio: 'pipe', timeout: 30000 });
               const remoteHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
