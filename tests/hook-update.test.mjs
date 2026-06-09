@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { execSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, statSync } from 'fs';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, statSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -540,6 +540,121 @@ describe('non-blocking SessionStart helpers (P3d)', () => {
     process.env.CLAUDE_MEM_SKIP_UPDATE = '1';
     expect(mod.isUpdateCheckDue()).toBe(false);
     expect(mod.getCachedUpdateBanner()).toBeNull();
+  });
+});
+
+// A plugin-cache version dir: ~/.claude/plugins/cache/sdsrss/claude-mem-lite/<ver>/
+// with a package.json whose name passes validateExtractedTarball and the three
+// required entry points. No source-files.mjs → loadReleaseManifest falls back to
+// the real LOCAL_SOURCE_FILES manifest; only the files present here get copied.
+function makeCacheVersion(home, version, body = `// v${version}`) {
+  const dir = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite', version);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'claude-mem-lite', version }, null, 2));
+  writeFileSync(join(dir, 'cli.mjs'), `#!/usr/bin/env node\n${body} cli\n`);
+  writeFileSync(join(dir, 'server.mjs'), `${body} server`);
+  writeFileSync(join(dir, 'hook.mjs'), `${body} hook`);
+  writeFileSync(join(dir, 'schema.mjs'), `${body} schema`);
+  return dir;
+}
+
+describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
+  it('upgrades the data-dir code from a newer cache version without running npm install', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    makeCacheVersion(home, '2.0.0', '// v2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+
+    const result = await syncDataDirFromCache();
+    expect(result).toMatchObject({ synced: true, from: '1.0.0', to: '2.0.0' });
+    // Source files landed at the cache version
+    expect(JSON.parse(readFileSync(join(codeDir, 'package.json'), 'utf8')).version).toBe('2.0.0');
+    expect(readFileSync(join(codeDir, 'cli.mjs'), 'utf8')).toContain('v2.0.0 cli');
+    expect(readFileSync(join(codeDir, 'hook.mjs'), 'utf8')).toContain('v2.0.0 hook');
+    expect(readFileSync(join(codeDir, 'schema.mjs'), 'utf8')).toContain('v2.0.0 schema');
+    // Local-cache sync MUST NOT shell out to npm install
+    expect(mockedExecSync).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform === 'win32')('marks the synced cli.mjs executable', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    await syncDataDirFromCache();
+    expect(statSync(join(codeDir, 'cli.mjs')).mode & 0o111).not.toBe(0);
+  });
+
+  it('leaves the data-dir node_modules untouched (skipNpmInstall)', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    mkdirSync(join(codeDir, 'node_modules', 'better-sqlite3'), { recursive: true });
+    writeFileSync(join(codeDir, 'node_modules', 'better-sqlite3', 'index.js'), '// abi-correct');
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    await syncDataDirFromCache();
+    expect(readFileSync(join(codeDir, 'node_modules', 'better-sqlite3', 'index.js'), 'utf8')).toContain('abi-correct');
+  });
+
+  it('no-ops when the data-dir is already at or ahead of the cache version', async () => {
+    const { home, codeDir } = makeCodeHome('2.0.0');
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    const result = await syncDataDirFromCache();
+    expect(result).toMatchObject({ synced: false, reason: 'data-dir-current', sourceVersion: '2.0.0', dataVersion: '2.0.0' });
+    // cli.mjs was never written by the no-op (makeCodeHome doesn't create it)
+    expect(existsSync(join(codeDir, 'cli.mjs'))).toBe(false);
+  });
+
+  it('picks the highest valid cache version when scanning', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    makeCacheVersion(home, '2.0.0');
+    makeCacheVersion(home, '2.10.0');   // semver, not lexicographic — must win over 2.0.0/2.9.0
+    makeCacheVersion(home, '2.9.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    const result = await syncDataDirFromCache();
+    expect(result).toMatchObject({ synced: true, to: '2.10.0' });
+    expect(JSON.parse(readFileSync(join(codeDir, 'package.json'), 'utf8')).version).toBe('2.10.0');
+  });
+
+  it('returns no-cache when the plugin cache dir is absent', async () => {
+    const { home } = makeCodeHome('1.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'no-cache' });
+  });
+
+  it('skips a cache version whose package.json name is not claude-mem-lite', async () => {
+    const { home } = makeCodeHome('1.0.0');
+    const dir = makeCacheVersion(home, '2.0.0');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'evil-squatter', version: '2.0.0' }, null, 2));
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    // Only that one (invalid) version exists → no valid version to sync from
+    expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'no-valid-cache-version' });
+  });
+
+  it('skips in dev mode (data-dir server.mjs is a symlink)', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    // Replace the regular-file server.mjs with a symlink → isDevMode() true
+    rmSync(join(codeDir, 'server.mjs'), { force: true });
+    const realSrc = join(makeDir('mem-dev-src'), 'server.mjs');
+    writeFileSync(realSrc, '// dev source');
+    symlinkSync(realSrc, join(codeDir, 'server.mjs'));
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'dev-mode' });
+  });
+
+  it('skips when the resolved source is the target dir (non-plugin direct install)', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    // sourceDir === targetDir → self-sync guard fires before any version compare
+    expect(await syncDataDirFromCache({ sourceDir: codeDir })).toMatchObject({ synced: false, reason: 'source-is-target' });
+  });
+
+  it('honors an explicit sourceDir (launch.mjs passes the running ROOT)', async () => {
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    const root = makeCacheVersion(home, '3.1.0', '// v3.1.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    const result = await syncDataDirFromCache({ sourceDir: root });
+    expect(result).toMatchObject({ synced: true, to: '3.1.0' });
+    expect(readFileSync(join(codeDir, 'cli.mjs'), 'utf8')).toContain('v3.1.0 cli');
   });
 });
 

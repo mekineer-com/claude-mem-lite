@@ -4,7 +4,7 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync, chmodSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
 import { DB_DIR, CODE_DIR } from './schema.mjs';
@@ -356,7 +356,15 @@ export function validateExtractedTarball(sourceDir, expectedVersion, expectedNam
   return { ok: true };
 }
 
-export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR) {
+// opts.skipNpmInstall — copy + atomically switch the source files WITHOUT
+// running `npm install` in staging. Used by syncDataDirFromCache: when the
+// source is a local plugin-cache version (not a downloaded tarball), the
+// target data dir already carries a working, ABI-correct node_modules, so a
+// reinstall is pure cost. With staging holding no node_modules the switch loop
+// below skips the 'node_modules' switchable path (existsSync guard), leaving
+// the target's node_modules untouched. Dependency bumps still flow through the
+// GitHub-tarball path (downloadAndInstall), which keeps skipNpmInstall=false.
+export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR, opts = {}) {
   const ts = `${Date.now()}-${process.pid}`;
   const stagingDir = join(targetDir, `.update-staging-${ts}`);
   const backupDir = join(targetDir, `.update-backup-${ts}`);
@@ -371,11 +379,13 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
     mkdirSync(backupDir, { recursive: true });
 
     copyReleaseIntoStaging(sourceDir, stagingDir, manifest);
-    execSync(NPM_INSTALL_CMD, {
-      cwd: stagingDir,
-      timeout: 60000,
-      stdio: 'pipe',
-    });
+    if (!opts.skipNpmInstall) {
+      execSync(NPM_INSTALL_CMD, {
+        cwd: stagingDir,
+        timeout: 60000,
+        stdio: 'pipe',
+      });
+    }
 
     for (const relPath of switchablePaths) {
       const stagedPath = join(stagingDir, relPath);
@@ -453,6 +463,91 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
     try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
     try { rmSync(backupDir, { recursive: true, force: true }); } catch {}
     return false;
+  }
+}
+
+// ── Plugin-cache → data-dir code sync ──────────────────────
+// Root cause this fixes: a plugin-mode install carries TWO independently
+// versioned code copies sharing one DB. The plugin cache
+// (~/.claude/plugins/cache/<mp>/claude-mem-lite/<ver>/) runs the MCP server and
+// is advanced by Claude Code's marketplace updater; on launch it opens the
+// shared DB and migrates the schema FORWARD. The data-dir copy
+// (~/.claude-mem-lite/) backs the standalone CLI symlink and the settings.json
+// hooks, but is only advanced by the GitHub-tarball auto-update — which plugin
+// mode disables (allowInstall=false) and which stalls easily (24h throttle,
+// rate limits, staging npm install). The data-dir code then lags the schema the
+// cache wrote and the CLI/hooks fail to open the DB
+// ("schema is vN but binary supports up to vN-1").
+//
+// Fix: make the data-dir code TRACK the plugin-cache version. The exact files
+// are already on disk in the cache, so this is a local source-file copy — no
+// network, no npm install — and the synced code is precisely the version that
+// migrated the DB, so schema compatibility is guaranteed by construction.
+// node_modules is left untouched (skipNpmInstall). Only ever upgrades; equal
+// versions no-op, which is the natural per-session throttle.
+//
+// opts.sourceDir   — explicit source (launch.mjs passes the running ROOT, the
+//                    exact version that owns the migrated DB). Omitted → scan
+//                    the plugin cache for the highest valid version.
+// opts.targetDir   — defaults to INSTALL_DIR (the homedir code dir, NOT
+//                    CLAUDE_MEM_DIR — see schema.mjs CODE_DIR / #8632).
+// opts.cacheBase   — override the cache root (tests).
+export async function syncDataDirFromCache(opts = {}) {
+  try {
+    const targetDir = opts.targetDir || INSTALL_DIR;
+
+    // Dev install: the data-dir entries are symlinks into the source repo.
+    // Overwriting them would clobber the working tree — never sync.
+    if (isDevMode()) return { synced: false, reason: 'dev-mode' };
+
+    let sourceDir = opts.sourceDir || null;
+    if (!sourceDir) {
+      const cacheBase = opts.cacheBase
+        || join(homedir(), '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      if (!existsSync(cacheBase)) return { synced: false, reason: 'no-cache' };
+      const versions = readdirSync(cacheBase)
+        .filter(n => /^\d+\.\d+/.test(n))
+        .sort((a, b) => compareVersions(b, a));   // newest first
+      for (const v of versions) {
+        const dir = join(cacheBase, v);
+        if (validateExtractedTarball(dir, null).ok) { sourceDir = dir; break; }
+      }
+      if (!sourceDir) return { synced: false, reason: 'no-valid-cache-version' };
+    }
+
+    // Non-plugin direct install: ROOT === data dir. Syncing a dir onto itself
+    // is a no-op at best and a same-path rename hazard at worst.
+    if (resolve(sourceDir) === resolve(targetDir)) {
+      return { synced: false, reason: 'source-is-target' };
+    }
+
+    const val = validateExtractedTarball(sourceDir, null);
+    if (!val.ok) return { synced: false, reason: `invalid-source: ${val.reason}` };
+
+    let sourceVersion;
+    try {
+      sourceVersion = JSON.parse(readFileSync(join(sourceDir, 'package.json'), 'utf8')).version;
+    } catch { return { synced: false, reason: 'source-version-unreadable' }; }
+
+    let dataVersion = '0.0.0';
+    try {
+      dataVersion = JSON.parse(readFileSync(join(targetDir, 'package.json'), 'utf8')).version || '0.0.0';
+    } catch { /* missing/corrupt target package.json → treat as 0.0.0, sync */ }
+
+    // Only ever upgrade. Equal → no-op (cheap version compare runs every session).
+    if (compareVersions(sourceVersion, dataVersion) <= 0) {
+      return { synced: false, reason: 'data-dir-current', sourceVersion, dataVersion };
+    }
+
+    debugLog('DEBUG', 'hook-update',
+      `Syncing data-dir code ${dataVersion} → ${sourceVersion} from plugin cache (${sourceDir})`);
+    const ok = await installExtractedRelease(sourceDir, targetDir, { skipNpmInstall: true });
+    return ok
+      ? { synced: true, from: dataVersion, to: sourceVersion }
+      : { synced: false, reason: 'install-failed', from: dataVersion, to: sourceVersion };
+  } catch (err) {
+    debugCatch(err, 'syncDataDirFromCache');
+    return { synced: false, reason: 'error' };
   }
 }
 

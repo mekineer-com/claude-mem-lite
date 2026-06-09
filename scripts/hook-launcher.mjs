@@ -104,6 +104,31 @@ async function attemptHeal(reason) {
   return result.status === 0;
 }
 
+// Defense-in-depth for plugin-mode version drift: the plugin-cache MCP server
+// (kept current by Claude Code) migrates the shared DB schema forward, while
+// this data-dir code (the standalone CLI + these hooks) is only advanced by the
+// GitHub-tarball auto-update, which plugin mode disables — so it can lag the
+// schema and fail to open the DB. syncDataDirFromCache copies the current cache
+// source files locally to close that gap. launch.mjs (MCP start) is the primary
+// healer; this is a backup that also covers the case where the MCP server never
+// starts. Gated to session-start (once per session, OFF the per-tool hot path)
+// and fully best-effort: a stale module without the fn, or any error, just
+// falls through to the normal entry import. The dynamic import keeps this
+// launcher's pure-`node:` static-import charter intact (it must survive a broken
+// install even if hook-update.mjs is unimportable).
+async function trySyncDataDirFromCache() {
+  try {
+    const { syncDataDirFromCache } = await import(
+      pathToFileURL(join(INSTALL_DIR, 'hook-update.mjs')).href
+    );
+    if (typeof syncDataDirFromCache === 'function') await syncDataDirFromCache();
+  } catch { /* best-effort — proceed to the normal entry regardless */ }
+}
+
+if (rest.includes('session-start')) {
+  await trySyncDataDirFromCache();
+}
+
 try {
   await runEntry();
 } catch (e) {

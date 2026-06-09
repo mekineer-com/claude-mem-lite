@@ -74,6 +74,27 @@ try {
   }
 }
 
+// Keep the data-dir code (~/.claude-mem-lite/ — backs the standalone CLI symlink
+// and the settings.json hooks) in lockstep with THIS running version. In plugin
+// mode the MCP server runs from the plugin cache (kept current by Claude Code's
+// marketplace updater) and migrates the shared DB schema forward; the data-dir
+// copy is only advanced by the GitHub-tarball auto-update, which plugin mode
+// disables and which stalls easily, so it drifts behind and the CLI/hooks then
+// fail to open the DB the cache migrated ("schema is vN but binary supports up
+// to vN-1"). syncDataDirFromCache copies the source files locally (no network,
+// no npm install) so the data-dir becomes exactly the version that owns the DB.
+// Best-effort — a sync failure must never block the MCP server launch. It runs
+// from the current cache code, so an already-drifted install self-heals on the
+// next launch once its cache reaches a version carrying this call.
+if (process.env.CLAUDE_PLUGIN_ROOT) {
+  try {
+    const { syncDataDirFromCache } = await import('../hook-update.mjs');
+    await syncDataDirFromCache({ sourceDir: ROOT });
+  } catch (e) {
+    process.stderr.write(`[claude-mem-lite] data-dir sync skipped: ${e.message}\n`);
+  }
+}
+
 // Dev mode: prefer ~/.claude-mem-lite/server.mjs (symlinked to source) over
 // CLAUDE_PLUGIN_ROOT (potentially stale plugin cache). This ensures the MCP
 // server always runs the latest code when installed with `install --dev`.

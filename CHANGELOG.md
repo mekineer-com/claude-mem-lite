@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.95.0 — fix: plugin-mode data-dir/cache version skew that breaks the CLI on a migrated DB
+
+### Auto-update
+
+**fix: the standalone CLI + hooks no longer drift behind the plugin cache and fail to open the DB.** A plugin-mode install carries two independently-versioned code copies sharing one database: the plugin cache (`~/.claude/plugins/cache/sdsrss/claude-mem-lite/<ver>/`, kept current by Claude Code's marketplace updater, runs the MCP server and migrates the DB schema **forward** on launch) and the data dir (`~/.claude-mem-lite/`, which backs the `~/.local/bin/claude-mem-lite` symlink and the settings.json hooks). The data dir is only advanced by the GitHub-tarball auto-update — and `hook-update.mjs:checkForUpdate` sets `allowInstall = !pluginMode`, so plugin mode **never** installs there, only shows a banner. The cache therefore races ahead and migrates the DB to schema v37 while the frozen data-dir CLI/hooks support only ≤v36, producing `Cannot open database: DB schema is v37 but this claude-mem-lite binary supports up to v36` on every CLI call (observed in the field at cache 2.94.0 / data-dir 2.89.0).
+
+**fix: `syncDataDirFromCache()` keeps the data-dir code in lockstep with the running cache version.** New export in `hook-update.mjs`: it resolves the source (the running `ROOT` from `launch.mjs`, or the highest valid cache version by scan), validates it via `validateExtractedTarball`, semver-compares, and on `cache > data-dir` copies the source files **locally** — no network, no rate limit, no `npm install`. The synced code is exactly the version that migrated the DB, so schema compatibility holds by construction. A new `installExtractedRelease(…, { skipNpmInstall: true })` option drives the local copy; because staging then contains no `node_modules`, the switch loop's `existsSync` guard skips that path and the data-dir's working, ABI-correct `node_modules` is left untouched. Guards: dev-mode (symlinked `server.mjs`) skip, source-is-target skip, only-ever-upgrade (equal → no-op, the natural per-session throttle).
+
+**Mounted at two points.** `scripts/launch.mjs` calls it on MCP-server start (runs from the current cache, so an already-drifted install self-heals on the next session once its cache reaches a version carrying this call) — the primary healer. `scripts/hook-launcher.mjs` calls it on `session-start` only via a best-effort dynamic import (backup for the MCP-never-starts case), preserving the launcher's pure-`node:` static-import charter so it still survives a broken install. Known limitation: a cache version that **bumps a dependency** still relies on the GitHub-tarball path for the data dir; the schema-skew case (pure-JS migration) — the actual failure mode here — is fully covered. 11 new tests in `tests/hook-update.test.mjs` (that file 28 → 39); full suite 2744 passed.
+
 ## v2.94.0 — secret-scrub provider coverage + CJK dictionary expansion (two deferred items, evidence-gated)
 
 Closes two deferred-work items (D#31, D#32), each resolved against a measurement instead of intuition.
