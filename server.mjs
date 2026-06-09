@@ -20,6 +20,7 @@ import {
 } from './lib/maintain-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
+import { formatObsFieldValue } from './cli/common.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
 // Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
@@ -801,8 +802,12 @@ server.registerTool(
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
           if (f === 'text' && row.narrative && typeof val === 'string' && val.startsWith(row.narrative)) continue;
+          // Shared formatter (cli/common.mjs) renders epoch-ms time fields as
+          // `<ms> (<relative>)` — parity with the CLI `get` path so an LLM reader
+          // gets a scannable hint instead of a bare millisecond integer.
+          const display = formatObsFieldValue(f, val);
           const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
-          lines.push(`${f}: ${typeof val === 'string' && val.length > maxLen ? val.slice(0, maxLen) + '…' : val}`);
+          lines.push(`${f}: ${typeof display === 'string' && display.length > maxLen ? display.slice(0, maxLen) + '…' : display}`);
         }
         sections.push(lines.join('\n'));
       }

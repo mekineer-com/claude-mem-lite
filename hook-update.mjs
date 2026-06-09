@@ -155,8 +155,22 @@ function isPluginMode() {
 // ── Dev Mode Detection ─────────────────────────────────────
 function isDevMode() {
   try {
-    const serverPath = join(INSTALL_DIR, 'server.mjs');
-    return existsSync(serverPath) && lstatSync(serverPath).isSymbolicLink();
+    // A dev checkout always carries a .git dir. This catches a whole-directory
+    // symlink (~/.claude-mem-lite -> /repo): lstat on server.mjs there follows the
+    // intermediate symlink and sees a regular file, so the per-file probe below
+    // would return false and auto-update would clobber the working tree.
+    if (existsSync(join(INSTALL_DIR, '.git'))) return true;
+    // Standard `install --dev` symlinks individual source files; checking several
+    // core files (not just server.mjs) survives the drift case where one file was
+    // replaced by a plain copy while the install is still symlink-provisioned —
+    // mirrors lib/doctor-drift.mjs's "any symlink ⇒ dev" detection. A copy-based
+    // real install (install.mjs non-dev) has no symlinks and no .git, so this
+    // cannot false-positive into never auto-updating.
+    for (const f of ['server.mjs', 'hook.mjs', 'cli.mjs', 'mem-cli.mjs']) {
+      const p = join(INSTALL_DIR, f);
+      if (existsSync(p) && lstatSync(p).isSymbolicLink()) return true;
+    }
+    return false;
   } catch { return false; }
 }
 

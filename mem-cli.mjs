@@ -33,7 +33,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
-import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags } from './cli/common.mjs';
+import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
@@ -559,24 +559,12 @@ function cmdRecall(db, args) {
 
 const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
 
-// Integer-typed time-epoch fields on the observations table that the `get`
-// command renders. Callers expect raw ms (audit) AND a relative-time hint
-// (human-scan), so formatObsFieldValue emits both. Other epoch fields like
-// `created_at_epoch` / `optimized_at` / `last_injected_at` aren't in
-// OBS_FIELDS so they don't surface via `get`.
-export const OBS_TIME_FIELDS = ['superseded_at', 'last_accessed_at'];
-
-// Pure formatter — null/undefined/non-time pass through; time fields on
-// integer values render as `<raw> (<relative>)` mirroring the convention
-// already used by `recent` / `timeline` / `recall`. Pre-2.63.0 the get
-// path printed bare ms (e.g. `last_accessed_at: 1778357330957`).
-export function formatObsFieldValue(field, val) {
-  if (val === null || val === undefined) return val;
-  if (OBS_TIME_FIELDS.includes(field) && typeof val === 'number') {
-    return `${val} (${relativeTime(val)})`;
-  }
-  return val;
-}
+// Time-field formatting moved to cli/common.mjs so the CLI `get` and the MCP
+// `mem_get` (server.mjs) share one source and can't drift (the drift bug:
+// MCP printed bare ms while CLI showed `<ms> (<relative>)`). Imported at the
+// top; re-exported here for back-compat with existing importers
+// (tests/get-time-format.test.mjs).
+export { OBS_TIME_FIELDS, formatObsFieldValue };
 
 function renderObsRows(db, ids, requestedFields) {
   const placeholders = ids.map(() => '?').join(',');
@@ -1797,12 +1785,15 @@ function cmdExport(db, args) {
 
   // Full round-trippable column set so `restore` rebuilds observations faithfully —
   // content + value-signals (access/cited/uncited/injection/decay) + branch + timing.
-  // Additive vs the pre-v2.90 13-col shape; existing `export | jq '.[].title'` consumers
-  // are unaffected. id + memory_session_id are informational (restore remaps id and
-  // buckets under a restore session).
+  // `search_aliases` is an FTS5-indexed column (BM25 weight 5) — dropping it on
+  // export silently lost the LLM-generated alternate query terms on restore, so a
+  // restored memory became unfindable by its aliases. Additive vs the pre-v2.90
+  // 13-col shape; existing `export | jq '.[].title'` consumers are unaffected.
+  // id + memory_session_id are informational (restore remaps id and buckets under
+  // a restore session).
   const rows = db.prepare(`
     SELECT id, memory_session_id, project, type, title, subtitle, narrative, concepts, facts,
-           files_read, files_modified, lesson_learned, importance, branch,
+           files_read, files_modified, lesson_learned, search_aliases, importance, branch,
            access_count, cited_count, uncited_streak, injection_count, decay_seen_count,
            last_accessed_at, created_at, created_at_epoch
     FROM observations WHERE ${wheres.join(' AND ')}
@@ -1863,7 +1854,7 @@ function cmdRestore(db, argv) {
 
   const dupCheck = db.prepare('SELECT id FROM observations WHERE project = ? AND title = ? AND created_at_epoch = ? LIMIT 1');
   const signalUpdate = db.prepare(`UPDATE observations SET
-      subtitle = ?, concepts = ?, facts = ?, files_read = ?, branch = COALESCE(?, branch),
+      subtitle = ?, concepts = ?, facts = ?, search_aliases = ?, files_read = ?, branch = COALESCE(?, branch),
       access_count = ?, cited_count = ?, uncited_streak = ?, injection_count = ?,
       decay_seen_count = ?, last_accessed_at = ?
     WHERE id = ?`);
@@ -1893,8 +1884,10 @@ function cmdRestore(db, argv) {
       });
       if (res.kind !== 'saved') { skipped++; continue; } // saveObservation Jaccard dedup
       // Re-apply the fields saveObservation zeros/derives so the backup is faithful.
+      // search_aliases is its own FTS5 column, so this UPDATE re-syncs the index
+      // (via the observations FTS triggers) and restored aliases stay searchable.
       signalUpdate.run(
-        r.subtitle || '', r.concepts || '', r.facts || '', r.files_read || '[]', r.branch ?? null,
+        r.subtitle || '', r.concepts || '', r.facts || '', r.search_aliases ?? null, r.files_read || '[]', r.branch ?? null,
         num(r.access_count), num(r.cited_count), num(r.uncited_streak), num(r.injection_count),
         num(r.decay_seen_count), r.last_accessed_at ?? null,
         res.id,

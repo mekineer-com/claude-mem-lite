@@ -601,7 +601,12 @@ export async function handleLLMEpisode() {
     await sleep(delayMs);
   }
 
-  const fileList = episode.files.map(f => basename(f)).join(', ') || '(multiple)';
+  // `episode.files` is normally a [] from createEpisode, but a malformed or
+  // older-format tmp file can omit it — `.map()` on undefined would throw here,
+  // before any cleanup, leaking the tmp file (which is then retried and crashes
+  // forever). Guard defensively, mirroring buildImmediateObservation's `|| []`.
+  const episodeFiles = Array.isArray(episode.files) ? episode.files : [];
+  const fileList = episodeFiles.map(f => basename(f)).join(', ') || '(multiple)';
 
   // Defense-in-depth (cso F#4): split static instructions (system) from
   // per-call data (user). Episode descriptions and file paths come from tool
@@ -622,7 +627,7 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
 JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
 ${SHARED_OBS_SCHEMA_TAIL}`;
     const user = `Tool: ${e.tool}
-File: ${episode.files.join(', ') || 'unknown'}
+File: ${episodeFiles.join(', ') || 'unknown'}
 Action: ${e.desc}
 Error: ${e.isError ? 'yes' : 'no'}`;
     prompt = { system, user };
@@ -743,7 +748,7 @@ ${actionList}`;
         narrative: truncate(parsed.narrative || '', 500),
         concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
         facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
-        files: episode.files,
+        files: episodeFiles,
         filesRead: episode.filesRead || [],
         // v2.33.1: when lesson is low-signal, don't trust Haiku's importance
         // inflation. v2.54.0: extended from {change, discovery} to all types
@@ -752,7 +757,12 @@ ${actionList}`;
         // imp=2-3 even when lesson is null after retry. Keep `decision` exempt:
         // it's rare (39 obs / 94.9% hit-rate) and the retry path already gave
         // it a second chance; a no-lesson decision is still a worthwhile signal.
-        importance: isLessonLowSignal && parsed.type !== 'decision'
+        // `!retryRecovered`: when the P3 retry recovered a substantive lesson,
+        // the obs is no longer low-signal — capping it to 1 would negate the
+        // retry's entire purpose (a recovered bugfix lesson would silently drop
+        // out of --importance 2 searches and the working tier). Gate the cap on
+        // the *effective* low-signal state, not the pre-retry flag.
+        importance: isLessonLowSignal && !retryRecovered && parsed.type !== 'decision'
           ? Math.min(ruleImportance, 1)
           : Math.max(ruleImportance, clampImportance(parsed.importance)),
         lessonLearned,

@@ -98,6 +98,24 @@ export function fmtDateShort(iso) {
   return iso.slice(0, 10);
 }
 
+// Integer epoch-ms time fields on the observations table that `get`/`mem_get`
+// render. Shared by the CLI (mem-cli.mjs) and the MCP server (server.mjs) so the
+// two `get` paths can't drift — pre-2.97 the MCP path printed bare ms
+// (`last_accessed_at: 1781024049720`) while the CLI showed `<ms> (<relative>)`,
+// because the formatter lived only in mem-cli.mjs.
+export const OBS_TIME_FIELDS = ['superseded_at', 'last_accessed_at'];
+
+// Pure formatter — null/undefined/non-time pass through; integer time fields
+// render as `<raw> (<relative>)` so callers get both an audit value and a
+// human/LLM-scannable hint, mirroring `recent`/`timeline`/`recall`.
+export function formatObsFieldValue(field, val) {
+  if (val === null || val === undefined) return val;
+  if (OBS_TIME_FIELDS.includes(field) && typeof val === 'number') {
+    return `${val} (${relativeTime(val)})`;
+  }
+  return val;
+}
+
 // ─── ID Token Parsing ────────────────────────────────────────────────────────
 // Re-exported from lib/id-routing.mjs so CLI and MCP (server.mjs) share a single
 // parser — parity per #8050. Keep this re-export for back-compat with the

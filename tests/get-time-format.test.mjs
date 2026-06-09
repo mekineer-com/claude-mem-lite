@@ -7,6 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { formatObsFieldValue, OBS_TIME_FIELDS } from '../mem-cli.mjs';
+import { formatObsFieldValue as commonFormat, OBS_TIME_FIELDS as commonFields } from '../cli/common.mjs';
 
 describe('formatObsFieldValue', () => {
   it('formats time fields as `<raw> (<relative>)`', () => {
@@ -39,5 +40,13 @@ describe('formatObsFieldValue', () => {
   it('OBS_TIME_FIELDS contains the two known time fields', () => {
     expect(OBS_TIME_FIELDS).toContain('last_accessed_at');
     expect(OBS_TIME_FIELDS).toContain('superseded_at');
+  });
+
+  // Single-source guard: the CLI (`get`) and the MCP server (`mem_get`) must use
+  // the SAME formatter, or they drift — pre-2.97 the MCP path printed bare ms.
+  // mem-cli.mjs re-exports from cli/common.mjs, so identity must hold.
+  it('mem-cli re-exports the exact cli/common formatter (no drift)', () => {
+    expect(formatObsFieldValue).toBe(commonFormat);
+    expect(OBS_TIME_FIELDS).toBe(commonFields);
   });
 });

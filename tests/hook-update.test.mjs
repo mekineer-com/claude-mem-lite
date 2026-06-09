@@ -653,6 +653,29 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
     expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'dev-mode' });
   });
 
+  it('treats a .git dir as dev mode (whole-directory symlink, server.mjs is a plain file)', async () => {
+    // ~/.claude-mem-lite -> /repo whole-dir symlink: server.mjs there is a plain
+    // file so the per-file probe misses it, but the checkout's .git is present.
+    // Without this, auto-update would clobber the working tree.
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    mkdirSync(join(codeDir, '.git'), { recursive: true });
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'dev-mode' });
+  });
+
+  it('treats a symlinked core file as dev mode even when server.mjs drifted to a plain copy', async () => {
+    // Standard `install --dev` symlinks many files; if server.mjs drifts to a plain
+    // copy but hook.mjs is still a symlink, the install is clearly dev-provisioned.
+    const { home, codeDir } = makeCodeHome('1.0.0'); // server.mjs is a plain file
+    const realSrc = join(makeDir('mem-dev-src2'), 'hook.mjs');
+    writeFileSync(realSrc, '// dev hook source');
+    symlinkSync(realSrc, join(codeDir, 'hook.mjs'));
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'dev-mode' });
+  });
+
   it('skips a pure-plugin data dir that has no prior code install (no orphan code written)', async () => {
     // makeCodeHome writes package.json + server.mjs but NO node_modules — a
     // pure-plugin data dir holds only DATA and runs code from the cache. Drop

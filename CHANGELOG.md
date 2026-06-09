@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.97.0 — eight-round dogfooding sweep: LLM-pipeline + MCP/CLI parity + export fidelity + auto-update safety
+
+Eight end-to-end dogfooding rounds (real CLI/MCP/hook usage, not unit tests). Each round dispatched bug-hunters across a subsystem and verified findings against ground truth; the majority of candidate findings were refuted (e.g. an `import-jsonl` "data loss" claim was disproven by scanning 4884 real transcript turns — the triggering shape occurs 0 times). Five real defects survived verification and are fixed here, each with a regression test. Full suite 2752 → 2759 passed.
+
+### LLM pipeline
+
+**fix: a recovered bugfix lesson no longer has its importance silently capped to 1.** In `hook-llm.mjs`, the P3 lesson-retry recovers a substantive `lesson_learned` when Haiku's first pass returns `none`, but `isLessonLowSignal` was computed once from that first pass and never recomputed — so the importance gate still fired, storing the recovered bugfix at importance 1. That dropped it out of `--importance 2` searches and the working tier, negating the retry's entire purpose. The cap now also gates on `!retryRecovered`, so a recovered lesson keeps the rule/Haiku importance.
+
+**fix: `handleLLMEpisode` no longer crashes and leaks a temp file when an episode lacks a `files` field.** A malformed or older-format `ep-flush-*.json` without `files` threw `TypeError: Cannot read properties of undefined (reading 'map')` *before* any cleanup, leaking the temp file — which was then retried and crashed forever (silent background-worker death + temp accumulation). `episode.files` is now guarded with `Array.isArray(...) ? ... : []`, mirroring `buildImmediateObservation`.
+
+### MCP/CLI parity
+
+**fix: MCP `mem_get` no longer prints bare epoch milliseconds for time fields.** `last_accessed_at` / `superseded_at` rendered as raw integers (`last_accessed_at: 1781024049720`) — meaningless to an LLM reader — while the CLI `get` showed `<ms> (<relative>)`. Root cause was CLI/MCP duplication drift: the formatter lived only in `mem-cli.mjs` (the 144KB CLI module the server won't import). Moved `formatObsFieldValue` + `OBS_TIME_FIELDS` to the shared `cli/common.mjs`, imported by both paths, with an identity test locking the single source against re-drift.
+
+### Export fidelity
+
+**fix: `export` → `restore` no longer drops `search_aliases`.** The export `SELECT` omitted the `search_aliases` column even though its own comment claimed a "full round-trippable column set." `search_aliases` is an FTS5-indexed column (BM25 weight 5) holding LLM-generated alternate query terms, so a restored memory became unfindable by its aliases. Added it to the export `SELECT` and the restore `signalUpdate`; the `UPDATE` re-syncs the FTS index via the observations triggers. Verified end-to-end cross-DB: an alias-only term finds the memory after a round-trip.
+
+### Auto-update safety
+
+**fix: `isDevMode()` is harder to false-negative into clobbering a dev checkout.** Auto-update guarded against overwriting a working tree by probing only whether `server.mjs` is a symlink. Two ways that false-negatives — a whole-directory symlink (`~/.claude-mem-lite -> /repo`, where `server.mjs` resolves to a plain file) and per-file symlink drift (which `doctor`'s dev-drift check already surfaces) — would let auto-update download a release tarball over the source. `isDevMode()` now also treats a `.git` dir as dev and checks several core files for symlink status (aligning with `lib/doctor-drift.mjs`'s any-symlink detection). A copy-based real install has neither, so this cannot false-positive into never updating.
+
 ## v2.96.0 — fix: registry repo clones are partial+sparse instead of retaining full working trees
 
 ### Disk

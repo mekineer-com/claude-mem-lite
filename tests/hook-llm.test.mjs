@@ -1,6 +1,6 @@
 // Tests for hook-llm.mjs — saveObservation, dedup tiers, related linking, LLM episode/summary
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { writeFileSync, rmSync } from 'fs';
+import { writeFileSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTestDb, insertSession } from './test-helpers.mjs';
@@ -329,6 +329,93 @@ describe('handleLLMEpisode', () => {
 
     // Only 1 callLLM call — no retry for 'change'
     expect(callLLM.mock.calls.length).toBe(1);
+  });
+
+  it('P3: recovered bugfix lesson keeps full importance (not capped to 1)', async () => {
+    // Regression: isLessonLowSignal was computed once from the FIRST pass and
+    // never recomputed after the retry recovered a lesson, so a bugfix with a
+    // recovered lesson was stored at importance=1, dropping it out of
+    // --importance 2 searches and the working tier — negating the whole point
+    // of the retry. Post-fix importance = max(ruleImportance, Haiku importance)
+    // = max(1, 2) = 2 (the Haiku-rated "notable" flows through instead of cap).
+    callLLM
+      .mockReturnValueOnce(JSON.stringify({
+        type: 'bugfix',
+        title: 'Fix FTS corruption on access_count UPDATE',
+        narrative: 'Wrapped in try/catch',
+        concepts: ['fts5'], facts: ['au trigger re-inserts FTS row'],
+        importance: 2,
+        lesson_learned: 'none',
+      }))
+      .mockReturnValueOnce(JSON.stringify({
+        lesson: 'FTS5 trigger fires on ANY column UPDATE including access_count — wrap writes in try/catch so SQLITE_CORRUPT_VTAB does not cascade.',
+      }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['schema.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Wrap FTS update', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const ev = db.prepare(`SELECT importance, body FROM events WHERE project = ?`).all('test-proj');
+    expect(ev.length).toBe(1);
+    expect(ev[0].body).toContain('FTS5 trigger fires on ANY column UPDATE');
+    // Recovered lesson → importance NOT capped to 1; Haiku's 2 flows through.
+    expect(ev[0].importance).toBe(2);
+  });
+
+  it('still caps importance to 1 when retry does NOT recover a lesson', async () => {
+    // Counterpart to the above: when the retry also returns low-signal, the cap
+    // must still fire so genuinely lesson-less bugfixes stay low-importance.
+    callLLM
+      .mockReturnValueOnce(JSON.stringify({
+        type: 'bugfix',
+        title: 'Touched schema file',
+        narrative: 'n', concepts: ['x'], facts: ['y'],
+        importance: 2,
+        lesson_learned: 'none',
+      }))
+      .mockReturnValueOnce(JSON.stringify({ lesson: 'none' }));
+
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['schema.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'edit', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const ev = db.prepare(`SELECT importance FROM events WHERE project = ?`).all('test-proj');
+    expect(ev.length).toBe(1);
+    expect(ev[0].importance).toBe(1);
+  });
+
+  it('does not crash and cleans up tmp file when episode.files is missing', async () => {
+    // Regression: episode.files.map() / .join() threw on a malformed tmp file
+    // lacking the `files` field, BEFORE any cleanup — leaking the tmp file,
+    // which was then retried and crashed forever.
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change',
+      title: 'Some edit',
+      narrative: 'n', concepts: ['x'], facts: ['y'],
+      importance: 1,
+      lesson_learned: 'A genuine lesson worth keeping for later sessions here.',
+    }));
+
+    // Note: NO `files` key.
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj', filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'edit something', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await expect(handleLLMEpisode()).resolves.not.toThrow();
+    // tmp file must be cleaned up, not leaked.
+    expect(existsSync(tmpFile)).toBe(false);
   });
 
   // v2.56.0 #1 paired-gate DROP. Catches Haiku-titled change obs with null

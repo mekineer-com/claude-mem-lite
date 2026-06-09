@@ -109,6 +109,35 @@ describe('D#25 export → restore round-trip', () => {
     expect(count).toBe(2); // no duplication
   });
 
+  it('round-trips search_aliases and keeps them FTS-searchable after restore', () => {
+    // Regression: export dropped the search_aliases column, so a restored memory
+    // became unfindable by its LLM-generated alternate query terms. Seed an obs
+    // whose alias term ("zqxwombat") appears ONLY in search_aliases — not in
+    // title/narrative — so a hit proves the alias column survived + re-indexed.
+    const db = initDb(srcDir + '-alias');
+    insertSession(db, { id: 'a-sess', project: 'aliasproj', memoryId: 'a-sess' });
+    insertObs(db, {
+      sessionId: 'a-sess', project: 'aliasproj', type: 'bugfix',
+      title: 'sqlite vtab cascade fix', narrative: 'fixed the cascade on UPDATE',
+      searchAliases: 'zqxwombat promisor blobless', importance: 2,
+    });
+    db.close();
+
+    writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir + '-alias').stdout);
+    runCli(['restore', expFile], dstDir);
+
+    const rdb = new Database(join(dstDir, 'claude-mem-lite.db'));
+    const row = rdb.prepare("SELECT search_aliases FROM observations WHERE title = 'sqlite vtab cascade fix'").get();
+    rdb.close();
+    expect(row.search_aliases).toBe('zqxwombat promisor blobless');
+
+    // Alias-only term must find the restored obs (proves FTS index re-synced).
+    const search = runCli(['search', 'zqxwombat'], dstDir);
+    expect(search.stdout).toMatch(/sqlite vtab cascade fix/);
+
+    try { rmSync(srcDir + '-alias', { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
   it('--dry-run previews without writing', () => {
     writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir).stdout);
     const r = runCli(['restore', expFile, '--dry-run'], dstDir);
