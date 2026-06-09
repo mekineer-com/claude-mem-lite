@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.95.1 — fix: `syncDataDirFromCache` only heals an existing code install (no orphan writes)
+
+**fix: the data-dir sync no longer writes source files into a pure-plugin data dir.** `scripts/setup.sh` (the plugin's SessionStart bootstrap) materializes only the **data** dir — DB, `runtime/`, and `node_modules` — and never copies source code or runs `install.mjs`; a `~/.claude-mem-lite/` code copy exists only for users who separately ran `claude-mem-lite install` (the direct-install path that actually drifts, e.g. the v2.95.0 report). For a pure-plugin user, v2.95.0's `syncDataDirFromCache` read no `package.json` (treating the dir as version `0.0.0`) and would copy ~50 source files into a dir that held only data — a non-functional orphan code tree (no wired deps) that also made `launch-preflight`'s fallback mis-detect a "complete" install. `syncDataDirFromCache` now requires proof of a real prior code install — both `package.json` **and** a resolvable `node_modules/better-sqlite3` binding — before syncing, returning `no-existing-code-install` otherwise. The reported direct-install drift has both, so it still heals; pure-plugin data dirs are left untouched. Two new guard tests; full suite 2746 passed. Verified end-to-end against the real repo: a simulated stale `2.89.0`/schema-v36 data dir syncs to `2.95.x`/schema-v37 with `node_modules` preserved.
+
 ## v2.95.0 — fix: plugin-mode data-dir/cache version skew that breaks the CLI on a migrated DB
 
 ### Auto-update

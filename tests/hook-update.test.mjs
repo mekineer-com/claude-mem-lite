@@ -558,9 +558,18 @@ function makeCacheVersion(home, version, body = `// v${version}`) {
   return dir;
 }
 
+// syncDataDirFromCache only heals an EXISTING standalone-CLI code install,
+// proven by package.json (makeCodeHome writes it) + a resolvable better-sqlite3
+// binding. This seeds the binding so the sync path proceeds in tests.
+function seedBinding(codeDir) {
+  mkdirSync(join(codeDir, 'node_modules', 'better-sqlite3'), { recursive: true });
+  writeFileSync(join(codeDir, 'node_modules', 'better-sqlite3', 'index.js'), '// abi-correct');
+}
+
 describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
   it('upgrades the data-dir code from a newer cache version without running npm install', async () => {
     const { home, codeDir } = makeCodeHome('1.0.0');
+    seedBinding(codeDir);
     makeCacheVersion(home, '2.0.0', '// v2.0.0');
     const { syncDataDirFromCache } = await loadModule({ HOME: home });
 
@@ -577,6 +586,7 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
 
   it.skipIf(process.platform === 'win32')('marks the synced cli.mjs executable', async () => {
     const { home, codeDir } = makeCodeHome('1.0.0');
+    seedBinding(codeDir);
     makeCacheVersion(home, '2.0.0');
     const { syncDataDirFromCache } = await loadModule({ HOME: home });
     await syncDataDirFromCache();
@@ -595,6 +605,7 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
 
   it('no-ops when the data-dir is already at or ahead of the cache version', async () => {
     const { home, codeDir } = makeCodeHome('2.0.0');
+    seedBinding(codeDir);
     makeCacheVersion(home, '2.0.0');
     const { syncDataDirFromCache } = await loadModule({ HOME: home });
     const result = await syncDataDirFromCache();
@@ -605,6 +616,7 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
 
   it('picks the highest valid cache version when scanning', async () => {
     const { home, codeDir } = makeCodeHome('1.0.0');
+    seedBinding(codeDir);
     makeCacheVersion(home, '2.0.0');
     makeCacheVersion(home, '2.10.0');   // semver, not lexicographic — must win over 2.0.0/2.9.0
     makeCacheVersion(home, '2.9.0');
@@ -641,6 +653,28 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
     expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'dev-mode' });
   });
 
+  it('skips a pure-plugin data dir that has no prior code install (no orphan code written)', async () => {
+    // makeCodeHome writes package.json + server.mjs but NO node_modules — a
+    // pure-plugin data dir holds only DATA and runs code from the cache. Drop
+    // package.json too so neither proof-of-install signal is present.
+    const { home, codeDir } = makeCodeHome('1.0.0');
+    rmSync(join(codeDir, 'package.json'), { force: true });
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    const result = await syncDataDirFromCache();
+    expect(result).toMatchObject({ synced: false, reason: 'no-existing-code-install' });
+    // No source files leaked into the data dir
+    expect(existsSync(join(codeDir, 'cli.mjs'))).toBe(false);
+    expect(existsSync(join(codeDir, 'hook.mjs'))).toBe(false);
+  });
+
+  it('skips a data dir that has package.json but no resolvable better-sqlite3 binding', async () => {
+    const { home } = makeCodeHome('1.0.0'); // package.json present, no node_modules
+    makeCacheVersion(home, '2.0.0');
+    const { syncDataDirFromCache } = await loadModule({ HOME: home });
+    expect(await syncDataDirFromCache()).toMatchObject({ synced: false, reason: 'no-existing-code-install' });
+  });
+
   it('skips when the resolved source is the target dir (non-plugin direct install)', async () => {
     const { home, codeDir } = makeCodeHome('1.0.0');
     const { syncDataDirFromCache } = await loadModule({ HOME: home });
@@ -650,6 +684,7 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
 
   it('honors an explicit sourceDir (launch.mjs passes the running ROOT)', async () => {
     const { home, codeDir } = makeCodeHome('1.0.0');
+    seedBinding(codeDir);
     const root = makeCacheVersion(home, '3.1.0', '// v3.1.0');
     const { syncDataDirFromCache } = await loadModule({ HOME: home });
     const result = await syncDataDirFromCache({ sourceDir: root });

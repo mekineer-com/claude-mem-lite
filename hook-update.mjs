@@ -521,6 +521,19 @@ export async function syncDataDirFromCache(opts = {}) {
       return { synced: false, reason: 'source-is-target' };
     }
 
+    // Only heal an EXISTING standalone-CLI code install — the case that actually
+    // drifts. A pure-plugin user's ~/.claude-mem-lite/ holds only DATA (DB +
+    // runtime, maybe node_modules) and runs ALL code from the cache; setup.sh
+    // never materializes source files there. Writing them in would create a
+    // non-functional orphan code tree and make launch-preflight's fallback
+    // mis-detect it as a complete install. Require proof of a real prior code
+    // install: package.json AND a resolvable better-sqlite3 binding (both present
+    // on a drifted direct install; absent for a pure-plugin data dir).
+    if (!existsSync(join(targetDir, 'package.json'))
+        || !existsSync(join(targetDir, 'node_modules', 'better-sqlite3'))) {
+      return { synced: false, reason: 'no-existing-code-install' };
+    }
+
     const val = validateExtractedTarball(sourceDir, null);
     if (!val.ok) return { synced: false, reason: `invalid-source: ${val.reason}` };
 
