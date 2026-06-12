@@ -69,6 +69,8 @@
     "lib/save-observation.mjs",
     "lib/observation-write.mjs",
     "lib/recall-core.mjs",
+    "lib/timeline-core.mjs",
+    "lib/search-core.mjs",
     "lib/compress-core.mjs",
     "lib/maintain-core.mjs",
     "lib/dedup-constants.mjs",

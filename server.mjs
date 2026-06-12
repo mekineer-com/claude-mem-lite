@@ -5,13 +5,14 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined } from './utils.mjs';
-import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
+import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
-import { searchObservationsHybrid, findFtsAnchor, countSearchTotal } from './search-engine.mjs';
+import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
+import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
@@ -19,7 +20,7 @@ import {
   OP_CAP, STALE_AGE_MS,
 } from './lib/maintain-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
-import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
+import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { formatObsFieldValue } from './cli/common.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
@@ -36,7 +37,7 @@ import { join, sep } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
+import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
@@ -91,7 +92,7 @@ function getRegistryDb() {
   return registryDb;
 }
 
-// inferProject, jaccardSimilarity, sanitizeFtsQuery, typeIcon, truncate, fmtDate imported from utils.mjs
+// inferProject, typeIcon, truncate, fmtDate imported from utils.mjs
 
 // ─── Project Name Resolution ────────────────────────────────────────────────
 // Users naturally type short names like "mem" but inferProject() stores
@@ -118,8 +119,7 @@ function resolveProject(name) { return _resolveProjectShared(db, name); }
 //   Importance:    0.5 + 0.5 × importance (range 0.5–2.0)
 //   Access bonus:  1 + 0.1 × ln(1 + access_count)
 
-// SESS_BM25, TYPE_DECAY_CASE imported from utils.mjs
-const RECENCY_HALF_LIFE_MS = DEFAULT_DECAY_HALF_LIFE_MS;
+// Session/prompt FTS scoring (SESS_BM25 + recency decay) lives in lib/search-core.mjs.
 
 // ─── MCP Server ─────────────────────────────────────────────────────────────
 
@@ -176,30 +176,11 @@ function searchSessions(ctx) {
   const results = [];
 
   if (ftsQuery) {
-    const now = Date.now();
-    const sessionProjectBoost = args.project ? null : currentProject;
-    const rows = db.prepare(`
-      SELECT s.id, s.request, s.completed, s.project, s.created_at, s.created_at_epoch,
-             ${SESS_BM25}
-               * (1.0 + EXP(-0.693 * (? - s.created_at_epoch) / ${RECENCY_HALF_LIFE_MS}.0))
-               * (CASE WHEN ? IS NOT NULL AND s.project = ? THEN 2.0 ELSE 1.0 END) as score
-      FROM session_summaries_fts
-      JOIN session_summaries s ON session_summaries_fts.rowid = s.id
-      WHERE session_summaries_fts MATCH ?
-        AND (? IS NULL OR s.project = ?)
-        AND (? IS NULL OR s.created_at_epoch >= ?)
-        AND (? IS NULL OR s.created_at_epoch <= ?)
-      ORDER BY score
-      LIMIT ? OFFSET ?
-    `).all(
-      now,
-      sessionProjectBoost, sessionProjectBoost,
-      ftsQuery,
-      args.project ?? null, args.project ?? null,
-      epochFrom, epochFrom,
-      epochTo, epochTo,
-      perSourceLimit, perSourceOffset
-    );
+    const rows = searchSessionsFts(db, {
+      ftsQuery, project: args.project ?? null,
+      projectBoost: args.project ? null : currentProject,
+      epochFrom, epochTo, perSourceLimit, perSourceOffset,
+    });
     for (const r of rows) {
       results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
     }
@@ -232,67 +213,14 @@ function searchPrompts(ctx) {
   const results = [];
 
   if (ftsQuery) {
-    const rows = db.prepare(`
-      SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch,
-             bm25(user_prompts_fts, 1) as score
-      FROM user_prompts_fts
-      JOIN user_prompts p ON user_prompts_fts.rowid = p.id
-      JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
-      WHERE user_prompts_fts MATCH ?
-        AND p.prompt_text NOT LIKE '<task-notification>%'
-        AND (? IS NULL OR s.project = ?)
-        AND (? IS NULL OR p.created_at_epoch >= ?)
-        AND (? IS NULL OR p.created_at_epoch <= ?)
-      ORDER BY score
-      LIMIT ? OFFSET ?
-    `).all(
-      ftsQuery,
-      args.project ?? null, args.project ?? null,
-      epochFrom, epochFrom,
-      epochTo, epochTo,
-      perSourceLimit, perSourceOffset
-    );
-    // CJK precision filter: unicode61 FTS degrades CJK bigram queries to
-    // single-char AND, letting any prose sharing common chars leak through.
-    // Require ≥30% of query's CJK bigrams/keywords as contiguous substrings.
-    const keptRows = args.query ? rows.filter(r => cjkPrecisionOk(args.query, r.prompt_text)) : rows;
-    for (const r of keptRows) {
+    // CJK precision gate + LIKE fallback live in the shared core (see
+    // lib/search-core.mjs for the leak rationale).
+    const rows = searchPromptsFts(db, {
+      query: args.query, ftsQuery, project: args.project ?? null,
+      epochFrom, epochTo, perSourceLimit, perSourceOffset,
+    });
+    for (const r of rows) {
       results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
-    }
-    // CJK LIKE fallback: FTS5 unicode61 can't tokenize CJK substrings in prompts
-    if (keptRows.length === 0 && args.query) {
-      const cjkPatterns = extractCjkLikePatterns(args.query);
-      if (cjkPatterns.length > 0) {
-        const likeConds = cjkPatterns.map(() => 'p.prompt_text LIKE ?');
-        const likeParams = cjkPatterns.map(p => `%${p}%`);
-        const fallbackRows = db.prepare(`
-          SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
-          FROM user_prompts p
-          JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
-          WHERE (${likeConds.join(' OR ')})
-            AND p.prompt_text NOT LIKE '<task-notification>%'
-            AND (? IS NULL OR s.project = ?)
-            AND (? IS NULL OR p.created_at_epoch >= ?)
-            AND (? IS NULL OR p.created_at_epoch <= ?)
-          ORDER BY p.created_at_epoch DESC
-          LIMIT ? OFFSET ?
-        `).all(
-          ...likeParams,
-          args.project ?? null, args.project ?? null,
-          epochFrom, epochFrom,
-          epochTo, epochTo,
-          perSourceLimit, perSourceOffset
-        );
-        // Parity with mem-cli.mjs: the LIKE fallback is an OR'd bigram
-        // substring scan with no scoring gate. The precision filter must
-        // apply here too — without it, queries whose FTS set is empty
-        // re-admit the full common-char noise band that FTS would have
-        // dropped downstream anyway.
-        const keptFallback = args.query ? fallbackRows.filter(r => cjkPrecisionOk(args.query, r.prompt_text)) : fallbackRows;
-        for (const r of keptFallback) {
-          results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: 0 });
-        }
-      }
     }
   } else if (searchType === 'prompts') {
     const params = [];
@@ -388,32 +316,20 @@ server.registerTool(
     // args.or (Batch A CLI↔MCP alignment): force OR from start, matching
     // CLI `search --or`. The default path still does AND with OR-fallback
     // inside searchObservations when AND returns 0.
-    let ftsQuery = sanitizeFtsQuery(args.query);
-    if (ftsQuery && args.or) {
-      ftsQuery = relaxFtsQueryToOr(ftsQuery) || ftsQuery;
-    }
+    const ftsQuery = buildSearchFtsQuery(args.query, { or: args.or });
     const searchType = args.type;
     const currentProject = inferProject();
 
-    // Over-fetch from offset 0 for EVERY mode, then apply `offset` exactly once at
-    // the merge slice below — identical to the CLI (mem-cli.mjs perSourceOffset=0).
-    // The old single-source branch (perSourceLimit=limit, perSourceOffset=offset)
-    // double-applied offset: it pushed offset into the per-source SQL AND re-sliced
-    // by offset at merge, so explicit `type=observations` paging overlapped (page 0
-    // == page 1) and gapped (oldest rows unreachable). It also fetched only `limit`
-    // rows — fewer than offset+limit — so there was nothing to page into. (#8217)
-    const perSourceLimit = Math.max(limit * 3, offset + limit + 10);
-    const perSourceOffset = 0;
+    // Over-fetch from offset 0 for EVERY mode, then apply `offset` exactly once
+    // at the merge slice below — shared sizing with the CLI (see
+    // computePerSourceWindow for the #8217 double-offset rationale).
+    const { perSourceLimit, perSourceOffset } = computePerSourceWindow(limit, offset);
 
-    // Parse date bounds to epoch (with validation)
-    // date_to with date-only format (YYYY-MM-DD) extends to end-of-day (23:59:59.999Z)
-    const epochFrom = args.date_from ? new Date(args.date_from).getTime() : null;
-    let epochTo = args.date_to ? new Date(args.date_to).getTime() : null;
-    if (epochTo !== null && args.date_to && /^\d{4}-\d{2}-\d{2}$/.test(args.date_to)) {
-      epochTo += 86400000 - 1; // extend to 23:59:59.999
-    }
-    if (epochFrom !== null && isNaN(epochFrom)) throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
-    if (epochTo !== null && isNaN(epochTo)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
+    // Parse date bounds to epoch (with validation; date-only date_to extends
+    // to end-of-day 23:59:59.999Z — shared with CLI --from/--to)
+    const bounds = parseDateBounds(args.date_from, args.date_to);
+    if (!bounds.ok) throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
+    const { epochFrom, epochTo } = bounds;
 
     // Early return when query was provided but sanitized to nothing (all FTS5 keywords/special chars)
     if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance) {
@@ -450,19 +366,11 @@ server.registerTool(
       }
     }
 
-    // Cross-source score normalization: normalize each source to [-1, 0] before merging
-    // Prevents observations (BM25 scores can reach -40) from systematically outranking
-    // sessions (-6) and prompts (-1) regardless of actual relevance
+    // Cross-source score normalization (shared with CLI — lib/search-core.mjs):
+    // normalize each source to [-1, 0] before merging so observations (BM25 can
+    // reach -40) don't systematically outrank sessions (-6) and prompts (-1).
     if (isCrossSource && results.length > 0 && ftsQuery) {
-      for (const source of ['obs', 'session', 'prompt']) {
-        const sourceResults = results.filter(r => r.source === source && r.score !== null && r.score !== undefined);
-        // Skip normalization for single-result sources — avoids inflating a weak match to -1.0
-        if (sourceResults.length < 2) continue;
-        const maxAbs = Math.max(...sourceResults.map(r => Math.abs(r.score)));
-        if (maxAbs > 0) {
-          for (const r of sourceResults) r.score = r.score / maxAbs;
-        }
-      }
+      normalizeCrossSourceScores(results, 'source');
     }
 
     // Global sort (cross-source)
@@ -482,41 +390,17 @@ server.registerTool(
       results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 
-    // Tier post-filter: batch-lookup full rows and classify
+    // Tier post-filter: batch-lookup full rows and classify (shared with CLI).
+    // Classification uses the explicitly-requested project, not the CWD-inferred
+    // one — see applyTierFilter for the cross-project rationale.
     if (args.tier) {
-      const obsIds = results.filter(r => r.source === 'obs').map(r => r.id);
-      if (obsIds.length > 0) {
-        const placeholders = obsIds.map(() => '?').join(',');
-        const fullRows = db.prepare(
-          `SELECT id, compressed_into, superseded_at, memory_session_id, project, importance, last_accessed_at, created_at_epoch, type FROM observations WHERE id IN (${placeholders})`
-        ).all(...obsIds);
-        const rowMap = new Map(fullRows.map(r => [r.id, r]));
-        // Use the explicitly-requested project for tier classification, not the
-        // CWD-inferred one — else computeTier's "obs.project === currentProject"
-        // (working/active rules) fails for cross-project searches and the tier=
-        // filter silently drops valid rows. mem_stats/mem_browse already resolve
-        // args.project first; this restores parity.
-        const tierCtx = { now: Date.now(), currentProject: args.project || currentProject, currentSessionId: '' };
-        const filtered = results.filter(r => {
-          if (r.source !== 'obs') return true;
-          const full = rowMap.get(r.id);
-          return full && computeTier(full, tierCtx) === args.tier;
-        });
-        results.length = 0;
-        results.push(...filtered);
-      } else if (args.tier !== 'archive') {
-        // No obs results but tier filter set — keep non-obs results
-      }
+      const filtered = applyTierFilter(db, results, { tier: args.tier, sourceKey: 'source', currentProject: args.project || currentProject });
+      results.length = 0;
+      results.push(...filtered);
     }
 
-    // Apply user-requested sort (after relevance scoring)
-    const sort = args.sort || 'relevance';
-    if (sort === 'time') {
-      results.sort((a, b) => (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
-    } else if (sort === 'importance') {
-      results.sort((a, b) => (b.importance ?? 1) - (a.importance ?? 1) || (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
-    }
-    // else 'relevance' keeps BM25 score order (already sorted)
+    // Apply user-requested sort (after relevance scoring; shared with CLI)
+    applyUserSort(results, args.sort || 'relevance');
 
     // `total` must be the TRUE population, invariant to limit/offset. In cross-source
     // mode results is over-fetched (perSourceLimit scales with limit+offset), so
@@ -526,7 +410,7 @@ server.registerTool(
     const trueTotal = countSearchTotal(db, {
       effectiveSource: effectiveType || null,
       ftsQuery,
-      obsFtsQuery: ctx.orFallbackFired === true ? (relaxFtsQueryToOr(ftsQuery) || ftsQuery) : ftsQuery,
+      obsFtsQuery: effectiveObsFtsQuery(ftsQuery, ctx.orFallbackFired === true),
       args: { project: args.project || null, obs_type: args.obs_type || null, importance: args.importance || null, branch: args.branch || null },
       project: args.project || null,
       epochFrom, epochTo,
@@ -596,95 +480,33 @@ server.registerTool(
 
     // Resolve prefixed-token anchor (e.g. "P#3462" / "S#53" / "#8121") — users pasting
     // from mem_search results expect the same routing as CLI `timeline --anchor`.
-    // Prompt/session anchors resolve to the nearest-in-time observation so
-    // before/after semantics still apply to the observations timeline.
-    // Also covers bare numeric anchors so compressed-obs routing applies uniformly —
-    // without this, `anchor: 7826` (int) would bypass the compressed check and
+    // Resolution ladder (prompt/session → nearest obs, compressed re-anchor, bare-int
+    // fallback) is shared with the CLI via lib/timeline-core.mjs. Covers bare numeric
+    // anchors too, so `anchor: 7826` (int) can't bypass the compressed check and
     // silently straddle a dead record.
     if (typeof anchorId === 'string' || typeof anchorId === 'number') {
-      const parsed = parseIdToken(anchorId);
-      if (!parsed) {
-        return { content: [{ type: 'text', text: `Invalid anchor "${args.anchor}". Expected N, #N, P#N, or S#N.` }] };
+      const resolved = resolveAnchorToken(db, anchorId, { project: args.project ?? null });
+      if (!resolved.ok) {
+        return { content: [{ type: 'text', text: formatAnchorError(resolved.error, 'mcp') }] };
       }
-      if (parsed.source === 'prompt' || parsed.source === 'session') {
-        const srcTable = parsed.source === 'prompt' ? 'user_prompts' : 'session_summaries';
-        const srcPrefix = parsed.source === 'prompt' ? 'P#' : 'S#';
-        const row = db.prepare(`SELECT created_at_epoch FROM ${srcTable} WHERE id = ?`).get(parsed.id);
-        if (!row) return { content: [{ type: 'text', text: `${parsed.source === 'prompt' ? 'Prompt' : 'Session'} ${srcPrefix}${parsed.id} not found.` }] };
-        const projArg = args.project;
-        const nearest = db.prepare(`
-          SELECT id FROM observations
-          WHERE COALESCE(compressed_into, 0) = 0 ${projArg ? 'AND project = ?' : ''}
-          ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
-        `).get(...(projArg ? [projArg, row.created_at_epoch] : [row.created_at_epoch]));
-        if (!nearest) return { content: [{ type: 'text', text: `No observations near ${srcPrefix}${parsed.id}.` }] };
-        anchorId = nearest.id;
-        anchorNote = `(anchored to #${nearest.id}, closest obs to ${srcPrefix}${parsed.id})`;
-      } else {
-        // Bare "#N" or "N" — resolve to obs, falling back to prompt/session like CLI bare-int path.
-        // Route compressed obs to its parent so the before/after window (which filters compressed)
-        // isn't shown around a dead anchor. Negative sentinels (-1 dropped, -2 pending purge) surface
-        // an explicit error — they have no canonical parent.
-        const obsRow = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(parsed.id);
-        if (obsRow) {
-          const ci = obsRow.compressed_into;
-          if (ci && ci > 0) {
-            anchorId = ci;
-            anchorNote = `(anchored to #${ci}, #${parsed.id} was compressed into it)`;
-          } else if (ci && ci < 0) {
-            return { content: [{ type: 'text', text: `Observation #${parsed.id} was compressed and pruned; no canonical anchor available.` }] };
-          } else {
-            anchorId = parsed.id;
-          }
-        } else {
-          const promptRow = db.prepare('SELECT created_at_epoch FROM user_prompts WHERE id = ?').get(parsed.id);
-          const sessionRow = promptRow ? null : db.prepare('SELECT created_at_epoch FROM session_summaries WHERE id = ?').get(parsed.id);
-          const hit = promptRow ? { row: promptRow, prefix: 'P#', name: 'prompt' }
-                    : sessionRow ? { row: sessionRow, prefix: 'S#', name: 'session' }
-                    : null;
-          if (!hit) {
-            return { content: [{ type: 'text', text: `Observation, prompt, or session with id ${parsed.id} not found.` }] };
-          }
-          const projArg = args.project;
-          const nearest = db.prepare(`
-            SELECT id FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0 ${projArg ? 'AND project = ?' : ''}
-            ORDER BY ABS(created_at_epoch - ?) ASC LIMIT 1
-          `).get(...(projArg ? [projArg, hit.row.created_at_epoch] : [hit.row.created_at_epoch]));
-          if (!nearest) return { content: [{ type: 'text', text: `No observations near ${hit.prefix}${parsed.id} (${hit.name}).` }] };
-          anchorId = nearest.id;
-          anchorNote = `(anchored to #${nearest.id}, closest obs to ${hit.prefix}${parsed.id})`;
-        }
-      }
+      anchorId = resolved.anchorId;
+      anchorNote = resolved.anchorNote;
     }
 
-    // Auto-find anchor via FTS (with recency decay). Routes through shared
-    // findFtsAnchor so CLI `timeline --query` and MCP mem_timeline use
-    // identical AND→OR fallback semantics (paired-path per #8217). When the
-    // OR fallback fired, surface a hint so the caller knows the match was
-    // not an exact AND coverage of the query — mirrors search transparency.
+    // Auto-find anchor via FTS (with recency decay). Shared with CLI
+    // `timeline --query` so AND→OR fallback semantics stay identical (#8217);
+    // the relaxed-note hint mirrors search transparency.
     if (!anchorId && args.query) {
-      const ftsQuery = sanitizeFtsQuery(args.query);
-      const found = findFtsAnchor(db, { ftsQuery, project: args.project ?? null });
+      const found = resolveQueryAnchor(db, args.query, { project: args.project ?? null });
       if (found) {
-        anchorId = found.id;
-        if (found.relaxed && !anchorNote) {
-          anchorNote = `(query "${args.query}" relaxed AND→OR — no row matched all terms)`;
-        }
+        anchorId = found.anchorId;
+        if (found.anchorNote && !anchorNote) anchorNote = found.anchorNote;
       }
     }
 
     // No anchor: return most recent
     if (!anchorId) {
-      const compressedFilter = 'COALESCE(compressed_into, 0) = 0';
-      const projectFilter = args.project ? `WHERE ${compressedFilter} AND project = ?` : `WHERE ${compressedFilter}`;
-      const params = args.project ? [args.project, before + after + 1] : [before + after + 1];
-      const rows = db.prepare(`
-        SELECT id, type, title, subtitle, project, created_at
-        FROM observations ${projectFilter}
-        ORDER BY created_at_epoch DESC
-        LIMIT ?
-      `).all(...params);
+      const rows = fetchRecentTimeline(db, { project: args.project ?? null, limit: before + after + 1 });
 
       if (rows.length === 0) {
         return { content: [{ type: 'text', text: 'No observations found.' }] };
@@ -697,45 +519,13 @@ server.registerTool(
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // Get anchor epoch
-    const anchorRow = db.prepare('SELECT created_at_epoch, project FROM observations WHERE id = ?').get(anchorId);
-    if (!anchorRow) {
+    // Window fetch (access-count bump + project auto-scope) shared with CLI.
+    const win = fetchTimelineWindow(db, anchorId, { before, after, project: args.project ?? null });
+    if (!win) {
       return { content: [{ type: 'text', text: `Observation #${anchorId} not found.` }] };
     }
 
-    // Update access_count for anchor (aligned with CLI timeline)
-    try {
-      db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?').run(Date.now(), anchorId);
-    } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-
-    // Auto-scope to anchor's project when caller didn't pass one: "timeline around #N"
-    // means same-project context by default; cross-project bleed breaks user mental model.
-    const effectiveProject = args.project || anchorRow.project;
-    const projectFilter = effectiveProject ? 'AND project = ?' : '';
-    const baseParams = effectiveProject ? [effectiveProject] : [];
-
-    // Before anchor
-    const beforeRows = db.prepare(`
-      SELECT id, type, title, subtitle, project, created_at
-      FROM observations
-      WHERE created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
-      ORDER BY created_at_epoch DESC
-      LIMIT ?
-    `).all(anchorRow.created_at_epoch, ...baseParams, before);
-
-    // After anchor
-    const afterRows = db.prepare(`
-      SELECT id, type, title, subtitle, project, created_at
-      FROM observations
-      WHERE created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
-      ORDER BY created_at_epoch ASC
-      LIMIT ?
-    `).all(anchorRow.created_at_epoch, ...baseParams, after);
-
-    // Anchor itself
-    const anchor = db.prepare('SELECT id, type, title, subtitle, project, created_at FROM observations WHERE id = ?').get(anchorId);
-
-    const all = [...beforeRows.reverse(), anchor, ...afterRows];
+    const all = [...win.beforeRows, win.anchor, ...win.afterRows];
     const lines = [`Timeline around #${anchorId}${anchorNote ? ' ' + anchorNote : ''}:\n`];
     for (const r of all) {
       const marker = r.id === anchorId ? ' ◀' : '';

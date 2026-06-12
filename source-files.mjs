@@ -83,6 +83,13 @@ export const SOURCE_FILES = [
   // auto-update. Same single-source-of-truth pattern (see #8217).
   'lib/observation-write.mjs',
   'lib/recall-core.mjs',
+  // Shared timeline core (anchor resolution + before/after window) and shared
+  // cross-source search core (sessions/prompts FTS, CJK fallback, normalization,
+  // pagination math). Statically imported by mem-cli.mjs AND server.mjs — same
+  // single-source-of-truth pattern; missing either from the manifest would break
+  // `timeline`/`search` and mem_timeline/mem_search on auto-update.
+  'lib/timeline-core.mjs',
+  'lib/search-core.mjs',
   // Shared "compress old low-value observations into weekly summaries" core.
   // Statically imported by mem-cli.mjs (cmdCompress), server.mjs (mem_compress),
   // and hook.mjs (handleAutoCompress) — same single-source-of-truth pattern as
