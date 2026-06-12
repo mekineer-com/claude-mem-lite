@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, scrubSecrets, cjkBigrams, fmtDate, debugLog, debugCatch, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined, notLowSignalTitleClause } from './utils.mjs';
+import { truncate, typeIcon, sanitizeFtsQuery, relaxFtsQueryToOr, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, isPathConfined } from './utils.mjs';
 import { extractCjkLikePatterns, cjkPrecisionOk } from './nlp.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
@@ -32,18 +32,20 @@ function descriptionOf(name) {
   return d;
 }
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
-import { basename, join, sep } from 'path';
+import { join, sep } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, parseIdToken, bucketIdTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { recallByFile } from './lib/recall-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
 } from './lib/deferred-work.mjs';
-import { getVocabulary, _resetVocabCache, computeVector } from './tfidf.mjs';
+import { _resetVocabCache } from './tfidf.mjs';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
@@ -1819,28 +1821,11 @@ server.registerTool(
 
     params.push(args.id);
 
-    // Atomic: update fields + rebuild FTS text + re-vectorize
+    // Atomic: update fields + rebuild derived columns (FTS text + vector) via the
+    // shared core — single source with CLI cmdUpdate (lib/observation-write.mjs).
     db.transaction(() => {
       db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-
-      // Rebuild FTS text field (must include CJK bigrams + search_aliases to match mem_save/hook-llm)
-      const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts, lesson_learned, search_aliases FROM observations WHERE id = ?').get(args.id);
-      const base = [row.title, row.subtitle, row.narrative, row.concepts, row.facts, row.lesson_learned, row.search_aliases].filter(Boolean).join(' ');
-      const bigrams = cjkBigrams((row.title || '') + ' ' + (row.narrative || ''));
-      const textField = bigrams ? base + ' ' + bigrams : base;
-      db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, args.id);
-
-      // Re-vectorize (non-critical — catch to avoid rollback)
-      try {
-        const vocab = getVocabulary(db);
-        if (vocab) {
-          const vec = computeVector(textField, vocab);
-          if (vec) {
-            db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-              .run(args.id, Buffer.from(vec.buffer), vocab.version, Date.now());
-          }
-        }
-      } catch (e) { debugCatch(e, 'mem_update-vector'); }
+      rebuildObservationDerived(db, args.id);
     })();
 
     return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}` }] };
@@ -1906,34 +1891,15 @@ server.registerTool(
     inputSchema: memRecallSchema,
   },
   safeHandler(async (args) => {
-    const filename = basename(args.file);
-    const limit = args.limit ?? 10;
-    const includeNoise = args.include_noise === true;
-
-    const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const likePattern = `%${escaped}`;
-    const noiseClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
-    const rows = db.prepare(`
-      SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.created_at, o.project
-      FROM observations o
-      JOIN observation_files of2 ON of2.obs_id = o.id
-      WHERE COALESCE(o.compressed_into, 0) = 0
-        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
-        ${noiseClause}
-      ORDER BY o.created_at_epoch DESC
-      LIMIT ?
-    `).all(filename, likePattern, limit);
+    // Shared core with CLI cmdRecall: query + escaping + access bump (lib/recall-core.mjs)
+    const { filename, rows } = recallByFile(db, args.file, {
+      limit: args.limit ?? 10,
+      includeNoise: args.include_noise === true,
+    });
 
     if (rows.length === 0) {
       return { content: [{ type: 'text', text: `No history for "${filename}". This file hasn't been observed yet.` }] };
     }
-
-    // Update access_count for recalled observations
-    const recalledIds = rows.map(r => r.id);
-    const ph = recalledIds.map(() => '?').join(',');
-    try {
-      db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...recalledIds);
-    } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
 
     const lines = [`History for ${filename} (${rows.length} observation${rows.length !== 1 ? 's' : ''}):\n`];
     for (const r of rows) {

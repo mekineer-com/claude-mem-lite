@@ -213,4 +213,46 @@ describe('MCP protocol surface', () => {
     expect(seen.length).toBe(9);
     expect(new Set(seen).size).toBe(9);
   });
+
+  // CLI/MCP validation parity (convergence audit 2026-06-13): cmdUpdate rejects
+  // empty titles and >500-char lessons; the MCP schema validated importance/type
+  // but let these two through. Invariant asserted on the DB, not the transport:
+  // a rejected update must not persist.
+  it('mem_update rejects an empty/whitespace title (parity with CLI)', async () => {
+    const saveRes = await client.callTool({
+      name: 'mem_save',
+      arguments: { content: 'parity probe original body', title: 'parity-title-probe', type: 'discovery', importance: 1 },
+    });
+    const id = Number((textOf(saveRes).match(/#(\d+)/) || [])[1]);
+    expect(id).toBeGreaterThan(0);
+
+    let rejected;
+    try {
+      const res = await client.callTool({ name: 'mem_update', arguments: { id, title: '   ' } });
+      rejected = res.isError === true;
+    } catch { rejected = true; }
+    expect(rejected).toBe(true);
+
+    const getRes = await client.callTool({ name: 'mem_get', arguments: { ids: String(id) } });
+    expect(textOf(getRes)).toContain('parity-title-probe');
+  });
+
+  it('mem_update rejects a lesson_learned over 500 chars (parity with CLI)', async () => {
+    const saveRes = await client.callTool({
+      name: 'mem_save',
+      arguments: { content: 'lesson cap probe body', title: 'lesson-cap-probe', type: 'discovery', importance: 1 },
+    });
+    const id = Number((textOf(saveRes).match(/#(\d+)/) || [])[1]);
+    expect(id).toBeGreaterThan(0);
+
+    let rejected;
+    try {
+      const res = await client.callTool({ name: 'mem_update', arguments: { id, lesson_learned: 'L'.repeat(501) } });
+      rejected = res.isError === true;
+    } catch { rejected = true; }
+    expect(rejected).toBe(true);
+
+    const getRes = await client.callTool({ name: 'mem_get', arguments: { ids: String(id) } });
+    expect(textOf(getRes)).not.toContain('LLLLLLLL');
+  });
 });

@@ -218,11 +218,15 @@ export const memMaintainSchema = {
 
 export const memUpdateSchema = {
   id: coerceInt.pipe(z.number().int().positive()).describe('Observation ID to update'),
-  title: z.string().optional().describe('New title'),
+  // CLI parity (cmdUpdate): empty/whitespace title would render as `(untitled)`
+  // in every listing — reject here like the CLI does, instead of persisting it.
+  title: z.string().refine(s => s.trim() !== '', 'title cannot be empty').optional().describe('New title'),
   narrative: z.string().optional().describe('New narrative/content'),
   type: OBS_TYPE_ENUM.optional().describe('New observation type'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('New importance (1-3)'),
-  lesson_learned: z.string().optional().describe('Add or update lesson learned'),
+  // 500-char cap mirrors memSaveSchema + cmdUpdate — update was the one path
+  // that let overlong lessons leak into the DB via MCP.
+  lesson_learned: z.string().max(500).optional().describe('Add or update lesson learned'),
   concepts: z.string().optional().describe('Space-separated concept tags'),
 };
 

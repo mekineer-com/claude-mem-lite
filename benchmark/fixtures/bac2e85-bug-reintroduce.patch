@@ -1,0 +1,83 @@
+diff --git a/lib/maintain-core.mjs b/lib/maintain-core.mjs
+index ef69b5b..5f9c29e 100644
+--- a/lib/maintain-core.mjs
++++ b/lib/maintain-core.mjs
+@@ -48,16 +48,14 @@ export function recoverChildrenOf(db, ids) {
+ }
+ 
+ export function cleanupBroken(db, { projectFilter, baseParams, opCap = OP_CAP }) {
+-  const doomed = db.prepare(`
+-    SELECT id FROM observations
+-    WHERE COALESCE(compressed_into, 0) = 0
+-      AND (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
+-      ${projectFilter} LIMIT ${opCap}
+-  `).all(...baseParams).map(r => r.id);
+-  if (!doomed.length) return 0;
+-  recoverChildrenOf(db, doomed); // empty-content row could still be a cluster keeper
+-  const ph = doomed.map(() => '?').join(',');
+-  return db.prepare(`DELETE FROM observations WHERE id IN (${ph})`).run(...doomed).changes;
++  return db.prepare(`
++    DELETE FROM observations WHERE id IN (
++      SELECT id FROM observations
++      WHERE COALESCE(compressed_into, 0) = 0
++        AND (title IS NULL OR title = '') AND (narrative IS NULL OR narrative = '')
++        ${projectFilter} LIMIT ${opCap}
++    )
++  `).run(...baseParams).changes;
+ }
+ 
+ /**
+@@ -198,17 +196,13 @@ export function purgeStalePreview(db, { projectFilter, baseParams }, retainCutof
+ 
+ /** Delete pending-purge observations older than the retain cutoff. Returns rows deleted. */
+ export function purgeStale(db, { projectFilter, baseParams, opCap = OP_CAP }, retainCutoff) {
+-  const doomed = db.prepare(`
+-    SELECT id FROM observations
+-    WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ?
+-      ${projectFilter} LIMIT ${opCap}
+-  `).all(retainCutoff, ...baseParams).map(r => r.id);
+-  if (!doomed.length) return 0;
+-  // A keeper that absorbed dups can later be marked idle (compressed_into=PENDING_PURGE)
+-  // and reach here; deleting it would orphan its children. Recover them first.
+-  recoverChildrenOf(db, doomed);
+-  const ph = doomed.map(() => '?').join(',');
+-  return db.prepare(`DELETE FROM observations WHERE id IN (${ph})`).run(...doomed).changes;
++  return db.prepare(`
++    DELETE FROM observations WHERE id IN (
++      SELECT id FROM observations
++      WHERE compressed_into = ${COMPRESSED_PENDING_PURGE} AND created_at_epoch < ?
++        ${projectFilter} LIMIT ${opCap}
++    )
++  `).run(retainCutoff, ...baseParams).changes;
+ }
+ 
+ /**
+diff --git a/tests/maintain-core.test.mjs b/tests/maintain-core.test.mjs
+index b5def84..95d9e54 100644
+--- a/tests/maintain-core.test.mjs
++++ b/tests/maintain-core.test.mjs
+@@ -188,24 +188,5 @@ describe('execute ops', () => {
+   // --- hard-delete must not orphan a deleted keeper's children (compressed_into has no FK) ---
+   const exists = (db, id) => db.prepare('SELECT COUNT(*) AS c FROM observations WHERE id = ?').get(id).c;
+ 
+-  test('purgeStale recovers children of a purged keeper instead of orphaning them', () => {
+-    const db = freshDb();
+-    // A keeper that absorbed a dup, later marked idle (compressed_into=PENDING_PURGE).
+-    const keeper = add(db, { title: 'idle keeper marked for purge', compressedInto: COMPRESSED_PENDING_PURGE });
+-    const child = add(db, { title: 'dup merged into the keeper', compressedInto: keeper });
+-    expect(purgeStale(db, ctx(0), Date.now() - 30 * DAY)).toBe(1); // keeper deleted
+-    expect(exists(db, keeper)).toBe(0);
+-    expect(exists(db, child)).toBe(1);                  // child survives (pre-fix: orphaned)
+-    expect(get(db, child, 'compressed_into')).toBeNull(); // recovered: un-hidden, reachable again
+-  });
+ 
+-  test('cleanupBroken recovers children of a deleted empty keeper', () => {
+-    const db = freshDb();
+-    const emptyKeeper = add(db, { title: '', narrative: '' }); // empty-content but a cluster keeper
+-    const child = add(db, { title: 'dup merged into empty keeper', compressedInto: emptyKeeper });
+-    expect(cleanupBroken(db, ctx(0))).toBe(1);          // empty keeper deleted
+-    expect(exists(db, emptyKeeper)).toBe(0);
+-    expect(exists(db, child)).toBe(1);                  // child survives (pre-fix: orphaned)
+-    expect(get(db, child, 'compressed_into')).toBeNull();
+-  });
+ });

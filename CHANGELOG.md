@@ -2,6 +2,27 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.98.0 — salience forcing-function at the injection action point + CLI/MCP convergence round 1
+
+**Behavior change (user-visible, opt-out available).** The efficacy severe test (memory #8651, `benchmark/efficacy-README.md`) showed that a verified, on-topic, near-verbatim lesson injection moved bug-reintroduction only from 100% (arm C 8/8 fail) to 50% (arm A 4/8 pass): the agent *sees* the lesson and ignores it about half the time. The bottleneck is acting, not retrieval — so v2.98 raises salience exactly at the action point:
+
+- **Edit/Write lesson blocks now end with an ack directive** — `state '#NN applied' or '#NN n/a — <reason>' in your next user-facing message` — closing the loop with the existing citation-decay tracker (cited lessons promote, ignored ones decay).
+- **Read→Edit no longer goes fully silent at the Edit.** The shared cooldown previously meant a lesson shown at Read time (the most passive moment) left the actual edit with zero context. The first Edit/Write after a Read-time injection now emits a one-line ack nudge naming the lesson IDs — bodies are not re-emitted, so the token cost is one line, once per file per session.
+- **Opt-out / revert path:** set `CLAUDE_MEM_SALIENCE=legacy` (or `0`) in your environment to restore the pre-v2.98 passive framing exactly. Cooldown files gain a `mode: read|edit` field; entries written by older versions are treated as already-handled (no surprise re-injection after upgrade).
+- The change is self-announcing: the new directive line appears in the first Edit-with-lessons injection after upgrade.
+
+**Instrument repair: the severe test survives HEAD drift (memory #8650 follow-through).** `git revert -n bac2e85` stopped applying clean once later commits (the #8639 self-merge guard; `recoverChildrenOf` exported for the delete paths) touched its region — the predicted clean-revert pool decay, which had silently reduced the usable commit pool to zero. `efficacy-harness.mjs` now supports `patchFile` construction: a hand-resolved bug-reintroduction patch (`benchmark/fixtures/bac2e85-bug-reintroduce.patch`) restores the pre-fix buggy bodies onto current code, keeps the now-shared `recoverChildrenOf`, excises the two regression tests from the worktree oracle, and scores against the HEAD oracle (`oracleRef`). Baseline validated: bug-set = 2/15 RED, same two tests as the original construction.
+
+### CLI/MCP convergence (round 1 of the dual-implementation audit)
+
+A structured audit mapped all 20 MCP tools to their CLI counterparts: 12 pairs still duplicate query-building/validation/formatting logic — the drift class behind the v2.97 `mem_get` formatter drift and the `mem_search` pagination bugs. This round closes the two worst small ones; `mem_timeline` and `mem_search` extractions are deferred with full notes (D#33, D#34).
+
+- **fix: MCP `mem_update` validation parity.** The MCP schema validated `importance` (1–3) and `type` (enum) but accepted an empty/whitespace `title` (renders as `(untitled)` everywhere) and an unbounded `lesson_learned` (CLI and `mem_save` cap at 500 chars). Both now rejected at the schema, asserted by protocol-level regression tests against the DB state.
+- **refactor: single-source update-derived rebuild.** `cmdUpdate` and `mem_update` hand-copied the FTS `text` rebuild + re-vectorize block; now both call `rebuildObservationDerived()` in `lib/observation-write.mjs`.
+- **refactor: single-source file recall.** `cmdRecall` and `mem_recall` hand-copied the junction query, LIKE-wildcard escaping, noise filtering, and the access-count bump; now both call `recallByFile()` in `lib/recall-core.mjs` (6 new contract tests, including the underscore-as-wildcard trap).
+
+Suite 2759 → 2776 passed (+17). Knip baseline restored to 0 unused files (the four research scripts under `benchmark/` are now declared entries).
+
 ## v2.97.0 — eight-round dogfooding sweep: LLM-pipeline + MCP/CLI parity + export fidelity + auto-update safety
 
 Eight end-to-end dogfooding rounds (real CLI/MCP/hook usage, not unit tests). Each round dispatched bug-hunters across a subsystem and verified findings against ground truth; the majority of candidate findings were refuted (e.g. an `import-jsonl` "data loss" claim was disproven by scanning 4884 real transcript turns — the triggering shape occurs 0 times). Five real defects survived verification and are fixed here, each with a regression test. Full suite 2752 → 2759 passed.

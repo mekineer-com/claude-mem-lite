@@ -4,12 +4,12 @@
 
 import { homedir } from 'os';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, scrubSecrets, cjkBigrams, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, scrubSecrets, SESS_BM25, DEFAULT_DECAY_HALF_LIFE_MS } from './utils.mjs';
 import { cjkPrecisionOk } from './nlp.mjs';
 import { extractCjkLikePatterns } from './nlp.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { computeTier, TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { getVocabulary, computeVector, _resetVocabCache } from './tfidf.mjs';
+import { _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
 import { searchObservationsHybrid, findFtsAnchor, countSearchTotal } from './search-engine.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
@@ -27,7 +27,7 @@ import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
-import { basename, join, sep } from 'path';
+import { join, sep } from 'path';
 import { readFileSync, existsSync, readdirSync } from 'fs';
 
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
@@ -35,6 +35,8 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
+import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { recallByFile } from './lib/recall-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import {
@@ -493,35 +495,12 @@ function cmdRecall(db, args) {
     return;
   }
 
-  const filename = basename(file);
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 1000 });
   const includeNoise = flags['include-noise'] === true || flags['include-noise'] === 'true';
   const jsonOutput = flags.json === true || flags.json === 'true';
 
-  // Search via observation_files junction table for indexed filename lookups
-  const escaped = filename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-  const likePattern = `%${escaped}`;
-  const noiseClause = includeNoise ? '' : `AND ${notLowSignalTitleClause('o')}`;
-  const rows = db.prepare(`
-    SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned, o.importance,
-                    o.created_at, o.created_at_epoch, o.project
-    FROM observations o
-    JOIN observation_files of2 ON of2.obs_id = o.id
-    WHERE COALESCE(o.compressed_into, 0) = 0
-      AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
-      ${noiseClause}
-    ORDER BY o.created_at_epoch DESC
-    LIMIT ?
-  `).all(filename, likePattern, limit);
-
-  if (rows.length > 0) {
-    // Update access_count for recalled observations (aligned with MCP mem_recall)
-    const recalledIds = rows.map(r => r.id);
-    const recallPh = recalledIds.map(() => '?').join(',');
-    try {
-      db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${recallPh})`).run(Date.now(), ...recalledIds);
-    } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-  }
+  // Shared core with MCP mem_recall: query + escaping + access bump (lib/recall-core.mjs)
+  const { filename, rows } = recallByFile(db, file, { limit, includeNoise });
 
   if (jsonOutput) {
     out(JSON.stringify({
@@ -1708,28 +1687,11 @@ function cmdUpdate(db, args) {
 
   params.push(id);
 
-  // Atomic: update fields + rebuild FTS text + re-vectorize (aligned with MCP mem_update)
+  // Atomic: update fields + rebuild derived columns (FTS text + vector) via the
+  // shared core — single source with MCP mem_update (lib/observation-write.mjs).
   db.transaction(() => {
     db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-
-    // Rebuild FTS text field
-    const row = db.prepare('SELECT title, subtitle, narrative, concepts, facts, lesson_learned, search_aliases FROM observations WHERE id = ?').get(id);
-    const base = [row.title, row.subtitle, row.narrative, row.concepts, row.facts, row.lesson_learned, row.search_aliases].filter(Boolean).join(' ');
-    const bigrams = cjkBigrams((row.title || '') + ' ' + (row.narrative || ''));
-    const textField = bigrams ? base + ' ' + bigrams : base;
-    db.prepare('UPDATE observations SET text = ? WHERE id = ?').run(textField, id);
-
-    // Re-vectorize (non-critical — catch to avoid rollback)
-    try {
-      const vocab = getVocabulary(db);
-      if (vocab) {
-        const vec = computeVector(textField, vocab);
-        if (vec) {
-          db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-            .run(id, Buffer.from(vec.buffer), vocab.version, Date.now());
-        }
-      }
-    } catch { /* non-critical */ }
+    rebuildObservationDerived(db, id);
   })();
 
   out(`[mem] Updated #${id}: ${updates.map(u => u.split(' =')[0]).join(', ')}`);

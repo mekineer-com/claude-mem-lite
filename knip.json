@@ -5,6 +5,10 @@
     "hook.mjs",
     "install.mjs",
     "benchmark/cite-recall.mjs",
+    "benchmark/efficacy-observational.mjs",
+    "benchmark/efficacy-power.mjs",
+    "benchmark/efficacy-harness.mjs",
+    "benchmark/cjk-straddle-prevalence.mjs",
     "scripts/*.mjs",
     "scripts/*.js",
     "tests/**/*.test.mjs"

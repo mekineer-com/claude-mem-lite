@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 2.97.0
+- **Version**: 2.98.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (61 test files, vitest)
 - **Lint**: `npx eslint .`
@@ -78,7 +78,12 @@ language in the MCP tool description — when the two conflict, this contract wi
 asymmetric-quiet (1 lesson, 120-char cap, requires `lesson_learned`); Edit/Write is
 decision-support (up to 3 lessons, 240-char cap, admits high-importance bugfix/decision
 without lesson when title is non-LOW_SIGNAL). Read→Edit on the same file in one session
-shares cooldown — no double injection. If you saw lines like `#NN [bugfix] ...`, cite `#NN`
+shares cooldown for the lesson BODIES (no double injection), but since v2.98 the first
+Edit after a Read-time injection re-surfaces the lesson IDs as a one-line ack directive —
+answer it ('#NN applied' or '#NN n/a — <reason>') in your next user-facing text; Edit-path
+lesson blocks carry the same directive (opt-out: CLAUDE_MEM_SALIENCE=legacy). Rationale:
+the #8651 severe test showed passively-framed lessons get ignored ~50% of the time even
+when on-topic. If you saw lines like `#NN [bugfix] ...`, cite `#NN`
 the NEXT time you produce user-facing text — tool-only follow-up turns don't satisfy this;
 carry the IDs in working memory and cite when you write back. The plugin tracks citation
 outcomes per session: un-cited lessons auto-decay (importance −1 after 3 consecutive uncited

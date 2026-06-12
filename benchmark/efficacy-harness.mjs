@@ -59,12 +59,26 @@ function sh(cmd, opts = {}) { return execSync(cmd, { encoding: 'utf8', maxBuffer
 function git(cwd, cmd) { return sh(`git -C '${cwd}' ${cmd}`); }
 
 // ── worktree lifecycle ───────────────────────────────────────────────────────
-function makeBugPresentWorktree(commit) {
+function makeBugPresentWorktree(spec) {
   const wt = mkdtempSync(join(tmpdir(), 'eff-wt-'));
   git(REPO, `worktree add -q '${wt}' HEAD`);
   try { symlinkSync(NODE_MODULES, join(wt, 'node_modules')); } catch { /* exists */ }
+  if (spec.patchFile) {
+    // Patch construction: when later commits touched the fix's region, surgical
+    // revert conflicts forever (#8650 — the clean-revert pool decays as HEAD moves).
+    // A hand-resolved bug-reintroduction patch (old buggy bodies restored onto
+    // current code, regression tests excised from the worktree oracle) keeps the
+    // cell usable. Oracle at scoring comes from oracleRef (HEAD) in this mode.
+    try {
+      git(wt, `apply '${join(REPO, spec.patchFile)}'`);
+    } catch (e) {
+      dropWorktree(wt);
+      const err = new Error('patch apply failed'); err.code = 'REVERT_CONFLICT'; throw err;
+    }
+    return wt;
+  }
   try {
-    git(wt, `revert -n ${commit}`); // bug latent; oracle test also reverted (kept OUT)
+    git(wt, `revert -n ${spec.hash}`); // bug latent; oracle test also reverted (kept OUT)
   } catch (e) {
     // surgical revert conflicts when later commits touched the same region — older
     // commits are systematically harder to revert cleanly. Mark unusable, don't crash.
@@ -82,6 +96,7 @@ function dropWorktree(wt) {
 // returns Map<testFullName, 'passed'|'failed'>
 function runOracle(wt, oracleTestRel, commit) {
   // place the post-fix oracle test into the worktree, then run ONLY it
+  // (patch-constructed cells score against the HEAD oracle via oracleRef)
   const oracleContent = git(REPO, `show ${commit}:${oracleTestRel}`);
   writeFileSync(join(wt, oracleTestRel), oracleContent);
   let out;
@@ -125,7 +140,7 @@ function probeInjection(sandbox, wt, srcFile) {
 // ── one session ──────────────────────────────────────────────────────────────
 async function runArmSeed(spec, arm, seed) {
   let wt;
-  try { wt = makeBugPresentWorktree(spec.hash); }
+  try { wt = makeBugPresentWorktree(spec); }
   catch (e) { return { commit: spec.hash, arm, seed, pass: null, note: e.code === 'REVERT_CONFLICT' ? 'revert conflict' : 'worktree fail' }; }
   const sb = seedSandbox(arm, spec);
   const cell = { commit: spec.hash, arm, seed };
@@ -141,7 +156,7 @@ async function runArmSeed(spec, arm, seed) {
         `claude -p ${JSON.stringify(task)} --permission-mode bypassPermissions --allowedTools 'Read,Edit' --output-format text`],
         { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: (SESSION_TIMEOUT + 30) * 1000 });
     } catch (e) { cell.sessionErr = String(e.message).slice(0, 120); }
-    const res = runOracle(wt, spec.oracleTest, spec.hash);
+    const res = runOracle(wt, spec.oracleTest, spec.oracleRef || spec.hash);
     if (!res) { cell.pass = null; cell.note = 'oracle parse failed'; return cell; }
     cell.pass = spec.bugSet.every((t) => res.get(t) === 'passed') ? 1 : 0;
     cell.bugSetResults = spec.bugSet.map((t) => [t, res.get(t)]);
@@ -155,10 +170,10 @@ async function runArmSeed(spec, arm, seed) {
 // ── baseline: discover bug-set + validate construction (no sessions) ─────────
 function validateConstruction(spec) {
   let wt;
-  try { wt = makeBugPresentWorktree(spec.hash); }
+  try { wt = makeBugPresentWorktree(spec); }
   catch (e) { return { ok: false, reason: e.code === 'REVERT_CONFLICT' ? 'revert conflict (older commit, region changed since)' : String(e.message).slice(0, 80) }; }
   try {
-    const res = runOracle(wt, spec.oracleTest, spec.hash);
+    const res = runOracle(wt, spec.oracleTest, spec.oracleRef || spec.hash);
     if (!res) return { ok: false, reason: 'oracle parse failed' };
     const failing = [...res.entries()].filter(([, s]) => s === 'failed').map(([t]) => t);
     if (failing.length === 0) return { ok: false, reason: 'empty bug-set (revert did not make oracle RED) — unusable' };

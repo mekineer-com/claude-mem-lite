@@ -3,16 +3,23 @@
   "commits": [
     {
       "hash": "bac2e85",
-      "srcFiles": ["lib/maintain-core.mjs"],
+      "srcFiles": [
+        "lib/maintain-core.mjs"
+      ],
       "oracleTest": "tests/maintain-core.test.mjs",
       "task": "In lib/maintain-core.mjs, the functions cleanupBroken and purgeStale each delete at most opCap rows in one SQL statement (LIMIT opCap). Change BOTH so they delete ALL matching rows, looping in batches of opCap until no rows match. Each function must still return the total number of rows deleted, and you must not change their signatures or which rows count as deletable.",
       "lessonTitle": "purgeStale/cleanupBroken orphaned a deleted keeper's children (compressed_into no FK)",
       "lesson": "When hard-DELETEing rows referenced by a no-FK soft-delete pointer (compressed_into), recover the referencing rows FIRST (null the pointer to un-hide) — enumerate ALL hard-delete paths (purgeStale AND cleanupBroken), not just the obvious one.",
-      "lessonBody": "compressed_into has no FK; hard-deleting a merge-target orphans its children, hidden from every COALESCE(compressed_into,0)=0 view. Fix: recoverChildrenOf sets compressed_into=NULL on children, THEN delete."
+      "lessonBody": "compressed_into has no FK; hard-deleting a merge-target orphans its children, hidden from every COALESCE(compressed_into,0)=0 view. Fix: recoverChildrenOf sets compressed_into=NULL on children, THEN delete.",
+      "patchFile": "benchmark/fixtures/bac2e85-bug-reintroduce.patch",
+      "oracleRef": "HEAD",
+      "_construction": "patch (2026-06-13): surgical revert started conflicting once later commits (#8639 self-merge guard, recoverChildrenOf export for delete paths) touched the region — exactly #8650 pool decay. Patch restores the pre-bac2e85 buggy bodies of cleanupBroken/purgeStale onto current code, KEEPS recoverChildrenOf (now shared by delete paths), and excises the 2 regression tests from the worktree oracle. Regenerate when it stops applying: see git log for this file."
     },
     {
       "hash": "3f26b7a",
-      "srcFiles": ["mem-cli.mjs"],
+      "srcFiles": [
+        "mem-cli.mjs"
+      ],
       "oracleTest": "tests/cli.test.mjs",
       "task": "In mem-cli.mjs cmdSearch, the vector/RRF retrieval branch hydrates each candidate result with a `SELECT ... FROM observations WHERE id = ?`. One of the two hydration SELECTs omits the `project` column while the other includes it. Make the two hydration SELECTs consistent so every vector/RRF result object carries the same fields, including `project`.",
       "lessonTitle": "search --type filter bypass via vector RRF path (CLI parity gap)",
@@ -21,7 +28,9 @@
     },
     {
       "hash": "aacab0c",
-      "srcFiles": ["mem-cli.mjs"],
+      "srcFiles": [
+        "mem-cli.mjs"
+      ],
       "oracleTest": "tests/citation-stats-cli.test.mjs",
       "task": "In mem-cli.mjs cmdCitationStats, the query that builds the 'promoted' list selects the top cited observations ordered by cited_count descending. Add importance as a secondary sort key so that among rows with equal cited_count, higher-importance rows come first. Keep the LIMIT.",
       "lessonTitle": "multi-lifecycle-flag queries must enumerate every state (compressed_into AND superseded_at)",
