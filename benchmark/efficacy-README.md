@@ -72,5 +72,23 @@ node benchmark/efficacy-harness.mjs                  # STEP 3 driver — spawns 
 - **`CLAUDE_PROJECT_DIR` must be the repo** in both arms, or `inferProject` keys
   off the `/tmp` cwd and injection is silently empty (bug #8648, baked into the
   harness).
+- **Environment isolation is NOT guaranteed (2026-06-13 contamination diagnosis).**
+  `claude -p --allowedTools 'Read,Edit'` does not confine a session whose global
+  `~/.claude` config auto-dispatches subagents: an orchestrator-mode setup spawned
+  a worker with full Bash, which ran `claude-mem-lite recall/get`, `git diff`
+  (reading the construction diff — oracle leak, now closed by committing the
+  construction inside the worktree), and `vitest` on the worktree oracle. Two
+  consequences: (1) **runs are only comparable under the same global config** —
+  the June-4 A=4/8, C=0/8 baseline and any post-config-change run measure
+  different systems; a re-measure after a product change must re-run BOTH arms
+  in the same session environment; (2) for a clean cell, pin the session to an
+  isolated settings file containing ONLY the mem hooks (not yet implemented —
+  see deferred item D#35).
+- **Ack ≠ comprehension (single-case but vivid, from the same diagnosis).** With
+  v2.98 salience the diagnosed agent recalled the full lesson via CLI, declared
+  "Lesson #1 applied", and still shipped the bug — it misread recover-before-delete
+  as a batching-cascade concern and never called `recoverChildrenOf`. Salience
+  moves seeing→engaging; it cannot fix misapplication. Expect the realistic
+  ceiling to stay below 100% regardless of injection format.
 
 Not wired into CI — this is a research instrument, run on demand.

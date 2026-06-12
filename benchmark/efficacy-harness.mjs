@@ -75,6 +75,7 @@ function makeBugPresentWorktree(spec) {
       dropWorktree(wt);
       const err = new Error('patch apply failed'); err.code = 'REVERT_CONFLICT'; throw err;
     }
+    commitConstruction(wt);
     return wt;
   }
   try {
@@ -86,7 +87,21 @@ function makeBugPresentWorktree(spec) {
     dropWorktree(wt);
     const err = new Error('revert conflict'); err.code = 'REVERT_CONFLICT'; throw err;
   }
+  commitConstruction(wt);
   return wt;
+}
+
+// Oracle-leak guard (found in the 2026-06-13 contamination diagnosis): leaving the
+// bug-present construction as an UNCOMMITTED diff lets any session with shell
+// access run `git diff` and read exactly what was reverted/excised — including
+// the oracle's regression tests. Committing inside the worktree makes the
+// construction invisible to git inspection (worktree HEAD is local; REPO is not
+// touched). NOTE: this closes only the git-diff channel; see efficacy-README
+// "Environment isolation" for the orchestrator/Bash escape that still requires
+// a pinned-settings session to fully close.
+function commitConstruction(wt) {
+  git(wt, 'add -A');
+  git(wt, `-c user.email=harness@efficacy -c user.name=efficacy-harness commit -qm 'chore: routine maintenance'`);
 }
 function dropWorktree(wt) {
   try { git(REPO, `worktree remove --force '${wt}'`); } catch { /* */ }
