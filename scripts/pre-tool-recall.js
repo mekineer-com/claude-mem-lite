@@ -29,6 +29,15 @@ const CROSS_HOOK_DEDUP_MS = 5 * 60 * 1000;
 // legacy global path so env-less test harnesses still behave.
 const LEGACY_COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
 const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (used only for legacy fallback)
+// v2.98 salience forcing-function (#8651: verified injection only moved
+// bug-reintroduction 100%→50% — the agent sees lessons and ignores them; the
+// bottleneck is ACTING). Default ON: Edit/Write lesson blocks end with an ack
+// directive, and Read→Edit re-surfaces the Read-time lesson IDs as a one-line
+// ack nudge at the actual action point. CLAUDE_MEM_SALIENCE=legacy (or 0)
+// restores the pre-v2.98 passive behavior.
+const SALIENCE_LEGACY = process.env.CLAUDE_MEM_SALIENCE === 'legacy'
+  || process.env.CLAUDE_MEM_SALIENCE === '0';
+const ACK_DIRECTIVE = "apply each lesson to this edit or rule it out — state '#NN applied' or '#NN n/a — <reason>' in your next user-facing message.";
 const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold for legacy file
 // Stale-cooldown GC moved to hook.mjs::handleSessionStart — running it on every
 // Edit cost 15-30 disk stats per call. SessionStart fires once at session boot,
@@ -183,7 +192,35 @@ try {
   const cooldown = readCooldown(cooldownPath);
   const now = Date.now();
   if (isSessionScoped) {
-    if (cooldown[filePath]) process.exit(0); // already recalled this file in-session
+    const entry = cooldown[filePath];
+    if (entry) {
+      // v2.98 salience: the old full-dedup meant a Read-injected lesson left the
+      // actual Edit with ZERO context at the action point — the most likely spot
+      // for #8651's "saw it, ignored it". When this Edit/Write follows a
+      // Read-mode injection that surfaced lessons, emit a one-line ack nudge
+      // naming the IDs (no lesson bodies — token cost stays minimal), then mark
+      // the entry handled so the next Edit is silent again. Entries without a
+      // mode field (pre-v2.98) are treated as already handled.
+      const seenIds = (typeof entry === 'object' && Array.isArray(entry.lessonIds))
+        ? entry.lessonIds : [];
+      const wasReadMode = typeof entry === 'object' && entry.mode === 'read';
+      if (!isRead && wasReadMode && seenIds.length > 0 && !SALIENCE_LEGACY) {
+        const idList = seenIds.map(id => `#${id}`).join(', ');
+        process.stdout.write(JSON.stringify({
+          suppressOutput: true,
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            additionalContext: [
+              '[mem] PreToolUse recall — system-injected context, continue your planned action:',
+              `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACK_DIRECTIVE}`,
+            ].join('\n'),
+          },
+        }));
+        cooldown[filePath] = { ...entry, mode: 'edit' };
+        writeCooldown(cooldownPath, cooldown, isSessionScoped);
+      }
+      process.exit(0); // already recalled this file in-session
+    }
   } else {
     const ts = entryTimestamp(cooldown[filePath]);
     if (ts && (now - ts) < COOLDOWN_MS) process.exit(0);
@@ -329,6 +366,14 @@ try {
           lines.push(`  #${r.id} [${r.type}] ${title}`);
         }
       }
+      // v2.98 salience: Edit/Write is the action point — close the block with an
+      // explicit ack directive instead of leaving the lessons as passive FYI
+      // (#8651: passive framing was ignored ~half the time even when on-topic).
+      // Read keeps the quiet form; its forcing-function fires at the later Edit
+      // via the Read→Edit ack nudge above.
+      if (!isRead && !SALIENCE_LEGACY) {
+        lines.push(`[mem] ⚠ Before this edit: ${ACK_DIRECTIVE}`);
+      }
     } else if (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1') {
       // R-4: Edit/Write empty → short backfill reminder. OPT-IN (default off) as
       // of the cross-project audit: this "no prior lessons, remember to /lesson"
@@ -360,7 +405,10 @@ try {
     // v2.81: record the emitted lesson IDs so flushEpisode (hook.mjs) can
     // build the PostToolUse cite-back hint when the user actually edits the
     // file. Empty array on no-lesson branches keeps the schema uniform.
-    cooldown[filePath] = { ts: now, lessonIds: allRows.map(r => r.id) };
+    // v2.98: mode records WHERE the injection happened so the Read→Edit ack
+    // nudge can distinguish "lessons seen passively at Read" from "already
+    // surfaced at an action point".
+    cooldown[filePath] = { ts: now, lessonIds: allRows.map(r => r.id), mode: isRead ? 'read' : 'edit' };
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
     // A3 (v2.83): merge our newly-emitted IDs into the cross-hook injected
     // file so the next UPS prompt skips them too. Always write, even on

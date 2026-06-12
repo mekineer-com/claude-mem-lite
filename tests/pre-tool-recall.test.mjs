@@ -1145,6 +1145,202 @@ describe('pre-tool-recall', () => {
     });
   });
 
+  // ─── Salience forcing-function (v2.98) ─────────────────────────────────────
+  // Efficacy severe test #8651: verified on-topic injection moved bug-reintroduction
+  // only 100%→50% — the agent SEES the lesson and ignores it half the time. The
+  // bottleneck is ACTING, not retrieval. Two changes raise salience at the action
+  // point: (1) Edit/Write lesson blocks end with an explicit ack directive
+  // ('#NN applied' / '#NN n/a — <reason>'); (2) Read→Edit on the same file no
+  // longer goes fully silent — the Edit emits a compact ack nudge naming the IDs
+  // shown at Read time (the old behavior injected only at Read, the most passive
+  // point, and NOTHING at the actual edit). CLAUDE_MEM_SALIENCE=legacy opts out.
+  describe('salience forcing-function (v2.98)', () => {
+    let tmpRoot;
+    let projectDir;
+    let lessonObsId;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-salience-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'saltest');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-sal', project: 'parent--saltest', memoryId: 'mem-sal' });
+      const info = insertObs(db, {
+        sessionId: 'mem-sal', project: 'parent--saltest',
+        type: 'bugfix', importance: 2,
+        title: 'salience probe bug',
+        lessonLearned: 'recover orphaned children before hard-deleting a keeper',
+        filesModified: `["${join(projectDir, 'maintain.mjs')}"]`,
+      });
+      lessonObsId = Number(info?.lastInsertRowid ?? info);
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    const envFor = (extra = {}) => ({
+      CLAUDE_MEM_DIR: tmpRoot,
+      CLAUDE_PROJECT_DIR: projectDir,
+      ...extra,
+    });
+
+    it('Edit: lesson block ends with the ack directive line', async () => {
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'maintain.mjs') },
+        session_id: 'sess-sal-1',
+      }, envFor());
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for maintain.mjs:');
+      expect(ctx).toContain("'#NN applied'");
+      expect(ctx).toContain("'#NN n/a — <reason>'");
+    });
+
+    it('Edit: CLAUDE_MEM_SALIENCE=legacy restores the passive block (no directive)', async () => {
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'maintain.mjs') },
+        session_id: 'sess-sal-2',
+      }, envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }));
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for maintain.mjs:');
+      expect(ctx).not.toContain("'#NN applied'");
+    });
+
+    it('Read: stays passive — no ack directive on the quiet 1-lesson injection', async () => {
+      const { stdout } = await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'maintain.mjs') },
+        session_id: 'sess-sal-3',
+      }, envFor());
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('[mem] Lessons for maintain.mjs:');
+      expect(ctx).not.toContain("'#NN applied'");
+    });
+
+    it('Read→Edit same session: Edit emits a compact ack nudge naming the Read-time IDs', async () => {
+      const filePath = join(projectDir, 'maintain.mjs');
+      await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: filePath },
+        session_id: 'sess-sal-4',
+      }, envFor());
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+        session_id: 'sess-sal-4',
+      }, envFor());
+      const parsed = JSON.parse(stdout);
+      const ctx = parsed.hookSpecificOutput.additionalContext;
+      expect(ctx).toContain(`#${lessonObsId}`);
+      expect(ctx).toContain("'#NN applied'");
+      // Compact nudge — must NOT re-emit the lesson body (token cost stays one line).
+      expect(ctx).not.toContain('recover orphaned children');
+      // #7758 framing guard: still announces itself as system-injected continuation.
+      expect(ctx).toMatch(/system-injected/);
+    });
+
+    it('Read→Edit→Edit: the ack nudge fires once — second Edit is silent', async () => {
+      const filePath = join(projectDir, 'maintain.mjs');
+      const session = 'sess-sal-5';
+      await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor());
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor());
+      const { stdout: third } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor());
+      expect(third).toBe('');
+    });
+
+    it('Read→Edit on a file with NO lessons stays silent (no spurious ack nudge)', async () => {
+      const filePath = join(projectDir, 'lessonless.mjs');
+      const session = 'sess-sal-6';
+      await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor());
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor());
+      expect(stdout).toBe('');
+    });
+
+    it('Read→Edit ack nudge suppressed under CLAUDE_MEM_SALIENCE=legacy (old full-dedup)', async () => {
+      const filePath = join(projectDir, 'maintain.mjs');
+      const session = 'sess-sal-7';
+      await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }));
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+        session_id: session,
+      }, envFor({ CLAUDE_MEM_SALIENCE: 'legacy' }));
+      expect(stdout).toBe('');
+    });
+
+    it('cooldown entry records the injection mode (read vs edit)', async () => {
+      const readFile = join(projectDir, 'maintain.mjs');
+      await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: readFile },
+        session_id: 'sess-sal-8',
+      }, envFor());
+      const cooldown = JSON.parse(readFileSync(
+        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-8.json'), 'utf8',
+      ));
+      expect(cooldown[readFile].mode).toBe('read');
+
+      const editFile = join(projectDir, 'fresh-edit.mjs');
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: editFile },
+        session_id: 'sess-sal-9',
+      }, envFor());
+      const cooldown2 = JSON.parse(readFileSync(
+        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-9.json'), 'utf8',
+      ));
+      expect(cooldown2[editFile].mode).toBe('edit');
+    });
+
+    it('legacy cooldown entry without mode field: Edit stays silent (back-compat)', async () => {
+      // Pre-v2.98 entries have {ts, lessonIds} but no mode — we can't tell Read
+      // from Edit, so the safe interpretation is "already handled" (silent).
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+      const filePath = join(projectDir, 'maintain.mjs');
+      writeFileSync(
+        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-sal-legacy.json'),
+        JSON.stringify({ [filePath]: { ts: Date.now(), lessonIds: [lessonObsId] } }),
+      );
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: filePath },
+        session_id: 'sess-sal-legacy',
+      }, envFor());
+      expect(stdout).toBe('');
+    });
+  });
+
   // ─── A3 (v2.83): cross-hook ID dedup ──────────────────────────────────────
   // UPS writes `INJECTED_IDS_FILE` at `<DB_DIR>/runtime/.claude-mem-injected-<project>`
   // with `{ids, ts, count}`. Pre-tool-recall reads it; if a lesson row was
