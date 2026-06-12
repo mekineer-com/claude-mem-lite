@@ -101,7 +101,10 @@ function makeBugPresentWorktree(spec) {
 // a pinned-settings session to fully close.
 function commitConstruction(wt) {
   git(wt, 'add -A');
-  git(wt, `-c user.email=harness@efficacy -c user.name=efficacy-harness commit -qm 'chore: routine maintenance'`);
+  // --no-verify: worktrees share .git/hooks, so the repo's pre-commit (lint +
+  // full suite) would run against the intentionally-buggy construction and
+  // reject the commit.
+  git(wt, `-c user.email=harness@efficacy -c user.name=efficacy-harness commit -q --no-verify -m 'chore: routine maintenance'`);
 }
 function dropWorktree(wt) {
   try { git(REPO, `worktree remove --force '${wt}'`); } catch { /* */ }
