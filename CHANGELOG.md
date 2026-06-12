@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v2.99.0 — CLI/MCP convergence round 2 (timeline + search cores) + isolated efficacy re-measure
+
+No user-visible behavior change. This release closes the two largest remaining dual implementations from the v2.98 audit (D#33/D#34) and lands the pinned-isolation benchmark mode whose first run materially revises the project's own efficacy claims (D#35).
+
+### CLI/MCP convergence (round 2 — the two big ones)
+
+- **refactor: single-source timeline core.** `cmdTimeline` (CLI) and `mem_timeline` (MCP) hand-copied the anchor-resolution ladder (P#/S# token → nearest observation, compressed-observation re-anchor with negative-sentinel errors, bare-int prompt/session fallback), the `findFtsAnchor` query wrapper, and the before/after window queries — synced only by "aligned with" comments. All of it now lives in `lib/timeline-core.mjs`; the two surfaces keep argument parsing and rendering. Error-message dialects (CLI `[mem] `-prefixed vs MCP trailing-period) are frozen side-by-side in one `formatAnchorError` table instead of being normalized, so both sides' regression-anchored strings are preserved and the divergence is explicit. 24 new contract tests.
+- **refactor: single-source search core.** `cmdSearch` and `mem_search` duplicated FTS query build (+`--or` relax), date-bound parsing (end-of-day extension), over-fetch sizing (the #8217/#8638 single-slice pagination contract), the sessions/prompts FTS queries including the CJK precision gate + LIKE fallback, cross-source score normalization, user sort, and the tier post-filter — the exact drift class behind the v2.98 pagination bugs. Now shared via `lib/search-core.mjs`. Known behavioral asymmetries are documented as preserved, not silently converged (CLI forces `source=observations` for `--type/--tier/--importance/--branch` while MCP only does for `obs_type`; CLI-only inverted-range warning; CLI-only legacy-DB try/catch). 20 new contract tests.
+
+Suite 2776 → 2820 passed (+44); knip reports no new unused exports; both new lib files registered in `package.json` files[] + `source-files.mjs` (the #8615 tarball-completeness pair).
+
+### Benchmark: pinned-isolation mode + a corrected efficacy picture
+
+- **`efficacy-harness.mjs --isolated`** builds a throwaway `CLAUDE_CONFIG_DIR` (credentials + the two injection-relevant mem hooks wired to the checkout, global `model` carried over) so cells run with no global plugins/orchestrator config; `--arms=A,AL,C` adds a same-environment salience-vs-legacy comparison (`AL` = arm A under `CLAUDE_MEM_SALIENCE=legacy`). Cells record `env` + `model` tags so cross-config pooling mistakes are visible in the data.
+- **The result revises memory #8651.** Under isolation with the model pinned to the June-4 baseline's (k=8/arm, injection verified 16/16): **A=0/8, AL=0/8, C=0/8**. The June-4 "on-topic injection is 50% effective" upper bound does not survive a leak-free environment; replica evidence shows sessions dispatch the built-in Agent tool (whose worker has full Bash regardless of `--allowedTools` under `bypassPermissions`), and the June-4 4/8 is best explained by the since-closed uncommitted-construction `git diff` oracle leak. See `benchmark/efficacy-README.md` conclusion #4 for the full chain of evidence and the instrument's resulting floor problem.
+
 ## v2.98.0 — salience forcing-function at the injection action point + CLI/MCP convergence round 1
 
 **Behavior change (user-visible, opt-out available).** The efficacy severe test (memory #8651, `benchmark/efficacy-README.md`) showed that a verified, on-topic, near-verbatim lesson injection moved bug-reintroduction only from 100% (arm C 8/8 fail) to 50% (arm A 4/8 pass): the agent *sees* the lesson and ignores it about half the time. The bottleneck is acting, not retrieval — so v2.98 raises salience exactly at the action point:
