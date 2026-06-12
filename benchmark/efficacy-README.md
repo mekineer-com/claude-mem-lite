@@ -40,6 +40,25 @@ product change**, not to rediscover these:
 **When to re-run:** after adding a salience/forcing-function at the injection
 point, run STEP 3 on `bac2e85` again and check whether arm A moves above 4/8.
 
+4. **The June-4 4/8 does not survive isolation (D#35 re-measure, 2026-06-13).**
+   Under `--isolated` with the model pinned to the same Fable used by the
+   baseline (`env: isolated-v2`, k=8/arm, injection verified 16/16):
+   **A=0/8, AL(legacy format)=0/8, C=0/8** — Δ(A−C)=0pp, salience-vs-legacy
+   indistinguishable at the floor. Mechanism evidence from a kept-worktree
+   replica: the session dispatches the **built-in Agent tool** (a `worker`
+   subagent with full Bash — `--allowedTools 'Read,Edit'` does not confine it
+   under `bypassPermissions`), the worker performs the batching task correctly,
+   runs the worktree's (regression-excised) tests for false confidence, and
+   ships without restoring the `recoverChildrenOf` calls the injected lesson
+   explicitly warns about. With the construction committed (git-diff leak
+   closed), the lesson alone moved nothing. Best current estimate: the June-4
+   A=4/8 was substantially an artifact of the uncommitted-construction oracle
+   leak, and the true clean-environment upper bound on this commit is ~0 —
+   strengthening #8651's conclusion (ACTING is the bottleneck) past "50%
+   effective" toward "not measurably effective on this instrument". The
+   instrument itself now has a floor problem: to discriminate salience formats
+   it needs an easier commit set or a tool-confined runner.
+
 ## The three steps
 
 | File | Step | What it does | Cost |
@@ -81,9 +100,17 @@ node benchmark/efficacy-harness.mjs                  # STEP 3 driver — spawns 
   consequences: (1) **runs are only comparable under the same global config** —
   the June-4 A=4/8, C=0/8 baseline and any post-config-change run measure
   different systems; a re-measure after a product change must re-run BOTH arms
-  in the same session environment; (2) for a clean cell, pin the session to an
-  isolated settings file containing ONLY the mem hooks (not yet implemented —
-  see deferred item D#35).
+  in the same session environment; (2) for a clean cell, run with `--isolated`
+  (implemented for D#35): the harness builds a throwaway `CLAUDE_CONFIG_DIR`
+  containing only the credentials and the two injection-relevant mem hooks
+  (PreToolUse `pre-tool-recall.js`, UserPromptSubmit `user-prompt-search.js`)
+  wired to this checkout — no global plugins, no orchestrator, no
+  subagent-dispatch escape. `setup.sh`/`post-tool-use.sh` are deliberately
+  excluded (they hardcode `$HOME/.claude-mem-lite` and would touch live data).
+  `--arms=A,AL,C` adds the salience-format comparison in the same env:
+  `AL` = arm A under `CLAUDE_MEM_SALIENCE=legacy`. Isolated cells carry
+  `env: "isolated-v1"` in `tasks/efficacy-results.json` and must not be pooled
+  with non-isolated cells.
 - **Ack ≠ comprehension (single-case but vivid, from the same diagnosis).** With
   v2.98 salience the diagnosed agent recalled the full lesson via CLI, declared
   "Lesson #1 applied", and still shipped the bug — it misread recover-before-delete

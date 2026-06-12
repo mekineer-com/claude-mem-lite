@@ -31,10 +31,14 @@
 //   node benchmark/efficacy-harness.mjs --k=3             # full run (default arms A,C)
 //   node benchmark/efficacy-harness.mjs --commit=bac2e85  # one commit
 //   node benchmark/efficacy-harness.mjs --concurrency=3
+//   node benchmark/efficacy-harness.mjs --isolated --arms=A,AL,C
+//     # D#35 mode: pinned CLAUDE_CONFIG_DIR (mem-only hooks, no global plugins/
+//     # orchestrator), plus AL = arm A under CLAUDE_MEM_SALIENCE=legacy so
+//     # v2.98-salience vs legacy injection format is measured in the SAME env.
 
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, symlinkSync } from 'fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, symlinkSync, copyFileSync, chmodSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir, homedir } from 'os';
 import { execSync, execFileSync, execFile } from 'child_process';
 import { promisify } from 'util';
 const execFileP = promisify(execFile);
@@ -44,7 +48,12 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true];
 }));
 const K = parseInt(args.k || '3', 10);
+// Arms: A = lesson injected (current salience, v2.98 ack-directive),
+//       AL = lesson injected with CLAUDE_MEM_SALIENCE=legacy (pre-v2.98 format),
+//       C = empty sandbox control.
 const ARMS = (args.arms || 'A,C').split(',');
+const INJECTED_ARMS = new Set(['A', 'AL']);
+const ISOLATED = !!args.isolated;
 const BASELINE_ONLY = !!args['baseline-only'];
 const ONLY_COMMIT = args.commit || null;
 const CONCURRENCY = parseInt(args.concurrency || '3', 10);
@@ -110,6 +119,50 @@ function dropWorktree(wt) {
   try { git(REPO, `worktree remove --force '${wt}'`); } catch { /* */ }
 }
 
+// ── pinned session environment (D#35) ───────────────────────────────────────
+// --isolated closes the orchestrator/Bash escape from the 2026-06-13
+// contamination diagnosis: `--allowedTools` does not confine a session whose
+// global ~/.claude config auto-dispatches Bash-capable subagents. We point
+// CLAUDE_CONFIG_DIR at a throwaway dir so the session sees NO global plugins,
+// hooks, or orchestrator config — only the two mem hooks the experiment is
+// about, wired to THIS checkout. Hook subset is deliberate:
+//   • PreToolUse pre-tool-recall.js  — the injection channel under test
+//   • UserPromptSubmit user-prompt-search.js — prompt-level injection parity
+// setup.sh and post-tool-use.sh are EXCLUDED: both hardcode
+// $HOME/.claude-mem-lite and would write to the user's live data dir from
+// inside the cells (the node paths honor the CLAUDE_MEM_DIR sandbox; the bash
+// ones don't). SessionStart/Stop (hook.mjs) are excluded too — Haiku
+// summarization is irrelevant to edit quality and just adds cost.
+// Credentials: Linux stores them in ~/.claude/.credentials.json; copy into
+// the pinned dir (0600) so headless auth works without the real config.
+// Model: MUST be carried over from the user's global settings — the isolated-v1
+// run omitted it and all 24 cells ran the `claude -p` default model, flooring
+// every arm at 0/8 (a model confounder, not an efficacy result). Cells record
+// the model so cross-run pooling mistakes are visible in the data.
+function pinnedModel() {
+  if (args.model) return args.model;
+  try { return JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8')).model ?? null; }
+  catch { return null; }
+}
+function makePinnedConfigDir(model) {
+  const cfg = mkdtempSync(join(tmpdir(), 'eff-cfg-'));
+  copyFileSync(join(homedir(), '.claude', '.credentials.json'), join(cfg, '.credentials.json'));
+  chmodSync(join(cfg, '.credentials.json'), 0o600);
+  const hook = (script, timeout) => ({
+    type: 'command',
+    command: `node "${join(REPO, 'scripts/hook-launcher.mjs')}" scripts/${script}`,
+    timeout,
+  });
+  writeFileSync(join(cfg, 'settings.json'), JSON.stringify({
+    ...(model ? { model } : {}),
+    hooks: {
+      PreToolUse: [{ matcher: 'Edit|Write|NotebookEdit|Read', hooks: [hook('pre-tool-recall.js', 3)] }],
+      UserPromptSubmit: [{ matcher: '*', hooks: [hook('user-prompt-search.js', 2)] }],
+    },
+  }, null, 2));
+  return cfg;
+}
+
 // ── oracle scoring via vitest json reporter ──────────────────────────────────
 // returns Map<testFullName, 'passed'|'failed'>
 function runOracle(wt, oracleTestRel, commit) {
@@ -133,7 +186,7 @@ function runOracle(wt, oracleTestRel, commit) {
 // ── mem sandbox seeding ──────────────────────────────────────────────────────
 function seedSandbox(arm, spec) {
   const sb = mkdtempSync(join(tmpdir(), `eff-mem${arm}-`));
-  if (arm === 'A') {
+  if (INJECTED_ARMS.has(arm)) {
     const filesArg = spec.srcFiles.map((f) => `--files ${f}`).join(' ');
     execFileSync('bash', ['-c',
       `CLAUDE_MEM_DIR='${sb}' claude-mem-lite save --type bugfix --importance 2 --project projects--mem ` +
@@ -156,21 +209,29 @@ function probeInjection(sandbox, wt, srcFile) {
 }
 
 // ── one session ──────────────────────────────────────────────────────────────
-async function runArmSeed(spec, arm, seed) {
+async function runArmSeed(spec, arm, seed, cfgDir, model) {
   let wt;
   try { wt = makeBugPresentWorktree(spec); }
   catch (e) { return { commit: spec.hash, arm, seed, pass: null, note: e.code === 'REVERT_CONFLICT' ? 'revert conflict' : 'worktree fail' }; }
   const sb = seedSandbox(arm, spec);
   const cell = { commit: spec.hash, arm, seed };
+  if (cfgDir) { cell.env = 'isolated-v2'; cell.model = model || 'cli-default'; }
+  if (INJECTED_ARMS.has(arm)) cell.salience = arm === 'AL' ? 'legacy' : 'current';
   try {
-    if (arm === 'A') {
+    if (INJECTED_ARMS.has(arm)) {
       cell.injected = probeInjection(sb, wt, spec.srcFiles[0]);
       if (!cell.injected) { cell.pass = null; cell.note = 'INJECTION FAILED — discard'; return cell; }
     }
     const task = spec.task + TASK_SUFFIX;
+    const envVars = [
+      `CLAUDE_MEM_DIR='${sb}'`,
+      `CLAUDE_PROJECT_DIR='${REPO}'`,
+      cfgDir ? `CLAUDE_CONFIG_DIR='${cfgDir}'` : '',
+      arm === 'AL' ? `CLAUDE_MEM_SALIENCE=legacy` : '',
+    ].filter(Boolean).join(' ');
     try {
       await execFileP('bash', ['-c',
-        `cd '${wt}' && CLAUDE_MEM_DIR='${sb}' CLAUDE_PROJECT_DIR='${REPO}' timeout ${SESSION_TIMEOUT} ` +
+        `cd '${wt}' && ${envVars} timeout ${SESSION_TIMEOUT} ` +
         `claude -p ${JSON.stringify(task)} --permission-mode bypassPermissions --allowedTools 'Read,Edit' --output-format text`],
         { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: (SESSION_TIMEOUT + 30) * 1000 });
     } catch (e) { cell.sessionErr = String(e.message).slice(0, 120); }
@@ -209,8 +270,10 @@ const config = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
 let commits = config.commits;
 if (ONLY_COMMIT) commits = commits.filter((c) => c.hash.startsWith(ONLY_COMMIT));
 
-console.log(`efficacy-harness: ${commits.length} commits, arms=${ARMS}, k=${K}, baseline-only=${BASELINE_ONLY}`);
-console.log('NOTE: measures an UPPER BOUND (lesson↔task isomorphic). Severe test, not a powered test.\n');
+console.log(`efficacy-harness: ${commits.length} commits, arms=${ARMS}, k=${K}, baseline-only=${BASELINE_ONLY}, isolated=${ISOLATED}`);
+console.log('NOTE: measures an UPPER BOUND (lesson↔task isomorphic). Severe test, not a powered test.');
+if (!ISOLATED && !BASELINE_ONLY) console.log('WARNING: running under the user global ~/.claude config — cells are NOT comparable across config changes (see efficacy-README "Environment isolation"). Use --isolated.');
+console.log('');
 
 // Phase 1: validate constructions + discover bug-sets
 for (const spec of commits) {
@@ -233,17 +296,22 @@ for (const spec of usable) for (const arm of ARMS) for (let s = 1; s <= K; s++) 
 }
 console.log(`${queue.length} sessions to run (${done.size} already done), concurrency=${CONCURRENCY}\n`);
 
+const pinModel = ISOLATED ? pinnedModel() : null;
+const cfgDir = ISOLATED && queue.length ? makePinnedConfigDir(pinModel) : null;
+if (cfgDir) console.log(`pinned session config: ${cfgDir} (mem-only hooks, no global plugins, model=${pinModel || 'cli-default'})\n`);
+process.on('exit', () => { if (cfgDir) rmSync(cfgDir, { recursive: true, force: true }); });
+
 let active = 0, idx = 0, completed = 0;
 await new Promise((resolve) => {
   const pump = () => {
     if (idx >= queue.length && active === 0) return resolve();
     while (active < CONCURRENCY && idx < queue.length) {
       const job = queue[idx++]; active++;
-      Promise.resolve().then(() => runArmSeed(job.spec, job.arm, job.seed)).then((cell) => {
+      Promise.resolve().then(() => runArmSeed(job.spec, job.arm, job.seed, cfgDir, pinModel)).then((cell) => {
         results.cells.push(cell); saveResults(results); active--; completed++;
         console.log(`  [${completed}/${queue.length}] ${cell.commit} arm ${cell.arm} #${cell.seed}: ` +
           (cell.pass === null ? `SKIP(${cell.note})` : cell.pass ? 'PASS' : 'FAIL') +
-          (cell.arm === 'A' && cell.injected === false ? ' ⚠NOINJECT' : ''));
+          (INJECTED_ARMS.has(cell.arm) && cell.injected === false ? ' ⚠NOINJECT' : ''));
         pump();
       });
     }
@@ -261,12 +329,19 @@ for (const spec of usable) {
     row[arm] = { n: cells.length, pass: cells.filter((c) => c.pass === 1).length };
   }
   perCommit.push(row);
-  const a = row.A, c = row.C;
-  console.log(`  ${spec.hash}  A=${a?.pass}/${a?.n}  C=${c?.pass}/${c?.n}  Δ=${a && c && a.n && c.n ? (((a.pass / a.n) - (c.pass / c.n)) * 100).toFixed(0) + 'pp' : 'n/a'}`);
+  const c = row.C;
+  const armStr = ARMS.map((arm) => `${arm}=${row[arm]?.pass}/${row[arm]?.n}`).join('  ');
+  const deltaStr = ARMS.filter((arm) => arm !== 'C').map((arm) => {
+    const a = row[arm];
+    return `Δ(${arm}−C)=${a && c && a.n && c.n ? (((a.pass / a.n) - (c.pass / c.n)) * 100).toFixed(0) + 'pp' : 'n/a'}`;
+  }).join('  ');
+  console.log(`  ${spec.hash}  ${armStr}  ${deltaStr}`);
 }
-// commit-level paired mean Δ
-const deltas = perCommit.filter((r) => r.A?.n && r.C?.n).map((r) => (r.A.pass / r.A.n) - (r.C.pass / r.C.n));
-const meanD = deltas.length ? deltas.reduce((x, y) => x + y, 0) / deltas.length : null;
-console.log(`\nCOMMIT-LEVEL mean Δ (A−C) = ${meanD == null ? 'n/a' : (meanD * 100).toFixed(1) + 'pp'} over ${deltas.length} commits.`);
+// commit-level paired mean Δ, one line per injected arm vs C
+for (const arm of ARMS.filter((a) => a !== 'C')) {
+  const deltas = perCommit.filter((r) => r[arm]?.n && r.C?.n).map((r) => (r[arm].pass / r[arm].n) - (r.C.pass / r.C.n));
+  const meanD = deltas.length ? deltas.reduce((x, y) => x + y, 0) / deltas.length : null;
+  console.log(`\nCOMMIT-LEVEL mean Δ (${arm}−C) = ${meanD == null ? 'n/a' : (meanD * 100).toFixed(1) + 'pp'} over ${deltas.length} commits.`);
+}
 console.log('UPPER BOUND. No significance claimed (step-2 power). NULL/near-0 here = strong negative; large + = on-topic injection works (not realistic efficacy).');
 saveResults(results);
