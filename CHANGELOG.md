@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.0.1 — Tier-1 firing counters for the v3.0.0 read-time features
+
+Observability follow-on to v3.0.0. `scripts/pre-tool-recall.js` now records a `file_intel` / `reread_warn` event via `lib/metrics.mjs` on each ① file-intelligence / ② repeated-read-guard firing — gated by `CLAUDE_MEM_METRICS=1` (default off, zero hot-path cost; `recordMetric` no-ops when disabled). Counts surface in `claude-mem-lite stats` (a new `Feature injections (7d)` line, with an enable hint when empty) and `claude-mem-lite doctor` (the existing metrics block), so the two features become observable over time instead of fire-and-forget. The heed proxy (did the agent act on the nudge) is deferred to a tier-2 follow-on.
+
+Also folds in a test-only hardening: the `source-files-sync` completeness walk now follows `../` imports (it matched only `./` — the blind spot that nearly shipped `lib/file-intel.mjs` / `lib/reread-guard.mjs` missing from the tarball), and the `launch.mjs` invariant is corrected from "under scripts/ only" to "under scripts/ OR in SOURCE_FILES".
+
+Suite 2857 → 2860 passed (+3 metrics integration tests). No dependency changes; hono stays pinned at 4.12.26.
+
 ## v3.0.0 — Read-time proactive context: file intelligence + repeated-read guard
 
 Two additive, default-on (env-opt-out) features on the `PreToolUse:Read` path, delivered through the existing `additionalContext` injection channel. Both were distilled from a competitive read of OpenWolf (`cytostack/openwolf`): its headline ideas — a file index that tells the agent what a file holds before it reads it, and a repeated-read warning — re-implemented through our injection channel (which actually reaches the model) rather than OpenWolf's stderr-only hooks (which only surface to the user).
