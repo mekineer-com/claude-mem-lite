@@ -24,7 +24,7 @@
 // would defeat the entire purpose — the launcher must survive a broken
 // install.
 
-import { existsSync, mkdirSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -37,8 +37,18 @@ const RUNTIME_DIR = process.env.CLAUDE_MEM_DIR
   : join(homedir(), '.claude-mem-lite', 'runtime');
 const HEAL_MARKER = join(RUNTIME_DIR, 'hook-launcher-lastheal');
 const HEAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+// Observable breakage state: written when the launcher degrades a broken install
+// to exit 0, cleared once the install is confirmed healthy. `doctor` reads it so
+// the intentional silence (no stack trace per fire) stays detectable. (#4/#8)
+const BROKEN_MARKER = join(RUNTIME_DIR, 'hook-launcher-broken');
 
-// Last-resort recovery string for users whose `claude-mem-lite repair` path
+// Resolvable invocation of the bundled CLI's repair path. Absolute via
+// INSTALL_DIR (import.meta.url) so it works on a plugin-only install, where
+// bare `claude-mem-lite` is not on PATH and ~/.claude-mem-lite/ holds no source.
+// cli.mjs routes `repair` → install.mjs. (review #3)
+const CLI_REPAIR = `node ${join(INSTALL_DIR, 'cli.mjs')} repair`;
+
+// Last-resort recovery string for users whose `cli.mjs repair` path
 // itself failed (install.mjs missing / repair errored / retry still drifting).
 // Duplicated in install.mjs::repair() catch; both are reachable when local
 // scripts are broken, so neither can import a shared constant.
@@ -76,13 +86,51 @@ async function runEntry({ bustCache = false } = {}) {
 // Anchor on any path the error exposes — the missing URL and/or the importer
 // (present in both messages as "imported from <path>"). If it sits inside our
 // install, a self-heal could fix it.
+// package.json dependency set of THIS install — read lazily, best-effort. Lets
+// isLocalModuleErr tell a genuinely-ours missing bare dependency (better-sqlite3,
+// zod, …) apart from a foreign/mistyped package name that merely happens to be
+// imported from an install-dir file. The former is self-healable; the latter is
+// a real packaging bug that must surface a Node stack trace rather than be
+// swallowed by an exit-0 self-heal. (review #5/#7)
+function ownDependencies() {
+  try {
+    const pkg = JSON.parse(readFileSync(join(INSTALL_DIR, 'package.json'), 'utf8'));
+    return new Set([
+      ...Object.keys(pkg.dependencies || {}),
+      ...Object.keys(pkg.optionalDependencies || {}),
+    ]);
+  } catch {
+    return null; // unreadable package.json → caller stays permissive
+  }
+}
+
 function isLocalModuleErr(e) {
   if (!e || e.code !== 'ERR_MODULE_NOT_FOUND') return false;
-  const importer = /imported from (.+?)\s*$/.exec(String(e.message || ''))?.[1];
-  const paths = [e.url, importer]
-    .filter(Boolean)
-    .map((p) => String(p).replace(/^file:\/\//, ''));
-  return paths.some((p) => p.startsWith(INSTALL_DIR) || p.includes('.claude-mem-lite'));
+  // Missing RELATIVE module: e.url is the missing file's URL. Ours iff it sits
+  // under our install dir (the `.claude-mem-lite` substring also covers the
+  // symlink-farm dev/direct-install case where INSTALL_DIR is the realpath).
+  if (e.url) {
+    const p = String(e.url).replace(/^file:\/\//, '');
+    return p.startsWith(INSTALL_DIR) || p.includes('.claude-mem-lite');
+  }
+  // Missing BARE dependency: e.url is UNDEFINED; message is
+  // `Cannot find package '<name>' imported from <importer>`. The (.+) capture
+  // needs no `m` flag (`.` stops at a newline) and so tolerates a multi-line
+  // message that appends a hint line after the importer path — the old
+  // `(.+?)\s*$` returned undefined there and misclassified the dep. (review #11/#15)
+  const msg = String(e.message || '');
+  const importer = /imported from (.+)/.exec(msg)?.[1]?.trim();
+  if (!importer) return false;
+  const importerPath = importer.replace(/^file:\/\//, '');
+  if (!(importerPath.startsWith(INSTALL_DIR) || importerPath.includes('.claude-mem-lite'))) return false;
+  // Importer is ours — but only self-heal if the missing package is one we
+  // actually declare. A foreign/typo'd name re-throws so the bug is visible.
+  const pkgName = /Cannot find package '([^']+)'/.exec(msg)?.[1];
+  const deps = ownDependencies();
+  if (!deps || !pkgName) return true; // best-effort: can't verify → stay permissive
+  // Normalize sub-path / scoped imports to the package root (better-sqlite3/x → better-sqlite3).
+  const root = pkgName.startsWith('@') ? pkgName.split('/').slice(0, 2).join('/') : pkgName.split('/')[0];
+  return deps.has(root);
 }
 
 // Human-readable label for the "Detected broken install (<reason>)" line:
@@ -107,11 +155,29 @@ function recordHealAttempt() {
   } catch { /* best-effort */ }
 }
 
+// Drop the 6h cooldown once a heal fully resolves. The marker is written BEFORE
+// spawn (rate-limits concurrent fires), but a SUCCESSFUL heal must not keep
+// blocking an unrelated later breakage that happens within the window. (#6/#9)
+function clearHealMarker() {
+  try { unlinkSync(HEAL_MARKER); } catch { /* already gone — fine */ }
+}
+
+function recordBreakage(reason) {
+  try {
+    mkdirSync(RUNTIME_DIR, { recursive: true });
+    writeFileSync(BROKEN_MARKER, JSON.stringify({ reason, ts: Date.now() }));
+  } catch { /* best-effort */ }
+}
+
+function clearBreakage() {
+  try { if (existsSync(BROKEN_MARKER)) unlinkSync(BROKEN_MARKER); } catch { /* best-effort */ }
+}
+
 async function attemptHeal(reason) {
   if (recentHealAttempt()) {
     process.stderr.write(
       `[claude-mem-lite] Self-heal skipped (last attempt < 6h ago).\n` +
-      `[claude-mem-lite] Manual recovery: claude-mem-lite repair\n` +
+      `[claude-mem-lite] Manual recovery: ${CLI_REPAIR}\n` +
       `[claude-mem-lite] If that fails, run: ${TARBALL_FALLBACK}\n`,
     );
     return false;
@@ -160,19 +226,30 @@ if (rest.includes('session-start')) {
 
 try {
   await runEntry();
+  // A clean session-start fire confirms the install is healthy → clear any stale
+  // breakage marker. Gated to session-start so the per-tool hot path pays nothing.
+  if (rest.includes('session-start')) clearBreakage();
 } catch (e) {
   if (!isLocalModuleErr(e)) throw e;
-  const healed = await attemptHeal(describeFailure(e));
+  const reason = describeFailure(e);
+  const healed = await attemptHeal(reason);
   if (!healed) {
     // Broken/missing dependency we can't repair right now (repair failed, or
     // was skipped within the 6h cooldown). attemptHeal already wrote actionable
     // guidance — degrade quietly instead of re-throwing the original import
-    // error, which would spew a Node stack trace on every hook fire.
+    // error, which would spew a Node stack trace on every hook fire. Record the
+    // breakage so the exit-0 silence stays observable to `doctor`. (#4/#8)
+    recordBreakage(reason);
     process.exit(0);
   }
   try {
     await runEntry({ bustCache: true });
+    // Fully healed: drop the cooldown so an UNRELATED later break can heal
+    // immediately (#6/#9), and clear the breakage marker.
+    clearHealMarker();
+    clearBreakage();
   } catch (retryErr) {
+    recordBreakage(`retry-failed: ${retryErr.message}`);
     process.stderr.write(
       `[claude-mem-lite] Hook still failing after self-heal: ${retryErr.message}\n` +
       `[claude-mem-lite] Manual recovery: ${TARBALL_FALLBACK}\n`,

@@ -70,7 +70,7 @@ describe('buildServerInstructions(quiet)', () => {
 
   it('quiet mode still includes base CLI + tool list', () => {
     const out = buildServerInstructions(true);
-    expect(out).toContain('claude-mem-lite search');
+    expect(out).toContain('cli.mjs search'); // resolvable absolute-path form (v3.1.1)
     expect(out).toContain('MCP tools:');
     expect(out).toContain('Long-term memory across sessions');
   });

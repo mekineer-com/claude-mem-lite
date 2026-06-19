@@ -2,6 +2,7 @@
 // Single source of truth — used by server.mjs (runtime) and contract.test.mjs (validation tests)
 
 import { z } from 'zod';
+import { CLI_INVOKE } from './cli-path.mjs';
 
 export const OBS_TYPE_ENUM = z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
 
@@ -349,7 +350,7 @@ export const tools = [
       '  - Looking for prior art on a module/feature before refactoring\n' +
       '  - User asks "have we seen this before" or references something not in visible context\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs search "<query>" [--type bugfix]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' search "<query>" [--type bugfix]',
     inputSchema: memSearchSchema,
   },
   {
@@ -367,7 +368,7 @@ export const tools = [
       '  - User asks "what did we do yesterday / last" with no topic keyword\n' +
       '  - Verifying that a just-made change was captured as an observation\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs recent [N]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' recent [N]',
     inputSchema: memRecentSchema,
   },
   {
@@ -387,7 +388,7 @@ export const tools = [
       '  - A search hit is interesting and you want its chronological neighbours\n' +
       '  - Replaying a session narrative around a known observation ID\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs timeline --anchor <ID> [--before N --after N]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' timeline --anchor <ID> [--before N --after N]',
     inputSchema: memTimelineSchema,
   },
   {
@@ -407,7 +408,7 @@ export const tools = [
       '\n' +
       'On miss, response includes "Try: …" hint listing other sources the ID lives in.\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs get <id>[,<id>,...] — accepts P#/S#/# prefix.',
+      'Equivalent CLI: ' + CLI_INVOKE + ' get <id>[,<id>,...] — accepts P#/S#/# prefix.',
     inputSchema: memGetSchema,
   },
   {
@@ -425,7 +426,7 @@ export const tools = [
       '  - Cleaning up an observation saved from a test run or incorrect save\n' +
       '  - Always run once with confirm=false, then again with confirm=true\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs delete <id>[,<id>,...] [--confirm]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' delete <id>[,<id>,...] [--confirm]',
     inputSchema: memDeleteSchema,
     hidden: true,
   },
@@ -444,7 +445,7 @@ export const tools = [
       '  - After a non-obvious architecture/tradeoff decision — set type="decision", lesson_learned="<constraint + why>"\n' +
       '  - User explicitly asks "remember this" or "save a note that ..."\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs save --type bugfix --lesson "..." "<content>"',
+      'Equivalent CLI: ' + CLI_INVOKE + ' save --type bugfix --lesson "..." "<content>"',
     inputSchema: memSaveSchema,
   },
   {
@@ -462,7 +463,7 @@ export const tools = [
       '  - Diagnosing why search feels sparse or noisy at a macro level\n' +
       '  - Auditing a project before major compression/maintenance\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs stats [--project X] [--days 30]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' stats [--project X] [--days 30]',
     inputSchema: memStatsSchema,
     hidden: true,
   },
@@ -481,7 +482,7 @@ export const tools = [
       '  - After a major project phase completes and old per-file observations are noise\n' +
       '  - Stats show thousands of low-importance rows dragging search quality\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs compress [--execute] [--age-days 90]  (preview is default)',
+      'Equivalent CLI: ' + CLI_INVOKE + ' compress [--execute] [--age-days 90]  (preview is default)',
     inputSchema: memCompressSchema,
     hidden: true,
   },
@@ -500,7 +501,7 @@ export const tools = [
       '  - After bulk imports or a long offline period\n' +
       '  - User asks for periodic maintenance / cleanup\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs maintain scan --ops dedup,decay',
+      'Equivalent CLI: ' + CLI_INVOKE + ' maintain scan --ops dedup,decay',
     inputSchema: memMaintainSchema,
     hidden: true,
   },
@@ -519,7 +520,7 @@ export const tools = [
       '  - stats show many degraded (title-only, no lesson) observations\n' +
       '  - Start with action="preview" to see candidates before spending tokens\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs optimize [--run|--run-all] [--task re-enrich,normalize,cluster-merge,smart-compress] [--max N]  (preview is default)',
+      'Equivalent CLI: ' + CLI_INVOKE + ' optimize [--run|--run-all] [--task re-enrich,normalize,cluster-merge,smart-compress] [--max N]  (preview is default)',
     inputSchema: memOptimizeSchema,
     hidden: true,
   },
@@ -538,7 +539,7 @@ export const tools = [
       '  - Looking for a tool by capability → action="search" with keywords\n' +
       '  - User explicitly asks to import a GitHub repo → action="import_url"\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs registry <list|search|import|...> [args]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' registry <list|search|import|...> [args]',
     inputSchema: memRegistrySchema,
     hidden: true,
   },
@@ -576,7 +577,7 @@ export const tools = [
       '  - You later discover additional context worth appending to lesson_learned\n' +
       '  - Reclassifying an observation after its true type becomes clear\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs update <id> [--title ...] [--lesson ...]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' update <id> [--title ...] [--lesson ...]',
     inputSchema: memUpdateSchema,
     hidden: true,
   },
@@ -595,7 +596,7 @@ export const tools = [
       '  - Moving observations between machines or projects\n' +
       '  - User asks for a JSON snapshot of a project\'s memories\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs export [--format jsonl] [--project X] [--limit 500]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' export [--format jsonl] [--project X] [--limit 500]',
     inputSchema: memExportSchema,
     hidden: true,
   },
@@ -614,7 +615,7 @@ export const tools = [
       '  - User asks "what do we know about <file>"\n' +
       '  - Investigating a recurring issue in a file you have not touched recently\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs recall "<file>" [--limit 10]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' recall "<file>" [--limit 10]',
     inputSchema: memRecallSchema,
   },
   {
@@ -632,7 +633,7 @@ export const tools = [
       '  - After a crash, power loss, or manual DB edit\n' +
       '  - doctor / stats flags FTS integrity problems\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs fts-check [--rebuild]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' fts-check [--rebuild]',
     inputSchema: memFtsCheckSchema,
     hidden: true,
   },
@@ -651,7 +652,7 @@ export const tools = [
       '  - Triaging what to compress or clean up before running maintenance\n' +
       '  - Scanning for interesting anchors to follow up with mem_timeline\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs browse [--tier active] [--project X]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' browse [--tier active] [--project X]',
     inputSchema: memBrowseSchema,
     hidden: true,
   },
@@ -670,7 +671,7 @@ export const tools = [
       '  - Wrap-up phase enumerates follow-up items for the next session\n' +
       '  - Bug surfaces but root cause is out of this session\'s scope\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs defer add "<title>" [--priority 1|2|3] [--detail "..."] [--files a.mjs,b.mjs]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' defer add "<title>" [--priority 1|2|3] [--detail "..."] [--files a.mjs,b.mjs]',
     inputSchema: memDeferSchema,
   },
   {
@@ -687,7 +688,7 @@ export const tools = [
       '  - About to refer to "item N" and need to confirm what N points to\n' +
       '  - Auditing carry-forward state across multiple sessions\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs defer list [--project X] [--limit 10]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' defer list [--project X] [--limit 10]',
     inputSchema: memDeferListSchema,
   },
   {
@@ -705,7 +706,7 @@ export const tools = [
       '  - Scope changed and the work is no longer needed\n' +
       '  - User explicitly says "drop the deferred X, never mind"\n' +
       '\n' +
-      'Equivalent CLI: node ~/.claude-mem-lite/cli.mjs defer drop <D#N|ordinal> --reason "..."',
+      'Equivalent CLI: ' + CLI_INVOKE + ' defer drop <D#N|ordinal> --reason "..."',
     inputSchema: memDeferDropSchema,
   },
 ];

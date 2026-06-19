@@ -37,7 +37,7 @@ Run via Bash — the CLI takes the lesson text as positional args and stores
 the full text as the title (the `activity save` command uses title-as-body
 when `--body` is absent):
 
-    node ~/.claude-mem-lite/cli.mjs activity save \
+    node ${CLAUDE_PLUGIN_ROOT}/cli.mjs activity save \
       --type lesson \
       --title "<first 60 chars of text>" \
       --body "<full text>" \

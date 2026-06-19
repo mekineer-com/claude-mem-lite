@@ -27,4 +27,4 @@ Once unadopted, the conservative hook layer (SessionStart `File Lessons` /
 `Key Context`, MCP instructions `WHEN TO USE`) goes back to verbose mode —
 Claude Code will see the full injection again on the next session start.
 
-!node ~/.claude-mem-lite/cli.mjs unadopt $ARGUMENTS
+!node ${CLAUDE_PLUGIN_ROOT}/cli.mjs unadopt $ARGUMENTS

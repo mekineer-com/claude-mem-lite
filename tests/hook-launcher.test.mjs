@@ -4,7 +4,7 @@
 // because the launcher derives its install dir from __dirname and the whole
 // point of the wrapper is what happens at process boundaries.
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync } from 'fs';
+import { mkdirSync, writeFileSync, copyFileSync, existsSync, rmSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
@@ -141,5 +141,82 @@ describe('hook-launcher self-heal', () => {
     expect(r.stderr).toMatch(/Detected broken install/);
     expect(r.stdout).toContain('HEALED-OK');
     expect(r.status).toBe(0);
+  });
+
+  it('re-throws a foreign/typo bare dependency NOT in package.json (surfaces the packaging bug)', () => {
+    // #5/#7: a missing bare package imported from an install-dir file was
+    // blanket-classified as ours → self-healed → swallowed at exit 0, hiding a
+    // genuine packaging bug. With package.json readable, an UNDECLARED package
+    // re-throws Node's default error instead of being silently degraded.
+    const root = makeInstall('cml-launcher-foreign');
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { 'better-sqlite3': '^12' } }));
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+    writeFileSync(join(root, 'entry.mjs'), "import x from 'totally-foreign-not-ours';\n");
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).not.toMatch(/Detected broken install/);
+    expect(r.stderr).not.toMatch(/REPAIR-ATTEMPTED/);
+    expect(r.stderr).toMatch(/totally-foreign-not-ours/);
+  });
+
+  it('still self-heals a missing dependency that IS declared in package.json (#5/#7)', () => {
+    const root = makeInstall('cml-launcher-owndep');
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ dependencies: { 'declared-dep-xyz': '^1' } }));
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+    writeFileSync(join(root, 'entry.mjs'), "import x from 'declared-dep-xyz';\n");
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.stderr).toMatch(/Detected broken install/);
+    expect(r.stderr).toMatch(/REPAIR-ATTEMPTED/);
+    expect(r.status).toBe(0);
+  });
+
+  it('records an observable breakage marker when degrading to exit 0 (#4/#8)', () => {
+    const root = makeInstall('cml-launcher-broken-marker');
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+    writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    const marker = join(root, 'runtime', 'hook-launcher-broken');
+    expect(existsSync(marker)).toBe(true);
+    const rec = JSON.parse(readFileSync(marker, 'utf8'));
+    expect(rec.reason).toBeTruthy();
+    expect(typeof rec.ts).toBe('number');
+  });
+
+  it('degrades to exit 0 (no stack trace) when the entry still fails after a "successful" repair (#14)', () => {
+    // The retry-fail branch (exit code 1→0 in v3.1.0, previously untested):
+    // install.mjs reports success (exit 0) but does NOT fix the import, so the
+    // cache-busted retry throws again. Must degrade to exit 0 + record breakage.
+    const root = makeInstall('cml-launcher-retry-fail');
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-DONE");process.exit(0);\n');
+    writeFileSync(join(root, 'entry.mjs'), "import './still-missing.mjs';\n");
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/Detected broken install/);
+    expect(r.stderr).toMatch(/Hook still failing after self-heal/);
+    expect(r.stderr).not.toMatch(/node:internal/);
+    expect(existsSync(join(root, 'runtime', 'hook-launcher-broken'))).toBe(true);
+  });
+
+  it('clears the heal cooldown + breakage markers after a fully successful self-heal (#6/#9)', () => {
+    const root = makeInstall('cml-launcher-heal-clears');
+    writeFileSync(
+      join(root, 'install.mjs'),
+      `import { writeFileSync, mkdirSync } from 'fs';\n` +
+      `import { join, dirname } from 'path';\n` +
+      `import { fileURLToPath } from 'url';\n` +
+      `const __dirname = dirname(fileURLToPath(import.meta.url));\n` +
+      `const target = join(__dirname, 'missing-local.mjs');\n` +
+      `mkdirSync(dirname(target), { recursive: true });\n` +
+      `writeFileSync(target, 'process.stdout.write("HEALED-OK\\\\n");\\n');\n` +
+      `process.exit(0);\n`,
+    );
+    writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('HEALED-OK');
+    // cooldown cleared so an unrelated later breakage can heal immediately
+    expect(existsSync(join(root, 'runtime', 'hook-launcher-lastheal'))).toBe(false);
+    expect(existsSync(join(root, 'runtime', 'hook-launcher-broken'))).toBe(false);
   });
 });

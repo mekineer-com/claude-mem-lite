@@ -127,6 +127,8 @@
 
 插件模式会管理自己的运行时与钩子。SessionStart 时它现在只会**检查并提示**新版本，不会直接覆盖插件目录中的文件。插件模式请通过 Claude 的插件更新流程完成升级。
 
+> **插件安装本身即完整** —— hooks、MCP 工具、以及捆绑的 slash 命令（`/mem`、`/lesson`、`/bug`、`/adopt`）全部从插件内运行，无需第二步。slash 命令以从插件目录解析出的绝对路径调用捆绑 CLI（`${CLAUDE_PLUGIN_ROOT}/cli.mjs <cmd>`），因此不依赖 `PATH` 上的任何东西。全局 `claude-mem-lite` **shell** 命令（用于你自己在终端里跑查询）是**可选**的 —— `npm i -g claude-mem-lite` —— 且是**独立**的 npm 安装：插件的自动更新**不会**刷新它，想保持同步就重新跑 `npm i -g claude-mem-lite@latest`。插件要完整工作**并不需要**它。
+
 ### 方式二：npx（一行命令）
 
 ```bash
@@ -223,9 +225,9 @@ v2.34.0 起服务端注册 17 个工具，但 `tools/list` 只暴露 6 个 **核
 | `mem_update` | `claude-mem-lite update <id>` | 原地更新某条观察。 |
 | `mem_stats` | `claude-mem-lite stats` | 计数、类型分布、每日活动。 |
 | `mem_delete` | `claude-mem-lite delete <id>` | 预览 / 确认流程，FTS5 自动清理。 |
-| `mem_compress` | `claude-mem-lite compress --preview` | 压缩旧的低价值观察。 |
-| `mem_maintain` | `claude-mem-lite maintain --action scan` | 去重 / decay / 清理 / 向量重建。 |
-| `mem_optimize` | `claude-mem-lite optimize --action preview` | LLM 深度优化：re-enrich / normalize / cluster-merge。 |
+| `mem_compress` | `claude-mem-lite compress` | 压缩旧的低价值观察（默认 preview；`--execute` 执行）。 |
+| `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | 去重 / decay / 清理 / 向量重建（`scan` 预览，`execute` 执行）。 |
+| `mem_optimize` | `claude-mem-lite optimize` | LLM 深度优化：re-enrich / normalize / cluster-merge（默认 preview；`--run` 执行）。 |
 | `mem_export` | `claude-mem-lite export` | JSON / JSONL 导出，支持项目/类型/日期过滤。 |
 | `mem_fts_check` | `claude-mem-lite fts-check [--rebuild]` | FTS5 完整性检查与重建。 |
 | `mem_browse` | `claude-mem-lite browse` | 分层仪表盘（working / active / archive）。 |

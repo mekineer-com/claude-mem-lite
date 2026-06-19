@@ -7,6 +7,8 @@
 // docs/plans/2026-04-16-invited-memory-pattern.md so installs do a version-
 // bump replace instead of treating the old content as a user edit.
 
+import { CLI_INVOKE } from './cli-path.mjs';
+
 export const PLUGIN_SLUG = 'claude-mem-lite';
 export const CURRENT_SENTINEL_VERSION = 'v1';
 
@@ -26,7 +28,7 @@ export function getIndexLine() {
 export function getDetailDoc() {
   return `# claude-mem-lite 插件契约
 
-> 由 \`node ~/.claude-mem-lite/cli.mjs adopt\` 生成；卸载用 \`node ~/.claude-mem-lite/cli.mjs unadopt\`。
+> 由 \`${CLI_INVOKE} adopt\` 生成；卸载用 \`${CLI_INVOKE} unadopt\`。
 > 设计背景见 docs/plans/2026-04-16-invited-memory-pattern.md。
 
 ## 何时调用 MCP 工具
@@ -58,37 +60,37 @@ MCP 层，按名 \`tools/call\` 仍可命中，但对 Claude Code 这类只读 t
 
 | 场景 | CLI |
 |------|-----|
-| 清理过期记忆 | \`node ~/.claude-mem-lite/cli.mjs maintain scan --ops purge_stale\` → \`maintain execute --ops purge_stale\` |
-| 深度优化（Haiku） | \`node ~/.claude-mem-lite/cli.mjs optimize\`（默认 preview；\`--run\` 执行，\`--task re-enrich,normalize,cluster-merge,smart-compress\` 选阶段） |
-| 压缩旧条目 | \`node ~/.claude-mem-lite/cli.mjs compress\`（默认 preview；\`--execute\` 执行，\`--age-days N\` 改阈值） |
-| FTS5 索引检查 / 重建 | \`node ~/.claude-mem-lite/cli.mjs fts-check [--rebuild]\` |
-| tier 分组浏览 | \`node ~/.claude-mem-lite/cli.mjs browse [--tier active]\` |
-| 导出 JSON/JSONL | \`node ~/.claude-mem-lite/cli.mjs export [--format jsonl]\` |
-| 统计总量 / 健康 | \`node ~/.claude-mem-lite/cli.mjs stats [--days 30]\` |
-| 删除某条 | \`node ~/.claude-mem-lite/cli.mjs delete <id>[,<id>]\` |
-| 更新某条 | \`node ~/.claude-mem-lite/cli.mjs update <id> [--title ...]\` |
-| 列 / 搜索 / 导入 skill-agent registry | \`node ~/.claude-mem-lite/cli.mjs registry <list\\|search\\|import>\` |
+| 清理过期记忆 | \`${CLI_INVOKE} maintain scan --ops purge_stale\` → \`maintain execute --ops purge_stale --confirm\`（execute 删行必须带 \`--confirm\`，否则只预览） |
+| 深度优化（Haiku） | \`${CLI_INVOKE} optimize\`（默认 preview；\`--run\` 执行，\`--task re-enrich,normalize,cluster-merge,smart-compress\` 选阶段） |
+| 压缩旧条目 | \`${CLI_INVOKE} compress\`（默认 preview；\`--execute\` 执行，\`--age-days N\` 改阈值） |
+| FTS5 索引检查 / 重建 | \`${CLI_INVOKE} fts-check [--rebuild]\` |
+| tier 分组浏览 | \`${CLI_INVOKE} browse [--tier active]\` |
+| 导出 JSON/JSONL | \`${CLI_INVOKE} export [--format jsonl]\` |
+| 统计总量 / 健康 | \`${CLI_INVOKE} stats [--days 30]\` |
+| 删除某条 | \`${CLI_INVOKE} delete <id>[,<id>]\` |
+| 更新某条 | \`${CLI_INVOKE} update <id> [--title ...]\` |
+| 列 / 搜索 / 导入 skill-agent registry | \`${CLI_INVOKE} registry <list\\|search\\|import>\` |
 | 按 registry 名载入 skill/agent | （MCP only：\`mem_use\`；由用户主动请求时才使用） |
 
 ## CLI 速查（常用检索）
 
 | 命令 | 用途 |
 |------|------|
-| \`node ~/.claude-mem-lite/cli.mjs search "query"\` | FTS5 全文搜索 |
-| \`node ~/.claude-mem-lite/cli.mjs search "err" --type bugfix\` | 按类型过滤 |
-| \`node ~/.claude-mem-lite/cli.mjs recall "file.mjs"\` | 文件相关记忆 |
-| \`node ~/.claude-mem-lite/cli.mjs recent 5\` | 最近 5 条 |
-| \`node ~/.claude-mem-lite/cli.mjs get 42,43\` | 按 ID 展开 |
-| \`node ~/.claude-mem-lite/cli.mjs timeline --anchor 42\` | 时间线上下文 |
+| \`${CLI_INVOKE} search "query"\` | FTS5 全文搜索 |
+| \`${CLI_INVOKE} search "err" --type bugfix\` | 按类型过滤 |
+| \`${CLI_INVOKE} recall "file.mjs"\` | 文件相关记忆 |
+| \`${CLI_INVOKE} recent 5\` | 最近 5 条 |
+| \`${CLI_INVOKE} get 42,43\` | 按 ID 展开 |
+| \`${CLI_INVOKE} timeline --anchor 42\` | 时间线上下文 |
 
 ## 质量门槛
 
 - \`mem_save\` 的 \`lesson_learned\` 不要写 \`none\`——写不出教训就保持 NULL
-- \`decision\` 命中率 72.7% vs \`change\` 16.5%——一条好 decision ≈ 20 条 change
+- \`decision\` 的命中率高于 \`change\`（当前遥测约 3:1，数值会漂移——用 \`${CLI_INVOKE} stats\` 实测，别套固定倍数）；方向稳健：一条好 decision 抵数条 change
 - 一般搜索跳过 \`obs_type\` 让系统自动路由；特定意图再过滤
 
 ## 卸载
 
-\`node ~/.claude-mem-lite/cli.mjs unadopt\` 精确移除 sentinel 段 + 本文件；其它 MEMORY.md 内容不动。
+\`${CLI_INVOKE} unadopt\` 精确移除 sentinel 段 + 本文件；其它 MEMORY.md 内容不动。
 `;
 }

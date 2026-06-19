@@ -2,6 +2,31 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.1.1 — Code-review follow-up: correct the v3.1.0 path fix + harden the self-heal launcher
+
+A multi-agent review of v3.1.0 surfaced 15 verified findings. The headline: the v3.1.0 "absolute-path" CLI fix pointed at `node ~/.claude-mem-lite/cli.mjs`, which **does not exist on a plugin-only install** — `setup.sh` provisions the data dir but never materializes source there, so that path only resolved on direct-install symlink farms. This release replaces it with surface-aware resolution and closes the launcher / observability / metadata gaps the review found.
+
+### Bundled-CLI path now resolves on every install shape
+
+New single-source `cli-path.mjs` exports `CLI_INVOKE`, an absolute path resolved via `import.meta.url` (cli.mjs is its sibling) — correct on plugin-cache, `npm i -g` symlink-farm, and manual installs alike. The 19 `tool-schemas.mjs` per-tool "Equivalent CLI" hints, the MCP `instructions` examples + preamble (`server-internals.mjs`), the invited-memory adopt doc (`adopt-content.mjs`), and the two runtime recovery hints (`hook-launcher.mjs` + `lib/native-binding-hint.mjs` → `cli.mjs repair`) all use it. The five bundled slash commands (`commands/*.md`) instead use the literal `${CLAUDE_PLUGIN_ROOT}/cli.mjs`, which Claude Code — not the shell — substitutes at execution time (the env var is absent from a plain Bash env). `cli-path.mjs` is registered in `SOURCE_FILES` + `package.json` `files` so it always ships.
+
+### Self-heal launcher: narrower classification + observability
+
+- `isLocalModuleErr` no longer blanket-classifies any missing bare dependency imported from an install-dir file as "ours" — a package absent from `package.json` re-throws (surfacing a genuine packaging bug) instead of being swallowed at exit 0; a declared dependency still self-heals. Importer extraction now tolerates a multi-line error message.
+- The intentional degrade-to-exit-0 now writes an observable breakage marker that `doctor` surfaces, cleared once the install is confirmed healthy — so a silently-degraded hook is detectable instead of invisible.
+- A successful self-heal now clears the 6h cooldown, so an unrelated later breakage can heal immediately rather than waiting out the window.
+
+### Native-binding hint: per-fault cooldown + atomic marker
+
+The `ERR_DLOPEN_FAILED` rebuild-hint cooldown is now keyed on the fault identity, so a *distinct* native failure within the 6h window still surfaces instead of being silenced by an earlier, unrelated one. The marker write is atomic (tmp + rename) to stop a torn read from re-triggering a duplicate hint.
+
+### Docs / metadata
+
+Replaced the stale invited-memory `decision ≈ 20× change` ratio with the project's current ~3:1 re-measure framing, added the required `--confirm` to the `purge_stale` cheatsheet, fixed phantom CLI flags in both READMEs (`maintain --action` / `compress --preview` / `optimize --action` → the real subcommands), corrected the `README.md` self-contained-install paragraph to the `${CLAUDE_PLUGIN_ROOT}` form, and added that paragraph to `README.zh-CN.md`.
+
+No dependency changes. Full suite green (2884 tests).
+
+
 ## v3.1.0 — Self-contained plugin commands + hook fault-tolerance for broken/missing native deps
 
 Three independent robustness fixes, all on the install/runtime edges a `/plugin install` (with no separate `npm i -g`) exposes.

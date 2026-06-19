@@ -107,7 +107,7 @@ describe('Phase D conditional trim — buildServerInstructions via effectiveQuie
     });
     const instr = buildServerInstructions(effectiveQuiet());
     expect(instr).not.toContain('WHEN TO USE');
-    expect(instr).toContain('claude-mem-lite search'); // base CLI help still present
+    expect(instr).toContain('cli.mjs search'); // base CLI help still present (resolvable path form)
   });
 });
 

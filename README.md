@@ -160,7 +160,7 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 
 Plugin mode manages its own hooks/runtime. On session start it only **checks and reports** new claude-mem-lite versions; it does **not** self-overwrite plugin files in place. Update plugin-mode installs through Claude's plugin workflow.
 
-> **The plugin install is complete on its own** — hooks, MCP tools, and the bundled slash commands (`/mem`, `/lesson`, `/bug`, `/adopt`) all run from the plugin with no second step. The slash commands invoke the bundled CLI by absolute path (`node ~/.claude-mem-lite/cli.mjs <cmd>`), so they work without anything on your `PATH`. A global `claude-mem-lite` **shell** command (for running queries yourself in a terminal) is **optional** — `npm i -g claude-mem-lite` — and is a *separate* npm install: the plugin's auto-update does **not** refresh it, so re-run `npm i -g claude-mem-lite@latest` if you want that shell command kept in sync. You do **not** need it for the plugin to be fully functional.
+> **The plugin install is complete on its own** — hooks, MCP tools, and the bundled slash commands (`/mem`, `/lesson`, `/bug`, `/adopt`) all run from the plugin with no second step. The slash commands invoke the bundled CLI by an absolute path resolved from the plugin directory (`${CLAUDE_PLUGIN_ROOT}/cli.mjs <cmd>`), so they work without anything on your `PATH`. A global `claude-mem-lite` **shell** command (for running queries yourself in a terminal) is **optional** — `npm i -g claude-mem-lite` — and is a *separate* npm install: the plugin's auto-update does **not** refresh it, so re-run `npm i -g claude-mem-lite@latest` if you want that shell command kept in sync. You do **not** need it for the plugin to be fully functional.
 
 > **Auto-adopt fires on the first SessionStart per project (v2.82.1+).** The plugin automatically writes the **invited-memory sentinel** (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) into the project's memdir — **no manual `/adopt` needed**, regardless of install path (npm, npx, `/plugin`, manual). Per-project opt-out: `claude-mem-lite adopt --disable` (`--enable` to re-arm). Global opt-out: `export MEM_NO_AUTO_ADOPT=1`. Manual `/adopt` remains available for re-applying after edits and for the `--all` batch path.
 
@@ -263,9 +263,9 @@ surface — reach them through the CLI column in the second table.
 | `mem_update` | `claude-mem-lite update <id>` | Edit an observation in place. |
 | `mem_stats` | `claude-mem-lite stats` | Counts, type distribution, daily activity. |
 | `mem_delete` | `claude-mem-lite delete <id>` | Preview / confirm workflow, FTS5 cleanup. |
-| `mem_compress` | `claude-mem-lite compress --preview` | Roll up old low-value observations. |
-| `mem_maintain` | `claude-mem-lite maintain --action scan` | dedup / decay / cleanup / rebuild_vectors. |
-| `mem_optimize` | `claude-mem-lite optimize --action preview` | LLM-powered re-enrich / normalize / cluster-merge. |
+| `mem_compress` | `claude-mem-lite compress` | Roll up old low-value observations (preview default; `--execute` to apply). |
+| `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | dedup / decay / cleanup / rebuild_vectors (`scan` previews, `execute` applies). |
+| `mem_optimize` | `claude-mem-lite optimize` | LLM-powered re-enrich / normalize / cluster-merge (preview default; `--run` to apply). |
 | `mem_export` | `claude-mem-lite export` | JSON / JSONL dump, filters by project, type, date. |
 | `mem_fts_check` | `claude-mem-lite fts-check [--rebuild]` | FTS5 integrity + rebuild. |
 | `mem_browse` | `claude-mem-lite browse` | Tier-grouped dashboard (working / active / archive). |

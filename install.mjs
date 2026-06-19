@@ -1369,6 +1369,23 @@ async function doctor() {
     issues++;
   }
 
+  // Hook self-heal runtime: the launcher (scripts/hook-launcher.mjs) degrades a
+  // broken install to exit 0 so it never spams a Node stack trace on every hook
+  // fire. That silence is intentional but hides failure — it drops a breakage
+  // marker so this check can surface the otherwise-invisible degraded state.
+  const brokenMarker = join(MEM_DATA_DIR, 'runtime', 'hook-launcher-broken');
+  if (existsSync(brokenMarker)) {
+    let detail = '';
+    try {
+      const b = JSON.parse(readFileSync(brokenMarker, 'utf8'));
+      const ageH = Math.round((Date.now() - (b.ts || 0)) / 3600000);
+      detail = ` (last: ${b.reason || 'unknown'}, ~${ageH}h ago)`;
+    } catch { /* unreadable marker → bare warning */ }
+    dwarn(`Hook self-heal: a recent hook fire degraded to exit-0${detail} — run \`node ${join(PROJECT_DIR, 'install.mjs')} repair\``);
+  } else {
+    ok('Hook self-heal: no recent silent hook breakage');
+  }
+
   // Plugin/hook lifecycle state
   const settings = readSettings();
   const hasHooks = hasMemHooksConfigured(settings);

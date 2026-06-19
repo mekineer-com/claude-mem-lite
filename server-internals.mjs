@@ -4,6 +4,7 @@
 import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { porterStem } from './tfidf.mjs';
+import { CLI_INVOKE } from './cli-path.mjs';
 
 // ─── MCP Server Instructions Builder ───────────────────────────────────────
 // Phase A (v2.31.3+): when quiet=true, drops WHEN-TO-USE proactive-trigger and
@@ -14,13 +15,13 @@ import { porterStem } from './tfidf.mjs';
 const INSTRUCTIONS_BASE = [
   'Long-term memory across sessions. Hooks auto-inject context; CLI preferred for explicit queries.',
   '',
-  'CLI (via Bash) — invoke as `node ~/.claude-mem-lite/cli.mjs <cmd>` (shipped with the plugin), or bare `claude-mem-lite <cmd>` only if you ran the optional global `npm i -g claude-mem-lite`:',
-  '  claude-mem-lite search "query"              — FTS5 full-text search',
-  '  claude-mem-lite search "err" --type bugfix  — filter by type',
-  '  claude-mem-lite recall "file.mjs"           — file-related memories',
-  '  claude-mem-lite recent 5                    — latest observations',
-  '  claude-mem-lite get 42,43                   — full details by ID',
-  '  claude-mem-lite timeline --anchor 42        — chronological context',
+  `CLI (via Bash) — invoke as \`${CLI_INVOKE} <cmd>\` (resolves on any install shape; the bare \`claude-mem-lite\` shorthand works only after an optional global \`npm i -g claude-mem-lite\`):`,
+  `  ${CLI_INVOKE} search "query"  — FTS5 full-text search`,
+  `  ${CLI_INVOKE} search "err" --type bugfix  — filter by type`,
+  `  ${CLI_INVOKE} recall "file.mjs"  — file-related memories`,
+  `  ${CLI_INVOKE} recent 5  — latest observations`,
+  `  ${CLI_INVOKE} get 42,43  — full details by ID`,
+  `  ${CLI_INVOKE} timeline --anchor 42  — chronological context`,
   '',
   'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access (always available — no PATH/CLI install needed).',
   'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
