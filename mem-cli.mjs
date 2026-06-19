@@ -39,6 +39,7 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
+import { aggregateMetrics } from './lib/metrics.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
@@ -1154,6 +1155,13 @@ async function cmdStats(db, args) {
   out(`  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`);
   out(`  Compressed: ${compressedCount.c}`);
   out(`  Hook errors (last 24h): ${hookErrors24h}${hookErrors24h > 0 ? `  ← tail ${join(DB_DIR, 'runtime/hook-errors')}` : ''}`);
+  // Tier-1 firing counters for ① file-intel + ② reread-guard (recorded by
+  // pre-tool-recall.js via lib/metrics.mjs; CLAUDE_MEM_METRICS=1 to enable).
+  const featAgg = aggregateMetrics(DB_DIR, 7);
+  const fiN = featAgg.file_intel?.count ?? 0;
+  const rrN = featAgg.reread_warn?.count ?? 0;
+  const metricsOn = process.env.CLAUDE_MEM_METRICS === '1';
+  out(`  Feature injections (7d): 📄 file-intel ${fiN} · 🔁 reread-warn ${rrN}${(!metricsOn && fiN + rrN === 0) ? '  (set CLAUDE_MEM_METRICS=1 to record)' : ''}`);
   if (noiseRatio > 0.6) out('  ⚠️ High noise ratio — consider running mem compress');
   out('');
   // Tier counts only live (uncompressed, non-superseded) observations — surface the

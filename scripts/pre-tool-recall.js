@@ -12,6 +12,7 @@ import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
 import { fileIntelFor } from '../lib/file-intel.mjs';
 import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
+import { recordMetric } from '../lib/metrics.mjs';
 
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
@@ -258,6 +259,7 @@ try {
               ].join('\n'),
             },
           }));
+          recordMetric(DATA_DIR, { event: 'reread_warn' }); // tier-1 firing counter (②)
         }
       }
       process.exit(0); // already recalled this file in-session
@@ -388,6 +390,9 @@ try {
     if (isRead && !FILE_INTEL_OFF) {
       try { fileIntelLine = fileIntelFor(filePath, { minTokens: FILE_INTEL_MIN_TOKENS }); } catch {}
     }
+    // Tier-1 firing counter (①). recordMetric no-ops unless CLAUDE_MEM_METRICS=1,
+    // so default users pay nothing; observers see counts in `doctor` / `stats`.
+    if (fileIntelLine) recordMetric(DATA_DIR, { event: 'file_intel' });
     const lines = [];
     // v2.34.6: Read mode uses 120-char truncation (Edit mode keeps the 240-char
     // cap from R3-UX). Rationale: Read is a one-shot nudge with 1 lesson max;
