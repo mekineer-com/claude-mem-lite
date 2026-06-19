@@ -17,8 +17,15 @@ const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js'
 
 function runScript(input, env = {}) {
   return new Promise((resolveP, reject) => {
+    // Hermetic metrics gate: an ambient CLAUDE_MEM_METRICS from the shell (e.g.
+    // exported via Claude Code settings) must NOT leak into the child — tests
+    // opt in explicitly via `env`. Without this, the "default off" case inherits
+    // the shell value and the disabled-path assertion fails locally while CI's
+    // clean env hides it (mem #8725).
+    const childEnv = { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '', ...env };
+    if (!('CLAUDE_MEM_METRICS' in env)) delete childEnv.CLAUDE_MEM_METRICS;
     const child = spawn('node', [SCRIPT_PATH], {
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '', ...env },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
