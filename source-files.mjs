@@ -121,6 +121,10 @@ export const SOURCE_FILES = [
   // Statically imported by hook-llm, hook-handoff, hook-optimize, hook,
   // mem-cli; reached transitively from server.mjs and cli.mjs.
   'lib/scrub-record.mjs',
+  // Rate-limited friendly hint for an unloadable native DB binding
+  // (ERR_DLOPEN_FAILED). Statically imported by hook.mjs; ship it so the
+  // dispatch catch path resolves in installed/tarball runtimes.
+  'lib/native-binding-hint.mjs',
   // Cold-start backfill: parses ~/.claude/projects/<encoded>/<uuid>.jsonl
   // transcripts into user_prompts + observations. Dynamic-imported by
   // mem-cli.mjs::cmdImportJsonl; listed here so source-files-sync.test.mjs

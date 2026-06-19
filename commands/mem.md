@@ -23,16 +23,16 @@ Search and browse your project memory efficiently.
 
 When the user invokes `/mem`, parse their intent:
 
-- `/mem search <query>` → run `claude-mem-lite search <query>` via Bash
-- `/mem recent` or `/mem recent 20` → run `claude-mem-lite recent [N]` via Bash
-- `/mem recall <file>` → run `claude-mem-lite recall <file>` via Bash
-- `/mem timeline <id>` → run `claude-mem-lite timeline --anchor <id>` via Bash
+- `/mem search <query>` → run `node ~/.claude-mem-lite/cli.mjs search <query>` via Bash
+- `/mem recent` or `/mem recent 20` → run `node ~/.claude-mem-lite/cli.mjs recent [N]` via Bash
+- `/mem recall <file>` → run `node ~/.claude-mem-lite/cli.mjs recall <file>` via Bash
+- `/mem timeline <id>` → run `node ~/.claude-mem-lite/cli.mjs timeline --anchor <id>` via Bash
 - `/mem save <text>` → call `mem_save` MCP tool with the text as content
-- `/mem stats` → run `claude-mem-lite stats` via Bash
-- `/mem get <ids>` → run `claude-mem-lite get <ids>` via Bash
+- `/mem stats` → run `node ~/.claude-mem-lite/cli.mjs stats` via Bash
+- `/mem get <ids>` → run `node ~/.claude-mem-lite/cli.mjs get <ids>` via Bash
 - `/mem cleanup` → run `mem_maintain(action="scan")`, report pending purge count and stale items to user, ask for confirmation, then run `mem_maintain(action="execute", operations=["purge_stale"])` if confirmed
 - `/mem cleanup Nd` (e.g. `60d`) → same as above but use `retain_days=N` to only purge items older than N days
 - `/mem cleanup keep Nd` (e.g. `keep 14d`) → same as above with `retain_days=N`
-- `/mem <query>` (no subcommand) → treat as search, run `claude-mem-lite search <query>` via Bash
+- `/mem <query>` (no subcommand) → treat as search, run `node ~/.claude-mem-lite/cli.mjs search <query>` via Bash
 
-Use Bash commands first. For detailed data, use `claude-mem-lite get <id>` via Bash.
+Use Bash commands first. For detailed data, use `node ~/.claude-mem-lite/cli.mjs get <id>` via Bash.

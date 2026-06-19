@@ -160,6 +160,8 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 
 Plugin mode manages its own hooks/runtime. On session start it only **checks and reports** new claude-mem-lite versions; it does **not** self-overwrite plugin files in place. Update plugin-mode installs through Claude's plugin workflow.
 
+> **The plugin install is complete on its own** — hooks, MCP tools, and the bundled slash commands (`/mem`, `/lesson`, `/bug`, `/adopt`) all run from the plugin with no second step. The slash commands invoke the bundled CLI by absolute path (`node ~/.claude-mem-lite/cli.mjs <cmd>`), so they work without anything on your `PATH`. A global `claude-mem-lite` **shell** command (for running queries yourself in a terminal) is **optional** — `npm i -g claude-mem-lite` — and is a *separate* npm install: the plugin's auto-update does **not** refresh it, so re-run `npm i -g claude-mem-lite@latest` if you want that shell command kept in sync. You do **not** need it for the plugin to be fully functional.
+
 > **Auto-adopt fires on the first SessionStart per project (v2.82.1+).** The plugin automatically writes the **invited-memory sentinel** (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) into the project's memdir — **no manual `/adopt` needed**, regardless of install path (npm, npx, `/plugin`, manual). Per-project opt-out: `claude-mem-lite adopt --disable` (`--enable` to re-arm). Global opt-out: `export MEM_NO_AUTO_ADOPT=1`. Manual `/adopt` remains available for re-applying after edits and for the `--all` batch path.
 
 ### Method 2: npx (one-liner)

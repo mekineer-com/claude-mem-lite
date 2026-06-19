@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.1.0 — Self-contained plugin commands + hook fault-tolerance for broken/missing native deps
+
+Three independent robustness fixes, all on the install/runtime edges a `/plugin install` (with no separate `npm i -g`) exposes.
+
+### Hooks survive a missing or unloadable native binding
+
+`scripts/hook-launcher.mjs` classified a MISSING bare dependency (e.g. a half-installed `better-sqlite3` → `ERR_MODULE_NOT_FOUND` with `e.url` undefined and a `Cannot find package '...' imported from <importer>` message) as a *foreign* error and re-threw it — so every hook fire dumped a Node stack trace until the install healed. It now anchors install-locality on the importer path (present in both the relative-miss and bare-dep message shapes); when a broken install can't be repaired right now it degrades to one clean recovery line + exit 0 instead of a per-fire stack trace. This covers all six hook entries, since the launcher is their shared wrapper.
+
+Separately, an UNLOADABLE binding (`ERR_DLOPEN_FAILED`, e.g. an ABI-stale `.node` after a Node upgrade) — which throws lazily at the first `new Database()` inside a handler, not at import — is now collapsed by `hook.mjs`'s dispatch catch into a single rate-limited (6h) hint via the new `lib/native-binding-hint.mjs`, instead of logging the raw multi-line `NODE_MODULE_VERSION` message on every fire. The actual rebuild stays the MCP server launch path's job (`lib/binding-probe.mjs`).
+
+### Bundled slash commands no longer require a global CLI on PATH
+
+`/plugin install` provisions the cache hooks/MCP and the `~/.claude-mem-lite` data dir, but never puts a `claude-mem-lite` command on `PATH` — only `npm i -g` does (via `package.json` `bin`). The bundled slash commands (`/mem`, `/adopt`, `/unadopt`, `/lesson`, `/bug`) ran bare `claude-mem-lite <cmd>`, so on a plugin-only install they failed with "command not found". They now invoke the bundled CLI by absolute path — `node ~/.claude-mem-lite/cli.mjs <cmd>` (`cli.mjs` ships in `SOURCE_FILES`, so it is always provisioned; CODE_DIR is homedir-fixed). The MCP server instructions (`server-internals.mjs`), the per-tool `Equivalent CLI:` hints (`tool-schemas.mjs`, ×19), and the invited-memory cheatsheet (`adopt-content.mjs`) were updated to match, and the README now states the plugin is complete on its own with the global `claude-mem-lite` shell command as an optional, separate `npm i -g` that the plugin auto-update does not refresh. Also corrected three phantom-flag examples in the adopt-content cheatsheet (`maintain --action`, `optimize --action`, `compress --preview` → the real `maintain scan|execute --ops`, `optimize --run`, `compress --execute`).
+
+No dependency changes. Full suite green (2868 tests).
+
 ## v3.0.1 — Tier-1 firing counters for the v3.0.0 read-time features
 
 Observability follow-on to v3.0.0. `scripts/pre-tool-recall.js` now records a `file_intel` / `reread_warn` event via `lib/metrics.mjs` on each ① file-intelligence / ② repeated-read-guard firing — gated by `CLAUDE_MEM_METRICS=1` (default off, zero hot-path cost; `recordMetric` no-ops when disabled). Counts surface in `claude-mem-lite stats` (a new `Feature injections (7d)` line, with an enable hint when empty) and `claude-mem-lite doctor` (the existing metrics block), so the two features become observable over time instead of fire-and-forget. The heed proxy (did the agent act on the nudge) is deferred to a tier-2 follow-on.

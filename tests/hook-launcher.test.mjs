@@ -78,21 +78,46 @@ describe('hook-launcher self-heal', () => {
   it('runs install.mjs repair on local ERR_MODULE_NOT_FOUND and records cooldown', () => {
     const root = makeInstall('cml-launcher-heal');
     // Stub install.mjs simulating a failed repair (no network in tests).
-    // attemptHeal returns false; launcher rethrows the original error.
+    // attemptHeal returns false; the launcher then degrades quietly (exit 0)
+    // instead of re-throwing the original import error as a stack trace.
     writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
     writeFileSync(join(root, 'entry.mjs'), "import './missing-local.mjs';\n");
 
     const first = runLauncher(root, ['entry.mjs']);
     expect(first.stderr).toMatch(/Detected broken install/);
     expect(first.stderr).toMatch(/REPAIR-ATTEMPTED/);
-    expect(first.status).not.toBe(0);
+    expect(first.status).toBe(0);
+    expect(first.stderr).not.toMatch(/node:internal|ERR_MODULE_NOT_FOUND/);
     expect(existsSync(join(root, 'runtime', 'hook-launcher-lastheal'))).toBe(true);
 
-    // Second invocation within cooldown skips repair (still throws original)
+    // Second invocation within cooldown skips repair and still degrades quietly
+    // (clean guidance, exit 0, no stack trace) rather than failing every fire.
     const second = runLauncher(root, ['entry.mjs']);
     expect(second.stderr).not.toMatch(/REPAIR-ATTEMPTED/);
     expect(second.stderr).toMatch(/Self-heal skipped/);
-    expect(second.status).not.toBe(0);
+    expect(second.status).toBe(0);
+    expect(second.stderr).not.toMatch(/node:internal|ERR_MODULE_NOT_FOUND/);
+  });
+
+  it('treats a missing bare dependency (e.g. better-sqlite3) as a broken install, not a foreign error', () => {
+    // Root-cause regression: a half-installed/missing npm dependency throws
+    // ERR_MODULE_NOT_FOUND with e.url UNDEFINED and message "Cannot find
+    // package '<name>' imported from <importer>". The pre-fix classifier keyed
+    // off file://INSTALL_DIR and misread this as a foreign error → re-threw a
+    // Node stack trace on every hook fire (the Stop-hook noise users saw).
+    const root = makeInstall('cml-launcher-baredep');
+    writeFileSync(join(root, 'install.mjs'), 'console.error("REPAIR-ATTEMPTED");process.exit(1);\n');
+    // entry imports a bare package that does not exist — mirrors schema.mjs →
+    // better-sqlite3 during a half-finished npm install.
+    writeFileSync(join(root, 'entry.mjs'), "import x from 'better-sqlite3-nope-xyz';\n");
+
+    const r = runLauncher(root, ['entry.mjs']);
+    // Recognized as ours → self-heal attempted (vs silently re-thrown).
+    expect(r.stderr).toMatch(/Detected broken install/);
+    expect(r.stderr).toMatch(/REPAIR-ATTEMPTED/);
+    // Best-effort hook: degrades to exit 0 with no raw Node stack trace.
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toMatch(/node:internal/);
   });
 
   it('re-runs the entry after a successful self-heal', () => {

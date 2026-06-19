@@ -26,7 +26,7 @@ export function getIndexLine() {
 export function getDetailDoc() {
   return `# claude-mem-lite 插件契约
 
-> 由 \`claude-mem-lite adopt\` 生成；卸载用 \`claude-mem-lite unadopt\`。
+> 由 \`node ~/.claude-mem-lite/cli.mjs adopt\` 生成；卸载用 \`node ~/.claude-mem-lite/cli.mjs unadopt\`。
 > 设计背景见 docs/plans/2026-04-16-invited-memory-pattern.md。
 
 ## 何时调用 MCP 工具
@@ -58,28 +58,28 @@ MCP 层，按名 \`tools/call\` 仍可命中，但对 Claude Code 这类只读 t
 
 | 场景 | CLI |
 |------|-----|
-| 清理过期记忆 | \`claude-mem-lite maintain --action scan\` → \`--action execute\` |
-| 深度优化（Haiku） | \`claude-mem-lite optimize --action preview\` |
-| 压缩旧条目 | \`claude-mem-lite compress --preview\` |
-| FTS5 索引检查 / 重建 | \`claude-mem-lite fts-check [--rebuild]\` |
-| tier 分组浏览 | \`claude-mem-lite browse [--tier active]\` |
-| 导出 JSON/JSONL | \`claude-mem-lite export [--format jsonl]\` |
-| 统计总量 / 健康 | \`claude-mem-lite stats [--days 30]\` |
-| 删除某条 | \`claude-mem-lite delete <id>[,<id>]\` |
-| 更新某条 | \`claude-mem-lite update <id> [--title ...]\` |
-| 列 / 搜索 / 导入 skill-agent registry | \`claude-mem-lite registry <list\\|search\\|import>\` |
+| 清理过期记忆 | \`node ~/.claude-mem-lite/cli.mjs maintain scan --ops purge_stale\` → \`maintain execute --ops purge_stale\` |
+| 深度优化（Haiku） | \`node ~/.claude-mem-lite/cli.mjs optimize\`（默认 preview；\`--run\` 执行，\`--task re-enrich,normalize,cluster-merge,smart-compress\` 选阶段） |
+| 压缩旧条目 | \`node ~/.claude-mem-lite/cli.mjs compress\`（默认 preview；\`--execute\` 执行，\`--age-days N\` 改阈值） |
+| FTS5 索引检查 / 重建 | \`node ~/.claude-mem-lite/cli.mjs fts-check [--rebuild]\` |
+| tier 分组浏览 | \`node ~/.claude-mem-lite/cli.mjs browse [--tier active]\` |
+| 导出 JSON/JSONL | \`node ~/.claude-mem-lite/cli.mjs export [--format jsonl]\` |
+| 统计总量 / 健康 | \`node ~/.claude-mem-lite/cli.mjs stats [--days 30]\` |
+| 删除某条 | \`node ~/.claude-mem-lite/cli.mjs delete <id>[,<id>]\` |
+| 更新某条 | \`node ~/.claude-mem-lite/cli.mjs update <id> [--title ...]\` |
+| 列 / 搜索 / 导入 skill-agent registry | \`node ~/.claude-mem-lite/cli.mjs registry <list\\|search\\|import>\` |
 | 按 registry 名载入 skill/agent | （MCP only：\`mem_use\`；由用户主动请求时才使用） |
 
 ## CLI 速查（常用检索）
 
 | 命令 | 用途 |
 |------|------|
-| \`claude-mem-lite search "query"\` | FTS5 全文搜索 |
-| \`claude-mem-lite search "err" --type bugfix\` | 按类型过滤 |
-| \`claude-mem-lite recall "file.mjs"\` | 文件相关记忆 |
-| \`claude-mem-lite recent 5\` | 最近 5 条 |
-| \`claude-mem-lite get 42,43\` | 按 ID 展开 |
-| \`claude-mem-lite timeline --anchor 42\` | 时间线上下文 |
+| \`node ~/.claude-mem-lite/cli.mjs search "query"\` | FTS5 全文搜索 |
+| \`node ~/.claude-mem-lite/cli.mjs search "err" --type bugfix\` | 按类型过滤 |
+| \`node ~/.claude-mem-lite/cli.mjs recall "file.mjs"\` | 文件相关记忆 |
+| \`node ~/.claude-mem-lite/cli.mjs recent 5\` | 最近 5 条 |
+| \`node ~/.claude-mem-lite/cli.mjs get 42,43\` | 按 ID 展开 |
+| \`node ~/.claude-mem-lite/cli.mjs timeline --anchor 42\` | 时间线上下文 |
 
 ## 质量门槛
 
@@ -89,6 +89,6 @@ MCP 层，按名 \`tools/call\` 仍可命中，但对 Claude Code 这类只读 t
 
 ## 卸载
 
-\`claude-mem-lite unadopt\` 精确移除 sentinel 段 + 本文件；其它 MEMORY.md 内容不动。
+\`node ~/.claude-mem-lite/cli.mjs unadopt\` 精确移除 sentinel 段 + 本文件；其它 MEMORY.md 内容不动。
 `;
 }

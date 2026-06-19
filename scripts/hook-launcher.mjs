@@ -9,10 +9,16 @@
 // launcher is defense-in-depth for similar future drift (corrupt download,
 // half-applied install, manual file deletion).
 //
-// Behavior: try-import the target entry. On ERR_MODULE_NOT_FOUND whose URL
-// points under the install dir, run `install.mjs repair` (rate-limited via a
-// 6h marker file under runtime/) and retry the import once. On any other
-// exception, re-throw so Node's default error surface is preserved.
+// Behavior: try-import the target entry. On ERR_MODULE_NOT_FOUND originating
+// from our install — either a missing relative module (e.url under the install
+// dir) or a missing bare dependency like better-sqlite3 (e.url is undefined and
+// the importer named in the message is under the install dir) — run
+// `install.mjs repair` (rate-limited via a 6h marker file under runtime/) and
+// retry the import once. If repair is unavailable or fails, degrade quietly:
+// these are best-effort memory hooks, so a broken/missing dependency emits one
+// clean recovery line and exits 0 rather than dumping a Node stack trace on
+// every fire. On any other (foreign) exception, re-throw so Node's default
+// error surface is preserved.
 //
 // HARD constraint: pure node: imports only. Importing anything from lib/ here
 // would defeat the entire purpose — the launcher must survive a broken
@@ -59,10 +65,33 @@ async function runEntry({ bustCache = false } = {}) {
   await import(url);
 }
 
+// Two ERR_MODULE_NOT_FOUND shapes reach here (both verified against Node 22):
+//   • missing relative module → e.url = file://<missing-path> (under install)
+//   • missing bare dependency (e.g. a half-installed better-sqlite3) → e.url is
+//     UNDEFINED and the message is `Cannot find package '<name>' imported from
+//     <importer>`. This is the shape that bricked the hooks: the old
+//     file://INSTALL_DIR prefix test never matched it in a dev-dir install, so
+//     a missing dependency was misread as a foreign error and re-thrown as a
+//     Node stack trace on every hook fire.
+// Anchor on any path the error exposes — the missing URL and/or the importer
+// (present in both messages as "imported from <path>"). If it sits inside our
+// install, a self-heal could fix it.
 function isLocalModuleErr(e) {
   if (!e || e.code !== 'ERR_MODULE_NOT_FOUND') return false;
-  const where = String(e.url || e.message || '');
-  return where.includes('.claude-mem-lite') || where.startsWith(`file://${INSTALL_DIR}`);
+  const importer = /imported from (.+?)\s*$/.exec(String(e.message || ''))?.[1];
+  const paths = [e.url, importer]
+    .filter(Boolean)
+    .map((p) => String(p).replace(/^file:\/\//, ''));
+  return paths.some((p) => p.startsWith(INSTALL_DIR) || p.includes('.claude-mem-lite'));
+}
+
+// Human-readable label for the "Detected broken install (<reason>)" line:
+// prefer the missing dependency/module name over a raw path fragment.
+function describeFailure(e) {
+  const pkg = /Cannot find package '([^']+)'/.exec(String(e.message || ''))?.[1];
+  if (pkg) return pkg;
+  if (e.url) return String(e.url).split('/').pop();
+  return String(e.message || 'unknown').split('/').slice(-2).join('/');
 }
 
 function recentHealAttempt() {
@@ -133,9 +162,14 @@ try {
   await runEntry();
 } catch (e) {
   if (!isLocalModuleErr(e)) throw e;
-  const reason = String(e.url || e.message).split('/').slice(-2).join('/');
-  const healed = await attemptHeal(reason);
-  if (!healed) throw e;
+  const healed = await attemptHeal(describeFailure(e));
+  if (!healed) {
+    // Broken/missing dependency we can't repair right now (repair failed, or
+    // was skipped within the 6h cooldown). attemptHeal already wrote actionable
+    // guidance — degrade quietly instead of re-throwing the original import
+    // error, which would spew a Node stack trace on every hook fire.
+    process.exit(0);
+  }
   try {
     await runEntry({ bustCache: true });
   } catch (retryErr) {
@@ -143,6 +177,6 @@ try {
       `[claude-mem-lite] Hook still failing after self-heal: ${retryErr.message}\n` +
       `[claude-mem-lite] Manual recovery: ${TARBALL_FALLBACK}\n`,
     );
-    process.exit(1);
+    process.exit(0);
   }
 }

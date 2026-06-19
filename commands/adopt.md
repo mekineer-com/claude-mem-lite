@@ -57,4 +57,4 @@ session. After running `adopt`:
 
 Same caveat applies in reverse for `/unadopt`.
 
-!claude-mem-lite adopt $ARGUMENTS
+!node ~/.claude-mem-lite/cli.mjs adopt $ARGUMENTS

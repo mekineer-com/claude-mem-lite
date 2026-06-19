@@ -14,7 +14,7 @@ import { porterStem } from './tfidf.mjs';
 const INSTRUCTIONS_BASE = [
   'Long-term memory across sessions. Hooks auto-inject context; CLI preferred for explicit queries.',
   '',
-  'CLI (via Bash):',
+  'CLI (via Bash) — invoke as `node ~/.claude-mem-lite/cli.mjs <cmd>` (shipped with the plugin), or bare `claude-mem-lite <cmd>` only if you ran the optional global `npm i -g claude-mem-lite`:',
   '  claude-mem-lite search "query"              — FTS5 full-text search',
   '  claude-mem-lite search "err" --type bugfix  — filter by type',
   '  claude-mem-lite recall "file.mjs"           — file-related memories',
@@ -22,7 +22,7 @@ const INSTRUCTIONS_BASE = [
   '  claude-mem-lite get 42,43                   — full details by ID',
   '  claude-mem-lite timeline --anchor 42        — chronological context',
   '',
-  'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access.',
+  'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access (always available — no PATH/CLI install needed).',
   'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
   'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
 ];

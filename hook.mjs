@@ -45,6 +45,7 @@ import {
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
+import { formatHookError } from './lib/native-binding-hint.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { cleanupBroken, decayAndMarkIdle, boostAccessed } from './lib/maintain-core.mjs';
 import {
@@ -1439,9 +1440,13 @@ try {
     case 'update-check':     await checkForUpdate(); break;
   }
 } catch (err) {
-  // Always log fatal errors (ungated) with structured format
-  const ts = new Date().toISOString();
-  console.error(`[claude-mem-lite] [${ts}] [ERROR] ${event}: ${err.message}`);
+  // Log fatal errors (ungated) with structured format. ERR_DLOPEN_FAILED (an
+  // unloadable native DB binding, e.g. ABI-stale after a Node upgrade) is
+  // collapsed to one short, rate-limited rebuild hint instead of the raw
+  // multi-line NODE_MODULE_VERSION message on every fire — see
+  // lib/native-binding-hint.mjs.
+  const line = formatHookError(err, event, { runtimeDir: RUNTIME_DIR });
+  if (line) console.error(line);
 }
 
 process.exit(0);

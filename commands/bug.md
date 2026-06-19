@@ -42,7 +42,7 @@ Build the body as `<description>\n\nRepro:\n<repro-steps>` (or just
 
 Run via Bash:
 
-    claude-mem-lite activity save \
+    node ~/.claude-mem-lite/cli.mjs activity save \
       --type bug \
       --title "<first 60 chars of description>" \
       --body "<body>" \
