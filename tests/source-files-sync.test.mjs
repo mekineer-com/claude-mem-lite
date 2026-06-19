@@ -40,8 +40,11 @@ function stripComments(src) {
 function extractLocalImports(sourcePath) {
   const src = stripComments(readFileSync(sourcePath, 'utf8'));
   const out = new Set();
-  for (const m of src.matchAll(/(?:from|import)\s+['"](\.\/[^'"]+)['"]/g)) out.add(m[1]);
-  for (const m of src.matchAll(/import\s*\(\s*['"](\.\/[^'"]+)['"]/g)) out.add(m[1]);
+  // Match both same-dir (./) and parent (../) relative specifiers. Parent imports
+  // are common from scripts/ (e.g. ../lib/foo.mjs) and within lib/ (../schema.mjs);
+  // a ./-only pattern silently skipped them, hiding tarball-completeness gaps.
+  for (const m of src.matchAll(/(?:from|import)\s+['"](\.\.?\/[^'"]+)['"]/g)) out.add(m[1]);
+  for (const m of src.matchAll(/import\s*\(\s*['"](\.\.?\/[^'"]+)['"]/g)) out.add(m[1]);
   return out;
 }
 
@@ -79,15 +82,18 @@ test('install.mjs and hook-update.mjs both reference the shared SOURCE_FILES mod
   expect(hookUpdateSrc).toMatch(/from\s+['"]\.\/source-files\.mjs['"]/);
 });
 
-// scripts/launch.mjs is the MCP server's actual entry point. Pre-2.53.0 it was
-// import-free so it didn't need transitive coverage; v2.53.0 added a relative
-// import (./launch-preflight.mjs) and the regression class is now identical to
-// issue #15 — just one directory level up. scripts/ is whole-tree copied by
-// install.mjs / hook-update.mjs (NOT via SOURCE_FILES), so the invariant we
-// assert is different: every relative .mjs reachable from scripts/launch.mjs
-// must (a) exist on disk and (b) live under scripts/, so the directory copy
-// catches it.
-test('scripts/launch.mjs and its transitive .mjs imports stay under scripts/', () => {
+// scripts/launch.mjs is the MCP server's actual entry point. It statically imports
+// ./launch-preflight.mjs and DYNAMICALLY imports ../lib/binding-probe.mjs +
+// ../hook-update.mjs (v2.84 self-heal: rebuild native bindings / repair a partial
+// install before launch). Its reachable set therefore spans both shipping
+// mechanisms — same-dir files ride the scripts/ tree copy; parent files
+// (binding-probe, hook-update, and their transitive deps) ride SOURCE_FILES — so
+// the invariant is the union: every reachable .mjs must exist on disk and be
+// EITHER under scripts/ OR in SOURCE_FILES. (Until the walker learned `../`, those
+// parent imports were invisible and this asserted the stricter, wrong "under
+// scripts/ only".)
+test('scripts/launch.mjs transitive .mjs imports are all shipped (under scripts/ or in SOURCE_FILES)', () => {
+  const shipped = new Set(SOURCE_FILES);
   const visited = walk('scripts/launch.mjs');
   const errors = [];
   for (const mod of visited) {
@@ -97,8 +103,8 @@ test('scripts/launch.mjs and its transitive .mjs imports stay under scripts/', (
       errors.push(`${mod} — referenced from scripts/launch.mjs but missing on disk`);
       continue;
     }
-    if (!mod.startsWith('scripts/')) {
-      errors.push(`${mod} — scripts/launch.mjs imports outside scripts/, breaks plugin-cache install`);
+    if (!mod.startsWith('scripts/') && !shipped.has(mod)) {
+      errors.push(`${mod} — reachable from scripts/launch.mjs but neither under scripts/ nor in SOURCE_FILES`);
     }
   }
   expect(errors, `\nscripts/launch.mjs companion-file invariant broken:\n  ${errors.join('\n  ')}\n`).toEqual([]);
@@ -123,35 +129,15 @@ test('package.json files array ships source-files.mjs and every SOURCE_FILES ent
 // lib/reread-guard.mjs slipped through before this guard. Hook scripts have a
 // mixed import model: lib/root deps ship via SOURCE_FILES; sibling scripts ship
 // via the scripts/ directory copy. So every .mjs reachable from a hook script
-// must be EITHER in SOURCE_FILES OR under scripts/.
-//
-// Local walker (not the shared one above): hook scripts sit under scripts/ and
-// import parents via `../`, but extractLocalImports only matches `./`. Widening
-// the shared regex would also change the ENTRY_MODULES / launch.mjs walks, so we
-// keep a `../`-aware extractor scoped to this test.
-function hookWalk(entryRel, seen = new Set()) {
-  if (seen.has(entryRel)) return seen;
-  seen.add(entryRel);
-  const abs = resolve(ROOT, entryRel);
-  if (!existsSync(abs)) return seen;
-  const src = readFileSync(abs, 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
-  const specs = new Set();
-  for (const m of src.matchAll(/(?:from|import\()\s*['"](\.\.?\/[^'"]+)['"]/g)) specs.add(m[1]);
-  for (const rel of specs) {
-    const relFromRoot = relative(ROOT, resolve(dirname(abs), rel));
-    if (/\.(mjs|js)$/.test(relFromRoot)) hookWalk(relFromRoot, seen);
-  }
-  return seen;
-}
-
+// must be EITHER in SOURCE_FILES OR under scripts/ — the same union as launch.mjs
+// above, now that the shared walk() follows `../`.
 test('hook scripts: every transitive .mjs import is shipped (SOURCE_FILES or under scripts/)', () => {
   const shipped = new Set(SOURCE_FILES);
   const missing = [];
   for (const script of HOOK_SCRIPT_FILES) {
     if (!/\.(mjs|js)$/.test(script)) continue; // skip .sh
     const entry = `scripts/${script}`;
-    for (const mod of hookWalk(entry)) {
+    for (const mod of walk(entry)) {
       if (!/\.mjs$/.test(mod)) continue;
       if (mod.startsWith('scripts/')) continue; // shipped via the scripts/ tree copy
       if (!shipped.has(mod)) missing.push(`${mod} (reached from ${entry})`);
