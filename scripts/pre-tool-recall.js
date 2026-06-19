@@ -10,6 +10,8 @@ import { homedir } from 'os';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
+import { fileIntelFor } from '../lib/file-intel.mjs';
+import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
 
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
@@ -39,6 +41,23 @@ const SALIENCE_LEGACY = process.env.CLAUDE_MEM_SALIENCE === 'legacy'
   || process.env.CLAUDE_MEM_SALIENCE === '0';
 const ACK_DIRECTIVE = "apply each lesson to this edit or rule it out — state '#NN applied' or '#NN n/a — <reason>' in your next user-facing message.";
 const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold for legacy file
+// Feature ① (file intelligence): on the first Read of a file each session, inject
+// its approximate token size + a one-line summary so the agent can decide to read
+// fully, slice, or grep. Read-only (Edit/Write already commit to the file). Default
+// ON; CLAUDE_MEM_FILE_INTEL=0 disables. Files below the token floor stay silent so
+// small reads carry no noise. Env names mirror schema.mjs CLAUDE_MEM_* convention (#8447).
+const FILE_INTEL_OFF = ['0', 'off', 'false', 'no'].includes(
+  String(process.env.CLAUDE_MEM_FILE_INTEL || '').toLowerCase());
+const FILE_INTEL_MIN_TOKENS = Math.max(1,
+  parseInt(process.env.CLAUDE_MEM_FILE_INTEL_MIN_TOKENS, 10) || 800);
+// Feature ② (repeated-read guard): when the agent does a FULL re-read of a file
+// it already read this session and the file is unchanged (mtime), nudge it to
+// reuse context instead of re-slurping. Read-only; only fires above the floor and
+// never on offset/limit paging. Default ON; CLAUDE_MEM_REREAD_GUARD=0 disables.
+const REREAD_GUARD_OFF = ['0', 'off', 'false', 'no'].includes(
+  String(process.env.CLAUDE_MEM_REREAD_GUARD || '').toLowerCase());
+const REREAD_MIN_TOKENS = Math.max(1,
+  parseInt(process.env.CLAUDE_MEM_REREAD_MIN_TOKENS, 10) || 600);
 // Stale-cooldown GC moved to hook.mjs::handleSessionStart — running it on every
 // Edit cost 15-30 disk stats per call. SessionStart fires once at session boot,
 // which is enough to keep RUNTIME_DIR from growing unbounded.
@@ -153,11 +172,17 @@ try {
   let filePath;
   let sessionId;
   let toolName;
+  // isFullRead: a Read with no offset/limit reads the whole file. The reread
+  // guard only flags full-vs-full re-reads, so paging never trips it.
+  let isFullRead = true;
   try {
     const event = JSON.parse(input);
     filePath = event.tool_input?.file_path;
     sessionId = event.session_id || null;
     toolName = event.tool_name || null;
+    const off = event.tool_input?.offset;
+    const lim = event.tool_input?.limit;
+    isFullRead = (off === undefined || off === null) && (lim === undefined || lim === null);
   } catch (e) {
     recordHookError('pre-recall:json', e, RUNTIME_DIR, { inputLen: input.length });
     process.exit(0);
@@ -218,6 +243,22 @@ try {
         }));
         cooldown[filePath] = { ...entry, mode: 'edit' };
         writeCooldown(cooldownPath, cooldown, isSessionScoped);
+      } else if (isRead && !REREAD_GUARD_OFF && typeof entry === 'object' && entry.reread) {
+        // ② repeated-read guard: a full re-read of an unchanged, sizable file —
+        // nudge to reuse what's already in context. Read-only; never throws.
+        const meta = readFileMeta(filePath);
+        if (shouldWarnReread(entry.reread, meta ? meta.mtimeMs : null, isFullRead, REREAD_MIN_TOKENS)) {
+          process.stdout.write(JSON.stringify({
+            suppressOutput: true,
+            hookSpecificOutput: {
+              hookEventName: 'PreToolUse',
+              additionalContext: [
+                '[mem] PreToolUse recall — system-injected context, continue your planned action:',
+                buildRereadWarning(basename(filePath), entry.reread.tokens),
+              ].join('\n'),
+            },
+          }));
+        }
       }
       process.exit(0); // already recalled this file in-session
     }
@@ -340,6 +381,13 @@ try {
     // v2.31 T2: emit JSON with hookSpecificOutput.additionalContext so the message
     // reliably renders across CC variants (sdscc drops plain-text stdout from PreToolUse).
     // suppressOutput:true hides it from transcript mode per CC hook docs.
+    // Feature ①: file intelligence (size + summary) for the first Read of this
+    // file this session. Read-only; opt out via CLAUDE_MEM_FILE_INTEL=0. Never
+    // throws — fileIntelFor returns null on unreadable/below-threshold files.
+    let fileIntelLine = null;
+    if (isRead && !FILE_INTEL_OFF) {
+      try { fileIntelLine = fileIntelFor(filePath, { minTokens: FILE_INTEL_MIN_TOKENS }); } catch {}
+    }
     const lines = [];
     // v2.34.6: Read mode uses 120-char truncation (Edit mode keeps the 240-char
     // cap from R3-UX). Rationale: Read is a one-shot nudge with 1 lesson max;
@@ -347,11 +395,20 @@ try {
     // carries the actionable "Fix:" guidance — short enough per-lesson at 240,
     // but the total payload is bounded by the 3-row limit and the cooldown.
     const LESSON_MAX = isRead ? 120 : 240;
-    if (allRows.length > 0) {
+    // Feature ① (file-intel): null on Edit/Write and on below-threshold or
+    // unreadable files. When present (first Read of a sizable file this session),
+    // it leads the injection, above any lessons.
+    const hasLessons = allRows.length > 0;
+    const showFraming = hasLessons || Boolean(fileIntelLine)
+      || (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1');
+    if (showFraming) {
       // Framing line mirrors #7758 handoff-injection fix: without an explicit
       // "system-injected, continue" disclaimer, observed turn-end after Edit+reminder
       // when the model misreads passive lesson context as a closing note.
       lines.push(`[mem] PreToolUse recall — system-injected context, continue your planned action:`);
+    }
+    if (fileIntelLine) lines.push(fileIntelLine);
+    if (hasLessons) {
       lines.push(`[mem] Lessons for ${fname}:`);
       for (const r of allRows) {
         if (r.lesson_learned) {
@@ -386,7 +443,7 @@ try {
       //
       // Read never emitted this (passive). The cooldown write below still runs on
       // every branch, so Read→Edit dedup + cite-back lessonId tracking are intact.
-      lines.push(`[mem] PreToolUse recall — system-injected context, continue your planned action:`);
+      // (Framing line already pushed above via showFraming.)
       lines.push(`[mem] No prior lessons for ${fname} — if you solve a non-obvious bug here, run: /lesson --file ${fname} "<root cause + fix>"`);
     }
 
@@ -408,7 +465,16 @@ try {
     // v2.98: mode records WHERE the injection happened so the Read→Edit ack
     // nudge can distinguish "lessons seen passively at Read" from "already
     // surfaced at an action point".
-    cooldown[filePath] = { ts: now, lessonIds: allRows.map(r => r.id), mode: isRead ? 'read' : 'edit' };
+    // ② repeated-read guard: record file metadata on the first Read so a later
+    // full re-read of the unchanged file can be flagged. Read-only, session-scoped;
+    // one stat + bounded read, first-read only.
+    const rereadMeta = (isRead && !REREAD_GUARD_OFF && isSessionScoped) ? readFileMeta(filePath) : null;
+    cooldown[filePath] = {
+      ts: now,
+      lessonIds: allRows.map(r => r.id),
+      mode: isRead ? 'read' : 'edit',
+      ...(rereadMeta ? { reread: { mtimeMs: rereadMeta.mtimeMs, tokens: rereadMeta.tokens, full: isFullRead } } : {}),
+    };
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
     // A3 (v2.83): merge our newly-emitted IDs into the cross-hook injected
     // file so the next UPS prompt skips them too. Always write, even on

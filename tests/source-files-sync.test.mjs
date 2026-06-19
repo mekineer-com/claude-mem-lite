@@ -13,7 +13,7 @@
 // entry points, catching any future file added without being shipped.
 
 import { test, expect } from 'vitest';
-import { SOURCE_FILES } from '../source-files.mjs';
+import { SOURCE_FILES, HOOK_SCRIPT_FILES } from '../source-files.mjs';
 import { readFileSync, existsSync } from 'fs';
 import { dirname, resolve, relative } from 'path';
 
@@ -114,4 +114,49 @@ test('package.json files array ships source-files.mjs and every SOURCE_FILES ent
   const IMPLICITLY_SHIPPED = new Set(['package.json', 'package-lock.json']);
   const missingFromPkg = SOURCE_FILES.filter(f => !files.has(f) && !IMPLICITLY_SHIPPED.has(f));
   expect(missingFromPkg, `\npackage.json files missing SOURCE_FILES entries:\n  ${missingFromPkg.join('\n  ')}\n`).toEqual([]);
+});
+
+// Blind-spot closer: the SOURCE_FILES coverage test above only walks the 5 main
+// ENTRY_MODULES, so a lib/ module imported ONLY by a standalone hook script (e.g.
+// scripts/pre-tool-recall.js) could be left out of SOURCE_FILES + files[] and
+// silently dropped from the npm tarball — exactly how lib/file-intel.mjs and
+// lib/reread-guard.mjs slipped through before this guard. Hook scripts have a
+// mixed import model: lib/root deps ship via SOURCE_FILES; sibling scripts ship
+// via the scripts/ directory copy. So every .mjs reachable from a hook script
+// must be EITHER in SOURCE_FILES OR under scripts/.
+//
+// Local walker (not the shared one above): hook scripts sit under scripts/ and
+// import parents via `../`, but extractLocalImports only matches `./`. Widening
+// the shared regex would also change the ENTRY_MODULES / launch.mjs walks, so we
+// keep a `../`-aware extractor scoped to this test.
+function hookWalk(entryRel, seen = new Set()) {
+  if (seen.has(entryRel)) return seen;
+  seen.add(entryRel);
+  const abs = resolve(ROOT, entryRel);
+  if (!existsSync(abs)) return seen;
+  const src = readFileSync(abs, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+  const specs = new Set();
+  for (const m of src.matchAll(/(?:from|import\()\s*['"](\.\.?\/[^'"]+)['"]/g)) specs.add(m[1]);
+  for (const rel of specs) {
+    const relFromRoot = relative(ROOT, resolve(dirname(abs), rel));
+    if (/\.(mjs|js)$/.test(relFromRoot)) hookWalk(relFromRoot, seen);
+  }
+  return seen;
+}
+
+test('hook scripts: every transitive .mjs import is shipped (SOURCE_FILES or under scripts/)', () => {
+  const shipped = new Set(SOURCE_FILES);
+  const missing = [];
+  for (const script of HOOK_SCRIPT_FILES) {
+    if (!/\.(mjs|js)$/.test(script)) continue; // skip .sh
+    const entry = `scripts/${script}`;
+    for (const mod of hookWalk(entry)) {
+      if (!/\.mjs$/.test(mod)) continue;
+      if (mod.startsWith('scripts/')) continue; // shipped via the scripts/ tree copy
+      if (!shipped.has(mod)) missing.push(`${mod} (reached from ${entry})`);
+    }
+  }
+  const unique = [...new Set(missing)].sort();
+  expect(unique, `\nhook-script imports missing from SOURCE_FILES:\n  ${unique.join('\n  ')}\n`).toEqual([]);
 });

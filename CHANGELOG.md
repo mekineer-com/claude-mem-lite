@@ -2,6 +2,38 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.0.0 — Read-time proactive context: file intelligence + repeated-read guard
+
+Two additive, default-on (env-opt-out) features on the `PreToolUse:Read` path, delivered through the existing `additionalContext` injection channel. Both were distilled from a competitive read of OpenWolf (`cytostack/openwolf`): its headline ideas — a file index that tells the agent what a file holds before it reads it, and a repeated-read warning — re-implemented through our injection channel (which actually reaches the model) rather than OpenWolf's stderr-only hooks (which only surface to the user).
+
+### ① File intelligence — `lib/file-intel.mjs`
+
+Before the agent reads a file, inject its approximate token size + a one-line summary (markdown heading / leading comment / JS exports), so it can choose to read fully, read a slice, or grep instead:
+
+```
+[mem] 📄 server.mjs ~6.1k tok · Exports createServer, registerTool + 8 more
+```
+
+- Pure, zero-dependency module: the ~30ms standalone hook can't import `utils.mjs` (it drags in `child_process`/`nlp`), so `estimateContentTokens` is a hand-mirror of `utils.estimateTokens`, pinned by a cross-check test.
+- First Read per file per session only (shares the existing lesson cooldown); gated on `statSync(isFile)` so it only annotates real on-disk files. Read-only.
+- Default ON; `CLAUDE_MEM_FILE_INTEL=0` disables, `CLAUDE_MEM_FILE_INTEL_MIN_TOKENS` (default 800) tunes the floor.
+
+### ② Repeated-read guard — `lib/reread-guard.mjs`
+
+On a full re-read of an unchanged file already read this session, nudge the agent to reuse what it has:
+
+```
+[mem] 🔁 You already read server.mjs this session (~6.1k tok, unchanged) — reuse what you have instead of re-reading; pass offset/limit if you need a specific part.
+```
+
+The value over OpenWolf's equivalent is the false-positive guards it omits (it warns on any repeat; its "unless modified" lives only in instructions): warns ONLY when (1) both prior and current reads are full-file (offset/limit paging never trips it), (2) mtime is unchanged since the recorded read (a file edited between reads is legitimately re-read), (3) tokens ≥ floor (default 600). Records `{mtimeMs, tokens, full}` into the existing session cooldown entry — no new state file. Default ON; `CLAUDE_MEM_REREAD_GUARD=0` disables, `CLAUDE_MEM_REREAD_MIN_TOKENS` tunes the floor. Known v1 limit: the silent repeat-read early-exit doesn't re-record mtime, so a post-edit multi-reread isn't caught (no false positives, just a missed catch).
+
+### Release hardening
+
+- **Closed a tarball-completeness blind spot.** `tests/source-files-sync.test.mjs` only walked imports from the 5 main entry points, so `lib/` modules imported *only* by a standalone hook script (`scripts/pre-tool-recall.js`) were invisible — `lib/file-intel.mjs` / `lib/reread-guard.mjs` would have shipped missing from the npm tarball and `ERR_MODULE_NOT_FOUND` on every user's first Read. Added a hook-script coverage test (with a `../`-aware import walker, since the shared one matches only `./`) and registered both modules in `source-files.mjs` + `package.json` `files[]`.
+
+Suite 2820 → 2857 passed (+37; ① 22, ② 14, release-hardening 1). Added-IO latency: an A/B of the same binary (features on vs off, env-gated, interleaved, N=21) showed a −0.09ms median delta on a ~33ms spawn-dominated hook — within noise; `hook-latency.test.mjs` green. Both features were verified live in-repo via the dev-installed hook.
+
 ## v2.99.0 — CLI/MCP convergence round 2 (timeline + search cores) + isolated efficacy re-measure
 
 No user-visible behavior change. This release closes the two largest remaining dual implementations from the v2.98 audit (D#33/D#34) and lands the pinned-isolation benchmark mode whose first run materially revises the project's own efficacy claims (D#35).

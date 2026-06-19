@@ -52,6 +52,12 @@ export const SOURCE_FILES = [
   // and mem-cli.mjs (countRecentHookErrors for `stats`). Missing from
   // manifest → tarball ships hooks that ERR_MODULE_NOT_FOUND on every fire.
   'lib/hook-telemetry.mjs',
+  // v3.0: read-time file-intelligence (①) + repeated-read guard (②). Imported
+  // ONLY by scripts/pre-tool-recall.js (reread-guard also imports file-intel) —
+  // NOT reachable from the 5 ENTRY_MODULES, so the hook-script coverage test in
+  // source-files-sync.test.mjs is what keeps these from being dropped on bump.
+  'lib/file-intel.mjs',
+  'lib/reread-guard.mjs',
   'lib/metrics.mjs',
   // v2.71.x: better-sqlite3 ABI probe + auto-rebuild. Shared by install.mjs
   // (post-`npm install` verify) and scripts/launch.mjs (pre-server-launch
