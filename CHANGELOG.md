@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.1.2 — Opt-in LLM multi-query/HyDE deep search + memory-prompt injection guard
+
+The headline is a new **opt-in deep search** that closes the vocabulary-mismatch recall gap — when your words differ from the words a memory actually used, a plain FTS/TF-IDF search misses. Plus a security hardening of the Haiku memory prompts and a vocabulary-mismatch benchmark harness.
+
+### Opt-in LLM multi-query / HyDE deep search
+
+New `deep-search.mjs`: one Haiku call rewrites a query into keyword / concept-expansion / HyDE variants, each runs the real hybrid search (`searchObservationsHybrid`), and the N ranked lists are RRF-fused. Surfaced as CLI `search --deep` and MCP `mem_search deep=true` — **opt-in, default off**; passive recall stays sub-millisecond single-query.
+
+Reliability is by construction: the original query is always variant[0], so a failed/empty/malformed rewrite collapses to the single-query baseline — never worse, including in the error dimension (an engine error on the original query propagates rather than being swallowed). On the vocabulary-mismatch benchmark, fusion lifts R@10 from 0.33 to 0.87 on the all-rewrites-usable ceiling; live Haiku rewrite reliability lands between that ceiling and the 0.33 floor.
+
+A max-effort code review of the deep path surfaced 15 verified findings — all the deep path inheriting single-query-pipeline invariants. The correctness + observability cluster is fixed: the "N of M" total now reflects the fused variant set, supersession-tagging runs for deep results, empty/special-char queries reach the rewrite on both surfaces, and CLI + MCP both report which variants were searched.
+
+### Memory-prompt injection guard
+
+`MEMORY_INPUT_GUARD` added to the Haiku episode/summary prompts (`hook-llm.mjs`): an explicit instruction that captured content (diffs, tool output, user text) is data, never instructions — shrinking the memory-poisoning surface. A security control, not a quality lever.
+
+### Benchmark
+
+New vocabulary-mismatch suite (`benchmark/fixtures/test-queries-vocab-mismatch.json` + `--queries` flag) quantifies the natural-language recall deficit, and a deterministic `--deep-search` mode (recorded rewrites + fake llm) measures fusion quality isolated from live Haiku flakiness.
+
+No dependency changes. Full suite green (2909 tests).
+
 ## v3.1.1 — Code-review follow-up: correct the v3.1.0 path fix + harden the self-heal launcher
 
 A multi-agent review of v3.1.0 surfaced 15 verified findings. The headline: the v3.1.0 "absolute-path" CLI fix pointed at `node ~/.claude-mem-lite/cli.mjs`, which **does not exist on a plugin-only install** — `setup.sh` provisions the data dir but never materializes source there, so that path only resolved on direct-install symlink farms. This release replaces it with surface-aware resolution and closes the launcher / observability / metadata gaps the review found.
