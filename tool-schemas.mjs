@@ -93,7 +93,7 @@ export const memSearchSchema = {
   sort: z.enum(['relevance', 'time', 'importance']).optional().describe('Sort order: relevance (default, BM25), time (newest first), importance (highest first)'),
   include_noise: z.boolean().optional().describe('Include hook-llm fallback titles ("Modified X", "Worked on X", raw error logs) — hidden by default as they have ~3% access rate'),
   or: coerceBool.optional().describe('Force OR semantics between query terms from the start (default: AND with automatic OR-fallback when AND returns 0). Aligns with CLI --or.'),
-  deep: coerceBool.optional().describe('Opt-in LLM multi-query/HyDE deep search: one Haiku call rewrites the query into keyword/concept/HyDE variants, each runs the hybrid search, results RRF-fused. Observations-only; costs a Haiku call + seconds of latency. Use ONLY when a normal search missed because your wording differs from the stored terms (vocabulary mismatch). Default false; passive recall stays single-query.'),
+  deep: coerceBool.optional().describe('Tri-state LLM multi-query/HyDE deep search (observations-only). true=force; false=never; omit=AUTO (default ON for mem_search): a normal search that returns weak/few results auto-escalates with ONE Haiku call (query rewritten to keyword/concept/HyDE variants, RRF-fused). Set CLAUDE_MEM_AUTO_DEEP=0 to disable AUTO. Passive recall stays single-query.'),
 };
 
 export const memRecentSchema = {
@@ -350,7 +350,7 @@ export const tools = [
       '  - Investigating a concrete error keyword with obs_type="bugfix"\n' +
       '  - Looking for prior art on a module/feature before refactoring\n' +
       '  - User asks "have we seen this before" or references something not in visible context\n' +
-      '  - A normal search missed — set deep=true to LLM-rewrite the query (slower)\n' +
+      '  - A normal search missed — weak results auto-escalate to deep (set deep=false to opt out)\n' +
       '\n' +
       'Equivalent CLI: ' + CLI_INVOKE + ' search "<query>" [--type bugfix] [--deep]',
     inputSchema: memSearchSchema,
