@@ -223,3 +223,61 @@ describe('deepSearch — error handling (F5: never-worse in the error dimension)
     expect(results.map(r => r.id)).toEqual([1]); // original survived; bad rewrite ignored
   });
 });
+
+import {
+  AUTO_DEEP_MIN_RESULTS,
+  shouldEscalateToDeep,
+  resolveDeepMode,
+} from '../deep-search.mjs';
+
+describe('shouldEscalateToDeep — zero-LLM weak-result heuristic', () => {
+  it('escalates when result count is below the floor', () => {
+    expect(shouldEscalateToDeep([{ id: 1 }, { id: 2 }], {})).toBe(true); // 2 < 3
+  });
+
+  it('does NOT escalate when enough results and no OR fallback', () => {
+    const rows = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+    expect(shouldEscalateToDeep(rows, { orFallbackFired: false })).toBe(false);
+  });
+
+  it('escalates when the engine had to relax AND→OR (orFallbackFired)', () => {
+    const rows = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }];
+    expect(shouldEscalateToDeep(rows, { orFallbackFired: true })).toBe(true);
+  });
+
+  it('treats null/empty results as weak', () => {
+    expect(shouldEscalateToDeep(null, {})).toBe(true);
+    expect(shouldEscalateToDeep([], {})).toBe(true);
+  });
+
+  it('honors a custom minResults', () => {
+    expect(shouldEscalateToDeep([{ id: 1 }], {}, { minResults: 1 })).toBe(false);
+  });
+});
+
+describe('resolveDeepMode — tri-state precedence', () => {
+  it('explicit true → deep (ignores env)', () => {
+    expect(resolveDeepMode(true, { surface: 'cli', env: { CLAUDE_MEM_AUTO_DEEP: '0' } })).toBe('deep');
+  });
+
+  it('explicit false → normal (ignores env)', () => {
+    expect(resolveDeepMode(false, { surface: 'mcp', env: { CLAUDE_MEM_AUTO_DEEP: '1' } })).toBe('normal');
+  });
+
+  it('undefined + env unset → per-surface default (mcp=auto, cli=normal)', () => {
+    expect(resolveDeepMode(undefined, { surface: 'mcp', env: {} })).toBe('auto');
+    expect(resolveDeepMode(undefined, { surface: 'cli', env: {} })).toBe('normal');
+  });
+
+  it('undefined + env=1 → auto on both surfaces', () => {
+    expect(resolveDeepMode(undefined, { surface: 'cli', env: { CLAUDE_MEM_AUTO_DEEP: '1' } })).toBe('auto');
+  });
+
+  it('undefined + env=0 → normal on both surfaces', () => {
+    expect(resolveDeepMode(undefined, { surface: 'mcp', env: { CLAUDE_MEM_AUTO_DEEP: '0' } })).toBe('normal');
+  });
+
+  it('AUTO_DEEP_MIN_RESULTS is the documented default of 3', () => {
+    expect(AUTO_DEEP_MIN_RESULTS).toBe(3);
+  });
+});

@@ -38,6 +38,56 @@ import { RRF_K } from './tfidf.mjs';
 // original + up to 3 rewrites (keyword / concept-expansion / HyDE).
 export const MAX_VARIANTS = 4;
 
+// ─── Auto-escalation (opt-in adaptive deep search) ──────────────────────────
+// Result-count floor below which a normal search is "weak" enough to auto-escalate
+// to deepSearch. Calibrated against the deep-search benchmark fixtures; 3 is the
+// starting point (vocabulary-mismatch misses typically return 0-2 obs rows).
+export const AUTO_DEEP_MIN_RESULTS = 3;
+
+/**
+ * Zero-LLM heuristic: are the normal-search results weak enough to warrant
+ * auto-escalating to deepSearch? Reads ONLY rows already in hand + the hybrid
+ * engine's ctx flags. Never calls an LLM, so the decision itself is free — only
+ * a positive verdict costs a Haiku call (the escalation).
+ *
+ * Weak when: too few results, OR the engine had to relax AND→OR
+ * (ctx.orFallbackFired) — a direct vocabulary-mismatch symptom, exactly what
+ * deep/HyDE exists to fix.
+ *
+ * @param {Array} results  normal-search rows
+ * @param {object} ctx     the hybrid ctx the engine mutated (orFallbackFired)
+ * @param {object} [opts]
+ * @param {number} [opts.minResults=AUTO_DEEP_MIN_RESULTS]
+ * @returns {boolean}
+ */
+export function shouldEscalateToDeep(results, ctx, { minResults = AUTO_DEEP_MIN_RESULTS } = {}) {
+  const n = Array.isArray(results) ? results.length : 0;
+  if (n < minResults) return true;
+  if (ctx && ctx.orFallbackFired === true) return true;
+  return false;
+}
+
+/**
+ * Resolve the tri-state deep mode. Precedence: explicit value > env flag >
+ * per-surface default.
+ * @param {boolean|undefined} explicitDeep  caller's deep value (undefined = not passed)
+ * @param {object} opts
+ * @param {'mcp'|'cli'} opts.surface
+ * @param {object} [opts.env=process.env]
+ * @returns {'deep'|'auto'|'normal'}
+ *   'deep'   — force deepSearch
+ *   'auto'   — run normal search, escalate if weak
+ *   'normal' — run normal search, never escalate
+ */
+export function resolveDeepMode(explicitDeep, { surface, env = process.env } = {}) {
+  if (explicitDeep === true) return 'deep';
+  if (explicitDeep === false) return 'normal';
+  const flag = env.CLAUDE_MEM_AUTO_DEEP;
+  if (flag === '0') return 'normal';
+  if (flag === '1') return 'auto';
+  return surface === 'mcp' ? 'auto' : 'normal';
+}
+
 // Echoes hook-llm.mjs MEMORY_INPUT_GUARD (kept inline rather than imported so
 // this module — and the tests that import it — never pull in hook-llm's
 // native-heavy chain; see #8729). Same security intent: the query is untrusted.
