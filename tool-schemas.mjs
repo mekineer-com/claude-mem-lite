@@ -350,7 +350,7 @@ export const tools = [
       '  - Investigating a concrete error keyword with obs_type="bugfix"\n' +
       '  - Looking for prior art on a module/feature before refactoring\n' +
       '  - User asks "have we seen this before" or references something not in visible context\n' +
-      '  - A normal search missed and your words differ from stored terms — set deep=true (LLM multi-query/HyDE)\n' +
+      '  - A normal search missed — set deep=true to LLM-rewrite the query (slower)\n' +
       '\n' +
       'Equivalent CLI: ' + CLI_INVOKE + ' search "<query>" [--type bugfix] [--deep]',
     inputSchema: memSearchSchema,
