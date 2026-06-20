@@ -1,0 +1,65 @@
+{
+  "_doc": "Recorded query rewrites for the deep-search benchmark (--deep-search). One entry per query in test-queries-vocab-mismatch.json, keyed by the EXACT query string. Each holds the 3 variants a query-rewriter (deep-search.mjs buildRewritePrompt) is meant to emit: [0] keyword/tech-term form, [1] concept expansion, [2] HyDE hypothetical sentence. METHODOLOGY: variants were authored from the QUERY TEXT + the query's stated intent (desc) using general domain knowledge only (e.g. 'container orchestration' -> 'Kubernetes' is textbook) — NOT by inspecting relevant_ids or the corpus, so the benchmark measures the production fusion path on representative rewrites rather than cherry-picked headwords. This freezes the deterministic CEILING of the fusion machinery (all rewrites usable). Live Haiku reliability is lower (#8731: 5/12 rewrites came back empty); deep-search.mjs always keeps the original query as variant[0], so the live result lands between the single-query baseline (floor, R@10 ~0.33) and this ceiling, never below baseline. Re-record from live Haiku by capturing rewriteQuery() output per query. Authored 2026-06-21.",
+  "rewrites": {
+    "container orchestration platform": [
+      "Kubernetes pods cluster",
+      "EKS GKE node pool scheduling autoscaling",
+      "We moved the service onto a Kubernetes cluster, scheduling pods across worker nodes."
+    ],
+    "automated release rollout to production": [
+      "continuous deployment GitOps pipeline",
+      "ArgoCD canary progressive deployment release automation",
+      "Set up GitOps continuous deployment with ArgoCD performing canary rollouts to prod."
+    ],
+    "realtime server push to clients": [
+      "WebSocket server-sent events SSE",
+      "GraphQL subscriptions live updates broadcast streaming",
+      "Implemented live updates that push data to clients over WebSocket and SSE."
+    ],
+    "distributed message queue backbone": [
+      "Kafka event streaming",
+      "Kafka topics producer consumer event bus broker",
+      "Built the event pipeline on Kafka topics for distributed streaming between services."
+    ],
+    "declarative cloud infrastructure provisioning": [
+      "Terraform Pulumi infrastructure as code",
+      "Terraform modules state provisioning cloud resources",
+      "Provisioned cloud infrastructure declaratively using Terraform modules."
+    ],
+    "production monitoring and tracing stack": [
+      "observability distributed tracing Prometheus",
+      "Grafana metrics OpenTelemetry spans alerting monitoring",
+      "Set up observability with Prometheus metrics and distributed tracing spans."
+    ],
+    "the app crashed because it ran out of memory": [
+      "OOM out of memory error",
+      "OOMKilled memory leak heap exhaustion container limit",
+      "The process was OOMKilled after a memory leak exhausted the heap."
+    ],
+    "two operations happening at the same time corrupt or duplicate data": [
+      "race condition concurrency bug",
+      "concurrent writes mutex lock deadlock data corruption duplicate",
+      "A race condition between concurrent writes duplicated the persisted data."
+    ],
+    "how do I keep the app working when there is no internet connection?": [
+      "offline-first architecture",
+      "offline sync service worker IndexedDB local cache connectivity",
+      "Implemented offline-first sync so the app keeps working without connectivity."
+    ],
+    "timestamps show the wrong time for users in different parts of the world": [
+      "timezone UTC conversion bug",
+      "timezone offset daylight saving time UTC normalization locale",
+      "Fixed wrong times by normalizing all timestamps to UTC and converting per timezone."
+    ],
+    "stop users from submitting bad or malformed input": [
+      "input validation",
+      "request payload validation schema sanitization zod reject",
+      "Added input validation with a schema that rejects malformed user requests."
+    ],
+    "the screen freezes and stutters when there is a lot of data": [
+      "UI jank dropped frames",
+      "render performance fps virtualization main thread blocking large list",
+      "Fixed UI jank and dropped frames when rendering a large list of data."
+    ]
+  }
+}

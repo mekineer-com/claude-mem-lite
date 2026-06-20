@@ -7,6 +7,7 @@ import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
+import { deepSearch } from '../deep-search.mjs';
 import { computeVector, rebuildVocabulary, _resetVocabCache, VOCAB_DIM, MIN_COSINE_SIMILARITY, RRF_K } from '../tfidf.mjs';
 import { createTestDb } from '../tests/test-helpers.mjs';
 
@@ -621,9 +622,60 @@ export function runVectorSweep(db, queries, opts = {}) {
   return { rows, best, pinned, pinnedIsBest };
 }
 
+// ─── Deep Search (LLM multi-query / HyDE) ─────────────────────────────────────
+//
+// Measures the production deep-search path (deep-search.mjs) on the
+// vocabulary-mismatch fixture against the single-query production_hybrid
+// baseline. Uses a fixture-backed FAKE llm (recorded rewrites) so the result is
+// deterministic and CI-able — it isolates FUSION quality from live Haiku rewrite
+// flakiness (#8730: don't let a flaky live-LLM into the gate; #8731: real Haiku
+// returned 5/12 empty). deep-search keeps the original query as variant[0], so
+// the live number lands between this ceiling and the single-query floor.
+export async function runDeepSearch(db, queries, rewritesByQuery, { rrfK } = {}) {
+  // Fake llm: resolve recorded rewrites by the query text carried in the user slot.
+  const fakeLLM = async (prompt) => {
+    const q = ((prompt && prompt.user) || '').trim();
+    const variants = rewritesByQuery[q];
+    return Array.isArray(variants) && variants.length ? { variants } : null;
+  };
+
+  let baseR = 0, baseNd = 0, baseMrr = 0;
+  let deepR = 0, deepNd = 0, deepMrr = 0;
+  const perQuery = [];
+  for (const q of queries) {
+    const base = searchProductionHybrid(db, q.query, { limit: 10, project: q.project, obsType: q.type });
+    const { results: deep, variants } = await deepSearch(
+      db, { query: q.query, project: q.project, type: q.type, limit: 10 }, { llm: fakeLLM, rrfK },
+    );
+    const bR = computeRecallAtK(base, q.relevant_ids, 10);
+    const dR = computeRecallAtK(deep, q.relevant_ids, 10);
+    baseR += bR; baseNd += computeNDCG(base, q.relevant_ids, 10); baseMrr += computeMRR(base, q.relevant_ids);
+    deepR += dR; deepNd += computeNDCG(deep, q.relevant_ids, 10); deepMrr += computeMRR(deep, q.relevant_ids);
+    perQuery.push({
+      id: q.id, query: q.query,
+      baseline_recall_at_10: round(bR), deep_recall_at_10: round(dR),
+      recall_delta: round(dR - bR), variant_count: variants.length,
+    });
+  }
+  const n = queries.length || 1;
+  const baseline = { recall_at_10: round(baseR / n), ndcg_at_10: round(baseNd / n), mrr_at_10: round(baseMrr / n) };
+  const deepM = { recall_at_10: round(deepR / n), ndcg_at_10: round(deepNd / n), mrr_at_10: round(deepMrr / n) };
+  return {
+    queryCount: queries.length,
+    baseline,
+    deep: deepM,
+    delta: {
+      recall_at_10: round(deepM.recall_at_10 - baseline.recall_at_10),
+      ndcg_at_10: round(deepM.ndcg_at_10 - baseline.ndcg_at_10),
+      mrr_at_10: round(deepM.mrr_at_10 - baseline.mrr_at_10),
+    },
+    perQuery,
+  };
+}
+
 // ─── CLI Entry Point ────────────────────────────────────────────────────────
 
-function main() {
+async function main() {
   const seedPath = join(__dirname, 'fixtures', 'seed-data.json');
   // --queries <path>: run an alternate query fixture (path relative to benchmark/,
   // or absolute) instead of the default keyword set. Used by the isolated
@@ -649,7 +701,39 @@ function main() {
   const holdoutMode = args.has('--holdout');
   const productionHybridMode = args.has('--production-hybrid');
   const vectorSweepMode = args.has('--vector-sweep');
+  const deepSearchMode = args.has('--deep-search');
   const ablations = !args.has('--no-ablations');
+
+  // --deep-search: production deep-search (deep-search.mjs) vs single-query
+  // baseline on the vocab-mismatch suite, using recorded rewrites (deterministic
+  // fake llm). Defaults to the vocab-mismatch fixture (the set the rewrites file
+  // matches) unless --queries overrode it; --rewrites overrides the rewrites path.
+  if (deepSearchMode) {
+    const dqPath = qFlagIdx >= 0 && cliArgv[qFlagIdx + 1]
+      ? queriesPath
+      : join(__dirname, 'fixtures', 'test-queries-vocab-mismatch.json');
+    const rFlagIdx = cliArgv.indexOf('--rewrites');
+    const rewritesPath = rFlagIdx >= 0 && cliArgv[rFlagIdx + 1]
+      ? (isAbsolute(cliArgv[rFlagIdx + 1]) ? cliArgv[rFlagIdx + 1] : join(__dirname, cliArgv[rFlagIdx + 1]))
+      : join(__dirname, 'fixtures', 'rewrites-vocab-mismatch.json');
+    const dQueries = JSON.parse(readFileSync(dqPath, 'utf8')).queries;
+    const rewritesFile = JSON.parse(readFileSync(rewritesPath, 'utf8'));
+    const rewritesByQuery = rewritesFile.rewrites || rewritesFile;
+
+    const seeded = seedVectors(db);
+    console.error(`Seeded ${seeded.vectors} observation vectors (vocab ${seeded.vocabVersion}, dim ${seeded.dim})`);
+    console.error('Running deep-search benchmark (recorded rewrites, deterministic fake llm)...');
+    const res = await runDeepSearch(db, dQueries, rewritesByQuery);
+    console.log(JSON.stringify(res, null, 2));
+    console.error('\n─── Deep Search (LLM multi-query/HyDE, recorded rewrites) ───');
+    console.error(`  baseline (single-query): R@10=${res.baseline.recall_at_10}  nDCG=${res.baseline.ndcg_at_10}  MRR=${res.baseline.mrr_at_10}`);
+    console.error(`  deep     (multi + RRF):  R@10=${res.deep.recall_at_10}  nDCG=${res.deep.ndcg_at_10}  MRR=${res.deep.mrr_at_10}`);
+    console.error(`  Δ:                       R@10=${res.delta.recall_at_10}  nDCG=${res.delta.ndcg_at_10}  MRR=${res.delta.mrr_at_10}`);
+    console.error('  (deterministic ceiling — all rewrites usable. Live Haiku reliability is lower; deep-search keeps the');
+    console.error('   original query as variant[0], so the live number stays >= the single-query baseline.)');
+    db.close();
+    return;
+  }
 
   // --vector-sweep: pin VOCAB_DIM × MIN_COSINE × RRF_K on the real hybrid path.
   if (vectorSweepMode) {
@@ -794,5 +878,5 @@ function main() {
 // Run if executed directly
 const isMain = process.argv[1] && fileURLToPath(import.meta.url).includes(process.argv[1].replace(/\.mjs$/, ''));
 if (isMain) {
-  main();
+  main().catch((err) => { console.error(err); process.exitCode = 1; });
 }
