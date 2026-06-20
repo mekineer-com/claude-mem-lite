@@ -18,6 +18,8 @@ import {
   rrfFuseN,
   deepSearch,
   MAX_VARIANTS,
+  hasEscalatableCorpus,
+  AUTO_DEEP_MIN_CORPUS,
 } from '../deep-search.mjs';
 
 // llm stub: returns canned parsed-JSON objects (the shape callModelJSON yields),
@@ -139,6 +141,8 @@ function makeSeed() {
   // 3 Kubernetes obs (relevant) deliberately never use the words "container" or
   // "orchestration"; 2 database distractors. So the literal query misses the
   // relevant set entirely until a rewrite injects the real headword.
+  // Padding obs 6-15 keep the corpus >= AUTO_DEEP_MIN_CORPUS (10) without
+  // matching weak query tokens (zqxjv9471kpw / container / orchestration).
   return {
     observations: [
       mk(1, 'kubernetes pod scheduling', 'kubernetes scheduler assigns pods across worker nodes in the cluster'),
@@ -146,6 +150,16 @@ function makeSeed() {
       mk(3, 'kubernetes ingress routing', 'kubernetes ingress routes traffic to pods via service endpoints'),
       mk(4, 'database migration script', 'update database schema add user table columns and index'),
       mk(5, 'database query optimization', 'optimize slow database query with index on large table scan'),
+      mk(6, 'typescript compiler options', 'configure tsconfig target and module resolution for esm output'),
+      mk(7, 'eslint rule configuration', 'add no-unused-vars and prefer-const rules to eslint config'),
+      mk(8, 'vitest test runner setup', 'configure vitest globals and coverage thresholds in vite config'),
+      mk(9, 'npm publish workflow', 'publish package to npm registry with provenance and access public'),
+      mk(10, 'git branch strategy', 'use feature branches and squash merge to keep main history linear'),
+      mk(11, 'sqlite fts5 tokenizer', 'fts5 porter tokenizer improves recall for stemmed english queries'),
+      mk(12, 'better-sqlite3 pragma', 'set journal mode wal and synchronous normal for write throughput'),
+      mk(13, 'node esm loader', 'esm loader requires explicit dot-mjs extensions for relative imports'),
+      mk(14, 'github actions cache', 'cache node modules between runs using actions cache key on lockfile'),
+      mk(15, 'semver release tagging', 'push annotated tag vX.Y.Z to trigger publish workflow in ci'),
     ],
     sessions: [],
   };
@@ -552,6 +566,139 @@ describe('CLI cmdSearch auto-escalation (D#39)', () => {
 
     expect(parsed.deep).toBe(false);
     expect(llm.calls()).toBe(0);
+    db.close();
+  });
+});
+
+// ─── hasEscalatableCorpus unit tests ─────────────────────────────────────────
+
+describe('hasEscalatableCorpus — corpus-size guard', () => {
+  // Tracks which (db, project) pairs already have a session row so we don't
+  // violate the sdk_sessions FK on repeated insertObs calls.
+  const sessionCreated = new WeakMap();
+
+  function freshDb() {
+    const db = createTestDb();
+    _resetVocabCache();
+    return db;
+  }
+
+  function insertObs(db, { project = 'p', superseded = false, compressedInto = null } = {}) {
+    const key = `${project}`;
+    if (!sessionCreated.get(db)?.has(key)) {
+      insertSession(db, { id: `sess-guard-${project}`, project });
+      const s = sessionCreated.get(db) ?? new Set();
+      s.add(key);
+      sessionCreated.set(db, s);
+    }
+    db.prepare(`
+      INSERT INTO observations
+        (memory_session_id, project, text, type, title, created_at, created_at_epoch,
+         superseded_at, compressed_into)
+      VALUES (?, ?, 'text', 'bugfix', 'title', '2026-01-01', 1000000,
+              ?, ?)
+    `).run(`sess-guard-${project}`, project, superseded ? 1 : null, compressedInto);
+  }
+
+  it('returns false when live obs count is below AUTO_DEEP_MIN_CORPUS', () => {
+    const db = freshDb();
+    for (let i = 0; i < 9; i++) insertObs(db);
+    expect(hasEscalatableCorpus(db, null)).toBe(false);
+    db.close();
+  });
+
+  it('returns true when live obs count equals AUTO_DEEP_MIN_CORPUS', () => {
+    const db = freshDb();
+    for (let i = 0; i < 10; i++) insertObs(db);
+    expect(hasEscalatableCorpus(db, null)).toBe(true);
+    db.close();
+  });
+
+  it('returns true when live obs count exceeds AUTO_DEEP_MIN_CORPUS', () => {
+    const db = freshDb();
+    for (let i = 0; i < 15; i++) insertObs(db);
+    expect(hasEscalatableCorpus(db, null)).toBe(true);
+    db.close();
+  });
+
+  it('superseded rows do not count toward live corpus', () => {
+    const db = freshDb();
+    // 9 live + 5 superseded = 14 total, but only 9 live → false
+    for (let i = 0; i < 9; i++) insertObs(db);
+    for (let i = 0; i < 5; i++) insertObs(db, { superseded: true });
+    expect(hasEscalatableCorpus(db, null)).toBe(false);
+    db.close();
+  });
+
+  it('compressed rows do not count toward live corpus', () => {
+    const db = freshDb();
+    // 9 live + 5 compressed = 14 total, but only 9 live → false
+    for (let i = 0; i < 9; i++) insertObs(db);
+    for (let i = 0; i < 5; i++) insertObs(db, { compressedInto: 999 });
+    expect(hasEscalatableCorpus(db, null)).toBe(false);
+    db.close();
+  });
+
+  it('project filter scopes the count correctly', () => {
+    const db = freshDb();
+    // 10 live obs in proj-x, 2 in proj-y
+    for (let i = 0; i < 10; i++) insertObs(db, { project: 'proj-x' });
+    for (let i = 0; i < 2; i++) insertObs(db, { project: 'proj-y' });
+    expect(hasEscalatableCorpus(db, 'proj-x')).toBe(true);
+    expect(hasEscalatableCorpus(db, 'proj-y')).toBe(false);
+    expect(hasEscalatableCorpus(db, null)).toBe(true); // global: 12 total
+    db.close();
+  });
+
+  it('AUTO_DEEP_MIN_CORPUS exported constant is 10', () => {
+    expect(AUTO_DEEP_MIN_CORPUS).toBe(10);
+  });
+});
+
+// ─── Corpus-guard integration: escalation suppressed on near-empty store ─────
+
+describe('corpus guard integration — escalation suppressed on near-empty store', () => {
+  it('MCP: < 10 live obs + weak query → NO escalation (llm called 0 times)', async () => {
+    // Seed only 5 obs (< AUTO_DEEP_MIN_CORPUS) — the guard should block escalation
+    // even though the result count is < AUTO_DEEP_MIN_RESULTS.
+    const db = createTestDb();
+    _resetVocabCache();
+    const tinyMk = (id, title, narrative) => ({
+      id, session_id: 's1', project: 'proj-tiny', text: `${title} ${narrative}`,
+      type: 'bugfix', title, narrative, facts: '', concepts: '', files_modified: '[]',
+      importance: 2, epoch_offset_days: -1,
+    });
+    seedDatabase(db, {
+      observations: [
+        tinyMk(1, 'alpha one', 'alpha narrative one'),
+        tinyMk(2, 'beta two', 'beta narrative two'),
+        tinyMk(3, 'gamma three', 'gamma narrative three'),
+        tinyMk(4, 'delta four', 'delta narrative four'),
+        tinyMk(5, 'epsilon five', 'epsilon narrative five'),
+      ],
+      sessions: [],
+    });
+    seedVectors(db);
+
+    const llm = stubLLM({ variants: ['kubernetes pods'] });
+    // 'zqxjv9471kpw' hits 0 obs → would normally escalate, but corpus < 10 → no escalation
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw', project: 'proj-tiny' }, { llm });
+    expect(res.escalated).toBe(false);
+    expect(llm.calls()).toBe(0);
+    db.close();
+  });
+
+  it('MCP: >= 10 live obs + weak query → escalates (llm called 1 time)', async () => {
+    // makeSeed() now has 15 obs → corpus guard passes → escalation fires on weak query
+    const db = createTestDb();
+    _resetVocabCache();
+    seedDatabase(db, makeSeed());
+    seedVectors(db);
+
+    const llm = stubLLM({ variants: ['kubernetes pods', 'k8s cluster scheduling'] });
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw' }, { llm });
+    expect(res.escalated).toBe(true);
+    expect(llm.calls()).toBe(1);
     db.close();
   });
 });

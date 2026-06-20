@@ -44,6 +44,28 @@ export const MAX_VARIANTS = 4;
 // starting point (vocabulary-mismatch misses typically return 0-2 obs rows).
 export const AUTO_DEEP_MIN_RESULTS = 3;
 
+// Corpus-size floor below which auto-escalation is skipped entirely.
+// A near-empty store can't be rescued by HyDE/multi-query, so the Haiku call
+// would be wasted. Project-scoped when a project arg is provided, else global.
+export const AUTO_DEEP_MIN_CORPUS = 10;
+
+/**
+ * Cheap guard: does the project have enough stored observations for deep search
+ * to plausibly help? A near-empty store can't be rescued by HyDE/multi-query —
+ * skip escalation (and its Haiku call) there. Project-scoped when `project` is
+ * given, else global. Counts only live obs (not superseded/compressed).
+ * @returns {boolean} true if count >= min
+ */
+export function hasEscalatableCorpus(db, project, min = AUTO_DEEP_MIN_CORPUS) {
+  try {
+    const where = ['superseded_at IS NULL', 'COALESCE(compressed_into, 0) = 0'];
+    const params = [];
+    if (project) { where.push('project = ?'); params.push(project); }
+    const row = db.prepare(`SELECT COUNT(*) AS c FROM observations WHERE ${where.join(' AND ')}`).get(...params);
+    return (row?.c ?? 0) >= min;
+  } catch { return true; } // on any error, don't suppress escalation (fail open)
+}
+
 /**
  * Is a usable LLM available for AUTO escalation? True when a stub/real llm is
  * injected (tests), or a FAST provider key is set. The claude-CLI fallback is

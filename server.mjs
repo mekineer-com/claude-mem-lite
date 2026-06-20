@@ -10,7 +10,7 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
-import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
+import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady, hasEscalatableCorpus } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
@@ -404,7 +404,7 @@ async function runSearchPipeline(db, args, { llm } = {}) {
         // results is already obs-only here (sessions/prompts pushed below), but the
         // filter makes the invariant explicit and robust to future reordering.
         const obsCountBeforeEscalation = results.length;
-        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx)) {
+        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx) && hasEscalatableCorpus(db, args.project || null)) {
           await runDeepInto();
           isDeep = true;
           escalated = true;
