@@ -2,13 +2,15 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
-## Unreleased
+## v3.2.0 — Adaptive deep-search auto-escalation
 
 ### change: Adaptive deep-search auto-escalation
 
 `mem_search` now auto-escalates to LLM multi-query/HyDE deep search when a normal search returns weak/few results (fewer than 3), so callers no longer must pass `deep=true`. The `deep` parameter is now tri-state: `true` forces deep, `false` disables it, and omitting it selects AUTO mode.
 
 AUTO is default-ON for the MCP `mem_search` tool and default-OFF for the CLI `search` command. The environment variable `CLAUDE_MEM_AUTO_DEEP=0` disables AUTO globally; `=1` enables it on the CLI as well. The CLI adds a `--no-deep` flag for explicit opt-out. AUTO only fires when a fast LLM provider is configured (ANTHROPIC_API_KEY or OPENROUTER_API_KEY) or an llm is injected; it never auto-spawns the slower claude-CLI fallback (explicit `deep=true` still may).
+
+AUTO is also skipped on near-empty projects (fewer than 10 stored observations), where deep search has nothing to find — avoiding a wasted Haiku call on brand-new or sparse stores.
 
 The passive hook recall path is unchanged—it remains a single-query, sub-millisecond path with no LLM. Escalation costs one Haiku call only when AUTO actually fires and the conditions are met.
 
