@@ -1,0 +1,125 @@
+{
+  "_doc": "Vocabulary-mismatch query suite — ISOLATED from the main keyword benchmark (test-queries.json) so it never dilutes baseline.json / the CI gate. Run (MUST pass --production-hybrid; the default FTS-only path AND-joins multi-word NL queries and scores ~0, which is a misleading artifact): node benchmark/benchmark.mjs --queries fixtures/test-queries-vocab-mismatch.json --production-hybrid. Baseline: benchmark/baseline-vocab-mismatch.json. Observed R@10 ~0.33 vs ~0.90 keyword (2026-06) — the gap is the real vocabulary-mismatch deficit. Each query reuses SEMANTIC ground-truth (relevant_ids audited against narrative, not keyword match); the query wording deliberately OMITS the concept headword that would be a trivial FTS hit, to measure recall when user words != memory words. Two tiers: vocab_mismatch_synonym (lexical variant) and vocab_mismatch_paraphrase (natural-language description). Built + audited 2026-06-21.",
+  "queries": [
+    {
+      "id": "vm-1",
+      "query": "container orchestration platform",
+      "desc": "Kubernetes work phrased with the textbook category name",
+      "category": "vocab_mismatch_synonym",
+      "project": null,
+      "type": null,
+      "relevant_ids": [49, 67, 95, 161, 166, 188, 191],
+      "rationale": "Corpus uniformly says 'Kubernetes'/'EKS'/'pod'/'cluster'; 'orchestration' = 0 hits. Anchored to q25 but DROPPED #171 (Airflow workflow-orchestration, different sense)."
+    },
+    {
+      "id": "vm-2",
+      "query": "automated release rollout to production",
+      "desc": "Continuous-deployment / GitOps work phrased as 'release rollout'",
+      "category": "vocab_mismatch_synonym",
+      "project": null,
+      "type": null,
+      "relevant_ids": [24, 54, 73, 99],
+      "rationale": "Tokens 'release'/'rollout' absent; corpus says 'deployment'/'GitOps'/'ArgoCD'/'canary'. Dropped q12's #88 (CI-secrets bug) & #171 (Airflow upgrade); added #54 (ArgoCD CD sync-loop bug)."
+    },
+    {
+      "id": "vm-3",
+      "query": "realtime server push to clients",
+      "desc": "WebSocket/SSE live-update work phrased as 'server push'",
+      "category": "vocab_mismatch_synonym",
+      "project": null,
+      "type": null,
+      "relevant_ids": [20, 108, 152, 140],
+      "rationale": "'push' absent; corpus says 'WebSocket'/'GraphQL subscriptions'/'broadcasts'/'SSE'. Anchored to q15 + extended with #140 (SSE), the canonical non-WebSocket server-push."
+    },
+    {
+      "id": "vm-4",
+      "query": "distributed message queue backbone",
+      "desc": "Kafka event-streaming work phrased with the generic 'message queue' category",
+      "category": "vocab_mismatch_synonym",
+      "project": null,
+      "type": null,
+      "relevant_ids": [15, 37, 63, 75],
+      "rationale": "Headword 'Kafka' in all 4; 'message queue'/'queue'/'message' absent, and avoided 'broker'/'event bus' (present in #15/#63) to keep it a fair synonym. Reuses q2."
+    },
+    {
+      "id": "vm-5",
+      "query": "declarative cloud infrastructure provisioning",
+      "desc": "Terraform/Pulumi IaC work phrased as the 'infrastructure as code' category",
+      "category": "vocab_mismatch_synonym",
+      "project": null,
+      "type": null,
+      "relevant_ids": [21, 74, 112, 130, 165, 192, 199],
+      "rationale": "Headword 'Terraform'/'Pulumi'; 'declarative'/'cloud' absent, avoided literal 'infrastructure as code' (#199 only). Reuses q16."
+    },
+    {
+      "id": "vm-6",
+      "query": "production monitoring and tracing stack",
+      "desc": "Observability tooling phrased without the word 'observability'",
+      "category": "vocab_mismatch_synonym",
+      "project": null,
+      "type": null,
+      "relevant_ids": [86, 115, 125, 144],
+      "rationale": "'observability' literal only in #115; others say 'distributed tracing'/'monitoring alerts'/'Prometheus service discovery'. Excluded #136 (Kubecost/FinOps) & #73 (canary that adds a dashboard)."
+    },
+    {
+      "id": "vm-7",
+      "query": "the app crashed because it ran out of memory",
+      "desc": "Functional description of OOM / memory-exhaustion bugs",
+      "category": "vocab_mismatch_paraphrase",
+      "project": null,
+      "type": null,
+      "relevant_ids": [25, 49, 51, 181, 185],
+      "rationale": "Spelled-out 'ran out of memory' = 0 hits; corpus uses jargon 'OOM'/'OOMKilled'/'memory leak'. Excluded #20 (conn leak) & #107 (UI-thread freeze, not OOM)."
+    },
+    {
+      "id": "vm-8",
+      "query": "two operations happening at the same time corrupt or duplicate data",
+      "desc": "Functional description of concurrency / race-condition bugs",
+      "category": "vocab_mismatch_paraphrase",
+      "project": null,
+      "type": null,
+      "relevant_ids": [26, 29, 53, 113, 120, 195],
+      "rationale": "Jargon 'race condition'/'concurrent'/'deadlock'/'mutex' absent from query (symptom described). Excluded #197 (pool exhaustion), #76 (flaky test), #159 (retry herd)."
+    },
+    {
+      "id": "vm-9",
+      "query": "how do I keep the app working when there is no internet connection?",
+      "desc": "Functional description of offline-first architecture",
+      "category": "vocab_mismatch_paraphrase",
+      "project": null,
+      "type": null,
+      "relevant_ids": [33, 121, 113],
+      "rationale": "'internet'/'no connection' absent; corpus says 'offline-first'/'WatermelonDB'/'regained connectivity'. Tight; excluded #124 (MMKV persistence) & #138 (React Query refetch). LOW cardinality (3, two near-dup)."
+    },
+    {
+      "id": "vm-10",
+      "query": "timestamps show the wrong time for users in different parts of the world",
+      "desc": "Functional description of timezone-handling bugs",
+      "category": "vocab_mismatch_paraphrase",
+      "project": null,
+      "type": null,
+      "relevant_ids": [50, 114],
+      "rationale": "Avoids headword 'timezone'/'UTC'. Tight pair; excluded #145 (SCD dates) & #167 (event-time watermark). LOW cardinality (2) — recall noisier here."
+    },
+    {
+      "id": "vm-11",
+      "query": "stop users from submitting bad or malformed input",
+      "desc": "Functional description of input/request validation",
+      "category": "vocab_mismatch_paraphrase",
+      "project": null,
+      "type": null,
+      "relevant_ids": [11, 60, 98, 175],
+      "rationale": "Tighter than q8's heterogeneous set: only USER-input validation (#11 zod wizard, #60 req middleware, #98 upload, #175 anti-injection). Dropped Terraform/Parquet/data-contract 'validation'."
+    },
+    {
+      "id": "vm-12",
+      "query": "the screen freezes and stutters when there is a lot of data",
+      "desc": "Functional description of UI-thread jank / frozen-UI performance bugs",
+      "category": "vocab_mismatch_paraphrase",
+      "project": null,
+      "type": null,
+      "relevant_ids": [2, 52, 107, 174],
+      "rationale": "'stutter' absent; corpus says 'fps drops'/'froze the UI'/'jank'. UI-responsiveness subset; excluded #163 (cold-start latency). Overlaps q9 on #2/#52/#174 but is the distinct UI-jank symptom."
+    }
+  ]
+}

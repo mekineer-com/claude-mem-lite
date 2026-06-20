@@ -3,7 +3,7 @@
 // Uses the exact same BM25 scoring formula from server.mjs
 
 import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
@@ -625,7 +625,14 @@ export function runVectorSweep(db, queries, opts = {}) {
 
 function main() {
   const seedPath = join(__dirname, 'fixtures', 'seed-data.json');
-  const queriesPath = join(__dirname, 'fixtures', 'test-queries.json');
+  // --queries <path>: run an alternate query fixture (path relative to benchmark/,
+  // or absolute) instead of the default keyword set. Used by the isolated
+  // vocab-mismatch suite so it never dilutes the main baseline / CI gate.
+  const cliArgv = process.argv.slice(2);
+  const qFlagIdx = cliArgv.indexOf('--queries');
+  const queriesPath = qFlagIdx >= 0 && cliArgv[qFlagIdx + 1]
+    ? (isAbsolute(cliArgv[qFlagIdx + 1]) ? cliArgv[qFlagIdx + 1] : join(__dirname, cliArgv[qFlagIdx + 1]))
+    : join(__dirname, 'fixtures', 'test-queries.json');
 
   const seedData = JSON.parse(readFileSync(seedPath, 'utf-8'));
   const queryData = JSON.parse(readFileSync(queriesPath, 'utf-8'));
