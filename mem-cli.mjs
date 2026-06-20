@@ -111,9 +111,16 @@ async function cmdSearch(db, args) {
   }
 
   const ftsQuery = buildSearchFtsQuery(query, { or: useOr });
-  if (!ftsQuery) {
+  // --deep proceeds even when the literal query sanitizes to nothing — its LLM
+  // rewrite may still produce searchable variants (F3, parity with server.mjs).
+  if (!ftsQuery && !deep) {
     fail(`[mem] No valid search terms in "${query}"`);
     return;
+  }
+  // --deep ignores --or: each variant runs AND + the engine's built-in
+  // OR-fallback, so --or has no effect on the deep path — say so (F8).
+  if (deep && useOr) {
+    process.stderr.write('[mem] Note: --or has no effect with --deep (variants use AND + engine OR-fallback)\n');
   }
 
   // Warn if obs-only filters used with non-observation source
@@ -231,7 +238,7 @@ async function cmdSearch(db, args) {
 
   if (results.length === 0) {
     if (jsonOutput) {
-      out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, results: [] }));
+      out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep, variants: deep ? deepVariants : undefined, results: [] }));
     } else {
       out(`[mem] No results for "${query}"`);
     }
@@ -268,22 +275,28 @@ async function cmdSearch(db, args) {
   // pagination contract). countSearchTotal mirrors each source's MATCH+filters;
   // clamp to >= results.length so it never understates the rows actually shown
   // (vector/concept augmentation can add obs rows beyond the FTS count).
-  const trueTotal = countSearchTotal(db, {
-    effectiveSource,
-    ftsQuery,
-    obsFtsQuery: effectiveObsFtsQuery(ftsQuery, orFallbackFired),
-    args: { project: project || null, obs_type: type || null, importance: minImportance || null, branch: branch || null },
-    project: project || null,
-    epochFrom: dateFrom,
-    epochTo: dateTo,
-    includeNoise,
-  });
-  const total = Math.max(trueTotal, results.length);
+  // For --deep the population is the fused variant result set: deepSearch already
+  // returned all fused rows (capped at perSourceLimit) and they are the only rows
+  // in `results` (deep is obs-only). countSearchTotal would instead count the
+  // ORIGINAL query's FTS matches — wrong, and ~0 on the vocabulary-mismatch
+  // queries deep exists for, which falsely shrinks the "N of M" total (F1).
+  const total = deep
+    ? results.length
+    : Math.max(countSearchTotal(db, {
+      effectiveSource,
+      ftsQuery,
+      obsFtsQuery: effectiveObsFtsQuery(ftsQuery, orFallbackFired),
+      args: { project: project || null, obs_type: type || null, importance: minImportance || null, branch: branch || null },
+      project: project || null,
+      epochFrom: dateFrom,
+      epochTo: dateTo,
+      includeNoise,
+    }), results.length);
   const paged = results.slice(offset, offset + limit);
 
   if (paged.length === 0) {
     if (jsonOutput) {
-      out(JSON.stringify({ query, total, returned: 0, offset, limit, results: [] }));
+      out(JSON.stringify({ query, total, returned: 0, offset, limit, deep, variants: deep ? deepVariants : undefined, results: [] }));
     } else {
       out(`[mem] No results for "${query}" at offset ${offset}`);
     }

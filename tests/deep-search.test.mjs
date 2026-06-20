@@ -118,6 +118,14 @@ describe('rrfFuseN', () => {
     // id:1 (ranks 1,2) and id:3 (ranks 3,1) outrank singletons id:2, id:9.
     expect(fused.slice(0, 2).map(r => r.id).sort()).toEqual([1, 3]);
   });
+
+  it('keeps the row from the variant that ranked an id highest (F10 — best snippet)', () => {
+    const a = [{ id: 9 }, { id: 1, snippet: 'from-A-rank1' }]; // id:1 at index 1
+    const b = [{ id: 1, snippet: 'from-B-rank0' }, { id: 9 }]; // id:1 at index 0 (best)
+    const fused = rrfFuseN([a, b]);
+    // First-seen (old behavior) would keep 'from-A-rank1'; best-rank keeps rank-0 row.
+    expect(fused.find(r => r.id === 1).snippet).toBe('from-B-rank0');
+  });
 });
 
 // ─── DB-backed fusion: deepSearch over the real searchObservationsHybrid ──────
@@ -195,5 +203,23 @@ describe('deepSearch — fusion over real hybrid search', () => {
     expect(variants).toEqual([q]);
     expect(results.map(r => r.id)).toEqual(baseIds); // identical order, identical set
     db.close();
+  });
+});
+
+describe('deepSearch — error handling (F5: never-worse in the error dimension)', () => {
+  it('propagates an engine error on the ORIGINAL query (does not swallow to empty)', async () => {
+    const throwing = () => { throw new Error('db corrupt'); };
+    await expect(
+      deepSearch(null, { query: 'q' }, { llm: stubLLM({ variants: [] }), searchFn: throwing }),
+    ).rejects.toThrow('db corrupt');
+  });
+
+  it('swallows an error on a REWRITE variant but keeps the original-query results', async () => {
+    let call = 0;
+    const searchFn = () => { call++; if (call === 1) return [{ id: 1 }]; throw new Error('variant fail'); };
+    const { results } = await deepSearch(
+      null, { query: 'q' }, { llm: stubLLM({ variants: ['rewrite'] }), searchFn },
+    );
+    expect(results.map(r => r.id)).toEqual([1]); // original survived; bad rewrite ignored
   });
 });

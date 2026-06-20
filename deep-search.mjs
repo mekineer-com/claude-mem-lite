@@ -153,8 +153,17 @@ export function rrfFuseN(rankedLists, k = RRF_K) {
       if (!r || r.id === undefined || r.id === null) return;
       const add = 1 / (k + i + 1);
       const prev = scores.get(r.id);
-      if (prev) prev.score += add;
-      else scores.set(r.id, { row: r, score: add });
+      if (prev) {
+        prev.score += add;
+        // Keep the row from the variant that ranked this id HIGHEST (lowest
+        // index). searchObservationsHybrid emits query-dependent fields per
+        // variant (notably the FTS snippet), so first-seen would often show the
+        // weaker original/keyword variant's context; the best-ranked appearance
+        // carries the most relevant snippet/match context (F10).
+        if (i < prev.bestRank) { prev.row = r; prev.bestRank = i; }
+      } else {
+        scores.set(r.id, { row: r, score: add, bestRank: i });
+      }
     });
   }
   return [...scores.values()]
@@ -210,7 +219,12 @@ export async function deepSearch(db, params, { llm = defaultLLM, searchFn = defa
   if (!query) return { results: [], variants: [] };
 
   const variants = await rewriteQuery(query, { llm });
-  const lists = variants.map((v) => {
+  const lists = variants.map((v, i) => {
+    // variant[0] is the ORIGINAL query: let an engine error propagate exactly as
+    // it does on the single-query baseline path, so "never worse than baseline"
+    // holds in the error dimension too — a DB failure must not be silently
+    // swallowed into an empty result (F5). Only rewrite variants are best-effort.
+    if (i === 0) return searchFn(db, v, params) || [];
     try {
       return searchFn(db, v, params) || [];
     } catch {

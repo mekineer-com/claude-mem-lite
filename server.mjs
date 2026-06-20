@@ -250,7 +250,13 @@ function searchPrompts(ctx) {
 function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFallbackFired = false) {
   if (paginatedResults.length === 0) {
     const hint = [];
-    if (args.query && !ftsQuery) {
+    if (args.deep) {
+      // Deep search runs even when the literal query sanitizes to empty, so the
+      // "query was filtered" hint below would be misleading — the LLM rewrite ran
+      // N variants and simply found nothing (F9).
+      hint.push('No results — deep search rewrote the query into variants and still found nothing.');
+      hint.push('This is a recall miss (the rewrite ran), not a query-syntax issue; the memory likely has no related observations.');
+    } else if (args.query && !ftsQuery) {
       hint.push(`Query "${args.query}" was filtered (FTS5 keywords/special chars only).`);
       hint.push('Tip: use content words instead of operators (AND, OR, NOT, NEAR).');
     } else {
@@ -345,6 +351,7 @@ server.registerTool(
     const isCrossSource = !effectiveType;
     const ctx = { ftsQuery, searchType: effectiveType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
     const results = [];
+    let deepVariants = null;
 
     if (!effectiveType || effectiveType === 'observations') {
       if (args.deep) {
@@ -352,7 +359,7 @@ server.registerTool(
         // search → RRF fusion, collapsing to the single query (== baseline) when
         // the rewrite yields nothing (deep-search.mjs). Over-fetch perSourceLimit
         // so the pagination slice below has room.
-        const { results: deepRows } = await deepSearch(db, {
+        const { results: deepRows, variants } = await deepSearch(db, {
           query: args.query,
           project: args.project || null,
           type: args.obs_type || null,
@@ -364,6 +371,7 @@ server.registerTool(
           currentProject,
         });
         results.push(...deepRows);
+        deepVariants = variants;
       } else {
         results.push(...searchObservations(ctx));
       }
@@ -407,12 +415,17 @@ server.registerTool(
       }
     }
 
-    // Re-rank observations by file context overlap and mark superseded
-    if (ftsQuery && results.some(r => r.source === 'obs')) {
+    // Re-rank observations by file context overlap and mark superseded.
+    // markSuperseded is pure correctness (stale-tag) and must run for deep results
+    // too, including the case where the ORIGINAL query sanitized to an empty
+    // ftsQuery but the rewrite still returned rows (F2). reRankWithContext + the
+    // re-sort are FTS-rank operations; deep rows are already RRF-ranked, so on the
+    // empty-ftsQuery deep path we tag-but-don't-reorder (keep RRF order).
+    if ((ftsQuery || args.deep) && results.some(r => r.source === 'obs')) {
       const obsResults = results.filter(r => r.source === 'obs');
-      reRankWithContext(db, obsResults, currentProject);
+      if (ftsQuery) reRankWithContext(db, obsResults, currentProject);
       markSuperseded(obsResults);
-      results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+      if (ftsQuery) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 
     // Tier post-filter: batch-lookup full rows and classify (shared with CLI).
@@ -432,20 +445,34 @@ server.registerTool(
     // results.length is NOT the population — count the real MATCH set instead. Clamp
     // to >= results.length so vector/concept-augmented obs rows are never undercounted.
     // (paired-path with mem-cli.mjs via shared countSearchTotal — #8217)
-    const trueTotal = countSearchTotal(db, {
-      effectiveSource: effectiveType || null,
-      ftsQuery,
-      obsFtsQuery: effectiveObsFtsQuery(ftsQuery, ctx.orFallbackFired === true),
-      args: { project: args.project || null, obs_type: args.obs_type || null, importance: args.importance || null, branch: args.branch || null },
-      project: args.project || null,
-      epochFrom, epochTo,
-      includeNoise: args.include_noise === true,
-    });
-    const totalBeforePagination = Math.max(trueTotal, results.length);
+    // For --deep the population is the fused variant set already in `results`
+    // (deep is obs-only, returned by deepSearch capped at perSourceLimit).
+    // countSearchTotal would count the ORIGINAL query's FTS matches instead —
+    // wrong, and ~0 on the vocabulary-mismatch queries deep exists for (F1).
+    const totalBeforePagination = args.deep
+      ? results.length
+      : Math.max(countSearchTotal(db, {
+        effectiveSource: effectiveType || null,
+        ftsQuery,
+        obsFtsQuery: effectiveObsFtsQuery(ftsQuery, ctx.orFallbackFired === true),
+        args: { project: args.project || null, obs_type: args.obs_type || null, importance: args.importance || null, branch: args.branch || null },
+        project: args.project || null,
+        epochFrom, epochTo,
+        includeNoise: args.include_noise === true,
+      }), results.length);
     // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
     const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
 
-    return formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, ctx.orFallbackFired === true);
+    const output = formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, ctx.orFallbackFired === true);
+    // Surface the rewrite to the calling agent (CLI prints this to stderr + JSON;
+    // MCP had no signal at all — F13). Tells the agent whether deep actually
+    // reformulated the query or collapsed to the single-query baseline.
+    if (args.deep && deepVariants && output.content?.[0]?.type === 'text') {
+      output.content[0].text += deepVariants.length > 1
+        ? `\n\n[deep search: rewrote into ${deepVariants.length} variants — ${deepVariants.slice(1).map(v => JSON.stringify(v)).join(', ')}]`
+        : '\n\n[deep search: rewrite produced no usable variants; searched the original query only (== baseline)]';
+    }
+    return output;
   })
 );
 
