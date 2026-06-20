@@ -228,7 +228,29 @@ import {
   AUTO_DEEP_MIN_RESULTS,
   shouldEscalateToDeep,
   resolveDeepMode,
+  autoDeepLlmReady,
 } from '../deep-search.mjs';
+
+describe('autoDeepLlmReady — LLM availability gate for AUTO escalation', () => {
+  it('returns true when an llm is injected, regardless of env', () => {
+    const injected = async () => null;
+    expect(autoDeepLlmReady({}, injected)).toBe(true);
+    expect(autoDeepLlmReady({ ANTHROPIC_API_KEY: undefined }, injected)).toBe(true);
+  });
+
+  it('returns true when ANTHROPIC_API_KEY is set (no injected llm)', () => {
+    expect(autoDeepLlmReady({ ANTHROPIC_API_KEY: 'sk-test-key' })).toBe(true);
+  });
+
+  it('returns true when OPENROUTER_API_KEY is set (no injected llm)', () => {
+    expect(autoDeepLlmReady({ OPENROUTER_API_KEY: 'or-test-key' })).toBe(true);
+  });
+
+  it('returns false when neither key is set and no llm is injected', () => {
+    expect(autoDeepLlmReady({})).toBe(false);
+    expect(autoDeepLlmReady({ SOME_OTHER_KEY: 'value' })).toBe(false);
+  });
+});
 
 describe('CLI deep-mode resolution (default-off)', () => {
   it('CLI default is normal (no escalation) when env unset', () => {

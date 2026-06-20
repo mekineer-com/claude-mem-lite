@@ -10,7 +10,7 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
 import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
-import { deepSearch, resolveDeepMode, shouldEscalateToDeep } from './deep-search.mjs';
+import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -210,7 +210,7 @@ async function cmdSearch(db, args) {
     } else {
       obsResults = searchObservationsHybrid(db, obsCtx);
       if (obsCtx.orFallbackFired) orFallbackFired = true;
-      if (deepMode === 'auto' && shouldEscalateToDeep(obsResults, obsCtx)) {
+      if (deepMode === 'auto' && autoDeepLlmReady() && shouldEscalateToDeep(obsResults, obsCtx)) {
         process.stderr.write('[mem] auto-escalated to deep search (weak results)\n');
         obsResults = await runDeep();
         isDeep = true;

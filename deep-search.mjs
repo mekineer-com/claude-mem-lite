@@ -45,6 +45,19 @@ export const MAX_VARIANTS = 4;
 export const AUTO_DEEP_MIN_RESULTS = 3;
 
 /**
+ * Is a usable LLM available for AUTO escalation? True when a stub/real llm is
+ * injected (tests), or a FAST provider key is set. The claude-CLI fallback is
+ * deliberately excluded — spawning a subprocess per search is too slow for the
+ * default (automatic) path; explicit deep=true may still use it.
+ * @param {object} [env=process.env]
+ * @param {Function|undefined} [injectedLlm]
+ * @returns {boolean}
+ */
+export function autoDeepLlmReady(env = process.env, injectedLlm) {
+  return !!injectedLlm || !!(env.ANTHROPIC_API_KEY || env.OPENROUTER_API_KEY);
+}
+
+/**
  * Zero-LLM heuristic: are the normal-search results weak enough to warrant
  * auto-escalating to deepSearch? Reads ONLY rows already in hand. Never calls
  * an LLM, so the decision itself is free — only a positive verdict costs a
