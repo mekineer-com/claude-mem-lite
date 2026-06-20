@@ -273,6 +273,7 @@ describe('CLI deep-mode resolution (default-off)', () => {
   });
 });
 import { handleSearchForTest } from '../server.mjs';
+import { cmdSearchForTest } from '../mem-cli.mjs';
 
 describe('shouldEscalateToDeep — zero-LLM weak-result heuristic', () => {
   it('escalates when result count is below the floor', () => {
@@ -449,6 +450,108 @@ describe('mem_search auto-escalation (MCP, default-on)', () => {
     // obs=0 → must escalate regardless of the 3 session hits
     expect(res.escalated).toBe(true);
     expect(llm.calls()).toBe(1);
+    db.close();
+  });
+});
+
+// ─── CLI cmdSearch auto-escalation (D#39) ────────────────────────────────────
+//
+// Covers the #8735 fused-total branch: `total = isDeep ? results.length : countSearchTotal`.
+// On the ESCALATED path the total must reflect the fused variant result set, NOT
+// the original-query FTS count (which is ~0 for vocabulary-mismatch queries).
+
+describe('CLI cmdSearch auto-escalation (D#39)', () => {
+  function seededDb() {
+    const db = createTestDb();
+    _resetVocabCache();
+    seedDatabase(db, makeSeed());
+    seedVectors(db);
+    return db;
+  }
+
+  it('auto-escalates on a weak query and total reflects the fused variant set (#8735)', async () => {
+    const db = seededDb();
+    const llm = stubLLM({ variants: ['kubernetes pods', 'k8s cluster scheduling'] });
+    const prev = process.env.CLAUDE_MEM_AUTO_DEEP;
+    process.env.CLAUDE_MEM_AUTO_DEEP = '1';
+    let parsed;
+    try {
+      // 'zqxjv9471kpw' hits 0 obs in the seeded corpus → count < AUTO_DEEP_MIN_RESULTS → escalates.
+      // The LLM variants DO hit the kubernetes obs → fused results > 0.
+      // --json lets us parse total directly without text parsing.
+      let stdout = '';
+      const origWrite = process.stdout.write;
+      process.stdout.write = (str) => { stdout += str; return true; };
+      try {
+        await cmdSearchForTest(db, ['zqxjv9471kpw', '--json'], { llm });
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      parsed = JSON.parse(stdout.trim());
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_MEM_AUTO_DEEP;
+      else process.env.CLAUDE_MEM_AUTO_DEEP = prev;
+    }
+
+    // #8735: total is results.length (fused) not the original FTS count (~0).
+    expect(parsed.deep).toBe(true);
+    expect(parsed.total).toBeGreaterThan(0);
+    expect(parsed.results.length).toBeGreaterThan(0);
+    // The kubernetes obs ids 1,2,3 should appear in the fused results.
+    const ids = parsed.results.map(r => r.id);
+    expect(ids.some(id => [1, 2, 3].includes(id))).toBe(true);
+    expect(llm.calls()).toBe(1);
+    db.close();
+  });
+
+  it('default-off: no escalation without CLAUDE_MEM_AUTO_DEEP, stub LLM never called', async () => {
+    const db = seededDb();
+    const llm = stubLLM({ variants: ['kubernetes pods'] });
+    const prev = process.env.CLAUDE_MEM_AUTO_DEEP;
+    delete process.env.CLAUDE_MEM_AUTO_DEEP;
+    let parsed;
+    try {
+      let stdout = '';
+      const origWrite = process.stdout.write;
+      process.stdout.write = (str) => { stdout += str; return true; };
+      try {
+        await cmdSearchForTest(db, ['zqxjv9471kpw', '--json'], { llm });
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      parsed = JSON.parse(stdout.trim());
+    } finally {
+      if (prev !== undefined) process.env.CLAUDE_MEM_AUTO_DEEP = prev;
+    }
+
+    expect(parsed.deep).toBe(false);
+    expect(llm.calls()).toBe(0);
+    db.close();
+  });
+
+  it('--no-deep suppresses escalation even with CLAUDE_MEM_AUTO_DEEP=1', async () => {
+    const db = seededDb();
+    const llm = stubLLM({ variants: ['kubernetes pods'] });
+    const prev = process.env.CLAUDE_MEM_AUTO_DEEP;
+    process.env.CLAUDE_MEM_AUTO_DEEP = '1';
+    let parsed;
+    try {
+      let stdout = '';
+      const origWrite = process.stdout.write;
+      process.stdout.write = (str) => { stdout += str; return true; };
+      try {
+        await cmdSearchForTest(db, ['zqxjv9471kpw', '--json', '--no-deep'], { llm });
+      } finally {
+        process.stdout.write = origWrite;
+      }
+      parsed = JSON.parse(stdout.trim());
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_MEM_AUTO_DEEP;
+      else process.env.CLAUDE_MEM_AUTO_DEEP = prev;
+    }
+
+    expect(parsed.deep).toBe(false);
+    expect(llm.calls()).toBe(0);
     db.close();
   });
 });

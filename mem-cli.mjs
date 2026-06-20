@@ -48,7 +48,7 @@ import {
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
-async function cmdSearch(db, args) {
+async function cmdSearch(db, args, { llm } = {}) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
@@ -194,7 +194,7 @@ async function cmdSearch(db, args) {
         epochTo: dateTo,
         limit: perSourceLimit,
         currentProject: project ? null : inferProject(),
-      });
+      }, llm ? { llm } : undefined);
       deepVariants = ds.variants;
       if (deepVariants.length > 1) {
         process.stderr.write(`[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`);
@@ -210,7 +210,7 @@ async function cmdSearch(db, args) {
     } else {
       obsResults = searchObservationsHybrid(db, obsCtx);
       if (obsCtx.orFallbackFired) orFallbackFired = true;
-      if (deepMode === 'auto' && autoDeepLlmReady() && shouldEscalateToDeep(obsResults, obsCtx)) {
+      if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(obsResults, obsCtx)) {
         process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${obsResults.length} hits)\n`);
         obsResults = await runDeep();
         isDeep = true;
@@ -516,6 +516,9 @@ const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'fac
 // top; re-exported here for back-compat with existing importers
 // (tests/get-time-format.test.mjs).
 export { OBS_TIME_FIELDS, formatObsFieldValue };
+// Test seam: exposes cmdSearch with the llm injection slot without going through
+// ensureDb — lets hermetic tests pass a seeded :memory: db and a stub llm.
+export async function cmdSearchForTest(db, args, opts) { return cmdSearch(db, args, opts); }
 
 function renderObsRows(db, ids, requestedFields) {
   const placeholders = ids.map(() => '?').join(',');
