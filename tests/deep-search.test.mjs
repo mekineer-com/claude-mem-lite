@@ -229,6 +229,27 @@ import {
   shouldEscalateToDeep,
   resolveDeepMode,
 } from '../deep-search.mjs';
+
+describe('CLI deep-mode resolution (default-off)', () => {
+  it('CLI default is normal (no escalation) when env unset', () => {
+    const prev = process.env.CLAUDE_MEM_AUTO_DEEP;
+    delete process.env.CLAUDE_MEM_AUTO_DEEP;
+    try {
+      expect(resolveDeepMode(undefined, { surface: 'cli' })).toBe('normal');
+    } finally {
+      if (prev !== undefined) process.env.CLAUDE_MEM_AUTO_DEEP = prev;
+    }
+  });
+
+  it('CLI --deep forces deep; --no-deep forces normal', () => {
+    expect(resolveDeepMode(true, { surface: 'cli', env: {} })).toBe('deep');
+    expect(resolveDeepMode(false, { surface: 'cli', env: {} })).toBe('normal');
+  });
+
+  it('CLI opts into auto only when CLAUDE_MEM_AUTO_DEEP=1', () => {
+    expect(resolveDeepMode(undefined, { surface: 'cli', env: { CLAUDE_MEM_AUTO_DEEP: '1' } })).toBe('auto');
+  });
+});
 import { handleSearchForTest } from '../server.mjs';
 
 describe('shouldEscalateToDeep — zero-LLM weak-result heuristic', () => {

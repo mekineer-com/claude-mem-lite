@@ -10,7 +10,7 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
 import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
-import { deepSearch } from './deep-search.mjs';
+import { deepSearch, resolveDeepMode, shouldEscalateToDeep } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -52,7 +52,7 @@ async function cmdSearch(db, args) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep]');
+    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep]');
     return;
   }
 
@@ -103,7 +103,11 @@ async function cmdSearch(db, args) {
   // --deep: opt-in LLM multi-query / HyDE deep search (deep-search.mjs). Costs one
   // Haiku call + N hybrid searches; observations-only. NOT the passive path — this
   // is the explicit "search harder" lever for vocabulary-mismatch recall misses.
-  const deep = flags.deep === true || flags.deep === 'true';
+  // --deep forces deep; --no-deep forces normal; neither = unset (env/default decide).
+  const explicitDeep = (flags.deep === true || flags.deep === 'true')
+    ? true
+    : ((flags['no-deep'] === true || flags['no-deep'] === 'true') ? false : undefined);
+  const deepMode = resolveDeepMode(explicitDeep, { surface: 'cli' });
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
     fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
@@ -113,13 +117,13 @@ async function cmdSearch(db, args) {
   const ftsQuery = buildSearchFtsQuery(query, { or: useOr });
   // --deep proceeds even when the literal query sanitizes to nothing — its LLM
   // rewrite may still produce searchable variants (F3, parity with server.mjs).
-  if (!ftsQuery && !deep) {
+  if (!ftsQuery && deepMode === 'normal') {
     fail(`[mem] No valid search terms in "${query}"`);
     return;
   }
   // --deep ignores --or: each variant runs AND + the engine's built-in
   // OR-fallback, so --or has no effect on the deep path — say so (F8).
-  if (deep && useOr) {
+  if (deepMode === 'deep' && useOr) {
     process.stderr.write('[mem] Note: --or has no effect with --deep (variants use AND + engine OR-fallback)\n');
   }
 
@@ -135,10 +139,10 @@ async function cmdSearch(db, args) {
   // who passed --branch expecting a branch-scoped result.
   // --deep is observations-only (deepSearch fuses searchObservationsHybrid lists);
   // it overrides --source and the obs-only filter inference.
-  if (deep && source && source !== 'observations') {
+  if (deepMode === 'deep' && source && source !== 'observations') {
     process.stderr.write(`[mem] Note: --deep searches observations only; ignoring --source ${source}\n`);
   }
-  const effectiveSource = deep
+  const effectiveSource = deepMode !== 'normal'
     ? 'observations'
     : (source || ((type || tier || minImportance || branch) ? 'observations' : null));
 
@@ -156,14 +160,29 @@ async function cmdSearch(db, args) {
   let orFallbackFired = false;
 
   let deepVariants = null;
+  let isDeep = deepMode === 'deep';
+
   // Search observations — shared engine with server.mjs (#8198/#8212 paired-path fix)
   if (!effectiveSource || effectiveSource === 'observations') {
-    let obsResults;
-    if (deep) {
-      // Opt-in deep search: rewrite the query into variants (keyword / concept /
-      // HyDE), run each through the hybrid engine, RRF-fuse. Collapses to the
-      // single query when the rewrite yields nothing — never worse than baseline
-      // (deep-search.mjs). Over-fetch perSourceLimit so the offset/slice below has room.
+    const obsCtx = {
+      ftsQuery,
+      args: {
+        project: project || null,
+        obs_type: type || null,
+        importance: minImportance || null,
+        branch: branch || null,
+        include_noise: includeNoise,
+      },
+      epochFrom: dateFrom,
+      epochTo: dateTo,
+      perSourceLimit,
+      perSourceOffset,
+      currentProject: project ? null : inferProject(),
+      limit,
+      orFallbackFired: false,
+    };
+
+    const runDeep = async () => {
       const ds = await deepSearch(db, {
         query,
         project: project || null,
@@ -176,33 +195,26 @@ async function cmdSearch(db, args) {
         limit: perSourceLimit,
         currentProject: project ? null : inferProject(),
       });
-      obsResults = ds.results;
       deepVariants = ds.variants;
       if (deepVariants.length > 1) {
         process.stderr.write(`[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`);
       } else {
         process.stderr.write('[mem] Deep search: rewrite returned no usable variants; used original query only\n');
       }
+      return ds.results;
+    };
+
+    let obsResults;
+    if (deepMode === 'deep') {
+      obsResults = await runDeep();
     } else {
-      const obsCtx = {
-        ftsQuery,
-        args: {
-          project: project || null,
-          obs_type: type || null,
-          importance: minImportance || null,
-          branch: branch || null,
-          include_noise: includeNoise,
-        },
-        epochFrom: dateFrom,
-        epochTo: dateTo,
-        perSourceLimit,
-        perSourceOffset,
-        currentProject: project ? null : inferProject(),
-        limit,
-        orFallbackFired: false,
-      };
       obsResults = searchObservationsHybrid(db, obsCtx);
       if (obsCtx.orFallbackFired) orFallbackFired = true;
+      if (deepMode === 'auto' && shouldEscalateToDeep(obsResults, obsCtx)) {
+        process.stderr.write('[mem] auto-escalated to deep search (weak results)\n');
+        obsResults = await runDeep();
+        isDeep = true;
+      }
     }
     for (const r of obsResults) results.push({ ...r, _source: 'obs', score: r.score ?? 0 });
 
@@ -215,7 +227,7 @@ async function cmdSearch(db, args) {
   }
 
   // Search sessions (shared engine with MCP mem_search — lib/search-core.mjs)
-  if (!effectiveSource || effectiveSource === 'sessions') {
+  if ((!effectiveSource || effectiveSource === 'sessions') && !isDeep) {
     try {
       const sessRows = searchSessionsFts(db, {
         ftsQuery, project, projectBoost: project ? null : inferProject(),
@@ -226,7 +238,7 @@ async function cmdSearch(db, args) {
   }
 
   // Search prompts (shared engine incl. CJK precision gate + LIKE fallback)
-  if (!effectiveSource || effectiveSource === 'prompts') {
+  if ((!effectiveSource || effectiveSource === 'prompts') && !isDeep) {
     try {
       const promptRows = searchPromptsFts(db, {
         query, ftsQuery, project,
@@ -238,7 +250,7 @@ async function cmdSearch(db, args) {
 
   if (results.length === 0) {
     if (jsonOutput) {
-      out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep, variants: deep ? deepVariants : undefined, results: [] }));
+      out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep: isDeep, variants: isDeep ? deepVariants : undefined, results: [] }));
     } else {
       out(`[mem] No results for "${query}"`);
     }
@@ -280,7 +292,7 @@ async function cmdSearch(db, args) {
   // in `results` (deep is obs-only). countSearchTotal would instead count the
   // ORIGINAL query's FTS matches — wrong, and ~0 on the vocabulary-mismatch
   // queries deep exists for, which falsely shrinks the "N of M" total (F1).
-  const total = deep
+  const total = isDeep
     ? results.length
     : Math.max(countSearchTotal(db, {
       effectiveSource,
@@ -296,7 +308,7 @@ async function cmdSearch(db, args) {
 
   if (paged.length === 0) {
     if (jsonOutput) {
-      out(JSON.stringify({ query, total, returned: 0, offset, limit, deep, variants: deep ? deepVariants : undefined, results: [] }));
+      out(JSON.stringify({ query, total, returned: 0, offset, limit, deep: isDeep, variants: isDeep ? deepVariants : undefined, results: [] }));
     } else {
       out(`[mem] No results for "${query}" at offset ${offset}`);
     }
@@ -339,8 +351,8 @@ async function cmdSearch(db, args) {
       returned: paged.length,
       offset,
       limit,
-      deep,
-      variants: deep ? deepVariants : undefined,
+      deep: isDeep,
+      variants: isDeep ? deepVariants : undefined,
       relaxed_and_to_or: orFallbackFired && !useOr,
       mixed_sources: hasMixed,
       results: items,
