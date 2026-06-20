@@ -46,24 +46,31 @@ export const AUTO_DEEP_MIN_RESULTS = 3;
 
 /**
  * Zero-LLM heuristic: are the normal-search results weak enough to warrant
- * auto-escalating to deepSearch? Reads ONLY rows already in hand + the hybrid
- * engine's ctx flags. Never calls an LLM, so the decision itself is free — only
- * a positive verdict costs a Haiku call (the escalation).
+ * auto-escalating to deepSearch? Reads ONLY rows already in hand. Never calls
+ * an LLM, so the decision itself is free — only a positive verdict costs a
+ * Haiku call (the escalation).
  *
- * Weak when: too few results, OR the engine had to relax AND→OR
- * (ctx.orFallbackFired) — a direct vocabulary-mismatch symptom, exactly what
- * deep/HyDE exists to fix.
+ * Weak when: too few results (count below minResults floor).
+ *
+ * NOTE: ctx.orFallbackFired was intentionally removed as an escalation trigger.
+ * orFallbackFired fires on SUCCESSFUL AND→OR recovery — when the fallback
+ * returns enough results it is a sign the query is working, not that it is
+ * weak. Escalating on a successful recovery (a) discards good results already
+ * in hand, (b) fires an unwanted LLM call, and (c) erases the AND→OR hint
+ * that surfaces to the caller. The genuinely-weak vocab-mismatch case (AND
+ * fails, OR also fails) is still caught: if OR recovers nothing, count is 0-2
+ * → escalates on count alone.
  *
  * @param {Array} results  normal-search rows
- * @param {object} ctx     the hybrid ctx the engine mutated (orFallbackFired)
+ * @param {object} ctx     the hybrid ctx the engine mutated (unused; kept for
+ *                         backward-compat with callers that pass it)
  * @param {object} [opts]
  * @param {number} [opts.minResults=AUTO_DEEP_MIN_RESULTS]
  * @returns {boolean}
  */
-export function shouldEscalateToDeep(results, ctx, { minResults = AUTO_DEEP_MIN_RESULTS } = {}) {
+export function shouldEscalateToDeep(results, _ctx, { minResults = AUTO_DEEP_MIN_RESULTS } = {}) {
   const n = Array.isArray(results) ? results.length : 0;
   if (n < minResults) return true;
-  if (ctx && ctx.orFallbackFired === true) return true;
   return false;
 }
 

@@ -229,6 +229,7 @@ import {
   shouldEscalateToDeep,
   resolveDeepMode,
 } from '../deep-search.mjs';
+import { handleSearchForTest } from '../server.mjs';
 
 describe('shouldEscalateToDeep — zero-LLM weak-result heuristic', () => {
   it('escalates when result count is below the floor', () => {
@@ -240,9 +241,12 @@ describe('shouldEscalateToDeep — zero-LLM weak-result heuristic', () => {
     expect(shouldEscalateToDeep(rows, { orFallbackFired: false })).toBe(false);
   });
 
-  it('escalates when the engine had to relax AND→OR (orFallbackFired)', () => {
+  it('does NOT escalate when AND→OR fallback recovered enough results (orFallbackFired is NOT a weak signal)', () => {
+    // orFallbackFired=true means the fallback SUCCEEDED — good results were recovered.
+    // Escalating here would discard those results, fire an unwanted LLM call, and
+    // erase the AND→OR hint. Count is ≥ floor → no escalation.
     const rows = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }];
-    expect(shouldEscalateToDeep(rows, { orFallbackFired: true })).toBe(true);
+    expect(shouldEscalateToDeep(rows, { orFallbackFired: true })).toBe(false);
   });
 
   it('treats null/empty results as weak', () => {
@@ -279,5 +283,96 @@ describe('resolveDeepMode — tri-state precedence', () => {
 
   it('AUTO_DEEP_MIN_RESULTS is the documented default of 3', () => {
     expect(AUTO_DEEP_MIN_RESULTS).toBe(3);
+  });
+});
+
+describe('mem_search auto-escalation (MCP, default-on)', () => {
+  // All tests are hermetic: they pass a seeded in-memory db to handleSearchForTest,
+  // which now threads it through ctx into searchObservations/searchSessions/searchPrompts.
+  // No production db is touched.
+  //
+  // Seeded corpus (from makeSeed()):
+  //   Strong (≥3 hits): 'kubernetes' → ids 1,2,3 (all three kubernetes obs)
+  //   Weak   (0 hits):  'zqxjv9471kpw' → no matches in any seeded row
+  function seededDb() {
+    const db = createTestDb();
+    _resetVocabCache();
+    seedDatabase(db, makeSeed());
+    seedVectors(db);
+    return db;
+  }
+
+  it('escalates on a weak/vocabulary-mismatch query and calls the LLM once', async () => {
+    const db = seededDb();
+    // 'zqxjv9471kpw' returns 0 from the seeded corpus → count < AUTO_DEEP_MIN_RESULTS → escalates.
+    const llm = stubLLM({ variants: ['kubernetes pods', 'k8s cluster scheduling'] });
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw' }, { llm });
+    expect(res.escalated).toBe(true);
+    expect(llm.calls()).toBe(1);
+    db.close();
+  });
+
+  it('does NOT escalate when normal search is strong, and never calls the LLM', async () => {
+    const db = seededDb();
+    const llm = stubLLM({ variants: ['should not be used'] });
+    // 'kubernetes' returns 3 results from the seeded corpus (ids 1,2,3) → no escalation.
+    const res = await handleSearchForTest(db, { query: 'kubernetes' }, { llm });
+    expect(res.escalated).toBe(false);
+    expect(llm.calls()).toBe(0);
+    db.close();
+  });
+
+  it('explicit deep=false suppresses escalation even on a weak query', async () => {
+    const db = seededDb();
+    const llm = stubLLM({ variants: ['nope'] });
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw', deep: false }, { llm });
+    expect(res.escalated).toBe(false);
+    expect(llm.calls()).toBe(0);
+    db.close();
+  });
+
+  it('CLAUDE_MEM_AUTO_DEEP=0 disables escalation', async () => {
+    const db = seededDb();
+    const llm = stubLLM({ variants: ['nope'] });
+    const prev = process.env.CLAUDE_MEM_AUTO_DEEP;
+    process.env.CLAUDE_MEM_AUTO_DEEP = '0';
+    try {
+      const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw' }, { llm });
+      expect(res.escalated).toBe(false);
+      expect(llm.calls()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_MEM_AUTO_DEEP; else process.env.CLAUDE_MEM_AUTO_DEEP = prev;
+    }
+    db.close();
+  });
+
+  it('zero-result auto-escalated search emits the deep-recall-miss hint, not the generic hint', async () => {
+    const db = seededDb();
+    // Weak query (0 seeded hits) → escalates; stub variants also miss the seeded
+    // corpus → deepSearch returns 0.
+    const llm = stubLLM({ variants: ['zqxjv1_miss1', 'zqxjv2_miss2'] });
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw' }, { llm });
+    expect(res.escalated).toBe(true);
+    expect(res.total).toBe(0);
+    // Must name the deep-search failure, not suggest re-phrasing
+    const text = res.content[0].text;
+    expect(text).toContain('deep search rewrote the query');
+    expect(text).not.toContain('Tip: check spelling');
+    db.close();
+  });
+
+  it('escalated total counts the fused variant set (#8735 invariant), not the original-query FTS count', async () => {
+    const db = seededDb();
+    // Weak query (0 seeded hits) → escalates; LLM variants hit the seeded kubernetes
+    // corpus via deepSearch (seeded db). total must be > 0 from the fused set even
+    // though the original query token has 0 FTS hits.
+    const llm = stubLLM({ variants: ['kubernetes pods', 'k8s cluster scheduling'] });
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw' }, { llm });
+    expect(res.escalated).toBe(true);
+    // total must be > 0: the fused variant set hits the kubernetes obs even though
+    // the original query ('zqxjv9471kpw') has 0 FTS hits.
+    // This guards against totalBeforePagination accidentally using the original FTS count.
+    expect(res.total).toBeGreaterThan(0);
+    db.close();
   });
 });
