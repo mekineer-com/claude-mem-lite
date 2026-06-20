@@ -6,7 +6,7 @@
 // single-query baseline — never worse. The LLM is dependency-injected (fake),
 // so nothing here touches a real provider or imports the native LLM client.
 import { describe, it, expect } from 'vitest';
-import { createTestDb } from './test-helpers.mjs';
+import { createTestDb, insertSession } from './test-helpers.mjs';
 import { _resetVocabCache } from '../tfidf.mjs';
 import { seedDatabase, seedVectors } from '../benchmark/benchmark.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
@@ -416,6 +416,39 @@ describe('mem_search auto-escalation (MCP, default-on)', () => {
     // the original query ('zqxjv9471kpw') has 0 FTS hits.
     // This guards against totalBeforePagination accidentally using the original FTS count.
     expect(res.total).toBeGreaterThan(0);
+    db.close();
+  });
+
+  it('escalates on obs=0 even when session/prompt rows match the query', async () => {
+    // Pins that obs-weakness — not cross-source count — drives escalation.
+    // Seed: 0 obs match 'zqxjv9471kpw', but 3 session_summaries rows do.
+    const db = seededDb();
+
+    // session_summaries has FK on memory_session_id → sdk_sessions
+    insertSession(db, { id: 'sess-cross-1', project: 'proj-a' });
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run('sess-cross-1', 'proj-a', 'zqxjv9471kpw session one', 'done', new Date(now).toISOString(), now);
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run('sess-cross-1', 'proj-a', 'zqxjv9471kpw session two', 'done', new Date(now + 1).toISOString(), now + 1);
+    db.prepare(`
+      INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run('sess-cross-1', 'proj-a', 'zqxjv9471kpw session three', 'done', new Date(now + 2).toISOString(), now + 2);
+
+    // Rebuild FTS so the new rows are findable
+    db.exec(`INSERT INTO session_summaries_fts(session_summaries_fts) VALUES('rebuild')`);
+
+    const llm = stubLLM({ variants: ['kubernetes pods'] });
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw' }, { llm });
+
+    // obs=0 → must escalate regardless of the 3 session hits
+    expect(res.escalated).toBe(true);
+    expect(llm.calls()).toBe(1);
     db.close();
   });
 });

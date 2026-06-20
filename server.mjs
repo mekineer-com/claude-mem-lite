@@ -367,6 +367,7 @@ async function runSearchPipeline(db, args, { llm } = {}) {
     let deepVariants = null;
     let isDeep = deepMode === 'deep';
     let escalated = false;
+    let escalatedObsCount = 0;
 
     // Helper: run deepSearch and load results into the shared `results` array.
     const runDeepInto = async () => {
@@ -400,10 +401,14 @@ async function runSearchPipeline(db, args, { llm } = {}) {
         // fired — a vocabulary-mismatch symptom), escalate to deep. ctx is mutated
         // by searchObservations to set ctx.orFallbackFired when the AND→OR relaxation
         // fires, so we read it here after the call.
-        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results, ctx)) {
+        // results is already obs-only here (sessions/prompts pushed below), but the
+        // filter makes the invariant explicit and robust to future reordering.
+        const obsCountBeforeEscalation = results.length;
+        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx)) {
           await runDeepInto();
           isDeep = true;
           escalated = true;
+          escalatedObsCount = obsCountBeforeEscalation;
         }
       }
     }
@@ -496,7 +501,7 @@ async function runSearchPipeline(db, args, { llm } = {}) {
     const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
 
     // Observability: announce auto-escalation on stderr (parity with CLI deep note).
-    if (escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results)\n`);
+    if (escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${escalatedObsCount} hits)\n`);
 
     const output = formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, ctx.orFallbackFired === true, isDeep);
     // Surface the rewrite to the calling agent (CLI prints this to stderr + JSON;
@@ -519,7 +524,8 @@ server.registerTool(
     inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
-    return runSearchPipeline(db, args, {});
+    const result = await runSearchPipeline(db, args, {});
+    return { content: result.content };
   })
 );
 

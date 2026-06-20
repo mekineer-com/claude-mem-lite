@@ -142,7 +142,7 @@ async function cmdSearch(db, args) {
   if (deepMode === 'deep' && source && source !== 'observations') {
     process.stderr.write(`[mem] Note: --deep searches observations only; ignoring --source ${source}\n`);
   }
-  const effectiveSource = deepMode !== 'normal'
+  const effectiveSource = deepMode === 'deep'
     ? 'observations'
     : (source || ((type || tier || minImportance || branch) ? 'observations' : null));
 
@@ -211,7 +211,7 @@ async function cmdSearch(db, args) {
       obsResults = searchObservationsHybrid(db, obsCtx);
       if (obsCtx.orFallbackFired) orFallbackFired = true;
       if (deepMode === 'auto' && autoDeepLlmReady() && shouldEscalateToDeep(obsResults, obsCtx)) {
-        process.stderr.write('[mem] auto-escalated to deep search (weak results)\n');
+        process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${obsResults.length} hits)\n`);
         obsResults = await runDeep();
         isDeep = true;
       }
