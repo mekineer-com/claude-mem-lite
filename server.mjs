@@ -10,6 +10,7 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
+import { deepSearch } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
@@ -331,18 +332,42 @@ server.registerTool(
     if (!bounds.ok) throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
     const { epochFrom, epochTo } = bounds;
 
-    // Early return when query was provided but sanitized to nothing (all FTS5 keywords/special chars)
-    if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance) {
+    // Early return when query was provided but sanitized to nothing (all FTS5
+    // keywords/special chars). Skipped for deep search — its LLM rewrite may
+    // still produce searchable variants from a query the FTS sanitizer rejects.
+    if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance && !args.deep) {
       return formatSearchOutput([], args, ftsQuery, 0);
     }
 
-    // When obs_type is specified, implicitly restrict to observations only
-    const effectiveType = searchType || (args.obs_type ? 'observations' : undefined);
+    // When obs_type is specified, implicitly restrict to observations only.
+    // --deep is observations-only too (deepSearch fuses hybrid-obs lists).
+    const effectiveType = args.deep ? 'observations' : (searchType || (args.obs_type ? 'observations' : undefined));
     const isCrossSource = !effectiveType;
     const ctx = { ftsQuery, searchType: effectiveType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
     const results = [];
 
-    if (!effectiveType || effectiveType === 'observations') results.push(...searchObservations(ctx));
+    if (!effectiveType || effectiveType === 'observations') {
+      if (args.deep) {
+        // Opt-in LLM multi-query/HyDE deep search: rewrite → per-variant hybrid
+        // search → RRF fusion, collapsing to the single query (== baseline) when
+        // the rewrite yields nothing (deep-search.mjs). Over-fetch perSourceLimit
+        // so the pagination slice below has room.
+        const { results: deepRows } = await deepSearch(db, {
+          query: args.query,
+          project: args.project || null,
+          type: args.obs_type || null,
+          importance: args.importance || null,
+          branch: args.branch || null,
+          includeNoise: args.include_noise === true,
+          epochFrom, epochTo,
+          limit: perSourceLimit,
+          currentProject,
+        });
+        results.push(...deepRows);
+      } else {
+        results.push(...searchObservations(ctx));
+      }
+    }
     if (!effectiveType || effectiveType === 'sessions')     results.push(...searchSessions(ctx));
     if (!effectiveType || effectiveType === 'prompts')       results.push(...searchPrompts(ctx));
 
