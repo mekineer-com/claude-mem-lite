@@ -3,6 +3,28 @@
 
 import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 
+// ─── Why these multipliers exist (read before "simplifying" them) ────────────
+//
+// The recency-decay, type-quality, project-boost, importance, cite, and noise
+// multipliers below encode PRODUCT PRIORS: recent / same-project / important /
+// frequently-cited memories are more relevant to the CURRENT dev session. They
+// are deliberately NOT retrieval-quality tricks, so retrieval benchmarks can't
+// score them — and a periodic audit WILL flag them as "0-lift dead weight":
+//   * benchmark.mjs --matrix (synthetic micro-fixture): decay/project/importance/
+//     access add <=0.006 nDCG, project & access exactly 0 — but the fixture is
+//     single-project, access_count=0, near-uniform timestamps, so it structurally
+//     cannot exercise them.
+//   * longmemeval.mjs --temporal (n=500, real session dates): bit-identical to
+//     uniform — LongMemEval-S windows (mean 27.9d, 74% <30d) are far shorter than
+//     these half-lives, so decay moves no rank.
+// Zero measured lift is a benchmark-MISMATCH artifact, not dead weight — 0 queries
+// are ever hurt. Decision (obs #8773): KEEP them; do NOT delete on "0 lift".
+// Guardrail: the ci-gate `hybrid_over_bm25 >= -0.05` floor (benchmark/ci-gate.mjs)
+// catches the SQL-path aggregate (decay/project/importance/access) turning
+// actively harmful. NOTE it does NOT yet cover type-quality/lesson/cite/noise.
+// Genuine validation needs a labeled real-dev-memory eval, not a lexical recall
+// benchmark.
+
 // ─── Type-Differentiated Recency Decay ──────────────────────────────────────
 
 /** Recency half-life per observation type (in milliseconds) */
