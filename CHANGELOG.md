@@ -2,7 +2,9 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
-## Unreleased
+## v3.4.0 — opt-in LLM rerank for deep search (CLI + MCP)
+
+Additive, opt-in, default-off — no change to default search behaviour. Existing `mem_search` / `claude-mem-lite search` calls behave exactly as in v3.3.x unless you pass the new `rerank` flag with `deep`.
 
 ### feat: opt-in LLM rerank stage on deep search (CLI `--rerank` + MCP `rerank`)
 
