@@ -59,6 +59,10 @@ export const SOURCE_FILES = [
   'lib/file-intel.mjs',
   'lib/reread-guard.mjs',
   'lib/metrics.mjs',
+  // v3.6.x: bind-salience producer — extracts identifiers a lesson names that
+  // are present in the pre-edit file (component 2). Imported ONLY by
+  // scripts/pre-tool-recall.js; kept here for the same reason as file-intel.mjs.
+  'lib/lesson-idents.mjs',
   // v2.71.x: better-sqlite3 ABI probe + auto-rebuild. Shared by install.mjs
   // (post-`npm install` verify) and scripts/launch.mjs (pre-server-launch
   // self-heal after Node ABI changes). Missing from manifest → auto-update

@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
-import { writeFileSync, mkdirSync, rmSync, mkdtempSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, rmSync, mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { initSchema } from '../schema.mjs';
 import { insertSession, insertObs } from './test-helpers.mjs';
@@ -60,5 +60,32 @@ describe('pre-tool-recall bind directive (component 1)', () => {
     const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
     expect(ctx).toContain('[mem] Lessons for maintain-core.mjs:');
     expect(ctx).not.toMatch(/concrete check|#NN applied/);
+  });
+
+  it('bind: records present lesson identifiers in the cooldown for the edited file', async () => {
+    // lesson names recoverChildrenOf; ensure it is present in the pre-edit file
+    const fp2 = join(projectDir, 'withident.mjs');
+    writeFileSync(fp2, 'export function recoverChildrenOf() {}\nexport function purgeStale() {}\n');
+    const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+    db.pragma('foreign_keys = OFF'); initSchema(db);
+    insertObs(db, {
+      sessionId: 'mem-bind', project: 'parent--bindtest', type: 'bugfix', importance: 2,
+      title: 'keep recover', lessonLearned: 'must call recoverChildrenOf before delete',
+      filesModified: `["${fp2}"]`,
+    });
+    db.close();
+
+    await runScript({ tool_name: 'Edit', session_id: 'b4', tool_input: { file_path: fp2 } }, env({ CLAUDE_MEM_SALIENCE: 'bind' }));
+
+    const cd = JSON.parse(readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-b4.json'), 'utf8'));
+    const entry = cd[fp2];
+    const allTokens = Object.values(entry.lessonIdents || {}).flat();
+    expect(allTokens).toContain('recoverChildrenOf');
+  });
+
+  it('default (current) salience does NOT write lessonIdents', async () => {
+    await runScript({ tool_name: 'Edit', session_id: 'b5', tool_input: { file_path: fp } }, env());
+    const cd = JSON.parse(readFileSync(join(tmpRoot, 'runtime', 'pre-recall-cooldown-b5.json'), 'utf8'));
+    expect(cd[fp].lessonIdents).toBeUndefined();
   });
 });

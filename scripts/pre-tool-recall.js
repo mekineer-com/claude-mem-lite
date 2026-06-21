@@ -13,6 +13,7 @@ import { citeFactorClause } from '../scoring-sql.mjs';
 import { fileIntelFor } from '../lib/file-intel.mjs';
 import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
 import { recordMetric } from '../lib/metrics.mjs';
+import { presentIdents } from '../lib/lesson-idents.mjs';
 
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
@@ -481,10 +482,27 @@ try {
     // full re-read of the unchanged file can be flagged. Read-only, session-scoped;
     // one stat + bounded read, first-read only.
     const rereadMeta = (isRead && !REREAD_GUARD_OFF && isSessionScoped) ? readFileMeta(filePath) : null;
+    // bind salience (component 2): record the identifiers each lesson NAMES that
+    // ALSO appear in the current (pre-edit) file, so post-tool-recall.js can flag
+    // an edit that drops one. Only under =bind with lessons — keeps the default
+    // path free of the extra file read. Bounded read; never throws.
+    let lessonIdents;
+    if (SALIENCE_BIND && allRows.length > 0) {
+      try {
+        const pre = readFileSync(filePath, 'utf8').slice(0, 256 * 1024);
+        const acc = {};
+        for (const r of allRows) {
+          const present = presentIdents(`${r.lesson_learned || ''} ${r.title || ''}`, pre);
+          if (present.length) acc[r.id] = present;
+        }
+        if (Object.keys(acc).length) lessonIdents = acc;
+      } catch { /* unreadable pre-edit file — skip the diff check */ }
+    }
     cooldown[filePath] = {
       ts: now,
       lessonIds: allRows.map(r => r.id),
       mode: isRead ? 'read' : 'edit',
+      ...(lessonIdents ? { lessonIdents } : {}),
       ...(rereadMeta ? { reread: { mtimeMs: rereadMeta.mtimeMs, tokens: rereadMeta.tokens, full: isFullRead } } : {}),
     };
     writeCooldown(cooldownPath, cooldown, isSessionScoped);
