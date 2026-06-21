@@ -158,6 +158,7 @@ export const HOOK_SCRIPT_FILES = [
   'user-prompt-search.js',
   'prompt-search-utils.mjs',
   'pre-tool-recall.js',
+  'post-tool-recall.js',
   'pre-skill-bridge.js',
   // v2.84: self-heal wrapper that detects ERR_MODULE_NOT_FOUND under the
   // install dir and runs install.mjs repair before retrying the entry.

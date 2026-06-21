@@ -134,6 +134,7 @@
     "scripts/post-tool-use.sh",
     "scripts/user-prompt-search.js",
     "scripts/pre-tool-recall.js",
+    "scripts/post-tool-recall.js",
     "scripts/pre-skill-bridge.js",
     "scripts/prompt-search-utils.mjs",
     "scripts/hook-launcher.mjs",

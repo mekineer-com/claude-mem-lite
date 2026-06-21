@@ -1,0 +1,71 @@
+#!/usr/bin/env node
+// scripts/post-tool-recall.js — PostToolUse companion to pre-tool-recall.js for
+// the bind-salience forcing-function (component 2). After an Edit/Write, if a
+// lesson surfaced for this file named an identifier that was present BEFORE the
+// edit (recorded in the cooldown by pre-tool-recall.js) and is now GONE, emit a
+// one-line non-blocking nudge. Only active under CLAUDE_MEM_SALIENCE=bind.
+//
+// Catches "you removed a required reference" lessons. It does NOT catch "you
+// failed to ADD a call" (the identifier was never in the pre-edit file →
+// presentIdents excluded it); that class is carried by the pre-edit
+// BIND_DIRECTIVE, not here. See the spec's component-2 limits.
+//
+// Safety: readonly, no DB, exit 0 always. cooldownPathFor mirrors
+// pre-tool-recall.js (inlined per the #8447 fast-path convention).
+
+import { existsSync, readFileSync } from 'fs';
+import { basename, join } from 'path';
+import { homedir } from 'os';
+
+const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
+
+const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
+const LEGACY_COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
+
+function cooldownPathFor(sessionId) {
+  if (!sessionId) return LEGACY_COOLDOWN_PATH;
+  const safe = String(sessionId).replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
+  return join(RUNTIME_DIR, `pre-recall-cooldown-${safe}.json`);
+}
+
+async function main() {
+  if (!SALIENCE_BIND) return;
+  if (process.env.CLAUDE_MEM_HOOK_RUNNING) return;
+  let input = '';
+  for await (const chunk of process.stdin) input += chunk;
+  let filePath, sessionId;
+  try {
+    const e = JSON.parse(input);
+    filePath = e.tool_input?.file_path;
+    sessionId = e.session_id || null;
+  } catch { return; }
+  if (!filePath) return;
+
+  const cdPath = cooldownPathFor(sessionId);
+  if (!existsSync(cdPath)) return;
+  let entry;
+  try { entry = JSON.parse(readFileSync(cdPath, 'utf8'))[filePath]; } catch { return; }
+  const idents = entry && entry.lessonIdents;
+  if (!idents || typeof idents !== 'object') return;
+
+  let post;
+  try { post = readFileSync(filePath, 'utf8'); } catch { return; }
+
+  const dropped = [];
+  for (const [obsId, tokens] of Object.entries(idents)) {
+    for (const t of tokens) if (!post.includes(t)) dropped.push({ obsId, token: t });
+  }
+  if (!dropped.length) return;
+
+  const lines = ['[mem] PostToolUse recall — system-injected context, continue your planned action:'];
+  for (const d of dropped.slice(0, 3)) {
+    lines.push(`[mem] ⚠ your edit to ${basename(filePath)} dropped \`${d.token}\` flagged by #${d.obsId} — if intentional say so, else re-check before moving on.`);
+  }
+  process.stdout.write(JSON.stringify({
+    suppressOutput: true,
+    hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: lines.join('\n') },
+  }));
+}
+
+main().catch(() => {}).finally(() => process.exit(0));
