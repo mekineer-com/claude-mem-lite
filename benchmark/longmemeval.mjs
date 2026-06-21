@@ -94,6 +94,22 @@ export function recallAnyAtK(rankedIds, goldIds, k = 5) {
   return rankedIds.slice(0, k).some((id) => gold.has(id)) ? 1 : 0;
 }
 
+// recall_frac@k (standard IR recall@k): the fraction of DISTINCT gold sessions that
+// appear in the top-k retrieved ids, |gold ∩ top-k| / |gold|. Equals recallAnyAtK
+// when |gold| === 1; on the multi-gold majority of LongMemEval-S (65% of questions)
+// it is the STRICTER metric — any-hit needs just one gold session, this needs all of
+// them for a perfect score. Reported alongside recall_any@k so the headline number
+// can never be mistaken for the looser metric. Membership-tested against the gold set
+// (not benchmark.mjs computeRecallAtK's positional count), so a gold id retrieved
+// twice can never push the score above 1.
+export function recallFractionalAtK(rankedIds, goldIds, k = 5) {
+  if (!goldIds || goldIds.length === 0) return 0;
+  const topK = new Set(rankedIds.slice(0, k));
+  let hit = 0;
+  for (const g of goldIds) if (topK.has(g)) hit++;
+  return hit / goldIds.length;
+}
+
 // ─── Per-question evaluation ─────────────────────────────────────────────────
 //
 // Fresh in-memory DB per question (the haystack is question-scoped: ~53 sessions
@@ -114,12 +130,17 @@ export function evalEntry(entry, { turns = 'user', ks = [1, 5, 10], limit = 10 }
   }
 
   const ksOut = {};
-  for (const k of ks) ksOut[String(k)] = recallAnyAtK(retrieved, goldIds, k);
+  const ksFracOut = {};
+  for (const k of ks) {
+    ksOut[String(k)] = recallAnyAtK(retrieved, goldIds, k);
+    ksFracOut[String(k)] = recallFractionalAtK(retrieved, goldIds, k);
+  }
   const rankedObjs = retrieved.map((sid) => ({ id: sid }));
   return {
     question_id: entry.question_id,
     question_type: entry.question_type || 'unknown',
     ks: ksOut,
+    ksFrac: ksFracOut,
     ndcg: computeNDCG(rankedObjs, goldIds, Math.max(...ks)),
     mrr: computeMRR(rankedObjs, goldIds),
     gold: goldIds,
@@ -131,11 +152,11 @@ export function evalEntry(entry, { turns = 'user', ks = [1, 5, 10], limit = 10 }
 export function runLongMemEval(entries, { turns = 'user', ks = [1, 5, 10], limit = 10 } = {}) {
   const perQuestion = entries.map((e) => evalEntry(e, { turns, ks, limit }));
 
-  const meanRecall = (rows) => {
+  const meanRecall = (rows, field = 'ks') => {
     const out = {};
     for (const k of ks) {
       const key = String(k);
-      out[key] = rows.length ? rows.reduce((s, r) => s + r.ks[key], 0) / rows.length : 0;
+      out[key] = rows.length ? rows.reduce((s, r) => s + r[field][key], 0) / rows.length : 0;
     }
     return out;
   };
@@ -145,13 +166,13 @@ export function runLongMemEval(entries, { turns = 'user', ks = [1, 5, 10], limit
   for (const r of perQuestion) (byType[r.question_type] ||= []).push(r);
   const perType = {};
   for (const [t, rows] of Object.entries(byType)) {
-    perType[t] = { n: rows.length, recallAny: meanRecall(rows), ndcg: mean(rows, (r) => r.ndcg), mrr: mean(rows, (r) => r.mrr) };
+    perType[t] = { n: rows.length, recallAny: meanRecall(rows), recallFrac: meanRecall(rows, 'ksFrac'), ndcg: mean(rows, (r) => r.ndcg), mrr: mean(rows, (r) => r.mrr) };
   }
 
   return {
     config: { turns, ks, limit },
     n: perQuestion.length,
-    overall: { recallAny: meanRecall(perQuestion), ndcg: mean(perQuestion, (r) => r.ndcg), mrr: mean(perQuestion, (r) => r.mrr) },
+    overall: { recallAny: meanRecall(perQuestion), recallFrac: meanRecall(perQuestion, 'ksFrac'), ndcg: mean(perQuestion, (r) => r.ndcg), mrr: mean(perQuestion, (r) => r.mrr) },
     perType,
     perQuestion,
   };
@@ -200,12 +221,15 @@ function main(argv) {
 
   const lines = [];
   lines.push(`\nLongMemEval — claude-mem-lite (lexical FTS5+TF-IDF+RRF, turns=${opts.turns}, n=${out.n})`);
-  lines.push(`  recall_any@k: ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallAny[String(k)])}`).join('  ')}   nDCG=${out.overall.ndcg.toFixed(3)}  MRR=${out.overall.mrr.toFixed(3)}`);
-  lines.push('  per question_type:');
+  lines.push(`  recall_any@k:  ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallAny[String(k)])}`).join('  ')}   nDCG=${out.overall.ndcg.toFixed(3)}  MRR=${out.overall.mrr.toFixed(3)}`);
+  lines.push(`  recall_frac@k: ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallFrac[String(k)])}`).join('  ')}   (standard recall@k = |gold∩topk|/|gold|; stricter on the 65% multi-gold questions)`);
+  lines.push('  per question_type (any-hit / fractional):');
   for (const [t, s] of Object.entries(out.perType).sort()) {
-    lines.push(`    ${t.padEnd(28)} n=${String(s.n).padStart(4)}  ${opts.ks.map((k) => `@${k}=${fmtPct(s.recallAny[String(k)])}`).join('  ')}`);
+    const any = opts.ks.map((k) => `@${k}=${fmtPct(s.recallAny[String(k)])}`).join(' ');
+    const frac = opts.ks.map((k) => `@${k}=${fmtPct(s.recallFrac[String(k)])}`).join(' ');
+    lines.push(`    ${t.padEnd(28)} n=${String(s.n).padStart(4)}  any[${any}]  frac[${frac}]`);
   }
-  lines.push('\n  NOTE: lexical baseline — not comparable to embedding R@5 on paraphrase categories. See file header.');
+  lines.push('\n  NOTE: lexical baseline. recall_any@k is the LongMemEval headline (and what agentmemory / MemPalace report); recall_frac@k is the stricter standard recall@k. Neither is comparable to embedding R@5 on paraphrase categories. See file header.');
   process.stdout.write(lines.join('\n') + '\n');
 
   if (opts.out) {

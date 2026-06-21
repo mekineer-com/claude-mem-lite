@@ -649,10 +649,15 @@ The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent sear
 Beyond the in-repo micro-benchmark above, claude-mem-lite is measured on
 [LongMemEval](https://github.com/xiaowu0162/LongMemEval) (Wu et al.) — a
 500-question long-term-memory benchmark — so its recall is comparable to the
-field, not just to itself. Metric is **recall_any@k**: is a gold evidence session
-in the top *k* retrieved? Corpus is user-turns-only (the standard raw-baseline
-rule). Runners: `benchmark/longmemeval.mjs` (lexical) and
-`benchmark/longmemeval-rerank.mjs` (rerank).
+field, not just to itself. Metric is **recall_any@k**: does *any* gold evidence session appear in the
+top *k* retrieved? This is the same session-level definition the systems we
+compare against report on this split — [agentmemory](https://github.com/rohitg00/agentmemory)
+(BM25 + vector + graph) and dense-embedding systems like MemPalace — so the rows
+below sit on one axis, not metric-shopped. (Note: 65% of the 500 questions have
+multiple gold sessions, so `recall_any@k` is looser than fractional recall there;
+all systems in this comparison report the any-hit form.) Corpus is user-turns-only
+(the standard raw-baseline rule). Runners: `benchmark/longmemeval.mjs` (lexical)
+and `benchmark/longmemeval-rerank.mjs` (rerank).
 
 | Retriever (zero embeddings) | @1 | @5 | @10 |
 |---|---|---|---|
@@ -664,15 +669,28 @@ hands the top 20 lexical candidates to a single Haiku call (~1.4 s/query) that
 reorders them. It is **never worse than the lexical baseline by construction** —
 any LLM or parse failure falls back to the original candidate order.
 
-**On embeddings, honestly.** With no LLM in the loop, dense-embedding retrieval
-still wins on raw recall — a dense-embedding baseline reports ~96.6% @5 on this
-split, versus our 90.6%. The rerank row's point is that a *single cheap LLM call
-closes that gap*: a zero-embedding lexical stack reaches 96.8% @5, edging the
-embedding raw number, because the lexical candidate set is already rich enough
-(recall@20 = 97.8%) that ranking — not recall — is the bottleneck. An
-embedding-plus-rerank stack still leads when both sides spend an LLM call; the
-takeaway is that claude-mem-lite needs **no vector model, no Python, and no
-external service** to reach embedding-competitive precision.
+**Stricter metric, for the record.** The rows above are `recall_any@k` — does *any*
+gold session reach the top *k* — the metric agentmemory and MemPalace publish, so the
+comparison is like-for-like. Under the stricter **standard recall@k** (`|gold ∩ top-k| /
+|gold|`, the *fraction* of all gold sessions retrieved), the lexical stack scores
+@1 = 46.9% / @5 = 84.4% / @10 = 91.9%. The whole gap is the 65% of questions with
+multiple gold sessions — any-hit needs one, fractional needs them all, and @1 is capped
+at 1/|gold| there; single-gold question types score identically under both.
+`benchmark/longmemeval.mjs` reports both columns (the rerank row's fractional is not yet
+measured).
+
+**On embeddings, honestly.** With no LLM in the loop, both a dense-embedding
+baseline (MemPalace, ~96.6% @5) and a BM25 + vector + graph hybrid (agentmemory,
+95.2% @5) out-recall our zero-embedding lexical stack (90.6% @5) at the same
+retrieval stage — dense and graph signal genuinely help raw recall, and most of
+our remaining gap is paraphrase (single-session-preference is our lowest category
+at 63%). The rerank row's point is that a *single cheap LLM call closes it*:
+reordering the top-20 lexical candidates reaches 96.8% @5 — matching the dense raw
+number and edging the hybrid's retrieval score — because the lexical candidate set
+is already rich enough (recall@20 = 97.8%) that ranking, not recall, is the
+bottleneck. An embedding-plus-rerank stack still leads when both sides spend an LLM
+call; the takeaway is that claude-mem-lite reaches embedding-competitive precision
+with **no vector model, no knowledge graph, no Python, and no external service**.
 
 Per-category @5 (lexical → +rerank): knowledge-update 98.7 → 100.0 ·
 single-session-user 91.4 → 98.6 · temporal-reasoning 89.5 → 97.7 · multi-session

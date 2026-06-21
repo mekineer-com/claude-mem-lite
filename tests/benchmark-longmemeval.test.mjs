@@ -16,6 +16,7 @@ import { fileURLToPath } from 'url';
 import {
   buildCorpus,
   recallAnyAtK,
+  recallFractionalAtK,
   evalEntry,
   runLongMemEval,
 } from '../benchmark/longmemeval.mjs';
@@ -38,6 +39,29 @@ describe('recallAnyAtK', () => {
   });
   it('is 0 for an empty gold set (no credit possible)', () => {
     expect(recallAnyAtK(['a', 'b'], [], 5)).toBe(0);
+  });
+});
+
+describe('recallFractionalAtK', () => {
+  it('equals any-hit when |gold| === 1', () => {
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['b'], 5)).toBe(1);
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['z'], 5)).toBe(0);
+  });
+  it('is the fraction of distinct gold sessions in top-k when |gold| > 1', () => {
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['a', 'b', 'z'], 5)).toBeCloseTo(2 / 3);
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['a', 'b', 'c'], 5)).toBe(1);
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['x', 'y'], 5)).toBe(0);
+  });
+  it('respects the k cutoff', () => {
+    // gold 'c' at rank 3 is inside @5, outside @2; gold 'a' is at rank 1.
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['a', 'c'], 2)).toBe(1 / 2);
+    expect(recallFractionalAtK(['a', 'b', 'c'], ['a', 'c'], 5)).toBe(1);
+  });
+  it('never exceeds 1 when a gold id is retrieved more than once', () => {
+    expect(recallFractionalAtK(['a', 'a', 'b'], ['a', 'b'], 3)).toBe(1);
+  });
+  it('is 0 for an empty gold set', () => {
+    expect(recallFractionalAtK(['a', 'b'], [], 5)).toBe(0);
   });
 });
 
