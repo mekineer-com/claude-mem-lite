@@ -13,7 +13,7 @@
 // deterministic stub; the default provider is the project's haiku-client
 // (OpenRouter / Anthropic / CLI per detectMode). "Never worse than baseline" by
 // construction: any LLM/parse failure falls back to the original candidate order.
-import { writeFileSync, mkdirSync } from 'fs';
+import { writeFileSync, appendFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { pathToFileURL } from 'url';
 import { createTestDb } from '../tests/test-helpers.mjs';
@@ -128,11 +128,12 @@ async function pMap(items, fn, concurrency) {
   return out;
 }
 
-export async function runRerankEval(entries, { turns = 'user', topK = 20, ks = [1, 5, 10], llm = defaultLlm, concurrency = 4, onProgress } = {}) {
+export async function runRerankEval(entries, { turns = 'user', topK = 20, ks = [1, 5, 10], llm = defaultLlm, concurrency = 4, onProgress, onResult } = {}) {
   let done = 0;
   const per = await pMap(entries, async (e) => {
     const r = await rerankEval(e, { turns, topK, ks, llm });
     done += 1;
+    if (onResult) onResult(r); // incremental: salvage partial results if the run is killed mid-way
     if (onProgress && (done % 50 === 0 || done === entries.length)) onProgress(done, entries.length);
     return r;
   }, concurrency);
@@ -179,12 +180,16 @@ async function main(argv) {
   if (Number.isFinite(o.max)) entries = entries.slice(0, o.max);
   process.stderr.write(`LLM rerank: ${entries.length} questions (type=${o.type || 'all'}, topK=${o.topK}, conc=${o.concurrency}) …\n`);
 
+  // Truncate the per-question file up front, then append each result as it lands
+  // (incremental — a kill mid-run leaves the completed questions on disk to salvage).
+  if (o.out) { mkdirSync(dirname(o.out), { recursive: true }); writeFileSync(o.out, ''); }
   const r = await runRerankEval(entries, {
     turns: o.turns,
     topK: o.topK,
     ks: o.ks,
     concurrency: o.concurrency,
     onProgress: (d, n) => process.stderr.write(`  ${d}/${n} done …\n`),
+    onResult: o.out ? (rec) => appendFileSync(o.out, JSON.stringify(rec) + '\n') : undefined,
   });
 
   const out = [];
@@ -200,10 +205,9 @@ async function main(argv) {
   process.stdout.write(out.join('\n') + '\n');
 
   if (o.out) {
-    mkdirSync(dirname(o.out), { recursive: true });
-    writeFileSync(o.out, r.perQuestion.map((x) => JSON.stringify(x)).join('\n') + '\n');
+    // per-question jsonl already written incrementally via onResult; summary here.
     writeFileSync(o.out.replace(/\.jsonl?$/, '') + '.summary.json', JSON.stringify({ config: r.config, n: r.n, parseRate: r.parseRate, overall: r.overall, perType: r.perType }, null, 2));
-    process.stderr.write(`Wrote → ${o.out}\n`);
+    process.stderr.write(`Wrote → ${o.out} (+ .summary.json)\n`);
   }
 }
 
