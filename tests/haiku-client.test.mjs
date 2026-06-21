@@ -38,6 +38,10 @@ describe('haiku-client.mjs', () => {
     // exercise OpenRouter explicitly re-stub them.
     vi.stubEnv('OPENROUTER_API_KEY', '');
     vi.stubEnv('OPENROUTER_MODEL', '');
+    // Proxy vars in the dev/CI shell would route the OpenRouter path through the
+    // CONNECT tunnel (real network) instead of the mocked fetch — same #8608 trap:
+    // an env-gated transport silently breaks tests that rely on the default path.
+    for (const v of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) vi.stubEnv(v, '');
     _resetMode();
     vi.restoreAllMocks();
     // Re-apply mock for execFileSync since restoreAllMocks clears it

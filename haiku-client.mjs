@@ -6,11 +6,83 @@
 // overridable via OPENROUTER_MODEL
 
 import { execFileSync, spawn } from 'child_process';
+import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { debugLog, debugCatch, parseJsonFromLLM } from './utils.mjs';
 import { DB_DIR } from './schema.mjs';
+
+// ─── Proxy support (native fetch ignores HTTP(S)_PROXY) ──────────────────────
+//
+// Node's global fetch (undici) does NOT honour HTTP(S)_PROXY env vars, and
+// undici's ProxyAgent isn't importable without adding a dependency. In an env
+// that requires a local proxy to reach external APIs (e.g.
+// HTTPS_PROXY=http://127.0.0.1:PORT), a direct fetch to openrouter.ai
+// hangs/times out. We tunnel HTTPS through the HTTP CONNECT proxy using built-ins
+// only. No proxy var (or a NO_PROXY host) → null → callers keep native fetch,
+// unchanged (zero behaviour change when no proxy is configured).
+function httpConnectProxyFor(targetUrl) {
+  const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (!proxy || !/^https?:\/\//.test(proxy)) return null; // socks5 ALL_PROXY not supported here
+  try {
+    const host = new URL(targetUrl).hostname;
+    const noProxy = (process.env.NO_PROXY || process.env.no_proxy || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (noProxy.some((n) => n === host || (n.startsWith('.') && host.endsWith(n.slice(1))))) return null;
+    return proxy;
+  } catch {
+    return null;
+  }
+}
+
+// fetch-compatible (subset) POST over an HTTP CONNECT tunnel: returns
+// { ok, status, json(), text() }. Rejects on connect/timeout/socket error so the
+// caller's try/catch degrades to the CLI exactly as a failed fetch would.
+function postViaConnectProxy(proxy, url, { headers = {}, body = '', timeout = 20000 }) {
+  return new Promise((resolve, reject) => {
+    const p = new URL(proxy);
+    const t = new URL(url);
+    const port = Number(t.port) || 443;
+    let settled = false;
+    const finish = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+    const connReq = http.request({
+      host: p.hostname,
+      port: Number(p.port) || 80,
+      method: 'CONNECT',
+      path: `${t.hostname}:${port}`,
+      headers: { Host: `${t.hostname}:${port}` },
+    });
+    connReq.setTimeout(timeout, () => connReq.destroy(new Error('proxy CONNECT timeout')));
+    connReq.on('error', (e) => finish(reject, e));
+    connReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return finish(reject, new Error(`proxy CONNECT ${res.statusCode}`));
+      }
+      const req = https.request(
+        url,
+        { method: 'POST', headers, createConnection: () => tls.connect({ socket, servername: t.hostname }) },
+        (resp) => {
+          let data = '';
+          resp.setEncoding('utf8');
+          resp.on('data', (c) => (data += c));
+          resp.on('end', () => finish(resolve, {
+            ok: resp.statusCode >= 200 && resp.statusCode < 300,
+            status: resp.statusCode,
+            json: () => JSON.parse(data),
+            text: () => data,
+          }));
+        }
+      );
+      req.setTimeout(timeout, () => req.destroy(new Error('proxy request timeout')));
+      req.on('error', (e) => finish(reject, e));
+      req.end(body);
+    });
+    connReq.end();
+  });
+}
 
 // ─── Model Resolution ────────────────────────────────────────────────────────
 
@@ -493,17 +565,20 @@ async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens, temperature
     if (system) messages.push({ role: 'system', content: system });
     messages.push({ role: 'user', content: user });
 
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        // Optional OpenRouter attribution headers (ignored by the API if absent).
-        'X-Title': 'claude-mem-lite',
-      },
-      body: JSON.stringify({ model, max_tokens: maxTokens, temperature, messages }),
-      signal: controller.signal,
-    });
+    const url = 'https://openrouter.ai/api/v1/chat/completions';
+    const reqHeaders = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      // Optional OpenRouter attribution headers (ignored by the API if absent).
+      'X-Title': 'claude-mem-lite',
+    };
+    const reqBody = JSON.stringify({ model, max_tokens: maxTokens, temperature, messages });
+    // Native fetch ignores HTTP(S)_PROXY; when a proxy is configured, tunnel the
+    // request through it — a direct fetch to openrouter.ai times out behind one.
+    const proxy = httpConnectProxyFor(url);
+    const res = proxy
+      ? await postViaConnectProxy(proxy, url, { headers: reqHeaders, body: reqBody, timeout })
+      : await fetch(url, { method: 'POST', headers: reqHeaders, body: reqBody, signal: controller.signal });
 
     if (!res.ok) {
       debugLog('WARN', `${tier}-openrouter`, `HTTP ${res.status}`);
