@@ -75,6 +75,23 @@ describe('deepSearch rerank stage (option C, opt-in)', () => {
     expect(prompt.user).toContain('find the auth bug');
   });
 
+  it('re-stamps scores in rerank order so a downstream score-sort preserves it (§9 paired-path)', async () => {
+    const rerankLlm = async () => ({ ranked: [3, 1, 2] });
+    const { results } = await deepSearch(
+      null, { query: 'q', limit: 10 },
+      { llm: noRewrite, searchFn: () => rows([10, 20, 30]), rerank: true, rerankLlm, rerankTextFn: textOf({}) },
+    );
+    // rerank order is [30,10,20]; scores must ascend in that order so a consumer that
+    // re-sorts by score (server.mjs reRankWithContext + sort) reproduces the rerank
+    // order instead of restoring the RRF order off the original scores.
+    expect(results.map((r) => r.id)).toEqual([30, 10, 20]);
+    const scores = results.map((r) => r.score);
+    expect(scores).toEqual([...scores].sort((a, b) => a - b)); // non-decreasing in array order
+    // Simulate the MCP consumer's sort-by-score: order must be unchanged.
+    const resorted = [...results].sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+    expect(resorted.map((r) => r.id)).toEqual([30, 10, 20]);
+  });
+
   it('passes only the top-K candidates to rerankTextFn (not the whole fused list)', async () => {
     let seenIds = null;
     const rerankTextFn = (_db, rs) => { seenIds = rs.map((r) => r.id); return new Map(rs.map((r) => [r.id, `x${r.id}`])); };

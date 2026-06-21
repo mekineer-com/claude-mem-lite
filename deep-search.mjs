@@ -476,7 +476,18 @@ export async function deepSearch(db, params, { llm, searchFn = defaultSearchFn, 
     const { order, parsed } = await llmRerankOrder(query, cand, rerankLlm || defaultRerankLLM);
     if (parsed) {
       const byId = new Map(top.map((r) => [r.id, r]));
-      ordered = [...order.map((id) => byId.get(id)).filter(Boolean), ...fused.slice(k)];
+      const head = order.map((id) => byId.get(id)).filter(Boolean);
+      // Re-stamp scores so `score` stays monotonic with the rerank order, reusing
+      // the top-K's OWN values ascending (best = most-negative first): the reranked
+      // block keeps the K best scores so it stays ahead of the fused tail, and orders
+      // within itself by rerank rank. This keeps the shared CLI↔MCP `score` ordering
+      // contract (#8217) consistent with the array order, so a consumer that re-sorts
+      // by score reproduces the rerank order instead of restoring the RRF order.
+      // (server.mjs also skips its context re-rank/re-sort when reranked, so the LLM
+      // judgement is the final order — the re-stamp keeps score honest regardless.)
+      const scores = top.map((r) => r.score).sort((a, b) => a - b);
+      head.forEach((r, i) => { r.score = scores[i]; r.rrfScore = -scores[i]; });
+      ordered = [...head, ...fused.slice(k)];
       reranked = true;
     }
   }

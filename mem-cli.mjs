@@ -169,6 +169,7 @@ async function cmdSearch(db, args, { llm } = {}) {
   let orFallbackFired = false;
 
   let deepVariants = null;
+  let isReranked = false;
   let isDeep = deepMode === 'deep';
 
   // Search observations — shared engine with server.mjs (#8198/#8212 paired-path fix)
@@ -205,6 +206,7 @@ async function cmdSearch(db, args, { llm } = {}) {
         currentProject: project ? null : inferProject(),
       }, llm ? { llm, rerank: rerank && !auto } : { auto, rerank: rerank && !auto });
       deepVariants = ds.variants;
+      isReranked = ds.reranked;
       if (deepVariants.length > 1) {
         process.stderr.write(`[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`);
       } else {
@@ -284,7 +286,9 @@ async function cmdSearch(db, args, { llm } = {}) {
   if (obsResults.length > 0) {
     // reRankWithContext/markSuperseded expect source='obs' — alias _source for compatibility
     for (const r of obsResults) r.source = 'obs';
-    reRankWithContext(db, obsResults, project || inferProject());
+    // Explicit LLM rerank order is final — skip file-context re-rank when reranked
+    // (paired-path with mem_search; markSuperseded still runs for stale-tagging).
+    if (!isReranked) reRankWithContext(db, obsResults, project || inferProject());
     markSuperseded(obsResults);
     if (isCrossSource) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
   }

@@ -777,3 +777,64 @@ describe('corpus guard integration — escalation suppressed on near-empty store
     db.close();
   });
 });
+
+describe('mem_search rerank threading (D#43 — opt-in, explicit-deep only)', () => {
+  // Unit tests (deep-search-rerank.test.mjs) prove the rerank stage reorders; these
+  // prove the SERVER threads rerankLlm into deepSearch and gates it on explicit deep.
+  function seededDb() {
+    const db = createTestDb();
+    _resetVocabCache();
+    seedDatabase(db, makeSeed());
+    seedVectors(db);
+    return db;
+  }
+  // identity rerank: keep candidate order but parse cleanly → reranked=true (no-op safe).
+  const identityRerank = (prompt) => {
+    const n = Number((prompt.user.match(/over 1\.\.(\d+)/) || [])[1]) || 0;
+    return { ranked: Array.from({ length: n }, (_, i) => i + 1) };
+  };
+
+  it('deep=true + rerank=true threads rerankLlm into the rerank stage (reranked=true, called once)', async () => {
+    const db = seededDb();
+    const rewrite = stubLLM({ variants: [] }); // collapse to single query → fused candidates
+    let rerankCalls = 0;
+    const rerankLlm = async (p) => { rerankCalls++; return identityRerank(p); };
+    const res = await handleSearchForTest(db, { query: 'kubernetes', deep: true, rerank: true }, { llm: rewrite, rerankLlm });
+    expect(res.reranked).toBe(true);
+    expect(rerankCalls).toBe(1);
+    expect(res.results.length).toBeGreaterThan(1);
+    db.close();
+  });
+
+  it('AUTO escalation never reranks even when rerank=true is passed (reranked=false, rerankLlm untouched)', async () => {
+    const db = seededDb();
+    const rewrite = stubLLM({ variants: ['kubernetes pods', 'k8s cluster scheduling'] });
+    let rerankCalls = 0;
+    const rerankLlm = async (p) => { rerankCalls++; return identityRerank(p); };
+    // deep omitted → weak query auto-escalates; rerank must NOT fire on the auto path.
+    const res = await handleSearchForTest(db, { query: 'zqxjv9471kpw', rerank: true }, { llm: rewrite, rerankLlm });
+    expect(res.escalated).toBe(true);
+    expect(res.reranked).toBe(false);
+    expect(rerankCalls).toBe(0);
+    db.close();
+  });
+
+  it('deep=true + rerank omitted does not rerank (reranked=false, rerankLlm untouched)', async () => {
+    const db = seededDb();
+    const rewrite = stubLLM({ variants: [] });
+    let rerankCalls = 0;
+    const rerankLlm = async (p) => { rerankCalls++; return identityRerank(p); };
+    const res = await handleSearchForTest(db, { query: 'kubernetes', deep: true }, { llm: rewrite, rerankLlm });
+    expect(res.reranked).toBe(false);
+    expect(rerankCalls).toBe(0);
+    db.close();
+  });
+
+  it('surfaces the rerank in the MCP text blob when reranked', async () => {
+    const db = seededDb();
+    const rewrite = stubLLM({ variants: [] });
+    const res = await handleSearchForTest(db, { query: 'kubernetes', deep: true, rerank: true }, { llm: rewrite, rerankLlm: identityRerank });
+    expect(res.content[0].text).toContain('LLM-reranked');
+    db.close();
+  });
+});

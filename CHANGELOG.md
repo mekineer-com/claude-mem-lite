@@ -4,13 +4,13 @@ All notable changes to claude-mem-lite are documented in this file.
 
 ## Unreleased
 
-### feat: opt-in LLM rerank stage on deep search (`--rerank`)
+### feat: opt-in LLM rerank stage on deep search (CLI `--rerank` + MCP `rerank`)
 
-Deep search can now LLM-rerank its RRF-fused candidates as an explicit, opt-in escalation: `claude-mem-lite search <q> --deep --rerank`. After the multi-query rewrite → per-variant hybrid → RRF fusion, the top-20 fused candidates are handed to a single Haiku call (~1.4 s) that reorders them by relevance. The result is **never worse than the fused order** by construction — any LLM or parse failure falls back to the fused order untouched (same reliability contract as the rewrite stage).
+Deep search can now LLM-rerank its RRF-fused candidates as an explicit, opt-in escalation — `claude-mem-lite search <q> --deep --rerank` (CLI) or `mem_search({query, deep: true, rerank: true})` (MCP). After the multi-query rewrite → per-variant hybrid → RRF fusion, the top-20 fused candidates are handed to a single Haiku call (~1.4 s) that reorders them by relevance. The result is **never worse than the fused order** by construction — any LLM or parse failure falls back to the fused order untouched (same reliability contract as the rewrite stage).
 
 The rerank core lives in a new `rerank.mjs` shared with the LongMemEval rerank benchmark (`benchmark/longmemeval-rerank.mjs`), so the shipped algorithm is exactly the one measured: lexical FTS5 + TF-IDF + RRF candidates + one top-20 rerank reach **96.8% recall_any@5** on LongMemEval (n=500, 99.8% JSON parse-rate), up from 90.6% lexical-only — edging a dense-embedding retriever's raw number with zero embedding dependency. The benchmark reranks single-query hybrid candidates; production reranks the richer multi-query RRF set, so the measured number is a conservative floor for this combination.
 
-Strictly opt-in: the AUTO escalation path **never** reranks, so no default search behaviour changes and the long-lived MCP server's hot path stays a single LLM call. Reachable via the CLI for now (`--rerank` requires `--deep`; a note prints if used alone); exposing it as a `mem_search` MCP arg is a tracked follow-up.
+Strictly opt-in: the AUTO escalation path **never** reranks (on either surface), so no default search behaviour changes and the long-lived MCP server's hot path stays a single LLM call. Both `--rerank` and the MCP `rerank` arg require explicit `deep=true`; a note prints / the arg is ignored otherwise. When reranked, the LLM order is final — the rerank stage re-stamps candidate scores in rank order and both the CLI and MCP post-processing skip their file-context re-rank/re-sort, so the same order surfaces on either surface (paired-path consistency). MCP responses carry a `reranked` field and a `[deep search: LLM-reranked …]` note.
 
 ## v3.3.1 — OpenRouter requests honour HTTP(S)_PROXY
 

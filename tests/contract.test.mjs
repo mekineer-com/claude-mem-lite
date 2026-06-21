@@ -86,6 +86,18 @@ describe('mem_search schema', () => {
     expect(r2.success).toBe(true);
     expect(r2.data.or).toBe(true);
   });
+
+  // D#43: CLI ↔ MCP alignment — CLI has `search --deep --rerank`, MCP must accept
+  // `rerank` too. Like `or`, prove it survives parse (not silently stripped).
+  it('accepts rerank:true and retains it in parsed output (aligns with CLI --rerank)', () => {
+    const r1 = parseSchema(memSearchSchema, { query: 'foo', deep: true, rerank: true });
+    expect(r1.success).toBe(true);
+    expect(r1.data.rerank).toBe(true);
+
+    const r2 = parseSchema(memSearchSchema, { query: 'foo', deep: true, rerank: 'true' });
+    expect(r2.success).toBe(true);
+    expect(r2.data.rerank).toBe(true);
+  });
 });
 
 // ─── mem_recent schema ──────────────────────────────────────────────────────

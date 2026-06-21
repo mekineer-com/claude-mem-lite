@@ -320,11 +320,11 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
 // NOTE: resolveProject() inside runSearchPipeline closes over the module-level `db`,
 // not the injected one. Tests that pass a project: arg via this seam will trigger
 // resolveProject() against the real (module) DB, not the test DB.
-export async function handleSearchForTest(db, args, { llm } = {}) {
-  return runSearchPipeline(db, args, { llm });
+export async function handleSearchForTest(db, args, { llm, rerankLlm } = {}) {
+  return runSearchPipeline(db, args, { llm, rerankLlm });
 }
 
-async function runSearchPipeline(db, args, { llm } = {}) {
+async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const limit = args.limit ?? 20;
     const offset = args.offset ?? 0;
@@ -349,6 +349,9 @@ async function runSearchPipeline(db, args, { llm } = {}) {
     // Resolve tri-state deep mode. MCP defaults to 'auto' (escalate on weak results)
     // unless explicitly overridden via args.deep or CLAUDE_MEM_AUTO_DEEP env flag.
     const deepMode = resolveDeepMode(args.deep, { surface: 'mcp' });
+    // Opt-in LLM rerank (D#43): explicit-deep only — never on AUTO escalation — so
+    // no default search behaviour changes. Parity with CLI `search --deep --rerank`.
+    const rerank = args.rerank === true && deepMode === 'deep';
 
     // Early return when query was provided but sanitized to nothing (all FTS5
     // keywords/special chars). Skipped for deep/auto — deep's LLM rewrite may
@@ -365,13 +368,14 @@ async function runSearchPipeline(db, args, { llm } = {}) {
     const ctx = { db, ftsQuery, searchType: effectiveType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
     const results = [];
     let deepVariants = null;
+    let deepReranked = false;
     let isDeep = deepMode === 'deep';
     let escalated = false;
     let escalatedObsCount = 0;
 
     // Helper: run deepSearch and load results into the shared `results` array.
     const runDeepInto = async ({ auto = false } = {}) => {
-      const { results: deepRows, variants } = await deepSearch(db, {
+      const { results: deepRows, variants, reranked } = await deepSearch(db, {
         query: args.query,
         project: args.project || null,
         type: args.obs_type || null,
@@ -381,11 +385,12 @@ async function runSearchPipeline(db, args, { llm } = {}) {
         epochFrom, epochTo,
         limit: perSourceLimit,
         currentProject,
-      }, llm ? { llm } : { auto });
+      }, llm ? { llm, rerank: rerank && !auto, rerankLlm } : { auto, rerank: rerank && !auto, rerankLlm });
       // Safe to reset: sessions/prompts are pushed AFTER the obs block, so nothing is lost here.
       results.length = 0;
       results.push(...deepRows);
       deepVariants = variants;
+      deepReranked = reranked;
     };
 
     if (!effectiveType || effectiveType === 'observations') {
@@ -460,9 +465,13 @@ async function runSearchPipeline(db, args, { llm } = {}) {
     // empty-ftsQuery deep path we tag-but-don't-reorder (keep RRF order).
     if ((ftsQuery || isDeep) && results.some(r => r.source === 'obs')) {
       const obsResults = results.filter(r => r.source === 'obs');
-      if (ftsQuery) reRankWithContext(db, obsResults, currentProject);
+      // When the deep candidates were explicitly LLM-reranked, that order is final:
+      // skip the file-context re-rank + re-sort (they would perturb the rerank order
+      // via score multiplication / score-sort). markSuperseded is pure stale-tagging
+      // and still runs. (D#43 — parity with the CLI deep path, which keeps array order.)
+      if (ftsQuery && !deepReranked) reRankWithContext(db, obsResults, currentProject);
       markSuperseded(obsResults);
-      if (ftsQuery) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+      if (ftsQuery && !deepReranked) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
     }
 
     // Tier post-filter: batch-lookup full rows and classify (shared with CLI).
@@ -512,9 +521,14 @@ async function runSearchPipeline(db, args, { llm } = {}) {
         ? `\n\n[deep search: rewrote into ${deepVariants.length} variants — ${deepVariants.slice(1).map(v => JSON.stringify(v)).join(', ')}]`
         : '\n\n[deep search: rewrite produced no usable variants; searched the original query only (== baseline)]';
     }
+    // Discoverability signal for the opt-in rerank (D#43): tell the calling agent the
+    // candidates were LLM-reranked — parity with the CLI stderr note.
+    if (deepReranked && output.content?.[0]?.type === 'text') {
+      output.content[0].text += '\n\n[deep search: LLM-reranked the top candidates by relevance]';
+    }
 
     // Return an object that exposes structured fields for tests + the MCP content blob.
-    return { ...output, results: paginatedResults, total: totalBeforePagination, escalated, variants: deepVariants };
+    return { ...output, results: paginatedResults, total: totalBeforePagination, escalated, variants: deepVariants, reranked: deepReranked };
 }
 
 server.registerTool(

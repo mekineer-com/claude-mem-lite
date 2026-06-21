@@ -94,6 +94,7 @@ export const memSearchSchema = {
   include_noise: z.boolean().optional().describe('Include hook-llm fallback titles ("Modified X", "Worked on X", raw error logs) — hidden by default as they have ~3% access rate'),
   or: coerceBool.optional().describe('Force OR semantics between query terms from the start (default: AND with automatic OR-fallback when AND returns 0). Aligns with CLI --or.'),
   deep: coerceBool.optional().describe('Tri-state LLM multi-query/HyDE deep search (observations-only). true=force; false=never; omit=AUTO (default ON for mem_search): a normal search that returns weak/few results auto-escalates with ONE Haiku call (query rewritten to keyword/concept/HyDE variants, RRF-fused). Set CLAUDE_MEM_AUTO_DEEP=0 to disable AUTO. Passive recall stays single-query.'),
+  rerank: coerceBool.optional().describe('Opt-in: LLM-rerank the deep-search candidates for ranking precision (one extra Haiku call, ~1.4s). Requires deep=true (no effect on AUTO/normal). Reserve for hard, ranking-sensitive queries where the right memory is likely retrieved but mis-ranked — skip for routine search. Default off.'),
 };
 
 export const memRecentSchema = {
