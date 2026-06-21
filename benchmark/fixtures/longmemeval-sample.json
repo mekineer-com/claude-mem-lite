@@ -1,0 +1,71 @@
+[
+  {
+    "question_id": "q-lexical-db",
+    "question_type": "single-session-user",
+    "question": "Which database did we pick for the analytics service?",
+    "answer": "ClickHouse",
+    "answer_session_ids": ["s-analytics"],
+    "haystack_session_ids": ["s-router", "s-analytics", "s-deploy"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Let's set up the frontend router and the navigation guards for the dashboard."},
+        {"role": "assistant", "content": "Sure, I'll scaffold the router and the guard hooks."}
+      ],
+      [
+        {"role": "user", "content": "For the analytics service we picked ClickHouse as our database because of its columnar query speed."},
+        {"role": "assistant", "content": "ClickHouse is a solid choice for that workload."}
+      ],
+      [
+        {"role": "user", "content": "Update the deployment manifest for the background worker queue."},
+        {"role": "assistant", "content": "Done, bumped the worker replica count."}
+      ]
+    ],
+    "haystack_dates": ["2026-01-01", "2026-01-02", "2026-01-03"]
+  },
+  {
+    "question_id": "q-assistant-codename",
+    "question_type": "single-session-assistant",
+    "question": "What codename did the assistant assign to the caching layer?",
+    "answer": "Hermes",
+    "answer_session_ids": ["s-cache"],
+    "haystack_session_ids": ["s-cache", "s-routing", "s-docs"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Can you help me think through the thing we discussed earlier this morning?"},
+        {"role": "assistant", "content": "Absolutely. I'll give the caching layer the codename Hermes so we can refer to it cleanly."}
+      ],
+      [
+        {"role": "user", "content": "The route loader needs lazy chunk splitting for the heavy pages."},
+        {"role": "assistant", "content": "I'll add dynamic imports to the route loader."}
+      ],
+      [
+        {"role": "user", "content": "Write the reference docs for the command-line flags."},
+        {"role": "assistant", "content": "Drafted the flag reference."}
+      ]
+    ],
+    "haystack_dates": ["2026-02-01", "2026-02-02", "2026-02-03"]
+  },
+  {
+    "question_id": "q-lexical-migration",
+    "question_type": "single-session-user",
+    "question": "Which tool did we use for the database schema migration?",
+    "answer": "Flyway",
+    "answer_session_ids": ["s-migrate"],
+    "haystack_session_ids": ["s-styles", "s-migrate", "s-auth"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Tweak the button styles and the spacing tokens in the design system."},
+        {"role": "assistant", "content": "Adjusted the spacing scale."}
+      ],
+      [
+        {"role": "user", "content": "We ran the database schema migration with Flyway and checked the versioned scripts into the repo."},
+        {"role": "assistant", "content": "Flyway will track the migration versions for you."}
+      ],
+      [
+        {"role": "user", "content": "Rotate the auth signing keys and invalidate old sessions."},
+        {"role": "assistant", "content": "Keys rotated, old sessions invalidated."}
+      ]
+    ],
+    "haystack_dates": ["2026-03-01", "2026-03-02", "2026-03-03"]
+  }
+]

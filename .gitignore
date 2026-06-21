@@ -22,3 +22,9 @@ tasks/
 tmp/
 .context/
 .npmrc
+
+# Benchmark datasets (large, ~300 MB each — fetched via benchmark/datasets/*.sh)
+# and raw per-question result dumps. Download scripts + READMEs stay committed.
+benchmark/datasets/*.json
+benchmark/datasets/*.jsonl
+benchmark/results/

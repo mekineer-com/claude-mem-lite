@@ -118,7 +118,9 @@ export function seedVectors(db, { dim } = {}) {
 // (currentProject), mirroring the FTS 'hybrid' mode's project-boost semantics
 // rather than a hard filter. minCosine / rrfK are sweep overrides (undefined →
 // the production MIN_COSINE_SIMILARITY / RRF_K defaults). Requires seedVectors first.
-function searchProductionHybrid(db, query, { limit = 10, project = null, obsType = null, minCosine, rrfK } = {}) {
+// Exported so external benchmark adapters (e.g. longmemeval.mjs) drive the exact
+// same production hybrid path instead of re-assembling ctx and drifting from it.
+export function searchProductionHybrid(db, query, { limit = 10, project = null, obsType = null, minCosine, rrfK } = {}) {
   const ftsQuery = sanitizeFtsQuery(query);
   const ctx = {
     ftsQuery,

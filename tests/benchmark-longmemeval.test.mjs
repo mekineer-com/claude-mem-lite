@@ -1,0 +1,99 @@
+// Tests for the LongMemEval benchmark adapter (benchmark/longmemeval.mjs).
+//
+// These prove three things that make our number comparable to MemPalace's
+// published LongMemEval R@5:
+//   1. recall_any@k is computed as "is ANY gold session in top-k" (their headline
+//      metric), NOT the fractional hits/relevant of computeRecallAtK.
+//   2. The corpus is built user-turns-only by default — exactly MemPalace's raw
+//      baseline rule (longmemeval_bench.py:188). The assistant content is excluded,
+//      so a fact that lives only in an assistant turn is NOT in the haystack.
+//   3. The adapter drives the REAL production hybrid path (FTS + TF-IDF + RRF) and
+//      retrieves a lexically-obvious gold session.
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import {
+  buildCorpus,
+  recallAnyAtK,
+  evalEntry,
+  runLongMemEval,
+} from '../benchmark/longmemeval.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const SAMPLE = JSON.parse(
+  readFileSync(join(__dirname, '../benchmark/fixtures/longmemeval-sample.json'), 'utf8')
+);
+const byId = (id) => SAMPLE.find((e) => e.question_id === id);
+
+describe('recallAnyAtK', () => {
+  it('is binary: 1 when any gold is in top-k, else 0', () => {
+    expect(recallAnyAtK(['a', 'b', 'c'], ['b'], 5)).toBe(1);
+    expect(recallAnyAtK(['a', 'b', 'c'], ['z'], 5)).toBe(0);
+  });
+  it('respects the k cutoff', () => {
+    // gold 'c' sits at rank 3 — inside @5, outside @2.
+    expect(recallAnyAtK(['a', 'b', 'c'], ['c'], 5)).toBe(1);
+    expect(recallAnyAtK(['a', 'b', 'c'], ['c'], 2)).toBe(0);
+  });
+  it('is 0 for an empty gold set (no credit possible)', () => {
+    expect(recallAnyAtK(['a', 'b'], [], 5)).toBe(0);
+  });
+});
+
+describe('buildCorpus — user-turns-only rule (MemPalace raw baseline)', () => {
+  const entry = byId('q-assistant-codename');
+
+  it('default (user mode) EXCLUDES assistant content from the haystack', () => {
+    const { data, idToSession, goldIds } = buildCorpus(entry);
+    expect(goldIds).toEqual(['s-cache']);
+    // one observation per haystack session, integer ids mapped back to session ids
+    expect(data.observations).toHaveLength(3);
+    expect(idToSession.get(1)).toBe('s-cache');
+    const goldDoc = data.observations.find((o) => idToSession.get(o.id) === 's-cache');
+    // "Hermes" lives ONLY in the assistant turn → must not be indexed in user mode
+    expect(goldDoc.narrative).not.toMatch(/Hermes/i);
+    expect(goldDoc.narrative).toMatch(/help me think through/i);
+  });
+
+  it('all mode INCLUDES assistant content (the rule is load-bearing)', () => {
+    const { data, idToSession } = buildCorpus(entry, { turns: 'all' });
+    const goldDoc = data.observations.find((o) => idToSession.get(o.id) === 's-cache');
+    expect(goldDoc.narrative).toMatch(/Hermes/i);
+  });
+});
+
+describe('evalEntry — real production hybrid retrieval', () => {
+  it('retrieves a lexically-obvious gold session at the top (recall_any@1 = 1)', () => {
+    const r = evalEntry(byId('q-lexical-db'), { turns: 'user', ks: [1, 5, 10] });
+    expect(r.question_id).toBe('q-lexical-db');
+    expect(r.ks['1']).toBe(1);
+    expect(r.ks['5']).toBe(1);
+    expect(r.gold).toEqual(['s-analytics']);
+    expect(r.retrieved).toContain('s-analytics');
+  });
+
+  it('does not credit an assistant-only fact under the user-turns-only rule', () => {
+    // The codename "Hermes" / "caching layer codename" is only in the assistant turn,
+    // so user-mode retrieval cannot surface it — this is the honest raw-baseline behavior.
+    const r = evalEntry(byId('q-assistant-codename'), { turns: 'user', ks: [1, 5, 10] });
+    expect(r.ks['5']).toBe(0);
+  });
+});
+
+describe('runLongMemEval — aggregation', () => {
+  it('aggregates recall_any@{1,5,10} overall and per question_type', () => {
+    const out = runLongMemEval(SAMPLE, { turns: 'user', ks: [1, 5, 10], limit: 10 });
+    expect(out.n).toBe(3);
+    expect(out.config.turns).toBe('user');
+    for (const k of ['1', '5', '10']) {
+      expect(out.overall.recallAny[k]).toBeGreaterThanOrEqual(0);
+      expect(out.overall.recallAny[k]).toBeLessThanOrEqual(1);
+    }
+    // two lexical single-session-user questions are both found; the assistant-only one is not
+    expect(out.overall.recallAny['5']).toBeCloseTo(2 / 3, 5);
+    expect(out.perType['single-session-user'].recallAny['5']).toBe(1);
+    expect(out.perType['single-session-assistant'].recallAny['5']).toBe(0);
+    expect(out.perQuestion).toHaveLength(3);
+  });
+});
