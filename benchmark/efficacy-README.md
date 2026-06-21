@@ -119,3 +119,33 @@ node benchmark/efficacy-harness.mjs                  # STEP 3 driver — spawns 
   ceiling to stay below 100% regardless of injection format.
 
 Not wired into CI — this is a research instrument, run on demand.
+
+## bind forcing-function re-measure (2026-06-22)
+
+Run on the **confined runner** (`benchmark/confine-tools.js` denies Bash|Agent|Task in
+the pinned config, so every edit flows through `Edit` and `pre-tool-recall.js` actually
+fires — closing the plumbing artifact that floored the 2026-06-13 isolated run).
+
+Arms (same isolated env, `--k=8`):
+- `C` empty control · `A` v2.98 ack directive · `F` bind directive + PostToolUse diff
+  re-inject (`CLAUDE_MEM_SALIENCE=bind`) · `T` empty sandbox + the fix spelled into the
+  task (`requirement`) = gauge sanity.
+
+Run: `node benchmark/efficacy-harness.mjs --isolated --arms=C,A,F,T --k=8 --commit=bac2e85 --model='claude-sonnet-4-6'`
+
+> **Warning:** the harness reads no model from settings.json by default — omitting
+> `--model` floors every arm on the `claude -p` CLI default (#8711 isolated-v1 trap),
+> so `--model` MUST be passed. Note: `claude-fable-5[1m]` (the #8711 isolated-v2
+> baseline model) is unavailable as of 2026-06-22; this measurement uses
+> `claude-sonnet-4-6`, which establishes a fresh baseline not directly comparable to
+> the historical fable-5 A=0/8 record (caveat #4 above).
+
+Success criteria:
+1. Gauge valid iff `T >= 6/8`. If T is low, no arm's 0 is interpretable — fix the cell/runner first.
+2. FF signal iff (gauge valid AND) `Δ(F−A) >= +2/8` (`>= +3/8` strong). k=8 → effect-size, no p-value.
+3. Honest null: T high but F≈A≈C≈0 → binding doesn't move this failure; report, don't ship the default flip.
+
+Component-2 limit: the diff re-inject only fires for "removed a required reference" lessons.
+bac2e85's lesson ("recover referencing rows first") names no identifier that is present-then-removed,
+so for this cell the **binding directive (component 1) carries the effect** — the PostToolUse layer
+is general insurance for other lesson shapes.

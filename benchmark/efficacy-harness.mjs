@@ -52,7 +52,9 @@ const args = Object.fromEntries(process.argv.slice(2).map((a) => {
 const K = parseInt(args.k || '3', 10);
 // Arms: A = lesson injected (current salience, v2.98 ack-directive),
 //       AL = lesson injected with CLAUDE_MEM_SALIENCE=legacy (pre-v2.98 format),
-//       C = empty sandbox control.
+//       C = empty sandbox control,
+//       F = lesson injected under CLAUDE_MEM_SALIENCE=bind (bind forcing-function),
+//       T = empty sandbox + spec.requirement appended to the task (positive control / gauge).
 const ARMS = (args.arms || 'A,C').split(',');
 const ISOLATED = !!args.isolated;
 const BASELINE_ONLY = !!args['baseline-only'];
@@ -165,6 +167,9 @@ function makePinnedConfigDir(model) {
       PreToolUse: [
         { matcher: 'Edit|Write|NotebookEdit|Read', hooks: [hook('pre-tool-recall.js', 3)] },
         { matcher: 'Bash|Agent|Task', hooks: [rawHook('benchmark/confine-tools.js', 2)] },
+      ],
+      PostToolUse: [
+        { matcher: 'Edit|Write', hooks: [hook('post-tool-recall.js', 3)] },
       ],
       UserPromptSubmit: [{ matcher: '*', hooks: [hook('user-prompt-search.js', 2)] }],
     },
