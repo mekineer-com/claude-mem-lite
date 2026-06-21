@@ -40,7 +40,14 @@ const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (used only for legacy fallback)
 // restores the pre-v2.98 passive behavior.
 const SALIENCE_LEGACY = process.env.CLAUDE_MEM_SALIENCE === 'legacy'
   || process.env.CLAUDE_MEM_SALIENCE === '0';
+const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
 const ACK_DIRECTIVE = "apply each lesson to this edit or rule it out — state '#NN applied' or '#NN n/a — <reason>' in your next user-facing message.";
+// v-bind salience forcing-function (#8771 audit: ack ≠ act). Instead of a cheap
+// '#NN applied / n/a' verdict, demand the model bind the lesson to the concrete
+// line it's editing and quote the satisfying edit line. Selected by
+// CLAUDE_MEM_SALIENCE=bind; default stays ACK_DIRECTIVE.
+const BIND_DIRECTIVE = "For each lesson: state the one concrete check it forces on the line(s) you're editing, quote the edit line that satisfies it, then report '#NN: <check> — pass' or '#NN: n/a — <why this edit can't reach it>'.";
+const ACTIVE_DIRECTIVE = SALIENCE_BIND ? BIND_DIRECTIVE : ACK_DIRECTIVE;
 const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold for legacy file
 // Feature ① (file intelligence): on the first Read of a file each session, inject
 // its approximate token size + a one-line summary so the agent can decide to read
@@ -238,7 +245,7 @@ try {
             hookEventName: 'PreToolUse',
             additionalContext: [
               '[mem] PreToolUse recall — system-injected context, continue your planned action:',
-              `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACK_DIRECTIVE}`,
+              `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACTIVE_DIRECTIVE}`,
             ].join('\n'),
           },
         }));
@@ -434,7 +441,7 @@ try {
       // Read keeps the quiet form; its forcing-function fires at the later Edit
       // via the Read→Edit ack nudge above.
       if (!isRead && !SALIENCE_LEGACY) {
-        lines.push(`[mem] ⚠ Before this edit: ${ACK_DIRECTIVE}`);
+        lines.push(`[mem] ⚠ Before this edit: ${ACTIVE_DIRECTIVE}`);
       }
     } else if (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1') {
       // R-4: Edit/Write empty → short backfill reminder. OPT-IN (default off) as
