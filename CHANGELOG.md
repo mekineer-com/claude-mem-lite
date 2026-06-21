@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.7.0 — opt-in `CLAUDE_MEM_SALIENCE=bind` forcing-function (experimental)
+
+Adds an opt-in injection-salience mode plus the efficacy-instrument fixes used to evaluate it. **Default behaviour is unchanged** — the new mode is gated behind `CLAUDE_MEM_SALIENCE=bind`; the existing default (`current`) and `legacy` values are untouched.
+
+### feat: `CLAUDE_MEM_SALIENCE=bind` comprehension-binding directive + diff re-inject
+
+Under `bind`, the Edit/Write lesson block ends with a comprehension-binding directive — state the one concrete check each lesson forces on the line you're editing and quote the satisfying edit line — instead of the `current` ack directive, and a new PostToolUse hook (`scripts/post-tool-recall.js`) flags when an edit drops a code identifier a lesson named. Identifier extraction is a pure helper (`lib/lesson-idents.mjs`). Everything is inert unless `CLAUDE_MEM_SALIENCE=bind`.
+
+Empirical note: on the project's own severe-test instrument (one constructable cell, sonnet, k=8) the bind directive measured **no effect over the `current` ack directive** — both 0/8, against an 8/8 task-explicit gauge — so on that cell the bottleneck is comprehension/application, not salience. Shipped opt-in for evaluation on other lesson shapes; the default is deliberately NOT changed.
+
+### fix(efficacy): confined runner + cross-hook dedup contamination (research instrument)
+
+`efficacy-harness` gains a confined runner (denies Bash/Agent so edits flow through the hooked `Edit` tool) and fixes a contamination where the injection probe poisoned the session's cross-hook dedup, zeroing injection in every injected arm and invalidating prior severe-test efficacy numbers. Benchmark-only; not in the user runtime path.
+
 ## v3.6.0 — per-session invocation→cite funnel in `citation-stats`
 
 Additive telemetry, no change to search/recall/injection behaviour. The citation-decay feedback loop already tracked per-observation cite counters (lifetime-cumulative) and recomputed a per-session cite-recall ratio at SessionStart (ephemeral, never stored). v3.6.0 persists each session's resolution as a trendable series so `citation-stats` can answer what the per-obs counters can't: **is memory invocation effectiveness rising or falling over time.**
