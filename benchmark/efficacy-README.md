@@ -149,3 +149,31 @@ Component-2 limit: the diff re-inject only fires for "removed a required referen
 bac2e85's lesson ("recover referencing rows first") names no identifier that is present-then-removed,
 so for this cell the **binding directive (component 1) carries the effect** — the PostToolUse layer
 is general insurance for other lesson shapes.
+
+### Contamination found + fixed — the result only became valid after this (2026-06-22)
+
+The FIRST run of the above floored every injected arm (A=0, F=0) for a **third, worse
+reason** than the 2026-06-13 plumbing issue: **`probeInjection` poisons the session's
+cross-hook dedup.** The probe runs `pre-tool-recall`, which writes the project-scoped
+`.claude-mem-injected-<project>` file into the sandbox; the actual `claude -p` session
+then reads it and **dedups the lesson away** → the model receives ZERO injection in every
+injected arm. The `injected=true` cell flag is misleading — it reflects the *probe*, not
+the session. Fixed in `efficacy-harness.mjs` (`rmSync` the sandbox `runtime/` after
+`probeInjection`, commit `aaba502`) so the session's first recall injects fresh. Verified
+directly: probe → clear → bind recall now emits the lesson + BIND_DIRECTIVE (was empty).
+**This very likely also contaminated the caveat-#4 fable-5 A=0/8 run** — re-read that as
+"the model never saw the lesson," not "saw and ignored it."
+
+### Result (post-fix, valid — sonnet-4-6, k=8, bac2e85)
+
+**C=0/8 · A=0/8 (v2.98 ack) · F=0/8 (bind FF) · T=8/8 (gauge).** Δ(A−C)=Δ(F−C)=0pp, Δ(T−C)=+100pp.
+
+Honest null (success criterion 3) on a **valid** instrument: injection verified reaching the
+model, gauge passes 8/8 (the model+runner+cell *can* produce the fix when the task spells it
+out), yet neither the v2.98 ack directive NOR the comprehension-binding bind forcing-function
+moves shipped-code correctness at all. Corrected reading of #8711's "ACTING is the bottleneck":
+with the lesson now demonstrably seen, the model still doesn't apply it — the gap is
+**comprehension/application, not salience/seeing**, so forcing *engagement* (bind) doesn't help.
+**Do NOT flip the `CLAUDE_MEM_SALIENCE` default; bind stays opt-in.** Caveat: one cell, one model,
+upper-bound — a null here ≠ "bind is useless everywhere" (component 2 never fires on bac2e85;
+other lesson shapes untested).
