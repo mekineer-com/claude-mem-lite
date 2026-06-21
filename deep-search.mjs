@@ -34,9 +34,18 @@
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { sanitizeFtsQuery } from './utils.mjs';
 import { RRF_K } from './tfidf.mjs';
+import { llmRerankOrder, defaultRerankLLM } from './rerank.mjs';
 
 // original + up to 3 rewrites (keyword / concept-expansion / HyDE).
 export const MAX_VARIANTS = 4;
+
+// How many RRF-fused candidates the opt-in rerank stage hands to the LLM. The
+// LongMemEval rerank benchmark (benchmark/longmemeval-rerank.mjs) measured the
+// lexical candidate set as rich enough at 20 (recall@20 = 97.8%) that reranking
+// the top-20 captures nearly all of that ceiling (96.8%@5); matching it here keeps
+// the shipped behaviour aligned with the measured number. Module-internal — callers
+// override per-call via deps.rerankTopK; export it if a config surface ever needs it.
+const RERANK_TOPK = 20;
 
 // ─── Auto-escalation (opt-in adaptive deep search) ──────────────────────────
 // Result-count floor below which a normal search is "weak" enough to auto-escalate
@@ -371,7 +380,33 @@ function defaultSearchFn(db, query, params) {
 }
 
 /**
- * Opt-in deep search: rewrite → per-variant hybrid search → RRF fusion.
+ * Build the candidate text the opt-in rerank stage shows the LLM. Prefers each
+ * observation's full `narrative` (the field the LongMemEval rerank benchmark
+ * scored); falls back to title / subtitle / snippet / lesson when narrative is
+ * unavailable or the db can't be read (injected rows / null db in unit tests).
+ * @param {Database|null} db
+ * @param {Array<object>} rows  fused candidate rows (already sliced to top-K)
+ * @returns {Map<any,string>} id → candidate text
+ */
+function defaultRerankText(db, rows) {
+  const fallback = (r) => [r.title, r.subtitle, r.snippet, r.lesson_learned].filter(Boolean).join(' — ');
+  if (!db) return new Map(rows.map((r) => [r.id, fallback(r)]));
+  try {
+    const ids = rows.map((r) => r.id);
+    const ph = ids.map(() => '?').join(',');
+    const found = new Map(
+      db.prepare(`SELECT id, narrative, title, subtitle FROM observations WHERE id IN (${ph})`)
+        .all(...ids)
+        .map((o) => [o.id, o.narrative || [o.title, o.subtitle].filter(Boolean).join(' — ')]),
+    );
+    return new Map(rows.map((r) => [r.id, found.get(r.id) || fallback(r)]));
+  } catch {
+    return new Map(rows.map((r) => [r.id, fallback(r)]));
+  }
+}
+
+/**
+ * Opt-in deep search: rewrite → per-variant hybrid search → RRF fusion → opt-in rerank.
  * @param {Database} db open better-sqlite3 handle
  * @param {object} params
  * @param {string} params.query  The user query.
@@ -386,11 +421,15 @@ function defaultSearchFn(db, query, params) {
  * @param {(db:Database, query:string, params:object)=>Array} [deps.searchFn]
  * @param {number} [deps.rrfK=RRF_K]
  * @param {boolean} [deps.auto=false]  use the fail-fast/throttled/cached auto provider
- * @returns {Promise<{results: Array, variants: string[]}>}
+ * @param {boolean} [deps.rerank=false]  opt-in: LLM-rerank the fused top-K (never on the auto path)
+ * @param {(prompt:object)=>Promise<any>} [deps.rerankLlm]  rerank provider (default: lazy haiku)
+ * @param {number} [deps.rerankTopK=RERANK_TOPK]  how many fused candidates to rerank
+ * @param {(db:Database, rows:Array)=>Map} [deps.rerankTextFn]  id→text builder for the rerank prompt
+ * @returns {Promise<{results: Array, variants: string[], reranked: boolean}>}
  */
-export async function deepSearch(db, params, { llm, searchFn = defaultSearchFn, rrfK = RRF_K, auto = false } = {}) {
+export async function deepSearch(db, params, { llm, searchFn = defaultSearchFn, rrfK = RRF_K, auto = false, rerank = false, rerankLlm, rerankTopK = RERANK_TOPK, rerankTextFn = defaultRerankText } = {}) {
   const query = String(params?.query ?? '').trim();
-  if (!query) return { results: [], variants: [] };
+  if (!query) return { results: [], variants: [], reranked: false };
 
   // No injected llm: EXPLICIT deep=true uses the patient defaultLLM; the AUTO
   // path uses a fail-fast + throttled provider with no retry and a process-
@@ -418,5 +457,29 @@ export async function deepSearch(db, params, { llm, searchFn = defaultSearchFn, 
 
   const fused = rrfFuseN(lists, rrfK);
   const limit = params.limit ?? 10;
-  return { results: fused.slice(0, limit), variants };
+
+  // Opt-in rerank stage (option C): reorder the fused top-K by an LLM relevance
+  // read, using the same core the LongMemEval benchmark measures (rerank.mjs) so
+  // the shipped algorithm == the measured one. Strictly opt-in — the AUTO
+  // escalation path never reranks, so no default search behaviour changes and the
+  // hot path stays a single LLM call. "Never worse than the fused order" by
+  // construction: a failed/unparseable rerank leaves the fused order untouched.
+  // The candidate set fed here is RICHER than the benchmark's single-query top-20
+  // (it is multi-query RRF), so the measured 96.8%@5 is a conservative floor.
+  let ordered = fused;
+  let reranked = false;
+  if (rerank && fused.length > 1) {
+    const k = Math.min(rerankTopK, fused.length);
+    const top = fused.slice(0, k);
+    const text = rerankTextFn(db, top);
+    const cand = top.map((r) => ({ sid: r.id, text: text.get(r.id) || '' }));
+    const { order, parsed } = await llmRerankOrder(query, cand, rerankLlm || defaultRerankLLM);
+    if (parsed) {
+      const byId = new Map(top.map((r) => [r.id, r]));
+      ordered = [...order.map((id) => byId.get(id)).filter(Boolean), ...fused.slice(k)];
+      reranked = true;
+    }
+  }
+
+  return { results: ordered.slice(0, limit), variants, reranked };
 }

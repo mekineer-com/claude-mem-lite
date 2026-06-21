@@ -52,7 +52,7 @@ async function cmdSearch(db, args, { llm } = {}) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep]');
+    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep] [--rerank]');
     return;
   }
 
@@ -108,6 +108,15 @@ async function cmdSearch(db, args, { llm } = {}) {
     ? true
     : ((flags['no-deep'] === true || flags['no-deep'] === 'true') ? false : undefined);
   const deepMode = resolveDeepMode(explicitDeep, { surface: 'cli' });
+
+  // --rerank: opt-in LLM rerank of the fused top-20 (option C, deep-search.mjs).
+  // One extra Haiku call (~1.4s); only meaningful on the explicit --deep path,
+  // never on auto-escalation. Same rerank core the LongMemEval benchmark measures.
+  const rerankFlag = flags.rerank === true || flags.rerank === 'true';
+  const rerank = rerankFlag && deepMode === 'deep';
+  if (rerankFlag && deepMode !== 'deep') {
+    process.stderr.write('[mem] Note: --rerank requires --deep (it reranks deep-search candidates); ignored\n');
+  }
 
   if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
     fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
@@ -194,12 +203,17 @@ async function cmdSearch(db, args, { llm } = {}) {
         epochTo: dateTo,
         limit: perSourceLimit,
         currentProject: project ? null : inferProject(),
-      }, llm ? { llm } : { auto });
+      }, llm ? { llm, rerank: rerank && !auto } : { auto, rerank: rerank && !auto });
       deepVariants = ds.variants;
       if (deepVariants.length > 1) {
         process.stderr.write(`[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`);
       } else {
         process.stderr.write('[mem] Deep search: rewrite returned no usable variants; used original query only\n');
+      }
+      if (rerank && !auto) {
+        process.stderr.write(ds.reranked
+          ? '[mem] Deep search: LLM-reranked the fused top-20\n'
+          : '[mem] Deep search: rerank produced no usable order; kept fused order\n');
       }
       return ds.results;
     };

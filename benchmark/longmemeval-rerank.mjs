@@ -19,72 +19,11 @@ import { pathToFileURL } from 'url';
 import { createTestDb } from '../tests/test-helpers.mjs';
 import { seedDatabase, seedVectors, searchProductionHybrid } from './benchmark.mjs';
 import { buildCorpus, recallAnyAtK, loadDataset } from './longmemeval.mjs';
-import { parseJsonFromLLM } from '../utils.mjs';
-
-const RERANK_SYSTEM =
-  'You rerank search results. Given a QUERY and numbered candidate session snippets, ' +
-  'decide which sessions most likely contain the answer to the query. ' +
-  'Return ONLY JSON {"ranked":[<candidate numbers, most relevant first, each number once>]}. No prose, no markdown.';
-
-export function buildRerankPrompt(query, snippets) {
-  const lines = snippets.map((s, i) => `${i + 1}. ${String(s).replace(/\s+/g, ' ').slice(0, 400)}`);
-  return {
-    system: RERANK_SYSTEM,
-    user: `QUERY: ${query}\n\nCANDIDATES:\n${lines.join('\n')}\n\nReturn {"ranked":[...]} over 1..${snippets.length}, best first.`,
-  };
-}
-
-// Default provider — lazy import so stub-injected tests never load the client.
-// Uses callLLMWithModel (returns {text}) rather than callModelJSONAsync (which
-// JSON-parses internally and nulls on any non-{...} output) so extractRanked can
-// recover bare-array answers the strict JSON parse drops.
-async function defaultLlm(prompt) {
-  const { callLLMWithModel } = await import('../haiku-client.mjs');
-  return callLLMWithModel(prompt, 'haiku', { timeout: 20000, maxTokens: 300 });
-}
-
-// Extract a 1-based ranking array from whatever the LLM returned: a {ranked:[...]}
-// object (stub / clean JSON), a bare array (clean OR prose-wrapped [..]), or a
-// {text} envelope from callLLMWithModel. The bare-array path is what lifts the
-// real parse-rate: claude-haiku often answers "[3,1,5]" instead of {"ranked":..},
-// and parseJsonFromLLM's leading JSON.parse returns that as an array (no .ranked),
-// which the old object-only check silently dropped. null → nothing recoverable.
-export function extractRanked(raw) {
-  if (raw == null) return null;
-  if (Array.isArray(raw)) return raw;
-  if (typeof raw === 'object' && Array.isArray(raw.ranked)) return raw.ranked;
-  const text = typeof raw === 'string' ? raw : typeof raw.text === 'string' ? raw.text : '';
-  if (!text) return null;
-  const obj = parseJsonFromLLM(text);
-  if (Array.isArray(obj)) return obj; // bare array [3,1,5]
-  if (obj && Array.isArray(obj.ranked)) return obj.ranked; // {"ranked":[...]}
-  const m = text.match(/\[\s*\d+(?:\s*,\s*\d+)*\s*\]/); // prose-wrapped [..]
-  if (m) {
-    try { const a = JSON.parse(m[0]); if (Array.isArray(a)) return a; } catch { /* fall through */ }
-  }
-  return null;
-}
-
-// Reorder candidate session ids per the LLM's chosen 1-based order; any failure →
-// original order ("never worse than baseline"). { order: sid[], parsed: bool }.
-export async function llmRerankOrder(query, cand /* [{sid,text}] */, llm) {
-  const prompt = buildRerankPrompt(query, cand.map((c) => c.text));
-  let raw;
-  try { raw = await llm(prompt); } catch { raw = null; }
-  const order = extractRanked(raw);
-  if (!order) return { order: cand.map((c) => c.sid), parsed: false };
-  const seen = new Set();
-  const out = [];
-  for (const n of order) {
-    const idx = Number(n) - 1;
-    if (Number.isInteger(idx) && idx >= 0 && idx < cand.length && !seen.has(idx)) {
-      seen.add(idx);
-      out.push(cand[idx].sid);
-    }
-  }
-  cand.forEach((c, i) => { if (!seen.has(i)) out.push(c.sid); }); // append omitted, original order
-  return { order: out, parsed: true };
-}
+// Rerank core is shared with the production deep-search rerank stage (rerank.mjs)
+// so the lift measured here reflects the EXACT algorithm that ships.
+import { llmRerankOrder, defaultRerankLLM as defaultLlm } from '../rerank.mjs';
+// Re-export the pieces the harness's own tests import (tests/benchmark-longmemeval-rerank.test.mjs).
+export { extractRanked, llmRerankOrder } from '../rerank.mjs';
 
 export async function rerankEval(entry, { turns = 'user', topK = 20, ks = [1, 5, 10], llm = defaultLlm } = {}) {
   const { data, idToSession, goldIds } = buildCorpus(entry, { turns });

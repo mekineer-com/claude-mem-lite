@@ -31,6 +31,7 @@
     "server-internals.mjs",
     "search-engine.mjs",
     "deep-search.mjs",
+    "rerank.mjs",
     "hook.mjs",
     "hook-shared.mjs",
     "hook-llm.mjs",
