@@ -71,7 +71,15 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // legacy trigger on existing DBs. LATEST_MIGRATION_COLUMN unchanged (no new column).
 // v37 (D#26): adds user_prompts.cc_session_id (additive, nullable). LATEST_MIGRATION_COLUMN
 // MOVES to it so the half-migrated-DB self-heal fast-path covers the new column.
-export const CURRENT_SCHEMA_VERSION = 37;
+// v38 (R1): citation_log table — per-session invocation→cite funnel telemetry. One
+// accumulating row per resolved session (injected_n / cited_n), written by
+// recordCitationFunnel from applyCitationDecay's touched/promoted at Stop. Turns the
+// per-obs cite counters (lifetime-cumulative) into a trendable per-session series so
+// `citation-stats` can answer "is memory invocation effectiveness rising or falling".
+// New TABLE (not a column) reached via CORE_SCHEMA's CREATE TABLE IF NOT EXISTS on the
+// forced migration pass; LATEST_MIGRATION_COLUMN unchanged (no new column) — same
+// pattern as v35/v36.
+export const CURRENT_SCHEMA_VERSION = 38;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
@@ -167,6 +175,15 @@ const CORE_SCHEMA = `
     match_keywords TEXT,
     created_at_epoch INTEGER,
     PRIMARY KEY (project, type, session_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS citation_log (
+    project TEXT NOT NULL,
+    memory_session_id TEXT NOT NULL,
+    resolved_at INTEGER,
+    injected_n INTEGER NOT NULL DEFAULT 0,
+    cited_n INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, memory_session_id)
   );
 `;
 

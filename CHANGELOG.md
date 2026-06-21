@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.6.0 — per-session invocation→cite funnel in `citation-stats`
+
+Additive telemetry, no change to search/recall/injection behaviour. The citation-decay feedback loop already tracked per-observation cite counters (lifetime-cumulative) and recomputed a per-session cite-recall ratio at SessionStart (ephemeral, never stored). v3.6.0 persists each session's resolution as a trendable series so `citation-stats` can answer what the per-obs counters can't: **is memory invocation effectiveness rising or falling over time.**
+
+### feat: per-session invocation→cite funnel (`citation_log` table + `citation-stats` trend)
+
+A new `citation_log` table (schema v38) records one accumulating row per resolved session — `(project, memory_session_id, resolved_at, injected_n, cited_n)`. It is written at Stop by `recordCitationFunnel`, fed directly from `applyCitationDecay`'s return: `touched` (observations resolved this run) is the denominator, `promoted` (observations cited this run) is the numerator. No new transcript scan, and idempotent against Stop multi-fire by construction — a re-fired Stop re-resolves nothing, so `touched` is 0 and the write is a no-op.
+
+`citation-stats` gains an "Invocation→cite funnel" section: the most recent sessions with their per-session cite rate, plus a windowed aggregate (`--days`, default 7) compared against the prior window of equal length, with a direction delta — e.g. `window rate 66.7% cited 6/9 (prior 7d 25.0%) ↑ +41.7pt`. The `--json` output gains a `funnel` object. Read logic lives in `computeCitationFunnelTrend` in the shared `lib/citation-tracker.mjs`, so any future MCP consumer calls the same function (no CLI↔MCP drift).
+
+This makes invocation effectiveness — previously inferable only from architecture — directly measurable per project over time.
+
 ## v3.5.0 — search results show a `~Nt` fetch-cost hint
 
 Additive, **default-on**. Every `mem_search` / `claude-mem-lite search` result row now carries a `~Nt` estimate of the tokens it would cost to fetch that result's full body via `mem_get`, so the agent (or you) can budget the search → timeline → get protocol before paying to expand any ID. Ranking, recall, and *which* results are returned are unchanged — only the rendered output gains a hint.

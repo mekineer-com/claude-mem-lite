@@ -40,6 +40,7 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
+import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
 import { aggregateMetrics } from './lib/metrics.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
@@ -2313,8 +2314,12 @@ function cmdCitationStats(db, args) {
     ? `${pollutedRows.n} obs have cited_count > decay_seen_count (pre-v34 backfill — invariant holds for new data).`
     : null;
 
+  // R1: per-session invocation→cite funnel trend (citation_log). Same `days` window
+  // as the per-project cite rate above; funnel.prior/delta_pt show the direction.
+  const funnel = computeCitationFunnelTrend(db, { days });
+
   if (json) {
-    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote }, null, 2));
+    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote, funnel }, null, 2));
     return;
   }
 
@@ -2324,6 +2329,28 @@ function cmdCitationStats(db, args) {
     const rate = r.resolved > 0 ? (r.cited * 100 / r.resolved).toFixed(1) + '%' : '—';
     out(`  ${r.project.padEnd(34)} ${String(rate).padStart(6)}   cited:${r.cited}/${r.resolved}   at_risk:${r.at_risk}`);
   }
+  out('');
+
+  // R1: invocation→cite funnel — per-session trend + window-vs-prior direction.
+  out(`Invocation→cite funnel (recent sessions, injected→cited; rate window ${days}d):`);
+  if (funnel.sessions.length === 0) {
+    out('  (no resolved sessions in window)');
+  } else {
+    for (const s of funnel.sessions) {
+      const day = s.resolved_at ? new Date(s.resolved_at).toISOString().slice(0, 10) : '—'.repeat(10);
+      const pct = (s.rate * 100).toFixed(1) + '%';
+      out(`  ${day}  ${(s.project || '').padEnd(28)} inj ${String(s.injected_n).padStart(3)}  cited ${String(s.cited_n).padStart(3)}  ${pct.padStart(6)}`);
+    }
+  }
+  let trendLine = `window rate ${(funnel.window.rate * 100).toFixed(1)}%  cited ${funnel.window.cited}/${funnel.window.injected}`;
+  if (funnel.delta_pt === null) {
+    trendLine += '  (no prior-window data)';
+  } else {
+    const arrow = funnel.delta_pt > 0 ? '↑' : funnel.delta_pt < 0 ? '↓' : '→';
+    const sign = funnel.delta_pt > 0 ? '+' : '';
+    trendLine += `  (prior ${days}d ${(funnel.prior.rate * 100).toFixed(1)}%)  ${arrow} ${sign}${funnel.delta_pt}pt`;
+  }
+  out(trendLine);
   out('');
   out('Active decay queue (uncited_streak >= 2, next miss → demote):');
   if (decayQueue.length === 0) out('  (none)');

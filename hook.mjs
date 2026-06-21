@@ -54,6 +54,7 @@ import {
   bumpCitationAccess,
   computeCiteRecall,
   applyCitationDecay,
+  recordCitationFunnel,
   hasMainThreadAssistantText,
 } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
@@ -572,6 +573,10 @@ async function handleStop() {
                 for (const id of citeBackIds) citedMain.add(id);
                 const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
                 debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
+                // R1: persist this session's invocation→cite funnel row. touched =
+                // obs resolved this run (denominator), promoted = obs cited this run
+                // (numerator). Idempotent (touched is 0 on re-fire) + best-effort.
+                recordCitationFunnel(db, project, sessionId, r.touched, r.promoted);
               }
             }
           } catch (e) { debugCatch(e, 'handleStop-citation-decay'); }

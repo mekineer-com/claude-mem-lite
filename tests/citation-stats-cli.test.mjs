@@ -185,4 +185,25 @@ describe('citation-stats CLI', () => {
     expect(Array.isArray(parsed.demoted)).toBe(true);
     expect(parsed.demoted[0].title).toBe('d-json');
   });
+
+  it('renders the per-session invocation→cite funnel section', async () => {
+    testDb.prepare(
+      'INSERT INTO citation_log (project, memory_session_id, resolved_at, injected_n, cited_n) VALUES (?,?,?,?,?)'
+    ).run('p1', 'fs1', Date.now(), 9, 6);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/funnel/i);
+    expect(output).toContain('9');
+    expect(output).toContain('6');
+  });
+
+  it('--json includes funnel trend object', async () => {
+    testDb.prepare(
+      'INSERT INTO citation_log (project, memory_session_id, resolved_at, injected_n, cited_n) VALUES (?,?,?,?,?)'
+    ).run('p1', 'fs1', Date.now(), 9, 6);
+    const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
+    const parsed = JSON.parse(output);
+    expect(parsed.funnel).toBeDefined();
+    expect(parsed.funnel.window.injected).toBe(9);
+    expect(parsed.funnel.window.cited).toBe(6);
+  });
 });
