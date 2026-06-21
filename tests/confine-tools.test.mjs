@@ -8,7 +8,7 @@ function run(input) {
     const c = spawn('node', [SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '';
     c.stdout.on('data', (d) => { out += d; });
-    c.on('close', () => res(out));
+    c.on('close', (code) => res({ out, code }));
     c.on('error', rej);
     c.stdin.write(JSON.stringify(input)); c.stdin.end();
     setTimeout(() => { c.kill(); rej(new Error('timeout')); }, 5000);
@@ -17,21 +17,23 @@ function run(input) {
 
 describe('confine-tools (harness-only deny hook)', () => {
   it('denies Bash with a permissionDecision + reason', async () => {
-    const out = await run({ tool_name: 'Bash', tool_input: { command: 'ls' } });
+    const { out, code } = await run({ tool_name: 'Bash', tool_input: { command: 'ls' } });
     const d = JSON.parse(out).hookSpecificOutput;
     expect(d.permissionDecision).toBe('deny');
     expect(d.permissionDecisionReason).toMatch(/Edit tool/);
+    expect(code).toBe(0);
   });
   it('denies Agent and Task too', async () => {
     for (const t of ['Agent', 'Task']) {
-      const out = await run({ tool_name: t, tool_input: {} });
+      const { out } = await run({ tool_name: t, tool_input: {} });
       expect(JSON.parse(out).hookSpecificOutput.permissionDecision).toBe('deny');
     }
   });
   it('allows Edit and Read (empty stdout = no decision)', async () => {
     for (const t of ['Edit', 'Read']) {
-      const out = await run({ tool_name: t, tool_input: { file_path: '/x' } });
+      const { out, code } = await run({ tool_name: t, tool_input: { file_path: '/x' } });
       expect(out).toBe('');
+      expect(code).toBe(0);
     }
   });
   it('survives malformed stdin (exit 0, empty out)', async () => {
