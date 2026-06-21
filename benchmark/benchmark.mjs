@@ -9,7 +9,7 @@ import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
 import { deepSearch } from '../deep-search.mjs';
 import { computeVector, rebuildVocabulary, _resetVocabCache, VOCAB_DIM, MIN_COSINE_SIMILARITY, RRF_K } from '../tfidf.mjs';
-import { OBS_BM25 } from '../scoring-sql.mjs';
+import { OBS_BM25, TYPE_QUALITY_CASE } from '../scoring-sql.mjs';
 import { createTestDb } from '../tests/test-helpers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -148,20 +148,26 @@ export function searchProductionHybrid(db, query, { limit = 10, project = null, 
 // ─── Search (mirrors server.mjs BM25 query exactly) ────────────────────────
 //
 // Modes:
-//   'hybrid'        — production scoring: BM25 × time-decay × project-boost ×
-//                     importance × access-bonus. Mirrors server.mjs.
+//   'hybrid'        — production scoring: BM25 × time-decay × type-quality ×
+//                     project-boost × importance × access-bonus × lesson-boost.
+//                     Mirrors search-engine.mjs FULL_SCORE (the full chain).
 //   'bm25_only'     — strips all multipliers, pure BM25 ranking. Tests whether
 //                     production multipliers add lift over raw FTS5.
 //   'recency'       — no FTS, ORDER BY created_at_epoch DESC. Tests whether FTS
 //                     retrieval adds anything over "newest-first" baseline.
 //   'random'        — deterministic shuffle (seeded by query). Sanity floor —
 //                     anything that doesn't beat random is broken.
-//   'no_decay'      — drop time-decay; keep project/importance/access. Per-term
-//                     ablation: how much does the recency multiplier earn?
+//   'no_decay'      — drop time-decay; keep the rest. Per-term ablation: how
+//                     much does the recency multiplier earn?
+//   'no_type'       — drop TYPE_QUALITY_CASE; isolates type-quality lift. The
+//                     fixture spans 5 types, so this one is genuinely measurable.
 //   'no_project'    — drop project boost; isolates whether current-project bias
 //                     is doing real work on the eval set.
 //   'no_importance' — drop the (0.5+0.5*importance) multiplier.
 //   'no_access'     — drop the (1+0.1*ln(1+access)) multiplier.
+//   'no_lesson'     — drop the (1+0.3*lesson) boost. The fixture has 0
+//                     lesson_learned rows, so this multiplier is a constant 1.0×
+//                     there and reports 0 by construction (untestable here).
 //
 // Per-term ablation modes were added to answer "do these multipliers earn their
 // keep?" — the previous matrix only compared full-hybrid vs bm25_only, leaving
@@ -171,23 +177,35 @@ export function searchProductionHybrid(db, query, { limit = 10, project = null, 
 
 const MULT_EXPR = {
   decay:      '(1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))',
+  // type imports the real TYPE_QUALITY_CASE (no hardcoded copy — #8770); lesson
+  // mirrors search-engine.mjs FULL_SCORE's inline boost (no exported constant —
+  // keep in sync). Both added so `hybrid` mirrors the full production chain.
+  type:       TYPE_QUALITY_CASE,
   project:    '(CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)',
   importance: '(0.5 + 0.5 * COALESCE(o.importance, 1))',
   access:     '(1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))',
+  lesson:     '(1.0 + 0.3 * (o.lesson_learned IS NOT NULL))',
 };
 const MULT_PARAMS = {
   decay:      (now)         => [now],
+  type:       ()            => [],
   project:    (_now, project)=> [project, project],
   importance: ()            => [],
   access:     ()            => [],
+  lesson:     ()            => [],
 };
+// NOTE: decay must precede project in every term list so the bound params
+// (decay → [now], project → [project, project]) stay aligned with the `?`
+// placeholders. type/importance/access/lesson contribute no params.
 const MODE_TERMS = {
-  hybrid:        ['decay', 'project', 'importance', 'access'],
+  hybrid:        ['decay', 'type', 'project', 'importance', 'access', 'lesson'],
   bm25_only:     [],
-  no_decay:      ['project', 'importance', 'access'],
-  no_project:    ['decay', 'importance', 'access'],
-  no_importance: ['decay', 'project', 'access'],
-  no_access:     ['decay', 'project', 'importance'],
+  no_decay:      ['type', 'project', 'importance', 'access', 'lesson'],
+  no_type:       ['decay', 'project', 'importance', 'access', 'lesson'],
+  no_project:    ['decay', 'type', 'importance', 'access', 'lesson'],
+  no_importance: ['decay', 'type', 'project', 'access', 'lesson'],
+  no_access:     ['decay', 'type', 'project', 'importance', 'lesson'],
+  no_lesson:     ['decay', 'type', 'project', 'importance', 'access'],
 };
 
 function searchObservations(db, query, options = {}) {
@@ -459,7 +477,7 @@ function round(v) {
 // doesn't beat recency-only is broken.
 
 const BASELINE_MODES = ['hybrid', 'bm25_only', 'recency', 'random'];
-const ABLATION_MODES = ['no_decay', 'no_project', 'no_importance', 'no_access'];
+const ABLATION_MODES = ['no_decay', 'no_type', 'no_project', 'no_importance', 'no_access', 'no_lesson'];
 
 /**
  * Deterministically partition a query fixture into train + eval splits so the

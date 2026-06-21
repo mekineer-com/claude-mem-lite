@@ -66,7 +66,7 @@ describe('benchmark ablation modes', () => {
     // One query is enough to exercise the SQL path for each mode.
     const queries = queryData.queries.slice(0, 1);
 
-    for (const mode of ['no_decay', 'no_project', 'no_importance', 'no_access']) {
+    for (const mode of ['no_decay', 'no_type', 'no_project', 'no_importance', 'no_access', 'no_lesson']) {
       const r = runBenchmark(db, queries, mode);
       expect(r.metrics.recall_at_10).toBeTypeOf('number');
       expect(r.mode).toBe(mode);

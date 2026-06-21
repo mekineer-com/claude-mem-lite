@@ -7,23 +7,26 @@ import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 //
 // The recency-decay, type-quality, project-boost, importance, cite, and noise
 // multipliers below encode PRODUCT PRIORS: recent / same-project / important /
-// frequently-cited memories are more relevant to the CURRENT dev session. They
-// are deliberately NOT retrieval-quality tricks, so retrieval benchmarks can't
-// score them — and a periodic audit WILL flag them as "0-lift dead weight":
-//   * benchmark.mjs --matrix (synthetic micro-fixture): decay/project/importance/
-//     access add <=0.006 nDCG, project & access exactly 0 — but the fixture is
-//     single-project, access_count=0, near-uniform timestamps, so it structurally
-//     cannot exercise them.
-//   * longmemeval.mjs --temporal (n=500, real session dates): bit-identical to
-//     uniform — LongMemEval-S windows (mean 27.9d, 74% <30d) are far shorter than
-//     these half-lives, so decay moves no rank.
-// Zero measured lift is a benchmark-MISMATCH artifact, not dead weight — 0 queries
-// are ever hurt. Decision (obs #8773): KEEP them; do NOT delete on "0 lift".
-// Guardrail: the ci-gate `hybrid_over_bm25 >= -0.05` floor (benchmark/ci-gate.mjs)
-// catches the SQL-path aggregate (decay/project/importance/access) turning
-// actively harmful. NOTE it does NOT yet cover type-quality/lesson/cite/noise.
-// Genuine validation needs a labeled real-dev-memory eval, not a lexical recall
-// benchmark.
+// high-signal-type / frequently-cited memories are more relevant to the CURRENT
+// dev session. A periodic audit tends to flag them as "0-lift dead weight" —
+// resist that on benchmark evidence alone. Measured (audit ②, obs #8773):
+//   * benchmark.mjs --matrix (micro-fixture, now models the full FULL_SCORE
+//     chain): type-quality is the TOP contributor (drop-type ΔnDCG=0.0082,
+//     ΔMRR=0.0166), decay +0.0043 nDCG, importance +0.0012; the chain lifts
+//     hybrid over bm25_only by +0.0093 nDCG / +0.0166 MRR (net 0 queries hurt).
+//     project, access and lesson read exactly 0 — but that is STRUCTURAL: the
+//     fixture is single-project, access_count=0, and has 0 lesson_learned rows,
+//     so it cannot vary those three axes.
+//   * longmemeval.mjs --temporal (n=500, real dates): bit-identical to uniform —
+//     LongMemEval-S windows (mean 27.9d, 74% <30d) are far shorter than these
+//     half-lives, so decay moves no rank there either.
+// Where a multiplier reads 0 it is a benchmark-MISMATCH artifact (the instrument
+// can't vary that axis), NOT proven dead weight. Decision: KEEP them; do NOT
+// delete on "0 lift". Guardrail: the ci-gate `hybrid_over_bm25 >= -0.05` floor
+// (benchmark/ci-gate.mjs) covers the full modelled chain
+// (decay/type/project/importance/access/lesson); cite + noise live on the
+// injection path (hook-memory.mjs) with no recall-benchmark coverage. Genuine
+// validation of the prior-encoding axes needs a labeled real-dev-memory eval.
 
 // ─── Type-Differentiated Recency Decay ──────────────────────────────────────
 
