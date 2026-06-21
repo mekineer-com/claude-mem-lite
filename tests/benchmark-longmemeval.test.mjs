@@ -15,6 +15,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import {
   buildCorpus,
+  parseLmeDate,
   recallAnyAtK,
   recallFractionalAtK,
   evalEntry,
@@ -102,6 +103,63 @@ describe('evalEntry — real production hybrid retrieval', () => {
     // so user-mode retrieval cannot surface it — this is the honest raw-baseline behavior.
     const r = evalEntry(byId('q-assistant-codename'), { turns: 'user', ks: [1, 5, 10] });
     expect(r.ks['5']).toBe(0);
+  });
+});
+
+describe('parseLmeDate — LongMemEval date parsing', () => {
+  it('parses the "YYYY/MM/DD (Day) HH:MM" format by stripping the weekday paren', () => {
+    const a = parseLmeDate('2023/05/30 (Tue) 23:40');
+    const b = parseLmeDate('2023/05/30 (Tue) 22:40');
+    expect(Number.isFinite(a)).toBe(true);
+    // one hour earlier → 3_600_000 ms less (sanity that HH:MM is honored)
+    expect(a - b).toBe(3600000);
+  });
+  it('returns null on missing / unparseable input (caller falls back to offset 0)', () => {
+    expect(parseLmeDate(null)).toBe(null);
+    expect(parseLmeDate(undefined)).toBe(null);
+    expect(parseLmeDate('')).toBe(null);
+    expect(parseLmeDate('not a date')).toBe(null);
+  });
+});
+
+describe('buildCorpus — temporal dating (--temporal ablation)', () => {
+  // Sessions precede the question by 0 / ~15 / ~90 days. question_date is the "now".
+  const datedEntry = {
+    question_id: 'q-dated',
+    question_date: '2023/05/30 (Tue) 12:00',
+    haystack_session_ids: ['s-old', 's-mid', 's-new'],
+    haystack_dates: ['2023/03/01 (Wed) 12:00', '2023/05/15 (Mon) 12:00', '2023/05/30 (Tue) 11:00'],
+    haystack_sessions: [
+      [{ role: 'user', content: 'old session about caching' }],
+      [{ role: 'user', content: 'mid session about indexing' }],
+      [{ role: 'user', content: 'new session about ranking' }],
+    ],
+    answer_session_ids: ['s-new'],
+  };
+
+  it('default (no temporal) keeps every session at offset 0 — preserves the uniform baseline', () => {
+    const { data } = buildCorpus(datedEntry);
+    expect(data.observations.map((o) => o.epoch_offset_days)).toEqual([0, 0, 0]);
+  });
+
+  it('temporal dates each session from haystack_dates relative to question_date (offsets ≤ 0, monotonic by age)', () => {
+    const { data } = buildCorpus(datedEntry, { temporal: true });
+    const [oldOff, midOff, newOff] = data.observations.map((o) => o.epoch_offset_days);
+    // newest session is ~1h before the question → ~0; older sessions are progressively more negative
+    expect(newOff).toBeGreaterThan(-1);
+    expect(newOff).toBeLessThanOrEqual(0);
+    expect(midOff).toBeLessThan(-10);
+    expect(midOff).toBeGreaterThan(-20);
+    expect(oldOff).toBeLessThan(-60);
+    // strictly increasing toward the present — the property the decay multiplier reads
+    expect(oldOff).toBeLessThan(midOff);
+    expect(midOff).toBeLessThan(newOff);
+  });
+
+  it('temporal with no dates falls back to offset 0 (no crash on undated datasets)', () => {
+    const undated = { ...datedEntry, haystack_dates: [], question_date: undefined };
+    const { data } = buildCorpus(undated, { temporal: true });
+    expect(data.observations.map((o) => o.epoch_offset_days)).toEqual([0, 0, 0]);
   });
 });
 

@@ -78,3 +78,22 @@ jobs:
       - run: npm ci
       - name: Run benchmark gate
         run: node benchmark/ci-gate.mjs
+
+  # Real publishable-tarball install: npm pack → clean-dir npm install →
+  # better-sqlite3 native rebuild → import entry + open DB. This is the ONLY CI
+  # coverage of the real install path — install-e2e.test.mjs uses --dev symlinks
+  # (skips npm install) and hook-update.test.mjs mocks all tarball I/O. Guards
+  # #8719 lockfile/native-shape drift, better-sqlite3 ABI breaks, and tarball
+  # runtime completeness. Runs in parallel (no `needs`): packaging health is
+  # orthogonal to the unit suite and should surface even if a unit test is flaky.
+  # No `npm ci` — the script packs from the "files" whitelist and installs fresh.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - name: Real tarball install smoke test
+        run: node scripts/smoke-tarball.mjs

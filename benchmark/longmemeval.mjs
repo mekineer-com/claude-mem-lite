@@ -18,9 +18,16 @@
 //     (their longmemeval_bench.py:188). A fact that lives only in an assistant
 //     turn is intentionally NOT in the haystack. `--turns all` indexes both and is
 //     NOT comparable to their raw number.
-//   * Timestamps are uniform (epoch_offset_days=0) so time-decay does not skew
-//     retrieval — this isolates the retrieval signal. Temporal modelling is a
-//     separate experiment.
+//   * Timestamps default to uniform (epoch_offset_days=0) so time-decay does not
+//     skew retrieval — this isolates the pure retrieval signal. Pass --temporal
+//     to date each session from its real haystack_dates relative to
+//     question_date; the production type-decay multiplier then varies by age, so
+//     the uniform-vs-temporal recall delta isolates decay's contribution.
+//     CAVEAT: LongMemEval gold is NOT recency-correlated (the answer can sit in
+//     any session), so a temporal delta measures decay against a recency-agnostic
+//     relevance structure — it does NOT model real dev-memory, where recent work
+//     is genuinely more relevant. A decay-hurts-recall result here is expected
+//     benchmark mismatch, not evidence that decay is dead weight.
 //   * Metric is recall_any@k ("is ANY gold session in top-k", binary, averaged) —
 //     the LongMemEval headline metric, NOT benchmark.mjs's fractional
 //     computeRecallAtK.
@@ -48,9 +55,27 @@ import {
 // an integer index and map back via idToSession. The session text lands in
 // `narrative` + `text` (both FTS-indexed via OBS_FTS_COLUMNS) and `narrative`
 // also feeds the TF-IDF vector arm, so both retrieval arms see the content.
-export function buildCorpus(entry, { turns = 'user' } = {}) {
+// LongMemEval dates look like "2023/05/30 (Tue) 23:40". Strip the weekday paren
+// so Date.parse accepts the "YYYY/MM/DD HH:MM" remainder. Returns epoch ms, or
+// null on missing/unparseable input (caller falls back to offset 0). Timezone is
+// irrelevant — only relative differences between session dates are used.
+export function parseLmeDate(s) {
+  if (!s || typeof s !== 'string') return null;
+  const t = Date.parse(s.replace(/\s*\([A-Za-z]+\)\s*/, ' ').trim());
+  return Number.isFinite(t) ? t : null;
+}
+
+export function buildCorpus(entry, { turns = 'user', temporal = false } = {}) {
   const sessions = entry.haystack_sessions || [];
   const sessionIds = entry.haystack_session_ids || [];
+  const dates = entry.haystack_dates || [];
+  // Temporal mode: date each session from its real haystack_dates relative to
+  // question_date (the "now" the question is asked at), so created_at_epoch — and
+  // therefore the production type-decay multiplier — varies by age instead of
+  // being a constant 2.0. Sessions precede the question, so offsets are ≤0.
+  // Uniform vs temporal differ ONLY in created_at_epoch, so any recall delta
+  // isolates decay (type/project/importance are identical across both runs).
+  const qNow = temporal ? parseLmeDate(entry.question_date) : null;
   const idToSession = new Map();
   const observations = [];
 
@@ -61,12 +86,19 @@ export function buildCorpus(entry, { turns = 'user' } = {}) {
     const intId = i + 1;
     const sid = sessionIds[i] ?? `idx-${i}`;
     idToSession.set(intId, sid);
+    let offsetDays = 0;
+    if (qNow !== null) {
+      const d = parseLmeDate(dates[i]);
+      if (d !== null) offsetDays = Math.min(0, (d - qNow) / 86400000);
+    }
     observations.push({
       id: intId,
       session_id: `lme-${entry.question_id}`,
       project: 'lme',
       // observations.type has a CHECK constraint; all docs share one type so
-      // TYPE_QUALITY is a constant multiplier with no within-corpus ranking effect.
+      // TYPE_QUALITY is a constant multiplier with no within-corpus ranking
+      // effect. With --temporal, the type-decay half-life (discovery=60d) is the
+      // only metadata axis that varies, which is exactly what we want to isolate.
       type: 'discovery',
       title: docText.slice(0, 80),
       narrative: docText,
@@ -75,7 +107,7 @@ export function buildCorpus(entry, { turns = 'user' } = {}) {
       facts: '',
       files_modified: '[]',
       importance: 1,
-      epoch_offset_days: 0,
+      epoch_offset_days: offsetDays,
     });
   }
 
@@ -115,8 +147,8 @@ export function recallFractionalAtK(rankedIds, goldIds, k = 5) {
 // Fresh in-memory DB per question (the haystack is question-scoped: ~53 sessions
 // in the real set), seed both retrieval arms, run the production hybrid search,
 // map result ids back to session ids, score recall_any@k.
-export function evalEntry(entry, { turns = 'user', ks = [1, 5, 10], limit = 10 } = {}) {
-  const { data, idToSession, goldIds } = buildCorpus(entry, { turns });
+export function evalEntry(entry, { turns = 'user', temporal = false, ks = [1, 5, 10], limit = 10 } = {}) {
+  const { data, idToSession, goldIds } = buildCorpus(entry, { turns, temporal });
   const fetchN = Math.max(limit, ...ks);
   const db = createTestDb();
   let retrieved = [];
@@ -149,8 +181,8 @@ export function evalEntry(entry, { turns = 'user', ks = [1, 5, 10], limit = 10 }
 }
 
 // ─── Aggregation ─────────────────────────────────────────────────────────────
-export function runLongMemEval(entries, { turns = 'user', ks = [1, 5, 10], limit = 10 } = {}) {
-  const perQuestion = entries.map((e) => evalEntry(e, { turns, ks, limit }));
+export function runLongMemEval(entries, { turns = 'user', temporal = false, ks = [1, 5, 10], limit = 10 } = {}) {
+  const perQuestion = entries.map((e) => evalEntry(e, { turns, temporal, ks, limit }));
 
   const meanRecall = (rows, field = 'ks') => {
     const out = {};
@@ -170,7 +202,7 @@ export function runLongMemEval(entries, { turns = 'user', ks = [1, 5, 10], limit
   }
 
   return {
-    config: { turns, ks, limit },
+    config: { turns, temporal, ks, limit },
     n: perQuestion.length,
     overall: { recallAny: meanRecall(perQuestion), recallFrac: meanRecall(perQuestion, 'ksFrac'), ndcg: mean(perQuestion, (r) => r.ndcg), mrr: mean(perQuestion, (r) => r.mrr) },
     perType,
@@ -185,10 +217,11 @@ export function loadDataset(path) {
 }
 
 function parseArgs(args) {
-  const opts = { turns: 'user', ks: [1, 5, 10], limit: 10, max: Infinity, out: null, dataset: null };
+  const opts = { turns: 'user', temporal: false, ks: [1, 5, 10], limit: 10, max: Infinity, out: null, dataset: null };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--turns') opts.turns = args[++i];
+    else if (a === '--temporal') opts.temporal = true;
     else if (a === '--ks') opts.ks = args[++i].split(',').map(Number);
     else if (a === '--limit') opts.limit = Number(args[++i]);
     else if (a === '--max') opts.max = Number(args[++i]);
@@ -206,7 +239,7 @@ function main(argv) {
   const opts = parseArgs(argv.slice(2));
   if (!opts.dataset) {
     process.stderr.write(
-      'Usage: node benchmark/longmemeval.mjs <dataset.json> [--turns user|all] [--ks 1,5,10] [--limit 10] [--max N] [--out results.jsonl]\n' +
+      'Usage: node benchmark/longmemeval.mjs <dataset.json> [--turns user|all] [--temporal] [--ks 1,5,10] [--limit 10] [--max N] [--out results.jsonl]\n' +
         'Dataset is not committed (~300 MB). Fetch it first:\n' +
         '  bash benchmark/datasets/download-longmemeval.sh\n'
     );
@@ -215,12 +248,12 @@ function main(argv) {
 
   let entries = loadDataset(opts.dataset);
   if (Number.isFinite(opts.max)) entries = entries.slice(0, opts.max);
-  process.stderr.write(`Running LongMemEval on ${entries.length} questions (turns=${opts.turns}) …\n`);
+  process.stderr.write(`Running LongMemEval on ${entries.length} questions (turns=${opts.turns}${opts.temporal ? ', temporal' : ''}) …\n`);
 
   const out = runLongMemEval(entries, { turns: opts.turns, ks: opts.ks, limit: opts.limit });
 
   const lines = [];
-  lines.push(`\nLongMemEval — claude-mem-lite (lexical FTS5+TF-IDF+RRF, turns=${opts.turns}, n=${out.n})`);
+  lines.push(`\nLongMemEval — claude-mem-lite (lexical FTS5+TF-IDF+RRF, turns=${opts.turns}${opts.temporal ? ', temporal' : ''}, n=${out.n})`);
   lines.push(`  recall_any@k:  ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallAny[String(k)])}`).join('  ')}   nDCG=${out.overall.ndcg.toFixed(3)}  MRR=${out.overall.mrr.toFixed(3)}`);
   lines.push(`  recall_frac@k: ${opts.ks.map((k) => `@${k}=${fmtPct(out.overall.recallFrac[String(k)])}`).join('  ')}   (standard recall@k = |gold∩topk|/|gold|; stricter on the 65% multi-gold questions)`);
   lines.push('  per question_type (any-hit / fractional):');
