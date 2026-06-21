@@ -236,6 +236,14 @@ async function runArmSeed(spec, arm, seed, cfgDir, model) {
     if (cfg.inject) {
       cell.injected = probeInjection(sb, wt, spec.srcFiles[0]);
       if (!cell.injected) { cell.pass = null; cell.note = 'INJECTION FAILED — discard'; return cell; }
+      // CONTAMINATION FIX (2026-06-22): probeInjection runs pre-tool-recall, which
+      // writes the PROJECT-scoped cross-hook dedup file (.claude-mem-injected-<project>)
+      // + a probe cooldown into the sandbox runtime. Left in place, the real session
+      // reads them (readCrossHookInjected) and DEDUPS the lesson away → ZERO injection
+      // in every injected arm (A/AL/F floored at 0 not because the directive is inert
+      // but because the model never saw the lesson). Wipe the sandbox runtime so the
+      // session's first recall injects fresh. Arm T (not injected) never probes.
+      rmSync(join(sb, 'runtime'), { recursive: true, force: true });
     }
     const reqSuffix = (cfg.appendRequirement && spec.requirement) ? ' ' + spec.requirement : '';
     const task = spec.task + reqSuffix + TASK_SUFFIX;
