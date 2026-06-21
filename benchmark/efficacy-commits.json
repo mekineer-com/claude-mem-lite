@@ -11,6 +11,7 @@
       "lessonTitle": "purgeStale/cleanupBroken orphaned a deleted keeper's children (compressed_into no FK)",
       "lesson": "When hard-DELETEing rows referenced by a no-FK soft-delete pointer (compressed_into), recover the referencing rows FIRST (null the pointer to un-hide) — enumerate ALL hard-delete paths (purgeStale AND cleanupBroken), not just the obvious one.",
       "lessonBody": "compressed_into has no FK; hard-deleting a merge-target orphans its children, hidden from every COALESCE(compressed_into,0)=0 view. Fix: recoverChildrenOf sets compressed_into=NULL on children, THEN delete.",
+      "requirement": "Additionally, each function must recover any orphaned children (set their compressed_into to NULL) BEFORE it hard-deletes a keeper row, so no child is left dangling behind a missing parent.",
       "patchFile": "benchmark/fixtures/bac2e85-bug-reintroduce.patch",
       "oracleRef": "HEAD",
       "_construction": "patch (2026-06-13): surgical revert started conflicting once later commits (#8639 self-merge guard, recoverChildrenOf export for delete paths) touched the region — exactly #8650 pool decay. Patch restores the pre-bac2e85 buggy bodies of cleanupBroken/purgeStale onto current code, KEEPS recoverChildrenOf (now shared by delete paths), and excises the 2 regression tests from the worktree oracle. Regenerate when it stops applying: see git log for this file."

@@ -43,6 +43,8 @@ import { execSync, execFileSync, execFile } from 'child_process';
 import { promisify } from 'util';
 const execFileP = promisify(execFile);
 
+import { armConfig, INJECTED_ARMS } from '../lib/efficacy-arms.mjs';
+
 const REPO = process.cwd();
 const args = Object.fromEntries(process.argv.slice(2).map((a) => {
   const m = a.match(/^--([^=]+)(?:=(.*))?$/); return m ? [m[1], m[2] ?? true] : [a, true];
@@ -52,7 +54,6 @@ const K = parseInt(args.k || '3', 10);
 //       AL = lesson injected with CLAUDE_MEM_SALIENCE=legacy (pre-v2.98 format),
 //       C = empty sandbox control.
 const ARMS = (args.arms || 'A,C').split(',');
-const INJECTED_ARMS = new Set(['A', 'AL']);
 const ISOLATED = !!args.isolated;
 const BASELINE_ONLY = !!args['baseline-only'];
 const ONLY_COMMIT = args.commit || null;
@@ -153,10 +154,18 @@ function makePinnedConfigDir(model) {
     command: `node "${join(REPO, 'scripts/hook-launcher.mjs')}" scripts/${script}`,
     timeout,
   });
+  const rawHook = (relPath, timeout) => ({
+    type: 'command',
+    command: `node "${join(REPO, relPath)}"`,
+    timeout,
+  });
   writeFileSync(join(cfg, 'settings.json'), JSON.stringify({
     ...(model ? { model } : {}),
     hooks: {
-      PreToolUse: [{ matcher: 'Edit|Write|NotebookEdit|Read', hooks: [hook('pre-tool-recall.js', 3)] }],
+      PreToolUse: [
+        { matcher: 'Edit|Write|NotebookEdit|Read', hooks: [hook('pre-tool-recall.js', 3)] },
+        { matcher: 'Bash|Agent|Task', hooks: [rawHook('benchmark/confine-tools.js', 2)] },
+      ],
       UserPromptSubmit: [{ matcher: '*', hooks: [hook('user-prompt-search.js', 2)] }],
     },
   }, null, 2));
@@ -186,7 +195,7 @@ function runOracle(wt, oracleTestRel, commit) {
 // ── mem sandbox seeding ──────────────────────────────────────────────────────
 function seedSandbox(arm, spec) {
   const sb = mkdtempSync(join(tmpdir(), `eff-mem${arm}-`));
-  if (INJECTED_ARMS.has(arm)) {
+  if (armConfig(arm).inject) {
     const filesArg = spec.srcFiles.map((f) => `--files ${f}`).join(' ');
     execFileSync('bash', ['-c',
       `CLAUDE_MEM_DIR='${sb}' claude-mem-lite save --type bugfix --importance 2 --project projects--mem ` +
@@ -216,18 +225,20 @@ async function runArmSeed(spec, arm, seed, cfgDir, model) {
   const sb = seedSandbox(arm, spec);
   const cell = { commit: spec.hash, arm, seed };
   if (cfgDir) { cell.env = 'isolated-v2'; cell.model = model || 'cli-default'; }
-  if (INJECTED_ARMS.has(arm)) cell.salience = arm === 'AL' ? 'legacy' : 'current';
+  const cfg = armConfig(arm);
+  if (cfg.inject) cell.salience = cfg.salience || 'current';
   try {
-    if (INJECTED_ARMS.has(arm)) {
+    if (cfg.inject) {
       cell.injected = probeInjection(sb, wt, spec.srcFiles[0]);
       if (!cell.injected) { cell.pass = null; cell.note = 'INJECTION FAILED — discard'; return cell; }
     }
-    const task = spec.task + TASK_SUFFIX;
+    const reqSuffix = (cfg.appendRequirement && spec.requirement) ? ' ' + spec.requirement : '';
+    const task = spec.task + reqSuffix + TASK_SUFFIX;
     const envVars = [
       `CLAUDE_MEM_DIR='${sb}'`,
       `CLAUDE_PROJECT_DIR='${REPO}'`,
       cfgDir ? `CLAUDE_CONFIG_DIR='${cfgDir}'` : '',
-      arm === 'AL' ? `CLAUDE_MEM_SALIENCE=legacy` : '',
+      cfg.salience ? `CLAUDE_MEM_SALIENCE=${cfg.salience}` : '',
     ].filter(Boolean).join(' ');
     try {
       await execFileP('bash', ['-c',
