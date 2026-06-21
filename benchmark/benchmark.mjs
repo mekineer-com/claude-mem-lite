@@ -642,8 +642,21 @@ export async function runDeepSearch(db, queries, rewritesByQuery, { rrfK } = {})
   let baseR = 0, baseNd = 0, baseMrr = 0;
   let deepR = 0, deepNd = 0, deepMrr = 0;
   const perQuery = [];
+  // Baseline = the SAME deep-search pipeline forced to one query (no-rewrite llm),
+  // so baseline and deep differ ONLY in variant count — never in project regime,
+  // perSourceLimit, or row shape. The old searchProductionHybrid baseline put
+  // `project` in the BOOST slot (currentProject) while deepSearch's buildHybridCtx
+  // puts it in the FILTER slot (args.project, which also disables the boost — see
+  // search-engine.mjs `projectBoost = args.project ? null : currentProject`).
+  // Comparing the two would confound multi-query fusion with project filter-vs-boost
+  // the moment a suite query carries a project (F14). Today's vocab-mismatch queries
+  // pass project=null, so this changes no number — it is a structural guard that also
+  // makes the rewrite-failure floor (deep == baseline) hold by construction.
+  const noRewriteLlm = async () => null;
   for (const q of queries) {
-    const base = searchProductionHybrid(db, q.query, { limit: 10, project: q.project, obsType: q.type });
+    const { results: base } = await deepSearch(
+      db, { query: q.query, project: q.project, type: q.type, limit: 10 }, { llm: noRewriteLlm, rrfK },
+    );
     const { results: deep, variants } = await deepSearch(
       db, { query: q.query, project: q.project, type: q.type, limit: 10 }, { llm: fakeLLM, rrfK },
     );
