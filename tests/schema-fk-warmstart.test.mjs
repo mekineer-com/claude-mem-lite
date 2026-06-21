@@ -12,7 +12,7 @@
 
 import { describe, test, expect } from 'vitest';
 import Database from 'better-sqlite3';
-import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
+import { initSchema, runDeferredCleanups, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
 import { insertSession, insertObs } from './test-helpers.mjs';
 
 // Initialize a fresh DB to CURRENT_SCHEMA_VERSION (full migration path), then simulate
@@ -79,6 +79,9 @@ describe('one-shot orphan junction cleanup on version-bump migration (regression
     db.prepare('UPDATE schema_version SET version = ?').run(CURRENT_SCHEMA_VERSION - 1);
     db.pragma('foreign_keys = OFF');
     initSchema(db);
+    // Orphan cleanups moved out of initSchema into runDeferredCleanups, which
+    // ensureDb() runs on every open (audit P1-5). Mirror that here.
+    runDeferredCleanups(db);
   }
 
   test('re-migration deletes orphaned observation_files and keeps valid rows', () => {

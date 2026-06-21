@@ -37,8 +37,9 @@ jobs:
           PKG_VERSION=$(node -p "require('./package.json').version")
           PLUGIN_VERSION=$(node -p "require('./.claude-plugin/plugin.json').version")
           MARKET_VERSION=$(node -p "require('./.claude-plugin/marketplace.json').plugins[0].version")
+          CLAUDEMD_VERSION=$(grep -oP '^- \*\*Version\*\*: \K[0-9]+\.[0-9]+\.[0-9]+' CLAUDE.md)
 
-          echo "Tag: $VERSION | package.json: $PKG_VERSION | plugin.json: $PLUGIN_VERSION | marketplace.json: $MARKET_VERSION"
+          echo "Tag: $VERSION | package.json: $PKG_VERSION | plugin.json: $PLUGIN_VERSION | marketplace.json: $MARKET_VERSION | CLAUDE.md: $CLAUDEMD_VERSION"
 
           if [ "$VERSION" != "$PKG_VERSION" ]; then
             echo "::error::Tag version ($VERSION) does not match package.json ($PKG_VERSION)"
@@ -52,11 +53,18 @@ jobs:
             echo "::error::marketplace.json version ($MARKET_VERSION) does not match tag ($VERSION)"
             exit 1
           fi
+          if [ "$VERSION" != "$CLAUDEMD_VERSION" ]; then
+            echo "::error::CLAUDE.md version ($CLAUDEMD_VERSION) does not match tag ($VERSION)"
+            exit 1
+          fi
           echo "All versions consistent: $VERSION"
 
   publish:
     needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write  # required for npm provenance attestation
     steps:
       - uses: actions/checkout@v5
 
@@ -69,9 +77,20 @@ jobs:
         run: npm ci
 
       - name: Publish to npm
-        run: npm publish --access public
+        # --provenance requires an OIDC-capable token (npm >=9.5). A legacy/classic
+        # NPM_TOKEN fails the provenance step (lesson #8583 — past E404s here were
+        # token issues). Default OFF for publish safety; opt in by setting the repo
+        # variable NPM_PROVENANCE=true once the token is granular/automation-scoped
+        # (the id-token: write permission above is harmless when provenance is OFF).
+        run: |
+          if [ "${NPM_PROVENANCE}" = "true" ]; then
+            npm publish --provenance --access public
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_PROVENANCE: ${{ vars.NPM_PROVENANCE }}
 
       - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:

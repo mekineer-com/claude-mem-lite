@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
@@ -9,10 +9,19 @@ import { ensureRegistryDb } from '../registry.mjs';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-skill-bridge.js');
 
+// Sandbox the hook-error log: pre-skill-bridge.js records parse/db errors via
+// recordHookError(RUNTIME_DIR). Without this, the 'not json' / error-path tests
+// below write JSONL into the REAL ~/.claude-mem-lite/runtime/hook-errors/, which
+// polluted the user's /health "hook errors (24h)" metric with test noise. The
+// script honors CLAUDE_MEM_RUNTIME_DIR, so redirect it to a throwaway dir.
+const TMP_RUNTIME = join(tmpdir(), `pre-skill-bridge-rt-${randomUUID()}`);
+mkdirSync(TMP_RUNTIME, { recursive: true });
+afterAll(() => { try { rmSync(TMP_RUNTIME, { recursive: true, force: true }); } catch {} });
+
 function runScript(inputStr, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('node', [SCRIPT_PATH], {
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '', ...env },
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '', CLAUDE_MEM_RUNTIME_DIR: TMP_RUNTIME, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';

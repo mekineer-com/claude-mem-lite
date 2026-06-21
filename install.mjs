@@ -2,7 +2,7 @@
 // claude-mem-lite Installer — Smart install/uninstall/status/doctor
 
 import { execSync, execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
 import { join, resolve, dirname, isAbsolute } from 'path';
 import { homedir, tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -41,6 +41,8 @@ import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
 import { probeBetterSqlite3Binding, ensureBetterSqlite3Working } from './lib/binding-probe.mjs';
 import { sweepStaleTestFixtures } from './lib/tmp-fixture-sweep.mjs';
+import { acquireLock } from './lib/proc-lock.mjs';
+import { atomicWriteFileSync } from './lib/atomic-write.mjs';
 
 // Re-export for backward compatibility — tests/install-hook-scripts.test.mjs
 // and any external consumers still import HOOK_SCRIPT_FILES from install.mjs.
@@ -1807,11 +1809,11 @@ function readSettings() {
 }
 
 function writeSettings(settings) {
-  const settingsDir = dirname(SETTINGS_PATH);
-  if (!existsSync(settingsDir)) mkdirSync(settingsDir, { recursive: true });
-  const tmp = SETTINGS_PATH + '.tmp';
-  writeFileSync(tmp, JSON.stringify(settings, null, 2) + '\n');
-  renameSync(tmp, SETTINGS_PATH);
+  // Atomic (pid-unique temp + rename) with a one-time .bak: settings.json is the
+  // user's Claude Code config. The old fixed ".tmp" name let concurrent installs
+  // clobber each other's temp mid-write, and there was no recovery artifact if a
+  // hook-merge bug dropped user config. atomicWriteFileSync handles dir creation.
+  atomicWriteFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n', { backup: true });
 }
 
 // ─── Cleanup Stale Files ─────────────────────────────────────────────────────
@@ -1919,8 +1921,7 @@ async function manualUpdate() {
 // buggy on disk.
 async function repair() {
   console.log('\nclaude-mem-lite repair — re-syncing from latest GitHub release\n');
-  const stagingDir = join(tmpdir(), `claude-mem-lite-repair-${Date.now()}`);
-  mkdirSync(stagingDir, { recursive: true });
+  const stagingDir = mkdtempSync(join(tmpdir(), 'claude-mem-lite-repair-'));
   try {
     const tarballUrl = 'https://api.github.com/repos/sdsrss/claude-mem-lite/tarball';
     const tarballPath = join(stagingDir, 'release.tgz');
@@ -2027,13 +2028,27 @@ function regenerateLockfile() {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+// Cross-process gate around the install write phase. repair() is intentionally
+// NOT locked here: it spawns `install.mjs install` as a child, which takes this
+// lock — locking the parent too would deadlock. A live peer (another session's
+// install/self-heal) holds it → skip rather than race into a torn install. Lock
+// path is shared with hook-update.installExtractedRelease (both env-aware).
+async function runLockedInstall() {
+  const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock'));
+  if (!release) {
+    console.log('[install] Another install/repair is in progress — skipping to avoid a torn write.');
+    return;
+  }
+  try { await install(); } finally { release(); }
+}
+
 export async function main(argv = process.argv.slice(2)) {
   cmd = argv[0];
   flags = new Set(argv.slice(1));
 
   switch (cmd) {
     case 'install':
-      await install();
+      await runLockedInstall();
       break;
     case 'uninstall':
       await uninstall();
@@ -2064,7 +2079,7 @@ export async function main(argv = process.argv.slice(2)) {
     default:
       if (IS_NPX) {
         // npx claude-mem-lite (no args) → auto install
-        await install();
+        await runLockedInstall();
       } else {
         // Name the unknown token before the usage block. Pre-fix `install frobnicate`
         // dumped usage silently, which read like the user had typed nothing — they had

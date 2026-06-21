@@ -3,9 +3,15 @@
 // FTS-only search. These tests pin that the vector arm is actually seeded and
 // exercised, and that the constant sweep runs over the real path.
 import { describe, it, expect } from 'vitest';
-import { createTestDb } from './test-helpers.mjs';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import { createTestDb, insertSession } from './test-helpers.mjs';
 import { _resetVocabCache } from '../tfidf.mjs';
 import { seedDatabase, seedVectors, runBenchmark, runVectorSweep } from '../benchmark/benchmark.mjs';
+import { OBS_BM25 } from '../scoring-sql.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Small synthetic corpus: two topical clusters with shared vocabulary (df>=2 so a
 // vocabulary builds) plus an off-topic distractor.
@@ -75,6 +81,68 @@ describe('benchmark production_hybrid scenario (P7)', () => {
     expect(sweep.pinned).toEqual({ dim: 512, minCosine: 0.05, rrfK: 60 });
     expect(typeof sweep.pinnedIsBest).toBe('boolean');
     expect(sweep.best).toBeTruthy();
+    db.close();
+  });
+});
+
+// FIX 1: the benchmark's FTS modes must score with the SAME BM25 weight
+// expression production uses (scoring-sql.mjs OBS_BM25), not a hardcoded literal.
+// The old literal carried only 7 weights, omitting the 8th column
+// (search_aliases) which then fell back to FTS5's default weight 1.0 instead of
+// production's 5.0 — so an ablation/matrix/ci-gate run scored a stale formula and
+// a search_aliases-weight change passed the gate invisibly.
+describe('benchmark BM25 parity with production OBS_BM25 (FIX 1)', () => {
+  const BENCH_PATH = join(__dirname, '..', 'benchmark', 'benchmark.mjs');
+  const source = readFileSync(BENCH_PATH, 'utf8');
+
+  it('imports OBS_BM25 from scoring-sql.mjs', () => {
+    expect(source).toMatch(/import\s*\{[^}]*\bOBS_BM25\b[^}]*\}\s*from\s*['"]\.\.\/scoring-sql\.mjs['"]/);
+  });
+
+  it('uses the imported constant, not an inline bm25(observations_fts, ...) literal', () => {
+    expect(source).toMatch(/baseBm25\s*=\s*OBS_BM25/);
+    // No hardcoded bm25(observations_fts, <numbers>) weight literal remains.
+    expect(source).not.toMatch(/bm25\(observations_fts\s*,\s*\d/);
+  });
+
+  it('OBS_BM25 carries one weight per FTS column (search_aliases is weighted, not defaulted)', () => {
+    // 8 FTS columns: title, subtitle, narrative, text, facts, concepts,
+    // lesson_learned, search_aliases → 8 numeric weights after the table name.
+    const weights = OBS_BM25.replace(/^bm25\(observations_fts,\s*/, '').replace(/\)\s*$/, '').split(',');
+    expect(weights.length).toBe(8);
+    // The 8th weight (search_aliases) must be the production value 5, not 1.
+    expect(weights[7].trim()).toBe('5');
+  });
+
+  it('benchmark FTS modes retrieve a token that lives ONLY in search_aliases', () => {
+    _resetVocabCache();
+    const db = createTestDb();
+    // Seed a couple of normal rows so the FTS table is non-trivial.
+    seedDatabase(db, {
+      observations: [
+        { id: 1, session_id: 's1', project: 'proj-a', text: 'docker compose setup', type: 'change',
+          title: 'docker compose', narrative: 'set up docker compose', facts: '', concepts: '',
+          files_modified: '[]', importance: 2, epoch_offset_days: -1 },
+      ],
+      sessions: [],
+    });
+    // One row whose distinctive token ('zqfftsalias') appears ONLY in search_aliases.
+    insertSession(db, { id: 's2', project: 'proj-a' });
+    db.prepare(`
+      INSERT INTO observations
+        (id, memory_session_id, project, text, type, title, narrative, search_aliases,
+         created_at, created_at_epoch, importance)
+      VALUES (99, 's2', 'proj-a', 'unrelated body', 'change', 'unrelated title',
+              'unrelated narrative', 'zqfftsalias', '2026-01-01', ?, 2)
+    `).run(Date.now());
+
+    // bm25_only mode goes through the benchmark's FTS searchObservations (now
+    // OBS_BM25-weighted). The alias-only token must be retrievable → proves the
+    // search_aliases column is FTS-indexed and inside the benchmark's match path.
+    const res = runBenchmark(db, [
+      { id: 'qa', query: 'zqfftsalias', relevant_ids: [99], project: 'proj-a', category: 'std' },
+    ], 'bm25_only');
+    expect(res.perQuery[0].result_ids).toContain(99);
     db.close();
   });
 });

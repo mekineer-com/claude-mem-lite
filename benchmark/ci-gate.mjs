@@ -1,8 +1,20 @@
 #!/usr/bin/env node
 // Benchmark CI gate — runs benchmark and fails if metrics regress below baseline thresholds.
-// Usage: node benchmark/ci-gate.mjs [--tolerance 0.05]
+// Usage: node benchmark/ci-gate.mjs [--tolerance 0.05] [--strict]
 //
-// Exit codes: 0 = pass, 1 = regression detected
+// The absolute-metric check runs the PRODUCTION-HYBRID path
+// (searchObservationsHybrid: FTS + TF-IDF vector + RRF) — the path real users
+// hit via mem_search/recall — NOT the lexical FTS-only `searchObservations`.
+// Gating the lexical path left months of vector-arm drift invisible while
+// guarding a path nobody uses. baseline.json must therefore be captured from the
+// SAME path: `node benchmark/benchmark.mjs --production-hybrid > benchmark/baseline.json`.
+//
+// Strict mode (--strict flag or CI_GATE_STRICT=1): a stale baseline FAILS the
+// gate instead of merely warning. Use it in release/CI contexts where a stale
+// baseline means the comparison is untrustworthy. Default (local runs) keeps the
+// advisory-only behaviour for fast iteration.
+//
+// Exit codes: 0 = pass, 1 = regression detected (or stale baseline in strict mode)
 
 import { readFileSync, statSync } from 'fs';
 import { join, dirname } from 'path';
@@ -14,6 +26,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // Parse tolerance from CLI args (default: 5% relative regression allowed)
 const toleranceIdx = process.argv.indexOf('--tolerance');
 const tolerance = toleranceIdx !== -1 ? parseFloat(process.argv[toleranceIdx + 1]) : 0.05;
+
+// Strict mode: a stale baseline becomes a hard failure instead of an advisory
+// warning. Opt-in via --strict flag or CI_GATE_STRICT=1 so normal local runs are
+// unaffected (backward-compatible). Honour the common truthy spellings.
+const STRICT = process.argv.includes('--strict') ||
+  /^(1|true|yes|on)$/i.test(String(process.env.CI_GATE_STRICT ?? '').trim());
 
 // v2.41: stale baseline warning. Baseline is load-bearing evidence; if it
 // predates significant code changes, the comparison is misleading. 30 days is
@@ -38,18 +56,32 @@ try {
   process.exit(1);
 }
 
+// Stale-baseline handling. Default: advisory warning, gate continues. Strict
+// (--strict / CI_GATE_STRICT=1): hard failure — recorded here and enforced in the
+// final exit decision (after the run, so the metric/matrix report still prints).
+let staleFailure = false;
 if (baselineAgeDays >= BASELINE_STALE_AGE_DAYS) {
-  console.warn(
-    `\n  ⚠ STALE BASELINE (${baselineAgeDays}d old, threshold ${BASELINE_STALE_AGE_DAYS}d).\n` +
-    `    Recapture: node benchmark/benchmark.mjs > benchmark/baseline.json\n` +
-    `    Gate continues to run — this is advisory, not a failure.`
-  );
+  if (STRICT) {
+    staleFailure = true;
+    console.error(
+      `\n  ✗ STALE BASELINE (${baselineAgeDays}d old, threshold ${BASELINE_STALE_AGE_DAYS}d) — FAILING (strict mode).\n` +
+      `    Recapture: node benchmark/benchmark.mjs --production-hybrid > benchmark/baseline.json`
+    );
+  } else {
+    console.warn(
+      `\n  ⚠ STALE BASELINE (${baselineAgeDays}d old, threshold ${BASELINE_STALE_AGE_DAYS}d).\n` +
+      `    Recapture: node benchmark/benchmark.mjs --production-hybrid > benchmark/baseline.json\n` +
+      `    Gate continues to run — this is advisory, not a failure (pass --strict to fail).`
+    );
+  }
 }
 
-// Run benchmark (JSON on stdout, logs on stderr)
+// Run benchmark on the PRODUCTION-HYBRID path (the path users actually hit), JSON
+// on stdout, logs on stderr. baseline.json is captured from this same path so
+// baseline and gate measure the same thing.
 let results;
 try {
-  const stdout = execSync('node benchmark/benchmark.mjs', {
+  const stdout = execSync('node benchmark/benchmark.mjs --production-hybrid', {
     cwd: join(__dirname, '..'),
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'inherit'],
@@ -190,8 +222,9 @@ if (!SKIP_MATRIX) {
 }
 
 const totalFailures = failures.length + matrixFailures.length;
-if (totalFailures > 0) {
-  console.log(`\n  ${totalFailures} metric(s) regressed beyond tolerance.`);
+if (totalFailures > 0 || staleFailure) {
+  if (totalFailures > 0) console.log(`\n  ${totalFailures} metric(s) regressed beyond tolerance.`);
+  if (staleFailure) console.log('  Baseline is stale and --strict was set — failing.');
   process.exit(1);
 } else {
   console.log('\n  All metrics + matrix deltas within tolerance.');

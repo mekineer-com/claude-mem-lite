@@ -70,6 +70,8 @@
     "lib/reread-guard.mjs",
     "lib/metrics.mjs",
     "lib/binding-probe.mjs",
+    "lib/proc-lock.mjs",
+    "lib/atomic-write.mjs",
     "lib/mem-override.mjs",
     "lib/save-observation.mjs",
     "lib/observation-write.mjs",

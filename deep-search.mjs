@@ -103,7 +103,9 @@ export function autoDeepLlmReady(env = process.env, injectedLlm) {
  * an LLM, so the decision itself is free — only a positive verdict costs a
  * Haiku call (the escalation).
  *
- * Weak when: too few results (count below minResults floor).
+ * Weak when: too few results (count below minResults floor) AND the corpus is
+ * large enough that deep search could plausibly find more (see corpus guard
+ * below).
  *
  * NOTE: ctx.orFallbackFired was intentionally removed as an escalation trigger.
  * orFallbackFired fires on SUCCESSFUL AND→OR recovery — when the fallback
@@ -114,17 +116,37 @@ export function autoDeepLlmReady(env = process.env, injectedLlm) {
  * fails, OR also fails) is still caught: if OR recovers nothing, count is 0-2
  * → escalates on count alone.
  *
+ * Corpus guard (folded in): the count-based trigger above is correct for a real
+ * corpus, but on a near-empty / brand-new / benchmark project EVERY 0-hit query
+ * looks "weak", so a caller that only checks the count would auto-escalate (and
+ * fire a Haiku rewrite) on a store HyDE/multi-query can't possibly rescue — the
+ * "[mem] auto-escalated … 0 hits" spam. hasEscalatableCorpus used to be a
+ * SEPARATE function each caller had to remember to AND in; folding it in here
+ * means passing `db` self-suppresses escalation when the corpus is too small,
+ * without changing the (correct) count trigger for real corpora. Backward-
+ * compatible: callers that omit `db` keep the pure count behaviour (and may
+ * still AND hasEscalatableCorpus themselves — double-gating with the same
+ * predicate is idempotent, never a regression).
+ *
  * @param {Array} results  normal-search rows
  * @param {object} ctx     the hybrid ctx the engine mutated (unused; kept for
  *                         backward-compat with callers that pass it)
  * @param {object} [opts]
  * @param {number} [opts.minResults=AUTO_DEEP_MIN_RESULTS]
+ * @param {Database} [opts.db]  open handle — when given, the corpus-size guard is
+ *                              evaluated here so escalation is suppressed on a
+ *                              too-small store. Omit to keep pure count behaviour.
+ * @param {string} [opts.project]  project scope for the corpus count (when db given)
+ * @param {number} [opts.minCorpus=AUTO_DEEP_MIN_CORPUS]  corpus-size floor (when db given)
  * @returns {boolean}
  */
-export function shouldEscalateToDeep(results, _ctx, { minResults = AUTO_DEEP_MIN_RESULTS } = {}) {
+export function shouldEscalateToDeep(results, _ctx, { minResults = AUTO_DEEP_MIN_RESULTS, db, project = null, minCorpus = AUTO_DEEP_MIN_CORPUS } = {}) {
   const n = Array.isArray(results) ? results.length : 0;
-  if (n < minResults) return true;
-  return false;
+  if (n >= minResults) return false;
+  // Count is weak. If a db was supplied, also require an escalatable corpus —
+  // this is the fold-in that stops 0-hit escalation on a near-empty store.
+  if (db && !hasEscalatableCorpus(db, project, minCorpus)) return false;
+  return true;
 }
 
 /**

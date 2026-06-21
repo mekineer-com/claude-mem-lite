@@ -64,6 +64,11 @@ export const SOURCE_FILES = [
   // self-heal after Node ABI changes). Missing from manifest → auto-update
   // ships a stale install that FATALs on first DB open after Node upgrade.
   'lib/binding-probe.mjs',
+  // audit P0/P1: inter-process install lock + atomic config writes — imported by
+  // install.mjs (settings.json + install lock) and hook-update.mjs (.claude.json
+  // + auto-update lock). Must ship or a partial install/update skips them.
+  'lib/proc-lock.mjs',
+  'lib/atomic-write.mjs',
   // v2.41 god-module split — mem-cli.mjs router + per-cmd handlers under cli/
   'cli/common.mjs',
   'cli/fts-check.mjs',

@@ -13,6 +13,8 @@ import { debugCatch, debugLog } from './utils.mjs';
 // extracted tarball's own source-files.mjs inside installExtractedRelease.
 // See loadReleaseManifest below.
 import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES } from './source-files.mjs';
+import { acquireLock } from './lib/proc-lock.mjs';
+import { atomicWriteFileSync } from './lib/atomic-write.mjs';
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
@@ -379,6 +381,16 @@ export function validateExtractedTarball(sourceDir, expectedVersion, expectedNam
 // the target's node_modules untouched. Dependency bumps still flow through the
 // GitHub-tarball path (downloadAndInstall), which keeps skipNpmInstall=false.
 export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR, opts = {}) {
+  // Cross-process lock: concurrent SessionStart self-heals / auto-updates must
+  // not interleave the rename loop below (→ mixed-version install). A live peer
+  // holding the lock means an install is already in flight — skip rather than
+  // race. Shared path with install.mjs so direct install + repair + auto-update
+  // are mutually exclusive.
+  const release = acquireLock(join(STATE_DIR, 'runtime', 'install.lock'));
+  if (!release) {
+    debugLog('DEBUG', 'hook-update', 'installExtractedRelease: another install/update is in progress — skipping');
+    return false;
+  }
   const ts = `${Date.now()}-${process.pid}`;
   const stagingDir = join(targetDir, `.update-staging-${ts}`);
   const backupDir = join(targetDir, `.update-backup-${ts}`);
@@ -439,7 +451,9 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
             debugLog('DEBUG', 'hook-update', `Post-update: removed stale global MCP "${k}"`);
           }
         }
-        if (changed) writeFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n');
+        // Atomic + one-time backup: ~/.claude.json is the user's ENTIRE Claude
+        // Code config; a torn write here breaks them outside our control.
+        if (changed) atomicWriteFileSync(claudeJsonPath, JSON.stringify(cfg, null, 2) + '\n', { backup: true });
       }
     } catch (e) { debugCatch(e, 'post-update-mcp-dedup'); }
 
@@ -477,6 +491,8 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
     try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
     try { rmSync(backupDir, { recursive: true, force: true }); } catch {}
     return false;
+  } finally {
+    release();
   }
 }
 

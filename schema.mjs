@@ -6,7 +6,7 @@ import Database from 'better-sqlite3';
 import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, chmodSync } from 'fs';
-import { OBS_FTS_COLUMNS } from './utils.mjs';
+import { OBS_FTS_COLUMNS, debugCatch } from './utils.mjs';
 
 // DATA location — DB, managed resources, registry DB, runtime/. Honors
 // CLAUDE_MEM_DIR so users can relocate state to a larger/faster volume.
@@ -79,7 +79,16 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // New TABLE (not a column) reached via CORE_SCHEMA's CREATE TABLE IF NOT EXISTS on the
 // forced migration pass; LATEST_MIGRATION_COLUMN unchanged (no new column) — same
 // pattern as v35/v36.
-export const CURRENT_SCHEMA_VERSION = 38;
+// v39 (audit P1-5): migration_cleanups table — a sentinel registry that makes the
+// one-shot DATA cleanups (orphan deletes, project-name normalization) RETRYABLE.
+// They previously ran inside the version-gated migration body and were swallowed
+// on failure AFTER the version stamp committed, so a failed cleanup could never
+// re-run (the fast-path then skipped the whole body). They now run via
+// runDeferredCleanups() on every ensureDb, each gated by a done-marker row: a
+// failure leaves the marker unset and retries on the next open. New TABLE via
+// CORE_SCHEMA on the forced pass; LATEST_MIGRATION_COLUMN unchanged (no new
+// column) — same pattern as v35/v36/v38.
+export const CURRENT_SCHEMA_VERSION = 39;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
@@ -184,6 +193,11 @@ const CORE_SCHEMA = `
     injected_n INTEGER NOT NULL DEFAULT 0,
     cited_n INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, memory_session_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS migration_cleanups (
+    name TEXT PRIMARY KEY,
+    done_at_epoch INTEGER NOT NULL
   );
 `;
 
@@ -556,18 +570,8 @@ export function initSchema(db) {
     }
   } catch { /* non-critical — migration can retry on next open */ }
 
-  // v35 (v2.87.0) P1: one-shot cleanup of orphaned observation_files. Same root
-  // cause as the v28 observation_vectors cleanup below — until the warm-start
-  // fast-path FK fix (initSchema early returns now restore foreign_keys=ON),
-  // ensureDb() handles ran with FK OFF, so ON DELETE CASCADE never fired and
-  // junction rows leaked (live DB: 6440/9569 = 67% orphans). Idempotent (NOT IN
-  // is empty on a clean DB); runs once per version bump via the fast-path gate.
-  try {
-    db.prepare(`
-      DELETE FROM observation_files
-      WHERE obs_id NOT IN (SELECT id FROM observations)
-    `).run();
-  } catch { /* non-critical — table-missing path handled by earlier CREATE */ }
+  // observation_files orphan cleanup moved to runDeferredCleanups() (audit P1-5):
+  // it now runs retryably outside the version fast-path. See DEFERRED_CLEANUPS.
 
   // Observation vectors table for TF-IDF vector search
   db.exec(`
@@ -582,16 +586,7 @@ export function initSchema(db) {
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obs_vectors_version ON observation_vectors(vocab_version)`);
 
-  // v28 (v2.47) P0-1: one-shot cleanup of orphaned observation_vectors.
-  // Live DBs accumulated 44% orphans even with ON DELETE CASCADE because
-  // early migrations ran with `foreign_keys=OFF` and deletes skipped cascade.
-  // Idempotent (NOT IN is empty on a clean DB), runs once per ensureDb().
-  try {
-    db.prepare(`
-      DELETE FROM observation_vectors
-      WHERE observation_id NOT IN (SELECT id FROM observations)
-    `).run();
-  } catch { /* non-critical — table-missing path handled by earlier CREATE */ }
+  // observation_vectors orphan cleanup moved to runDeferredCleanups() (audit P1-5).
 
   // Persisted vocabulary for stable TF-IDF vector indexing
   db.exec(`
@@ -605,46 +600,9 @@ export function initSchema(db) {
   `);
   db.exec('CREATE INDEX IF NOT EXISTS idx_vocab_state_version ON vocab_state(version)');
 
-  // Project name normalization: migrate short names ("mem") to canonical form ("projects--mem")
-  // Strategy: exact suffix match first, then substring match for package-name aliases
-  // Idempotent: only runs when short-name records exist
-  try {
-    const shortProjects = db.prepare(`
-      SELECT DISTINCT project FROM observations
-      WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
-      UNION
-      SELECT DISTINCT project FROM sdk_sessions
-      WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
-    `).all();
-    if (shortProjects.length > 0) {
-      const normalize = db.transaction(() => {
-        for (const { project: shortName } of shortProjects) {
-          // Strategy 1: exact suffix match (e.g., "mem" → "projects--mem")
-          let canonical = db.prepare(
-            `SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
-          ).get(`%--${shortName}`);
-          // Strategy 2: substring match for aliases (e.g., "claude-mem-lite" → match project containing "mem")
-          // Extract the most distinctive token from the short name for fuzzy matching
-          if (!canonical) {
-            const tokens = shortName.split(/[-_.]/).filter(t => t.length >= 5);
-            for (const token of tokens) {
-              canonical = db.prepare(
-                `SELECT project FROM observations WHERE project LIKE ? AND project LIKE '%--_%'
-                 GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
-              ).get(`%${token}%`);
-              if (canonical) break;
-            }
-          }
-          if (canonical) {
-            for (const table of ['observations', 'sdk_sessions', 'session_summaries']) {
-              db.prepare(`UPDATE ${table} SET project = ? WHERE project = ?`).run(canonical.project, shortName);
-            }
-          }
-        }
-      });
-      normalize();
-    }
-  } catch { /* non-critical — normalization can retry on next open */ }
+  // Project-name normalization moved to runDeferredCleanups() (audit P1-5) — it
+  // now retries on a later open if it fails, instead of being lost behind the
+  // version fast-path. See DEFERRED_CLEANUPS.
 
   // ─── v29 (v2.57.x): session-id mix invariant + lesson-retry stats ─────────
   //
@@ -802,6 +760,96 @@ export function auditSessionConsistency(db, { graceMinutes = 5 } = {}) {
     orphan_obs: orphanObs,
     healthy: idMixUuidShape === 0 && missingMemId === 0 && orphanObs === 0,
   };
+}
+
+// ─── Deferred one-shot cleanups (retryable) ─────────────────────────────────
+// Idempotent DATA cleanups that must survive a transient failure. They run on
+// EVERY ensureDb (after initSchema), each gated by a row in migration_cleanups:
+// a cleanup that throws leaves its marker unset and retries on the next open —
+// unlike the old version-gated body, where a swallowed failure committed
+// alongside the version stamp and the fast-path then skipped it forever (P1-5).
+const DEFERRED_CLEANUPS = [
+  {
+    // v35 (v2.87.0): orphaned observation_files. ON DELETE CASCADE didn't fire
+    // while early warm-start handles ran with foreign_keys OFF, so junction rows
+    // leaked. Idempotent (NOT IN is empty on a clean DB).
+    name: 'orphan-observation-files',
+    run: (db) => db.prepare(
+      `DELETE FROM observation_files WHERE obs_id NOT IN (SELECT id FROM observations)`
+    ).run(),
+  },
+  {
+    // v28 (v2.47) P0-1: orphaned observation_vectors — same FK-OFF root cause.
+    name: 'orphan-observation-vectors',
+    run: (db) => db.prepare(
+      `DELETE FROM observation_vectors WHERE observation_id NOT IN (SELECT id FROM observations)`
+    ).run(),
+  },
+  {
+    // Project-name normalization: migrate short names ("mem") to canonical
+    // ("projects--mem"). Exact suffix match first, then distinctive-token
+    // substring. Idempotent: only acts on remaining short-name records.
+    name: 'normalize-project-names',
+    run: (db) => {
+      const shortProjects = db.prepare(`
+        SELECT DISTINCT project FROM observations
+        WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
+        UNION
+        SELECT DISTINCT project FROM sdk_sessions
+        WHERE project NOT LIKE '%--_%' AND project != '' AND project IS NOT NULL
+      `).all();
+      if (shortProjects.length === 0) return;
+      const normalize = db.transaction(() => {
+        for (const { project: shortName } of shortProjects) {
+          let canonical = db.prepare(
+            `SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
+          ).get(`%--${shortName}`);
+          if (!canonical) {
+            const tokens = shortName.split(/[-_.]/).filter(t => t.length >= 5);
+            for (const token of tokens) {
+              canonical = db.prepare(
+                `SELECT project FROM observations WHERE project LIKE ? AND project LIKE '%--_%'
+                 GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
+              ).get(`%${token}%`);
+              if (canonical) break;
+            }
+          }
+          if (canonical) {
+            for (const table of ['observations', 'sdk_sessions', 'session_summaries']) {
+              db.prepare(`UPDATE ${table} SET project = ? WHERE project = ?`).run(canonical.project, shortName);
+            }
+          }
+        }
+      });
+      normalize();
+    },
+  },
+];
+
+/**
+ * Run registered one-shot data cleanups that haven't completed yet. Each is
+ * gated by a row in migration_cleanups, so a transient failure retries on the
+ * next open instead of being silently lost behind the schema-version fast-path
+ * (audit P1-5). Best-effort: never throws — callers open the DB regardless.
+ */
+export function runDeferredCleanups(db) {
+  let done;
+  try {
+    done = new Set(db.prepare('SELECT name FROM migration_cleanups').all().map(r => r.name));
+  } catch {
+    return; // table not present yet (pre-migration open) — nothing to do
+  }
+  const mark = db.prepare('INSERT OR IGNORE INTO migration_cleanups (name, done_at_epoch) VALUES (?, ?)');
+  for (const { name, run } of DEFERRED_CLEANUPS) {
+    if (done.has(name)) continue;
+    try {
+      run(db);
+      mark.run(name, Date.now());
+    } catch (e) {
+      // Leave the marker unset → retried next open. Surface for observability.
+      debugCatch(e, `deferred-cleanup:${name}`);
+    }
+  }
 }
 
 /**

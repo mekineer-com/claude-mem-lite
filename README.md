@@ -144,7 +144,7 @@ How claude-mem-lite differs from the major neighbors in the LLM-memory space (ve
 
 ## Requirements
 
-- **Node.js** >= 18
+- **Node.js** >= 20
 - **Claude Code** CLI installed and configured (`claude` command available)
 - **SQLite3** support (provided by `better-sqlite3`, compiled on install)
 - **Platform**: Linux or macOS (see [Platform Support](#platform-support))
@@ -632,17 +632,25 @@ claude-mem-lite/
 
 ## Search Quality
 
-Benchmarked on 200 observations across 30 queries (standard + hard-negative categories):
+Benchmarked on 200 observations across 30 queries (standard + hard-negative categories),
+measuring the **production-hybrid** retriever (FTS5 BM25 + TF-IDF vector + RRF) — the path
+`mem_search` / `recall` actually use. The CI gate (`npm run benchmark:gate`) runs this same
+path and fails on regression.
 
-| Metric | Score |
-|--------|-------|
-| Recall@10 | 0.88 |
-| Precision@10 | 0.96 |
-| nDCG@10 | 0.95 |
-| MRR@10 | 0.95 |
-| P95 search latency | 0.15ms |
+| Metric | Score (production-hybrid) |
+|--------|---------------------------|
+| Recall@10 | 0.90 |
+| Precision@10 | 0.79 |
+| nDCG@10 | 0.97 |
+| MRR@10 | 0.97 |
+| P95 search latency | ~3ms |
 
-The benchmark suite runs as a CI gate (`npm run benchmark:gate`) to prevent search quality regressions.
+> **Note on the path measured.** Earlier versions of this table reported the *lexical*
+> FTS-only path (Precision@10 0.96, P95 0.15ms). The hybrid vector arm trades raw
+> precision@10 for higher recall / nDCG / MRR by surfacing semantically-related candidates
+> beyond exact lexical matches; the gate now measures the hybrid path so these numbers
+> reflect real `mem_search` behavior. For field-comparable recall, see the LongMemEval
+> section below.
 
 ### Recall on LongMemEval (standard benchmark)
 

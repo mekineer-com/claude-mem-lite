@@ -10,7 +10,7 @@ import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
 import { searchObservationsHybrid, countSearchTotal, attachBodyTokens } from './search-engine.mjs';
-import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady, hasEscalatableCorpus } from './deep-search.mjs';
+import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
@@ -61,8 +61,19 @@ let db;
 try {
   db = ensureDb();
 } catch (firstErr) {
+  // WAL-delete recovery is ONLY safe for genuine corruption. On a transient
+  // error (SQLITE_BUSY) or the forward-version guard throw, deleting the WAL
+  // would discard committed-but-uncheckpointed transactions — silent data loss.
+  // Restrict the rm to corruption signatures; otherwise fail fast, WAL intact.
+  const sig = `${firstErr.code || ''} ${firstErr.message || ''}`;
+  const isCorruption = /SQLITE_CORRUPT|SQLITE_NOTADB|malformed|not a database|disk image/i.test(sig);
+  if (!isCorruption) {
+    console.error(`[claude-mem-lite] FATAL: Database cannot be opened: ${firstErr.message}`);
+    console.error(`[claude-mem-lite] Left WAL/SHM intact (not a corruption error). If this persists, retry or reinstall: node install.mjs install`);
+    process.exit(1);
+  }
   // Recovery: remove WAL/SHM files (corrupt WAL is the most common cause) and retry
-  debugLog('WARN', 'server', `DB open failed, attempting WAL recovery: ${firstErr.message}`);
+  debugLog('WARN', 'server', `DB corruption detected, attempting WAL recovery: ${firstErr.message}`);
   try { rmSync(DB_PATH + '-wal', { force: true }); } catch {}
   try { rmSync(DB_PATH + '-shm', { force: true }); } catch {}
   try {
@@ -412,7 +423,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
         // results is already obs-only here (sessions/prompts pushed below), but the
         // filter makes the invariant explicit and robust to future reordering.
         const obsCountBeforeEscalation = results.length;
-        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx) && hasEscalatableCorpus(db, args.project || null)) {
+        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx, { db, project: args.project || null })) {
           await runDeepInto({ auto: true });
           isDeep = true;
           escalated = true;

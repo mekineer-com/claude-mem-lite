@@ -3,7 +3,7 @@
 
 import { describe, test, expect } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
-import { initSchema } from '../schema.mjs';
+import { initSchema, runDeferredCleanups } from '../schema.mjs';
 
 describe('events table (T6)', () => {
   test('events table + FTS virtual table created fresh', () => {
@@ -151,10 +151,10 @@ describe('FTS trigger scoping (v27)', () => {
 });
 
 describe('observation_vectors cleanup (v2.47 P0-1)', () => {
-  test('initSchema deletes orphan observation_vectors (observation_id not in observations)', () => {
+  test('runDeferredCleanups deletes orphan observation_vectors (observation_id not in observations)', () => {
     // Live DB had 2839/6429 (44%) orphan vectors even with ON DELETE CASCADE
     // because historic deletes ran while foreign_keys=OFF during migrations.
-    // initSchema must scrub them once regardless of FK state.
+    // runDeferredCleanups must scrub them once regardless of FK state (P1-5).
     const db = createTestDb();
     db.prepare(`INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch) VALUES ('s', 's', 'p', datetime('now'), ?)`).run(Date.now());
     const obsInfo = db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, created_at, created_at_epoch) VALUES ('s', 'p', 'discovery', 't', datetime('now'), ?)`).run(Date.now());
@@ -170,6 +170,7 @@ describe('observation_vectors cleanup (v2.47 P0-1)', () => {
     db.exec('DELETE FROM schema_version');
     db.exec('INSERT INTO schema_version (version) VALUES (26)');
     initSchema(db);
+    runDeferredCleanups(db); // cleanup moved here from initSchema (audit P1-5)
     const orphanCount = db.prepare(`
       SELECT COUNT(*) AS c FROM observation_vectors ov
       LEFT JOIN observations o ON ov.observation_id = o.id
@@ -179,6 +180,42 @@ describe('observation_vectors cleanup (v2.47 P0-1)', () => {
     // Live vector preserved
     const liveRow = db.prepare(`SELECT observation_id FROM observation_vectors WHERE observation_id = ?`).get(liveId);
     expect(liveRow?.observation_id).toBe(liveId);
+  });
+});
+
+describe('runDeferredCleanups sentinel + retry (audit P1-5)', () => {
+  function insertOrphanVector(db, obsId) {
+    db.pragma('foreign_keys = OFF');
+    db.prepare(`INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)`)
+      .run(obsId, Buffer.alloc(8), 'v1', Date.now());
+  }
+
+  test('marks each cleanup done, then skips re-runs (run-once)', () => {
+    const db = createTestDb();
+    runDeferredCleanups(db);
+    const marks = db.prepare('SELECT name FROM migration_cleanups').all().map(r => r.name);
+    expect(marks).toContain('orphan-observation-vectors');
+    expect(marks).toContain('orphan-observation-files');
+    expect(marks).toContain('normalize-project-names');
+
+    // Marker is set → a newly-injected orphan is NOT re-cleaned (run-once).
+    insertOrphanVector(db, 88881);
+    runDeferredCleanups(db);
+    expect(db.prepare('SELECT COUNT(*) AS c FROM observation_vectors WHERE observation_id = 88881').get().c).toBe(1);
+  });
+
+  test('an unmarked cleanup re-runs on the next open (retry-after-failure path)', () => {
+    const db = createTestDb();
+    runDeferredCleanups(db); // marks all done
+    // Simulate a prior transient failure: the marker for this cleanup is absent.
+    db.prepare(`DELETE FROM migration_cleanups WHERE name = 'orphan-observation-vectors'`).run();
+    insertOrphanVector(db, 88882);
+
+    runDeferredCleanups(db);
+
+    // Unmarked → re-ran → orphan removed and the marker is restored.
+    expect(db.prepare('SELECT COUNT(*) AS c FROM observation_vectors WHERE observation_id = 88882').get().c).toBe(0);
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM migration_cleanups WHERE name = 'orphan-observation-vectors'`).get().c).toBe(1);
   });
 });
 

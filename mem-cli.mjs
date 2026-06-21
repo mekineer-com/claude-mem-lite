@@ -10,7 +10,7 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
 import { searchObservationsHybrid, countSearchTotal, attachBodyTokens } from './search-engine.mjs';
-import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady, hasEscalatableCorpus } from './deep-search.mjs';
+import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -227,7 +227,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     } else {
       obsResults = searchObservationsHybrid(db, obsCtx);
       if (obsCtx.orFallbackFired) orFallbackFired = true;
-      if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(obsResults, obsCtx) && hasEscalatableCorpus(db, project || null)) {
+      if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(obsResults, obsCtx, { db, project: project || null })) {
         process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${obsResults.length} hits)\n`);
         obsResults = await runDeep({ auto: true });
         isDeep = true;

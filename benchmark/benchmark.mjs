@@ -9,6 +9,7 @@ import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
 import { deepSearch } from '../deep-search.mjs';
 import { computeVector, rebuildVocabulary, _resetVocabCache, VOCAB_DIM, MIN_COSINE_SIMILARITY, RRF_K } from '../tfidf.mjs';
+import { OBS_BM25 } from '../scoring-sql.mjs';
 import { createTestDb } from '../tests/test-helpers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -206,7 +207,15 @@ function searchObservations(db, query, options = {}) {
   if (!ftsQuery) return [];
 
   const now = Date.now();
-  const baseBm25 = 'bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8)';
+  // Use the SAME BM25 weight expression production scoring uses (scoring-sql.mjs
+  // OBS_BM25), not a hardcoded literal. The old literal carried only 7 weights
+  // (omitting the search_aliases column, which then fell back to FTS5's default
+  // weight of 1.0 instead of production's 5.0) — so the ablation/matrix/ci-gate
+  // path scored a stale formula and a search_aliases-weight change passed the
+  // gate invisibly. Importing the constant keeps the micro-bench faithful to
+  // production by construction. On a fixture with no search_aliases data the
+  // 8th weight is inert, so existing numbers are unchanged.
+  const baseBm25 = OBS_BM25;
   const scoreExpr = terms.length === 0
     ? `${baseBm25} as score`
     : `${baseBm25} * ${terms.map((t) => MULT_EXPR[t]).join(' * ')} as score`;

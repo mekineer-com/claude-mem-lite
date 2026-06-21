@@ -392,6 +392,69 @@ describe('shouldEscalateToDeep — zero-LLM weak-result heuristic', () => {
   });
 });
 
+describe('shouldEscalateToDeep — folded-in corpus guard (FIX 2)', () => {
+  // Helper mirroring the hasEscalatableCorpus suite: seed N live obs.
+  function seedCorpus(db, n, project = 'p') {
+    insertSession(db, { id: `sess-fold-${project}`, project });
+    const stmt = db.prepare(`
+      INSERT INTO observations
+        (memory_session_id, project, text, type, title, created_at, created_at_epoch)
+      VALUES (?, ?, 'text', 'bugfix', 'title', '2026-01-01', 1000000)
+    `);
+    for (let i = 0; i < n; i++) stmt.run(`sess-fold-${project}`, project);
+  }
+
+  it('weak count on a NEAR-EMPTY corpus does NOT escalate when db is passed', () => {
+    const db = createTestDb(); _resetVocabCache();
+    seedCorpus(db, 2); // below AUTO_DEEP_MIN_CORPUS (10)
+    // 0 results = weak by count, but corpus too small → suppressed.
+    expect(shouldEscalateToDeep([], {}, { db })).toBe(false);
+    db.close();
+  });
+
+  it('weak count on a LARGE-ENOUGH corpus still escalates when db is passed', () => {
+    const db = createTestDb(); _resetVocabCache();
+    seedCorpus(db, 12); // >= AUTO_DEEP_MIN_CORPUS
+    expect(shouldEscalateToDeep([], {}, { db })).toBe(true);
+    db.close();
+  });
+
+  it('strong count never escalates regardless of corpus (count gate wins first)', () => {
+    const db = createTestDb(); _resetVocabCache();
+    seedCorpus(db, 50);
+    const rows = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }];
+    expect(shouldEscalateToDeep(rows, {}, { db })).toBe(false);
+    db.close();
+  });
+
+  it('omitting db keeps the pure count behaviour (backward-compatible)', () => {
+    // No db → corpus guard is skipped, so a 0-hit weak result escalates as before.
+    expect(shouldEscalateToDeep([], {})).toBe(true);
+    expect(shouldEscalateToDeep([{ id: 1 }, { id: 2 }], {})).toBe(true);
+  });
+
+  it('project scopes the folded-in corpus count', () => {
+    const db = createTestDb(); _resetVocabCache();
+    seedCorpus(db, 12, 'proj-x');
+    seedCorpus(db, 2, 'proj-y');
+    expect(shouldEscalateToDeep([], {}, { db, project: 'proj-x' })).toBe(true);  // 12 >= 10
+    expect(shouldEscalateToDeep([], {}, { db, project: 'proj-y' })).toBe(false); // 2 < 10
+    db.close();
+  });
+
+  it('is idempotent with an external hasEscalatableCorpus AND-gate (existing call sites)', () => {
+    // server.mjs / mem-cli.mjs do `shouldEscalateToDeep(rows, ctx) && hasEscalatableCorpus(db, project)`.
+    // Passing db into shouldEscalateToDeep too must give the SAME verdict — double-gating
+    // with the same predicate is never a regression.
+    const db = createTestDb(); _resetVocabCache();
+    seedCorpus(db, 2);
+    const external = shouldEscalateToDeep([], {}) && hasEscalatableCorpus(db, null);
+    const folded = shouldEscalateToDeep([], {}, { db });
+    expect(folded).toBe(external); // both false (corpus too small)
+    db.close();
+  });
+});
+
 describe('resolveDeepMode — tri-state precedence', () => {
   it('explicit true → deep (ignores env)', () => {
     expect(resolveDeepMode(true, { surface: 'cli', env: { CLAUDE_MEM_AUTO_DEEP: '0' } })).toBe('deep');
