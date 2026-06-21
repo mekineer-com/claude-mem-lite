@@ -3,6 +3,11 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     testTimeout: 20000,
+    // D#40: the CLI auto-escalation path is default-ON in production but must
+    // never spawn a real `claude` subprocess during the suite. This forces
+    // autoDeepLlmReady's CLI branch off in every worker; tests that exercise the
+    // auto path inject a stub llm or mock haiku-client instead.
+    env: { CLAUDE_MEM_AUTO_DEEP_CLI: '0' },
     // Reap test-fixture dirs leaked by prior interrupted/SIGKILL'd runs (afterEach
     // never reached). Runs once before the suite; 1h age guard never touches the
     // current run. See lib/tmp-fixture-sweep.mjs.

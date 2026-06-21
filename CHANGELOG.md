@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.3.0 — Deep-search auto-escalation now reaches CLI-auth users (default-on)
+
+### change: AUTO deep-search escalation extended to claude-CLI auth (D#40)
+
+**Behavior change (action may be needed).** v3.2.0 gated AUTO deep-search escalation on a fast provider key (`ANTHROPIC_API_KEY`/`OPENROUTER_API_KEY`) and explicitly *never* auto-spawned the claude-CLI fallback. That left the majority of Claude Code users — who authenticate via the CLI with no API key — without any auto-escalation. v3.3.0 reverses that: when a normal `mem_search` returns weak/few results (fewer than 3) on a non-empty store, AUTO now escalates via the claude CLI too.
+
+The CLI path is made safe for the long-lived MCP server: the subprocess call is fully **async** (never blocks the event loop), **fail-fast** (5s, no retry), **throttled** per process (one auto rewrite per 3s — bounds bursts), and **cached** (repeat queries skip the LLM). A failed/throttled rewrite degrades to the exact single-query baseline — never worse.
+
+**Opt-out:** set `CLAUDE_MEM_AUTO_DEEP_CLI=0` (also accepts `false`/`no`/`off`) to disable just the CLI auto path, or `CLAUDE_MEM_AUTO_DEEP=0` to disable all AUTO escalation. When AUTO fires you'll see `[mem] auto-escalated to deep search` on stderr.
+
+A pre-ship multi-agent review hardened the new async path: UTF-8/CJK chunk-boundary decoding (`setEncoding`), a provider-outage fallback that could have re-introduced a blocking `execFileSync` (now the async `callModelJSONAsync`), stderr-pipe draining, and the kill-switch spelling tolerance above.
+
+### fix: tool-description length test is environment-independent (D#38)
+
+`tests/tool-schemas.test.mjs` asserted the *rendered* description length (which embeds the absolute `cli.mjs` path), so the same source measured differently locally vs in CI — that swing red-ed the v3.1.2 release at 802 chars. It now bounds the *authored* prose (CLI path stripped), so local-green == CI-green.
+
+Full suite green (2970 tests). No dependency changes.
+
 ## v3.2.0 — Adaptive deep-search auto-escalation
 
 ### change: Adaptive deep-search auto-escalation

@@ -5,7 +5,7 @@
 // Model configurable via CLAUDE_MEM_MODEL (haiku|sonnet); OpenRouter slug
 // overridable via OPENROUTER_MODEL
 
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -247,6 +247,44 @@ export async function callModelJSON(prompt, model = 'haiku', opts) {
   return parseJsonFromLLM(result.text);
 }
 
+/**
+ * JSON-returning, FULLY-ASYNC model call for the long-lived server hot path
+ * (deep-search auto-escalation). Like callModelJSON, but every CLI invocation —
+ * cli-mode primary AND the post-provider-failure fallback — uses the
+ * non-blocking callModelCLIAsync, so a keyed-provider outage can never drop onto
+ * the blocking execFileSync path and freeze the MCP event loop (D#40). Never
+ * throws; returns parsed JSON or null.
+ * @param {string|{system?:string,user:string}} prompt
+ * @param {'haiku'|'sonnet'} model
+ * @param {{timeout?:number,maxTokens?:number,temperature?:number}} [opts]
+ * @returns {Promise<object|null>}
+ */
+export async function callModelJSONAsync(prompt, model = 'haiku', { timeout = 15000, maxTokens = 1000, temperature = DEFAULT_LLM_TEMPERATURE } = {}) {
+  if (!prompt) return null;
+  const resolvedModel = MODEL_MAP[model] ? model : 'haiku';
+  const mode = detectMode();
+
+  if (mode === 'cli') {
+    const res = await callModelCLIAsync(prompt, resolvedModel, { timeout });
+    return res?.text ? parseJsonFromLLM(res.text) : null;
+  }
+
+  // Keyed provider (api/openrouter): try it, then degrade to the ASYNC CLI on any
+  // failure — NOT the blocking execFileSync callModelCLI that callModelJSON uses.
+  let primary = null;
+  try {
+    primary = mode === 'api'
+      ? await callModelAPI(prompt, resolvedModel, { timeout, maxTokens, temperature })
+      : await callOpenRouterAPI(prompt, resolvedModel, { timeout, maxTokens, temperature });
+  } catch (e) {
+    debugCatch(e, `callModelJSONAsync:${mode}:${resolvedModel}`);
+  }
+  if (primary?.text) return parseJsonFromLLM(primary.text);
+
+  const res = await callModelCLIAsync(prompt, resolvedModel, { timeout });
+  return res?.text ? parseJsonFromLLM(res.text) : null;
+}
+
 async function callModelAPI(prompt, model, { timeout, maxTokens, temperature = DEFAULT_LLM_TEMPERATURE }) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
@@ -317,6 +355,72 @@ function callModelCLI(prompt, model, { timeout }) {
     debugCatch(e, `${model}-cli`);
     return null;
   }
+}
+
+/**
+ * Async, non-blocking sibling of callModelCLI for the long-lived MCP server hot
+ * path (deep-search auto-escalation, D#40). execFileSync blocks the event loop for
+ * the whole subprocess lifetime — acceptable in short-lived hook processes
+ * (callModelCLI), not inside an MCP request handler. Uses spawn + stdin so the
+ * untrusted query stays out of argv (ps-visible) and the boundary-marker model is
+ * preserved. Never rejects: resolves {text} on non-empty stdout, null on
+ * error/empty. On timeout it SIGKILLs the child with NO retry (fail-fast) and
+ * salvages a complete JSON payload from partial stdout (mirrors callModelCLI's
+ * catch-salvage; tolerant of Haiku's ```json fencing per #8605, which the upstream
+ * parseJsonFromLLM strips).
+ * @param {string|{system?:string,user:string}} prompt
+ * @param {'haiku'|'sonnet'} model
+ * @param {{timeout:number}} opts  SIGKILL after `timeout` ms; no retry.
+ * @returns {Promise<{text:string}|null>}
+ */
+export function callModelCLIAsync(prompt, model, { timeout }) {
+  return new Promise((resolve) => {
+    const modelName = MODEL_MAP[model] ? model : 'haiku';
+    let child;
+    try {
+      child = spawn(getClaudePath(), ['-p', '--model', modelName], {
+        env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+        cwd: '/tmp',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      debugCatch(e, `${model}-cli-async`);
+      resolve(null);
+      return;
+    }
+    let stdout = '';
+    let settled = false;
+    const done = (val) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      const t = stdout.trim();
+      if (t.startsWith('{') && t.endsWith('}')) {
+        try { JSON.parse(t); done({ text: t }); return; } catch { /* not complete JSON */ }
+      }
+      done(null);
+    }, timeout);
+    child.stdout?.setEncoding('utf8'); // decode multi-byte UTF-8 (CJK) across chunk boundaries
+    child.stdout?.on('data', (d) => { stdout += d; });
+    child.stderr?.on('data', () => {}); // drain stderr so a chatty child can't block on a full pipe
+    child.on('error', (e) => { debugCatch(e, `${model}-cli-async`); done(null); });
+    child.on('close', () => {
+      const t = stdout.trim();
+      done(t ? { text: t } : null);
+    });
+    // EPIPE guard: the child may exit before we finish writing stdin.
+    child.stdin?.on('error', () => {});
+    try {
+      child.stdin?.write(flattenForCLI(prompt));
+      child.stdin?.end();
+    } catch (e) {
+      debugCatch(e, `${model}-cli-async:stdin`);
+    }
+  });
 }
 
 // ─── API Mode ────────────────────────────────────────────────────────────────

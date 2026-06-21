@@ -182,7 +182,7 @@ async function cmdSearch(db, args, { llm } = {}) {
       orFallbackFired: false,
     };
 
-    const runDeep = async () => {
+    const runDeep = async ({ auto = false } = {}) => {
       const ds = await deepSearch(db, {
         query,
         project: project || null,
@@ -194,7 +194,7 @@ async function cmdSearch(db, args, { llm } = {}) {
         epochTo: dateTo,
         limit: perSourceLimit,
         currentProject: project ? null : inferProject(),
-      }, llm ? { llm } : undefined);
+      }, llm ? { llm } : { auto });
       deepVariants = ds.variants;
       if (deepVariants.length > 1) {
         process.stderr.write(`[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`);
@@ -212,7 +212,7 @@ async function cmdSearch(db, args, { llm } = {}) {
       if (obsCtx.orFallbackFired) orFallbackFired = true;
       if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(obsResults, obsCtx) && hasEscalatableCorpus(db, project || null)) {
         process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${obsResults.length} hits)\n`);
-        obsResults = await runDeep();
+        obsResults = await runDeep({ auto: true });
         isDeep = true;
       }
     }

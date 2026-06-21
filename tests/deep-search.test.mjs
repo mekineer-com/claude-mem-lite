@@ -5,7 +5,7 @@
 // always a variant, so a failed/empty/malformed rewrite degrades to exactly the
 // single-query baseline — never worse. The LLM is dependency-injected (fake),
 // so nothing here touches a real provider or imports the native LLM client.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDb, insertSession } from './test-helpers.mjs';
 import { _resetVocabCache } from '../tfidf.mjs';
 import { seedDatabase, seedVectors } from '../benchmark/benchmark.mjs';
@@ -20,6 +20,8 @@ import {
   MAX_VARIANTS,
   hasEscalatableCorpus,
   AUTO_DEEP_MIN_CORPUS,
+  makeThrottled,
+  _resetAutoDeepState,
 } from '../deep-search.mjs';
 
 // llm stub: returns canned parsed-JSON objects (the shape callModelJSON yields),
@@ -260,9 +262,82 @@ describe('autoDeepLlmReady — LLM availability gate for AUTO escalation', () =>
     expect(autoDeepLlmReady({ OPENROUTER_API_KEY: 'or-test-key' })).toBe(true);
   });
 
-  it('returns false when neither key is set and no llm is injected', () => {
-    expect(autoDeepLlmReady({})).toBe(false);
-    expect(autoDeepLlmReady({ SOME_OTHER_KEY: 'value' })).toBe(false);
+  it('returns true for CLI-auth (no key, no llm) by default — D#40 default-on', () => {
+    expect(autoDeepLlmReady({})).toBe(true);
+    expect(autoDeepLlmReady({ SOME_OTHER_KEY: 'value' })).toBe(true);
+  });
+
+  it('kill switch honors common disable spellings, not just the exact "0"', () => {
+    for (const off of ['0', 'false', 'off', 'NO', ' false ']) {
+      expect(autoDeepLlmReady({ CLAUDE_MEM_AUTO_DEEP_CLI: off }), `"${off}" should disable`).toBe(false);
+    }
+    // a non-disable value (or empty/unset) leaves it enabled (default-on)
+    expect(autoDeepLlmReady({ CLAUDE_MEM_AUTO_DEEP_CLI: '1' })).toBe(true);
+    expect(autoDeepLlmReady({ CLAUDE_MEM_AUTO_DEEP_CLI: '' })).toBe(true);
+    // an injected llm or a provider key still overrides the kill switch
+    expect(autoDeepLlmReady({ CLAUDE_MEM_AUTO_DEEP_CLI: '0' }, async () => null)).toBe(true);
+    expect(autoDeepLlmReady({ CLAUDE_MEM_AUTO_DEEP_CLI: '0', ANTHROPIC_API_KEY: 'sk' })).toBe(true);
+  });
+});
+
+describe('D#40 auto-path safety — throttle + rewrite cache + no-retry', () => {
+  beforeEach(() => { _resetAutoDeepState(); });
+
+  it('makeThrottled fires the wrapped llm at most once per interval', async () => {
+    let calls = 0;
+    const stub = async () => { calls++; return { variants: ['a', 'b'] }; };
+    const throttled = makeThrottled(stub, { intervalMs: 10000 });
+    const r1 = await throttled({ user: 'q' });
+    const r2 = await throttled({ user: 'q' });
+    expect(calls).toBe(1);                 // second call throttled
+    expect(r1).toEqual({ variants: ['a', 'b'] });
+    expect(r2).toBeNull();                 // throttled → null → degrades to baseline
+  });
+
+  it('makeThrottled fires again after _resetAutoDeepState clears the clock', async () => {
+    let n = 0;
+    const stub = async () => { n++; return { variants: ['a', 'b'] }; };
+    const throttled = makeThrottled(stub, { intervalMs: 10000 });
+    await throttled({ user: 'q' });
+    _resetAutoDeepState();
+    await throttled({ user: 'q' });
+    expect(n).toBe(2);
+  });
+
+  it('rewriteQuery caches a successful rewrite when cache=true (no repeat llm call)', async () => {
+    let n = 0;
+    const llm = async () => { n++; return { variants: ['kw form', 'concept'] }; };
+    const a = await rewriteQuery('same q', { llm, cache: true });
+    const b = await rewriteQuery('same q', { llm, cache: true });
+    expect(n).toBe(1);                     // second served from cache
+    expect(b).toEqual(a);
+  });
+
+  it('rewriteQuery does not consult the cache when cache=false (default)', async () => {
+    let n = 0;
+    const llm = async () => { n++; return { variants: ['kw form', 'concept'] }; };
+    await rewriteQuery('q2', { llm });
+    await rewriteQuery('q2', { llm });
+    expect(n).toBe(2);                     // no cache → called twice
+  });
+
+  it('rewriteQuery does not cache a failed rewrite (allows retry on a later call)', async () => {
+    let n = 0;
+    const llm = async () => { n++; return { variants: [] }; }; // never usable
+    // retries:0 → one attempt per call, so a cached failure would show as n=1.
+    const a = await rewriteQuery('q3', { llm, cache: true, retries: 0 });
+    const b = await rewriteQuery('q3', { llm, cache: true, retries: 0 });
+    expect(a).toEqual(['q3']);
+    expect(b).toEqual(['q3']);
+    expect(n).toBe(2);                     // failure not cached → second call re-attempts
+  });
+
+  it('rewriteQuery retries=0 makes exactly one llm attempt (fail-fast)', async () => {
+    let n = 0;
+    const llm = async () => { n++; return { variants: [] }; };
+    const r = await rewriteQuery('q4', { llm, retries: 0 });
+    expect(n).toBe(1);
+    expect(r).toEqual(['q4']);
   });
 });
 

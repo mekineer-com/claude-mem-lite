@@ -370,7 +370,7 @@ async function runSearchPipeline(db, args, { llm } = {}) {
     let escalatedObsCount = 0;
 
     // Helper: run deepSearch and load results into the shared `results` array.
-    const runDeepInto = async () => {
+    const runDeepInto = async ({ auto = false } = {}) => {
       const { results: deepRows, variants } = await deepSearch(db, {
         query: args.query,
         project: args.project || null,
@@ -381,7 +381,7 @@ async function runSearchPipeline(db, args, { llm } = {}) {
         epochFrom, epochTo,
         limit: perSourceLimit,
         currentProject,
-      }, llm ? { llm } : undefined);
+      }, llm ? { llm } : { auto });
       // Safe to reset: sessions/prompts are pushed AFTER the obs block, so nothing is lost here.
       results.length = 0;
       results.push(...deepRows);
@@ -405,7 +405,7 @@ async function runSearchPipeline(db, args, { llm } = {}) {
         // filter makes the invariant explicit and robust to future reordering.
         const obsCountBeforeEscalation = results.length;
         if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx) && hasEscalatableCorpus(db, args.project || null)) {
-          await runDeepInto();
+          await runDeepInto({ auto: true });
           isDeep = true;
           escalated = true;
           escalatedObsCount = obsCountBeforeEscalation;

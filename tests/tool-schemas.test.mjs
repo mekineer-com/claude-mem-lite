@@ -1,10 +1,24 @@
 // Task 5: Discouragement-style MCP tool descriptions
 // Every tool in `tool-schemas.mjs` must carry both "DO NOT use when" and
-// "USE when" markers, and stay under 800 chars. This test is the contract
+// "USE when" markers, and keep authored prose under 760 chars (the CLI path is
+// excluded — it is environment-dependent; see D#38). This test is the contract
 // that blocks encouragement-style descriptions from slipping back in.
 
 import { describe, test, expect } from 'vitest';
 import { tools } from '../tool-schemas.mjs';
+import { CLI_INVOKE } from '../cli-path.mjs';
+
+// Bound the AUTHORED description, not the rendered string. Every "Equivalent
+// CLI:" line embeds CLI_INVOKE = `node <abs path to cli.mjs>` (resolved from
+// import.meta.url), so description.length is environment-dependent: identical
+// source measured 778 locally vs 797 in CI, and at v3.1.2 that ~19-char swing
+// pushed the longest tool to 802 and red-ed the release (D#38). Strip the
+// volatile invoke string before measuring so local-green == CI-green. 760 ≈ the
+// budget the old <800 check already enforced on the canonical dev path
+// (800 − the 43-char local "node <path>"), keeping the longest current
+// description (mem_save, 735 authored) at ~25 chars headroom.
+const MAX_AUTHORED_DESCRIPTION = 760;
+const authoredLength = (desc) => desc.split(CLI_INVOKE).join('').length;
 
 describe('MCP tool descriptions use discouragement style', () => {
   test('there are exactly 20 tools (9 core + 11 hidden)', () => {
@@ -63,12 +77,15 @@ describe('MCP tool descriptions use discouragement style', () => {
       'mem_fts_check', 'mem_browse',
       'mem_defer', 'mem_defer_list', 'mem_defer_drop',
     ].map((n) => [n])
-  )('%s description has DO NOT / USE when markers and <800 chars', (name) => {
+  )('%s description has DO NOT / USE when markers and <760 authored chars', (name) => {
     const tool = tools.find((t) => t.name === name);
     expect(tool, `${name} not found in tools export`).toBeTruthy();
     expect(tool.description, `${name} missing "DO NOT use when"`).toMatch(/DO NOT use when/);
     expect(tool.description, `${name} missing "USE when"`).toMatch(/USE when/);
-    expect(tool.description.length, `${name} description too long`).toBeLessThan(800);
+    expect(
+      authoredLength(tool.description),
+      `${name} authored description too long (CLI path excluded — see D#38)`,
+    ).toBeLessThan(MAX_AUTHORED_DESCRIPTION);
   });
 
   test('every tool lists an Equivalent CLI line (or explicit "MCP only")', () => {
