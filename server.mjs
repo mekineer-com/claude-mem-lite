@@ -9,7 +9,7 @@ import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debu
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
-import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
+import { searchObservationsHybrid, countSearchTotal, attachBodyTokens } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady, hasEscalatableCorpus } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
@@ -294,21 +294,24 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
   const fallbackHint = orFallbackFired && !args.or ? ' (relaxed AND→OR)' : '';
   lines.push(`Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
 
+  // `~Nt` = estimated tokens to fetch this row's full body via mem_get (attachBodyTokens).
+  // Conditional so a result that skipped enrichment renders cleanly, not "~undefinedt".
+  const tok = r => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
   for (const r of paginatedResults) {
     if (r.source === 'obs') {
       const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
-      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}`);
+      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}${tok(r)}`);
       if (r.snippet && r.snippet.length > 10 && r.snippet !== r.title) {
         lines.push(`     ${truncate(r.snippet, 100)}`);
       }
     } else if (r.source === 'session') {
-      lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}`);
+      lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
     } else if (r.source === 'prompt') {
-      lines.push(`P#${r.id} 💬 ${truncate(r.text)} | ${fmtDate(r.date)}`);
+      lines.push(`P#${r.id} 💬 ${truncate(r.text)} | ${fmtDate(r.date)}${tok(r)}`);
     }
   }
 
-  lines.push(`\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details`);
+  lines.push(`\nWorkflow: mem_timeline(anchor=ID) for context | mem_get(ids=[...]) for full details  ·  ~Nt = est. tokens to fetch full detail`);
   return { content: [{ type: 'text', text: lines.join('\n') }] };
 }
 
@@ -508,6 +511,9 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
       }), results.length);
     // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
     const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
+    // Enrich the FINAL page with a fetch-cost estimate (~Nt) so the agent budgets before mem_get.
+    // Uses the same db threaded through the pipeline (#8743) — batch-fetches heavy obs fields by id.
+    attachBodyTokens(db, paginatedResults);
 
     // Observability: announce auto-escalation on stderr (parity with CLI deep note).
     if (escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${escalatedObsCount} hits)\n`);

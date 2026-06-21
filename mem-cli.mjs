@@ -9,7 +9,7 @@ import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
-import { searchObservationsHybrid, countSearchTotal } from './search-engine.mjs';
+import { searchObservationsHybrid, countSearchTotal, attachBodyTokens } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady, hasEscalatableCorpus } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
@@ -323,6 +323,9 @@ async function cmdSearch(db, args, { llm } = {}) {
       includeNoise,
     }), results.length);
   const paged = results.slice(offset, offset + limit);
+  // Enrich the final page with the ~Nt fetch-cost hint (paired with MCP mem_search; #8654 both
+  // source keys handled). Batch-fetches heavy obs fields by id — no-op on an empty page.
+  attachBodyTokens(db, paged);
 
   if (paged.length === 0) {
     if (jsonOutput) {
@@ -361,6 +364,7 @@ async function cmdSearch(db, args, { llm } = {}) {
         importance: r.importance ?? null,
         superseded: Boolean(r.superseded),
         files_modified: r.files_modified || null,
+        body_tokens: r.bodyTokens ?? null,
       };
     });
     out(JSON.stringify({
@@ -382,19 +386,22 @@ async function cmdSearch(db, args, { llm } = {}) {
   // Pluralize on total — "Found 1 of 44 result" reads wrong; the population (44) drives
   // grammatical number, not the page slice (1).
   out(`[mem] Found ${countLabel} result${total !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
+  // `~Nt` = est. tokens to fetch this row's full body via mem_get (attachBodyTokens, paired with
+  // MCP). Conditional so a row that skipped enrichment renders cleanly, not "~undefinedt".
+  const tok = r => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
   for (const r of paged) {
     const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
     if (r._source === 'session') {
       const date = fmtDateShort(r.created_at);
-      out(`S#${r.id} 📋 ${date}${timeStr} ${truncate(r.request || r.completed || '(no summary)', 80)}`);
+      out(`S#${r.id} 📋 ${date}${timeStr} ${truncate(r.request || r.completed || '(no summary)', 80)}${tok(r)}`);
     } else if (r._source === 'prompt') {
       const date = fmtDateShort(r.created_at);
-      out(`P#${r.id} 💬 ${date}${timeStr} ${truncate(r.prompt_text || '(empty)', 80)}`);
+      out(`P#${r.id} 💬 ${date}${timeStr} ${truncate(r.prompt_text || '(empty)', 80)}${tok(r)}`);
     } else {
       const date = fmtDateShort(r.created_at);
       const title = truncate(r.title || r.subtitle || '(untitled)', 80);
       const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
-      out(`#${r.id} ${typeIcon(r.type)} ${date}${timeStr} ${title}${supersededTag}`);
+      out(`#${r.id} ${typeIcon(r.type)} ${date}${timeStr} ${title}${supersededTag}${tok(r)}`);
       if (r.lesson_learned) {
         out(`  -> ${truncate(r.lesson_learned, 80)}`);
       }

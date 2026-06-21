@@ -9,7 +9,7 @@ import {
   OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE,
   DEFAULT_DECAY_HALF_LIFE_MS,
   notLowSignalTitleClause, LOW_SIGNAL_TITLE,
-  relaxFtsQueryToOr, debugLog, debugCatch,
+  relaxFtsQueryToOr, debugLog, debugCatch, estimateTokens,
 } from './utils.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
 import { extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
@@ -188,6 +188,45 @@ export function ftsRowToResult(r, { scoreMultiplier, snippet } = {}) {
     files_modified: r.files_modified, importance: r.importance, lesson_learned: r.lesson_learned,
     snippet: snippet ? (r.match_snippet || '') : '',
   };
+}
+
+// Per-result estimate of the token cost to fetch the FULL body via mem_get, surfaced as the
+// `~Nt` hint in search output so the agent can budget the 3-layer protocol (search → timeline →
+// get) before paying to expand any ID. Adopted from thedotmack/claude-mem's token-cost column
+// (reference_claude_mem_comparison) — the one genuinely portable idea from that analysis.
+//
+// Layer-1 search deliberately omits narrative/facts (that's what keeps the index light), so the
+// heavy obs fields are batch-fetched by id HERE rather than carried on every result. The source
+// key is read as `source || _source` because the two render paths disagree (#8654): MCP sets
+// `source`+`text`, CLI sets `_source`+`prompt_text`. estimateTokens floors at 1, so a missing row
+// or empty body yields 1 — never 0/NaN.
+export function attachBodyTokens(db, results) {
+  if (!Array.isArray(results) || results.length === 0) return results;
+  const obsIds = results
+    .filter(r => (r.source || r._source) === 'obs' && Number.isInteger(r.id))
+    .map(r => r.id);
+  const bodyById = new Map();
+  if (obsIds.length > 0) {
+    try {
+      const ph = obsIds.map(() => '?').join(',');
+      const rows = db.prepare(`SELECT id, narrative, facts, text FROM observations WHERE id IN (${ph})`).all(...obsIds);
+      for (const row of rows) bodyById.set(row.id, row);
+    } catch (e) { debugCatch(e, 'attachBodyTokens'); }
+  }
+  for (const r of results) {
+    const src = r.source || r._source;
+    let parts;
+    if (src === 'obs') {
+      const row = bodyById.get(r.id) || {};
+      parts = [r.title, r.subtitle, r.lesson_learned, row.narrative, row.facts, row.text];
+    } else if (src === 'session') {
+      parts = [r.request, r.completed, r.working_on];
+    } else {
+      parts = [r.text, r.prompt_text];
+    }
+    r.bodyTokens = estimateTokens(parts.filter(Boolean).join(' '));
+  }
+  return results;
 }
 
 function expandObsByConceptCo(db, ctx, now, existingIds, results, includeNoise = false) {

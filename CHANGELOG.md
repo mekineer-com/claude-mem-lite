@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.5.0 — search results show a `~Nt` fetch-cost hint
+
+Additive, **default-on**. Every `mem_search` / `claude-mem-lite search` result row now carries a `~Nt` estimate of the tokens it would cost to fetch that result's full body via `mem_get`, so the agent (or you) can budget the search → timeline → get protocol before paying to expand any ID. Ranking, recall, and *which* results are returned are unchanged — only the rendered output gains a hint.
+
+### feat: per-result `~Nt` token-cost hint (CLI + MCP)
+
+`mem_search` and the `search` CLI now append ` ~Nt` to each observation/session/prompt row, where `N` is the estimated cost to fetch that row's full body — `estimateTokens` over the heavy fields (`narrative`/`facts`/`text`) that `mem_get` returns, batch-fetched by id at format time via the new shared `attachBodyTokens` helper so the layer-1 search index stays light (no narrative carried in the result rows). The MCP footer documents the hint (`~Nt = est. tokens to fetch full detail`); CLI `--json` output gains a `body_tokens` field.
+
+This makes the existing 3-layer progressive-disclosure protocol actually budgetable: a 400-token result and a 40-token result are now visibly different *before* you fetch either. Adopted from thedotmack/claude-mem's token-cost column — the one portable idea from a full source-level comparison of that project (the rest was already present here, deliberately-skipped embedding infra, or unimplemented marketing). `attachBodyTokens` reads both render paths' source-key conventions (`source`/`_source`, `text`/`prompt_text`) so the CLI and MCP outputs stay paired.
+
 ## v3.4.0 — opt-in LLM rerank for deep search (CLI + MCP)
 
 Additive, opt-in, default-off — no change to default search behaviour. Existing `mem_search` / `claude-mem-lite search` calls behave exactly as in v3.3.x unless you pass the new `rerank` flag with `deep`.
