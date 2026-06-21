@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.3.1 — OpenRouter requests honour HTTP(S)_PROXY
+
+### fix: route OpenRouter through the HTTP(S)_PROXY proxy via a CONNECT tunnel
+
+Node's global `fetch` (undici) does not honour `HTTP_PROXY` / `HTTPS_PROXY` environment variables. So when `OPENROUTER_API_KEY` is set in an environment that requires a local proxy to reach external services, every OpenRouter call (hook summaries, deep-search query rewrites) went out **direct** — hanging ~8 s and timing out under load, then degrading to the slower `claude -p` CLI fallback. `callOpenRouterAPI` now tunnels HTTPS through the configured HTTP CONNECT proxy using Node built-ins only (`node:http` / `node:https` / `node:tls`) — **no new dependency** (undici's `ProxyAgent` is not importable without adding one on Node 22). When no proxy var is set, or the target host is matched by `NO_PROXY`, behaviour is unchanged (native `fetch`). Measured ~8 s → ~1.4 s per call (~5×), and OpenRouter JSON parse-rate on the rerank benchmark rose 60% → 100% once timeouts stopped. Only HTTP CONNECT proxies are handled; a `socks5://` `ALL_PROXY` is ignored. Hermetic-test fix: the haiku-client suite now neutralizes ambient proxy vars in `beforeEach` (same env-gated-transport trap as the OpenRouter-key handling) so fetch-mocking tests stay deterministic.
+
+### test: standardized LongMemEval recall benchmark + LLM-rerank experiment
+
+New dev tooling under `benchmark/` (does not change runtime package behaviour). `benchmark/longmemeval.mjs` measures the production FTS5 + TF-IDF + RRF retrieval against the standard LongMemEval long-term-memory benchmark — `recall_any@k`, user-turns-only corpus (matching the field's raw baseline), reusing the existing `benchmark.mjs` seed/search seams. `benchmark/longmemeval-rerank.mjs` is an opt-in LLM-rerank experiment over the top-K lexical candidates (injectable provider, stub-tested). Datasets are downloaded on demand via `benchmark/datasets/download-longmemeval.sh` and are git-ignored; see `benchmark/datasets/README.md`.
+
 ## v3.3.0 — Deep-search auto-escalation now reaches CLI-auth users (default-on)
 
 ### change: AUTO deep-search escalation extended to claude-CLI auth (D#40)
