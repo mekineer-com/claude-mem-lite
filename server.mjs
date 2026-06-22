@@ -9,11 +9,11 @@ import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debu
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
-import { searchObservationsHybrid, countSearchTotal, attachBodyTokens } from './search-engine.mjs';
+import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter, finalizeSearchPage } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
@@ -500,31 +500,14 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
     // Apply user-requested sort (after relevance scoring; shared with CLI)
     applyUserSort(results, args.sort || 'relevance');
 
-    // `total` must be the TRUE population, invariant to limit/offset. In cross-source
-    // mode results is over-fetched (perSourceLimit scales with limit+offset), so
-    // results.length is NOT the population — count the real MATCH set instead. Clamp
-    // to >= results.length so vector/concept-augmented obs rows are never undercounted.
-    // (paired-path with mem-cli.mjs via shared countSearchTotal — #8217)
-    // For deep (explicit or auto-escalated), the population is the fused variant set
-    // already in `results` (deep is obs-only, returned by deepSearch capped at
-    // perSourceLimit). countSearchTotal would count the ORIGINAL query's FTS matches
-    // instead — wrong, and ~0 on the vocabulary-mismatch queries deep exists for (F1).
-    const totalBeforePagination = isDeep
-      ? results.length
-      : Math.max(countSearchTotal(db, {
-        effectiveSource: effectiveType || null,
-        ftsQuery,
-        obsFtsQuery: effectiveObsFtsQuery(ftsQuery, ctx.orFallbackFired === true),
-        args: { project: args.project || null, obs_type: args.obs_type || null, importance: args.importance || null, branch: args.branch || null },
-        project: args.project || null,
-        epochFrom, epochTo,
-        includeNoise: args.include_noise === true,
-      }), results.length);
-    // Always apply pagination — single-source results can exceed SQL LIMIT due to expansion (concept co-occurrence, PRF, vector search)
-    const paginatedResults = (offset > 0 || results.length > limit) ? results.slice(offset, offset + limit) : results;
-    // Enrich the FINAL page with a fetch-cost estimate (~Nt) so the agent budgets before mem_get.
-    // Uses the same db threaded through the pipeline (#8743) — batch-fetches heavy obs fields by id.
-    attachBodyTokens(db, paginatedResults);
+    // True (limit/offset-invariant) population + page slice + ~Nt fetch-cost hints
+    // — shared count/paginate tail with the CLI (finalizeSearchPage; #8217/#8635).
+    // Uses the same db threaded through the pipeline (#8743).
+    const { total: totalBeforePagination, page: paginatedResults } = finalizeSearchPage(db, results, {
+      isDeep, offset, limit, effectiveSource: effectiveType, ftsQuery, orFallbackFired: ctx.orFallbackFired === true,
+      project: args.project, obsType: args.obs_type, importance: args.importance, branch: args.branch,
+      epochFrom, epochTo, includeNoise: args.include_noise === true,
+    });
 
     // Observability: announce auto-escalation on stderr (parity with CLI deep note).
     if (escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${escalatedObsCount} hits)\n`);

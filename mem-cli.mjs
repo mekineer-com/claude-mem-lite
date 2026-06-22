@@ -9,7 +9,7 @@ import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
-import { searchObservationsHybrid, countSearchTotal, attachBodyTokens } from './search-engine.mjs';
+import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
@@ -37,7 +37,7 @@ import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter } from './lib/search-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter, finalizeSearchPage } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
@@ -297,36 +297,14 @@ async function cmdSearch(db, args, { llm } = {}) {
   // Apply user-requested sort (after relevance scoring; shared with mem_search)
   applyUserSort(results, sort);
 
-  // Trim to limit with offset. The engine always received perSourceOffset=0 and
-  // over-fetched (see above), so the merged+reranked `results` start at row 0 and
-  // the offset is applied exactly ONCE here — for every mode.
-  //
-  // `total` must be the TRUE population, independent of --limit/--offset (else the
-  // over-fetched candidate count grew with the page and broke the "N of M" /
-  // pagination contract). countSearchTotal mirrors each source's MATCH+filters;
-  // clamp to >= results.length so it never understates the rows actually shown
-  // (vector/concept augmentation can add obs rows beyond the FTS count).
-  // For --deep the population is the fused variant result set: deepSearch already
-  // returned all fused rows (capped at perSourceLimit) and they are the only rows
-  // in `results` (deep is obs-only). countSearchTotal would instead count the
-  // ORIGINAL query's FTS matches — wrong, and ~0 on the vocabulary-mismatch
-  // queries deep exists for, which falsely shrinks the "N of M" total (F1).
-  const total = isDeep
-    ? results.length
-    : Math.max(countSearchTotal(db, {
-      effectiveSource,
-      ftsQuery,
-      obsFtsQuery: effectiveObsFtsQuery(ftsQuery, orFallbackFired),
-      args: { project: project || null, obs_type: type || null, importance: minImportance || null, branch: branch || null },
-      project: project || null,
-      epochFrom: dateFrom,
-      epochTo: dateTo,
-      includeNoise,
-    }), results.length);
-  const paged = results.slice(offset, offset + limit);
-  // Enrich the final page with the ~Nt fetch-cost hint (paired with MCP mem_search; #8654 both
-  // source keys handled). Batch-fetches heavy obs fields by id — no-op on an empty page.
-  attachBodyTokens(db, paged);
+  // True population + page slice + ~Nt fetch-cost hints — shared count/paginate
+  // tail with mem_search (finalizeSearchPage; the #8635 drift surface). offset is
+  // applied exactly ONCE here (sources over-fetched from offset 0).
+  const { total, page: paged } = finalizeSearchPage(db, results, {
+    isDeep, offset, limit, effectiveSource, ftsQuery, orFallbackFired,
+    project: project || null, obsType: type, importance: minImportance, branch,
+    epochFrom: dateFrom, epochTo: dateTo, includeNoise,
+  });
 
   if (paged.length === 0) {
     if (jsonOutput) {
