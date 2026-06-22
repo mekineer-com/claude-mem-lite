@@ -1,5 +1,9 @@
-// claude-mem-lite server internal functions
-// Extracted from server.mjs for testability (server.mjs has top-level side effects)
+// claude-mem-lite shared search-scoring / ranking helpers: re-ranking, supersede
+// marking, PRF term extraction, concept-expansion — plus the MCP instructions
+// builder and idle-cleanup/access-boost side helpers. Used by the MCP server,
+// the CLI (mem-cli), and search-engine; originally extracted from server.mjs for
+// testability (server.mjs has top-level side effects), hence the former
+// "server-internals" name — renamed in audit P3 since it is not server-only.
 
 import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';

@@ -8,7 +8,7 @@ import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './server-internals.mjs';
+import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';

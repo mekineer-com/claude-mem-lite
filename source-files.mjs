@@ -6,7 +6,7 @@
 
 export const SOURCE_FILES = [
   // Entry points and top-level modules
-  'cli.mjs', 'cli-path.mjs', 'server.mjs', 'server-internals.mjs', 'search-engine.mjs', 'deep-search.mjs', 'rerank.mjs', 'tool-schemas.mjs',
+  'cli.mjs', 'cli-path.mjs', 'server.mjs', 'search-scoring.mjs', 'search-engine.mjs', 'deep-search.mjs', 'rerank.mjs', 'tool-schemas.mjs',
   'hook.mjs', 'hook-shared.mjs', 'hook-llm.mjs', 'hook-memory.mjs', 'skip-tools.mjs',
   'hook-semaphore.mjs', 'hook-episode.mjs', 'hook-context.mjs', 'hook-handoff.mjs',
   'hook-update.mjs', 'hook-optimize.mjs', 'hook-precompact.mjs',

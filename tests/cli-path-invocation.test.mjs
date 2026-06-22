@@ -15,7 +15,7 @@ import { join, dirname } from 'node:path';
 
 import { CLI_PATH, CLI_INVOKE } from '../cli-path.mjs';
 import { tools } from '../tool-schemas.mjs';
-import { buildServerInstructions } from '../server-internals.mjs';
+import { buildServerInstructions } from '../search-scoring.mjs';
 import { getDetailDoc } from '../adopt-content.mjs';
 
 const ROOT = dirname(fileURLToPath(new URL('../cli-path.mjs', import.meta.url)));
@@ -72,7 +72,7 @@ describe('runtime recovery hints resolve `repair` by absolute path', () => {
 
 describe('source + manifest guards', () => {
   test('no JS-emitted surface still hardcodes the tilde path', () => {
-    for (const rel of ['tool-schemas.mjs', 'adopt-content.mjs', 'server-internals.mjs',
+    for (const rel of ['tool-schemas.mjs', 'adopt-content.mjs', 'search-scoring.mjs',
                        'lib/native-binding-hint.mjs', 'scripts/hook-launcher.mjs']) {
       const src = readFileSync(join(ROOT, rel), 'utf8');
       expect(src, `${rel} still contains the broken tilde path`).not.toContain(BROKEN);

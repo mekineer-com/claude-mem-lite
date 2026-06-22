@@ -12,7 +12,7 @@ import {
   relaxFtsQueryToOr, debugLog, debugCatch, estimateTokens,
 } from './utils.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
-import { extractPRFTerms, expandQueryByConcepts } from './server-internals.mjs';
+import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
 
 // Scoring expressions — full adds project boost + access bonus; simple is for
 // expansion paths where boost would over-amplify already-loose matches.

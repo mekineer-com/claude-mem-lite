@@ -9,7 +9,7 @@ import { join } from 'path';
 import { effectiveQuiet, isAdoptedHere, isQuietHooks } from '../hook-shared.mjs';
 import { writePluginSection, removePluginSection, memdirPath } from '../memdir.mjs';
 import { PLUGIN_SLUG, CURRENT_SENTINEL_VERSION, getIndexLine } from '../adopt-content.mjs';
-import { buildServerInstructions } from '../server-internals.mjs';
+import { buildServerInstructions } from '../search-scoring.mjs';
 import { buildSessionContextLines } from '../hook-context.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 

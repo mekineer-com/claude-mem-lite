@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
-import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup } from '../server-internals.mjs';
+import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup } from '../search-scoring.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 

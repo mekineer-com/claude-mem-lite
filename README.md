@@ -582,7 +582,7 @@ claude-mem-lite/
   commands/
     mem.md           # /mem command definition
   server.mjs           # MCP server: tool definitions, FTS5 search, database init
-  server-internals.mjs # Extracted search helpers: re-ranking, PRF, concept expansion
+  search-scoring.mjs # Extracted search helpers: re-ranking, PRF, concept expansion
   hook.mjs             # Claude Code hooks: episode capture, error recall, session management
   hook-llm.mjs         # Background LLM workers: episode extraction, session summaries
   hook-shared.mjs      # Shared hook infrastructure: session management, DB access, LLM calls

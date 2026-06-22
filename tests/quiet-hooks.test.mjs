@@ -12,7 +12,7 @@ import { mkdtempSync, mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { isQuietHooks } from '../hook-shared.mjs';
-import { buildServerInstructions } from '../server-internals.mjs';
+import { buildServerInstructions } from '../search-scoring.mjs';
 import { buildSessionContextLines } from '../hook-context.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 

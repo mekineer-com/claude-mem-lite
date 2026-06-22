@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { getCurrentBranch } from '../utils.mjs';
-import { markSuperseded } from '../server-internals.mjs';
+import { markSuperseded } from '../search-scoring.mjs';
 
 describe('Phase 1 schema migrations', () => {
   let db;

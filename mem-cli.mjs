@@ -8,7 +8,7 @@ import { truncate, typeIcon, inferProject, scrubSecrets } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
-import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './server-internals.mjs';
+import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';

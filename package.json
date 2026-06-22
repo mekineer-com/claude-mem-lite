@@ -28,7 +28,7 @@
     "cli-path.mjs",
     "mem-cli.mjs",
     "server.mjs",
-    "server-internals.mjs",
+    "search-scoring.mjs",
     "search-engine.mjs",
     "deep-search.mjs",
     "rerank.mjs",

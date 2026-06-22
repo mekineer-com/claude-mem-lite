@@ -524,7 +524,7 @@ claude-mem-lite/
   commands/
     mem.md           # /mem 命令定义
   server.mjs           # MCP 服务器：工具定义、FTS5 搜索、数据库初始化
-  server-internals.mjs # 搜索辅助模块：重排序、PRF、概念扩展
+  search-scoring.mjs # 搜索辅助模块：重排序、PRF、概念扩展
   hook.mjs             # Claude Code 钩子：episode 捕获、错误回忆、会话管理
   hook-llm.mjs         # 后台 LLM worker：episode 提取、会话摘要
   hook-shared.mjs      # 共享钩子基础设施：会话管理、数据库访问、LLM 调用
