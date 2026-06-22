@@ -38,6 +38,38 @@ describe('importJsonl — fixture', () => {
     expect(cnt.n).toBe(2);
   });
 
+  // recognized > 0 on a valid transcript even when fully deduped — this is the
+  // signal cmdImportJsonl uses to NOT mislabel an idempotent re-run as "wrong shape".
+  it('reports recognized transcript events on both first import and re-run', async () => {
+    const first = await importJsonl(db, FIXTURE, { project: 'proj' });
+    expect(first.recognized).toBeGreaterThan(0);
+    const second = await importJsonl(db, FIXTURE, { project: 'proj' });
+    expect(second.recognized).toBeGreaterThan(0); // still recognized, just all deduped
+    expect(second.prompts).toBe(0);
+    expect(second.observations).toBe(0);
+  });
+
+  // A wrong-shape file (e.g. `export` output: observation-shaped JSON with no
+  // user/assistant/tool_result events) yields recognized === 0 — the genuine
+  // "wrong shape" signal that must still fire the warning.
+  it('reports recognized === 0 for non-transcript (export-shaped) input', async () => {
+    const tmpPath = join(__dirname, 'fixtures/sample-claude-jsonl/export-shaped.jsonl');
+    const fs = await import('fs');
+    fs.writeFileSync(tmpPath, [
+      '{"id":1,"type":"bugfix","title":"obs one","narrative":"body"}',
+      '{"id":2,"type":"decision","title":"obs two","narrative":"body"}',
+    ].join('\n') + '\n');
+    try {
+      const r = await importJsonl(db, tmpPath, { project: 'proj' });
+      expect(r.recognized).toBe(0);
+      expect(r.prompts).toBe(0);
+      expect(r.observations).toBe(0);
+      expect(r.skipped).toBe(2);
+    } finally {
+      fs.unlinkSync(tmpPath);
+    }
+  });
+
   it('scrubs secrets from imported text fields', async () => {
     const tmpPath = join(__dirname, 'fixtures/sample-claude-jsonl/with-secret.jsonl');
     const fs = await import('fs');

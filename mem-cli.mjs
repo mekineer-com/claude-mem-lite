@@ -308,18 +308,26 @@ function cmdRecent(db, args) {
   const { positional, flags } = parseArgs(args);
   const rawArg = positional[0];
   const rawLimit = parseInt(rawArg, 10);
+  // Single source of the upper bound for BOTH the positional [N] and the --limit
+  // flag (help: "alias for [N] (max 1000)"). Pre-fix the positional path skipped
+  // this cap, so `recent 999999` issued an uncapped `LIMIT 999999` full-table dump
+  // while `recent --limit 999999` correctly rejected → default — exactly the
+  // "none capped --limit dumps the whole set" footgun parseIntFlag was extracted
+  // to close (lib/cli-flags.mjs). Keep the literal in one place so the two paths
+  // can't drift apart again.
+  const RECENT_MAX = 1000;
   // isNumericToken first: "2abc"→2 / "1e2"→1 are positive integers that the bare check
   // accepted silently; the positional path must reject garbage like the --limit flag does.
-  const isValid = rawArg !== undefined && isNumericToken(rawArg) && Number.isInteger(rawLimit) && rawLimit > 0;
+  const isValid = rawArg !== undefined && isNumericToken(rawArg) && Number.isInteger(rawLimit) && rawLimit > 0 && rawLimit <= RECENT_MAX;
   if (rawArg !== undefined && !isValid) {
-    process.stderr.write(`[mem] Invalid count "${rawArg}" (must be a positive integer); using default 10\n`);
+    process.stderr.write(`[mem] Invalid count "${rawArg}" (must be an integer between 1 and ${RECENT_MAX}); using default 10\n`);
   }
   // Positional [N] wins for backward-compat; --limit is sibling-parity alias
   // (search/recall/browse/stats all accept --limit). Pre-2.69 `recent --limit N`
   // was silently ignored — surprising users extrapolating from siblings.
   const limit = isValid
     ? rawLimit
-    : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 1000 });
+    : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: RECENT_MAX });
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
   const jsonOutput = flags.json === true || flags.json === 'true';
 
@@ -1768,7 +1776,7 @@ function cmdMaintain(db, args) {
     out(`[mem] Maintenance scan:`);
     out(`  Total active: ${stats.total}`);
     out(`  Near-duplicate pairs: ${duplicates.length}`);
-    out(`  Stale (>30d, imp=1, no access): ${stats.stale}`);
+    out(`  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`);
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
     out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — run: maintain execute --ops demote_pinned`);
@@ -2585,7 +2593,7 @@ async function cmdImportJsonl(db, argv) {
   if (files.length === 0) { out('[mem] No .jsonl files found.'); return; }
 
   const { importJsonl } = await import('./lib/import-jsonl.mjs');
-  let totalPrompts = 0, totalObs = 0, totalSkip = 0, totalOrphans = 0, errorCount = 0;
+  let totalPrompts = 0, totalObs = 0, totalSkip = 0, totalOrphans = 0, totalRecognized = 0, errorCount = 0;
   for (const f of files) {
     // Per-file isolation: one unreadable file (EACCES, EBUSY, mid-batch IO error)
     // shouldn't crash the whole import — readFileSync inside importJsonl would
@@ -2605,18 +2613,29 @@ async function cmdImportJsonl(db, argv) {
     totalObs += r.observations;
     totalSkip += r.skipped;
     totalOrphans += r.orphans || 0;
+    totalRecognized += r.recognized || 0;
     out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations, ${r.orphans || 0} orphan tool_use, ${r.skipped} skipped`);
   }
   const errorTail = errorCount > 0 ? `, ${errorCount} file(s) errored` : '';
   out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
-  if (totalPrompts > 0 || totalObs > 0) {
+  if (totalPrompts > 0 || totalObs > 0 || totalOrphans > 0) {
+    // Orphan tool_use events persist as (truncated) observations, so they count as
+    // "something was imported" — otherwise an orphan-only first import would wrongly
+    // fall through to the "already imported" no-op branch below.
     out(`[mem] Try: claude-mem-lite recent 5 --project ${project}`);
+  } else if (totalRecognized > 0) {
+    // Lines WERE Claude Code transcript events but produced no new rows — the file
+    // was already imported (idempotent re-run) or carried no extractable content.
+    // Distinct from the wrong-shape case below: do NOT cry "wrong shape" at a valid
+    // transcript the user successfully imported earlier (cold-start backfill re-runs
+    // hit this on every already-ingested file).
+    out(`[mem] Nothing new: ${totalRecognized} transcript event(s) already imported (re-running import-jsonl on the same transcript is a safe no-op).`);
   } else if (totalSkip > 0 && errorCount === 0) {
-    // Nothing imported but every line was skipped — almost always the wrong file
-    // format (import-jsonl ingests Claude Code transcript JSONL, not `export` output,
-    // which is observation-shaped). Pre-fix this exited 0 with no signal, so pointing
-    // it at the wrong file looked like success. Make the no-op explicit (stdout, like
-    // the summary lines above).
+    // No transcript event recognized at all — almost always the wrong file format
+    // (import-jsonl ingests Claude Code transcript JSONL, not `export` output, which
+    // is observation-shaped). Pre-fix this exited 0 with no signal, so pointing it at
+    // the wrong file looked like success. Make the no-op explicit (stdout, like the
+    // summary lines above).
     out(`[mem] Warning: 0 imported, ${totalSkip} line(s) skipped — none matched the expected Claude Code transcript JSONL shape (user/assistant/tool_result). 'export' output is NOT re-importable via import-jsonl.`);
   }
 }

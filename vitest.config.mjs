@@ -7,7 +7,15 @@ export default defineConfig({
     // never spawn a real `claude` subprocess during the suite. This forces
     // autoDeepLlmReady's CLI branch off in every worker; tests that exercise the
     // auto path inject a stub llm or mock haiku-client instead.
-    env: { CLAUDE_MEM_AUTO_DEEP_CLI: '0' },
+    //
+    // Hermetic LLM mode: a dev/CI shell that exports a real ANTHROPIC_API_KEY /
+    // OPENROUTER_API_KEY flips detectMode() to 'api'/'openrouter', so any un-mocked
+    // LLM path would make a REAL network call — non-deterministic (rate-limit flakes),
+    // slow, and billable. haiku-client.test.mjs + e2e.test.mjs already stub these
+    // per-file ("the dev/CI shell may export a real key"); force them empty GLOBALLY
+    // so no test can leak a live call by forgetting to. Tests that exercise keyed
+    // mode override locally via vi.stubEnv (which restores to '' after each test).
+    env: { CLAUDE_MEM_AUTO_DEEP_CLI: '0', ANTHROPIC_API_KEY: '', OPENROUTER_API_KEY: '' },
     // Reap test-fixture dirs leaked by prior interrupted/SIGKILL'd runs (afterEach
     // never reached). Runs once before the suite; 1h age guard never touches the
     // current run. See lib/tmp-fixture-sweep.mjs.

@@ -476,6 +476,35 @@ describe('CLI recent command', () => {
     expect(resultLines.length).toBe(10);
   });
 
+  // Regression: positional [N] must honor the same max:1000 cap as --limit. Pre-fix
+  // the positional path skipped parseIntFlag's upper bound, so `recent 999999` issued
+  // an uncapped `LIMIT 999999` full-table dump while `recent --limit 999999` correctly
+  // rejected → default 10. The help calls [N] and --limit equivalent ("max 1000"), and
+  // parseIntFlag was extracted precisely to stop "none capped --limit" result dumps.
+  it('positional count over max (1000) warns and falls back to default 10', async () => {
+    for (let i = 0; i < 12; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `Obs ${i}`, text: `content ${i}`, epochOffset: i * 60000,
+      });
+    }
+    const output = await captureStdout(() => run(['recent', '999999']));
+    expect(output).toContain('between 1 and 1000');
+    const resultLines = output.trim().split('\n').filter(l => l.startsWith('#'));
+    expect(resultLines.length).toBe(10);
+  });
+
+  // Boundary: exactly 1000 is the documented max and must remain valid (≤1000).
+  it('positional count at the 1000 boundary is accepted (no warning)', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Boundary obs', text: 'content', epochOffset: 1000,
+    });
+    const output = await captureStdout(() => run(['recent', '1000']));
+    expect(output).not.toContain('Invalid count');
+    expect(output).toContain('Boundary obs');
+  });
+
   // `recent --type bugfix` previously parsed as a silent no-op — the flag was unrecognized
   // and returned every obs type. Mirrors the validation cmdSearch already had.
   it('--type filter narrows to a single observation type', async () => {
@@ -1448,7 +1477,7 @@ describe('CLI maintain command', () => {
   it('scan returns 0 (not null) when project has no observations', async () => {
     const output = await captureStdout(() => run(['maintain', 'scan', '--project', 'empty--project']));
     expect(output).not.toContain('null');
-    expect(output).toContain('Stale (>30d, imp=1, no access): 0');
+    expect(output).toContain('Stale (>30d, imp=1, no access, never injected): 0');
     expect(output).toContain('Broken (no title/narrative): 0');
     expect(output).toContain('Boostable (accessed>3, imp<3): 0');
   });

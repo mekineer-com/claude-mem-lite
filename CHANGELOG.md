@@ -2,6 +2,34 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.11.0 — five robustness fixes from an end-to-end QA pass: secret-scrub leak, scan/execute parity, CLI cap, import-jsonl UX, hermetic tests
+
+A batch of correctness/safety fixes surfaced by a full end-to-end dogfooding pass (CLI, passive hooks, MCP server, maintenance ops, LLM enrichment, adopt/unadopt file writes, concurrency). One security fix, one scan↔execute parity fix, one CLI bound fix, one import-UX fix, one test-hermeticity fix. No new features, no breaking changes; default behavior is unchanged except the secret-scrub widening noted below. Test suite 3163 → 3174 (+11 regression tests, all green); ESLint clean.
+
+### fix(secret-scrub): bare-noun `=` assignments now scrub even mid-prose — closes a credential leak
+
+`<English-word> password=<value>` (e.g. `Config has password=hunter2supersecret`) leaked into the DB because the bare-noun prose lookbehind `(?<![A-Za-z][ \t])` was separator-agnostic — it skipped any `password|passwd|token|bearer|secret` preceded by "word ", including `=` assignments (which are config, not prose). The unquoted + quoted noun patterns are now split: `=` always scrubs; `:` keeps the prose guard, so `the token: alice` stays unscrubbed. Provider-prefix keys (AKIA…/ghp_…/sk-…/JWT/sk_live_…) were always scrubbed; only this prose-with-`=` shape leaked. Every #8283 pinned prose case uses `:`, so the `=` arm is leak-closing with no false-positive shift on the protected set.
+
+### fix(maintain): scan "Stale" count now matches what `decay` actually marks idle
+
+`maintain scan`'s "Stale (>30d, imp=1, no access)" count omitted the `injection_count=0` guard that `decayAndMarkIdle`'s mark-idle pass enforces (#8614), so scan over-counted by the injected-but-decayed rows `decay` never marks idle — exactly the rows `demote_pinned` drops to importance 1 (they keep `injection_count>0`). Users saw "Stale: 2" then "marked 0 idle". `maintenanceStats.stale` now carries the same guard (single source `lib/maintain-core.mjs`, shared by CLI + MCP); the label reads "no access, never injected".
+
+### fix(cli): `recent <N>` positional now honors the documented `max:1000` cap
+
+The positional `[N]` path skipped the upper bound that the `--limit` alias enforces via `parseIntFlag`, so `recent 999999` issued an uncapped `LIMIT 999999` full-table fetch while `recent --limit 999999` correctly rejected → default. Both paths now share one `RECENT_MAX = 1000` constant. The help already documented `[N]` and `--limit` as equivalent ("alias for [N] (max 1000)").
+
+### fix(import-jsonl): re-running on an already-imported transcript no longer claims "wrong shape"
+
+The "0 imported, N skipped" summary fired the wrong-shape warning ("'export' output is NOT re-importable") on idempotent re-runs, alarming users whose transcripts were valid and simply already ingested (cold-start backfill hits this on every re-run). `importJsonl` now returns `recognized` (count of user/assistant/tool_result events); the wrong-shape warning fires only when `recognized === 0`, otherwise it reports "already imported — safe no-op". Orphan `tool_use` events count as imported so an orphan-only first import isn't mislabeled.
+
+### test: vitest config forces LLM API keys empty so the suite is hermetic under an ambient key
+
+A dev/CI shell exporting a real `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` flips `detectMode()` to `api`/`openrouter`, so any un-mocked LLM path could make a real (slow, billable, rate-limit-flaky) network call. `haiku-client.test.mjs` + `e2e.test.mjs` already stubbed the keys per file; `vitest.config.mjs` `test.env` now forces both empty globally so every worker resolves to `cli` mode regardless of the ambient shell. Per-file `vi.stubEnv` overrides for keyed-mode tests still work (they restore to `''`).
+
+### docs(benchmark): record why `reRankWithContext` is not mirrored in the longmemeval adapter
+
+Comment-only note in `searchProductionHybrid`: the longmemeval corpus seeds no `observation_files`, so the file-activity recency booster `reRankWithContext` is a structural no-op on that corpus — closing the fidelity gap flagged in v3.10.0 by construction rather than leaving it deferred.
+
 ## v3.10.0 — RRF pagination stability (D#30 reopened) + `--json` envelope on empty/not-found paths
 
 A search-pagination correctness fix, two CLI `--json` contract repairs, and a benchmark-fidelity alignment. The default search (`limit=20`, `offset=0`) is byte-identical to v3.9.1 — only small-`limit`, `--offset`, and deep-page behavior changes. Test suite 3157 → 3163 (+6 regression tests, all green); ESLint clean; longmemeval unchanged (`recall_any@5=90.6%` full dataset).

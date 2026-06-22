@@ -780,6 +780,44 @@ describe('CLI E2E: import-jsonl routing', () => {
     expect(exitCode).toBe(0);
     expect(stdout).toMatch(/^\s*import-jsonl\b/m);
   });
+
+  // Regression: re-running import-jsonl on an already-imported transcript is a
+  // successful idempotent no-op, but the "0 imported, N skipped" warning text
+  // claimed "none matched the expected shape — 'export' output is NOT re-importable",
+  // scaring users whose transcripts are valid and were simply already imported.
+  // The shape-mismatch warning must fire ONLY when no transcript event was recognized.
+  it('re-running on an already-imported transcript does not claim wrong shape', () => {
+    const transcript = join(tmpHome, 'rerun.jsonl');
+    writeFileSync(transcript, [
+      '{"type":"user","sessionId":"e2e-rerun-1","timestamp":"2026-06-20T10:00:00.000Z","message":{"role":"user","content":"investigate the cache eviction policy"}}',
+      '{"type":"assistant","sessionId":"e2e-rerun-1","timestamp":"2026-06-20T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu_x1","name":"Read","input":{"file_path":"/p/cache.mjs"}}]}}',
+      '{"type":"user","sessionId":"e2e-rerun-1","timestamp":"2026-06-20T10:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_x1","content":"file contents here"}]}}',
+    ].join('\n') + '\n');
+
+    const first = runCli(['import-jsonl', transcript, '--project', 'rerun-proj']);
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toContain('+1 prompts');
+
+    const second = runCli(['import-jsonl', transcript, '--project', 'rerun-proj']);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).not.toContain('none matched');
+    expect(second.stdout).toContain('no-op');
+  });
+
+  // The shape-mismatch warning must STILL fire for genuinely wrong input (e.g.
+  // someone pointing import-jsonl at `export` output, which is observation-shaped
+  // JSON with no user/assistant/tool_result events).
+  it('warns about wrong shape when no transcript event is recognized', () => {
+    const exportShaped = join(tmpHome, 'export-output.jsonl');
+    writeFileSync(exportShaped, [
+      '{"id":1,"type":"bugfix","title":"Some saved obs","narrative":"body"}',
+      '{"id":2,"type":"decision","title":"Another obs","narrative":"body"}',
+    ].join('\n') + '\n');
+
+    const { stdout, exitCode } = runCli(['import-jsonl', exportShaped, '--project', 'wrong-proj']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('none matched');
+  });
 });
 
 describe('CLI E2E: context', () => {

@@ -11,12 +11,14 @@ export const SECRET_PATTERNS = [
   // and short values (<6 chars) that are typically variable names not secrets.
   //
   // Split into two patterns so prose mentions don't get scrubbed:
-  //   1. Bare credential nouns (password|passwd|token|bearer) commonly appear in
-  //      English prose — "Marker token: xyzpdq", "the bearer: alice". We require
-  //      the keyword NOT to be preceded by an English-word + horizontal-space
-  //      (the prose mention shape). Code/config has the keyword at start-of-line,
-  //      after a separator, or in object-literal context — none of which match
-  //      "letter-then-space" preceding the keyword.
+  //   1. Bare credential nouns (password|passwd|token|bearer|secret) commonly appear
+  //      in English prose — "Marker token: xyzpdq", "the bearer: alice". The prose
+  //      mention shape is the `:` form, so the prose lookbehind (NOT preceded by
+  //      English-word + horizontal-space) guards ONLY the `:` separator. An `=` is
+  //      config-assignment syntax, never prose, so `<word> password=<secret>` ALWAYS
+  //      scrubs — without this split that leaked (the lookbehind skipped any noun
+  //      after "word ", regardless of separator). No pinned prose case uses `=` (all
+  //      are `:`), so the `=` arm is leak-closing with no FP shift on the protected set.
   //   2. Structured keys (api_key, auth_token, …) keep the original behavior —
   //      a separator/compound key is unambiguous config syntax even when
   //      preceded by prose ("see auth_token: shhhhhh").
@@ -26,7 +28,10 @@ export const SECRET_PATTERNS = [
   // keyword. Allowing a leading `_` catches those while the prose lookbehind still
   // excludes "Marker token: …". `secret` added so a bare SECRET=… with a mixed-alnum
   // value is covered (the hex-only assignment pattern below misses non-hex values).
-  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  //   1a. `=` assignment → ALWAYS scrub (config syntax, never prose):
+  [/((?:\b|_)(?:password|passwd|token|bearer|secret)\s*=\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  //   1b. `:` separator → keep the prose lookbehind ("the token: alice" is prose):
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // access_token / refresh_token are the canonical OAuth2 field names — they were
   // missing from this KV list (drift vs the JSON list below). `(?:\b|_)` for the same
   // underscore-prefix reason.
@@ -47,8 +52,11 @@ export const SECRET_PATTERNS = [
   // object-literal / YAML / quoted-.env shapes. Split into the SAME two patterns as the
   // unquoted KV pairs above so prose survives — a quoted value does not turn prose into
   // config (`the token: "x"` is still prose, must NOT scrub; #8283 / utils.test.mjs:1090).
-  //   (a) bare credential nouns keep the prose lookbehind:
-  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  //   (a) bare credential nouns: `=` always scrubs; `:` keeps the prose lookbehind
+  //       (mirrors the unquoted 1a/1b split — a quoted value doesn't turn `:` prose
+  //       into config, but `<word> password="x"` is still a leak):
+  [/((?:\b|_)(?:password|passwd|token|bearer|secret)\s*=\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
   //   (b) structured keys + named env vars are unambiguous config even after a word
   //       (`see api_key: "x"` DOES scrub, mirroring the unquoted structured-key path):
   [/((?:\b|_)(?:pgpassword|pgpass|mysql_pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],

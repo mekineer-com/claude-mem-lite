@@ -289,6 +289,38 @@ describe('scrubSecrets — well-known no-separator credential env vars (audit #2
   });
 });
 
+describe('scrubSecrets — bare-noun `=` assignment scrubs even mid-prose (round-4 leak)', () => {
+  // Round-4 finding: `<English-word> password=<value>` (assignment in a sentence)
+  // leaked because the prose lookbehind `(?<![A-Za-z][ \t])` skipped ANY bare noun
+  // preceded by "word ", regardless of separator. The prose shape the lookbehind
+  // exists to protect is `:` ("the token: alice") — an `=` is config assignment, not
+  // prose. Split the noun patterns: `=` always scrubs, `:` keeps the prose guard.
+  it('scrubs password=/token=/secret= even when preceded by a prose word', () => {
+    expect(scrubSecrets('Config has password=hunter2supersecret in env'))
+      .not.toContain('hunter2supersecret');
+    expect(scrubSecrets('never commit password=mysecretvalue123'))
+      .not.toContain('mysecretvalue123');
+    expect(scrubSecrets('we set token=abc123def456ghi for the call'))
+      .not.toContain('abc123def456ghi');
+    expect(scrubSecrets('the secret=topsecretpayload99 leaked'))
+      .not.toContain('topsecretpayload99');
+  });
+  it('scrubs a quoted bare-noun `=` assignment even mid-prose', () => {
+    expect(scrubSecrets('config has password="realquotedsecret" set'))
+      .not.toContain('realquotedsecret');
+  });
+  // The `:` prose protection MUST survive the split (these stay unscrubbed).
+  it('still does NOT scrub bare nouns in `:` prose (split preserves #8283)', () => {
+    expect(scrubSecrets('the token: somemarkervalue')).toBe('the token: somemarkervalue');
+    expect(scrubSecrets('the bearer: "alicewashere"')).toBe('the bearer: "alicewashere"');
+  });
+  // Boundary cases MUST still survive (no \b/_ before the keyword).
+  it('still does NOT scrub letter-glued non-keywords (topsecret=, mypassword=)', () => {
+    expect(scrubSecrets('topsecret=foobar123')).toBe('topsecret=foobar123');
+    expect(scrubSecrets('mypassword=foobar123')).toBe('mypassword=foobar123');
+  });
+});
+
 describe('scrubSecrets / scrubRecord — <private> stripped on persistence (audit #2c)', () => {
   it('scrubSecrets strips <private>...</private> blocks', () => {
     expect(scrubSecrets('before <private>topsecret stuff</private> after'))

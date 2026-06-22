@@ -10,7 +10,7 @@ import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
   mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf,
-  selectFuzzyDedupeIds,
+  selectFuzzyDedupeIds, maintenanceStats,
 } from '../lib/maintain-core.mjs';
 
 const DAY = 86400000;
@@ -78,6 +78,27 @@ describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
     expect(get(db, B, 'importance')).toBe(2);                  // decayed 3->2
     expect(get(db, C, 'compressed_into')).toBeNull();          // injection protected
     expect(get(db, D, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+  });
+});
+
+describe('maintenanceStats (scan preview must match what execute does)', () => {
+  // Regression: the scan "Stale (>30d, imp=1, no access)" count omitted the
+  // injection_count=0 guard that decayAndMarkIdle's mark-idle pass enforces
+  // (v2.56.0 / #8614). So `maintain scan` over-counted stale by including
+  // injected-but-decayed rows decay will NEVER mark idle — e.g. exactly the rows
+  // `demote_pinned` just dropped to imp=1 (they keep inj>0). User sees "Stale: 2",
+  // runs decay, gets "marked 0 idle" → the same scan↔execute drift #8614 fixed.
+  test('stale count excludes injection-protected rows (parity with decay mark-idle)', () => {
+    const db = freshDb();
+    add(db, { title: 'idle never injected', importance: 1, injectionCount: 0 }); // decay marks idle → stale
+    add(db, { title: 'idle but injected', importance: 1, injectionCount: 8 });   // decay PROTECTS → not stale
+
+    const stats = maintenanceStats(db, ctx(Date.now() - 30 * DAY));
+    expect(stats.stale).toBe(1); // only the never-injected row (was 2 pre-fix)
+
+    // The parity claim itself: scan's stale count == rows decay actually marks idle.
+    const { idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+    expect(idleMarked).toBe(stats.stale);
   });
 });
 

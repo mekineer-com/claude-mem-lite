@@ -997,7 +997,7 @@ server.registerTool(
         `Memory maintenance scan:`,
         `  Total active observations: ${stats.total}`,
         `  Near-duplicate pairs: ${duplicates.length}`,
-        `  Stale (>30d, imp=1, no access): ${stats.stale}`,
+        `  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`,
         `  Broken (no title/narrative): ${stats.broken}`,
         `  Boostable (accessed>3, imp<3): ${stats.boostable}`,
         `  Pending purge (idle-marked): ${stats.pendingPurge}`,

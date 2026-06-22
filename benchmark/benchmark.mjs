@@ -143,6 +143,22 @@ export function searchProductionHybrid(db, query, { limit = 10, project = null, 
     rrfK,
   };
   const rows = searchObservationsHybrid(db, ctx);
+  // Fidelity note — reRankWithContext is INTENTIONALLY not mirrored here (it is the
+  // one production post-fusion stage searchObservationsHybrid does not run; lib/
+  // search-core.mjs:446 applies it after this call in the CLI/MCP path). It is a
+  // file-activity recency booster: it boosts obs whose `observation_files` junction
+  // rows match files touched in the last 2h of the SAME project, else early-returns
+  // a no-op. The longmemeval corpus has NONE of that signal — seedDatabase never
+  // writes observation_files and the adapter sets files_modified='[]', so the boost's
+  // first query returns 0 rows and the stage is a *structural* identity on this
+  // corpus (verified no-op, not an approximation). Sessions are conversations with no
+  // file associations, so no realistic future corpus seeds that junction either —
+  // mirroring the call would be dead code that never enters its body, unlike the
+  // computePerSourceWindow pool coupling (#8799) which every query exercises. So this
+  // gap is closed-by-construction, not deferred. (Score signs ARE compatible: the
+  // hybrid path negates RRF/vector scores to "negative = better" — search-engine.mjs
+  // :437/:450 — matching reRankWithContext's BM25 assumption, so wiring it would be
+  // safe if the data ever existed; it doesn't.)
   return rows.slice(0, limit).map(r => ({
     id: r.id, type: r.type, title: r.title, project: r.project,
     score: r.score ?? 0, importance: r.importance,
