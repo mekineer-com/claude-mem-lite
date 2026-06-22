@@ -13,7 +13,7 @@ import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter, finalizeSearchPage } from './lib/search-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
@@ -177,91 +177,9 @@ function safeHandler(fn) {
 // Observation-search core (FTS query/params builders, hybrid pipeline) lives in
 // search-engine.mjs so mem-cli.mjs gets the identical implementation.
 
-// Thin wrapper around the shared engine — keeps the existing call sites
-// (searchObservations(ctx)) without ferrying `db` through every layer.
-// ctx.db is set by runSearchPipeline when an injected db is present (e.g. tests);
-// falls back to the module-level db for the normal MCP handler path.
-function searchObservations(ctx) {
-  return searchObservationsHybrid(ctx.db ?? db, ctx);
-}
-
-function searchSessions(ctx) {
-  const _db = ctx.db ?? db;
-  const { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject } = ctx;
-  const results = [];
-
-  if (ftsQuery) {
-    const rows = searchSessionsFts(_db, {
-      ftsQuery, project: args.project ?? null,
-      projectBoost: args.project ? null : currentProject,
-      epochFrom, epochTo, perSourceLimit, perSourceOffset,
-    });
-    for (const r of rows) {
-      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
-    }
-  } else if (!searchType) {
-    // Skip sessions in unfiltered no-query mode (too noisy)
-  } else {
-    const params = [];
-    const wheres = [];
-    if (args.project) { wheres.push('project = ?'); params.push(args.project); }
-    if (epochFrom !== null) { wheres.push('created_at_epoch >= ?'); params.push(epochFrom); }
-    if (epochTo !== null) { wheres.push('created_at_epoch <= ?'); params.push(epochTo); }
-    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-    params.push(perSourceLimit, perSourceOffset);
-    const rows = _db.prepare(`
-      SELECT id, request, completed, project, created_at, created_at_epoch
-      FROM session_summaries ${where}
-      ORDER BY created_at_epoch DESC
-      LIMIT ? OFFSET ?
-    `).all(...params);
-    for (const r of rows) {
-      results.push({ source: 'session', id: r.id, request: r.request, completed: r.completed, project: r.project, date: r.created_at, created_at_epoch: r.created_at_epoch });
-    }
-  }
-
-  return results;
-}
-
-function searchPrompts(ctx) {
-  const _db = ctx.db ?? db;
-  const { ftsQuery, searchType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset } = ctx;
-  const results = [];
-
-  if (ftsQuery) {
-    // CJK precision gate + LIKE fallback live in the shared core (see
-    // lib/search-core.mjs for the leak rationale).
-    const rows = searchPromptsFts(_db, {
-      query: args.query, ftsQuery, project: args.project ?? null,
-      epochFrom, epochTo, perSourceLimit, perSourceOffset,
-    });
-    for (const r of rows) {
-      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch, score: r.score });
-    }
-  } else if (searchType === 'prompts') {
-    const params = [];
-    const wheres = [];
-    if (args.project) { wheres.push('s.project = ?'); params.push(args.project); }
-    if (epochFrom !== null) { wheres.push('p.created_at_epoch >= ?'); params.push(epochFrom); }
-    if (epochTo !== null) { wheres.push('p.created_at_epoch <= ?'); params.push(epochTo); }
-    const where = wheres.length ? `WHERE ${wheres.join(' AND ')}` : '';
-    params.push(perSourceLimit, perSourceOffset);
-    const rows = _db.prepare(`
-      SELECT p.id, p.prompt_text, p.content_session_id, p.created_at, p.created_at_epoch
-      FROM user_prompts p
-      JOIN sdk_sessions s ON p.content_session_id = s.content_session_id
-      ${where}
-      ORDER BY p.created_at_epoch DESC
-      LIMIT ? OFFSET ?
-    `).all(...params);
-    for (const r of rows) {
-      results.push({ source: 'prompt', id: r.id, text: r.prompt_text, session: r.content_session_id, date: r.created_at, created_at_epoch: r.created_at_epoch });
-    }
-  }
-
-  return results;
-}
-
+// searchObservations / searchSessions / searchPrompts were consolidated into the
+// shared coreRunSearchPipeline (lib/search-core.mjs). This surface is now a thin
+// adapter (runSearchPipeline below); only output formatting stays local.
 function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFallbackFired = false, isDeepSearch = false) {
   if (paginatedResults.length === 0) {
     const hint = [];
@@ -339,196 +257,74 @@ export async function handleSearchForTest(db, args, { llm, rerankLlm } = {}) {
 }
 
 async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
-    if (args.project) args = { ...args, project: resolveProject(args.project) };
-    const limit = args.limit ?? 20;
-    const offset = args.offset ?? 0;
-    // args.or (Batch A CLI↔MCP alignment): force OR from start, matching
-    // CLI `search --or`. The default path still does AND with OR-fallback
-    // inside searchObservations when AND returns 0.
-    const ftsQuery = buildSearchFtsQuery(args.query, { or: args.or });
-    const searchType = args.type;
-    const currentProject = inferProject();
+  if (args.project) args = { ...args, project: resolveProject(args.project) };
+  const limit = args.limit ?? 20;
+  const offset = args.offset ?? 0;
+  // args.or: force OR from the start (CLI `search --or` parity). The default path
+  // still does AND with the engine's OR-fallback when AND returns 0.
+  const ftsQuery = buildSearchFtsQuery(args.query, { or: args.or });
+  const currentProject = inferProject();
 
-    // Over-fetch from offset 0 for EVERY mode, then apply `offset` exactly once
-    // at the merge slice below — shared sizing with the CLI (see
-    // computePerSourceWindow for the #8217 double-offset rationale).
-    const { perSourceLimit, perSourceOffset } = computePerSourceWindow(limit, offset);
+  const bounds = parseDateBounds(args.date_from, args.date_to);
+  if (!bounds.ok) throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
+  const { epochFrom, epochTo } = bounds;
 
-    // Parse date bounds to epoch (with validation; date-only date_to extends
-    // to end-of-day 23:59:59.999Z — shared with CLI --from/--to)
-    const bounds = parseDateBounds(args.date_from, args.date_to);
-    if (!bounds.ok) throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
-    const { epochFrom, epochTo } = bounds;
+  // MCP defaults to 'auto' (escalate on weak results) unless overridden by
+  // args.deep or CLAUDE_MEM_AUTO_DEEP. Rerank is explicit-deep only (D#43).
+  const deepMode = resolveDeepMode(args.deep, { surface: 'mcp' });
+  const rerank = args.rerank === true && deepMode === 'deep';
 
-    // Resolve tri-state deep mode. MCP defaults to 'auto' (escalate on weak results)
-    // unless explicitly overridden via args.deep or CLAUDE_MEM_AUTO_DEEP env flag.
-    const deepMode = resolveDeepMode(args.deep, { surface: 'mcp' });
-    // Opt-in LLM rerank (D#43): explicit-deep only — never on AUTO escalation — so
-    // no default search behaviour changes. Parity with CLI `search --deep --rerank`.
-    const rerank = args.rerank === true && deepMode === 'deep';
+  // Early return when query was provided but sanitized to nothing (all FTS5
+  // keywords/special chars). Skipped for deep/auto (the LLM rewrite may still
+  // produce variants) and for filter-only listings (date/obs_type/importance).
+  if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance && deepMode === 'normal') {
+    return { ...formatSearchOutput([], args, ftsQuery, 0), escalated: false, results: [], total: 0, variants: null };
+  }
 
-    // Early return when query was provided but sanitized to nothing (all FTS5
-    // keywords/special chars). Skipped for deep/auto — deep's LLM rewrite may
-    // still produce searchable variants from a query the FTS sanitizer rejects,
-    // and auto could escalate similarly.
-    if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance && deepMode === 'normal') {
-      return { ...formatSearchOutput([], args, ftsQuery, 0), escalated: false, results: [], total: 0, variants: null };
+  // obs_type ⇒ observations-only; deep is observations-only too (deepSearch fuses
+  // hybrid-obs lists). args.type is the source filter (observations|sessions|prompts).
+  const effectiveType = deepMode === 'deep' ? 'observations' : (args.type || (args.obs_type ? 'observations' : undefined));
+
+  const r = await coreRunSearchPipeline(
+    {
+      db, currentProject, env: process.env,
+      searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
+      reRankWithContext, markSuperseded, llm, rerankLlm,
+    },
+    {
+      query: args.query, ftsQuery, effectiveSource: effectiveType, deepMode, rerank,
+      limit, offset, project: args.project ?? null, obsType: args.obs_type ?? null,
+      importance: args.importance ?? null, branch: args.branch ?? null,
+      includeNoise: args.include_noise === true, epochFrom, epochTo,
+      sort: args.sort || 'relevance', tier: args.tier ?? null,
+      // ── MCP surface policy ──
+      obsTypeFallback: true,             // list-recent-by-type when 0 matches
+      crossSourceEpochSortNoFts: true,   // epoch-sort cross-source with no ftsQuery
+      rerankPolicy: 'mcp',               // (ftsQuery||isDeep) gate; re-rank/re-sort on ftsQuery&&!reranked
+      rerankProject: currentProject,
+      recentListingNoFts: true,          // recent-listing for explicit --source with no ftsQuery
+      tolerateMissingFts: false,
+      tierPosition: 'late',              // tier filter after re-rank
+      tierProject: args.project || currentProject,
     }
+  );
 
-    // When obs_type is specified, implicitly restrict to observations only.
-    // deep mode is observations-only too (deepSearch fuses hybrid-obs lists).
-    const effectiveType = deepMode === 'deep' ? 'observations' : (searchType || (args.obs_type ? 'observations' : undefined));
-    const isCrossSource = !effectiveType;
-    const ctx = { db, ftsQuery, searchType: effectiveType, args, epochFrom, epochTo, perSourceLimit, perSourceOffset, currentProject, limit };
-    const results = [];
-    let deepVariants = null;
-    let deepReranked = false;
-    let isDeep = deepMode === 'deep';
-    let escalated = false;
-    let escalatedObsCount = 0;
+  // Observability: announce auto-escalation on stderr (parity with CLI deep note).
+  if (r.escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${r.escalatedObsCount} hits)\n`);
 
-    // Helper: run deepSearch and load results into the shared `results` array.
-    const runDeepInto = async ({ auto = false } = {}) => {
-      const { results: deepRows, variants, reranked } = await deepSearch(db, {
-        query: args.query,
-        project: args.project || null,
-        type: args.obs_type || null,
-        importance: args.importance || null,
-        branch: args.branch || null,
-        includeNoise: args.include_noise === true,
-        epochFrom, epochTo,
-        limit: perSourceLimit,
-        currentProject,
-      }, llm ? { llm, rerank: rerank && !auto, rerankLlm } : { auto, rerank: rerank && !auto, rerankLlm });
-      // Safe to reset: sessions/prompts are pushed AFTER the obs block, so nothing is lost here.
-      results.length = 0;
-      results.push(...deepRows);
-      deepVariants = variants;
-      deepReranked = reranked;
-    };
+  const output = formatSearchOutput(r.page, args, ftsQuery, r.total, r.orFallbackFired, r.isDeep);
+  // Surface the rewrite to the calling agent (F13) + the rerank signal (D#43).
+  if (r.isDeep && r.variants && output.content?.[0]?.type === 'text') {
+    output.content[0].text += r.variants.length > 1
+      ? `\n\n[deep search: rewrote into ${r.variants.length} variants — ${r.variants.slice(1).map(v => JSON.stringify(v)).join(', ')}]`
+      : '\n\n[deep search: rewrite produced no usable variants; searched the original query only (== baseline)]';
+  }
+  if (r.reranked && output.content?.[0]?.type === 'text') {
+    output.content[0].text += '\n\n[deep search: LLM-reranked the top candidates by relevance]';
+  }
 
-    if (!effectiveType || effectiveType === 'observations') {
-      if (deepMode === 'deep') {
-        // Opt-in LLM multi-query/HyDE deep search: rewrite → per-variant hybrid
-        // search → RRF fusion, collapsing to the single query (== baseline) when
-        // the rewrite yields nothing (deep-search.mjs). Over-fetch perSourceLimit
-        // so the pagination slice below has room.
-        await runDeepInto();
-      } else {
-        results.push(...searchObservations(ctx));
-        // Auto-escalate: if normal search is weak (too few results or OR fallback
-        // fired — a vocabulary-mismatch symptom), escalate to deep. ctx is mutated
-        // by searchObservations to set ctx.orFallbackFired when the AND→OR relaxation
-        // fires, so we read it here after the call.
-        // results is already obs-only here (sessions/prompts pushed below), but the
-        // filter makes the invariant explicit and robust to future reordering.
-        const obsCountBeforeEscalation = results.length;
-        if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(results.filter(r => r.source === 'obs'), ctx, { db, project: args.project || null })) {
-          await runDeepInto({ auto: true });
-          isDeep = true;
-          escalated = true;
-          escalatedObsCount = obsCountBeforeEscalation;
-        }
-      }
-    }
-    // Sessions and prompts are excluded when deep (obs-only invariant, #8735).
-    if ((!effectiveType || effectiveType === 'sessions') && !isDeep) results.push(...searchSessions(ctx));
-    if ((!effectiveType || effectiveType === 'prompts') && !isDeep)   results.push(...searchPrompts(ctx));
-
-    // Type-list fallback: when obs_type is specified and FTS finds nothing,
-    // list recent observations of that type (user likely wants to browse by type)
-    if (results.length === 0 && args.obs_type) {
-      const typeWheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL', 'type = ?'];
-      const typeParams = [args.obs_type];
-      if (args.project) { typeWheres.push('project = ?'); typeParams.push(args.project); }
-      if (epochFrom !== null) { typeWheres.push('created_at_epoch >= ?'); typeParams.push(epochFrom); }
-      if (epochTo !== null) { typeWheres.push('created_at_epoch <= ?'); typeParams.push(epochTo); }
-      if (args.importance) { typeWheres.push('COALESCE(importance, 1) >= ?'); typeParams.push(args.importance); }
-      typeParams.push(limit);
-      const typeRows = db.prepare(`
-        SELECT id, type, title, subtitle, project, created_at, importance, files_modified
-        FROM observations WHERE ${typeWheres.join(' AND ')}
-        ORDER BY created_at_epoch DESC LIMIT ?
-      `).all(...typeParams);
-      for (const r of typeRows) {
-        results.push({ source: 'obs', id: r.id, type: r.type, title: r.title, subtitle: r.subtitle, project: r.project, date: r.created_at, importance: r.importance, files_modified: r.files_modified, score: 0, snippet: '' });
-      }
-    }
-
-    // Cross-source score normalization (shared with CLI — lib/search-core.mjs):
-    // normalize each source to [-1, 0] before merging so observations (BM25 can
-    // reach -40) don't systematically outrank sessions (-6) and prompts (-1).
-    if (isCrossSource && results.length > 0 && ftsQuery) {
-      normalizeCrossSourceScores(results, 'source');
-    }
-
-    // Global sort (cross-source)
-    if (isCrossSource && results.length > 0) {
-      if (ftsQuery) {
-        results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
-      } else {
-        results.sort((a, b) => (b.created_at_epoch ?? 0) - (a.created_at_epoch ?? 0));
-      }
-    }
-
-    // Re-rank observations by file context overlap and mark superseded.
-    // markSuperseded is pure correctness (stale-tag) and must run for deep results
-    // too, including the case where the ORIGINAL query sanitized to an empty
-    // ftsQuery but the rewrite still returned rows (F2). reRankWithContext + the
-    // re-sort are FTS-rank operations; deep rows are already RRF-ranked, so on the
-    // empty-ftsQuery deep path we tag-but-don't-reorder (keep RRF order).
-    if ((ftsQuery || isDeep) && results.some(r => r.source === 'obs')) {
-      const obsResults = results.filter(r => r.source === 'obs');
-      // When the deep candidates were explicitly LLM-reranked, that order is final:
-      // skip the file-context re-rank + re-sort (they would perturb the rerank order
-      // via score multiplication / score-sort). markSuperseded is pure stale-tagging
-      // and still runs. (D#43 — parity with the CLI deep path, which keeps array order.)
-      if (ftsQuery && !deepReranked) reRankWithContext(db, obsResults, currentProject);
-      markSuperseded(obsResults);
-      if (ftsQuery && !deepReranked) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
-    }
-
-    // Tier post-filter: batch-lookup full rows and classify (shared with CLI).
-    // Classification uses the explicitly-requested project, not the CWD-inferred
-    // one — see applyTierFilter for the cross-project rationale.
-    if (args.tier) {
-      const filtered = applyTierFilter(db, results, { tier: args.tier, sourceKey: 'source', currentProject: args.project || currentProject });
-      results.length = 0;
-      results.push(...filtered);
-    }
-
-    // Apply user-requested sort (after relevance scoring; shared with CLI)
-    applyUserSort(results, args.sort || 'relevance');
-
-    // True (limit/offset-invariant) population + page slice + ~Nt fetch-cost hints
-    // — shared count/paginate tail with the CLI (finalizeSearchPage; #8217/#8635).
-    // Uses the same db threaded through the pipeline (#8743).
-    const { total: totalBeforePagination, page: paginatedResults } = finalizeSearchPage(db, results, {
-      isDeep, offset, limit, effectiveSource: effectiveType, ftsQuery, orFallbackFired: ctx.orFallbackFired === true,
-      project: args.project, obsType: args.obs_type, importance: args.importance, branch: args.branch,
-      epochFrom, epochTo, includeNoise: args.include_noise === true,
-    });
-
-    // Observability: announce auto-escalation on stderr (parity with CLI deep note).
-    if (escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${escalatedObsCount} hits)\n`);
-
-    const output = formatSearchOutput(paginatedResults, args, ftsQuery, totalBeforePagination, ctx.orFallbackFired === true, isDeep);
-    // Surface the rewrite to the calling agent (CLI prints this to stderr + JSON;
-    // MCP had no signal at all — F13). Tells the agent whether deep actually
-    // reformulated the query or collapsed to the single-query baseline.
-    if (isDeep && deepVariants && output.content?.[0]?.type === 'text') {
-      output.content[0].text += deepVariants.length > 1
-        ? `\n\n[deep search: rewrote into ${deepVariants.length} variants — ${deepVariants.slice(1).map(v => JSON.stringify(v)).join(', ')}]`
-        : '\n\n[deep search: rewrite produced no usable variants; searched the original query only (== baseline)]';
-    }
-    // Discoverability signal for the opt-in rerank (D#43): tell the calling agent the
-    // candidates were LLM-reranked — parity with the CLI stderr note.
-    if (deepReranked && output.content?.[0]?.type === 'text') {
-      output.content[0].text += '\n\n[deep search: LLM-reranked the top candidates by relevance]';
-    }
-
-    // Return an object that exposes structured fields for tests + the MCP content blob.
-    return { ...output, results: paginatedResults, total: totalBeforePagination, escalated, variants: deepVariants, reranked: deepReranked };
+  // Expose structured fields for tests + the MCP content blob.
+  return { ...output, results: r.page, total: r.total, escalated: r.escalated, variants: r.variants, reranked: r.reranked };
 }
 
 server.registerTool(

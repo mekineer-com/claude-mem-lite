@@ -37,7 +37,7 @@ import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, computePerSourceWindow, searchSessionsFts, searchPromptsFts, normalizeCrossSourceScores, applyUserSort, applyTierFilter, finalizeSearchPage } from './lib/search-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
@@ -156,116 +156,51 @@ async function cmdSearch(db, args, { llm } = {}) {
     ? 'observations'
     : (source || ((type || tier || minImportance || branch) ? 'observations' : null));
 
-  // Cross-source mode: each source needs more candidates than the final limit
-  // so the post-merge sort has room to pick the best from each (shared sizing
-  // with mem_search — without this, obs gets systematically squeezed out by
-  // sessions). Over-fetch from offset 0; --offset applies ONCE at the final
-  // slice below (see computePerSourceWindow for the #8217/#8638 rationale).
-  const isCrossSourceMode = !effectiveSource;
-  const { perSourceLimit, perSourceOffset } = computePerSourceWindow(limit, offset);
-
-  const results = [];
-  // Tracks whether AND returned 0 and OR recovered non-empty. Mirrors server.mjs
-  // ctx.orFallbackFired so the header can surface a "(relaxed AND→OR)" hint.
-  let orFallbackFired = false;
-
-  let deepVariants = null;
-  let isReranked = false;
-  let isDeep = deepMode === 'deep';
-
-  // Search observations — shared engine with server.mjs (#8198/#8212 paired-path fix)
-  if (!effectiveSource || effectiveSource === 'observations') {
-    const obsCtx = {
-      ftsQuery,
-      args: {
-        project: project || null,
-        obs_type: type || null,
-        importance: minImportance || null,
-        branch: branch || null,
-        include_noise: includeNoise,
-      },
-      epochFrom: dateFrom,
-      epochTo: dateTo,
-      perSourceLimit,
-      perSourceOffset,
-      currentProject: project ? null : inferProject(),
-      limit,
-      orFallbackFired: false,
-    };
-
-    const runDeep = async ({ auto = false } = {}) => {
-      const ds = await deepSearch(db, {
-        query,
-        project: project || null,
-        type: type || null,
-        importance: minImportance || null,
-        branch: branch || null,
-        includeNoise,
-        epochFrom: dateFrom,
-        epochTo: dateTo,
-        limit: perSourceLimit,
-        currentProject: project ? null : inferProject(),
-      }, llm ? { llm, rerank: rerank && !auto } : { auto, rerank: rerank && !auto });
-      deepVariants = ds.variants;
-      isReranked = ds.reranked;
-      if (deepVariants.length > 1) {
-        process.stderr.write(`[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`);
-      } else {
-        process.stderr.write('[mem] Deep search: rewrite returned no usable variants; used original query only\n');
-      }
-      if (rerank && !auto) {
-        process.stderr.write(ds.reranked
-          ? '[mem] Deep search: LLM-reranked the fused top-20\n'
-          : '[mem] Deep search: rerank produced no usable order; kept fused order\n');
-      }
-      return ds.results;
-    };
-
-    let obsResults;
-    if (deepMode === 'deep') {
-      obsResults = await runDeep();
-    } else {
-      obsResults = searchObservationsHybrid(db, obsCtx);
-      if (obsCtx.orFallbackFired) orFallbackFired = true;
-      if (deepMode === 'auto' && autoDeepLlmReady(process.env, llm) && shouldEscalateToDeep(obsResults, obsCtx, { db, project: project || null })) {
-        process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${obsResults.length} hits)\n`);
-        obsResults = await runDeep({ auto: true });
-        isDeep = true;
-      }
+  const res = await coreRunSearchPipeline(
+    {
+      db, currentProject: project ? null : inferProject(), env: process.env,
+      searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
+      reRankWithContext, markSuperseded, llm,
+    },
+    {
+      query, ftsQuery, effectiveSource, deepMode, rerank,
+      limit, offset, project: project || null, obsType: type, importance: minImportance,
+      branch, includeNoise, epochFrom: dateFrom, epochTo: dateTo, sort, tier,
+      // ── CLI surface policy ──
+      obsTypeFallback: false,            // #8217 removed list-by-type fallback from the CLI
+      crossSourceEpochSortNoFts: false,  // CLI never reaches cross-source with empty ftsQuery (fails earlier)
+      rerankPolicy: 'cli',               // re-rank/supersede on any obs; re-sort gated on cross-source
+      rerankProject: project || inferProject(),
+      recentListingNoFts: false,
+      tolerateMissingFts: true,          // pre-FTS legacy DBs: swallow session/prompt FTS errors
+      tierPosition: 'early',             // tier filter inside the obs block (before sessions/prompts)
+      tierProject: project || inferProject(),
     }
-    for (const r of obsResults) results.push({ ...r, _source: 'obs', score: r.score ?? 0 });
+  );
+  const isDeep = res.isDeep;
+  const orFallbackFired = res.orFallbackFired;
+  const deepVariants = res.variants;
+  const paged = res.page;
+  const total = res.total;
 
-    // Tier post-filter — applied to ALL obs results from the engine.
-    if (tier) {
-      const filtered = applyTierFilter(db, results, { tier, sourceKey: '_source', currentProject: project || inferProject() });
-      results.length = 0;
-      results.push(...filtered);
-    }
+  // Deep / escalation observability on stderr — reconstructed from core signals.
+  // The CLI emitted these inline in runDeep; same strings, same order (escalation →
+  // variants → rerank). rerank is only ever true on explicit --deep (never auto).
+  if (res.escalated) process.stderr.write(`[mem] auto-escalated to deep search (weak results: ${res.escalatedObsCount} hits)\n`);
+  if (isDeep && deepVariants) {
+    process.stderr.write(deepVariants.length > 1
+      ? `[mem] Deep search: rewrote into ${deepVariants.length} query variants, RRF-fused\n`
+      : '[mem] Deep search: rewrite returned no usable variants; used original query only\n');
+  }
+  if (rerank) {
+    process.stderr.write(res.reranked
+      ? '[mem] Deep search: LLM-reranked the fused top-20\n'
+      : '[mem] Deep search: rerank produced no usable order; kept fused order\n');
   }
 
-  // Search sessions (shared engine with MCP mem_search — lib/search-core.mjs)
-  if ((!effectiveSource || effectiveSource === 'sessions') && !isDeep) {
-    try {
-      const sessRows = searchSessionsFts(db, {
-        ftsQuery, project, projectBoost: project ? null : inferProject(),
-        epochFrom: dateFrom, epochTo: dateTo, perSourceLimit, perSourceOffset,
-      });
-      for (const r of sessRows) results.push({ ...r, _source: 'session' });
-    } catch { /* session FTS may not exist in older DBs */ }
-  }
-
-  // Search prompts (shared engine incl. CJK precision gate + LIKE fallback)
-  if ((!effectiveSource || effectiveSource === 'prompts') && !isDeep) {
-    try {
-      const promptRows = searchPromptsFts(db, {
-        query, ftsQuery, project,
-        epochFrom: dateFrom, epochTo: dateTo, perSourceLimit, perSourceOffset,
-      });
-      for (const r of promptRows) results.push({ ...r, _source: 'prompt' });
-    } catch { /* prompt FTS may not exist in older DBs */ }
-  }
-
-  if (results.length === 0) {
+  // "nothing matched" (no offset) vs "this page is empty" (with offset) — the two
+  // CLI messages. preFinalizeCount is the pre-pagination population (post-tier).
+  if (res.preFinalizeCount === 0) {
     if (jsonOutput) {
       out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep: isDeep, variants: isDeep ? deepVariants : undefined, results: [] }));
     } else {
@@ -273,38 +208,6 @@ async function cmdSearch(db, args, { llm } = {}) {
     }
     return;
   }
-
-  // Cross-source score normalization (shared with mem_search).
-  // ftsQuery gate prevents normalization when scores are all 0 (no-FTS path).
-  const isCrossSource = isCrossSourceMode;
-  if (isCrossSource && results.length > 0 && ftsQuery) {
-    normalizeCrossSourceScores(results, '_source');
-    results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
-  }
-
-  // Context re-ranking + superseded marking (aligned with MCP mem_search)
-  const obsResults = results.filter(r => r._source === 'obs');
-  if (obsResults.length > 0) {
-    // reRankWithContext/markSuperseded expect source='obs' — alias _source for compatibility
-    for (const r of obsResults) r.source = 'obs';
-    // Explicit LLM rerank order is final — skip file-context re-rank when reranked
-    // (paired-path with mem_search; markSuperseded still runs for stale-tagging).
-    if (!isReranked) reRankWithContext(db, obsResults, project || inferProject());
-    markSuperseded(obsResults);
-    if (isCrossSource) results.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
-  }
-
-  // Apply user-requested sort (after relevance scoring; shared with mem_search)
-  applyUserSort(results, sort);
-
-  // True population + page slice + ~Nt fetch-cost hints — shared count/paginate
-  // tail with mem_search (finalizeSearchPage; the #8635 drift surface). offset is
-  // applied exactly ONCE here (sources over-fetched from offset 0).
-  const { total, page: paged } = finalizeSearchPage(db, results, {
-    isDeep, offset, limit, effectiveSource, ftsQuery, orFallbackFired,
-    project: project || null, obsType: type, importance: minImportance, branch,
-    epochFrom: dateFrom, epochTo: dateTo, includeNoise,
-  });
 
   if (paged.length === 0) {
     if (jsonOutput) {
@@ -315,24 +218,24 @@ async function cmdSearch(db, args, { llm } = {}) {
     return;
   }
 
-  // paired-path with server.mjs formatSearchOutput (#8198): "N of M" total when paged < total.
+  // "N of M" total when paged < total (paired-path with server.mjs formatSearchOutput, #8198).
   const showTime = sort === 'time';
-  const hasMixed = paged.some(r => r._source === 'session' || r._source === 'prompt');
+  const hasMixed = paged.some(r => r.source === 'session' || r.source === 'prompt');
   // Suppressed when --or was explicit — user already asked for OR, no "fallback" there.
   const fallbackHint = orFallbackFired && !useOr ? ' (relaxed AND→OR)' : '';
 
   if (jsonOutput) {
     const items = paged.map(r => {
       const base = {
-        source: r._source,
+        source: r.source,
         id: r.id,
         created_at: r.created_at,
         score: r.score ?? null,
       };
-      if (r._source === 'session') {
+      if (r.source === 'session') {
         return { ...base, request: r.request || null, completed: r.completed || null, project: r.project || null };
       }
-      if (r._source === 'prompt') {
+      if (r.source === 'prompt') {
         return { ...base, prompt_text: r.prompt_text || null };
       }
       return {
@@ -370,10 +273,10 @@ async function cmdSearch(db, args, { llm } = {}) {
   const tok = r => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
   for (const r of paged) {
     const timeStr = showTime && r.created_at_epoch ? ` (${relativeTime(r.created_at_epoch)})` : '';
-    if (r._source === 'session') {
+    if (r.source === 'session') {
       const date = fmtDateShort(r.created_at);
       out(`S#${r.id} 📋 ${date}${timeStr} ${truncate(r.request || r.completed || '(no summary)', 80)}${tok(r)}`);
-    } else if (r._source === 'prompt') {
+    } else if (r.source === 'prompt') {
       const date = fmtDateShort(r.created_at);
       out(`P#${r.id} 💬 ${date}${timeStr} ${truncate(r.prompt_text || '(empty)', 80)}${tok(r)}`);
     } else {

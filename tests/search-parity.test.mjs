@@ -1,0 +1,163 @@
+// Cross-surface parity: the CLI (cmdSearch) and MCP (mem_search) search surfaces
+// now share ONE orchestrator (coreRunSearchPipeline, lib/search-core.mjs). This is
+// the structural guarantee that replaced the ~34 hand-maintained "paired-path"
+// sync comments (audit P1-2): for the same query + equivalent explicit args, both
+// surfaces must return the identical result set — same source+id order, the same
+// scores, and the same total.
+//
+// The two surfaces have legitimately different DEFAULTS (MCP deep=auto vs CLI
+// normal; the obs-only force rule). To measure ORCHESTRATOR parity rather than
+// default-policy parity, every scenario drives both seams with explicit equivalent
+// args and passes no llm (so auto-escalation never fires on either side).
+
+import { describe, test, expect, beforeAll } from 'vitest';
+import { createTestDb, insertSession, insertObs, insertPrompt } from './test-helpers.mjs';
+import { handleSearchForTest } from '../server.mjs';
+import { cmdSearchForTest } from '../mem-cli.mjs';
+
+// Minimal LLM stub (mirrors tests/deep-search.test.mjs:29): async fn returning the
+// configured response, clamped to the last; .calls() tracks invocations. A fresh
+// stub per surface keeps each call counter independent.
+function stubLLM(...responses) {
+  let i = 0;
+  const fn = async () => { const r = responses[Math.min(i, responses.length - 1)]; i++; return typeof r === 'function' ? r() : r; };
+  fn.calls = () => i;
+  return fn;
+}
+
+let db;
+
+beforeAll(() => {
+  db = createTestDb();
+  // Session first — observations FK-reference sdk_sessions(memory_session_id), and
+  // initSchema leaves foreign_keys ON (#8611). sess-1 also backs the prompt FTS join.
+  insertSession(db, { id: 'sess-1', project: 'test' });
+  // Observations sharing the keyword "parity", varied type / recency / files.
+  insertObs(db, { type: 'bugfix', title: 'parity drift in finalizeSearchPage', text: 'parity tail count', importance: 3, epochOffset: -1000, filesModified: JSON.stringify(['lib/search-core.mjs']) });
+  insertObs(db, { type: 'decision', title: 'parity via paired-path comments', text: 'parity sync', importance: 2, epochOffset: -2000 });
+  insertObs(db, { type: 'discovery', title: 'parity test seam threads db', text: 'parity ctx', importance: 1, epochOffset: -3000 });
+  insertObs(db, { type: 'bugfix', title: 'parity score normalization', text: 'parity bm25', importance: 2, epochOffset: -4000, filesModified: JSON.stringify(['server.mjs', 'mem-cli.mjs']) });
+  insertObs(db, { type: 'refactor', title: 'unrelated cache change', text: '缓存 优化 路径', importance: 1, epochOffset: -5000 });
+
+  // Pad the live corpus past AUTO_DEEP_MIN_CORPUS (10) so auto-escalation's corpus
+  // guard (hasEscalatableCorpus) fires; all carry "parity" so deep-fusion variants
+  // hit them. Distinct epochs avoid score/recency ties (stable order across surfaces).
+  for (let i = 0; i < 7; i++) {
+    insertObs(db, { type: 'discovery', title: `parity corpus filler ${i}`, text: 'parity corpus filler', importance: 1, epochOffset: -6000 - i * 100 });
+  }
+
+  // Sessions (session_summaries drives session FTS via the au trigger; its
+  // memory_session_id FK-references sdk_sessions, so seed those rows first).
+  insertSession(db, { id: 'csess-1', memoryId: 'msess-1', project: 'test' });
+  insertSession(db, { id: 'csess-2', memoryId: 'msess-2', project: 'test' });
+  const ins = db.prepare(`INSERT INTO session_summaries (memory_session_id, project, request, completed, created_at, created_at_epoch) VALUES (?, ?, ?, ?, ?, ?)`);
+  ins.run('msess-1', 'test', 'investigate parity between CLI and MCP search', 'unified the orchestrator', new Date(Date.now() - 1500).toISOString(), Date.now() - 1500);
+  ins.run('msess-2', 'test', 'parity follow-up: delete sync comments', 'done', new Date(Date.now() - 2500).toISOString(), Date.now() - 2500);
+
+  // Prompts (sess-1 sdk_sessions row seeded above backs the FTS join).
+  insertPrompt(db, { contentSessionId: 'sess-1', text: 'how do we keep search parity across surfaces?', promptNumber: 1, epochOffset: -1200 });
+  insertPrompt(db, { contentSessionId: 'sess-1', text: '缓存 路径 parity 检查', promptNumber: 2, epochOffset: -2200 });
+});
+
+/** Run the MCP seam → normalized [{source,id,score}] + total + deepRan. */
+async function runMcp(args, llm = null) {
+  const res = await handleSearchForTest(db, args, llm ? { llm } : {});
+  return {
+    total: res.total,
+    rows: res.results.map((r) => ({ source: r.source, id: r.id, score: r.score ?? null })),
+    deepRan: res.variants !== null, // variants is null-or-array; non-null whenever deep ran (explicit or auto-escalated)
+  };
+}
+
+/** Run the CLI seam (--json) capturing stdout → normalized [{source,id,score}] + total + deepRan. */
+async function runCli(argv, llm = null) {
+  let stdout = '';
+  const origOut = process.stdout.write;
+  const origErr = process.stderr.write;
+  process.stdout.write = (s) => { stdout += s; return true; };
+  process.stderr.write = () => true; // swallow the deep/escalation notes
+  try {
+    await cmdSearchForTest(db, [...argv, '--json'], llm ? { llm } : {});
+  } finally {
+    process.stdout.write = origOut;
+    process.stderr.write = origErr;
+  }
+  const parsed = JSON.parse(stdout.trim());
+  return {
+    total: parsed.total,
+    rows: parsed.results.map((r) => ({ source: r.source, id: r.id, score: r.score ?? null })),
+    deepRan: parsed.deep === true,
+  };
+}
+
+function key(rows) { return rows.map((r) => `${r.source}#${r.id}`); }
+
+/**
+ * @param {string} name
+ * @param {object} mcpArgs  explicit MCP args
+ * @param {string[]} cliArgv equivalent CLI argv (positional query + flags)
+ * @param {{ llm?: () => Function, autoDeep?: boolean, expectDeep?: boolean }} [opts]
+ *   llm: factory returning a FRESH stub per surface (independent call counters);
+ *   autoDeep: set CLAUDE_MEM_AUTO_DEEP=1 around the run (CLI opts into auto-escalation);
+ *   expectDeep: assert BOTH surfaces took the deep path — guards the scenario against
+ *   passing as a silent no-op (e.g. escalation that never fired).
+ */
+function parity(name, mcpArgs, cliArgv, { llm = null, autoDeep = false, expectDeep = false } = {}) {
+  test(name, async () => {
+    const prevEnv = process.env.CLAUDE_MEM_AUTO_DEEP;
+    if (autoDeep) process.env.CLAUDE_MEM_AUTO_DEEP = '1';
+    try {
+      const mcp = await runMcp(mcpArgs, llm ? llm() : null);
+      const cli = await runCli(cliArgv, llm ? llm() : null);
+      // Identical id-order (the load-bearing parity assertion).
+      expect(key(cli.rows)).toEqual(key(mcp.rows));
+      // Identical population.
+      expect(cli.total).toBe(mcp.total);
+      // Identical scores. Tolerance 6 digits: the only difference is recency decay
+      // (EXP over Date.now()), since the two seams run a few ms apart — a real
+      // scoring divergence would be orders of magnitude larger. (Deep/RRF scores are
+      // rank-based, so they compare exactly.)
+      expect(cli.rows.length).toBe(mcp.rows.length);
+      for (let i = 0; i < mcp.rows.length; i++) {
+        if (mcp.rows[i].score === null || cli.rows[i].score === null) {
+          expect(cli.rows[i].score).toBe(mcp.rows[i].score);
+        } else {
+          expect(cli.rows[i].score).toBeCloseTo(mcp.rows[i].score, 6);
+        }
+      }
+      if (expectDeep) {
+        expect(mcp.deepRan).toBe(true);
+        expect(cli.deepRan).toBe(true);
+      }
+    } finally {
+      if (autoDeep) {
+        if (prevEnv === undefined) delete process.env.CLAUDE_MEM_AUTO_DEEP;
+        else process.env.CLAUDE_MEM_AUTO_DEEP = prevEnv;
+      }
+    }
+  });
+}
+
+describe('CLI ↔ MCP search parity (audit P1-2 — one orchestrator)', () => {
+  parity('cross-source FTS query', { query: 'parity', deep: false }, ['parity', '--no-deep']);
+  parity('obs-only by type (bugfix)', { query: 'parity', obs_type: 'bugfix', deep: false }, ['parity', '--type', 'bugfix', '--no-deep']);
+  parity('source=sessions', { query: 'parity', type: 'sessions', deep: false }, ['parity', '--source', 'sessions', '--no-deep']);
+  parity('source=prompts', { query: 'parity', type: 'prompts', deep: false }, ['parity', '--source', 'prompts', '--no-deep']);
+  parity('paging (offset 1, limit 2)', { query: 'parity', offset: 1, limit: 2, deep: false }, ['parity', '--offset', '1', '--limit', '2', '--no-deep']);
+  parity('sort=time', { query: 'parity', sort: 'time', deep: false }, ['parity', '--sort', 'time', '--no-deep']);
+  parity('CJK query (prompt CJK fallback path)', { query: '缓存', deep: false }, ['缓存', '--no-deep']);
+
+  // Deep path: both surfaces route through the SAME injected deepSearch (LLM rewrite
+  // → RRF fusion), so the fused obs set + order must match exactly. rerankPolicy
+  // differs (mcp/cli) but converges here — both re-rank with the same project.
+  parity('explicit --deep (LLM rewrite + RRF fusion)',
+    { query: 'parity', deep: true }, ['parity', '--deep'],
+    { llm: () => stubLLM({ variants: ['parity drift', 'parity normalization'] }), expectDeep: true });
+
+  // Auto-escalation: a 0-hit query over a >MIN_CORPUS corpus escalates on BOTH
+  // surfaces (MCP auto by default; CLI via CLAUDE_MEM_AUTO_DEEP=1) and fuses the same
+  // variant set. The stub variant ('parity') hits the seeded corpus.
+  parity('auto-escalation on a weak query',
+    { query: 'zzznomatchqxz' }, ['zzznomatchqxz'],
+    { llm: () => stubLLM({ variants: ['parity'] }), autoDeep: true, expectDeep: true });
+});
