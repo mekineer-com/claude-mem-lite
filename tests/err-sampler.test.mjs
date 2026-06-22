@@ -5,10 +5,10 @@
 // throw and must not interfere with hook hot path when disabled.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, mkdirSync, writeFileSync, utimesSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { maybeSampleError, _sampleRate } from '../lib/err-sampler.mjs';
+import { maybeSampleError, _sampleRate, SAMPLE_LOG_RETENTION_MS } from '../lib/err-sampler.mjs';
 
 describe('err-sampler — maybeSampleError', () => {
   let tmp;
@@ -88,6 +88,25 @@ describe('err-sampler — maybeSampleError', () => {
     expect(_sampleRate()).toBe(0);
     process.env.CLAUDE_MEM_CATCH_SAMPLE = '-1';
     expect(_sampleRate()).toBe(0);
+  });
+
+  // Audit 2026-06-22 P2 #7: the retention constant existed but nothing pruned, so
+  // errors/ grew one shard/day forever once CLAUDE_MEM_CATCH_SAMPLE was set.
+  it('prunes daily shards older than the retention window on write', () => {
+    process.env.CLAUDE_MEM_CATCH_SAMPLE = '1';
+    const errDir = join(tmp, 'errors');
+    mkdirSync(errDir, { recursive: true });
+    const oldShard = join(errDir, '2000-01-01.jsonl');
+    writeFileSync(oldShard, '{"old":true}\n');
+    const wellPast = (Date.now() - SAMPLE_LOG_RETENTION_MS - 86400000) / 1000; // seconds
+    utimesSync(oldShard, wellPast, wellPast);
+    const freshShard = join(errDir, '2099-01-01.jsonl'); // mtime = now → kept
+    writeFileSync(freshShard, '{"fresh":true}\n');
+
+    maybeSampleError(new Error('trigger a write'), 'ctx', tmp);
+
+    expect(existsSync(oldShard)).toBe(false);   // pruned
+    expect(existsSync(freshShard)).toBe(true);  // within window → kept
   });
 
   it('appends to same daily file on multiple calls', () => {

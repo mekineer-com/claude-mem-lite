@@ -771,5 +771,47 @@ describe('release signature verification (P1 supply-chain)', () => {
       delete process.env.CLAUDE_MEM_SKIP_SIG_VERIFY;
     }
   });
+
+  // Audit 2026-06-22 P1 #5: once a pubkey is embedded the verifier must fail CLOSED.
+  // Pre-fix it was opportunistic-forever — an attacker who can publish a release (or
+  // MITM the asset CDN) bypassed verification by simply omitting the signature assets
+  // (the tags-fallback path always sends assets:[]). The publicKey param lets the test
+  // exercise the keyed regime without committing a real embedded key.
+  it('key present + NO signature assets → refuses to install (downgrade/strip protection)', async () => {
+    const { verifyReleaseAuthenticity } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { pub } = makeSignedRelease();
+    globalThis.fetch = vi.fn(); // must NOT be reached
+    const r = await verifyReleaseAuthenticity('/nonexistent', [], pub);
+    expect(r).toMatchObject({ ok: false, action: 'missing-signature' });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('key present + tags-fallback (assets undefined) → refuses', async () => {
+    const { verifyReleaseAuthenticity } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { pub } = makeSignedRelease();
+    const r = await verifyReleaseAuthenticity('/nonexistent', undefined, pub);
+    expect(r).toMatchObject({ ok: false, action: 'missing-signature' });
+  });
+
+  it('key present + valid signature assets → verified (legit signed release still installs)', async () => {
+    const { verifyReleaseAuthenticity } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { dir, pub, bytes, sig } = makeSignedRelease();
+    const assets = [
+      { name: 'release-manifest.json', browser_download_url: 'https://github.com/x/y/releases/download/v1/release-manifest.json' },
+      { name: 'release-manifest.json.sig', browser_download_url: 'https://github.com/x/y/releases/download/v1/release-manifest.json.sig' },
+    ];
+    globalThis.fetch = vi.fn(async (url) => ({
+      ok: true, status: 200,
+      arrayBuffer: async () => (String(url).endsWith('.sig') ? Buffer.from(sig) : Buffer.from(bytes)),
+    }));
+    const r = await verifyReleaseAuthenticity(dir, assets, pub);
+    expect(r).toMatchObject({ ok: true, action: 'verified' });
+  });
+
+  it('empty embedded key stays opportunistic (skipped-no-pubkey — unchanged default)', async () => {
+    const { verifyReleaseAuthenticity } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const r = await verifyReleaseAuthenticity('/nonexistent', [], '');
+    expect(r).toMatchObject({ ok: true, action: 'skipped-no-pubkey' });
+  });
 });
 

@@ -110,7 +110,7 @@ const TRIGGERS_SCHEMA = `
 const INVOCATIONS_SCHEMA = `
   CREATE TABLE IF NOT EXISTS invocations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    resource_id   INTEGER NOT NULL REFERENCES resources(id),
+    resource_id   INTEGER NOT NULL REFERENCES resources(id) ON DELETE CASCADE,
     session_id    TEXT,
     trigger       TEXT CHECK(trigger IN ('session_start','pre_tool_use','user_explicit','user_prompt')),
     tier          INTEGER CHECK(tier IN (1,2,3)),
@@ -195,11 +195,19 @@ export function ensureRegistryDb(dbPath) {
   } catch (e) { debugCatch(e, 'resources-column-migration'); }
 
   // Migrate: add 'github' to source CHECK constraint (required for smart import)
-  // Must disable FK checks during table recreation (RENAME triggers FK validation)
+  // Must disable FK checks during table recreation (RENAME triggers FK validation).
+  // legacy_alter_table=ON is REQUIRED: under modern SQLite (the better-sqlite3
+  // default) `ALTER TABLE resources RENAME TO resources_old` rewrites child-table FK
+  // references, so invocations.resource_id would become `REFERENCES resources_old`
+  // and the trailing DROP would leave it dangling — silently killing every future
+  // `INSERT INTO invocations` (audit P0 #1). Legacy mode keeps child FKs pointing at
+  // the original name, which the freshly-created `resources` table then satisfies.
+  let resourcesRebuilt = false;
   try {
     const resSchema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='resources'`).get();
     if (resSchema?.sql && !resSchema.sql.includes("'github'")) {
       db.pragma('foreign_keys = OFF');
+      db.pragma('legacy_alter_table = ON');
       try {
         db.transaction(() => {
           const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_old'`).get();
@@ -216,10 +224,18 @@ export function ensureRegistryDb(dbPath) {
           const common = cols.filter(c => newCols.has(c)).join(', ');
           db.exec(`INSERT INTO resources (${common}) SELECT ${common} FROM resources_old`);
           db.exec(`DROP TABLE resources_old`);
+          // Recreate the table's indexes: the CREATE INDEX IF NOT EXISTS inside
+          // RESOURCES_SCHEMA above was SKIPPED while resources_old still held the
+          // index names, so the rebuilt table had NONE — including the UNIQUE
+          // idx_res_type_name that upsertResource's ON CONFLICT(type,name) requires
+          // (review HIGH-1; pre-existing, closed here). Names are free post-DROP.
+          db.exec(RESOURCES_SCHEMA);
         })();
       } finally {
+        db.pragma('legacy_alter_table = OFF');
         db.pragma('foreign_keys = ON');
       }
+      resourcesRebuilt = true;
     }
   } catch (e) { debugCatch(e, 'resources-source-check-migration'); }
 
@@ -230,6 +246,16 @@ export function ensureRegistryDb(dbPath) {
   }
   // Triggers: always ensure (IF NOT EXISTS) — fixes DBs where FTS5 was created without triggers
   db.exec(TRIGGERS_SCHEMA);
+
+  // The source-CHECK migration replaced the `resources` content table out from under
+  // the external-content FTS index (content=resources), leaving resources_fts stale.
+  // Rebuild it so a later DELETE's res_fts_delete trigger doesn't throw "database disk
+  // image is malformed" against the mismatched index. Gated on the migration actually
+  // having run so we don't rebuild on every open.
+  if (resourcesRebuilt) {
+    try { db.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')"); }
+    catch (e) { debugCatch(e, 'resources-fts-rebuild-after-source-check'); }
+  }
 
   db.exec(INVOCATIONS_SCHEMA);
 
@@ -281,10 +307,44 @@ export function ensureRegistryDb(dbPath) {
     }
   } catch (e) { debugCatch(e, 'rejection_reason-migration'); }
 
-  // Migrate: ensure composite index on invocations(resource_id, created_at) for correlated subqueries
+  // Migrate: add ON DELETE CASCADE to invocations.resource_id (audit P0 #4). Old DBs
+  // declared the FK with no ON DELETE action, so deleting a resource that had
+  // invocation history threw SQLITE_CONSTRAINT_FOREIGNKEY (registry remove /
+  // mem_registry delete) or silently no-op'd (dead-repo purge). SQLite can't ALTER an
+  // FK, so rebuild the table. Renaming the CHILD table is safe (nothing references
+  // invocations), so legacy_alter_table is not a concern here. Runs after the
+  // rejection_reason ADD COLUMN so the column exists in both old and new tables.
   try {
-    db.exec(`CREATE INDEX IF NOT EXISTS idx_invocations_resource_created ON invocations(resource_id, created_at)`);
-  } catch (e) { debugCatch(e, 'invocations-resource-created-index-migration'); }
+    const schema = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='invocations'`).get();
+    if (schema?.sql && !/ON DELETE CASCADE/i.test(schema.sql)) {
+      db.transaction(() => {
+        const hasOld = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='invocations_old'`).get();
+        if (hasOld) db.exec(`DROP TABLE invocations_old`);
+        db.exec(`ALTER TABLE invocations RENAME TO invocations_old`);
+        db.exec(INVOCATIONS_SCHEMA);
+        // Omit rejection_reason from the copy (matching the CHECK migrations above):
+        // it was historically a bare TEXT with NO CHECK, so an old row could hold a
+        // value outside INVOCATIONS_SCHEMA's current rejection_reason CHECK whitelist.
+        // Copying it would throw SQLITE_CONSTRAINT_CHECK → rollback → the FK is left
+        // un-cascaded forever and every retry re-fails (review HIGH-2). The column is
+        // never written at runtime, so copied rows get NULL — no data loss.
+        db.exec(`INSERT INTO invocations
+          (id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at)
+          SELECT id, resource_id, session_id, trigger, tier, recommended, adopted, outcome, score, created_at
+          FROM invocations_old`);
+        db.exec(`DROP TABLE invocations_old`);
+        // Recreate the table's indexes — the INVOCATIONS_SCHEMA CREATE INDEX above was
+        // skipped while invocations_old held the names (review HIGH-1). Free post-DROP.
+        db.exec(INVOCATIONS_SCHEMA);
+      })();
+    }
+  } catch (e) { debugCatch(e, 'invocations-ondelete-cascade-migration'); }
+
+  // (Removed the separate idx_invocations_resource_created migration — it was a column-
+  // identical duplicate of idx_inv_resource (resource_id, created_at) in INVOCATIONS_SCHEMA.
+  // It only ever survived because the rebuild migrations dropped idx_inv_resource; now that
+  // the rebuilds recreate their indexes (review HIGH-1), the duplicate is pure dead weight.
+  // Pre-existing DBs keep their old idx_invocations_resource_created; it's harmless.)
 
   db.exec(PREINSTALLED_SCHEMA);
 

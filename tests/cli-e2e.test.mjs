@@ -116,6 +116,53 @@ function seedObs({ type = 'discovery', title, text = '', importance = 1, filesMo
 
 // ─── Test Suites ─────────────────────────────────────────────────────────────
 
+// Audit 2026-06-22 P1 #3: cmdSearch lacked rejectBareStringFlags for its string
+// flags, so a value-less flag parsed to boolean `true` and either crashed or
+// silently changed results. One guard fixes all three symptoms.
+describe('CLI E2E: search bare-flag guard (audit #3)', () => {
+  it('rejects bare --branch cleanly instead of crashing with a raw SQLite stack', () => {
+    seedObs({ type: 'bugfix', title: 'auth token bug', text: 'auth token bug' });
+    const { stderr, stdout, exitCode } = runCli(['search', 'auth', '--branch']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--branch requires a value');
+    expect(stdout + stderr).not.toContain('SqliteError');
+    expect(stdout + stderr).not.toMatch(/can only bind/i);
+  });
+
+  it('rejects bare --to instead of silently returning zero results', () => {
+    seedObs({ type: 'bugfix', title: 'auth token bug', text: 'auth token bug' });
+    const { stderr, exitCode } = runCli(['search', 'auth', '--to']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--to requires a value');
+  });
+
+  it('rejects bare --project instead of silently searching unscoped', () => {
+    seedObs({ type: 'bugfix', title: 'auth token bug', text: 'auth token bug' });
+    const { stderr, exitCode } = runCli(['search', 'auth', '--project']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--project requires a value');
+  });
+});
+
+// Audit 2026-06-22 P2 #9: on the single-source CLI path the context re-rank
+// (reRankWithContext) mutated scores but the pipeline never re-sorted, so the
+// recency/file-overlap boost had zero effect on displayed order.
+describe('CLI E2E: single-source context re-rank reorders results (audit #9)', () => {
+  it('floats a result whose file is recently active above an equal-relevance peer', () => {
+    // A and B have identical relevance and are 3h old (searchable, not "recently
+    // active" themselves). C is recent and re-touches src/a.mjs, making ONLY that
+    // file active — so A gets the file-overlap boost and B does not.
+    seedObs({ type: 'discovery', title: 'widgetzz alpha', text: 'widgetzz alpha', filesModified: '["src/b.mjs"]', epochOffset: -3 * 3600000 });
+    seedObs({ type: 'discovery', title: 'widgetzz alpha', text: 'widgetzz alpha', filesModified: '["src/a.mjs"]', epochOffset: -3 * 3600000 });
+    seedObs({ type: 'discovery', title: 'unrelated recent note', text: 'nothing to match', filesModified: '["src/a.mjs"]', epochOffset: 0 });
+    const out = JSON.parse(runCli(['search', 'widgetzz', '--type', 'discovery', '--json']).stdout);
+    const matched = out.results.filter(r => (r.files_modified || '').includes('src/'));
+    expect(matched.length).toBe(2);
+    // The active-file result (src/a.mjs) must rank first now that the boost is applied.
+    expect(matched[0].files_modified).toContain('src/a.mjs');
+  });
+});
+
 describe('CLI E2E: search', () => {
   it('finds observations via FTS5 and returns formatted output', () => {
     seedObs({ type: 'bugfix', title: 'Fixed database connection pool leak', text: 'database connection pool was exhausted under load' });

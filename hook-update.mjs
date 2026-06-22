@@ -440,20 +440,27 @@ async function fetchAssetBuffer(url) {
 }
 
 // I/O gate called from downloadAndInstall after validateExtractedTarball.
-// Opportunistic: returns ok=false ONLY on a genuine tampering signal. Missing
-// embedded key, missing signature assets, asset-fetch failure, or the
-// CLAUDE_MEM_SKIP_SIG_VERIFY escape hatch all return ok=true so a verification
-// gap can never permanently brick auto-update.
-export async function verifyReleaseAuthenticity(extractedDir, assets) {
+// Two regimes, switched by whether a public key is embedded:
+//   • No embedded key (the shipped default, RELEASE_PUBLIC_KEY=''): INERT —
+//     skipped-no-pubkey so an un-provisioned key can never brick auto-update.
+//   • Key embedded (signing active): FAIL CLOSED — a missing signature asset, a
+//     signature-asset fetch failure, or an invalid signature all return ok=false.
+//     Once we publish signed releases, an attacker who can publish a release or MITM
+//     the asset CDN must not bypass verification by stripping the signature assets
+//     (the tags-fallback path also sends assets:[]). A transient fetch failure only
+//     defers the install to the next ~6h poll, not a permanent brick. (audit P1 #5)
+// The CLAUDE_MEM_SKIP_SIG_VERIFY escape hatch still forces a skip. publicKey is a
+// param (defaulting to the embedded constant) only so tests can exercise both regimes.
+export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey = RELEASE_PUBLIC_KEY) {
   if (process.env.CLAUDE_MEM_SKIP_SIG_VERIFY) return { ok: true, action: 'skipped-env' };
-  if (!RELEASE_PUBLIC_KEY) return { ok: true, action: 'skipped-no-pubkey' };
+  if (!publicKey) return { ok: true, action: 'skipped-no-pubkey' };
 
   const list = Array.isArray(assets) ? assets : [];
   const manifestAsset = list.find(a => a && a.name === MANIFEST_ASSET_NAME);
   const sigAsset = list.find(a => a && a.name === SIGNATURE_ASSET_NAME);
   if (!manifestAsset || !sigAsset) {
-    debugLog('WARN', 'hook-update', 'Release carries no signature assets — proceeding unverified (unsigned release)');
-    return { ok: true, action: 'skipped-no-signature' };
+    debugLog('WARN', 'hook-update', 'Signed-release mode: release carries no signature assets — refusing to install (possible downgrade/strip)');
+    return { ok: false, action: 'missing-signature' };
   }
 
   let manifestBytes, signatureB64;
@@ -461,12 +468,12 @@ export async function verifyReleaseAuthenticity(extractedDir, assets) {
     manifestBytes = await fetchAssetBuffer(manifestAsset.browser_download_url);
     signatureB64 = (await fetchAssetBuffer(sigAsset.browser_download_url)).toString('utf8').trim();
   } catch (e) {
-    // A flaky asset CDN is not a tampering signal — don't brick the update over it.
-    debugLog('WARN', 'hook-update', `Signature asset fetch failed (${e.message}) — proceeding unverified`);
-    return { ok: true, action: 'skipped-fetch-failed' };
+    // Can't fetch the signature → can't verify → don't install this cycle (retries next poll).
+    debugLog('WARN', 'hook-update', `Signed-release mode: signature asset fetch failed (${e.message}) — refusing to install this cycle`);
+    return { ok: false, action: 'signature-fetch-failed' };
   }
 
-  const r = verifyDownloadedRelease(extractedDir, manifestBytes, signatureB64);
+  const r = verifyDownloadedRelease(extractedDir, manifestBytes, signatureB64, publicKey);
   if (!r.ok) return { ok: false, action: r.reason };
   debugLog('DEBUG', 'hook-update', 'Release signature verified');
   return { ok: true, action: 'verified' };

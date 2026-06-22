@@ -2,6 +2,33 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.9.0 — full-codebase audit fixes: secret-scrub, registry FK migration, auto-update fail-closed (P1–P5 + self-review)
+
+A comprehensive read-only audit (parallel reviewers over the whole runtime + a fresh-eyes self-review of the diff) surfaced a set of security and data-integrity defects; this release fixes them. No new features, no breaking changes. Test suite 3120 → 3153 (+33 regression tests, all green); ESLint clean.
+
+### fix(security): secret-scrub coverage holes + `<private>` never ran on writes
+
+`scrubSecrets` silently missed the most common credential shapes: quote-wrapped values (`api_key="…"`, `password: '…'`) — the unquoted KV patterns stop at the quote, so a quoted value matched zero chars — and keyword-without-separator env vars (`PGPASSWORD=`, `MYSQL_PWD=`). Both leaked verbatim into the local DB + `errors/*.jsonl`. Added a quoted-value pattern (split, like the unquoted patterns, into prose-guarded bare nouns vs. always-on structured keys/env vars so `the token: "x"` prose is still kept — #8283) and the named env vars. Separately, the documented `<private>…</private>` opt-out only ran on the user-prompt hook, never on persistence paths — folded `stripPrivate` into `scrubSecrets` so every write/log path inherits it. The deliberate low-false-positive design (`topsecret=`, `access_token_count:`, `PWD=` are NOT credentials) is preserved.
+
+### fix(registry): source-CHECK migration corrupted the invocations FK + left FTS/indexes broken
+
+On any registry DB old enough to trigger the "add 'github' to source CHECK" migration, the `ALTER TABLE resources RENAME` rewrote the child `invocations.resource_id` FK to the temp table under modern SQLite (`legacy_alter_table=0`), and the trailing `DROP` left it dangling — silently killing all future invocation logging. Fixed with `PRAGMA legacy_alter_table=ON` around the rebuild. The same rebuild also (a) left the external-content `resources_fts` stale → a later resource `DELETE` threw "database disk image is malformed" (now rebuilt after the migration), and (b) silently dropped the table's own indexes — including the UNIQUE `idx_res_type_name` that `upsertResource`'s `ON CONFLICT(type,name)` depends on, breaking the entire registry write path (now the schema is re-exec'd after the `DROP` to recreate indexes). Added `ON DELETE CASCADE` to the invocations FK (+ a rebuild migration) so deleting a recommended resource cascades instead of throwing; the rebuild omits the CHECK-constrained `rejection_reason` column so a legacy out-of-whitelist value can't roll the migration back.
+
+### fix(security): auto-update fails closed once a signing key is embedded
+
+`verifyReleaseAuthenticity` was opportunistic-forever: with a public key embedded, an attacker who could publish a release (or MITM the asset CDN) bypassed verification simply by omitting the signature assets. It now fails closed in signed-release mode — a missing signature asset or a fetch failure refuses the install (a transient failure just defers to the next poll). Still inert by default (no key embedded), so current installs auto-update exactly as before.
+
+### fix(cli): `search` rejects value-less string flags instead of crashing / silently mis-scoping
+
+A bare `--branch` parsed to boolean `true` and reached the SQLite bind, crashing with a raw stack trace; bare `--to` silently filtered to an epoch-1 upper bound (zero results); bare `--project` silently searched unscoped. One `rejectBareStringFlags` guard fixes all three.
+
+### fix(hooks): shutdown durability, unbounded error log, title-only dedup, dead re-rank
+
+- **SIGTERM/SIGINT** now persists the in-flight episode synchronously (`saveEpisodeImmediate`) before writing the flush file — that file had no consumer, so episodes were lost on abnormal termination.
+- **err-sampler** now prunes daily shards past the 14-day retention window (the constant existed but nothing read it, so `errors/` grew unbounded once sampling was enabled).
+- **auto fuzzy-dedup** now requires body similarity in addition to title similarity — title-only (a word-set metric) was hiding distinct observations that shared a title token-set.
+- **CLI single-source search** now re-sorts after the context re-rank, so the recency/file-overlap boost actually affects ordering (it was computed but discarded).
+
 ## v3.8.0 — release supply-chain hardening: signed auto-update + provenance (audit P1–P3)
 
 Security/CI hardening from the install-integrity audit. The auto-update path gains optional cryptographic verification and the release pipeline tightens its version + lint gates. **Default behaviour is unchanged** — release-signature verification is inert until a signing key is provisioned (no public key is embedded yet), so existing installs auto-update exactly as before.

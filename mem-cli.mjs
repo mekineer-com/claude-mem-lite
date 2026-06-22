@@ -57,6 +57,11 @@ async function cmdSearch(db, args, { llm } = {}) {
     return;
   }
 
+  // Bare string flags parse to boolean `true`; without this guard `--branch` reaches
+  // the SQLite bind and crashes, while `--to`/`--project` silently change results
+  // (epoch-1 upper bound → zero rows; unscoped search). (audit P1 #3)
+  if (rejectBareStringFlags(flags, ['source', 'project', 'from', 'to', 'branch'])) return;
+
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
   const type = flags.type || null;
   const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);

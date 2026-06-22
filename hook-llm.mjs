@@ -20,6 +20,7 @@ import {
 } from './hook-shared.mjs';
 import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
 import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from './lib/low-signal-patterns.mjs';
+import { episodeHasSignificantContent } from './hook-episode.mjs';
 
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
@@ -465,6 +466,24 @@ export function buildDegradedTitle(episode) {
     .replace(/\t/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+// Best-effort SYNCHRONOUS persist of an episode's rule-based observation. Shared by
+// the normal flush and the SIGTERM/SIGINT shutdown handler. The ep-flush-* file the
+// shutdown handler writes has NO consumer (only spawnBackground-passed files are
+// processed), so without this the in-flight episode is silently lost on abnormal
+// termination — and spawning a detached child from a dying process is unreliable, so
+// the save must be synchronous (audit #6). Never throws; returns the obs id or null.
+export function saveEpisodeImmediate(episode, externalDb) {
+  try {
+    if (!episode || !Array.isArray(episode.entries) || episode.entries.length === 0) return null;
+    if (!episodeHasSignificantContent(episode)) return null;
+    const obs = buildImmediateObservation(episode);
+    return saveObservation(obs, episode.project, episode.sessionId, externalDb) || null;
+  } catch (e) {
+    debugCatch(e, 'saveEpisodeImmediate');
+    return null;
+  }
 }
 
 /**

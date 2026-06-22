@@ -1,6 +1,8 @@
 // claude-mem-lite: Secret pattern detection and scrubbing
 // Extracted from utils.mjs for focused responsibility
 
+import { stripPrivate } from './lib/private-strip.mjs';
+
 // ─── Secret Patterns ──────────────────────────────────────────────────────
 
 export const SECRET_PATTERNS = [
@@ -28,7 +30,28 @@ export const SECRET_PATTERNS = [
   // access_token / refresh_token are the canonical OAuth2 field names — they were
   // missing from this KV list (drift vs the JSON list below). `(?:\b|_)` for the same
   // underscore-prefix reason.
-  [/((?:\b|_)(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  // `pgpassword|pgpass|mysql_pwd` are well-known credential ENV-VAR names whose
+  // keyword tail is unreachable via the noun list above (`PGPASSWORD`=PG+password has
+  // no \b/_ before "password"; `MYSQL_PWD` has no "password"/"token" substring). They
+  // live in THIS pattern (no prose lookbehind) so `export PGPASSWORD=x` / `env MYSQL_PWD=x`
+  // scrub — a compound credential env-var name is unambiguous config even after a word.
+  // Enumerating known names (not a blanket letter-prefix) preserves the deliberate
+  // low-FP decision that `topsecret=` / `access_token_count:` are non-credentials
+  // (#8283 + utils.test.mjs:1089-1100); bare `pwd` is omitted so `PWD=` (a path) survives.
+  [/((?:\b|_)(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|pgpassword|pgpass|mysql_pwd)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  // Bare-key QUOTED values — `api_key="..."`, `password: '...'`. The unquoted KV
+  // patterns above stop at `'`/`"` (excluded from their value class), so a quoted
+  // value matched 0 chars and slipped through. Consumes the opening quote, the value,
+  // and the matching close quote (backref \2), replacing only the value. Unlike the
+  // JSON pattern below it does NOT require the KEY to be quoted, covering `key="value"`
+  // object-literal / YAML / quoted-.env shapes. Split into the SAME two patterns as the
+  // unquoted KV pairs above so prose survives — a quoted value does not turn prose into
+  // config (`the token: "x"` is still prose, must NOT scrub; #8283 / utils.test.mjs:1090).
+  //   (a) bare credential nouns keep the prose lookbehind:
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  //   (b) structured keys + named env vars are unambiguous config even after a word
+  //       (`see api_key: "x"` DOES scrub, mirroring the unquoted structured-key path):
+  [/((?:\b|_)(?:pgpassword|pgpass|mysql_pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
   // AWS access keys (AKIA...)
   [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
   // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold
@@ -94,12 +117,15 @@ export const SECRET_PATTERNS = [
 
 /**
  * Scrub known secret patterns (API keys, tokens, credentials) from text.
+ * Also strips user-marked `<private>...</private>` blocks first, so every
+ * persistence/log path that scrubs secrets inherits the `<private>` opt-out —
+ * previously stripPrivate ran only on the user-prompt hook, not on writes.
  * @param {string} text Input text potentially containing secrets
  * @returns {string} Text with secrets replaced by '***'
  */
 export function scrubSecrets(text) {
   if (!text || typeof text !== 'string') return text || '';
-  let result = text;
+  let result = stripPrivate(text);
   for (const [pattern, replacement] of SECRET_PATTERNS) {
     result = result.replace(pattern, replacement);
   }

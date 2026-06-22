@@ -27,7 +27,6 @@ import {
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
   COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25,
-  computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -43,11 +42,11 @@ import {
   sessionFile, getSessionId, createSessionId, openDb,
   spawnBackground, sweepOrphanEpisodeFiles,
 } from './hook-shared.mjs';
-import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation } from './hook-llm.mjs';
+import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation, saveEpisodeImmediate } from './hook-llm.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds } from './lib/maintain-core.mjs';
 import {
   extractCitationsFromTranscript,
   extractAllInjected,
@@ -66,7 +65,6 @@ import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
 import { loadCiteBackForEpisode, extractCiteBackSignals, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
-import { MINHASH_PREFILTER, FUZZY_DEDUP_THRESHOLD } from './lib/dedup-constants.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -115,6 +113,10 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
       try {
         const ep = readEpisodeRaw();
         if (ep && ep.entries && ep.entries.length > 0) {
+          // Persist a rule-based observation synchronously BEFORE writing the flush
+          // file — that file has no consumer, so this is the only thing that prevents
+          // the in-flight episode being lost on abnormal termination (audit #6).
+          saveEpisodeImmediate(ep);
           const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
           writeFileSync(flushFile, JSON.stringify(ep));
           try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
@@ -788,7 +790,7 @@ function runSessionStartAutoMaintain(db) {
         const SCAN_LIMIT = 500;
         const FUZZY_MAX_MERGES = 20;
         const recent = db.prepare(`
-          SELECT id, title, importance, created_at_epoch
+          SELECT id, title, importance, created_at_epoch, narrative, text
           FROM observations
           WHERE COALESCE(compressed_into, 0) = 0
             AND superseded_at IS NULL
@@ -797,24 +799,14 @@ function runSessionStartAutoMaintain(db) {
           ORDER BY created_at_epoch DESC LIMIT ${SCAN_LIMIT}
         `).all(STALE_AGE);
         if (recent.length >= 2) {
-          const titles = recent.map(r => r.title.trim());
-          const minhashes = titles.map(t => t ? computeMinHash(t) : null);
-          const fuzzyRemoveIds = [];
-          const removed = new Set();
-          outer: for (let i = 0; i < recent.length; i++) {
-            if (!minhashes[i] || removed.has(recent[i].id)) continue;
-            for (let j = i + 1; j < recent.length; j++) {
-              if (!minhashes[j] || removed.has(recent[j].id)) continue;
-              if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PREFILTER) continue;
-              if (jaccardSimilarity(titles[i], titles[j]) < FUZZY_DEDUP_THRESHOLD) continue;
-              // Keep the higher-importance row; tiebreak by older (lower id wins access history)
-              const keep = (recent[i].importance ?? 1) >= (recent[j].importance ?? 1) ? recent[i] : recent[j];
-              const remove = keep === recent[i] ? recent[j] : recent[i];
-              fuzzyRemoveIds.push(remove.id);
-              removed.add(remove.id);
-              if (fuzzyRemoveIds.length >= FUZZY_MAX_MERGES) break outer;
-            }
-          }
+          // audit #8: supersede only when title AND body match — title-only (a word-SET
+          // metric) collapsed distinct observations sharing a title token-set. The
+          // selection is the shared pure core in lib/maintain-core (unit-tested there).
+          const rows = recent.map(r => ({
+            id: r.id, title: r.title, importance: r.importance,
+            body: (r.narrative && r.narrative.trim()) || (r.text && r.text.trim()) || '',
+          }));
+          const fuzzyRemoveIds = selectFuzzyDedupeIds(rows, { maxMerges: FUZZY_MAX_MERGES });
           if (fuzzyRemoveIds.length > 0) {
             const ph = fuzzyRemoveIds.map(() => '?').join(',');
             db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup-fuzzy' WHERE id IN (${ph})`)

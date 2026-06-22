@@ -10,6 +10,7 @@ import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
   mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf,
+  selectFuzzyDedupeIds,
 } from '../lib/maintain-core.mjs';
 
 const DAY = 86400000;
@@ -207,5 +208,57 @@ describe('execute ops', () => {
     expect(exists(db, emptyKeeper)).toBe(0);
     expect(exists(db, child)).toBe(1);                  // child survives (pre-fix: orphaned)
     expect(get(db, child, 'compressed_into')).toBeNull();
+  });
+});
+
+// Audit 2026-06-22 P2 #8: the hook fuzzy-dedup pass compared TITLES only (a word-set
+// metric), so distinct observations sharing a title token-set were auto-hidden. The
+// pass now also requires body similarity. selectFuzzyDedupeIds is the extracted pure
+// core so this is unit-testable without driving the whole SessionStart hook.
+describe('selectFuzzyDedupeIds — title + body fuzzy dedup (audit #8)', () => {
+  const row = (id, title, body, importance = 1) => ({ id, title, body, importance });
+
+  // Both titles carry the IDENTICAL token set, just reordered → title Jaccard = 1.0
+  // (clears the 0.95 floor). So the BODY comparison is the only thing that decides,
+  // which is exactly what audit #8 added. (Using titles that differ by a token would
+  // pass-for-the-wrong-reason: blocked on title, not body.)
+  const TITLE_A = 'Fix auth bug login handler';
+  const TITLE_B = 'Fix login handler auth bug';
+
+  test('dedupes a genuine re-save: same title token-set AND near-identical body', () => {
+    const rows = [
+      row(1, TITLE_A, 'auth token was not refreshed on expiry so calls returned 401'),
+      row(2, TITLE_B, 'auth token was not refreshed on expiry so calls returned 401 again'),
+    ];
+    expect(selectFuzzyDedupeIds(rows)).toEqual([2]);
+  });
+
+  test('does NOT dedupe same-title-token-set rows with DIFFERENT bodies (the fix)', () => {
+    const rows = [
+      row(1, TITLE_A, 'root cause was a missing await on the refresh call'),
+      row(2, TITLE_B, 'root cause was an off-by-one in the retry backoff loop'),
+    ];
+    expect(selectFuzzyDedupeIds(rows)).toEqual([]);
+  });
+
+  test('dedupes when both bodies are empty (no body to differ)', () => {
+    const rows = [row(1, 'Modified config json file', ''), row(2, 'Modified config json file', '')];
+    expect(selectFuzzyDedupeIds(rows)).toEqual([2]);
+  });
+
+  test('does NOT dedupe when one row has a body and the other does not', () => {
+    const rows = [
+      row(1, 'Modified config json file', 'added the retry flag and bumped the timeout to thirty'),
+      row(2, 'Modified config json file', ''),
+    ];
+    expect(selectFuzzyDedupeIds(rows)).toEqual([]);
+  });
+
+  test('keeps the higher-importance row and removes the lower-importance peer', () => {
+    const rows = [
+      row(1, 'Fix the auth bug in login', 'identical body text shared by both candidate rows', 1),
+      row(2, 'Fix the auth bug in login', 'identical body text shared by both candidate rows', 3),
+    ];
+    expect(selectFuzzyDedupeIds(rows)).toEqual([1]);
   });
 });

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
 import { scrubRecord } from '../lib/scrub-record.mjs';
 import { scrubSecrets } from '../secret-scrub.mjs';
+import { stripPrivate } from '../lib/private-strip.mjs';
 
 const SECRET = 'sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const POISONED = `error from upstream: token=${SECRET} not found`;
@@ -230,5 +231,79 @@ describe('scrubSecrets — provider-prefixed credentials (D#32 safe subset)', ()
   it('still scrubs underscore-cased env-var assignments (#8664)', () => {
     expect(scrubSecrets('DB_PASSWORD=hunter2supersecret')).not.toContain('hunter2supersecret');
     expect(scrubSecrets('GH_TOKEN=ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toContain('***');
+  });
+});
+
+// ─── Audit 2026-06-22 P0 #2: secret-scrub coverage holes ──────────────────────
+describe('scrubSecrets — quoted credential values (audit #2a)', () => {
+  it('scrubs bare-key quoted values: key="value" / key:\'value\'', () => {
+    expect(scrubSecrets('api_key="secretvalue123456"')).not.toContain('secretvalue123456');
+    expect(scrubSecrets("password: 'hunter2hunter2'")).not.toContain('hunter2hunter2');
+    expect(scrubSecrets('token="ghs_realtokenABCDEF"')).not.toContain('ghs_realtokenABCDEF');
+    expect(scrubSecrets('client_secret = "abcdef123456ZZ"')).not.toContain('abcdef123456ZZ');
+  });
+  it('replaces only the value, preserving key + quotes', () => {
+    expect(scrubSecrets('api_key="secretvalue123456"')).toBe('api_key="***"');
+    expect(scrubSecrets("password: 'hunter2hunter2'")).toBe("password: '***'");
+  });
+  it('still does NOT break JSON.parse of a quoted-key object (line-80 path intact)', () => {
+    const out = scrubSecrets('{"api_key": "secretvalue123456", "ok": "fine"}');
+    expect(out).not.toContain('secretvalue123456');
+    expect(() => JSON.parse(out)).not.toThrow();
+  });
+
+  // Review catch: the quoted pattern must carry the SAME prose split as the unquoted
+  // patterns — bare credential nouns preceded by "<word> " are prose, not config, and
+  // must survive even when the value is quoted (#8283; the unquoted form already keeps
+  // them, so the quoted form must too). Structured keys / env vars still scrub in prose.
+  it('does NOT over-scrub a bare noun in prose just because the value is quoted', () => {
+    expect(scrubSecrets('the bearer: "alicewashere"')).toBe('the bearer: "alicewashere"');
+    expect(scrubSecrets('the token: "somemarkervalue"')).toBe('the token: "somemarkervalue"');
+    expect(scrubSecrets('Decision: keep the token: "opaque-by-design" here'))
+      .toContain('opaque-by-design');
+  });
+  it('STILL scrubs a structured key / env var even mid-prose (quoted)', () => {
+    expect(scrubSecrets('see api_key: "realsecret123"')).not.toContain('realsecret123');
+    expect(scrubSecrets('the PGPASSWORD: "hunter2hunter2" here')).not.toContain('hunter2hunter2');
+  });
+});
+
+describe('scrubSecrets — well-known no-separator credential env vars (audit #2b)', () => {
+  it('scrubs PGPASSWORD= / MYSQL_PWD= (standard secret env-var names)', () => {
+    expect(scrubSecrets('PGPASSWORD=hunter2hunter2 psql -h db.prod')).not.toContain('hunter2hunter2');
+    expect(scrubSecrets('MYSQL_PWD=secretpass123 mysql')).not.toContain('secretpass123');
+    expect(scrubSecrets('export PGPASS=hunter2hunter2')).not.toContain('hunter2hunter2');
+  });
+  // Guard: PWD is the present-working-dir env var, NOT a secret. The fix
+  // deliberately omits a bare `pwd` keyword to avoid scrubbing real paths.
+  it('does NOT scrub PWD= (working-directory env var, not a credential)', () => {
+    expect(scrubSecrets('PWD=/home/user/projectdir')).toContain('/home/user/projectdir');
+    expect(scrubSecrets('cd "$PWD" && ls')).toContain('PWD');
+  });
+  // Consistency guard: arbitrary letter-prefixed identifiers stay non-credentials,
+  // matching the deliberate low-FP decision at utils.test.mjs:1089-1100 (#8283).
+  // We enumerate known secret env-var NAMES rather than a blanket letter-prefix.
+  it('does NOT scrub arbitrary letter-prefixed words (topsecret=, mypassword=)', () => {
+    expect(scrubSecrets('topsecret=foobar123')).toBe('topsecret=foobar123');
+    expect(scrubSecrets('mypassword=foobar123')).toBe('mypassword=foobar123');
+  });
+});
+
+describe('scrubSecrets / scrubRecord — <private> stripped on persistence (audit #2c)', () => {
+  it('scrubSecrets strips <private>...</private> blocks', () => {
+    expect(scrubSecrets('before <private>topsecret stuff</private> after'))
+      .not.toContain('topsecret stuff');
+  });
+  it('scrubRecord (the persistence chokepoint) strips <private> from text fields', () => {
+    const out = scrubRecord('observations', {
+      text: 'x <private>leaked-secret-here</private> y',
+      title: 'normal title',
+    });
+    expect(out.text).not.toContain('leaked-secret-here');
+    expect(out.title).toBe('normal title');
+  });
+  it('stripPrivate remains idempotent (double-strip is a no-op)', () => {
+    const once = stripPrivate('a <private>x</private> b');
+    expect(stripPrivate(once)).toBe(once);
   });
 });
