@@ -647,6 +647,403 @@ function gcStalePreRecallCooldowns() {
   } catch { /* silent — RUNTIME_DIR may not exist on first run */ }
 }
 
+// ─── SessionStart phase helpers ──────────────────────────────────────────────
+// Extracted verbatim from handleSessionStart (audit P1-10) so the dispatcher
+// reads as a sequence of named phases. Each is a self-contained side-effect unit
+// (db / fs / stdout / background spawns) with a narrow input contract and no
+// return-state coupling; behavior is byte-identical to the prior inline blocks.
+
+function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now }) {
+  // ── DB mutations in a transaction (crash-safe consistency) ──
+  const staleSessionCutoff = Date.now() - STALE_SESSION_MS;
+  const autoCompressAge = Date.now() - 30 * 86400000; // 30 days (accelerated from 90)
+
+  db.transaction(() => {
+    // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
+    db.prepare(`
+      INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES (?, ?, ?, ?, ?, 'active')
+    `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
+
+    // Complete previous session if this is a mid-session restart (/clear, /compact, crash)
+    if (prevSessionId) {
+      db.prepare(`
+        UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?
+        WHERE content_session_id = ? AND status = 'active'
+      `).run(now.toISOString(), now.getTime(), prevSessionId);
+    }
+
+    // Stale session cleanup: mark 24h+ active sessions as abandoned
+    db.prepare(`
+      UPDATE sdk_sessions SET status = 'abandoned'
+      WHERE status = 'active' AND started_at_epoch < ?
+    `).run(staleSessionCutoff);
+
+    // Auto-compress: mark old low-importance observations as compressed (30+ days, importance=1)
+    // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
+    // v2.56.0 #4: protect injection_count > 0 obs (proven contextually relevant
+    // via hook-memory injection, even if user never explicitly fetched). Same
+    // protection applied symmetrically in auto-maintain decay/mark-idle below.
+    const compressed = db.prepare(`
+      UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
+      WHERE COALESCE(compressed_into, 0) = 0
+        AND importance = 1
+        AND COALESCE(injection_count, 0) = 0
+        AND created_at_epoch < ?
+        AND project = ?
+    `).run(autoCompressAge, project);
+    if (compressed.changes > 0) {
+      debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
+    }
+
+    // v2.47 P0-3: accelerated compress for LOW_SIGNAL + no-signal noise.
+    // 7-day window instead of 30. The write-side capNoiseImportance forces
+    // imp=1 on these already; this just shrinks the GC latency so the
+    // projected 32.5% corpus reduction materializes within a week on live
+    // DBs instead of bleeding into the 30-day tier.
+    const noiseCompressAge = Date.now() - 7 * 86400000;
+    const noiseCompressed = db.prepare(`
+      UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
+      WHERE COALESCE(compressed_into, 0) = 0
+        AND importance = 1
+        AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
+        AND (facts IS NULL OR facts = '' OR facts = '[]')
+        AND (
+          title LIKE 'Modified %' OR title LIKE 'Worked on %'
+          OR title LIKE 'Reviewed %' OR title LIKE 'Error%'
+        )
+        AND created_at_epoch < ?
+        AND project = ?
+    `).run(noiseCompressAge, project);
+    if (noiseCompressed.changes > 0) {
+      debugLog('DEBUG', 'session-start', `auto-compressed ${noiseCompressed.changes} LOW_SIGNAL noise (7d window)`);
+    }
+  })();
+}
+
+function runSessionStartAutoMaintain(db) {
+  // Auto-maintain: cleanup + decay + boost + purge, gated to once per 24h
+  const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
+  let shouldMaintain = true;
+  try {
+    const last = JSON.parse(readFileSync(maintainFile, 'utf8'));
+    if (Date.now() - last.epoch < 24 * 3600000) shouldMaintain = false;
+  } catch {}
+  if (shouldMaintain) {
+    try {
+      const STALE_AGE = Date.now() - 30 * 86400000;
+      const OP_CAP = 500;
+
+      // Purge FIRST: delete pending-purge entries. Schema has no marked_at_epoch, so we
+      // anchor retention on created_at_epoch instead: 30d marking gate + 7d grace = 37d.
+      // Older cutoffs (e.g. 7d) were always redundant with the 30d marking filter and
+      // made purge effectively immediate on the next maintenance cycle — fix for T4-P1-A.
+      const purged = db.prepare(`
+        DELETE FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE}
+          AND created_at_epoch < ?
+      `).run(Date.now() - 37 * 86400000);
+      if (purged.changes > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged.changes} stale observations`);
+
+      // cleanup / decay+mark-idle / boost via maintain-core (shared with CLI + MCP).
+      // injection_count>0 protection lives in decayAndMarkIdle. Whole-DB, cap 500.
+      const mctx = { projectFilter: '', baseParams: [], staleAge: STALE_AGE, opCap: OP_CAP };
+
+      const cleaned = cleanupBroken(db, mctx);
+      if (cleaned > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned} broken observations`);
+
+      const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
+      if (decayed > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed} stale observations`);
+      if (idleMarked > 0) debugLog('DEBUG', 'auto-maintain', `marked ${idleMarked} idle as pending-purge`);
+
+      const boosted = boostAccessed(db, mctx);
+      if (boosted > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted} frequently-accessed observations`);
+
+      // Auto-dedup (exact): merge identical-title observations within 1h.
+      // Catches rapid duplicate writes (same hook firing twice, race conditions).
+      const dupPairs = db.prepare(`
+        SELECT a.id as keep_id, b.id as remove_id
+        FROM observations a
+        JOIN observations b ON a.title = b.title AND a.project = b.project
+          AND a.id < b.id
+          AND ABS(a.created_at_epoch - b.created_at_epoch) < 3600000
+          AND COALESCE(a.compressed_into, 0) = 0
+          AND COALESCE(b.compressed_into, 0) = 0
+        LIMIT 20
+      `).all();
+      if (dupPairs.length > 0) {
+        const removeIds = dupPairs.map(p => p.remove_id);
+        const ph = removeIds.map(() => '?').join(',');
+        db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph})`).run(Date.now(), ...removeIds);
+        debugLog('DEBUG', 'auto-maintain', `auto-deduped ${dupPairs.length} near-identical observations`);
+      }
+
+      // Auto-dedup (fuzzy): catches near-identical titles that exact-match
+      // misses across larger time windows — e.g. episode-batch titles like
+      // "Modified A.mjs, B.mjs" vs "Modified B.mjs, A.mjs" written days apart.
+      // MinHash pre-filter (≥0.7) cuts the O(N²) scan; Jaccard ≥0.95 stays
+      // well clear of legit "two updates same area" pairs (those typically
+      // score 0.7–0.85, surfaced via `maintain scan` for manual review).
+      // Bounded by ${SCAN_LIMIT} recent rows × ${FUZZY_MAX_MERGES}-merge cap.
+      if (!process.env.CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY) {
+        const SCAN_LIMIT = 500;
+        const FUZZY_MAX_MERGES = 20;
+        const recent = db.prepare(`
+          SELECT id, title, importance, created_at_epoch
+          FROM observations
+          WHERE COALESCE(compressed_into, 0) = 0
+            AND superseded_at IS NULL
+            AND created_at_epoch > ?
+            AND title IS NOT NULL AND title != ''
+          ORDER BY created_at_epoch DESC LIMIT ${SCAN_LIMIT}
+        `).all(STALE_AGE);
+        if (recent.length >= 2) {
+          const titles = recent.map(r => r.title.trim());
+          const minhashes = titles.map(t => t ? computeMinHash(t) : null);
+          const fuzzyRemoveIds = [];
+          const removed = new Set();
+          outer: for (let i = 0; i < recent.length; i++) {
+            if (!minhashes[i] || removed.has(recent[i].id)) continue;
+            for (let j = i + 1; j < recent.length; j++) {
+              if (!minhashes[j] || removed.has(recent[j].id)) continue;
+              if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PREFILTER) continue;
+              if (jaccardSimilarity(titles[i], titles[j]) < FUZZY_DEDUP_THRESHOLD) continue;
+              // Keep the higher-importance row; tiebreak by older (lower id wins access history)
+              const keep = (recent[i].importance ?? 1) >= (recent[j].importance ?? 1) ? recent[i] : recent[j];
+              const remove = keep === recent[i] ? recent[j] : recent[i];
+              fuzzyRemoveIds.push(remove.id);
+              removed.add(remove.id);
+              if (fuzzyRemoveIds.length >= FUZZY_MAX_MERGES) break outer;
+            }
+          }
+          if (fuzzyRemoveIds.length > 0) {
+            const ph = fuzzyRemoveIds.map(() => '?').join(',');
+            db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup-fuzzy' WHERE id IN (${ph})`)
+              .run(Date.now(), ...fuzzyRemoveIds);
+            debugLog('DEBUG', 'auto-maintain', `fuzzy auto-deduped ${fuzzyRemoveIds.length} near-identical observations`);
+          }
+        }
+      }
+
+      // Orphan sweep: remove `ep-flush-*` / `pending-*` runtime files older
+      // than 1h. handleLLMEpisode normally unlinks its own tmpFile on every
+      // exit path, but a crashed worker (OOM, host reboot, kill -9) leaves
+      // the file behind, and the doctor "Stale temp files" warning then
+      // accumulates indefinitely. fs-only; runs inside the 24h gate so it
+      // shares cadence with the rest of auto-maintain.
+      try {
+        const swept = sweepOrphanEpisodeFiles(RUNTIME_DIR);
+        if (swept > 0) debugLog('DEBUG', 'auto-maintain', `swept ${swept} orphan ep-flush/pending file(s)`);
+      } catch (e) { debugCatch(e, 'auto-maintain-orphan-sweep'); }
+
+      // Mark maintenance as done (24h gate) — even though compression runs in background
+      writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
+      // Weekly summary grouping runs in background to avoid blocking SessionStart
+      if (!process.env.CLAUDE_MEM_SKIP_COMPRESS) spawnBackground('auto-compress');
+      if (!process.env.CLAUDE_MEM_SKIP_OPTIMIZE) spawnBackground('llm-optimize');
+    } catch (e) { debugCatch(e, 'auto-maintain'); }
+  }
+}
+
+function saveHandoffAndFastSummary(db, { prevSessionId, prevProject, project, ccSessionId, episodeSnapshot, now }) {
+  // Shared clear handoff reference — queried once, used by fast summary + working state
+  let prevClearHandoff = null;
+
+  if (prevSessionId) {
+    // Save handoff for cross-session continuity (/clear or /compact).
+    // prevSessionId is the mem-internal id — use it to look up the finished session's
+    // user_prompts / observations. ccSessionId (same CC session across /clear) scopes
+    // the stored row so UserPromptSubmit can read its own handoff back.
+    // Legacy/test paths (no stdin) fall back to prevSessionId for both.
+    const handoffScopeId = ccSessionId || prevSessionId;
+    try { buildAndSaveHandoff(db, prevSessionId, prevProject || project, 'clear', episodeSnapshot, handoffScopeId); }
+    catch (e) { debugCatch(e, 'session-start-handoff'); }
+
+    // Read the just-saved handoff for downstream consumers (fast summary remaining, working state).
+    // Session-scoped read to avoid picking up a parallel session's clear handoff.
+    try {
+      prevClearHandoff = db.prepare(
+        'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ? AND session_id = ?'
+      ).get(prevProject || project, 'clear', handoffScopeId);
+    } catch {}
+
+    // Generate session summary for previous session (background Haiku — richer version)
+    spawnBackground('llm-summary', prevSessionId, prevProject || project);
+
+    // Build fast synchronous summary for immediate context availability.
+    // Background llm-summary will produce a richer Haiku version later;
+    // context injection query (ORDER BY created_at_epoch DESC) auto-prefers latest.
+    try {
+      const firstPrompt = db.prepare(`
+        SELECT prompt_text FROM user_prompts
+        WHERE content_session_id = ?
+        ORDER BY prompt_number ASC LIMIT 1
+      `).get(prevSessionId);
+
+      const prevObs = db.prepare(`
+        SELECT title FROM observations
+        WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+        ORDER BY created_at_epoch DESC LIMIT 5
+      `).all(prevSessionId);
+
+      // Raw values flow into scrubRecord; truncation deferred to .run() so
+      // secrets straddling the truncation boundary still match scrubSecrets
+      // regex length floors.
+      const fastRequestRaw = firstPrompt?.prompt_text || '';
+      const fastCompletedRaw = prevObs.map(o => o.title).filter(Boolean).join('; ');
+
+      // Infer remaining_items from handoff unfinished (already built above at line 476)
+      let fastRemainingRaw = '';
+      if (prevClearHandoff?.unfinished) {
+        fastRemainingRaw = extractUnfinishedSummary(prevClearHandoff.unfinished, 0);
+      }
+      // Fallback: episode errors
+      if (!fastRemainingRaw && episodeSnapshot?.entries) {
+        const errors = episodeSnapshot.entries.filter(e => e.isError).map(e => e.desc).filter(Boolean);
+        if (errors.length > 0) fastRemainingRaw = errors.join('; ');
+      }
+
+      if (fastRequestRaw || fastCompletedRaw) {
+        const safe = scrubRecord('session_summaries', {
+          request: fastRequestRaw,
+          completed: fastCompletedRaw,
+          remaining_items: fastRemainingRaw,
+        });
+        db.prepare(`
+          INSERT INTO session_summaries
+          (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+          VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', 'fast', ?, ?)
+        `).run(prevSessionId, prevProject || project, truncate(safe.request, 200), truncate(safe.completed, 300), truncate(safe.remaining_items, 200), now.toISOString(), now.getTime());
+      }
+    } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
+  }
+}
+
+function cleanStaleLockFiles() {
+  // Clean stale lock files in runtime dir
+  try {
+    for (const f of readdirSync(RUNTIME_DIR)) {
+      if (!f.endsWith('.lock')) continue;
+      const lp = join(RUNTIME_DIR, f);
+      try {
+        const raw = readFileSync(lp, 'utf8');
+        const info = JSON.parse(raw);
+        const age = Date.now() - (info.ts || 0);
+        let stale = age > STALE_LOCK_MS;
+        if (!stale && info.pid) {
+          try { process.kill(info.pid, 0); } catch (killErr) {
+            stale = killErr.code === 'ESRCH';
+          }
+        }
+        if (stale) unlinkSync(lp);
+      } catch {
+        try {
+          const st = statSync(lp);
+          if (Date.now() - st.mtimeMs > STALE_LOCK_MS) unlinkSync(lp);
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
+function buildFallbackFastSummary(db, { project, now, prevSessionId }) {
+  // Fallback fast summary: if a recently completed session has no summary yet
+  // (e.g. /exit → fast restart before Haiku finishes), build one synchronously.
+  // Skipped when prevSessionId is set (already handled above).
+  if (!prevSessionId) {
+    try {
+      const recentSession = db.prepare(`
+        SELECT content_session_id, project FROM sdk_sessions
+        WHERE project = ? AND status = 'completed' AND completed_at_epoch > ?
+        ORDER BY completed_at_epoch DESC LIMIT 1
+      `).get(project, Date.now() - 120000); // within last 2 minutes
+
+      if (recentSession) {
+        const hasSummary = db.prepare(`
+          SELECT 1 FROM session_summaries WHERE memory_session_id = ? LIMIT 1
+        `).get(recentSession.content_session_id);
+
+        if (!hasSummary) {
+          const fp = db.prepare(`
+            SELECT prompt_text FROM user_prompts
+            WHERE content_session_id = ? ORDER BY prompt_number ASC LIMIT 1
+          `).get(recentSession.content_session_id);
+          const po = db.prepare(`
+            SELECT title FROM observations
+            WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
+            ORDER BY created_at_epoch DESC LIMIT 5
+          `).all(recentSession.content_session_id);
+
+          // Raw values into scrubRecord; truncation at .run() preserves
+          // straddling-secret detection (per privacy review).
+          const frRaw = fp?.prompt_text || '';
+          const fcRaw = po.map(o => o.title).filter(Boolean).join('; ');
+          if (frRaw || fcRaw) {
+            const safe = scrubRecord('session_summaries', {
+              request: frRaw,
+              completed: fcRaw,
+            });
+            db.prepare(`
+              INSERT INTO session_summaries
+              (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
+              VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
+            `).run(recentSession.content_session_id, project, truncate(safe.request, 200), truncate(safe.completed, 300), now.toISOString(), now.getTime());
+          }
+        }
+      }
+    } catch (e) { debugCatch(e, 'session-start-exit-fast-summary'); }
+  }
+}
+
+async function emitStartupDashboard(db, project) {
+  // T10c: Startup dashboard — aggregate git/tasks/plans/handoff/events into a
+  // structured JSON hookSpecificOutput block. Emitted BEFORE the plain-text
+  // <claude-mem-context> so both surfaces coexist. Empty string → skip.
+  try {
+    const { buildDashboard } = await import('./lib/startup-dashboard.mjs');
+    let dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
+    const citeNudge = buildCiteRecallNudge(project);
+    if (citeNudge) {
+      dashboardText = dashboardText ? `${citeNudge}\n${dashboardText}` : citeNudge;
+    }
+    // v2.79: surface setup.sh dependency-install failure as a high-visibility
+    // line at the very top of the dashboard. setup.sh writes runtime/.deps-broken
+    // (JSON: ts/reason/root/repair) on failure and removes it on success — so
+    // a stale flag self-heals on the next clean SessionStart. Without this
+    // surface, hook degradation looks identical to "nothing happening" until
+    // the user notices missing context days later.
+    try {
+      const depsFlag = join(RUNTIME_DIR, '.deps-broken');
+      if (existsSync(depsFlag)) {
+        let detail = 'unknown';
+        let repair = '';
+        try {
+          const raw = readFileSync(depsFlag, 'utf8').trim();
+          const parsed = JSON.parse(raw);
+          detail = parsed.reason || detail;
+          repair = parsed.repair || '';
+        } catch { /* corrupt flag — surface the fact only */ }
+        const nudgeLines = [
+          '⚠️ [claude-mem-lite] Hook dependencies failed to install on the last SessionStart.',
+          `   Reason: ${detail}`,
+        ];
+        if (repair) nudgeLines.push(`   Repair: ${repair}`);
+        nudgeLines.push('   Until fixed, PreToolUse / PostToolUse / memory injection are degraded.');
+        const nudge = nudgeLines.join('\n');
+        dashboardText = dashboardText ? `${nudge}\n${dashboardText}` : nudge;
+      }
+    } catch (e) { debugCatch(e, 'session-start-deps-flag'); }
+    if (dashboardText) {
+      process.stdout.write(JSON.stringify({
+        suppressOutput: true,
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: dashboardText,
+        },
+      }) + '\n');
+    }
+  } catch (e) { debugCatch(e, 'session-start-dashboard'); }
+}
+
 async function handleSessionStart() {
   // GC stale per-session cooldown files. Cheap (<5ms typical) and idempotent;
   // moved here from pre-tool-recall.js's hot path.
@@ -754,386 +1151,19 @@ async function handleSessionStart() {
   try {
     const now = new Date();
 
-    // ── DB mutations in a transaction (crash-safe consistency) ──
-    const staleSessionCutoff = Date.now() - STALE_SESSION_MS;
-    const autoCompressAge = Date.now() - 30 * 86400000; // 30 days (accelerated from 90)
+    runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now });
 
-    db.transaction(() => {
-      // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
-      db.prepare(`
-        INSERT OR IGNORE INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
-        VALUES (?, ?, ?, ?, ?, 'active')
-      `).run(sessionId, sessionId, project, now.toISOString(), now.getTime());
-
-      // Complete previous session if this is a mid-session restart (/clear, /compact, crash)
-      if (prevSessionId) {
-        db.prepare(`
-          UPDATE sdk_sessions SET status = 'completed', completed_at = ?, completed_at_epoch = ?
-          WHERE content_session_id = ? AND status = 'active'
-        `).run(now.toISOString(), now.getTime(), prevSessionId);
-      }
-
-      // Stale session cleanup: mark 24h+ active sessions as abandoned
-      db.prepare(`
-        UPDATE sdk_sessions SET status = 'abandoned'
-        WHERE status = 'active' AND started_at_epoch < ?
-      `).run(staleSessionCutoff);
-
-      // Auto-compress: mark old low-importance observations as compressed (30+ days, importance=1)
-      // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
-      // v2.56.0 #4: protect injection_count > 0 obs (proven contextually relevant
-      // via hook-memory injection, even if user never explicitly fetched). Same
-      // protection applied symmetrically in auto-maintain decay/mark-idle below.
-      const compressed = db.prepare(`
-        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
-        WHERE COALESCE(compressed_into, 0) = 0
-          AND importance = 1
-          AND COALESCE(injection_count, 0) = 0
-          AND created_at_epoch < ?
-          AND project = ?
-      `).run(autoCompressAge, project);
-      if (compressed.changes > 0) {
-        debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
-      }
-
-      // v2.47 P0-3: accelerated compress for LOW_SIGNAL + no-signal noise.
-      // 7-day window instead of 30. The write-side capNoiseImportance forces
-      // imp=1 on these already; this just shrinks the GC latency so the
-      // projected 32.5% corpus reduction materializes within a week on live
-      // DBs instead of bleeding into the 30-day tier.
-      const noiseCompressAge = Date.now() - 7 * 86400000;
-      const noiseCompressed = db.prepare(`
-        UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
-        WHERE COALESCE(compressed_into, 0) = 0
-          AND importance = 1
-          AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
-          AND (facts IS NULL OR facts = '' OR facts = '[]')
-          AND (
-            title LIKE 'Modified %' OR title LIKE 'Worked on %'
-            OR title LIKE 'Reviewed %' OR title LIKE 'Error%'
-          )
-          AND created_at_epoch < ?
-          AND project = ?
-      `).run(noiseCompressAge, project);
-      if (noiseCompressed.changes > 0) {
-        debugLog('DEBUG', 'session-start', `auto-compressed ${noiseCompressed.changes} LOW_SIGNAL noise (7d window)`);
-      }
-    })();
-
-    // Auto-maintain: cleanup + decay + boost + purge, gated to once per 24h
-    const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
-    let shouldMaintain = true;
-    try {
-      const last = JSON.parse(readFileSync(maintainFile, 'utf8'));
-      if (Date.now() - last.epoch < 24 * 3600000) shouldMaintain = false;
-    } catch {}
-    if (shouldMaintain) {
-      try {
-        const STALE_AGE = Date.now() - 30 * 86400000;
-        const OP_CAP = 500;
-
-        // Purge FIRST: delete pending-purge entries. Schema has no marked_at_epoch, so we
-        // anchor retention on created_at_epoch instead: 30d marking gate + 7d grace = 37d.
-        // Older cutoffs (e.g. 7d) were always redundant with the 30d marking filter and
-        // made purge effectively immediate on the next maintenance cycle — fix for T4-P1-A.
-        const purged = db.prepare(`
-          DELETE FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE}
-            AND created_at_epoch < ?
-        `).run(Date.now() - 37 * 86400000);
-        if (purged.changes > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged.changes} stale observations`);
-
-        // cleanup / decay+mark-idle / boost via maintain-core (shared with CLI + MCP).
-        // injection_count>0 protection lives in decayAndMarkIdle. Whole-DB, cap 500.
-        const mctx = { projectFilter: '', baseParams: [], staleAge: STALE_AGE, opCap: OP_CAP };
-
-        const cleaned = cleanupBroken(db, mctx);
-        if (cleaned > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned} broken observations`);
-
-        const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
-        if (decayed > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed} stale observations`);
-        if (idleMarked > 0) debugLog('DEBUG', 'auto-maintain', `marked ${idleMarked} idle as pending-purge`);
-
-        const boosted = boostAccessed(db, mctx);
-        if (boosted > 0) debugLog('DEBUG', 'auto-maintain', `boosted ${boosted} frequently-accessed observations`);
-
-        // Auto-dedup (exact): merge identical-title observations within 1h.
-        // Catches rapid duplicate writes (same hook firing twice, race conditions).
-        const dupPairs = db.prepare(`
-          SELECT a.id as keep_id, b.id as remove_id
-          FROM observations a
-          JOIN observations b ON a.title = b.title AND a.project = b.project
-            AND a.id < b.id
-            AND ABS(a.created_at_epoch - b.created_at_epoch) < 3600000
-            AND COALESCE(a.compressed_into, 0) = 0
-            AND COALESCE(b.compressed_into, 0) = 0
-          LIMIT 20
-        `).all();
-        if (dupPairs.length > 0) {
-          const removeIds = dupPairs.map(p => p.remove_id);
-          const ph = removeIds.map(() => '?').join(',');
-          db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph})`).run(Date.now(), ...removeIds);
-          debugLog('DEBUG', 'auto-maintain', `auto-deduped ${dupPairs.length} near-identical observations`);
-        }
-
-        // Auto-dedup (fuzzy): catches near-identical titles that exact-match
-        // misses across larger time windows — e.g. episode-batch titles like
-        // "Modified A.mjs, B.mjs" vs "Modified B.mjs, A.mjs" written days apart.
-        // MinHash pre-filter (≥0.7) cuts the O(N²) scan; Jaccard ≥0.95 stays
-        // well clear of legit "two updates same area" pairs (those typically
-        // score 0.7–0.85, surfaced via `maintain scan` for manual review).
-        // Bounded by ${SCAN_LIMIT} recent rows × ${FUZZY_MAX_MERGES}-merge cap.
-        if (!process.env.CLAUDE_MEM_SKIP_AUTO_DEDUP_FUZZY) {
-          const SCAN_LIMIT = 500;
-          const FUZZY_MAX_MERGES = 20;
-          const recent = db.prepare(`
-            SELECT id, title, importance, created_at_epoch
-            FROM observations
-            WHERE COALESCE(compressed_into, 0) = 0
-              AND superseded_at IS NULL
-              AND created_at_epoch > ?
-              AND title IS NOT NULL AND title != ''
-            ORDER BY created_at_epoch DESC LIMIT ${SCAN_LIMIT}
-          `).all(STALE_AGE);
-          if (recent.length >= 2) {
-            const titles = recent.map(r => r.title.trim());
-            const minhashes = titles.map(t => t ? computeMinHash(t) : null);
-            const fuzzyRemoveIds = [];
-            const removed = new Set();
-            outer: for (let i = 0; i < recent.length; i++) {
-              if (!minhashes[i] || removed.has(recent[i].id)) continue;
-              for (let j = i + 1; j < recent.length; j++) {
-                if (!minhashes[j] || removed.has(recent[j].id)) continue;
-                if (estimateJaccardFromMinHash(minhashes[i], minhashes[j]) < MINHASH_PREFILTER) continue;
-                if (jaccardSimilarity(titles[i], titles[j]) < FUZZY_DEDUP_THRESHOLD) continue;
-                // Keep the higher-importance row; tiebreak by older (lower id wins access history)
-                const keep = (recent[i].importance ?? 1) >= (recent[j].importance ?? 1) ? recent[i] : recent[j];
-                const remove = keep === recent[i] ? recent[j] : recent[i];
-                fuzzyRemoveIds.push(remove.id);
-                removed.add(remove.id);
-                if (fuzzyRemoveIds.length >= FUZZY_MAX_MERGES) break outer;
-              }
-            }
-            if (fuzzyRemoveIds.length > 0) {
-              const ph = fuzzyRemoveIds.map(() => '?').join(',');
-              db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup-fuzzy' WHERE id IN (${ph})`)
-                .run(Date.now(), ...fuzzyRemoveIds);
-              debugLog('DEBUG', 'auto-maintain', `fuzzy auto-deduped ${fuzzyRemoveIds.length} near-identical observations`);
-            }
-          }
-        }
-
-        // Orphan sweep: remove `ep-flush-*` / `pending-*` runtime files older
-        // than 1h. handleLLMEpisode normally unlinks its own tmpFile on every
-        // exit path, but a crashed worker (OOM, host reboot, kill -9) leaves
-        // the file behind, and the doctor "Stale temp files" warning then
-        // accumulates indefinitely. fs-only; runs inside the 24h gate so it
-        // shares cadence with the rest of auto-maintain.
-        try {
-          const swept = sweepOrphanEpisodeFiles(RUNTIME_DIR);
-          if (swept > 0) debugLog('DEBUG', 'auto-maintain', `swept ${swept} orphan ep-flush/pending file(s)`);
-        } catch (e) { debugCatch(e, 'auto-maintain-orphan-sweep'); }
-
-        // Mark maintenance as done (24h gate) — even though compression runs in background
-        writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));
-        // Weekly summary grouping runs in background to avoid blocking SessionStart
-        if (!process.env.CLAUDE_MEM_SKIP_COMPRESS) spawnBackground('auto-compress');
-        if (!process.env.CLAUDE_MEM_SKIP_OPTIMIZE) spawnBackground('llm-optimize');
-      } catch (e) { debugCatch(e, 'auto-maintain'); }
-    }
+    runSessionStartAutoMaintain(db);
 
     // ── Non-transactional operations (side effects, background work) ──
 
-    // Shared clear handoff reference — queried once, used by fast summary + working state
-    let prevClearHandoff = null;
+    saveHandoffAndFastSummary(db, { prevSessionId, prevProject, project, ccSessionId, episodeSnapshot, now });
 
-    if (prevSessionId) {
-      // Save handoff for cross-session continuity (/clear or /compact).
-      // prevSessionId is the mem-internal id — use it to look up the finished session's
-      // user_prompts / observations. ccSessionId (same CC session across /clear) scopes
-      // the stored row so UserPromptSubmit can read its own handoff back.
-      // Legacy/test paths (no stdin) fall back to prevSessionId for both.
-      const handoffScopeId = ccSessionId || prevSessionId;
-      try { buildAndSaveHandoff(db, prevSessionId, prevProject || project, 'clear', episodeSnapshot, handoffScopeId); }
-      catch (e) { debugCatch(e, 'session-start-handoff'); }
+    cleanStaleLockFiles();
 
-      // Read the just-saved handoff for downstream consumers (fast summary remaining, working state).
-      // Session-scoped read to avoid picking up a parallel session's clear handoff.
-      try {
-        prevClearHandoff = db.prepare(
-          'SELECT working_on, unfinished, key_files FROM session_handoffs WHERE project = ? AND type = ? AND session_id = ?'
-        ).get(prevProject || project, 'clear', handoffScopeId);
-      } catch {}
+    buildFallbackFastSummary(db, { project, now, prevSessionId });
 
-      // Generate session summary for previous session (background Haiku — richer version)
-      spawnBackground('llm-summary', prevSessionId, prevProject || project);
-
-      // Build fast synchronous summary for immediate context availability.
-      // Background llm-summary will produce a richer Haiku version later;
-      // context injection query (ORDER BY created_at_epoch DESC) auto-prefers latest.
-      try {
-        const firstPrompt = db.prepare(`
-          SELECT prompt_text FROM user_prompts
-          WHERE content_session_id = ?
-          ORDER BY prompt_number ASC LIMIT 1
-        `).get(prevSessionId);
-
-        const prevObs = db.prepare(`
-          SELECT title FROM observations
-          WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-          ORDER BY created_at_epoch DESC LIMIT 5
-        `).all(prevSessionId);
-
-        // Raw values flow into scrubRecord; truncation deferred to .run() so
-        // secrets straddling the truncation boundary still match scrubSecrets
-        // regex length floors.
-        const fastRequestRaw = firstPrompt?.prompt_text || '';
-        const fastCompletedRaw = prevObs.map(o => o.title).filter(Boolean).join('; ');
-
-        // Infer remaining_items from handoff unfinished (already built above at line 476)
-        let fastRemainingRaw = '';
-        if (prevClearHandoff?.unfinished) {
-          fastRemainingRaw = extractUnfinishedSummary(prevClearHandoff.unfinished, 0);
-        }
-        // Fallback: episode errors
-        if (!fastRemainingRaw && episodeSnapshot?.entries) {
-          const errors = episodeSnapshot.entries.filter(e => e.isError).map(e => e.desc).filter(Boolean);
-          if (errors.length > 0) fastRemainingRaw = errors.join('; ');
-        }
-
-        if (fastRequestRaw || fastCompletedRaw) {
-          const safe = scrubRecord('session_summaries', {
-            request: fastRequestRaw,
-            completed: fastCompletedRaw,
-            remaining_items: fastRemainingRaw,
-          });
-          db.prepare(`
-            INSERT INTO session_summaries
-            (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-            VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', 'fast', ?, ?)
-          `).run(prevSessionId, prevProject || project, truncate(safe.request, 200), truncate(safe.completed, 300), truncate(safe.remaining_items, 200), now.toISOString(), now.getTime());
-        }
-      } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
-    }
-
-    // Clean stale lock files in runtime dir
-    try {
-      for (const f of readdirSync(RUNTIME_DIR)) {
-        if (!f.endsWith('.lock')) continue;
-        const lp = join(RUNTIME_DIR, f);
-        try {
-          const raw = readFileSync(lp, 'utf8');
-          const info = JSON.parse(raw);
-          const age = Date.now() - (info.ts || 0);
-          let stale = age > STALE_LOCK_MS;
-          if (!stale && info.pid) {
-            try { process.kill(info.pid, 0); } catch (killErr) {
-              stale = killErr.code === 'ESRCH';
-            }
-          }
-          if (stale) unlinkSync(lp);
-        } catch {
-          try {
-            const st = statSync(lp);
-            if (Date.now() - st.mtimeMs > STALE_LOCK_MS) unlinkSync(lp);
-          } catch {}
-        }
-      }
-    } catch {}
-
-    // Fallback fast summary: if a recently completed session has no summary yet
-    // (e.g. /exit → fast restart before Haiku finishes), build one synchronously.
-    // Skipped when prevSessionId is set (already handled above).
-    if (!prevSessionId) {
-      try {
-        const recentSession = db.prepare(`
-          SELECT content_session_id, project FROM sdk_sessions
-          WHERE project = ? AND status = 'completed' AND completed_at_epoch > ?
-          ORDER BY completed_at_epoch DESC LIMIT 1
-        `).get(project, Date.now() - 120000); // within last 2 minutes
-
-        if (recentSession) {
-          const hasSummary = db.prepare(`
-            SELECT 1 FROM session_summaries WHERE memory_session_id = ? LIMIT 1
-          `).get(recentSession.content_session_id);
-
-          if (!hasSummary) {
-            const fp = db.prepare(`
-              SELECT prompt_text FROM user_prompts
-              WHERE content_session_id = ? ORDER BY prompt_number ASC LIMIT 1
-            `).get(recentSession.content_session_id);
-            const po = db.prepare(`
-              SELECT title FROM observations
-              WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-              ORDER BY created_at_epoch DESC LIMIT 5
-            `).all(recentSession.content_session_id);
-
-            // Raw values into scrubRecord; truncation at .run() preserves
-            // straddling-secret detection (per privacy review).
-            const frRaw = fp?.prompt_text || '';
-            const fcRaw = po.map(o => o.title).filter(Boolean).join('; ');
-            if (frRaw || fcRaw) {
-              const safe = scrubRecord('session_summaries', {
-                request: frRaw,
-                completed: fcRaw,
-              });
-              db.prepare(`
-                INSERT INTO session_summaries
-                (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-                VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
-              `).run(recentSession.content_session_id, project, truncate(safe.request, 200), truncate(safe.completed, 300), now.toISOString(), now.getTime());
-            }
-          }
-        }
-      } catch (e) { debugCatch(e, 'session-start-exit-fast-summary'); }
-    }
-
-    // T10c: Startup dashboard — aggregate git/tasks/plans/handoff/events into a
-    // structured JSON hookSpecificOutput block. Emitted BEFORE the plain-text
-    // <claude-mem-context> so both surfaces coexist. Empty string → skip.
-    try {
-      const { buildDashboard } = await import('./lib/startup-dashboard.mjs');
-      let dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
-      const citeNudge = buildCiteRecallNudge(project);
-      if (citeNudge) {
-        dashboardText = dashboardText ? `${citeNudge}\n${dashboardText}` : citeNudge;
-      }
-      // v2.79: surface setup.sh dependency-install failure as a high-visibility
-      // line at the very top of the dashboard. setup.sh writes runtime/.deps-broken
-      // (JSON: ts/reason/root/repair) on failure and removes it on success — so
-      // a stale flag self-heals on the next clean SessionStart. Without this
-      // surface, hook degradation looks identical to "nothing happening" until
-      // the user notices missing context days later.
-      try {
-        const depsFlag = join(RUNTIME_DIR, '.deps-broken');
-        if (existsSync(depsFlag)) {
-          let detail = 'unknown';
-          let repair = '';
-          try {
-            const raw = readFileSync(depsFlag, 'utf8').trim();
-            const parsed = JSON.parse(raw);
-            detail = parsed.reason || detail;
-            repair = parsed.repair || '';
-          } catch { /* corrupt flag — surface the fact only */ }
-          const nudgeLines = [
-            '⚠️ [claude-mem-lite] Hook dependencies failed to install on the last SessionStart.',
-            `   Reason: ${detail}`,
-          ];
-          if (repair) nudgeLines.push(`   Repair: ${repair}`);
-          nudgeLines.push('   Until fixed, PreToolUse / PostToolUse / memory injection are degraded.');
-          const nudge = nudgeLines.join('\n');
-          dashboardText = dashboardText ? `${nudge}\n${dashboardText}` : nudge;
-        }
-      } catch (e) { debugCatch(e, 'session-start-deps-flag'); }
-      if (dashboardText) {
-        process.stdout.write(JSON.stringify({
-          suppressOutput: true,
-          hookSpecificOutput: {
-            hookEventName: 'SessionStart',
-            additionalContext: dashboardText,
-          },
-        }) + '\n');
-      }
-    } catch (e) { debugCatch(e, 'session-start-dashboard'); }
+    await emitStartupDashboard(db, project);
 
     // Build the full context body via shared helper (also used by `mem-cli context`).
     // Queries session_summaries, key observations, clear handoff, and the
