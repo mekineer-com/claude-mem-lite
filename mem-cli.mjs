@@ -133,7 +133,15 @@ async function cmdSearch(db, args, { llm } = {}) {
   // --deep proceeds even when the literal query sanitizes to nothing — its LLM
   // rewrite may still produce searchable variants (F3, parity with server.mjs).
   if (!ftsQuery && deepMode === 'normal') {
-    fail(`[mem] No valid search terms in "${query}"`);
+    // A query that sanitizes to an empty FTS expression (only operators/punctuation/
+    // sub-min-length tokens) is a zero-result search, not a malformed one. In --json
+    // mode emit the same empty envelope as the no-match path below so programmatic
+    // consumers always get parseable stdout (the human path keeps the stderr hint).
+    if (jsonOutput) {
+      out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep: false, results: [] }));
+    } else {
+      fail(`[mem] No valid search terms in "${query}"`);
+    }
     return;
   }
   // --deep ignores --or: each variant runs AND + the engine's built-in
@@ -607,7 +615,20 @@ function cmdTimeline(db, args) {
   if (flags.anchor !== undefined && flags.anchor !== true) {
     const resolved = resolveAnchorToken(db, flags.anchor, { project });
     if (!resolved.ok) {
-      fail(formatAnchorError(resolved.error, 'cli'));
+      // --json must always emit a parseable envelope. An explicit-but-missing anchor is
+      // a direct-lookup miss (like `get` on a bad id) → anchor:null + error code, rc=1.
+      if (jsonOutput) {
+        process.exitCode = 1;
+        out(JSON.stringify({
+          anchor: null,
+          anchor_note: formatAnchorError(resolved.error, 'mcp'),
+          before: [],
+          after: [],
+          error: resolved.error.code || 'anchor_resolution_failed',
+        }));
+      } else {
+        fail(formatAnchorError(resolved.error, 'cli'));
+      }
       return;
     }
     anchorId = resolved.anchorId;
@@ -663,7 +684,20 @@ function cmdTimeline(db, args) {
   // Window fetch (access-count bump + project auto-scope) shared with MCP.
   const win = fetchTimelineWindow(db, anchorId, { before, after, project });
   if (!win) {
-    fail(`[mem] Observation #${anchorId} not found`);
+    // Anchor resolved to a real id but the window fetch found no row (e.g. project
+    // mismatch). Same --json contract as the resolution-miss path above.
+    if (jsonOutput) {
+      process.exitCode = 1;
+      out(JSON.stringify({
+        anchor: null,
+        anchor_note: `Observation #${anchorId} not found.`,
+        before: [],
+        after: [],
+        error: 'id-not-found',
+      }));
+    } else {
+      fail(`[mem] Observation #${anchorId} not found`);
+    }
     return;
   }
   const { anchor, beforeRows, afterRows } = win;
@@ -2334,6 +2368,8 @@ Commands:
       --project P       Filter by project
     drop <D#N|ordinal>[,...]  Drop one or more deferred items (no fix needed)
       --reason "..."    Required audit trail
+      --project P       Project for ordinal resolution (default: current; must
+                        match the "defer list --project P" you read ordinals from)
 
   delete <id1,id2,...>  Delete observations by ID
     --confirm           Execute deletion (preview by default)

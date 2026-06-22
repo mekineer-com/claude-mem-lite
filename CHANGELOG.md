@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.10.0 — RRF pagination stability (D#30 reopened) + `--json` envelope on empty/not-found paths
+
+A search-pagination correctness fix, two CLI `--json` contract repairs, and a benchmark-fidelity alignment. The default search (`limit=20`, `offset=0`) is byte-identical to v3.9.1 — only small-`limit`, `--offset`, and deep-page behavior changes. Test suite 3157 → 3163 (+6 regression tests, all green); ESLint clean; longmemeval unchanged (`recall_any@5=90.6%` full dataset).
+
+### fix(search): RRF pagination is now offset-independent — adjacent `--offset` pages no longer overlap/gap
+
+`computePerSourceWindow` sized the fused candidate pool as `max(limit*3, offset+limit+10)` — it GREW with `offset` (added in #8638 for deep-page reachability). Because RRF fusion of FTS + vector ranks is candidate-pool-sensitive (an id present in BOTH arms outranks one in a single arm), a larger pool re-ranks the prefix — so adjacent `--offset` pages sliced different orderings and OVERLAPPED/GAPPED on a vector-populated DB, and top-N changed with `limit` (the #1 hit at `limit=10` could be absent at `limit=5`). #8642 declared this closed, but its guard test seeds NO `observation_vectors`, so it only ever exercised the prefix-stable FTS-only path. The fix makes the pool a function of `limit` only — `max(limit*3, MIN_FUSION_POOL=60)`, where 60 (= default `limit=20` × the 3× over-fetch buffer) is a floor so every `limit ≤ 20` shares one 60-candidate pool: same-limit pages are disjoint/stable and `top-5 ⊂ top-10 ⊂ top-20`. `limit=20` `offset=0` stays byte-identical (60). Trade-off: pages past the pool now return empty instead of the overlapping rows the offset-scaling used to surface (stability over deep reach). Verified on the real DB (2134 vectors) and guarded by a new vector-seeded e2e test that RED-fails on the old formula.
+
+### fix(cli): `--json` always emits a parseable envelope on the empty / not-found paths
+
+`search` with a query that sanitized to no FTS terms (`"AND OR NOT"`, single chars) and `timeline --anchor <missing>` took an early `fail()` that wrote to stderr and emitted NOTHING on stdout — breaking `JSON.parse` for programmatic consumers, while `recall` already returned `{total:0,results:[]}` for the empty case. `search` now emits the same empty envelope (`{query,total:0,returned:0,…,results:[]}`, rc 0); `timeline` emits `{anchor:null,anchor_note,before:[],after:[],error}` (rc 1, like a `get` on a missing id). Non-`--json` output is unchanged.
+
+### test(benchmark): `searchProductionHybrid` uses the production candidate-pool window
+
+The longmemeval adapter fused `max(limit,20)` instead of the production `computePerSourceWindow`, so the benchmark could not observe a change to the production pool. It now calls `computePerSourceWindow(limit, 0)` — longmemeval is coupled to the production pool, so future pool changes are benchmark-observable. Aligning the pool (20 → 60 at the benchmark's `limit=10`) moved no number (recall is pool-insensitive across 20–100). Remaining smaller gap: the adapter still skips `reRankWithContext`.
+
+### docs(cli): `defer drop` help documents `--project`
+
+`defer drop` accepted `--project` (needed because ordinals are per-project) but the top-level `--help` omitted it, so dropping a non-CWD project's item by ordinal hit a confusing "no corresponding open deferred item in project …" error. The help now lists it.
+
 ## v3.9.1 — audit follow-ups: citation-decay thread-filter symmetry + update-id truncation guard
 
 Two remaining items from the audit's deferred P2/P3 list. No features, no breaking changes. Test suite 3153 → 3157 (+4 regression tests, all green); ESLint clean.

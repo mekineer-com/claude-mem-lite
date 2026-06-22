@@ -1,6 +1,8 @@
 // Tests for mem-cli.mjs — CLI command layer
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { seedVectors } from '../benchmark/benchmark.mjs';
+// _resetVocabCache is imported below via the post-mock dynamic import (line ~101).
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
@@ -331,6 +333,21 @@ describe('CLI search command', () => {
     expect(() => new Date(obs.created_at).toISOString()).not.toThrow();
   });
 
+  it('emits a valid empty JSON envelope when the query sanitizes to no terms (--json contract)', async () => {
+    // Regression: `search 'AND OR NOT' --json` (or any query that strips to an empty
+    // FTS expression) hit the early `fail()` for empty ftsQuery, which writes to stderr
+    // and emits NOTHING on stdout — breaking JSON.parse for programmatic consumers. The
+    // no-match path already returns {total:0,results:[]}; no-valid-terms must match it,
+    // since "search whose terms all dropped" is just another zero-result search.
+    const output = await captureStdoutOnly(() => run(['search', 'AND OR NOT', '--json']));
+    expect(output.trim()).not.toBe('');
+    const parsed = JSON.parse(output);
+    expect(parsed.total).toBe(0);
+    expect(parsed.returned).toBe(0);
+    expect(parsed.results).toEqual([]);
+    process.exitCode = undefined;
+  });
+
   // R-3: lesson_learned presence lifts rank vs identical obs without lesson.
   // Empirical basis: bugfix with lesson has +6.3pp hit rate over bugfix without.
   // The multiplier is intentionally small (×1.3) — this is a gentle rerank, not a bucket.
@@ -588,6 +605,58 @@ describe('CLI get command', () => {
   });
 });
 
+// ─── pagination stability WITH vectors (D#30 reopened) ───────────────────────
+// The #8642 guard test (cli-e2e) seeds NO observation_vectors, so it only proved
+// FTS-only pagination is stable. This block populates vectors so the FTS+vector
+// RRF fusion is live — the exact path that overlapped/gapped on the real DB before
+// computePerSourceWindow was made offset-independent.
+describe('CLI search pagination stability (hybrid FTS+vector RRF)', () => {
+  beforeEach(() => {
+    _resetVocabCache();
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+    // 25 obs all matching "widget" with VARIED FTS weight (widget repeated 0–4×)
+    // and varied vector content (distinct term mixes) so fusion is non-trivial and
+    // candidate-pool-sensitive — a smaller pool would re-rank the prefix.
+    for (let i = 0; i < 25; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `widget pipeline stage ${i} ${i % 3 === 0 ? 'cache' : 'queue'} handler`,
+        text: `widget pipeline payload ${i} ${'widget '.repeat(i % 5)}`,
+        epochOffset: -i * 1000,
+      });
+    }
+    seedVectors(testDb);   // build vocab + observation_vectors over the corpus
+    _resetVocabCache();    // force the search to reload the seeded vocab
+  });
+  afterEach(() => { testDb.close(); });
+
+  const idsOf = async (...args) => {
+    const out = await captureStdoutOnly(() => run(['search', 'widget', '--source', 'observations', '--json', ...args]));
+    return JSON.parse(out).results.map(r => r.id);
+  };
+
+  it('paging limit=5 across offsets is disjoint and reconstructs the single query', async () => {
+    const vecCount = testDb.prepare('SELECT COUNT(*) AS c FROM observation_vectors').get().c;
+    expect(vecCount).toBeGreaterThan(0); // guard: vector arm is actually live
+    const p0 = await idsOf('--limit', '5', '--offset', '0');
+    const p1 = await idsOf('--limit', '5', '--offset', '5');
+    const p2 = await idsOf('--limit', '5', '--offset', '10');
+    const combined = await idsOf('--limit', '15', '--offset', '0');
+    const paged = [...p0, ...p1, ...p2];
+    expect(new Set(paged).size).toBe(paged.length);   // no id on two pages
+    expect(paged).toEqual(combined);                  // identical order ⇒ stable
+  });
+
+  it('top-N is limit-stable for limits ≤ 20 (top-5 ⊂ top-10 ⊂ top-20)', async () => {
+    const t5 = await idsOf('--limit', '5');
+    const t10 = await idsOf('--limit', '10');
+    const t20 = await idsOf('--limit', '20');
+    expect(t10.slice(0, 5)).toEqual(t5);
+    expect(t20.slice(0, 10)).toEqual(t10);
+  });
+});
+
 // ─── timeline command ────────────────────────────────────────────────────────
 
 describe('CLI timeline command', () => {
@@ -632,6 +701,20 @@ describe('CLI timeline command', () => {
   it('shows "not found" for invalid anchor', async () => {
     const output = await captureStdout(() => run(['timeline', '--anchor', '999']));
     expect(output).toContain('not found');
+  });
+
+  it('emits a valid JSON envelope when the anchor is not found (--json contract)', async () => {
+    // Regression: `timeline --anchor 999 --json` hit `fail(formatAnchorError(...))`,
+    // emitting nothing on stdout and breaking JSON.parse. --json must always yield a
+    // parseable envelope; anchor:null + an error code signals the miss to consumers.
+    const output = await captureStdoutOnly(() => run(['timeline', '--anchor', '999', '--json']));
+    expect(output.trim()).not.toBe('');
+    const parsed = JSON.parse(output);
+    expect(parsed.anchor).toBeNull();
+    expect(parsed.error).toBeTruthy();
+    expect(parsed.before).toEqual([]);
+    expect(parsed.after).toEqual([]);
+    process.exitCode = undefined;
   });
 
   it('shows recent observations when no --anchor provided', async () => {

@@ -220,12 +220,17 @@ describe('CLI E2E: search', () => {
   });
 
   it('pages are disjoint and stably ordered across --offset (D#30 candidate-pool stability)', () => {
-    // Seed enough near-identical matches that the hybrid (FTS + vector + RRF) path is
-    // active and the candidate pool spans several pages. Paging through must reconstruct
-    // the single-query ordering exactly — no overlap, no gap, no re-rank between pages.
+    // Seed enough matches that the candidate pool spans several pages. Paging through must
+    // reconstruct the single-query ordering exactly — no overlap, no gap, no re-rank.
     // 50 > the deep-page over-fetch pool (perSourceLimit = max(limit*3, offset+limit+10)),
-    // so deep pages include FTS-tail rows absent from shallow pools — the exact dual-hit
-    // (FTS-tail + vector) boundary case where RRF could re-rank between pages.
+    // so deep pages include FTS-tail rows absent from shallow pools.
+    // SCOPE (honest, per D#30 re-audit): seedObs writes NO observation_vectors, so this
+    // exercises the FTS-ONLY ordering — which is deterministic (ORDER BY score) and hence
+    // pagination-stable, the property guarded here. It does NOT cover the production
+    // FTS+vector RRF fusion: with vectors present the fused order is candidate-pool-
+    // sensitive (perSourceLimit grows with offset+limit → the prefix re-ranks across
+    // pages → pages overlap), which #8642 over-broadly claimed was stable. See the
+    // memory correcting that decision before trusting "pagination is stable" wholesale.
     for (let i = 0; i < 50; i++) {
       seedObs({ title: `Sprocket module ${i}`, text: `sprocket module unique payload ${i}` });
     }

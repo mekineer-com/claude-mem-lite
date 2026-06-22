@@ -7,6 +7,7 @@ import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
 import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
+import { computePerSourceWindow } from '../lib/search-core.mjs';
 import { deepSearch } from '../deep-search.mjs';
 import { computeVector, rebuildVocabulary, _resetVocabCache, VOCAB_DIM, MIN_COSINE_SIMILARITY, RRF_K } from '../tfidf.mjs';
 import { OBS_BM25, TYPE_QUALITY_CASE } from '../scoring-sql.mjs';
@@ -123,13 +124,19 @@ export function seedVectors(db, { dim } = {}) {
 // same production hybrid path instead of re-assembling ctx and drifting from it.
 export function searchProductionHybrid(db, query, { limit = 10, project = null, obsType = null, minCosine, rrfK } = {}) {
   const ftsQuery = sanitizeFtsQuery(query);
+  // Fidelity: use the SAME candidate-pool window the production CLI/MCP path uses
+  // (lib/search-core.mjs computePerSourceWindow) instead of a hardcoded max(limit,20).
+  // Previously the benchmark fused a different pool than production, so longmemeval
+  // could not observe a change to the production pool (e.g. the D#30 offset-independent
+  // fix). offset is always 0 here (the benchmark never paginates).
+  const { perSourceLimit, perSourceOffset } = computePerSourceWindow(limit, 0);
   const ctx = {
     ftsQuery,
     args: { obs_type: obsType ?? undefined },
     epochFrom: null,
     epochTo: null,
-    perSourceLimit: Math.max(limit, 20),
-    perSourceOffset: 0,
+    perSourceLimit,
+    perSourceOffset,
     currentProject: project,
     limit,
     minCosine,

@@ -59,8 +59,36 @@ describe('search-core', () => {
       expect(computePerSourceWindow(20, 0)).toEqual({ perSourceLimit: 60, perSourceOffset: 0 });
     });
 
-    it('scales with offset so deep pages stay reachable (#8638)', () => {
-      expect(computePerSourceWindow(10, 100)).toEqual({ perSourceLimit: 120, perSourceOffset: 0 });
+    // D#30 re-audit: the fusion pool MUST be offset-independent. Previously
+    // (#8638) it grew as max(limit*3, offset+limit+10) so deep pages stayed
+    // reachable — but a larger pool re-ranks the RRF/vector prefix, so adjacent
+    // --offset pages sliced different orderings and OVERLAPPED/GAPPED. Stability
+    // (correct pages) wins over reachability (deep pages that returned wrong rows).
+    it('is offset-independent so --offset pages slice one stable ordering (D#30)', () => {
+      const w0 = computePerSourceWindow(10, 0);
+      const w50 = computePerSourceWindow(10, 50);
+      const w500 = computePerSourceWindow(10, 500);
+      expect(w0.perSourceLimit).toBe(w50.perSourceLimit);
+      expect(w50.perSourceLimit).toBe(w500.perSourceLimit);
+      expect(w0.perSourceOffset).toBe(0);
+    });
+
+    // MIN_FUSION_POOL floor: limits ≤ 20 (the common range: mem_search=20,
+    // mem_recall/recent=10) all fuse the SAME 60-candidate pool, so top-N is
+    // limit-stable (top-5 ⊂ top-10 ⊂ top-20) and the default limit=20 offset=0
+    // pool is byte-identical to before (60) — no recall regression on the
+    // benchmarked path (longmemeval recall@k is pool-insensitive across 20–100).
+    it('floors small limits to the default-20 pool so top-N is limit-stable', () => {
+      expect(computePerSourceWindow(5, 0).perSourceLimit).toBe(60);
+      expect(computePerSourceWindow(10, 0).perSourceLimit).toBe(60);
+      expect(computePerSourceWindow(20, 0).perSourceLimit).toBe(60);
+    });
+
+    // Larger limits keep the 3× over-fetch buffer (the AND→OR / vector / concept
+    // stages re-add rows), so the pool tracks limit above the floor.
+    it('keeps 3x over-fetch above the floor for large limits', () => {
+      expect(computePerSourceWindow(50, 0).perSourceLimit).toBe(150);
+      expect(computePerSourceWindow(50, 30).perSourceLimit).toBe(150); // still offset-independent
     });
   });
 
