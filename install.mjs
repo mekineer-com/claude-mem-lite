@@ -343,710 +343,747 @@ function isPartialSparseClone(clonePath) {
 
 // ─── Install ────────────────────────────────────────────────────────────────
 
+
+// Dynamic-import helpers, resolved against the installed copy at INSTALL_DIR
+// (lets install.mjs run from a /tmp staging dir whose node_modules is at
+// INSTALL_DIR, not the script dir). Used by the resource / db-verify / adopt steps.
+const importFromInstall = (rel) => import(pathToFileURL(join(INSTALL_DIR, rel)).href);
+const requireFromInstall = createRequire(pathToFileURL(join(INSTALL_DIR, 'package.json')).href);
+
+// ─── install() step helpers (audit P1-9) ──────────────────────────────────────
+function installSourceFiles(IS_DEV) {
+// Auto-migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
+const oldUnhidden = join(homedir(), 'claude-mem-lite');
+if (!existsSync(DATA_DIR) && existsSync(oldUnhidden)) {
+  log('Migrating ~/claude-mem-lite/ → ~/.claude-mem-lite/...');
+  renameSync(oldUnhidden, DATA_DIR);
+  ok('Directory migrated');
+}
+
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+// Under relocation the DB/managed/runtime live here, not in the code dir — create it too.
+if (!existsSync(MEM_DATA_DIR)) mkdirSync(MEM_DATA_DIR, { recursive: true });
+
+if (IS_DEV) {
+  log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
+  // Symlink individual source files
+  for (const f of SOURCE_FILES) {
+    const target = join(PROJECT_DIR, f);
+    const link = join(DATA_DIR, f);
+    if (existsSync(target)) {
+      // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
+      const linkParent = dirname(link);
+      if (!existsSync(linkParent)) mkdirSync(linkParent, { recursive: true });
+      // Remove existing file/symlink before creating
+      if (existsSync(link)) try { unlinkSync(link); } catch {}
+      symlinkSync(target, link);
+    }
+  }
+  // Symlink scripts/ directory
+  const scriptsLink = join(DATA_DIR, 'scripts');
+  if (existsSync(scriptsLink)) try { rmSync(scriptsLink, { recursive: true, force: true }); } catch {}
+  symlinkSync(join(PROJECT_DIR, 'scripts'), scriptsLink);
+  // Symlink node_modules/
+  const nmLink = join(DATA_DIR, 'node_modules');
+  if (existsSync(nmLink)) try { rmSync(nmLink, { recursive: true, force: true }); } catch {}
+  symlinkSync(join(PROJECT_DIR, 'node_modules'), nmLink);
+  // Symlink registry/ directory
+  const regLink = join(DATA_DIR, 'registry');
+  if (existsSync(regLink)) try { rmSync(regLink, { recursive: true, force: true }); } catch {}
+  if (existsSync(join(PROJECT_DIR, 'registry'))) {
+    symlinkSync(join(PROJECT_DIR, 'registry'), regLink);
+  }
+  // commands/ is intentionally NOT linked: Claude Code reads slash commands
+  // from the plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/commands/)
+  // or user-level ~/.claude/commands/, never from ~/.claude-mem-lite/commands/.
+  // Pre-v2.55 maintained a symlink/copy here that had no consumers.
+  ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
+} else {
+  log('Installing to ~/.claude-mem-lite/...');
+  const scriptsDir = join(DATA_DIR, 'scripts');
+  if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
+  for (const f of SOURCE_FILES) {
+    const src = join(PROJECT_DIR, f);
+    const dst = join(DATA_DIR, f);
+    if (existsSync(src)) {
+      // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
+      const dstParent = dirname(dst);
+      if (!existsSync(dstParent)) mkdirSync(dstParent, { recursive: true });
+      copyFileSync(src, dst);
+    }
+  }
+  // Copy hook scripts (settings.json hook commands point at these — must
+  // stay in sync with HOOK_SCRIPT_FILES manifest)
+  copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir);
+  // Ensure bash script is executable
+  try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
+  // commands/ is intentionally NOT copied — see dev-mode branch above.
+  // Copy registry manifest
+  const registryDir = join(DATA_DIR, 'registry');
+  if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
+  const manifestSrc = join(PROJECT_DIR, 'registry', 'preinstalled.json');
+  if (existsSync(manifestSrc)) copyFileSync(manifestSrc, join(registryDir, 'preinstalled.json'));
+  ok('Source files copied to ~/.claude-mem-lite/');
+
+  // v2.48 P1-4: prune stale top-level .mjs + 0-byte .db files left behind by
+  // prior upgrades (e.g. dispatch.mjs removed in v2.20.0, zero-byte mem.db /
+  // memory.db / registry.db from pre-consolidation installs). Subdirs +
+  // symlinks + non-empty DBs are always preserved.
+  try {
+    const pruned = pruneStaleInstallFiles(DATA_DIR, SOURCE_FILES);
+    if (pruned.length > 0) {
+      ok(`Pruned ${pruned.length} stale file(s): ${pruned.map(p => p.split('/').pop()).join(', ')}`);
+    }
+  } catch (e) { /* prune is best-effort — never block install */ void e; }
+}
+}
+
+async function installDependencies(IS_DEV) {
+// 2. npm install (skip for --dev: node_modules is symlinked)
+if (IS_DEV) {
+  ok('Dependencies: using dev dir (symlinked)');
+} else {
+  log('Ensuring dependencies installed...');
+  try {
+    // stderr inherited so users see real-time progress (network slowness,
+    // node-gyp compile spinner, prebuild-install fallback messages). With
+    // `stdio: 'pipe'` the install appeared to hang under the 5-min Bash
+    // timeout when better-sqlite3 had no Node v24 prebuild and had to
+    // compile from source — see bug audit 2026-05.
+    execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: ['ignore', 'pipe', 'inherit'] });
+    ok('Dependencies installed');
+  } catch (e) {
+    fail('npm install failed: ' + e.message);
+    process.exit(1);
+  }
+  // npm install exits 0 even when the better-sqlite3 prebuilt .node binary
+  // mismatches the running Node ABI (e.g. NODE_MODULE_VERSION 137 on Node v24).
+  // Probe and auto-rebuild before declaring success — otherwise the next
+  // launch FATALs with "Could not locate the bindings file".
+  const verify = await ensureBetterSqlite3Working(INSTALL_DIR);
+  if (verify.ok) {
+    ok(`better-sqlite3: ${verify.action}`);
+  } else {
+    fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
+    log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --build-from-source');
+    process.exit(1);
+  }
+}
+}
+
+function createCliSymlink() {
+// 2b. Create global CLI symlink (claude-mem-lite command)
+const cliSource = join(INSTALL_DIR, 'cli.mjs');
+if (existsSync(cliSource)) {
+  try { execFileSync('chmod', ['+x', cliSource], { stdio: 'pipe' }); } catch {}
+  // Try ~/.local/bin first (user-writable, commonly on PATH)
+  const localBin = join(homedir(), '.local', 'bin');
+  const cliLink = join(localBin, 'claude-mem-lite');
+  try {
+    if (!existsSync(localBin)) mkdirSync(localBin, { recursive: true });
+    if (existsSync(cliLink)) unlinkSync(cliLink);
+    symlinkSync(cliSource, cliLink);
+    ok(`CLI: ${cliLink} → ${cliSource}`);
+  } catch {
+    // Fallback: try /usr/local/bin (may need sudo)
+    try {
+      const globalLink = '/usr/local/bin/claude-mem-lite';
+      if (existsSync(globalLink)) unlinkSync(globalLink);
+      symlinkSync(cliSource, globalLink);
+      ok(`CLI: ${globalLink} → ${cliSource}`);
+    } catch {
+      warn('CLI symlink failed — run manually: ln -sf ' + cliSource + ' ~/.local/bin/claude-mem-lite');
+    }
+  }
+}
+}
+
+function registerMcpServer() {
+// 3. Register MCP server (skip if plugin system already handles it)
+// Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem-lite.
+// Duplicate registrations in practice come from old global install.mjs state
+// (claude mcp add) or stale marketplace copies, not from the cache root itself.
+// Global registration via `claude mcp add` creates a DUPLICATE mcp__mem-lite__* server.
+// The legacy generic name "mem" (pre-v2.78) is also purged so a user who installed in
+// either era ends up with a single canonical "mem-lite" registration.
+// Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
+const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
+let pluginHandlesMcp = false;
+try {
+  const installed = JSON.parse(readFileSync(installedPluginsPath, 'utf8'));
+  pluginHandlesMcp = !!installed?.plugins?.[PLUGIN_KEY]?.length;
+} catch { /* not installed via plugin system */ }
+
+if (pluginHandlesMcp) {
+  log('MCP server: plugin system handles registration (skipping global)');
+  // Clean up stale global registrations (both legacy "mem" and current "mem-lite")
+  for (const name of ['mem', 'mem-lite']) {
+    try {
+      execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
+      ok(`Removed stale global MCP "${name}"`);
+    } catch {}
+  }
+} else {
+  log('Registering MCP server...');
+  try {
+    // Purge legacy "mem" and any pre-existing "mem-lite" before re-registering
+    for (const name of ['mem', 'mem-lite']) {
+      try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' }); } catch {}
+      try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', name], { stdio: 'pipe' }); } catch {}
+    }
+    execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem-lite', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
+    ok('MCP server registered: mem-lite');
+  } catch (e) {
+    fail('MCP registration failed: ' + e.message);
+    warn('Try manually: claude mcp add -s user -t stdio mem-lite -- node ' + SERVER_PATH);
+  }
+}
+}
+
+function dedupePluginCacheAndHooks() {
+// 3b. Deduplicate: if marketplace plugin also registers MCP + hooks,
+// clear them to prevent double execution. install.mjs hooks (in settings.json)
+// point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
+// while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
+//
+// MCP dedup: Claude Code copies .mcp.json from marketplace clone → plugin cache.
+// Do NOT modify marketplace .mcp.json — it breaks the MCP server registration chain.
+// Dedup is handled by skipping global `claude mcp add` when plugin system is active.
+const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
+const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
+
+if (existsSync(pluginDir)) {
+  // NOTE: Do NOT clear marketplace .mcp.json — Claude Code copies from
+  // marketplace clone → plugin cache on updates. Clearing it causes the
+  // cache .mcp.json to lose the MCP server definition, breaking plugin MCP.
+  // Dedup is already handled by skipping global `claude mcp add` above.
+
+  // Clear plugin hooks to prevent double hook execution
+  try {
+    if (existsSync(pluginHooksPath)) {
+      const pluginHooks = JSON.parse(readFileSync(pluginHooksPath, 'utf8'));
+      if (pluginHooks.hooks && Object.keys(pluginHooks.hooks).length > 0) {
+        writeFileSync(pluginHooksPath, JSON.stringify({
+          description: pluginHooks.description || 'claude-mem-lite hooks',
+          _note: 'Hooks managed by install.mjs in settings.json — this file cleared to prevent duplicates',
+          hooks: {}
+        }, null, 2) + '\n');
+        ok('Marketplace plugin: hooks cleared (prevents duplicate)');
+      }
+    }
+  } catch (e) { warn(`Marketplace hooks dedup: ${e.message}`); }
+
+  // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection.
+  // ALSO clear cached hooks.json in every version dir — Claude Code runtime reads hooks from
+  // ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json, NOT from the marketplace source.
+  // Clearing only the marketplace source (above) leaves stale cache copies that double-register
+  // hooks alongside install.mjs-written settings.json entries.
+  try {
+    const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
+    if (existsSync(cacheBase)) {
+      const launchSyncFiles = ['launch.mjs', 'launch-preflight.mjs'];
+      let clearedHooks = 0;
+      for (const ver of readdirSync(cacheBase)) {
+        const verDir = join(cacheBase, ver);
+
+        // Sync launch.mjs + its preflight companion (issue #15)
+        if (existsSync(join(verDir, 'scripts'))) {
+          for (const f of launchSyncFiles) {
+            const src = join(PROJECT_DIR, 'scripts', f);
+            if (existsSync(src)) {
+              try { copyFileSync(src, join(verDir, 'scripts', f)); } catch { /* keep going */ }
+            }
+          }
+        }
+
+        // Clear cached hooks.json (runtime reads here, not marketplace source)
+        const cachedHooksPath = join(verDir, 'hooks', 'hooks.json');
+        if (existsSync(cachedHooksPath)) {
+          try {
+            const h = JSON.parse(readFileSync(cachedHooksPath, 'utf8'));
+            if (h.hooks && Object.keys(h.hooks).length > 0) {
+              writeFileSync(cachedHooksPath, JSON.stringify({
+                description: h.description || 'claude-mem-lite hooks',
+                _note: `Hooks managed by install.mjs in settings.json — cache hooks.json cleared to prevent duplicate registration (cache ver: ${ver})`,
+                hooks: {}
+              }, null, 2) + '\n');
+              clearedHooks++;
+            }
+          } catch { /* silent — never block install on one bad cache entry */ }
+        }
+      }
+      const parts = ['launch.mjs synced (dev mode MCP routing)'];
+      if (clearedHooks > 0) parts.push(`${clearedHooks} stale hooks.json cleared`);
+      ok(`Plugin cache: ${parts.join('; ')}`);
+    }
+  } catch (e) { warn(`Plugin cache sync: ${e.message}`); }
+}
+}
+
+function configureHooks() {
+// 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
+log('Configuring hooks...');
+const settings = readSettings();
+if (clearPluginDisabledMarkerForDirectInstall(settings)) {
+  ok('Cleared stale disabled plugin flag so install.mjs-managed hooks can run');
+}
+settings.hooks = settings.hooks || {};
+
+const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
+const PREFILTER_PATH = join(SCRIPTS_PATH, 'post-tool-use.sh');
+// v2.84: every Node hook invocation routes through hook-launcher.mjs so an
+// ERR_MODULE_NOT_FOUND from a partial-install drift auto-heals via
+// install.mjs repair instead of permanently bricking the hook chain.
+const LAUNCHER_PATH = join(SCRIPTS_PATH, 'hook-launcher.mjs');
+const nodeHook = (entry, ...args) => `node "${LAUNCHER_PATH}" ${entry} ${args.join(' ')}`.trim();
+
+const memPostToolUse = {
+  matcher: '*',
+  hooks: [{
+    type: 'command',
+    command: `bash "${PREFILTER_PATH}"`,
+    timeout: 5
+  }]
+};
+
+const memSessionStart = {
+  matcher: 'startup|clear|compact',
+  hooks: [{
+    type: 'command',
+    command: nodeHook('hook.mjs', 'session-start'),
+    timeout: 10
+  }]
+};
+
+const memStop = {
+  matcher: '*',
+  hooks: [{
+    type: 'command',
+    command: nodeHook('hook.mjs', 'stop'),
+    timeout: 5
+  }]
+};
+
+const memUserPrompt = {
+  matcher: '*',
+  hooks: [
+    {
+      type: 'command',
+      command: nodeHook('scripts/user-prompt-search.js'),
+      timeout: 2
+    },
+    {
+      type: 'command',
+      command: nodeHook('hook.mjs', 'user-prompt'),
+      timeout: 5
+    }
+  ]
+};
+
+const memPreToolRecall = {
+  // v2.34.6: Read added to cover planning-Read (pre-Edit exploration).
+  // Read-path uses a tighter filter (lesson_learned required, top-1,
+  // 120-char truncation, silent-on-empty) — see scripts/pre-tool-recall.js.
+  matcher: 'Edit|Write|NotebookEdit|Read',
+  hooks: [
+    {
+      type: 'command',
+      command: nodeHook('scripts/pre-tool-recall.js'),
+      timeout: 3
+    }
+  ]
+};
+
+const memPreSkillBridge = {
+  matcher: 'Skill',
+  hooks: [
+    {
+      type: 'command',
+      command: nodeHook('scripts/pre-skill-bridge.js'),
+      timeout: 3
+    }
+  ]
+};
+
+// Filter out existing mem hooks, then append fresh ones
+// PreToolUse has two separate matchers, so we register both
+const hookConfigs = {
+  PreToolUse: [memPreToolRecall, memPreSkillBridge],
+  PostToolUse: [memPostToolUse],
+  SessionStart: [memSessionStart],
+  Stop: [memStop],
+  UserPromptSubmit: [memUserPrompt],
+};
+
+for (const [event, configs] of Object.entries(hookConfigs)) {
+  const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
+  settings.hooks[event] = [...existing, ...configs];
+}
+
+writeSettings(settings);
+ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
+}
+
+function backupLegacyClaudeMemData() {
+// 5. Legacy ~/.claude-mem/ → ~/.claude-mem-lite/ — back up, don't reuse.
+// The legacy DB is schema v16 (schema_versions plural) and there's no
+// bridge in MIGRATIONS[] to v28. Reusing it FATALs on first launch with
+// "no such column: memory_session_id". Rename to a timestamped backup
+// so the new install creates a fresh v28 DB.
+try {
+  const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, MEM_DATA_DIR);
+  if (r.action === 'backed-up') {
+    ok(`Legacy ~/.claude-mem/ DB backed up to ${r.backupPath}`);
+    log('New v28 DB will be created on first launch (legacy schema is incompatible).');
+  }
+} catch (e) {
+  warn('Legacy DB backup failed: ' + e.message);
+}
+
+// 5b. Rename claude-mem.db → claude-mem-lite.db in same directory
+const oldDbInDir = join(MEM_DATA_DIR, 'claude-mem.db');
+if (existsSync(oldDbInDir) && !existsSync(DB_PATH)) {
+  renameSync(oldDbInDir, DB_PATH);
+  for (const ext of ['-wal', '-shm']) {
+    if (existsSync(oldDbInDir + ext)) try { renameSync(oldDbInDir + ext, DB_PATH + ext); } catch {}
+  }
+  ok('Database renamed: claude-mem.db → claude-mem-lite.db');
+}
+}
+
+async function installPreinstalledResources() {
+// 6. Install pre-installed resources (skills + agents)
+if (process.env.CLAUDE_MEM_SKIP_REPOS) {
+  ok('Skill/agent registry: skipped (CLAUDE_MEM_SKIP_REPOS)');
+} else try {
+  const manifestPath = join(INSTALL_DIR, 'registry', 'preinstalled.json');
+  if (!existsSync(manifestPath)) {
+    // For git-clone mode, check PROJECT_DIR
+    const altPath = join(PROJECT_DIR, 'registry', 'preinstalled.json');
+    if (existsSync(altPath)) {
+      const registryDir = join(INSTALL_DIR, 'registry');
+      if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
+      copyFileSync(altPath, manifestPath);
+    }
+  }
+
+  if (existsSync(manifestPath)) {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const resources = manifest.resources || [];
+
+    if (resources.length > 0) {
+      const managedDir = join(MEM_DATA_DIR, 'managed');
+
+      // 6a. Git shallow clone unique repos
+      const repos = new Map();
+      for (const r of resources) {
+        if (!repos.has(r.repo)) repos.set(r.repo, []);
+        repos.get(r.repo).push(r);
+      }
+
+      let cloned = 0, updated = 0;
+      const deadRepos = new Set(); // repos that no longer exist (404)
+
+      const isRepoNotFound = (err) => {
+        const msg = (err?.stderr ? err.stderr.toString() : '') + (err?.message || '');
+        return /repository.*not found|404/i.test(msg);
+      };
+
+      for (const [repoUrl, entries] of repos) {
+        const repoName = repoUrl.split('/').slice(-2).join('-').replace(/[^a-zA-Z0-9._-]/g, '_');
+        const clonePath = join(managedDir, 'repos', repoName);
+        let repoReady = false;
+
+        const plan = planRepoSparsePaths(entries);
+        const cloneUrl = `${repoUrl.replace(/\.git$/, '')}.git`;
+        // Clone only what we extract: a partial (blob:none) + sparse clone fetches
+        // just the manifest subpaths' subtrees instead of the whole repo. Falls
+        // back to a plain shallow clone if partial-clone/sparse-checkout is
+        // unsupported (old git/server) — identical to the prior behavior.
+        const cloneSlim = () => {
+          if (plan.full) {
+            execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
+            return;
+          }
+          try {
+            execFileSync('git', ['clone', '--depth', '1', '--filter=blob:none', '--no-checkout', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
+            execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 });
+            execFileSync('git', ['-C', clonePath, 'checkout'], { stdio: 'pipe', timeout: 30000 });
+          } catch {
+            try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
+            execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
+          }
+        };
+
+        // Migrate a legacy full clone: drop it so the fresh-clone path below
+        // rebuilds it slim. managed/repos is a rebuildable cache, so this loses
+        // nothing and reclaims the bulk of its footprint on the next install run.
+        if (!plan.full && existsSync(clonePath) && !isPartialSparseClone(clonePath)) {
+          try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
+        }
+
+        if (!existsSync(clonePath)) {
+          // Fresh clone (also the rebuild path for a just-migrated legacy clone)
+          try {
+            mkdirSync(join(managedDir, 'repos'), { recursive: true });
+            cloneSlim();
+            cloned++;
+            repoReady = true;
+          } catch (err) {
+            if (isRepoNotFound(err)) {
+              deadRepos.add(repoUrl);
+              warn(`  Repo not found (removed?): ${repoUrl}`);
+            } else {
+              warn(`  Clone failed: ${repoUrl}`);
+            }
+            continue;
+          }
+        } else {
+          // Update existing: fetch latest and fast-forward
+          try {
+            // Re-assert the sparse set so a newer manifest that adds a subpath to
+            // an already-slim clone checks it out (idempotent; no-op for full clones).
+            if (!plan.full && isPartialSparseClone(clonePath)) {
+              try { execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 }); } catch {}
+            }
+            const localHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
+            execFileSync('git', ['-C', clonePath, 'fetch', '--depth', '1', 'origin'], { stdio: 'pipe', timeout: 30000 });
+            const remoteHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
+            if (localHash !== remoteHash) {
+              execFileSync('git', ['-C', clonePath, 'reset', '--hard', 'FETCH_HEAD'], { stdio: 'pipe' });
+              updated++;
+              repoReady = true; // needs re-copy
+            }
+          } catch (err) {
+            if (isRepoNotFound(err)) {
+              deadRepos.add(repoUrl);
+              warn(`  Repo not found (removed?): ${repoUrl} — cleaning up`);
+              // Remove local clone
+              try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
+              // Remove extracted resources
+              for (const entry of entries) {
+                const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
+                const destPath = join(destDir, entry.name);
+                try { if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true }); } catch {}
+              }
+              continue;
+            }
+            // Transient failure — use existing clone as-is
+          }
+        }
+
+        // Copy resources to managed/skills/ or managed/agents/
+        // Re-copy if repo was freshly cloned or updated
+        mkdirSync(join(managedDir, 'skills'), { recursive: true });
+        mkdirSync(join(managedDir, 'agents'), { recursive: true });
+        for (const entry of entries) {
+          // Path traversal guard: reject entries with '..' or absolute paths
+          if (entry.path.includes('..') || entry.name.includes('..') ||
+              isAbsolute(entry.path) || isAbsolute(entry.name)) continue;
+          const srcPath = entry.path === '.' ? clonePath : join(clonePath, entry.path);
+          const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
+          const destPath = join(destDir, entry.name);
+          if (existsSync(srcPath) && (repoReady || !existsSync(destPath))) {
+            try {
+              if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true });
+              cpSync(srcPath, destPath, { recursive: true });
+            } catch {}
+          }
+        }
+      }
+      ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size - deadRepos.size} active` +
+         (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : ''));
+
+      // 6b. Init registry DB and record preinstalled entries
+      const { ensureRegistryDb } = await importFromInstall('registry.mjs');
+      const regDbPath = join(MEM_DATA_DIR, 'resource-registry.db');
+      const rdb = ensureRegistryDb(regDbPath);
+
+      const insertPre = rdb.prepare(`
+        INSERT OR REPLACE INTO preinstalled (name, type, repo_url, repo_path, tags, enabled)
+        VALUES (?, ?, ?, ?, ?, 1)
+      `);
+      const activeResources = deadRepos.size > 0
+        ? resources.filter(r => !deadRepos.has(r.repo))
+        : resources;
+      for (const r of activeResources) {
+        insertPre.run(r.name, r.type, r.repo, r.path, JSON.stringify(r.tags || []));
+      }
+
+      // Clean up DB entries for dead repos
+      if (deadRepos.size > 0) {
+        const delPre = rdb.prepare('DELETE FROM preinstalled WHERE repo_url = ?');
+        const delRes = rdb.prepare('DELETE FROM resources WHERE repo_url = ?');
+        for (const deadUrl of deadRepos) {
+          try { delPre.run(deadUrl); } catch {}
+          try { delRes.run(deadUrl); } catch {}
+        }
+      }
+      ok(`Registry DB initialized (${activeResources.length} preinstalled entries` +
+         (deadRepos.size > 0 ? `, ${deadRepos.size} dead repos purged` : '') + ')');
+
+      // 6c. Fetch GitHub stars (best-effort, unauthenticated)
+      log('  Fetching GitHub stars...');
+      const starCache = new Map();
+      for (const [repoUrl] of repos) {
+        if (deadRepos.has(repoUrl)) continue;
+        const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
+        if (match) {
+          try {
+            const apiUrl = `https://api.github.com/repos/${match[1]}/${match[2]}`;
+            const res = execFileSync('curl', ['-sf', apiUrl], { encoding: 'utf8', timeout: 10000 });
+            const data = JSON.parse(res);
+            if (typeof data.stargazers_count === 'number') {
+              starCache.set(repoUrl, data.stargazers_count);
+            }
+          } catch {}
+        }
+      }
+      if (starCache.size > 0) ok(`Stars fetched (${starCache.size}/${repos.size} repos)`);
+
+      // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
+      log('  Scanning resources...');
+      const { scanAllResources, diffResources } = await importFromInstall('registry-scanner.mjs');
+      const scanned = scanAllResources({ dataDir: MEM_DATA_DIR });
+
+      // Attach star counts and repo URLs
+      for (const s of scanned) {
+        const entry = resources.find(r => r.name === s.name && r.type === s.type);
+        if (entry) {
+          s.repoUrl = entry.repo;
+          s.repoStars = starCache.get(entry.repo) || 0;
+        }
+      }
+
+      const { toIndex } = diffResources(rdb, scanned);
+      if (toIndex.length > 0) {
+        // Use fallback indexing at install time (no Haiku calls)
+        // Full Haiku indexing happens on first SessionStart
+        const { upsertResource } = await importFromInstall('registry.mjs');
+        for (const res of toIndex) {
+          try {
+            const metaKey = `${res.type}:${res.name}`;
+            const meta = RESOURCE_METADATA[metaKey];
+            upsertResource(rdb, {
+              name: res.name,
+              type: res.type,
+              status: 'active',
+              source: res.source,
+              repo_url: res.repoUrl || null,
+              repo_stars: res.repoStars || 0,
+              local_path: res.localPath,
+              file_hash: res.fileHash,
+              invocation_name: meta?.invocation_name || deriveInvocationName(res.name),
+              intent_tags: meta?.intent_tags || res.name.replace(/-/g, ' '),
+              domain_tags: meta?.domain_tags || '',
+              trigger_patterns: meta?.trigger_patterns || `when user needs ${res.name.replace(/-/g, ' ')}`,
+              capability_summary: meta?.capability_summary || `${res.type}: ${res.name.replace(/-/g, ' ')}`,
+            });
+          } catch {}
+        }
+        ok(`Resources registered: ${toIndex.length} indexed`);
+      }
+
+      // Apply curated metadata to all known resources (fixes existing installs)
+      reindexKnownResources(rdb);
+      ok('Resource metadata curated (FTS5 reindexed)');
+
+      // Register plugin resources (skills/agents from other plugins, no local files)
+      const virtualCount = registerVirtualResources(rdb);
+      if (virtualCount > 0) ok(`Plugin resources registered: ${virtualCount} virtual entries`);
+
+      rdb.close();
+    }
+  } else {
+    log('  No preinstalled manifest found, skipping');
+  }
+} catch (e) {
+  warn('Resource setup: ' + e.message);
+  log('  Skills/agents will be indexed on first use');
+}
+}
+
+function verifyDatabase() {
+// 7. Verify database
+if (existsSync(DB_PATH)) {
+  try {
+    const Database = requireFromInstall('better-sqlite3');
+    const db = new Database(DB_PATH, { readonly: true });
+    const count = db.prepare('SELECT COUNT(*) as c FROM observations').get();
+    db.close();
+    ok(`Database accessible: ${count.c} observations`);
+  } catch (e) {
+    warn('Database check failed: ' + e.message);
+  }
+} else {
+  log('No existing database — will be created on first use');
+}
+}
+
+async function dogfoodAutoAdopt() {
+// 7b. Dogfood auto-adopt (invited-memory, Phase C T13).
+// Only fires when install.mjs is running from the claude-mem-lite source repo
+// itself (detected via git remote match). In npm/npx flows PROJECT_DIR is a
+// cache dir with no git metadata, so this is a no-op for end users.
+// --no-adopt override respected.
+if (!flags.has('--no-adopt')) {
+  try {
+    const remote = execFileSync('git', ['-C', PROJECT_DIR, 'config', '--get', 'remote.origin.url'], { encoding: 'utf8', stdio: 'pipe' }).trim();
+    const isDogfood = /github\.com[:/]sdsrss\/claude-mem-lite(\.git)?$/i.test(remote);
+    if (isDogfood) {
+      const { cmdAdopt } = await importFromInstall('adopt-cli.mjs');
+      cmdAdopt([]);
+      ok('Invited-memory: auto-adopt for claude-mem-lite dogfood repo');
+    }
+  } catch {
+    // Not a git repo, or git missing — silent skip (this is the normal npm path).
+  }
+}
+}
+
+function disableOldClaudeMemPlugin() {
+  const settings = readSettings();
+// 8. Disable old claude-mem plugin
+if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
+  settings.enabledPlugins['claude-mem@thedotmack'] = false;
+  writeSettings(settings);
+  ok('Old claude-mem plugin disabled');
+}
+}
+
+function offerCleanOldVectorDb() {
+// 9. Offer to clean old vector-db
+const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
+if (existsSync(vectorDbPath)) {
+  try {
+    const size = execFileSync('du', ['-sh', vectorDbPath], { encoding: 'utf8' }).trim().split('\t')[0];
+    warn(`Old vector-db exists (${size}). Run: rm -rf ~/.claude-mem/vector-db/`);
+  } catch {}
+}
+}
+
 async function install() {
   console.log('\nclaude-mem-lite installer\n');
-
-  // Resolve dynamic imports against the installed copy at INSTALL_DIR rather
-  // than install.mjs's own directory. Lets install.mjs run correctly from a
-  // /tmp staging dir (repair flow, `curl … | tar xz | node install.mjs install`)
-  // where PROJECT_DIR has no node_modules but INSTALL_DIR does — step 2 below
-  // ran `npm install --cwd INSTALL_DIR`. Pre-fix, steps 6/7 fired
-  // "Cannot find package 'better-sqlite3' imported from /tmp/…/registry.mjs"
-  // and silently skipped registry-DB seeding + DB health check on every repair.
-  const importFromInstall = (rel) => import(pathToFileURL(join(INSTALL_DIR, rel)).href);
-  const requireFromInstall = createRequire(pathToFileURL(join(INSTALL_DIR, 'package.json')).href);
 
   // 1. Install source files to ~/.claude-mem-lite/
   const IS_DEV = flags.has('--dev');
 
-  // Auto-migrate unhidden dir (~/claude-mem-lite/ → ~/.claude-mem-lite/)
-  const oldUnhidden = join(homedir(), 'claude-mem-lite');
-  if (!existsSync(DATA_DIR) && existsSync(oldUnhidden)) {
-    log('Migrating ~/claude-mem-lite/ → ~/.claude-mem-lite/...');
-    renameSync(oldUnhidden, DATA_DIR);
-    ok('Directory migrated');
-  }
-
-  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  // Under relocation the DB/managed/runtime live here, not in the code dir — create it too.
-  if (!existsSync(MEM_DATA_DIR)) mkdirSync(MEM_DATA_DIR, { recursive: true });
-
-  if (IS_DEV) {
-    log('Dev mode — creating symlinks in ~/.claude-mem-lite/...');
-    // Symlink individual source files
-    for (const f of SOURCE_FILES) {
-      const target = join(PROJECT_DIR, f);
-      const link = join(DATA_DIR, f);
-      if (existsSync(target)) {
-        // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
-        const linkParent = dirname(link);
-        if (!existsSync(linkParent)) mkdirSync(linkParent, { recursive: true });
-        // Remove existing file/symlink before creating
-        if (existsSync(link)) try { unlinkSync(link); } catch {}
-        symlinkSync(target, link);
-      }
-    }
-    // Symlink scripts/ directory
-    const scriptsLink = join(DATA_DIR, 'scripts');
-    if (existsSync(scriptsLink)) try { rmSync(scriptsLink, { recursive: true, force: true }); } catch {}
-    symlinkSync(join(PROJECT_DIR, 'scripts'), scriptsLink);
-    // Symlink node_modules/
-    const nmLink = join(DATA_DIR, 'node_modules');
-    if (existsSync(nmLink)) try { rmSync(nmLink, { recursive: true, force: true }); } catch {}
-    symlinkSync(join(PROJECT_DIR, 'node_modules'), nmLink);
-    // Symlink registry/ directory
-    const regLink = join(DATA_DIR, 'registry');
-    if (existsSync(regLink)) try { rmSync(regLink, { recursive: true, force: true }); } catch {}
-    if (existsSync(join(PROJECT_DIR, 'registry'))) {
-      symlinkSync(join(PROJECT_DIR, 'registry'), regLink);
-    }
-    // commands/ is intentionally NOT linked: Claude Code reads slash commands
-    // from the plugin cache (~/.claude/plugins/cache/<mp>/<plugin>/<ver>/commands/)
-    // or user-level ~/.claude/commands/, never from ~/.claude-mem-lite/commands/.
-    // Pre-v2.55 maintained a symlink/copy here that had no consumers.
-    ok('Symlinks created in ~/.claude-mem-lite/ → dev dir');
-  } else {
-    log('Installing to ~/.claude-mem-lite/...');
-    const scriptsDir = join(DATA_DIR, 'scripts');
-    if (!existsSync(scriptsDir)) mkdirSync(scriptsDir, { recursive: true });
-    for (const f of SOURCE_FILES) {
-      const src = join(PROJECT_DIR, f);
-      const dst = join(DATA_DIR, f);
-      if (existsSync(src)) {
-        // Ensure parent dir exists for subdir entries (e.g. 'lib/activity.mjs')
-        const dstParent = dirname(dst);
-        if (!existsSync(dstParent)) mkdirSync(dstParent, { recursive: true });
-        copyFileSync(src, dst);
-      }
-    }
-    // Copy hook scripts (settings.json hook commands point at these — must
-    // stay in sync with HOOK_SCRIPT_FILES manifest)
-    copyHookScripts(join(PROJECT_DIR, 'scripts'), scriptsDir);
-    // Ensure bash script is executable
-    try { execFileSync('chmod', ['+x', join(scriptsDir, 'post-tool-use.sh')], { stdio: 'pipe' }); } catch {}
-    // commands/ is intentionally NOT copied — see dev-mode branch above.
-    // Copy registry manifest
-    const registryDir = join(DATA_DIR, 'registry');
-    if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
-    const manifestSrc = join(PROJECT_DIR, 'registry', 'preinstalled.json');
-    if (existsSync(manifestSrc)) copyFileSync(manifestSrc, join(registryDir, 'preinstalled.json'));
-    ok('Source files copied to ~/.claude-mem-lite/');
-
-    // v2.48 P1-4: prune stale top-level .mjs + 0-byte .db files left behind by
-    // prior upgrades (e.g. dispatch.mjs removed in v2.20.0, zero-byte mem.db /
-    // memory.db / registry.db from pre-consolidation installs). Subdirs +
-    // symlinks + non-empty DBs are always preserved.
-    try {
-      const pruned = pruneStaleInstallFiles(DATA_DIR, SOURCE_FILES);
-      if (pruned.length > 0) {
-        ok(`Pruned ${pruned.length} stale file(s): ${pruned.map(p => p.split('/').pop()).join(', ')}`);
-      }
-    } catch (e) { /* prune is best-effort — never block install */ void e; }
-  }
-
-  // 2. npm install (skip for --dev: node_modules is symlinked)
-  if (IS_DEV) {
-    ok('Dependencies: using dev dir (symlinked)');
-  } else {
-    log('Ensuring dependencies installed...');
-    try {
-      // stderr inherited so users see real-time progress (network slowness,
-      // node-gyp compile spinner, prebuild-install fallback messages). With
-      // `stdio: 'pipe'` the install appeared to hang under the 5-min Bash
-      // timeout when better-sqlite3 had no Node v24 prebuild and had to
-      // compile from source — see bug audit 2026-05.
-      execSync(NPM_INSTALL_CMD, { cwd: INSTALL_DIR, stdio: ['ignore', 'pipe', 'inherit'] });
-      ok('Dependencies installed');
-    } catch (e) {
-      fail('npm install failed: ' + e.message);
-      process.exit(1);
-    }
-    // npm install exits 0 even when the better-sqlite3 prebuilt .node binary
-    // mismatches the running Node ABI (e.g. NODE_MODULE_VERSION 137 on Node v24).
-    // Probe and auto-rebuild before declaring success — otherwise the next
-    // launch FATALs with "Could not locate the bindings file".
-    const verify = await ensureBetterSqlite3Working(INSTALL_DIR);
-    if (verify.ok) {
-      ok(`better-sqlite3: ${verify.action}`);
-    } else {
-      fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
-      log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --build-from-source');
-      process.exit(1);
-    }
-  }
-
-  // 2b. Create global CLI symlink (claude-mem-lite command)
-  const cliSource = join(INSTALL_DIR, 'cli.mjs');
-  if (existsSync(cliSource)) {
-    try { execFileSync('chmod', ['+x', cliSource], { stdio: 'pipe' }); } catch {}
-    // Try ~/.local/bin first (user-writable, commonly on PATH)
-    const localBin = join(homedir(), '.local', 'bin');
-    const cliLink = join(localBin, 'claude-mem-lite');
-    try {
-      if (!existsSync(localBin)) mkdirSync(localBin, { recursive: true });
-      if (existsSync(cliLink)) unlinkSync(cliLink);
-      symlinkSync(cliSource, cliLink);
-      ok(`CLI: ${cliLink} → ${cliSource}`);
-    } catch {
-      // Fallback: try /usr/local/bin (may need sudo)
-      try {
-        const globalLink = '/usr/local/bin/claude-mem-lite';
-        if (existsSync(globalLink)) unlinkSync(globalLink);
-        symlinkSync(cliSource, globalLink);
-        ok(`CLI: ${globalLink} → ${cliSource}`);
-      } catch {
-        warn('CLI symlink failed — run manually: ln -sf ' + cliSource + ' ~/.local/bin/claude-mem-lite');
-      }
-    }
-  }
-
-  // 3. Register MCP server (skip if plugin system already handles it)
-  // Plugin MCP must stay at root .mcp.json so Claude Code registers plugin:*:mem-lite.
-  // Duplicate registrations in practice come from old global install.mjs state
-  // (claude mcp add) or stale marketplace copies, not from the cache root itself.
-  // Global registration via `claude mcp add` creates a DUPLICATE mcp__mem-lite__* server.
-  // The legacy generic name "mem" (pre-v2.78) is also purged so a user who installed in
-  // either era ends up with a single canonical "mem-lite" registration.
-  // Detect plugin mode: installed_plugins.json has our entry → plugin handles MCP.
-  const installedPluginsPath = join(homedir(), '.claude', 'plugins', 'installed_plugins.json');
-  let pluginHandlesMcp = false;
-  try {
-    const installed = JSON.parse(readFileSync(installedPluginsPath, 'utf8'));
-    pluginHandlesMcp = !!installed?.plugins?.[PLUGIN_KEY]?.length;
-  } catch { /* not installed via plugin system */ }
-
-  if (pluginHandlesMcp) {
-    log('MCP server: plugin system handles registration (skipping global)');
-    // Clean up stale global registrations (both legacy "mem" and current "mem-lite")
-    for (const name of ['mem', 'mem-lite']) {
-      try {
-        execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' });
-        ok(`Removed stale global MCP "${name}"`);
-      } catch {}
-    }
-  } else {
-    log('Registering MCP server...');
-    try {
-      // Purge legacy "mem" and any pre-existing "mem-lite" before re-registering
-      for (const name of ['mem', 'mem-lite']) {
-        try { execFileSync('claude', ['mcp', 'remove', '-s', 'user', name], { stdio: 'pipe' }); } catch {}
-        try { execFileSync('claude', ['mcp', 'remove', '-s', 'project', name], { stdio: 'pipe' }); } catch {}
-      }
-      execFileSync('claude', ['mcp', 'add', '-s', 'user', '-t', 'stdio', 'mem-lite', '--', 'node', SERVER_PATH], { stdio: 'pipe' });
-      ok('MCP server registered: mem-lite');
-    } catch (e) {
-      fail('MCP registration failed: ' + e.message);
-      warn('Try manually: claude mcp add -s user -t stdio mem-lite -- node ' + SERVER_PATH);
-    }
-  }
-
-  // 3b. Deduplicate: if marketplace plugin also registers MCP + hooks,
-  // clear them to prevent double execution. install.mjs hooks (in settings.json)
-  // point to ~/.claude-mem-lite/ (latest code in dev mode via symlinks),
-  // while plugin hooks use ${CLAUDE_PLUGIN_ROOT} (potentially stale marketplace copy).
-  //
-  // MCP dedup: Claude Code copies .mcp.json from marketplace clone → plugin cache.
-  // Do NOT modify marketplace .mcp.json — it breaks the MCP server registration chain.
-  // Dedup is handled by skipping global `claude mcp add` when plugin system is active.
-  const pluginDir = join(homedir(), '.claude', 'plugins', 'marketplaces', MARKETPLACE_KEY);
-  const pluginHooksPath = join(pluginDir, 'hooks', 'hooks.json');
-
-  if (existsSync(pluginDir)) {
-    // NOTE: Do NOT clear marketplace .mcp.json — Claude Code copies from
-    // marketplace clone → plugin cache on updates. Clearing it causes the
-    // cache .mcp.json to lose the MCP server definition, breaking plugin MCP.
-    // Dedup is already handled by skipping global `claude mcp add` above.
-
-    // Clear plugin hooks to prevent double hook execution
-    try {
-      if (existsSync(pluginHooksPath)) {
-        const pluginHooks = JSON.parse(readFileSync(pluginHooksPath, 'utf8'));
-        if (pluginHooks.hooks && Object.keys(pluginHooks.hooks).length > 0) {
-          writeFileSync(pluginHooksPath, JSON.stringify({
-            description: pluginHooks.description || 'claude-mem-lite hooks',
-            _note: 'Hooks managed by install.mjs in settings.json — this file cleared to prevent duplicates',
-            hooks: {}
-          }, null, 2) + '\n');
-          ok('Marketplace plugin: hooks cleared (prevents duplicate)');
-        }
-      }
-    } catch (e) { warn(`Marketplace hooks dedup: ${e.message}`); }
-
-    // Sync launch.mjs to plugin cache — ensures MCP server loads dev code via symlink detection.
-    // ALSO clear cached hooks.json in every version dir — Claude Code runtime reads hooks from
-    // ~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json, NOT from the marketplace source.
-    // Clearing only the marketplace source (above) leaves stale cache copies that double-register
-    // hooks alongside install.mjs-written settings.json entries.
-    try {
-      const cacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
-      if (existsSync(cacheBase)) {
-        const launchSyncFiles = ['launch.mjs', 'launch-preflight.mjs'];
-        let clearedHooks = 0;
-        for (const ver of readdirSync(cacheBase)) {
-          const verDir = join(cacheBase, ver);
-
-          // Sync launch.mjs + its preflight companion (issue #15)
-          if (existsSync(join(verDir, 'scripts'))) {
-            for (const f of launchSyncFiles) {
-              const src = join(PROJECT_DIR, 'scripts', f);
-              if (existsSync(src)) {
-                try { copyFileSync(src, join(verDir, 'scripts', f)); } catch { /* keep going */ }
-              }
-            }
-          }
-
-          // Clear cached hooks.json (runtime reads here, not marketplace source)
-          const cachedHooksPath = join(verDir, 'hooks', 'hooks.json');
-          if (existsSync(cachedHooksPath)) {
-            try {
-              const h = JSON.parse(readFileSync(cachedHooksPath, 'utf8'));
-              if (h.hooks && Object.keys(h.hooks).length > 0) {
-                writeFileSync(cachedHooksPath, JSON.stringify({
-                  description: h.description || 'claude-mem-lite hooks',
-                  _note: `Hooks managed by install.mjs in settings.json — cache hooks.json cleared to prevent duplicate registration (cache ver: ${ver})`,
-                  hooks: {}
-                }, null, 2) + '\n');
-                clearedHooks++;
-              }
-            } catch { /* silent — never block install on one bad cache entry */ }
-          }
-        }
-        const parts = ['launch.mjs synced (dev mode MCP routing)'];
-        if (clearedHooks > 0) parts.push(`${clearedHooks} stale hooks.json cleared`);
-        ok(`Plugin cache: ${parts.join('; ')}`);
-      }
-    } catch (e) { warn(`Plugin cache sync: ${e.message}`); }
-  }
-
-  // 4. Configure hooks (merge: preserve user's existing hooks, replace ours)
-  log('Configuring hooks...');
-  const settings = readSettings();
-  if (clearPluginDisabledMarkerForDirectInstall(settings)) {
-    ok('Cleared stale disabled plugin flag so install.mjs-managed hooks can run');
-  }
-  settings.hooks = settings.hooks || {};
-
-  const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
-  const PREFILTER_PATH = join(SCRIPTS_PATH, 'post-tool-use.sh');
-  // v2.84: every Node hook invocation routes through hook-launcher.mjs so an
-  // ERR_MODULE_NOT_FOUND from a partial-install drift auto-heals via
-  // install.mjs repair instead of permanently bricking the hook chain.
-  const LAUNCHER_PATH = join(SCRIPTS_PATH, 'hook-launcher.mjs');
-  const nodeHook = (entry, ...args) => `node "${LAUNCHER_PATH}" ${entry} ${args.join(' ')}`.trim();
-
-  const memPostToolUse = {
-    matcher: '*',
-    hooks: [{
-      type: 'command',
-      command: `bash "${PREFILTER_PATH}"`,
-      timeout: 5
-    }]
-  };
-
-  const memSessionStart = {
-    matcher: 'startup|clear|compact',
-    hooks: [{
-      type: 'command',
-      command: nodeHook('hook.mjs', 'session-start'),
-      timeout: 10
-    }]
-  };
-
-  const memStop = {
-    matcher: '*',
-    hooks: [{
-      type: 'command',
-      command: nodeHook('hook.mjs', 'stop'),
-      timeout: 5
-    }]
-  };
-
-  const memUserPrompt = {
-    matcher: '*',
-    hooks: [
-      {
-        type: 'command',
-        command: nodeHook('scripts/user-prompt-search.js'),
-        timeout: 2
-      },
-      {
-        type: 'command',
-        command: nodeHook('hook.mjs', 'user-prompt'),
-        timeout: 5
-      }
-    ]
-  };
-
-  const memPreToolRecall = {
-    // v2.34.6: Read added to cover planning-Read (pre-Edit exploration).
-    // Read-path uses a tighter filter (lesson_learned required, top-1,
-    // 120-char truncation, silent-on-empty) — see scripts/pre-tool-recall.js.
-    matcher: 'Edit|Write|NotebookEdit|Read',
-    hooks: [
-      {
-        type: 'command',
-        command: nodeHook('scripts/pre-tool-recall.js'),
-        timeout: 3
-      }
-    ]
-  };
-
-  const memPreSkillBridge = {
-    matcher: 'Skill',
-    hooks: [
-      {
-        type: 'command',
-        command: nodeHook('scripts/pre-skill-bridge.js'),
-        timeout: 3
-      }
-    ]
-  };
-
-  // Filter out existing mem hooks, then append fresh ones
-  // PreToolUse has two separate matchers, so we register both
-  const hookConfigs = {
-    PreToolUse: [memPreToolRecall, memPreSkillBridge],
-    PostToolUse: [memPostToolUse],
-    SessionStart: [memSessionStart],
-    Stop: [memStop],
-    UserPromptSubmit: [memUserPrompt],
-  };
-
-  for (const [event, configs] of Object.entries(hookConfigs)) {
-    const existing = Array.isArray(settings.hooks[event]) ? settings.hooks[event].filter(cfg => !isMemHook(cfg)) : [];
-    settings.hooks[event] = [...existing, ...configs];
-  }
-
-  writeSettings(settings);
-  ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
-
-  // 5. Legacy ~/.claude-mem/ → ~/.claude-mem-lite/ — back up, don't reuse.
-  // The legacy DB is schema v16 (schema_versions plural) and there's no
-  // bridge in MIGRATIONS[] to v28. Reusing it FATALs on first launch with
-  // "no such column: memory_session_id". Rename to a timestamped backup
-  // so the new install creates a fresh v28 DB.
-  try {
-    const r = migrateLegacyClaudeMemData(OLD_DATA_DIR, MEM_DATA_DIR);
-    if (r.action === 'backed-up') {
-      ok(`Legacy ~/.claude-mem/ DB backed up to ${r.backupPath}`);
-      log('New v28 DB will be created on first launch (legacy schema is incompatible).');
-    }
-  } catch (e) {
-    warn('Legacy DB backup failed: ' + e.message);
-  }
-
-  // 5b. Rename claude-mem.db → claude-mem-lite.db in same directory
-  const oldDbInDir = join(MEM_DATA_DIR, 'claude-mem.db');
-  if (existsSync(oldDbInDir) && !existsSync(DB_PATH)) {
-    renameSync(oldDbInDir, DB_PATH);
-    for (const ext of ['-wal', '-shm']) {
-      if (existsSync(oldDbInDir + ext)) try { renameSync(oldDbInDir + ext, DB_PATH + ext); } catch {}
-    }
-    ok('Database renamed: claude-mem.db → claude-mem-lite.db');
-  }
-
-  // 6. Install pre-installed resources (skills + agents)
-  if (process.env.CLAUDE_MEM_SKIP_REPOS) {
-    ok('Skill/agent registry: skipped (CLAUDE_MEM_SKIP_REPOS)');
-  } else try {
-    const manifestPath = join(INSTALL_DIR, 'registry', 'preinstalled.json');
-    if (!existsSync(manifestPath)) {
-      // For git-clone mode, check PROJECT_DIR
-      const altPath = join(PROJECT_DIR, 'registry', 'preinstalled.json');
-      if (existsSync(altPath)) {
-        const registryDir = join(INSTALL_DIR, 'registry');
-        if (!existsSync(registryDir)) mkdirSync(registryDir, { recursive: true });
-        copyFileSync(altPath, manifestPath);
-      }
-    }
-
-    if (existsSync(manifestPath)) {
-      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-      const resources = manifest.resources || [];
-
-      if (resources.length > 0) {
-        const managedDir = join(MEM_DATA_DIR, 'managed');
-
-        // 6a. Git shallow clone unique repos
-        const repos = new Map();
-        for (const r of resources) {
-          if (!repos.has(r.repo)) repos.set(r.repo, []);
-          repos.get(r.repo).push(r);
-        }
-
-        let cloned = 0, updated = 0;
-        const deadRepos = new Set(); // repos that no longer exist (404)
-
-        const isRepoNotFound = (err) => {
-          const msg = (err?.stderr ? err.stderr.toString() : '') + (err?.message || '');
-          return /repository.*not found|404/i.test(msg);
-        };
-
-        for (const [repoUrl, entries] of repos) {
-          const repoName = repoUrl.split('/').slice(-2).join('-').replace(/[^a-zA-Z0-9._-]/g, '_');
-          const clonePath = join(managedDir, 'repos', repoName);
-          let repoReady = false;
-
-          const plan = planRepoSparsePaths(entries);
-          const cloneUrl = `${repoUrl.replace(/\.git$/, '')}.git`;
-          // Clone only what we extract: a partial (blob:none) + sparse clone fetches
-          // just the manifest subpaths' subtrees instead of the whole repo. Falls
-          // back to a plain shallow clone if partial-clone/sparse-checkout is
-          // unsupported (old git/server) — identical to the prior behavior.
-          const cloneSlim = () => {
-            if (plan.full) {
-              execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
-              return;
-            }
-            try {
-              execFileSync('git', ['clone', '--depth', '1', '--filter=blob:none', '--no-checkout', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
-              execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 });
-              execFileSync('git', ['-C', clonePath, 'checkout'], { stdio: 'pipe', timeout: 30000 });
-            } catch {
-              try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
-              execFileSync('git', ['clone', '--depth', '1', cloneUrl, clonePath], { stdio: 'pipe', timeout: 30000 });
-            }
-          };
-
-          // Migrate a legacy full clone: drop it so the fresh-clone path below
-          // rebuilds it slim. managed/repos is a rebuildable cache, so this loses
-          // nothing and reclaims the bulk of its footprint on the next install run.
-          if (!plan.full && existsSync(clonePath) && !isPartialSparseClone(clonePath)) {
-            try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
-          }
-
-          if (!existsSync(clonePath)) {
-            // Fresh clone (also the rebuild path for a just-migrated legacy clone)
-            try {
-              mkdirSync(join(managedDir, 'repos'), { recursive: true });
-              cloneSlim();
-              cloned++;
-              repoReady = true;
-            } catch (err) {
-              if (isRepoNotFound(err)) {
-                deadRepos.add(repoUrl);
-                warn(`  Repo not found (removed?): ${repoUrl}`);
-              } else {
-                warn(`  Clone failed: ${repoUrl}`);
-              }
-              continue;
-            }
-          } else {
-            // Update existing: fetch latest and fast-forward
-            try {
-              // Re-assert the sparse set so a newer manifest that adds a subpath to
-              // an already-slim clone checks it out (idempotent; no-op for full clones).
-              if (!plan.full && isPartialSparseClone(clonePath)) {
-                try { execFileSync('git', ['-C', clonePath, 'sparse-checkout', 'set', '--no-cone', ...plan.paths], { stdio: 'pipe', timeout: 30000 }); } catch {}
-              }
-              const localHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
-              execFileSync('git', ['-C', clonePath, 'fetch', '--depth', '1', 'origin'], { stdio: 'pipe', timeout: 30000 });
-              const remoteHash = execFileSync('git', ['-C', clonePath, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', stdio: 'pipe' }).trim();
-              if (localHash !== remoteHash) {
-                execFileSync('git', ['-C', clonePath, 'reset', '--hard', 'FETCH_HEAD'], { stdio: 'pipe' });
-                updated++;
-                repoReady = true; // needs re-copy
-              }
-            } catch (err) {
-              if (isRepoNotFound(err)) {
-                deadRepos.add(repoUrl);
-                warn(`  Repo not found (removed?): ${repoUrl} — cleaning up`);
-                // Remove local clone
-                try { rmSync(clonePath, { recursive: true, force: true }); } catch {}
-                // Remove extracted resources
-                for (const entry of entries) {
-                  const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
-                  const destPath = join(destDir, entry.name);
-                  try { if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true }); } catch {}
-                }
-                continue;
-              }
-              // Transient failure — use existing clone as-is
-            }
-          }
-
-          // Copy resources to managed/skills/ or managed/agents/
-          // Re-copy if repo was freshly cloned or updated
-          mkdirSync(join(managedDir, 'skills'), { recursive: true });
-          mkdirSync(join(managedDir, 'agents'), { recursive: true });
-          for (const entry of entries) {
-            // Path traversal guard: reject entries with '..' or absolute paths
-            if (entry.path.includes('..') || entry.name.includes('..') ||
-                isAbsolute(entry.path) || isAbsolute(entry.name)) continue;
-            const srcPath = entry.path === '.' ? clonePath : join(clonePath, entry.path);
-            const destDir = join(managedDir, entry.type === 'skill' ? 'skills' : 'agents');
-            const destPath = join(destDir, entry.name);
-            if (existsSync(srcPath) && (repoReady || !existsSync(destPath))) {
-              try {
-                if (existsSync(destPath)) rmSync(destPath, { recursive: true, force: true });
-                cpSync(srcPath, destPath, { recursive: true });
-              } catch {}
-            }
-          }
-        }
-        ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size - deadRepos.size} active` +
-           (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : ''));
-
-        // 6b. Init registry DB and record preinstalled entries
-        const { ensureRegistryDb } = await importFromInstall('registry.mjs');
-        const regDbPath = join(MEM_DATA_DIR, 'resource-registry.db');
-        const rdb = ensureRegistryDb(regDbPath);
-
-        const insertPre = rdb.prepare(`
-          INSERT OR REPLACE INTO preinstalled (name, type, repo_url, repo_path, tags, enabled)
-          VALUES (?, ?, ?, ?, ?, 1)
-        `);
-        const activeResources = deadRepos.size > 0
-          ? resources.filter(r => !deadRepos.has(r.repo))
-          : resources;
-        for (const r of activeResources) {
-          insertPre.run(r.name, r.type, r.repo, r.path, JSON.stringify(r.tags || []));
-        }
-
-        // Clean up DB entries for dead repos
-        if (deadRepos.size > 0) {
-          const delPre = rdb.prepare('DELETE FROM preinstalled WHERE repo_url = ?');
-          const delRes = rdb.prepare('DELETE FROM resources WHERE repo_url = ?');
-          for (const deadUrl of deadRepos) {
-            try { delPre.run(deadUrl); } catch {}
-            try { delRes.run(deadUrl); } catch {}
-          }
-        }
-        ok(`Registry DB initialized (${activeResources.length} preinstalled entries` +
-           (deadRepos.size > 0 ? `, ${deadRepos.size} dead repos purged` : '') + ')');
-
-        // 6c. Fetch GitHub stars (best-effort, unauthenticated)
-        log('  Fetching GitHub stars...');
-        const starCache = new Map();
-        for (const [repoUrl] of repos) {
-          if (deadRepos.has(repoUrl)) continue;
-          const match = repoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
-          if (match) {
-            try {
-              const apiUrl = `https://api.github.com/repos/${match[1]}/${match[2]}`;
-              const res = execFileSync('curl', ['-sf', apiUrl], { encoding: 'utf8', timeout: 10000 });
-              const data = JSON.parse(res);
-              if (typeof data.stargazers_count === 'number') {
-                starCache.set(repoUrl, data.stargazers_count);
-              }
-            } catch {}
-          }
-        }
-        if (starCache.size > 0) ok(`Stars fetched (${starCache.size}/${repos.size} repos)`);
-
-        // 6d. Scan and index resources (fallback-only, Haiku indexing deferred to first run)
-        log('  Scanning resources...');
-        const { scanAllResources, diffResources } = await importFromInstall('registry-scanner.mjs');
-        const scanned = scanAllResources({ dataDir: MEM_DATA_DIR });
-
-        // Attach star counts and repo URLs
-        for (const s of scanned) {
-          const entry = resources.find(r => r.name === s.name && r.type === s.type);
-          if (entry) {
-            s.repoUrl = entry.repo;
-            s.repoStars = starCache.get(entry.repo) || 0;
-          }
-        }
-
-        const { toIndex } = diffResources(rdb, scanned);
-        if (toIndex.length > 0) {
-          // Use fallback indexing at install time (no Haiku calls)
-          // Full Haiku indexing happens on first SessionStart
-          const { upsertResource } = await importFromInstall('registry.mjs');
-          for (const res of toIndex) {
-            try {
-              const metaKey = `${res.type}:${res.name}`;
-              const meta = RESOURCE_METADATA[metaKey];
-              upsertResource(rdb, {
-                name: res.name,
-                type: res.type,
-                status: 'active',
-                source: res.source,
-                repo_url: res.repoUrl || null,
-                repo_stars: res.repoStars || 0,
-                local_path: res.localPath,
-                file_hash: res.fileHash,
-                invocation_name: meta?.invocation_name || deriveInvocationName(res.name),
-                intent_tags: meta?.intent_tags || res.name.replace(/-/g, ' '),
-                domain_tags: meta?.domain_tags || '',
-                trigger_patterns: meta?.trigger_patterns || `when user needs ${res.name.replace(/-/g, ' ')}`,
-                capability_summary: meta?.capability_summary || `${res.type}: ${res.name.replace(/-/g, ' ')}`,
-              });
-            } catch {}
-          }
-          ok(`Resources registered: ${toIndex.length} indexed`);
-        }
-
-        // Apply curated metadata to all known resources (fixes existing installs)
-        reindexKnownResources(rdb);
-        ok('Resource metadata curated (FTS5 reindexed)');
-
-        // Register plugin resources (skills/agents from other plugins, no local files)
-        const virtualCount = registerVirtualResources(rdb);
-        if (virtualCount > 0) ok(`Plugin resources registered: ${virtualCount} virtual entries`);
-
-        rdb.close();
-      }
-    } else {
-      log('  No preinstalled manifest found, skipping');
-    }
-  } catch (e) {
-    warn('Resource setup: ' + e.message);
-    log('  Skills/agents will be indexed on first use');
-  }
-
-  // 7. Verify database
-  if (existsSync(DB_PATH)) {
-    try {
-      const Database = requireFromInstall('better-sqlite3');
-      const db = new Database(DB_PATH, { readonly: true });
-      const count = db.prepare('SELECT COUNT(*) as c FROM observations').get();
-      db.close();
-      ok(`Database accessible: ${count.c} observations`);
-    } catch (e) {
-      warn('Database check failed: ' + e.message);
-    }
-  } else {
-    log('No existing database — will be created on first use');
-  }
-
-  // 7b. Dogfood auto-adopt (invited-memory, Phase C T13).
-  // Only fires when install.mjs is running from the claude-mem-lite source repo
-  // itself (detected via git remote match). In npm/npx flows PROJECT_DIR is a
-  // cache dir with no git metadata, so this is a no-op for end users.
-  // --no-adopt override respected.
-  if (!flags.has('--no-adopt')) {
-    try {
-      const remote = execFileSync('git', ['-C', PROJECT_DIR, 'config', '--get', 'remote.origin.url'], { encoding: 'utf8', stdio: 'pipe' }).trim();
-      const isDogfood = /github\.com[:/]sdsrss\/claude-mem-lite(\.git)?$/i.test(remote);
-      if (isDogfood) {
-        const { cmdAdopt } = await importFromInstall('adopt-cli.mjs');
-        cmdAdopt([]);
-        ok('Invited-memory: auto-adopt for claude-mem-lite dogfood repo');
-      }
-    } catch {
-      // Not a git repo, or git missing — silent skip (this is the normal npm path).
-    }
-  }
-
-  // 8. Disable old claude-mem plugin
-  if (settings.enabledPlugins?.['claude-mem@thedotmack'] !== undefined) {
-    settings.enabledPlugins['claude-mem@thedotmack'] = false;
-    writeSettings(settings);
-    ok('Old claude-mem plugin disabled');
-  }
-
-  // 9. Offer to clean old vector-db
-  const vectorDbPath = join(OLD_DATA_DIR, 'vector-db');
-  if (existsSync(vectorDbPath)) {
-    try {
-      const size = execFileSync('du', ['-sh', vectorDbPath], { encoding: 'utf8' }).trim().split('\t')[0];
-      warn(`Old vector-db exists (${size}). Run: rm -rf ~/.claude-mem/vector-db/`);
-    } catch {}
-  }
+  installSourceFiles(IS_DEV);
+  await installDependencies(IS_DEV);
+  createCliSymlink();
+  registerMcpServer();
+  dedupePluginCacheAndHooks();
+  configureHooks();
+  backupLegacyClaudeMemData();
+  await installPreinstalledResources();
+  verifyDatabase();
+  await dogfoodAutoAdopt();
+  disableOldClaudeMemPlugin();
+  offerCleanOldVectorDb();
 
   console.log('\n  Done! Restart Claude Code to activate.\n');
 }
+
 
 // ─── Uninstall ──────────────────────────────────────────────────────────────
 
