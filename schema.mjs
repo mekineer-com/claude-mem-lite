@@ -894,7 +894,13 @@ export function ensureDb() {
   db.pragma('foreign_keys = OFF'); // Enabled after dedup migration
 
   try {
-    return initSchema(db);
+    const ready = initSchema(db);
+    // P1-5: sentinel-gated data cleanups must run on EVERY open (schema.mjs:766).
+    // They were extracted out of initSchema into runDeferredCleanups but never
+    // wired into a production opener — without this call they ran nowhere but
+    // tests, silently halting orphan/normalize hygiene. Best-effort: never throws.
+    runDeferredCleanups(ready);
+    return ready;
   } catch (e) {
     try { db.close(); } catch {}
     throw e;
