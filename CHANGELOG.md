@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.7.1 — deferred-cleanup wiring fix + search-orchestrator unification
+
+Maintenance release: a data-hygiene fix plus internal refactors from the v3.6.0 audit follow-up. No user-facing API or default-behaviour changes.
+
+### fix(schema): run deferred data cleanups on every DB open (audit P1-5)
+
+The orphan-row + project-name cleanups that v3.7.0 extracted into `runDeferredCleanups()` were never wired into a production DB opener — `ensureDb()` called only `initSchema()`, so the cleanups ran nowhere but tests while a comment claimed they run "on every ensureDb". `ensureDb()` now runs them after `initSchema` (each step sentinel-gated, best-effort/never-throws), restoring orphaned `observation_files` / `observation_vectors` scrubbing and project-name normalisation on open.
+
+### refactor(search): unify the CLI/MCP search orchestrator (audit P1-2)
+
+The ~180-line cross-source search body (deep/escalation → per-source query → normalize/sort → re-rank/supersede → tier → paginate), previously duplicated in `server.mjs` and `mem-cli.mjs` and hand-synced by ~34 paired-path comments, is now a single `coreRunSearchPipeline` in `lib/search-core.mjs`; both surfaces are thin adapters with behaviour preserved exactly (every per-surface difference is an explicit named opt). A new cross-surface golden parity test (`tests/search-parity.test.mjs`, 9 scenarios incl. deep + auto-escalation) is the structural replacement for the deleted sync comments.
+
+### refactor: v3.6.0 audit follow-ups
+
+`install()` split into per-step functions (P1-9); `handleSessionStart` split into named phase functions (P1-10); `server-internals.mjs` renamed to `search-scoring.mjs` (P3); shared `finalizeSearchPage` count/paginate tail extracted.
+
 ## v3.7.0 — opt-in `CLAUDE_MEM_SALIENCE=bind` forcing-function (experimental)
 
 Adds an opt-in injection-salience mode plus the efficacy-instrument fixes used to evaluate it. **Default behaviour is unchanged** — the new mode is gated behind `CLAUDE_MEM_SALIENCE=bind`; the existing default (`current`) and `legacy` values are untouched.
