@@ -948,6 +948,24 @@ describe('CLI update command', () => {
     expect(output).toContain('No fields to update');
   });
 
+  // Audit P3 #1: a float-shaped positional id like "3.9" fell through parseIdToken
+  // (regex-anchored, no match) to a bare parseInt fallback that truncated 3.9 → 3
+  // and silently UPDATE'd the WRONG row #3 (update has no preview/--confirm).
+  // cmdDelete rejected such input; cmdUpdate now matches — strict parseIdToken gate.
+  it('rejects float-shaped id "3.9" instead of truncating to row #3', async () => {
+    for (let i = 0; i < 3; i++) {
+      insertObs(testDb, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+        title: `row ${i + 1}`, text: 'content',
+      });
+    }
+    const output = await captureStdout(() => run(['update', '3.9', '--title', 'HACKED']));
+    expect(output).toContain('Usage');
+    // Row #3 must be untouched — the truncation bug would have set it to "HACKED".
+    const row = testDb.prepare('SELECT title FROM observations WHERE id = 3').get();
+    expect(row.title).toBe('row 3');
+  });
+
   it('updates title', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',

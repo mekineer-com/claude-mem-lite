@@ -403,3 +403,71 @@ describe('extractAllInjected (union wrapper)', () => {
     expect([...all].sort()).toEqual([...ptr].sort());
   });
 });
+
+describe('extractAllInjected mainOnly thread filter (citation-decay symmetry)', () => {
+  // The Stop-handler citation-decay loop counts the cited NUMERATOR with
+  // extractCitationsFromTranscript({ mainOnly: true }) — sidechain (subagent)
+  // text is excluded because the parent isn't accountable for it. The injected
+  // DENOMINATOR must use the SAME thread filter, else an obs injected+cited only
+  // inside a sidechain lands in the denominator but never the numerator and is
+  // streak-demoted despite being used. mainOnly closes that asymmetry.
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'cite-side-')); });
+  afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch {} });
+
+  function writeTranscript(entries) {
+    const path = join(tmp, 'transcript.jsonl');
+    writeFileSync(path, entries.map(e => JSON.stringify(e)).join('\n'));
+    return path;
+  }
+
+  const mainPtr = {
+    type: 'attachment',
+    isSidechain: false,
+    attachment: {
+      type: 'hook_success',
+      command: 'node /opt/scripts/pre-tool-recall.js',
+      stdout: JSON.stringify({ hookSpecificOutput: { additionalContext: '  #502 [bugfix] main-thread lesson' } }),
+    },
+  };
+  const sidechainPtr = {
+    type: 'attachment',
+    isSidechain: true,
+    attachment: {
+      type: 'hook_success',
+      command: 'node /opt/scripts/pre-tool-recall.js',
+      stdout: JSON.stringify({ hookSpecificOutput: { additionalContext: '  #501 [bugfix] subagent-only lesson' } }),
+    },
+  };
+
+  it('default (mainOnly omitted) includes sidechain injections — preserves P4 bump semantics', () => {
+    const path = writeTranscript([mainPtr, sidechainPtr]);
+    const ids = extractAllInjected(path);
+    expect(ids.has(501)).toBe(true);
+    expect(ids.has(502)).toBe(true);
+    expect(ids.size).toBe(2);
+  });
+
+  it('mainOnly:true excludes sidechain injections so they match the mainOnly citation numerator', () => {
+    const path = writeTranscript([mainPtr, sidechainPtr]);
+    const ids = extractAllInjected(path, { mainOnly: true });
+    expect(ids.has(502)).toBe(true);
+    expect(ids.has(501)).toBe(false); // subagent-only — must not enter the decay denominator
+    expect(ids.size).toBe(1);
+  });
+
+  it('mainOnly:true keeps attachments with isSidechain absent (treated as main thread)', () => {
+    // Real transcripts stamp isSidechain on every line; legacy/synthetic lines
+    // without the field must default to included (=== true is the only exclusion).
+    const noFlag = {
+      type: 'attachment',
+      attachment: {
+        type: 'hook_success',
+        command: 'node /opt/scripts/pre-tool-recall.js',
+        stdout: JSON.stringify({ hookSpecificOutput: { additionalContext: '  #777 [decision] no-flag line' } }),
+      },
+    };
+    const path = writeTranscript([noFlag]);
+    expect(extractAllInjected(path, { mainOnly: true }).has(777)).toBe(true);
+  });
+});

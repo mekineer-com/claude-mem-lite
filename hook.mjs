@@ -553,7 +553,11 @@ async function handleStop() {
           // Union closed by extractAllInjected — one integration point so the
           // contract test in tests/citation-tracker-userprompt.test.mjs covers it.
           try {
-            const injected = extractAllInjected(transcriptPath);
+            // mainOnly: the injected denominator must use the same thread
+            // filter as citedMain (the numerator, below) — an obs injected only
+            // inside a subagent (sidechain) would otherwise enter the denominator
+            // but never the numerator and streak-demote despite being used there.
+            const injected = extractAllInjected(transcriptPath, { mainOnly: true });
             // P5 ①: cite-back signals — observations whose warned file the agent
             // edited this session. Union into injected so they're resolved (they
             // were injected via pre-tool-recall) and, below, into cited so the

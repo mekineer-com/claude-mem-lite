@@ -1405,8 +1405,11 @@ function cmdUpdate(db, args) {
          `Prompts and sessions are append-only.`);
     return;
   }
+  // Strict parseIdToken gate (aligned with cmdDelete): a bare parseInt fallback
+  // truncated "3.9" → 3 and silently UPDATE'd the WRONG row #3 (no preview, no
+  // --confirm). Require an exact obs-id token; non-matching input → usage error.
   const parsed = raw ? parseIdToken(raw) : null;
-  const id = parsed && parsed.source === null ? parsed.id : parseInt(raw, 10);
+  const id = parsed && parsed.source === null ? parsed.id : NaN;
   if (!id || isNaN(id)) {
     fail('[mem] Usage: claude-mem-lite update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
     return;

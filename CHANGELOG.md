@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.9.1 — audit follow-ups: citation-decay thread-filter symmetry + update-id truncation guard
+
+Two remaining items from the audit's deferred P2/P3 list. No features, no breaking changes. Test suite 3153 → 3157 (+4 regression tests, all green); ESLint clean.
+
+### fix(citation-decay): injected denominator now uses the same `mainOnly` thread filter as the cited numerator
+
+The Stop-handler citation-decay loop counted the **cited numerator** with `extractCitationsFromTranscript({ mainOnly: true })` (sidechain/subagent text excluded — the parent isn't accountable for it) but the **injected denominator** used `extractAllInjected(transcriptPath)` with no thread filter. An observation injected and cited only inside a subagent would enter the denominator but never the numerator, accruing an uncited streak and demoting despite being used. Threaded a `mainOnly` option through `eachHookAttachment` → all four injection extractors → `extractAllInjected`, and pass `{ mainOnly: true }` at the decay site so both sides skip `isSidechain === true`. Note: latent in the current Claude Code transcript model — subagent turns are written to separate transcript files (no inline `isSidechain` lines), so neither side currently sees sidechain content; this aligns the accounting against the inlined-sidechain model the existing `mainOnly` filter already defends.
+
+### fix(cli): `update <id>` rejects float-shaped ids instead of truncating to the wrong row
+
+`cmdUpdate` fell through `parseIdToken` (regex-anchored, no match on `"3.9"`) to a bare `parseInt(raw, 10)` fallback that truncated `3.9 → 3` and silently `UPDATE`'d the wrong row #3 — with no preview and no `--confirm`. `cmdDelete` already rejected such input; `cmdUpdate` now matches it with a strict `parseIdToken` gate (non-matching input → usage error, no mutation).
+
 ## v3.9.0 — full-codebase audit fixes: secret-scrub, registry FK migration, auto-update fail-closed (P1–P5 + self-review)
 
 A comprehensive read-only audit (parallel reviewers over the whole runtime + a fresh-eyes self-review of the diff) surfaced a set of security and data-integrity defects; this release fixes them. No new features, no breaking changes. Test suite 3120 → 3153 (+33 regression tests, all green); ESLint clean.
