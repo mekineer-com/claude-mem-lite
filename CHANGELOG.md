@@ -2,6 +2,32 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.8.0 — release supply-chain hardening: signed auto-update + provenance (audit P1–P3)
+
+Security/CI hardening from the install-integrity audit. The auto-update path gains optional cryptographic verification and the release pipeline tightens its version + lint gates. **Default behaviour is unchanged** — release-signature verification is inert until a signing key is provisioned (no public key is embedded yet), so existing installs auto-update exactly as before.
+
+### feat(security): signed auto-update with opportunistic Ed25519 verification (P1)
+
+`hook-update.mjs` now verifies a downloaded release before installing it. A new shared `lib/release-digest.mjs` builds a SHA-256 manifest over the release's file *contents* (not the byte-unstable git-archive tarball) and an embedded Ed25519 public key checks a detached signature over that manifest; CI signs it via `scripts/sign-release.mjs` and `publish.yml` uploads `release-manifest.json[.sig]` as Release assets. Verification is **opportunistic and inert until keyed** — an empty embedded key, an unsigned release, or an asset-fetch failure all proceed unchanged; only a *present-but-invalid* signature or a file-hash mismatch rejects the update (it stays on the current version, never a brick). Escape hatch: `CLAUDE_MEM_SKIP_SIG_VERIFY=1`. Activation is a one-time ops step (generate an Ed25519 keypair → embed the public key in `hook-update.mjs` → add the private key as the `RELEASE_SIGNING_KEY` GitHub secret); the private key never ships in the repo.
+
+Threat model: this stops in-transit tampering, mirror/CDN swaps, and wrong-artifact installs, and is tamper-evident; it does **not** stop a malicious commit by someone with repo+CI write access (CI signs whatever is tagged) — inherent to all CI-built provenance.
+
+### feat(release): non-blocking npm provenance (P1)
+
+`publish.yml` now attempts `npm publish --provenance` and falls back to a plain publish with a `::warning::` if attestation fails, so enabling the `NPM_PROVENANCE` repo variable is safe even before the npm token is confirmed automation/granular-scoped (a classic token previously hard-failed the release — #8583).
+
+### fix(ci): version-consistency gate now covers package-lock.json (P2)
+
+`publish.yml`'s release gate validated 4 of the 5 versioned files; it now also checks `package-lock.json`, matching the local pre-commit hook (5/5).
+
+### fix(ci): ShellCheck job now gates the build (P3)
+
+`scripts/setup.sh`'s two intentional `SC2016` findings (`node -e` blocks that pass variables via env, by design) carry inline `# shellcheck disable=SC2016` directives, so `ci.yml`'s ShellCheck job drops `continue-on-error` and now fails on new shell issues.
+
+### docs: npx install caveat (P3)
+
+The README notes that `npx github:…` installs the repo's default branch (HEAD); the npm package (`npx claude-mem-lite`) or a pinned `#vX.Y.Z` tag is the stable path.
+
 ## v3.7.1 — deferred-cleanup wiring fix + search-orchestrator unification
 
 Maintenance release: a data-hygiene fix plus internal refactors from the v3.6.0 audit follow-up. No user-facing API or default-behaviour changes.

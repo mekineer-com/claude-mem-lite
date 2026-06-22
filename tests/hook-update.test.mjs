@@ -4,6 +4,8 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
+import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
+import { buildReleaseManifest, serializeManifest } from '../lib/release-digest.mjs';
 
 vi.mock('node:child_process', () => ({ execSync: vi.fn() }));
 const mockedExecSync = vi.mocked(execSync);
@@ -713,6 +715,61 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
     const result = await syncDataDirFromCache({ sourceDir: root });
     expect(result).toMatchObject({ synced: true, to: '3.1.0' });
     expect(readFileSync(join(codeDir, 'cli.mjs'), 'utf8')).toContain('v3.1.0 cli');
+  });
+});
+
+describe('release signature verification (P1 supply-chain)', () => {
+  function makeSignedRelease(version = '9.9.9') {
+    const dir = makeDir('mem-sig-release');
+    writeFileSync(join(dir, 'cli.mjs'), '// cli\n');
+    writeFileSync(join(dir, 'server.mjs'), '// server\n');
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pub = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+    const bytes = serializeManifest(buildReleaseManifest(dir, ['cli.mjs', 'server.mjs'], version));
+    const sig = cryptoSign(null, Buffer.from(bytes), privateKey).toString('base64');
+    return { dir, pub, bytes, sig };
+  }
+
+  it('verifyDownloadedRelease passes for a valid signature + intact files', async () => {
+    const { verifyDownloadedRelease } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { dir, pub, bytes, sig } = makeSignedRelease();
+    expect(verifyDownloadedRelease(dir, bytes, sig, pub)).toMatchObject({ ok: true, reason: 'verified' });
+  });
+
+  it('verifyDownloadedRelease rejects a tampered file (hash mismatch)', async () => {
+    const { verifyDownloadedRelease } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { dir, pub, bytes, sig } = makeSignedRelease();
+    writeFileSync(join(dir, 'server.mjs'), '// TROJANED\n'); // post-sign tamper
+    const r = verifyDownloadedRelease(dir, bytes, sig, pub);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toMatch(/file-mismatch/);
+  });
+
+  it('verifyDownloadedRelease rejects a signature from a foreign key', async () => {
+    const { verifyDownloadedRelease } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { dir, bytes, sig } = makeSignedRelease();
+    const { publicKey: otherPub } = generateKeyPairSync('ed25519');
+    const r = verifyDownloadedRelease(dir, bytes, sig, otherPub.export({ type: 'spki', format: 'pem' }).toString());
+    expect(r).toMatchObject({ ok: false, reason: 'signature-invalid' });
+  });
+
+  it('verifyReleaseAuthenticity is INERT when no public key is embedded (back-compat default)', async () => {
+    const { verifyReleaseAuthenticity } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    // Embedded RELEASE_PUBLIC_KEY is '' by default → skip without touching the network.
+    const assets = [{ name: 'release-manifest.json', browser_download_url: 'https://github.com/x/y/releases/download/v1/release-manifest.json' }];
+    globalThis.fetch = vi.fn(); // must NOT be called
+    expect(await verifyReleaseAuthenticity('/nonexistent', assets)).toMatchObject({ ok: true, action: 'skipped-no-pubkey' });
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('verifyReleaseAuthenticity honors the CLAUDE_MEM_SKIP_SIG_VERIFY escape hatch', async () => {
+    const mod = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    process.env.CLAUDE_MEM_SKIP_SIG_VERIFY = '1';
+    try {
+      expect(await mod.verifyReleaseAuthenticity('/nonexistent', [])).toMatchObject({ ok: true, action: 'skipped-env' });
+    } finally {
+      delete process.env.CLAUDE_MEM_SKIP_SIG_VERIFY;
+    }
   });
 });
 

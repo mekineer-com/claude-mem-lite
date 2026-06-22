@@ -15,6 +15,7 @@ import { debugCatch, debugLog } from './utils.mjs';
 import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES } from './source-files.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
 import { atomicWriteFileSync } from './lib/atomic-write.mjs';
+import { verifyReleaseFiles, verifyManifestSignature } from './lib/release-digest.mjs';
 
 // ── Configuration ──────────────────────────────────────────
 const GITHUB_REPO = 'sdsrss/claude-mem-lite';
@@ -77,7 +78,7 @@ export async function checkForUpdate(options = {}) {
     if (hasUpdate) {
       debugLog('DEBUG', 'hook-update', `Update available: ${currentVersion} → ${latest.version}`);
       const canInstall = !pluginMode && Boolean(allowInstall);
-      const success = canInstall ? await downloadAndInstall(latest.tarballUrl, latest.version) : false;
+      const success = canInstall ? await downloadAndInstall(latest.tarballUrl, latest.version, latest.assets) : false;
       const newState = {
         lastCheck: new Date().toISOString(),
         installedVersion: success ? latest.version : currentVersion,
@@ -206,6 +207,7 @@ async function fetchLatestRelease() {
       version: result.tag_name.replace(/^v/, ''),
       tarballUrl: result.tarball_url,
       releaseUrl: result.html_url,
+      assets: Array.isArray(result.assets) ? result.assets : [],
     };
   }
 
@@ -221,6 +223,7 @@ async function fetchLatestRelease() {
       version: tag.name.replace(/^v/, ''),
       tarballUrl: `https://api.github.com/repos/${GITHUB_REPO}/tarball/${tag.name}`,
       releaseUrl: `https://github.com/${GITHUB_REPO}/releases/tag/${tag.name}`,
+      assets: [],
     };
   }
 
@@ -301,7 +304,7 @@ async function loadReleaseManifest(sourceDir) {
 
 // ── Download & Install ─────────────────────────────────────
 // Direct file copy instead of running old install.mjs (avoids symlink overwrite in dev)
-async function downloadAndInstall(tarballUrl, expectedVersion) {
+async function downloadAndInstall(tarballUrl, expectedVersion, assets = []) {
   const tmpDir = join(tmpdir(), `claude-mem-lite-update-${Date.now()}`);
   try {
     mkdirSync(tmpDir, { recursive: true });
@@ -321,6 +324,17 @@ async function downloadAndInstall(tarballUrl, expectedVersion) {
     const validation = validateExtractedTarball(tmpDir, expectedVersion);
     if (!validation.ok) {
       debugLog('WARN', 'hook-update', `Tarball validation failed: ${validation.reason}`);
+      return false;
+    }
+
+    // P1 supply-chain: cryptographically verify the release before installing.
+    // Opportunistic + inert until keyed — ok=false ONLY on a real tampering
+    // signal (signature present but invalid, or a file hash mismatch). Missing
+    // key / missing signature assets / fetch failure / escape hatch all proceed,
+    // so this never bricks auto-update for unsigned or pre-key releases.
+    const authentic = await verifyReleaseAuthenticity(tmpDir, assets);
+    if (!authentic.ok) {
+      debugLog('WARN', 'hook-update', `Release authenticity check failed (${authentic.action}) — aborting update`);
       return false;
     }
 
@@ -370,6 +384,92 @@ export function validateExtractedTarball(sourceDir, expectedVersion, expectedNam
   }
 
   return { ok: true };
+}
+
+// ── Release signature verification (P1 supply-chain hardening) ──────────────
+// Embedded Ed25519 PUBLIC key (SPKI PEM). EMPTY = unconfigured → verification is
+// INERT and auto-update behaves exactly as before. Activating it is a one-time
+// ops step (no private key ever ships in the repo):
+//   1. Generate a keypair (writes the PRIVATE key to a local file, prints PUBLIC):
+//        node -e "const c=require('crypto');const{publicKey,privateKey}=c.generateKeyPairSync('ed25519');process.stdout.write(publicKey.export({type:'spki',format:'pem'}));require('fs').writeFileSync('release-signing-key.pem',privateKey.export({type:'pkcs8',format:'pem'}))"
+//   2. Paste the printed PUBLIC key between the backticks below.
+//   3. Add the PRIVATE key (release-signing-key.pem contents) as the GitHub
+//      Actions secret RELEASE_SIGNING_KEY, then delete the local file.
+//      NEVER commit the private key.
+// Once a signed release exists, clients verify it; unsigned/older releases still
+// install (opportunistic). Signer: scripts/sign-release.mjs. Core: lib/release-digest.mjs.
+const RELEASE_PUBLIC_KEY = '';
+const MANIFEST_ASSET_NAME = 'release-manifest.json';
+const SIGNATURE_ASSET_NAME = 'release-manifest.json.sig';
+
+// Pure verifier (no I/O) — exported for unit testing. ok=true ONLY when the
+// Ed25519 signature over `manifestBytes` is valid for `publicKeyPem` AND every
+// file the manifest lists matches its sha256 under `extractedDir`.
+export function verifyDownloadedRelease(extractedDir, manifestBytes, signatureB64, publicKeyPem = RELEASE_PUBLIC_KEY) {
+  if (!verifyManifestSignature(manifestBytes, signatureB64, publicKeyPem)) {
+    return { ok: false, reason: 'signature-invalid' };
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(Buffer.isBuffer(manifestBytes) ? manifestBytes.toString('utf8') : String(manifestBytes));
+  } catch {
+    return { ok: false, reason: 'manifest-unparseable' };
+  }
+  const files = verifyReleaseFiles(extractedDir, manifest);
+  if (!files.ok) {
+    return { ok: false, reason: `file-mismatch: ${[...files.mismatches, ...files.missing].slice(0, 5).join(', ')}` };
+  }
+  return { ok: true, reason: 'verified' };
+}
+
+// Fetch a GitHub Release asset as a Buffer. Host-locked to github.com (the asset
+// browser_download_url); GitHub's own 302 to its CDN is followed by fetch.
+async function fetchAssetBuffer(url) {
+  if (!/^https:\/\/github\.com\/[\w./%~-]+$/.test(url || '')) {
+    throw new Error(`rejected asset url: ${url}`);
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// I/O gate called from downloadAndInstall after validateExtractedTarball.
+// Opportunistic: returns ok=false ONLY on a genuine tampering signal. Missing
+// embedded key, missing signature assets, asset-fetch failure, or the
+// CLAUDE_MEM_SKIP_SIG_VERIFY escape hatch all return ok=true so a verification
+// gap can never permanently brick auto-update.
+export async function verifyReleaseAuthenticity(extractedDir, assets) {
+  if (process.env.CLAUDE_MEM_SKIP_SIG_VERIFY) return { ok: true, action: 'skipped-env' };
+  if (!RELEASE_PUBLIC_KEY) return { ok: true, action: 'skipped-no-pubkey' };
+
+  const list = Array.isArray(assets) ? assets : [];
+  const manifestAsset = list.find(a => a && a.name === MANIFEST_ASSET_NAME);
+  const sigAsset = list.find(a => a && a.name === SIGNATURE_ASSET_NAME);
+  if (!manifestAsset || !sigAsset) {
+    debugLog('WARN', 'hook-update', 'Release carries no signature assets — proceeding unverified (unsigned release)');
+    return { ok: true, action: 'skipped-no-signature' };
+  }
+
+  let manifestBytes, signatureB64;
+  try {
+    manifestBytes = await fetchAssetBuffer(manifestAsset.browser_download_url);
+    signatureB64 = (await fetchAssetBuffer(sigAsset.browser_download_url)).toString('utf8').trim();
+  } catch (e) {
+    // A flaky asset CDN is not a tampering signal — don't brick the update over it.
+    debugLog('WARN', 'hook-update', `Signature asset fetch failed (${e.message}) — proceeding unverified`);
+    return { ok: true, action: 'skipped-fetch-failed' };
+  }
+
+  const r = verifyDownloadedRelease(extractedDir, manifestBytes, signatureB64);
+  if (!r.ok) return { ok: false, action: r.reason };
+  debugLog('DEBUG', 'hook-update', 'Release signature verified');
+  return { ok: true, action: 'verified' };
 }
 
 // opts.skipNpmInstall — copy + atomically switch the source files WITHOUT

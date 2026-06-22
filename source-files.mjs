@@ -73,6 +73,10 @@ export const SOURCE_FILES = [
   // + auto-update lock). Must ship or a partial install/update skips them.
   'lib/proc-lock.mjs',
   'lib/atomic-write.mjs',
+  // P1 supply-chain: shared release-signing core (sha256 manifest + Ed25519
+  // verify). Imported by hook-update.mjs (verify) + scripts/sign-release.mjs (CI
+  // sign). Must ship or auto-update can't verify release signatures.
+  'lib/release-digest.mjs',
   // v2.41 god-module split — mem-cli.mjs router + per-cmd handlers under cli/
   'cli/common.mjs',
   'cli/fts-check.mjs',

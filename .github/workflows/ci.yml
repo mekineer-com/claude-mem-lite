@@ -22,13 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # shellcheck is preinstalled on ubuntu-latest runners.
-      # TODO: scripts/setup.sh has 2 SC2016 (info) findings on the node -e
-      # heredocs (lines ~89/144 — single-quoted on purpose, shell vars are passed
-      # via env not expansion). Baseline = info-only, no warnings/errors. Flip
-      # continue-on-error to false once those are addressed so this job gates.
+      # shellcheck is preinstalled on ubuntu-latest runners. setup.sh's two
+      # node -e blocks are single-quoted on purpose (vars passed via env, not
+      # shell expansion) and now carry inline `# shellcheck disable=SC2016`
+      # directives, so this job gates on a clean exit 0.
       - name: ShellCheck shipped scripts
-        continue-on-error: true
         run: shellcheck scripts/post-tool-use.sh scripts/pre-commit.sh scripts/setup.sh
 
   audit:

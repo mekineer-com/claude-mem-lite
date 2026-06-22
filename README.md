@@ -172,6 +172,8 @@ npx github:sdsrss/claude-mem-lite
 
 Source files are automatically copied to `~/.claude-mem-lite/` for persistence.
 
+> **Note:** `npx github:…` installs from the repo's **default branch (HEAD)**, which can be ahead of the latest published release. For the stable released version use the npm package (`npx claude-mem-lite`), or pin a release tag: `npx github:sdsrss/claude-mem-lite#vX.Y.Z`.
+
 ### Method 3: git clone
 
 ```bash

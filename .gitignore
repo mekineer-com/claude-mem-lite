@@ -28,3 +28,11 @@ tmp/
 benchmark/datasets/*.json
 benchmark/datasets/*.jsonl
 benchmark/results/
+
+# CI-generated release-signing artifacts (P1) — produced by scripts/sign-release.mjs
+# in the publish job and uploaded as GitHub Release assets; never committed.
+release-manifest.json
+release-manifest.json.sig
+# Release signing PRIVATE key — generated locally during Phase-2 activation, then
+# added as the RELEASE_SIGNING_KEY GitHub secret and deleted. Must NEVER be committed.
+release-signing-key.pem

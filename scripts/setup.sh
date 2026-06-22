@@ -86,6 +86,7 @@ mark_deps_broken() {
   # having to re-derive them. Delegate JSON serialization to node so embedded
   # quotes / shell metachars in $ROOT or $reason can't produce an invalid file
   # (bash `printf '"..%s.."'` cannot escape arbitrary strings safely; v2.79.1 fix).
+  # shellcheck disable=SC2016  # node script single-quoted on purpose; vars passed via env (MARK_*), not shell expansion
   MARK_REASON="$reason" MARK_ROOT="$ROOT" MARK_FLAG="$DEPS_FLAG" node -e '
     const fs = require("fs");
     const reason = process.env.MARK_REASON || "unknown";
@@ -141,6 +142,7 @@ fi
 #    versions; same shape as the .deps-broken self-heal pattern.
 MCP_MIGRATION="$DATA_DIR/runtime/.mcp-dedup-v2.78"
 if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" && ! -f "$MCP_MIGRATION" ]]; then
+  # shellcheck disable=SC2016  # node script single-quoted on purpose; CLAUDE_JSON passed via env, not shell expansion
   CLAUDE_JSON="$HOME/.claude.json" node -e '
     const fs = require("fs");
     let changed = false;
