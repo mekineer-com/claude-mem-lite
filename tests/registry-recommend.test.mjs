@@ -8,6 +8,7 @@ import {
   getRecoCooldown, setRecoCooldown,
   logShadowReco, logShadowAdoption, computeFunnel,
   recommendSkill, recordSkillAdoption, formatFunnel, readShadowLog,
+  replayGate, computeSweep, formatSweep,
 } from '../registry-recommend.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
 
@@ -44,6 +45,11 @@ describe('intentMatch', () => {
   it('matches a tag as a token prefix (plural-tolerant)', () => { expect(intentMatch('please write tests for foo', cand('tdd', -3, 'test,tdd'))).toBe(true); });
   it('does not match incidental superstrings', () => { expect(intentMatch('grab the latest build', cand('tdd', -3, 'test'))).toBe(false); });
   it('false when candidate has no intent tags', () => { expect(intentMatch('write tests', cand('x', -3, ''))).toBe(false); });
+  // CJK bridge: pure-中文 prompts have no word boundaries and intent_tags are English, so a
+  // Chinese prompt structurally failed gate 3 until CJK_INTENT_MAP injects English equivalents.
+  it('matches an English intent_tag from a pure-CJK prompt (测试→test)', () => { expect(intentMatch('帮我写测试', cand('tdd', -3, 'test,tdd'))).toBe(true); });
+  it('bridges other CJK intents (部署→deploy)', () => { expect(intentMatch('准备部署到生产', cand('deployer', -3, 'deploy,release'))).toBe(true); });
+  it('does not bridge-match an unrelated tag from incidental CJK', () => { expect(intentMatch('今天天气不错', cand('deployer', -3, 'deploy,release'))).toBe(false); });
 });
 
 describe('applyGate', () => {
@@ -131,5 +137,118 @@ describe('formatFunnel', () => {
   it('renders counts, block reasons, precision proxy', () => {
     const out = formatFunnel({ reco: 10, pass: 4, blockByReason: { below_floor: 5, intent_mismatch: 1 }, adopt: 3, passSkills: { tdd: 4 }, adoptSkills: { tdd: 2, qa: 1 } });
     expect(out).toContain('reco=10'); expect(out).toContain('pass=4'); expect(out).toContain('below_floor'); expect(out).toContain('tdd');
+  });
+  it('renders matched precision + targeting lift when session data is present', () => {
+    const out = formatFunnel({
+      reco: 4, pass: 2, blockByReason: {}, adopt: 3, passSkills: { tdd: 2 }, adoptSkills: { tdd: 2 },
+      sessions: 3, matched: { pass: 2, adopt: 1, precision: 0.5 },
+      lift: { tdd: { passSessions: 2, hitSessions: 1, adoptGivenPass: 0.5, baseRate: 0.6667, lift: 0.75 } },
+    });
+    expect(out).toContain('sessions=3');
+    expect(out).toContain('1/2 (50%)');
+    expect(out).toContain('lift 0.75');
+  });
+  it('omits the matched/lift block for a session-less (back-compat) funnel object', () => {
+    const out = formatFunnel({ reco: 1, pass: 0, blockByReason: {}, adopt: 0, passSkills: {}, adoptSkills: {} });
+    expect(out).not.toContain('matched precision');
+  });
+});
+
+const SEED_TDD = `INSERT INTO resources (name,type,source,file_hash,status,local_path,quality_tier,trigger_patterns,keywords,intent_tags,capability_summary,use_cases)
+  VALUES ('tdd','skill','preinstalled','h','active','/p','installed','write failing test tdd red green','test tdd vitest','test,tdd','tdd skill','writing tests')`;
+
+describe('session-keyed shadow rows (B1)', () => {
+  withSandbox();
+  const prevMode = process.env.CLAUDE_MEM_RECOMMEND_MODE;
+  afterAll(() => { if (prevMode === undefined) delete process.env.CLAUDE_MEM_RECOMMEND_MODE; else process.env.CLAUDE_MEM_RECOMMEND_MODE = prevMode; });
+  it('threads session id into both reco and adopt rows so they can be paired', () => {
+    process.env.CLAUDE_MEM_RECOMMEND_MODE = 'shadow';
+    const db = createRegistryTestDb(); db.prepare(SEED_TDD).run();
+    recommendSkill(db, 'please write tdd tests for the parser', 'pb1', { sessionId: 'sess-A', hasSignal: true });
+    recordSkillAdoption('Skill', { skill: 'tdd' }, 'pb1', 'sess-A');
+    const rows = [...readShadowLog(1)].filter(x => x.project === 'pb1');
+    const reco = rows.find(x => x.kind === 'reco');
+    const adopt = rows.find(x => x.kind === 'adopt');
+    expect(reco.session).toBe('sess-A');
+    expect(adopt.session).toBe('sess-A');
+    db.close();
+  });
+});
+
+describe('computeFunnel matched precision + lift (B2)', () => {
+  withSandbox();
+  it('pairs in-session PASS→adopt and computes per-skill targeting lift', () => {
+    // s1: gate would PASS tdd, Claude adopts tdd  → matched hit
+    logShadowReco('pf', { session: 's1', verdict: 'PASS', reason: 'pass', skill: 'tdd', relevance: -10, ncand: 2 });
+    logShadowAdoption('pf', { session: 's1', skill: 'tdd' });
+    // s2: gate would PASS tdd, Claude adopts qa instead → matched miss for tdd
+    logShadowReco('pf', { session: 's2', verdict: 'PASS', reason: 'pass', skill: 'tdd', relevance: -10, ncand: 2 });
+    logShadowAdoption('pf', { session: 's2', skill: 'qa' });
+    // s3: no reco, Claude adopts tdd organically → raises tdd's base rate
+    logShadowAdoption('pf', { session: 's3', skill: 'tdd' });
+    const f = computeFunnel(1);
+    expect(f.sessions).toBe(3);
+    expect(f.matched.pass).toBe(2);
+    expect(f.matched.adopt).toBe(1);
+    expect(f.matched.precision).toBeCloseTo(0.5, 5);
+    // tdd: adopted-given-pass = 1/2 = 0.5; base rate = adopted in 2/3 sessions = 0.667; lift = 0.75
+    expect(f.lift.tdd.lift).toBeCloseTo(0.75, 2);
+    // qa never PASSed → absent from the lift table (lift is over gate decisions, not adoptions)
+    expect(f.lift.qa).toBeUndefined();
+  });
+});
+
+describe('reco row replay vector (B3)', () => {
+  withSandbox();
+  const prevMode = process.env.CLAUDE_MEM_RECOMMEND_MODE;
+  afterAll(() => { if (prevMode === undefined) delete process.env.CLAUDE_MEM_RECOMMEND_MODE; else process.env.CLAUDE_MEM_RECOMMEND_MODE = prevMode; });
+  it('logs top2 relevance + intent/cooldown bits so the gate can be replayed offline', () => {
+    process.env.CLAUDE_MEM_RECOMMEND_MODE = 'shadow';
+    const db = createRegistryTestDb();
+    db.prepare(SEED_TDD).run();
+    db.prepare(`INSERT INTO resources (name,type,source,file_hash,status,local_path,quality_tier,trigger_patterns,keywords,intent_tags,capability_summary,use_cases)
+      VALUES ('tdd2','skill','preinstalled','h2','active','/p','installed','write failing test tdd','test tdd','test,tdd','another tdd skill','writing tests')`).run();
+    recommendSkill(db, 'please write tdd tests', 'pv', { sessionId: 'sv' });
+    const reco = [...readShadowLog(1)].filter(x => x.kind === 'reco' && x.project === 'pv')[0];
+    expect(typeof reco.intentTop).toBe('boolean');
+    expect(reco.cooldownTop).toBe(false);
+    expect(reco.rel2 === null || typeof reco.rel2 === 'number').toBe(true);
+    db.close();
+  });
+});
+
+describe('replayGate (B3 offline threshold replay)', () => {
+  const row = (relevance, rel2, intentTop = true, cooldownTop = false) => ({ relevance, rel2, intentTop, cooldownTop });
+  it('PASS when top clears floor, margin ok, intent matched, not cooled', () => { expect(replayGate(row(-10, -5), -8, 1)).toBe('PASS'); });
+  it('BLOCK below_floor at a stricter floor', () => { expect(replayGate(row(-6, -2), -8, 1)).toBe('BLOCK'); });
+  it('BLOCK low_margin when top2 is within margin', () => { expect(replayGate(row(-10, -9.5), -8, 1)).toBe('BLOCK'); });
+  it('single candidate (rel2 null) skips the margin gate', () => { expect(replayGate(row(-10, null), -8, 1)).toBe('PASS'); });
+  it('BLOCK on intent mismatch or cooldown regardless of thresholds', () => {
+    expect(replayGate(row(-10, -5, false, false), -8, 1)).toBe('BLOCK');
+    expect(replayGate(row(-10, -5, true, true), -8, 1)).toBe('BLOCK');
+  });
+  it('null relevance always BLOCKs', () => { expect(replayGate(row(null, null), -8, 1)).toBe('BLOCK'); });
+});
+
+describe('computeSweep (B3 ROC over thresholds)', () => {
+  withSandbox();
+  it('replays the gate per (floor,margin) and joins adoptions for matched precision', () => {
+    // sx: strong tdd vector, adopted
+    logShadowReco('psw', { session: 'sx', verdict: 'PASS', reason: 'pass', skill: 'tdd', relevance: -10, rel2: -5, intentTop: true, cooldownTop: false, ncand: 2 });
+    logShadowAdoption('psw', { session: 'sx', skill: 'tdd' });
+    // sy: weak qa vector (rel -3), not adopted — only clears a loose floor
+    logShadowReco('psw', { session: 'sy', verdict: 'BLOCK', reason: 'below_floor', skill: 'qa', relevance: -3, rel2: null, intentTop: true, cooldownTop: false, ncand: 1 });
+    const grid = computeSweep(1, [-8, -2], [0]);
+    const strict = grid.find(g => g.floor === -8 && g.margin === 0);
+    const loose = grid.find(g => g.floor === -2 && g.margin === 0);
+    expect(strict.pass).toBe(1); expect(strict.matchAdopt).toBe(1); expect(strict.precision).toBeCloseTo(1, 5);
+    expect(loose.pass).toBe(2); expect(loose.matchAdopt).toBe(1); expect(loose.precision).toBeCloseTo(0.5, 5);
+  });
+});
+
+describe('formatSweep', () => {
+  it('renders each grid cell with pass count and matched precision', () => {
+    const out = formatSweep([{ floor: -8, margin: 0, pass: 3, matchPass: 3, matchAdopt: 2, precision: 2 / 3 }]);
+    expect(out).toContain('floor=-8'); expect(out).toContain('pass=3'); expect(out).toContain('67%');
   });
 });

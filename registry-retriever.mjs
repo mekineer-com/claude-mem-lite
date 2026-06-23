@@ -85,6 +85,23 @@ function extractCJKTokens(text) {
   return found;
 }
 
+/**
+ * English intent equivalents of any CJK_INTENT_MAP phrase present in `text` (deduped).
+ * Shared primitive so the skill-recommendation gate's intent match (registry-recommend.mjs)
+ * can bridge pure-中文 prompts to English intent_tags — Chinese has no word boundaries, so a
+ * phrase like "写测试" never token-matches the English tag "test" without this. Latin in keys
+ * ("修bug") is lowercased on the haystack so case can't miss; CJK is case-invariant.
+ */
+export function cjkIntentTokens(text) {
+  const s = String(text || '').toLowerCase();
+  const out = [];
+  const seen = new Set();
+  for (const [key, en] of Object.entries(CJK_INTENT_MAP)) {
+    if (s.includes(key) && !seen.has(en)) { seen.add(en); out.push(en); }
+  }
+  return out;
+}
+
 // ─── Query Building ──────────────────────────────────────────────────────────
 
 /**

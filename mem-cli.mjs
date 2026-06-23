@@ -13,7 +13,7 @@ import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { computeFunnel, formatFunnel } from './registry-recommend.mjs';
+import { computeFunnel, formatFunnel, computeSweep, formatSweep, DEFAULT_SWEEP_FLOORS, DEFAULT_SWEEP_MARGINS } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
@@ -1952,6 +1952,19 @@ function cmdRegistry(_memDb, args) {
   if (action === 'recommend-stats') {
     const days = (typeof flags.days === 'string' || typeof flags.days === 'number') && +flags.days > 0 ? Math.floor(+flags.days) : 7;
     out(formatFunnel(computeFunnel(days)));
+    if (flags.sweep) {
+      // Offline ROC over the shipped gate thresholds (B3). Parse `--floors`/`--margins` as
+      // comma lists of finite numbers; fall back to the spanning defaults on bad/empty input.
+      const parseNums = (v, fallback) => {
+        if (typeof v !== 'string') return fallback;
+        const nums = v.split(',').map(x => Number(x.trim())).filter(Number.isFinite);
+        return nums.length ? nums : fallback;
+      };
+      const floors = parseNums(flags.floors, DEFAULT_SWEEP_FLOORS);
+      const margins = parseNums(flags.margins, DEFAULT_SWEEP_MARGINS);
+      out('');
+      out(formatSweep(computeSweep(days, floors, margins)));
+    }
     return;
   }
 

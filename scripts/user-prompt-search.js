@@ -711,7 +711,9 @@ async function main() {
         const hasSignal = !!(extractErrorSignature(promptText) || extractFiles(promptText).length > 0 || detectIntent(promptText));
         const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
         rdb.pragma('busy_timeout = 500');
-        try { recommendSkill(rdb, promptText, inferProject(), { hasSignal }); }
+        // CC session_id (hook stdin) is the cross-hook pairing key: PostToolUse adoptions
+        // in this same session join back to this reco for matched precision (B1).
+        try { recommendSkill(rdb, promptText, inferProject(), { hasSignal, sessionId: hookData.session_id }); }
         finally { rdb.close(); }
       }
     } catch { /* silent — never block on recommendation failure */ }

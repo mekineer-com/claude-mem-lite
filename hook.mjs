@@ -263,7 +263,9 @@ async function handlePostToolUse() {
   // skill load's response shape varies. Never throws.
   if (tool_name === 'Skill') {
     const ti = typeof tool_input === 'string' ? tryParseJson(tool_input) : (tool_input || {});
-    try { recordSkillAdoption('Skill', ti, inferProject()); } catch {}
+    // hookData.session_id (CC UUID) pairs this adoption to the would-be reco from the
+    // UserPromptSubmit hook earlier in the same session (matched precision, B1).
+    try { recordSkillAdoption('Skill', ti, inferProject(), hookData.session_id); } catch {}
   }
 
   const resp = normalizeToolResponse(tool_response);

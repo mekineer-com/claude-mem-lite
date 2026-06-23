@@ -6,7 +6,7 @@
 import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { searchResources } from './registry-retriever.mjs';
+import { searchResources, cjkIntentTokens } from './registry-retriever.mjs';
 
 const VALID_MODES = new Set(['shadow', 'live', 'off']);
 
@@ -49,6 +49,10 @@ export function intentMatch(promptText, candidate) {
   const tags = String(candidate.intent_tags || '').toLowerCase().split(/[,\s]+/).filter(Boolean);
   if (tags.length === 0) return false;
   const tokens = String(promptText).toLowerCase().split(TOKEN_SPLIT).filter(Boolean);
+  // CJK bridge: intent_tags are English, but Chinese has no word boundaries, so a pure-中文
+  // prompt ("写测试") tokenizes to one CJK run that never prefix-matches "test". Inject the
+  // English equivalents of any CJK_INTENT_MAP phrase present so 中文 prompts can clear gate 3.
+  for (const en of cjkIntentTokens(promptText)) tokens.push(en);
   return tags.some(tag => tokens.some(tok => (tag.length >= 3 ? tok.startsWith(tag) : tok === tag)));
 }
 
@@ -118,18 +122,98 @@ export function* readShadowLog(days = 7) {
   }
 }
 
-/** Aggregate the would-be funnel for the flip decision (spec §8). */
+const lc = (s) => String(s ?? '').toLowerCase();
+
+/**
+ * Aggregate the would-be funnel for the flip decision (spec §8).
+ *
+ * Coarse global counts (reco/pass/blockByReason/adopt/passSkills/adoptSkills) are kept for
+ * back-compat. The flip-decision metrics live under `matched`/`lift`/`sessions`:
+ *  - matched: in-session PASS→adopt pairing (true matched precision, not a global name join).
+ *  - lift[skill]: P(adopt | gate PASSed it this session) / base-rate(adopt). >1 means the gate
+ *    beats the skill's organic base rate — the only popularity-robust evidence the gate has
+ *    targeting signal. Null-session rows can't be paired, so they feed only the coarse counts.
+ */
 export function computeFunnel(days = 7) {
   const stats = { reco: 0, pass: 0, blockByReason: {}, adopt: 0, passSkills: {}, adoptSkills: {} };
   const bump = (obj, k) => { if (k) obj[k] = (obj[k] || 0) + 1; };
+  const bySession = new Map();
+  const sess = (id) => { let e = bySession.get(id); if (!e) { e = { pass: new Set(), adopt: new Set() }; bySession.set(id, e); } return e; };
   for (const row of readShadowLog(days)) {
     if (row.kind === 'reco') {
       stats.reco++;
-      if (row.verdict === 'PASS') { stats.pass++; bump(stats.passSkills, row.skill); }
+      if (row.verdict === 'PASS') { stats.pass++; bump(stats.passSkills, row.skill); if (row.session) sess(row.session).pass.add(lc(row.skill)); }
       else bump(stats.blockByReason, row.reason);
-    } else if (row.kind === 'adopt') { stats.adopt++; bump(stats.adoptSkills, row.skill); }
+    } else if (row.kind === 'adopt') {
+      stats.adopt++; bump(stats.adoptSkills, row.skill);
+      if (row.session) sess(row.session).adopt.add(lc(row.skill));
+    }
+  }
+  stats.sessions = bySession.size;
+  let mPass = 0, mAdopt = 0;
+  const passSessions = {}, hitSessions = {}, baseSessions = {};
+  for (const { pass, adopt } of bySession.values()) {
+    for (const sk of pass) { mPass++; passSessions[sk] = (passSessions[sk] || 0) + 1; if (adopt.has(sk)) { mAdopt++; hitSessions[sk] = (hitSessions[sk] || 0) + 1; } }
+    for (const sk of adopt) baseSessions[sk] = (baseSessions[sk] || 0) + 1;
+  }
+  stats.matched = { pass: mPass, adopt: mAdopt, precision: mPass ? mAdopt / mPass : null };
+  stats.lift = {};
+  for (const sk of Object.keys(passSessions)) {
+    const ps = passSessions[sk], hs = hitSessions[sk] || 0;
+    const baseRate = stats.sessions ? (baseSessions[sk] || 0) / stats.sessions : 0;
+    const adoptGivenPass = ps ? hs / ps : 0;
+    stats.lift[sk] = { passSessions: ps, hitSessions: hs, adoptGivenPass, baseRate, lift: baseRate > 0 ? adoptGivenPass / baseRate : null };
   }
   return stats;
+}
+
+// Default sweep grid (B3). Raw BM25 magnitudes for real matches run ≈ -10..-15, so the
+// shipped floor (-1.5) is far more permissive than it looks; the grid spans that real range
+// so the ROC curve actually moves. Override via `recommend-stats --sweep --floors a,b --margins x,y`.
+export const DEFAULT_SWEEP_FLOORS = [-1.5, -5, -8, -10, -12];
+export const DEFAULT_SWEEP_MARGINS = [0, 0.5, 1, 2, 4];
+
+/**
+ * Recompute the gate verdict for a logged reco row at a hypothetical (floor, margin),
+ * from its eager replay vector (relevance/rel2/intentTop/cooldownTop). Pure — no retrieval.
+ * intent/cooldown are fixed pass/block bits; only floor and margin are swept.
+ */
+export function replayGate(row, floor, margin) {
+  const r1 = row.relevance;
+  // null/undefined relevance coerces to 0/NaN, so `r1 <= floor` is false → BLOCK (no null check).
+  if (!(r1 <= floor)) return 'BLOCK';
+  if (Number.isFinite(row.rel2) && !((row.rel2 - r1) >= margin)) return 'BLOCK';
+  if (!row.intentTop) return 'BLOCK';
+  if (row.cooldownTop) return 'BLOCK';
+  return 'PASS';
+}
+
+/**
+ * Offline ROC sweep (B3): replay every reco row at each (floor × margin) and join the would-be
+ * PASSes with in-session adoptions for matched precision. Turns the flip decision from one
+ * underpowered point estimate into a precision/recall curve over collected shadow data (spec §8).
+ */
+export function computeSweep(days = 7, floors = DEFAULT_SWEEP_FLOORS, margins = DEFAULT_SWEEP_MARGINS) {
+  const recos = [];
+  const adoptBySession = new Map();
+  for (const row of readShadowLog(days)) {
+    if (row.kind === 'reco') recos.push(row);
+    else if (row.kind === 'adopt' && row.session) {
+      if (!adoptBySession.has(row.session)) adoptBySession.set(row.session, new Set());
+      adoptBySession.get(row.session).add(lc(row.skill));
+    }
+  }
+  const grid = [];
+  for (const floor of floors) for (const margin of margins) {
+    let pass = 0, matchPass = 0, matchAdopt = 0;
+    for (const r of recos) {
+      if (replayGate(r, floor, margin) !== 'PASS') continue;
+      pass++;
+      if (r.session) { matchPass++; if (adoptBySession.get(r.session)?.has(lc(r.skill))) matchAdopt++; }
+    }
+    grid.push({ floor, margin, pass, matchPass, matchAdopt, precision: matchPass ? matchAdopt / matchPass : null });
+  }
+  return grid;
 }
 
 /**
@@ -143,10 +227,20 @@ export function recommendSkill(rdb, promptText, project, opts = {}) {
   try { candidates = fetchInstalledSkillCandidates(rdb, promptText); } catch { /* ignore */ }
   const cooldownSet = new Set(Object.keys(getRecoCooldown(project)));
   const result = applyGate(candidates, promptText, cooldownSet);
+  // Eager replay vector (B3): applyGate short-circuits, so a row that BLOCKed at below_floor
+  // never evaluated intent/cooldown. Compute the gate's raw inputs unconditionally here so an
+  // offline sweep can recompute the verdict at any (floor, margin) without re-running retrieval.
+  const top = candidates[0] || null;
   logShadowReco(project, {
+    // session id (B1): the cross-hook key that lets PostToolUse adoptions be paired with
+    // this reco in the SAME session — without it, precision is only a global name-set join.
+    session: opts.sessionId ?? null,
     mode, verdict: result.verdict, reason: result.reason,
-    skill: result.candidate ? result.candidate.name : null,
-    relevance: result.candidate ? result.candidate.relevance : null,
+    skill: top ? top.name : null,
+    relevance: top ? top.relevance : null,
+    rel2: candidates[1] ? candidates[1].relevance : null,
+    intentTop: top ? intentMatch(promptText, top) : false,
+    cooldownTop: top ? cooldownSet.has(String(top.name).toLowerCase()) : false,
     ncand: candidates.length,
     // #8259: UserPromptSubmit injection cite-recall was 25.8% until gated on explicit
     // signal. Record signal-presence so the Phase-2 flip can test whether live injection
@@ -159,12 +253,14 @@ export function recommendSkill(rdb, promptText, project, opts = {}) {
 }
 
 /** PostToolUse adoption probe — Skill is the only visible adoption signal (mem_use is pre-filtered). */
-export function recordSkillAdoption(toolName, toolInput, project) {
+export function recordSkillAdoption(toolName, toolInput, project, sessionId = null) {
   if (getRecommendMode() === 'off') return;
   if (toolName !== 'Skill') return;
   const skill = toolInput && typeof toolInput === 'object' ? toolInput.skill : null;
   if (!skill) return;
-  logShadowAdoption(project, { skill: String(skill).toLowerCase() });
+  // session id (B1): same cross-hook key as the reco row, so adoptions pair to the
+  // would-be recommendation that fired earlier in this session (matched precision).
+  logShadowAdoption(project, { session: sessionId ?? null, skill: String(skill).toLowerCase() });
 }
 
 /** Human-readable funnel for `registry recommend-stats`. */
@@ -174,10 +270,32 @@ export function formatFunnel(s) {
   const overlap = Object.keys(s.passSkills).filter(k => s.adoptSkills[k])
     .map(k => `${k}(pass ${s.passSkills[k]}/adopt ${s.adoptSkills[k]})`).join(', ') || '(none)';
   const passRate = s.reco ? (100 * s.pass / s.reco).toFixed(1) : '0.0';
-  return [
+  const lines = [
     'shadow recommendation funnel:',
     `  reco=${s.reco}  pass=${s.pass} (${passRate}% of reco)  adopt=${s.adopt}`,
     `  block reasons:\n${blocks}`,
     `  PASS∩adopt (coarse precision proxy): ${overlap}`,
-  ].join('\n');
+  ];
+  // B2: session-paired matched precision + targeting lift (the flip-decision metrics).
+  if (typeof s.sessions === 'number') {
+    const mp = s.matched && s.matched.pass
+      ? `${s.matched.adopt}/${s.matched.pass} (${(100 * s.matched.precision).toFixed(0)}%)` : 'n/a';
+    const liftRows = Object.entries(s.lift || {}).filter(([, v]) => Number.isFinite(v.lift))
+      .sort((a, b) => b[1].lift - a[1].lift).slice(0, 5)
+      .map(([k, v]) => `${k}(lift ${v.lift.toFixed(2)}; ${v.hitSessions}/${v.passSessions} pass→adopt vs base ${(100 * v.baseRate).toFixed(0)}%)`)
+      .join(', ') || '(none)';
+    lines.push(`  sessions=${s.sessions}  matched precision (in-session PASS→adopt): ${mp}`);
+    lines.push(`  targeting lift (>1 = gate beats organic base rate): ${liftRows}`);
+  }
+  return lines.join('\n');
+}
+
+/** Human-readable threshold sweep for `registry recommend-stats --sweep`. */
+export function formatSweep(grid) {
+  const lines = ['gate threshold sweep (floor × margin → pass / matched precision):'];
+  for (const g of grid) {
+    const prec = Number.isFinite(g.precision) ? `${(100 * g.precision).toFixed(0)}%` : 'n/a';
+    lines.push(`  floor=${g.floor} margin=${g.margin}: pass=${g.pass}  matched=${g.matchAdopt}/${g.matchPass}  prec=${prec}`);
+  }
+  return lines.join('\n');
 }

@@ -1,7 +1,22 @@
 // tests/registry-retriever.test.mjs
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createRegistryTestDb } from './test-helpers.mjs';
-import { buildEnhancedQuery, buildQueryFromText, filterByProjectDomain, retrieveResources, searchResources } from '../registry-retriever.mjs';
+import { buildEnhancedQuery, buildQueryFromText, filterByProjectDomain, retrieveResources, searchResources, cjkIntentTokens } from '../registry-retriever.mjs';
+
+describe('cjkIntentTokens', () => {
+  it('returns English intent equivalents for CJK phrases present (substring map)', () => {
+    const out = cjkIntentTokens('帮我写测试然后部署');
+    expect(out).toContain('test');
+    expect(out).toContain('deploy');
+  });
+  it('dedupes when multiple CJK keys map to the same English intent', () => {
+    const out = cjkIntentTokens('写测试和单元测试'); // 测试→test, 单元测试→test
+    expect(out.filter(x => x === 'test').length).toBe(1);
+  });
+  it('returns [] for a pure-English prompt (no CJK keys can match)', () => {
+    expect(cjkIntentTokens('just refactor and deploy this')).toEqual([]);
+  });
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 

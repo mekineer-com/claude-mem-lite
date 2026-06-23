@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.12.0 — shadow-first skill recommendation (Phase 1): measure before injecting
+
+A new subsystem that, when a prompt signals intent, identifies the installed skill most likely to help — but in **shadow mode only** (the default): it logs what it *would have* recommended without injecting anything into context. No user-visible runtime behavior change (shadow logs are silent; zero context injection); the point of Phase 1 is to collect calibration data before any live injection (Phase 2, gated separately on that data). Opt in/out via `CLAUDE_MEM_RECOMMEND_MODE=shadow|live|off` (default `shadow`; `off` = kill-switch). Test suite 3174 → 3217 (+43, all green); ESLint clean.
+
+### feat(recommend): 4-gate precision filter over installed skills (shadow orchestrator)
+
+`registry-recommend.mjs` retrieves installed-skill candidates for each UserPromptSubmit and runs a 4-gate serial filter — absolute BM25 floor → top1/top2 margin → intent-tag token match → per-session cooldown — surfacing at most one would-be recommendation per prompt. PostToolUse records organic `Skill` adoptions. Both write to an append-only JSONL shadow log under `RUNTIME_DIR/recommendations/`, physically isolated from the registry DB so shadow data can never bias the live composite scorer before the feature is calibrated.
+
+### feat(recommend): flip-decision metrics — session-matched precision + targeting lift, not a global name join
+
+The shadow funnel (`registry recommend-stats [--days N]`) now keys recommendations and adoptions by Claude Code session id (threaded from hook stdin through both UserPromptSubmit and PostToolUse), so a would-be recommendation pairs to an adoption *in the same session* — true matched precision, not a popularity-confounded global PASS∩adopt name intersection. It also reports per-skill **lift** = P(adopt | gate PASSed it this session) ÷ organic base rate; lift > 1 is the only popularity-robust evidence the gate has real targeting signal. Rationale: shadow adoption is a biased-low proxy for live P(adopt | injected), so the Phase-2 flip criterion is lift + per-session injection density, not a raw-precision threshold (a single dogfooder's volume never reaches significance on raw precision).
+
+### feat(recommend): offline ROC threshold sweep (`recommend-stats --sweep`)
+
+Each shadow reco logs an eager replay vector (top1/top2 relevance + intent + cooldown bits, computed unconditionally so a short-circuited BLOCK still records them). `replayGate`/`computeSweep` re-run the gate at swept (floor, margin) thresholds without re-querying, joining the would-be PASSes with in-session adoptions — turning gate calibration from one underpowered point estimate into a precision/recall curve over collected data. `--floors a,b,c --margins x,y,z` override the spanning defaults.
+
+### feat(recommend): intent gate now bridges 中文 prompts (CJK_INTENT_MAP)
+
+`intent_tags` are English and Chinese has no word boundaries, so a pure-中文 prompt (`帮我写测试`) tokenized to one CJK run that could never prefix-match the English tag `test` — gate 3 was structurally unreachable for Chinese prompts. `cjkIntentTokens` (exported from `registry-retriever.mjs`, reusing the existing substring `CJK_INTENT_MAP`) now injects English intent equivalents into the match, closing a recall hole for bilingual use. Substring matching can incidentally over-match (`测试版`→`test`) but is contained by the other three gates and remains shadow-only.
+
 ## v3.11.0 — five robustness fixes from an end-to-end QA pass: secret-scrub leak, scan/execute parity, CLI cap, import-jsonl UX, hermetic tests
 
 A batch of correctness/safety fixes surfaced by a full end-to-end dogfooding pass (CLI, passive hooks, MCP server, maintenance ops, LLM enrichment, adopt/unadopt file writes, concurrency). One security fix, one scan↔execute parity fix, one CLI bound fix, one import-UX fix, one test-hermeticity fix. No new features, no breaking changes; default behavior is unchanged except the secret-scrub widening noted below. Test suite 3163 → 3174 (+11 regression tests, all green); ESLint clean.
