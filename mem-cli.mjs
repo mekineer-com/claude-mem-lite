@@ -13,6 +13,7 @@ import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
+import { computeFunnel, formatFunnel } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
@@ -1941,8 +1942,16 @@ import { cmdFtsCheck } from './cli/fts-check.mjs';
 function cmdRegistry(_memDb, args) {
   const { positional, flags } = parseArgs(args);
   const action = positional[0];
-  if (!action || !['list', 'stats', 'search', 'import', 'remove', 'reindex'].includes(action)) {
-    fail('[mem] Usage: claude-mem-lite registry <list|stats|search|import|remove|reindex> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
+  if (!action || !['list', 'stats', 'search', 'import', 'remove', 'reindex', 'recommend-stats'].includes(action)) {
+    fail('[mem] Usage: claude-mem-lite registry <list|stats|search|import|remove|reindex|recommend-stats> [--type skill|agent] [--query Q] [--name N] [--resource-type T]');
+    return;
+  }
+
+  // recommend-stats reads the shadow-recommendation JSONL (filesystem), not the
+  // registry DB — handle it before opening rdb so it works without a registry DB.
+  if (action === 'recommend-stats') {
+    const days = (typeof flags.days === 'string' || typeof flags.days === 'number') && +flags.days > 0 ? Math.floor(+flags.days) : 7;
+    out(formatFunnel(computeFunnel(days)));
     return;
   }
 

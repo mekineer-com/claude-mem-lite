@@ -20,7 +20,7 @@ export function getRecommendMode() {
 // relevance is raw bm25 (negative; more negative = better). Candidate must clear |floor|.
 export const RECO_BM25_FLOOR = -1.5;     // require row.relevance <= -1.5
 export const RECO_MARGIN = 0.5;          // require candidates[1].relevance - candidates[0].relevance >= 0.5
-export const RECO_COOLDOWN_MS = 300_000; // 5 min, mirrors T4 SKILL_COOLDOWN_MS
+const RECO_COOLDOWN_MS = 300_000;        // 5 min, mirrors T4 SKILL_COOLDOWN_MS (internal)
 
 // Lazy runtime-path resolution: read CLAUDE_MEM_DIR at call time (mirrors schema.mjs:13
 // DB_DIR formula) so tests sandbox via env without ESM-cache gymnastics, and prod reads

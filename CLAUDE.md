@@ -52,6 +52,7 @@ as the floor; flag NEW unused exports as PR review signal.
 | `registry.mjs` | Resource registry DB schema + CRUD |
 | `registry-retriever.mjs` | FTS5 search + BM25 composite scoring + domain filtering |
 | `registry-indexer.mjs` | Resource indexing pipeline |
+| `registry-recommend.mjs` | Intent-based skill recommendation (shadow-first): 4-gate precision filter over installed skills, append-only shadow log + funnel, `Skill`-adoption probe. Mode via `CLAUDE_MEM_RECOMMEND_MODE` (shadow\|live\|off, default shadow) |
 | `tfidf.mjs` | TF-IDF vector engine — tokenization, vocabulary, vectors, cosine similarity, RRF merge |
 | `tier.mjs` | Temporal tier system — activity-based time window classification |
 | `schema.mjs` | DB schema definitions and migrations (incl. vocab_state, observation_vectors) |
@@ -67,6 +68,7 @@ as the floor; flag NEW unused exports as PR review signal.
 - FTS5 search: sanitizeFtsQuery (synonym expansion) → BM25 scoring → OR fallback → concept co-occurrence
 - Context delivery: SessionStart hook stdout emits the `<claude-mem-context>` block fresh from DB; CLAUDE.md is no longer auto-updated (pre-v2.30 left a stale snapshot here)
 - Skill commands (`/search`, `/recall`, `/recent`, `/timeline`) use `!` preprocessing for CLI injection
+- Skill recommendation (shadow-first): `CLAUDE_MEM_RECOMMEND_MODE=shadow|live|off` (default `shadow`). Phase 1 logs would-be recommendations to `RUNTIME_DIR/recommendations/*.jsonl` (zero injection); inspect with `claude-mem-lite registry recommend-stats [--days N]`. Live injection (UserPromptSubmit, sibling to the T4 explicit-name pointer) is Phase 2, gated on shadow-data calibration. Adoption = `Skill` tool only (`mem_use` is pre-filtered in PostToolUse).
 
 ## Mem usage contract (applies to ALL sessions touching this repo)
 
