@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.12.0
+- **Version**: 3.12.1
 - **Package manager**: npm
-- **Test**: `npx vitest run` (158 test files / 3174 tests, vitest)
+- **Test**: `npx vitest run` (159 test files / 3218 tests, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **DB**: better-sqlite3 + FTS5 full-text search

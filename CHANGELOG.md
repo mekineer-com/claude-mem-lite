@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.12.1 — fix: shadow reco matched-precision join key (logged registry name, not Skill slug)
+
+The shadow recommendation funnel read 0% matched precision across the entire (floor × margin) sweep — which looked like a targeting failure but was a measurement bug. `recommendSkill` logged the registry short name (e.g. `superpowers-tdd`) into the shadow reco row, but adoption rows log the Skill-tool invocation slug (e.g. `superpowers:test-driven-development`); the in-session PASS→adopt join compared name vs slug and so never matched for any namespaced/aliased skill, masking real targeting signal. Fix: log `top.invocation_name || top.name` (the registry already stores the correct slug in `invocation_name`, populated by the scanner; `SEARCH_SQL` is `SELECT r.*` so candidates already carry it). Forward-only — the handful of pre-fix shadow rows stay name-keyed and won't retroactively pair. Shadow-mode only; no user-visible runtime behavior change. Diagnostic note recorded: a 0% metric flat across a full threshold sweep is more likely a join-key/instrumentation artifact than a real signal — at low N, read the raw events before concluding. Test suite 3217 → 3218 (+1 regression test, all green); ESLint clean.
+
 ## v3.12.0 — shadow-first skill recommendation (Phase 1): measure before injecting
 
 A new subsystem that, when a prompt signals intent, identifies the installed skill most likely to help — but in **shadow mode only** (the default): it logs what it *would have* recommended without injecting anything into context. No user-visible runtime behavior change (shadow logs are silent; zero context injection); the point of Phase 1 is to collect calibration data before any live injection (Phase 2, gated separately on that data). Opt in/out via `CLAUDE_MEM_RECOMMEND_MODE=shadow|live|off` (default `shadow`; `off` = kill-switch). Test suite 3174 → 3217 (+43, all green); ESLint clean.

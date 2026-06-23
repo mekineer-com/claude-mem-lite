@@ -236,7 +236,10 @@ export function recommendSkill(rdb, promptText, project, opts = {}) {
     // this reco in the SAME session — without it, precision is only a global name-set join.
     session: opts.sessionId ?? null,
     mode, verdict: result.verdict, reason: result.reason,
-    skill: top ? top.name : null,
+    // join key MUST be the Skill-tool invocation slug (e.g. 'superpowers:test-driven-development'),
+    // NOT the registry short name ('superpowers-tdd') — adoption rows log toolInput.skill (the slug),
+    // so logging top.name made in-session matched precision a guaranteed 0 for every namespaced skill.
+    skill: top ? (top.invocation_name || top.name) : null,
     relevance: top ? top.relevance : null,
     rel2: candidates[1] ? candidates[1].relevance : null,
     intentTop: top ? intentMatch(promptText, top) : false,

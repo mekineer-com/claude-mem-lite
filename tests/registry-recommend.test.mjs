@@ -175,6 +175,31 @@ describe('session-keyed shadow rows (B1)', () => {
   });
 });
 
+describe('reco join key = invocation slug (matched-precision regression)', () => {
+  withSandbox();
+  const prevMode = process.env.CLAUDE_MEM_RECOMMEND_MODE;
+  afterAll(() => { if (prevMode === undefined) delete process.env.CLAUDE_MEM_RECOMMEND_MODE; else process.env.CLAUDE_MEM_RECOMMEND_MODE = prevMode; });
+  // Real-world bug: the registry stores name='superpowers-tdd' but the Skill tool — and thus the
+  // adoption row — uses the slug 'superpowers:test-driven-development'. Logging top.name made the
+  // in-session PASS→adopt join compare name vs slug, so matched precision was a guaranteed 0 for
+  // every namespaced/aliased skill, masking real targeting signal. Fixtures elsewhere use
+  // name==slug, so only an invocation_name≠name fixture catches this.
+  it('logs the candidate invocation_name (slug) so reco pairs with the adoption row', () => {
+    process.env.CLAUDE_MEM_RECOMMEND_MODE = 'shadow';
+    const db = createRegistryTestDb();
+    db.prepare(`INSERT INTO resources (name,invocation_name,type,source,file_hash,status,local_path,quality_tier,trigger_patterns,keywords,intent_tags,capability_summary,use_cases)
+      VALUES ('superpowers-tdd','superpowers:test-driven-development','skill','preinstalled','h','active','/p','installed','write failing test tdd red green','test tdd vitest','test,tdd','tdd skill','writing tests')`).run();
+    recommendSkill(db, 'please write tdd tests for the parser', 'pjk', { sessionId: 'sk' });
+    recordSkillAdoption('Skill', { skill: 'superpowers:test-driven-development' }, 'pjk', 'sk');
+    const rows = [...readShadowLog(1)].filter(x => x.project === 'pjk');
+    const reco = rows.find(x => x.kind === 'reco');
+    const adopt = rows.find(x => x.kind === 'adopt');
+    expect(reco.skill).toBe('superpowers:test-driven-development'); // was 'superpowers-tdd' (the bug)
+    expect(reco.skill).toBe(adopt.skill); // keys align → matched precision can now pair
+    db.close();
+  });
+});
+
 describe('computeFunnel matched precision + lift (B2)', () => {
   withSandbox();
   it('pairs in-session PASS→adopt and computes per-skill targeting lift', () => {
