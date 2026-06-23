@@ -136,7 +136,7 @@ export function computeFunnel(days = 7) {
  * Phase-1 shadow orchestrator: retrieve → gate → log → cooldown on PASS.
  * Emits NOTHING and writes NO live telemetry. `off` → no-op. Returns the verdict.
  */
-export function recommendSkill(rdb, promptText, project) {
+export function recommendSkill(rdb, promptText, project, opts = {}) {
   const mode = getRecommendMode();
   if (mode === 'off') return { verdict: 'OFF', reason: 'off', candidate: null };
   let candidates = [];
@@ -148,6 +148,10 @@ export function recommendSkill(rdb, promptText, project) {
     skill: result.candidate ? result.candidate.name : null,
     relevance: result.candidate ? result.candidate.relevance : null,
     ncand: candidates.length,
+    // #8259: UserPromptSubmit injection cite-recall was 25.8% until gated on explicit
+    // signal. Record signal-presence so the Phase-2 flip can test whether live injection
+    // should gate on it (the decisive lever per that lesson). Shadow does not gate on it.
+    hasSignal: opts.hasSignal ?? null,
   });
   // Simulate live cooldown timing so the shadow funnel reflects real injection cadence.
   if (result.verdict === 'PASS') setRecoCooldown(project, result.candidate.name);

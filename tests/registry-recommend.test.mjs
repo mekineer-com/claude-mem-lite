@@ -7,7 +7,7 @@ import {
   fetchInstalledSkillCandidates, intentMatch, applyGate,
   getRecoCooldown, setRecoCooldown,
   logShadowReco, logShadowAdoption, computeFunnel,
-  recommendSkill, recordSkillAdoption, formatFunnel,
+  recommendSkill, recordSkillAdoption, formatFunnel, readShadowLog,
 } from '../registry-recommend.mjs';
 import { createRegistryTestDb } from './test-helpers.mjs';
 
@@ -104,10 +104,13 @@ describe('recommendSkill + recordSkillAdoption (shadow)', () => {
     process.env.CLAUDE_MEM_RECOMMEND_MODE = 'shadow';
     const db = createRegistryTestDb(); seed(db);
     const before = db.prepare('SELECT COUNT(*) c FROM invocations').get().c;
-    const r = recommendSkill(db, 'please write tdd tests for the parser', 'p1');
+    const r = recommendSkill(db, 'please write tdd tests for the parser', 'p1', { hasSignal: true });
     expect(['PASS', 'BLOCK']).toContain(r.verdict);
     expect(db.prepare('SELECT COUNT(*) c FROM invocations').get().c).toBe(before);
     expect(computeFunnel(1).reco).toBeGreaterThanOrEqual(1);
+    const recoRows = [...readShadowLog(1)].filter(x => x.kind === 'reco' && x.project === 'p1');
+    expect(recoRows.length).toBeGreaterThanOrEqual(1);
+    expect(recoRows[0].hasSignal).toBe(true);
     db.close();
   });
   it('off mode is a no-op', () => {

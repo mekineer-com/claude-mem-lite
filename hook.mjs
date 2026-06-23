@@ -58,6 +58,7 @@ import {
 } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
+import { recordSkillAdoption } from './registry-recommend.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -256,6 +257,14 @@ async function handlePostToolUse() {
   // Skip noise (source of truth: skip-tools.mjs)
   if (SKIP_TOOLS.has(tool_name)) return;
   if (SKIP_PREFIXES.some(p => tool_name.startsWith(p))) return;
+
+  // Shadow skill-adoption telemetry. mem_use is pre-filtered above, so the Skill tool is
+  // the only visible adoption signal (v1). Placed before the resp-length gate because a
+  // skill load's response shape varies. Never throws.
+  if (tool_name === 'Skill') {
+    const ti = typeof tool_input === 'string' ? tryParseJson(tool_input) : (tool_input || {});
+    try { recordSkillAdoption('Skill', ti, inferProject()); } catch {}
+  }
 
   const resp = normalizeToolResponse(tool_response);
   if (!resp || resp.length < 10) return;

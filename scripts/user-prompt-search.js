@@ -11,6 +11,7 @@ import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join, sep } from 'path';
 import Database from 'better-sqlite3';
 import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
+import { recommendSkill } from '../registry-recommend.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -697,6 +698,23 @@ async function main() {
         }
       }
     } catch { /* silent — never block on registry failure */ }
+
+    // ─── L2: Intent-based skill recommendation (shadow-first, v3.12) ─────
+    // Distinct from L1 (explicit-name pointer): fires on intent even when the
+    // user did not name a skill. Phase 1 = shadow only (logs, never emits).
+    // Reuses a readonly registry DB; cooldown/shadow writes go to the FS.
+    try {
+      if (existsSync(REGISTRY_DB_PATH)) {
+        // #8259: explicit-signal presence is the decisive lever for UPS injection
+        // quality (UPS cite-recall was 25.8% until gated on it). Logged in shadow so
+        // Phase 2 can decide whether live injection gates on it. Shadow measures broadly.
+        const hasSignal = !!(extractErrorSignature(promptText) || extractFiles(promptText).length > 0 || detectIntent(promptText));
+        const rdb = new Database(REGISTRY_DB_PATH, { readonly: true });
+        rdb.pragma('busy_timeout = 500');
+        try { recommendSkill(rdb, promptText, inferProject(), { hasSignal }); }
+        finally { rdb.close(); }
+      }
+    } catch { /* silent — never block on recommendation failure */ }
   } catch {
     // Hooks must never break Claude Code — swallow all errors
   } finally {

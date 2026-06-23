@@ -15,6 +15,9 @@ export const SOURCE_FILES = [
   'package.json', 'package-lock.json', 'skill.md',
   'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
+  // registry-recommend.mjs: statically imported by hook.mjs (PostToolUse adoption probe)
+  // and scripts/user-prompt-search.js (UserPromptSubmit shadow recommendation).
+  'registry-recommend.mjs',
   // registry-enricher/-github/-importer are dynamically imported by server.mjs
   // (mem_registry tool) and mem-cli.mjs (registry CLI subcommands). Missing
   // them from SOURCE_FILES silently broke those code paths prior to this fix.
