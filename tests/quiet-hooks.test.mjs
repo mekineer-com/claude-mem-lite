@@ -145,7 +145,7 @@ describe('server.mjs instructions-mode stderr trace', () => {
       try {
         const env = { HOME: process.env.HOME, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
         const r = await runServer(env);
-        expect(r.stderr).toContain('[mem] instructions: BASE reason=adopted:MEMORY.md-sentinel');
+        expect(r.stderr).toContain('[mem] instructions: BASE reason=adopted:steering');
       } finally {
         try { rmSync(join(process.env.HOME, '.claude', 'projects', encoded), { recursive: true, force: true }); } catch {}
       }

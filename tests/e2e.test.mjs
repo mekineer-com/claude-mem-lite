@@ -1042,9 +1042,12 @@ describe('Suite 8a: Additional E2E', () => {
     db.close();
 
     // Two session-starts
-    const run1 = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
+    // MEM_NO_AUTO_ADOPT isolates the context-delivery invariant from the v3.13
+    // managed-block write (adoption is exercised in Suite 11 / adopt-cli tests).
+    const noAdopt = { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2, MEM_NO_AUTO_ADOPT: '1' };
+    const run1 = runHook('session-start', { env: noAdopt });
     const claudeMd1 = readFileSync(join(projDir2, 'CLAUDE.md'), 'utf8');
-    const run2 = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir2 } });
+    const run2 = runHook('session-start', { env: noAdopt });
     const claudeMd2 = readFileSync(join(projDir2, 'CLAUDE.md'), 'utf8');
 
     // CLAUDE.md stays exactly as written (no context block ever appears)
@@ -1180,7 +1183,9 @@ describe('Suite 8a: Additional E2E', () => {
     `).run(sessId, now.toISOString(), now.getTime());
     db.close();
 
-    const run = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3 } });
+    // MEM_NO_AUTO_ADOPT isolates the context-delivery invariant from the v3.13
+    // managed-block write (which would legitimately create CLAUDE.md).
+    const run = runHook('session-start', { env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir3, MEM_NO_AUTO_ADOPT: '1' } });
 
     // CLAUDE.md must NOT be created
     const claudeMdPath = join(projDir3, 'CLAUDE.md');
@@ -1219,7 +1224,9 @@ describe('Suite 8: Session-start context delivery', () => {
     db.close();
 
     const run = runHook('session-start', {
-      env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir },
+      // MEM_NO_AUTO_ADOPT isolates the context-delivery invariant from the v3.13
+      // managed-block write — this test asserts CLAUDE.md is byte-untouched.
+      env: { HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir, MEM_NO_AUTO_ADOPT: '1' },
     });
 
     // Context appears in hook stdout (the delivery channel Claude actually reads)
@@ -1534,9 +1541,15 @@ describe('Suite 11: first-run auto-adopt', () => {
     const encoded = String(cwd).replace(/[^a-zA-Z0-9]/g, '-');
     return join(home, '.claude', 'projects', encoded, 'memory');
   }
-  function sentinelPresent(home, cwd) {
+  // Legacy memory-dir sentinel (pre-v3.13) — used only to assert migration removes it.
+  function legacySentinelPresent(home, cwd) {
     const p = join(encodedMemdir(home, cwd), 'MEMORY.md');
     return existsSync(p) && readFileSync(p, 'utf8').includes('claude-mem-lite:begin v1');
+  }
+  // v3.13 scheme: adopted = managed block in the project-tree CLAUDE.md.
+  function adopted(cwd) {
+    const p = join(cwd, 'CLAUDE.md');
+    return existsSync(p) && readFileSync(p, 'utf8').includes('claude-mem-lite:begin v2');
   }
 
   it('CLAUDE_PLUGIN_ROOT + first run → adopts + writes marker', () => {
@@ -1548,7 +1561,7 @@ describe('Suite 11: first-run auto-adopt', () => {
         MEM_NO_AUTO_ADOPT: undefined,
       },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+    expect(adopted(projectDir)).toBe(true);
     // Marker key is inferProject() output — contains "testproj"
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const markers = readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'));
@@ -1565,7 +1578,7 @@ describe('Suite 11: first-run auto-adopt', () => {
     runHook('session-start', {
       env: { HOME: tmpHome, MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+    expect(adopted(projectDir)).toBe(true);
     const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
     const markers = readdirSync(runtimeDir).filter(f => f.startsWith('.auto-adopt-'));
     expect(markers.length).toBeGreaterThan(0);
@@ -1577,7 +1590,7 @@ describe('Suite 11: first-run auto-adopt', () => {
     runHook('session-start', {
       env: { HOME: tmpHome, MEM_NO_AUTO_ADOPT: '1', MEM_QUIET_HOOKS: undefined },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+    expect(adopted(projectDir)).toBe(false);
   });
 
   it('CLAUDE_PLUGIN_ROOT + MEM_NO_AUTO_ADOPT=1 → does NOT adopt', () => {
@@ -1589,7 +1602,7 @@ describe('Suite 11: first-run auto-adopt', () => {
         MEM_QUIET_HOOKS: undefined,
       },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+    expect(adopted(projectDir)).toBe(false);
   });
 
   // v2.82.0: MEM_QUIET_HOOKS no longer gates auto-adopt. It's a stdout
@@ -1604,7 +1617,7 @@ describe('Suite 11: first-run auto-adopt', () => {
         MEM_NO_AUTO_ADOPT: undefined,
       },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+    expect(adopted(projectDir)).toBe(true);
   });
 
   // v2.82.0: per-project opt-out via .mem-no-auto-adopt sentinel.
@@ -1620,35 +1633,47 @@ describe('Suite 11: first-run auto-adopt', () => {
         MEM_NO_AUTO_ADOPT: undefined,
       },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+    expect(adopted(projectDir)).toBe(false);
   });
 
-  it('marker present → skips adopt on subsequent SessionStart (respects /unadopt)', () => {
-    // First run: adopts + writes marker
-    runHook('session-start', {
-      env: {
-        HOME: tmpHome,
-        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
-        MEM_QUIET_HOOKS: undefined,
-        MEM_NO_AUTO_ADOPT: undefined,
-      },
-    });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(true);
+  // v3.13: the SessionStart sync is now IDEMPOTENT and ungated by the one-shot
+  // marker (it is the migration vehicle). So removing the block by hand and
+  // re-running re-adopts — only `--disable` / MEM_NO_AUTO_ADOPT stops it. This
+  // replaces the pre-v3.13 "marker present → skips" behavior.
+  it('block removed but marker present → next SessionStart RE-ADOPTS (sync is ungated)', () => {
+    const env = { HOME: tmpHome, CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root', MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined };
+    runHook('session-start', { env });
+    expect(adopted(projectDir)).toBe(true);
 
-    // Manually remove the sentinel (simulating /unadopt) but keep the marker
-    const memPath = join(encodedMemdir(tmpHome, projectDir), 'MEMORY.md');
-    writeFileSync(memPath, '');
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+    // Simulate a manual block removal while the runtime marker still exists.
+    rmSync(join(projectDir, 'CLAUDE.md'), { force: true });
+    rmSync(join(projectDir, '.claude'), { recursive: true, force: true });
+    expect(adopted(projectDir)).toBe(false);
 
-    // Second session: marker still present → must NOT re-adopt
+    runHook('session-start', { env });
+    expect(adopted(projectDir)).toBe(true); // re-adopted
+  });
+
+  // Full migration integration: a project carrying the legacy memory-dir
+  // sentinel gets it stripped AND the CLAUDE.md block written on SessionStart.
+  it('legacy memory-dir sentinel is migrated to the CLAUDE.md block on SessionStart', () => {
+    const memdir = encodedMemdir(tmpHome, projectDir);
+    mkdirSync(memdir, { recursive: true });
+    // seed a legacy v1 block + a state sidecar (so the migration proves authorship)
+    writeFileSync(join(memdir, 'MEMORY.md'),
+      '## 用户偏好\n- keep\n<!-- claude-mem-lite:begin v1 -->\n## 插件契约\n- legacy line\n<!-- claude-mem-lite:end -->\n');
+    writeFileSync(join(memdir, '.plugin_claude_mem_lite_state.json'),
+      JSON.stringify({ version: 'v1', bodyHash: 'x', writtenAt: '2026-01-01' }));
+    writeFileSync(join(memdir, 'plugin_claude_mem_lite.md'), '# legacy');
+    expect(legacySentinelPresent(tmpHome, projectDir)).toBe(true);
+
     runHook('session-start', {
-      env: {
-        HOME: tmpHome,
-        CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root',
-        MEM_QUIET_HOOKS: undefined,
-        MEM_NO_AUTO_ADOPT: undefined,
-      },
+      env: { HOME: tmpHome, CLAUDE_PLUGIN_ROOT: '/tmp/fake-plugin-root', MEM_QUIET_HOOKS: undefined, MEM_NO_AUTO_ADOPT: undefined },
     });
-    expect(sentinelPresent(tmpHome, projectDir)).toBe(false);
+
+    expect(legacySentinelPresent(tmpHome, projectDir)).toBe(false); // legacy stripped
+    expect(existsSync(join(memdir, 'plugin_claude_mem_lite.md'))).toBe(false);
+    expect(readFileSync(join(memdir, 'MEMORY.md'), 'utf8')).toContain('- keep'); // user prose kept
+    expect(adopted(projectDir)).toBe(true); // new block written
   });
 });

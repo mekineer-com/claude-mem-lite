@@ -8,9 +8,11 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdir
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
-// Phase D: invited-memory sentinel detection. memdir.mjs only pulls in fs/path/os/crypto;
-// adopt-content.mjs is pure strings. No circular deps — memdir doesn't import hook-shared.
-import { memdirPath as _memdirPath, isAdopted as _isAdopted } from './memdir.mjs';
+// Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
+// fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
+// neither imports hook-shared.
+import { memdirPath as _memdirPath, isAdopted as _isAdoptedMemdir } from './memdir.mjs';
+import { isAdopted as _isAdoptedClaudeMd } from './claudemd.mjs';
 import { PLUGIN_SLUG as _PLUGIN_SLUG } from './adopt-content.mjs';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -38,14 +40,18 @@ export function isQuietHooks() {
   return process.env.MEM_QUIET_HOOKS === '1';
 }
 
-// Phase D (v2.32.1+): if the current project has adopted our invited-memory
-// sentinel, MEMORY.md already carries the triggers at system-prompt authority
-// — so hook + MCP-instruction output can also go quiet. isQuietHooks (env)
+// Phase D (v2.32.1+) → v3.13: if the current project has adopted our steering,
+// the contract is already loaded at system-prompt authority — so hook +
+// MCP-instruction output can also go quiet. v3.13 moved that contract from the
+// memory-dir MEMORY.md sentinel to the project CLAUDE.md managed block, so check
+// the new scheme first and keep the legacy memdir sentinel as a fallback (an
+// un-migrated project stays quiet through the transition). isQuietHooks (env)
 // remains an independent, stronger override.
 export function isAdoptedHere(cwd) {
   try {
     const resolved = cwd || process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-    return _isAdopted(_memdirPath(resolved), _PLUGIN_SLUG);
+    return _isAdoptedClaudeMd(resolved, _PLUGIN_SLUG)
+      || _isAdoptedMemdir(_memdirPath(resolved), _PLUGIN_SLUG);
   } catch {
     return false;
   }

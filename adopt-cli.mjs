@@ -1,25 +1,32 @@
-// Phase C (Invited-Memory plan, T11): CLI handlers for
-//   claude-mem-lite adopt [--all] [--force] [--dry-run] [--status]
-//   claude-mem-lite unadopt [--all]
+// CLAUDE.md-steering plan (v3.13): CLI handlers for
+//   claude-mem-lite adopt   [--all] [--force] [--dry-run] [--status] [--disable|--enable]
+//   claude-mem-lite unadopt [--all] [--force] [--dry-run] [--status]
 //
-// adopt = write sentinel section into MEMORY.md + drop plugin_claude_mem_lite.md
-// unadopt = precise sentinel removal + doc cleanup
-// --all  = scan every project under ~/.claude/projects/*/memory/
-// --force = override UserEditedError
-// --dry-run = print intent without writing
-// --status = list all adopted projects + versions
+// adopt   = write the managed block into <cwd>/CLAUDE.md + drop
+//           <cwd>/.claude/plugin_claude_mem_lite.md, and migrate this project's
+//           legacy memory-dir sentinel away.
+// unadopt = remove the CLAUDE.md block + detail doc (and clean any legacy residue).
+//
+// The project path is needed to write CLAUDE.md, but the per-project memdir slug
+// (~/.claude/projects/<encoded>/) is a LOSSY encoding of the real cwd — it cannot
+// be decoded back to a filesystem path. So `--all` cannot adopt arbitrary projects;
+// it is redefined as a legacy-cleanup sweep (strip old memory-dir sentinels across
+// every memdir). New-scheme adoption happens per-project on SessionStart (cwd known).
 
 import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import {
-  memdirPath, writePluginSection, removePluginSection,
-  writePluginDoc, removePluginDoc,
-  isAdopted, hasPluginState, readMemoryIndex,
-  UserEditedError, BudgetExceededError,
+  memdirPath, removePluginSection, removePluginDoc,
+  isAdopted as memdirIsAdopted, hasPluginState,
 } from './memdir.mjs';
 import {
-  PLUGIN_SLUG, CURRENT_SENTINEL_VERSION, getIndexLine, getDetailDoc,
+  writeManaged, removeManaged, isAdopted as claudeMdIsAdopted,
+  needsRefresh, migrateLegacyMemoryDir, hasLegacyMemdirSentinel,
+  claudeMdPath, detailDocPath,
+} from './claudemd.mjs';
+import {
+  PLUGIN_SLUG, CURRENT_SENTINEL_VERSION, buildClaudeMdBlock, getDetailDoc,
 } from './adopt-content.mjs';
 
 function log(msg) { console.log(msg); }
@@ -56,7 +63,8 @@ function hasFlag(args, flag) { return Array.isArray(args) && args.includes(flag)
 // `rm ~/.claude-mem-lite/runtime/.auto-adopt-*`. Managed via
 // `claude-mem-lite adopt --disable` / `--enable`. silentAutoAdopt checks it
 // at entry and skips WITHOUT writing the runtime marker, so toggling
-// `--enable` re-arms auto-adopt on the next SessionStart.
+// `--enable` re-arms auto-adopt on the next SessionStart. Kept in the memdir
+// (not the project tree) so it survives `unadopt` cleaning out .claude/.
 const DISABLE_SENTINEL_BASENAME = '.mem-no-auto-adopt';
 
 export function disableSentinelPath(memdir) {
@@ -68,97 +76,98 @@ export function isAutoAdoptDisabled(memdir) {
 }
 
 /**
- * cmdAdopt — write sentinel section + plugin doc to memdir.
- * Exit code 1 on any hard failure; skipped (--all + UserEditedError) doesn't
- * fail the batch.
+ * cmdAdopt — write the CLAUDE.md managed block + detail doc for the current
+ * project, and migrate its legacy memory-dir sentinel away.
+ *
+ * `--all` does NOT adopt every project (their real paths are unrecoverable from
+ * the lossy memdir slug) — it sweeps the legacy memory-dir cleanup across all
+ * memdirs. `--status`/`--disable`/`--enable` as before.
  */
 export function cmdAdopt(args = []) {
   if (hasFlag(args, '--status')) return statusAll();
   if (hasFlag(args, '--disable')) return cmdDisable(args);
   if (hasFlag(args, '--enable')) return cmdEnable(args);
+  if (hasFlag(args, '--all')) return migrateAll(args);
 
-  const all = hasFlag(args, '--all');
   const force = hasFlag(args, '--force');
   const dryRun = hasFlag(args, '--dry-run');
+  const cwd = detectCwd();
 
-  const targets = all
-    ? listAllMemdirs().map((m) => m.memdir)
-    : [memdirPath(detectCwd())];
-
-  if (targets.length === 0) {
-    log('[adopt] no memdirs to adopt (use without --all for current project)');
-    return;
-  }
-
-  let created = 0, updated = 0, unchanged = 0, skipped = 0, failed = 0;
-  for (const memdir of targets) {
-    const r = adoptOne(memdir, { force, dryRun, all });
-    if (r.action === 'created') created++;
-    else if (r.action === 'updated') updated++;
-    else if (r.action === 'unchanged') unchanged++;
-    else if (r.action === 'skipped') skipped++;
-    else if (r.action === 'dry-run') unchanged++;
-    else failed++;
-  }
-
-  log('');
-  log(`[adopt] ${targets.length} target(s): ${created} created, ${updated} updated, ${unchanged} unchanged, ${skipped} skipped, ${failed} failed`);
-  if (failed > 0) process.exitCode = 1;
+  adoptOne(cwd, { force, dryRun });
 }
 
-function adoptOne(memdir, { force, dryRun, all }) {
-  const contentLine = getIndexLine();
+function adoptOne(cwd, { force, dryRun }) {
+  const block = buildClaudeMdBlock();
+  const doc = getDetailDoc();
   const version = CURRENT_SENTINEL_VERSION;
 
   if (dryRun) {
-    log(`[adopt --dry-run] ${memdir}`);
-    log(`  MEMORY.md line: ${contentLine}`);
-    log(`  detail file:    plugin_claude_mem_lite.md (${getDetailDoc().length} chars)`);
+    log(`[adopt --dry-run] ${cwd}`);
+    log(`  CLAUDE.md block:  ${claudeMdPath(cwd)} (${block.length} chars, ${version})`);
+    log(`  detail doc:       ${detailDocPath(cwd, PLUGIN_SLUG)} (${doc.length} chars)`);
+    if (hasLegacyMemdirSentinel(cwd, PLUGIN_SLUG)) {
+      log(`  legacy migrate:   would strip memory-dir sentinel @ ${memdirPath(cwd)}`);
+    }
     return { action: 'dry-run' };
   }
 
   try {
-    const r = writePluginSection(memdir, { slug: PLUGIN_SLUG, version, contentLine, force });
-    writePluginDoc(memdir, PLUGIN_SLUG, getDetailDoc());
-    log(`[adopt] ${memdir} → ${r.action}`);
+    const mig = migrateLegacyMemoryDir(cwd, PLUGIN_SLUG, { force });
+    const r = writeManaged(cwd, { slug: PLUGIN_SLUG, version, block, doc });
+    const migNote = mig.action === 'removed' ? ' (+migrated legacy memdir)' : '';
+    log(`[adopt] ${cwd} → ${r.action}${migNote}`);
     return r;
   } catch (e) {
-    if (e instanceof UserEditedError && all) {
-      log(`[adopt] ${memdir} → skipped (user-edited; pass --force to override)`);
-      return { action: 'skipped' };
-    }
-    if (e instanceof UserEditedError) {
-      log(`[adopt] ${memdir} → refused: ${e.message}`);
-      log('[adopt] pass --force to overwrite, or edit/uninstall manually.');
-      return { action: 'failed' };
-    }
-    if (e instanceof BudgetExceededError) {
-      log(`[adopt] ${memdir} → failed: ${e.message}`);
-      return { action: 'failed' };
-    }
-    log(`[adopt] ${memdir} → error: ${e.message}`);
+    log(`[adopt] ${cwd} → error: ${e.message}`);
+    process.exitCode = 1;
     return { action: 'failed' };
   }
 }
 
 /**
- * silentAutoAdopt — plugin-mode first-run auto-adopt helper (v2.33.0+).
+ * migrateAll — `claude-mem-lite adopt --all`: legacy-cleanup sweep. Strips the
+ * old memory-dir sentinel + detail doc from every memdir. Does NOT write any
+ * CLAUDE.md block (target paths are unrecoverable) — that happens per-project on
+ * the next SessionStart. Respects the foreign-content guard unless --force.
+ */
+function migrateAll(args) {
+  const force = hasFlag(args, '--force');
+  const dryRun = hasFlag(args, '--dry-run');
+  const dirs = listAllMemdirs();
+  if (dirs.length === 0) { log('[adopt --all] no memdirs found'); return; }
+
+  let removed = 0, absent = 0, skipped = 0;
+  for (const { projectSlug, memdir } of dirs) {
+    if (dryRun) {
+      const has = memdirIsAdopted(memdir, PLUGIN_SLUG);
+      const action = !has ? 'absent'
+        : (hasPluginState(memdir, PLUGIN_SLUG) || force) ? 'would-remove' : 'would-skip-foreign';
+      log(`[adopt --all --dry-run] ${projectSlug} → ${action}`);
+      if (action === 'would-remove') removed++;
+      else if (action === 'would-skip-foreign') skipped++;
+      else absent++;
+      continue;
+    }
+    const r = removePluginSection(memdir, PLUGIN_SLUG, { force });
+    if (r.action === 'removed') { removePluginDoc(memdir, PLUGIN_SLUG); removed++; }
+    else if (r.action === 'skipped-foreign') skipped++;
+    else absent++;
+  }
+  log('');
+  log(`[adopt --all] legacy memory-dir cleanup over ${dirs.length} project(s): ${removed} cleaned, ${skipped} skipped-foreign, ${absent} none.`);
+  log('[adopt --all] CLAUDE.md adoption is per-project — it runs automatically on each project\'s next SessionStart.');
+}
+
+/**
+ * silentAutoAdopt — SessionStart idempotent sync (migration vehicle).
  *
- * Preconditions (caller must gate): CLAUDE_PLUGIN_ROOT set, MEM_NO_AUTO_ADOPT!=1,
- * first-attempt marker absent. This helper does NOT re-check those — it only
- * does the write + marker persistence. (v2.82.0: dropped MEM_QUIET_HOOKS gate;
- * quiet is a stdout control, not a side-effect control.)
- *
- * Behavior:
- *   - If `<memdir>/.mem-no-auto-adopt` exists: skip silently, do NOT write the
- *     runtime marker. This keeps `--enable` re-armable: deleting the disable
- *     sentinel lets the next SessionStart try again.
- *   - Else: writes plugin sentinel + detail doc to the memdir for `cwd`.
- *   - Writes a per-project first-attempt marker under `markerDir` so a later
- *     `/unadopt` is respected (no re-adopt loop).
- *   - Silent: never logs, never throws. Returns structured result.
- *
- * Returns { ok, action, reason } — caller uses for telemetry / debugLog only.
+ * Called every plugin-mode SessionStart (NOT gated by the one-shot marker, so
+ * existing users whose marker predates v3.13 still migrate). Order:
+ *   1. respect per-project `.mem-no-auto-adopt` opt-out → skip.
+ *   2. migrate legacy memory-dir sentinel away (idempotent; no-op once gone).
+ *   3. adopt the CLAUDE.md scheme if absent; else refresh if shipped content
+ *      drifted (unless CLAUDE_MEM_NO_TEMPLATE_REFRESH=1).
+ * Silent: never logs, never throws. Returns { ok, action, reason } for debugLog.
  */
 export function silentAutoAdopt({ cwd, markerDir, markerKey }) {
   const memdir = memdirPath(cwd);
@@ -166,27 +175,26 @@ export function silentAutoAdopt({ cwd, markerDir, markerKey }) {
     if (isAutoAdoptDisabled(memdir)) {
       return { ok: true, action: 'disabled', reason: 'disabled-by-sentinel' };
     }
-    if (isAdopted(memdir, PLUGIN_SLUG)) {
-      writeMarker(markerDir, markerKey);
-      return { ok: true, action: 'already-adopted' };
+    migrateLegacyMemoryDir(cwd, PLUGIN_SLUG);
+
+    const block = buildClaudeMdBlock();
+    const doc = getDetailDoc();
+    const version = CURRENT_SENTINEL_VERSION;
+
+    let action = 'already-adopted';
+    if (!claudeMdIsAdopted(cwd, PLUGIN_SLUG)) {
+      writeManaged(cwd, { slug: PLUGIN_SLUG, version, block, doc });
+      action = 'adopted';
+    } else if (process.env.CLAUDE_MEM_NO_TEMPLATE_REFRESH !== '1'
+        && needsRefresh(cwd, { slug: PLUGIN_SLUG, version, block, doc })) {
+      writeManaged(cwd, { slug: PLUGIN_SLUG, version, block, doc });
+      action = 'refreshed';
     }
-    writePluginSection(memdir, {
-      slug: PLUGIN_SLUG,
-      version: CURRENT_SENTINEL_VERSION,
-      contentLine: getIndexLine(),
-      force: false,
-    });
-    writePluginDoc(memdir, PLUGIN_SLUG, getDetailDoc());
-    writeMarker(markerDir, markerKey);
-    return { ok: true, action: 'adopted' };
+    if (markerDir && markerKey) writeMarker(markerDir, markerKey);
+    return { ok: true, action };
   } catch (e) {
-    // Budget exceeded, user-edited conflict, or FS error — write marker so we
-    // don't retry on every SessionStart. User can run /adopt --force manually.
-    try { writeMarker(markerDir, markerKey); } catch { /* marker best-effort */ }
-    const reason = e instanceof UserEditedError ? 'user-edited'
-      : e instanceof BudgetExceededError ? 'budget-exceeded'
-      : 'error';
-    return { ok: false, action: 'skipped', reason, err: e };
+    try { if (markerDir && markerKey) writeMarker(markerDir, markerKey); } catch { /* best-effort */ }
+    return { ok: false, action: 'skipped', reason: 'error', err: e };
   }
 }
 
@@ -202,13 +210,8 @@ export function hasAutoAdoptMarker(markerDir, markerKey) {
 
 /**
  * cmdDisable — `claude-mem-lite adopt --disable [--all]`.
- *
  * Writes `<memdir>/.mem-no-auto-adopt` so SessionStart auto-adopt skips this
- * project permanently. Idempotent: re-running on an already-disabled memdir is
- * a no-op. Does NOT remove an existing sentinel — pair with `unadopt` if you
- * want both. The two operations are deliberately separate:
- *   - `unadopt`      = "remove the contract now"
- *   - `adopt --disable` = "and don't auto-write it back"
+ * project permanently. Does NOT remove an existing block — pair with `unadopt`.
  */
 function cmdDisable(args) {
   const all = hasFlag(args, '--all');
@@ -216,10 +219,7 @@ function cmdDisable(args) {
     ? listAllMemdirs().map((m) => m.memdir)
     : [memdirPath(detectCwd())];
 
-  if (targets.length === 0) {
-    log('[adopt --disable] no memdirs found');
-    return;
-  }
+  if (targets.length === 0) { log('[adopt --disable] no memdirs found'); return; }
 
   let disabled = 0, already = 0;
   for (const memdir of targets) {
@@ -234,17 +234,13 @@ function cmdDisable(args) {
     log(`[adopt --disable] ${memdir} → disabled`);
     disabled++;
   }
-
   log('');
   log(`[adopt --disable] ${targets.length} target(s): ${disabled} newly disabled, ${already} already disabled`);
 }
 
 /**
- * cmdEnable — `claude-mem-lite adopt --enable [--all]`.
- *
- * Removes the `<memdir>/.mem-no-auto-adopt` sentinel so the next SessionStart
- * can auto-adopt again. Idempotent. Does NOT trigger an immediate adoption —
- * run plain `claude-mem-lite adopt` if you want that now.
+ * cmdEnable — `claude-mem-lite adopt --enable [--all]`. Removes the
+ * `.mem-no-auto-adopt` sentinel so the next SessionStart can auto-adopt again.
  */
 function cmdEnable(args) {
   const all = hasFlag(args, '--all');
@@ -252,10 +248,7 @@ function cmdEnable(args) {
     ? listAllMemdirs().map((m) => m.memdir)
     : [memdirPath(detectCwd())];
 
-  if (targets.length === 0) {
-    log('[adopt --enable] no memdirs found');
-    return;
-  }
+  if (targets.length === 0) { log('[adopt --enable] no memdirs found'); return; }
 
   let enabled = 0, absent = 0;
   for (const memdir of targets) {
@@ -269,56 +262,48 @@ function cmdEnable(args) {
     log(`[adopt --enable] ${memdir} → enabled`);
     enabled++;
   }
-
   log('');
   log(`[adopt --enable] ${targets.length} target(s): ${enabled} re-enabled, ${absent} not-disabled`);
 }
 
+/**
+ * statusAll — report the current project's new-scheme adoption, plus a sweep of
+ * how many memdirs still carry the legacy sentinel (i.e. await migration).
+ */
 function statusAll() {
+  const cwd = detectCwd();
+  const adoptedHere = claudeMdIsAdopted(cwd, PLUGIN_SLUG);
+  log('[adopt --status] current project:');
+  log(`  cwd:        ${cwd}`);
+  log(`  CLAUDE.md:  ${adoptedHere ? `✓ adopted (${CURRENT_SENTINEL_VERSION})` : '✗ not adopted'}`);
+  if (hasLegacyMemdirSentinel(cwd, PLUGIN_SLUG)) {
+    log('  legacy:     ⚠ memory-dir sentinel still present (migrates on next SessionStart, or run `adopt`)');
+  }
+
   const dirs = listAllMemdirs();
-  log('[adopt --status] scanning ~/.claude/projects/*/memory/');
-  if (dirs.length === 0) { log('  (no memdirs found)'); return; }
-  let adopted = 0, disabled = 0;
-  for (const { projectSlug, memdir } of dirs) {
-    const isAdoptedHere = isAdopted(memdir, PLUGIN_SLUG);
-    const isDisabledHere = isAutoAdoptDisabled(memdir);
-    if (isAdoptedHere) {
-      const idx = readMemoryIndex(memdir, PLUGIN_SLUG);
-      const suffix = isDisabledHere ? ' [auto-adopt disabled]' : '';
-      log(`  ✓ ${projectSlug} (${idx.version})${suffix}`);
-      adopted++;
-      if (isDisabledHere) disabled++;
-    } else if (isDisabledHere) {
-      log(`  ✗ ${projectSlug} (auto-adopt disabled, no sentinel)`);
-      disabled++;
-    }
+  let legacy = 0, disabled = 0;
+  for (const { memdir } of dirs) {
+    if (memdirIsAdopted(memdir, PLUGIN_SLUG)) legacy++;
+    if (isAutoAdoptDisabled(memdir)) disabled++;
   }
   log('');
-  log(`[adopt --status] ${adopted}/${dirs.length} adopted${disabled > 0 ? `, ${disabled} disabled` : ''}`);
+  log(`[adopt --status] scanned ${dirs.length} memdir(s): ${legacy} with legacy sentinel (await migration), ${disabled} auto-adopt-disabled.`);
+  if (legacy > 0) log('[adopt --status] run `claude-mem-lite adopt --all` to sweep legacy memory-dir sentinels now.');
 
-  // Gating snapshot — helps debug "why didn't auto-adopt fire?"
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT ? 'set' : 'unset';
   const noAutoAdopt = process.env.MEM_NO_AUTO_ADOPT === '1' ? '1 (opt-out)' : 'unset';
   log('');
-  log('Auto-adopt gates (next SessionStart will fire only if both pass):');
-  log(`  CLAUDE_PLUGIN_ROOT  = ${pluginRoot}  (plugin-mode install required; npx stays opt-in)`);
+  log('Auto-adopt gates (next SessionStart fires only if these pass):');
+  log(`  CLAUDE_PLUGIN_ROOT  = ${pluginRoot}  (any install path is consent; gate is the per-project opt-out below)`);
   log(`  MEM_NO_AUTO_ADOPT   = ${noAutoAdopt}  (global escape hatch)`);
   log('Per-project opt-out: `claude-mem-lite adopt --disable` (run --enable to re-arm).');
 }
 
 /**
- * cmdUnadopt — precise removal of sentinel section + plugin doc.
- * Exit code stays 0: unadopt is idempotent; "absent" isn't an error.
- *
- * Flags:
- *   --all       Operate on every memdir under ~/.claude/projects/*\/memory/
- *   --status    Read-only: list currently-adopted memdirs (mirrors `adopt --status`).
- *   --dry-run   Preview what would be removed; no filesystem writes.
- *
- * Pre-fix history: unrecognized flags (e.g. `--status` extrapolated from `adopt --status`,
- * or `--dry-run` extrapolated from `adopt --dry-run`) were silently ignored and the
- * destructive default ran anyway, removing the sentinel block when the user expected
- * a read-only probe.
+ * cmdUnadopt — remove the CLAUDE.md managed block + detail doc for the current
+ * project, and clean any legacy memory-dir residue. `--all` sweeps the legacy
+ * memory-dir cleanup across every memdir (CLAUDE.md blocks for other projects
+ * can't be located from the lossy slug). Idempotent: exit code stays 0.
  */
 export function cmdUnadopt(args = []) {
   if (hasFlag(args, '--status')) return statusAll();
@@ -326,41 +311,21 @@ export function cmdUnadopt(args = []) {
   const all = hasFlag(args, '--all');
   const dryRun = hasFlag(args, '--dry-run');
   const force = hasFlag(args, '--force');
-  const targets = all
-    ? listAllMemdirs().map((m) => m.memdir)
-    : [memdirPath(detectCwd())];
 
-  if (targets.length === 0) {
-    log('[unadopt] no memdirs found');
+  if (all) return migrateAll(['--all', ...(force ? ['--force'] : []), ...(dryRun ? ['--dry-run'] : [])]);
+
+  const cwd = detectCwd();
+  if (dryRun) {
+    const blockState = claudeMdIsAdopted(cwd, PLUGIN_SLUG) ? 'would-remove CLAUDE.md block + detail doc' : 'no CLAUDE.md block';
+    const legacy = hasLegacyMemdirSentinel(cwd, PLUGIN_SLUG) ? 'would-clean legacy memory-dir sentinel' : 'no legacy residue';
+    log(`[unadopt --dry-run] ${cwd}`);
+    log(`  ${blockState}`);
+    log(`  ${legacy}`);
     return;
   }
 
-  let removed = 0, absent = 0, skipped = 0;
-  for (const memdir of targets) {
-    if (dryRun) {
-      // Mirror the live foreign-content guard: a sentinel with no state sidecar would be
-      // skipped (not removed) unless --force, so dry-run must report it the same way.
-      const action = !isAdopted(memdir, PLUGIN_SLUG) ? 'absent'
-        : (hasPluginState(memdir, PLUGIN_SLUG) || force) ? 'would-remove'
-          : 'would-skip-foreign';
-      log(`[unadopt --dry-run] ${memdir} → ${action}`);
-      if (action === 'would-remove') removed++;
-      else if (action === 'would-skip-foreign') skipped++;
-      else absent++;
-      continue;
-    }
-    const r = removePluginSection(memdir, PLUGIN_SLUG, { force });
-    if (r.action === 'removed') { removePluginDoc(memdir, PLUGIN_SLUG); removed++; }
-    else if (r.action === 'skipped-foreign') skipped++;
-    else absent++;
-    log(`[unadopt] ${memdir} → ${r.action}`);
-  }
-
-  if (skipped > 0) {
-    log('[unadopt] skipped-foreign = a sentinel block with no plugin state file (not proven plugin-written).');
-    log('[unadopt] pass --force to remove it anyway.');
-  }
-  log('');
-  const verb = dryRun ? 'would remove' : 'removed';
-  log(`[unadopt${dryRun ? ' --dry-run' : ''}] ${targets.length} target(s): ${removed} ${verb}, ${skipped} skipped-foreign, ${absent} absent`);
+  const r = removeManaged(cwd, PLUGIN_SLUG);
+  const mig = migrateLegacyMemoryDir(cwd, PLUGIN_SLUG, { force });
+  const migNote = mig.action === 'removed' ? ' (+cleaned legacy memdir)' : '';
+  log(`[unadopt] ${cwd} → ${r.action}${migNote}`);
 }

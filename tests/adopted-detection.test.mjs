@@ -8,7 +8,8 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { effectiveQuiet, isAdoptedHere, isQuietHooks } from '../hook-shared.mjs';
 import { writePluginSection, removePluginSection, memdirPath } from '../memdir.mjs';
-import { PLUGIN_SLUG, CURRENT_SENTINEL_VERSION, getIndexLine } from '../adopt-content.mjs';
+import { writeManaged, removeManaged } from '../claudemd.mjs';
+import { PLUGIN_SLUG, CURRENT_SENTINEL_VERSION, buildClaudeMdBlock, getDetailDoc } from '../adopt-content.mjs';
 import { buildServerInstructions } from '../search-scoring.mjs';
 import { buildSessionContextLines } from '../hook-context.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
@@ -39,11 +40,22 @@ describe('isAdoptedHere / effectiveQuiet', () => {
     rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  it('isAdoptedHere reflects sentinel presence in current-project memdir', () => {
+  it('isAdoptedHere reflects the new CLAUDE.md managed block', () => {
+    expect(isAdoptedHere()).toBe(false);
+    writeManaged(fakeCwd, {
+      slug: PLUGIN_SLUG, version: CURRENT_SENTINEL_VERSION,
+      block: buildClaudeMdBlock(), doc: getDetailDoc(),
+    });
+    expect(isAdoptedHere()).toBe(true);
+    removeManaged(fakeCwd, PLUGIN_SLUG);
+    expect(isAdoptedHere()).toBe(false);
+  });
+
+  it('isAdoptedHere still recognises a legacy memory-dir sentinel (transition fallback)', () => {
     expect(isAdoptedHere()).toBe(false);
     const memdir = memdirPath(fakeCwd);
     writePluginSection(memdir, {
-      slug: PLUGIN_SLUG, version: CURRENT_SENTINEL_VERSION, contentLine: getIndexLine(),
+      slug: PLUGIN_SLUG, version: CURRENT_SENTINEL_VERSION, contentLine: 'x',
     });
     expect(isAdoptedHere()).toBe(true);
     removePluginSection(memdir, PLUGIN_SLUG);

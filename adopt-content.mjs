@@ -1,96 +1,139 @@
-// Phase C (Invited-Memory plan, T10): Content generators for the
-// claude-mem-lite sentinel line and its companion plugin_claude_mem_lite.md
-// detail doc. Kept separate so the strings are testable without side effects
-// and can evolve without touching memdir.mjs primitives.
+// CLAUDE.md-steering plan (v3.13): content generators for the claude-mem-lite
+// managed block (written into <cwd>/CLAUDE.md) and its companion
+// <cwd>/.claude/plugin_claude_mem_lite.md detail doc. Kept separate from the
+// claudemd.mjs primitives so the strings are testable without side effects.
 //
-// Bumping CURRENT_SENTINEL_VERSION: pick the next vN and update
-// docs/plans/2026-04-16-invited-memory-pattern.md so installs do a version-
-// bump replace instead of treating the old content as a user edit.
+// Bumping CURRENT_SENTINEL_VERSION: pick the next vN. On the next SessionStart
+// needsRefresh() sees the version change and refreshes the block in place
+// (version bump = intended content change, so it overwrites rather than treating
+// the drift as a user edit). v1 = legacy memory-dir sentinel (now migrated away);
+// v2 = project-tree CLAUDE.md managed block.
 
 import { CLI_INVOKE } from './cli-path.mjs';
 
 export const PLUGIN_SLUG = 'claude-mem-lite';
-export const CURRENT_SENTINEL_VERSION = 'v1';
+export const CURRENT_SENTINEL_VERSION = 'v2';
 
 /**
- * One-line entry injected into MEMORY.md's sentinel section. Must stay ≤150
- * chars so it clears Claude Code's 200-line MEMORY.md cap with headroom.
+ * The concise managed block injected into <cwd>/CLAUDE.md (between the
+ * slug-scoped sentinels — those are added by claudemd.renderBlock, NOT here).
+ * Universal: the memory contract is the same for every project, so there is no
+ * per-project-type variation. Keep it tight (cheap always-loaded context); the
+ * full tables + rules live in the detail doc this block points to.
  */
-export function getIndexLine() {
-  return '- [claude-mem-lite](plugin_claude_mem_lite.md) — Edit 前 `mem_recall(file=…)`；bugfix 后 `mem_save(type="bugfix", lesson_learned, importance=2)`';
+export function buildClaudeMdBlock() {
+  // Intentionally machine-stable: MCP tool names only, NO CLI_INVOKE (that
+  // resolves to an absolute path that differs per install — it would make this
+  // committed/refreshed block churn across machines). The robust CLI table lives
+  // in the detail doc (.claude/, gitignored).
+  return `## claude-mem-lite — 持久记忆 (persistent memory)
+
+PreToolUse hooks 在 Read/Edit/Write 前已自动 \`mem_recall\` 过往教训。下面是值得你主动发起的调用：
+
+| 时机 | 调用 |
+|------|------|
+| Edit/Write 前 | hook 已自动 recall；若注入了 \`#NN\` 教训，下次产出用户可见文字时引用 \`#NN\`（引用=采纳反馈，未引用会衰减） |
+| 解决非平凡 bug 后 | \`mem_save(type="bugfix", lesson_learned="<根因+修法>", importance=2)\` |
+| 非显然架构决策后 | \`mem_save(type="decision", lesson_learned="<约束+取舍>")\` |
+| 推迟到下个会话 | \`mem_defer({title, priority:1|2|3, detail})\`；修好时给 \`mem_save\` 加 \`closes_deferred=[N]\` |
+| 查过往工作 / 历史 | \`mem_search "关键词"\` · \`mem_recent\` · \`mem_timeline\` |
+
+完整工具+CLI 表、citation/decay 规则、save 纪律见 → \`.claude/plugin_claude_mem_lite.md\``;
 }
 
 /**
- * Full detail doc rendered into `memdir/plugin_claude_mem_lite.md`. Not
- * auto-loaded by Claude Code — the MEMORY.md index line points to it and
- * Claude reads it on demand when the injected hint suggests relevance.
+ * Full detail doc rendered into `<cwd>/.claude/plugin_claude_mem_lite.md`.
+ * Not auto-loaded by Claude Code — the CLAUDE.md block points to it and Claude
+ * reads it on demand. claudemd.writeManaged() prepends the `managed-by` marker;
+ * this returns pure content.
  */
 export function getDetailDoc() {
-  return `# claude-mem-lite 插件契约
+  return `# claude-mem-lite 插件契约（完整）
 
-> 由 \`${CLI_INVOKE} adopt\` 生成；卸载用 \`${CLI_INVOKE} unadopt\`。
-> 设计背景见 docs/plans/2026-04-16-invited-memory-pattern.md。
+> 由 \`${CLI_INVOKE} adopt\` 生成、随版本自动刷新；卸载用 \`${CLI_INVOKE} unadopt\`。
+> 精炼触发表在项目 \`CLAUDE.md\` 的 \`claude-mem-lite\` 托管块里；本文件是其展开。
+> 设计背景见 docs/CLAUDE-MD-STEERING-PLAN.md。
 
-## 何时调用 MCP 工具
+## 被动 recall（hook 已自动跑，你只需采纳）
 
-以下 6 个核心 MCP 工具在 \`tools/list\` 中默认暴露，覆盖了契约的热路径：
-\`mem_search\` / \`mem_recent\` / \`mem_recall\` / \`mem_get\` / \`mem_save\` / \`mem_timeline\`。
+PreToolUse hook 在你 Read / Edit / Write 文件前已自动 \`mem_recall\` 该文件：
+- **Read** 路径：asymmetric-quiet——最多 1 条 lesson、120 字符、要求带 \`lesson_learned\`。
+- **Edit / Write** 路径：decision-support——最多 3 条、240 字符、高重要度 bugfix/decision 即使无
+  lesson 也注入。
+- Read→Edit 同文件共享 cooldown（不重复注入正文），但 Read 注入后的首个 Edit 会把 lesson **ID**
+  以一行 ack 指令重新浮出。看到 \`#NN [bugfix] …\` 这类行时：**下次产出用户可见文字时引用 \`#NN\`**
+  （\`'#NN applied'\` 或 \`'#NN n/a — <理由>'\`）。纯工具回合不算；把 ID 记在工作记忆里，写回时引用。
+- 系统按会话追踪引用：未引用的 lesson 连续 3 个会话后 importance −1（地板 0），被引用的 +1（封顶 3）。
+  引用是给系统的反馈，不是合规仪式——注入池据此自调。
+
+## 何时主动调用 MCP 工具
+
+\`tools/list\` 默认暴露 6 个核心工具 + 3 个 defer 工具：
+\`mem_search\` / \`mem_recent\` / \`mem_recall\` / \`mem_get\` / \`mem_save\` / \`mem_timeline\` +
+\`mem_defer\` / \`mem_defer_list\` / \`mem_defer_drop\`。
 
 | 时机 | 工具 | 关键参数 |
 |------|------|----------|
-| Edit / Write 前 | \`mem_recall\` | \`file="<路径>"\` —— 过往 bugfix 与教训 |
+| Edit / Write 前 | \`mem_recall\` | \`file="<路径>"\`（hook 通常已代劳） |
 | Test failure / error | \`mem_search\` | \`query="<错误关键词>", obs_type="bugfix"\` |
 | Refactor 前 | \`mem_search\` | \`query="<模块>", obs_type="refactor"\` |
 | 新功能起手 | \`mem_search\` | \`query="<功能区域>"\` —— 找 prior art |
-| Bugfix 解决后 | \`mem_save\` | \`type="bugfix", lesson_learned="<根因+修法>", importance=2\` |
-| 架构决策后 | \`mem_save\` | \`type="decision", lesson_learned="<取舍理由>", importance=2\` |
+| 解决非平凡 bug 后 | \`mem_save\` | \`type="bugfix", lesson_learned="<根因+修法>", importance=2\` |
+| 非显然架构决策后 | \`mem_save\` | \`type="decision", lesson_learned="<约束+取舍>"\` |
 | 上下文提到 #NN | \`mem_get\` | \`ids=[NN]\` |
 
-## Decision rules（替代多步 search）
+## 必做契约（dogfood，本仓库尤其严格）
 
-- "最近做了啥" → \`mem_recent\`
-- "<文件> 有哪些记忆" → \`mem_recall\`
-- "#NN 前后发生了啥" → \`mem_timeline\`
+- **解决非平凡 bug 后**（≠ typo / rename）**必须** \`mem_save(type="bugfix",
+  lesson_learned="<一行根因+一行修法>", importance=2)\`。判据：未来改同一文件的会话看到这条能否避坑？能→存。
+- **非显然架构决策后**（≠ 改名/挪代码）调 \`mem_save(type="decision",
+  lesson_learned="<约束+为何这样选+牺牲了什么>")\`。\`decision\` 命中率显著高于 \`change\`（当前遥测约
+  3:1，会漂移——用 \`${CLI_INVOKE} stats\` 实测，别套固定倍数）；方向稳健：一条好 decision 抵数条 change。
+  别注水：decision 只留给真权衡，不是风格选择。
+- **推迟到未来会话**（≠ 在途 todo、≠ 本 PR 跟进）调
+  \`mem_defer({title, priority:1|2|3, detail:"<约束+为何推迟>"})\`。
+  触发词：中文「下次/下个会话/不在本轮范围/留给下个会话」；en「next session / defer to next round /
+  out of scope for this PR / pick up later」。
+- 修掉 deferred 项时 **必须** 给 \`mem_save\` 加 \`closes_deferred=[N]\`（N 是 SessionStart
+  \`### Deferred Work\` banner 里的序号，或原始 id \`["D#42"]\`，混用 OK），让 carry-forward 链闭合。
+  若该项无需修（flaky/scope shift）改用 \`mem_defer_drop({id, reason})\`，reason 必填、作审计。
+- **不要为凑 schema 写 \`lesson_learned: 'none'\`**：写不出能复用的教训就留 NULL，接受低重要度观测。
+  Haiku 默认过于激进地填 "none"——手动 save 时覆盖它。
 
 ## 维护 / 管理类工具（走 CLI）
 
-v2.34.0 起，以下 11 个工具从 \`tools/list\` 中隐藏以缩小启动上下文；它们仍注册在
-MCP 层，按名 \`tools/call\` 仍可命中，但对 Claude Code 这类只读 tools/list 的
-调用方只走下面的 CLI 入口：
+以下工具从 \`tools/list\` 隐藏（缩小启动上下文）；仍注册在 MCP 层、按名 \`tools/call\` 可命中，
+但对 Claude Code 这类只读 tools/list 的调用方只走 CLI：
 
 | 场景 | CLI |
 |------|-----|
-| 清理过期记忆 | \`${CLI_INVOKE} maintain scan --ops purge_stale\` → \`maintain execute --ops purge_stale --confirm\`（execute 删行必须带 \`--confirm\`，否则只预览） |
-| 深度优化（Haiku） | \`${CLI_INVOKE} optimize\`（默认 preview；\`--run\` 执行，\`--task re-enrich,normalize,cluster-merge,smart-compress\` 选阶段） |
-| 压缩旧条目 | \`${CLI_INVOKE} compress\`（默认 preview；\`--execute\` 执行，\`--age-days N\` 改阈值） |
+| 清理过期记忆 | \`${CLI_INVOKE} maintain scan --ops purge_stale\` → \`maintain execute --ops purge_stale --confirm\`（删行必须 \`--confirm\`） |
+| 深度优化（Haiku） | \`${CLI_INVOKE} optimize\`（默认 preview；\`--run\` 执行，\`--task re-enrich,normalize,cluster-merge,smart-compress\`） |
+| 压缩旧条目 | \`${CLI_INVOKE} compress\`（默认 preview；\`--execute\` 执行，\`--age-days N\`） |
 | FTS5 索引检查 / 重建 | \`${CLI_INVOKE} fts-check [--rebuild]\` |
 | tier 分组浏览 | \`${CLI_INVOKE} browse [--tier active]\` |
 | 导出 JSON/JSONL | \`${CLI_INVOKE} export [--format jsonl]\` |
 | 统计总量 / 健康 | \`${CLI_INVOKE} stats [--days 30]\` |
-| 删除某条 | \`${CLI_INVOKE} delete <id>[,<id>]\` |
-| 更新某条 | \`${CLI_INVOKE} update <id> [--title ...]\` |
-| 列 / 搜索 / 导入 skill-agent registry | \`${CLI_INVOKE} registry <list\\|search\\|import>\` |
-| 按 registry 名载入 skill/agent | （MCP only：\`mem_use\`；由用户主动请求时才使用） |
+| 删除 / 更新某条 | \`${CLI_INVOKE} delete <id>[,<id>]\` · \`${CLI_INVOKE} update <id> [--title ...]\` |
+| skill-agent registry | \`${CLI_INVOKE} registry <list\\|search\\|import>\` |
 
 ## CLI 速查（常用检索）
 
 | 命令 | 用途 |
 |------|------|
-| \`${CLI_INVOKE} search "query"\` | FTS5 全文搜索 |
+| \`${CLI_INVOKE} search "query"\` | FTS5 全文搜索（默认排除低信号 \`Modified X\` 等；加 \`--include-noise\` 找文件变更记录） |
 | \`${CLI_INVOKE} search "err" --type bugfix\` | 按类型过滤 |
 | \`${CLI_INVOKE} recall "file.mjs"\` | 文件相关记忆 |
 | \`${CLI_INVOKE} recent 5\` | 最近 5 条 |
 | \`${CLI_INVOKE} get 42,43\` | 按 ID 展开 |
 | \`${CLI_INVOKE} timeline --anchor 42\` | 时间线上下文 |
 
-## 质量门槛
+## 卸载 / 关闭
 
-- \`mem_save\` 的 \`lesson_learned\` 不要写 \`none\`——写不出教训就保持 NULL
-- \`decision\` 的命中率高于 \`change\`（当前遥测约 3:1，数值会漂移——用 \`${CLI_INVOKE} stats\` 实测，别套固定倍数）；方向稳健：一条好 decision 抵数条 change
-- 一般搜索跳过 \`obs_type\` 让系统自动路由；特定意图再过滤
-
-## 卸载
-
-\`${CLI_INVOKE} unadopt\` 精确移除 sentinel 段 + 本文件；其它 MEMORY.md 内容不动。
+- \`${CLI_INVOKE} unadopt\`：移除 CLAUDE.md 托管块 + \`.claude/plugin_claude_mem_lite.md\`；
+  CLAUDE.md 里你自己的内容（sentinel 之外）不动。
+- 本项目永久关闭自动 adopt：\`${CLI_INVOKE} adopt --disable\`（\`--enable\` 重新武装）。
+- 全局禁用自动 adopt：环境变量 \`MEM_NO_AUTO_ADOPT=1\`。
+- 关闭版本漂移自动刷新（保留你对托管块的手改）：\`CLAUDE_MEM_NO_TEMPLATE_REFRESH=1\`。
 `;
 }

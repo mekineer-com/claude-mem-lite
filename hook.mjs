@@ -63,7 +63,7 @@ import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
-import { silentAutoAdopt, hasAutoAdoptMarker } from './adopt-cli.mjs';
+import { silentAutoAdopt } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
 import { loadCiteBackForEpisode, extractCiteBackSignals, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
@@ -1074,36 +1074,32 @@ async function handleSessionStart() {
     }
   } catch (e) { debugCatch(e, 'session-start-cache-heal'); }
 
-  // First-run auto-adopt (v2.33.0 plugin-mode → v2.82.1 install-mode-agnostic).
+  // Auto-adopt + migrate (v3.13 CLAUDE.md-steering). silentAutoAdopt is now an
+  // IDEMPOTENT per-session sync, so it runs on EVERY SessionStart — not gated by
+  // the one-shot RUNTIME_DIR marker. That gate is deliberately gone: existing
+  // users whose marker predates v3.13 must still get migrated (legacy memory-dir
+  // sentinel stripped, CLAUDE.md managed block written) on their next session.
+  // The sync short-circuits cheaply once a project is already on the new scheme.
   // ANY install path — `/plugin install`, `npm install -g`, `npx`, manual — is
-  // consent to integration. Writing the MEMORY.md sentinel once per project on
-  // first SessionStart avoids the opt-in friction that left ~zero users on
-  // auto-adopt (runtime-marker directory was empty machine-wide despite v2.33
-  // shipping ~5 weeks earlier — `install.mjs`-written hooks don't propagate
-  // ${CLAUDE_PLUGIN_ROOT}, so the v2.33.0 gate was a no-op for npm/manual
-  // installs, which is most of them). Scope is now:
+  // consent to integration. Scope:
   //   - gated by !MEM_NO_AUTO_ADOPT (explicit global escape hatch)
-  //   - per-project opt-out via `<memdir>/.mem-no-auto-adopt` sentinel
-  //     (managed by `claude-mem-lite adopt --disable / --enable`); checked
-  //     inside silentAutoAdopt so the helper is safe to call directly too.
-  //   - first-attempt marker persists in RUNTIME_DIR so a subsequent /unadopt
-  //     is respected (no re-adopt loop).
+  //   - per-project opt-out via `<memdir>/.mem-no-auto-adopt` sentinel (managed
+  //     by `claude-mem-lite adopt --disable / --enable`; checked inside
+  //     silentAutoAdopt).
+  //   - CLAUDE_MEM_NO_TEMPLATE_REFRESH=1 freezes the block against drift refresh.
   // Note v2.82.0: removed MEM_QUIET_HOOKS gate. That env var suppresses stdout
   // noise; it must NOT also disable side-effect work (PostToolUse writes the
-  // DB unconditionally — auto-adopt should follow the same rule).
-  // Failures (user-edited sentinel, budget exceeded, FS errors) are swallowed;
-  // the marker is still written so we don't retry on every SessionStart.
+  // DB unconditionally — auto-adopt follows the same rule). Failures are
+  // swallowed; the marker is still written for telemetry/back-compat.
   try {
     if (process.env.MEM_NO_AUTO_ADOPT !== '1') {
       const project = inferProject();
-      if (!hasAutoAdoptMarker(RUNTIME_DIR, project)) {
-        const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-        const r = silentAutoAdopt({ cwd, markerDir: RUNTIME_DIR, markerKey: project });
-        if (r.ok) {
-          debugLog('DEBUG', 'session-start-auto-adopt', `action=${r.action} project=${project}`);
-        } else {
-          debugLog('DEBUG', 'session-start-auto-adopt', `skipped project=${project} reason=${r.reason}`);
-        }
+      const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+      const r = silentAutoAdopt({ cwd, markerDir: RUNTIME_DIR, markerKey: project });
+      if (r.ok) {
+        debugLog('DEBUG', 'session-start-auto-adopt', `action=${r.action} project=${project}`);
+      } else {
+        debugLog('DEBUG', 'session-start-auto-adopt', `skipped project=${project} reason=${r.reason}`);
       }
     }
   } catch (e) { debugCatch(e, 'session-start-auto-adopt'); }

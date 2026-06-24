@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.12.1
+- **Version**: 3.13.0
 - **Package manager**: npm
-- **Test**: `npx vitest run` (159 test files / 3218 tests, vitest)
+- **Test**: `npx vitest run` (160 test files / 3233 tests, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **DB**: better-sqlite3 + FTS5 full-text search
@@ -70,63 +70,18 @@ as the floor; flag NEW unused exports as PR review signal.
 - Skill commands (`/search`, `/recall`, `/recent`, `/timeline`) use `!` preprocessing for CLI injection
 - Skill recommendation (shadow-first): `CLAUDE_MEM_RECOMMEND_MODE=shadow|live|off` (default `shadow`). Phase 1 logs would-be recommendations to `RUNTIME_DIR/recommendations/*.jsonl` (zero injection); reco rows carry a CC `session` id + a replay vector (relevance/rel2/intentTop/cooldownTop), adopt rows carry the same `session` so PostToolUse adoptions pair to the reco in-session. Inspect with `claude-mem-lite registry recommend-stats [--days N] [--sweep]`: funnel = session-keyed matched precision + per-skill lift; `--sweep` = offline ROC over (floor,margin). Calibration caveat: shadow adoption is a biased-LOW proxy for live `P(adopt|inject)`, so the flip metric is **lift > 1** (gate beats organic base rate) + per-session PASS density, NOT a raw-precision threshold (single-dev volume never reaches significance). Live injection (UserPromptSubmit, sibling to the T4 explicit-name pointer) is Phase 2. Adoption = `Skill` tool only (`mem_use` is pre-filtered in PostToolUse).
 
-## Mem usage contract (applies to ALL sessions touching this repo)
+<!-- claude-mem-lite:begin v2 -->
+## claude-mem-lite — 持久记忆 (persistent memory)
 
-This project *is* the memory plugin. Dogfood it. The rules below override soft "proactive trigger"
-language in the MCP tool description — when the two conflict, this contract wins.
+PreToolUse hooks 在 Read/Edit/Write 前已自动 `mem_recall` 过往教训。下面是值得你主动发起的调用：
 
-**Before you Read, Edit, or Write any code file**: the PreToolUse hook
-(`scripts/pre-tool-recall.js`) has already run `mem_recall` for that file. Read mode is
-asymmetric-quiet (1 lesson, 120-char cap, requires `lesson_learned`); Edit/Write is
-decision-support (up to 3 lessons, 240-char cap, admits high-importance bugfix/decision
-without lesson when title is non-LOW_SIGNAL). Read→Edit on the same file in one session
-shares cooldown for the lesson BODIES (no double injection), but since v2.98 the first
-Edit after a Read-time injection re-surfaces the lesson IDs as a one-line ack directive —
-answer it ('#NN applied' or '#NN n/a — <reason>') in your next user-facing text; Edit-path
-lesson blocks carry the same directive (opt-out: CLAUDE_MEM_SALIENCE=legacy). Rationale:
-the #8651 severe test showed passively-framed lessons get ignored ~50% of the time even
-when on-topic. If you saw lines like `#NN [bugfix] ...`, cite `#NN`
-the NEXT time you produce user-facing text — tool-only follow-up turns don't satisfy this;
-carry the IDs in working memory and cite when you write back. The plugin tracks citation
-outcomes per session: un-cited lessons auto-decay (importance −1 after 3 consecutive uncited
-sessions; floor 0) and cited lessons auto-promote (importance +1, capped at 3). The injection
-pool self-tunes from your behavior — citing is feedback to the system, not a compliance ritual.
+| 时机 | 调用 |
+|------|------|
+| Edit/Write 前 | hook 已自动 recall；若注入了 `#NN` 教训，下次产出用户可见文字时引用 `#NN`（引用=采纳反馈，未引用会衰减） |
+| 解决非平凡 bug 后 | `mem_save(type="bugfix", lesson_learned="<根因+修法>", importance=2)` |
+| 非显然架构决策后 | `mem_save(type="decision", lesson_learned="<约束+取舍>")` |
+| 推迟到下个会话 | `mem_defer({title, priority:1|2|3, detail})`；修好时给 `mem_save` 加 `closes_deferred=[N]` |
+| 查过往工作 / 历史 | `mem_search "关键词"` · `mem_recent` · `mem_timeline` |
 
-**After solving a non-trivial bug** (≠ typo fix, ≠ rename): you **must** call
-`mem_save(type='bugfix', lesson_learned='<one-line root cause + one-line fix>',
-importance=2)`. Test: could a future session touching the same file have avoided this bug
-if they'd seen the lesson? If yes → save it. If no → it wasn't a real bug fix.
-
-**After making a non-obvious architectural decision** (≠ renaming, ≠ moving code): call
-`mem_save(type='decision', lesson_learned='<constraint + why this choice + what it trades off>')`.
-Empirical note: `decision` observations retrieve at a materially higher cite-rate than
-`change` (~3:1 in current telemetry; an older 2026-05 snapshot read ~20:1 but that magnitude
-no longer holds — re-measure with `claude-mem-lite stats` rather than trusting a fixed
-number). The direction is robust: a good decision memory is worth several change memories.
-Do not inflate this — decision is reserved for real tradeoffs, not style choices.
-
-**When deferring work to a future session** (≠ in-flight todo, ≠ this-PR follow-up):
-call `mem_defer({title: '<one-line subject>', priority: <1|2|3>, detail: '<constraint + why deferred>'})`.
-
-Triggers (bilingual):
-- 中文: "下次/下个会话/留给独立 session/不在本轮范围/留给下个会话"
-- en: "next session / defer to next round / out of scope for this PR / pick up later"
-- explicit user wrap-up: "记一下，下次处理 X" / "remember to do Y next time"
-
-When you fix a deferred item, **must** add `closes_deferred=[N]` to the `mem_save`
-call so the carry-forward chain closes properly. `N` is the per-project ordinal
-shown in the SessionStart `### Deferred Work` banner (e.g. `closes_deferred=[1]`),
-or the raw id as `closes_deferred=["D#42"]`. Mixed array is OK.
-
-If the deferred item turned out to not need fixing (flaky test, scope shift),
-use `mem_defer_drop({id: <D#N|ordinal>, reason: '...'})` instead. The reason is
-required and forms the audit trail for "why no fix shipped".
-
-**Do not write `lesson_learned: 'none'` just to satisfy the schema.** Either write a lesson
-that a future session could actually use, or leave the field NULL and accept a low-importance
-observation. The Haiku prompt defaults to "none" far too aggressively; when you save manually,
-you override that default.
-
-**When searching memory via CLI/MCP**: default search now excludes low-signal fallback titles
-(`Modified X`, `Worked on X`, raw error logs). If you're auditing or specifically hunting a
-file-change record, pass `--include-noise` (CLI) or `include_noise=true` (MCP).
+完整工具+CLI 表、citation/decay 规则、save 纪律见 → `.claude/plugin_claude_mem_lite.md`
+<!-- claude-mem-lite:end -->

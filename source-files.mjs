@@ -87,7 +87,9 @@ export const SOURCE_FILES = [
   'cli/activity.mjs',
   'server/fts-check.mjs',
   // v2.32 invited-memory: memdir primitives + adopt/unadopt CLI
+  // v3.13 CLAUDE.md-steering: claudemd.mjs project-tree managed block + migration
   'memdir.mjs',
+  'claudemd.mjs',
   'adopt-content.mjs',
   'adopt-cli.mjs',
   // P0 (v2.59.x): user-explicit "ignore memory" override detector. Lives

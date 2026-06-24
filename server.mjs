@@ -143,7 +143,7 @@ const _quiet = effectiveQuiet();
 if (process.env.CLAUDE_MEM_QUIET_TRACE !== '0') {
   const reason = process.env.MEM_QUIET_HOOKS === '1'
     ? 'env:MEM_QUIET_HOOKS=1'
-    : _quiet ? 'adopted:MEMORY.md-sentinel' : 'none';
+    : _quiet ? 'adopted:steering' : 'none';
   const mode = _quiet ? 'BASE' : 'BASE+VERBOSE';
   process.stderr.write(`[mem] instructions: ${mode} reason=${reason}\n`);
 }
@@ -1715,7 +1715,7 @@ server.registerTool(
 // and direct MCP clients), but only the core tools appear in the `tools/list`
 // response. Hiding the maintenance/admin tools keeps Claude Code's startup
 // context small while preserving the contract that the plugin dogfoods (see
-// CLAUDE.md §Mem usage contract and adopt-content.mjs).
+// the CLAUDE.md managed block + adopt-content.mjs detail doc).
 // Surface counts as of v2.70.0: 9 core (mem_search/recent/timeline/get/save/
 // recall + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden (maintenance/
 // admin/specialized) = 20 registered; tests/tool-schemas.test.mjs is the
