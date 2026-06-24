@@ -76,7 +76,14 @@ export function detectBashSignificance(input, response) {
   // Allow intervening global git options (`-C <path>`, `-c k=v`, `--no-pager`, …) between
   // `git` and the subcommand — `git -C /repo push` is the standard multi-repo/scripted form.
   const isGit = /\bgit\s+(?:(?:-[cC]\s+\S+|--?[\w-]+(?:=\S+)?)\s+)*(commit|merge|rebase|cherry-pick|push)\b/i.test(cmd);
-  const isDeploy = /\b(deploy|docker|kubectl|terraform)\b/i.test(cmd);
+  // Deploy + publish/release: the actual "ship". Package publish and GitHub
+  // release are rare, high-value events; without them a release session records
+  // the git push but not the publish that defines it. `npm run publish-*` is
+  // excluded (custom script, ambiguous) — only the direct publish verb counts.
+  const isDeploy = /\b(deploy|docker|kubectl|terraform)\b/i.test(cmd)
+    || /\b(?:npm|pnpm|yarn|bun|cargo)\s+publish\b/i.test(cmd)
+    || /\bgh\s+release\s+(?:create|edit|upload|delete)\b/i.test(cmd)
+    || /\btwine\s+upload\b/i.test(cmd);
   return {
     isError, isTest, isBuild, isGit, isDeploy,
     isSignificant: isError || isTest || isBuild || isGit || isDeploy,

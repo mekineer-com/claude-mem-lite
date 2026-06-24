@@ -154,6 +154,55 @@ describe('sanitizeFtsQuery', () => {
     expect(sanitizeFtsQuery('term -extra')).toBe('term extra');
   });
 
+  it('strips trailing sentence punctuation so the final word still expands', () => {
+    // A natural-language question ends in "?"/"."/","; the punctuation must NOT
+    // ride along on the final token. Left on, "bug?" misses the synonym map
+    // (no OR-expansion) AND gets phrase-quoted as a literal — silently shrinking
+    // recall on the most salient (final) word. Every LongMemEval question, and
+    // most real prompts, end in "?".
+    const q = sanitizeFtsQuery('how do I fix the bug?');
+    expect(q).not.toContain('"bug?"');
+    expect(q).toContain('(bug OR error OR defect)');
+    expect(sanitizeFtsQuery('hello world.')).toBe('hello world');
+    expect(sanitizeFtsQuery('the smoker?')).toBe('smoker');
+    expect(sanitizeFtsQuery('what, exactly!')).toBe('exactly');
+    // Internal punctuation (file names, versions) is preserved — only edges
+    // trimmed — so "cli.mjs" stays an adjacent phrase, unchanged by the trim.
+    expect(sanitizeFtsQuery('cli.mjs')).toBe('"cli.mjs"');
+    expect(sanitizeFtsQuery('cli.mjs.')).toBe('"cli.mjs"');
+  });
+
+  it('drops orphan contraction fragments left by apostrophe splitting', () => {
+    // Splitting on apostrophe (the FTS5-aligned fix) leaves non-word stems for
+    // verb/negation contractions: "I've"→"ve", "we'll"→"ll", "wouldn't"→
+    // "wouldn". Left in, they become *required* AND terms (pure noise). They are
+    // unambiguous non-words, so they're filtered. Ambiguous real words (don,
+    // won, haven) are deliberately NOT filtered.
+    expect(sanitizeFtsQuery("I've been thinking")).toBe('thinking');
+    expect(sanitizeFtsQuery("we'll see soon")).toBe('see soon');
+    expect(sanitizeFtsQuery("this doesn't work")).toBe('work');
+    expect(sanitizeFtsQuery("wouldn't matter")).toBe('matter');
+    // 're' is a real word ("re:"/regarding) so it is deliberately NOT stripped —
+    // the they're/we're 're' artifact survives, a conscious trade vs dropping a
+    // legitimate token.
+    expect(sanitizeFtsQuery("re the meeting")).toBe('re meeting');
+  });
+
+  it('treats apostrophes as separators (aligns with FTS5 index tokenization)', () => {
+    // FTS5 unicode61 splits on apostrophe: "doesn't" is indexed as "doesn"+"t".
+    // The query tokenizer MUST match. Otherwise a possessive in the question
+    // ("sister's") phrase-quotes to "sister s" (adjacency) and misses the
+    // non-possessive mention ("my sister") in the gold doc. 20.6% of LongMemEval
+    // questions carry an apostrophe (mostly possessives). Straight + curly.
+    expect(sanitizeFtsQuery("my sister's birthday")).toBe('sister birthday');
+    expect(sanitizeFtsQuery("dog's name")).toBe('dog name');
+    expect(sanitizeFtsQuery("artist's album")).toBe('artist album');
+    // contraction whose stem is a stopword drops out entirely
+    expect(sanitizeFtsQuery("What's my favorite coffee?")).toBe('favorite coffee');
+    // curly apostrophe (U+2019) handled identically
+    expect(sanitizeFtsQuery('the company’s policy')).toBe('company policy');
+  });
+
   it('strips FTS5 special characters', () => {
     // "test" now has synonyms "spec" and "测试" (CJK), so any query containing "test" gets OR-expanded
     expect(sanitizeFtsQuery('test{foo}')).toBe('(test OR spec OR 测试) AND foo');
@@ -631,6 +680,24 @@ describe('detectBashSignificance', () => {
     expect(detectBashSignificance({ command: 'docker build .' }, 'ok').isDeploy).toBe(true);
     expect(detectBashSignificance({ command: 'kubectl apply -f k8s/' }, 'ok').isDeploy).toBe(true);
     expect(detectBashSignificance({ command: 'terraform plan' }, 'ok').isDeploy).toBe(true);
+  });
+
+  it('detects publish/release commands (the actual ship)', () => {
+    // Publishing a package / cutting a release is a rare, high-value event — the
+    // ship itself. Previously skipped (isDeploy matched only deploy/docker/
+    // kubectl/terraform), so a release session captured the git push but not the
+    // npm publish / gh release that defines it.
+    expect(detectBashSignificance({ command: 'npm publish' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'npm publish --access public' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'pnpm publish' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'yarn publish' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'cargo publish' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'gh release create v1.0.0' }, 'ok').isDeploy).toBe(true);
+    expect(detectBashSignificance({ command: 'twine upload dist/*' }, 'ok').isDeploy).toBe(true);
+    // read-only release queries stay insignificant
+    expect(detectBashSignificance({ command: 'gh release list' }, 'ok').isDeploy).toBe(false);
+    expect(detectBashSignificance({ command: 'npm view pkg versions' }, 'ok').isDeploy).toBe(false);
+    expect(detectBashSignificance({ command: 'npm run publish-docs' }, 'ok').isDeploy).toBe(false);
   });
 
   it('returns all false for ordinary commands', () => {

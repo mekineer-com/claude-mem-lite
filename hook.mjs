@@ -1188,8 +1188,13 @@ async function handleSessionStart() {
     // project that the `### Deferred Work` block now reads from the
     // deferred_work table (was: high-importance observations in v2.69.x).
     // Idempotent via marker file; subsequent SessionStarts are silent.
-    try { emitV270UpgradeBanner({ project, runtimeDir: RUNTIME_DIR }); }
-    catch (e) { debugCatch(e, 'session-start-v270-banner'); }
+    try {
+      // Gate on prior data: a brand-new install never had v2.69.x deferred-block
+      // semantics, so the migration notice is wrong noise (it fired for every
+      // fresh install since v2.70). Only genuine upgraders with observations see it.
+      const obsCount = db.prepare('SELECT COUNT(*) AS c FROM observations WHERE project = ?').get(project)?.c || 0;
+      emitV270UpgradeBanner({ project, runtimeDir: RUNTIME_DIR, hasPriorData: obsCount > 0 });
+    } catch (e) { debugCatch(e, 'session-start-v270-banner'); }
 
     // Pre-load TF-IDF vocabulary cache for this session (from DB, ~1ms)
     try { getVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }

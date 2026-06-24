@@ -110,7 +110,12 @@ export function tierSqlParams(ctx) {
  * @returns {string}
  */
 export function relativeTime(epoch, now) {
-  const diff = now - epoch;
+  // Clamp negative diffs: a future / clock-skewed epoch must not render as a
+  // negative duration ("-7200s ago"). The first branch below (diff < 60000)
+  // would otherwise fire on any negative diff and print Math.floor(diff/1000),
+  // i.e. "-7200s ago" for a 2h-future timestamp. (cli/common.mjs's sibling
+  // relativeTime handles this via an early `diff < 0` → "just now".)
+  const diff = Math.max(0, now - epoch);
   if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3600000) return `${Math.floor(diff / 60000)}min ago`;
   if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;

@@ -207,4 +207,8 @@ describe('relativeTime', () => {
   it('formats hours', () => { expect(relativeTime(NOW - 3 * HOUR, NOW)).toBe('3h ago'); });
   it('formats days', () => { expect(relativeTime(NOW - 5 * DAY, NOW)).toBe('5d ago'); });
   it('formats months', () => { expect(relativeTime(NOW - 45 * DAY, NOW)).toBe('1mo ago'); });
+  // Future / clock-skew timestamps must not render a negative duration
+  // ("-7200s ago"). Clamp to the present so display stays sensible.
+  it('clamps future timestamps to now', () => { expect(relativeTime(NOW + 2 * HOUR, NOW)).toBe('0s ago'); });
+  it('clamps a few seconds in the future', () => { expect(relativeTime(NOW + 5000, NOW)).toBe('0s ago'); });
 });

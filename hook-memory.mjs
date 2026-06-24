@@ -131,7 +131,23 @@ function hasFilePaths(filesModified) {
  * @returns {object[]} Top memories (max 3) with {id, type, title, lesson_learned}
  */
 export function searchRelevantMemories(db, userPrompt, project, excludeIds = []) {
-  if (!db || !userPrompt || userPrompt.length < 5) return [];
+  // Min-length guard is English-centric: 5 chars ≈ one short English word. A CJK
+  // query is meaningful at 2 chars (状态/架构) and most real Chinese queries are
+  // 2-4 chars (状态管理, 召回率, 熔断降级) — the bare `.length < 5` silently
+  // rejected ALL of them, so a Chinese-primary user got zero memory injection.
+  // Apply the 5-char floor only to non-CJK queries; CJK needs ≥2.
+  if (!db || !userPrompt) return [];
+  const queryHasCjk = /[一-鿿㐀-䶿]/.test(userPrompt);
+  if (userPrompt.length < (queryHasCjk ? 2 : 5)) return [];
+  // CJK-DOMINANT (not merely CJK-containing) gates the OR-fallback bypass below.
+  // A substring test would let one incidental CJK char — an IME-leaked particle,
+  // a 中文 noun in an otherwise-English prompt — flip OR-fallback on and inject
+  // off-topic noise (a real precision regression for bilingual users). Require
+  // CJK chars to be at least as many as ASCII letters so only genuinely-Chinese
+  // queries (优化召回率) get the bigram-inflation rescue, not "fix the bug 啊".
+  const _cjkChars = (userPrompt.match(/[一-鿿㐀-䶿]/g) || []).length;
+  const _asciiLetters = (userPrompt.match(/[A-Za-z]/g) || []).length;
+  const queryIsCjkDominant = _cjkChars > 0 && _cjkChars >= _asciiLetters;
 
   // v2.41 metrics: record timing + candidate/filter/return counts per call.
   // Gated by CLAUDE_MEM_METRICS=1 — no-op when disabled (zero hot-path cost).
@@ -192,9 +208,16 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     const queryTokenCount = ftsQuery.includes(' AND ')
       ? ftsQuery.split(' AND ').length
       : ftsQuery.split(/\s+/).filter(t => t && !t.startsWith('(') || !t.endsWith(')')).length;
+    // CJK-dominant queries bypass the token-count gate: a single CJK word becomes
+    // 2-N overlapping bigrams (优化召回率 → 优化/召回/回率), inflating
+    // queryTokenCount past the gate, so the AND-too-strict query never gets the OR
+    // rescue that CJK retrieval relies on. The CLI/hybrid path relaxes CJK to OR
+    // unconditionally; mirror that here. Noise is contained downstream (0.4x OR
+    // penalty + BM25 threshold + term-coverage filter). queryIsCjkDominant (not
+    // mere CJK presence) is the gate — see its definition at the function top.
     if (rows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
-      if (orQuery && queryTokenCount <= OR_FALLBACK_MAX_TOKENS) {
+      if (orQuery && (queryIsCjkDominant || queryTokenCount <= OR_FALLBACK_MAX_TOKENS)) {
         try { rows = selectStmt.all(orQuery, project, cutoff); usedOrFallback = true; } catch {}
       }
     }
@@ -225,7 +248,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       crossRows = crossStmt.all(ftsQuery, project, cutoff);
       if (crossRows.length === 0) {
         const orQuery = relaxFtsQueryToOr(ftsQuery);
-        if (orQuery && queryTokenCount <= OR_FALLBACK_MAX_TOKENS) {
+        if (orQuery && (queryIsCjkDominant || queryTokenCount <= OR_FALLBACK_MAX_TOKENS)) {
           try { crossRows = crossStmt.all(orQuery, project, cutoff); crossUsedOr = true; } catch {}
         }
       }

@@ -222,7 +222,19 @@ export function expandToken(token) {
 
 // ─── Stop Words ──────────────────────────────────────────────────────────────
 
-export const FTS_STOP_WORDS = new Set([...BASE_STOP_WORDS]);
+// Orphan stems left when apostrophe-splitting contractions ("I've"→"ve",
+// "wouldn't"→"wouldn"). Non-words only — they'd otherwise survive as required
+// AND terms and silently shrink recall. Ambiguous real words are intentionally
+// excluded so legitimate queries for them still work: don/won/haven/can, and
+// 're' ("re:"/regarding) — even though that leaves the they're/we're artifact,
+// dropping a real word is the worse failure.
+const CONTRACTION_FRAGMENTS = [
+  've', 'll',
+  'doesn', 'didn', 'isn', 'wasn', 'aren', 'weren',
+  'wouldn', 'couldn', 'shouldn', 'hasn', 'hadn', 'mustn', 'needn', 'mightn',
+];
+
+export const FTS_STOP_WORDS = new Set([...BASE_STOP_WORDS, ...CONTRACTION_FRAGMENTS]);
 
 // ─── FTS5 Query Sanitization ─────────────────────────────────────────────────
 
@@ -241,15 +253,30 @@ export function sanitizeFtsQuery(query) {
     // "never throws on MATCH" invariant. The metachar class below doesn't cover them.
     // eslint-disable-next-line no-control-regex -- intentional: stripping control chars IS the fix
     .replace(/[\x00-\x1f\x7f]/g, ' ')
+    // Apostrophe variants → space, matching FTS5 unicode61's own tokenization
+    // (it splits on apostrophe: "doesn't" is indexed as "doesn"+"t"). Without
+    // this, a possessive/contraction ("sister's", "What's") would phrase-quote
+    // to "sister s" (adjacency) and miss the bare-word mention ("my sister") in
+    // the doc, and contraction stems never reach the stopword filter. Straight
+    // ('), curly (' '), and modifier (ʼ) apostrophes all normalized.
+    .replace(/['‘’ʼ]/g, ' ')
     .replace(/[{}()[\]^~*:"\\]/g, ' ')
     .replace(/(^|\s)-/g, '$1')
     .trim();
   if (!cleaned) return null;
-  let tokens = cleaned.split(/\s+/).filter(t =>
-    t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR(\/\d*)?$/i.test(t)
-    // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
-    && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
-  );
+  let tokens = cleaned.split(/\s+/)
+    // Trim leading/trailing sentence punctuation (. , ? ! ; …) from each token.
+    // Natural-language queries end in "?" and clauses in ",": left on, the final
+    // (most salient) token rides as "bug?"/"month," which (a) misses the synonym
+    // map → no OR-expansion, and (b) gets phrase-quoted as a literal by
+    // expandToken. Edges only — internal dots/hyphens (cli.mjs, gardening-related)
+    // are preserved so filenames/compounds still phrase-match.
+    .map(t => t.replace(/^[.,;:!?]+|[.,;:!?]+$/g, ''))
+    .filter(t =>
+      t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR(\/\d*)?$/i.test(t)
+      // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
+      && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
+    );
   // Filter stop words (but keep all if filtering would empty the query)
   const filtered = tokens.filter(t => !FTS_STOP_WORDS.has(t.toLowerCase()));
   if (filtered.length > 0) tokens = filtered;

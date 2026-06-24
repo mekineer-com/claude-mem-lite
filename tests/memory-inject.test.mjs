@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { searchRelevantMemories, recallForFile, formatMemoryLine } from '../hook-memory.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { cjkBigrams } from '../utils.mjs';
 
 // ─── P1: formatMemoryLine — stale-obs verify-before-use hint ───────────────
 // A surfaced obs older than 30 days that references file paths has elevated
@@ -211,6 +212,35 @@ describe('searchRelevantMemories', () => {
     });
     const results = searchRelevantMemories(db, 'hi', 'proj', []);
     expect(results.length).toBe(0);
+  });
+
+  // CJK recall: the English-centric `< 5` length guard + bigram-inflated
+  // OR-fallback gate silently zeroed Chinese queries (a Chinese-primary user got
+  // no injection). Measured on a 25-obs CJK harness: recall@5 60% → 100%.
+  it('CJK: retrieves a memory for a short (≤4-char) Chinese query', () => {
+    // "熔断降级" is 4 chars — meaningful in Chinese but rejected by the old <5 guard.
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'decision',
+      title: '熔断降级策略', narrative: '依赖故障时返回兜底数据',
+      text: '熔断降级策略 依赖故障时返回兜底数据 ' + cjkBigrams('熔断降级策略 依赖故障时返回兜底数据'),
+      importance: 2,
+    });
+    const results = searchRelevantMemories(db, '熔断降级', 'proj', []);
+    expect(results.length).toBeGreaterThan(0);
+  });
+
+  it('CJK: OR-fallback rescues a multi-bigram Chinese query whose AND form misses', () => {
+    // "提升召回率" bigrams to 提升/升召/召回/回率 (5 AND-tokens → old gate suppressed
+    // OR). The gold lacks 提升/升召, so strict AND misses; the CJK gate bypass lets
+    // the OR rescue match via 召回/回率.
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'decision',
+      title: '召回率优化方案', narrative: '多查询融合加 RRF 排序',
+      text: '召回率优化方案 多查询融合加 RRF 排序 ' + cjkBigrams('召回率优化方案 多查询融合加 排序'),
+      importance: 2,
+    });
+    const results = searchRelevantMemories(db, '提升召回率', 'proj', []);
+    expect(results.length).toBeGreaterThan(0);
   });
 
   // R1: LOW_SIGNAL title filtering — degraded titles from hook-llm fallback

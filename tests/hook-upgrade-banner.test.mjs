@@ -31,4 +31,28 @@ describe('v2.70.0 first-run upgrade banner', () => {
       rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
+
+  it('suppresses the banner for a fresh install (no prior data) but still marks it', () => {
+    // A brand-new user never had the v2.69.x deferred-block semantics, so the
+    // "v2.70.0 upgrade notice / pin to 2.69.x" is wrong noise. Suppress when the
+    // project has no prior observations — and write the marker so it stays
+    // suppressed once they start accumulating data.
+    const runtimeDir = mkdtempSync(join(tmpdir(), 'mem-banner-fresh-'));
+    try {
+      const project = 'fresh-install-proj';
+      const marker = join(runtimeDir, `.deferred-block-migrated-${project}`);
+      const writes = [];
+      const orig = process.stderr.write.bind(process.stderr);
+      process.stderr.write = (msg) => { writes.push(String(msg)); return true; };
+      try {
+        emitV270UpgradeBanner({ project, runtimeDir, hasPriorData: false });
+      } finally {
+        process.stderr.write = orig;
+      }
+      expect(writes.length).toBe(0);          // no banner
+      expect(existsSync(marker)).toBe(true);  // but permanently suppressed
+    } finally {
+      rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
 });
