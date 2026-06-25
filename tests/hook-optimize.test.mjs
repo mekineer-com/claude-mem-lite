@@ -369,6 +369,27 @@ describe('normalize', () => {
     const result = applyNormalization(db, []);
     expect(result.updated).toBe(0);
   });
+
+  // Gate-decision skeleton (no IO). A malformed-but-valid-JSON gate file must
+  // FAIL OPEN — a missing/non-numeric/future epoch produced NaN >= INTERVAL = false,
+  // which permanently disabled normalize with no recovery (contradicting the
+  // corrupt-file catch branch which already returns true).
+  it('_normalizeGateOpen fails open on a malformed/missing/future epoch', async () => {
+    const { _normalizeGateOpen } = await import('../hook-optimize.mjs');
+    const now = 1_800_000_000_000;
+    const WEEK = 7 * 86400000;
+    // fail-open (run)
+    expect(_normalizeGateOpen({}, now)).toBe(true);                 // missing epoch
+    expect(_normalizeGateOpen({ epoch: 'x' }, now)).toBe(true);     // non-numeric
+    expect(_normalizeGateOpen({ epoch: null }, now)).toBe(true);    // null
+    expect(_normalizeGateOpen({ epoch: NaN }, now)).toBe(true);     // NaN
+    expect(_normalizeGateOpen({ epoch: now + WEEK }, now)).toBe(true); // future
+    expect(_normalizeGateOpen(null, now)).toBe(true);              // no object
+    // honor the interval for a valid epoch
+    expect(_normalizeGateOpen({ epoch: now }, now)).toBe(false);          // just ran
+    expect(_normalizeGateOpen({ epoch: now - 86400000 }, now)).toBe(false); // 1d ago
+    expect(_normalizeGateOpen({ epoch: now - WEEK - 1 }, now)).toBe(true);  // >7d ago
+  });
 });
 
 describe('cluster-merge', () => {

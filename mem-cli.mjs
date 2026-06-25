@@ -1636,12 +1636,26 @@ function cmdRestore(db, argv) {
   const trimmed = raw.trim();
   if (!trimmed) { out('[mem] Empty file — nothing to restore.'); return; }
   let rows;
-  try {
-    rows = trimmed[0] === '['
-      ? JSON.parse(trimmed)
-      : trimmed.split('\n').filter(l => l.trim()).map(l => JSON.parse(l));
-  } catch (e) { fail(`[mem] "${file}" is not valid export JSON/JSONL: ${e.message}`); return; }
-  if (!Array.isArray(rows) || rows.length === 0) { out('[mem] No observations in file.'); return; }
+  let parseFailures = 0;
+  if (trimmed[0] === '[') {
+    // Whole-array JSON is a single document — partial parse is impossible, so
+    // a syntax error rejects the file (unchanged behavior).
+    try { rows = JSON.parse(trimmed); }
+    catch (e) { fail(`[mem] "${file}" is not valid export JSON/JSONL: ${e.message}`); return; }
+  } else {
+    // JSONL: tolerate per-line syntax errors so one corrupt line in a large
+    // backup doesn't discard every valid row. Parse failures fold into the
+    // malformed tally below (the loop already skips valid-JSON-but-wrong-shape
+    // rows the same way) — a backup tool must recover what it can.
+    rows = [];
+    for (const line of trimmed.split('\n')) {
+      if (!line.trim()) continue;
+      try { rows.push(JSON.parse(line)); }
+      catch { parseFailures++; }
+    }
+  }
+  if (!Array.isArray(rows) || (rows.length === 0 && parseFailures === 0)) { out('[mem] No observations in file.'); return; }
+  if (rows.length === 0) { fail(`[mem] "${file}": all ${parseFailures} line(s) failed to parse as JSONL.`); return; }
 
   const projOverride = flags.project ? resolveProject(db, flags.project) : null;
   const dryRun = flags['dry-run'] === true || flags['dry-run'] === 'true';
@@ -1693,7 +1707,12 @@ function cmdRestore(db, argv) {
       if (process.env.CLAUDE_MEM_DEBUG) process.stderr.write(`[mem] restore row failed: ${e.message}\n`);
     }
   }
-  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped, ${malformed} malformed/failed from ${rows.length} row(s).`);
+  // Fold JSONL per-line syntax failures into the malformed tally and the
+  // denominator so the report reflects every non-blank input line, not just the
+  // ones that parsed.
+  const totalMalformed = malformed + parseFailures;
+  const totalLines = rows.length + parseFailures;
+  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
 }
 
 // ─── Compress ────────────────────────────────────────────────────────────────

@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.16.1 — restore recovers partial backups; normalize gate fails open
+
+Two robustness fixes from a continued QA pass over the LLM-optimization and import skeletons (gate logic, error handling, parse tolerance — no LLM required to exercise). Suite 3259 → 3261 (+2), ESLint clean.
+
+**`restore` aborted the whole JSONL import on a single corrupt line.** `restore` parsed a `.jsonl` backup with `lines.map(l => JSON.parse(l))`, so the first malformed line threw and the **entire file was rejected — zero rows imported** — even though the per-row loop already counts `malformed/failed` rows, i.e. per-row tolerance was the design intent. For a backup/restore tool, one corrupt line (partial write, disk glitch, hand-edit) discarding every valid row is data loss. The JSONL path now parses each line independently and folds syntax failures into the malformed tally; a mixed file recovers all valid rows (measured: an 11-line file with one broken line → 6 restored, 5 malformed/failed, was 0 restored), and an all-corrupt file gets a clear "all N line(s) failed to parse" error instead of a silent no-op. The whole-array (`[…]`) JSON path stays all-or-nothing — a single JSON document can't be partially parsed. `saveObservation`'s 5-minute Jaccard dedup still applies, so same-content rows within the window still collapse.
+
+**`shouldRunNormalize` could permanently disable the normalize optimization.** The 7-day gate read `runtime/last-normalize.json` and returned `Date.now() - last.epoch >= INTERVAL`. It fails **open** on a corrupt file (JSON.parse throws → caught → run), but a malformed-but-valid-JSON gate (missing `epoch` key, non-numeric/null epoch, or a future epoch from clock skew) made the subtraction `NaN`, and `NaN >= INTERVAL` is `false` — silently **blocking normalize forever** with no recovery, contradicting the catch branch's clear fail-open intent. Such a file can come from a partial/interrupted write. The decision is now a pure, testable helper (`_normalizeGateOpen`) that fails open when `epoch` is non-finite or in the future, and honors the interval otherwise.
+
 ## v3.16.0 — natural-language memory injection restored (English) + SessionStart table/robustness fixes
 
 A QA pass simulating real end-to-end usage surfaced and fixed four retrieval, rendering, and robustness bugs across the passive-hook surface. Each fix ships with regression tests; suite 3253 → 3259 (+6, all green), ESLint clean.

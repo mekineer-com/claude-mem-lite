@@ -203,10 +203,22 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
 const NORMALIZE_GATE_FILE = join(RUNTIME_DIR, 'last-normalize.json');
 const NORMALIZE_INTERVAL_MS = 7 * 86400000; // 7 days
 
+// Pure gate decision (no IO) — exported for testing. Fail-OPEN on a
+// malformed-but-valid-JSON gate: a missing/non-numeric `epoch` makes
+// `now - epoch` NaN, and `NaN >= INTERVAL` is false — which would PERMANENTLY
+// block normalize with no recovery, contradicting the catch-branch's fail-open
+// intent (a corrupt file that fails JSON.parse already returns true). A future
+// epoch (clock skew / NTP correction) is equally suspect → run.
+export function _normalizeGateOpen(last, now) {
+  const epoch = last?.epoch;
+  if (typeof epoch !== 'number' || !Number.isFinite(epoch) || epoch > now) return true;
+  return now - epoch >= NORMALIZE_INTERVAL_MS;
+}
+
 export function shouldRunNormalize() {
   try {
     const last = JSON.parse(readFileSync(NORMALIZE_GATE_FILE, 'utf8'));
-    return Date.now() - last.epoch >= NORMALIZE_INTERVAL_MS;
+    return _normalizeGateOpen(last, Date.now());
   } catch {
     return true;
   }

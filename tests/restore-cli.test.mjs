@@ -161,7 +161,24 @@ describe('D#25 export → restore round-trip', () => {
     writeFileSync(bad, 'this is not an export\n');
     const r = runCli(['restore', bad], dstDir);
     expect(r.exitCode).not.toBe(0);
-    expect(r.stderr + r.stdout).toMatch(/not valid export/);
+    // Single garbage line goes the JSONL path → all-failed-to-parse rejection.
+    expect(r.stderr + r.stdout).toMatch(/not valid export|failed to parse/);
+  });
+
+  it('JSONL: recovers valid rows when some lines are corrupt (does not abort the whole import)', () => {
+    // A single broken line in a large backup must not discard every valid row —
+    // a backup tool recovers what it can. Parse failures fold into malformed/failed.
+    const mixed = join(dstDir, 'mixed.jsonl');
+    const now = new Date().toISOString();
+    writeFileSync(mixed, [
+      JSON.stringify({ title: 'valid alpha', type: 'bugfix', project: 'p', narrative: 'fixed the auth token refresh crash under load', created_at: now }),
+      '{ this line is broken json',
+      JSON.stringify({ title: 'valid beta', type: 'decision', project: 'p', narrative: 'chose redis over memcached for ttl support', created_at: now }),
+    ].join('\n'));
+    const r = runCli(['restore', mixed], dstDir);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toMatch(/2 restored/);
+    expect(r.stdout).toMatch(/1 malformed\/failed from 3 row\(s\)/);
   });
 
   it('remaps ids — no PK collision when restoring into a DB that already has rows', () => {
