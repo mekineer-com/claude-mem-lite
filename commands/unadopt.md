@@ -1,6 +1,6 @@
 ---
 name: unadopt
-description: "Use when: user wants to remove the claude-mem-lite steering block from the current project (or sweep legacy memory-dir sentinels everywhere with --all). Removes the <cwd>/CLAUDE.md managed block + <cwd>/.claude/plugin_claude_mem_lite.md and cleans any legacy memory-dir residue. User content outside the sentinel is preserved. Benign no-op when not adopted."
+description: "Use when: user wants to remove the claude-mem-lite steering block from the current project (or from every project Claude Code knows about with --all). Removes the <cwd>/CLAUDE.md managed block + <cwd>/.claude/plugin_claude_mem_lite.md and cleans any legacy memory-dir residue. User content outside the sentinel is preserved. Benign no-op when not adopted."
 ---
 
 # /unadopt
@@ -24,9 +24,11 @@ project (slug-scoped — other plugins' blocks survive).
 
 - `--force` — also remove a legacy memory-dir block lacking a state sidecar
 - `--dry-run` — preview what would be removed; no writes
-- `--all` — legacy-cleanup sweep: strip the old memory-dir sentinel across every
-  project (CLAUDE.md blocks for other projects can't be located from the encoded
-  slug — `cd` into a project and run `/unadopt` there to remove its block).
+- `--all` — remove the CLAUDE.md managed block from every project in Claude
+  Code's known-project list (`~/.claude.json` `projects`), plus sweep any legacy
+  memory-dir sentinels. Slug-scoped, so user content and other plugins' blocks
+  survive. A project Claude Code never opened isn't listed — `cd` into it and run
+  `/unadopt` there. Pair with `--dry-run` to preview.
 - `--status` — read-only adoption probe (mirrors `/adopt --status`)
 
 ## Note: this does not stop auto-adopt

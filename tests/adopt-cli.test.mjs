@@ -13,7 +13,7 @@ import { PLUGIN_SLUG } from '../adopt-content.mjs';
 
 function claudeMd(cwd) { return join(cwd, 'CLAUDE.md'); }
 function detailDoc(cwd) { return join(cwd, '.claude', 'plugin_claude_mem_lite.md'); }
-const BEGIN = `<!-- ${PLUGIN_SLUG}:begin v2 -->`;
+const BEGIN = `<!-- ${PLUGIN_SLUG}:begin v1 -->`;
 
 // Seed a legacy memory-dir sentinel for `cwd` (the pre-v3.13 scheme) so we can
 // assert migration strips it.
@@ -247,7 +247,7 @@ describe('silentAutoAdopt (SessionStart sync)', () => {
   it('refreshes when the installed block version drifts', () => {
     silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
     // Simulate an older version installed.
-    const stale = readFileSync(claudeMd(fakeCwd), 'utf8').replace(`${PLUGIN_SLUG}:begin v2`, `${PLUGIN_SLUG}:begin v1`);
+    const stale = readFileSync(claudeMd(fakeCwd), 'utf8').replace(`${PLUGIN_SLUG}:begin v1`, `${PLUGIN_SLUG}:begin v0`);
     writeFileSync(claudeMd(fakeCwd), stale);
     const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
     expect(r.action).toBe('refreshed');
@@ -256,12 +256,12 @@ describe('silentAutoAdopt (SessionStart sync)', () => {
 
   it('CLAUDE_MEM_NO_TEMPLATE_REFRESH=1 freezes the block against drift', () => {
     silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
-    const stale = readFileSync(claudeMd(fakeCwd), 'utf8').replace(`${PLUGIN_SLUG}:begin v2`, `${PLUGIN_SLUG}:begin v1`);
+    const stale = readFileSync(claudeMd(fakeCwd), 'utf8').replace(`${PLUGIN_SLUG}:begin v1`, `${PLUGIN_SLUG}:begin v0`);
     writeFileSync(claudeMd(fakeCwd), stale);
     process.env.CLAUDE_MEM_NO_TEMPLATE_REFRESH = '1';
     const r = silentAutoAdopt({ cwd: fakeCwd, markerDir, markerKey: 'proj-x' });
     expect(r.action).toBe('already-adopted');
-    expect(readFileSync(claudeMd(fakeCwd), 'utf8')).toContain(`${PLUGIN_SLUG}:begin v1`);
+    expect(readFileSync(claudeMd(fakeCwd), 'utf8')).toContain(`${PLUGIN_SLUG}:begin v0`);
   });
 
   it('hasAutoAdoptMarker is per-key (scoping works)', () => {

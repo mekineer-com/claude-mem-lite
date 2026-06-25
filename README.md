@@ -299,10 +299,15 @@ surface — reach them through the CLI column in the second table.
 
 ### Invited Memory (v2.32+)
 
-Opt-in mechanism that installs a single sentinel-wrapped line into the project's
-memdir (`~/.claude/projects/<encoded>/memory/MEMORY.md`) so Claude Code loads
-the plugin's MCP-tool triggers as **user-memory** — a higher instruction-following
-authority than MCP server instructions (which are framed as tool metadata).
+Opt-in mechanism that installs a slug-scoped managed block into the project's
+own `CLAUDE.md` (plus an on-demand detail doc under `.claude/`) so Claude Code
+loads the plugin's MCP-tool triggers as **project instructions** — a higher
+instruction-following authority than MCP server instructions (which are framed
+as tool metadata). Claude Code loads `CLAUDE.md` and the memdir `MEMORY.md` at
+equal weight, so steering lives in `CLAUDE.md` (the canonical home for project
+instructions) rather than polluting `MEMORY.md`, which is reserved for the user's
+own memories. The pre-v3.13 scheme wrote into `MEMORY.md`; it is migrated away
+automatically on the next SessionStart.
 
 ```bash
 claude-mem-lite adopt              # install for current project
@@ -317,30 +322,38 @@ claude-mem-lite unadopt            # remove sentinel + doc (runtime marker stays
 Slash commands `/adopt` and `/unadopt` wrap the same CLI.
 
 **What adoption changes:**
-- A `<!-- claude-mem-lite:begin v1 -->…<!-- claude-mem-lite:end -->` block is
-  added to `MEMORY.md` under a `## 插件契约` header, containing one ≤150-char
-  line pointing at `mem_recall` / `mem_save` with their key arguments.
-- A `plugin_claude_mem_lite.md` detail file is written (not auto-loaded; read
-  on demand when the MEMORY.md pointer surfaces in context).
+- A `<!-- claude-mem-lite:begin v1 -->…<!-- claude-mem-lite:end -->` managed
+  block is added to `<cwd>/CLAUDE.md` under its own
+  `## claude-mem-lite — persistent memory` header, containing a compact trigger
+  table pointing at `mem_recall` / `mem_save` / `mem_defer` with their key
+  arguments. The block is slug-scoped: only this region is managed; the rest of
+  your `CLAUDE.md` is preserved verbatim, and it coexists with other plugins'
+  blocks (e.g. `code-graph-mcp`) in the same file.
+- A `<cwd>/.claude/plugin_claude_mem_lite.md` detail file is written (not
+  auto-loaded; read on demand when the `CLAUDE.md` block points to it). The
+  block auto-refreshes when the shipped content drifts (version bump or template
+  change), unless `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`.
 - Post-adopt the conservative hook layer auto-trims: MCP server instructions
   drop the `WHEN TO USE` section, SessionStart injection drops the `File Lessons`
   / `Key Context` sections. `#ID` references and the `Recent` table still fire
   so `mem_get` remains reachable.
 
 **When does it take effect?**
-- The MEMORY.md sentinel and the hook-layer trim (`File Lessons` / `Key Context` /
-  lesson suffix) apply on the **next SessionStart** (any new Claude Code session
-  in the adopted project).
+- The `CLAUDE.md` managed block and the hook-layer trim (`File Lessons` /
+  `Key Context` / lesson suffix) apply on the **next SessionStart** (any new
+  Claude Code session in the adopted project).
 - The MCP server instructions are built once at server boot and MCP has no
   "push" protocol — the `WHEN TO USE` / `Decision rules` trim only applies
   after Claude Code restarts and re-spawns the mem-lite MCP server. A single
   `/exit` + fresh session is enough. Same caveat applies to `unadopt`.
 
 **Safety:**
-- Hash-guarded: editing the sentinel body yourself blocks automatic rewrites
-  unless you pass `--force`.
-- Budget-gated: refuses to insert when MEMORY.md is already >180 lines, so
-  Claude Code's 200-line MEMORY.md cap won't truncate the block.
+- Hash-guarded: editing the managed-block body yourself blocks automatic
+  rewrites unless you pass `--force`.
+- Slug-scoped & dedup-guarded: only the `claude-mem-lite:begin…end` region is
+  ever rewritten, and duplicate / CRLF-orphaned copies are collapsed to one.
+  Unlike the legacy `MEMORY.md` scheme there is no line-budget gate — `CLAUDE.md`
+  has no truncation cap.
 - **Auto-adopt fires on the first SessionStart per project for any install
   path (v2.82.1+).** Per-project opt-out: `claude-mem-lite adopt --disable`
   (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker

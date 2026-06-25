@@ -3,16 +3,21 @@
 // <cwd>/.claude/plugin_claude_mem_lite.md detail doc. Kept separate from the
 // claudemd.mjs primitives so the strings are testable without side effects.
 //
-// Bumping CURRENT_SENTINEL_VERSION: pick the next vN. On the next SessionStart
-// needsRefresh() sees the version change and refreshes the block in place
-// (version bump = intended content change, so it overwrites rather than treating
-// the drift as a user edit). v1 = legacy memory-dir sentinel (now migrated away);
-// v2 = project-tree CLAUDE.md managed block.
+// CURRENT_SENTINEL_VERSION tags the managed block as `<!-- claude-mem-lite:begin
+// vN -->`. needsRefresh() only checks for *inequality* against the installed tag,
+// so any change triggers an in-place refresh (version change = intended content
+// change, overwritten rather than treated as a user edit) — the value need not be
+// monotonic. We deliberately use `v1` (not `v2`) so the version digit differs from
+// the sibling code-graph-mcp plugin's `<!-- code-graph-mcp:begin v2 -->` block in
+// the same CLAUDE.md; the slug already scopes the two independently (claudemd.mjs),
+// so this is a cosmetic distinguisher, not a functional one. The pre-v3.13 legacy
+// memory-dir MEMORY.md sentinel also carried `v1`, but it lives in a different file
+// and is migrated away (claudemd.migrateLegacyMemoryDir), so there is no collision.
 
 import { CLI_INVOKE } from './cli-path.mjs';
 
 export const PLUGIN_SLUG = 'claude-mem-lite';
-export const CURRENT_SENTINEL_VERSION = 'v2';
+export const CURRENT_SENTINEL_VERSION = 'v1';
 
 /**
  * The concise managed block injected into <cwd>/CLAUDE.md (between the
@@ -26,19 +31,19 @@ export function buildClaudeMdBlock() {
   // resolves to an absolute path that differs per install — it would make this
   // committed/refreshed block churn across machines). The robust CLI table lives
   // in the detail doc (.claude/, gitignored).
-  return `## claude-mem-lite — 持久记忆 (persistent memory)
+  return `## claude-mem-lite — persistent memory
 
-PreToolUse hooks 在 Read/Edit/Write 前已自动 \`mem_recall\` 过往教训。下面是值得你主动发起的调用：
+PreToolUse hooks already run \`mem_recall\` for past lessons before Read/Edit/Write. The calls worth making proactively:
 
-| 时机 | 调用 |
+| When | Call |
 |------|------|
-| Edit/Write 前 | hook 已自动 recall；若注入了 \`#NN\` 教训，下次产出用户可见文字时引用 \`#NN\`（引用=采纳反馈，未引用会衰减） |
-| 解决非平凡 bug 后 | \`mem_save(type="bugfix", lesson_learned="<根因+修法>", importance=2)\` |
-| 非显然架构决策后 | \`mem_save(type="decision", lesson_learned="<约束+取舍>")\` |
-| 推迟到下个会话 | \`mem_defer({title, priority:1|2|3, detail})\`；修好时给 \`mem_save\` 加 \`closes_deferred=[N]\` |
-| 查过往工作 / 历史 | \`mem_search "关键词"\` · \`mem_recent\` · \`mem_timeline\` |
+| Before Edit/Write | hook already recalled; if a \`#NN\` lesson was injected, cite \`#NN\` next time you produce user-visible text (citing = adopting the feedback; uncited lessons decay) |
+| After fixing a non-trivial bug | \`mem_save(type="bugfix", lesson_learned="<root cause + fix>", importance=2)\` |
+| After a non-obvious architecture decision | \`mem_save(type="decision", lesson_learned="<constraint + tradeoff>")\` |
+| Deferring to a future session | \`mem_defer({title, priority:1|2|3, detail})\`; when fixed, add \`closes_deferred=[N]\` to \`mem_save\` |
+| Looking up past work / history | \`mem_search "keywords"\` · \`mem_recent\` · \`mem_timeline\` |
 
-完整工具+CLI 表、citation/decay 规则、save 纪律见 → \`.claude/plugin_claude_mem_lite.md\``;
+Full tool + CLI tables, citation/decay rules, and save discipline → \`.claude/plugin_claude_mem_lite.md\``;
 }
 
 /**

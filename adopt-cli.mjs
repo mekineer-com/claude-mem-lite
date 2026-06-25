@@ -13,9 +13,9 @@
 // it is redefined as a legacy-cleanup sweep (strip old memory-dir sentinels across
 // every memdir). New-scheme adoption happens per-project on SessionStart (cwd known).
 
-import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, readdirSync, statSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, isAbsolute } from 'path';
 import {
   memdirPath, removePluginSection, removePluginDoc,
   isAdopted as memdirIsAdopted, hasPluginState,
@@ -52,6 +52,25 @@ function listAllMemdirs() {
     } catch { /* ignore entries we can't stat */ }
   }
   return out;
+}
+
+function claudeConfigPath() { return join(homedir(), '.claude.json'); }
+
+// Real adopted-project paths come from Claude Code's own ~/.claude.json `projects`
+// map (keys are absolute cwds Claude Code has opened). The memdir slug under
+// ~/.claude/projects/ is a LOSSY encoding that can't be decoded back to a path,
+// so this is the only source that lets `unadopt --all` reach scattered CLAUDE.md
+// managed blocks. Filtered to absolute, still-existing dirs; claudeMdIsAdopted()
+// then gates which actually carry our block. Caveat: a project Claude Code never
+// recorded is invisible here and needs a per-project `unadopt`.
+function listKnownProjectDirs() {
+  const p = claudeConfigPath();
+  if (!existsSync(p)) return [];
+  try {
+    const cfg = JSON.parse(readFileSync(p, 'utf8'));
+    const projects = cfg && cfg.projects && typeof cfg.projects === 'object' ? Object.keys(cfg.projects) : [];
+    return projects.filter((d) => typeof d === 'string' && isAbsolute(d) && existsSync(d));
+  } catch { return []; }
 }
 
 function hasFlag(args, flag) { return Array.isArray(args) && args.includes(flag); }
@@ -290,6 +309,12 @@ function statusAll() {
   log(`[adopt --status] scanned ${dirs.length} memdir(s): ${legacy} with legacy sentinel (await migration), ${disabled} auto-adopt-disabled.`);
   if (legacy > 0) log('[adopt --status] run `claude-mem-lite adopt --all` to sweep legacy memory-dir sentinels now.');
 
+  const known = listKnownProjectDirs();
+  let adoptedCount = 0;
+  for (const dir of known) if (claudeMdIsAdopted(dir, PLUGIN_SLUG)) adoptedCount++;
+  log(`[adopt --status] known projects (~/.claude.json): ${known.length} scanned, ${adoptedCount} with a CLAUDE.md managed block.`);
+  if (adoptedCount > 0) log('[adopt --status] run `claude-mem-lite unadopt --all` to remove every CLAUDE.md block.');
+
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT ? 'set' : 'unset';
   const noAutoAdopt = process.env.MEM_NO_AUTO_ADOPT === '1' ? '1 (opt-out)' : 'unset';
   log('');
@@ -305,6 +330,54 @@ function statusAll() {
  * memory-dir cleanup across every memdir (CLAUDE.md blocks for other projects
  * can't be located from the lossy slug). Idempotent: exit code stays 0.
  */
+/**
+ * unadoptAll — `claude-mem-lite unadopt --all`. Removes the CLAUDE.md managed
+ * block + detail doc from EVERY adopted project Claude Code knows about (real
+ * paths from ~/.claude.json `projects`), then sweeps the legacy memory-dir
+ * residue across all memdirs. removeManaged is slug-scoped, so user content and
+ * other plugins' blocks are never touched. Honors --dry-run / --force.
+ *
+ * Unlike `adopt --all` (still a legacy-only sweep — adopting arbitrary projects
+ * is unsafe), unadopt is purely subtractive, so reaching every known project is
+ * both safe and what the uninstall hint promises.
+ */
+function unadoptAll(args) {
+  const force = hasFlag(args, '--force');
+  const dryRun = hasFlag(args, '--dry-run');
+
+  // 1. New scheme: scrub CLAUDE.md managed blocks across known project paths.
+  const projectDirs = listKnownProjectDirs();
+  let blocks = 0;
+  for (const dir of projectDirs) {
+    if (!claudeMdIsAdopted(dir, PLUGIN_SLUG)) continue;
+    if (dryRun) {
+      log(`[unadopt --all --dry-run] ${dir} → would-remove CLAUDE.md block + detail doc`);
+      blocks++;
+      continue;
+    }
+    const r = removeManaged(dir, PLUGIN_SLUG);
+    if (r.action === 'removed') { log(`[unadopt --all] ${dir} → removed`); blocks++; }
+  }
+
+  // 2. Legacy memory-dir cleanup across every memdir (foreign-content guarded).
+  const dirs = listAllMemdirs();
+  let legacy = 0;
+  for (const { memdir } of dirs) {
+    if (dryRun) {
+      if (memdirIsAdopted(memdir, PLUGIN_SLUG) && (hasPluginState(memdir, PLUGIN_SLUG) || force)) legacy++;
+      continue;
+    }
+    const r = removePluginSection(memdir, PLUGIN_SLUG, { force });
+    if (r.action === 'removed') { removePluginDoc(memdir, PLUGIN_SLUG); legacy++; }
+  }
+
+  log('');
+  log(`[unadopt --all] ${dryRun ? 'would remove' : 'removed'} ${blocks} CLAUDE.md block(s) across ${projectDirs.length} known project(s); ${legacy} legacy memory-dir sentinel(s) ${dryRun ? 'pending' : 'cleaned'}.`);
+  if (projectDirs.length === 0) {
+    log('[unadopt --all] no known projects found in ~/.claude.json — if a project was adopted but never opened in Claude Code, run `claude-mem-lite unadopt` from inside it.');
+  }
+}
+
 export function cmdUnadopt(args = []) {
   if (hasFlag(args, '--status')) return statusAll();
 
@@ -312,7 +385,7 @@ export function cmdUnadopt(args = []) {
   const dryRun = hasFlag(args, '--dry-run');
   const force = hasFlag(args, '--force');
 
-  if (all) return migrateAll(['--all', ...(force ? ['--force'] : []), ...(dryRun ? ['--dry-run'] : [])]);
+  if (all) return unadoptAll(args);
 
   const cwd = detectCwd();
   if (dryRun) {

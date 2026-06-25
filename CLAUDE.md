@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.14.0
+- **Version**: 3.15.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (160 test files / 3242 tests, vitest)
 - **Lint**: `npx eslint .`
@@ -70,20 +70,20 @@ as the floor; flag NEW unused exports as PR review signal.
 - Skill commands (`/search`, `/recall`, `/recent`, `/timeline`) use `!` preprocessing for CLI injection
 - Skill recommendation (shadow-first): `CLAUDE_MEM_RECOMMEND_MODE=shadow|live|off` (default `shadow`). Phase 1 logs would-be recommendations to `RUNTIME_DIR/recommendations/*.jsonl` (zero injection); reco rows carry a CC `session` id + a replay vector (relevance/rel2/intentTop/cooldownTop), adopt rows carry the same `session` so PostToolUse adoptions pair to the reco in-session. Inspect with `claude-mem-lite registry recommend-stats [--days N] [--sweep]`: funnel = session-keyed matched precision + per-skill lift; `--sweep` = offline ROC over (floor,margin). Calibration caveat: shadow adoption is a biased-LOW proxy for live `P(adopt|inject)`, so the flip metric is **lift > 1** (gate beats organic base rate) + per-session PASS density, NOT a raw-precision threshold (single-dev volume never reaches significance). Live injection (UserPromptSubmit, sibling to the T4 explicit-name pointer) is Phase 2. Adoption = `Skill` tool only (`mem_use` is pre-filtered in PostToolUse).
 
-<!-- claude-mem-lite:begin v2 -->
-## claude-mem-lite — 持久记忆 (persistent memory)
+<!-- claude-mem-lite:begin v1 -->
+## claude-mem-lite — persistent memory
 
-PreToolUse hooks 在 Read/Edit/Write 前已自动 `mem_recall` 过往教训。下面是值得你主动发起的调用：
+PreToolUse hooks already run `mem_recall` for past lessons before Read/Edit/Write. The calls worth making proactively:
 
-| 时机 | 调用 |
+| When | Call |
 |------|------|
-| Edit/Write 前 | hook 已自动 recall；若注入了 `#NN` 教训，下次产出用户可见文字时引用 `#NN`（引用=采纳反馈，未引用会衰减） |
-| 解决非平凡 bug 后 | `mem_save(type="bugfix", lesson_learned="<根因+修法>", importance=2)` |
-| 非显然架构决策后 | `mem_save(type="decision", lesson_learned="<约束+取舍>")` |
-| 推迟到下个会话 | `mem_defer({title, priority:1|2|3, detail})`；修好时给 `mem_save` 加 `closes_deferred=[N]` |
-| 查过往工作 / 历史 | `mem_search "关键词"` · `mem_recent` · `mem_timeline` |
+| Before Edit/Write | hook already recalled; if a `#NN` lesson was injected, cite `#NN` next time you produce user-visible text (citing = adopting the feedback; uncited lessons decay) |
+| After fixing a non-trivial bug | `mem_save(type="bugfix", lesson_learned="<root cause + fix>", importance=2)` |
+| After a non-obvious architecture decision | `mem_save(type="decision", lesson_learned="<constraint + tradeoff>")` |
+| Deferring to a future session | `mem_defer({title, priority:1|2|3, detail})`; when fixed, add `closes_deferred=[N]` to `mem_save` |
+| Looking up past work / history | `mem_search "keywords"` · `mem_recent` · `mem_timeline` |
 
-完整工具+CLI 表、citation/decay 规则、save 纪律见 → `.claude/plugin_claude_mem_lite.md`
+Full tool + CLI tables, citation/decay rules, and save discipline → `.claude/plugin_claude_mem_lite.md`
 <!-- claude-mem-lite:end -->
 
 <!-- code-graph-mcp:begin v2 -->

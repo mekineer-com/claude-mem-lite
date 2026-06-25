@@ -1549,7 +1549,7 @@ describe('Suite 11: first-run auto-adopt', () => {
   // v3.13 scheme: adopted = managed block in the project-tree CLAUDE.md.
   function adopted(cwd) {
     const p = join(cwd, 'CLAUDE.md');
-    return existsSync(p) && readFileSync(p, 'utf8').includes('claude-mem-lite:begin v2');
+    return existsSync(p) && readFileSync(p, 'utf8').includes('claude-mem-lite:begin v1');
   }
 
   it('CLAUDE_PLUGIN_ROOT + first run → adopts + writes marker', () => {

@@ -16,7 +16,7 @@ force it immediately (e.g. after editing the block out by hand).
 
 ## What it writes
 
-1. **`<cwd>/CLAUDE.md`** — a concise `<!-- claude-mem-lite:begin v2 -->…<!-- :end -->`
+1. **`<cwd>/CLAUDE.md`** — a concise `<!-- claude-mem-lite:begin v1 -->…<!-- :end -->`
    managed block (trigger table → `mem_recall` / `mem_save` / `mem_defer`).
    Slug-scoped: only this block is managed; the rest of your `CLAUDE.md` is
    preserved verbatim. Auto-refreshes when the shipped content drifts.
