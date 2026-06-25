@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.16.2 — correct fts-check CLI syntax in LLM-facing docs; robust GitHub-URL parsing
+
+Two fixes from a QA pass over the LLM-facing description surface and the registry GitHub-import skeleton. Suite 3261 → 3264 (+3), ESLint clean.
+
+**LLM-facing docs taught Claude Code the wrong `fts-check` syntax.** Four mirrored copies — the `mem_fts_check` MCP tool description, the adoption detail doc (`.claude/plugin_claude_mem_lite.md`, written into every adopted project and read by Claude Code), and both READMEs — documented the CLI fallback as `fts-check [--rebuild]`. But the CLI parses `fts-check` as a positional subcommand (`fts-check <check|rebuild>`); `fts-check --rebuild` just prints usage and **does not rebuild**, so the documented LLM/Bash fallback silently no-ops. The tool description's own prose already used the correct "check"/"rebuild" subcommand terms, contradicting its `Equivalent CLI` line. All four are corrected to `fts-check <check|rebuild>`; a contract test now asserts the subcommand form and rejects the `--rebuild` flag form, and the other dual-mode commands (`maintain`/`activity`/`defer`/`registry`) were swept clean.
+
+**`registry import` mishandled a copy-pasted GitHub URL with a query string or fragment.** `parseGitHubUrl` regex-matched the raw URL, so a browser-pasted `?tab=readme` or `#section` anchor leaked into the captured branch (`main?recursive=1#x`) and corrupted the GitHub API URL built from it → a confusing 404 on a URL that opens fine in the browser. The parser now strips query + fragment up front (`url.split(/[?#]/)[0]`); clean URLs are unaffected. SSRF-safety is unchanged and now covered by tests — host-spoofing lookalikes (`github.com.evil.com`, `github.com@evil.com`, `evil.com/github.com`) are still rejected before any network call.
+
 ## v3.16.1 — restore recovers partial backups; normalize gate fails open
 
 Two robustness fixes from a continued QA pass over the LLM-optimization and import skeletons (gate logic, error handling, parse tolerance — no LLM required to exercise). Suite 3259 → 3261 (+2), ESLint clean.

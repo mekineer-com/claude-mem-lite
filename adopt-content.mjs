@@ -115,7 +115,7 @@ PreToolUse hook 在你 Read / Edit / Write 文件前已自动 \`mem_recall\` 该
 | 清理过期记忆 | \`${CLI_INVOKE} maintain scan --ops purge_stale\` → \`maintain execute --ops purge_stale --confirm\`（删行必须 \`--confirm\`） |
 | 深度优化（Haiku） | \`${CLI_INVOKE} optimize\`（默认 preview；\`--run\` 执行，\`--task re-enrich,normalize,cluster-merge,smart-compress\`） |
 | 压缩旧条目 | \`${CLI_INVOKE} compress\`（默认 preview；\`--execute\` 执行，\`--age-days N\`） |
-| FTS5 索引检查 / 重建 | \`${CLI_INVOKE} fts-check [--rebuild]\` |
+| FTS5 索引检查 / 重建 | \`${CLI_INVOKE} fts-check <check\\|rebuild>\` |
 | tier 分组浏览 | \`${CLI_INVOKE} browse [--tier active]\` |
 | 导出 JSON/JSONL | \`${CLI_INVOKE} export [--format jsonl]\` |
 | 统计总量 / 健康 | \`${CLI_INVOKE} stats [--days 30]\` |

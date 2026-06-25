@@ -229,7 +229,7 @@ v2.34.0 起服务端注册 17 个工具，但 `tools/list` 只暴露 6 个 **核
 | `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | 去重 / decay / 清理 / 向量重建（`scan` 预览，`execute` 执行）。 |
 | `mem_optimize` | `claude-mem-lite optimize` | LLM 深度优化：re-enrich / normalize / cluster-merge（默认 preview；`--run` 执行）。 |
 | `mem_export` | `claude-mem-lite export` | JSON / JSONL 导出，支持项目/类型/日期过滤。 |
-| `mem_fts_check` | `claude-mem-lite fts-check [--rebuild]` | FTS5 完整性检查与重建。 |
+| `mem_fts_check` | `claude-mem-lite fts-check <check\|rebuild>` | FTS5 完整性检查与重建。 |
 | `mem_browse` | `claude-mem-lite browse` | 分层仪表盘（working / active / archive）。 |
 | `mem_registry` | `claude-mem-lite registry <action>` | 列 / 搜索 / 导入 / 移除 skill / agent。 |
 | `mem_use` | _MCP only_ | 从 registry 按名载入 skill / agent。 |

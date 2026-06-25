@@ -269,7 +269,7 @@ surface — reach them through the CLI column in the second table.
 | `mem_maintain` | `claude-mem-lite maintain scan --ops dedup,decay` | dedup / decay / cleanup / rebuild_vectors (`scan` previews, `execute` applies). |
 | `mem_optimize` | `claude-mem-lite optimize` | LLM-powered re-enrich / normalize / cluster-merge (preview default; `--run` to apply). |
 | `mem_export` | `claude-mem-lite export` | JSON / JSONL dump, filters by project, type, date. |
-| `mem_fts_check` | `claude-mem-lite fts-check [--rebuild]` | FTS5 integrity + rebuild. |
+| `mem_fts_check` | `claude-mem-lite fts-check <check\|rebuild>` | FTS5 integrity + rebuild. |
 | `mem_browse` | `claude-mem-lite browse` | Tier-grouped dashboard (working / active / archive). |
 | `mem_registry` | `claude-mem-lite registry <action>` | List / search / import / remove skills + agents. |
 | `mem_use` | _MCP only_ | Load a skill / agent from the registry by name. |

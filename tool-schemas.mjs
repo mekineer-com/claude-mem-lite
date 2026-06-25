@@ -636,7 +636,7 @@ export const tools = [
       '  - After a crash, power loss, or manual DB edit\n' +
       '  - doctor / stats flags FTS integrity problems\n' +
       '\n' +
-      'Equivalent CLI: ' + CLI_INVOKE + ' fts-check [--rebuild]',
+      'Equivalent CLI: ' + CLI_INVOKE + ' fts-check <check|rebuild>',
     inputSchema: memFtsCheckSchema,
     hidden: true,
   },

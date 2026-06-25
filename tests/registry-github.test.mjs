@@ -32,6 +32,25 @@ describe('parseGitHubUrl', () => {
     const r = parseGitHubUrl('https://github.com/user/repo.git');
     expect(r).toEqual({ owner: 'user', repo: 'repo', branch: 'main', path: '' });
   });
+
+  it('strips a copy-pasted query string / fragment so it does not leak into branch', () => {
+    // A browser-copied "?tab=…" or "#section" must not become part of the branch
+    // ("main?recursive=1#x") and corrupt the GitHub API URL → confusing 404.
+    expect(parseGitHubUrl('https://github.com/user/repo/tree/main?recursive=1#x'))
+      .toEqual({ owner: 'user', repo: 'repo', branch: 'main', path: '' });
+    expect(parseGitHubUrl('https://github.com/user/repo/tree/main#readme'))
+      .toEqual({ owner: 'user', repo: 'repo', branch: 'main', path: '' });
+    expect(parseGitHubUrl('https://github.com/user/repo?tab=readme'))
+      .toEqual({ owner: 'user', repo: 'repo', branch: 'main', path: '' });
+    expect(parseGitHubUrl('https://github.com/user/repo/tree/dev/skills/foo?ref=abc'))
+      .toEqual({ owner: 'user', repo: 'repo', branch: 'dev', path: 'skills/foo' });
+  });
+
+  it('rejects host-spoofing / SSRF lookalikes', () => {
+    expect(parseGitHubUrl('https://github.com.evil.com/user/repo')).toBeNull();
+    expect(parseGitHubUrl('https://github.com@evil.com/user/repo')).toBeNull();
+    expect(parseGitHubUrl('https://evil.com/github.com/user/repo')).toBeNull();
+  });
 });
 
 describe('URL builders', () => {

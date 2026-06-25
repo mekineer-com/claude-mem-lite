@@ -96,4 +96,15 @@ describe('MCP tool descriptions use discouragement style', () => {
       ).toBe(true);
     }
   });
+
+  // The CLI uses positional subcommands for its dual-mode commands, not flags.
+  // mem_fts_check's Equivalent CLI once read `fts-check [--rebuild]`, which the CLI
+  // rejects (it expects `fts-check <check|rebuild>`) — so the documented LLM/Bash
+  // fallback silently printed usage instead of rebuilding. Guard the subcommand form.
+  test('mem_fts_check documents the subcommand form, not a --rebuild flag', () => {
+    const tool = tools.find((t) => t.name === 'mem_fts_check');
+    expect(tool).toBeTruthy();
+    expect(tool.description).toMatch(/fts-check <check\|rebuild>/);
+    expect(tool.description).not.toMatch(/fts-check\s+\[?--rebuild/);
+  });
 });

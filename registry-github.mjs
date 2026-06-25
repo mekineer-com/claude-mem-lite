@@ -9,7 +9,12 @@
  */
 export function parseGitHubUrl(url) {
   if (!url || typeof url !== 'string') return null;
-  const match = url.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?(?:\/tree\/([^/]+)(\/.*)?)?$/);
+  // Drop any query string / fragment (a copy-pasted "?tab=readme" or "#section"
+  // browser anchor) before matching. Otherwise it leaks into the captured branch
+  // ("main?x#y") and corrupts the GitHub API URL built from it, so the import
+  // fails with a confusing 404 on a URL that opens fine in the browser.
+  const clean = url.split(/[?#]/)[0];
+  const match = clean.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?(?:\/tree\/([^/]+)(\/.*)?)?$/);
   if (!match) return null;
   const [, owner, repo, branch, pathRaw] = match;
   return {
