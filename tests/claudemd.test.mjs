@@ -97,6 +97,15 @@ describe('claudemd primitives', () => {
   it('removeManaged on a never-adopted project is absent (no throw)', () => {
     expect(removeManaged(cwd, SLUG).action).toBe('absent');
   });
+
+  it('removeManaged deletes a CLAUDE.md that adopt created (block was the whole file)', () => {
+    // No pre-existing CLAUDE.md → writeManaged creates one holding only the block.
+    // unadopt must leave no trace: remove the file, not write a 0-byte CLAUDE.md.
+    writeManaged(cwd, argsOf(cwd));
+    expect(existsSync(claudeMdPath(cwd))).toBe(true);
+    expect(removeManaged(cwd, SLUG).action).toBe('removed');
+    expect(existsSync(claudeMdPath(cwd))).toBe(false);
+  });
 });
 
 describe('migrateLegacyMemoryDir', () => {

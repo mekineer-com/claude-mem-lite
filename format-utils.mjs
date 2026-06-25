@@ -61,6 +61,11 @@ export function fmtDate(iso) {
 export function fmtTime(iso) {
   if (!iso) return '';
   const d = new Date(iso);
+  // Guard against an unparseable timestamp (e.g. corrupt/imported created_at):
+  // a bare new Date('garbage') yields Invalid Date → getUTCHours() is NaN →
+  // "NaN:NaN" leaking into the SessionStart Recent table. Degrade to '' like the
+  // falsy-input case above.
+  if (Number.isNaN(d.getTime())) return '';
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 

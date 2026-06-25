@@ -200,7 +200,18 @@ export function removeManaged(cwd, slug) {
       if (blockAtStart) raw = raw.replace(/^\s+/, '');
       action = 'removed';
     }
-    if (action === 'removed') atomicWrite(p, raw);
+    if (action === 'removed') {
+      // When the managed block was the ENTIRE file (adopt created CLAUDE.md
+      // because none existed), removing it leaves nothing but whitespace.
+      // Delete the now-empty file rather than writing a 0-byte CLAUDE.md, so
+      // unadopt fully restores the pre-adopt state — mirrors the emptied-.claude/
+      // cleanup below ("unadopt leaves no trace").
+      if (raw.trim() === '') {
+        try { unlinkSync(p); } catch { atomicWrite(p, raw); }
+      } else {
+        atomicWrite(p, raw);
+      }
+    }
   }
   const dp = detailDocPath(cwd, slug);
   if (existsSync(dp)) try { unlinkSync(dp); } catch { /* best-effort */ }

@@ -16,8 +16,23 @@ const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature:
 // Adaptive BM25 thresholds — scale with corpus size to filter noise.
 // Larger corpora produce more weak matches from common words.
 const BM25_THRESHOLD = { TINY: 0, SMALL: 1.5, MEDIUM: 2.5, LARGE: 3.5 };
-// OR fallback max token count — queries with 3+ tokens that fail AND are likely off-topic
-const OR_FALLBACK_MAX_TOKENS = 2;
+// OR fallback max token count — when an AND query returns nothing, retry as OR
+// only if the query has at most this many significant terms. Natural-language
+// user prompts ("how did we fix the parser null deref bug?") almost always
+// exceed this after synonym expansion, so the old hard 2 silently denied them
+// the OR rescue and the UPS injection path returned 0 results for real prompts
+// (semantic-keyed recall measured at 26%, #8255; 0/11 on a realistic NL corpus).
+// Precision for OR results is already enforced downstream by three independent
+// gates — the 0.4x OR penalty, the adaptive BM25 threshold, and the 40%
+// term-coverage filter (v27) — so the token gate is a redundant, overly-strict
+// fourth guard predating term-coverage. Default raised to 8 (covers typical NL
+// prompts); env override `MEM_OR_FALLBACK_MAX_TOKENS` ∈ [0, 50], invalid → 8.
+function getOrFallbackMaxTokens() {
+  const raw = process.env.MEM_OR_FALLBACK_MAX_TOKENS;
+  if (raw === undefined || raw === '') return 8;
+  const n = parseInt(raw, 10);
+  return Number.isInteger(n) && n >= 0 && n <= 50 ? n : 8;
+}
 
 // v27: term-coverage post-filter. Drops high-BM25 candidates whose visible
 // fields (title + lesson_learned) cover <N% of the query's significant terms.
@@ -215,9 +230,10 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // unconditionally; mirror that here. Noise is contained downstream (0.4x OR
     // penalty + BM25 threshold + term-coverage filter). queryIsCjkDominant (not
     // mere CJK presence) is the gate — see its definition at the function top.
+    const orFallbackMaxTokens = getOrFallbackMaxTokens();
     if (rows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
-      if (orQuery && (queryIsCjkDominant || queryTokenCount <= OR_FALLBACK_MAX_TOKENS)) {
+      if (orQuery && (queryIsCjkDominant || queryTokenCount <= orFallbackMaxTokens)) {
         try { rows = selectStmt.all(orQuery, project, cutoff); usedOrFallback = true; } catch {}
       }
     }
@@ -248,7 +264,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       crossRows = crossStmt.all(ftsQuery, project, cutoff);
       if (crossRows.length === 0) {
         const orQuery = relaxFtsQueryToOr(ftsQuery);
-        if (orQuery && (queryIsCjkDominant || queryTokenCount <= OR_FALLBACK_MAX_TOKENS)) {
+        if (orQuery && (queryIsCjkDominant || queryTokenCount <= orFallbackMaxTokens)) {
           try { crossRows = crossStmt.all(orQuery, project, cutoff); crossUsedOr = true; } catch {}
         }
       }

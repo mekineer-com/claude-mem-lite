@@ -243,6 +243,39 @@ describe('searchRelevantMemories', () => {
     expect(results.length).toBeGreaterThan(0);
   });
 
+  it('NL: OR-fallback rescues a natural-language English prompt whose AND form misses', () => {
+    // Real user prompts are full sentences. After synonym expansion the AND form
+    // becomes 5 groups: "(fix OR…) AND parser AND null AND deref AND (bug OR…)".
+    // The gold lacks a "bug" synonym and uses "Fixed" (no stemmer matches "fix"),
+    // so strict AND returns nothing. Before the OR gate was raised from 2 to 8,
+    // these >2-token NL prompts were denied the OR rescue and the UPS injection
+    // path returned 0 results for real prompts (#8255 semantic recall 26%).
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'bugfix',
+      title: 'Fixed null deref in parser when input is empty',
+      lessonLearned: 'check for null before dereferencing the parser node',
+      importance: 2,
+    });
+    const results = searchRelevantMemories(db, 'how did we fix the parser null deref bug?', 'proj', []);
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].title).toContain('parser');
+  });
+
+  it('NL precision: a topically-adjacent prompt sharing no whole word stays below the coverage floor', () => {
+    // "parse command line args" shares no whole word with the parser obs (word-
+    // boundary: "parse" ≠ "parser"); the OR rescue must NOT inject it. Guards the
+    // raised OR gate against precision regression — the 40% term-coverage filter
+    // is what keeps OR-fallback honest.
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'proj', type: 'bugfix',
+      title: 'Fixed null deref in parser when input is empty',
+      lessonLearned: 'check for null before dereferencing the parser node',
+      importance: 2,
+    });
+    const results = searchRelevantMemories(db, 'how do I parse command line arguments in node', 'proj', []);
+    expect(results.length).toBe(0);
+  });
+
   // R1: LOW_SIGNAL title filtering — degraded titles from hook-llm fallback
   // (Modified X, Worked on X, Reviewed N files:, etc.) must not be injected.
 

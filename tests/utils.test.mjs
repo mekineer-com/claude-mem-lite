@@ -1411,6 +1411,12 @@ describe('fmtTime', () => {
     const result = fmtTime('2026-01-15T09:05:00.000Z');
     expect(result).toBe('09:05');
   });
+
+  it('returns empty string for an unparseable timestamp (no "NaN:NaN")', () => {
+    // A corrupt/imported created_at must not leak "NaN:NaN" into the Recent table.
+    expect(fmtTime('not-a-date')).toBe('');
+    expect(fmtTime('2026-13-99T99:99:99Z')).toBe('');
+  });
 });
 
 // ─── isoWeekKey ─────────────────────────────────────────────────────────────

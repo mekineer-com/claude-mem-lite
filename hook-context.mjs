@@ -27,6 +27,15 @@ function inferProjectDir() {
  * @param {string} project Project name to check velocity for
  * @returns {{tier1: number, tier2: number, tier3: number, sessWindow: number}} Time window durations in ms
  */
+// Sanitize a string for a GitHub-flavored-markdown table cell: a literal `|`
+// in a title (e.g. "grep | sort | uniq") would otherwise open phantom columns
+// and corrupt the <claude-mem-context> Recent table the model+user see every
+// SessionStart. Escape pipes and collapse any CR/LF/tab to a space so one obs
+// stays one row/cell.
+function mdCell(s) {
+  return String(s ?? '').replace(/[\r\n\t]+/g, ' ').replace(/\|/g, '\\|');
+}
+
 export function computeAdaptiveWindows(db, project) {
   const sevenDaysAgo = Date.now() - 7 * 86400000;
   const row = db.prepare(`
@@ -446,7 +455,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     obsLines.push('|----|------|---|-------|');
     for (const o of obsToShow) {
       const proj = o.project && o.project !== project ? ` (${o.project})` : '';
-      obsLines.push(`| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${truncate(o.title || '(untitled)', 60)}${proj} |`);
+      obsLines.push(`| #${o.id} | ${fmtTime(o.created_at)} | ${typeIcon(o.type)} | ${mdCell(truncate(o.title || '(untitled)', 60) + proj)} |`);
     }
   }
 

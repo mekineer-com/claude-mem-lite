@@ -520,6 +520,31 @@ describe('buildSessionContextLines: Deferred Work block (deferred_work-backed)',
   });
 });
 
+describe('buildSessionContextLines: Recent table cell safety', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-r', project: 'test' }); });
+  afterEach(() => { db.close(); });
+
+  it('escapes a literal pipe in a title so the markdown table stays 4 columns', () => {
+    insertObs(db, { sessionId: 'sess-r', project: 'test', type: 'decision', title: 'Use grep | sort | uniq pipeline', importance: 3 });
+    const out = buildSessionContextLines(db, 'test');
+    const row = out.split('\n').find(l => l.includes('grep'));
+    expect(row).toBeTruthy();
+    // Every cell-separating pipe is unescaped; title pipes are escaped \| — so a
+    // correct row has exactly the 5 structural pipes of a 4-column row.
+    const structuralPipes = (row.match(/(^|[^\\])\|/g) || []).length;
+    expect(structuralPipes).toBe(5);
+    expect(row).toContain('grep \\| sort \\| uniq');
+  });
+
+  it('collapses CR/LF/tab in a title to spaces so one obs stays one row', () => {
+    insertObs(db, { sessionId: 'sess-r', project: 'test', type: 'bugfix', title: 'multi\nline\ttitle', importance: 2 });
+    const out = buildSessionContextLines(db, 'test');
+    const row = out.split('\n').find(l => l.includes('multi'));
+    expect(row).toContain('multi line title');
+  });
+});
+
 function extractSection(text, header) {
   const lines = text.split('\n');
   const startIdx = lines.findIndex(l => l.startsWith(`### ${header}`));
