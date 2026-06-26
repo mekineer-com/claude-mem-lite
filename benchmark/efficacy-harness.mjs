@@ -386,24 +386,58 @@ const perCommit = [];
 for (const spec of usable) {
   const row = { commit: spec.hash };
   for (const arm of ARMS) {
-    const cells = results.cells.filter((c) => c.commit === spec.hash && c.arm === arm && c.pass !== null
-      && !(c.arm === 'B' && c.bridgeFired === false));
+    // ITT (intention-to-treat): count ALL non-null cells. For arm B, non-fired cells
+    // fail open to the ACK directive (≈ arm A) — that IS what "turn the flag on" does
+    // in production, so they belong in the headline. Silently dropping them would bias
+    // Δ optimistic (it can manufacture a positive result by removing ~0-scoring cells).
+    const cells = results.cells.filter((c) => c.commit === spec.hash && c.arm === arm && c.pass !== null);
     row[arm] = { n: cells.length, pass: cells.filter((c) => c.pass === 1).length };
+  }
+  // arm-B per-protocol (fired-only) subset: a secondary, OPTIMISTIC diagnostic that
+  // excludes fail-open-to-ACK cells. Never the headline; feeds the Δ_fired lines below.
+  if (ARMS.includes('B')) {
+    const fired = results.cells.filter((c) => c.commit === spec.hash && c.arm === 'B' && c.pass !== null && c.bridgeFired !== false);
+    row.B_fired = { n: fired.length, pass: fired.filter((c) => c.pass === 1).length };
   }
   perCommit.push(row);
   const c = row.C;
-  const armStr = ARMS.map((arm) => `${arm}=${row[arm]?.pass}/${row[arm]?.n}`).join('  ');
+  const armStr = ARMS.map((arm) => `${arm}=${row[arm]?.pass}/${row[arm]?.n}`).join('  ')
+    + (row.B_fired ? `  B_fired=${row.B_fired.pass}/${row.B_fired.n}` : '');
   const deltaStr = ARMS.filter((arm) => arm !== 'C').map((arm) => {
     const a = row[arm];
     return `Δ(${arm}−C)=${a && c && a.n && c.n ? (((a.pass / a.n) - (c.pass / c.n)) * 100).toFixed(0) + 'pp' : 'n/a'}`;
   }).join('  ');
   console.log(`  ${spec.hash}  ${armStr}  ${deltaStr}`);
 }
-// commit-level paired mean Δ, one line per injected arm vs C
+// commit-level paired mean Δ between two row keys, over commits where both have ≥1 cell.
+function pairedMeanDelta(left, right) {
+  const deltas = perCommit.filter((r) => r[left]?.n && r[right]?.n)
+    .map((r) => (r[left].pass / r[left].n) - (r[right].pass / r[right].n));
+  return { meanD: deltas.length ? deltas.reduce((x, y) => x + y, 0) / deltas.length : null, n: deltas.length };
+}
+const fmtD = (d) => (d.meanD == null ? 'n/a' : (d.meanD * 100).toFixed(1) + 'pp');
+
+// ITT (intention-to-treat) headline, one line per injected arm vs C. For arm B this
+// includes fail-open-to-ACK cells — the trustworthy "what flipping the flag does" number.
 for (const arm of ARMS.filter((a) => a !== 'C')) {
-  const deltas = perCommit.filter((r) => r[arm]?.n && r.C?.n).map((r) => (r[arm].pass / r[arm].n) - (r.C.pass / r.C.n));
-  const meanD = deltas.length ? deltas.reduce((x, y) => x + y, 0) / deltas.length : null;
-  console.log(`\nCOMMIT-LEVEL mean Δ (${arm}−C) = ${meanD == null ? 'n/a' : (meanD * 100).toFixed(1) + 'pp'} over ${deltas.length} commits.`);
+  const d = pairedMeanDelta(arm, 'C');
+  const label = arm === 'B' ? 'Δ_ITT(B−C)' : `Δ(${arm}−C)`;
+  console.log(`\nCOMMIT-LEVEL mean ${label} = ${fmtD(d)} over ${d.n} commits.` +
+    (arm === 'B' ? '  [ITT — trustworthy/primary: includes fail-open-to-ACK cells]' : ''));
+}
+// arm B extra deltas: ITT vs A, plus the fired-only (per-protocol) subset. Fired-only
+// EXCLUDES fail-open-to-ACK cells → OPTIMISTIC, so it is a diagnostic, NOT the headline.
+if (ARMS.includes('B')) {
+  if (ARMS.includes('A')) {
+    const d = pairedMeanDelta('B', 'A');
+    console.log(`COMMIT-LEVEL mean Δ_ITT(B−A) = ${fmtD(d)} over ${d.n} commits.  [ITT — trustworthy/primary]`);
+  }
+  const dfc = pairedMeanDelta('B_fired', 'C');
+  console.log(`COMMIT-LEVEL mean Δ_fired(B−C) = ${fmtD(dfc)} over ${dfc.n} commits.  [fired-only (per-protocol — excludes fail-open-to-ACK cells; OPTIMISTIC)]`);
+  if (ARMS.includes('A')) {
+    const dfa = pairedMeanDelta('B_fired', 'A');
+    console.log(`COMMIT-LEVEL mean Δ_fired(B−A) = ${fmtD(dfa)} over ${dfa.n} commits.  [fired-only (per-protocol — OPTIMISTIC)]`);
+  }
 }
 console.log('UPPER BOUND. No significance claimed (step-2 power). NULL/near-0 here = strong negative; large + = on-topic injection works (not realistic efficacy).');
 saveResults(results);
