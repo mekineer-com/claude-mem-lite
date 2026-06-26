@@ -177,3 +177,37 @@ with the lesson now demonstrably seen, the model still doesn't apply it — the 
 **Do NOT flip the `CLAUDE_MEM_SALIENCE` default; bind stays opt-in.** Caveat: one cell, one model,
 upper-bound — a null here ≠ "bind is useless everywhere" (component 2 never fires on bac2e85;
 other lesson shapes untested).
+
+## comprehension-bridge measure (2026-06-27)
+
+Added arm **B** = `CLAUDE_MEM_SALIENCE=bridge`: at the PreToolUse edit point, a Haiku call rewrites the
+recalled lesson into a check **bound to the actual edit hunk** (the specificity arm T has but A/F lack).
+bac2e85 only (the other 2 commits in `efficacy-commits.json` are now unrevertable — region drifted), k=8,
+`claude-sonnet-4-6`, reusing the cached A/C/F/T cells from the bind re-measure above.
+
+**B=0/8 · A=0/8 (ack) · F=0/8 (bind) · C=0/8 · T=8/8.** Δ_ITT(B−C)=Δ_ITT(B−A)=0pp, Δ(T−C)=+100pp.
+
+This is a clean **channel × specificity 2×2** on one commit. The bridge's emitted check on bac2e85 is
+near-identical *content* to arm T's spelled-in requirement ("null `compressed_into` before hard-deleting
+in `cleanupBroken`/`purgeStale`") — verified by a direct probe — so B vs T isolates **delivery channel**
+(PreToolUse `additionalContext` vs the task prompt) with content held ~constant:
+
+| | task-prompt | hook-injection |
+|---|---|---|
+| **specific** | T = **8/8** | B = **0/8** |
+| **generic** | — | A/F = 0/8 |
+
+Firing was confirmed, not assumed: all 8 B cells recorded `injected=true` (lesson reached the session)
+and the bridge demonstrably emits the specific check, with `salience=bridge`. So the model **saw a correct,
+specific, T-equivalent check and still applied it 0/8** — exactly like ack/bind.
+
+**Conclusion: the bottleneck is the delivery CHANNEL (and the comprehension→action step), NOT content
+specificity.** Making the lesson maximally specific at the PreToolUse hook-injection point does not move
+the needle; the same content in the *task prompt* (T) moves it 100pp. The comprehension-bridge, as
+designed (smarter injection at the hook point), cannot cross that gap. **Do NOT flip the default; `bridge`
+stays opt-in.** Caveat: n=1, one model, upper-bound — but because it is a content-held-constant
+channel-isolation contrast with firing verified, this null is more informative than a bare population
+estimate: it is "saw a correct specific directive and ignored it," not "couldn't measure an effect."
+**Implication for D#44:** the lever is getting high-value lesson content into the *instruction/task
+channel* (where T succeeds), not making hook-injected directives smarter. That is a distinct design
+direction (e.g. UserPromptSubmit instruction-layer injection), to be brainstormed separately.

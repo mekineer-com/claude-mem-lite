@@ -42,6 +42,7 @@ const COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes (used only for legacy fallback)
 const SALIENCE_LEGACY = process.env.CLAUDE_MEM_SALIENCE === 'legacy'
   || process.env.CLAUDE_MEM_SALIENCE === '0';
 const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
+const SALIENCE_BRIDGE = process.env.CLAUDE_MEM_SALIENCE === 'bridge';
 const ACK_DIRECTIVE = "apply each lesson to this edit or rule it out — state '#NN applied' or '#NN n/a — <reason>' in your next user-facing message.";
 // v-bind salience forcing-function (#8771 audit: ack ≠ act). Instead of a cheap
 // '#NN applied / n/a' verdict, demand the model bind the lesson to the concrete
@@ -75,6 +76,30 @@ function cooldownPathFor(sessionId) {
   if (!sessionId) return LEGACY_COOLDOWN_PATH;
   const safe = String(sessionId).replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
   return join(RUNTIME_DIR, `pre-recall-cooldown-${safe}.json`);
+}
+
+// Comprehension-bridge (CLAUDE_MEM_SALIENCE=bridge): rewrite the top bound lesson
+// into a check naming a symbol in THIS change. Dynamic import keeps the LLM stack
+// out of the default fast path (#8447). Fail-open: null → caller uses ACK line.
+async function bridgeTopLesson(rows, changeText) {
+  if (!SALIENCE_BRIDGE || !changeText) return null;
+  const fake = process.env.CLAUDE_MEM_BRIDGE_FAKE;
+  let extractIdents, bridgeLesson;
+  try {
+    ({ extractIdents } = await import('../lib/lesson-idents.mjs'));
+    if (!fake) ({ bridgeLesson } = await import('../lib/lesson-bridge.mjs'));
+  } catch { return null; }
+  for (const r of rows) {
+    const lesson = r.lesson_learned;
+    if (!lesson) continue;
+    if (!extractIdents(lesson).some((id) => changeText.includes(id))) continue;
+    let res;
+    if (fake) res = /^n\s*\/?\s*a$/i.test(fake.trim()) ? { ok: false } : { ok: true, check: fake.trim().slice(0, 200) };
+    else res = await bridgeLesson({ lesson, hunk: changeText });
+    if (res.ok) return { id: r.id, check: res.check };
+    return null; // top bound lesson abstained → fall back to ACK, don't scan further
+  }
+  return null;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -181,11 +206,13 @@ try {
   let filePath;
   let sessionId;
   let toolName;
+  let toolInput;
   // isFullRead: a Read with no offset/limit reads the whole file. The reread
   // guard only flags full-vs-full re-reads, so paging never trips it.
   let isFullRead = true;
   try {
     const event = JSON.parse(input);
+    toolInput = event.tool_input;
     filePath = event.tool_input?.file_path;
     sessionId = event.session_id || null;
     toolName = event.tool_name || null;
@@ -442,7 +469,11 @@ try {
       // Read keeps the quiet form; its forcing-function fires at the later Edit
       // via the Read→Edit ack nudge above.
       if (!isRead && !SALIENCE_LEGACY) {
-        lines.push(`[mem] ⚠ Before this edit: ${ACTIVE_DIRECTIVE}`);
+        const changeText = [toolInput?.old_string, toolInput?.new_string, toolInput?.content]
+          .filter(Boolean).join('\n');
+        const bridged = await bridgeTopLesson(allRows, changeText);
+        if (bridged) lines.push(`[mem] ⚠ #${bridged.id} → this edit must: ${bridged.check}. Confirm your new code satisfies it.`);
+        else lines.push(`[mem] ⚠ Before this edit: ${ACTIVE_DIRECTIVE}`);
       }
     } else if (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1') {
       // R-4: Edit/Write empty → short backfill reminder. OPT-IN (default off) as

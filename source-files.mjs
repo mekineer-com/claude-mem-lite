@@ -66,6 +66,11 @@ export const SOURCE_FILES = [
   // are present in the pre-edit file (component 2). Imported ONLY by
   // scripts/pre-tool-recall.js; kept here for the same reason as file-intel.mjs.
   'lib/lesson-idents.mjs',
+  // comprehension-bridge forcing-function (CLAUDE_MEM_SALIENCE=bridge): rewrites
+  // a recalled lesson into a check bound to the change hunk. Dynamic-imported by
+  // scripts/pre-tool-recall.js ONLY under the flag, but must still ship so the
+  // hook can resolve it at runtime when a user opts in.
+  'lib/lesson-bridge.mjs',
   // v2.71.x: better-sqlite3 ABI probe + auto-rebuild. Shared by install.mjs
   // (post-`npm install` verify) and scripts/launch.mjs (pre-server-launch
   // self-heal after Node ABI changes). Missing from manifest → auto-update

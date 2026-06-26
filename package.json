@@ -71,6 +71,7 @@
     "lib/reread-guard.mjs",
     "lib/metrics.mjs",
     "lib/lesson-idents.mjs",
+    "lib/lesson-bridge.mjs",
     "lib/binding-probe.mjs",
     "lib/proc-lock.mjs",
     "lib/atomic-write.mjs",
