@@ -33,8 +33,15 @@ export async function acquireLLMSlot() {
         if (fd !== undefined) closeSync(fd);
       }
     } catch {
-      // Slot file already exists for this PID — stale cleanup should have removed it;
-      // retry and let O_CREAT|O_EXCL succeed on next iteration (avoid non-atomic fallback)
+      // Our own pid-named slot file already exists: a leftover from a prior acquire
+      // that never released (crash between acquire and releaseLLMSlot, or PID reuse).
+      // We are inside acquire and therefore do NOT currently hold a slot, so it is
+      // always stale — remove it and retry. The await is essential: a bare `continue`
+      // here re-hits the same EEXIST every iteration, a synchronous tight loop that
+      // pins a core until the 30s deadline (the age-based cleanup below is unreachable
+      // on this path — it only runs after a successful create).
+      try { unlinkSync(slotFile); } catch {}
+      await sleepMs(50 + Math.random() * 100);
       continue;
     }
 

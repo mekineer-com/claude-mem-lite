@@ -911,6 +911,28 @@ describe('CLI stats command', () => {
     expect(stats.data_health.low_value_count).toBe(1); // only the live row, not the compressed one
     expect(stats.data_health.compressed).toBe(1);
   });
+
+  // Memory-quality audit (2026-06): the imp=1 "Low-value" gauge structurally can't
+  // see template / tool-log titles (Modified/Error/Worked on…) — they often carry
+  // inflated importance and recent access, so the gauge reported 0% noise on a store
+  // that was ~24% low-signal-titled. low_signal_titles surfaces that population using
+  // the same LOW_SIGNAL pattern source (lib/low-signal-patterns.mjs) as the read filter.
+  it('counts low-signal titles the imp=1 gauge cannot see', async () => {
+    insertObs(testDb, { // LOW_SIGNAL title + high importance + accessed → invisible to low_value_count
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Error while working on auth.js', text: 'cmd → ERROR', importance: 3, accessCount: 5,
+    });
+    insertObs(testDb, { // substantive title → must NOT count as low-signal
+      sessionId: 'mem-s1', project: 'test--project', type: 'decision',
+      title: 'Chose RRF over linear fusion for hybrid recall', text: 'rationale', importance: 2, accessCount: 1,
+    });
+    const output = await captureStdoutOnly(() => run(['stats', '--json']));
+    const stats = JSON.parse(output);
+    expect(stats.data_health.low_signal_titles).toBe(1); // the "Error while working" row, not the decision
+    expect(stats.data_health.low_value_count).toBe(0);    // neither is imp=1+unaccessed+stale → old gauge blind
+    const text = await captureStdout(() => run(['stats']));
+    expect(text).toContain('Low-signal titles');
+  });
 });
 
 // ─── help and unknown commands ───────────────────────────────────────────────

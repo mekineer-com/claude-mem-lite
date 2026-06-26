@@ -6,6 +6,7 @@
 import { cjkBigrams } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { createHash } from 'crypto';
+import { rrfAccumulate } from './lib/rrf.mjs';
 
 export const VOCAB_DIM = 512;
 export const MIN_COSINE_SIMILARITY = 0.05;
@@ -14,6 +15,21 @@ export const VECTOR_SCAN_LIMIT = 500;
 // (BM25 and vector lists contribute more equally); lower k lets the top few ranks
 // dominate. 60 is the de-facto RRF default and balances the two retrievers here.
 export const RRF_K = 60;
+
+// Phase-1 disable of the TF-IDF vector arm (memory-quality audit 2026-06-27).
+// The arm reads ~0 benchmark lift (ci-gate hybrid_over_bm25 = 0), pays a
+// computeVector on every observation write, only scans the most-recent
+// VECTOR_SCAN_LIMIT rows (misses older memories), and drifted unnoticed for
+// months. Default OFF. To re-enable: set CLAUDE_MEM_VECTORS=1 AND run
+// `claude-mem-lite maintain execute --ops rebuild_vectors` to repopulate vectors for
+// observations created while disabled — re-enabling WITHOUT a rebuild leaves a
+// partially-populated index (the primary + enrich/compress/optimize write paths all
+// stopped writing while off) → silently degraded hybrid recall until the next
+// rebuild. Tables + code are retained pending Phase-2 removal. Read at call time (not
+// import) so tests + the benchmark A/B can toggle it via env.
+export function vectorsEnabled() {
+  return process.env.CLAUDE_MEM_VECTORS === '1';
+}
 
 const VOCAB_STOP_WORDS = new Set([
   ...BASE_STOP_WORDS,
@@ -275,6 +291,14 @@ export function rebuildVocabulary(db, opts) {
  * @returns {object|null} vocabulary
  */
 export function getVocabulary(db) {
+  // Phase-1 choke point: when the vector arm is disabled there is no vocabulary to
+  // serve. Returning null here makes EVERY vector write/read path skip via its
+  // existing `if (vocab)` guard — including the enrich (hook-llm), compress
+  // (compress-core) and optimize (hook-optimize) write paths that don't go through
+  // insertObservationVector — so no path can be "missed" and observation_vectors
+  // stays uniformly stale (not half-populated) while disabled. computeVector is
+  // null-safe, so even a caller that skips its guard no-ops rather than crashes.
+  if (!vectorsEnabled()) return null;
   if (_vocabCache) return _vocabCache;
 
   // Try loading from persisted vocab_state
@@ -423,14 +447,9 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
  * @returns {{ id: number, rrfScore: number }[]}
  */
 export function rrfMerge(bm25Results, vectorResults, k = RRF_K) {
-  const scores = new Map();
-  bm25Results.forEach((r, i) => {
-    scores.set(r.id, (scores.get(r.id) ?? 0) + 1 / (k + i + 1));
-  });
-  vectorResults.forEach((r, i) => {
-    scores.set(r.id, (scores.get(r.id) ?? 0) + 1 / (k + i + 1));
-  });
-  return [...scores.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([id, score]) => ({ id, rrfScore: score }));
+  // Thin 2-list adapter over the shared RRF core (lib/rrf.mjs). Emits the minimal
+  // { id, rrfScore } shape this module's callers (search-engine.mjs) expect; the
+  // accumulator's best-rank row tracking is irrelevant here and ignored.
+  return rrfAccumulate([bm25Results, vectorResults], k)
+    .map(({ id, score }) => ({ id, rrfScore: score }));
 }

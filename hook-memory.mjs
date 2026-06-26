@@ -222,7 +222,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // Count original search terms (AND-separated groups), not expanded synonym tokens.
     const queryTokenCount = ftsQuery.includes(' AND ')
       ? ftsQuery.split(' AND ').length
-      : ftsQuery.split(/\s+/).filter(t => t && !t.startsWith('(') || !t.endsWith(')')).length;
+      : ftsQuery.split(/\s+/).filter(t => t && !t.startsWith('(') && !t.endsWith(')')).length;
     // CJK-dominant queries bypass the token-count gate: a single CJK word becomes
     // 2-N overlapping bigrams (优化召回率 → 优化/召回/回率), inflating
     // queryTokenCount past the gate, so the AND-too-strict query never gets the OR
@@ -385,7 +385,11 @@ export function recallForFile(db, filePath, project) {
     `).all(project, cutoff, filePath, likePattern, MAX_FILE_RECALL);
     const now = Date.now();
     const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
-    for (const r of rows) updateStmt.run(now, r.id);
+    // Per-row try/catch for FTS trigger safety — mirror the injection-bump loop
+    // (searchRelevantMemories) and project_non_obvious.md. Without it, one
+    // SQLITE_CORRUPT_VTAB on the access_count UPDATE trigger throws to the outer
+    // catch and discards the ENTIRE file-recall result set.
+    for (const r of rows) { try { updateStmt.run(now, r.id); } catch {} }
     return rows;
   } catch (e) {
     debugCatch(e, 'recallForFile');

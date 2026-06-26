@@ -244,7 +244,10 @@ export function cleanupClaudeMdLegacyBlock() {
 
   if (normalized === content) { dropMarker(); return; }
 
-  const tmp = claudeMdPath + '.mem-tmp';
+  // Per-pid temp suffix so two concurrent first-run SessionStarts in the same
+  // project (e.g. two terminals) can't rename each other's half-written temp
+  // onto the user's tracked CLAUDE.md. Matches the idiom in hook-shared.mjs.
+  const tmp = claudeMdPath + `.mem-tmp-${process.pid}`;
   try {
     writeFileSync(tmp, normalized);
     renameSync(tmp, claudeMdPath);

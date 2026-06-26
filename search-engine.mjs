@@ -11,7 +11,7 @@ import {
   notLowSignalTitleClause, LOW_SIGNAL_TITLE,
   relaxFtsQueryToOr, debugLog, debugCatch, estimateTokens,
 } from './utils.mjs';
-import { getVocabulary, computeVector, vectorSearch, rrfMerge } from './tfidf.mjs';
+import { getVocabulary, computeVector, vectorSearch, rrfMerge, vectorsEnabled } from './tfidf.mjs';
 import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
 
 // Scoring expressions — full adds project boost + access bonus; simple is for
@@ -395,6 +395,7 @@ export function searchObservationsHybrid(db, ctx) {
 
   // Vector search + RRF hybrid merge
   try {
+    if (!vectorsEnabled()) return results;  // Phase-1: vector arm disabled → BM25-only path (audit 2026-06-27)
     const vocab = getVocabulary(db);
     if (!vocab) return results;
     const queryText = ftsQuery.replace(/['"()]/g, ' ');

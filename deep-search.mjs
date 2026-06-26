@@ -34,6 +34,7 @@
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { sanitizeFtsQuery } from './utils.mjs';
 import { RRF_K } from './tfidf.mjs';
+import { rrfAccumulate } from './lib/rrf.mjs';
 import { llmRerankOrder, defaultRerankLLM } from './rerank.mjs';
 
 // original + up to 3 rewrites (keyword / concept-expansion / HyDE).
@@ -350,28 +351,12 @@ export async function rewriteQuery(query, { llm = defaultLLM, retries = 1, cache
  *   match the hybrid path's convention) plus an rrfScore field.
  */
 export function rrfFuseN(rankedLists, k = RRF_K) {
-  const scores = new Map();
-  for (const list of rankedLists) {
-    if (!Array.isArray(list)) continue;
-    list.forEach((r, i) => {
-      if (!r || r.id === undefined || r.id === null) return;
-      const add = 1 / (k + i + 1);
-      const prev = scores.get(r.id);
-      if (prev) {
-        prev.score += add;
-        // Keep the row from the variant that ranked this id HIGHEST (lowest
-        // index). searchObservationsHybrid emits query-dependent fields per
-        // variant (notably the FTS snippet), so first-seen would often show the
-        // weaker original/keyword variant's context; the best-ranked appearance
-        // carries the most relevant snippet/match context (F10).
-        if (i < prev.bestRank) { prev.row = r; prev.bestRank = i; }
-      } else {
-        scores.set(r.id, { row: r, score: add, bestRank: i });
-      }
-    });
-  }
-  return [...scores.values()]
-    .sort((a, b) => b.score - a.score)
+  // Thin N-list adapter over the shared RRF core (lib/rrf.mjs). Emits full source
+  // rows with score = -rrfScore (negative = better, matching the hybrid path's
+  // convention) plus an rrfScore field. rrfAccumulate already keeps each id's
+  // best-ranked row, so query-dependent fields (notably the FTS snippet) come from
+  // the strongest variant rather than first-seen (F10).
+  return rrfAccumulate(rankedLists, k)
     .map(({ row, score }) => ({ ...row, score: -score, rrfScore: score }));
 }
 

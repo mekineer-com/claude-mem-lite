@@ -101,7 +101,12 @@ describe('re-enrich', () => {
 // This test calls rebuildVector directly and asserts the row actually lands.
 describe('rebuildVector (Bug #1)', () => {
   let db;
+  let prevVec;
   beforeEach(async () => {
+    // rebuildVector writes observation_vectors — exercise it with the vector arm ON
+    // (choke-point-gated OFF by default since the 2026-06 memory-quality audit).
+    prevVec = process.env.CLAUDE_MEM_VECTORS;
+    process.env.CLAUDE_MEM_VECTORS = '1';
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
     // Seed several observations so rebuildVocabulary has enough corpus to build a vocab
@@ -118,7 +123,11 @@ describe('rebuildVector (Bug #1)', () => {
     _resetVocabCache();
     rebuildVocabulary(db);
   });
-  afterEach(() => { db.close(); });
+  afterEach(() => {
+    db.close();
+    if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS;
+    else process.env.CLAUDE_MEM_VECTORS = prevVec;
+  });
 
   it('writes a row to observation_vectors for the target observation', async () => {
     const { rebuildVector } = await import('../hook-optimize.mjs');

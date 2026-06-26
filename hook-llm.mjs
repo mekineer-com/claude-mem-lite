@@ -740,9 +740,15 @@ ${actionList}`;
           (parsed.type === 'bugfix' || parsed.type === 'decision') &&
           !process.env.CLAUDE_MEM_NO_LESSON_RETRY) {
         retryAttempted = true;
+        // The first callLLM released its slot in the finally above; this lesson
+        // retry is a SECOND LLM call and must re-acquire the semaphore or it
+        // bypasses LLM_SEM_MAX — a burst of bugfix/decision episodes would otherwise
+        // spawn unbounded concurrent Haiku calls. Under contention we skip the retry
+        // rather than exceed the limit (the lesson is an optional enhancement).
+        const retrySlot = await acquireLLMSlot();
         try {
           const retryPrompt = buildLessonRetryPrompt(episode, parsed);
-          const retryRaw = await callLLM(retryPrompt, 10000);
+          const retryRaw = retrySlot ? await callLLM(retryPrompt, 10000) : null;
           if (retryRaw) {
             const retry = parseJsonFromLLM(retryRaw);
             const retryLesson = typeof retry?.lesson === 'string' ? retry.lesson.trim() : '';
@@ -754,6 +760,7 @@ ${actionList}`;
             }
           }
         } catch (e) { debugCatch(e, 'lesson-retry'); }
+        finally { if (retrySlot) releaseLLMSlot(); }
       }
       // v2.57.x B2: persist retry outcome counters. The retry path costs
       // 1 extra Haiku call per bugfix/decision episode; if recovered/attempts

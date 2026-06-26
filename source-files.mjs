@@ -114,6 +114,9 @@ export const SOURCE_FILES = [
   // `timeline`/`search` and mem_timeline/mem_search on auto-update.
   'lib/timeline-core.mjs',
   'lib/search-core.mjs',
+  // Reciprocal Rank Fusion core (D#42 single source-of-truth); transitively
+  // reached via tfidf.mjs (rrfMerge) and deep-search.mjs (rrfFuseN).
+  'lib/rrf.mjs',
   // Shared "compress old low-value observations into weekly summaries" core.
   // Statically imported by mem-cli.mjs (cmdCompress), server.mjs (mem_compress),
   // and hook.mjs (handleAutoCompress) — same single-source-of-truth pattern as

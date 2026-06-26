@@ -12,6 +12,7 @@ import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, b
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
+import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
@@ -864,6 +865,15 @@ server.registerTool(
     `).get(thirtyDaysAgo, ...baseParams);
 
     const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
+    // Low-signal-title population (template / tool-log titles the read-side filter
+    // already excludes). The imp=1 "Low-value" metric can't see these, so the
+    // gauge under-reports real noise without it. See lib/low-signal-patterns.mjs.
+    const lowSignalTitle = db.prepare(`
+      SELECT COUNT(*) as c FROM observations
+      WHERE NOT ${buildNotLowSignalSql()}
+        AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
+    `).get(...baseParams);
+    const lowSignalRatio = obsTotal.c > 0 ? lowSignalTitle.c / obsTotal.c : 0;
     const compressedCount = db.prepare(`
       SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}
     `).get(...baseParams);
@@ -900,8 +910,9 @@ server.registerTool(
       `  Est. tokens: ${tokenEst.t ?? 0}`,
       `  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`,
       `  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`,
+      `  Low-signal titles (Modified/Error/Worked on…): ${lowSignalTitle.c} (${(lowSignalRatio * 100).toFixed(1)}%)`,
       `  Compressed: ${compressedCount.c}`,
-      ...(noiseRatio > 0.6 ? ['  ⚠️ High noise ratio — consider running mem_compress'] : []),
+      ...((noiseRatio > 0.6 || lowSignalRatio > 0.3) ? ['  ⚠️ High noise ratio — consider running mem_compress / maintain'] : []),
       '',
       // Tier counts only live (uncompressed, non-superseded) observations — surface
       // the full decomposition so live + compressed + superseded = Total adds up cleanly.

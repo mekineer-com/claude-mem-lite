@@ -15,6 +15,7 @@ import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { computeFunnel, formatFunnel, computeSweep, formatSweep, DEFAULT_SWEEP_FLOORS, DEFAULT_SWEEP_MARGINS } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
+import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
@@ -1098,6 +1099,18 @@ async function cmdStats(db, args) {
       AND created_at_epoch < ? ${projectFilter}
   `).get(thirtyDaysAgo, ...baseParams);
   const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
+  // Low-signal-title population: template / tool-log titles (Modified, Worked on,
+  // Error while working, Error:, node/npm/npx …) that the retrieval layer already
+  // filters out by default. The imp=1 "Low-value" metric above structurally can't
+  // see these — they often carry inflated importance and recent access — so the
+  // health gauge under-reports real noise without this line. Same LOW_SIGNAL
+  // pattern source as the read-side filter (lib/low-signal-patterns.mjs).
+  const lowSignalTitle = db.prepare(`
+    SELECT COUNT(*) as c FROM observations
+    WHERE NOT ${buildNotLowSignalSql()}
+      AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
+  `).get(...baseParams);
+  const lowSignalRatio = obsTotal.c > 0 ? lowSignalTitle.c / obsTotal.c : 0;
   const compressedCount = db.prepare(
     `SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}`
   ).get(...baseParams);
@@ -1143,6 +1156,8 @@ async function cmdStats(db, args) {
         avg_importance: Number((avgImp.v ?? 1).toFixed(2)),
         low_value_count: lowVal.c,
         noise_ratio: Number(noiseRatio.toFixed(4)),
+        low_signal_titles: lowSignalTitle.c,
+        low_signal_ratio: Number(lowSignalRatio.toFixed(4)),
         compressed: compressedCount.c,
         superseded_only: supersededOnlyCount.c,
         hook_errors_24h: hookErrors24h,
@@ -1179,6 +1194,7 @@ async function cmdStats(db, args) {
   out(`  Est. tokens: ${tokenEst.t ?? 0}`);
   out(`  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`);
   out(`  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`);
+  out(`  Low-signal titles (Modified/Error/Worked on…): ${lowSignalTitle.c} (${(lowSignalRatio * 100).toFixed(1)}%)`);
   out(`  Compressed: ${compressedCount.c}`);
   out(`  Hook errors (last 24h): ${hookErrors24h}${hookErrors24h > 0 ? `  ← tail ${join(DB_DIR, 'runtime/hook-errors')}` : ''}`);
   // Tier-1 firing counters for ① file-intel + ② reread-guard (recorded by
@@ -1188,7 +1204,7 @@ async function cmdStats(db, args) {
   const rrN = featAgg.reread_warn?.count ?? 0;
   const metricsOn = process.env.CLAUDE_MEM_METRICS === '1';
   out(`  Feature injections (7d): 📄 file-intel ${fiN} · 🔁 reread-warn ${rrN}${(!metricsOn && fiN + rrN === 0) ? '  (set CLAUDE_MEM_METRICS=1 to record)' : ''}`);
-  if (noiseRatio > 0.6) out('  ⚠️ High noise ratio — consider running mem compress');
+  if (noiseRatio > 0.6 || lowSignalRatio > 0.3) out('  ⚠️ High noise ratio — consider running mem maintain / compress');
   out('');
   // Tier counts only live (uncompressed, non-superseded) observations — surface the
   // full decomposition so live + compressed + superseded = Total adds up cleanly.
@@ -1902,7 +1918,23 @@ function cmdMaintain(db, args) {
     }
 
     if (ops.includes('purge_stale')) {
-      const retainDays = parseInt(flags['retain-days'], 10) || 30;
+      // --retain-days: default 30 when absent; reject negative / 0 / NaN / out-of-range.
+      // A negative value made retainCutoff a FUTURE timestamp → purged the entire
+      // pending-purge backlog regardless of age; 0/garbage silently became 30 and
+      // masked typos. Parity with the mem_maintain MCP zod bound [7, 365].
+      let retainDays = 30;
+      if (flags['retain-days'] !== undefined) {
+        // Number + isInteger (not parseInt) so "7.5"/"30x" are rejected rather than
+        // silently truncated to 7/30 — parity with the mem_maintain zod .int() bound.
+        const parsed = Number(flags['retain-days']);
+        if (!Number.isInteger(parsed) || parsed < 7 || parsed > 365) {
+          // fail() only sets exitCode + writes stderr; it does NOT throw, so we
+          // MUST return or execution falls through to the DELETE with the bad value.
+          fail(`[mem] --retain-days must be an integer in [7, 365] (got "${flags['retain-days']}")`);
+          return;
+        }
+        retainDays = parsed;
+      }
       const retainCutoff = Date.now() - retainDays * 86400000;
       // T2-P0-A (CLI parity): purge_stale is the only DELETE in this code path — require
       // --confirm so a mis-typed `maintain execute --ops purge_stale` can't wipe rows silently.

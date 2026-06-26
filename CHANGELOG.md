@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.17.0 — memory-quality audit: vector arm disabled (~0 lift), honest noise gauge, concurrency + validation hardening
+
+A full audit of the memory store (stored-data quality + retrieval architecture + code) drove this batch; the headline is removing a retrieval arm that paid for itself with ~0 recall. Suite 3280 → 3291 (+11), ESLint clean, knip flat. Vetted by three independent adversarial reviewers before landing.
+
+**change: the TF-IDF vector arm is disabled by default** (a user-visible default-recall change — gated and reversible). The TF-IDF/cosine "hybrid" arm read ~0 benchmark lift over plain BM25 (`benchmark/ci-gate.mjs`: `hybrid_over_bm25 = 0` on the canonical corpus), yet paid a `computeVector` on every observation write, only scanned the most-recent 500 rows (so it never saw older memories), and had drifted unverified for months. It is now gated OFF behind `vectorsEnabled()` at the choke point `getVocabulary()` — so every write/search/maintain path skips it, including the enrich/compress/optimize write paths. Measured zero recall loss: `production_hybrid` recall@10 = 0.8998 (off) vs 0.8980 (on). To re-enable, set `CLAUDE_MEM_VECTORS=1` **and** run `claude-mem-lite maintain execute --ops rebuild_vectors` (re-enabling without a rebuild leaves a partially-populated index). The tables and code are retained pending a later removal. Caveat: the "0 lift" is canonical-corpus-empirical, not a per-corpus guarantee — pin `claude-mem-lite@3.16.3` (or set the env) if your corpus relies on semantic recall.
+
+**feat: `stats` surfaces low-signal-title noise.** The Data Health gauge's `low_value` metric (imp=1 + never-accessed + >30d) structurally could not see template / tool-log-titled noise (`Modified X`, `Error: …`), which often carries inflated importance — so it reported ~0% noise on a store that was ~24% low-signal-titled. A new `low_signal_titles` count + ratio (reusing the read-side `LOW_SIGNAL` patterns) makes the gauge honest, and the high-noise warning now fires on it too, with CLI ↔ MCP parity.
+
+**fix: LLM-semaphore busy-spin + retry-outside-slot** (`hook-semaphore.mjs`, `hook-llm.mjs`). A bare `continue` on an own-PID slot collision was a synchronous tight loop that pinned a core and froze the worker's event loop for up to 30s (blocking the very release that would clear the slot); it now removes the stale own-slot file and `await`s. Separately, the bugfix/decision lesson-retry `callLLM` ran *after* the slot was released, bypassing `LLM_SEM_MAX`; it now re-acquires a slot (and skips the retry under contention rather than exceeding the limit).
+
+**fix: `maintain purge_stale --retain-days` validation** (`mem-cli.mjs`). A negative value made the cutoff a *future* timestamp and purged the entire pending-purge backlog regardless of age; the flag is now validated to an integer in [7, 365] (parity with the `mem_maintain` zod bound), rejecting negatives, non-integers, and out-of-range — with the mandatory `return` after `fail()` (which sets exit code but does not throw).
+
+**fix: CLAUDE.md cleanup temp-file race** (`hook-context.mjs`). `cleanupClaudeMdLegacyBlock` wrote a fixed `.mem-tmp` then renamed it over the user's tracked CLAUDE.md; two concurrent first-run SessionStarts in the same project could clobber it mid-write. The temp file is now per-PID-suffixed.
+
+**refactor: single-source RRF (D#42).** `rrfMerge` (`tfidf.mjs`) and `rrfFuseN` (`deep-search.mjs`) were duplicate hand-written reciprocal-rank-fusion loops; both now delegate to `lib/rrf.mjs` `rrfAccumulate`. Output is byte-identical (verified by an adversarial differential harness; new `tests/rrf.test.mjs` locks the id=0 / null-id / tie-order / best-rank edges).
+
+**fix: OR-fallback token-count operator precedence** (`hook-memory.mjs`) — `&&` was intended; `||` made the parenthesized synonym-group exclusion dead code, inflating the token count and wrongly denying the OR-fallback rescue for some natural-language prompts. **fix: `recallForFile` per-row `try/catch`** so one FTS-trigger error on the `access_count` bump no longer discards the whole file-recall result set.
+
 ## v3.16.3 — round-trip CLI steering (unvalidated hypothesis) · error-recall gate + lesson-inline · subagent cite-recall instrument
 
 Three linked changes to the memory-injection surface plus a code-review fix. Suite 3264 → 3280 (+16), ESLint clean. All additive and backward-compatible — to revert, pin `claude-mem-lite@3.16.2`.

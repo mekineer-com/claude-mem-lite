@@ -81,6 +81,10 @@ describe('compressGroup', () => {
   });
 
   test('writes an observation_vectors row for the summary so it is hybrid-recallable', () => {
+    // compressGroup writes observation_vectors — exercise with the vector arm ON
+    // (choke-point-gated OFF by default since the 2026-06 memory-quality audit).
+    const prevVec = process.env.CLAUDE_MEM_VECTORS;
+    process.env.CLAUDE_MEM_VECTORS = '1';
     const db = createTestDb();
     seed(db);
     // Real words so the TF-IDF vocabulary builds and the summary narrative
@@ -118,5 +122,7 @@ describe('compressGroup', () => {
     const hits = vectorSearch(db, qvec, { project: 'proj-a', vocabVersion: vocab.version });
     expect(hits.some((h) => h.id === summaryId)).toBe(true);
     db.close();
+    if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS;
+    else process.env.CLAUDE_MEM_VECTORS = prevVec;
   });
 });

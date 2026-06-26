@@ -1,6 +1,6 @@
 // tests/tfidf.test.mjs
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { tokenize, buildVocabulary, rebuildVocabulary, getVocabulary, computeVector, cosineSimilarity, vectorSearch, VOCAB_DIM, MIN_COSINE_SIMILARITY, VECTOR_SCAN_LIMIT, porterStem, _resetVocabCache } from '../tfidf.mjs';
+import { tokenize, buildVocabulary, rebuildVocabulary, getVocabulary, computeVector, cosineSimilarity, vectorSearch, VOCAB_DIM, MIN_COSINE_SIMILARITY, VECTOR_SCAN_LIMIT, porterStem, _resetVocabCache, vectorsEnabled } from '../tfidf.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 describe('tokenize', () => {
@@ -290,20 +290,29 @@ describe('persisted vocabulary', () => {
   });
 
   it('getVocabulary loads from DB without recomputing', () => {
-    const db = createTestDb();
-    insertSession(db, { id: 'sess-1' });
-    // Need 2+ docs with shared terms for df>=2
-    insertObs(db, { title: 'test observation one', narrative: 'content here' });
-    insertObs(db, { title: 'test content two', narrative: 'another test observation' });
-    const v1 = rebuildVocabulary(db);
-    _resetVocabCache();
-    const v2 = getVocabulary(db);
-    expect(v2.version).toBe(v1.version);
-    expect(v2.terms.size).toBe(v1.terms.size);
-    for (const [term, entry] of v1.terms) {
-      expect(v2.terms.get(term)?.index).toBe(entry.index);
+    // getVocabulary is choke-point-gated to null when the vector arm is OFF (default);
+    // this test exercises the vector engine itself, so enable it.
+    const prev = process.env.CLAUDE_MEM_VECTORS;
+    process.env.CLAUDE_MEM_VECTORS = '1';
+    try {
+      const db = createTestDb();
+      insertSession(db, { id: 'sess-1' });
+      // Need 2+ docs with shared terms for df>=2
+      insertObs(db, { title: 'test observation one', narrative: 'content here' });
+      insertObs(db, { title: 'test content two', narrative: 'another test observation' });
+      const v1 = rebuildVocabulary(db);
+      _resetVocabCache();
+      const v2 = getVocabulary(db);
+      expect(v2.version).toBe(v1.version);
+      expect(v2.terms.size).toBe(v1.terms.size);
+      for (const [term, entry] of v1.terms) {
+        expect(v2.terms.get(term)?.index).toBe(entry.index);
+      }
+      db.close();
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_MEM_VECTORS;
+      else process.env.CLAUDE_MEM_VECTORS = prev;
     }
-    db.close();
   });
 
   it('rebuildVocabulary deletes observation_vectors with stale vocab_version', () => {
@@ -454,5 +463,29 @@ describe('sublinear TF in computeVector', () => {
       }
     }
     db.close();
+  });
+});
+
+// Phase-1 vector-arm gate (memory-quality audit 2026-06-27). The TF-IDF vector arm
+// reads ~0 benchmark lift; it is disabled by default and gated at the write/search/
+// maintain sites via vectorsEnabled(). Read at call time so tests + the benchmark A/B
+// can toggle via env. Locks the default-OFF contract + reversibility.
+describe('vectorsEnabled (Phase-1 TF-IDF vector arm gate)', () => {
+  const orig = process.env.CLAUDE_MEM_VECTORS;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.CLAUDE_MEM_VECTORS;
+    else process.env.CLAUDE_MEM_VECTORS = orig;
+  });
+
+  it('is OFF by default — vector arm disabled', () => {
+    delete process.env.CLAUDE_MEM_VECTORS;
+    expect(vectorsEnabled()).toBe(false);
+  });
+
+  it('re-enables only when CLAUDE_MEM_VECTORS=1 (reversible), evaluated at call time', () => {
+    process.env.CLAUDE_MEM_VECTORS = '1';
+    expect(vectorsEnabled()).toBe(true);
+    process.env.CLAUDE_MEM_VECTORS = '0';
+    expect(vectorsEnabled()).toBe(false);
   });
 });

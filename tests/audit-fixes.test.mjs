@@ -615,6 +615,26 @@ describe('T2 CLI fixes', () => {
     const row = testDb.prepare("SELECT id FROM observations WHERE title = 'CLI PURGEABLE 2'").get();
     expect(row).toBeUndefined();
   });
+
+  it('CLI parity: maintain purge_stale rejects out-of-range --retain-days (no DELETE)', async () => {
+    // A negative --retain-days made retainCutoff a FUTURE timestamp → purged the
+    // whole pending-purge backlog regardless of age. Invalid input must abort the
+    // DELETE. fail() sets exitCode but does NOT throw, so the fix needs an explicit
+    // return — without it execution falls through to the purge with the bad value.
+    insertObs(testDb, {
+      sessionId: 't2-mem', project: 'test--probe', type: 'change',
+      title: 'CLI NEG RETAIN', text: 'stale', importance: 1,
+      epochOffset: -60 * 86_400_000, compressedInto: COMPRESSED_PENDING_PURGE,
+    });
+    const output = await captureStdout(() => run([
+      'maintain', 'execute', '--ops', 'purge_stale', '--confirm', '--retain-days', '-5',
+    ]));
+    expect(output).toContain('--retain-days must be an integer in [7, 365]');
+    expect(output).not.toMatch(/Purged \d+ stale/);
+    // Row must survive — the invalid run never reached the DELETE.
+    const row = testDb.prepare("SELECT id FROM observations WHERE title = 'CLI NEG RETAIN'").get();
+    expect(row).toBeDefined();
+  });
 });
 
 // ─── T2 maintain schema surface ──────────────────────────────────────────────
