@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.16.2
+- **Version**: 3.16.3
 - **Package manager**: npm
-- **Test**: `npx vitest run` (160 test files / 3242 tests, vitest)
+- **Test**: `npx vitest run` (164 test files / 3280 tests, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **DB**: better-sqlite3 + FTS5 full-text search
@@ -82,6 +82,8 @@ PreToolUse hooks already run `mem_recall` for past lessons before Read/Edit/Writ
 | After a non-obvious architecture decision | `mem_save(type="decision", lesson_learned="<constraint + tradeoff>")` |
 | Deferring to a future session | `mem_defer({title, priority:1|2|3, detail})`; when fixed, add `closes_deferred=[N]` to `mem_save` |
 | Looking up past work / history | `mem_search "keywords"` · `mem_recent` · `mem_timeline` |
+
+Path cost is round-trips, not milliseconds: the PreToolUse hook above already recalls (0 calls) — prefer it. For an explicit query, if these `mem_*` tools are deferred behind ToolSearch this session, the Bash CLI (exact path in the detail doc) is one call vs two (ToolSearch + call).
 
 Full tool + CLI tables, citation/decay rules, and save discipline → `.claude/plugin_claude_mem_lite.md`
 <!-- claude-mem-lite:end -->

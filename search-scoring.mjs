@@ -15,9 +15,14 @@ import { CLI_INVOKE } from './cli-path.mjs';
 // Decision-rules sections; keeps the irreducible CLI/MCP tool list. Intended
 // for users who adopted invited-memory (MEMORY.md sentinel carries the same
 // triggers at higher authority). Default false preserves v2.31.2 behavior.
+// The CLI-vs-MCP round-trip routing rule lives in BASE (not VERBOSE) on purpose:
+// it must reach adopted (quiet) projects too, where tool-heavy sessions defer the
+// mem_* tools behind ToolSearch (CLI via Bash = 1 model round-trip; ToolSearch +
+// call = 2). Execution latency is NOT the lever — warm MCP (~25ms) actually beats
+// CLI cold-start (~90ms); both are noise against one model turn. Round-trips are.
 
 const INSTRUCTIONS_BASE = [
-  'Long-term memory across sessions. Hooks auto-inject context; CLI preferred for explicit queries.',
+  'Long-term memory across sessions. Hooks auto-inject context (0 round-trips) — prefer adopting that over any call. For an explicit query, pick the path with fewer model round-trips (CLI vs MCP below).',
   '',
   `CLI (via Bash) — invoke as \`${CLI_INVOKE} <cmd>\` (resolves on any install shape; the bare \`claude-mem-lite\` shorthand works only after an optional global \`npm i -g claude-mem-lite\`):`,
   `  ${CLI_INVOKE} search "query"  — FTS5 full-text search`,
@@ -27,7 +32,7 @@ const INSTRUCTIONS_BASE = [
   `  ${CLI_INVOKE} get 42,43  — full details by ID`,
   `  ${CLI_INVOKE} timeline --anchor 42  — chronological context`,
   '',
-  'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline for programmatic access (always available — no PATH/CLI install needed).',
+  'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline. If already loaded, call directly (warm server, fastest path). In tool-heavy sessions these are deferred behind ToolSearch — if using one would cost a ToolSearch load first, run the Bash CLI above instead: one call, not two. Neither needs a PATH/CLI install.',
   'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
   'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
 ];

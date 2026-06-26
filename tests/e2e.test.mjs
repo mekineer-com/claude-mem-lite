@@ -794,12 +794,18 @@ describe('Suite 6: Error Recall', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
 
-    // Seed DB with a relevant observation
+    // Seed DB with a relevant observation carrying a lesson_learned (→ inlined top-1)
     const db = openTestDb(tmpHome);
     const now = new Date();
     db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'ECONNREFUSED connection refused port 3000', 'bugfix', 'Fixed ECONNREFUSED on port 3000', '', 'Server was not running, needed to start it first', 'Start the dev server before curling the health endpoint.', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    // Low-signal "Modified %" obs that ALSO matches the FTS keywords (econnrefused
+    // in text) — must be gated OUT of error-recall by notLowSignalTitleClause.
+    db.prepare(`
       INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
-      VALUES (?, 'parent--testproj', 'ECONNREFUSED connection refused port 3000', 'bugfix', 'Fixed ECONNREFUSED on port 3000', '', 'Server was not running, needed to start it first', '', '', '[]', '[]', 2, ?, ?)
+      VALUES (?, 'parent--testproj', 'ECONNREFUSED noise low signal row', 'change', 'Modified netcfg.json', '', '', '', '', '[]', '[]', 1, ?, ?)
     `).run(sessionId, now.toISOString(), now.getTime());
     db.close();
 
@@ -813,6 +819,10 @@ describe('Suite 6: Error Recall', () => {
 
     expect(stdout).toContain('[claude-mem-lite] Related memories found for this error');
     expect(stdout).toContain('ECONNREFUSED');
+    // ② precision-half: top-1 lesson_learned is inlined (agent acts with no follow-up mem_get)
+    expect(stdout).toContain('Start the dev server before curling the health endpoint.');
+    // ② precision-half: low-signal 'Modified %' obs is gated out despite matching FTS
+    expect(stdout).not.toContain('Modified netcfg.json');
   });
 });
 

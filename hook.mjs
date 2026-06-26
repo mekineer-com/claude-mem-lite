@@ -26,7 +26,7 @@ import {
   truncate, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
-  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25,
+  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -363,19 +363,18 @@ function triggerErrorRecall(db, toolInput, response) {
 
     const nowR = Date.now();
     const rows = db.prepare(`
-      SELECT o.id, o.type, o.title
+      SELECT o.id, o.type, o.title, o.lesson_learned
       FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ? AND o.project = ?
+        AND ${notLowSignalTitleClause('o')}
       ORDER BY ${OBS_BM25}
         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
       LIMIT 3
     `).all(ftsQuery, project, nowR);
 
-    if (rows.length > 0) {
-      const hints = rows.map(r => `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`).join('\n');
-      process.stdout.write(`[claude-mem-lite] Related memories found for this error:\n${hints}\n  → Use mem_get(ids=[${rows.map(r => r.id).join(',')}]) for details.\n`);
-    }
+    const out = formatErrorRecallHints(rows);
+    if (out) process.stdout.write(out);
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }
 

@@ -43,6 +43,8 @@ PreToolUse hooks already run \`mem_recall\` for past lessons before Read/Edit/Wr
 | Deferring to a future session | \`mem_defer({title, priority:1|2|3, detail})\`; when fixed, add \`closes_deferred=[N]\` to \`mem_save\` |
 | Looking up past work / history | \`mem_search "keywords"\` · \`mem_recent\` · \`mem_timeline\` |
 
+Path cost is round-trips, not milliseconds: the PreToolUse hook above already recalls (0 calls) — prefer it. For an explicit query, if these \`mem_*\` tools are deferred behind ToolSearch this session, the Bash CLI (exact path in the detail doc) is one call vs two (ToolSearch + call).
+
 Full tool + CLI tables, citation/decay rules, and save discipline → \`.claude/plugin_claude_mem_lite.md\``;
 }
 
@@ -76,6 +78,16 @@ PreToolUse hook 在你 Read / Edit / Write 文件前已自动 \`mem_recall\` 该
 \`tools/list\` 默认暴露 6 个核心工具 + 3 个 defer 工具：
 \`mem_search\` / \`mem_recent\` / \`mem_recall\` / \`mem_get\` / \`mem_save\` / \`mem_timeline\` +
 \`mem_defer\` / \`mem_defer_list\` / \`mem_defer_drop\`。
+
+### 选 MCP 还是 CLI：按 round-trip,不是执行毫秒
+
+真正的开销是模型往返次数,不是工具执行——暖 MCP 调用 ~25ms、CLI 冷启 ~90ms,在一次推理(秒级)面前都是噪声。按往返次数选路：
+
+1. **被动 hook（0 往返）**：上面的 PreToolUse recall 已自动跑,最快,优先采纳,别重复调。
+2. **CLI via Bash（1 往返）**：工具多的会话里 \`mem_*\` 会被 defer 到 ToolSearch 后面——这时一次 MCP 调用 = ToolSearch + call = **2 往返**,而 Bash 跑一条 CLI 只 **1 往返**。派出去的子 agent 通常也拿不到 \`mem_*\` 工具,CLI 是它唯一的 1-往返路径。用下面「CLI 速查」表里的命令。
+3. **MCP 直调（已加载时 1 往返）**：\`mem_*\` 已在上下文里(未被 defer)就直接调,暖进程执行最快、省掉 ToolSearch。
+
+一句话：能让 hook 代劳就别调；要显式查,若得先 ToolSearch 才能用 \`mem_*\`,改跑 CLI。
 
 | 时机 | 工具 | 关键参数 |
 |------|------|----------|

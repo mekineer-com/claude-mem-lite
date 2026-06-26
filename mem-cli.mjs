@@ -26,8 +26,9 @@ import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
+import { aggregateProjectCiteRecall } from './lib/citation-tracker.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
-import { join, sep } from 'path';
+import { join, sep, dirname } from 'path';
 import { readFileSync, existsSync, readdirSync } from 'fs';
 
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
@@ -2210,19 +2211,60 @@ function cmdMemdirAudit(args) {
   if (nonCompliant > 0) process.exitCode = 1;
 }
 
+// `citation-stats --sidechain`: subagent (sidechain) cite-recall, the blind spot the
+// main decay loop excludes (it runs mainOnly). aggregateProjectCiteRecall scans THIS
+// project's transcripts: top-level <session>.jsonl = main, and
+// <session>/subagents/agent-*.jsonl = sidechain (descends ONE level into the literal
+// subagents/ dir only, no unbounded recursion). Same methodology, so comparable.
+function _reportSidechainCiteRecall({ days, json }) {
+  const cutoff = Date.now() - days * 86400 * 1000;
+  // memdir = ~/.claude/projects/<encoded>/memory; transcripts are its siblings.
+  const txDir = dirname(memdirPath(process.cwd()));
+  const { main, sidechain } = aggregateProjectCiteRecall(txDir, { cutoff });
+  const rate = b => (b.injected > 0 ? (100 * b.recalled / b.injected) : null);
+  const sideRate = rate(sidechain), mainRate = rate(main);
+
+  if (json) {
+    out(JSON.stringify({
+      window_days: days,
+      main: { ...main, rate: mainRate },
+      sidechain: { ...sidechain, rate: sideRate },
+    }));
+    return;
+  }
+
+  const pct = r => (r === null ? '—' : `${r.toFixed(1)}%`);
+  out(`Sidechain (subagent) cite-recall — last ${days}d:`);
+  out(`  main        ${pct(mainRate).padStart(6)}   recalled ${main.recalled} / injected ${main.injected}   (${main.files} transcript(s))`);
+  out(`  sidechain   ${pct(sideRate).padStart(6)}   recalled ${sidechain.recalled} / injected ${sidechain.injected}   (${sidechain.files} subagent file(s), ${sidechain.withInjections} with injections)`);
+  if (sidechain.files > 0 && sidechain.injected === 0) {
+    out('  → subagent transcripts exist but received ZERO memory injections: claude-mem-lite');
+    out('    hooks do NOT fire inside subagents (no PreToolUse/PostToolUse recall, no');
+    out('    SessionStart block, no mem_* tools). Subagents are memory-blind — giving them');
+    out('    memory needs a NEW surface (inject at Agent/Task dispatch), not deepening.');
+  } else if (sidechain.files === 0) {
+    out('  → no subagent transcripts in window.');
+  }
+}
+
 /**
  * `citation-stats` — visualize the citation-decay feedback loop:
  * per-project cite rate + active decay queue + recently promoted.
  * Read-only over observations.
  *
  * Flags:
- *   --json      machine-readable output
- *   --days N    project cite-rate window (default 7)
+ *   --json       machine-readable output
+ *   --days N     project cite-rate window (default 7)
+ *   --sidechain  subagent (sidechain) cite-recall vs main — the decay-loop blind spot
  */
 function cmdCitationStats(db, args) {
   const { flags } = parseArgs(args);
   const json = flags.json === true || flags.json === 'true';
   const days = parseIntFlag(flags.days, { name: '--days', defaultValue: 7, max: 365 });
+
+  if (flags.sidechain === true || flags.sidechain === 'true') {
+    return _reportSidechainCiteRecall({ days, json });
+  }
 
   const cutoff = Date.now() - days * 86400 * 1000;
   const perProject = db.prepare(`

@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.16.3 — round-trip CLI steering (unvalidated hypothesis) · error-recall gate + lesson-inline · subagent cite-recall instrument
+
+Three linked changes to the memory-injection surface plus a code-review fix. Suite 3264 → 3280 (+16), ESLint clean. All additive and backward-compatible — to revert, pin `claude-mem-lite@3.16.2`.
+
+**Deferred→CLI round-trip steering (LLM-facing — a HYPOTHESIS, not yet measured).** In a tool-heavy Claude Code session the MCP `mem_*` tools get deferred behind a ToolSearch step, so invoking one costs 2 model round-trips (ToolSearch + call) vs 1 for the bundled Bash CLI. The MCP `instructions` field (`search-scoring.mjs`) and the adopted-project steering block + detail doc (`adopt-content.mjs`) now carry a *conditional* rule: when `mem_*` is deferred, prefer the CLI; when already loaded, call it directly (warm server, fastest). The rule is advisory and changes no tool behavior; the prior misleading "(always available)" framing for the MCP tools was corrected. **Its efficacy — does it actually cut round-trips or lift cite-rate? — is asserted, not measured.** Treat it as a hypothesis to validate against `citation-stats`, not a proven win.
+
+**Error-recall now gates noise and inlines the top hit's lesson.** On a failed Bash command, `triggerErrorRecall` previously emitted `#ID title → use mem_get for details` — a pointer that, at the exact moment a fix is needed, cost a *deferred* `mem_get` (2 round-trips) to read the actual lesson. It now (a) drops low-signal rows up front via the shared `notLowSignalTitleClause` (no more "Modified X" noise), and (b) inlines the top-1 hit's `lesson_learned` (≤200 chars) so the fix is right there at 0 round-trips; lower hits stay pointers (bounded payload). Driven by the D#44 efficacy audit: error-recall is a low-cite, semantic-keyed surface, so the discipline is to gate upstream rather than enrich noise. The stronger "forcing-function" lever is deferred to a measured experiment.
+
+**`citation-stats --sidechain` — a subagent cite-recall instrument, and what it found.** New read-only diagnostic that scans a project's transcripts and reports memory cite-recall for subagent (sidechain) work separately from the main thread, keyed by file location (Claude Code writes each subagent to its own `<session>/subagents/agent-*.jsonl`). First reading: **subagents receive zero memory injections** — claude-mem-lite hooks do not fire inside subagents (no PreToolUse/PostToolUse recall, no SessionStart block, no `mem_*` tools), so subagents are currently memory-blind. The metric makes that observable and will register non-zero if a future surface ever injects into them.
+
+**Citation-decay correctness fix (from code review).** Inlining a lesson body exposed a latent bug: the injected-id extractors scanned an unanchored regex over the whole emit, so a lesson quoting another observation (`… same as #1234 [decision]`) was miscounted as an injected row and polluted the citation-decay denominator (a spurious uncited-streak → false demotion). `extractInjectedFromErrorRecall` and the pre-existing `extractInjectedFromPreToolUse` are now line-anchored (`INJECTED_ROW_RE`); regression tests added.
+
 ## v3.16.2 — correct fts-check CLI syntax in LLM-facing docs; robust GitHub-URL parsing
 
 Two fixes from a QA pass over the LLM-facing description surface and the registry GitHub-import skeleton. Suite 3261 → 3264 (+3), ESLint clean.

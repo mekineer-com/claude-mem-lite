@@ -16,7 +16,7 @@ import { join, dirname } from 'node:path';
 import { CLI_PATH, CLI_INVOKE } from '../cli-path.mjs';
 import { tools } from '../tool-schemas.mjs';
 import { buildServerInstructions } from '../search-scoring.mjs';
-import { getDetailDoc } from '../adopt-content.mjs';
+import { getDetailDoc, buildClaudeMdBlock } from '../adopt-content.mjs';
 
 const ROOT = dirname(fileURLToPath(new URL('../cli-path.mjs', import.meta.url)));
 const BROKEN = '~/.claude-mem-lite/cli.mjs';
@@ -54,6 +54,17 @@ describe('LLM-visible CLI hints advertise the resolvable path, not the tilde pat
     const doc = getDetailDoc();
     expect(doc).not.toContain(BROKEN);
     expect(doc).toContain(CLI_PATH);
+    // routing-cost guidance present: deferred mem_* → CLI is fewer round-trips
+    expect(doc).toContain('ToolSearch');
+    expect(doc).toContain('round-trip');
+  });
+
+  test('adopt CLAUDE.md block carries the round-trip routing note, stays machine-stable', () => {
+    const block = buildClaudeMdBlock();
+    expect(block).toContain('ToolSearch');
+    expect(block).toContain('round-trips');
+    // committed/refreshed block must NOT bake an absolute per-install path
+    expect(block).not.toContain(CLI_PATH);
   });
 });
 

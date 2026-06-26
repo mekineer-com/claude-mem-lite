@@ -25,6 +25,32 @@ export function truncate(str, max = 80) {
 }
 
 /**
+ * Render the PostToolUse error-recall hint block (hook.mjs::triggerErrorRecall).
+ * The single most-relevant hit (rows[0]) that carries a lesson_learned gets its
+ * lesson INLINED, so the agent can act with zero follow-up round-trips: the old
+ * "pointer + mem_get for details" form cost a deferred mem_get (2 model turns in
+ * tool-heavy sessions, where mem_* is gated behind ToolSearch) at the exact
+ * moment a fix is needed. Later rows stay as #ID pointers to keep the injected
+ * payload bounded (one body, not three). Upstream noise gating (low-signal title
+ * exclusion) is the SELECT's job (see triggerErrorRecall).
+ * @param {Array<{id:number,type:string,title:string,lesson_learned?:string}>} rows
+ * @returns {string} stdout block (trailing newline) or '' when there are no rows
+ */
+export function formatErrorRecallHints(rows) {
+  if (!rows || rows.length === 0) return '';
+  const lines = rows.map((r, i) => {
+    const head = `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`;
+    // Inline the lesson body for the single most-relevant hit only (bounded payload).
+    if (i === 0 && typeof r.lesson_learned === 'string' && r.lesson_learned.trim()) {
+      return `${head} \u2014 ${truncate(r.lesson_learned.trim(), 200)}`;
+    }
+    return head;
+  });
+  const ids = rows.map(r => r.id).join(',');
+  return `[claude-mem-lite] Related memories found for this error:\n${lines.join('\n')}\n  \u2192 Use mem_get(ids=[${ids}]) for details.\n`;
+}
+
+/**
  * Map observation type to its display emoji icon.
  * @param {string} type Observation type (decision, bugfix, feature, etc.)
  * @returns {string} Emoji icon for the type

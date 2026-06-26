@@ -75,6 +75,15 @@ describe('buildServerInstructions(quiet)', () => {
     expect(out).toContain('Long-term memory across sessions');
   });
 
+  it('BASE carries the CLI-vs-MCP round-trip routing rule (reaches adopted/quiet projects)', () => {
+    // The deferred-tool steering must live in BASE, not VERBOSE — adopted projects
+    // get BASE only, yet are exactly where tool-heavy sessions defer mem_* behind
+    // ToolSearch. Guards against a future "tighten instructions" edit dropping it.
+    const out = buildServerInstructions(true);
+    expect(out).toContain('round-trips');
+    expect(out).toContain('ToolSearch');
+  });
+
   it('quiet output is meaningfully shorter than verbose', () => {
     const verbose = buildServerInstructions(false);
     const quiet = buildServerInstructions(true);
