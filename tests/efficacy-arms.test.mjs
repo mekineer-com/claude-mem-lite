@@ -12,13 +12,16 @@ describe('efficacy arm semantics (single tested source of truth — cf. #8711 en
   it('AL: legacy-format injection', () => {
     expect(armConfig('AL')).toEqual({ inject: true, salience: 'legacy', appendRequirement: false });
   });
+  it('B: bridge-salience injection (comprehension-bridge FF)', () => {
+    expect(armConfig('B')).toEqual({ inject: true, salience: 'bridge', appendRequirement: false });
+  });
   it('C: empty control', () => {
     expect(armConfig('C')).toEqual({ inject: false, salience: '', appendRequirement: false });
   });
   it('T: empty sandbox + spelled-out requirement (positive control)', () => {
     expect(armConfig('T')).toEqual({ inject: false, salience: '', appendRequirement: true });
   });
-  it('INJECTED_ARMS is exactly {A, AL, F}', () => {
-    expect([...INJECTED_ARMS].sort()).toEqual(['A', 'AL', 'F']);
+  it('INJECTED_ARMS is exactly {A, AL, B, F}', () => {
+    expect([...INJECTED_ARMS].sort()).toEqual(['A', 'AL', 'B', 'F']);
   });
 });
