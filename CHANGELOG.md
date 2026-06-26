@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.18.0 — opt-in comprehension-bridge forcing-function (measured null, default off) + scoring-path golden lock
+
+A focused batch: a new opt-in error-recall forcing-function, the experiment that measured it, and a regression lock for the scoring engine. Suite 3291 → 3317 (+26), ESLint clean. The headline feature ships **default-off** because the experiment found it does not move the needle — an honest, recorded null that redirects the next attempt rather than shipping unmeasured sophistication.
+
+**feat (opt-in, default OFF): `CLAUDE_MEM_SALIENCE=bridge` comprehension bridge.** At the PreToolUse edit point, a Haiku call rewrites the recalled lesson into a one-line check *bound to the actual edit hunk* (naming the real symbols being changed), instead of the generic ack directive. Fail-open: any `N/A` / timeout / error falls back to the existing ack line, and the LLM stack is dynamic-imported only under the flag so the default fast-path stays byte-identical. This is the comprehension-targeted forcing-function the #8771 audit asked for.
+
+**measured: it does not work — and the contrast says why.** Severe-test arm B on the one still-usable efficacy commit (`bac2e85`, `claude-sonnet-4-6`, k=8): **B=0/8 vs T=8/8**, tied with ack/bind/control at 0. Because the bridge's emitted check is ~content-identical to arm T's spelled-in requirement, B-vs-T isolates the *delivery channel* with content held constant: the same correct, specific directive moves shipped-code correctness +100pp when it sits in the task prompt (T) and **+0pp when injected via the PreToolUse hook (B)** — with firing verified (lesson injected 8/8, the specific check demonstrably emitted). **The bottleneck is the delivery channel + the comprehension→action step, not content specificity.** n=1 channel-isolation (the bench has decayed to one revertable commit), so this is a mechanism finding, not a powered verdict. Default stays off; the next lever for D#44 is the instruction/task channel, not smarter hook injection. Full writeup: `benchmark/efficacy-README.md`.
+
+**test: golden drift-lock for the two scoring paths.** A ratio-isolation suite (identical FTS content → BM25 cancels) pins the passive-injection (`hook-memory`) and explicit-search (`FULL_SCORE`) multiplier chains and their *intentional* importance divergence (binary 1.0/0.6 vs linear 0.5+0.5·imp), so a future "unify the scorers" edit fails loudly instead of silently shifting one ranking. Mutation-verified to catch drift; also pins the cross-project default at 0.4 (a stale inline comment said 0.7).
+
+**infra: efficacy harness arm B** — bridge-bindable commit selection + ITT/fired-only paired deltas, with no silent dropping of non-fired cells (which would bias the verdict optimistic).
+
 ## v3.17.0 — memory-quality audit: vector arm disabled (~0 lift), honest noise gauge, concurrency + validation hardening
 
 A full audit of the memory store (stored-data quality + retrieval architecture + code) drove this batch; the headline is removing a retrieval arm that paid for itself with ~0 recall. Suite 3280 → 3291 (+11), ESLint clean, knip flat. Vetted by three independent adversarial reviewers before landing.
