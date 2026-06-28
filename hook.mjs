@@ -47,7 +47,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
@@ -286,6 +286,9 @@ async function handlePostToolUse() {
     files,
     ts: Date.now(),
     isError: bashSig?.isError || false,
+    // isHardError gates the bugfix-shape save-nudge (lib/cite-back-hint.mjs): a real
+    // failure fingerprint, not just "error" appearing in search/log output.
+    isHardError: bashSig?.isHardError || false,
     isSignificant: EDIT_TOOLS.has(tool_name) ||
                    bashSig?.isSignificant || false,
     bashSig: bashSig || null,
@@ -711,6 +714,12 @@ function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now
       WHERE COALESCE(compressed_into, 0) = 0
         AND COALESCE(importance, 1) <= 1
         AND COALESCE(injection_count, 0) = 0
+        -- v3.23: never auto-hide a row that carries a real lesson. compression folds
+        -- sources into a title-only summary (lesson lost), and COMPRESSED_AUTO hides the
+        -- row from search entirely. A low-importance obs whose lesson_learned is the
+        -- distilled value must stay findable (audit: 62 lessons buried this way). The 7d
+        -- noise block below already excludes lessons; this 30d block had drifted.
+        AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
         AND created_at_epoch < ?
         AND project = ?
     `).run(autoCompressAge, project);
@@ -778,6 +787,12 @@ function runSessionStartAutoMaintain(db) {
 
       const cleaned = cleanupBroken(db, mctx);
       if (cleaned > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned} broken observations`);
+
+      // Self-heal legacy orphans: children whose compression keeper was hard-deleted
+      // before recoverChildrenOf existed are hidden + queue-less (unreachable). Resurface
+      // them so normal decay/GC handles them on merit. Non-destructive (un-hide only).
+      const orphansRecovered = recoverOrphanedChildren(db, mctx);
+      if (orphansRecovered > 0) debugLog('DEBUG', 'auto-maintain', `recovered ${orphansRecovered} orphaned compression children`);
 
       const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
       if (decayed > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed} stale observations`);

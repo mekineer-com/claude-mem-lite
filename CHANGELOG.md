@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.23.0 — injection/noise + storage audit: honest noise gauge, change-aware bugfix nudge, lesson preservation, importance de-inflation
+
+A three-pillar audit (injection / storage / retrieval, 3 parallel agents) centered on whether memory injection adds noise that disturbs coding. Headline finding: the disturbance is *relevance/behavior*, not token volume (per-session fixed injection ≈ 800 tok). Eight source files + six test files changed; suite 3353 → 3367 (+14), ESLint clean. A live data-recovery pass (310 unreachable rows + 64 buried lessons) and a re-armed efficacy bridge measurement ride along.
+
+**fix (honesty): the `stats` noise gauge no longer reports a false `0.0% noise`.** The `Low-value` predicate gated on `importance = 1`, structurally blind to the imp=0 population (decay floor + LLM low-signal filter push ~half a mature live corpus to 0) — so the gauge read 0.0% on a dormant-heavy store. Now `importance <= 1` + `injection_count = 0` (mirrors decay's never-injected guard), across both the CLI `cmdStats` and the MCP `mem_stats` paths. Live: 0.0% → an honest ~10-12%.
+
+**fix (noise): the PostToolUse "unsaved bugfix-shape" nudge no longer fires on non-fixes.** It gated on `isError`, inferred from output *text* — so `claude-mem-lite search "error"`, a green test log, or any command whose output merely mentions "error" looked like a failure, and an unrelated edit in the same episode read as an unsaved fix. A new `isHardError` (strict subset of `isError`, requiring a real failure fingerprint — stack frame / panic / AssertionError / named Error class) now gates the nudge, with a legacy fallback for in-flight episodes.
+
+**fix (data-integrity): compression orphans are recovered, and lessons are never auto-GC'd.** `recoverChildrenOf` only fired at delete time for the keepers being deleted, so children whose keeper was hard-deleted in a past release were left hidden behind a missing parent — in no queue, unreachable by every view. New `recoverOrphanedChildren` (wired into all three maintenance paths: hook / CLI / MCP) resurfaces them. Separately, the 30-day auto-compress mark, the compress candidate query, AND the decay mark-idle pass now all exclude rows carrying a real `lesson_learned` — a lesson is the distilled value of a lessons store and must not be silently compressed or purged. (A live maintenance pass recovered 310 unreachable rows and resurfaced 64 buried lessons.)
+
+**change (scoring): auto-captured importance is no longer force-promoted to "critical" by a file path.** `computeRuleImportance` returns 3 for any episode touching schema/migration/.env/.key paths; via `Math.max` that overrode Haiku's own judgment, so in a repo that edits those files constantly, ordinary episodes (version bumps, read-only validations) inherited imp=3 with a null lesson. The path heuristic's contribution is now capped at 2; Haiku's own importance can still reach 3, and manual `mem_save` is unaffected.
+
+**test (efficacy): the comprehension-bridge A/B (arm B) is measurable again.** `aacab0c` lost its clean surgical revert as HEAD moved past its region (#8650 pool decay); a `patchFile` reconstruction restores it, taking the bridge-applicable commit count from 1 to 2.
+
 ## v3.22.0 — end-to-end user-simulation audit: maintenance data-loss fix, imp=0 GC, CLI/hook robustness
 
 A two-round "real user" E2E bug-hunt (4 parallel finder agents + per-bug reproduction) across the CLI, MCP, and passive-hook paths. 15 confirmed bugs fixed — headlined by a HIGH data-loss path. Suite 3339 → 3353 (+14), ESLint clean, knip baseline unchanged. The recurring theme is again §9 parallel-path miss: the CLI/MCP maintenance paths had drifted from the auto-maintain hook's correct order.

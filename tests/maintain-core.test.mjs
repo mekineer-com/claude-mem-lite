@@ -9,7 +9,7 @@ import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
-  mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf,
+  mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf, recoverOrphanedChildren,
   selectFuzzyDedupeIds, maintenanceStats, hardDeleteCandidateCount,
 } from '../lib/maintain-core.mjs';
 
@@ -43,6 +43,44 @@ describe('hardDeleteCandidateCount (MED-2 pre-maintenance snapshot guard)', () =
     const db = freshDb();
     add(db, { title: 'healthy', narrative: 'fine' });
     expect(hardDeleteCandidateCount(db, ctx(), { cleanup: true, purge: true })).toBe(0);
+    db.close();
+  });
+});
+
+describe('recoverOrphanedChildren (self-heal legacy orphans — keeper deleted pre-recoverChildrenOf)', () => {
+  test('resurfaces children whose keeper no longer exists; leaves valid keepers + negative sentinels alone', () => {
+    const db = freshDb();
+    const keeper = add(db, { title: 'live keeper' });
+    const validChild = add(db, { title: 'valid child', compressedInto: keeper });    // keeper exists → stay hidden
+    const orphan = add(db, { title: 'orphaned child', compressedInto: 88888 });       // keeper gone → resurface
+    const autoMarked = add(db, { title: 'auto', compressedInto: -1 });                // COMPRESSED_AUTO sentinel
+    const pendingPurge = add(db, { title: 'pending', compressedInto: COMPRESSED_PENDING_PURGE }); // -2 sentinel
+
+    const recovered = recoverOrphanedChildren(db, ctx());
+
+    expect(recovered).toBe(1);                                       // only the orphan
+    expect(get(db, orphan, 'compressed_into')).toBeNull();           // resurfaced to live
+    expect(get(db, validChild, 'compressed_into')).toBe(keeper);     // untouched (keeper exists)
+    expect(get(db, autoMarked, 'compressed_into')).toBe(-1);         // sentinel untouched
+    expect(get(db, pendingPurge, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE); // sentinel untouched
+    db.close();
+  });
+
+  test('is idempotent — a second pass recovers nothing', () => {
+    const db = freshDb();
+    add(db, { title: 'orphan', compressedInto: 77777 });
+    expect(recoverOrphanedChildren(db, ctx())).toBe(1);
+    expect(recoverOrphanedChildren(db, ctx())).toBe(0);
+    db.close();
+  });
+
+  test('respects projectFilter (only recovers orphans in the scoped project)', () => {
+    const db = freshDb();
+    insertSession(db, { id: 'sess-b', project: 'proj-b' });
+    add(db, { title: 'orphan a', compressedInto: 66666 }); // proj-a (add default)
+    Number(insertObs(db, { sessionId: 'sess-b', project: 'proj-b', epochOffset: OLD, title: 'orphan b', compressedInto: 55555 }).lastInsertRowid);
+    const recovered = recoverOrphanedChildren(db, { projectFilter: 'AND project = ?', baseParams: ['proj-a'] });
+    expect(recovered).toBe(1); // only the proj-a orphan
     db.close();
   });
 });
@@ -118,6 +156,18 @@ describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
     expect(get(db, two, 'importance')).toBe(1);                  // decayed 2->1
     expect(get(db, two, 'compressed_into')).toBeNull();          // NOT marked this pass (grace cycle)
     expect(get(db, one, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+  });
+
+  test('v3.23: never marks a lesson-bearing imp-1 row idle — lessons are not auto-GC-able', () => {
+    const db = freshDb();
+    const noLesson = add(db, { title: 'idle no lesson', importance: 1, injectionCount: 0 });
+    const withLesson = add(db, { title: 'idle but has lesson', importance: 1, injectionCount: 0, lessonLearned: 'strip the query string before parsing the branch name' });
+
+    const { idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+
+    expect(idleMarked).toBe(1);                                          // only the no-lesson row
+    expect(get(db, noLesson, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+    expect(get(db, withLesson, 'compressed_into')).toBeNull();          // lesson protected from purge
   });
 });
 

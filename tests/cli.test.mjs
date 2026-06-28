@@ -933,6 +933,27 @@ describe('CLI stats command', () => {
     const text = await captureStdout(() => run(['stats']));
     expect(text).toContain('Low-signal titles');
   });
+
+  // v3.23: the imp=0 dormant population (decay floor + LLM low-signal filter push
+  // rows to 0) was invisible to the old `importance = 1` gauge — the structural
+  // blindness that let it report "0.0% noise" on a store that was ~half imp=0.
+  // `<= 1` + never-injected makes the gauge honest without miscounting pinned noise.
+  it('counts imp=0 dormant rows the old imp=1 gauge was blind to', async () => {
+    const old = 40 * 86400000; // >30d so both clear the staleness threshold
+    insertObs(testDb, { // imp=0, never accessed/injected, stale → now counts (was invisible)
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Decayed dormant row', text: 'dormant', importance: 0, accessCount: 0,
+      injectionCount: 0, epochOffset: -old, compressedInto: null,
+    });
+    insertObs(testDb, { // imp=0 BUT injected → "pinned noise" (tracked separately), not "never used" → excluded
+      sessionId: 'mem-s1', project: 'test--project', type: 'discovery',
+      title: 'Injected but decayed', text: 'pinned', importance: 0, accessCount: 0,
+      injectionCount: 4, epochOffset: -old, compressedInto: null,
+    });
+    const output = await captureStdoutOnly(() => run(['stats', '--json']));
+    const stats = JSON.parse(output);
+    expect(stats.data_health.low_value_count).toBe(1); // the dormant imp=0 row, not the injected one
+  });
 });
 
 // ─── help and unknown commands ───────────────────────────────────────────────

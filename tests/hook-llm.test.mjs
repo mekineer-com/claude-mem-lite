@@ -394,6 +394,33 @@ describe('handleLLMEpisode', () => {
     expect(ev[0].importance).toBe(1);
   });
 
+  it('v3.23: file-path heuristic caps at 2 — a schema edit Haiku rates low is not force-promoted to imp=3', async () => {
+    // computeRuleImportance returns 3 for any entry touching schema./.env/.key; via Math.max
+    // that force-promoted thin-lesson schema edits to "critical" imp=3 regardless of Haiku's
+    // judgment (audit: auto imp=3 = 34.8%). The rule contribution is now capped at 2.
+    callLLM.mockReturnValueOnce(JSON.stringify({
+      type: 'change', // not an EVENT_TYPE → lands in observations
+      title: 'Adjusted schema column default',
+      narrative: 'changed default, reran',
+      concepts: ['schema'], facts: [],
+      importance: 1, // Haiku judged it minor
+      lesson_learned: 'a column default change still needs a backfill plan for existing rows',
+    }));
+    const episode = {
+      sessionId: 'ep-sess', project: 'test-proj',
+      files: ['schema.mjs'], filesRead: [],
+      // entry.files (not episode.files) is what computeRuleImportance inspects → ruleImportance=3
+      entries: [{ tool: 'Edit', desc: 'edit schema default', isError: false, files: ['schema.mjs'] }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const obs = db.prepare(`SELECT importance FROM observations WHERE project = ?`).all('test-proj');
+    expect(obs.length).toBe(1);
+    expect(obs[0].importance).toBe(2); // rule 3 capped to 2; max(2, Haiku 1) = 2 (was 3 pre-fix)
+  });
+
   it('does not crash and cleans up tmp file when episode.files is missing', async () => {
     // Regression: episode.files.map() / .join() threw on a malformed tmp file
     // lacking the `files` field, BEFORE any cleanup — leaking the tmp file,

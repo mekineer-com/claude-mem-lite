@@ -44,6 +44,18 @@ describe('selectCompressionCandidates', () => {
     expect(selectCompressionCandidates(db, { cutoff }).length).toBe(1);
     expect(selectCompressionCandidates(db, { cutoff, includeAutoMarked: true }).length).toBe(2);
   });
+
+  test('excludes rows carrying a real lesson_learned — folding into a title-only summary would discard it', () => {
+    const db = createTestDb();
+    seed(db);
+    insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'noise no lesson', importance: 1, epochOffset: OLD });
+    insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'sentinel none', importance: 1, epochOffset: OLD, lessonLearned: 'none' });
+    insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'has real lesson', importance: 1, epochOffset: OLD, lessonLearned: 'strip query string before parsing the branch name' });
+
+    const cutoff = Date.now() - 30 * DAY;
+    const got = selectCompressionCandidates(db, { cutoff }).map((r) => r.title).sort();
+    expect(got).toEqual(['noise no lesson', 'sentinel none']); // real-lesson row preserved; 'none' sentinel still compressible
+  });
 });
 
 describe('groupByProjectWeek', () => {

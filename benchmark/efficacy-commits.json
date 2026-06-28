@@ -36,7 +36,10 @@
       "task": "In mem-cli.mjs cmdCitationStats, the query that builds the 'promoted' list selects the top cited observations ordered by cited_count descending. Add importance as a secondary sort key so that among rows with equal cited_count, higher-importance rows come first. Keep the LIMIT.",
       "lessonTitle": "multi-lifecycle-flag queries must enumerate every state (compressed_into AND superseded_at)",
       "lesson": "When a schema has multiple lifecycle flags (compressed_into, superseded_at), partition/filter queries must enumerate every state — checking only COALESCE(compressed_into,0)=0 misses superseded-not-compressed rows. Exclude superseded_at rows from any 'live/promoted' list.",
-      "lessonBody": "A 'promoted'/'live' list that filters only on compressed_into still surfaces superseded rows (superseded_at IS NOT NULL). Add AND superseded_at IS NULL alongside the compressed_into gate."
+      "lessonBody": "A 'promoted'/'live' list that filters only on compressed_into still surfaces superseded rows (superseded_at IS NOT NULL). Add AND superseded_at IS NULL alongside the compressed_into gate.",
+      "patchFile": "benchmark/fixtures/aacab0c-bug-reintroduce.patch",
+      "oracleRef": "HEAD",
+      "_construction": "patch (2026-06-29): surgical revert started conflicting once later commits touched cmdCitationStats's region (#8650 pool decay). Patch removes `AND superseded_at IS NULL` from the promoted-list query (reintroduces the superseded-leak bug) and excises the 'excludes superseded rows' oracle test from the worktree; the HEAD oracle scores it. Task (add importance secondary sort) is the neutral region-touch. bridge-applicable: lesson idents compressed_into/superseded_at appear in the diff. Regenerate when it stops applying."
     }
   ]
 }

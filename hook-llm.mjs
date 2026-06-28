@@ -803,9 +803,16 @@ ${actionList}`;
         // retry's entire purpose (a recovered bugfix lesson would silently drop
         // out of --importance 2 searches and the working tier). Gate the cap on
         // the *effective* low-signal state, not the pre-retry flag.
+        // v3.23: cap the FILE-PATH heuristic's contribution at 2. computeRuleImportance
+        // returns 3 for any entry touching schema./migration/prisma/.env/.key paths; via the
+        // Math.max below that force-promoted ordinary has-lesson episodes to "critical" imp=3
+        // even when Haiku judged them 1-2 (audit: auto imp=3 = 34.8%, e.g. a thin-lesson edit
+        // to schema.mjs). Haiku's OWN importance can still reach 3 (genuine judgment); only the
+        // path heuristic is capped. The isLessonLowSignal branch still floors no-lesson
+        // non-decision autos at ≤1; manual mem_save uses a different path and is unaffected.
         importance: isLessonLowSignal && !retryRecovered && parsed.type !== 'decision'
           ? Math.min(ruleImportance, 1)
-          : Math.max(ruleImportance, clampImportance(parsed.importance)),
+          : Math.max(Math.min(ruleImportance, 2), clampImportance(parsed.importance)),
         lessonLearned,
         searchAliases,
       };

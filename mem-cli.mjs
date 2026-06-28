@@ -18,6 +18,7 @@ import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from '
 import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
+  recoverOrphanedChildren,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
@@ -1096,9 +1097,17 @@ async function cmdStats(db, args) {
     `SELECT AVG(COALESCE(importance,1)) as v FROM observations WHERE 1=1 ${projectFilter}`
   ).get(...baseParams);
   const thirtyDaysAgo = now - 30 * 86400000;
+  // v3.23 noise-gauge de-blinding: the prior `importance = 1` predicate was
+  // structurally blind to imp=0 — decay's floor + the LLM low-signal filter push
+  // dormant rows to 0, which on a real store is ~half the live corpus. The gauge
+  // therefore reported "0.0% noise" while the store was dormant-heavy. `<= 1` makes
+  // imp=0 visible; injection_count=0 mirrors decay's NEVER-INJECTED guard so an
+  // injected-but-decayed row (pinned noise, tracked separately) is not miscounted
+  // as "never used".
   const lowVal = db.prepare(`
     SELECT COUNT(*) as c FROM observations
-    WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+    WHERE COALESCE(importance,1) <= 1 AND COALESCE(access_count,0) = 0
+      AND COALESCE(injection_count,0) = 0
       AND COALESCE(compressed_into, 0) = 0
       AND created_at_epoch < ? ${projectFilter}
   `).get(thirtyDaysAgo, ...baseParams);
@@ -1197,7 +1206,7 @@ async function cmdStats(db, args) {
   out('Data Health:');
   out(`  Est. tokens: ${tokenEst.t ?? 0}`);
   out(`  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`);
-  out(`  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`);
+  out(`  Low-value (imp≤1, never used, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`);
   out(`  Low-signal titles (Modified/Error/Worked on…): ${lowSignalTitle.c} (${(lowSignalRatio * 100).toFixed(1)}%)`);
   out(`  Compressed: ${compressedCount.c}`);
   out(`  Hook errors (last 24h): ${hookErrors24h}${hookErrors24h > 0 ? `  ← tail ${join(DB_DIR, 'runtime/hook-errors')}` : ''}`);
@@ -1944,6 +1953,10 @@ function cmdMaintain(db, args) {
     if (ops.includes('cleanup')) {
       const deleted = cleanupBroken(db, mctx);
       results.push(`Cleaned up ${deleted} broken observations${capHint(deleted)}`);
+      // Self-heal legacy orphans (keeper hard-deleted pre-recoverChildrenOf): resurface
+      // unreachable children. Non-destructive — un-hide only, no delete.
+      const orphans = recoverOrphanedChildren(db, mctx);
+      if (orphans > 0) results.push(`Recovered ${orphans} orphaned compression children`);
     }
 
     if (ops.includes('decay')) {

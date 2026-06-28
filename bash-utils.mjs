@@ -13,6 +13,16 @@ const CMD_WRAPPERS = new Set(['sudo', 'doas', 'env', 'time', 'command', 'nice', 
 // git read subcommands whose output contains commit/log/match text, not failures.
 const GIT_READ_SUBCMDS = new Set(['grep', 'log', 'show', 'diff', 'blame', 'ls-files', 'cat-file', 'whatchanged', 'shortlog', 'reflog', 'status']);
 
+// Hard failure fingerprints — a real crash / thrown exception / non-zero-exit marker,
+// as opposed to output that merely CONTAINS the word "error" (search results, log
+// scans, prose). Deliberately strong/narrow: a JS stack frame (`\n   at fn (…)`),
+// panic/traceback/segfault, ENOENT/command-not-found, AssertionError, or a *named*
+// error class (TypeError:/ReferenceError:/…). Generic `Error:`/`exception` are
+// intentionally excluded — they appear too often in benign search/log output. Gates
+// the bugfix-shape save-nudge (lib/cite-back-hint.mjs) so `node cli.mjs search "error"`
+// + an edit in the same episode no longer looks like an unsaved fix.
+const HARD_ERROR_RE = /\bERR!|\bpanic\b|traceback|segfault|core dumped|\benoent\b|command not found|assertion\s?error|\n\s+at\s+\S|(?:type|reference|range|syntax|eval|uri)error:/i;
+
 // True when the command's PRIMARY operation (left of the first pipe, past any
 // env-assignments / wrapper like `sudo`/`env`/`time`) is a read/search — including
 // `git grep`/`git log`. Anchoring on the primary command (not "search verb appears
@@ -69,6 +79,10 @@ export function detectBashSignificance(input, response) {
   const hasHardErrorSignal = hasGreenTestSummary
     && /\bERR!|panic|traceback|enoent|command not found|exception|AssertionError|TypeError:|SyntaxError:/i.test(response);
   const isError = looksLikeError && !(hasGreenTestSummary && !hasHardErrorSignal);
+  // Strict subset of isError: a genuine failure fingerprint, not just the word "error"
+  // in benign output. Consumers that must avoid false positives (the bugfix-shape
+  // save-nudge) gate on this instead of isError.
+  const isHardError = isError && HARD_ERROR_RE.test(response);
   // Match actual test runner invocations, not commands that merely reference "test" as a keyword
   const isTest = /\b(npm\s+test|npm\s+run\s+test|yarn\s+test|pnpm\s+test|pnpm\s+run\s+test|bun\s+test|go\s+test|cargo\s+test)\b/i.test(cmd)
     || /\b(jest|pytest|vitest|mocha|cypress|playwright)\b/i.test(cmd);
@@ -85,7 +99,7 @@ export function detectBashSignificance(input, response) {
     || /\bgh\s+release\s+(?:create|edit|upload|delete)\b/i.test(cmd)
     || /\btwine\s+upload\b/i.test(cmd);
   return {
-    isError, isTest, isBuild, isGit, isDeploy,
+    isError, isHardError, isTest, isBuild, isGit, isDeploy,
     isSignificant: isError || isTest || isBuild || isGit || isDeploy,
   };
 }

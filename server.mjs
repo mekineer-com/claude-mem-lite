@@ -17,6 +17,7 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
+  recoverOrphanedChildren,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS,
@@ -863,9 +864,14 @@ server.registerTool(
     `).get(...baseParams);
 
     const thirtyDaysAgo = Date.now() - 30 * 86400000;
+    // v3.23 noise-gauge de-blinding (mirrors mem-cli cmdStats): `<= 1` makes the
+    // imp=0 dormant population visible (decay floor + LLM low-signal filter push
+    // ~half the live corpus to 0); injection_count=0 mirrors decay's NEVER-INJECTED
+    // guard so injected-but-decayed pinned noise isn't miscounted as "never used".
     const lowVal = db.prepare(`
       SELECT COUNT(*) as c FROM observations
-      WHERE COALESCE(importance,1) = 1 AND COALESCE(access_count,0) = 0
+      WHERE COALESCE(importance,1) <= 1 AND COALESCE(access_count,0) = 0
+        AND COALESCE(injection_count,0) = 0
         AND COALESCE(compressed_into, 0) = 0
         AND created_at_epoch < ? ${projectFilter}
     `).get(thirtyDaysAgo, ...baseParams);
@@ -915,7 +921,7 @@ server.registerTool(
       'Data Health:',
       `  Est. tokens: ${tokenEst.t ?? 0}`,
       `  Avg importance: ${(avgImp.v ?? 1).toFixed(2)}`,
-      `  Low-value (imp=1, never accessed, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`,
+      `  Low-value (imp≤1, never used, >30d): ${lowVal.c} (${(noiseRatio * 100).toFixed(1)}% noise)`,
       `  Low-signal titles (Modified/Error/Worked on…): ${lowSignalTitle.c} (${(lowSignalRatio * 100).toFixed(1)}%)`,
       `  Compressed: ${compressedCount.c}`,
       ...((noiseRatio > 0.6 || lowSignalRatio > 0.3) ? ['  ⚠️ High noise ratio — consider running mem_compress / maintain'] : []),
@@ -1109,6 +1115,10 @@ server.registerTool(
         if (ops.includes('cleanup')) {
           const deleted = cleanupBroken(db, mctx);
           results.push(`Cleaned up ${deleted} broken observations` + (deleted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+          // Self-heal legacy orphans (keeper hard-deleted pre-recoverChildrenOf):
+          // resurface unreachable children. Non-destructive — un-hide only, no delete.
+          const orphans = recoverOrphanedChildren(db, mctx);
+          if (orphans > 0) results.push(`Recovered ${orphans} orphaned compression children`);
         }
 
         if (ops.includes('decay')) {

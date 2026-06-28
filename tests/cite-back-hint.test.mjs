@@ -19,6 +19,11 @@ const editEntry = (file, tool = 'Edit') => ({ tool, files: [file], isError: fals
 const readEntry = (file) => ({ tool: 'Read', files: [file], isError: false });
 const bashErr = () => ({ tool: 'Bash', files: [], isError: true });
 const bashOk = () => ({ tool: 'Bash', files: [], isError: false });
+// v3.23 isHardError split — a SOFT error is output that merely mentions "error"
+// (search results, green test logs) with no failure fingerprint; a HARD error is a
+// real crash/exception. The bugfix-shape nudge must fire only on hard errors.
+const bashSoftErr = () => ({ tool: 'Bash', files: [], isError: true, isHardError: false });
+const bashHardErr = () => ({ tool: 'Bash', files: [], isError: true, isHardError: true });
 
 describe('buildCiteBackHint', () => {
   it('returns a hint when an edited file has prior lessons in cooldown', () => {
@@ -217,6 +222,34 @@ describe('buildUnsavedBugfixHint', () => {
     expect(hint).toContain('c.mjs');
     expect(hint).not.toContain('d.mjs');
     expect(hint).toMatch(/4 file\(s\)/);
+  });
+
+  // v3.23: gate the nudge on isHardError, not isError. The audit caught it firing on a
+  // read-only session (greps + `node cli.mjs search "error"`) plus a scratch write —
+  // output that mentions "error" but is not a fix.
+  it('does NOT fire when the only error is soft — isHardError=false', () => {
+    const episode = {
+      entries: [editEntry('/p/foo.mjs'), bashSoftErr(), editEntry('/p/foo.mjs'), bashSoftErr()],
+    };
+    expect(buildUnsavedBugfixHint(episode)).toBeNull();
+  });
+
+  it('fires when a hard failure fingerprint is present — isHardError=true', () => {
+    const episode = {
+      entries: [editEntry('/p/foo.mjs'), bashHardErr(), bashOk(), editEntry('/p/foo.mjs')],
+    };
+    const hint = buildUnsavedBugfixHint(episode);
+    expect(hint).not.toBeNull();
+    expect(hint).toContain('Unsaved bugfix-shape');
+  });
+
+  it('falls back to isError for legacy entries lacking the isHardError field', () => {
+    // bashErr() has no isHardError field (undefined) → fallback to isError so episodes
+    // captured before the field existed still nudge.
+    const episode = {
+      entries: [editEntry('/p/foo.mjs'), bashErr(), editEntry('/p/foo.mjs'), bashOk()],
+    };
+    expect(buildUnsavedBugfixHint(episode)).not.toBeNull();
   });
 });
 

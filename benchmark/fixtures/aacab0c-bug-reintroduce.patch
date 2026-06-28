@@ -1,0 +1,30 @@
+diff --git a/mem-cli.mjs b/mem-cli.mjs
+index 3e2ec7c..a5af78a 100644
+--- a/mem-cli.mjs
++++ b/mem-cli.mjs
+@@ -2363,7 +2363,6 @@ function cmdCitationStats(db, args) {
+       FROM observations
+      WHERE importance >= 3 AND cited_count >= 1
+        AND COALESCE(compressed_into, 0) = 0
+-       AND superseded_at IS NULL
+   ORDER BY cited_count DESC
+      LIMIT 10
+   `).all();
+diff --git a/tests/citation-stats-cli.test.mjs b/tests/citation-stats-cli.test.mjs
+index 052fb70..edb26f9 100644
+--- a/tests/citation-stats-cli.test.mjs
++++ b/tests/citation-stats-cli.test.mjs
+@@ -158,13 +158,6 @@ describe('citation-stats CLI', () => {
+     expect(output).toContain('Cite rate by project');
+   });
+ 
+-  it('excludes superseded rows from all sections', async () => {
+-    const id = obs({ title: 'superseded promoted', importance: 3, cited_count: 5 });
+-    testDb.prepare('UPDATE observations SET superseded_at = ? WHERE id = ?').run(Date.now(), id);
+-    const output = await captureStdout(() => run(['citation-stats']));
+-    expect(output).not.toContain('superseded promoted');
+-  });
+-
+   it('reports recently-demoted (demoted_at within window)', async () => {
+     const fresh = obs({ title: 'just demoted', importance: 1 });
+     testDb.prepare('UPDATE observations SET demoted_at = ? WHERE id = ?').run(Date.now(), fresh);

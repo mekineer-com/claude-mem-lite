@@ -108,3 +108,34 @@ describe('detectBashSignificance — green test summary exemption', () => {
     expect(detectBashSignificance({ command: 'git log --grep=commit' }, out).isGit).toBe(false);
   });
 });
+
+describe('detectBashSignificance — isHardError (bugfix-nudge gate)', () => {
+  it('isHardError=false when output only MENTIONS error words (no failure fingerprint)', () => {
+    // The audit false-positive: `node cli.mjs search "error"` returns memory rows that
+    // mention "error" → isError=true (node is not a search verb), but it is NOT a fix.
+    const out = 'Found 3 results for "error":\n#42 Error handling in auth\n#88 retry on error path';
+    const sig = detectBashSignificance({ command: 'node cli.mjs search "error"' }, out);
+    expect(sig.isError).toBe(true);
+    expect(sig.isHardError).toBe(false);
+  });
+
+  it('isHardError=true on a real test failure / thrown exception with a stack', () => {
+    // Representative real bugfix episode: a test fails, then you edit to fix it.
+    const out = '1 failed\nAssertionError: expected 1 to be 2\n    at /p/app.test.mjs:10:3';
+    const sig = detectBashSignificance({ command: 'node app.mjs' }, out);
+    expect(sig.isError).toBe(true);      // "failed" word trips isError (not a green "0 fail" summary)
+    expect(sig.isHardError).toBe(true);  // AssertionError + stack frame → real failure fingerprint
+  });
+
+  it('isHardError=true on npm ERR! / build-failure fingerprints', () => {
+    const out = 'src/index.ts:42 - error TS2322\nnpm ERR! code 1\nnpm ERR! build failed';
+    expect(detectBashSignificance({ command: 'npm run build 2>&1 | tail' }, out).isHardError).toBe(true);
+  });
+
+  it('isHardError is a strict subset of isError — search commands never hard-error', () => {
+    const readOut = 'config.log:42: throw new Error(x)\n  // error handler here too';
+    const sig = detectBashSignificance({ command: 'git grep error src/' }, readOut);
+    expect(sig.isError).toBe(false);
+    expect(sig.isHardError).toBe(false);
+  });
+});
