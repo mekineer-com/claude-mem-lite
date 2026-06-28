@@ -617,6 +617,11 @@ server.registerTool(
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
+    // Snapshot before the irreversible hard-delete so a wrong-id delete has a pre-image,
+    // matching the CLI delete + maintain purge/cleanup paths (audit MED-2). Best-effort
+    // (never throws, skips :memory:). Must run OUTSIDE the transaction below (VACUUM).
+    snapshotDb(db, { tag: 'pre-delete' });
+
     // Wrap cleanup + deletion in a transaction for consistency
     const deletedIds = new Set(args.ids);
     const deleteTx = db.transaction(() => {
@@ -1088,6 +1093,19 @@ server.registerTool(
       }
 
       db.transaction(() => {
+        // PURGE FIRST — matches the auto-maintain hook order (hook.mjs:766) and the CLI
+        // cmdMaintain. Running decay BEFORE purge in one transaction marked a stale row
+        // pending-purge AND deleted it in the SAME call (zero grace), while the pre-txn
+        // snapshot guard counts only PRE-EXISTING pending rows so it skipped the backup →
+        // permanent loss of notable imp-2/3 memories (audit HIGH-1). Purging first deletes
+        // only rows a PRIOR run marked (backed up); rows decay marks below wait one cycle.
+        if (ops.includes('purge_stale')) {
+          const retainDays = args.retain_days ?? 30;
+          const retainCutoff = Date.now() - retainDays * 86400000;
+          const purged = purgeStale(db, mctx, retainCutoff);
+          results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)` + (purged >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+        }
+
         if (ops.includes('cleanup')) {
           const deleted = cleanupBroken(db, mctx);
           results.push(`Cleaned up ${deleted} broken observations` + (deleted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
@@ -1117,13 +1135,6 @@ server.registerTool(
 
         if (!ops.includes('dedup') && args.merge_ids) {
           results.push('Warning: merge_ids provided but "dedup" not in operations — merge_ids ignored');
-        }
-
-        if (ops.includes('purge_stale')) {
-          const retainDays = args.retain_days ?? 30;
-          const retainCutoff = Date.now() - retainDays * 86400000;
-          const purged = purgeStale(db, mctx, retainCutoff);
-          results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)` + (purged >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
       })();
 

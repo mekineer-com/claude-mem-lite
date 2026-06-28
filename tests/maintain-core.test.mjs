@@ -101,6 +101,24 @@ describe('decayAndMarkIdle (injection protection — the drift fix)', () => {
     expect(get(db, C, 'compressed_into')).toBeNull();          // injection protected
     expect(get(db, D, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
   });
+
+  test('MED-1: marks only PRE-EXISTING imp-1 rows, NOT freshly-decayed imp-2 (per-tier grace)', () => {
+    // Mark-idle runs BEFORE decay so a notable imp-2 row decays 2->1 this pass but is not
+    // hidden as pending-purge until the NEXT pass. Pre-fix (decay-first) collapsed 2->1->pending
+    // in one call, which — combined with purge running in the same maintain invocation — deleted
+    // notable memories with zero grace (audit HIGH-1 root mechanism).
+    const db = freshDb();
+    const two = add(db, { title: 'stale imp2', importance: 2, injectionCount: 0 }); // decays 2->1 this pass
+    const one = add(db, { title: 'stale imp1', importance: 1, injectionCount: 0 }); // marked pending this pass
+
+    const { decayed, idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
+
+    expect(decayed).toBe(1);    // the imp-2 row stepped down
+    expect(idleMarked).toBe(1); // ONLY the pre-existing imp-1, not the freshly-decayed one
+    expect(get(db, two, 'importance')).toBe(1);                  // decayed 2->1
+    expect(get(db, two, 'compressed_into')).toBeNull();          // NOT marked this pass (grace cycle)
+    expect(get(db, one, 'compressed_into')).toBe(COMPRESSED_PENDING_PURGE);
+  });
 });
 
 describe('maintenanceStats (scan preview must match what execute does)', () => {

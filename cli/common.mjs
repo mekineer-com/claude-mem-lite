@@ -21,7 +21,19 @@ export function parseArgs(argv) {
   while (i < argv.length) {
     const arg = argv[i];
     if (arg.startsWith('--')) {
-      const key = arg.slice(2);
+      const body = arg.slice(2);
+      // `--key=value` (GNU long-option form). Split on the FIRST '=' so values that
+      // themselves contain '=' (e.g. `--from=2026-01-01`, a token with '=') stay intact.
+      // Without this, `--type=feature` parsed as a boolean flag literally named
+      // "type=feature"; the real `--type` stayed undefined and the default silently
+      // applied — a save landed in the wrong project / type with no error.
+      const eq = body.indexOf('=');
+      if (eq >= 0) {
+        flags[body.slice(0, eq)] = body.slice(eq + 1);
+        i++;
+        continue;
+      }
+      const key = body;
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith('--') && (!next.startsWith('-') || /^-\d/.test(next))) {
         flags[key] = next;

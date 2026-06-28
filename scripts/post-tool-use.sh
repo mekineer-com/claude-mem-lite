@@ -32,7 +32,11 @@ if [[ "$tool" == "Read" ]]; then
     # Sanitize project name to match utils.mjs inferProject()
     project="${project//[^a-zA-Z0-9_.-]/-}"
     project="${project:-unknown}"
-    runtime_dir="$HOME/.claude-mem-lite/runtime"
+    # Honor CLAUDE_MEM_DIR relocation (mirrors schema.mjs DB_DIR → hook-shared RUNTIME_DIR).
+    # hook.mjs flushEpisode reads reads-<project>.txt from CLAUDE_MEM_DIR/runtime; if this
+    # bash fast-path wrote to $HOME unconditionally, a relocated install would drop all
+    # Read context from episodes AND grow an uncollected reads file in $HOME forever.
+    runtime_dir="${CLAUDE_MEM_DIR:-$HOME/.claude-mem-lite}/runtime"
     mkdir -p "$runtime_dir" 2>/dev/null
     # Use printf to avoid shell interpretation of special characters in file paths
     printf '%s\n' "$file_path" >> "${runtime_dir}/reads-${project}.txt"

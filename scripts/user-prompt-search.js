@@ -491,6 +491,11 @@ async function main() {
 
   let hookData;
   try { hookData = JSON.parse(raw); } catch { return; }
+  // JSON.parse('null'/'42'/'"x"') succeeds with a non-object; dereferencing .prompt on
+  // it threw a raw TypeError → unhandled rejection → exit 1 (this was the lone hook
+  // script without an exit-0 safety net, violating the "hooks never exit non-zero"
+  // invariant — exit 2 on UserPromptSubmit would even block the user's prompt).
+  if (!hookData || typeof hookData !== 'object') return;
 
   const rawPrompt = hookData.prompt || hookData.user_prompt;
   if (!rawPrompt || typeof rawPrompt !== 'string') return;
@@ -724,4 +729,8 @@ async function main() {
   }
 }
 
-main();
+// Swallow any rejection so the hook can never surface a non-zero exit (the invariant
+// every sibling hook script upholds). Deliberately NOT `.finally(process.exit(0))` —
+// this hook detaches a background `claude -p` search and a forced exit would kill it;
+// letting the loop drain naturally exits 0 once the detached child is unref'd.
+main().catch(() => {});

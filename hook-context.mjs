@@ -5,7 +5,7 @@ import { basename, join } from 'path';
 import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
 import {
   estimateTokens, truncate, typeIcon, fmtTime, inferProject,
-  debugLog, debugCatch,
+  debugLog, debugCatch, neutralizeContextDelimiters,
   DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
 } from './utils.mjs';
 import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet } from './hook-shared.mjs';
@@ -462,7 +462,11 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     }
   }
 
-  return [...summaryLines, ...handoffLines, ...deferredLines, ...obsLines].join('\n');
+  // Defang any literal block-delimiter tag carried in a title/lesson/summary so a row
+  // can't prematurely close the <claude-mem-context> block it's wrapped in (mdCell does
+  // the same for `|`). One source of truth: both the SessionStart hook and the CLI
+  // `context` command consume this return.
+  return neutralizeContextDelimiters([...summaryLines, ...handoffLines, ...deferredLines, ...obsLines].join('\n'));
 }
 
 /**

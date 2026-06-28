@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters } from './utils.mjs';
 import { citeFactorJs } from './scoring-sql.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
@@ -123,7 +123,10 @@ export function formatMemoryLine(obs) {
     && hasFilePaths(obs.files_modified)) {
     staleHint = ' [verify-before-use]';
   }
-  return `- [${obs.type}] ${truncate(obs.title, 80)}${lessonTag} (#${obs.id})${staleHint}`;
+  // Defang any literal block-delimiter tag in title/lesson so it can't prematurely close
+  // the <memory-context> block this line is injected into (parity with hook-context's
+  // <claude-mem-context> defense).
+  return neutralizeContextDelimiters(`- [${obs.type}] ${truncate(obs.title, 80)}${lessonTag} (#${obs.id})${staleHint}`);
 }
 
 function hasFilePaths(filesModified) {

@@ -24,6 +24,24 @@ export function truncate(str, max = 80) {
   return str.slice(0, end) + '\u2026';
 }
 
+// The block delimiters claude-mem-lite wraps injected context in. Any user-derived text
+// (observation title / lesson, handoff body) that contains one of these LITERALLY would
+// prematurely open or close the block it lands in, and the model then reads the rest as
+// undelimited context. Reachable by editing files that contain these tokens \u2014 e.g.
+// developing claude-mem-lite itself, where source/observations carry the delimiter names.
+const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff)>/gi;
+
+/**
+ * Defang the literal context-block delimiter tags in user-derived text. Strips just the
+ * angle brackets, so `</claude-mem-context>` renders as `/claude-mem-context` \u2014 still
+ * readable, but no longer a structural delimiter. Complements `mdCell`'s pipe-escaping.
+ * @param {string} s Input string (any type; coerced)
+ * @returns {string} Text with delimiter tags defanged
+ */
+export function neutralizeContextDelimiters(s) {
+  return String(s ?? '').replace(CONTEXT_DELIMITER_RE, (m) => m.slice(1, -1));
+}
+
 /**
  * Render the PostToolUse error-recall hint block (hook.mjs::triggerErrorRecall).
  * The single most-relevant hit (rows[0]) that carries a lesson_learned gets its

@@ -16,8 +16,13 @@ import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
 
 // Scoring expressions — full adds project boost + access bonus; simple is for
 // expansion paths where boost would over-amplify already-loose matches.
+// `MAX(0, now - ts)` clamps the recency age to >= 0: a far-FUTURE created_at/last_accessed
+// (reachable via restore/import-jsonl, which accept arbitrary epochs) otherwise made the
+// exponent large-positive → EXP overflowed to +Infinity → score -Infinity → that row sorted
+// #1 for any match AND JSON.stringify emitted `"score": null` (numeric-contract break). A
+// future row now reads as age 0 = max (finite) recency, not Infinity.
 const FULL_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+  * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
@@ -25,7 +30,7 @@ const FULL_SCORE = `${OBS_BM25}
   * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
-  * (1.0 + EXP(-0.693 * (? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
+  * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
@@ -320,7 +325,7 @@ export function findFtsAnchor(db, { ftsQuery, project = null, nowT = null, halfL
       AND (? IS NULL OR o.project = ?)
       AND COALESCE(o.compressed_into, 0) = 0
     ORDER BY ${OBS_BM25}
-      * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${halfLifeMs}.0))
+      * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / ${halfLifeMs}.0))
     LIMIT 1
   `;
   const stmt = db.prepare(sql);

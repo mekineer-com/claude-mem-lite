@@ -14,7 +14,7 @@ export { cjkBigrams, extractCjkSynonymTokens, extractCjkKeywords, extractCjkLike
 export { resolveProject, _resetProjectCache } from './project-utils.mjs';
 export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
 export { stripPrivate } from './lib/private-strip.mjs';
-export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey, formatErrorRecallHints } from './format-utils.mjs';
+export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey, formatErrorRecallHints, neutralizeContextDelimiters } from './format-utils.mjs';
 export { computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity } from './hash-utils.mjs';
 export { detectBashSignificance, extractErrorKeywords, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
 

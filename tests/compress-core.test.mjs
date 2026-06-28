@@ -17,10 +17,13 @@ function seed(db) {
 }
 
 describe('selectCompressionCandidates', () => {
-  test('returns only importance=1, never-accessed, old, uncompressed observations', () => {
+  test('returns importance<=1 (incl. decay-floor imp=0), never-accessed, old, uncompressed observations', () => {
     const db = createTestDb();
     seed(db);
     insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'keep me', importance: 1, epochOffset: OLD });
+    // imp=0 (citation-decay floor / LLM low-signal filter) is STRICTLY lower value than imp=1
+    // and must be a candidate too — `= 1` (exact) left these immortal (audit imp=0 GC fix).
+    insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'floored imp0', importance: 0, epochOffset: OLD });
     insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'too important', importance: 2, epochOffset: OLD });
     insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'accessed', importance: 1, accessCount: 3, epochOffset: OLD });
     insertObs(db, { sessionId: 'sess-1', project: 'proj-a', title: 'too recent', importance: 1, epochOffset: 0 });
@@ -28,7 +31,7 @@ describe('selectCompressionCandidates', () => {
 
     const cutoff = Date.now() - 30 * DAY;
     const got = selectCompressionCandidates(db, { cutoff });
-    expect(got.map((r) => r.title)).toEqual(['keep me']);
+    expect(got.map((r) => r.title).sort()).toEqual(['floored imp0', 'keep me']);
   });
 
   test('includeAutoMarked folds in auto-compressed (COMPRESSED_AUTO) rows', () => {

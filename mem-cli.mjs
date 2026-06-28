@@ -324,7 +324,10 @@ function cmdRecent(db, args) {
   // accepted silently; the positional path must reject garbage like the --limit flag does.
   const isValid = rawArg !== undefined && isNumericToken(rawArg) && Number.isInteger(rawLimit) && rawLimit > 0 && rawLimit <= RECENT_MAX;
   if (rawArg !== undefined && !isValid) {
-    process.stderr.write(`[mem] Invalid count "${rawArg}" (must be an integer between 1 and ${RECENT_MAX}); using default 10\n`);
+    // Name the ACTUAL fallback: a present --limit overrides the positional below, so
+    // claiming "default 10" when `recent abc --limit 5` returns 5 misled the user.
+    const fallbackLabel = flags.limit !== undefined ? '--limit' : 'default 10';
+    process.stderr.write(`[mem] Invalid count "${rawArg}" (must be an integer between 1 and ${RECENT_MAX}); using ${fallbackLabel}\n`);
   }
   // Positional [N] wins for backward-compat; --limit is sibling-parity alias
   // (search/recall/browse/stats all accept --limit). Pre-2.69 `recent --limit N`
@@ -1423,6 +1426,12 @@ function cmdDelete(db, args) {
     return;
   }
 
+  // Snapshot before the irreversible hard-delete so a wrong-id delete has a pre-image,
+  // matching the maintain purge/cleanup hard-delete paths (audit MED-2). Best-effort
+  // (never throws, skips :memory:); rows here are confirmed + non-empty, so the delete
+  // always removes something worth backing up. Must run OUTSIDE the transaction (VACUUM).
+  snapshotDb(db, { tag: 'pre-delete' });
+
   // Transaction: clean up related_ids references + delete (aligned with MCP mem_delete)
   const deletedIds = new Set(ids);
   const deleteTx = db.transaction(() => {
@@ -1552,6 +1561,12 @@ function cmdUpdate(db, args) {
 
 function cmdExport(db, args) {
   const { flags } = parseArgs(args);
+  // Guard value-less string flags. Bare `--to` parsed to boolean `true`, and
+  // `new Date(true).getTime()` is 1 (NOT NaN), so the isNaN guard below missed it and
+  // the filter became `created_at_epoch <= 1` → an EMPTY export with exit 0. A backup
+  // script (`export --to "$END" > backup.json`) with an unset `$END` would silently
+  // write an empty backup and report success. Reject like cmdSearch does.
+  if (rejectBareStringFlags(flags, ['project', 'type', 'from', 'to'])) return;
   const wheres = [];
   const params = [];
   // --include-compressed: include compressed observations (aligned with MCP mem_export)
@@ -1743,8 +1758,10 @@ function cmdCompress(db, args) {
   // got the 30-day cutoff without knowing their input was discarded.
   let ageDays = 30;
   if (flags['age-days'] !== undefined) {
-    const parsed = parseInt(flags['age-days'], 10);
-    if (!Number.isFinite(parsed) || parsed < 1) {
+    // isNumericToken (not bare parseInt) so "1e5"→1 and "30x"→30 are rejected rather than
+    // silently mis-parsed into a far-too-broad cutoff — parity with recent/search/maintain.
+    const parsed = Number(flags['age-days']);
+    if (!isNumericToken(flags['age-days']) || !Number.isInteger(parsed) || parsed < 1) {
       fail(`[mem] Invalid --age-days "${flags['age-days']}". Must be a positive integer.`);
       return;
     }
@@ -1800,6 +1817,11 @@ function cmdMaintain(db, args) {
     fail("[mem] Usage: claude-mem-lite maintain <scan|execute> [--ops cleanup,decay,boost,demote_pinned,dedup,purge_stale,rebuild_vectors,vacuum] [--project P] [--retain-days N] [--merge-ids keepId:removeId,...] — 'scan' previews, 'execute' applies.");
     return;
   }
+  // Guard value-less string flags before any `.split()` / resolveProject runs. A bare
+  // `--merge-ids` parsed to boolean `true`, and `true.split(',')` (line ~1911) crashed
+  // with a raw stack trace — the one string-flag path that lacked this #8470 guard, and
+  // the exact form the `scan` output suggests copy-pasting (`--merge-ids <pairs>`).
+  if (rejectBareStringFlags(flags, ['ops', 'project', 'merge-ids', 'retain-days'])) return;
 
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const projectFilter = project ? 'AND project = ?' : '';
@@ -1868,15 +1890,57 @@ function cmdMaintain(db, args) {
   // T2-P1-B: surface the OP_CAP hit so users know to re-run, matching MCP mem_maintain.
   const capHint = (changes) => (changes >= OP_CAP ? ' (cap reached, re-run for more)' : '');
 
-  // MED-2: snapshot the DB before the irreversible cleanup/purge hard-deletes —
-  // only when rows will actually be removed, and OUTSIDE the transaction below
-  // (VACUUM cannot run inside one). Best-effort; snapshotDb never throws.
-  const willPurge = ops.includes('purge_stale') && (flags.confirm === true || flags.confirm === 'true');
+  // Parse + validate --retain-days BEFORE the transaction so an invalid value rejects the
+  // whole command atomically. The old code validated inside db.transaction() with a bare
+  // `return`, so an earlier op (cleanup hard-delete / decay / boost) had already mutated and
+  // the transaction COMMITTED despite the exit-1 error (audit MED-2 atomicity).
+  let retainDays = 30;
+  if (ops.includes('purge_stale') && flags['retain-days'] !== undefined) {
+    // Number + isInteger (not parseInt) so "7.5"/"30x" are rejected rather than silently
+    // truncated — parity with the mem_maintain zod .int().min(7).max(365) bound.
+    const parsed = Number(flags['retain-days']);
+    if (!Number.isInteger(parsed) || parsed < 7 || parsed > 365) {
+      fail(`[mem] --retain-days must be an integer in [7, 365] (got "${flags['retain-days']}")`);
+      return;
+    }
+    retainDays = parsed;
+  }
+  const retainCutoff = Date.now() - retainDays * 86400000;
+  // purge_stale is the only DELETE here — require --confirm so a mis-typed run can't wipe rows.
+  const confirmed = flags.confirm === true || flags.confirm === 'true';
+
+  // Snapshot the DB before the irreversible cleanup/purge hard-deletes — only when rows will
+  // actually be removed, and OUTSIDE the transaction below (VACUUM cannot run inside one).
+  // Best-effort; snapshotDb never throws.
+  const willPurge = ops.includes('purge_stale') && confirmed;
   if (hardDeleteCandidateCount(db, mctx, { cleanup: ops.includes('cleanup'), purge: willPurge }) > 0) {
     snapshotDb(db, { tag: 'pre-maintain' });
   }
 
   db.transaction(() => {
+    // PURGE FIRST — matches the auto-maintain hook order (hook.mjs:766). Running decay BEFORE
+    // purge in one transaction marked a stale row pending-purge AND deleted it in the SAME call
+    // (zero grace), and the pre-txn snapshot guard counts only PRE-EXISTING pending rows so it
+    // skipped the backup → permanent, unrecoverable loss of notable imp-2/3 memories (audit
+    // HIGH-1). Purging first deletes only rows a PRIOR run marked (which the guard saw + backed
+    // up); rows decay marks below wait for the next maintain run, regaining the grace cycle.
+    if (ops.includes('purge_stale')) {
+      if (!confirmed) {
+        const previewRow = purgeStalePreview(db, mctx, retainCutoff);
+        const pushLines = [`purge_stale preview (no --confirm):`,
+          `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`];
+        if (previewRow.candidates > 0) {
+          pushLines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
+          pushLines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
+        }
+        pushLines.push(`  To delete, re-run with --confirm.`);
+        results.push(pushLines.join('\n'));
+      } else {
+        const purged = purgeStale(db, mctx, retainCutoff);
+        results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)${capHint(purged)}`);
+      }
+    }
+
     if (ops.includes('cleanup')) {
       const deleted = cleanupBroken(db, mctx);
       results.push(`Cleaned up ${deleted} broken observations${capHint(deleted)}`);
@@ -1926,43 +1990,6 @@ function cmdMaintain(db, args) {
       results.push('Warning: --merge-ids provided but "dedup" not in operations — merge-ids ignored');
     }
 
-    if (ops.includes('purge_stale')) {
-      // --retain-days: default 30 when absent; reject negative / 0 / NaN / out-of-range.
-      // A negative value made retainCutoff a FUTURE timestamp → purged the entire
-      // pending-purge backlog regardless of age; 0/garbage silently became 30 and
-      // masked typos. Parity with the mem_maintain MCP zod bound [7, 365].
-      let retainDays = 30;
-      if (flags['retain-days'] !== undefined) {
-        // Number + isInteger (not parseInt) so "7.5"/"30x" are rejected rather than
-        // silently truncated to 7/30 — parity with the mem_maintain zod .int() bound.
-        const parsed = Number(flags['retain-days']);
-        if (!Number.isInteger(parsed) || parsed < 7 || parsed > 365) {
-          // fail() only sets exitCode + writes stderr; it does NOT throw, so we
-          // MUST return or execution falls through to the DELETE with the bad value.
-          fail(`[mem] --retain-days must be an integer in [7, 365] (got "${flags['retain-days']}")`);
-          return;
-        }
-        retainDays = parsed;
-      }
-      const retainCutoff = Date.now() - retainDays * 86400000;
-      // T2-P0-A (CLI parity): purge_stale is the only DELETE in this code path — require
-      // --confirm so a mis-typed `maintain execute --ops purge_stale` can't wipe rows silently.
-      const confirmed = flags.confirm === true || flags.confirm === 'true';
-      if (!confirmed) {
-        const previewRow = purgeStalePreview(db, mctx, retainCutoff);
-        const pushLines = [`purge_stale preview (no --confirm):`,
-          `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`];
-        if (previewRow.candidates > 0) {
-          pushLines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
-          pushLines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
-        }
-        pushLines.push(`  To delete, re-run with --confirm.`);
-        results.push(pushLines.join('\n'));
-      } else {
-        const purged = purgeStale(db, mctx, retainCutoff);
-        results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)${capHint(purged)}`);
-      }
-    }
   })();
 
   // FTS optimize

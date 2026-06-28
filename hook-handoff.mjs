@@ -2,7 +2,7 @@
 // Extracted for testability — hook.mjs has module-level side effects
 
 import { basename } from 'path';
-import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, scrubSecrets, LOW_SIGNAL_TITLE, EDIT_TOOLS, isMetaTriggerPrompt, notLowSignalTitleClause } from './utils.mjs';
+import { truncate, extractMatchKeywords, tokenizeHandoff, isSpecificTerm, scrubSecrets, LOW_SIGNAL_TITLE, EDIT_TOOLS, isMetaTriggerPrompt, notLowSignalTitleClause, neutralizeContextDelimiters } from './utils.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import {
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT, HANDOFF_ANCHOR_MAX_AGE,
@@ -418,11 +418,15 @@ function renderHandoffFromRow(handoff, db, project) {
     `<session-handoff source="${handoff.type}" age="${ageStr}" origin="hook-injected">`,
   ];
 
+  // Defang delimiter tags in the free-text fields ONLY — never the structural
+  // <session-handoff> tags in `lines`, or the block would lose its own framing. A
+  // user prompt or edit snippet carrying a literal </session-handoff> would otherwise
+  // close the block early and the rest would read as a real user message.
   if (handoff.working_on) {
-    lines.push('## Working On', handoff.working_on, '');
+    lines.push('## Working On', neutralizeContextDelimiters(handoff.working_on), '');
   }
   if (handoff.completed) {
-    lines.push('## Completed', ...handoff.completed.split('\n').map(l => `- ${l}`), '');
+    lines.push('## Completed', ...neutralizeContextDelimiters(handoff.completed).split('\n').map(l => `- ${l}`), '');
   }
   if (handoff.unfinished) {
     // Extract only the pending-work portion (before narrative history separator).
@@ -431,7 +435,7 @@ function renderHandoffFromRow(handoff, db, project) {
     // completeness claim the episode buffer can't support.
     const pending = extractUnfinishedSummary(handoff.unfinished);
     if (pending) {
-      lines.push('## Recent activity', ...pending.split('; ').map(l => `- ${l}`), '');
+      lines.push('## Recent activity', ...neutralizeContextDelimiters(pending).split('; ').map(l => `- ${l}`), '');
     }
   }
   if (handoff.key_files) {
@@ -441,7 +445,7 @@ function renderHandoffFromRow(handoff, db, project) {
     } catch {}
   }
   if (handoff.key_decisions) {
-    lines.push('## Key Decisions', ...handoff.key_decisions.split('\n').map(l => `- ${l}`), '');
+    lines.push('## Key Decisions', ...neutralizeContextDelimiters(handoff.key_decisions).split('\n').map(l => `- ${l}`), '');
   }
 
   lines.push('</session-handoff>');

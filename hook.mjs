@@ -39,6 +39,7 @@ import { entry as preCompactEntry } from './hook-precompact.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
   SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS,
+  HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT,
   sessionFile, getSessionId, createSessionId, openDb,
   spawnBackground, sweepOrphanEpisodeFiles,
 } from './hook-shared.mjs';
@@ -696,15 +697,19 @@ function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now
       WHERE status = 'active' AND started_at_epoch < ?
     `).run(staleSessionCutoff);
 
-    // Auto-compress: mark old low-importance observations as compressed (30+ days, importance=1)
+    // Auto-compress: mark old low-importance observations as compressed (30+ days, importance<=1)
     // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
     // v2.56.0 #4: protect injection_count > 0 obs (proven contextually relevant
     // via hook-memory injection, even if user never explicitly fetched). Same
     // protection applied symmetrically in auto-maintain decay/mark-idle below.
+    // `<= 1` (was `= 1`): citation-decay floors importance at 0 (added v2.73.2, after this
+    // predicate was written) and the LLM low-signal filter saves at imp=0 — those rows are
+    // STRICTLY lower value than imp=1 yet escaped GC, accumulating to ~40% of a mature DB
+    // (immortal: hidden from injection by the imp>=1 floor, but visible as explicit-search noise).
     const compressed = db.prepare(`
       UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
       WHERE COALESCE(compressed_into, 0) = 0
-        AND importance = 1
+        AND COALESCE(importance, 1) <= 1
         AND COALESCE(injection_count, 0) = 0
         AND created_at_epoch < ?
         AND project = ?
@@ -722,7 +727,7 @@ function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now
     const noiseCompressed = db.prepare(`
       UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
       WHERE COALESCE(compressed_into, 0) = 0
-        AND importance = 1
+        AND COALESCE(importance, 1) <= 1
         AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
         AND (facts IS NULL OR facts = '' OR facts = '[]')
         AND (
@@ -847,6 +852,20 @@ function runSessionStartAutoMaintain(db) {
         const swept = sweepOrphanEpisodeFiles(RUNTIME_DIR);
         if (swept > 0) debugLog('DEBUG', 'auto-maintain', `swept ${swept} orphan ep-flush/pending file(s)`);
       } catch (e) { debugCatch(e, 'auto-maintain-orphan-sweep'); }
+
+      // GC expired session_handoffs: the consume-DELETE (handleSessionStart) only removes
+      // the single handoff a continuation reads back; an 'exit'/'compact' that is never
+      // resumed (and every superseded 'clear') lingers forever — read paths filter by
+      // expiry but nothing reaped the rows. Delete past-expiry rows with a +1d margin so a
+      // still-readable handoff is never raced away. 'clear' 6h+1d, 'exit'/other 7d+1d.
+      try {
+        const gc = db.prepare(`
+          DELETE FROM session_handoffs
+          WHERE (type = 'clear' AND created_at_epoch < ?)
+             OR (type != 'clear' AND created_at_epoch < ?)
+        `).run(Date.now() - HANDOFF_EXPIRY_CLEAR - 86400000, Date.now() - HANDOFF_EXPIRY_EXIT - 86400000);
+        if (gc.changes > 0) debugLog('DEBUG', 'auto-maintain', `gc'd ${gc.changes} expired session_handoffs`);
+      } catch (e) { debugCatch(e, 'auto-maintain-handoff-gc'); }
 
       // Mark maintenance as done (24h gate) — even though compression runs in background
       writeFileSync(maintainFile, JSON.stringify({ epoch: Date.now() }));

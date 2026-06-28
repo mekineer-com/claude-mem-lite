@@ -720,6 +720,32 @@ describe('user-prompt-search subprocess integration', () => {
     expect(stdout).toBe('');
   });
 
+  it('exits 0 silently on stdin that parses to a non-object (null/number/string) — no crash stack', async () => {
+    // JSON.parse('null') succeeds with `null`; dereferencing `.prompt` on it threw a raw
+    // TypeError → unhandled rejection → exit 1 (this was the lone hook script with no exit-0
+    // safety net, and exit 2 on UserPromptSubmit would even BLOCK the user's prompt).
+    for (const payload of ['null', '42', '"x"']) {
+      const { stdout, stderr, code } = await new Promise((resolvePromise) => {
+        const proc = spawn(process.execPath, [SCRIPT_PATH], {
+          env: { ...process.env, CLAUDE_MEM_DIR: testDir },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+        proc.on('exit', (c) => { clearTimeout(killTimer); resolvePromise({ stdout, stderr, code: c }); });
+        proc.on('error', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr, code: -1 }); });
+        proc.stdin.write(payload);
+        proc.stdin.end();
+      });
+      expect(code, `payload=${payload}`).toBe(0);
+      expect(stderr).not.toContain('TypeError');
+      expect(stdout).toBe('');
+    }
+  });
+
   it('skips task-notification protocol messages', async () => {
     const { stdout } = await runScript({
       prompt: '<task-notification>some internal protocol message that is long enough</task-notification>',

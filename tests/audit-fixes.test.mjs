@@ -654,6 +654,49 @@ describe('T2 CLI fixes', () => {
     const row = testDb.prepare("SELECT id FROM observations WHERE title = 'CLI NEG RETAIN'").get();
     expect(row).toBeDefined();
   });
+
+  it('HIGH-1: decay,purge_stale runs purge BEFORE decay — a row marked THIS run is not deleted same-run', async () => {
+    // Pre-fix the CLI ran decay (which marks an old stale row pending-purge) BEFORE purge in
+    // one transaction, so the row was marked AND deleted in the same call — zero grace, and
+    // the pre-txn snapshot guard (counts only PRE-EXISTING pending rows) skipped the backup →
+    // permanent loss of notable memories. Purge now runs first (matching the auto-maintain hook).
+    insertObs(testDb, {
+      sessionId: 't2-mem', project: 'test--probe', type: 'decision',
+      title: 'MARKED THIS RUN', text: 'x', narrative: 'rationale',
+      importance: 1, epochOffset: -60 * 86_400_000, // old, never accessed/injected → mark-idle marks it
+    });
+    const out1 = await captureStdout(() => run([
+      'maintain', 'execute', '--ops', 'decay,purge_stale', '--confirm', '--retain-days', '7',
+    ]));
+    expect(out1).toMatch(/Purged 0 stale observations/); // purge ran first, nothing pre-existing pending
+    const row = testDb.prepare("SELECT compressed_into FROM observations WHERE title = 'MARKED THIS RUN'").get();
+    expect(row).toBeDefined();                                  // SURVIVED (pre-fix: deleted same run)
+    expect(row.compressed_into).toBe(COMPRESSED_PENDING_PURGE); // marked, to be purged on a LATER run
+
+    // Next run: the row is now PRE-EXISTING pending → purge deletes it (with the snapshot guard live).
+    const out2 = await captureStdout(() => run([
+      'maintain', 'execute', '--ops', 'decay,purge_stale', '--confirm', '--retain-days', '7',
+    ]));
+    expect(out2).toMatch(/Purged 1 stale observations/);
+    expect(testDb.prepare("SELECT id FROM observations WHERE title = 'MARKED THIS RUN'").get()).toBeUndefined();
+  });
+
+  it('MED-2: invalid --retain-days rejects atomically — a cleanup hard-delete in the same command does NOT commit', async () => {
+    // The retain-days range check used to live INSIDE db.transaction() with a bare `return`,
+    // so cleanup/decay had already mutated and the transaction COMMITTED despite exit 1.
+    insertObs(testDb, {
+      sessionId: 't2-mem', project: 'test--probe', type: 'change',
+      title: '', text: 'broken', narrative: '', importance: 1, // cleanupBroken candidate
+      epochOffset: -60 * 86_400_000,
+    });
+    const output = await captureStdout(() => run([
+      'maintain', 'execute', '--ops', 'cleanup,purge_stale', '--confirm', '--retain-days', '3',
+    ]));
+    expect(output).toContain('--retain-days must be an integer in [7, 365]');
+    expect(output).not.toMatch(/Cleaned up \d+ broken/); // cleanup never ran — validated before the txn
+    const broken = testDb.prepare("SELECT id FROM observations WHERE title = '' AND narrative = ''").get();
+    expect(broken).toBeDefined(); // the broken row survives (atomic reject)
+  });
 });
 
 // ─── T2 maintain schema surface ──────────────────────────────────────────────

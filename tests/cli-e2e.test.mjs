@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, rmSync, writeFileSync, readdirSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -141,6 +141,62 @@ describe('CLI E2E: search bare-flag guard (audit #3)', () => {
     const { stderr, exitCode } = runCli(['search', 'auth', '--project']);
     expect(exitCode).toBe(1);
     expect(stderr).toContain('--project requires a value');
+  });
+});
+
+// 2026-06-29 E2E bug-hunt: parsing-robustness + scoring-overflow fixes.
+describe('CLI E2E: 2026-06-29 audit parsing/scoring guards', () => {
+  it('HIGH: maintain bare --merge-ids fails cleanly, not with a raw TypeError stack', () => {
+    const { stderr, stdout, exitCode } = runCli(['maintain', 'execute', '--ops', 'dedup', '--merge-ids']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--merge-ids requires a value');
+    expect(stdout + stderr).not.toContain('TypeError');
+    expect(stdout + stderr).not.toMatch(/\.split is not a function/);
+  });
+
+  it('MED: export bare --to fails cleanly, never a silent EMPTY backup with rc 0', () => {
+    seedObs({ type: 'bugfix', title: 'exportable note', text: 'exportable note' });
+    const { stdout, stderr, exitCode } = runCli(['export', '--to']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--to requires a value');
+    expect(stdout.trim()).not.toBe('[]'); // would-be empty export must not be emitted
+  });
+
+  it('MED: --key=value long-option form is honored, not silently dropped to the default', () => {
+    const saved = runCli(['save', 'kvform note alpha', '--type=feature', '--project=kvproj']);
+    expect(saved.stdout).toMatch(/project: kvproj/); // not the current/default project
+    expect(saved.stdout).toContain('[feature]');      // not the default discovery type
+    const recent = JSON.parse(runCli(['recent', '--limit=1', '--project=kvproj', '--json']).stdout);
+    expect(recent.results.length).toBe(1);            // --limit=1 applied, scoped to kvproj
+  });
+
+  it('LOW: compress --age-days rejects "1e5"/"30x" instead of mis-parsing to a too-broad cutoff', () => {
+    expect(runCli(['compress', '--age-days', '1e5']).stderr).toContain('Invalid --age-days');
+    expect(runCli(['compress', '--age-days', '30x']).stderr).toContain('Invalid --age-days');
+    // a valid value is still accepted
+    expect(runCli(['compress', '--age-days', '45']).exitCode).toBe(0);
+  });
+
+  it('LOW: a far-future created_at_epoch yields a FINITE score (no EXP overflow → null / rank #1 poison)', () => {
+    seedObs({ type: 'change', title: 'future row zeta', text: 'database restore zeta', epochOffset: 30 * 365 * 86400000 });
+    seedObs({ type: 'change', title: 'normal row zeta', text: 'database restore zeta', epochOffset: -3600000 });
+    const out = JSON.parse(runCli(['search', 'database restore zeta', '--json']).stdout);
+    expect(out.results.length).toBeGreaterThanOrEqual(2);
+    for (const r of out.results) {
+      expect(r.score).not.toBeNull();          // JSON.stringify(-Infinity) === null pre-fix
+      expect(Number.isFinite(r.score)).toBe(true);
+    }
+  });
+
+  it('LOW: a confirmed delete snapshots a pre-delete .bak first; preview does not', () => {
+    seedObs({ type: 'discovery', title: 'deletable scratch note', text: 'deletable scratch note' });
+    const bakCount = () => readdirSync(dataDir).filter(f => f.includes('.pre-delete-') && f.endsWith('.bak')).length;
+    expect(bakCount()).toBe(0);
+    runCli(['delete', '1']);                 // preview only — no --confirm
+    expect(bakCount()).toBe(0);              // preview must not snapshot
+    const out = runCli(['delete', '1', '--confirm']);
+    expect(out.stdout).toMatch(/Deleted 1 observation/);
+    expect(bakCount()).toBe(1);              // confirmed delete leaves a recoverable pre-image
   });
 });
 

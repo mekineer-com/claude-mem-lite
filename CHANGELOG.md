@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.22.0 — end-to-end user-simulation audit: maintenance data-loss fix, imp=0 GC, CLI/hook robustness
+
+A two-round "real user" E2E bug-hunt (4 parallel finder agents + per-bug reproduction) across the CLI, MCP, and passive-hook paths. 15 confirmed bugs fixed — headlined by a HIGH data-loss path. Suite 3339 → 3353 (+14), ESLint clean, knip baseline unchanged. The recurring theme is again §9 parallel-path miss: the CLI/MCP maintenance paths had drifted from the auto-maintain hook's correct order.
+
+**fix (HIGH, data-loss): `maintain --ops decay,purge_stale` no longer deletes notable memories with no backup.** The CLI `maintain` and MCP `mem_maintain` ran `decay` BEFORE `purge_stale` in one transaction, so a stale importance-2/3 row was marked pending-purge AND hard-deleted in the same invocation (zero grace), while the pre-transaction snapshot guard — which counts only PRE-EXISTING pending rows — was blind to the just-marked row and skipped the backup. Result: a natural "do everything" command permanently erased notable rows. Both paths now **purge first** (matching the auto-maintain hook), so a confirmed purge only deletes rows a PRIOR run marked (which the guard saw and snapshotted); rows decay marks now wait a cycle. Two compounding fixes ride along: `decayAndMarkIdle` now marks-idle BEFORE decaying so an imp-2 row no longer collapses 2→1→pending in one pass (per-tier grace + accurate `maintain scan` forecast), and the CLI `--retain-days` range check moved OUT of the transaction so an invalid value rejects atomically instead of committing the earlier ops.
+
+**fix (data-hygiene): importance-0 observations are now GC-eligible instead of immortal.** Citation-decay floors importance at 0 and the LLM low-signal filter saves at imp=0 — but auto-compress and the weekly-summary candidate query gated on `importance = 1` (exact), written before the decay-to-0 feature existed. Those strictly-lower-value rows escaped compression forever (~40% of a mature DB), hidden from injection yet surfacing as explicit-search noise. All three predicates now use `importance <= 1`.
+
+**fix (data-safety): `delete --confirm` snapshots a pre-image first.** The interactive CLI `delete` and MCP `mem_delete` hard-deleted with no backup, unlike the maintain paths; a wrong-id delete is now recoverable from a `<db>.pre-delete-*.bak` (preview still takes none).
+
+**fix (CLI robustness): bare value-less flags and `--key=value` no longer misbehave.** Bare `--merge-ids` crashed `maintain` with a raw `TypeError` stack (the lone string-flag path missing the `rejectBareStringFlags` guard); bare `export --to` silently emitted an EMPTY export with exit 0 (`new Date(true)` is epoch 1, not `NaN`, so the backup-script footgun slipped the guard); `--key=value` long-option form was silently dropped (`save --project=X` saved to the *current* project) — `parseArgs` now accepts it. Plus `compress --age-days 1e5/30x` is rejected instead of mis-parsed, and `recent`'s invalid-count message names the real fallback.
+
+**fix (hook robustness): the passive pipeline can't be broken by adversarial content.** `post-tool-use.sh` honored only `$HOME` for its runtime dir, so a relocated `CLAUDE_MEM_DIR` install lost all Read-context tracking and grew an uncollected file forever; `user-prompt-search.js` threw (exit 1) on stdin that parsed to a non-object (the one hook lacking an exit-0 net — exit 2 on UserPromptSubmit would block the prompt); and injected `<claude-mem-context>` / `<memory-context>` / `<session-handoff>` blocks could be closed early by an observation title/lesson containing the literal delimiter tag (reachable when developing claude-mem-lite itself) — a new `neutralizeContextDelimiters` defangs them.
+
+**fix (scoring): a far-future `created_at_epoch` no longer poisons ranking.** A corrupt/imported future timestamp made the unclamped recency `EXP()` overflow to `+Infinity` → score `-Infinity` (sorted #1 for any match) and `JSON.stringify` emitted `"score": null`. The four recency expressions now clamp the age with `MAX(0, …)`.
+
+**internal: expired `session_handoffs` are now GC'd.** auto-maintain reaps past-expiry handoff rows (per-type, +1d safety margin) — previously only the single consumed handoff was ever deleted, so unresumed `exit`/superseded `clear` rows lingered.
+
 ## v3.21.0 — maintenance-layer durability: pre-purge DB snapshot, self-healing auto-update, orphan-safe hook purge
 
 Three durability fixes around the destructive maintenance + auto-update paths. Suite 3330 → 3339 (+9), ESLint clean, knip baseline unchanged.

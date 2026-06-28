@@ -1088,6 +1088,14 @@ describe('Suite 8a: Additional E2E', () => {
       VALUES (?, 'parent--testproj', 'old routine note', 'discovery', 'Old routine observation', '', '', '', '', '[]', '[]', 1, ?, ?)
     `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
 
+    // Old imp=0 observation (citation-decay floor / LLM low-signal filter) — STRICTLY lower
+    // value than imp=1, so it MUST be GC-eligible too. Pre-fix the auto-compress predicate was
+    // `importance = 1` (exact) and imp=0 rows were immortal — ~40% of a mature DB. (audit imp=0)
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'old floored note', 'discovery', 'Old floored observation', '', '', '', '', '[]', '[]', 0, ?, ?)
+    `).run(sessId, new Date(hundredDaysAgo).toISOString(), hundredDaysAgo);
+
     // Old, higher-importance observation (should NOT be auto-compressed)
     // access_count=1 prevents auto-maintain decay from reducing importance
     db.prepare(`
@@ -1104,13 +1112,36 @@ describe('Suite 8a: Additional E2E', () => {
     const obs = db2.prepare('SELECT id, importance, compressed_into FROM observations ORDER BY id').all();
     db2.close();
 
-    expect(obs.length).toBe(2);
+    expect(obs.length).toBe(3);
     // importance=1 should be marked as auto-compressed
     const lowImportance = obs.find(o => o.importance === 1);
     expect(lowImportance.compressed_into).toBe(-1);
+    // importance=0 (decay floor / filtered) must ALSO be auto-compressed, not immortal
+    const flooredImportance = obs.find(o => o.importance === 0);
+    expect(flooredImportance.compressed_into).toBe(-1);
     // importance=2 should be untouched
     const highImportance = obs.find(o => o.importance === 2);
     expect(highImportance.compressed_into).toBeNull();
+  });
+
+  it('auto-maintain GCs expired session_handoffs (reaps past-expiry, keeps fresh)', () => {
+    // The consume-DELETE only removes the one handoff a continuation reads back; an unresumed
+    // 'exit' and every superseded 'clear' lingered forever (read paths filter by expiry but
+    // nothing reaped the rows). auto-maintain now deletes past-expiry rows with a +1d margin.
+    const db = openTestDb(tmpHome);
+    const now = Date.now();
+    const ins = db.prepare('INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch) VALUES (?,?,?,?,?)');
+    ins.run('parent--testproj', 'exit', 's-old', 'old', now - 10 * 86400000);     // 10d → GC
+    ins.run('parent--testproj', 'exit', 's-new', 'new', now - 1 * 86400000);      // 1d  → keep
+    ins.run('parent--testproj', 'clear', 's-clr', 'old clear', now - 2 * 86400000); // 2d → GC (clear 6h+1d)
+    db.close();
+
+    runHook('session-start', { env: { HOME: tmpHome } });
+
+    const db2 = openTestDb(tmpHome);
+    const surviving = db2.prepare('SELECT session_id FROM session_handoffs ORDER BY session_id').all().map(r => r.session_id);
+    db2.close();
+    expect(surviving).toEqual(['s-new']); // only the within-expiry exit handoff remains
   });
 
   it('auto-compress creates weekly summaries for old low-value observations', () => {

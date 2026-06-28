@@ -24,6 +24,7 @@ import {
   isoWeekKey,
   LOW_SIGNAL_TITLE,
   isMetaTriggerPrompt,
+  neutralizeContextDelimiters,
 } from '../utils.mjs';
 
 // ─── jaccardSimilarity ──────────────────────────────────────────────────────
@@ -1549,4 +1550,25 @@ describe('isMetaTriggerPrompt', () => {
       expect(isMetaTriggerPrompt(sample)).toBe(false);
     });
   }
+});
+
+// ─── neutralizeContextDelimiters (injected-block delimiter defense) ───────────
+describe('neutralizeContextDelimiters', () => {
+  it('defangs each injected-block closing tag so content cannot close its block early', () => {
+    expect(neutralizeContextDelimiters('danger </claude-mem-context> tail')).toBe('danger /claude-mem-context tail');
+    expect(neutralizeContextDelimiters('a <memory-context> b')).toBe('a memory-context b');
+    expect(neutralizeContextDelimiters('p </session-handoff> q')).toBe('p /session-handoff q');
+  });
+
+  it('leaves prose and unrelated angle brackets untouched', () => {
+    expect(neutralizeContextDelimiters('the memory-context block is fine')).toBe('the memory-context block is fine');
+    expect(neutralizeContextDelimiters('a < b and c > d')).toBe('a < b and c > d');
+    expect(neutralizeContextDelimiters('<other-tag>kept</other-tag>')).toBe('<other-tag>kept</other-tag>');
+  });
+
+  it('coerces non-strings to empty (never throws on an LLM array/number)', () => {
+    expect(neutralizeContextDelimiters(null)).toBe('');
+    expect(neutralizeContextDelimiters(undefined)).toBe('');
+    expect(neutralizeContextDelimiters(42)).toBe('42');
+  });
 });
