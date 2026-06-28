@@ -43,7 +43,7 @@ import { execSync, execFileSync, execFile } from 'child_process';
 import { promisify } from 'util';
 const execFileP = promisify(execFile);
 
-import { armConfig, INJECTED_ARMS } from '../lib/efficacy-arms.mjs';
+import { armConfig, INJECTED_ARMS, taskSuffixForArm } from '../lib/efficacy-arms.mjs';
 import { lessonBindsToRegion, bridgeFired } from '../lib/efficacy-bridge-select.mjs';
 
 const REPO = process.cwd();
@@ -55,7 +55,9 @@ const K = parseInt(args.k || '3', 10);
 //       AL = lesson injected with CLAUDE_MEM_SALIENCE=legacy (pre-v2.98 format),
 //       C = empty sandbox control,
 //       F = lesson injected under CLAUDE_MEM_SALIENCE=bind (bind forcing-function),
-//       T = empty sandbox + spec.requirement appended to the task (positive control / gauge).
+//       T = empty sandbox + spec.requirement appended to the task (positive control / gauge),
+//       U = empty sandbox + the lesson appended at the task-prompt position under the imperative
+//           template (channel-isolation vs T; gates the live Phase-2 emitter).
 const ARMS = (args.arms || 'A,C').split(',');
 const ISOLATED = !!args.isolated;
 const BASELINE_ONLY = !!args['baseline-only'];
@@ -273,8 +275,7 @@ async function runArmSeed(spec, arm, seed, cfgDir, model) {
         rmSync(join(sb, 'runtime'), { recursive: true, force: true });
       }
     }
-    const reqSuffix = (cfg.appendRequirement && spec.requirement) ? ' ' + spec.requirement : '';
-    const task = spec.task + reqSuffix + TASK_SUFFIX;
+    const task = spec.task + taskSuffixForArm(arm, spec) + TASK_SUFFIX;
     const envVars = [
       `CLAUDE_MEM_DIR='${sb}'`,
       `CLAUDE_PROJECT_DIR='${REPO}'`,
