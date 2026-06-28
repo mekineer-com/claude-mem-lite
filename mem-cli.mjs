@@ -19,9 +19,10 @@ import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
-  recoverChildrenOf,
+  recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
 } from './lib/maintain-core.mjs';
+import { snapshotDb } from './lib/db-backup.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
@@ -1866,6 +1867,14 @@ function cmdMaintain(db, args) {
 
   // T2-P1-B: surface the OP_CAP hit so users know to re-run, matching MCP mem_maintain.
   const capHint = (changes) => (changes >= OP_CAP ? ' (cap reached, re-run for more)' : '');
+
+  // MED-2: snapshot the DB before the irreversible cleanup/purge hard-deletes —
+  // only when rows will actually be removed, and OUTSIDE the transaction below
+  // (VACUUM cannot run inside one). Best-effort; snapshotDb never throws.
+  const willPurge = ops.includes('purge_stale') && (flags.confirm === true || flags.confirm === 'true');
+  if (hardDeleteCandidateCount(db, mctx, { cleanup: ops.includes('cleanup'), purge: willPurge }) > 0) {
+    snapshotDb(db, { tag: 'pre-maintain' });
+  }
 
   db.transaction(() => {
     if (ops.includes('cleanup')) {

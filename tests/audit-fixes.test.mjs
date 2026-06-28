@@ -11,7 +11,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawn } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, readdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import Database from 'better-sqlite3';
@@ -478,6 +478,25 @@ describe('MCP T2 audit fixes (stdio)', () => {
     expect(remaining[0].title).toBe('LIVE CONTROL');
   });
 
+  it('MED-2: a confirmed purge VACUUM-snapshots the DB first (point-in-time pre-image)', async () => {
+    await initialize(proc);
+    expect(readdirSync(tmp).filter((n) => n.includes('.pre-maintain-')).length).toBe(0);
+
+    const resp = await callTool('mem_maintain', {
+      action: 'execute', operations: ['purge_stale'], confirm: true,
+    });
+    expect(resp.result?.content?.[0]?.text || '').toMatch(/Purged 3 stale observations/);
+
+    const baks = readdirSync(tmp).filter((n) => n.includes('.pre-maintain-') && n.endsWith('.bak'));
+    expect(baks.length).toBeGreaterThanOrEqual(1);
+    // Snapshot must be a usable copy taken BEFORE the delete — it still holds all 4
+    // rows (3 purgeable + 1 live), proving it is a pre-image, not a post-delete copy.
+    const snap = new Database(join(tmp, baks[0]), { readonly: true });
+    const c = snap.prepare('SELECT COUNT(*) AS c FROM observations').get().c;
+    snap.close();
+    expect(c).toBe(4);
+  });
+
   it('T2-P0-A: confirm=false is explicit dry-run (same as omitted)', async () => {
     await initialize(proc);
     const resp = await callTool('mem_maintain', {
@@ -753,6 +772,39 @@ describe('T4-P1-A: auto-maintain 7-day retention (hook.mjs)', () => {
       expect(titles).not.toContain('row A (40d)');
       expect(titles).toContain('row B (34d)');
       expect(titles).toContain('row C (20d, unmarked)');
+    } finally { db2.close(); }
+  });
+
+  it('recovers children of a purged keeper instead of orphaning them (hook → shared purgeStale)', () => {
+    // The hook purge was an inline DELETE that skipped recoverChildrenOf: deleting a
+    // keeper that had absorbed dups left its children with compressed_into dangling at
+    // a now-deleted id. Routing through purgeStale recovers them first.
+    const { db, dbPath } = initHomeDb(tmpHome);
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES ('t4-orph-sess', 't4-ret-mem', 'audit--t4', ?, ?, 'active')
+    `).run(new Date().toISOString(), now);
+
+    const insertObsRaw = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts,
+        files_read, files_modified, importance, compressed_into, access_count, created_at, created_at_epoch)
+      VALUES ('t4-ret-mem', 'audit--t4', ?, 'change', ?, '', '', '', '', '[]', '[]', 1, ?, 0, ?, ?)
+    `);
+    // keeper: pending-purge, 40d → will be deleted; child points at it and must be recovered.
+    const keeperId = Number(insertObsRaw.run('keeper body', 'doomed keeper (40d)', PENDING_PURGE_MARKER, new Date(now - 40 * DAY_MS).toISOString(), now - 40 * DAY_MS).lastInsertRowid);
+    insertObsRaw.run('child body', 'child of keeper', keeperId, new Date(now).toISOString(), now);
+    db.close();
+
+    runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-t4-orph' }) });
+
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const keeperGone = !db2.prepare('SELECT 1 FROM observations WHERE title = ?').get('doomed keeper (40d)');
+      const child = db2.prepare('SELECT compressed_into FROM observations WHERE title = ?').get('child of keeper');
+      expect(keeperGone).toBe(true);
+      expect(child).toBeDefined();
+      expect(child.compressed_into).toBeNull(); // recovered, NOT left dangling at the deleted keeper id
     } finally { db2.close(); }
   });
 });

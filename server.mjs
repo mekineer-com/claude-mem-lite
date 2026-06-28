@@ -18,9 +18,10 @@ import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './l
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
-  recoverChildrenOf,
+  recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS,
 } from './lib/maintain-core.mjs';
+import { snapshotDb } from './lib/db-backup.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { formatObsFieldValue } from './cli/common.mjs';
@@ -1076,6 +1077,14 @@ server.registerTool(
         lines.push('Nothing was deleted. To execute, re-run with confirm=true:');
         lines.push(`  mem_maintain(action="execute", operations=${JSON.stringify(ops)}, confirm=true${args.retain_days ? `, retain_days=${args.retain_days}` : ''}${args.project ? `, project="${args.project}"` : ''})`);
         return { content: [{ type: 'text', text: lines.join('\n') }] };
+      }
+
+      // MED-2: snapshot the DB before the irreversible cleanup/purge hard-deletes —
+      // only when rows will actually be removed, and OUTSIDE the transaction below
+      // (VACUUM cannot run inside one). purge_stale is already confirmed by here (the
+      // preview branch returned above otherwise). Best-effort; snapshotDb never throws.
+      if (hardDeleteCandidateCount(db, mctx, { cleanup: ops.includes('cleanup'), purge: ops.includes('purge_stale') }) > 0) {
+        snapshotDb(db, { tag: 'pre-maintain' });
       }
 
       db.transaction(() => {

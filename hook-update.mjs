@@ -489,6 +489,51 @@ export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey 
 // below skips the 'node_modules' switchable path (existsSync guard), leaving
 // the target's node_modules untouched. Dependency bumps still flow through the
 // GitHub-tarball path (downloadAndInstall), which keeps skipNpmInstall=false.
+// Undo a (partial or complete) file swap: delete the freshly-installed files, then
+// rename each backup back into place. Shared by the error path and the MED-5
+// post-install smoke gate so there is ONE rollback implementation.
+function rollbackInstall(installed, backedUp, backupDir, targetDir) {
+  for (const relPath of installed.reverse()) {
+    try { rmSync(join(targetDir, relPath), { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  for (const relPath of backedUp.reverse()) {
+    const backupPath = join(backupDir, relPath);
+    const targetPath = join(targetDir, relPath);
+    try {
+      if (existsSync(backupPath)) {
+        mkdirSync(dirname(targetPath), { recursive: true });
+        renameSync(backupPath, targetPath);
+      }
+    } catch (restoreErr) {
+      debugCatch(restoreErr, `installExtractedRelease-restore-${relPath}`);
+    }
+  }
+}
+
+// MED-5 post-install health gate: load-test the freshly-switched code in a SEPARATE
+// process before the backup is discarded. A clean file swap can still yield an
+// install that won't boot — a syntax error, an unresolved import from a half-applied
+// mixed-version swap (renameSync loop hard-killed mid-way), or a native ABI mismatch.
+// `cli.mjs help` boots the CLI entry, which dynamically imports the mem-cli module
+// graph (maintain-core / search-engine / scoring / db-backup / schema / …) and exits
+// 0 without opening the DB or a server. hook.mjs and server.mjs auto-execute on
+// import (so they can't be import-smoked) — they get a `node --check` syntax pass.
+// execSync (not execFileSync) so the unit-test child_process mock intercepts it.
+function smokeInstalledRelease(targetDir) {
+  const q = (s) => JSON.stringify(s);
+  try {
+    execSync(`${q(process.execPath)} ${q(join(targetDir, 'cli.mjs'))} help`, { timeout: 20000, stdio: 'ignore' });
+    for (const entry of ['hook.mjs', 'server.mjs']) {
+      const p = join(targetDir, entry);
+      if (existsSync(p)) execSync(`${q(process.execPath)} --check ${q(p)}`, { timeout: 10000, stdio: 'ignore' });
+    }
+    return true;
+  } catch (e) {
+    debugLog('WARN', 'hook-update', `post-install smoke failed (rolling back): ${e.message}`);
+    return false;
+  }
+}
+
 export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR, opts = {}) {
   // Cross-process lock: concurrent SessionStart self-heals / auto-updates must
   // not interleave the rename loop below (→ mixed-version install). A live peer
@@ -541,6 +586,16 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
       installed.push(relPath);
     }
 
+    // MED-5: before discarding the rollback backup, prove the switched code boots.
+    // If it can't, restore the backup and report failure — the running (old) version
+    // keeps working rather than leaving a broken install with no way back.
+    if (!opts.skipSmoke && !smokeInstalledRelease(targetDir)) {
+      rollbackInstall(installed, backedUp, backupDir, targetDir);
+      rmSync(stagingDir, { recursive: true, force: true });
+      rmSync(backupDir, { recursive: true, force: true });
+      return false;
+    }
+
     rmSync(stagingDir, { recursive: true, force: true });
     rmSync(backupDir, { recursive: true, force: true });
 
@@ -580,25 +635,9 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
     return true;
   } catch (err) {
     debugCatch(err, 'installExtractedRelease');
-
-    for (const relPath of installed.reverse()) {
-      try { rmSync(join(targetDir, relPath), { recursive: true, force: true }); } catch {}
-    }
-    for (const relPath of backedUp.reverse()) {
-      const backupPath = join(backupDir, relPath);
-      const targetPath = join(targetDir, relPath);
-      try {
-        if (existsSync(backupPath)) {
-          mkdirSync(dirname(targetPath), { recursive: true });
-          renameSync(backupPath, targetPath);
-        }
-      } catch (restoreErr) {
-        debugCatch(restoreErr, `installExtractedRelease-restore-${relPath}`);
-      }
-    }
-
-    try { rmSync(stagingDir, { recursive: true, force: true }); } catch {}
-    try { rmSync(backupDir, { recursive: true, force: true }); } catch {}
+    rollbackInstall(installed, backedUp, backupDir, targetDir);
+    try { rmSync(stagingDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    try { rmSync(backupDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     return false;
   } finally {
     release();

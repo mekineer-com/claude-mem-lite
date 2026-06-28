@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.21.0 — maintenance-layer durability: pre-purge DB snapshot, self-healing auto-update, orphan-safe hook purge
+
+Three durability fixes around the destructive maintenance + auto-update paths. Suite 3330 → 3339 (+9), ESLint clean, knip baseline unchanged.
+
+**feat (MED-2): point-in-time DB snapshot before irreversible maintenance.** The three entry points that hard-DELETE rows — auto-maintain (SessionStart), CLI `maintain`, and MCP `mem_maintain` — now take a `VACUUM INTO` snapshot (`<db>.pre-maintain-*.bak`, newest 3 retained) BEFORE deleting, but only when rows will actually be removed (a cheap COUNT guard, so a no-op maintenance run costs nothing). `VACUUM INTO` is WAL-safe (a plain file copy would miss un-checkpointed frames); it runs outside the transaction because VACUUM can't run inside one. Best-effort — a snapshot failure logs and proceeds, never blocking maintenance. Replaces the prior single-ad-hoc-backup dependency with a rolling pre-image.
+
+**feat (MED-5): post-install health gate + auto-rollback for self-update.** After an auto-update swaps files in, it now boots the switched code in a separate process (`cli.mjs help`, which loads the mem-cli module graph, plus a `node --check` on the auto-executing `hook.mjs`/`server.mjs`) BEFORE discarding the rollback backup. If the new version can't load — a syntax error, an unresolved import from a half-applied mixed-version swap, an ABI mismatch — it restores the backup and reports failure, so the running version keeps working instead of bricking. The two rollback paths (error + smoke-fail) now share one implementation.
+
+**fix (data-integrity): the hook auto-maintain purge no longer orphans children.** Its inline `DELETE` skipped `recoverChildrenOf`, so purging a keeper that had absorbed duplicates left their `compressed_into` dangling at a deleted id. It now routes through the shared `purgeStale` (recovers children first, caps at opCap) — eliminating a parallel-path duplication with the CLI/MCP purge in the process.
+
 ## v3.20.0 — auto-update now verifies release signatures (supply-chain: fail-closed)
 
 Completes the HIGH-1 supply-chain fix from v3.19.0. The Ed25519 **public key is now embedded** in `hook-update.mjs`, so auto-update **fails closed**: a release missing valid signature assets — or carrying a signature that doesn't verify against the embedded key — is refused, instead of installing opportunistically. This closes the window where an attacker who could publish a release (or MITM the asset CDN) bypassed verification by simply stripping the signature assets.

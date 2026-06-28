@@ -10,7 +10,7 @@ import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
   mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf,
-  selectFuzzyDedupeIds, maintenanceStats,
+  selectFuzzyDedupeIds, maintenanceStats, hardDeleteCandidateCount,
 } from '../lib/maintain-core.mjs';
 
 const DAY = 86400000;
@@ -24,6 +24,28 @@ function freshDb() {
   insertSession(db, { id: 'sess-1', project: 'proj-a' });
   return db;
 }
+
+describe('hardDeleteCandidateCount (MED-2 pre-maintenance snapshot guard)', () => {
+  test('counts pending-purge and/or broken rows per selected ops; 0 when none', () => {
+    const db = freshDb();
+    add(db, { title: 'live' });                                          // neither
+    add(db, { title: 'doomed', compressedInto: COMPRESSED_PENDING_PURGE }); // purge candidate
+    add(db, { title: '', narrative: '' });                              // broken candidate
+
+    expect(hardDeleteCandidateCount(db, ctx(), { purge: true })).toBe(1);
+    expect(hardDeleteCandidateCount(db, ctx(), { cleanup: true })).toBe(1);
+    expect(hardDeleteCandidateCount(db, ctx(), { cleanup: true, purge: true })).toBe(2);
+    expect(hardDeleteCandidateCount(db, ctx(), {})).toBe(0); // no destructive op selected
+    db.close();
+  });
+
+  test('returns 0 on a clean DB (no snapshot taken for a no-op maintenance run)', () => {
+    const db = freshDb();
+    add(db, { title: 'healthy', narrative: 'fine' });
+    expect(hardDeleteCandidateCount(db, ctx(), { cleanup: true, purge: true })).toBe(0);
+    db.close();
+  });
+});
 
 describe('recoverChildrenOf (shared hard-delete guard — CLI + MCP + maintain)', () => {
   test('resets compressed_into to NULL for rows pointing at the doomed keepers', () => {

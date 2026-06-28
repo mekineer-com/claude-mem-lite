@@ -131,6 +131,10 @@ export const SOURCE_FILES = [
   // Statically imported by mem-cli.mjs (cmdMaintain), server.mjs (mem_maintain),
   // and hook.mjs (handleAutoMaintain) — missing it would break maintain on auto-update.
   'lib/maintain-core.mjs',
+  // Pre-maintenance VACUUM INTO snapshot (MED-2). Statically imported by mem-cli.mjs,
+  // server.mjs, and hook.mjs before their destructive purge/cleanup — missing it
+  // would crash maintain on auto-update with an unresolved import.
+  'lib/db-backup.mjs',
   // P10 dedup/merge threshold constants — single source of truth for the Jaccard
   // dedup/merge cutoffs. Statically imported by hook.mjs, hook-llm.mjs,
   // hook-optimize.mjs, mem-cli.mjs, server.mjs, and the save/maintain cores;

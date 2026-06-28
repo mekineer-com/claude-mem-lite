@@ -163,6 +163,26 @@ describe('hook update lifecycle', () => {
     expect(readdirSync(dataDir).filter(name => name.startsWith('.update-'))).toHaveLength(0);
   });
 
+  it('MED-5: rolls back when the post-install smoke fails (broken install not kept)', async () => {
+    const dataDir = makeDataDir();
+    const releaseDir = makeReleaseDir();
+    mockedExecSync.mockImplementation((cmd, opts = {}) => {
+      if (String(cmd).startsWith('npm install')) { mkdirSync(join(opts.cwd, 'node_modules'), { recursive: true }); return ''; }
+      // The post-install smoke (node cli.mjs help / node --check) fails → the swapped
+      // code does not boot, so the install must be reverted to the prior version.
+      if (String(cmd).includes('cli.mjs') || String(cmd).includes('--check')) {
+        throw new Error('SyntaxError: Unexpected token (simulated broken install)');
+      }
+      return '';
+    });
+    const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+    expect(await installExtractedRelease(releaseDir, dataDir)).toBe(false);
+    // Old version restored, the broken new version reverted, no leftover staging/backup dirs.
+    expect(readFileSync(join(dataDir, 'hook.mjs'), 'utf8')).toContain('old hook');
+    expect(readdirSync(dataDir).filter(name => name.startsWith('.update-'))).toHaveLength(0);
+  });
+
   // Regression: scripts/ is curated to HOOK_SCRIPT_FILES only — dev-only
   // helpers (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…) and
   // any future subdirectories MUST NOT leak into ~/.claude-mem-lite/scripts/.
@@ -582,8 +602,9 @@ describe('syncDataDirFromCache (plugin-cache → data-dir code sync)', () => {
     expect(readFileSync(join(codeDir, 'cli.mjs'), 'utf8')).toContain('v2.0.0 cli');
     expect(readFileSync(join(codeDir, 'hook.mjs'), 'utf8')).toContain('v2.0.0 hook');
     expect(readFileSync(join(codeDir, 'schema.mjs'), 'utf8')).toContain('v2.0.0 schema');
-    // Local-cache sync MUST NOT shell out to npm install
-    expect(mockedExecSync).not.toHaveBeenCalled();
+    // Local-cache sync MUST NOT shell out to npm install. (The MED-5 post-install
+    // smoke may invoke `node … help` / `node --check`, but never `npm install`.)
+    expect(mockedExecSync.mock.calls.some((c) => String(c[0]).startsWith('npm install'))).toBe(false);
   });
 
   it.skipIf(process.platform === 'win32')('marks the synced cli.mjs executable', async () => {

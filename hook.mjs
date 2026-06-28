@@ -26,7 +26,7 @@ import {
   truncate, inferProject, detectBashSignificance,
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
-  COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
+  COMPRESSED_AUTO, OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -46,7 +46,8 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale } from './lib/maintain-core.mjs';
+import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
   extractAllInjected,
@@ -749,20 +750,26 @@ function runSessionStartAutoMaintain(db) {
     try {
       const STALE_AGE = Date.now() - 30 * 86400000;
       const OP_CAP = 500;
-
-      // Purge FIRST: delete pending-purge entries. Schema has no marked_at_epoch, so we
-      // anchor retention on created_at_epoch instead: 30d marking gate + 7d grace = 37d.
-      // Older cutoffs (e.g. 7d) were always redundant with the 30d marking filter and
-      // made purge effectively immediate on the next maintenance cycle — fix for T4-P1-A.
-      const purged = db.prepare(`
-        DELETE FROM observations WHERE compressed_into = ${COMPRESSED_PENDING_PURGE}
-          AND created_at_epoch < ?
-      `).run(Date.now() - 37 * 86400000);
-      if (purged.changes > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged.changes} stale observations`);
-
-      // cleanup / decay+mark-idle / boost via maintain-core (shared with CLI + MCP).
-      // injection_count>0 protection lives in decayAndMarkIdle. Whole-DB, cap 500.
+      // Shared maintenance context (whole-DB, cap 500) — used by every maintain-core
+      // op below AND the MED-2 snapshot guard. injection_count>0 protection lives in
+      // decayAndMarkIdle.
       const mctx = { projectFilter: '', baseParams: [], staleAge: STALE_AGE, opCap: OP_CAP };
+
+      // MED-2: snapshot the DB before the irreversible purge/cleanup hard-deletes
+      // below, but only when rows will actually be removed (cheap COUNT). Must run
+      // here, outside any transaction — VACUUM cannot run inside one. Best-effort:
+      // snapshotDb never throws, so a backup failure cannot block auto-maintain.
+      if (hardDeleteCandidateCount(db, mctx, { cleanup: true, purge: true }) > 0) {
+        snapshotDb(db, { tag: 'pre-maintain' });
+      }
+
+      // Purge FIRST via the SHARED purgeStale — was an inline DELETE that skipped
+      // recoverChildrenOf, so purging a keeper that had absorbed dups orphaned its
+      // children (compressed_into dangling at a deleted id). purgeStale recovers them
+      // first and caps at opCap. Schema has no marked_at_epoch, so retention anchors on
+      // created_at_epoch: 30d marking gate + 7d grace = 37d.
+      const purged = purgeStale(db, mctx, Date.now() - 37 * 86400000);
+      if (purged > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged} stale observations`);
 
       const cleaned = cleanupBroken(db, mctx);
       if (cleaned > 0) debugLog('DEBUG', 'auto-maintain', `cleaned ${cleaned} broken observations`);
