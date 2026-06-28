@@ -54,6 +54,14 @@ if (!Number.isFinite(START) || !Number.isFinite(END) || START >= END) {
 
 const ID_RE = /#(\d{2,6})\b/g;
 const INJECT_MARKER = /\[mem\]/;
+// Path B (hook.mjs <memory-context> semantic injection) carries NO [mem] marker —
+// its lines are `- [type] title (#id)`. Pre-2026-06-29 this tool's [mem]-only gate
+// counted ONLY path A ([mem] FYI, user-prompt-search.js) under "UserPromptSubmit"
+// and left path B invisible. Recognise it and bucket it as a distinct pseudo-hook
+// so the two sibling UserPromptSubmit injectors get separate cite-recall. They are
+// always separate attachments (never co-located), so per-attachment marker routing
+// cleanly splits them.
+const MEMCTX_MARKER = /<memory-context/;
 
 function extractIds(text) {
   const ids = new Set();
@@ -113,10 +121,14 @@ for (const file of candidateFiles) {
 
     if (entry.attachment) {
       const text = (entry.attachment.stdout || '') + '\n' + (entry.attachment.content || '');
-      if (INJECT_MARKER.test(text)) {
+      if (INJECT_MARKER.test(text) || MEMCTX_MARKER.test(text)) {
         const ids = extractIds(text);
         if (ids.size > 0) {
-          const hookName = entry.attachment.hookName || entry.attachment.hookEvent || 'unknown';
+          const baseHook = entry.attachment.hookName || entry.attachment.hookEvent || 'unknown';
+          // Split path B (<memory-context>) from path A ([mem] FYI) — both are
+          // UserPromptSubmit attachments. This makes path-B cite-recall (the
+          // Item-1 question) measurable instead of silently folded into nothing.
+          const hookName = MEMCTX_MARKER.test(text) ? `${baseHook}:memory-context` : baseHook;
           let bucket = sessionInjectionsByHook.get(hookName);
           if (!bucket) { bucket = new Set(); sessionInjectionsByHook.set(hookName, bucket); }
           for (const id of ids) bucket.add(id);
