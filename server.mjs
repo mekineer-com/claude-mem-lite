@@ -98,7 +98,7 @@ function getRegistryDb() {
   if (registryDb) return registryDb;
   try {
     registryDb = ensureRegistryDb(REGISTRY_DB_PATH);
-    registryDb.pragma('busy_timeout = 3000');
+    registryDb.pragma('busy_timeout = 5000'); // match main DB + ensureRegistryDb (was 3000, overriding it back down)
   } catch (e) {
     debugLog('WARN', 'server', `Registry DB not available: ${e.message}`);
   }

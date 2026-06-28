@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.19.0 — security hardening from a production audit + release signing activated
+
+A 4-agent production-readiness audit (the retrieval engine held at A− with no regression) surfaced three HIGH issues, all in the periphery and all fixed here, plus release-signing activation and a release-gating smoke test. Suite 3317 → 3329 (+12), ESLint clean, knip baseline unchanged. The recurring theme across the fixes is one anti-pattern — a hardened main path with an unguarded sibling branch (§9 parallel-path miss).
+
+**fix (security): the `events` table is now secret-scrubbed at the write choke-point.** `saveEvent` runs `scrubRecord('events', …)` over `title`/`body`, closing an at-rest leak where the auto-capture event path (raw Haiku summary) and the `/bug`,`/lesson` CLI wrote credentials verbatim into an FTS-indexed, `mem export`-able table — while the sibling `change` path already scrubbed. Covers both writers in one place.
+
+**fix (data-integrity): cluster-merge no longer destroys the keeper's original text.** The background optimize merge snapshots the keeper's pre-merge row as a recoverable `compressed_into` child before overwriting it in place, so the cluster's most-important member's full text survives the LLM's ≤800-char summary (mirroring `compressGroup`'s non-destructive semantics). Keeper id stays stable — no caller breakage.
+
+**fix (security): secret-scrub category gaps closed.** Adds non-AKIA AWS access-key prefixes (ASIA/AROA/AIDA/…), PGP + ENCRYPTED PEM private-key blocks, prefixed/suffixed JSON secret keys (`x_api_key`, `aws_secret_access_key`), and `ftp`/`ftps` basic-auth URLs. The pinned low-FP assignment-vs-prose split is preserved (290/290 FP regression tests green).
+
+**fix: `events_fts` is now covered by `fts-check` and `rebuild`** — the events FTS index previously had no corruption-detection or recovery path.
+
+**hardening: release signing activated + a real-install release gate.** With `RELEASE_SIGNING_KEY` provisioned, `sign-release.mjs` emits a signed `release-manifest.json` + `.sig` on every release; client-side verification stays opportunistic until the public key is embedded (staged deliberately so an unsigned release can never brick auto-update). `publish.yml`'s validate job now runs `smoke-tarball.mjs` (npm pack → real install → better-sqlite3 native rebuild → import → open DB), so a broken tarball blocks the publish instead of shipping.
+
+**internal:** registry `busy_timeout` 3000 → 5000 (aligns with the main DB under install/recommend write concurrency); the scoring golden gains a recency-decay axis (pins Path B exponential decay vs Path A age-flatness — the divergence the ratio-isolation harness had left unguarded); the shadow-recommendation log gains daily-shard GC (90-day retention) to bound previously-unbounded growth.
+
 ## v3.18.0 — opt-in comprehension-bridge forcing-function (measured null, default off) + scoring-path golden lock
 
 A focused batch: a new opt-in error-recall forcing-function, the experiment that measured it, and a regression lock for the scoring engine. Suite 3291 → 3317 (+26), ESLint clean. The headline feature ships **default-off** because the experiment found it does not move the needle — an honest, recorded null that redirects the next attempt rather than shipping unmeasured sophistication.

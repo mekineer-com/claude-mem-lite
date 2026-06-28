@@ -918,7 +918,7 @@ export function ensureDb() {
  * @returns {{rebuilt: string[], errors: string[]}} Results per FTS table
  */
 export function rebuildFTS(db) {
-  const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts'];
+  const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts', 'events_fts'];
   const idRe = /^[a-z][a-z0-9_]*$/;
   const rebuilt = [];
   const errors = [];
@@ -942,7 +942,7 @@ export function rebuildFTS(db) {
  * @returns {{healthy: boolean, details: string[]}}
  */
 export function checkFTSIntegrity(db) {
-  const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts'];
+  const FTS_TABLES = ['observations_fts', 'session_summaries_fts', 'user_prompts_fts', 'events_fts'];
   const idRe = /^[a-z][a-z0-9_]*$/;
   const details = [];
   let healthy = true;

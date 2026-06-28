@@ -3,7 +3,7 @@
 //
 // Phase-1 invariant: shadow AND live only LOG. Neither emits to stdout nor writes
 // invocations/recommend_count. Live injection is Phase 2. `off` skips all work.
-import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { searchResources, cjkIntentTokens } from './registry-retriever.mjs';
@@ -107,6 +107,31 @@ function appendShadow(row) {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
     appendFileSync(join(dir, `${today()}.jsonl`), JSON.stringify(row) + '\n', { mode: 0o600 });
   } catch { /* shadow sink must never crash the hook */ }
+}
+
+/**
+ * Prune shadow-log daily shards older than `retainDays`. appendShadow writes one
+ * YYYY-MM-DD.jsonl per day with no GC, so a long-lived install grows the dir
+ * unbounded (audit: shadow log non-bounded). Shard date is read from the filename
+ * (ISO dates sort lexicographically = chronologically). 90d keeps a full quarter
+ * for recommend-stats --days while bounding the dir to ~90 sub-MB files.
+ * Best-effort, never throws — called from the SessionStart GC sweep.
+ * @returns {number} shards removed
+ */
+export function gcOldShadowShards(retainDays = 90) {
+  try {
+    const dir = shadowDir();
+    if (!existsSync(dir)) return 0;
+    const cutoff = new Date(Date.now() - retainDays * 86_400_000).toISOString().slice(0, 10);
+    let removed = 0;
+    for (const name of readdirSync(dir)) {
+      const m = /^(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(name);
+      if (m && m[1] < cutoff) {
+        try { unlinkSync(join(dir, name)); removed++; } catch { /* per-entry, silent */ }
+      }
+    }
+    return removed;
+  } catch { return 0; }
 }
 
 export function logShadowReco(project, rec) { appendShadow({ ts: new Date().toISOString(), kind: 'reco', project, ...rec }); }

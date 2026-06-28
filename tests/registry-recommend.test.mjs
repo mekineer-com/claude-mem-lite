@@ -8,8 +8,9 @@ import {
   getRecoCooldown, setRecoCooldown,
   logShadowReco, logShadowAdoption, computeFunnel,
   recommendSkill, recordSkillAdoption, formatFunnel, readShadowLog,
-  replayGate, computeSweep, formatSweep,
+  replayGate, computeSweep, formatSweep, gcOldShadowShards,
 } from '../registry-recommend.mjs';
+import { mkdirSync, writeFileSync, existsSync } from 'fs';
 import { createRegistryTestDb } from './test-helpers.mjs';
 
 // Point CLAUDE_MEM_DIR at a fresh sandbox dir for the enclosing describe. Works WITHOUT
@@ -275,5 +276,29 @@ describe('formatSweep', () => {
   it('renders each grid cell with pass count and matched precision', () => {
     const out = formatSweep([{ floor: -8, margin: 0, pass: 3, matchPass: 3, matchAdopt: 2, precision: 2 / 3 }]);
     expect(out).toContain('floor=-8'); expect(out).toContain('pass=3'); expect(out).toContain('67%');
+  });
+});
+
+describe('gcOldShadowShards', () => {
+  withSandbox();
+  it('prunes shards older than retainDays, keeps recent ones', () => {
+    const dir = join(process.env.CLAUDE_MEM_DIR, 'runtime', 'recommendations');
+    mkdirSync(dir, { recursive: true });
+    const oldDate = new Date(Date.now() - 100 * 86_400_000).toISOString().slice(0, 10);
+    const recentDate = new Date(Date.now() - 3 * 86_400_000).toISOString().slice(0, 10);
+    writeFileSync(join(dir, `${oldDate}.jsonl`), '{}\n');
+    writeFileSync(join(dir, `${recentDate}.jsonl`), '{}\n');
+    writeFileSync(join(dir, 'not-a-shard.txt'), 'keep'); // non-shard untouched
+
+    const removed = gcOldShadowShards(30);
+    expect(removed).toBe(1);
+    expect(existsSync(join(dir, `${oldDate}.jsonl`))).toBe(false);
+    expect(existsSync(join(dir, `${recentDate}.jsonl`))).toBe(true);
+    expect(existsSync(join(dir, 'not-a-shard.txt'))).toBe(true);
+  });
+
+  it('returns 0 (no throw) when no shard exceeds retainDays', () => {
+    // dir now holds only the recent shard from the prior test — nothing to prune.
+    expect(gcOldShadowShards(30)).toBe(0);
   });
 });

@@ -105,6 +105,19 @@ describe('Path A — passive injection scoring (hook-memory searchRelevantMemori
     db.close();
   });
 
+  it('recency is AGE-FLAT: a 30-day-old row scores ~1.0× a fresh one (no graded decay)', () => {
+    // Path A has only a hard 60-day cutoff (MEMORY_LOOKBACK_MS), no exponential
+    // decay term. Two rows of the same type within the window, differing only in
+    // created_at_epoch, must score equal. This pins the intentional divergence
+    // from Path B (which DOES decay) so a later "add decay to injection" or
+    // "unify the scorers" edit fails loudly. created_at_epoch is non-FTS → testable.
+    const db = freshDb();
+    const { baseId: fresh, variantId: old } = seedPair(db, { epochOffset: 0 }, { epochOffset: -30 * 86400000 });
+    const m = injectScores(db);
+    expect(ratio(m, old, fresh)).toBeCloseTo(1.0, 3);
+    db.close();
+  });
+
   it('cross-project penalty defaults to 0.4× (NOT the stale "0.7" in the inline comment)', () => {
     const db = freshDb();
     // Both rows must be decision+imp2 so only the project axis varies: same-project full
@@ -144,6 +157,20 @@ describe('Path B — explicit search scoring (searchObservationsHybrid FULL_SCOR
     const { baseId, variantId } = seedPair(db, { accessCount: 0 }, { accessCount: 10 });
     const m = searchScores(db);
     expect(ratio(m, variantId, baseId)).toBeCloseTo(1 + 0.1 * Math.log(11), 4);
+    db.close();
+  });
+
+  it('recency decay: a feature row aged one half-life (30d) scores 0.75× a fresh one', () => {
+    // Path B applies 1 + EXP(-0.693·age/halfLife); feature half-life = 30d
+    // (DECAY_HALF_LIFE_BY_TYPE). Fresh row → 1+EXP(0)=2.0; one-half-life-old →
+    // 1+EXP(-0.693)=1.5; ratio = 0.75. created_at_epoch is non-FTS so the BM25
+    // component cancels. This pins the decay axis the ratio-isolation header had
+    // left unguarded — a change to the half-life table or the decay constant now
+    // fails here instead of silently shifting Path B ranking.
+    const db = freshDb();
+    const { baseId: fresh, variantId: aged } = seedPair(db, { epochOffset: 0 }, { epochOffset: -30 * 86400000 });
+    const m = searchScores(db);
+    expect(ratio(m, aged, fresh)).toBeCloseTo(0.75, 2);
     db.close();
   });
 

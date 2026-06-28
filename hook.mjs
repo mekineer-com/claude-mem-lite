@@ -58,7 +58,7 @@ import {
 } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
-import { recordSkillAdoption } from './registry-recommend.mjs';
+import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -1054,6 +1054,8 @@ async function handleSessionStart() {
   // GC stale per-session cooldown files. Cheap (<5ms typical) and idempotent;
   // moved here from pre-tool-recall.js's hot path.
   gcStalePreRecallCooldowns();
+  // Bound the shadow-recommendation log (daily JSONL shards, no GC at write time).
+  try { gcOldShadowShards(); } catch { /* best-effort, never blocks SessionStart */ }
 
   // Plugin cache self-heal: Claude Code auto-updates the marketplace plugin can
   // re-populate cache/<ver>/hooks/hooks.json, reintroducing duplicate hook

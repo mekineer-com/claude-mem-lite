@@ -64,6 +64,15 @@ jobs:
           fi
           echo "All versions consistent: $VERSION"
 
+      - name: Smoke-test the publishable tarball
+        # Gate the release on the riskiest path: npm pack → real npm install of the
+        # tarball → better-sqlite3 native rebuild → import entry points → open a DB.
+        # Nothing else here exercises it — install-e2e runs --dev (symlinks, no
+        # install), hook-update mocks tarball I/O, completeness is static-only. A
+        # missing files[] entry or a native ABI break would otherwise publish a
+        # tarball that bricks every fresh `npx`/`npm i` install. (audit MED-4)
+        run: node scripts/smoke-tarball.mjs
+
   publish:
     needs: validate
     runs-on: ubuntu-latest

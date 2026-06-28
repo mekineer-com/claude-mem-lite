@@ -60,8 +60,10 @@ export const SECRET_PATTERNS = [
   //   (b) structured keys + named env vars are unambiguous config even after a word
   //       (`see api_key: "x"` DOES scrub, mirroring the unquoted structured-key path):
   [/((?:\b|_)(?:pgpassword|pgpass|mysql_pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
-  // AWS access keys (AKIA...)
-  [/\bAKIA[A-Z0-9]{16}\b/g, '***'],
+  // AWS access keys: AKIA (long-term) + ASIA (STS temp) + AROA (role) + AIDA
+  // (user) + ANPA/ANVA/AGPA (other principal types). All share the 4-letter
+  // prefix + exactly 16 base32 chars shape — specific enough for near-zero FP.
+  [/\b(?:AKIA|ASIA|AROA|AIDA|ANPA|ANVA|AGPA)[A-Z0-9]{16}\b/g, '***'],
   // OpenAI / Anthropic keys (sk-...) — specific prefixes have lower length threshold
   [/\bsk-(?:proj|ant|ant-api\d{2})-[a-zA-Z0-9_-]{8,}\b/g, '***'],
   [/\bsk-[a-zA-Z0-9_-]{20,}\b/g, '***'],
@@ -74,8 +76,10 @@ export const SECRET_PATTERNS = [
   [/\bxox[bpas]-[a-zA-Z0-9-]{10,}\b/g, '***'],
   // JWT tokens (eyJ...eyJ...)
   [/\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+\b/g, '***'],
-  // PEM private key blocks
-  [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, '***PEM_KEY***'],
+  // PEM private key blocks. `[A-Z0-9 ]*` covers every armor label — RSA/EC/DSA/
+  // OPENSSH plus ENCRYPTED and PGP (… PRIVATE KEY BLOCK) — that the fixed
+  // alternation missed; the block delimiters make FP impossible.
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g, '***PEM_KEY***'],
   // Long hex strings in assignments (e.g. SECRET_KEY=abc123def456...)
   [/(\b(?:key|secret|token|hash)\s*[=:]\s*)[0-9a-f]{32,}\b/gi, '$1***'],
   // Google Cloud API keys (AIza...)
@@ -84,8 +88,9 @@ export const SECRET_PATTERNS = [
   [/(Authorization:\s*Bearer\s+)[^\s,;'"}\]]+/gi, '$1***'],
   // Supabase / generic long base64 keys (40+ chars, common in env vars)
   [/(\b(?:SUPABASE_KEY|SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL|REDIS_URL)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
-  // Basic auth in URLs (https://user:password@host)
-  [/https?:\/\/[^@/\s]+:[^@/\s]+@/gi, 'https://***:***@'],
+  // Basic auth in URLs (https://user:password@host). ftp/ftps added — file-drop
+  // creds are a common leak shape the https-only form missed.
+  [/(https?|ftps?):\/\/[^@/\s]+:[^@/\s]+@/gi, '$1://***:***@'],
   // Database connection strings (postgres, mysql, mongodb, redis, amqp)
   [/\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s,;'"}\]]+/gi, '$1://***'],
   // npm tokens (npm_...)
@@ -109,6 +114,13 @@ export const SECRET_PATTERNS = [
   // these slip through. Match the value-quoted form explicitly. Length floor
   // (6) avoids tripping on intentional placeholder shorts ("...", "secret").
   [/("(?:password|passwd|token|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|access[_-]?token|private[_-]?key|client[_-]?secret|auth[_-]?token|bearer|refresh[_-]?token|session[_-]?id|sessionid)"\s*:\s*")[^"]{6,}(")/gi, '$1***$2'],
+  // JSON keys with vendor PREFIX/SUFFIX around the core credential noun —
+  // `"x_api_key"`, `"aws_secret_access_key"`, `"my_password"`, `"gh_token"`.
+  // The exact-name list above misses these. Anchored to the credential nouns
+  // (password|secret|api_key|auth_token|access_token|private_key) so a benign
+  // `"token_count"` value (numeric, <6 non-quote chars after scrub) and prose
+  // keys stay low-FP; over-scrub is the safe direction for at-rest memory.
+  [/("\w*(?:password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key)\w*"\s*:\s*")[^"]{6,}(")/gi, '$1***$2'],
   // Session cookies in headers / urlencoded bodies (sessionid=, session_id=, JSESSIONID=, PHPSESSID=).
   // 16+ chars filters out short test fixtures like sessionid=abc.
   [/\b((?:session[_-]?id|sessionid|jsessionid|phpsessid)\s*[=:]\s*)[^\s,;'"}\]]{16,}/gi, '$1***'],

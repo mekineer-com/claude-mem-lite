@@ -1706,8 +1706,9 @@ describe('mem_fts_check', () => {
     const { checkFTSIntegrity } = await import('../schema.mjs');
     const result = checkFTSIntegrity(db);
     expect(result.healthy).toBe(true);
-    expect(result.details).toHaveLength(3);
+    expect(result.details).toHaveLength(4); // observations + session_summaries + user_prompts + events
     expect(result.details.every(d => d.endsWith(': ok'))).toBe(true);
+    expect(result.details.some(d => d.startsWith('events_fts'))).toBe(true);
   });
 
   it('should rebuild FTS indexes', async () => {
@@ -1715,7 +1716,8 @@ describe('mem_fts_check', () => {
     insertSession(db, { id: 'sess-fts', project: 'test' });
     insertObs(db, { sessionId: 'sess-fts', title: 'Test obs' });
     const result = rebuildFTS(db);
-    expect(result.rebuilt).toHaveLength(3);
+    expect(result.rebuilt).toHaveLength(4); // now includes events_fts (audit MED-1)
+    expect(result.rebuilt).toContain('events_fts');
     expect(result.errors).toHaveLength(0);
   });
 });

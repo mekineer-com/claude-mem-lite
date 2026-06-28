@@ -467,6 +467,21 @@ Return ONLY valid JSON:
       lesson_learned: lessonLearned,
     });
     db.transaction(() => {
+      // Snapshot the keeper's pre-merge row BEFORE overwriting it, so its original
+      // full text survives as a recoverable compressed_into child (mirroring
+      // compressGroup / recoverChildrenOf). The keeper is the cluster's most-
+      // important member; an in-place overwrite by the LLM's ≤800-char summary
+      // would otherwise destroy its original text irreversibly (HIGH-3 data loss).
+      // Column list is derived from the live schema (minus id/compressed_into) so
+      // it stays correct as migrations add columns; names are internal identifiers.
+      const snapCols = db.prepare(`PRAGMA table_info(observations)`).all()
+        .map(c => c.name).filter(c => c !== 'id' && c !== 'compressed_into');
+      const snapColList = snapCols.join(', ');
+      db.prepare(
+        `INSERT INTO observations (${snapColList}, compressed_into)
+         SELECT ${snapColList}, ? FROM observations WHERE id = ?`
+      ).run(keeper.id, keeper.id);
+
       db.prepare(`
         UPDATE observations SET title=?, narrative=?, concepts=?, facts=?, text=?,
           importance=?, lesson_learned=?, minhash_sig=?, optimized_at=?

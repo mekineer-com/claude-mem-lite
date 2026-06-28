@@ -165,7 +165,10 @@ export function ensureRegistryDb(dbPath) {
 
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 3000');
+  // 5000ms to match the main DB: registry writes (install indexing rewriting
+  // resources + resources_fts) race shadow-recommend writes + mem_registry reads
+  // on the same file; 3000ms was insufficient under that concurrency (schema.mjs).
+  db.pragma('busy_timeout = 5000');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
 

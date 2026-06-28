@@ -445,6 +445,35 @@ describe('cluster-merge', () => {
     expect(other.compressed_into).toBe(obs[0].id);
   });
 
+  it('snapshots the keeper original text before in-place overwrite (HIGH-3: data loss)', async () => {
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Keeper original title', narrative: 'irreplaceable repro steps', importance: 3, accessCount: 5 });
+    insertObs(db, { title: 'Other member', narrative: 'minor', importance: 1, accessCount: 1 });
+    const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
+    const keeperId = obs.find(o => o.importance === 3).id;
+
+    callModelJSON.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Merged summary title',
+      merged_narrative: 'lossy summary that drops the repro steps',
+      merged_concepts: ['x'], merged_facts: ['y'], merged_lesson: null, importance: 2,
+    });
+
+    const result = await executeMergeCluster(db, obs);
+    expect(result.merged).toBe(true);
+
+    // keeper holds the merged content in place (id stable — no caller breakage)
+    const keeper = db.prepare('SELECT * FROM observations WHERE id = ?').get(keeperId);
+    expect(keeper.title).toBe('Merged summary title');
+
+    // the keeper's ORIGINAL text survives as a recoverable compressed_into child
+    const snap = db.prepare(
+      "SELECT * FROM observations WHERE compressed_into = ? AND title = 'Keeper original title'"
+    ).get(keeperId);
+    expect(snap, 'keeper original must be snapshotted, not lost').toBeTruthy();
+    expect(snap.narrative).toBe('irreplaceable repro steps');
+  });
+
   it('skips merge when LLM says should_merge=false', async () => {
     const { executeMergeCluster } = await import('../hook-optimize.mjs');
     insertObs(db, { title: 'Obs A', narrative: 'About auth' });

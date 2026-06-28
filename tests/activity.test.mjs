@@ -29,6 +29,23 @@ describe('activity store', () => {
     expect(row.title).toBe('fix x');
   });
 
+  test('saveEvent scrubs secrets in title and body (HIGH-2: events at-rest leak)', () => {
+    const db = createTestDb();
+    const id = saveEvent(db, {
+      project: 'mem',
+      event_type: 'bug',
+      title: 'repro: export GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+      body: 'connect with postgres://user:hunter2pw@db.internal:5432/app and api_key=sk-abcdefghij1234567890',
+      importance: 2,
+    });
+    const row = getEvent(db, id);
+    expect(row.title).not.toMatch(/ghp_abcdefghij/);
+    expect(row.title).toContain('***');
+    expect(row.body).not.toMatch(/hunter2pw/);
+    expect(row.body).not.toMatch(/sk-abcdefghij/);
+    expect(row.body).toContain('***');
+  });
+
   test('searchEvents uses FTS and filters by type', () => {
     const db = createTestDb();
     saveEvent(db, { project: 'mem', event_type: 'bugfix', title: 'auth null deref', importance: 2 });

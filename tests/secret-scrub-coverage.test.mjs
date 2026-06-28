@@ -7,6 +7,51 @@ import { stripPrivate } from '../lib/private-strip.mjs';
 const SECRET = 'sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const POISONED = `error from upstream: token=${SECRET} not found`;
 
+describe('scrubSecrets — category gaps closed (audit MED-6)', () => {
+  it('scrubs non-AKIA AWS access-key prefixes (ASIA/AROA/AIDA)', () => {
+    expect(scrubSecrets('ASIAY34FZKBOKMUTVV7A')).toBe('***');
+    expect(scrubSecrets('AROAEXAMPLE123456789')).toBe('***');
+    expect(scrubSecrets('AIDAEXAMPLE123456789')).toBe('***');
+    // AKIA still works (no regression)
+    expect(scrubSecrets('AKIAIOSFODNN7EXAMPLE')).toBe('***');
+  });
+
+  it('scrubs PGP and ENCRYPTED private key blocks', () => {
+    const pgp = '-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF...secret...\n-----END PGP PRIVATE KEY BLOCK-----';
+    expect(scrubSecrets(pgp)).not.toContain('lQOYBF');
+    const enc = '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFDjBA...secret...\n-----END ENCRYPTED PRIVATE KEY-----';
+    expect(scrubSecrets(enc)).not.toContain('MIIFDjBA');
+    // RSA still works (no regression)
+    const rsa = '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB...\n-----END RSA PRIVATE KEY-----';
+    expect(scrubSecrets(rsa)).not.toContain('MIIEpAIB');
+  });
+
+  it('scrubs prefixed/suffixed JSON secret keys (x_api_key, aws_secret_access_key)', () => {
+    expect(scrubSecrets('{"x_api_key": "abcdef123456ghijkl"}')).not.toContain('abcdef123456');
+    expect(scrubSecrets('{"aws_secret_access_key": "wJalrXUtnFEMI1234567890"}')).not.toContain('wJalrXUtnFEMI');
+    expect(scrubSecrets('{"my_password": "hunter2hunter2"}')).not.toContain('hunter2hunter2');
+  });
+
+  it('scrubs ftp basic-auth credentials in URLs', () => {
+    expect(scrubSecrets('ftp://deploy:s3cr3tpass@files.internal/app')).not.toContain('s3cr3tpass');
+    // https still works (no regression)
+    expect(scrubSecrets('https://u:p4ssw0rd@host/x')).not.toContain('p4ssw0rd');
+  });
+});
+
+describe('scrubRecord — events table fields (HIGH-2)', () => {
+  it('scrubs title and body', () => {
+    const out = scrubRecord('events', { title: `bug: ${SECRET}`, body: POISONED });
+    expect(out.title).not.toContain(SECRET);
+    expect(out.body).not.toContain(SECRET);
+  });
+  it('leaves event_type/project identifiers untouched', () => {
+    const out = scrubRecord('events', { event_type: 'bugfix', project: 'mem', title: 'x', body: null });
+    expect(out.event_type).toBe('bugfix');
+    expect(out.project).toBe('mem');
+  });
+});
+
 describe('scrubRecord — observation table fields', () => {
   it('scrubs every text field listed in OBSERVATION_TEXT_FIELDS', () => {
     const row = {
