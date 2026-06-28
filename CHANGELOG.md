@@ -2,6 +2,12 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.20.0 — auto-update now verifies release signatures (supply-chain: fail-closed)
+
+Completes the HIGH-1 supply-chain fix from v3.19.0. The Ed25519 **public key is now embedded** in `hook-update.mjs`, so auto-update **fails closed**: a release missing valid signature assets — or carrying a signature that doesn't verify against the embedded key — is refused, instead of installing opportunistically. This closes the window where an attacker who could publish a release (or MITM the asset CDN) bypassed verification by simply stripping the signature assets.
+
+Safe to activate now because v3.19.0 shipped as the first **signed** release and its published signature was verified end-to-end against this exact public key before embedding (the matching private key lives only in the `RELEASE_SIGNING_KEY` CI secret). Older/unsigned releases and the `CLAUDE_MEM_SKIP_SIG_VERIFY` escape hatch are unaffected; setting the key back to `''` reverts to opportunistic install. Suite +1 (embedded-key parse/reject lock), ESLint clean.
+
 ## v3.19.0 — security hardening from a production audit + release signing activated
 
 A 4-agent production-readiness audit (the retrieval engine held at A− with no regression) surfaced three HIGH issues, all in the periphery and all fixed here, plus release-signing activation and a release-gating smoke test. Suite 3317 → 3329 (+12), ESLint clean, knip baseline unchanged. The recurring theme across the fixes is one anti-pattern — a hardened main path with an unguarded sibling branch (§9 parallel-path miss).

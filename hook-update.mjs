@@ -387,18 +387,20 @@ export function validateExtractedTarball(sourceDir, expectedVersion, expectedNam
 }
 
 // ── Release signature verification (P1 supply-chain hardening) ──────────────
-// Embedded Ed25519 PUBLIC key (SPKI PEM). EMPTY = unconfigured → verification is
-// INERT and auto-update behaves exactly as before. Activating it is a one-time
-// ops step (no private key ever ships in the repo):
-//   1. Generate a keypair (writes the PRIVATE key to a local file, prints PUBLIC):
-//        node -e "const c=require('crypto');const{publicKey,privateKey}=c.generateKeyPairSync('ed25519');process.stdout.write(publicKey.export({type:'spki',format:'pem'}));require('fs').writeFileSync('release-signing-key.pem',privateKey.export({type:'pkcs8',format:'pem'}))"
-//   2. Paste the printed PUBLIC key between the backticks below.
-//   3. Add the PRIVATE key (release-signing-key.pem contents) as the GitHub
-//      Actions secret RELEASE_SIGNING_KEY, then delete the local file.
-//      NEVER commit the private key.
-// Once a signed release exists, clients verify it; unsigned/older releases still
-// install (opportunistic). Signer: scripts/sign-release.mjs. Core: lib/release-digest.mjs.
-const RELEASE_PUBLIC_KEY = '';
+// Embedded Ed25519 PUBLIC key (SPKI PEM). ACTIVE since v3.20.0 — auto-update now
+// FAILS CLOSED: a release missing valid signature assets is refused (the matching
+// private key is the GitHub Actions secret RELEASE_SIGNING_KEY; signer:
+// scripts/sign-release.mjs; verifier core: lib/release-digest.mjs). The signature
+// over v3.19.0's published manifest was verified against this key end-to-end
+// before activation. The CLAUDE_MEM_SKIP_SIG_VERIFY env escape hatch still forces a
+// skip. To ROTATE: generate a new keypair, set the new private key as the secret
+// and ship one signed release with it BEFORE replacing the key below — embedding a
+// key whose releases are not yet signed bricks auto-update (fail-closed on unsigned).
+// Setting this back to '' reverts to opportunistic (install-unsigned) behavior.
+const RELEASE_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAau5x65mqsYxJU2cO2ORteueK71EuB4aphVZds8FOZKk=
+-----END PUBLIC KEY-----
+`;
 const MANIFEST_ASSET_NAME = 'release-manifest.json';
 const SIGNATURE_ASSET_NAME = 'release-manifest.json.sig';
 

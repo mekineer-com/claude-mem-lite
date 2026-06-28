@@ -753,13 +753,25 @@ describe('release signature verification (P1 supply-chain)', () => {
     expect(r).toMatchObject({ ok: false, reason: 'signature-invalid' });
   });
 
-  it('verifyReleaseAuthenticity is INERT when no public key is embedded (back-compat default)', async () => {
+  it('verifyReleaseAuthenticity uses the embedded key by default → FAILS CLOSED (active since v3.20.0)', async () => {
     const { verifyReleaseAuthenticity } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
-    // Embedded RELEASE_PUBLIC_KEY is '' by default → skip without touching the network.
+    // A real RELEASE_PUBLIC_KEY is now embedded → the default regime VERIFIES.
+    // A release carrying a manifest but NO .sig asset is refused (downgrade/strip
+    // protection), short-circuiting before any network fetch.
     const assets = [{ name: 'release-manifest.json', browser_download_url: 'https://github.com/x/y/releases/download/v1/release-manifest.json' }];
-    globalThis.fetch = vi.fn(); // must NOT be called
-    expect(await verifyReleaseAuthenticity('/nonexistent', assets)).toMatchObject({ ok: true, action: 'skipped-no-pubkey' });
+    globalThis.fetch = vi.fn(); // must NOT be called — missing sig asset short-circuits
+    expect(await verifyReleaseAuthenticity('/nonexistent', assets)).toMatchObject({ ok: false, action: 'missing-signature' });
     expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  it('embedded default key parses + rejects a foreign signature (signature-invalid, not a crash)', async () => {
+    // Locks that the pasted RELEASE_PUBLIC_KEY is a valid Ed25519 SPKI key: this path
+    // reaches createPublicKey(embedded) + crypto.verify. A manifest signed by a
+    // DIFFERENT (test) key must come back signature-invalid — proving the embedded key
+    // both parses and correctly refuses a non-matching signature (guards a corrupt paste).
+    const { verifyDownloadedRelease } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    const { dir, bytes, sig } = makeSignedRelease(); // signed by makeSignedRelease's own key, not the embedded one
+    expect(verifyDownloadedRelease(dir, bytes, sig)).toMatchObject({ ok: false, reason: 'signature-invalid' });
   });
 
   it('verifyReleaseAuthenticity honors the CLAUDE_MEM_SKIP_SIG_VERIFY escape hatch', async () => {
