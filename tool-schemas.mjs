@@ -101,6 +101,7 @@ export const memSearchSchema = {
 export const memRecentSchema = {
   limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max results (default 10)'),
   project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
+  obs_type: OBS_TYPE_ENUM.optional().describe('Filter observation type (e.g. bugfix, decision) — CLI `recent --type` parity'),
   date_since: z.string().optional().describe('Relative lower bound from now: 7d/24h/90m/2w/30s. Only items newer than the window (pair with a high limit for "everything since X")'),
 };
 

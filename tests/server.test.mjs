@@ -330,6 +330,15 @@ describe('mem_recent date_since filter', () => {
     await expect(handleRecentForTest(db, { project: 'test', date_since: '7days' }))
       .rejects.toThrow(/date_since/);
   });
+
+  it('obs_type filters to one observation type (CLI recent --type parity)', async () => {
+    insertObs(db, { sessionId: 'sess-1', project: 'test', type: 'bugfix', title: 'recent-bugfix-row', text: 'bug' });
+    const res = await handleRecentForTest(db, { project: 'test', obs_type: 'bugfix', limit: 100 });
+    const text = res.content[0].text;
+    expect(text).toContain('recent-bugfix-row');
+    expect(text).not.toContain('recent-fresh-row'); // discovery rows excluded
+    expect(text).not.toContain('recent-stale-row');
+  });
 });
 
 // ─── WAL checkpoint ─────────────────────────────────────────────────────────

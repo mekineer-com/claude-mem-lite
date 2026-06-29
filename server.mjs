@@ -361,6 +361,9 @@ async function runRecent(db, args) {
   const params = [];
   const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
   if (project) { wheres.push('project = ?'); params.push(project); }
+  // obs_type: observation-type filter (CLI `recent --type` parity). The zod enum
+  // already rejected an invalid value before the handler ran.
+  if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
   // date_since: relative lower bound on created_at (CLI `recent --since` parity).
   if (args.date_since !== undefined) {
     const d = parseDuration(args.date_since);

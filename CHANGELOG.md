@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.32.0 — `obs_type` filter on MCP `mem_recent` (closes a CLI↔MCP parity gap)
+
+**feat (mcp): `mem_recent` gains an optional `obs_type` filter** (`bugfix`/`decision`/`feature`/`refactor`/`discovery`/`change`) — the CLI's `recent --type` had no MCP counterpart, so an agent asking for "recent bugfixes" had to over-fetch and filter client-side. Validated by the shared `OBS_TYPE_ENUM` (an unknown value is rejected by the schema before the handler runs), and it composes with `date_since`/`project`/`limit`. Opt-in; no change to the default (unfiltered) listing. Tests: schema accept-valid/reject-unknown + an end-to-end check through the `handleRecentForTest` seam (obs_type=bugfix returns only the bugfix row). Suite 3416 → 3418, ESLint clean.
+
 ## v3.31.0 — `date_since` on MCP `mem_recent` (completes agent `--since` parity)
 
 **feat (mcp): `mem_recent` gains an optional `date_since` arg** — `7d`/`24h`/`90m`/`2w`/`30s` — mirroring v3.30.0's `mem_search` addition on the `recent` surface so the agent can ask for "everything since X" (pair with a high `limit`). Opt-in; the same `parseDuration` + `created_at_epoch >= now-ms` lower bound as the CLI `recent --since` (v3.29.0). The inline handler was extracted into a `runRecent(db, args)` core with an exported `handleRecentForTest` seam (mirroring `handleSearchForTest`), so the MCP path is now end-to-end testable with an injected db. 4 new tests (schema accept/reject + fresh-only / wide-window / invalid-duration via the seam). `mo`/`y` units stay out (deliberately omitted as calendar-ambiguous — use `30d`/`365d`). Suite 3412 → 3416, ESLint clean.

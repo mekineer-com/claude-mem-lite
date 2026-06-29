@@ -135,6 +135,11 @@ describe('mem_recent schema', () => {
     expect(parseSchema(memRecentSchema, { date_since: '7d' }).success).toBe(true);
     expect(parseSchema(memRecentSchema, { date_since: 7 }).success).toBe(false);
   });
+
+  it('accepts a valid obs_type and rejects an unknown one', () => {
+    expect(parseSchema(memRecentSchema, { obs_type: 'bugfix' }).success).toBe(true);
+    expect(parseSchema(memRecentSchema, { obs_type: 'notatype' }).success).toBe(false);
+  });
 });
 
 // ─── mem_timeline schema ────────────────────────────────────────────────────
