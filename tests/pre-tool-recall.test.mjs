@@ -918,6 +918,25 @@ describe('pre-tool-recall', () => {
       expect(parsed.hookSpecificOutput.additionalContext).toContain('Sourced from CLAUDE_MEM_DB_PATH override');
       expect(parsed.hookSpecificOutput.additionalContext).not.toContain('A specific lesson visible only when DB is correctly sandboxed');
     });
+
+    it('resolves the project from PWD (not cwd) when CLAUDE_PROJECT_DIR is unset — save-path parity', async () => {
+      // Round 6: the save path (utils.mjs::inferProject) and the bash fast-path resolve the
+      // project from process.env.PWD; recall MUST match or it queries a different project.
+      // Here CLAUDE_PROJECT_DIR='' disables the primary and the child's cwd is the repo root
+      // (≠ projectDir), so the seeded "parent--memdirtest" lesson surfaces ONLY if inferProject
+      // honors the PWD fallback. Pre-fix (cwd-only) this recalled nothing.
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'target.mjs') },
+        session_id: 'sess-memdir-pwd',
+      }, {
+        CLAUDE_MEM_DIR: tmpRoot,
+        CLAUDE_PROJECT_DIR: '',
+        PWD: projectDir,
+      });
+      const parsed = JSON.parse(stdout);
+      expect(parsed.hookSpecificOutput.additionalContext).toContain('A specific lesson visible only when DB is correctly sandboxed');
+    });
   });
 
   // v2.81: cooldown entries record the lesson IDs that were emitted, so the

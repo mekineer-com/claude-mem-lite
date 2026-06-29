@@ -104,14 +104,19 @@ async function bridgeTopLesson(rows, changeText) {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+// SYNC: must produce the SAME string as utils.mjs::inferProject (the path obs are SAVED
+// under) and the bash post-tool-use.sh fast-path — recall queries the SAVE-path project.
+// This previously used process.cwd() WITHOUT the process.env.PWD fallback the other two
+// have, so under a symlinked project dir (PWD = logical/symlinked path, cwd = resolved)
+// with CLAUDE_PROJECT_DIR unset it computed a DIFFERENT project than the save path and
+// silently recalled nothing. Resolution order + sanitize + 100-char cap now match utils.
 function inferProject() {
-  const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const dir = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
   const base = basename(dir);
   const parent = basename(join(dir, '..'));
-  let project = (parent && parent !== '.' && parent !== '/')
+  const raw = (parent && parent !== '.' && parent !== '/')
     ? `${parent}--${base}` : base;
-  project = project.replace(/[^a-zA-Z0-9_.-]/g, '-') || 'unknown';
-  return project;
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100) || 'unknown';
 }
 
 function readCooldown(cooldownPath) {
