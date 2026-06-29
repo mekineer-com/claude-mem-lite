@@ -433,6 +433,26 @@ describe('CLI recent command', () => {
     expect(output).toContain('2h ago');
   });
 
+  it('--since filters to a relative window; invalid duration errors', async () => {
+    const mk = (title, ageMs) => testDb.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES ('mem-s1', 'test--project', ?, 'discovery', ?, '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run(title, title, new Date(Date.now() - ageMs).toISOString(), Date.now() - ageMs);
+    mk('fresh-2h', 2 * 3600000);
+    mk('old-10d', 10 * 86400000);
+
+    const within = await captureStdout(() => run(['recent', '100', '--since', '24h']));
+    expect(within).toContain('fresh-2h');
+    expect(within).not.toContain('old-10d');
+
+    const wide = await captureStdout(() => run(['recent', '100', '--since', '30d']));
+    expect(wide).toContain('fresh-2h');
+    expect(wide).toContain('old-10d');
+
+    const errOut = await captureStdout(() => run(['recent', '--since', '7days']));
+    expect(errOut).toContain('Invalid --since');
+  });
+
   it('excludes compressed observations', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',

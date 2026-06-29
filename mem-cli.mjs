@@ -42,7 +42,7 @@ import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './lib/search-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
@@ -58,7 +58,7 @@ async function cmdSearch(db, args, { llm } = {}) {
   const { positional, flags } = parseArgs(args);
   const query = positional.join(' ');
   if (!query) {
-    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep] [--rerank]');
+    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--since DUR] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep] [--rerank]');
     return;
   }
 
@@ -76,8 +76,12 @@ async function cmdSearch(db, args, { llm } = {}) {
   }
   const source = flags.source || null; // observations|sessions|prompts (null = all)
   const project = flags.project ? resolveProject(db, flags.project) : null;
-  const bounds = parseDateBounds(flags.from, flags.to);
-  if (!bounds.ok) { fail(`[mem] Invalid --${bounds.bad} date: "${bounds.value}". Use YYYY-MM-DD or ISO 8601.`); return; }
+  const bounds = parseDateBounds(flags.from, flags.to, flags.since);
+  if (!bounds.ok) {
+    if (bounds.bad === 'since') fail(`[mem] Invalid --since "${bounds.value}". Use <N><unit>, e.g. 7d, 24h, 90m, 2w.`);
+    else fail(`[mem] Invalid --${bounds.bad} date: "${bounds.value}". Use YYYY-MM-DD or ISO 8601.`);
+    return;
+  }
   const { epochFrom: dateFrom, epochTo: dateTo } = bounds;
   // Inverted range silently returns 0 rows; warn so users see the cause, don't error
   // (a deliberate "search for nothing in this window" is not malformed input).
@@ -352,6 +356,12 @@ function cmdRecent(db, args) {
   const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
   if (project) { wheres.push('project = ?'); params.push(project); }
   if (type) { wheres.push('type = ?'); params.push(type); }
+  // --since: relative lower bound on created_at (e.g. "recent 1000 --since 24h").
+  if (flags.since !== undefined) {
+    const d = parseDuration(flags.since);
+    if (!d.ok) { fail(`[mem] Invalid --since "${flags.since}". Use <N><unit>, e.g. 7d, 24h, 90m, 2w.`); return; }
+    wheres.push('created_at_epoch >= ?'); params.push(Date.now() - d.ms);
+  }
   params.push(limit);
 
   const rows = db.prepare(`
@@ -2485,6 +2495,7 @@ Commands:
     --project P         Filter by project
     --from DATE         Start date (YYYY-MM-DD or ISO 8601)
     --to DATE           End date (YYYY-MM-DD or ISO 8601)
+    --since DUR         Relative lower bound: 7d|24h|90m|2w|30s (ignored if --from set)
     --importance N      Minimum importance (1=routine, 2=notable, 3=critical)
     --branch B          Filter by git branch
     --offset N          Skip first N results (pagination)
@@ -2496,6 +2507,7 @@ Commands:
 
   recent [N]            Show N most recent observations (default 10)
     --limit N           Sibling-parity alias for [N] (max 1000)
+    --since DUR         Only items newer than a relative window: 7d|24h|90m|2w|30s
     --project P         Filter by project
     --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
     --json              Output as JSON: {project,limit,type,total,results:[…]}

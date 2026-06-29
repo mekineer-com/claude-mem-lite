@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertPrompt } from './test-helpers.mjs';
 import { computeTier } from '../tier.mjs';
 import {
-  buildSearchFtsQuery, parseDateBounds, computePerSourceWindow,
+  buildSearchFtsQuery, parseDateBounds, parseDuration, computePerSourceWindow,
   effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts,
   normalizeCrossSourceScores, applyUserSort, applyTierFilter,
 } from '../lib/search-core.mjs';
@@ -51,6 +51,48 @@ describe('search-core', () => {
 
     it('returns nulls when no bounds given', () => {
       expect(parseDateBounds(undefined, undefined)).toEqual({ ok: true, epochFrom: null, epochTo: null });
+    });
+
+    it('derives epochFrom from a relative --since when no --from given', () => {
+      const now = 1_000_000_000_000;
+      const r = parseDateBounds(undefined, undefined, '7d', now);
+      expect(r.ok).toBe(true);
+      expect(r.epochFrom).toBe(now - 7 * 86400000);
+      expect(r.epochTo).toBe(null);
+    });
+
+    it('lets an explicit --from win over --since', () => {
+      const now = 1_000_000_000_000;
+      const r = parseDateBounds('2026-06-01', null, '7d', now);
+      expect(r.ok).toBe(true);
+      expect(r.epochFrom).toBe(new Date('2026-06-01').getTime()); // not now-7d
+    });
+
+    it('flags an invalid --since duration', () => {
+      expect(parseDateBounds(null, null, '7days')).toEqual({ ok: false, bad: 'since', value: '7days' });
+    });
+  });
+
+  describe('parseDuration', () => {
+    it('parses each unit to milliseconds', () => {
+      expect(parseDuration('30s')).toEqual({ ok: true, ms: 30_000 });
+      expect(parseDuration('90m')).toEqual({ ok: true, ms: 90 * 60_000 });
+      expect(parseDuration('24h')).toEqual({ ok: true, ms: 24 * 3_600_000 });
+      expect(parseDuration('7d')).toEqual({ ok: true, ms: 7 * 86_400_000 });
+      expect(parseDuration('2w')).toEqual({ ok: true, ms: 2 * 604_800_000 });
+    });
+
+    it('is case-insensitive and tolerates inner whitespace', () => {
+      expect(parseDuration('24H')).toEqual({ ok: true, ms: 24 * 3_600_000 });
+      expect(parseDuration(' 3 d ')).toEqual({ ok: true, ms: 3 * 86_400_000 });
+    });
+
+    it('rejects missing/unknown unit, zero, non-string, and multi-unit', () => {
+      for (const bad of ['7', '7days', '0d', '-1d', '7y', '', 'd', '1.5d', '7d8h']) {
+        expect(parseDuration(bad), bad).toEqual({ ok: false });
+      }
+      expect(parseDuration(7)).toEqual({ ok: false });
+      expect(parseDuration(null)).toEqual({ ok: false });
     });
   });
 

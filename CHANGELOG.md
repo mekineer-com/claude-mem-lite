@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.29.0 — `--since` relative time window for `search` and `recent`
+
+**feat (cli): `--since <duration>` filters results to a relative time window** — `7d`, `24h`, `90m`, `2w`, `30s` (case-insensitive, single unit). It's the relative complement to the absolute `--from`/`--to`: users think in "last week", not ISO dates. Examples: `search "login bug" --since 7d`, `recent 1000 --since 24h`. Purely additive — no existing behavior changes, and retrieval ranking / benchmarks are untouched (it only narrows the candidate epoch range). A new `parseDuration` helper (in `search-core`) parses the duration; `parseDateBounds` derives `epochFrom` from `--since` when no `--from` is given, and an explicit `--from` always wins. Invalid durations (`7days`, `1.5d`, `7d8h`, `0d`) get an actionable error. Months/years are intentionally omitted (calendar-ambiguous — use absolute bounds for longer spans). `timeline` is excluded (it's anchor-relative, so a window doesn't map), and the MCP `mem_search` tool is unchanged (the CLI is the surface here; a `date_since` arg there would be a separate tool-schema change). 7 new tests; suite 3403 → 3410, ESLint clean.
+
 ## v3.28.3 — three hardenings: tier JS↔SQL drift guard, tool-call tag defang, import size cap
 
 **fix (tier): the SQL classifier no longer falls through to the default window for a known type.** `TIER_CASE_SQL`'s final `created_at_epoch >= ?` arm now carries a `(type IS NULL OR type NOT IN (…6 known types…))` guard, mirroring `computeTier`'s `ACTIVE_WINDOWS[type] ?? DEFAULT` (a *known* type never takes the `??` branch). Behavior-neutral today — every type window is currently ≥ the default, so an enumerated type past its window is also past the default and already archives — but it removes a latent landmine: lowering any `DECAY_HALF_LIFE_BY_TYPE` entry below `change`'s would have made a past-its-window row re-qualify as `active` in SQL while the JS classifier said `archive`. The `type IS NULL` arm preserves null-type rows on the default window. Property + sample parity tests still green; a new test pins the shortened-window case.
