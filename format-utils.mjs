@@ -24,12 +24,21 @@ export function truncate(str, max = 80) {
   return str.slice(0, end) + '\u2026';
 }
 
-// The block delimiters claude-mem-lite wraps injected context in. Any user-derived text
-// (observation title / lesson, handoff body) that contains one of these LITERALLY would
-// prematurely open or close the block it lands in, and the model then reads the rest as
-// undelimited context. Reachable by editing files that contain these tokens \u2014 e.g.
-// developing claude-mem-lite itself, where source/observations carry the delimiter names.
-const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff)>/gi;
+// Two delimiter classes are defanged here:
+//   1. The blocks claude-mem-lite wraps injected context in (claude-mem-context /
+//      memory-context / session-handoff). User-derived text containing one LITERALLY
+//      would prematurely open/close the block it lands in, spilling the rest as
+//      undelimited context.
+//   2. Harness-authority tags the runtime injects (system-reminder / task-notification).
+//      Memory replays arbitrary captured text \u2014 file contents, tool output, web pages \u2014
+//      so a poisoned observation carrying a literal <system-reminder>\u2026</system-reminder>
+//      would smuggle a forged privileged-channel instruction into the model's context.
+//      It can't escape its wrapper (class 1 closers are defanged), but a nested forged
+//      authority tag is still an indirect-prompt-injection vector; strip the brackets so
+//      it reads as inert text. Other tags (<other-tag>) are deliberately left intact.
+// Reachable by editing files that contain these tokens \u2014 e.g. developing claude-mem-lite
+// itself, where source/observations carry the delimiter names.
+const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification)>/gi;
 
 /**
  * Defang the literal context-block delimiter tags in user-derived text. Strips just the

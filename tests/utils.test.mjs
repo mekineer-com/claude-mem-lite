@@ -1566,6 +1566,16 @@ describe('neutralizeContextDelimiters', () => {
     expect(neutralizeContextDelimiters('<other-tag>kept</other-tag>')).toBe('<other-tag>kept</other-tag>');
   });
 
+  it('defangs forged harness-authority delimiters (system-reminder, task-notification)', () => {
+    // Memory replays arbitrary captured text (file contents, tool output, web pages).
+    // A poisoned observation carrying a literal <system-reminder> would inject a forged
+    // harness-authority instruction inside the memory block; strip the brackets so it
+    // reads as inert text, not a privileged channel.
+    expect(neutralizeContextDelimiters('danger <system-reminder> tail')).toBe('danger system-reminder tail');
+    expect(neutralizeContextDelimiters('p </system-reminder> q')).toBe('p /system-reminder q');
+    expect(neutralizeContextDelimiters('a </task-notification> b')).toBe('a /task-notification b');
+  });
+
   it('coerces non-strings to empty (never throws on an LLM array/number)', () => {
     expect(neutralizeContextDelimiters(null)).toBe('');
     expect(neutralizeContextDelimiters(undefined)).toBe('');
