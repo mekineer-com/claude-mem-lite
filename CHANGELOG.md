@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.28.1 — scrub secrets before truncation (boundary leak) + RRF intra-list dedup
+
+**fix (security): scrub secrets at FULL length BEFORE truncating, across every save/enrich/prompt path.** The `scrubSecrets` assignment-keyword regex only fires when a `KEY=value` value is ≥6 chars (shorter values are left alone to avoid false-positives on prose). Several paths truncated raw text FIRST and scrubbed the result, so a real secret straddling the cut was sliced to a 1–5 char head that the regex no longer matched — the partial secret persisted into the stored title/narrative/prompt while the full-length field stayed clean. Fixed by deriving/scrubbing at full length before the cut at: `lib/save-observation.mjs` (manual `mem_save` title from `content.slice(0,100)`), `hook-llm.mjs` (first-pass + enrich title/narrative `truncate(…,120/500)`), `hook-optimize.mjs` (re-enrich / cluster-merge / compress LLM-output title/narrative/lesson), and `hook.mjs` (`user_prompts.prompt_text` raw prompt `slice(0,10000)`, also re-emitted via `server`/`mem-cli`). The known-safe scrub-then-truncate paths (`hook-handoff`, `session_summaries`, `compress-core`, display-time truncation) were verified unchanged. Each fix carries a RED→GREEN regression test (manual save, LLM episode/events, re-enrich, end-to-end `user-prompt` hook).
+
+**fix (rrf): count an intra-list duplicate id ONCE at its best rank.** `lib/rrf.mjs::rrfAccumulate` summed `1/(k+rank+1)` per-occurrence, so an id repeated within a SINGLE ranked list inflated to a fake cross-ranker-consensus score — violating the documented "across every ranked list it appears in" contract. Latent today (both callers — `tfidf.rrfMerge` inputs and `deep-search.rrfFuseN` lists — emit deduped lists), fixed defensively with a per-list seen-set so a future caller passing a non-deduped list can't be mis-ranked. RED→GREEN test added.
+
+Suite 3394 → 3399 (+5 regression tests), ESLint clean.
+
 ## v3.28.0 — search-pipeline micro-cleanup (post-review)
 
 **refactor (search): `coreRunSearchPipeline` builds the obs-filtered list only when a re-rank actually fires.** A post-v3.27.0 code review flagged that deleting `markSuperseded` (v3.27.0) left `const obsResults = results.filter(...)` running even on the no-rerank path (`deepReranked` / MCP `isDeep`+`!ftsQuery`), where the result was discarded. It's now built inside the `doReRank` branch — behavior-neutral (`reRankWithContext` still receives the same list and the result re-sort is unchanged), just dropping a wasted O(n) filter on that path. Suite 3394, ESLint clean. (Also refreshed the internal knip baseline note 51→53, re-verified no rot.)
