@@ -211,23 +211,25 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
   return false;
 }
 
-// ─── Identifier-exact-match precision bypass (default OFF) ───────────────────
+// ─── Identifier-exact-match precision bypass (default ON since v3.26.0) ──────
 //
-// CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=1 enables it. Rationale: the score-floors below
+// Set CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=0 to disable. Rationale: the score-floors below
 // (OR_TOP_BM25_FLOOR / TOP_REL_FLOOR) drop the WHOLE FTS set when the top row's
 // magnitude is weak. But a rare code identifier (camelCase / snake_case / CONST_CASE
 // / kebab≥3) match has high *semantic* precision even at modest BM25 — a df=1 term
 // like `sanitizeFtsQuery` scores only ~23 raw yet is an unambiguous hit. So an obs
 // whose title/lesson EXACT-matches an identifier the prompt names is a precision pass
 // — the same independent-signal rationale that already exempts sigRows (error
-// signatures) and fileRows (file names) from these floors. When enabled, such rows are
-// restored after the floors run.
+// signatures) and fileRows (file names) from these floors. Such rows are restored
+// after the floors run.
 //
-// Default OFF — opt-in. benchmark/ups-ab.mjs measured it TRADEOFF on the real corpus
-// (+3 recall recoveries / +4 injections over 12 positives / 8 hard-negatives); the
-// "cost" was eager surfacing of on-identifier obs on non-recall-framed prompts, not
-// off-topic noise. Kept opt-in (below the NET-POSITIVE/NEUTRAL ship bar). See #8858.
-export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS === '1';
+// Default ON — flipped in v3.26.0 after a corrected benchmark/ups-ab.mjs re-measurement
+// (#8858 two-bucket: TRUE off-topic FP isolated from on-topic eagerness). Over 12
+// positives / 7 true-precision hard-negatives: recall up, TRUE off-topic FP = 0 (stable
+// ×3 runs) → VERDICT NET-POSITIVE. The only behavior delta is on-topic eagerness (naming
+// an identifier surfaces its obs) — the highest-precision injection trigger there is. The
+// prose stop-list (IDENTIFIER_STOPWORDS) keeps the extractor off ordinary English.
+export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
 const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
 
 // All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive
@@ -615,8 +617,8 @@ async function main() {
     const signalPresent = hasExplicitSignal(promptText, {
       errSig, files: filesForGate, intent,
     });
-    // Identifier tokens the prompt names (for the precision bypass below). Empty
-    // unless CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=1, so this is a no-op when disabled.
+    // Identifier tokens the prompt names (for the precision bypass below). Empty only
+    // when CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=0 (bypass is default-on), then it is a no-op.
     const promptIdentifiers = IDENTIFIER_BYPASS ? extractTechIdentifiers(promptText) : [];
 
     if (intent?.useRecent) {
@@ -649,7 +651,7 @@ async function main() {
         typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
       );
 
-      // Identifier-exact-match precision bypass (default off — see IDENTIFIER_BYPASS).
+      // Identifier-exact-match precision bypass (default on — see IDENTIFIER_BYPASS).
       // Capture rows that exact-match a prompt identifier BEFORE the set-floors below;
       // they carry independent precision signal (sigRows/fileRows rationale) and are
       // restored after the floors so a low top-score can't drop a named-identifier hit.

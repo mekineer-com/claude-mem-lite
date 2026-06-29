@@ -2,7 +2,7 @@
   "_meta": {
     "purpose": "UPS-path A/B labeled set for the identifier-exact-match floor-bypass (CLAUDE_MEM_UPS_IDENTIFIER_BYPASS). Run via benchmark/ups-ab.mjs against the REAL projects--mem corpus.",
     "snapshot_date": "2026-06-29",
-    "construction": "positives = real imp>=2 obs whose title carries a camelCase/snake_case identifier, phrased as an explicit recall question naming that identifier; expected = that obs (mostly low cited_count, i.e. floor-gated in control). hard_negatives = (a) queries naming an identifier whose matching obs is tangential to the asked intent (injecting it = noise), and (b) signal-less prose where the bypass must NOT fire (no identifier). Per-query output is printed for audit.",
+    "construction": "positives = real imp>=2 obs whose title carries a camelCase/snake_case identifier, phrased as an explicit recall question naming that identifier; expected = that obs (mostly low cited_count, i.e. floor-gated in control). hard_negatives = the TRUE precision test (#8858): (a) prompts naming a GENERIC compound field (created_at / files_modified / created_at_epoch) that collides across many UNRELATED obs, so any injection is a true off-topic match; (b) signal-less prose where the bypass must NOT fire. topical_eager = prompts naming a SPECIFIC identifier whose matching obs is on-topic-but-unrequested — eagerness, NOT a true FP (#8858 warns against counting these as precision cost); reported separately, excluded from the verdict. Per-query output is printed for audit.",
     "ids_are_live": "obs ids reference the live DB at snapshot_date; re-derive if the corpus drifts."
   },
   "positives": [
@@ -20,13 +20,18 @@
     { "query": "remind me about the parseIntFlag positional cmdRecent cap bypass", "expected_ids": [8802] }
   ],
   "hard_negatives": [
-    { "query": "what is our general philosophy for writing a good lesson_learned field", "expected_ids": [], "note": "lesson_learned matches #8850/#8847 (specific bugs); intent is style guidance, not those bugs" },
-    { "query": "should ensureDb be called once at startup or per request architecturally", "expected_ids": [], "note": "ensureDb matches #8784 (a specific half-fix); intent is an architecture question" },
-    { "query": "is parseIntFlag a good name or should we rename it for clarity", "expected_ids": [], "note": "parseIntFlag matches #8802 (the cap bug); intent is naming bikeshedding" },
-    { "query": "how does deepSearch compare to a single-query search in general", "expected_ids": [], "note": "deepSearch matches #8759 (rerank wiring); intent is a conceptual comparison" },
+    { "query": "in the database schema what is the difference between created_at and created_at_epoch", "expected_ids": [], "note": "TRUE off-topic test: created_at/created_at_epoch are generic schema fields shared by many unrelated obs (markSuperseded sort, fmtTime, decay); intent is schema understanding, so any specific-bug obs is a true off-topic match" },
+    { "query": "when an observation is saved what data goes into the files_modified column", "expected_ids": [], "note": "TRUE off-topic test: files_modified is a generic field touched by many unrelated obs; intent is the data model, not any specific bug" },
+    { "query": "how is created_at_epoch computed when storing a new observation row", "expected_ids": [], "note": "TRUE off-topic test: generic field-mechanics question; a specific-bug obs that merely mentions created_at_epoch is off-topic" },
     { "query": "how is the project going overall this week", "expected_ids": [], "note": "no identifier — bypass must not fire" },
     { "query": "what should I focus on working on next", "expected_ids": [], "note": "no identifier — bypass must not fire" },
     { "query": "can you give me a quick summary of the database", "expected_ids": [], "note": "no identifier — bypass must not fire" },
     { "query": "does the whole thing actually work end to end", "expected_ids": [], "note": "no identifier — bypass must not fire" }
+  ],
+  "topical_eager": [
+    { "query": "what is our general philosophy for writing a good lesson_learned field", "expected_ids": [], "note": "lesson_learned matches specific-bug obs; on-topic to the named field but unrequested — eagerness, not a true off-topic FP" },
+    { "query": "should ensureDb be called once at startup or per request architecturally", "expected_ids": [], "note": "ensureDb matches #8784; on-topic to ensureDb, intent is architecture — eager surfacing" },
+    { "query": "is parseIntFlag a good name or should we rename it for clarity", "expected_ids": [], "note": "parseIntFlag matches #8802; on-topic to parseIntFlag, intent is naming — eager" },
+    { "query": "how does deepSearch compare to a single-query search in general", "expected_ids": [], "note": "deepSearch matches #8759; on-topic to deepSearch, intent is conceptual — eager" }
   ]
 }

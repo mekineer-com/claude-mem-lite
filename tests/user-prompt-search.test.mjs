@@ -659,6 +659,10 @@ function runScript(hookData, extraEnv = {}) {
         // their pre-gate semantics. Tests that exercise the gate itself pass
         // explicit CLAUDE_MEM_UPS_TOP_MIN overrides.
         CLAUDE_MEM_UPS_TOP_MIN: '0',
+        // Pin the identifier bypass OFF for integration tests so the production default
+        // (ON since v3.26.0) doesn't leak into floor/gate fixtures — same isolation
+        // rationale as CLAUDE_MEM_UPS_TOP_MIN above. Bypass-specific tests pass '1'.
+        CLAUDE_MEM_UPS_IDENTIFIER_BYPASS: '0',
         ...extraEnv,
       },
       stdio: ['pipe', 'pipe', 'pipe'],

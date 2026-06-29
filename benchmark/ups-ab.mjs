@@ -19,8 +19,12 @@
 // Metrics (per arm):
 //   positives      — recall: fraction of each query's expected obs that got injected,
 //                    + hits: # of positives whose expected obs ALL surfaced.
-//   hard_negatives — noise: # of injected obs that were NOT expected (ideal 0), across
-//                    identifier-tangential queries + signal-less prose (bypass must not fire).
+//   hard_negatives — noise: TRUE off-topic FPs (#8858) — generic compound fields that
+//                    collide across unrelated obs + signal-less prose (bypass must not fire).
+//                    This is the precision cost the verdict reacts to.
+//   topical_eager  — eager: on-identifier obs surfaced for a specific-identifier prompt that
+//                    did NOT ask for recall. On-topic, not wrong; reported, NOT in the verdict
+//                    (#8858: counting these as noise conflates eagerness with a true FP).
 //
 // Verdict (treatment vs control): NET-POSITIVE (recall up, precision flat) /
 // TRADEOFF (both move) / REJECT (precision down, no recall gain) / NEUTRAL.
@@ -87,11 +91,21 @@ function runArm(bypass) {
     const noise = injected.filter(id => !q.expected_ids.includes(id));
     return { query: q.query, expected: q.expected_ids, injected, noise: noise.length };
   });
+  // topical_eager: prompts naming a SPECIFIC identifier whose match is on-topic-but-unrequested
+  // (#8858). Measured for visibility but NEVER folded into the verdict's precision cost — it is
+  // eagerness, not a true off-topic false-positive.
+  const topical = (SUITE.topical_eager || []).map(q => {
+    const injected = injectedFor(q.query, bypass);
+    const eager = injected.filter(id => !q.expected_ids.includes(id));
+    return { query: q.query, expected: q.expected_ids, injected, eager: eager.length };
+  });
   const pos_hits = positives.filter(p => p.hit).length;
   const pos_recall = positives.reduce((s, p) => s + p.recall, 0) / (positives.length || 1);
   const neg_noise = negatives.reduce((s, n) => s + n.noise, 0);
   const neg_dirty = negatives.filter(n => n.noise > 0).length;
-  return { positives, negatives, pos_hits, pos_recall, neg_noise, neg_dirty };
+  const eager_inj = topical.reduce((s, t) => s + t.eager, 0);
+  const eager_dirty = topical.filter(t => t.eager > 0).length;
+  return { positives, negatives, topical, pos_hits, pos_recall, neg_noise, neg_dirty, eager_inj, eager_dirty };
 }
 
 function pct(n) { return (100 * n).toFixed(0) + '%'; }
@@ -114,8 +128,10 @@ if (jsonOut) {
   console.error(`\n─── UPS identifier-bypass A/B (project=${PROJECT}, ${P} positives / ${N} hard-negatives) ───`);
   console.error(`                    control (off)      treatment (on)`);
   console.error(`  positives hits    ${String(control.pos_hits).padStart(2)}/${P}  (recall ${pct(control.pos_recall)})      ${String(treatment.pos_hits).padStart(2)}/${P}  (recall ${pct(treatment.pos_recall)})`);
-  console.error(`  hard-neg noise    ${control.neg_noise} obs (${control.neg_dirty}/${N} dirty)        ${treatment.neg_noise} obs (${treatment.neg_dirty}/${N} dirty)`);
-  console.error(`\n  Δ recall(hits) = ${recallGain >= 0 ? '+' : ''}${recallGain}   Δ precision(noise) = ${precisionCost >= 0 ? '+' : ''}${precisionCost}`);
+  console.error(`  hard-neg noise    ${control.neg_noise} obs (${control.neg_dirty}/${N} dirty)        ${treatment.neg_noise} obs (${treatment.neg_dirty}/${N} dirty)   [TRUE off-topic FP]`);
+  const ET = (SUITE.topical_eager || []).length;
+  if (ET) console.error(`  topical-eager     ${control.eager_inj} obs (${control.eager_dirty}/${ET} dirty)        ${treatment.eager_inj} obs (${treatment.eager_dirty}/${ET} dirty)   [on-topic, NOT in verdict]`);
+  console.error(`\n  Δ recall(hits) = ${recallGain >= 0 ? '+' : ''}${recallGain}   Δ precision(true-FP) = ${precisionCost >= 0 ? '+' : ''}${precisionCost}`);
   console.error(`  VERDICT: ${verdict}`);
   console.error(`\n  Positives detail [✓=target surfaced]:`);
   for (let i = 0; i < control.positives.length; i++) {
@@ -126,7 +142,15 @@ if (jsonOut) {
   console.error(`\n  Hard-negatives detail [noise = injected obs not expected]:`);
   for (let i = 0; i < control.negatives.length; i++) {
     const c = control.negatives[i], t = treatment.negatives[i];
-    const flip = (c.noise === 0 && t.noise > 0) ? '  ← NEW NOISE' : '';
+    const flip = (c.noise === 0 && t.noise > 0) ? '  ← NEW TRUE-FP' : '';
     console.error(`    [${c.noise}→${t.noise}] ctl=[${c.injected.join(',') || '—'}] trt=[${t.injected.join(',') || '—'}]  "${c.query.slice(0, 42)}"${flip}`);
+  }
+  if (ET) {
+    console.error(`\n  Topical-eager detail [eager = on-identifier obs surfaced, not a true FP]:`);
+    for (let i = 0; i < control.topical.length; i++) {
+      const c = control.topical[i], t = treatment.topical[i];
+      const flip = (c.eager === 0 && t.eager > 0) ? '  ← NEW EAGER' : '';
+      console.error(`    [${c.eager}→${t.eager}] ctl=[${c.injected.join(',') || '—'}] trt=[${t.injected.join(',') || '—'}]  "${c.query.slice(0, 42)}"${flip}`);
+    }
   }
 }

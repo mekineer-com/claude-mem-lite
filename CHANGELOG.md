@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.26.0 — identifier floor-bypass now ON by default (measured NET-POSITIVE)
+
+`CLAUDE_MEM_UPS_IDENTIFIER_BYPASS` flips from opt-in to **default-ON** after a corrected UPS-path A/B re-measurement. Set `=0` to disable. Suite 3405, ESLint clean.
+
+**change (injection, default-ON): an obs whose title/lesson exact-matches a code identifier the prompt names now bypasses the UserPromptSubmit score-floors by default.** Shipped opt-in in v3.24.0; v3.25.0's review tightened the extractor (prose stop-list). This release flips the default after re-running `benchmark/ups-ab.mjs` with **corrected hard-negatives (#8858)**: the old set counted *on-topic eagerness* as noise, conflating it with true off-topic false-positives. Splitting the buckets — generic-compound collisions (`created_at` / `files_modified`) + signal-less prose as the true-precision test, specific-identifier-on-topic queries as a separate *eager* bucket — measured **TRUE off-topic FP = 0 (stable ×3 runs), recall up → VERDICT NET-POSITIVE**. The only behavior delta is on-topic eagerness (naming an identifier surfaces its obs), the highest-precision injection trigger there is. Disable with `CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=0`. (`CLAUDE_MEM_TASK_IMPERATIVE` stays default-OFF — its flip is gated on a live cite-recall canary, not this A/B.)
+
+**test (benchmark): `ups-ab.mjs` isolates true off-topic FP from on-topic eagerness (#8858).** The harness reports a separate `topical_eager` bucket — specific-identifier queries whose match is on-topic-but-unrequested — excluded from the verdict, so a lever's precision cost reflects only genuine off-topic noise. Integration tests pin `CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=0` so the new production default doesn't leak into floor/gate fixtures. Dev tooling, not shipped.
+
 ## v3.25.0 — code-review follow-up: UPS prose-match precision, CLI/hook fixes, markSuperseded review-correction
 
 A code review of v3.24.0 (one reviewer subagent; every finding re-verified against the code before acting) produced one precision fix on a default-ON path, three small correctness fixes, and a documentation correction where the review disproved a v3.24.0 root-cause claim. Suite 3403 → 3405 (+2), ESLint clean. No production behavior regressions; the markSuperseded item is behavior-neutral.
