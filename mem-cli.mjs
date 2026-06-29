@@ -1761,6 +1761,13 @@ function cmdRestore(db, argv) {
 
 function cmdCompress(db, args) {
   const { flags } = parseArgs(args);
+  // Sibling-command flag footgun: compress executes with --execute (optimize uses
+  // --run, maintain uses positional `execute`). A bare --run previously fell through to
+  // a silent preview; fail fast pointing at the right flag. --execute still wins if both.
+  if ((flags.run === true || flags.run === 'true') && flags.execute !== true && flags.execute !== 'true') {
+    fail("[mem] compress executes with --execute, not --run (--run is optimize's flag). Re-run: claude-mem-lite compress --execute");
+    return;
+  }
   const preview = flags.execute !== true && flags.execute !== 'true';
   // Reject malformed --age-days explicitly. The prior fallback (`|| 30`) silently used
   // the default whenever the value parsed as NaN or <1, so users typing `--age-days abc`
@@ -2857,6 +2864,13 @@ async function cmdEnrich(argv) {
 async function cmdOptimize(db, args) {
   const run = args.includes('--run');
   const runAll = args.includes('--run-all');
+  // Sibling-command flag footgun: optimize executes with --run (compress uses
+  // --execute, maintain uses positional `execute`). A bare --execute previously fell
+  // through to a silent preview, so the user thought they ran a mutation but didn't.
+  if (args.includes('--execute') && !run && !runAll) {
+    fail("[mem] optimize executes with --run, not --execute (--execute is compress's flag). Re-run: claude-mem-lite optimize --run");
+    return;
+  }
   const verbose = args.includes('--verbose') || args.includes('-v');
   // T2-P1-D: --task accepts a single task or a comma-separated list, parity with MCP memOptimizeSchema.tasks.
   const VALID_TASKS = ['re-enrich', 'normalize', 'cluster-merge', 'smart-compress'];

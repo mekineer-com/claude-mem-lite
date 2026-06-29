@@ -116,6 +116,29 @@ function seedObs({ type = 'discovery', title, text = '', importance = 1, filesMo
 
 // ─── Test Suites ─────────────────────────────────────────────────────────────
 
+// Round 5: the three mutating maintenance commands used three different "do it"
+// conventions — compress `--execute`, optimize `--run`, maintain positional `execute`.
+// Borrowing the wrong sibling's flag SILENTLY fell through to a preview / no-op, so a
+// user who typed `optimize --execute` thought they ran a mutation but didn't. Each now
+// fails fast pointing at its real flag (maintain already errored on a stray flag).
+describe('CLI E2E: execute-flag footgun guard (Round 5)', () => {
+  it('compress rejects --run (its flag is --execute) instead of silently previewing', () => {
+    const { stderr, exitCode } = runCli(['compress', '--run']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/--execute/);
+  });
+  it('optimize rejects --execute (its flag is --run) instead of silently previewing', () => {
+    const { stderr, exitCode } = runCli(['optimize', '--execute']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/--run/);
+  });
+  it('compress still previews with no execute flag, and --execute is still honored', () => {
+    const preview = runCli(['compress']);
+    expect(preview.exitCode).toBe(0);
+    expect(preview.stdout + preview.stderr).not.toMatch(/--execute.*instead|did you mean/);
+  });
+});
+
 // Audit 2026-06-22 P1 #3: cmdSearch lacked rejectBareStringFlags for its string
 // flags, so a value-less flag parsed to boolean `true` and either crashed or
 // silently changed results. One guard fixes all three symptoms.
