@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.28.0 — search-pipeline micro-cleanup (post-review)
+
+**refactor (search): `coreRunSearchPipeline` builds the obs-filtered list only when a re-rank actually fires.** A post-v3.27.0 code review flagged that deleting `markSuperseded` (v3.27.0) left `const obsResults = results.filter(...)` running even on the no-rerank path (`deepReranked` / MCP `isDeep`+`!ftsQuery`), where the result was discarded. It's now built inside the `doReRank` branch — behavior-neutral (`reRankWithContext` still receives the same list and the result re-sort is unchanged), just dropping a wasted O(n) filter on that path. Suite 3394, ESLint clean. (Also refreshed the internal knip baseline note 51→53, re-verified no rot.)
+
 ## v3.27.0 — remove the markSuperseded display heuristic (unsound overlay on superseded_at)
 
 Deletes the in-memory `[SUPERSEDED]` display tag from `search`/`recent` output. It was a display-only heuristic — pure file-overlap + `importance<=` + recency, with no content check — layered on top of the real `superseded_at` mechanism (set by `maintain`/`compress`, which already excludes those rows from search). Because files get touched for many unrelated reasons, the heuristic over-tagged genuinely-current observations as superseded; it was also the locus of the v3.24.0 misdiagnosis (corrected in v3.25.0) and was flagged near-inert long ago. Removed across `search-scoring` / `search-core` / `mem-cli` / `server` + 4 test files; the real `superseded_at` column and the `superseded_only` stats decomposition are unchanged. Suite 3405 → 3394 (−11 markSuperseded-only tests), ESLint clean, knip unchanged (53; the +2 over the 2026-06-05 baseline of 51 is pre-existing drift, verified knip-neutral for this change).
