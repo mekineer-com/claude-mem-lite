@@ -8,7 +8,7 @@ import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
+import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -231,8 +231,7 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
   const tok = r => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
   for (const r of paginatedResults) {
     if (r.source === 'obs') {
-      const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
-      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${supersededTag}${tok(r)}`);
+      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
       if (r.snippet && r.snippet.length > 10 && r.snippet !== r.title) {
         lines.push(`     ${truncate(r.snippet, 100)}`);
       }
@@ -292,7 +291,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
     {
       db, currentProject, env: process.env,
       searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
-      reRankWithContext, markSuperseded, llm, rerankLlm,
+      reRankWithContext, llm, rerankLlm,
     },
     {
       query: args.query, ftsQuery, effectiveSource: effectiveType, deepMode, rerank,

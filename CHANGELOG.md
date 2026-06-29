@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.27.0 — remove the markSuperseded display heuristic (unsound overlay on superseded_at)
+
+Deletes the in-memory `[SUPERSEDED]` display tag from `search`/`recent` output. It was a display-only heuristic — pure file-overlap + `importance<=` + recency, with no content check — layered on top of the real `superseded_at` mechanism (set by `maintain`/`compress`, which already excludes those rows from search). Because files get touched for many unrelated reasons, the heuristic over-tagged genuinely-current observations as superseded; it was also the locus of the v3.24.0 misdiagnosis (corrected in v3.25.0) and was flagged near-inert long ago. Removed across `search-scoring` / `search-core` / `mem-cli` / `server` + 4 test files; the real `superseded_at` column and the `superseded_only` stats decomposition are unchanged. Suite 3405 → 3394 (−11 markSuperseded-only tests), ESLint clean, knip unchanged (53; the +2 over the 2026-06-05 baseline of 51 is pre-existing drift, verified knip-neutral for this change).
+
 ## v3.26.0 — identifier floor-bypass now ON by default (measured NET-POSITIVE)
 
 `CLAUDE_MEM_UPS_IDENTIFIER_BYPASS` flips from opt-in to **default-ON** after a corrected UPS-path A/B re-measurement. Set `=0` to disable. Suite 3405, ESLint clean.

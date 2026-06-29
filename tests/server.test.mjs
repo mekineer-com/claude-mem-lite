@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
-import { reRankWithContext, markSuperseded, autoBoostIfNeeded, runIdleCleanup } from '../search-scoring.mjs';
+import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup } from '../search-scoring.mjs';
 
 // ─── Dedup Migration ────────────────────────────────────────────────────────
 
@@ -462,38 +462,6 @@ describe('reRankWithContext', () => {
     reRankWithContext(db, results, 'test');
     // No files → no crash, score unchanged
     expect(results[0].score).toBe(-5.0);
-  });
-});
-
-// ─── Phase 2b: markSuperseded ────────────────────────────────────────────────
-
-describe('markSuperseded', () => {
-  it('marks older lower-importance obs as superseded', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 1 },
-      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 2 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBe(true);  // old, imp=1 <= newest imp=2
-    expect(results[1].superseded).toBeUndefined();  // newest
-  });
-
-  it('preserves high-importance old obs', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 3 },
-      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 1 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBeUndefined();  // imp=3 > newest imp=1
-    expect(results[1].superseded).toBeUndefined();  // newest
-  });
-
-  it('handles obs without files', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', importance: 1 },
-      { source: 'session', id: 2, date: '2026-02-01' },
-    ];
-    expect(() => markSuperseded(results)).not.toThrow();
   });
 });
 

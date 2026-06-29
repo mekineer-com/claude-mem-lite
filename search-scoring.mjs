@@ -127,53 +127,6 @@ export function reRankWithContext(db, results, project) {
   // Note: caller re-sorts the main results array after this — no sort needed here
 }
 
-/**
- * Mark older, lower-importance observations as superseded when multiple touch the same file.
- * Mutates result objects in-place by adding superseded=true flag.
- * @param {object[]} results Array of search result objects with source, files_modified,
- *   created_at_epoch (or created_at / legacy date), importance
- */
-export function markSuperseded(results) {
-  if (!results || results.length === 0) return;
-  // Build map: file → [result objects], only for obs with files
-  const fileMap = new Map();
-  for (const r of results) {
-    if (r.source !== 'obs' || !r.files_modified) continue;
-    let files;
-    try { files = JSON.parse(r.files_modified || '[]'); } catch (e) { debugCatch(e, 'markSuperseded-parse'); continue; }
-    for (const f of files) {
-      if (!fileMap.has(f)) fileMap.set(f, []);
-      fileMap.get(f).push(r);
-    }
-  }
-  // For each file with 2+ observations: mark older lower-importance as superseded (in-memory only)
-  // Note: DB persistence removed — search is a read operation and should not write.
-  // Persistent superseding belongs in mem_maintain/mem_compress write paths.
-  for (const [, obsForFile] of fileMap) {
-    if (obsForFile.length < 2) continue;
-    // Sort newest-first by recency. Every production obs row carries `date`
-    // (= created_at ISO, set by ftsRowToResult); the FTS/type paths also carry
-    // created_at_epoch, the vector/type-list paths carry date-only. So the prior
-    // `b.date` sort already ordered correctly in production — this is defensive
-    // hardening, not a prod no-op fix (a post-release review corrected the original
-    // #8821 "missing-`date`" diagnosis). Prefer the numeric epoch, fall back to the
-    // ISO created_at (lexically chronological), then legacy `date`, so the key holds
-    // for any caller regardless of which recency fields it supplies.
-    obsForFile.sort((a, b) => {
-      const ka = a.created_at_epoch ?? a.created_at ?? a.date ?? '';
-      const kb = b.created_at_epoch ?? b.created_at ?? b.date ?? '';
-      if (typeof ka === 'number' && typeof kb === 'number') return kb - ka;
-      return String(kb).localeCompare(String(ka));
-    });
-    const newest = obsForFile[0];
-    for (let i = 1; i < obsForFile.length; i++) {
-      if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {
-        obsForFile[i].superseded = true;
-      }
-    }
-  }
-}
-
 // ─── Pseudo-Relevance Feedback (PRF) ────────────────────────────────────────
 // Two-phase document-level expansion: extract discriminative terms from top
 // results' full text (title + narrative), filter out query terms + stop words,

@@ -8,7 +8,7 @@ import { truncate, typeIcon, inferProject, scrubSecrets } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
-import { autoBoostIfNeeded, reRankWithContext, markSuperseded } from './search-scoring.mjs';
+import { autoBoostIfNeeded, reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
@@ -178,7 +178,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     {
       db, currentProject: project ? null : inferProject(), env: process.env,
       searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
-      reRankWithContext, markSuperseded, llm,
+      reRankWithContext, llm,
     },
     {
       query, ftsQuery, effectiveSource, deepMode, rerank,
@@ -262,7 +262,6 @@ async function cmdSearch(db, args, { llm } = {}) {
         title: r.title || r.subtitle || null,
         lesson_learned: r.lesson_learned || null,
         importance: r.importance ?? null,
-        superseded: Boolean(r.superseded),
         files_modified: r.files_modified || null,
         body_tokens: r.bodyTokens ?? null,
       };
@@ -300,8 +299,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     } else {
       const date = fmtDateShort(r.created_at);
       const title = truncate(r.title || r.subtitle || '(untitled)', 80);
-      const supersededTag = r.superseded ? ' [SUPERSEDED]' : '';
-      out(`#${r.id} ${typeIcon(r.type)} ${date}${timeStr} ${title}${supersededTag}${tok(r)}`);
+      out(`#${r.id} ${typeIcon(r.type)} ${date}${timeStr} ${title}${tok(r)}`);
       if (r.lesson_learned) {
         out(`  -> ${truncate(r.lesson_learned, 80)}`);
       }

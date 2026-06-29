@@ -2,7 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { sanitizeFtsQuery, jaccardSimilarity, computeMinHash, scrubSecrets, isoWeekKey } from '../utils.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts } from '../search-scoring.mjs';
+import { reRankWithContext, extractPRFTerms, expandQueryByConcepts } from '../search-scoring.mjs';
 
 // ─── Search Pipeline Integration ─────────────────────────────────────────────
 
@@ -14,7 +14,7 @@ describe('search pipeline integration', () => {
   });
   afterEach(() => { db.close(); });
 
-  it('full search flow: insert → FTS query → rerank → superseded → results', () => {
+  it('full search flow: insert → FTS query → rerank → results', () => {
     // Seed diverse observations
     insertObs(db, { title: 'auth token refresh bug', text: 'auth token refresh bug', filesModified: '["src/auth.js"]', importance: 1, epochOffset: -5 * 86400000 });
     insertObs(db, { title: 'auth session handling fix', text: 'auth session handling fix', filesModified: '["src/auth.js"]', importance: 2, epochOffset: -1000 });
@@ -48,15 +48,6 @@ describe('search pipeline integration', () => {
 
     // Step 2: reRank (recent auth.js edits should boost)
     reRankWithContext(db, results, 'test');
-
-    // Step 3: markSuperseded
-    markSuperseded(results);
-
-    // The older lower-importance auth.js obs should be superseded
-    const oldAuth = results.find(r => r.title.includes('token refresh'));
-    const newAuth = results.find(r => r.title.includes('session handling'));
-    expect(oldAuth.superseded).toBe(true);
-    expect(newAuth.superseded).toBeUndefined();
   });
 
   it('concept co-occurrence expansion finds related results', () => {

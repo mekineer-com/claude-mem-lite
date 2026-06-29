@@ -1,7 +1,7 @@
 // Unit tests for search-scoring.mjs (extracted from server.mjs for testability)
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { reRankWithContext, markSuperseded, extractPRFTerms, expandQueryByConcepts, PRF_STOP_WORDS } from '../search-scoring.mjs';
+import { reRankWithContext, extractPRFTerms, expandQueryByConcepts, PRF_STOP_WORDS } from '../search-scoring.mjs';
 
 // ─── reRankWithContext ──────────────────────────────────────────────────────
 
@@ -81,87 +81,6 @@ describe('reRankWithContext', () => {
     ];
     expect(() => reRankWithContext(db, results, 'test')).not.toThrow();
     expect(results[0].score).toBe(-5.0);
-  });
-});
-
-// ─── markSuperseded ─────────────────────────────────────────────────────────
-
-describe('markSuperseded', () => {
-  it('marks older lower-importance obs as superseded', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 1 },
-      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 2 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBe(true);
-    expect(results[1].superseded).toBeUndefined();
-  });
-
-  it('preserves high-importance old records', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["auth.js"]', importance: 3 },
-      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["auth.js"]', importance: 1 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBeUndefined(); // imp 3 > newest imp 1
-    expect(results[1].superseded).toBeUndefined(); // newest
-  });
-
-  it('handles single-file results', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["only.js"]', importance: 1 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBeUndefined();
-  });
-
-  it('handles multi-file cross-references', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-01-01', files_modified: '["a.js","b.js"]', importance: 1 },
-      { source: 'obs', id: 2, date: '2026-02-01', files_modified: '["b.js","c.js"]', importance: 1 },
-      { source: 'obs', id: 3, date: '2026-03-01', files_modified: '["c.js","d.js"]', importance: 1 },
-    ];
-    markSuperseded(results);
-    // For b.js: #1 (oldest) superseded by #2 (newest for b.js)
-    expect(results[0].superseded).toBe(true);
-    // For c.js: #2 superseded by #3 (newest for c.js)
-    expect(results[1].superseded).toBe(true);
-    expect(results[2].superseded).toBeUndefined();
-  });
-
-  // The real production (ftsRowToResult) obs row carries ALL of `date` (= created_at
-  // ISO) + created_at + created_at_epoch, in RELEVANCE order (not recency). The
-  // recency sort must put the genuinely-newest row first so a current top-importance
-  // obs is never mis-tagged [SUPERSEDED] by a higher-ranked older same-file peer.
-  // (The prior `b.date` sort also handled this shape — production always supplied
-  // `date` — so this is a behavior guard on the real shape, not a missing-field fix.)
-  it('orders by recency on the real production (ftsRowToResult) row shape', () => {
-    const results = [
-      // id 2 is NEWEST but ranked first by relevance (relevance ≠ recency).
-      { source: 'obs', id: 2, date: '2026-06-24T00:00:00.000Z', created_at: '2026-06-24T00:00:00.000Z', created_at_epoch: 1750723200000, files_modified: '["nlp.mjs"]', importance: 3 },
-      { source: 'obs', id: 1, date: '2026-06-20T00:00:00.000Z', created_at: '2026-06-20T00:00:00.000Z', created_at_epoch: 1750377600000, files_modified: '["nlp.mjs"]', importance: 3 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBeUndefined(); // id 2 is newest → never superseded
-    expect(results[1].superseded).toBe(true);      // id 1 is older, equal importance → superseded
-  });
-
-  // Vector + type-list fallback paths emit a `date`-only obs shape (no created_at /
-  // created_at_epoch); the sort's final `date` fallback must still order by recency.
-  it('orders date-only rows (vector / type-list paths) by recency', () => {
-    const results = [
-      { source: 'obs', id: 1, date: '2026-06-24T00:00:00.000Z', files_modified: '["a.js"]', importance: 2 },
-      { source: 'obs', id: 2, date: '2026-06-20T00:00:00.000Z', files_modified: '["a.js"]', importance: 2 },
-    ];
-    markSuperseded(results);
-    expect(results[0].superseded).toBeUndefined(); // id 1 is newest → never superseded
-    expect(results[1].superseded).toBe(true);      // id 2 is older, equal importance → superseded
-  });
-
-  it('handles empty results', () => {
-    expect(() => markSuperseded([])).not.toThrow();
-    expect(() => markSuperseded(null)).not.toThrow();
-    expect(() => markSuperseded(undefined)).not.toThrow();
   });
 });
 
