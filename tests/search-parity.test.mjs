@@ -161,3 +161,39 @@ describe('CLI ↔ MCP search parity (audit P1-2 — one orchestrator)', () => {
     { query: 'zzznomatchqxz' }, ['zzznomatchqxz'],
     { llm: () => stubLLM({ variants: ['parity'] }), autoDeep: true, expectDeep: true });
 });
+
+describe('date_since end-to-end (MCP date_since == CLI --since)', () => {
+  test('excludes rows older than the relative window on both surfaces, identically', async () => {
+    // Fresh DB so the relative window discriminates (the shared corpus is all ms-old).
+    const fdb = createTestDb();
+    try {
+      insertSession(fdb, { id: 'ds-sess', project: 'dstest' });
+      insertObs(fdb, { sessionId: 'ds-sess', project: 'dstest', title: 'sincetoken fresh', text: 'sincetoken fresh', epochOffset: -2 * 3600000 });   // 2h ago
+      insertObs(fdb, { sessionId: 'ds-sess', project: 'dstest', title: 'sincetoken stale', text: 'sincetoken stale', epochOffset: -10 * 86400000 }); // 10d ago
+
+      const mcp = await handleSearchForTest(fdb, { query: 'sincetoken', project: 'dstest', date_since: '24h' }, {});
+
+      let stdout = '';
+      const o = process.stdout.write, e = process.stderr.write;
+      process.stdout.write = (s) => { stdout += s; return true; };
+      process.stderr.write = () => true;
+      try {
+        await cmdSearchForTest(fdb, ['sincetoken', '--project', 'dstest', '--since', '24h', '--json'], {});
+      } finally { process.stdout.write = o; process.stderr.write = e; }
+      const cli = JSON.parse(stdout.trim());
+
+      // 24h window keeps only the 2h-old row on the MCP surface…
+      expect(mcp.results.length).toBe(1);
+      expect(mcp.results[0].title).toContain('fresh');
+      // …and the CLI --since surface returns the identical id set (parity).
+      expect(cli.results.map((r) => `${r.source}#${r.id}`))
+        .toEqual(mcp.results.map((r) => `${r.source}#${r.id}`));
+
+      // Invalid relative duration is rejected by the MCP handler.
+      await expect(handleSearchForTest(fdb, { query: 'sincetoken', date_since: '7days' }, {}))
+        .rejects.toThrow(/date_since/);
+    } finally {
+      fdb.close();
+    }
+  });
+});

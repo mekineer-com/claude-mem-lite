@@ -35,11 +35,18 @@ describe('mem_search schema', () => {
       project: 'myproject',
       date_from: '2026-01-01',
       date_to: '2026-12-31',
+      date_since: '7d',
       importance: 2,
       limit: 50,
       offset: 10,
     });
     expect(result.success).toBe(true);
+  });
+
+  it('accepts an optional date_since string and rejects a non-string', () => {
+    expect(parseSchema(memSearchSchema, { date_since: '24h' }).success).toBe(true);
+    expect(parseSchema(memSearchSchema, {}).success).toBe(true); // omitted is fine (optional)
+    expect(parseSchema(memSearchSchema, { date_since: 7 }).success).toBe(false);
   });
 
   it('accepts empty object (all optional)', () => {

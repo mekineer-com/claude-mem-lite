@@ -85,6 +85,7 @@ export const memSearchSchema = {
   project: z.string().optional().describe('Filter by project name'),
   date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
   date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD). Date-only format is inclusive (covers full day)'),
+  date_since: z.string().optional().describe('Relative lower bound from now: 7d/24h/90m/2w/30s. Use for "recent" queries instead of computing a date_from; ignored when date_from is set'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Minimum importance (1=routine, 2=notable, 3=critical)'),
   branch: z.string().optional().describe('Filter by git branch name'),
   tier: z.enum(['working', 'active', 'archive']).optional().describe('Filter by memory tier (working=current session, active=within decay window, archive=old/compressed)'),

@@ -267,8 +267,11 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
   const ftsQuery = buildSearchFtsQuery(args.query, { or: args.or });
   const currentProject = inferProject();
 
-  const bounds = parseDateBounds(args.date_from, args.date_to);
-  if (!bounds.ok) throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
+  const bounds = parseDateBounds(args.date_from, args.date_to, args.date_since);
+  if (!bounds.ok) {
+    if (bounds.bad === 'since') throw new Error(`Invalid date_since: "${bounds.value}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
+    throw new Error(`Invalid date_${bounds.bad}: "${bounds.value}" (use ISO 8601 or YYYY-MM-DD)`);
+  }
   const { epochFrom, epochTo } = bounds;
 
   // MCP defaults to 'auto' (escalate on weak results) unless overridden by
