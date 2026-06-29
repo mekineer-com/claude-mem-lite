@@ -62,6 +62,12 @@ const INJECT_MARKER = /\[mem\]/;
 // always separate attachments (never co-located), so per-attachment marker routing
 // cleanly splits them.
 const MEMCTX_MARKER = /<memory-context/;
+// Task-imperative line (CLAUDE_MEM_TASK_IMPERATIVE, default off): `Memory — a past
+// lesson applies to THIS task. You must: … (#NN)`. It is co-located with the
+// <memory-context> block in the SAME UserPromptSubmit attachment, so per-attachment
+// routing would fold its #NN into :memory-context. Per-line routing (below) credits
+// it to a distinct :imperative bucket so its cite-recall is measurable on its own.
+const IMP_MARKER = /Memory — a past lesson applies to THIS task\. You must:/;
 
 function extractIds(text) {
   const ids = new Set();
@@ -105,6 +111,22 @@ function getStats(sid) {
   return s;
 }
 
+// Route a set of injected ids into a (per-session + global) hook bucket. Factored so
+// path-A/B and the co-located :imperative line share one accounting path.
+function routeIds(sessionInjectionsByHook, hookName, ids, stats) {
+  let bucket = sessionInjectionsByHook.get(hookName);
+  if (!bucket) { bucket = new Set(); sessionInjectionsByHook.set(hookName, bucket); }
+  for (const id of ids) bucket.add(id);
+  if (!hookInject.has(hookName)) {
+    hookInject.set(hookName, new Set());
+    hookOcc.set(hookName, 0);
+    hookCitedFromInjection.set(hookName, new Set());
+  }
+  for (const id of ids) hookInject.get(hookName).add(id);
+  hookOcc.set(hookName, hookOcc.get(hookName) + ids.size);
+  stats.hadInjection = true;
+}
+
 for (const file of candidateFiles) {
   const sessionInjectionsByHook = new Map();
   let firstSid = null;
@@ -121,25 +143,24 @@ for (const file of candidateFiles) {
 
     if (entry.attachment) {
       const text = (entry.attachment.stdout || '') + '\n' + (entry.attachment.content || '');
-      if (INJECT_MARKER.test(text) || MEMCTX_MARKER.test(text)) {
-        const ids = extractIds(text);
-        if (ids.size > 0) {
-          const baseHook = entry.attachment.hookName || entry.attachment.hookEvent || 'unknown';
-          // Split path B (<memory-context>) from path A ([mem] FYI) — both are
-          // UserPromptSubmit attachments. This makes path-B cite-recall (the
-          // Item-1 question) measurable instead of silently folded into nothing.
-          const hookName = MEMCTX_MARKER.test(text) ? `${baseHook}:memory-context` : baseHook;
-          let bucket = sessionInjectionsByHook.get(hookName);
-          if (!bucket) { bucket = new Set(); sessionInjectionsByHook.set(hookName, bucket); }
-          for (const id of ids) bucket.add(id);
-          if (!hookInject.has(hookName)) {
-            hookInject.set(hookName, new Set());
-            hookOcc.set(hookName, 0);
-            hookCitedFromInjection.set(hookName, new Set());
+      if (INJECT_MARKER.test(text) || MEMCTX_MARKER.test(text) || IMP_MARKER.test(text)) {
+        const baseHook = entry.attachment.hookName || entry.attachment.hookEvent || 'unknown';
+        const allLines = text.split('\n');
+
+        // Task-imperative line is co-located with <memory-context> in the same
+        // attachment — split it out per-line so its #NN credits a distinct bucket.
+        const impIds = extractIds(allLines.filter((l) => IMP_MARKER.test(l)).join('\n'));
+        if (impIds.size > 0) routeIds(sessionInjectionsByHook, `${baseHook}:imperative`, impIds, stats);
+
+        // Split path B (<memory-context>) from path A ([mem] FYI) — both are
+        // UserPromptSubmit attachments. This makes path-B cite-recall measurable.
+        const restText = allLines.filter((l) => !IMP_MARKER.test(l)).join('\n');
+        if (INJECT_MARKER.test(restText) || MEMCTX_MARKER.test(restText)) {
+          const ids = extractIds(restText);
+          if (ids.size > 0) {
+            const hookName = MEMCTX_MARKER.test(restText) ? `${baseHook}:memory-context` : baseHook;
+            routeIds(sessionInjectionsByHook, hookName, ids, stats);
           }
-          for (const id of ids) hookInject.get(hookName).add(id);
-          hookOcc.set(hookName, hookOcc.get(hookName) + ids.size);
-          stats.hadInjection = true;
         }
       }
     }
