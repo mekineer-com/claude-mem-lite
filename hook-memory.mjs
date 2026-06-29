@@ -5,6 +5,7 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, no
 import { citeFactorJs } from './scoring-sql.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
+import { extractIdents } from './lib/lesson-idents.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -398,4 +399,43 @@ export function recallForFile(db, filePath, project) {
     debugCatch(e, 'recallForFile');
     return [];
   }
+}
+
+/**
+ * Phase-2 task-imperative selection (spec 2026-06-29 §4.1): the single highest-value
+ * lesson relevant to THIS prompt, for delivery at the task-prompt position under the
+ * imperative template. Own gate (importance>=2 + non-empty lesson + identifier overlap
+ * with the prompt, top-1) — deliberately independent of searchRelevantMemories' coverage/
+ * BM25 filters so a high-value lesson is not dropped by the context-list scoring.
+ * @returns {{id:number, lesson_learned:string}|null}
+ */
+export function selectImperativeLesson(db, userPrompt, project, excludeIds = []) {
+  if (!db || !userPrompt) return null;
+  const promptIdents = new Set(extractIdents(userPrompt));
+  if (promptIdents.size === 0) return null; // no symbol anchor → no imperative (precision-first)
+  const exclude = new Set(excludeIds);
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT id, title, lesson_learned, importance
+      FROM observations
+      WHERE project = ?
+        AND COALESCE(compressed_into, 0) = 0
+        AND COALESCE(importance, 1) >= 2
+        AND lesson_learned IS NOT NULL
+        AND TRIM(lesson_learned) != ''
+        AND LOWER(TRIM(lesson_learned)) != 'none'
+      ORDER BY importance DESC, created_at_epoch DESC
+      LIMIT 50
+    `).all(project);
+  } catch { return null; }
+  let best = null, bestScore = 0;
+  for (const r of rows) {
+    if (exclude.has(r.id)) continue;
+    const overlap = extractIdents(`${r.lesson_learned} ${r.title || ''}`).filter((id) => promptIdents.has(id)).length;
+    if (overlap === 0) continue;
+    const score = (r.importance || 2) * overlap;
+    if (score > bestScore) { bestScore = score; best = r; }
+  }
+  return best ? { id: best.id, lesson_learned: best.lesson_learned } : null;
 }
