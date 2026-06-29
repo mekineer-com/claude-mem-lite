@@ -59,6 +59,13 @@ point, run STEP 3 on `bac2e85` again and check whether arm A moves above 4/8.
    instrument itself now has a floor problem: to discriminate salience formats
    it needs an easier commit set or a tool-confined runner.
 
+5. **The channel lever works — task-prompt beats hook-injection (2026-06-29).** The same lesson content
+   that scores 0/8 at the PreToolUse hook (arm B) scores **6–8/8 at the task-prompt position with imperative
+   framing** (arm U), without being a genuine controller spec. So #8651's "ACTING is the bottleneck" is now
+   precise: the wall is the **PreToolUse position**, not injected instructions per se — moving high-value
+   content to the UserPromptSubmit/task channel crosses it. Full table + caveats: *task-imperative measure
+   (2026-06-29)* below.
+
 ## The three steps
 
 | File | Step | What it does | Cost |
@@ -211,3 +218,46 @@ estimate: it is "saw a correct specific directive and ignored it," not "couldn't
 **Implication for D#44:** the lever is getting high-value lesson content into the *instruction/task
 channel* (where T succeeds), not making hook-injected directives smarter. That is a distinct design
 direction (e.g. UserPromptSubmit instruction-layer injection), to be brainstormed separately.
+
+## task-imperative measure (2026-06-29) — the channel lever, confirmed
+
+Added arm **U** = the recalled lesson delivered at the **task-prompt position** (where T lives), wrapped in
+a deterministic imperative template (`Memory — a past lesson applies to THIS task. You must: <lesson>.`),
+content held constant with arm A, attribution kept but the path-A/B softeners dropped. This fills the cell
+the bridge measure (above) left open: the *same content* as the failed hook arms, moved to the channel T
+succeeds in — but **without** T's privilege of being the genuine controller spec. `--arms=C,A,B,U,T --k=8`,
+`claude-sonnet-4-6`, n=2 bridge-bindable commits (`bac2e85` + `aacab0c`-patch); arm U fresh, the `bac2e85`
+A/B/C/T cells reused from the cached bridge run above.
+
+| commit | C | A | B | **U** | T |
+|---|---|---|---|---|---|
+| `bac2e85` | 0/8 | 0/8 | 0/8 | **6/8** | 8/8 |
+| `aacab0c` | 0/8 | 0/8 | 0/8 | **8/8** | 0/8 \* |
+
+\* `aacab0c` has no `requirement` field in `efficacy-commits.json`, so arm T degenerates to the control
+(no fix spelled in) — its T=0/8 is a bench-config gap, **not** a model confounder; the C/A/B/U arms are
+valid, the T ceiling is simply absent there. Follow-up: author a `requirement` for `aacab0c`.
+
+Commit-level **Δ(U−C) = +87.5pp** vs Δ_ITT(B−C) = 0pp and Δ(A−C) = 0pp. On `bac2e85` (the commit with a
+valid T ceiling) U=6/8 sits next to the T=8/8 ceiling and far above the B=0/8 hook floor; on `aacab0c` U=8/8
+while every hook/control arm is 0/8.
+
+**Conclusion: the channel lever works.** The bridge measure proved hook-injected content (PreToolUse
+`additionalContext`) is ignored even when specific (B=0/8); this proves the *same content* at the
+**task-prompt position with imperative framing** is acted on 6–8/8 — without being a genuine controller
+spec. So the wall the bridge isolated is the **PreToolUse position specifically**, not "injected
+(non-human) instructions in general." This is the measured confirmation of the predicted lever
+(#8651 / #8771: the gap is ACTING; the fix is the *instruction/task channel*, not smarter hook directives).
+
+**Caveats (honest):** (1) **Upper bound** — lesson≈fix on this severe rig, so U=6–8/8 means "a *highly
+relevant* lesson delivered imperatively at the task position gets acted on," NOT "any injected memory will."
+The live selection gate (`importance>=2` + identifier overlap, top-1) is what must hold that relevance in
+production. (2) **Power** — n=2 commits / 1 model, only `bac2e85` has a valid T ceiling; channel-isolation
+evidence, not a population estimate. (3) U=6/8 < T=8/8 on `bac2e85`: memory-attributed imperative is *near*
+but not equal to a genuine spec — the residual 2/8 is the attribution gap.
+
+**Verdict: NET-POSITIVE → the live UserPromptSubmit task-imperative emitter (Phase 2) is ship-eligible**,
+behind `CLAUDE_MEM_TASK_IMPERATIVE` (default off); flipping the default on stays gated on the live
+cite-recall canary not regressing (spec §5.3). Rig infra is permanent (`lib/task-imperative.mjs`,
+`lib/efficacy-arms.mjs` `taskSuffixForArm`). Spec/plan:
+`docs/superpowers/specs|plans/2026-06-29-task-imperative-memory-injection*` (local-only).
