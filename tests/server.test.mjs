@@ -4,6 +4,7 @@ import { resolve } from 'path';
 import Database from 'better-sqlite3';
 import { sanitizeFtsQuery, jaccardSimilarity, isoWeekKey } from '../utils.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { handleRecentForTest } from '../server.mjs';
 import { initSchema, CURRENT_SCHEMA_VERSION } from '../schema.mjs';
 import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup } from '../search-scoring.mjs';
 
@@ -296,6 +297,38 @@ describe('date_to inclusive (YYYY-MM-DD covers full day)', () => {
     }
     // Should remain as noon, not extended
     expect(epochTo).toBe(new Date('2026-02-10T12:00:00Z').getTime());
+  });
+});
+
+// ─── mem_recent date_since (CLI `recent --since` parity) ─────────────────────
+
+describe('mem_recent date_since filter', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    insertObs(db, { sessionId: 'sess-1', project: 'test', title: 'recent-fresh-row', text: 'fresh', epochOffset: -2 * 3600000 });   // 2h ago
+    insertObs(db, { sessionId: 'sess-1', project: 'test', title: 'recent-stale-row', text: 'stale', epochOffset: -10 * 86400000 }); // 10d ago
+  });
+  afterEach(() => { db.close(); });
+
+  it('keeps only rows newer than the relative window', async () => {
+    const res = await handleRecentForTest(db, { project: 'test', date_since: '24h', limit: 100 });
+    const text = res.content[0].text;
+    expect(text).toContain('recent-fresh-row');
+    expect(text).not.toContain('recent-stale-row');
+  });
+
+  it('includes both rows for a wide window', async () => {
+    const res = await handleRecentForTest(db, { project: 'test', date_since: '30d', limit: 100 });
+    const text = res.content[0].text;
+    expect(text).toContain('recent-fresh-row');
+    expect(text).toContain('recent-stale-row');
+  });
+
+  it('rejects an invalid duration', async () => {
+    await expect(handleRecentForTest(db, { project: 'test', date_since: '7days' }))
+      .rejects.toThrow(/date_since/);
   });
 });
 

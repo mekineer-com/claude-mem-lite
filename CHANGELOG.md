@@ -2,6 +2,10 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.31.0 — `date_since` on MCP `mem_recent` (completes agent `--since` parity)
+
+**feat (mcp): `mem_recent` gains an optional `date_since` arg** — `7d`/`24h`/`90m`/`2w`/`30s` — mirroring v3.30.0's `mem_search` addition on the `recent` surface so the agent can ask for "everything since X" (pair with a high `limit`). Opt-in; the same `parseDuration` + `created_at_epoch >= now-ms` lower bound as the CLI `recent --since` (v3.29.0). The inline handler was extracted into a `runRecent(db, args)` core with an exported `handleRecentForTest` seam (mirroring `handleSearchForTest`), so the MCP path is now end-to-end testable with an injected db. 4 new tests (schema accept/reject + fresh-only / wide-window / invalid-duration via the seam). `mo`/`y` units stay out (deliberately omitted as calendar-ambiguous — use `30d`/`365d`). Suite 3412 → 3416, ESLint clean.
+
 ## v3.30.0 — `date_since` on MCP `mem_search` (agent parity with CLI `--since`)
 
 **feat (mcp): `mem_search` gains an optional `date_since` arg** — `7d`/`24h`/`90m`/`2w`/`30s` — bringing v3.29.0's CLI `--since` to the surface the agent actually calls. It's the relative complement to `date_from`/`date_to`: the agent can ask for "recent" memories without computing an absolute date. Opt-in (omitted by default → no change to default search behavior or ranking); reuses the same `parseDateBounds` path, so an explicit `date_from` still wins and the epoch bound flows through the shared `coreRunSearchPipeline` unchanged. An end-to-end parity test pins MCP `date_since` == CLI `--since` (same filtered id set), plus invalid-duration rejection and schema accept/reject. `recall` and `browse` were intentionally left out (`recall`'s value is full file history; `browse`'s relative window conflicts with the archive tier being old by definition). Suite 3410 → 3412, ESLint clean.

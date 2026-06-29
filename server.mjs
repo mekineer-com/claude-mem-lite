@@ -14,7 +14,7 @@ import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } f
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
-import { buildSearchFtsQuery, parseDateBounds, coreRunSearchPipeline } from './lib/search-core.mjs';
+import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   recoverOrphanedChildren,
@@ -346,41 +346,56 @@ server.registerTool(
 
 // ─── Tool: mem_recent ────────────────────────────────────────────────────────
 
+// In-process test seam (mirrors handleSearchForTest, #8743): threads an injected
+// db through the SAME body the registered handler runs. NOTE: a `project` arg is
+// still resolved via resolveProject() against the MODULE db, not the injected one.
+export async function handleRecentForTest(db, args) {
+  return runRecent(db, args);
+}
+
+async function runRecent(db, args) {
+  if (args.project) args = { ...args, project: resolveProject(args.project) };
+  const limit = args.limit ?? 10;
+  const project = args.project || inferProject();
+
+  const params = [];
+  const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
+  if (project) { wheres.push('project = ?'); params.push(project); }
+  // date_since: relative lower bound on created_at (CLI `recent --since` parity).
+  if (args.date_since !== undefined) {
+    const d = parseDuration(args.date_since);
+    if (!d.ok) throw new Error(`Invalid date_since: "${args.date_since}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
+    wheres.push('created_at_epoch >= ?'); params.push(Date.now() - d.ms);
+  }
+  params.push(limit);
+
+  const rows = db.prepare(`
+    SELECT id, type, title, subtitle, project, created_at, created_at_epoch
+    FROM observations
+    WHERE ${wheres.join(' AND ')}
+    ORDER BY created_at_epoch DESC
+    LIMIT ?
+  `).all(...params);
+
+  if (rows.length === 0) {
+    return { content: [{ type: 'text', text: `No recent observations${project ? ` (${project})` : ''}.` }] };
+  }
+
+  const lines = [`Recent observations (${project || 'all'}):\n`];
+  for (const r of rows) {
+    lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`);
+  }
+  lines.push(`\nWorkflow: mem_get(ids=[...]) for full details | mem_timeline(anchor=ID) for context`);
+  return { content: [{ type: 'text', text: lines.join('\n') }] };
+}
+
 server.registerTool(
   'mem_recent',
   {
     description: descriptionOf('mem_recent'),
     inputSchema: memRecentSchema,
   },
-  safeHandler(async (args) => {
-    if (args.project) args = { ...args, project: resolveProject(args.project) };
-    const limit = args.limit ?? 10;
-    const project = args.project || inferProject();
-
-    const params = [];
-    const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
-    if (project) { wheres.push('project = ?'); params.push(project); }
-    params.push(limit);
-
-    const rows = db.prepare(`
-      SELECT id, type, title, subtitle, project, created_at, created_at_epoch
-      FROM observations
-      WHERE ${wheres.join(' AND ')}
-      ORDER BY created_at_epoch DESC
-      LIMIT ?
-    `).all(...params);
-
-    if (rows.length === 0) {
-      return { content: [{ type: 'text', text: `No recent observations${project ? ` (${project})` : ''}.` }] };
-    }
-
-    const lines = [`Recent observations (${project || 'all'}):\n`];
-    for (const r of rows) {
-      lines.push(`#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || r.subtitle || '(untitled)')} | ${r.project} | ${fmtDate(r.created_at)}`);
-    }
-    lines.push(`\nWorkflow: mem_get(ids=[...]) for full details | mem_timeline(anchor=ID) for context`);
-    return { content: [{ type: 'text', text: lines.join('\n') }] };
-  })
+  safeHandler(async (args) => runRecent(db, args))
 );
 
 // ─── Tool: mem_timeline ─────────────────────────────────────────────────────

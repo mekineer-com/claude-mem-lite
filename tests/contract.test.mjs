@@ -130,6 +130,11 @@ describe('mem_recent schema', () => {
     expect(result.success).toBe(true);
     expect(result.data.limit).toBe(5);
   });
+
+  it('accepts an optional date_since string and rejects a non-string', () => {
+    expect(parseSchema(memRecentSchema, { date_since: '7d' }).success).toBe(true);
+    expect(parseSchema(memRecentSchema, { date_since: 7 }).success).toBe(false);
+  });
 });
 
 // ─── mem_timeline schema ────────────────────────────────────────────────────
