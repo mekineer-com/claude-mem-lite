@@ -66,6 +66,10 @@ export const SOURCE_FILES = [
   // are present in the pre-edit file (component 2). Imported ONLY by
   // scripts/pre-tool-recall.js; kept here for the same reason as file-intel.mjs.
   'lib/lesson-idents.mjs',
+  // Phase-2 task-imperative framing helper (2026-06-29): formatTaskImperative, the single
+  // source of the imperative line. Statically imported by hook.mjs (live emitter, gated by
+  // CLAUDE_MEM_TASK_IMPERATIVE) — must ship even with the flag off.
+  'lib/task-imperative.mjs',
   // comprehension-bridge forcing-function (CLAUDE_MEM_SALIENCE=bridge): rewrites
   // a recalled lesson into a check bound to the change hunk. Dynamic-imported by
   // scripts/pre-tool-recall.js ONLY under the flag, but must still ship so the

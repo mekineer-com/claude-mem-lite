@@ -59,7 +59,8 @@ import {
   hasMainThreadAssistantText,
 } from './lib/citation-tracker.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
-import { searchRelevantMemories, formatMemoryLine } from './hook-memory.mjs';
+import { searchRelevantMemories, formatMemoryLine, selectImperativeLesson } from './hook-memory.mjs';
+import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
@@ -1386,6 +1387,7 @@ async function handleUserPrompt() {
         ORDER BY created_at_epoch DESC LIMIT 5
       `).all(project);
       const keyContextIds = keyObs.map(o => o.id);
+      const pathAInjectedIds = [];
 
       // Read IDs already injected by user-prompt-search.js to avoid duplicate injection
       try {
@@ -1394,16 +1396,35 @@ async function handleUserPrompt() {
         const { ids, ts } = JSON.parse(raw);
         // Only use if written within last 10 seconds (same prompt cycle)
         if (ts && Date.now() - ts < 10000 && Array.isArray(ids)) {
-          for (const id of ids) keyContextIds.push(id);
+          for (const id of ids) { keyContextIds.push(id); pathAInjectedIds.push(id); }
         }
       } catch { /* file may not exist — that's fine */ }
 
-      const memories = searchRelevantMemories(db, promptText, project, keyContextIds);
+      // Phase-2 task-imperative (default OFF — CLAUDE_MEM_TASK_IMPERATIVE): the single
+      // highest-value lesson relevant to THIS prompt, delivered at the prompt position under
+      // an imperative template. Excluded from the <memory-context> list so it is never
+      // injected twice. Channel-isolation measure (efficacy arm U, 2026-06-29): task-prompt
+      // 6-8/8 vs PreToolUse hook 0/8. Flipping the default ON is a separate L3 decision
+      // gated on the live cite-recall canary.
+      const taskImperativeOn = process.env.CLAUDE_MEM_TASK_IMPERATIVE === 'on'
+        || process.env.CLAUDE_MEM_TASK_IMPERATIVE === '1';
+      // Exclude only ids path-A (user-prompt-search.js) already injected — NOT the
+      // key-context top-5, which overlaps the high-value lesson pool and would suppress
+      // the pick. The chosen id is excluded from the <memory-context> block below instead.
+      const imperativePick = taskImperativeOn
+        ? selectImperativeLesson(db, promptText, project, pathAInjectedIds)
+        : null;
+      const contextExclude = imperativePick ? [...keyContextIds, imperativePick.id] : keyContextIds;
+
+      const memories = searchRelevantMemories(db, promptText, project, contextExclude);
       if (memories.length > 0) {
         const lines = ['<memory-context relevance="high">'];
         for (const m of memories) lines.push(formatMemoryLine(m));
         lines.push('</memory-context>');
         process.stdout.write(lines.join('\n') + '\n');
+      }
+      if (imperativePick) {
+        process.stdout.write(formatTaskImperative(imperativePick.lesson_learned, imperativePick.id) + '\n');
       }
     } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
   } finally {
