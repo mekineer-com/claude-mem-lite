@@ -46,10 +46,25 @@ describe('parseGitHubUrl', () => {
       .toEqual({ owner: 'user', repo: 'repo', branch: 'dev', path: 'skills/foo' });
   });
 
+  it('treats scheme + host as case-insensitive (RFC 3986) but preserves path case', () => {
+    // A pasted "HTTPS://GitHub.com/…" is a valid URL that opens in the browser; rejecting
+    // it as "Invalid GitHub URL" is wrong. Scheme + host are case-insensitive; the path
+    // (owner / repo / branch / dir) is case-SENSITIVE on GitHub and must be preserved.
+    expect(parseGitHubUrl('HTTPS://GitHub.com/anthropics/skills'))
+      .toEqual({ owner: 'anthropics', repo: 'skills', branch: 'main', path: '' });
+    expect(parseGitHubUrl('https://GITHUB.COM/user/repo/tree/main'))
+      .toEqual({ owner: 'user', repo: 'repo', branch: 'main', path: '' });
+    expect(parseGitHubUrl('HTTPS://GitHub.com/Anthropic-AI/My_Repo/tree/Feature/Src/File'))
+      .toEqual({ owner: 'Anthropic-AI', repo: 'My_Repo', branch: 'Feature', path: 'Src/File' });
+  });
+
   it('rejects host-spoofing / SSRF lookalikes', () => {
     expect(parseGitHubUrl('https://github.com.evil.com/user/repo')).toBeNull();
     expect(parseGitHubUrl('https://github.com@evil.com/user/repo')).toBeNull();
     expect(parseGitHubUrl('https://evil.com/github.com/user/repo')).toBeNull();
+    // case-insensitivity must NOT open a spoofing hole (the structural host check stands)
+    expect(parseGitHubUrl('HTTPS://GitHub.com.evil.com/user/repo')).toBeNull();
+    expect(parseGitHubUrl('https://GITHUB.COM@evil.com/user/repo')).toBeNull();
   });
 });
 
