@@ -130,7 +130,8 @@ export function reRankWithContext(db, results, project) {
 /**
  * Mark older, lower-importance observations as superseded when multiple touch the same file.
  * Mutates result objects in-place by adding superseded=true flag.
- * @param {object[]} results Array of search result objects with source, files_modified, date, importance
+ * @param {object[]} results Array of search result objects with source, files_modified,
+ *   created_at_epoch (or created_at / legacy date), importance
  */
 export function markSuperseded(results) {
   if (!results || results.length === 0) return;
@@ -150,7 +151,18 @@ export function markSuperseded(results) {
   // Persistent superseding belongs in mem_maintain/mem_compress write paths.
   for (const [, obsForFile] of fileMap) {
     if (obsForFile.length < 2) continue;
-    obsForFile.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    // Sort newest-first by recency. The production search pipeline supplies
+    // created_at_epoch (numeric) + created_at (ISO) — NOT `date`; the prior
+    // `b.date` sort silently no-op'd there (every key undefined → localeCompare 0),
+    // so "newest" degraded to relevance order and a current top-importance obs got
+    // a false [SUPERSEDED] tag (#8821). Prefer numeric epoch, fall back to the ISO
+    // string (lexically chronological), then legacy `date` for older callers/tests.
+    obsForFile.sort((a, b) => {
+      const ka = a.created_at_epoch ?? a.created_at ?? a.date ?? '';
+      const kb = b.created_at_epoch ?? b.created_at ?? b.date ?? '';
+      if (typeof ka === 'number' && typeof kb === 'number') return kb - ka;
+      return String(kb).localeCompare(String(ka));
+    });
     const newest = obsForFile[0];
     for (let i = 1; i < obsForFile.length; i++) {
       if ((obsForFile[i].importance ?? 1) <= (newest.importance ?? 1)) {

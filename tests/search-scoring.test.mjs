@@ -129,6 +129,34 @@ describe('markSuperseded', () => {
     expect(results[2].superseded).toBeUndefined();
   });
 
+  // Regression (#8821): the production search pipeline (coreRunSearchPipeline) feeds
+  // result objects carrying `created_at` + `created_at_epoch` — NOT `date` — and in
+  // RELEVANCE order, which need not match recency. The recency sort must read the
+  // fields production actually provides; otherwise a genuinely-current top-importance
+  // obs gets a misleading [SUPERSEDED] tag just because a same-file peer ranked higher.
+  it('uses created_at/created_at_epoch (production fields), not a missing `date`', () => {
+    const results = [
+      // id 2 is NEWEST but ranked second (relevance ≠ recency).
+      { source: 'obs', id: 1, created_at: '2026-06-20T00:00:00.000Z', created_at_epoch: 1750377600000, files_modified: '["nlp.mjs"]', importance: 3 },
+      { source: 'obs', id: 2, created_at: '2026-06-24T00:00:00.000Z', created_at_epoch: 1750723200000, files_modified: '["nlp.mjs"]', importance: 3 },
+    ];
+    markSuperseded(results);
+    expect(results[1].superseded).toBeUndefined(); // id 2 is newest → never superseded
+    expect(results[0].superseded).toBe(true);      // id 1 is older, equal importance → superseded
+  });
+
+  // created_at-only callers (no epoch) must still sort correctly — ISO 8601 strings
+  // are lexically chronological, so the string fallback handles them.
+  it('falls back to created_at ISO string when created_at_epoch is absent', () => {
+    const results = [
+      { source: 'obs', id: 1, created_at: '2026-06-24T00:00:00.000Z', files_modified: '["a.js"]', importance: 2 },
+      { source: 'obs', id: 2, created_at: '2026-06-20T00:00:00.000Z', files_modified: '["a.js"]', importance: 2 },
+    ];
+    markSuperseded(results);
+    expect(results[0].superseded).toBeUndefined(); // id 1 is newest → never superseded
+    expect(results[1].superseded).toBe(true);      // id 2 is older, equal importance → superseded
+  });
+
   it('handles empty results', () => {
     expect(() => markSuperseded([])).not.toThrow();
     expect(() => markSuperseded(null)).not.toThrow();
