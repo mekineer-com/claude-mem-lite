@@ -83,7 +83,8 @@ describe('hook.mjs UserPromptSubmit task-imperative wiring (default off)', () =>
         input: stdin, timeout: 10000, encoding: 'utf8',
         env: { ...process.env, HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir,
           CLAUDE_MEM_SKIP_UPDATE: '1', CLAUDE_MEM_SKIP_COMPRESS: '1', CLAUDE_MEM_SKIP_OPTIMIZE: '1',
-          MEM_NO_AUTO_ADOPT: '1', MEM_QUIET_HOOKS: '1', CLAUDE_MEM_HOOK_RUNNING: undefined, ...extraEnv },
+          MEM_NO_AUTO_ADOPT: '1', MEM_QUIET_HOOKS: '1', CLAUDE_MEM_HOOK_RUNNING: undefined,
+          CLAUDE_MEM_TASK_IMPERATIVE: undefined, ...extraEnv },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       return { stdout, exitCode: 0 };

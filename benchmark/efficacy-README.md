@@ -232,15 +232,15 @@ A/B/C/T cells reused from the cached bridge run above.
 | commit | C | A | B | **U** | T |
 |---|---|---|---|---|---|
 | `bac2e85` | 0/8 | 0/8 | 0/8 | **6/8** | 8/8 |
-| `aacab0c` | 0/8 | 0/8 | 0/8 | **8/8** | 0/8 \* |
+| `aacab0c` | 0/8 | 0/8 | 0/8 | **8/8** | 8/8 |
 
-\* `aacab0c` has no `requirement` field in `efficacy-commits.json`, so arm T degenerates to the control
-(no fix spelled in) — its T=0/8 is a bench-config gap, **not** a model confounder; the C/A/B/U arms are
-valid, the T ceiling is simply absent there. Follow-up: author a `requirement` for `aacab0c`.
+Both commits carry a valid T ceiling. (`aacab0c` originally had no `requirement` → arm T degenerated to the
+control = 0/8; **fixed 2026-06-29** by spelling the `superseded_at IS NULL` fix into `requirement` (commit
+85bac7e) and re-running arm T at k=8 → **T=8/8**, all 8 sessions pass.)
 
-Commit-level **Δ(U−C) = +87.5pp** vs Δ_ITT(B−C) = 0pp and Δ(A−C) = 0pp. On `bac2e85` (the commit with a
-valid T ceiling) U=6/8 sits next to the T=8/8 ceiling and far above the B=0/8 hook floor; on `aacab0c` U=8/8
-while every hook/control arm is 0/8.
+Commit-level **Δ(U−C) = +87.5pp** vs **Δ(T−C) = +100pp** and Δ_ITT(B−C) = Δ(A−C) = 0pp. Both commits now
+have a valid T=8/8 ceiling: `bac2e85` U=6/8 (0.75× the ceiling), `aacab0c` U=8/8 (at the ceiling) — both
+far above the B=0/8 hook floor.
 
 **Conclusion: the channel lever works.** The bridge measure proved hook-injected content (PreToolUse
 `additionalContext`) is ignored even when specific (B=0/8); this proves the *same content* at the
@@ -252,8 +252,8 @@ spec. So the wall the bridge isolated is the **PreToolUse position specifically*
 **Caveats (honest):** (1) **Upper bound** — lesson≈fix on this severe rig, so U=6–8/8 means "a *highly
 relevant* lesson delivered imperatively at the task position gets acted on," NOT "any injected memory will."
 The live selection gate (`importance>=2` + identifier overlap, top-1) is what must hold that relevance in
-production. (2) **Power** — n=2 commits / 1 model, only `bac2e85` has a valid T ceiling; channel-isolation
-evidence, not a population estimate. (3) U=6/8 < T=8/8 on `bac2e85`: memory-attributed imperative is *near*
+production. (2) **Power** — n=2 commits / 1 model, both commits now have a valid T=8/8 ceiling
+(after the aacab0c bench fix); channel-isolation evidence, not a population estimate. (3) U=6/8 < T=8/8 on `bac2e85`: memory-attributed imperative is *near*
 but not equal to a genuine spec — the residual 2/8 is the attribution gap.
 
 **Verdict: NET-POSITIVE → the live UserPromptSubmit task-imperative emitter (Phase 2) is ship-eligible**,
