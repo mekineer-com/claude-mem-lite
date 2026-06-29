@@ -5,7 +5,7 @@ import { basename } from 'path';
 import { existsSync, readFileSync, unlinkSync, readdirSync } from 'fs';
 import {
   jaccardSimilarity, truncate, clampImportance, computeRuleImportance,
-  inferProject, parseJsonFromLLM,
+  inferProject, parseJsonFromLLM, scrubSecrets,
   computeMinHash, estimateJaccardFromMinHash, cjkBigrams, EDIT_TOOLS, LOW_SIGNAL_TITLE, debugCatch, debugLog, OBS_BM25,
   getCurrentBranch, notLowSignalTitleClause,
 } from './utils.mjs';
@@ -784,9 +784,13 @@ ${actionList}`;
 
       obs = {
         type: validTypes.has(parsed.type) ? parsed.type : 'change',
-        title: truncate(parsed.title, 120),
+        // Scrub BEFORE truncate: a secret Haiku regurgitated verbatim (the very
+        // case the downstream scrubRecord guards against) could straddle the
+        // 120/500-char cut, leaving a head the value-length-gated scrub regex no
+        // longer matches. Slicing scrubbed text keeps the boundary leak-free.
+        title: truncate(scrubSecrets(parsed.title || ''), 120),
         subtitle: fileList,
-        narrative: truncate(parsed.narrative || '', 500),
+        narrative: truncate(scrubSecrets(parsed.narrative || ''), 500),
         concepts: Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [],
         facts: Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [],
         files: episodeFiles,
@@ -881,9 +885,12 @@ ${actionList}`;
         // INSERT path. type is an enum, importance is numeric, files_read is a
         // JSON array (already scrubbed upstream), minhash_sig is hash bytes.
         const safe = scrubRecord('observations', {
-          title: truncate(obs.title, 120),
+          // Scrub BEFORE truncate (see first-pass note above): the truncate
+          // boundary must land on already-scrubbed text or a straddling secret
+          // leaks its head past the value-length-gated regex.
+          title: truncate(scrubSecrets(obs.title || ''), 120),
           subtitle: obs.subtitle || '',
-          narrative: truncate(obs.narrative || '', 500),
+          narrative: truncate(scrubSecrets(obs.narrative || ''), 500),
           concepts: conceptsText,
           facts: factsText,
           text: textField,

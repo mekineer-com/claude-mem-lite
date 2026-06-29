@@ -1346,7 +1346,11 @@ async function handleUserPrompt() {
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(
       sessionId,
-      scrubSecrets(promptText.slice(0, 10000)),
+      // Scrub BEFORE the 10k slice: a secret straddling char 10000 would otherwise
+      // be cut to a sub-6-char head that scrubSecrets's value-length floor no longer
+      // matches, persisting a partial secret into prompt_text (later re-emitted at
+      // server.mjs prompt_text + mem-cli recent). Scrubbing full text first is leak-free.
+      scrubSecrets(promptText).slice(0, 10000),
       promptNumber,
       ccSessionId,
       now.toISOString(), now.getTime()

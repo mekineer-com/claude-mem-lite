@@ -241,6 +241,45 @@ describe('handleLLMEpisode', () => {
     vi.clearAllMocks();
   });
 
+  it('scrubs a secret that straddles the title/narrative truncation boundary', async () => {
+    // Haiku occasionally regurgitates input verbatim. If a secret value lands
+    // across the 120-char title (or 500-char narrative) cut, truncate-before-
+    // scrub would leave a head the value-length-gated regex no longer matches.
+    // Place the cut so only a 3-char head of the AWS value survives. The
+    // assignment-keyword scrub needs a >=6-char value to fire, so a truncated
+    // head slips past it — the exact leak the scrub-before-truncate fix closes.
+    const titlePad = 'x'.repeat(93);  // value head 'AKI' lands at char 116-118, inside the 120 cut
+    const narrPad = 'y'.repeat(473);  // same 3-char straddle against the 500-char narrative cut
+    callLLM.mockReturnValue(JSON.stringify({
+      type: 'feature',
+      title: `${titlePad} AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE done`,
+      narrative: `${narrPad} AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE done`,
+      concepts: ['cfg'],
+      facts: [],
+      importance: 2,
+      lesson_learned: 'Config rotation lesson with enough signal to persist as a feature observation row',
+    }));
+    const episode = {
+      sessionId: 'ep-sess', project: 'sec-boundary',
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Rotate credentials', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    // 'feature' (like most LLM-extracted types except 'change') routes to the
+    // events table; 'body' carries the narrative. Assert the scrubbed form on
+    // whichever table the row landed in.
+    const ev = db.prepare('SELECT title, body FROM events WHERE project = ?').get('sec-boundary');
+    const obs = db.prepare('SELECT title, narrative FROM observations WHERE project = ?').get('sec-boundary');
+    const row = ev ? { title: ev.title, narrative: ev.body } : obs;
+    expect(row).toBeTruthy();
+    // A credential key directly followed by an alphanumeric char = unscrubbed secret.
+    expect(row.title).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+    expect(row.narrative || '').not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+  });
+
   it('P3: bugfix with null lesson retries and merges substantive lesson', async () => {
     // First pass returns type='bugfix' but lesson_learned=null.
     // P3 retry fires and recovers a real lesson. Observation saved (to events

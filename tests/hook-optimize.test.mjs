@@ -93,6 +93,32 @@ describe('re-enrich', () => {
     expect(obs.lesson_learned).toBe('FTS5 special chars need escaping');
     expect(obs.optimized_at).toBeGreaterThan(0);
   });
+
+  it('scrubs a secret straddling the title cut in the re-enriched output', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    // Degraded title makes it a re-enrich candidate.
+    insertObs(db, { title: 'Error in config.mjs', narrative: 'rotated credentials' });
+    // 93-char pad lands the AWS value head at ~char 116, inside the 120-char title
+    // cut, so a post-truncate scrub would miss the 3-char head. Even though the LLM
+    // input is scrubbed DB text, scrubRecord exists for untrusted LLM output — the
+    // scrub-before-truncate fix keeps the boundary leak-free.
+    const pad = 'x'.repeat(93);
+    callModelJSON.mockResolvedValue({
+      type: 'bugfix',
+      title: `${pad} AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE done`,
+      narrative: 'Re-enriched narrative body',
+      concepts: ['cfg'],
+      facts: [],
+      importance: 2,
+      lesson_learned: 'config rotation lesson with enough signal to persist',
+      search_aliases: ['cfg rotate'],
+    });
+
+    const result = await executeReenrich(db, 10);
+    expect(result.processed).toBe(1);
+    const obs = db.prepare('SELECT title FROM observations LIMIT 1').get();
+    expect(obs.title).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+  });
 });
 
 // Bug #1: rebuildVector was writing to a non-existent column `computed_at`.

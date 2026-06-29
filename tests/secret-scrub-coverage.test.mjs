@@ -3,6 +3,7 @@ import { createTestDb } from './test-helpers.mjs';
 import { scrubRecord } from '../lib/scrub-record.mjs';
 import { scrubSecrets } from '../secret-scrub.mjs';
 import { stripPrivate } from '../lib/private-strip.mjs';
+import { saveObservation } from '../lib/save-observation.mjs';
 
 const SECRET = 'sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const POISONED = `error from upstream: token=${SECRET} not found`;
@@ -382,5 +383,28 @@ describe('scrubSecrets / scrubRecord — <private> stripped on persistence (audi
   it('stripPrivate remains idempotent (double-strip is a no-op)', () => {
     const once = stripPrivate('a <private>x</private> b');
     expect(stripPrivate(once)).toBe(once);
+  });
+});
+
+describe('saveObservation — derived title scrubs BEFORE truncation (#secret-title-leak)', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+
+  // A secret that straddles the 100-char title-truncation boundary must not leak
+  // its head into the title. Pre-fix, `content.slice(0, 100)` truncated the AWS
+  // key to a short prefix that the value-length-gated scrub regex no longer
+  // matched, so the title kept a partial secret while the narrative was clean.
+  it('does not leak a boundary-straddling secret into the auto-derived title', () => {
+    // 75-char prefix lands the secret value right at the slice(0,100) cut, so
+    // pre-fix the title kept a bare `...ACCESS_KEY=AK` (head of the AWS key).
+    const prefix = 'x'.repeat(75) + ' ';
+    const content = `${prefix}AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE tail`;
+    const r = saveObservation(db, { content, type: 'discovery', project: 'sec-test', importance: 2 });
+    expect(r.kind).toBe('saved');
+    const row = db.prepare('SELECT title, narrative FROM observations WHERE id = ?').get(r.id);
+    // A credential key directly followed by an alphanumeric value char = an
+    // unscrubbed (partial) secret. Neither field may contain it.
+    expect(row.title).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+    expect(row.narrative).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
   });
 });

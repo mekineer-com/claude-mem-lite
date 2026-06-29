@@ -1102,6 +1102,44 @@ describe('T4-P2-D: prompt_counter is atomic per prompt', () => {
   });
 });
 
+describe('handleUserPrompt: secret scrub runs BEFORE the 10k prompt slice', () => {
+  let tmpHome, projDir;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), 'mem-prompt-scrub-'));
+    projDir = join(tmpHome, 'audit', 'scrub');
+    mkdirSync(projDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it('does not persist a secret value straddling the 10000-char prompt_text cut', () => {
+    const { db, dbPath } = initHomeDb(tmpHome);
+    db.close();
+
+    // 9974-char pad lands the AWS key value head at ~char 9997, so slice(0,10000)
+    // cuts it to a 3-char head ('AKI'). scrubSecrets's assignment regex needs a
+    // >=6-char value, so a post-slice scrub would miss the head — pre-fix the
+    // partial secret persisted into prompt_text. Scrubbing the full text first fixes it.
+    const pad = 'x'.repeat(9974);
+    const prompt = `${pad} AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE done`;
+    runHookCmd('user-prompt', {
+      home: tmpHome, cwd: projDir,
+      stdin: JSON.stringify({ prompt, session_id: 'cc-scrub' }),
+    });
+
+    const db2 = new Database(dbPath, { readonly: true });
+    try {
+      const row = db2.prepare('SELECT prompt_text FROM user_prompts ORDER BY id DESC LIMIT 1').get();
+      expect(row).toBeTruthy();
+      // A credential key directly followed by an alphanumeric char = unscrubbed secret head.
+      expect(row.prompt_text).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+    } finally { db2.close(); }
+  });
+});
+
 // ─── P0: detectMemOverride wired into handleUserPrompt ──────────────────────
 // Regex correctness lives in tests/user-prompt-search.test.mjs > detectMemOverride.
 // This integration test only verifies the wiring: a prompt that matches the

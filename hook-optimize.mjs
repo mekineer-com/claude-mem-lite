@@ -7,7 +7,7 @@ import { join } from 'path';
 import {
   truncate, debugLog, debugCatch, COMPRESSED_AUTO,
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity, clampImportance, cjkBigrams,
-  notLowSignalTitleClause,
+  notLowSignalTitleClause, scrubSecrets,
 } from './utils.mjs';
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
@@ -152,14 +152,17 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [];
       const conceptsText = concepts.join(' ');
       const factsText = facts.join(' ');
+      // Scrub BEFORE truncate so a secret straddling the cut can't leave a sub-6-char
+      // head that scrubSecrets's value-length floor no longer matches (the scrubRecord
+      // below would then miss it too). Mirrors the hook-llm save-path fix.
       const lessonLearned = typeof parsed.lesson_learned === 'string'
         && parsed.lesson_learned.toLowerCase() !== 'none'
         && parsed.lesson_learned.trim().length > 0
-        ? parsed.lesson_learned.slice(0, 500) : null;
+        ? scrubSecrets(parsed.lesson_learned).slice(0, 500) : null;
       const searchAliases = Array.isArray(parsed.search_aliases)
         ? parsed.search_aliases.slice(0, 6).join(' ') : null;
-      const title = truncate(parsed.title, 120);
-      const narrative = truncate(parsed.narrative || cand.narrative || '', 500);
+      const title = truncate(scrubSecrets(parsed.title || ''), 120);
+      const narrative = truncate(scrubSecrets(parsed.narrative || cand.narrative || ''), 500);
       const importance = clampImportance(parsed.importance);
 
       const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
@@ -446,11 +449,13 @@ Return ONLY valid JSON:
     const facts = Array.isArray(parsed.merged_facts) ? parsed.merged_facts.slice(0, 10) : [];
     const conceptsText = concepts.join(' ');
     const factsText = facts.join(' ');
-    const title = truncate(parsed.merged_title, 120);
-    const narrative = truncate(parsed.merged_narrative || '', 800);
+    // Scrub BEFORE truncate (see re-enrich note): keep the boundary cut on
+    // already-scrubbed text so a straddling secret can't leak a sub-floor head.
+    const title = truncate(scrubSecrets(parsed.merged_title || ''), 120);
+    const narrative = truncate(scrubSecrets(parsed.merged_narrative || ''), 800);
     const lessonLearned = typeof parsed.merged_lesson === 'string'
       && parsed.merged_lesson.trim().length > 0
-      ? parsed.merged_lesson.slice(0, 500) : null;
+      ? scrubSecrets(parsed.merged_lesson).slice(0, 500) : null;
 
     const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
     const textField = [conceptsText, factsText, bigramText].filter(Boolean).join(' ');
@@ -633,8 +638,9 @@ JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive sum
     const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
     if (!parsed || !parsed.title) return { compressed: false };
 
-    const title = truncate(parsed.title, 120);
-    const narrative = truncate(parsed.narrative || '', 800);
+    // Scrub BEFORE truncate (see re-enrich note): boundary cut on scrubbed text.
+    const title = truncate(scrubSecrets(parsed.title || ''), 120);
+    const narrative = truncate(scrubSecrets(parsed.narrative || ''), 800);
     const concepts = Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [];
     const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [];
     const conceptsText = concepts.join(' ');
@@ -642,7 +648,7 @@ JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive sum
     const lessonLearned = typeof parsed.lesson_learned === 'string'
       && parsed.lesson_learned.toLowerCase() !== 'none'
       && parsed.lesson_learned.trim().length > 0
-      ? parsed.lesson_learned.slice(0, 500) : null;
+      ? scrubSecrets(parsed.lesson_learned).slice(0, 500) : null;
     const searchAliases = Array.isArray(parsed.search_aliases)
       ? parsed.search_aliases.slice(0, 6).join(' ') : null;
 
