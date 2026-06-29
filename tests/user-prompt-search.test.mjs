@@ -22,6 +22,9 @@ import {
   matchRegistrySkillName,
   detectMemOverride,
 } from '../scripts/prompt-search-utils.mjs';
+// Importing the script runs main() once on load; with stdin closed (vitest) it
+// EOFs immediately and returns, so these pure exports are safe to import directly.
+import { extractTechIdentifiers, rowMatchesIdentifier } from '../scripts/user-prompt-search.js';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
 
@@ -516,6 +519,38 @@ function formatResults(rows) {
   }
   return lines.join('\n');
 }
+
+describe('extractTechIdentifiers', () => {
+  it('extracts camelCase / snake_case / CONST_CASE / kebab≥3, lowercased + deduped', () => {
+    expect(extractTechIdentifiers('the sanitizeFtsQuery and saveObservation paths')).toEqual(['sanitizeftsquery', 'saveobservation']);
+    expect(extractTechIdentifiers('set CLAUDE_MEM_DIR and OR_TOP_BM25_FLOOR')).toEqual(['claude_mem_dir', 'or_top_bm25_floor']);
+    expect(extractTechIdentifiers('the pre-tool-use launcher')).toEqual(['pre-tool-use']);
+  });
+  it('returns [] for prose with no identifiers (matches signal-gate exclusions)', () => {
+    expect(extractTechIdentifiers('how is it going today')).toEqual([]);
+    expect(extractTechIdentifiers('iOS and eBay and IBM')).toEqual([]); // excluded by TECH_IDENTIFIER_RE
+    expect(extractTechIdentifiers('')).toEqual([]);
+    expect(extractTechIdentifiers(null)).toEqual([]);
+  });
+});
+
+describe('rowMatchesIdentifier', () => {
+  const row = { title: 'Apostrophes not normalized in sanitizeFtsQuery', lesson_learned: 'guard the OR_TOP_BM25_FLOOR gate' };
+  it('matches an identifier present as a standalone token in title or lesson', () => {
+    expect(rowMatchesIdentifier(row, ['sanitizeftsquery'])).toBe(true);   // in title
+    expect(rowMatchesIdentifier(row, ['or_top_bm25_floor'])).toBe(true);  // in lesson
+    expect(rowMatchesIdentifier(row, ['saveobservation', 'sanitizeftsquery'])).toBe(true); // any
+  });
+  it('does NOT match a substring embedded in a longer identifier (token boundary)', () => {
+    expect(rowMatchesIdentifier({ title: 'sanitizeFtsQueryBuilder helper' }, ['sanitizeftsquery'])).toBe(false);
+    expect(rowMatchesIdentifier({ title: 'presanitizeFtsQuery' }, ['sanitizeftsquery'])).toBe(false);
+  });
+  it('does NOT match an absent identifier; tolerates empty / missing fields', () => {
+    expect(rowMatchesIdentifier(row, ['nonexistentident'])).toBe(false);
+    expect(rowMatchesIdentifier(row, [])).toBe(false);
+    expect(rowMatchesIdentifier({ title: null, lesson_learned: null }, ['x'])).toBe(false);
+  });
+});
 
 describe('formatResults', () => {
   it('returns null for empty/null results', () => {

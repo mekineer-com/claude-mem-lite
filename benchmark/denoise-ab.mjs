@@ -15,7 +15,8 @@
 //
 // This harness runs BOTH suites on the production-hybrid path and reports one
 // precision↔recall snapshot, A/B-comparable across a change. Workflow to evaluate
-// ANY denoising change (env-gated OR raw code edit) BEFORE deciding to ship it:
+// a SEARCH-PATH denoising change (env-gated OR raw code edit) BEFORE shipping it
+// (see SCOPE below — UserPromptSubmit/PreToolUse injection levers are NOT covered):
 //
 //   node benchmark/denoise-ab.mjs --save /tmp/before.json   # control (change off)
 //   …apply the denoising change (flip a default-off flag, or edit code)…
@@ -24,6 +25,20 @@
 // The verdict makes the tradeoff falsifiable: REJECT (recall regression, no gain),
 // TRADEOFF (precision up / recall down — a human judges worth), NET-POSITIVE, or
 // NEUTRAL. Dev tooling only — not shipped in SOURCE_FILES, no release impact.
+//
+// SCOPE — what runSnapshot actually exercises: searchProductionHybrid →
+// searchObservationsHybrid (search-engine.mjs), i.e. the CLI/MCP SEARCH path. That
+// covers query-construction + ranking levers: sanitizeFtsQuery synonym expansion,
+// the AND→OR relaxation, and FULL_SCORE's decay/type/importance multipliers. It does
+// NOT execute the UserPromptSubmit hook (scripts/user-prompt-search.js) or PreToolUse
+// recall (scripts/pre-tool-recall.js). The INJECTION-decision levers that live only
+// there — TOP_REL_FLOOR, OR_TOP_BM25_FLOOR, REQUIRE_EXPLICIT_SIGNAL, and the
+// cite_factor multiplier (scoring-sql.mjs::citeFactorClause, absent from
+// search-engine.mjs) — are therefore INVISIBLE to this harness: editing one and
+// re-running reports NEUTRAL (all Δ=0) no matter its true effect (verified 2026-06-29
+// by flipping the OR_TOP_BM25_FLOOR row-selection — zero metric movement). Evaluate
+// those on the UPS/PTR path directly; cite_factor additionally needs a corpus with
+// real citation history (cited_count / uncited_streak), which the fixtures lack.
 
 import { readFileSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';

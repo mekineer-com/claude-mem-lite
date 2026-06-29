@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "purpose": "UPS-path A/B labeled set for the identifier-exact-match floor-bypass (CLAUDE_MEM_UPS_IDENTIFIER_BYPASS). Run via benchmark/ups-ab.mjs against the REAL projects--mem corpus.",
+    "snapshot_date": "2026-06-29",
+    "construction": "positives = real imp>=2 obs whose title carries a camelCase/snake_case identifier, phrased as an explicit recall question naming that identifier; expected = that obs (mostly low cited_count, i.e. floor-gated in control). hard_negatives = (a) queries naming an identifier whose matching obs is tangential to the asked intent (injecting it = noise), and (b) signal-less prose where the bypass must NOT fire (no identifier). Per-query output is printed for audit.",
+    "ids_are_live": "obs ids reference the live DB at snapshot_date; re-derive if the corpus drifts."
+  },
+  "positives": [
+    { "query": "remind me what we found about apostrophes in sanitizeFtsQuery", "expected_ids": [8821] },
+    { "query": "what did the searchProductionHybrid computePerSourceWindow benchmark fidelity fix change", "expected_ids": [8799] },
+    { "query": "remind me about the coreRunSearchPipeline CLI and MCP unification", "expected_ids": [8786] },
+    { "query": "what was the runDeferredCleanups half-fix that never ran in ensureDb", "expected_ids": [8784] },
+    { "query": "remind me about the detectBashSignificance missed publish and release commands bug", "expected_ids": [8823] },
+    { "query": "what did we find about maintenanceStats in the maintain scan count", "expected_ids": [8804] },
+    { "query": "the citation-decay mainOnly injected vs cited thread-filter asymmetry", "expected_ids": [8795] },
+    { "query": "remind me about the execFileSync sandbox CLAUDE_PROJECT_DIR isolation drill", "expected_ids": [8827] },
+    { "query": "what was the cmdSearchForTest hermetic CLI auto-escalation test", "expected_ids": [8744] },
+    { "query": "the markSuperseded recency sort reading a missing date field", "expected_ids": [8855] },
+    { "query": "the opt-in LLM rerank stage wired into deepSearch", "expected_ids": [8759] },
+    { "query": "remind me about the parseIntFlag positional cmdRecent cap bypass", "expected_ids": [8802] }
+  ],
+  "hard_negatives": [
+    { "query": "what is our general philosophy for writing a good lesson_learned field", "expected_ids": [], "note": "lesson_learned matches #8850/#8847 (specific bugs); intent is style guidance, not those bugs" },
+    { "query": "should ensureDb be called once at startup or per request architecturally", "expected_ids": [], "note": "ensureDb matches #8784 (a specific half-fix); intent is an architecture question" },
+    { "query": "is parseIntFlag a good name or should we rename it for clarity", "expected_ids": [], "note": "parseIntFlag matches #8802 (the cap bug); intent is naming bikeshedding" },
+    { "query": "how does deepSearch compare to a single-query search in general", "expected_ids": [], "note": "deepSearch matches #8759 (rerank wiring); intent is a conceptual comparison" },
+    { "query": "how is the project going overall this week", "expected_ids": [], "note": "no identifier — bypass must not fire" },
+    { "query": "what should I focus on working on next", "expected_ids": [], "note": "no identifier — bypass must not fire" },
+    { "query": "can you give me a quick summary of the database", "expected_ids": [], "note": "no identifier — bypass must not fire" },
+    { "query": "does the whole thing actually work end to end", "expected_ids": [], "note": "no identifier — bypass must not fire" }
+  ]
+}

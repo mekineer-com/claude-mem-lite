@@ -197,6 +197,49 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
   return false;
 }
 
+// ─── Identifier-exact-match precision bypass (default OFF) ───────────────────
+//
+// CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=1 enables it. Rationale: the score-floors below
+// (OR_TOP_BM25_FLOOR / TOP_REL_FLOOR) drop the WHOLE FTS set when the top row's
+// magnitude is weak. But a rare code identifier (camelCase / snake_case / CONST_CASE
+// / kebab≥3) match has high *semantic* precision even at modest BM25 — a df=1 term
+// like `sanitizeFtsQuery` scores only ~23 raw yet is an unambiguous hit. So an obs
+// whose title/lesson EXACT-matches an identifier the prompt names is a precision pass
+// — the same independent-signal rationale that already exempts sigRows (error
+// signatures) and fileRows (file names) from these floors. When enabled, such rows are
+// restored after the floors run.
+//
+// Default OFF — opt-in. benchmark/ups-ab.mjs measured it TRADEOFF on the real corpus
+// (+3 recall recoveries / +4 injections over 12 positives / 8 hard-negatives); the
+// "cost" was eager surfacing of on-identifier obs on non-recall-framed prompts, not
+// off-topic noise. Kept opt-in (below the NET-POSITIVE/NEUTRAL ship bar). See #8858.
+export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS === '1';
+const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
+
+// All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive
+// row matching). Empty array when none — callers treat that as "no bypass candidates".
+export function extractTechIdentifiers(text) {
+  return [...new Set((String(text || '').match(TECH_IDENTIFIER_RE_G) || []).map(s => s.toLowerCase()))];
+}
+
+// True when the obs row's title or lesson contains any of `idsLower` as a standalone
+// token (not embedded in a longer identifier). Title/lesson only — the searchByFts
+// SELECT carries no narrative, and requiring the hit in the title/lesson is the
+// stricter, higher-precision condition (intentional).
+export function rowMatchesIdentifier(row, idsLower) {
+  if (!idsLower || idsLower.length === 0) return false;
+  const hay = `${row.title || ''} ${row.lesson_learned || ''}`.toLowerCase();
+  const isWordChar = (c) => c !== undefined && /[a-z0-9_]/.test(c);
+  return idsLower.some((id) => {
+    let from = 0, i;
+    while ((i = hay.indexOf(id, from)) >= 0) {
+      if (!isWordChar(hay[i - 1]) && !isWordChar(hay[i + id.length])) return true;
+      from = i + 1;
+    }
+    return false;
+  });
+}
+
 // ─── DB Query Functions ─────────────────────────────────────────────────────
 
 // Returns { rows, mode } where mode is 'AND' (initial pass), 'OR' (fallback
@@ -557,6 +600,9 @@ async function main() {
     const signalPresent = hasExplicitSignal(promptText, {
       errSig, files: filesForGate, intent,
     });
+    // Identifier tokens the prompt names (for the precision bypass below). Empty
+    // unless CLAUDE_MEM_UPS_IDENTIFIER_BYPASS=1, so this is a no-op when disabled.
+    const promptIdentifiers = IDENTIFIER_BYPASS ? extractTechIdentifiers(promptText) : [];
 
     if (intent?.useRecent) {
       // Recall intent: show recent observations
@@ -588,6 +634,14 @@ async function main() {
         typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
       );
 
+      // Identifier-exact-match precision bypass (default off — see IDENTIFIER_BYPASS).
+      // Capture rows that exact-match a prompt identifier BEFORE the set-floors below;
+      // they carry independent precision signal (sigRows/fileRows rationale) and are
+      // restored after the floors so a low top-score can't drop a named-identifier hit.
+      const bypassRows = (IDENTIFIER_BYPASS && promptIdentifiers.length > 0)
+        ? ftsRows.filter(r => rowMatchesIdentifier(r, promptIdentifiers))
+        : [];
+
       // v2.43.x: OR-mode raw-BM25 floor. In OR-fallback mode the composite
       // TOP_REL_FLOOR below is inflated by importance × type_quality × decay
       // multipliers — a weak single-stem hit on an importance=3 bugfix obs
@@ -609,6 +663,15 @@ async function main() {
       // largest magnitude (strongest match) in this scoring expression.
       if (ftsRows.length > 0 && Math.abs(ftsRows[0].relevance) < TOP_REL_FLOOR) {
         ftsRows = [];
+      }
+
+      // Restore identifier-matched precision rows the set-floors above dropped.
+      // No-op when the bypass is off (bypassRows is []) or when the floors kept the
+      // rows anyway (dedup by id). Re-sort so the merged set stays relevance-ordered.
+      if (bypassRows.length > 0) {
+        const kept = new Set(ftsRows.map(r => r.id));
+        for (const r of bypassRows) if (!kept.has(r.id)) ftsRows.push(r);
+        ftsRows.sort((a, b) => (a.relevance ?? 0) - (b.relevance ?? 0));
       }
 
       // Merge: FTS results first, then file results, deduplicated
