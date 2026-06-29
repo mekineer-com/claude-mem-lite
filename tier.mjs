@@ -73,7 +73,14 @@ export const TIER_CASE_SQL = `(CASE
   WHEN type = 'bugfix'    AND created_at_epoch >= ? THEN 'active'
   WHEN type = 'refactor'  AND created_at_epoch >= ? THEN 'active'
   WHEN type = 'change'    AND created_at_epoch >= ? THEN 'active'
-  WHEN created_at_epoch >= ? THEN 'active'
+  -- Default-window fallthrough is for UNKNOWN/null types ONLY, mirroring
+  -- computeTier's ACTIVE_WINDOWS[type] with a DEFAULT fallback (a KNOWN type
+  -- never takes the fallback). Without the type guard, a known type whose window
+  -- was configured SHORTER than the default would wrongly re-qualify as 'active'
+  -- here after its own window expired — diverging from the JS classifier.
+  -- The "type IS NULL" arm keeps null-type rows on the default window (JS parity).
+  WHEN (type IS NULL OR type NOT IN ('decision','discovery','feature','bugfix','refactor','change'))
+       AND created_at_epoch >= ? THEN 'active'
   ELSE 'archive'
 END)`;
 

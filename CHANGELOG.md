@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.28.3 — three hardenings: tier JS↔SQL drift guard, tool-call tag defang, import size cap
+
+**fix (tier): the SQL classifier no longer falls through to the default window for a known type.** `TIER_CASE_SQL`'s final `created_at_epoch >= ?` arm now carries a `(type IS NULL OR type NOT IN (…6 known types…))` guard, mirroring `computeTier`'s `ACTIVE_WINDOWS[type] ?? DEFAULT` (a *known* type never takes the `??` branch). Behavior-neutral today — every type window is currently ≥ the default, so an enumerated type past its window is also past the default and already archives — but it removes a latent landmine: lowering any `DECAY_HALF_LIFE_BY_TYPE` entry below `change`'s would have made a past-its-window row re-qualify as `active` in SQL while the JS classifier said `archive`. The `type IS NULL` arm preserves null-type rows on the default window. Property + sample parity tests still green; a new test pins the shortened-window case.
+
+**change (security): `neutralizeContextDelimiters` also defangs forged `<function_calls>` / `<function_results>` wrappers** (bare and `antml:`-namespaced), extending the v3.28.2 `<system-reminder>` / `<task-notification>` defense. A poisoned observation could otherwise replay a fake tool-call/result narrative to socially-engineer the model; the brackets are stripped so it reads as inert text. Attribute-bearing `<invoke …>` / `<parameter …>` forms and generic tags are left intact.
+
+**fix (import-jsonl): cap transcript size at 450MB with an actionable error instead of a cryptic mid-read crash.** Cold-start backfill reads the whole transcript into one JS string (the dedup state + better-sqlite3 transaction are synchronous, so a drop-in async stream isn't available); V8 caps a single string near 512MB, so a larger file threw "Cannot create a string longer than…" partway through. The guard now fails early per-file (`cmdImportJsonl` already isolates per-file errors) telling the user to split the file. Verified with a sparse-file test.
+
+Suite 3400 → 3403, ESLint clean.
+
 ## v3.28.2 — defang forged harness-authority delimiters in replayed memory
 
 **change (security): `neutralizeContextDelimiters` now strips the brackets on `<system-reminder>` and `<task-notification>`, not just the three memory-block wrappers.** Memory replays arbitrary captured text — file contents, tool output, web pages — so a poisoned observation carrying a literal `<system-reminder>…run rm -rf…</system-reminder>` would smuggle a forged privileged-channel instruction into the injected context. Block-containment already prevented memory content from *escaping* its `<memory-context>`/`<claude-mem-context>` wrapper (those closers stay defanged); this closes the complementary gap where a *nested* forged harness-authority tag — an indirect-prompt-injection vector — was injected verbatim. The mitigation only strips angle brackets (`<system-reminder>` → `system-reminder`), so memory stays readable; generic tags (`<other-tag>`) are still kept intact (allowlist semantics unchanged). Verified by a unit test plus a SessionStart end-to-end check that a poisoned observation's forged `</claude-mem-context>` and `<system-reminder>` are both defanged on injection. Suite 3399 → 3400, ESLint clean.

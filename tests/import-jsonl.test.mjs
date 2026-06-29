@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { writeFileSync, truncateSync, rmSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
 import { createTestDb } from './test-helpers.mjs';
-import { importJsonl } from '../lib/import-jsonl.mjs';
+import { importJsonl, MAX_IMPORT_BYTES } from '../lib/import-jsonl.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(__dirname, 'fixtures/sample-claude-jsonl/sample.jsonl');
@@ -150,6 +152,25 @@ describe('importJsonl — fixture', () => {
       expect(obs.text).toContain('transcript truncated');
     } finally {
       fs.unlinkSync(tmpPath);
+    }
+  });
+});
+
+describe('importJsonl — oversized-file guard', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); });
+
+  it('rejects a transcript above the size cap before reading it (no OOM)', async () => {
+    // Sparse file: logical size > cap, ~0 real disk blocks. statSync sees the
+    // logical size, so the guard throws before readFileSync materializes it.
+    const dir = mkdtempSync(join(tmpdir(), 'mem-import-big-'));
+    const big = join(dir, 'huge.jsonl');
+    writeFileSync(big, '');
+    truncateSync(big, MAX_IMPORT_BYTES + 1024);
+    try {
+      await expect(importJsonl(db, big, { project: 'proj' })).rejects.toThrow(/too large/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

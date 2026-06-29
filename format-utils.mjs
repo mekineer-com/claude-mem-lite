@@ -29,16 +29,20 @@ export function truncate(str, max = 80) {
 //      memory-context / session-handoff). User-derived text containing one LITERALLY
 //      would prematurely open/close the block it lands in, spilling the rest as
 //      undelimited context.
-//   2. Harness-authority tags the runtime injects (system-reminder / task-notification).
-//      Memory replays arbitrary captured text \u2014 file contents, tool output, web pages \u2014
-//      so a poisoned observation carrying a literal <system-reminder>\u2026</system-reminder>
-//      would smuggle a forged privileged-channel instruction into the model's context.
-//      It can't escape its wrapper (class 1 closers are defanged), but a nested forged
-//      authority tag is still an indirect-prompt-injection vector; strip the brackets so
-//      it reads as inert text. Other tags (<other-tag>) are deliberately left intact.
+//   2. Harness-authority + tool-call tags the runtime injects (system-reminder /
+//      task-notification / function_calls / function_results, the latter two also in
+//      their antml:-namespaced form). Memory replays arbitrary captured text \u2014 file
+//      contents, tool output, web pages \u2014 so a poisoned observation carrying a literal
+//      <system-reminder>\u2026</system-reminder> or a forged <function_calls>\u2026</function_calls>
+//      block would smuggle a privileged-channel instruction / fake tool-call narrative
+//      into the model's context. It can't escape its wrapper (class 1 closers are
+//      defanged), but a nested forged authority/tool tag is still an indirect-prompt-
+//      injection vector; strip the brackets so it reads as inert text. Other tags
+//      (<other-tag>) \u2014 and the attribute-bearing <invoke \u2026>/<parameter \u2026> forms \u2014 are
+//      deliberately left intact.
 // Reachable by editing files that contain these tokens \u2014 e.g. developing claude-mem-lite
 // itself, where source/observations carry the delimiter names.
-const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification)>/gi;
+const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification|(?:antml:)?function_calls|(?:antml:)?function_results)>/gi;
 
 /**
  * Defang the literal context-block delimiter tags in user-derived text. Strips just the

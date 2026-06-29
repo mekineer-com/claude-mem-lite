@@ -1576,6 +1576,21 @@ describe('neutralizeContextDelimiters', () => {
     expect(neutralizeContextDelimiters('a </task-notification> b')).toBe('a /task-notification b');
   });
 
+  it('defangs forged tool-call wrapper tags', () => {
+    // A poisoned observation could mimic a tool-call/result block to socially
+    // engineer the model ("the previous call succeeded, now run …"). Defang the
+    // bare wrappers; the optional namespaced form is exercised below by building
+    // the tag at runtime so the test source stays free of harness-meaningful tags.
+    expect(neutralizeContextDelimiters('x <function_calls> y')).toBe('x function_calls y');
+    expect(neutralizeContextDelimiters('x </function_calls> y')).toBe('x /function_calls y');
+    expect(neutralizeContextDelimiters('x <function_results> y')).toBe('x function_results y');
+    expect(neutralizeContextDelimiters('x </function_results> y')).toBe('x /function_results y');
+    // Namespaced form (prefix assembled at runtime to avoid a literal in source):
+    const ns = 'ant' + 'ml:';
+    expect(neutralizeContextDelimiters(`a <${ns}function_calls> b`)).toBe(`a ${ns}function_calls b`);
+    expect(neutralizeContextDelimiters(`a </${ns}function_results> b`)).toBe(`a /${ns}function_results b`);
+  });
+
   it('coerces non-strings to empty (never throws on an LLM array/number)', () => {
     expect(neutralizeContextDelimiters(null)).toBe('');
     expect(neutralizeContextDelimiters(undefined)).toBe('');

@@ -131,6 +131,33 @@ describe('TIER_CASE_SQL parity with computeTier', () => {
     }
   });
 
+  // Config-drift guard: if a type's active window is ever set SHORTER than the
+  // default (e.g. DECAY_HALF_LIFE_BY_TYPE.decision lowered below .change), the SQL
+  // must NOT fall through to the default window for that known type — it must use
+  // the type window only, matching computeTier (ACTIVE_WINDOWS[type] ?? DEFAULT,
+  // where a KNOWN type never takes the ?? branch). Pre-guard, line-76's bare
+  // `created_at_epoch >= ?` fired for any old known-type row within the default
+  // window, classifying a past-its-window decision as 'active' while JS said 'archive'.
+  it('does not fall through to the default window for a known type with a shortened window', () => {
+    insertObs(db, { sessionId: 'other-sess', title: 'short-window-decision', type: 'decision', epochOffset: -5 * DAY, project: 'other' });
+    // Custom params simulating decision-window=1d while default=14d (indices match tierSqlParams).
+    const params = [
+      'sess-current', 'test', NOW - HOUR, // session / project+importance working
+      'test', NOW - HOUR,                 // project+recent working
+      NOW - 1 * DAY,                      // decision window = 1d (SHORTER than default)
+      NOW - 120 * DAY,                    // discovery
+      NOW - 60 * DAY,                     // feature
+      NOW - 28 * DAY,                     // bugfix
+      NOW - 28 * DAY,                     // refactor
+      NOW - 14 * DAY,                     // change
+      NOW - 14 * DAY,                     // default fallthrough
+    ];
+    const row = db.prepare(`SELECT *, ${TIER_CASE_SQL} as tier FROM observations WHERE title = ?`).get(...params, 'short-window-decision');
+    // 5-day-old decision: past its 1d window, still within the 14d default. Type-window
+    // semantics → 'archive'. Pre-guard the default fallthrough wrongly returned 'active'.
+    expect(row.tier).toBe('archive');
+  });
+
   // Property test — drift guard for TIER_CASE_SQL ↔ computeTier duplication.
   // The two implementations must agree for ANY observation shape, not just the
   // hand-picked samples above. Generates random rows covering every branch of
