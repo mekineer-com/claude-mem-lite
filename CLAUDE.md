@@ -23,7 +23,7 @@ Used by `/health` skill (gstack). Persisted here so detection skips runtime prob
 - deadcode: ./node_modules/.bin/knip
 - shell: shellcheck scripts/post-tool-use.sh scripts/pre-commit.sh scripts/setup.sh
 
-Knip baseline (2026-06-05): 0 unused files, 51 unused exports. Two categories:
+Knip baseline (2026-06-29): 0 unused files, 53 unused exports (re-verified: the +2 since the 2026-06-05 count of 51 is benign growth — spot-checked suspects all have real refs, no reverted-feature rot). Two categories:
 (a) intentional — v2.21 utils.mjs split backward-compat re-exports + test-only
 exports (search-engine.mjs FTS/count helpers, ftsRowToResult) used internally and
 by tests; do NOT remove without audit. (b) NOT intentional — the v3 dispatch/
