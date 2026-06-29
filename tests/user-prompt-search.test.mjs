@@ -24,7 +24,7 @@ import {
 } from '../scripts/prompt-search-utils.mjs';
 // Importing the script runs main() once on load; with stdin closed (vitest) it
 // EOFs immediately and returns, so these pure exports are safe to import directly.
-import { extractTechIdentifiers, rowMatchesIdentifier } from '../scripts/user-prompt-search.js';
+import { extractTechIdentifiers, rowMatchesIdentifier, hasExplicitSignal } from '../scripts/user-prompt-search.js';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
 
@@ -531,6 +531,20 @@ describe('extractTechIdentifiers', () => {
     expect(extractTechIdentifiers('iOS and eBay and IBM')).toEqual([]); // excluded by TECH_IDENTIFIER_RE
     expect(extractTechIdentifiers('')).toEqual([]);
     expect(extractTechIdentifiers(null)).toEqual([]);
+  });
+  it('stop-lists ordinary English phrases / product names that structurally match (review #2)', () => {
+    expect(extractTechIdentifiers('make this up-to-date and state-of-the-art')).toEqual([]);
+    expect(extractTechIdentifiers('upgrade the macOS build')).toEqual([]);
+    // real ≥3-segment kebab identifiers survive alongside stop-listed prose
+    expect(extractTechIdentifiers('refactor pre-tool-use to be up-to-date')).toEqual(['pre-tool-use']);
+  });
+});
+
+describe('hasExplicitSignal — identifier gate (default-on)', () => {
+  it('passes on a real code identifier but not on a stop-listed prose phrase / product name', () => {
+    expect(hasExplicitSignal('sanitizeFtsQuery')).toBe(true);  // real identifier → signal
+    expect(hasExplicitSignal('up-to-date')).toBe(false);       // prose phrase → no signal
+    expect(hasExplicitSignal('macOS')).toBe(false);            // product name → no signal
   });
 });
 

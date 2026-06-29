@@ -131,6 +131,10 @@ describe('CLI E2E: execute-flag footgun guard (Round 5)', () => {
     const { stderr, exitCode } = runCli(['optimize', '--execute']);
     expect(exitCode).toBe(1);
     expect(stderr).toMatch(/--run/);
+    // the `--execute=value` form must also be caught (a bare includes('--execute') missed it)
+    const eq = runCli(['optimize', '--execute=true']);
+    expect(eq.exitCode).toBe(1);
+    expect(eq.stderr).toMatch(/--run/);
   });
   it('compress still previews with no execute flag, and --execute is still honored', () => {
     const preview = runCli(['compress']);

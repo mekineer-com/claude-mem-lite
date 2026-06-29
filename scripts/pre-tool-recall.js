@@ -116,7 +116,7 @@ function inferProject() {
   const parent = basename(join(dir, '..'));
   const raw = (parent && parent !== '.' && parent !== '/')
     ? `${parent}--${base}` : base;
-  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100) || 'unknown';
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
 }
 
 function readCooldown(cooldownPath) {

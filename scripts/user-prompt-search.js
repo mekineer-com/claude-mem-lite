@@ -172,6 +172,20 @@ function isFollowUpSession() {
 // catches the prompt via those channels rather than the identifier itself.
 const TECH_IDENTIFIER_RE = /\b(?:[a-z][a-z0-9]*_[a-z0-9_]+|[A-Z][A-Z0-9]*_[A-Z0-9_]+|[A-Z]{2,}[0-9][A-Z0-9_]*|[a-z]{2,}[A-Z][a-zA-Z0-9]+|[a-z]+(?:-[a-z]+){2,})\b/;
 
+// Reviewer #2 (v3.25.0): the kebab (≥3-seg) and camelCase arms above structurally
+// match a handful of ordinary English phrases / product names that are NOT code
+// identifiers — `up-to-date`, `state-of-the-art`, `macOS`, etc. Left unfiltered they
+// (a) widen the default-ON hasExplicitSignal gate on prose-only prompts and (b) let
+// such a token drive the opt-in identifier bypass. Stop-list them (lowercased). Real
+// 3-segment kebab identifiers (`pre-tool-use`, `user-prompt-search`) are deliberately
+// NOT here — only attested non-identifier prose.
+const IDENTIFIER_STOPWORDS = new Set([
+  'up-to-date', 'out-of-date', 'up-to-speed', 'out-of-the-box', 'state-of-the-art',
+  'end-to-end', 'off-by-one', 'easy-to-use', 'day-to-day', 'step-by-step',
+  'face-to-face', 'one-to-one', 'one-on-one', 'back-to-back', 'side-by-side',
+  'apples-to-apples', 'macos',
+]);
+
 // CJK presence channel (Important #2): bilingual users (project memory
 // `feedback_*` calls this out explicitly) ask CJK questions that may carry
 // genuine debug intent without containing an English identifier. CJK is
@@ -192,7 +206,7 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
   if (errSig === undefined && extractErrorSignature(text)) return true;
   if (files === undefined && extractFiles(text).length > 0) return true;
   if (intent === undefined && detectIntent(text)) return true;
-  if (TECH_IDENTIFIER_RE.test(text)) return true;
+  if (extractTechIdentifiers(text).length > 0) return true;
   if (CJK_CHAR_RE.test(text) && computeEffectiveLen(text) >= CJK_MIN_EFFECTIVE_LEN) return true;
   return false;
 }
@@ -219,7 +233,8 @@ const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
 // All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive
 // row matching). Empty array when none — callers treat that as "no bypass candidates".
 export function extractTechIdentifiers(text) {
-  return [...new Set((String(text || '').match(TECH_IDENTIFIER_RE_G) || []).map(s => s.toLowerCase()))];
+  return [...new Set((String(text || '').match(TECH_IDENTIFIER_RE_G) || []).map(s => s.toLowerCase()))]
+    .filter(s => !IDENTIFIER_STOPWORDS.has(s));
 }
 
 // True when the obs row's title or lesson contains any of `idsLower` as a standalone

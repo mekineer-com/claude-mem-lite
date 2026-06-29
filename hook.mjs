@@ -1424,7 +1424,10 @@ async function handleUserPrompt() {
         process.stdout.write(lines.join('\n') + '\n');
       }
       if (imperativePick) {
-        process.stdout.write(formatTaskImperative(imperativePick.lesson_learned, imperativePick.id) + '\n');
+        // Guard the write on a non-empty return — formatTaskImperative yields '' for a
+        // lesson that strips to empty (e.g. "."), which would otherwise emit a bare line.
+        const imperativeLine = formatTaskImperative(imperativePick.lesson_learned, imperativePick.id);
+        if (imperativeLine) process.stdout.write(imperativeLine + '\n');
       }
     } catch (e) { debugCatch(e, 'handleUserPrompt-memory'); }
   } finally {

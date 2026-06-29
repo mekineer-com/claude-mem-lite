@@ -2867,7 +2867,10 @@ async function cmdOptimize(db, args) {
   // Sibling-command flag footgun: optimize executes with --run (compress uses
   // --execute, maintain uses positional `execute`). A bare --execute previously fell
   // through to a silent preview, so the user thought they ran a mutation but didn't.
-  if (args.includes('--execute') && !run && !runAll) {
+  // Catch both `--execute` and the `--execute=value` form (the latter slipped a bare
+  // `args.includes('--execute')` and fell through to a silent preview — review minor).
+  const hasExecuteFlag = args.some(a => a === '--execute' || a.startsWith('--execute='));
+  if (hasExecuteFlag && !run && !runAll) {
     fail("[mem] optimize executes with --run, not --execute (--execute is compress's flag). Re-run: claude-mem-lite optimize --run");
     return;
   }

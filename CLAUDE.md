@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.24.0
+- **Version**: 3.25.0
 - **Package manager**: npm
-- **Test**: `npx vitest run` (171 test files / 3372 tests, vitest)
+- **Test**: `npx vitest run` (174 test files / 3405 tests, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **Denoising A/B** (evaluate any precision/recall lever BEFORE shipping): `node benchmark/denoise-ab.mjs --save before.json` (control) → apply the change → `node benchmark/denoise-ab.mjs --compare before.json` (verdict). Runs BOTH the precision hard-negative AND vocab-mismatch paraphrase suites so a lever's precision gain and recall cost are weighed on one screen — the split that let an OR-BM25 floor ship-then-revert (2026-06-29). Verdict: REJECT / TRADEOFF / NET-POSITIVE / NEUTRAL.
@@ -102,7 +102,7 @@ structural queries (LSP only sees open files; this sees everything). Fastest pat
 | Unfamiliar dir / module | `code-graph-mcp overview <dir>` |
 | Symbol source / signature | `code-graph-mcp show X` |
 | Concept search (no exact name) | `code-graph-mcp search "…"` (vector: MCP `semantic_code_search`) |
-| grep + AST context | `code-graph-mcp grep "pat" [paths]` |
+| grep + AST context | `code-graph-mcp grep "pat" [paths] [-t lang] [-g glob] [-c]` |
 
 Still use Grep for literal strings/regex in non-code files; still Read files you'll edit.
 Full command + MCP-tool table: `.claude/plugin_code_graph_mcp.md`

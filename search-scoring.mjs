@@ -151,12 +151,14 @@ export function markSuperseded(results) {
   // Persistent superseding belongs in mem_maintain/mem_compress write paths.
   for (const [, obsForFile] of fileMap) {
     if (obsForFile.length < 2) continue;
-    // Sort newest-first by recency. The production search pipeline supplies
-    // created_at_epoch (numeric) + created_at (ISO) — NOT `date`; the prior
-    // `b.date` sort silently no-op'd there (every key undefined → localeCompare 0),
-    // so "newest" degraded to relevance order and a current top-importance obs got
-    // a false [SUPERSEDED] tag (#8821). Prefer numeric epoch, fall back to the ISO
-    // string (lexically chronological), then legacy `date` for older callers/tests.
+    // Sort newest-first by recency. Every production obs row carries `date`
+    // (= created_at ISO, set by ftsRowToResult); the FTS/type paths also carry
+    // created_at_epoch, the vector/type-list paths carry date-only. So the prior
+    // `b.date` sort already ordered correctly in production — this is defensive
+    // hardening, not a prod no-op fix (a post-release review corrected the original
+    // #8821 "missing-`date`" diagnosis). Prefer the numeric epoch, fall back to the
+    // ISO created_at (lexically chronological), then legacy `date`, so the key holds
+    // for any caller regardless of which recency fields it supplies.
     obsForFile.sort((a, b) => {
       const ka = a.created_at_epoch ?? a.created_at ?? a.date ?? '';
       const kb = b.created_at_epoch ?? b.created_at ?? b.date ?? '';
