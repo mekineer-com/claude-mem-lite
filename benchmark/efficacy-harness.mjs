@@ -281,6 +281,11 @@ async function runArmSeed(spec, arm, seed, cfgDir, model) {
       `CLAUDE_PROJECT_DIR='${REPO}'`,
       cfgDir ? `CLAUDE_CONFIG_DIR='${cfgDir}'` : '',
       cfg.salience ? `CLAUDE_MEM_SALIENCE=${cfg.salience}` : '',
+      // Non-isolated cells (no cfgDir) spawn `claude -p` under the real ~/.claude,
+      // whose SessionStart auto-adopt (hook.mjs, gated on MEM_NO_AUTO_ADOPT) writes a
+      // sentinel into a throwaway worktree memdir that outlives the deleted worktree.
+      // Opt out so efficacy runs leave no ~/.claude/projects/*/memory residue.
+      `MEM_NO_AUTO_ADOPT=1`,
     ].filter(Boolean).join(' ');
     try {
       await execFileP('bash', ['-c',
