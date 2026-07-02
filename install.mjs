@@ -705,10 +705,24 @@ const memPreSkillBridge = {
   ]
 };
 
+// P0 subagent dispatch-time injection (default off — CLAUDE_MEM_SUBAGENT_INJECT).
+// Fires on the Agent/Task dispatch so a subagent (otherwise memory-blind — #8848)
+// can receive one relevant lesson via updatedInput. Parity with hooks/hooks.json.
+const memPreAgentInject = {
+  matcher: 'Agent|Task',
+  hooks: [
+    {
+      type: 'command',
+      command: nodeHook('scripts/pre-agent-inject.js'),
+      timeout: 5
+    }
+  ]
+};
+
 // Filter out existing mem hooks, then append fresh ones
-// PreToolUse has two separate matchers, so we register both
+// PreToolUse has three separate matchers, so we register all three
 const hookConfigs = {
-  PreToolUse: [memPreToolRecall, memPreSkillBridge],
+  PreToolUse: [memPreToolRecall, memPreSkillBridge, memPreAgentInject],
   PostToolUse: [memPostToolUse],
   SessionStart: [memSessionStart],
   Stop: [memStop],

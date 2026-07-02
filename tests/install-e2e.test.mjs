@@ -130,16 +130,21 @@ describe('E2E: Plugin install mode', () => {
     // v2.84: Node hook entries routed through hook-launcher.mjs for self-heal.
     expect(sessionStart).toContain('node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs" hook.mjs session-start');
 
-    // PreToolUse — two matchers
+    // PreToolUse — three matchers
     const preToolUse = hooks.hooks.PreToolUse;
-    expect(preToolUse).toHaveLength(2);
+    expect(preToolUse).toHaveLength(3);
     const preMatchers = preToolUse.map(h => h.matcher);
     expect(preMatchers).toContain('Edit|Write|NotebookEdit|Read');
     expect(preMatchers).toContain('Skill');
+    expect(preMatchers).toContain('Agent|Task');
 
     // PreToolUse Skill bridge
     const skillBridge = preToolUse.find(h => h.matcher === 'Skill');
     expect(skillBridge.hooks[0].command).toContain('pre-skill-bridge.js');
+
+    // PreToolUse Agent|Task subagent-injection hook (P0)
+    const agentInject = preToolUse.find(h => h.matcher === 'Agent|Task');
+    expect(agentInject.hooks[0].command).toContain('pre-agent-inject.js');
 
     // PostToolUse
     expect(hooks.hooks.PostToolUse).toHaveLength(1);
@@ -229,9 +234,9 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     expect(settings.hooks.UserPromptSubmit).toBeTruthy();
     expect(settings.hooks.PreToolUse).toBeTruthy();
 
-    // PreToolUse has two separate matchers
+    // PreToolUse has three separate matchers
     const preToolUse = settings.hooks.PreToolUse;
-    expect(preToolUse.length).toBeGreaterThanOrEqual(2);
+    expect(preToolUse.length).toBeGreaterThanOrEqual(3);
 
     // Edit/Write/Read recall hook (v2.34.6 extended Read)
     const editMatcher = preToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit|Read');
@@ -242,6 +247,11 @@ describe('E2E: Direct install mode (git clone / npx)', () => {
     const skillMatcher = preToolUse.find(h => h.matcher === 'Skill');
     expect(skillMatcher).toBeTruthy();
     expect(skillMatcher.hooks[0].command).toContain('pre-skill-bridge.js');
+
+    // Agent|Task subagent-injection hook (P0)
+    const agentMatcher = preToolUse.find(h => h.matcher === 'Agent|Task');
+    expect(agentMatcher).toBeTruthy();
+    expect(agentMatcher.hooks[0].command).toContain('pre-agent-inject.js');
 
     // UserPromptSubmit has both search + hook handlers
     const userPromptHooks = settings.hooks.UserPromptSubmit[0].hooks.map(h => h.command);
@@ -469,6 +479,7 @@ describe('E2E: Version consistency across all manifests', () => {
 
     // Smart invocation scripts
     expect(files).toContain('scripts/pre-skill-bridge.js');
+    expect(files).toContain('scripts/pre-agent-inject.js');
     expect(files).toContain('scripts/user-prompt-search.js');
     expect(files).toContain('scripts/prompt-search-utils.mjs');
     expect(files).toContain('scripts/pre-tool-recall.js');

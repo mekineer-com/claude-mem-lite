@@ -185,6 +185,7 @@ export const HOOK_SCRIPT_FILES = [
   'pre-tool-recall.js',
   'post-tool-recall.js',
   'pre-skill-bridge.js',
+  'pre-agent-inject.js',
   // v2.84: self-heal wrapper that detects ERR_MODULE_NOT_FOUND under the
   // install dir and runs install.mjs repair before retrying the entry.
   // hooks.json + install.mjs settings template invoke node hook entries

@@ -6,6 +6,7 @@ import { citeFactorJs } from './scoring-sql.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
 import { extractIdents } from './lib/lesson-idents.mjs';
+import { formatSubagentContext } from './lib/task-imperative.mjs';
 
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
@@ -438,4 +439,19 @@ export function selectImperativeLesson(db, userPrompt, project, excludeIds = [])
     if (score > bestScore) { bestScore = score; best = r; }
   }
   return best ? { id: best.id, lesson_learned: best.lesson_learned } : null;
+}
+
+// P0 (2026-07-03): compose the subagent-dispatch injection. Given a PreToolUse
+// Agent/Task tool_input, pick ONE project-scoped high-value lesson whose identifiers
+// overlap the SUBAGENT's task prompt (precision-first via selectImperativeLesson:
+// no overlap -> null -> no injection) and return a NEW tool_input with the
+// safe-framed context appended to `prompt`. Returns null when there is nothing to
+// inject. Pure over (db, toolInput, project) so it unit-tests without the subprocess.
+export function buildSubagentInjection(db, toolInput, project) {
+  if (!db || !toolInput || typeof toolInput.prompt !== 'string' || !toolInput.prompt.trim()) return null;
+  const pick = selectImperativeLesson(db, toolInput.prompt, project);
+  if (!pick || !pick.lesson_learned) return null;
+  const block = formatSubagentContext(pick.lesson_learned, pick.id);
+  if (!block) return null;
+  return { ...toolInput, prompt: `${toolInput.prompt}\n${block}` };
 }

@@ -50,6 +50,16 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs\" scripts/pre-agent-inject.js",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostToolUse": [
