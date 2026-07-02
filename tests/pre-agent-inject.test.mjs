@@ -6,12 +6,19 @@
 // Mechanism + safe framing verified live 2026-07-03 (Phase 0a/0b): a raw prepend
 // tripped the subagent's prompt-injection detector -> refusal; an appended,
 // attributed, reference-only block was adopted. These tests lock the pure logic.
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import Database from 'better-sqlite3';
+import { execFileSync } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join, resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { initSchema } from '../schema.mjs';
 import { insertSession, insertObs } from './test-helpers.mjs';
 import { formatSubagentContext } from '../lib/task-imperative.mjs';
 import { buildSubagentInjection } from '../hook-memory.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 describe('formatSubagentContext (safe framing — Phase 0b validated)', () => {
   it('frames an appended, attributed, reference-only block carrying the #id + lesson', () => {
@@ -60,5 +67,65 @@ describe('buildSubagentInjection', () => {
     expect(buildSubagentInjection(db, { prompt: '' }, 'p')).toBeNull();
     expect(buildSubagentInjection(db, {}, 'p')).toBeNull();
     expect(buildSubagentInjection(db, null, 'p')).toBeNull();
+  });
+});
+
+// Script-level plumbing (spawn the actual hook): flag gate, tool-name filter, the
+// emit envelope shape + stdout flush. Mirrors the repo convention (tests/audit-fixes
+// spawns pre-skill-bridge). The >64KB case guards the process.exit()-truncation fix.
+describe('pre-agent-inject.js (script plumbing, spawned)', () => {
+  const SCRIPT = resolve(__dirname, '../scripts/pre-agent-inject.js');
+  const CLI = resolve(__dirname, '../cli.mjs');
+  const REPO = resolve(__dirname, '..');
+  let sb;
+
+  beforeAll(() => {
+    sb = mkdtempSync(join(tmpdir(), 'pai-spawn-'));
+    // Seed one importance>=2 lesson naming rrfMerge via the CLI, so the child's
+    // ensureDb() opens a schema-compatible DB at <sb>/claude-mem-lite.db.
+    execFileSync(process.execPath, [CLI, 'save', 'rrf seed', '--type', 'decision',
+      '--importance', '2', '--project', 'projects--mem', '--lesson', 'use rrfMerge not naive union'],
+      { env: { ...process.env, CLAUDE_MEM_DIR: sb }, stdio: 'ignore', timeout: 20000 });
+  });
+  afterAll(() => { if (sb) { try { rmSync(sb, { recursive: true, force: true }); } catch { /* */ } } });
+
+  // CLAUDE_MEM_SUBAGENT_INJECT is cleared by default (it is set on in this project's
+  // settings.local.json for dogfood and would otherwise leak into the child — #87499fd).
+  const run = (payload, { on = false } = {}) => execFileSync(process.execPath, [SCRIPT], {
+    input: JSON.stringify(payload), encoding: 'utf8', timeout: 8000,
+    env: {
+      ...process.env, CLAUDE_MEM_DIR: sb, CLAUDE_PROJECT_DIR: REPO,
+      CLAUDE_MEM_HOOK_RUNNING: undefined,
+      CLAUDE_MEM_SUBAGENT_INJECT: on ? 'on' : undefined,
+    },
+  }).trim();
+
+  it('default OFF emits nothing (even for a matching Agent dispatch)', () => {
+    expect(run({ tool_name: 'Agent', tool_input: { prompt: 'refactor rrfMerge in tfidf' } })).toBe('');
+  });
+
+  it('enabled but non-Agent tool emits nothing', () => {
+    expect(run({ tool_name: 'Bash', tool_input: { command: 'ls' } }, { on: true })).toBe('');
+  });
+
+  it('enabled + Agent + matching lesson emits a valid PreToolUse updatedInput envelope', () => {
+    const out = run({ tool_name: 'Agent', tool_input: { subagent_type: 'general-purpose', description: 'x', prompt: 'refactor rrfMerge in tfidf' } }, { on: true });
+    const parsed = JSON.parse(out);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('PreToolUse');
+    expect(parsed.hookSpecificOutput.updatedInput.subagent_type).toBe('general-purpose');
+    expect(parsed.hookSpecificOutput.updatedInput.prompt.startsWith('refactor rrfMerge in tfidf')).toBe(true);
+    expect(parsed.hookSpecificOutput.updatedInput.prompt).toContain('use rrfMerge not naive union');
+  });
+
+  it('enabled + Agent + no identifier overlap emits nothing', () => {
+    expect(run({ tool_name: 'Agent', tool_input: { prompt: 'write a haiku about spring' } }, { on: true })).toBe('');
+  });
+
+  it('a >64KB prompt round-trips intact (stdout flush before exit — no truncation)', () => {
+    const big = 'refactor rrfMerge ' + 'x'.repeat(80000);
+    const out = run({ tool_name: 'Agent', tool_input: { prompt: big } }, { on: true });
+    const parsed = JSON.parse(out); // parses only if the full payload was flushed
+    expect(parsed.hookSpecificOutput.updatedInput.prompt.length).toBeGreaterThan(80000);
+    expect(parsed.hookSpecificOutput.updatedInput.prompt).toContain('use rrfMerge not naive union');
   });
 });

@@ -22,7 +22,10 @@ function readStdin() {
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (c) => {
       data += c;
-      if (data.length > 262144) { clearTimeout(timer); resolve(data.slice(0, 262144)); } // cap: agent prompts can be large
+      // cap: agent prompts can be large. destroy() so the loop can drain and exit on
+      // its own (see the no-forced-exit note at the bottom) rather than streaming to
+      // the 1.5s timeout.
+      if (data.length > 262144) { clearTimeout(timer); try { process.stdin.destroy(); } catch { /* */ } resolve(data.slice(0, 262144)); }
     });
     process.stdin.on('end', () => { clearTimeout(timer); resolve(data); });
     process.stdin.on('error', () => { clearTimeout(timer); resolve(data); });
@@ -60,4 +63,10 @@ async function main() {
   }
 }
 
-main().catch(() => {}).finally(() => process.exit(0));
+// No forced process.exit(0): every readStdin path ends/destroys stdin and db.close()
+// runs in main's finally, so the event loop drains and the process exits 0 on its own —
+// which FLUSHES stdout. The emitted updatedInput echoes the whole prompt back, so the
+// payload can exceed the ~64KB pipe buffer; a forced process.exit() would drop that
+// pending async write and truncate the JSON (the gotcha every sibling hook avoids).
+// Swallow any rejection so the exit code can never go non-zero.
+main().catch(() => {});
