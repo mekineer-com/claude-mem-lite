@@ -17,6 +17,7 @@ import { initSchema } from '../schema.mjs';
 import { insertSession, insertObs } from './test-helpers.mjs';
 import { formatSubagentContext } from '../lib/task-imperative.mjs';
 import { buildSubagentInjection } from '../hook-memory.mjs';
+import { inferProject } from '../utils.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -76,25 +77,32 @@ describe('buildSubagentInjection', () => {
 describe('pre-agent-inject.js (script plumbing, spawned)', () => {
   const SCRIPT = resolve(__dirname, '../scripts/pre-agent-inject.js');
   const CLI = resolve(__dirname, '../cli.mjs');
-  const REPO = resolve(__dirname, '..');
-  let sb;
+  let sb, project;
 
   beforeAll(() => {
     sb = mkdtempSync(join(tmpdir(), 'pai-spawn-'));
-    // Seed one importance>=2 lesson naming rrfMerge via the CLI, so the child's
-    // ensureDb() opens a schema-compatible DB at <sb>/claude-mem-lite.db.
+    // The script infers its project from CLAUDE_PROJECT_DIR (utils.inferProject). Pin
+    // that to sb and seed the lesson under the SAME inferred name, so they match
+    // regardless of the checkout path. A hardcoded --project only matched the author's
+    // machine; CI's checkout path infers a different name → selectImperativeLesson finds
+    // nothing → empty output → JSON.parse fails (the v3.33.1 CI red).
+    const prev = process.env.CLAUDE_PROJECT_DIR;
+    process.env.CLAUDE_PROJECT_DIR = sb;
+    project = inferProject();
+    if (prev === undefined) delete process.env.CLAUDE_PROJECT_DIR; else process.env.CLAUDE_PROJECT_DIR = prev;
     execFileSync(process.execPath, [CLI, 'save', 'rrf seed', '--type', 'decision',
-      '--importance', '2', '--project', 'projects--mem', '--lesson', 'use rrfMerge not naive union'],
+      '--importance', '2', '--project', project, '--lesson', 'use rrfMerge not naive union'],
       { env: { ...process.env, CLAUDE_MEM_DIR: sb }, stdio: 'ignore', timeout: 20000 });
   });
   afterAll(() => { if (sb) { try { rmSync(sb, { recursive: true, force: true }); } catch { /* */ } } });
 
   // CLAUDE_MEM_SUBAGENT_INJECT is cleared by default (it is set on in this project's
   // settings.local.json for dogfood and would otherwise leak into the child — #87499fd).
+  // CLAUDE_PROJECT_DIR = sb so the script infers the SAME project the lesson was seeded under.
   const run = (payload, { on = false } = {}) => execFileSync(process.execPath, [SCRIPT], {
     input: JSON.stringify(payload), encoding: 'utf8', timeout: 8000,
     env: {
-      ...process.env, CLAUDE_MEM_DIR: sb, CLAUDE_PROJECT_DIR: REPO,
+      ...process.env, CLAUDE_MEM_DIR: sb, CLAUDE_PROJECT_DIR: sb,
       CLAUDE_MEM_HOOK_RUNNING: undefined,
       CLAUDE_MEM_SUBAGENT_INJECT: on ? 'on' : undefined,
     },
