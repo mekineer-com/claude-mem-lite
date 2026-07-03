@@ -4,10 +4,10 @@
 
 import { readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, statSync } from 'fs';
 import { join, basename } from 'path';
-import { homedir } from 'os';
+import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 
 // D#29: honor CLAUDE_MEM_DIR (equals homedir when the env is unset).
-const MANAGED_DIR = join(process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite'), 'managed');
+const MANAGED_DIR = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'managed');
 const AGENTS_DIR = join(MANAGED_DIR, 'agents');
 
 const DRY_RUN = process.argv.includes('--dry-run');

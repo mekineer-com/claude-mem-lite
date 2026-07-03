@@ -26,15 +26,20 @@
 
 import { existsSync, mkdirSync, writeFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { dirname, join } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INSTALL_DIR = join(__dirname, '..');
-const RUNTIME_DIR = process.env.CLAUDE_MEM_DIR
-  ? join(process.env.CLAUDE_MEM_DIR, 'runtime')
-  : join(homedir(), '.claude-mem-lite', 'runtime');
+// A bogus CLAUDE_MEM_DIR ("undefined"/"null"/relative from a mis-quoted env
+// interpolation) must degrade to the default here, not become a stray dir. The
+// launcher's pure-node charter (above) forbids importing lib/resolve-data-dir.mjs,
+// and its fail-open duty forbids throwing, so mirror that guard inline + lenient:
+// non-absolute → default. Data-writing paths import that module and throw instead.
+const MEM_DIR = process.env.CLAUDE_MEM_DIR;
+const DATA_DIR = MEM_DIR && isAbsolute(MEM_DIR) ? MEM_DIR : join(homedir(), '.claude-mem-lite');
+const RUNTIME_DIR = join(DATA_DIR, 'runtime');
 const HEAL_MARKER = join(RUNTIME_DIR, 'hook-launcher-lastheal');
 const HEAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 // Observable breakage state: written when the launcher degrades a broken install

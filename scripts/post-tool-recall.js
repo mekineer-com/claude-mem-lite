@@ -15,11 +15,11 @@
 
 import { existsSync, readFileSync } from 'fs';
 import { basename, join } from 'path';
-import { homedir } from 'os';
+import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 
 const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
 
-const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
 const LEGACY_COOLDOWN_PATH = join(RUNTIME_DIR, 'pre-recall-cooldown.json');
 

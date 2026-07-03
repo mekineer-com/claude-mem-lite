@@ -7,6 +7,7 @@ import { join, resolve, dirname, isAbsolute } from 'path';
 import { homedir, tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'node:module';
+import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 
 const PROJECT_DIR = resolve(import.meta.dirname ?? dirname(fileURLToPath(import.meta.url)));
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
@@ -20,7 +21,7 @@ const DATA_DIR = join(homedir(), '.claude-mem-lite');
 // the runtime/data layer READS it (pre-fix: installer wrote homedir, runtime read
 // the relocated dir → preinstalled skills silently vanished, doctor read the wrong
 // DB). Equals DATA_DIR when CLAUDE_MEM_DIR is unset (the common case).
-const MEM_DATA_DIR = process.env.CLAUDE_MEM_DIR || DATA_DIR;
+const MEM_DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 const DB_PATH = join(MEM_DATA_DIR, 'claude-mem-lite.db');
 const OLD_DATA_DIR = join(homedir(), '.claude-mem');
 

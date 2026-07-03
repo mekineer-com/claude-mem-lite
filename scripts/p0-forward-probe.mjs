@@ -10,8 +10,9 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { homedir, tmpdir } from 'node:os';
 import { noisePenaltyClause } from '/mnt/data_ssd/dev/projects/mem/scoring-sql.mjs';
+import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 
-const MEM_DB = join(process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite'), 'claude-mem-lite.db');
+const MEM_DB = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'claude-mem-lite.db');
 const TRANSCRIPTS = join(homedir(), '.claude', 'projects', '-mnt-data-ssd-dev-projects-mem');
 const CUTOFF = Date.now() - 30 * 24 * 3600 * 1000;
 

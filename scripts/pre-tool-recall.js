@@ -6,7 +6,7 @@
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
-import { homedir } from 'os';
+import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
@@ -18,7 +18,7 @@ import { presentIdents } from '../lib/lesson-idents.mjs';
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
 // per-component overrides for tests that mix isolated + real paths.
-const DATA_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(DATA_DIR, 'claude-mem-lite.db');
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
 // A3 (v2.83): cross-hook dedup window — must mirror DEDUP_STALE_MS in

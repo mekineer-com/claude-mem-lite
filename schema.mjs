@@ -7,10 +7,11 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, chmodSync } from 'fs';
 import { OBS_FTS_COLUMNS, debugCatch } from './utils.mjs';
+import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 
 // DATA location — DB, managed resources, registry DB, runtime/. Honors
 // CLAUDE_MEM_DIR so users can relocate state to a larger/faster volume.
-export const DB_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+export const DB_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 export const DB_PATH = join(DB_DIR, 'claude-mem-lite.db');
 export const REGISTRY_DB_PATH = join(DB_DIR, 'resource-registry.db');
 // CODE / install location — server.mjs, hook.mjs, cli.mjs, package.json live

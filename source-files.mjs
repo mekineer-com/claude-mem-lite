@@ -29,6 +29,12 @@ export const SOURCE_FILES = [
   'tier.mjs', 'tfidf.mjs',
   'nlp.mjs', 'synonyms.mjs', 'scoring-sql.mjs', 'stop-words.mjs', 'project-utils.mjs',
   'secret-scrub.mjs', 'format-utils.mjs', 'hash-utils.mjs', 'bash-utils.mjs',
+  // Single source of truth for the CLAUDE_MEM_DIR → data-dir resolver (rejects a
+  // stringified "undefined"/"null"/relative env instead of creating a stray dir).
+  // Statically imported by schema.mjs / cli.mjs / install.mjs / registry-recommend.mjs
+  // AND hook scripts (pre-tool-recall / post-tool-recall / pre-skill-bridge) — ship it
+  // or auto-update leaves schema + every hook with ERR_MODULE_NOT_FOUND on each fire.
+  'lib/resolve-data-dir.mjs',
   // lib/ — statically imported by hook-llm.mjs (activity) + hook-handoff.mjs (git-state, task-reader);
   // dynamically imported by hook.mjs (startup-dashboard) + mem-cli.mjs (doctor-benchmark, plan-reader).
   'lib/activity.mjs',

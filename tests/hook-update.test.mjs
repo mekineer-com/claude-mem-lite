@@ -63,7 +63,12 @@ async function loadModule(env = {}) {
   vi.resetModules();
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
-  process.env.CLAUDE_MEM_DIR = env.CLAUDE_MEM_DIR;
+  // `process.env.X = undefined` coerces to the STRING "undefined", which the
+  // schema.mjs data-dir resolver now rejects (lib/resolve-data-dir.mjs). A test
+  // that doesn't relocate must leave CLAUDE_MEM_DIR truly UNSET, not "undefined"
+  // — mirror the afterEach delete instead of assigning a nullish value.
+  if (env.CLAUDE_MEM_DIR === undefined) delete process.env.CLAUDE_MEM_DIR;
+  else process.env.CLAUDE_MEM_DIR = env.CLAUDE_MEM_DIR;
   if (env.HOME) process.env.HOME = env.HOME;
   if (env.CLAUDE_PLUGIN_ROOT) process.env.CLAUDE_PLUGIN_ROOT = env.CLAUDE_PLUGIN_ROOT;
   return await import('../hook-update.mjs');

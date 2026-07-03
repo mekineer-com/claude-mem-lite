@@ -33,8 +33,10 @@ if (cmd === '--version' || cmd === '-v') {
   const { existsSync } = await import('fs');
   const { join } = await import('path');
   // D#29: honor CLAUDE_MEM_DIR so the install-vs-CLI help routing is correct on
-  // relocated installs (matches schema.mjs DB_DIR; HOME fallback when env unset).
-  const dataDir = process.env.CLAUDE_MEM_DIR || join(process.env.HOME || '', '.claude-mem-lite');
+  // relocated installs (matches schema.mjs DB_DIR via the shared resolver, which
+  // also fixes the HOME-unset relative-path fallback this branch used to have).
+  const { resolveDataDir } = await import('./lib/resolve-data-dir.mjs');
+  const dataDir = resolveDataDir(process.env.CLAUDE_MEM_DIR);
   const dbPath = join(dataDir, 'claude-mem-lite.db');
   if (existsSync(dbPath)) {
     const { run } = await import('./mem-cli.mjs');

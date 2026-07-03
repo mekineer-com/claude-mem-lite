@@ -6,12 +6,12 @@
 import Database from 'better-sqlite3';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { homedir } from 'os';
+import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { discoverAllManaged, withRelativePaths } from '../resource-discovery.mjs';
 
 // D#29: honor CLAUDE_MEM_DIR (offline indexer must read the same relocated data dir
 // install.mjs/registry-scanner use; equals homedir when the env is unset).
-const BASE_DIR = process.env.CLAUDE_MEM_DIR || join(homedir(), '.claude-mem-lite');
+const BASE_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 const MANAGED_DIR = join(BASE_DIR, 'managed');
 const DB_PATH = join(BASE_DIR, 'resource-registry.db');
 
