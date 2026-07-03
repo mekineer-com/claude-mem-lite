@@ -21,6 +21,7 @@ import {
   writePendingEntry,
   mergePendingEntries,
   episodeHasSignificantContent,
+  planEpisodeFlush,
 } from '../hook-episode.mjs';
 import { DB_DIR } from '../schema.mjs';
 
@@ -55,6 +56,78 @@ describe('hook-episode.mjs', () => {
   afterEach(() => {
     releaseLock();
     cleanupEpisodeFiles();
+  });
+
+  // ─── planEpisodeFlush ─────────────────────────────────────────────────────
+  describe('planEpisodeFlush', () => {
+    const mkEntry = (ccSession, file, tool = 'Edit') => ({
+      tool, desc: 'x', files: file ? [file] : [], ts: 1, isError: false,
+      isHardError: false, isSignificant: true, bashSig: null, ccSession,
+    });
+
+    it('single session → returns [episode] (same ref, behavior unchanged)', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.entries = [mkEntry('cc-A', '/a.js'), mkEntry('cc-A', '/b.js')];
+      const out = planEpisodeFlush(ep);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toBe(ep); // identity — single-group path must not clone
+    });
+
+    it('all-null (legacy/stdin-less) → single group, [episode] identity', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.entries = [mkEntry(null, '/a.js'), mkEntry(undefined, '/b.js')];
+      const out = planEpisodeFlush(ep);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toBe(ep);
+    });
+
+    it('two sessions interleaved → one sub-episode each, only its entries', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.filesRead = ['/read-shared.js'];
+      ep.entries = [
+        mkEntry('cc-A', '/a1.js'), mkEntry('cc-B', '/b1.js'), mkEntry('cc-A', '/a2.js'),
+      ];
+      const out = planEpisodeFlush(ep);
+      expect(out).toHaveLength(2);
+      const a = out.find(s => s.entries[0].ccSession === 'cc-A');
+      const b = out.find(s => s.entries[0].ccSession === 'cc-B');
+      expect(a.entries.map(e => e.files[0])).toEqual(['/a1.js', '/a2.js']);
+      expect(b.entries.map(e => e.files[0])).toEqual(['/b1.js']);
+    });
+
+    it('sub-episode files = union of that group entries files', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.entries = [mkEntry('cc-A', '/a1.js'), mkEntry('cc-B', '/b1.js'), mkEntry('cc-A', '/a1.js')];
+      const a = planEpisodeFlush(ep).find(s => s.entries[0].ccSession === 'cc-A');
+      expect(a.files).toEqual(['/a1.js']); // deduped union
+    });
+
+    it('filesRead inherited by every sub-episode; project/sessionId preserved', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.filesRead = ['/r1.js', '/r2.js'];
+      ep.entries = [mkEntry('cc-A', '/a.js'), mkEntry('cc-B', '/b.js')];
+      const out = planEpisodeFlush(ep);
+      for (const sub of out) {
+        expect(sub.filesRead).toEqual(['/r1.js', '/r2.js']);
+        expect(sub.project).toBe('proj');
+        expect(sub.sessionId).toBe('mem-s');
+      }
+    });
+
+    it('sub-episode carries no inherited savedId (each gets its own at flush)', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.savedId = 999; // simulate a stray parent id
+      ep.entries = [mkEntry('cc-A', '/a.js'), mkEntry('cc-B', '/b.js')];
+      for (const sub of planEpisodeFlush(ep)) {
+        expect(sub.savedId).toBeUndefined();
+      }
+    });
+
+    it('legacy null + tagged mix → __none__ group plus each tagged group', () => {
+      const ep = createEpisode('mem-s', 'proj');
+      ep.entries = [mkEntry(null, '/n.js'), mkEntry('cc-A', '/a.js')];
+      expect(planEpisodeFlush(ep)).toHaveLength(2);
+    });
   });
 
   // ─── createEpisode ──────────────────────────────────────────────────────

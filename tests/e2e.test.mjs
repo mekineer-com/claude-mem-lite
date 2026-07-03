@@ -327,6 +327,111 @@ describe('Suite 2: Episode Buffer Management', () => {
     }
   });
 
+  it('tags episode entries with the CC session_id', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('post-tool-use', {
+      stdin: JSON.stringify({
+        tool_name: 'Edit',
+        tool_input: { file_path: '/tmp/src/tag.js', old_string: 'a', new_string: 'b' },
+        tool_response: 'OK — edited file',
+        session_id: 'cc-sess-A',
+      }),
+      env: { HOME: tmpHome },
+    });
+    const epFile = getEpisodeFile(tmpHome);
+    expect(epFile).not.toBeNull();
+    const episode = JSON.parse(readFileSync(epFile, 'utf8'));
+    expect(episode.entries[0].ccSession).toBe('cc-sess-A');
+  });
+
+  it('two concurrent sessions in one buffer flush as separate observations', () => {
+    // CLAUDE_MEM_SKIP_EPISODE_LLM disables the detached llm-episode enrichment
+    // spawn so the assertion sees only the synchronous immediate observations
+    // (sibling of CLAUDE_MEM_SKIP_COMPRESS / _OPTIMIZE). CLAUDE_MEM_KEEP_LOW_SIGNAL
+    // stops the noise gate from dropping the trivial "Modified shared.js" change
+    // obs — orthogonal to grouping (merged→1, split→2, so toBe(2) still tests it).
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_EPISODE_LLM: '1', CLAUDE_MEM_KEEP_LOW_SIGNAL: '1' };
+    runHook('session-start', { env });
+    // Two sessions, DIFFERENT files: the buffer's 2-entry window (phase-transition
+    // only fires at entries.length >= 2) keeps both in ONE buffer, and distinct
+    // files give distinct obs titles so they aren't fuzzy-deduped into one. The
+    // split must therefore happen at flush (planEpisodeFlush), not via transition.
+    for (const [sid, file] of [['cc-A', '/tmp/src/alpha.js'], ['cc-B', '/tmp/src/beta.js']]) {
+      runHook('post-tool-use', {
+        stdin: JSON.stringify({
+          tool_name: 'Edit',
+          tool_input: { file_path: file, old_string: 'x', new_string: 'y' },
+          tool_response: 'OK — edited file',
+          session_id: sid,
+        }),
+        env,
+      });
+    }
+    // SessionStart(clear) flushes the leftover 2-session buffer; its receipt
+    // aggregates over the WHOLE episode (both sessions' entries), gated by
+    // anySignificant && RECEIPT_EVENTS — spec §4 #7.
+    const { stdout } = runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env });
+    expect(stdout).toMatch(/\[mem\] episode flushed: 2 entries/); // aggregate receipt, no throw
+
+    const db = openTestDb(tmpHome);
+    try {
+      const n = db.prepare('SELECT COUNT(*) c FROM observations').get().c;
+      expect(n).toBe(2); // one immediate observation per session group
+    } finally { db.close(); }
+  });
+
+  it('mixed significance: only the significant session-group produces an observation', () => {
+    // spec §4 #3. Session A does an Edit (significant); session B a benign Bash
+    // (no edit/error/build/test → insignificant). Both share one buffer (2-entry
+    // window), so the per-group significance gate in flushEpisodeGroup must drop
+    // B's group while saving A's.
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_EPISODE_LLM: '1', CLAUDE_MEM_KEEP_LOW_SIGNAL: '1' };
+    runHook('session-start', { env });
+    runHook('post-tool-use', {
+      stdin: JSON.stringify({
+        tool_name: 'Edit',
+        tool_input: { file_path: '/tmp/src/gamma.js', old_string: 'x', new_string: 'y' },
+        tool_response: 'OK — edited file', session_id: 'cc-A',
+      }), env,
+    });
+    runHook('post-tool-use', {
+      stdin: JSON.stringify({
+        tool_name: 'Bash',
+        tool_input: { command: 'pwd' },
+        tool_response: '/home/user/project/subdir', session_id: 'cc-B',
+      }), env,
+    });
+    runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env });
+    const db = openTestDb(tmpHome);
+    try {
+      expect(db.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(1);
+    } finally { db.close(); }
+  });
+
+  it('same-file concurrent sessions dedupe to one un-mixed observation (accepted limitation)', () => {
+    // spec §5 residual (honesty pin): when both sessions edit the SAME file, the
+    // two per-session immediate obs share the title "Modified same.js" and the
+    // Tier-1 Jaccard dedup collapses them to one. The win over the base bug holds
+    // — the survivor is ONE session's activity, not an A+B merged narrative — but
+    // "each session its own obs" is NOT achieved for the file-related case.
+    const env = { HOME: tmpHome, CLAUDE_MEM_SKIP_EPISODE_LLM: '1', CLAUDE_MEM_KEEP_LOW_SIGNAL: '1' };
+    runHook('session-start', { env });
+    for (const sid of ['cc-A', 'cc-B']) {
+      runHook('post-tool-use', {
+        stdin: JSON.stringify({
+          tool_name: 'Edit',
+          tool_input: { file_path: '/tmp/src/same.js', old_string: sid, new_string: sid + '!' },
+          tool_response: 'OK — edited file', session_id: sid,
+        }), env,
+      });
+    }
+    runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env });
+    const db = openTestDb(tmpHome);
+    try {
+      expect(db.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(1); // deduped, not 2
+    } finally { db.close(); }
+  });
+
   it('PostToolUse flush emits receipt JSON with correct event tag', () => {
     // v2.33.5: positive test for the PostToolUse receipt emission path.
     // Complements the Stop-must-not-emit assertion above — if a future edit

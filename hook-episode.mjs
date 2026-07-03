@@ -137,6 +137,39 @@ export function createEpisode(sessionId, project) {
 }
 
 /**
+ * Split an episode's entries by originating CC session so each concurrent
+ * session flushes as its own observation. Common path (single session, or all
+ * untagged/legacy entries) returns [episode] BY REFERENCE — behavior identical
+ * to pre-grouping. When >=2 sessions interleaved in one buffer, returns one
+ * sub-episode per session with its own entries + recomputed file union;
+ * filesRead (untagged bash reads-file) is inherited by every sub. Each sub
+ * resets savedId so it receives its own from its immediate-save (savedId is
+ * load-bearing: llm-episode upgrades the pre-saved obs by it).
+ * @param {object} episode
+ * @returns {object[]}
+ */
+export function planEpisodeFlush(episode) {
+  const groups = new Map();
+  for (const e of episode.entries) {
+    const key = e.ccSession ?? '__none__';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(e);
+  }
+  if (groups.size <= 1) return [episode];
+  const subs = [];
+  for (const [, entries] of groups) {
+    subs.push({
+      ...episode,
+      entries,
+      files: [...new Set(entries.flatMap(e => e.files || []))],
+      filesRead: episode.filesRead,
+      savedId: undefined,
+    });
+  }
+  return subs;
+}
+
+/**
  * Add file paths to an episode's file tracking set (deduped).
  * @param {object} episode The episode to update
  * @param {string[]} files Array of file paths to add

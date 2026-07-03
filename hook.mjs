@@ -31,7 +31,7 @@ import {
 import {
   readEpisodeRaw, episodeFile,
   acquireLock, releaseLock, readEpisode, writeEpisode,
-  createEpisode, addFileToEpisode,
+  createEpisode, addFileToEpisode, planEpisodeFlush,
   writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
 } from './hook-episode.mjs';
 import { cleanupClaudeMdLegacyBlock, buildSessionContextLines } from './hook-context.mjs';
@@ -162,77 +162,104 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
     episode.filesRead = episode.filesRead || [];
   }
 
-  const isSignificant = episodeHasSignificantContent(episode);
+  // Split by CC session so concurrent same-project sessions flush as separate
+  // observations. planEpisodeFlush returns [episode] BY REFERENCE for the common
+  // single-session (or all-legacy) case → flushEpisodeGroup(episode) is identical
+  // to pre-grouping. Two+ interleaved sessions each get their own sub-episode.
+  const subs = planEpisodeFlush(episode);
+  let anySignificant = false;
+  for (const sub of subs) {
+    const r = flushEpisodeGroup(sub);
+    if (r === 'writefail') {
+      // Single-group: preserve the original early return — buffer left un-unlinked
+      // for a later retry, no receipt. Multi-group: skip only the failed group and
+      // keep the rest. The asymmetry is safe: each group's immediate obs is persisted
+      // BEFORE its flush-file write, so re-flushing the whole buffer would re-emit
+      // already-saved groups as duplicate observations.
+      if (subs.length === 1) return;
+      continue;
+    }
+    if (r === 'significant') anySignificant = true;
+  }
 
-  // Immediate save: create rule-based observation for instant visibility.
-  // LLM background worker will upgrade title/narrative/importance later.
+  // Aggregate receipt over the whole episode, gated exactly as before
+  // (isSignificant → anySignificant). v2.33.4: Stop rejects hookSpecificOutput.
+  if (anySignificant && RECEIPT_EVENTS.has(hookEventName)) {
+    try {
+      const entries = episode.entries || [];
+      const toolCounts = {};
+      for (const e of entries) toolCounts[e.tool] = (toolCounts[e.tool] || 0) + 1;
+      const toolSummary = Object.entries(toolCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+        .map(([t, n]) => `${t}×${n}`)
+        .join(', ');
+      const lines = [`[mem] episode flushed: ${entries.length} entries (${toolSummary})`];
+      // v2.83: error→fix nudge lifted to lib/cite-back-hint.mjs::buildUnsavedBugfixHint
+      // so the wording (count + "Save now" verb) stays in sync with cite-back.
+      const bugfixHint = buildUnsavedBugfixHint(episode);
+      if (bugfixHint) lines.push(bugfixHint);
+      // v2.81: cite-back hint — fires when this episode edits a file that
+      // PreToolUse:Read/Edit nudged earlier in the same session. Precision
+      // signal (we know the file was warned about); orthogonal to the
+      // bugfix-shape nudge above and may co-fire.
+      const citeBack = loadCiteBackForEpisode(episode, RUNTIME_DIR);
+      if (citeBack) lines.push(citeBack);
+      // Trailing newline is REQUIRED: when this receipt flushes at SessionStart
+      // (leftover episode after /clear or /compact), the startup dashboard writes a
+      // second hookSpecificOutput object right after. Without the '\n' the two land
+      // back-to-back as `}{` on one line and Claude Code's line-based JSON parser
+      // drops both — losing the episode-flush / cite-back context exactly at the
+      // session boundary. Every other hookSpecificOutput write appends '\n'; this
+      // was the lone exception.
+      process.stdout.write(JSON.stringify({
+        suppressOutput: true,
+        hookSpecificOutput: {
+          hookEventName,
+          additionalContext: lines.join('\n'),
+        },
+      }) + '\n');
+    } catch { /* never block on receipt */ }
+  }
+
+  // Remove episode buffer AFTER spawning background workers to prevent concurrent overwrites
+  try { unlinkSync(episodeFile()); } catch {}
+}
+
+// Save one episode-shaped object: immediate rule-based observation (if
+// significant) + flush file + llm-episode enrichment spawn. Extracted from
+// flushEpisode so each CC-session slice (from planEpisodeFlush) flushes
+// independently and carries its OWN savedId into its OWN flush file — the
+// llm-episode worker upgrades the pre-saved obs by that id. Returns
+// 'significant' | 'insignificant' | 'writefail'. CLAUDE_MEM_SKIP_EPISODE_LLM
+// suppresses the detached enrichment spawn (test determinism; sibling of
+// CLAUDE_MEM_SKIP_COMPRESS / _OPTIMIZE) — the synchronous immediate obs still lands.
+function flushEpisodeGroup(ep) {
+  const isSignificant = episodeHasSignificantContent(ep);
+
+  // Immediate save: rule-based observation for instant visibility; the LLM
+  // background worker upgrades title/narrative/importance later.
   if (isSignificant) {
     try {
-      const obs = buildImmediateObservation(episode);
-      const id = saveObservation(obs, episode.project, episode.sessionId);
-      if (id) episode.savedId = id;
+      const obs = buildImmediateObservation(ep);
+      const id = saveObservation(obs, ep.project, ep.sessionId);
+      if (id) ep.savedId = id;
     } catch (e) { debugCatch(e, 'flushEpisode-immediateSave'); }
   }
 
-  // Write episode to flush file, then remove buffer AFTER spawn to prevent race
   const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
   try {
-    writeFileSync(flushFile, JSON.stringify(episode));
+    writeFileSync(flushFile, JSON.stringify(ep));
   } catch {
-    return;
+    return 'writefail';
   }
 
-  if (isSignificant) {
+  if (isSignificant && !process.env.CLAUDE_MEM_SKIP_EPISODE_LLM) {
     spawnBackground('llm-episode', flushFile);
-
-    // v2.33.1: structured flush receipt so Claude sees what mem just captured
-    // and the legacy error→fix nudge consolidates here. PostToolUse JSON with
-    // hookSpecificOutput.additionalContext reliably renders across CC variants;
-    // the old plain-text stdout write was invisible on some variants.
-    // v2.33.4: Stop event rejects hookSpecificOutput entirely — skip receipt.
-    if (RECEIPT_EVENTS.has(hookEventName)) {
-      try {
-        const entries = episode.entries || [];
-        const toolCounts = {};
-        for (const e of entries) toolCounts[e.tool] = (toolCounts[e.tool] || 0) + 1;
-        const toolSummary = Object.entries(toolCounts)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 3)
-          .map(([t, n]) => `${t}×${n}`)
-          .join(', ');
-        const lines = [`[mem] episode flushed: ${entries.length} entries (${toolSummary})`];
-        // v2.83: error→fix nudge lifted to lib/cite-back-hint.mjs::buildUnsavedBugfixHint
-        // so the wording (count + "Save now" verb) stays in sync with cite-back.
-        const bugfixHint = buildUnsavedBugfixHint(episode);
-        if (bugfixHint) lines.push(bugfixHint);
-        // v2.81: cite-back hint — fires when this episode edits a file that
-        // PreToolUse:Read/Edit nudged earlier in the same session. Precision
-        // signal (we know the file was warned about); orthogonal to the
-        // bugfix-shape nudge above and may co-fire.
-        const citeBack = loadCiteBackForEpisode(episode, RUNTIME_DIR);
-        if (citeBack) lines.push(citeBack);
-        // Trailing newline is REQUIRED: when this receipt flushes at SessionStart
-        // (leftover episode after /clear or /compact), the startup dashboard writes a
-        // second hookSpecificOutput object right after. Without the '\n' the two land
-        // back-to-back as `}{` on one line and Claude Code's line-based JSON parser
-        // drops both — losing the episode-flush / cite-back context exactly at the
-        // session boundary. Every other hookSpecificOutput write appends '\n'; this
-        // was the lone exception.
-        process.stdout.write(JSON.stringify({
-          suppressOutput: true,
-          hookSpecificOutput: {
-            hookEventName,
-            additionalContext: lines.join('\n'),
-          },
-        }) + '\n');
-      } catch { /* never block on receipt */ }
-    }
   } else {
     try { unlinkSync(flushFile); } catch {}
   }
-
-  // Remove episode buffer AFTER spawning background worker to prevent concurrent overwrites
-  try { unlinkSync(episodeFile()); } catch {}
+  return isSignificant ? 'significant' : 'insignificant';
 }
 
 // ─── PostToolUse Handler ────────────────────────────────────────────────────
@@ -294,6 +321,10 @@ async function handlePostToolUse() {
     isSignificant: EDIT_TOOLS.has(tool_name) ||
                    bashSig?.isSignificant || false,
     bashSig: bashSig || null,
+    // CC UUID from hook stdin — lets flushEpisode split a buffer shared by
+    // concurrent same-project sessions into per-session observations. Null for
+    // legacy/stdin-less invocations (→ single __none__ group = old behavior).
+    ccSession: hookData.session_id || null,
   };
 
   // Episode buffer management (locked to prevent TOCTOU race)
