@@ -68,4 +68,13 @@ async function main() {
   }));
 }
 
-main().catch(() => {}).finally(() => process.exit(0));
+// No forced process.exit(0): main() consumes stdin to EOF (or early-returns without
+// touching it) and holds no open handles (no DB, no timers), so the event loop drains
+// and the process exits 0 on its own — which FLUSHES the stdout nudge above. A forced
+// exit could drop that pending async write on a piped stdout (the v3.33.1 gotcha the
+// payload-bearing sibling hooks avoid). catch() keeps the exit code 0.
+// Swallow EPIPE: if Claude Code closes the read end before the async write drains, the
+// stream emits 'error' — without the (now-removed) forced exit, an unhandled one would
+// surface as a non-zero exit + stack. A hook must never fail loud on a dropped pipe.
+process.stdout.on('error', () => {});
+main().catch(() => {});

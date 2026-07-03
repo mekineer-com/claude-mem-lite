@@ -76,6 +76,27 @@ describe('saveObservation', () => {
     expect(row.text).toBe('auth jwt Uses RS256 signing');
   });
 
+  it('drops a low-yield change obs at the choke-point (substantive-title band, imp<2, no lesson)', () => {
+    // isLowYieldChangeObs targets change-rows with SUBSTANTIVE titles that isNoiseObservation
+    // (title-pattern keyed) misses. It previously ran ONLY on the LLM-success path
+    // (handleLLMEpisode:832); the pre-save write (buildImmediateObservation) bypassed it, so
+    // on LLM-failure — which keeps the pre-saved row — these low-yield change rows survived.
+    const obs = { type: 'change', title: 'Adjusted retry backoff in the API client', narrative: 'edited the client for the task', importance: 1, lessonLearned: null };
+    const id = saveObservation(obs, 'test', 'sess-1', db);
+    expect(id).toBeNull();
+    expect(db.prepare("SELECT COUNT(*) c FROM observations WHERE title = 'Adjusted retry backoff in the API client'").get().c).toBe(0);
+  });
+
+  it('keeps a change obs carrying a real lesson (gate is signal-gated, not a type blanket)', () => {
+    const obs = { type: 'change', title: 'Switched to connection pooling', narrative: 'refactor', importance: 1, lessonLearned: 'pool size must exceed worker count or requests deadlock' };
+    expect(saveObservation(obs, 'test', 'sess-1', db)).toBeGreaterThan(0);
+  });
+
+  it('keeps a change obs at importance>=2 (explicit signal overrides the low-yield gate)', () => {
+    const obs = { type: 'change', title: 'Reworked the auth token refresh flow', narrative: 'change', importance: 2, lessonLearned: null };
+    expect(saveObservation(obs, 'test', 'sess-1', db)).toBeGreaterThan(0);
+  });
+
   it('returns null for Tier 1 Jaccard dedup within 5 minutes', () => {
     const obs = { type: 'discovery', title: 'Fix login bug in auth module' };
     const id1 = saveObservation(obs, 'test', 'sess-1', db);
@@ -119,7 +140,7 @@ describe('saveObservation', () => {
 
   it('handles null concepts and facts arrays', () => {
     const id = saveObservation(
-      { type: 'change', title: 'Null arrays test', concepts: null, facts: null },
+      { type: 'change', title: 'Null arrays test', concepts: null, facts: null, importance: 2 },
       'test', 'sess-1', db
     );
     expect(id).toBeGreaterThan(0);
@@ -132,7 +153,7 @@ describe('saveObservation', () => {
 
   it('handles empty concepts and facts arrays', () => {
     const id = saveObservation(
-      { type: 'change', title: 'Empty arrays test', concepts: [], facts: [] },
+      { type: 'change', title: 'Empty arrays test', concepts: [], facts: [], importance: 2 },
       'test', 'sess-1', db
     );
     expect(id).toBeGreaterThan(0);
@@ -1753,6 +1774,9 @@ describe('persistHaikuSummary (T9 routing)', () => {
       title: 'refactored config loading',
       narrative: 'moved env parsing into loader',
       importance: 1,
+      // Real lesson so the low-yield-change gate keeps it — this test asserts change-type
+      // ROUTING (observations vs events), not the noise-drop behavior.
+      lesson_learned: 'extracting the loader clarifies config-path resolution order',
       files_modified: ['config.mjs'],
     }, { project: 'mem', session_id: 'sess-1' });
 

@@ -115,7 +115,7 @@ describe('startup dashboard (T10c)', () => {
     }
   });
 
-  test('surfaces handoff working_on when present', () => {
+  test('shows a continuation pointer (age signal, not the working_on content)', () => {
     const db = createTestDb();
     const text = buildDashboard({
       db, project: 'mem', projectPath: process.cwd(),
@@ -125,8 +125,12 @@ describe('startup dashboard (T10c)', () => {
         handoff: { created_at_epoch: Date.now() - 3600000, working_on: 'writing the plan' },
       },
     });
-    expect(text).toMatch(/Continuation/);
-    expect(text).toMatch(/writing the plan/);
+    // Pointer only — working_on CONTENT is delivered once by the <session-handoff> block
+    // (UserPromptSubmit), so the dashboard must NOT duplicate it into the model context.
+    // (This also means no replayed tool-XML can reach the dashboard surface anymore — the
+    // defang responsibility for working_on now lives solely in renderHandoffInjection.)
+    expect(text).toMatch(/Continuation available/);
+    expect(text).not.toMatch(/writing the plan/);
   });
 
   test('truncates tasks list to 3 with ellipsis', () => {
@@ -201,7 +205,29 @@ describe('startup dashboard (T10c)', () => {
         // handoff intentionally omitted to exercise the readRecentHandoff path
       },
     });
-    expect(text).toMatch(/resumable task/);
+    // DB-read path fired → the continuation pointer shows (working_on content itself is
+    // delivered by the <session-handoff> block, not the dashboard).
+    expect(text).toMatch(/Continuation available/);
+    expect(text).not.toMatch(/resumable task/);
+  });
+
+  test('does NOT show the continuation pointer for an exit handoff older than the injection expiry', () => {
+    const db = createTestDb();
+    // >7 days old — pickHandoffToInject filters it as expired, so the UserPromptSubmit
+    // injection could never deliver it. The dashboard must not promise a continuation it
+    // can't fulfill (batch2-reviewer Finding 1 regression guard).
+    db.prepare(`INSERT INTO session_handoffs (project, type, session_id, working_on, created_at_epoch)
+                VALUES ('mem', 'exit', 's1', 'ancient task', ?)`).run(Date.now() - 8 * 86400000);
+    const text = buildDashboard({
+      db, project: 'mem', projectPath: process.cwd(),
+      stubs: {
+        git: { changed: ['M x'], stashes: [], branch: 'main', headSha: 'abc' }, // ensure non-empty dashboard
+        tasks: [], plans: [],
+        // handoff omitted → exercises the age-filtered readRecentHandoff DB path
+      },
+    });
+    expect(text).not.toMatch(/Continuation/);
+    expect(text).not.toMatch(/ancient task/);
   });
 
   test('wall-clock under 200ms (perf budget)', () => {

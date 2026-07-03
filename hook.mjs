@@ -47,7 +47,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
@@ -62,6 +62,7 @@ import { extractTailAssistantText, extractStructuredSummary } from './lib/summar
 import { searchRelevantMemories, formatMemoryLine, selectImperativeLesson } from './hook-memory.mjs';
 import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
+import { gcOldMetricShards } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -795,6 +796,11 @@ function runSessionStartAutoMaintain(db) {
       const orphansRecovered = recoverOrphanedChildren(db, mctx);
       if (orphansRecovered > 0) debugLog('DEBUG', 'auto-maintain', `recovered ${orphansRecovered} orphaned compression children`);
 
+      // Heal lesson rows citation-decay buried at importance 0 under the old floor=0.
+      // Non-destructive (0→1 on lesson-bearing rows only); idempotent no-op once none remain.
+      const lessonsHealed = recoverBuriedLessons(db, mctx);
+      if (lessonsHealed > 0) debugLog('DEBUG', 'auto-maintain', `healed ${lessonsHealed} lesson rows buried at importance 0`);
+
       const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
       if (decayed > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed} stale observations`);
       if (idleMarked > 0) debugLog('DEBUG', 'auto-maintain', `marked ${idleMarked} idle as pending-purge`);
@@ -1098,6 +1104,9 @@ async function handleSessionStart() {
   gcStalePreRecallCooldowns();
   // Bound the shadow-recommendation log (daily JSONL shards, no GC at write time).
   try { gcOldShadowShards(); } catch { /* best-effort, never blocks SessionStart */ }
+  // Same for the opt-in metrics sink (RUNTIME_DIR's parent is DB_DIR). Runs even when
+  // metrics are disabled, so shards left by a since-toggled-off run still get pruned.
+  try { gcOldMetricShards(join(RUNTIME_DIR, '..')); } catch { /* best-effort */ }
 
   // Plugin cache self-heal: Claude Code auto-updates the marketplace plugin can
   // re-populate cache/<ver>/hooks/hooks.json, reintroducing duplicate hook

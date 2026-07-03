@@ -37,12 +37,16 @@ export function truncate(str, max = 80) {
 //      block would smuggle a privileged-channel instruction / fake tool-call narrative
 //      into the model's context. It can't escape its wrapper (class 1 closers are
 //      defanged), but a nested forged authority/tool tag is still an indirect-prompt-
-//      injection vector; strip the brackets so it reads as inert text. Other tags
-//      (<other-tag>) \u2014 and the attribute-bearing <invoke \u2026>/<parameter \u2026> forms \u2014 are
-//      deliberately left intact.
+//      injection vector; strip the brackets so it reads as inert text. Tool-call tags
+//      (<invoke \u2026>/<parameter \u2026>, bare + antml:-namespaced) are included: a prior turn's
+//      malformed tool-XML replayed through a handoff corrupted the continuation surface
+//      (mid-token truncation + model confusion), so replayed tool-XML must defang too.
+//      These carry attributes, so the match allows an optional attribute tail before the
+//      closing `>` \u2014 which also catches an attribute-bearing forgery of an authority tag
+//      (<system-reminder foo="\u2026">). Unrelated tags (<other-tag>) are left intact.
 // Reachable by editing files that contain these tokens \u2014 e.g. developing claude-mem-lite
 // itself, where source/observations carry the delimiter names.
-const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification|(?:antml:)?function_calls|(?:antml:)?function_results)>/gi;
+const CONTEXT_DELIMITER_RE = /<\/?(?:claude-mem-context|memory-context|session-handoff|system-reminder|task-notification|(?:antml:)?function_calls|(?:antml:)?function_results|(?:antml:)?invoke|(?:antml:)?parameter)(?:\s[^>]*)?>/gi;
 
 /**
  * Defang the literal context-block delimiter tags in user-derived text. Strips just the

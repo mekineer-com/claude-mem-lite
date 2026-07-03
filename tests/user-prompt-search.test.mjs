@@ -24,9 +24,38 @@ import {
 } from '../scripts/prompt-search-utils.mjs';
 // Importing the script runs main() once on load; with stdin closed (vitest) it
 // EOFs immediately and returns, so these pure exports are safe to import directly.
-import { extractTechIdentifiers, rowMatchesIdentifier, hasExplicitSignal } from '../scripts/user-prompt-search.js';
+import { extractTechIdentifiers, rowMatchesIdentifier, hasExplicitSignal, searchByFts } from '../scripts/user-prompt-search.js';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
+
+// ─── Unit Tests: searchByFts superseded exclusion ────────────────────────────
+
+describe('searchByFts — superseded exclusion (parity with path B + pre-tool-recall)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'mem-s1', project: 'p' });
+  });
+  afterEach(() => { try { db.close(); } catch {} });
+
+  it('excludes a superseded (de-dup loser) row, keeps the live one', () => {
+    // auto-dedup sets superseded_at but leaves compressed_into=0, so the compressed guard
+    // alone misses it. Query must filter superseded_at IS NULL like hook-memory:217 +
+    // pre-tool-recall:368. Verified RED-GREEN: without the filter searchByFts returns BOTH
+    // rows (scratchpad diagnostic), so the superseded id leaks into path A injection.
+    const supId = Number(insertObs(db, { sessionId: 'mem-s1', project: 'p', type: 'bugfix',
+      title: 'Superseded OAuth note', text: 'OAuth token refresh double-redirect race in the auth callback',
+      importance: 3, supersededAt: Date.now() }).lastInsertRowid);
+    const liveId = Number(insertObs(db, { sessionId: 'mem-s1', project: 'p', type: 'bugfix',
+      title: 'Live OAuth fix', text: 'OAuth token refresh double-redirect resolved via state parameter',
+      importance: 3 }).lastInsertRowid);
+
+    const { rows } = searchByFts(db, 'OAuth token refresh double-redirect', 'p', 10, null);
+    const ids = rows.map(r => r.id);
+    expect(ids).toContain(liveId);
+    expect(ids).not.toContain(supId);
+  });
+});
 
 // ─── Unit Tests: Skip Patterns ───────────────────────────────────────────────
 
@@ -949,6 +978,7 @@ describe('user-prompt-search subprocess integration', () => {
     );
     expect(stdout).toBe('');
   });
+
 
   // v2.34.5 Gap 1: prompts-table fallback. When observations FTS returns empty,
   // fall back to user_prompts_fts — user's own prior similar questions are

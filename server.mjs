@@ -17,7 +17,7 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
-  recoverOrphanedChildren,
+  recoverOrphanedChildren, recoverBuriedLessons,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS,
@@ -1139,6 +1139,10 @@ server.registerTool(
           // resurface unreachable children. Non-destructive — un-hide only, no delete.
           const orphans = recoverOrphanedChildren(db, mctx);
           if (orphans > 0) results.push(`Recovered ${orphans} orphaned compression children`);
+          // Heal lesson rows citation-decay buried at importance 0 (pre floor=1). 0→1 on
+          // lesson-bearing rows only; idempotent no-op once none remain.
+          const lessonsHealed = recoverBuriedLessons(db, mctx);
+          if (lessonsHealed > 0) results.push(`Healed ${lessonsHealed} lesson rows buried at importance 0`);
         }
 
         if (ops.includes('decay')) {

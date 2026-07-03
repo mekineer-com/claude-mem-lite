@@ -10,7 +10,7 @@ import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
   mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf, recoverOrphanedChildren,
-  selectFuzzyDedupeIds, maintenanceStats, hardDeleteCandidateCount,
+  recoverBuriedLessons, selectFuzzyDedupeIds, maintenanceStats, hardDeleteCandidateCount,
 } from '../lib/maintain-core.mjs';
 
 const DAY = 86400000;
@@ -81,6 +81,62 @@ describe('recoverOrphanedChildren (self-heal legacy orphans — keeper deleted p
     Number(insertObs(db, { sessionId: 'sess-b', project: 'proj-b', epochOffset: OLD, title: 'orphan b', compressedInto: 55555 }).lastInsertRowid);
     const recovered = recoverOrphanedChildren(db, { projectFilter: 'AND project = ?', baseParams: ['proj-a'] });
     expect(recovered).toBe(1); // only the proj-a orphan
+    db.close();
+  });
+});
+
+describe('recoverBuriedLessons (heal lesson rows citation-decay buried at importance 0)', () => {
+  test('lifts a lesson-bearing imp-0 row to 1; leaves non-lesson imp-0 + higher-imp rows alone', () => {
+    const db = freshDb();
+    const buriedLesson = add(db, { title: 'buried', importance: 0, lessonLearned: 'root cause + fix', injectionCount: 5 });
+    const buriedNoise  = add(db, { title: 'noise', importance: 0, lessonLearned: null, injectionCount: 5 });
+    const noneLesson   = add(db, { title: 'none-str', importance: 0, lessonLearned: 'none', injectionCount: 5 });
+    const liveLesson   = add(db, { title: 'live', importance: 2, lessonLearned: 'still useful' });
+
+    const healed = recoverBuriedLessons(db, ctx());
+
+    expect(healed).toBe(1);                       // only the buried lesson row
+    expect(get(db, buriedLesson, 'importance')).toBe(1);
+    expect(get(db, buriedNoise, 'importance')).toBe(0);   // non-lesson exhaust stays buried
+    expect(get(db, noneLesson, 'importance')).toBe(0);    // literal 'none' is not a lesson
+    expect(get(db, liveLesson, 'importance')).toBe(2);    // untouched
+    db.close();
+  });
+
+  test('idempotent — a second pass heals nothing', () => {
+    const db = freshDb();
+    add(db, { title: 'buried', importance: 0, lessonLearned: 'fix', injectionCount: 3 });
+    expect(recoverBuriedLessons(db, ctx())).toBe(1);
+    expect(recoverBuriedLessons(db, ctx())).toBe(0);
+    db.close();
+  });
+
+  test('never un-hides a compressed row (compressed_into set) even if it carries a lesson', () => {
+    const db = freshDb();
+    const hidden = add(db, { title: 'compressed', importance: 0, lessonLearned: 'fix', compressedInto: COMPRESSED_PENDING_PURGE });
+    expect(recoverBuriedLessons(db, ctx())).toBe(0);
+    expect(get(db, hidden, 'importance')).toBe(0);
+    db.close();
+  });
+
+  test('never lifts a superseded row (de-dup loser) back into injectability', () => {
+    // auto-dedup sets superseded_at but leaves compressed_into=0, so the compressed guard
+    // alone would miss it. The injection surfaces filter superseded_at IS NULL; this must too,
+    // or a superseded duplicate gets re-injected via user-prompt-search after healing.
+    const db = freshDb();
+    const superseded = add(db, { title: 'de-dup loser', importance: 0, lessonLearned: 'fix', supersededAt: Date.now() });
+    expect(recoverBuriedLessons(db, ctx())).toBe(0);
+    expect(get(db, superseded, 'importance')).toBe(0);
+    db.close();
+  });
+
+  test('respects projectFilter — only heals the scoped project', () => {
+    const db = freshDb();
+    add(db, { title: 'lesson a', importance: 0, lessonLearned: 'fix', injectionCount: 2 }); // proj-a (add default)
+    insertSession(db, { id: 'sess-b', project: 'proj-b' });
+    Number(insertObs(db, { sessionId: 'sess-b', project: 'proj-b', title: 'lesson b', importance: 0, lessonLearned: 'fix', injectionCount: 2 }).lastInsertRowid);
+    const healed = recoverBuriedLessons(db, { projectFilter: 'AND project = ?', baseParams: ['proj-a'] });
+    expect(healed).toBe(1); // only the proj-a lesson
     db.close();
   });
 });

@@ -86,7 +86,7 @@ describe('saveObservation populates observation_files', () => {
       title: 'edit two files',
       files: ['src/foo.js', 'src/bar.js'],
       filesRead: [],
-      importance: 1,
+      importance: 2,
     };
     const id = saveObservation(obs, 'test', 'test-sess', db);
     expect(id).not.toBeNull();

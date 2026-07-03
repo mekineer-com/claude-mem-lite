@@ -4,7 +4,7 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate, neutralizeContextDelimiters } from '../utils.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
@@ -265,7 +265,7 @@ export function rowMatchesIdentifier(row, idsLower) {
 // Each row includes `bm25_raw` (pre-multiplier bm25 magnitude) alongside the
 // composite `relevance`, so callers can distinguish raw-match strength from
 // importance/type/decay inflation.
-function searchByFts(db, queryText, project, limit, typeFilter) {
+export function searchByFts(db, queryText, project, limit, typeFilter) {
   const ftsQuery = sanitizeFtsQuery(queryText);
   if (!ftsQuery) return { rows: [], mode: null };
 
@@ -299,6 +299,7 @@ function searchByFts(db, queryText, project, limit, typeFilter) {
       AND o.importance >= 1
       AND o.created_at_epoch > ?
       AND COALESCE(o.compressed_into, 0) = 0
+      AND o.superseded_at IS NULL
       AND ${notLowSignalTitleClause('o')}
       ${typeClause}
     ORDER BY relevance
@@ -345,6 +346,7 @@ function searchByFile(db, files, project, limit) {
       WHERE o.project = ?
         AND o.importance >= 1
         AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
         AND o.created_at_epoch > ?
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
         AND ${notLowSignalTitleClause('o')}
@@ -420,6 +422,7 @@ function searchRecent(db, project, limit) {
     WHERE project = ?
       AND importance >= 1
       AND COALESCE(compressed_into, 0) = 0
+      AND superseded_at IS NULL
       AND created_at_epoch > ?
       AND ${notLowSignalTitleClause('')}
     ORDER BY created_at_epoch DESC
@@ -464,8 +467,10 @@ function formatResults(rows) {
   const lines = ['[mem] FYI — Related memories (continue your task):'];
   for (const r of rows) {
     const icon = typeIcon(r.type);
-    const title = truncate(r.title || '', 70);
-    const lesson = !QUIET_HOOKS && r.lesson_learned ? ` — ${truncate(r.lesson_learned, 50)}` : '';
+    // Defang replayed obs text before truncation: a poisoned title/lesson carrying tool-XML
+    // or a forged authority tag must not render as a live delimiter in this injected block.
+    const title = truncate(neutralizeContextDelimiters(r.title || ''), 70);
+    const lesson = !QUIET_HOOKS && r.lesson_learned ? ` — ${truncate(neutralizeContextDelimiters(r.lesson_learned), 50)}` : '';
     lines.push(`#${r.id} ${icon} ${title}${lesson}`);
   }
   return lines.join('\n');
@@ -479,7 +484,10 @@ function formatPromptResults(rows) {
   if (!rows || rows.length === 0) return null;
   const lines = ['[mem] FYI — Past similar questions (continue your task):'];
   for (const r of rows) {
-    const text = truncate((r.prompt_text || '').replace(/\s+/g, ' '), 80);
+    // prompt_text is a raw prior USER prompt — the highest-risk replayed class (this is
+    // exactly the column that carried malformed tool-XML into the handoff bug). Defang the
+    // delimiters, then collapse whitespace + truncate.
+    const text = truncate(neutralizeContextDelimiters(r.prompt_text || '').replace(/\s+/g, ' '), 80);
     lines.push(`P#${r.id} 💬 ${text}`);
   }
   return lines.join('\n');

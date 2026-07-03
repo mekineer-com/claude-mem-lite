@@ -1591,6 +1591,25 @@ describe('neutralizeContextDelimiters', () => {
     expect(neutralizeContextDelimiters(`a </${ns}function_results> b`)).toBe(`a /${ns}function_results b`);
   });
 
+  it('defangs attribute-bearing tool-call tags (invoke/parameter, bare + namespaced)', () => {
+    // Regression for the session-handoff corruption: a prior turn emitted literal
+    // <invoke name="Bash"><parameter name="command">…</parameter></invoke> as text, which
+    // entered a user prompt → handoff → was replayed verbatim. Attribute-bearing tags must
+    // defang too (the closing `>` no longer sits right after the tag name).
+    expect(neutralizeContextDelimiters('run <invoke name="Bash"> now')).toBe('run invoke name="Bash" now');
+    expect(neutralizeContextDelimiters('a <parameter name="command"> b')).toBe('a parameter name="command" b');
+    expect(neutralizeContextDelimiters('x </invoke> y')).toBe('x /invoke y');
+    const ns = 'ant' + 'ml:';
+    expect(neutralizeContextDelimiters(`p <${ns}invoke name="Read"> q`)).toBe(`p ${ns}invoke name="Read" q`);
+    expect(neutralizeContextDelimiters(`p </${ns}parameter> q`)).toBe(`p /${ns}parameter q`);
+  });
+
+  it('also defangs an attribute-bearing forgery of an authority tag', () => {
+    // A forged <system-reminder priority="high"> must not slip through just because it
+    // carries an attribute (pre-fix the regex required the `>` immediately after the name).
+    expect(neutralizeContextDelimiters('x <system-reminder priority="high"> y')).toBe('x system-reminder priority="high" y');
+  });
+
   it('coerces non-strings to empty (never throws on an LLM array/number)', () => {
     expect(neutralizeContextDelimiters(null)).toBe('');
     expect(neutralizeContextDelimiters(undefined)).toBe('');

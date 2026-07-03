@@ -5,8 +5,34 @@ import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSy
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
-  recordMetric, readMetrics, aggregateMetrics, formatSummary, timed, DEFAULT_WINDOW_DAYS,
+  recordMetric, readMetrics, aggregateMetrics, formatSummary, timed, DEFAULT_WINDOW_DAYS, gcOldMetricShards,
 } from '../lib/metrics.mjs';
+
+describe('gcOldMetricShards', () => {
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'metrics-gc-')); });
+  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  it('prunes shards older than retainDays, keeps recent + non-shard files', () => {
+    const dir = join(tmp, 'metrics');
+    mkdirSync(dir, { recursive: true });
+    const oldDate = new Date(Date.now() - 100 * 86400000).toISOString().slice(0, 10);
+    const recentDate = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+    writeFileSync(join(dir, `${oldDate}.jsonl`), '{}\n');
+    writeFileSync(join(dir, `${recentDate}.jsonl`), '{}\n');
+    writeFileSync(join(dir, 'not-a-shard.txt'), 'keep'); // non-shard untouched
+
+    const removed = gcOldMetricShards(tmp, 90);
+    expect(removed).toBe(1);
+    expect(existsSync(join(dir, `${oldDate}.jsonl`))).toBe(false);
+    expect(existsSync(join(dir, `${recentDate}.jsonl`))).toBe(true);
+    expect(existsSync(join(dir, 'not-a-shard.txt'))).toBe(true);
+  });
+
+  it('returns 0 when the metrics dir does not exist (no-op, no throw)', () => {
+    expect(gcOldMetricShards(tmp, 90)).toBe(0);
+  });
+});
 
 describe('metrics sink', () => {
   let tmp;

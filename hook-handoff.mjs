@@ -478,9 +478,12 @@ function renderHandoffFromRow(handoff, db, project) {
     if (summary && (summary.completed || summary.next_steps || summary.remaining_items)) {
       lines.push('');
       lines.push('<session-summary source="haiku">');
-      if (summary.completed) lines.push(summary.completed);
-      if (summary.remaining_items) lines.push(`Remaining: ${summary.remaining_items}`);
-      if (summary.next_steps) lines.push(`Next steps: ${summary.next_steps}`);
+      // Defang: these come from session_summaries, populated by Haiku OR by
+      // extractStructuredSummary over the assistant transcript tail — replayed text that can
+      // carry tool-XML / forged authority tags, same class as working_on above (audit MED-4).
+      if (summary.completed) lines.push(neutralizeContextDelimiters(summary.completed));
+      if (summary.remaining_items) lines.push(`Remaining: ${neutralizeContextDelimiters(summary.remaining_items)}`);
+      if (summary.next_steps) lines.push(`Next steps: ${neutralizeContextDelimiters(summary.next_steps)}`);
       lines.push('</session-summary>');
     }
   } catch {}

@@ -146,6 +146,22 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       return null;
     }
 
+    // Paired-gate DROP at the auto-capture choke-point (v3.35). isLowYieldChangeObs
+    // (type=change + imp<2 + no real lesson — the substantive-title band isNoiseObservation
+    // misses) previously ran ONLY on the LLM-success path (handleLLMEpisode). The pre-save
+    // write here and the LLM-failure fallback (which keeps the pre-saved row) both bypassed
+    // it, so template change-rows survived on LLM failure. Gate covers all three write paths.
+    // Runs BEFORE capNoiseImportance: the pre-assigned importance IS the rule signal for a
+    // provisional pre-save — an imp>=2 rule-triggered episode (config/error change) must land
+    // so it stays visible immediately, survives a total LLM failure (the keep-pre-saved
+    // branch), and keeps its original created_at for the later in-place upgrade. (A dropped
+    // pre-save is not lost on LLM success — that path clean-inserts a fresh row — but it loses
+    // those three.) capNoiseImportance then caps any title-noise survivor to imp=1 as before.
+    if (isLowYieldChangeObs(obs)) {
+      debugLog('saveObservation', `dropped low-yield change: ${truncate(obs.title || '', 60)}`);
+      return null;
+    }
+
     // v2.47 P0-3: importance cap for LOW_SIGNAL titles that kept the drop gate
     // open via importance>=2 but carry no lesson/facts signal. 341 rows in live
     // DB had imp=3 under these conditions (99.4% noise). Cap to 1 so they

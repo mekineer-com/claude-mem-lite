@@ -236,12 +236,24 @@ describe('applyCitationDecay', () => {
     expect(r.demoted_at).toBeLessThanOrEqual(Date.now());
   });
 
-  it('importance floor: uncited at importance=0 stays at 0, streak still resets', () => {
-    const id = makeObs({ importance: 0, uncited_streak: 2 });
+  it('importance floor=1: demote never drops a row below the injection-visibility boundary', () => {
+    // A row at imp=1, uncited past threshold, must NOT sink to 0. Both passive
+    // injection surfaces exclude imp=0 (pre-tool-recall >=2, user-prompt-search >=1),
+    // so a 0 is a one-way burial: never re-injected → never re-cited → never recovers.
+    // Floor=1 keeps it on the >=1 surface with a citation-recovery path.
+    const id = makeObs({ importance: 1, uncited_streak: 2 });
     applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
     const r = db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id);
-    expect(r.importance).toBe(0);
+    expect(r.importance).toBe(1);
     expect(r.uncited_streak).toBe(0);
+  });
+
+  it('legacy imp=0 row heals up to the floor on its next demote resolution', () => {
+    // Rows buried at 0 by the pre-fix floor lift back to 1 if ever resolved again
+    // (MAX(1, 0-1) = 1), so the floor change is self-healing for the injected path.
+    const id = makeObs({ importance: 0, uncited_streak: 2 });
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    expect(db.prepare('SELECT importance FROM observations WHERE id=?').get(id).importance).toBe(1);
   });
 
   it('partial cite: of injected {100, 200}, cited={100} → 100 promoted, 200 streak++', () => {
