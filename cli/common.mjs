@@ -89,6 +89,72 @@ export function rejectBareStringFlags(flags, keys) {
   return false;
 }
 
+// ─── Unknown-flag typo guard ─────────────────────────────────────────────────
+
+/**
+ * Union of every flag name any CLI command reads (parseArgs silently drops the rest).
+ * Over-inclusive BY DESIGN: a flag listed here that a given command ignores just means
+ * "no typo warning for it" — harmless. The only real risk is OMITTING a valid flag, and
+ * the edit-distance gate in suggestUnknownFlags() makes even that non-fatal (a distinct
+ * real flag rarely lands within distance 2 of another). Add new flags here when adding
+ * them to a command — same maintenance contract as JSON_SUPPORTED_CMDS in mem-cli.
+ */
+export const KNOWN_CLI_FLAGS = new Set([
+  'after', 'age-days', 'all', 'anchor', 'batch', 'before', 'benchmark', 'body', 'branch',
+  'capability-summary', 'category', 'closes-deferred', 'concepts', 'confirm', 'days', 'deep',
+  'detail', 'domain-tags', 'dry-run', 'enrich', 'execute', 'fields', 'file', 'files', 'floors',
+  'force', 'format', 'from', 'has', 'help', 'importance', 'include-compressed', 'include-noise',
+  'intent-tags', 'invocation-name', 'json', 'key', 'keywords', 'lesson', 'lesson-learned', 'limit',
+  'local-path', 'margins', 'max', 'memdir', 'merge-ids', 'metrics', 'name', 'narrative', 'no-deep',
+  'offset', 'ops', 'or', 'out', 'priority', 'project', 'quality', 'query', 'reason', 'repo-url',
+  'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'session-audit',
+  'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'tier', 'title',
+  'to', 'trigger-patterns', 'type', 'use-cases', 'verbose',
+]);
+
+/** Levenshtein distance, early-exit past `max` (cheap enough for a handful of flags). */
+function editDistance(a, b, max = 2) {
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > max) return max + 1;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= n; j++) {
+      const d = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] !== b[j - 1] ? 1 : 0));
+      cur[j] = d;
+      if (d < rowMin) rowMin = d;
+    }
+    if (rowMin > max) return max + 1; // whole row already past budget → give up
+    prev = cur;
+  }
+  return prev[n];
+}
+
+/**
+ * Detect likely-typo flags: names NOT in KNOWN_CLI_FLAGS but within edit distance 2 of
+ * a known flag. parseArgs silently drops unknown flags, so `save --improtance 3` used to
+ * persist the DEFAULT importance and `recent --projcte X` silently queried the inferred
+ * project — a typo produced a wrong result with zero signal. Returns [{flag, suggestion}].
+ * Unknown flags with NO close match are omitted: they may be a valid flag we didn't
+ * catalog, so silence beats a false alarm. Warning-only by contract — never fails.
+ * @param {object} flags Parsed flags from parseArgs.
+ * @returns {Array<{flag: string, suggestion: string}>}
+ */
+export function suggestUnknownFlags(flags) {
+  const result = [];
+  for (const key of Object.keys(flags)) {
+    if (!key || KNOWN_CLI_FLAGS.has(key)) continue;
+    let best = null, bestDist = 3;
+    for (const known of KNOWN_CLI_FLAGS) {
+      const d = editDistance(key, known);
+      if (d < bestDist) { bestDist = d; best = known; }
+    }
+    if (best && bestDist <= 2) result.push({ flag: key, suggestion: best });
+  }
+  return result;
+}
+
 // ─── Time Formatting ─────────────────────────────────────────────────────────
 
 /** "just now" / "5m ago" / "3h ago" / "2d ago" relative to now. */

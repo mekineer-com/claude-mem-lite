@@ -37,7 +37,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
-import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
+import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
@@ -3005,6 +3005,15 @@ export async function run(argv) {
   if (cmdArgs.includes('--help') || cmdArgs.includes('-h')) {
     cmdHelp();
     return;
+  }
+
+  // Typo guard: parseArgs silently DROPS unknown flags, so `save --improtance 3` used to
+  // persist the DEFAULT importance and `recent --projcte X` silently queried the inferred
+  // project — a misspelled flag changed results with zero signal. Warn (stderr, non-fatal)
+  // when a flag looks like a misspelling of a real one; stdout + exit code stay untouched,
+  // so JSON/text consumers are unaffected. Mirrors the unknown-COMMAND suggester in cli.mjs.
+  for (const { flag, suggestion } of suggestUnknownFlags(parseArgs(cmdArgs).flags)) {
+    process.stderr.write(`[mem] Unknown flag --${flag}; did you mean --${suggestion}?\n`);
   }
 
   // adopt / unadopt do pure filesystem work on ~/.claude/projects/<encoded>/memory/ —

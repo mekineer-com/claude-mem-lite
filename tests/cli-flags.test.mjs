@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { parseIntFlag, isNumericToken } from '../lib/cli-flags.mjs';
+import { suggestUnknownFlags, KNOWN_CLI_FLAGS } from '../cli/common.mjs';
 
 describe('parseIntFlag', () => {
   it('returns defaultValue when input is undefined / null / empty', () => {
@@ -119,5 +120,42 @@ describe('isNumericToken', () => {
     for (const bad of ['2abc', '3xyz', '0x10', '1e2', 'abc', '', '   ', 'NaN', 'Infinity']) {
       expect(isNumericToken(bad), `"${bad}" should be rejected`).toBe(false);
     }
+  });
+});
+
+// parseArgs silently drops unknown flags, so a misspelled flag (`--improtance 3`,
+// `--projcte X`, `--lmit 5`) changed results with zero signal. suggestUnknownFlags
+// catches likely typos (edit distance <= 2 from a known flag) without false-alarming
+// on valid flags or truly-novel names.
+describe('suggestUnknownFlags', () => {
+  it('flags a misspelled flag with the closest known suggestion', () => {
+    expect(suggestUnknownFlags({ improtance: '3' })).toEqual([{ flag: 'improtance', suggestion: 'importance' }]);
+    expect(suggestUnknownFlags({ projcte: 'x' })).toEqual([{ flag: 'projcte', suggestion: 'project' }]);
+    expect(suggestUnknownFlags({ lmit: '5' })).toEqual([{ flag: 'lmit', suggestion: 'limit' }]);
+  });
+
+  it('never warns on a valid flag', () => {
+    // Every catalogued flag must round-trip clean — else a correct invocation gets a
+    // spurious "did you mean" note. Guards against KNOWN_CLI_FLAGS omissions.
+    for (const known of KNOWN_CLI_FLAGS) {
+      expect(suggestUnknownFlags({ [known]: 'v' }), `--${known} must not warn`).toEqual([]);
+    }
+  });
+
+  it('stays silent for a truly-novel flag with no close match', () => {
+    // No close match => could be a valid flag we did not catalogue; silence beats a
+    // confusing wrong suggestion.
+    expect(suggestUnknownFlags({ xyzzy: '1' })).toEqual([]);
+    expect(suggestUnknownFlags({ 'completely-different-flag': true })).toEqual([]);
+  });
+
+  it('ignores the empty-string key from a bare `--`', () => {
+    expect(suggestUnknownFlags({ '': true })).toEqual([]);
+  });
+
+  it('reports multiple typos in one invocation', () => {
+    const result = suggestUnknownFlags({ improtance: '3', lmit: '5' });
+    expect(result).toHaveLength(2);
+    expect(result.map(r => r.flag).sort()).toEqual(['improtance', 'lmit']);
   });
 });

@@ -36,6 +36,29 @@ describe('resolveProject', () => {
     expect(resolveProject(db, 'unknown')).toBe('unknown');
   });
 
+  it('exact project name beats a substring match on a bigger project', () => {
+    // Regression: a project literally named 'p' (no "--") was shadowed by the
+    // substring fallback `%p%`, which matched every "projects--*" row and returned
+    // the biggest one (projects--mem), making project 'p' unreachable via --project.
+    insertSession(db, { id: 's1', project: 'projects--mem' });
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { sessionId: 's1', project: 'projects--mem', title: `big ${i}` });
+    }
+    insertSession(db, { id: 's2', project: 'p' });
+    insertObs(db, { sessionId: 's2', project: 'p', title: 'the p project' });
+    expect(resolveProject(db, 'p')).toBe('p');
+  });
+
+  it('canonical suffix match still wins over a stray exact short name', () => {
+    // Design intent preserved: when both "projects--mem" and a stray "mem" exist,
+    // typing "mem" resolves to the canonical (higher-data) form, NOT the stray.
+    insertSession(db, { id: 's1', project: 'projects--mem' });
+    insertObs(db, { sessionId: 's1', project: 'projects--mem', title: 'canonical' });
+    insertSession(db, { id: 's2', project: 'mem' });
+    insertObs(db, { sessionId: 's2', project: 'mem', title: 'stray' });
+    expect(resolveProject(db, 'mem')).toBe('projects--mem');
+  });
+
   it('caches resolved names across calls', () => {
     insertSession(db, { id: 's1', project: 'projects--cached' });
     insertObs(db, { sessionId: 's1', project: 'projects--cached', title: 'test' });

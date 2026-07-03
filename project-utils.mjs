@@ -32,6 +32,17 @@ export function resolveProject(db, name) {
   ).get(`%--${name}`);
   if (suffixed) { _cache.set(name, suffixed.project); return suffixed.project; }
 
+  // 1.5) Exact-name match: a project literally named "p" (e.g. inferProject() at a
+  // filesystem-root cwd yields no "--", or a manually-saved bare name). MUST beat the
+  // fuzzy prefix/substring fallbacks below — otherwise `%p%` matches every "projects--*"
+  // row and ORDER BY COUNT(*) returns the biggest UNRELATED project, making the exact
+  // project permanently unreachable via --project. Ranks below step 1 only, preserving
+  // the documented "prefer canonical parent--name over a stray short name" intent.
+  const exact = db.prepare(
+    'SELECT project FROM observations WHERE project = ? LIMIT 1'
+  ).get(name);
+  if (exact) { _cache.set(name, exact.project); return exact.project; }
+
   // 2) Prefix-in-suffix match: "code-graph" → "projects--code-graph-mcp"
   const prefixed = db.prepare(
     'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
