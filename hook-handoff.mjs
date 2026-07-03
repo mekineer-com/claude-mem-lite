@@ -136,10 +136,13 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     try {
       const tasks = taskReaderModule.readProjectTasks({ projectPath: process.cwd() });
       if (tasks.length > 0) {
+        // Join with the ENTRY separator ('; '), NOT '\n': extractUnfinishedSummary
+        // and renderHandoffFromRow split pending work on UNFINISHED_ENTRY_SEP, so a
+        // '\n'-join collapsed the whole task list into one unreadable multi-line bullet.
         unfinished = tasks
           .slice(0, 5)
           .map(t => `[${t.status}] ${t.title}`)
-          .join('\n');
+          .join(UNFINISHED_ENTRY_SEP);
       }
     } catch { /* task reader is best-effort; never block handoff */ }
   }
@@ -227,7 +230,7 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     project, type, storedSessionId,
     truncate(safe.working_on, 1000),
     safe.completed,
-    safe.unfinished.length > 3000 ? safe.unfinished.slice(0, 2999) + '…' : safe.unfinished,
+    safe.unfinished.length > 3000 ? Array.from(safe.unfinished).slice(0, 2999).join('') + '…' : safe.unfinished,
     safeKeyFiles,
     safe.key_decisions,
     safe.match_keywords,
@@ -441,7 +444,10 @@ function renderHandoffFromRow(handoff, db, project) {
   if (handoff.key_files) {
     try {
       const files = JSON.parse(handoff.key_files);
-      if (files.length > 0) lines.push('## Key Files', files.map(f => basename(f)).join(', '), '');
+      // Defang basenames too: a filename on disk can contain a literal authority tag
+      // (Linux allows almost any char but '/'), and this is the one field in this block
+      // that was rendered raw while working_on/unfinished/key_decisions all neutralize.
+      if (files.length > 0) lines.push('## Key Files', neutralizeContextDelimiters(files.map(f => basename(f)).join(', ')), '');
     } catch {}
   }
   if (handoff.key_decisions) {

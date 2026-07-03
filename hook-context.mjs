@@ -79,6 +79,11 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified, lesson_learned
     FROM observations
     WHERE project = ? AND COALESCE(compressed_into, 0) = 0
+      -- superseded invisibility: auto-dedup (hook.mjs) sets superseded_at but leaves
+      -- compressed_into=0, so the compressed filter alone lets the hidden near-duplicate
+      -- resurface in the most-visible surface (injected every SessionStart). Sibling
+      -- keyObs already filters this; obsPool + fallbackObs must match.
+      AND superseded_at IS NULL
       AND ${notLowSignalTitleClause('')}
       AND (
         (created_at_epoch > ? AND importance >= 1)
@@ -116,7 +121,12 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const lessonBoost = o.lesson_learned ? 1.3 : 1.0;
     const value = recency * typeQuality * impBoost * lessonBoost;
-    const cost = estimateTokens((o.title || '') + (o.narrative || ''));
+    // Cost = ONLY what is injected. The Recent table renders title-only (narrative is neither
+    // pushed nor emitted), so charging title+narrative made the budget measure ~5x the real
+    // injected size — it filled to ~44% of capacity and, worse, the √cost density term penalized
+    // long-narrative rows that cost nothing to inject. Title-only cost fills the budget with the
+    // rows actually shown and makes valueDensity = value per injected token.
+    const cost = estimateTokens(o.title || '');
     return { ...o, value, cost, valueDensity: cost > 0 ? value / Math.sqrt(cost) : 0 };
   });
 
@@ -294,6 +304,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
       SELECT id, type, title, project, created_at
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
         AND (
           (created_at_epoch > ? AND importance >= 1)
           OR (created_at_epoch > ? AND importance >= 2)

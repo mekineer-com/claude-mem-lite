@@ -118,12 +118,13 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
       try {
         const ep = readEpisodeRaw();
         if (ep && ep.entries && ep.entries.length > 0) {
-          // Persist a rule-based observation synchronously BEFORE writing the flush
-          // file — that file has no consumer, so this is the only thing that prevents
-          // the in-flight episode being lost on abnormal termination (audit #6).
+          // Persist a rule-based observation synchronously — the ONLY thing that
+          // salvages the in-flight episode on abnormal termination (audit #6). A
+          // detached llm-episode child can't be spawned from a dying process, so no
+          // ep-flush-* file is written here: it would have NO consumer AND would make
+          // every later handleLLMSummary poll the full CLAUDE_MEM_FLUSH_TIMEOUT (~15s)
+          // waiting for a file that only the 24h orphan-sweep ever removes.
           saveEpisodeImmediate(ep);
-          const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-          writeFileSync(flushFile, JSON.stringify(ep));
           try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
         }
       } catch {}
@@ -468,16 +469,24 @@ async function handleStop() {
         if (episode && episode.entries && episode.entries.length > 0 && episodeHasSignificantContent(episode)) {
           if (!episode.sessionId) episode.sessionId = sessionId;
           if (!episode.project) episode.project = project;
-          // Immediate save: persist rule-based observation to DB before spawning background worker.
-          // Without this, data is lost if the background worker fails.
-          try {
-            const obs = buildImmediateObservation(episode);
-            const id = saveObservation(obs, episode.project, episode.sessionId);
-            if (id) episode.savedId = id;
-          } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
-          const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-          writeFileSync(flushFile, JSON.stringify(episode));
-          spawnBackground('llm-episode', flushFile);
+          // Split by CC session before saving — parity with flushEpisode's non-contended path
+          // (v3.35.2). Without this, the lock-contended fallback re-merged exactly the interleaved
+          // concurrent-session buffers v3.35.2 split apart, co-attributing two sessions' work into
+          // one garbled observation. planEpisodeFlush returns [episode] by reference for the common
+          // single-session case, so this is a no-op there. Immediate-save each group BEFORE its
+          // flush-file write (same ordering as flushEpisodeGroup) so a worker crash can't lose it.
+          for (const sub of planEpisodeFlush(episode)) {
+            if (!sub.sessionId) sub.sessionId = sessionId;
+            if (!sub.project) sub.project = project;
+            try {
+              const obs = buildImmediateObservation(sub);
+              const id = saveObservation(obs, sub.project, sub.sessionId);
+              if (id) sub.savedId = id;
+            } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
+            const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
+            writeFileSync(flushFile, JSON.stringify(sub));
+            spawnBackground('llm-episode', flushFile);
+          }
         }
       } finally {
         try { unlinkSync(claimFile); } catch {}

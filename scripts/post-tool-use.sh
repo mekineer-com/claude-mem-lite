@@ -22,6 +22,12 @@ if [[ "$tool" == "Read" ]]; then
   if [[ "$input" =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
     file_path="${BASH_REMATCH[1]}"
     _dir="${CLAUDE_PROJECT_DIR:-$PWD}"
+    # Strip trailing slashes so ${_dir##*/} / ${_dir%/*} match Node's path.basename /
+    # path.dirname in inferProject(). Without this, CLAUDE_PROJECT_DIR="/org/proj/"
+    # gave bash "proj--" (empty base) while JS gave "org--proj" — a name mismatch that
+    # made flushEpisode read a DIFFERENT reads-<project>.txt, silently dropping this
+    # session's Read context AND orphaning the bash-named file (nothing ever collects it).
+    while [[ "$_dir" == */ && ${#_dir} -gt 1 ]]; do _dir="${_dir%/}"; done
     _base="${_dir##*/}"
     _parent="${_dir%/*}"; _parent="${_parent##*/}"
     if [[ -n "$_parent" && "$_parent" != "." && "$_parent" != "/" ]]; then
@@ -29,8 +35,11 @@ if [[ "$tool" == "Read" ]]; then
     else
       project="${_base}"
     fi
-    # Sanitize project name to match utils.mjs inferProject()
+    # Sanitize + truncate to 100 to match utils.mjs inferProject() EXACTLY
+    # (raw.replace(/[^a-zA-Z0-9_.-]/g,'-').slice(0,100)). A >100-char parent--base
+    # otherwise diverges from the JS side (same reads-file mismatch as above).
     project="${project//[^a-zA-Z0-9_.-]/-}"
+    project="${project:0:100}"
     project="${project:-unknown}"
     # Honor CLAUDE_MEM_DIR relocation (mirrors schema.mjs DB_DIR → hook-shared RUNTIME_DIR).
     # hook.mjs flushEpisode reads reads-<project>.txt from CLAUDE_MEM_DIR/runtime; if this

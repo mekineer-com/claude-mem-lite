@@ -62,8 +62,9 @@ const RESOURCES_SCHEMA = `
 `;
 
 // Canonical FTS5 column order — all consumers must use this order.
-// BM25 weights (positional): trigger_patterns(5), keywords(3), capability_summary(3),
+// BM25 weights (positional): trigger_patterns(3), keywords(3), capability_summary(3),
 //   intent_tags(2), use_cases(2), domain_tags(1), tech_stack(1), name(1)
+//   — must match the bm25(resources_fts, 3,3,3,2,2,1,1,1) call in COMPOSITE_EXPR.
 const FTS5_SCHEMA = `
   CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(
     trigger_patterns,
@@ -371,12 +372,23 @@ const UPSERT_SQL = `
     repo_stars=CASE WHEN excluded.repo_stars > 0 THEN excluded.repo_stars ELSE repo_stars END,
     local_path=excluded.local_path, file_hash=excluded.file_hash,
     invocation_name=CASE WHEN excluded.invocation_name != '' THEN excluded.invocation_name ELSE invocation_name END,
-    intent_tags=excluded.intent_tags, domain_tags=excluded.domain_tags,
-    action_type=excluded.action_type, trigger_patterns=excluded.trigger_patterns,
-    capability_summary=excluded.capability_summary, input_type=excluded.input_type,
-    output_type=excluded.output_type, prerequisites=excluded.prerequisites,
-    keywords=excluded.keywords, tech_stack=excluded.tech_stack,
-    use_cases=excluded.use_cases, complexity=excluded.complexity,
+    -- Preserve-on-empty (mirror repo_stars/invocation_name above): a PARTIAL re-upsert --
+    -- e.g. "registry import --name X --capability-summary ...", where mem-cli defaults every
+    -- other flag to '' -- must NOT blank the FTS text columns and silently drop the resource
+    -- out of search (import is the ONLY registry edit path; there is no update subcommand).
+    -- Full upserts are unaffected: every field is non-empty, so the CASE picks excluded.
+    intent_tags=CASE WHEN excluded.intent_tags != '' THEN excluded.intent_tags ELSE intent_tags END,
+    domain_tags=CASE WHEN excluded.domain_tags != '' THEN excluded.domain_tags ELSE domain_tags END,
+    action_type=CASE WHEN excluded.action_type != '' THEN excluded.action_type ELSE action_type END,
+    trigger_patterns=CASE WHEN excluded.trigger_patterns != '' THEN excluded.trigger_patterns ELSE trigger_patterns END,
+    capability_summary=CASE WHEN excluded.capability_summary != '' THEN excluded.capability_summary ELSE capability_summary END,
+    input_type=CASE WHEN excluded.input_type != '' THEN excluded.input_type ELSE input_type END,
+    output_type=CASE WHEN excluded.output_type != '' THEN excluded.output_type ELSE output_type END,
+    prerequisites=excluded.prerequisites,
+    keywords=CASE WHEN excluded.keywords != '' THEN excluded.keywords ELSE keywords END,
+    tech_stack=CASE WHEN excluded.tech_stack != '' THEN excluded.tech_stack ELSE tech_stack END,
+    use_cases=CASE WHEN excluded.use_cases != '' THEN excluded.use_cases ELSE use_cases END,
+    complexity=excluded.complexity,
     indexed_at=excluded.indexed_at, updated_at=datetime('now')
 `;
 

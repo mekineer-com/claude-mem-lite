@@ -13,7 +13,7 @@ export const SOURCE_FILES = [
   'plugin-cache-guard.mjs',
   'haiku-client.mjs', 'utils.mjs', 'schema.mjs',
   'package.json', 'package-lock.json', 'skill.md',
-  'registry.mjs', 'registry-scanner.mjs', 'registry-indexer.mjs',
+  'registry.mjs', 'registry-scanner.mjs',
   'registry-retriever.mjs', 'resource-discovery.mjs',
   // registry-recommend.mjs: statically imported by hook.mjs (PostToolUse adoption probe)
   // and scripts/user-prompt-search.js (UserPromptSubmit shadow recommendation).

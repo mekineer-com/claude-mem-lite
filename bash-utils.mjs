@@ -53,7 +53,13 @@ function isExcludedPath(p) {
  * @returns {{isError: boolean, isTest: boolean, isBuild: boolean, isGit: boolean, isDeploy: boolean, isSignificant: boolean}}
  */
 export function detectBashSignificance(input, response) {
-  const cmd = (input.command || '').toLowerCase();
+  // Coerce command to a string at the source. A malformed PostToolUse payload can
+  // hand us a non-string `command` (object/number); `(input.command||'').toLowerCase()`
+  // then threw, and this is called UNGUARDED in the hottest hook path (hook.mjs:309) —
+  // the throw propagated to main()'s exit(0), dropping the ENTIRE tool event (no episode
+  // entry, not even a pending file). A non-string command has nothing to analyze, so
+  // degrading to '' (no significance) is the correct, event-preserving fallback.
+  const cmd = (typeof input?.command === 'string' ? input.command : '').toLowerCase();
   // Skip error keyword matching only when the PRIMARY command is a read/search op (its
   // output naturally contains "error"-like keywords that aren't failures). Anchored on the
   // primary command — NOT "search verb appears anywhere" — so `npm run build 2>&1 | tail`

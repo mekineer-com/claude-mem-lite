@@ -454,12 +454,19 @@ export async function deepSearch(db, params, { llm, searchFn = defaultSearchFn, 
     // it does on the single-query baseline path, so "never worse than baseline"
     // holds in the error dimension too — a DB failure must not be silently
     // swallowed into an empty result (F5). Only rewrite variants are best-effort.
-    if (i === 0) return searchFn(db, v, params) || [];
-    try {
-      return searchFn(db, v, params) || [];
-    } catch {
-      return [];
-    }
+    let list;
+    if (i === 0) list = searchFn(db, v, params) || [];
+    else { try { list = searchFn(db, v, params) || []; } catch { list = []; } }
+    // rrfFuseN fuses by array index as rank, so each list MUST already be in
+    // composite-score order. searchObservationsHybrid appends downweighted
+    // concept(×0.7)/PRF(×0.6) expansion rows to the TAIL unsorted and, on the
+    // vectors-disabled path, returns BEFORE the sort its vector arm applies
+    // (search-engine.mjs:430) — so a sparse variant (common in deep search, the
+    // vocabulary-mismatch path) would hand a tail-ranked expansion row to RRF at a
+    // worse rank than its score earns. Sort so index == composite rank, mirroring
+    // the in-engine sort that already guards the vector-RRF merge.
+    list.sort((a, b) => (a.score ?? 0) - (b.score ?? 0));
+    return list;
   });
 
   const fused = rrfFuseN(lists, rrfK);

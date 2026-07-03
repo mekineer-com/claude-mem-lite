@@ -75,22 +75,35 @@ export const CONTINUE_KEYWORDS = /继续|接着|上次|之前的|前面的|刚�
 // caller will ever pick up, so sweeping them on SessionStart is safe.
 export const ORPHAN_EPISODE_AGE_MS = 60 * 60 * 1000;
 
-// Sweep stale `ep-flush-*` and `pending-*` files in `runtimeDir` whose mtime
-// is older than `ageMs` (default 1h). Returns the number of files removed.
-// fs-only — no DB / no network. Used by handleSessionStart auto-maintain to
-// prevent the doctor "Stale temp files" warning from accumulating across
-// crashes; equivalent to the manual path in `node install.mjs cleanup` but
-// age-gated so concurrent in-flight workers are never raced.
-export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE_MS, now = Date.now() } = {}) {
+// `reads-<project>.txt` (bash fast-path Read tracker) is consumed by flushEpisode's
+// rename-collect on the next edit-flush, NOT by a background worker — so a project
+// that reads but never triggers an edit-flush leaves it uncollected and unswept, and
+// it grows without bound (the 1h episode threshold is far too eager: a long read-only
+// investigation legitimately appends to it for hours). A dedicated 24h floor sweeps
+// only genuinely-abandoned trackers (no append AND no flush in a day → its paths are
+// stale to any current episode) while leaving every active session's file untouched.
+export const ORPHAN_READS_AGE_MS = 24 * 60 * 60 * 1000;
+
+// Sweep stale `ep-flush-*` / `pending-*` (older than `ageMs`, default 1h) and
+// `reads-*.txt` (older than `readsAgeMs`, default 24h) files in `runtimeDir` by
+// mtime. Returns the number of files removed. fs-only — no DB / no network. Used by
+// handleSessionStart auto-maintain to prevent the doctor "Stale temp files" warning
+// from accumulating across crashes; equivalent to the manual path in
+// `node install.mjs cleanup` but age-gated so concurrent in-flight workers / active
+// read sessions are never raced.
+export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE_MS, readsAgeMs = ORPHAN_READS_AGE_MS, now = Date.now() } = {}) {
   let entries;
   try { entries = readdirSync(runtimeDir); } catch { return 0; }
   const cutoff = now - ageMs;
+  const readsCutoff = now - readsAgeMs;
   let count = 0;
   for (const f of entries) {
-    if (!(f.startsWith('ep-flush-') || f.startsWith('pending-'))) continue;
+    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-');
+    const isReads = f.startsWith('reads-') && f.endsWith('.txt');
+    if (!isEpisode && !isReads) continue;
     const full = join(runtimeDir, f);
     try {
-      if (statSync(full).mtimeMs < cutoff) {
+      if (statSync(full).mtimeMs < (isReads ? readsCutoff : cutoff)) {
         unlinkSync(full);
         count++;
       }

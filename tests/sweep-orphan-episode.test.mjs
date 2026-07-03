@@ -1,7 +1,8 @@
 // Tests for sweepOrphanEpisodeFiles — the SessionStart auto-maintain helper
-// that removes crashed `ep-flush-*` / `pending-*` runtime files. Locks the
-// age-gated contract: in-flight files (mtime newer than ageMs) are NEVER
-// touched, only orphans are reaped.
+// that removes crashed `ep-flush-*` / `pending-*` runtime files (1h floor) and
+// abandoned `reads-*.txt` Read trackers (24h floor). Locks the age-gated
+// contract: in-flight episode files AND active read sessions (mtime newer than
+// their respective cutoff) are NEVER touched, only orphans are reaped.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync, utimesSync, existsSync, readdirSync } from 'fs';
@@ -34,12 +35,20 @@ describe('sweepOrphanEpisodeFiles', () => {
     expect(sweepOrphanEpisodeFiles(join(dir, 'missing'))).toBe(0);
   });
 
-  it('returns 0 when no matching files exist', () => {
-    writeWithMtime('not-an-episode.json', 99 * 3600 * 1000);
-    writeWithMtime('reads-foo.txt', 99 * 3600 * 1000);
+  it('returns 0 when no sweep-eligible files exist (unrelated file + fresh reads survive)', () => {
+    writeWithMtime('not-an-episode.json', 99 * 3600 * 1000); // never a sweep target
+    writeWithMtime('reads-foo.txt', 2 * 3600 * 1000);        // reads tracker, but < 24h → active
     expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
     expect(existsSync(join(dir, 'not-an-episode.json'))).toBe(true);
     expect(existsSync(join(dir, 'reads-foo.txt'))).toBe(true);
+  });
+
+  it('sweeps reads-*.txt older than the 24h floor but keeps active (< 24h) ones', () => {
+    const abandoned = writeWithMtime('reads-old.txt', 25 * 3600 * 1000); // 25h → abandoned
+    const active = writeWithMtime('reads-active.txt', 12 * 3600 * 1000);  // 12h → long read session
+    expect(sweepOrphanEpisodeFiles(dir)).toBe(1);
+    expect(existsSync(abandoned)).toBe(false);
+    expect(existsSync(active)).toBe(true);
   });
 
   it('sweeps ep-flush-* files older than ageMs', () => {
@@ -62,16 +71,16 @@ describe('sweepOrphanEpisodeFiles', () => {
     expect(existsSync(stale)).toBe(false);
   });
 
-  it('only matches the two known prefixes (no over-broad sweep)', () => {
+  it('only matches known prefixes (ep-flush/pending/reads) — no over-broad sweep', () => {
     writeWithMtime('ep-flush-orphan.json', 99 * 3600 * 1000);
     writeWithMtime('pending-orphan.json', 99 * 3600 * 1000);
+    writeWithMtime('reads-baz.txt', 99 * 3600 * 1000);       // abandoned tracker → swept (>24h)
     writeWithMtime('cite-recall-foo.json', 99 * 3600 * 1000); // cite-recall lives forever
     writeWithMtime('session-bar', 99 * 3600 * 1000);
-    writeWithMtime('reads-baz.txt', 99 * 3600 * 1000);
 
-    expect(sweepOrphanEpisodeFiles(dir)).toBe(2);
+    expect(sweepOrphanEpisodeFiles(dir)).toBe(3);
     const remaining = readdirSync(dir).sort();
-    expect(remaining).toEqual(['cite-recall-foo.json', 'reads-baz.txt', 'session-bar']);
+    expect(remaining).toEqual(['cite-recall-foo.json', 'session-bar']);
   });
 
   it('honors a custom `now` so callers can pin time for deterministic assertions', () => {

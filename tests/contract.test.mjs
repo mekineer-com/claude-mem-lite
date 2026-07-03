@@ -105,6 +105,22 @@ describe('mem_search schema', () => {
     expect(r2.success).toBe(true);
     expect(r2.data.rerank).toBe(true);
   });
+
+  // Regression: include_noise was bare z.boolean() (not coerceBool) on BOTH memSearchSchema
+  // and memRecallSchema, so a stringified "true" from a JSON-scalar MCP bridge hard-failed the
+  // whole call while every sibling bool (or/deep/rerank) accepted it. CLI↔MCP parity (#8703 class).
+  it('accepts include_noise as a stringified bool on both search and recall (coerceBool parity)', () => {
+    for (const val of ['true', true]) {
+      const s = parseSchema(memSearchSchema, { query: 'foo', include_noise: val });
+      expect(s.success).toBe(true);
+      expect(s.data.include_noise).toBe(true);
+      const r = parseSchema(memRecallSchema, { file: 'a.mjs', include_noise: val });
+      expect(r.success).toBe(true);
+      expect(r.data.include_noise).toBe(true);
+    }
+    // 'false' string coerces to false — not rejected, not truthy
+    expect(parseSchema(memSearchSchema, { query: 'foo', include_noise: 'false' }).data.include_noise).toBe(false);
+  });
 });
 
 // ─── mem_recent schema ──────────────────────────────────────────────────────

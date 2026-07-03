@@ -539,6 +539,14 @@ export function findSmartCompressCandidates(db, ageDays = 30, { project } = {}) 
     WHERE COALESCE(compressed_into, 0) = 0
       AND COALESCE(importance, 1) = 1
       AND COALESCE(access_count, 0) = 0
+      -- Never auto-compress a lesson-bearing row. Smart-compress sets compressed_into
+      -- on the originals (line ~693), which hides them from every injection/search
+      -- surface AND puts them out of recoverBuriedLessons' reach (it only lifts
+      -- compressed_into=0). A lesson demoted to imp=1 by citation-decay would be
+      -- silently buried by the unattended 24h llm-optimize run. Exact parity with the
+      -- canonical compress sibling selectCompressionCandidates (compress-core.mjs) —
+      -- "lessons never auto-GC" (also enforced in decayAndMarkIdle, maintain-core.mjs).
+      AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
       AND created_at_epoch < ?
       ${projectClause}
     ORDER BY project, created_at_epoch

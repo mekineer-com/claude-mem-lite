@@ -9,6 +9,7 @@
     "benchmark/efficacy-power.mjs",
     "benchmark/efficacy-harness.mjs",
     "benchmark/cjk-straddle-prevalence.mjs",
+    "benchmark/ups-ab.mjs",
     "scripts/*.mjs",
     "scripts/*.js",
     "tests/**/*.test.mjs"
@@ -21,7 +22,5 @@
     "server/**/*.mjs",
     "benchmark/**/*.mjs"
   ],
-  "ignore": [
-    "registry-indexer.mjs"
-  ]
+  "ignore": []
 }

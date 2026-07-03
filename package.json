@@ -102,7 +102,6 @@
     "registry.mjs",
     "registry-retriever.mjs",
     "registry-recommend.mjs",
-    "registry-indexer.mjs",
     "registry-scanner.mjs",
     "registry-github.mjs",
     "registry-importer.mjs",

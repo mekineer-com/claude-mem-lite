@@ -38,8 +38,10 @@ describe('getRecommendMode', () => {
   it('exposes negative floor + positive margin', () => { expect(RECO_BM25_FLOOR).toBeLessThan(0); expect(RECO_MARGIN).toBeGreaterThan(0); });
 });
 
-function cand(name, relevance, intent_tags = name, quality_tier = 'installed') {
-  return { name, relevance, intent_tags, quality_tier };
+function cand(name, relevance, intent_tags = name, quality_tier = 'installed', composite_score = relevance) {
+  // composite_score defaults to relevance so relevance-ordered fixtures stay valid; pass it
+  // explicitly to exercise the composite-vs-relevance margin (retriever orders by composite).
+  return { name, relevance, intent_tags, quality_tier, composite_score };
 }
 
 describe('intentMatch', () => {
@@ -62,6 +64,25 @@ describe('applyGate', () => {
   it('BLOCK cooldown', () => { expect(applyGate([cand('tdd', -3.0, 'test')], prompt, new Set(['tdd']))).toMatchObject({ verdict: 'BLOCK', reason: 'cooldown' }); });
   it('PASS single strong on-intent', () => { expect(applyGate([cand('tdd', -3.0, 'test,tdd')], prompt, new Set())).toMatchObject({ verdict: 'PASS', candidate: { name: 'tdd' } }); });
   it('PASS with clear margin', () => { expect(applyGate([cand('tdd', -3.0, 'test'), cand('qa', -1.0, 'test')], prompt, new Set()).verdict).toBe('PASS'); });
+
+  // Margin is measured in composite space, not relevance. Here the composite winner (top) has
+  // WORSE relevance than the runner-up — the exact composite-promotion the priors exist to do.
+  // Old relevance margin = rel[1]-rel[0] = -2.9-(-2.5) = -0.4 → spurious BLOCK. Composite margin
+  // = comp[1]-comp[0] = -2.5-(-3.0) = 0.5 ≥ 0.2 → PASS.
+  it('measures low_margin in composite space, not relevance (composite-promoted winner passes)', () => {
+    const top = cand('installed-tdd', -2.5, 'test,tdd', 'installed', -3.0); // composite-best, relevance-worse
+    const runner = cand('community-qa', -2.9, 'test', 'community', -2.5);
+    const r = applyGate([top, runner], prompt, new Set());
+    expect(r.verdict).toBe('PASS');
+    expect(r.candidate.name).toBe('installed-tdd');
+  });
+
+  // And a genuinely-close composite pair still BLOCKs (margin gate not defeated by the switch).
+  it('still BLOCKs low_margin when the composite gap is under RECO_MARGIN', () => {
+    const top = cand('a', -3.0, 'test', 'installed', -3.0);
+    const runner = cand('b', -3.0, 'test', 'community', -2.85); // composite gap 0.15 < 0.2
+    expect(applyGate([top, runner], prompt, new Set())).toMatchObject({ verdict: 'BLOCK', reason: 'low_margin' });
+  });
 });
 
 describe('fetchInstalledSkillCandidates', () => {
@@ -254,6 +275,14 @@ describe('replayGate (B3 offline threshold replay)', () => {
     expect(replayGate(row(-10, -5, true, true), -8, 1)).toBe('BLOCK');
   });
   it('null relevance always BLOCKs', () => { expect(replayGate(row(null, null), -8, 1)).toBe('BLOCK'); });
+
+  // New-row path: margin replayed on composite1/composite2 (matches live applyGate), not relevance.
+  it('replays the margin on composite when the row logged it', () => {
+    // composite gap 0.5 ≥ 0.2 → PASS, even though rel2-rel1 = -0.4 would BLOCK on relevance
+    expect(replayGate({ relevance: -10, rel2: -10.4, composite1: -4.0, composite2: -3.5, intentTop: true, cooldownTop: false }, -8, 0.2)).toBe('PASS');
+    // composite gap 0.1 < 0.2 → BLOCK, even though rel2-rel1 = 5 would PASS on relevance
+    expect(replayGate({ relevance: -10, rel2: -5, composite1: -4.0, composite2: -3.9, intentTop: true, cooldownTop: false }, -8, 0.2)).toBe('BLOCK');
+  });
 });
 
 describe('computeSweep (B3 ROC over thresholds)', () => {

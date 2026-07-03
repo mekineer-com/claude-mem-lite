@@ -2,6 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createRegistryTestDb } from './test-helpers.mjs';
 import { buildEnhancedQuery, buildQueryFromText, filterByProjectDomain, retrieveResources, searchResources, cjkIntentTokens } from '../registry-retriever.mjs';
+import { upsertResource } from '../registry.mjs';
 
 describe('cjkIntentTokens', () => {
   it('returns English intent equivalents for CJK phrases present (substring map)', () => {
@@ -257,5 +258,38 @@ describe('searchResources', () => {
       // First result should be debugging-related
       expect(results[0].name).toMatch(/debug/i);
     }
+  });
+});
+
+// Regression: `registry import` is the only registry edit path and mem-cli defaults every
+// unspecified flag to '', so a partial re-import (edit ONE field) must not blank the other
+// FTS text columns via UPSERT and silently drop the resource out of search.
+describe('upsertResource preserve-on-empty (partial re-import keeps search metadata)', () => {
+  let db;
+  beforeEach(() => { db = createRegistryTestDb(); });
+  afterEach(() => { try { db.close(); } catch {} });
+
+  it('a partial re-import keeps prior keywords searchable and preserves untouched columns', () => {
+    upsertResource(db, {
+      name: 'kube-deploy', type: 'skill', source: 'user', local_path: '',
+      capability_summary: 'deploy to kubernetes',
+      keywords: 'kubectl helm rollout', intent_tags: 'deploy',
+      domain_tags: 'devops', trigger_patterns: 'ship to k8s',
+    });
+    expect(searchResources(db, 'kubectl').some(r => r.name === 'kube-deploy')).toBe(true);
+
+    // Partial re-import: only capability_summary provided; upsertResource defaults the rest to ''
+    // (mem-cli's `registry import` does exactly this — every unspecified flag becomes '').
+    upsertResource(db, {
+      name: 'kube-deploy', type: 'skill', source: 'user', local_path: '',
+      capability_summary: 'deploy to kubernetes (v2)',
+    });
+
+    // Still findable by the ORIGINAL keyword — not blanked.
+    expect(searchResources(db, 'kubectl').some(r => r.name === 'kube-deploy')).toBe(true);
+    const row = db.prepare("SELECT capability_summary, keywords, intent_tags FROM resources WHERE name='kube-deploy'").get();
+    expect(row.capability_summary).toBe('deploy to kubernetes (v2)'); // the edited field took effect
+    expect(row.keywords).toBe('kubectl helm rollout');                // preserved, not blanked
+    expect(row.intent_tags).toBe('deploy');                           // preserved, not blanked
   });
 });

@@ -199,6 +199,7 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
       SELECT o.concepts FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
         AND (? IS NULL OR o.project = ?)
       ORDER BY ${OBS_BM25}
       LIMIT 20
@@ -281,6 +282,11 @@ export function runIdleCleanup(db) {
         WHERE importance <= 1 AND COALESCE(access_count, 0) = 0
           AND type IN (${types})
           AND created_at_epoch < ? AND COALESCE(compressed_into, 0) = 0
+          -- Never auto-mark a lesson-bearing row for purge. This idle path is the
+          -- MCP-server sibling of maintain-core.decayAndMarkIdle and must carry the
+          -- SAME "lessons never auto-GC" guard; without it a lesson demoted to imp≤1
+          -- by citation-decay gets pending-purge'd here and hard-deleted by purgeStale.
+          AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
       `).run(cutoff);
       totalMarked += marked.changes;
 
@@ -289,6 +295,10 @@ export function runIdleCleanup(db) {
         WHERE COALESCE(compressed_into, 0) = 0 AND importance = 1
           AND type IN (${types})
           AND created_at_epoch < ?
+          -- Same lesson guard: auto-compress (-1) hides the row from all retrieval and
+          -- recoverBuriedLessons only re-floors live (compressed_into=0) rows, so a
+          -- compressed lesson is unrecoverable. Parity with selectCompressionCandidates.
+          AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
       `).run(cutoff);
       totalCompressed += compressed.changes;
     }

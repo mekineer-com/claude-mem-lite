@@ -259,6 +259,7 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
     SELECT o.title, o.narrative FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
     WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
+      AND o.superseded_at IS NULL
       AND (? IS NULL OR o.project = ?)
     ORDER BY ${OBS_BM25}
     LIMIT 8
@@ -304,7 +305,9 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
  *   1. FTS5 MATCH with the sanitized query (AND-by-default), recency-weighted
  *   2. If AND returns 0 → relaxFtsQueryToOr fallback (mirrors searchObservationsHybrid)
  *
- * Always skips compressed rows.
+ * Always skips compressed AND superseded rows — paired with searchObservationsHybrid /
+ * buildObsFtsQuery so `timeline --query` / mem_timeline never anchor on a memory that
+ * search itself hides (an anchor on a replaced row strands navigation on stale content).
  *
  * @param {Database} db
  * @param {object} opts
@@ -324,6 +327,7 @@ export function findFtsAnchor(db, { ftsQuery, project = null, nowT = null, halfL
     WHERE observations_fts MATCH ?
       AND (? IS NULL OR o.project = ?)
       AND COALESCE(o.compressed_into, 0) = 0
+      AND o.superseded_at IS NULL
     ORDER BY ${OBS_BM25}
       * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / ${halfLifeMs}.0))
     LIMIT 1

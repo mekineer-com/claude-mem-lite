@@ -18,8 +18,12 @@ export function getRecommendMode() {
 
 // Provisional gate thresholds — calibrated from shadow data before Phase 2 (spec §8).
 // relevance is raw bm25 (negative; more negative = better). Candidate must clear |floor|.
-export const RECO_BM25_FLOOR = -1.5;     // require row.relevance <= -1.5
-export const RECO_MARGIN = 0.5;          // require candidates[1].relevance - candidates[0].relevance >= 0.5
+export const RECO_BM25_FLOOR = -1.5;     // floor stays on raw bm25 (absolute topical relevance)
+// Margin is measured in COMPOSITE space (the metric that orders + selects the winner), NOT raw
+// bm25 — see applyGate. composite = bm25*0.4 - priors, so the scale is ~0.4x raw; 0.5 raw ≈ 0.2
+// composite is the principled starting point. Final value comes from `recommend-stats --sweep`
+// after dogfood (D#47); DEFAULT_SWEEP_MARGINS is likewise on the composite scale.
+export const RECO_MARGIN = 0.2;          // require candidates[1].composite_score - candidates[0].composite_score >= this
 const RECO_COOLDOWN_MS = 300_000;        // 5 min, mirrors T4 SKILL_COOLDOWN_MS (internal)
 
 // Lazy runtime-path resolution: read CLAUDE_MEM_DIR at call time (mirrors schema.mjs:13
@@ -35,9 +39,14 @@ const TOKEN_SPLIT = /[^a-z0-9一-鿿]+/;
 export function fetchInstalledSkillCandidates(rdb, promptText, limit = 10) {
   if (!rdb || !promptText) return [];
   let rows;
-  try { rows = searchResources(rdb, promptText, { type: 'skill', limit }); }
+  // Over-fetch, THEN filter to installed. quality_tier='installed' is a post-SQL JS filter, so a
+  // plain LIMIT starves installed skills that rank below other-tier matches: a weak installed
+  // match sitting past the top-N is sliced off → the gate sees no candidate → spurious
+  // no_candidate BLOCK (the −0.15 installed composite bonus is negligible vs the bm25 spread).
+  // A wide headroom lets the composite-best installed skill actually survive to the gate.
+  try { rows = searchResources(rdb, promptText, { type: 'skill', limit: Math.max(limit * 5, 50) }); }
   catch { return []; }
-  return rows.filter(r => r.quality_tier === 'installed');
+  return rows.filter(r => r.quality_tier === 'installed').slice(0, limit);
 }
 
 /**
@@ -65,7 +74,13 @@ export function applyGate(candidates, promptText, cooldownSet) {
   const top = candidates[0];
   if (!(top.relevance <= RECO_BM25_FLOOR)) return { verdict: 'BLOCK', reason: 'below_floor', candidate: top };
   if (candidates.length >= 2) {
-    const margin = candidates[1].relevance - top.relevance; // positive when top is clearly better
+    // Separation measured in the SAME metric that ordered the candidates (composite_score),
+    // NOT relevance. candidates arrive composite ASC so `top` IS the composite winner; a raw
+    // relevance margin let a composite-promoted top sit BELOW candidates[1] in relevance →
+    // negative margin → spurious low_margin BLOCK (and a permanent dead-zone in the ROC sweep).
+    // composite2 - composite1 is >= 0 by sort order. The floor above stays on raw bm25 — the
+    // absolute-relevance gate that stops a popular-but-irrelevant composite promotion.
+    const margin = candidates[1].composite_score - top.composite_score;
     if (!(margin >= RECO_MARGIN)) return { verdict: 'BLOCK', reason: 'low_margin', candidate: top };
   }
   if (!intentMatch(promptText, top)) return { verdict: 'BLOCK', reason: 'intent_mismatch', candidate: top };
@@ -192,11 +207,13 @@ export function computeFunnel(days = 7) {
   return stats;
 }
 
-// Default sweep grid (B3). Raw BM25 magnitudes for real matches run ≈ -10..-15, so the
-// shipped floor (-1.5) is far more permissive than it looks; the grid spans that real range
-// so the ROC curve actually moves. Override via `recommend-stats --sweep --floors a,b --margins x,y`.
+// Default sweep grid (B3). FLOORS are raw bm25 (real matches run ≈ -10..-15, so the shipped
+// -1.5 floor is far more permissive than it looks; the grid spans that real range). MARGINS are
+// on the COMPOSITE scale (composite = bm25*0.4 - priors), matching replayGate's margin metric —
+// the old raw-bm25 grid [0,0.5,1,2,4] was ~2.5x too wide for composite separations.
+// Override via `recommend-stats --sweep --floors a,b --margins x,y`.
 export const DEFAULT_SWEEP_FLOORS = [-1.5, -5, -8, -10, -12];
-export const DEFAULT_SWEEP_MARGINS = [0, 0.5, 1, 2, 4];
+export const DEFAULT_SWEEP_MARGINS = [0, 0.05, 0.1, 0.2, 0.4];
 
 /**
  * Recompute the gate verdict for a logged reco row at a hypothetical (floor, margin),
@@ -207,7 +224,15 @@ export function replayGate(row, floor, margin) {
   const r1 = row.relevance;
   // null/undefined relevance coerces to 0/NaN, so `r1 <= floor` is false → BLOCK (no null check).
   if (!(r1 <= floor)) return 'BLOCK';
-  if (Number.isFinite(row.rel2) && !((row.rel2 - r1) >= margin)) return 'BLOCK';
+  // Margin on composite when the row logged it (post-switch rows), matching the live applyGate
+  // metric; fall back to the legacy relevance margin for rows written before composite1/composite2
+  // existed (they age out of the 7d sweep window). Single-candidate rows (no rel2/composite2) skip
+  // the margin gate either way. NOTE: sweep `margin` is on the COMPOSITE scale for new rows.
+  if (Number.isFinite(row.composite1) && Number.isFinite(row.composite2)) {
+    if (!((row.composite2 - row.composite1) >= margin)) return 'BLOCK';
+  } else if (Number.isFinite(row.rel2)) {
+    if (!((row.rel2 - r1) >= margin)) return 'BLOCK';
+  }
   if (!row.intentTop) return 'BLOCK';
   if (row.cooldownTop) return 'BLOCK';
   return 'PASS';
@@ -230,11 +255,25 @@ export function computeSweep(days = 7, floors = DEFAULT_SWEEP_FLOORS, margins = 
   }
   const grid = [];
   for (const floor of floors) for (const margin of margins) {
-    let pass = 0, matchPass = 0, matchAdopt = 0;
+    let pass = 0;
+    // Matched precision MUST dedup (session, skill) exactly like computeFunnel (mPass/mAdopt
+    // via per-session Sets). Counting raw reco rows here inflated matchPass by every repeat
+    // recommendation of the same skill in one session, so the sweep's precision silently
+    // disagreed with the funnel headline and was biased toward frequently-recommended skills —
+    // corrupting the exact (floor,margin) signal the sweep exists to inform. `pass` stays a raw
+    // volume count (it is not a precision denominator).
+    const passBySession = new Map(); // session -> Set<skillLower> that PASSED at this cell
     for (const r of recos) {
       if (replayGate(r, floor, margin) !== 'PASS') continue;
       pass++;
-      if (r.session) { matchPass++; if (adoptBySession.get(r.session)?.has(lc(r.skill))) matchAdopt++; }
+      if (!r.session) continue;
+      if (!passBySession.has(r.session)) passBySession.set(r.session, new Set());
+      passBySession.get(r.session).add(lc(r.skill));
+    }
+    let matchPass = 0, matchAdopt = 0;
+    for (const [session, skills] of passBySession) {
+      const adopted = adoptBySession.get(session);
+      for (const sk of skills) { matchPass++; if (adopted?.has(sk)) matchAdopt++; }
     }
     grid.push({ floor, margin, pass, matchPass, matchAdopt, precision: matchPass ? matchAdopt / matchPass : null });
   }
@@ -265,8 +304,10 @@ export function recommendSkill(rdb, promptText, project, opts = {}) {
     // NOT the registry short name ('superpowers-tdd') — adoption rows log toolInput.skill (the slug),
     // so logging top.name made in-session matched precision a guaranteed 0 for every namespaced skill.
     skill: top ? (top.invocation_name || top.name) : null,
-    relevance: top ? top.relevance : null,
-    rel2: candidates[1] ? candidates[1].relevance : null,
+    relevance: top ? top.relevance : null,                    // floor replay (absolute bm25)
+    rel2: candidates[1] ? candidates[1].relevance : null,     // legacy margin replay (pre-composite rows)
+    composite1: top ? top.composite_score : null,             // margin replay (composite — the live gate metric)
+    composite2: candidates[1] ? candidates[1].composite_score : null,
     intentTop: top ? intentMatch(promptText, top) : false,
     cooldownTop: top ? cooldownSet.has(String(top.name).toLowerCase()) : false,
     ncand: candidates.length,

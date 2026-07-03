@@ -235,7 +235,10 @@ async function fetchWithTimeout(url, headers) {
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(url, { signal: controller.signal, headers });
-    if (res.status === 403) {
+    if (res.status === 403 || res.status === 429) {
+      // 429 = GitHub secondary rate limit (403 = primary). Both must route to the 6h
+      // rate-limit backoff, not the 24h transient-failure path — else a 429 defers the
+      // next check a full day instead of retrying on the shorter rate-limit cadence.
       const state = readState();
       saveState({ ...state, rateLimited: true });
       debugLog('DEBUG', 'hook-update', 'GitHub API rate limited; will retry on the 6h rate-limit cadence');

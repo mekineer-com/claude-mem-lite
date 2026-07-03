@@ -103,6 +103,21 @@ describe('selectWithTokenBudget', () => {
     expect(result.totalTokens).toBe(0);
   });
 
+  // superseded invisibility on the most-visible surface: auto-dedup (hook.mjs) sets
+  // superseded_at but leaves compressed_into=0, so the compressed filter alone let the
+  // hidden near-duplicate resurface in the SessionStart "Recent" table. obsPool now filters
+  // superseded_at IS NULL (parity with the sibling keyObs query).
+  it('excludes superseded rows even when compressed_into is still 0 (auto-dedup shape)', () => {
+    insertObs(db, { sessionId: 'sess-1', project: 'test', type: 'decision', title: 'live decision', importance: 2 });
+    insertObs(db, {
+      sessionId: 'sess-1', project: 'test', type: 'decision', title: 'superseded dup', importance: 2,
+      supersededAt: Date.now(), supersededBy: 'auto-dedup', compressedInto: 0,
+    });
+    const titles = selectWithTokenBudget(db, 'test', 2000).observations.map(o => o.title);
+    expect(titles).toContain('live decision');
+    expect(titles).not.toContain('superseded dup');
+  });
+
   it('selects recent observations within budget', () => {
     for (let i = 0; i < 5; i++) {
       insertObs(db, {

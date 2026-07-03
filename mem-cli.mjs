@@ -1621,7 +1621,17 @@ function cmdExport(db, args) {
     process.stderr.write(`[mem] Note: --from "${flags.from}" is after --to "${flags.to}"; this range is empty\n`);
   }
 
-  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 200, max: 1000 });
+  // Backup default: with no --limit, export the COMPLETE matching set. `export` is
+  // the documented backup half of backup/restore (README; cmdRestore header), yet its
+  // old default capped at 200 (hard max 1000) and the "capped" warning went only to
+  // stderr — so a bare `export > backup.json` on a >200-row store silently wrote a
+  // truncated backup that lost rows on restore, and `--limit 5000` was REJECTED back
+  // to 200 (can't back up >1000 at all). Now: omit --limit → LIMIT -1 (SQLite = no
+  // limit); pass --limit N → honor any positive N (a backup may exceed 1000).
+  const limitGiven = flags.limit !== undefined && flags.limit !== null && flags.limit !== '';
+  const limit = limitGiven
+    ? parseIntFlag(flags.limit, { name: '--limit', defaultValue: 200 })
+    : -1;
   const format = flags.format || 'json';
   if (!['json', 'jsonl'].includes(format)) {
     fail(`[mem] Invalid format "${format}". Use: json or jsonl`);
@@ -1662,8 +1672,8 @@ function cmdExport(db, args) {
     out(JSON.stringify(rows, null, 2));
   }
 
-  if (rows.length >= limit) {
-    process.stderr.write(`[mem] Note: Results capped at ${limit}. Use --from/--to or --limit to export more.\n`);
+  if (limitGiven && rows.length >= limit) {
+    process.stderr.write(`[mem] Note: Results capped at ${limit}. Raise --limit or narrow --from/--to to export more.\n`);
   }
 }
 
@@ -2575,15 +2585,17 @@ Commands:
     --narrative T       New narrative
     --concepts T        Space-separated concept tags
 
-  export                Export observations as JSON/JSONL
-  restore <file>        Restore observations from an export file (JSON/JSONL); --dry-run to preview
+  export                Export observations as JSON/JSONL (complete backup by default)
     --project P         Filter by project
     --type T            Filter by type
     --format F          json (default) or jsonl
     --from DATE         Start date
     --to DATE           End date
     --include-compressed  Include compressed observations
-    --limit N           Max results (default 200, max 1000)
+    --limit N           Cap output at N rows (default: export ALL matching rows)
+  restore <file>        Restore observations from an export file (JSON/JSONL)
+    --project P         Override the restored project for every row
+    --dry-run           Preview what would be restored without writing
 
   compress              Compress old low-value observations
     --execute           Execute compression (preview by default)
@@ -2876,6 +2888,18 @@ async function cmdEnrich(argv) {
 }
 
 async function cmdOptimize(db, args) {
+  // cmdOptimize parses flags positionally (args.indexOf('--task') + args[idx+1])
+  // instead of the shared parseArgs, so the GNU `--flag=value` form silently
+  // vanished: indexOf found no bare `--flag`, dropping the value with zero signal.
+  // On the mutating --run path this was a real footgun — `optimize --run
+  // --task=smart-compress --project=p --max=5` ran ALL tasks across ALL projects at
+  // the default budget (tasks/project undefined → run-everything). Normalize
+  // `--flag=value` into `--flag value` up front so both forms parse identically;
+  // the `--execute=` special-case below already anticipated this for one flag.
+  args = args.flatMap(a => {
+    const m = /^(--[a-z][a-z-]*)=([\s\S]*)$/.exec(a);
+    return m ? [m[1], m[2]] : [a];
+  });
   const run = args.includes('--run');
   const runAll = args.includes('--run-all');
   // Sibling-command flag footgun: optimize executes with --run (compress uses
@@ -3045,11 +3069,15 @@ export async function run(argv) {
   const JSON_SUPPORTED_CMDS = new Set([
     'search', 'context', 'recent', 'recall', 'timeline', 'stats', 'browse', 'export', 'citation-stats',
   ]);
-  // `doctor --benchmark` already emits JSON on its own — don't print the misleading
-  // "doctor outputs text" note for that subpath. Without --benchmark, doctor is text
-  // and the note is still useful.
-  const doctorBenchmark = cmd === 'doctor' && cmdArgs.includes('--benchmark');
-  if (cmdArgs.includes('--json') && !JSON_SUPPORTED_CMDS.has(cmd) && !doctorBenchmark) {
+  // Suppress the note on subpaths that DO emit JSON, so it never FALSELY tells a script
+  // "outputs text" while writing valid JSON to stdout — a false note is worse than a
+  // missing one (it makes the consumer skip a parse that would have succeeded). doctor
+  // emits JSON for --benchmark / --metrics / --session-audit; activity's show/save emit
+  // JSON. Without those sub-flags, doctor is text and the note stays useful.
+  const jsonCapableSubpath =
+    (cmd === 'doctor' && (cmdArgs.includes('--benchmark') || cmdArgs.includes('--metrics') || cmdArgs.includes('--session-audit'))) ||
+    cmd === 'activity';
+  if (cmdArgs.includes('--json') && !JSON_SUPPORTED_CMDS.has(cmd) && !jsonCapableSubpath) {
     process.stderr.write(`[mem] Note: --json is supported only on: ${[...JSON_SUPPORTED_CMDS].join(', ')}. "${cmd}" outputs text.\n`);
   }
 

@@ -816,7 +816,14 @@ const DEFERRED_CLEANUPS = [
             }
           }
           if (canonical) {
-            for (const table of ['observations', 'sdk_sessions', 'session_summaries']) {
+            // Rename the short project to canonical on EVERY project-scoped table.
+            // Originally only the first three were rewritten, so a short-named
+            // project's deferred TODOs (deferred_work), activity (events), citation
+            // history (citation_log), and /clear-/exit handoffs (session_handoffs)
+            // were stranded on the old name — invisible to every project-scoped query
+            // after normalization. All seven carry a `project` column (verified).
+            for (const table of ['observations', 'sdk_sessions', 'session_summaries',
+                                 'session_handoffs', 'citation_log', 'events', 'deferred_work']) {
               db.prepare(`UPDATE ${table} SET project = ? WHERE project = ?`).run(canonical.project, shortName);
             }
           }

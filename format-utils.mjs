@@ -74,10 +74,14 @@ export function neutralizeContextDelimiters(s) {
 export function formatErrorRecallHints(rows) {
   if (!rows || rows.length === 0) return '';
   const lines = rows.map((r, i) => {
-    const head = `  #${r.id} [${r.type}] ${truncate(r.title, 60)}`;
+    // Defang title + lesson: this block is written to PostToolUse stdout \u2192 model context,
+    // and observations are stored raw (defense is at the injection boundary, not at save),
+    // so a poisoned lesson carrying a forged <system-reminder>/tool tag would inject here
+    // un-neutralized. Same guard the handoff render applies to its replayed fields.
+    const head = `  #${r.id} [${r.type}] ${neutralizeContextDelimiters(truncate(r.title, 60))}`;
     // Inline the lesson body for the single most-relevant hit only (bounded payload).
     if (i === 0 && typeof r.lesson_learned === 'string' && r.lesson_learned.trim()) {
-      return `${head} \u2014 ${truncate(r.lesson_learned.trim(), 200)}`;
+      return `${head} \u2014 ${neutralizeContextDelimiters(truncate(r.lesson_learned.trim(), 200))}`;
     }
     return head;
   });

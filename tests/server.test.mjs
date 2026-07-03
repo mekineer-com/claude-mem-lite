@@ -1374,6 +1374,51 @@ describe('type-aware idle cleanup', () => {
     expect(result.marked).toBe(2);
     expect(result.compressed).toBe(1);
   });
+
+  // "lessons never auto-GC" invariant — the MCP idle-cleanup is the automatic,
+  // default-production sibling of maintain-core.decayAndMarkIdle and must carry the
+  // same lesson guard on BOTH the pending-purge (-2) and auto-compress (-1) branches.
+  // Regression: a bugfix lesson demoted to imp=1 by citation-decay, aged past its
+  // threshold, was pending-purge'd here then hard-deleted by purgeStale.
+  it('never pending-purges a lesson-bearing row (branch-1 guard)', () => {
+    insertSession(db, { id: 'sess-idle-lesson', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-lesson', type: 'bugfix', title: 'demoted bugfix lesson',
+      lessonLearned: 'Never drop the WHERE clause on batch UPDATE',
+      importance: 1, accessCount: 0, epochOffset: -200 * 86400000,
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBeNull();
+  });
+
+  it('never auto-compresses an accessed lesson-bearing row (branch-2 guard)', () => {
+    insertSession(db, { id: 'sess-idle-lesson2', project: 'test' });
+    // imp=1 + accessed: the no-lesson sibling (test above) becomes -1; a lesson row must not.
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-lesson2', type: 'change', title: 'accessed change with lesson',
+      lessonLearned: 'RRF must pre-sort by composite score',
+      importance: 1, accessCount: 5, epochOffset: -30 * 86400000,
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBeNull();
+  });
+
+  it('still marks a "none"-sentinel row — the guard must not over-protect noise', () => {
+    insertSession(db, { id: 'sess-idle-none', project: 'test' });
+    const result = insertObs(db, {
+      sessionId: 'sess-idle-none', type: 'change', title: 'none-sentinel',
+      lessonLearned: 'none',
+      importance: 1, accessCount: 0, epochOffset: -20 * 86400000,
+    });
+    const id = Number(result.lastInsertRowid);
+    runIdleCleanup(db);
+    const row = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(row.compressed_into).toBe(-2);
+  });
 });
 
 // ─── Task 1: schema_version fast path ────────────────────────────────────────
