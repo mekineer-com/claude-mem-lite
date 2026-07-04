@@ -81,7 +81,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
   const projectClause = project ? 'AND project = ?' : '';
   if (scope === 'wide') {
     const stmt = db.prepare(`
-      SELECT id, title, narrative, type, subtitle, concepts, facts, project
+      SELECT id, title, narrative, type, subtitle, concepts, facts, search_aliases, project
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0
         AND superseded_at IS NULL
@@ -140,7 +140,13 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       const parsed = await callModelJSON(prompt, 'haiku', { timeout: 15000, maxTokens: 500 });
       if (!parsed || !parsed.title) { skipped++; continue; }
 
-      if (parsed.importance === 0 || parsed.importance === '0') {
+      // Auto-hide on importance:0 targets fully-degraded NARROW rows (this branch predates
+      // the wide-scope widening). A wide candidate has a substantive narrative (>100 chars)
+      // and a real bugfix/feature/decision type by construction, and COMPRESSED_AUTO(-1) is
+      // reachable by no auto-recovery pass — so one Haiku "importance 0" misjudgment would
+      // hide a real observation until manual surgery. In wide scope, fall through and let
+      // clampImportance floor it to 1 (kept visible, low-ranked) instead of hiding.
+      if ((parsed.importance === 0 || parsed.importance === '0') && scope !== 'wide') {
         db.prepare(`UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}, optimized_at = ? WHERE id = ?`)
           .run(Date.now(), cand.id);
         processed++;
@@ -150,8 +156,14 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       const type = validTypes.has(parsed.type) ? parsed.type : cand.type || 'change';
       const concepts = Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [];
       const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [];
-      const conceptsText = concepts.join(' ');
-      const factsText = facts.join(' ');
+      // Preserve-on-empty: wide-scope candidates can already carry concepts/facts/aliases
+      // (findReenrichCandidates requires only lesson_learned empty), so a partial re-enrich
+      // that returns a lesson but omits/empties these must NOT wipe them — the same UPDATE
+      // sets optimized_at, locking the row out of any future re-enrich (:88), so the loss is
+      // permanent. Keep the candidate's existing value when the LLM returned nothing. (Narrow
+      // candidates are all-null on these by their WHERE, so cand.* is falsy → no-op there.)
+      const conceptsText = concepts.length ? concepts.join(' ') : (cand.concepts || '');
+      const factsText = facts.length ? facts.join(' ') : (cand.facts || '');
       // Scrub BEFORE truncate so a secret straddling the cut can't leave a sub-6-char
       // head that scrubSecrets's value-length floor no longer matches (the scrubRecord
       // below would then miss it too). Mirrors the hook-llm save-path fix.
@@ -159,8 +171,8 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
         && parsed.lesson_learned.toLowerCase() !== 'none'
         && parsed.lesson_learned.trim().length > 0
         ? scrubSecrets(parsed.lesson_learned).slice(0, 500) : null;
-      const searchAliases = Array.isArray(parsed.search_aliases)
-        ? parsed.search_aliases.slice(0, 6).join(' ') : null;
+      const searchAliases = Array.isArray(parsed.search_aliases) && parsed.search_aliases.length
+        ? parsed.search_aliases.slice(0, 6).join(' ') : (cand.search_aliases || null);
       const title = truncate(scrubSecrets(parsed.title || ''), 120);
       const narrative = truncate(scrubSecrets(parsed.narrative || cand.narrative || ''), 500);
       const importance = clampImportance(parsed.importance);
@@ -361,9 +373,10 @@ export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const cutoff = Date.now() - MERGE_TIME_WINDOW_MS;
   const projectClause = project ? 'AND project = ?' : '';
   const stmt = db.prepare(`
-    SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig
+    SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig, lesson_learned
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
+      AND superseded_at IS NULL
       AND optimized_at IS NULL
       AND title IS NOT NULL AND title != ''
       AND created_at_epoch > ?
@@ -453,9 +466,25 @@ Return ONLY valid JSON:
     // already-scrubbed text so a straddling secret can't leak a sub-floor head.
     const title = truncate(scrubSecrets(parsed.merged_title || ''), 120);
     const narrative = truncate(scrubSecrets(parsed.merged_narrative || ''), 800);
-    const lessonLearned = typeof parsed.merged_lesson === 'string'
+    // Preserve-on-empty. The merge overwrites the keeper in place and hides every non-keeper
+    // member (compressed_into=keeper.id), so if the LLM returns merged_lesson:null (the prompt
+    // at :429 explicitly permits it) every cluster lesson would leave all live surfaces at once
+    // with no auto-recovery — the keeper snapshot and hidden members sit at compressed_into>0,
+    // which recoverBuriedLessons (compressed_into=0 only) skips. So use the LLM's synthesized
+    // lesson when non-empty, else fall back to the union of the members' own non-empty lessons.
+    // findMergeCandidates filters superseded_at IS NULL, so the union pulls only LIVE members
+    // (a tombstoned/retired lesson can't resurrect onto the keeper). The union is scrubbed then
+    // capped at 500 chars like a single lesson, so an unusually long union may truncate trailing
+    // members — still strictly better than the prior unconditional null (partial > total loss).
+    let lessonLearned = typeof parsed.merged_lesson === 'string'
       && parsed.merged_lesson.trim().length > 0
       ? scrubSecrets(parsed.merged_lesson).slice(0, 500) : null;
+    if (!lessonLearned) {
+      const memberLessons = [...new Set(cluster
+        .map(o => (o.lesson_learned || '').trim())
+        .filter(l => l && l.toLowerCase() !== 'none'))];
+      if (memberLessons.length) lessonLearned = scrubSecrets(memberLessons.join(' — ')).slice(0, 500);
+    }
 
     const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
     const textField = [conceptsText, factsText, bigramText].filter(Boolean).join(' ');

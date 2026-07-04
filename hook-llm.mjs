@@ -588,6 +588,58 @@ export function buildImmediateObservation(episode) {
   };
 }
 
+// ─── Haiku extraction recovery helpers ──────────────────────────────────────
+
+// Haiku's throwaway lesson sentinels + a min-length floor. A lesson equal to one
+// of these (case-insensitive) or shorter than 12 chars teaches a future session
+// nothing, so it is treated as "no lesson". Single source for the episode gate,
+// the P3 retry check, and the importance=0 discard guard (all three previously
+// duplicated the literal). Every sentinel is <12 chars, so the length floor
+// alone already excludes them — the set guards the exact-match cases.
+const LOW_SIGNAL_LESSON = new Set(['none', '', 'n/a', 'null', 'todo', 'tbd', 'na', '-', 'nothing', 'nil']);
+export function isLowSignalLesson(lesson) {
+  const t = typeof lesson === 'string' ? lesson.trim() : '';
+  return LOW_SIGNAL_LESSON.has(t.toLowerCase()) || t.length < 12;
+}
+
+// Haiku sometimes wraps the observation object in an envelope that
+// parseJsonFromLLM preserves verbatim (it strips ```json fences but does not
+// unwrap structure): a single-element array `[{...}]`, or a single object-valued
+// key such as `{"observation":{...}}`. Peel one such layer so the enrichment
+// fields (title / lesson_learned / narrative / facts) are reachable by the gate
+// in handleLLMEpisode. Returns the inner object, or `parsed` unchanged when it is
+// not a recognized envelope (incl. multi-element arrays — ambiguous, left for the
+// degraded fallback). Only unwraps when there is no usable top-level title, so a
+// legitimate `{title, ...}` observation is never disturbed.
+export function unwrapObservationEnvelope(parsed) {
+  if (Array.isArray(parsed)) {
+    const [only] = parsed;
+    return parsed.length === 1 && only && typeof only === 'object' && !Array.isArray(only) ? only : parsed;
+  }
+  if (parsed && typeof parsed === 'object' && typeof parsed.title !== 'string') {
+    const keys = Object.keys(parsed);
+    if (keys.length === 1) {
+      const inner = parsed[keys[0]];
+      if (inner && typeof inner === 'object' && !Array.isArray(inner)) return inner;
+    }
+  }
+  return parsed;
+}
+
+// True when a parsed Haiku object carries content worth preserving even if its
+// title is unusable: a substantive lesson (not a low-signal sentinel / too short),
+// a non-empty narrative, or >=1 non-empty fact. Gates the title-recovery path in
+// handleLLMEpisode so a genuinely empty parse still falls through to the
+// episode-inferred degraded observation (which classifies type/importance better
+// than a forced 'change' would).
+export function hasEnrichmentContent(parsed) {
+  if (!parsed || typeof parsed !== 'object') return false;
+  if (typeof parsed.lesson_learned === 'string' && !isLowSignalLesson(parsed.lesson_learned)) return true;
+  if (typeof parsed.narrative === 'string' && parsed.narrative.trim().length > 0) return true;
+  if (Array.isArray(parsed.facts) && parsed.facts.some(f => typeof f === 'string' && f.trim().length > 0)) return true;
+  return false;
+}
+
 // ─── Lesson retry prompt (P3) ───────────────────────────────────────────────
 
 /**
@@ -712,14 +764,36 @@ ${actionList}`;
       releaseLLMSlot();
     }
 
-    // Require a STRING title: a truthy non-string (LLM returned title as an array/number/
-    // object) would pass a bare `parsed.title` check, then crash truncate() downstream,
-    // aborting the worker before tmpFile cleanup (leak) and leaving the obs degraded.
-    if (parsed && typeof parsed.title === 'string' && parsed.title) {
+    // Recover from common Haiku envelope shapes before the title gate: a single-
+    // element array `[{...}]` or a single object-valued wrapper key
+    // `{"observation":{...}}`. parseJsonFromLLM strips fences but does NOT peel
+    // these, so the payload (title AND lesson) sits one level down. See
+    // unwrapObservationEnvelope.
+    if (parsed && typeof parsed === 'object') parsed = unwrapObservationEnvelope(parsed);
+
+    // Enter enrichment whenever Haiku returned a usable object — even if its TITLE
+    // is missing/empty/non-string. The gate was previously `typeof parsed.title ===
+    // 'string' && parsed.title` (guarding a truncate() crash on non-string titles),
+    // so a valid extraction with a bad title silently discarded Haiku's
+    // lesson_learned / narrative / facts: `obs` stayed undefined and control fell to
+    // the degraded fallback. Now, when there is substantive content but no usable
+    // title, degrade ONLY the title (buildDegradedTitle) and keep the lesson. A parse
+    // with neither a usable title nor content still falls through to
+    // buildImmediateObservation, which infers type/importance from the episode.
+    const titleUsable = parsed && typeof parsed.title === 'string' && !!parsed.title;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (titleUsable || hasEnrichmentContent(parsed))) {
+      // Synthesize a rule-based title when Haiku's is unusable (crash-safe, and the
+      // lesson survives). Only the title degrades; every other field is kept.
+      if (!titleUsable) parsed.title = buildDegradedTitle(episode);
       // Normalize narrative to a string too — same non-string crash risk in truncate().
       if (typeof parsed.narrative !== 'string') parsed.narrative = '';
-      // Discard if LLM judges observation has no learning value
-      if (parsed.importance === 0 || parsed.importance === '0') {
+      const rawLesson = typeof parsed.lesson_learned === 'string' ? parsed.lesson_learned.trim() : '';
+      // Discard if LLM judges observation has no learning value — UNLESS it co-emitted
+      // a substantive lesson. importance=0 + a real lesson is contradictory (Haiku
+      // flags "zero value" yet still teaches something); the lesson is the
+      // higher-value signal, so keep the row (importance clamps to >=1 downstream)
+      // rather than deleting it. Only the genuinely empty case is dropped.
+      if ((parsed.importance === 0 || parsed.importance === '0') && isLowSignalLesson(rawLesson)) {
         debugLog('DEBUG', 'llm-episode', `Discarded low-value observation: ${parsed.title}`);
         // If pre-saved, delete it too
         if (episode.savedId) {
@@ -740,9 +814,7 @@ ${actionList}`;
       // When filtered, downgrade importance to 0 so rule-based fallback in
       // hook.mjs:saveObservation writes the obs but hook queries (which all
       // require importance >= 1) ignore it.
-      const rawLesson = typeof parsed.lesson_learned === 'string' ? parsed.lesson_learned.trim() : '';
-      const lowSignalLesson = new Set(['none', '', 'n/a', 'null', 'todo', 'tbd', 'na', '-', 'nothing', 'nil']);
-      const isLessonLowSignal = lowSignalLesson.has(rawLesson.toLowerCase()) || rawLesson.length < 12;
+      const isLessonLowSignal = isLowSignalLesson(rawLesson);
       let lessonLearned = isLessonLowSignal ? null : rawLesson.slice(0, 500);
 
       // P3: for bugfix/decision, retry once with a lesson-focused prompt.
@@ -768,7 +840,7 @@ ${actionList}`;
           if (retryRaw) {
             const retry = parseJsonFromLLM(retryRaw);
             const retryLesson = typeof retry?.lesson === 'string' ? retry.lesson.trim() : '';
-            const retryIsLow = lowSignalLesson.has(retryLesson.toLowerCase()) || retryLesson.length < 12;
+            const retryIsLow = isLowSignalLesson(retryLesson);
             if (!retryIsLow) {
               lessonLearned = retryLesson.slice(0, 500);
               retryRecovered = true;
@@ -1044,7 +1116,28 @@ ${obsList}`;
       releaseLLMSlot();
     }
 
-    if (llmParsed && llmParsed.request) {
+    // Coerce a prose field to a string before scrub/bind. Haiku sometimes returns a LIST for
+    // completed/next_steps/remaining_items; binding a non-string straight to SQL throws
+    // ("Too many parameter values") out of this try/finally and drops the WHOLE summary incl.
+    // lessons + key_decisions. Join array items; non-strings → ''. (lessons/key_decisions are
+    // JSON.stringify'd separately below.)
+    const asText = v => Array.isArray(v)
+      ? v.filter(x => typeof x === 'string' && x.trim()).join('; ')
+      : (typeof v === 'string' ? v : '');
+
+    // Persist when ANY meaningful field is present — not just `request`. Gating on `request`
+    // alone dropped the whole INSERT/UPDATE (losing the session's highest-value fields:
+    // lessons + key_decisions) whenever Haiku returned an empty request string but a rich
+    // `{completed, lessons, key_decisions}` — a common degraded shape. Downstream tolerates an
+    // empty request: INSERT writes '' and the UPDATE COALESCE(NULLIF(?, ''), request) preserves
+    // the prior value. Use asText in the gate so a non-string / empty-array field can't falsely
+    // trigger it.
+    const hasSummaryContent = llmParsed && (
+      asText(llmParsed.request) || asText(llmParsed.completed) || asText(llmParsed.remaining_items) || asText(llmParsed.next_steps) ||
+      (Array.isArray(llmParsed.lessons) && llmParsed.lessons.length > 0) ||
+      (Array.isArray(llmParsed.key_decisions) && llmParsed.key_decisions.length > 0)
+    );
+    if (hasSummaryContent) {
       const now = new Date();
       const lessonsJson = Array.isArray(llmParsed.lessons) && llmParsed.lessons.length > 0
         ? JSON.stringify(llmParsed.lessons) : null;
@@ -1072,12 +1165,12 @@ ${obsList}`;
         // pre-scrub remains safer in principle but would diverge from the
         // merged INSERT contract.
         const safe = scrubRecord('session_summaries', {
-          request: llmParsed.request || '',
-          investigated: llmParsed.investigated || '',
-          learned: llmParsed.learned || '',
-          completed: llmParsed.completed || '',
-          next_steps: llmParsed.next_steps || '',
-          remaining_items: llmParsed.remaining_items || '',
+          request: asText(llmParsed.request),
+          investigated: asText(llmParsed.investigated),
+          learned: asText(llmParsed.learned),
+          completed: asText(llmParsed.completed),
+          next_steps: asText(llmParsed.next_steps),
+          remaining_items: asText(llmParsed.remaining_items),
           lessons: lessonsJson,
           key_decisions: decisionsJson,
         });
@@ -1105,12 +1198,12 @@ ${obsList}`;
         );
       } else {
         const safe = scrubRecord('session_summaries', {
-          request: llmParsed.request || '',
-          investigated: llmParsed.investigated || '',
-          learned: llmParsed.learned || '',
-          completed: llmParsed.completed || '',
-          next_steps: llmParsed.next_steps || '',
-          remaining_items: llmParsed.remaining_items || '',
+          request: asText(llmParsed.request),
+          investigated: asText(llmParsed.investigated),
+          learned: asText(llmParsed.learned),
+          completed: asText(llmParsed.completed),
+          next_steps: asText(llmParsed.next_steps),
+          remaining_items: asText(llmParsed.remaining_items),
           lessons: lessonsJson,
           key_decisions: decisionsJson,
         });

@@ -124,7 +124,13 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
           // ep-flush-* file is written here: it would have NO consumer AND would make
           // every later handleLLMSummary poll the full CLAUDE_MEM_FLUSH_TIMEOUT (~15s)
           // waiting for a file that only the 24h orphan-sweep ever removes.
-          saveEpisodeImmediate(ep);
+          // Split by CC session first (v3.35.2 parity): the normal flush and the Stop
+          // lock-contended fallback both planEpisodeFlush, but this crash path flushed the
+          // WHOLE buffer as one observation, co-attributing two interleaved same-project
+          // sessions into one garbled row. planEpisodeFlush returns [ep] by reference when
+          // there is ≤1 CC session (the common case → identical to before), else one sub
+          // per session. Pure/sync → safe inside the signal handler.
+          for (const sub of planEpisodeFlush(ep)) saveEpisodeImmediate(sub);
           try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
         }
       } catch {}

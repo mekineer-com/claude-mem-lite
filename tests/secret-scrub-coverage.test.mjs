@@ -408,3 +408,37 @@ describe('saveObservation — derived title scrubs BEFORE truncation (#secret-ti
     expect(row.narrative).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
   });
 });
+
+describe('scrubSecrets — quoted-key + passphrase (round-5 #8805 sibling)', () => {
+  const V = 'wJalrXUtnFEMIsupersecret';
+
+  it('scrubs single-quoted / mixed-quoted credential keys (Python dict reprs, single-quoted JS/JSON)', () => {
+    expect(scrubSecrets(`{'api_key': '${V}'}`)).not.toContain(V);
+    expect(scrubSecrets(`{"api_key": '${V}'}`)).not.toContain(V);   // mixed quotes
+    expect(scrubSecrets(`{'access_token':'${V}'}`)).not.toContain(V);
+    expect(scrubSecrets(`{'client_secret':'${V}'}`)).not.toContain(V);
+    expect(scrubSecrets(`{'private_key':'${V}'}`)).not.toContain(V);
+    // double-quoted JSON still scrubs (no regression)
+    expect(scrubSecrets(`{"api_key":"${V}"}`)).not.toContain(V);
+  });
+
+  it('scrubs passphrase (SSH/GPG/keystore) across =, :, quoted, and env-var shapes', () => {
+    expect(scrubSecrets(`passphrase=${V}`)).not.toContain(V);
+    expect(scrubSecrets(`GPG_PASSPHRASE=${V}`)).not.toContain(V);
+    expect(scrubSecrets(`passphrase: "${V}"`)).not.toContain(V);
+    expect(scrubSecrets(`{"gpg_passphrase":"${V}"}`)).not.toContain(V);
+  });
+
+  it('does NOT over-redact prose or non-credential quoted keys', () => {
+    // bare "token" is excluded from the quoted-key noun set, so a numeric count survives
+    expect(scrubSecrets(`{'token_count': 123456}`)).toBe(`{'token_count': 123456}`);
+    expect(scrubSecrets(`{'name': 'alice smith'}`)).toBe(`{'name': 'alice smith'}`);
+    expect(scrubSecrets('the token: opaque wisdom of the ancients')).toBe('the token: opaque wisdom of the ancients');
+    expect(scrubSecrets('I forgot my password yesterday')).toBe('I forgot my password yesterday');
+  });
+
+  it('scrubs a quoted-key secret through the scrubRecord persistence chokepoint', () => {
+    const rec = scrubRecord('observations', { narrative: `API failed. Response: {'access_token': '${V}', 'expires': 3600}` });
+    expect(rec.narrative).not.toContain(V);
+  });
+});

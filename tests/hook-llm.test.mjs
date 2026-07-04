@@ -23,7 +23,7 @@ vi.mock('../hook-shared.mjs', async () => {
   };
 });
 
-import { saveObservation, handleLLMEpisode, handleLLMSummary, buildDegradedTitle, persistHaikuSummary, buildImmediateObservation } from '../hook-llm.mjs';
+import { saveObservation, handleLLMEpisode, handleLLMSummary, buildDegradedTitle, persistHaikuSummary, buildImmediateObservation, unwrapObservationEnvelope, isLowSignalLesson, hasEnrichmentContent } from '../hook-llm.mjs';
 import { openDb, callLLM } from '../hook-shared.mjs';
 import { acquireLLMSlot } from '../hook-semaphore.mjs';
 
@@ -869,6 +869,129 @@ describe('handleLLMEpisode', () => {
     expect(ev[0].title).toBe('Error: app.mjs');
   });
 
+  // ─── Bad-title / envelope recovery: Haiku's lesson must survive ───────────
+  // A valid extraction whose `title` is empty/non-string, or whose object is
+  // wrapped in a single-element array / single object-valued key, previously
+  // failed the `typeof parsed.title === 'string' && parsed.title` gate → the
+  // whole enrichment block was skipped and the lesson was discarded. Recovery
+  // degrades ONLY the title and keeps the lesson.
+  const lessonSurvives = (project, needle) => {
+    const obs = db.prepare('SELECT lesson_learned FROM observations WHERE project = ?').all(project);
+    const ev = db.prepare('SELECT body FROM events WHERE project = ?').all(project);
+    return obs.some(r => (r.lesson_learned || '').includes(needle)) ||
+           ev.some(r => (r.body || '').includes(needle));
+  };
+
+  it('empty-string title: lesson survives on the pre-saved row (change → upgraded in place)', async () => {
+    const needle = 'config loader must read env before defaults or overrides are ignored';
+    insertSession(db, { id: 'ep-sess', project: 'badtitle-empty' });
+    const preSaved = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'change', 'Modified config.mjs', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('ep-sess', 'badtitle-empty', new Date().toISOString(), Date.now());
+    const savedId = Number(preSaved.lastInsertRowid);
+
+    callLLM.mockReturnValue(JSON.stringify({ type: 'change', title: '', importance: 1, lesson_learned: needle }));
+    const episode = {
+      sessionId: 'ep-sess', project: 'badtitle-empty', savedId,
+      files: ['config.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Edit config', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const row = db.prepare('SELECT lesson_learned FROM observations WHERE id = ?').get(savedId);
+    expect(row.lesson_learned).toBe(needle);  // was NULL (pre-saved row kept lessonless) before the fix
+  });
+
+  it('array-wrapped [{...}]: lesson survives (bugfix → events)', async () => {
+    const needle = 'FTS5 trigger fires on ANY column UPDATE — wrap access_count writes in try/catch';
+    insertSession(db, { id: 'ep-sess', project: 'badtitle-array' });
+    const preSaved = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'change', 'Modified schema.mjs', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('ep-sess', 'badtitle-array', new Date().toISOString(), Date.now());
+    const savedId = Number(preSaved.lastInsertRowid);
+
+    callLLM.mockReturnValue(JSON.stringify([{
+      type: 'bugfix', title: 'Fixed FTS corruption on access_count UPDATE', importance: 2, lesson_learned: needle,
+    }]));
+    const episode = {
+      sessionId: 'ep-sess', project: 'badtitle-array', savedId,
+      files: ['schema.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'Wrap FTS update in try/catch', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    expect(lessonSurvives('badtitle-array', needle)).toBe(true);  // no events row existed before the fix
+  });
+
+  it('key-wrapped {"observation":{...}}: lesson survives on a clean insert (no pre-save)', async () => {
+    const needle = 'env loader must read process.env before applying config defaults';
+    callLLM.mockReturnValue(JSON.stringify({ observation: {
+      type: 'change', title: 'Reworked env loader', importance: 1, lesson_learned: needle,
+    } }));
+    const episode = {
+      sessionId: 'ep-sess', project: 'badtitle-keywrap',
+      files: ['env.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'edit env loader', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    expect(lessonSurvives('badtitle-keywrap', needle)).toBe(true);  // buildImmediateObservation fallback dropped the lesson before the fix
+  });
+
+  it('importance=0 + substantive lesson: row is kept, not deleted (Finding 3)', async () => {
+    const needle = 'connection pool size must exceed worker count or requests deadlock';
+    insertSession(db, { id: 'ep-sess', project: 'imp0-lesson' });
+    const preSaved = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'change', 'Modified pool.mjs', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('ep-sess', 'imp0-lesson', new Date().toISOString(), Date.now());
+    const savedId = Number(preSaved.lastInsertRowid);
+
+    // Valid title (isolates Finding 3 from the title-recovery path) + importance 0 + a real lesson.
+    callLLM.mockReturnValue(JSON.stringify({ type: 'change', title: 'Reworked connection pooling', importance: 0, lesson_learned: needle }));
+    const episode = {
+      sessionId: 'ep-sess', project: 'imp0-lesson', savedId,
+      files: ['pool.mjs'], filesRead: [],
+      entries: [{ tool: 'Edit', desc: 'switch to pooling', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    const row = db.prepare('SELECT lesson_learned FROM observations WHERE id = ?').get(savedId);
+    expect(row).toBeTruthy();               // pre-saved row was DELETED by the importance=0 discard before the fix
+    expect(row.lesson_learned).toBe(needle);
+  });
+
+  it('importance=0 + no substantive lesson still discards the pre-saved row (behavior preserved)', async () => {
+    insertSession(db, { id: 'ep-sess', project: 'imp0-nolesson' });
+    const preSaved = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'change', 'Modified notes.mjs', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run('ep-sess', 'imp0-nolesson', new Date().toISOString(), Date.now());
+    const savedId = Number(preSaved.lastInsertRowid);
+
+    callLLM.mockReturnValue(JSON.stringify({ type: 'change', title: 'Browsed the notes file', importance: 0, lesson_learned: 'none' }));
+    const episode = {
+      sessionId: 'ep-sess', project: 'imp0-nolesson', savedId,
+      files: ['notes.mjs'], filesRead: [],
+      entries: [{ tool: 'Read', desc: 'read notes', isError: false }],
+    };
+    writeFileSync(tmpFile, JSON.stringify(episode));
+
+    await handleLLMEpisode();
+
+    expect(db.prepare('SELECT 1 FROM observations WHERE id = ?').get(savedId)).toBeFalsy();
+  });
+
   // v2.44+: buildImmediateObservation cap logic. computeRuleImportance uses
   // coarse file-name heuristics (schema.*, migration, auth.*, .env, .pem)
   // that fire on incidental file touches in broad multi-file episodes. For
@@ -1410,6 +1533,59 @@ describe('handleLLMSummary', () => {
     const count = db.prepare('SELECT COUNT(*) as cnt FROM session_summaries').get();
     expect(count.cnt).toBe(0);
   });
+
+  it('persists lessons + key_decisions even when Haiku returns an empty request (Finding 2)', async () => {
+    insertSession(db, { id: 'test-session', project: 'test-proj' });
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'feature', 'Auth work', '', 'Narrative', '', '', '[]', '[]', 1, ?, ?)
+    `).run('test-session', 'test-proj', new Date().toISOString(), Date.now());
+
+    // Empty request but a rich completed + lessons + key_decisions — a common
+    // degraded Haiku shape. The old `if (llmParsed.request)` gate dropped the whole
+    // INSERT, losing the session's highest-value fields (lessons + key_decisions).
+    callLLM.mockReturnValue(JSON.stringify({
+      request: '',
+      completed: 'Fixed auth token refresh in auth.mjs',
+      lessons: ['JWT needs RS256 for key rotation support'],
+      key_decisions: ['Chose SQLite over Postgres for zero-config deploys'],
+    }));
+
+    await handleLLMSummary();
+
+    const row = db.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').get('test-session');
+    expect(row).toBeTruthy();  // no summary row was written at all before the fix
+    expect(row.completed).toBe('Fixed auth token refresh in auth.mjs');
+    expect(row.lessons).toBe(JSON.stringify(['JWT needs RS256 for key rotation support']));
+    expect(row.key_decisions).toBe(JSON.stringify(['Chose SQLite over Postgres for zero-config deploys']));
+  });
+
+  it('coerces an array-valued completed/remaining_items to a string instead of throwing (R3)', async () => {
+    insertSession(db, { id: 'test-session', project: 'test-proj' });
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, ?, '', 'feature', 'Auth work', '', 'Narrative', '', '', '[]', '[]', 1, ?, ?)
+    `).run('test-session', 'test-proj', new Date().toISOString(), Date.now());
+
+    // Haiku returns completed/remaining_items as LISTS (plausible — they read as lists) with no
+    // request. Binding a non-string straight to SQL used to throw "Too many parameter values",
+    // dropping the whole summary incl. lessons. asText joins the array before scrub/bind.
+    callLLM.mockReturnValue(JSON.stringify({
+      request: '',
+      completed: ['Fixed token refresh', 'Added retry'],
+      remaining_items: ['Write integration tests'],
+      lessons: ['JWT needs RS256 for key rotation'],
+      key_decisions: ['Chose SQLite for zero-config'],
+    }));
+
+    await handleLLMSummary();  // must NOT throw (handleLLMSummary has no catch — a throw would surface here)
+
+    const row = db.prepare('SELECT * FROM session_summaries WHERE memory_session_id = ?').get('test-session');
+    expect(row).toBeTruthy();
+    expect(row.completed).toBe('Fixed token refresh; Added retry');   // array joined by asText
+    expect(row.remaining_items).toBe('Write integration tests');
+    expect(row.lessons).toBe(JSON.stringify(['JWT needs RS256 for key rotation']));  // lessons survived
+  });
 });
 
 // ─── session summary structured knowledge ────────────────────────────────────
@@ -1848,5 +2024,60 @@ describe('buildDegradedTitle', () => {
     const title = buildDegradedTitle(episode);
     expect(title).not.toMatch(/\t/);
     expect(title).toBe('check status here');
+  });
+});
+
+// ─── Haiku extraction recovery helpers ──────────────────────────────────────
+
+describe('unwrapObservationEnvelope', () => {
+  it('unwraps a single-element array [{...}]', () => {
+    expect(unwrapObservationEnvelope([{ title: 'x', lesson_learned: 'y' }])).toEqual({ title: 'x', lesson_learned: 'y' });
+  });
+
+  it('unwraps a single object-valued wrapper key {"observation":{...}}', () => {
+    expect(unwrapObservationEnvelope({ observation: { title: 'x' } })).toEqual({ title: 'x' });
+  });
+
+  it('leaves a normal observation object untouched (has a string title)', () => {
+    const o = { title: 'x', lesson_learned: 'y' };
+    expect(unwrapObservationEnvelope(o)).toBe(o);
+  });
+
+  it('leaves a multi-element array untouched (ambiguous — cannot pick one)', () => {
+    const a = [{ title: 'x' }, { title: 'y' }];
+    expect(unwrapObservationEnvelope(a)).toBe(a);
+  });
+
+  it('does not unwrap a single-key object whose value is not an object', () => {
+    const o = { lesson_learned: 'just a lesson, no title here' };
+    expect(unwrapObservationEnvelope(o)).toBe(o);
+  });
+});
+
+describe('isLowSignalLesson', () => {
+  it('treats sentinels and <12-char lessons as low-signal', () => {
+    for (const s of ['none', '  N/A ', 'null', 'nothing', 'too short', '', '-']) {
+      expect(isLowSignalLesson(s)).toBe(true);
+    }
+    expect(isLowSignalLesson(null)).toBe(true);
+    expect(isLowSignalLesson(42)).toBe(true);
+  });
+
+  it('treats a substantive lesson (>=12 chars, not a sentinel) as signal', () => {
+    expect(isLowSignalLesson('wrap FTS writes in a try/catch block')).toBe(false);
+  });
+});
+
+describe('hasEnrichmentContent', () => {
+  it('is true for a substantive lesson / narrative / fact', () => {
+    expect(hasEnrichmentContent({ lesson_learned: 'read env before applying defaults' })).toBe(true);
+    expect(hasEnrichmentContent({ narrative: 'refactored the loader' })).toBe(true);
+    expect(hasEnrichmentContent({ facts: ['loader reads env first'] })).toBe(true);
+  });
+
+  it('is false for an empty / sentinel-only parse', () => {
+    expect(hasEnrichmentContent({})).toBe(false);
+    expect(hasEnrichmentContent({ lesson_learned: 'none', narrative: '', facts: [] })).toBe(false);
+    expect(hasEnrichmentContent(null)).toBe(false);
   });
 });

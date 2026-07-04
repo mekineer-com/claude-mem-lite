@@ -151,10 +151,14 @@ export function extractCjkLikePatterns(query) {
 /**
  * Post-FTS precision filter for CJK queries.
  *
- * Background: FTS5 unicode61 tokenizer splits every CJK character into its
- * own token. An application-layer bigram query like "我是" then reduces to
- * (我 AND 是) at match time — matching any document that happens to contain
- * both chars anywhere, which is extremely permissive in Chinese prose.
+ * Background: this build's FTS5 unicode61 tokenizer indexes an entire CJK run
+ * as ONE token (it does NOT split each CJK character). CJK text is made
+ * searchable by the write path, which stores the content plus its space-
+ * separated overlapping bigrams; a query is likewise reduced to bigrams. An
+ * application-layer bigram query therefore matches via those stored bigrams,
+ * and after the AND→OR fallback (relaxFtsQueryToOr) any document sharing even a
+ * single query bigram becomes a hit — extremely permissive in Chinese prose,
+ * where common bigrams recur across unrelated topics.
  *
  * Precision check: given the raw query and a candidate result's full text,
  * require that at least `threshold` fraction of the query's CJK bigrams
@@ -276,6 +280,15 @@ export function sanitizeFtsQuery(query) {
       t && !/^-+$/.test(t) && !FTS5_KEYWORDS.has(t.toUpperCase()) && !/^NEAR(\/\d*)?$/i.test(t)
       // Skip single ASCII-letter tokens — too noisy for FTS5 (CJK single chars handled separately below)
       && !(t.length === 1 && /^[a-zA-Z]$/.test(t))
+      // Drop tokens with NO index-able character — emoji 💥, symbols ★☆✦, pure
+      // punctuation. unicode61 strips those at index time, so ftsToken would phrase-quote
+      // such a token ("💥") into a REQUIRED AND term that can never match → strict FTS
+      // returns 0 (and a lone-emoji query has no OR recovery). Gate on any Unicode LETTER
+      // or NUMBER (\p{L}/\p{N}), NOT an ASCII+Han allowlist: unicode61 indexes every
+      // script's letters (Cyrillic / Greek / kana / Hangul / Thai / accented Latin …), so
+      // an allowlist silently killed search for all non-Latin/non-Han scripts (round-5
+      // review catch). Letters are kept; only true symbols/emoji/punctuation are dropped.
+      && /[\p{L}\p{N}]/u.test(t)
     );
   // Filter stop words (but keep all if filtering would empty the query)
   const filtered = tokens.filter(t => !FTS_STOP_WORDS.has(t.toLowerCase()));
@@ -302,6 +315,25 @@ export function sanitizeFtsQuery(query) {
           }
         }
         continue;
+      }
+      // No dictionary word matched. For a PURE-CJK run, pushing the whole
+      // unsegmented token creates a required AND term that matches neither the
+      // stored full-run token nor its overlapping bigrams: the write path stores
+      // content + space-separated bigrams, so a run like "同义词扩展" is indexed
+      // only as the longer whole-run token AND as 同义/义词/词扩/扩展 — never as
+      // "同义词扩展" itself. The strict AND is thus unsatisfiable (strict FTS = 0);
+      // only relaxFtsQueryToOr in the callers salvaged recall. Emit the non-noise
+      // bigrams the index actually holds instead. Mixed-script tokens (latin+CJK,
+      // e.g. "xyzAbc不存在") stay whole — the latin portion is a literal anchor and
+      // bigramming the CJK suffix over-recalls (mirrors the bigram guard below).
+      if (!/[A-Za-z0-9]/.test(t)) {
+        const fallbackBigrams = cjkBigrams(t)
+          .split(' ')
+          .filter(bg => bg && !isCjkNoiseBigram(bg));
+        if (fallbackBigrams.length > 0) {
+          expandedTokens.push(...fallbackBigrams);
+          continue;
+        }
       }
     }
     expandedTokens.push(t);

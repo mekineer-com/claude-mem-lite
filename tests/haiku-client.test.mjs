@@ -16,9 +16,15 @@ vi.mock('../schema.mjs', () => ({
 vi.mock('../utils.mjs', () => ({
   debugLog: vi.fn(),
   debugCatch: vi.fn(),
+  // Mirror the fence-stripping in the real utils.mjs::parseJsonFromLLM. The CLI
+  // timeout salvage validates partial buffers through this, and Haiku wraps JSON in
+  // ```json fences (#8605), so a fence-blind mock would mask the salvage path.
   parseJsonFromLLM: vi.fn((raw) => {
     if (!raw) return null;
-    try { return JSON.parse(raw); } catch { return null; }
+    try { return JSON.parse(raw); } catch { /* try fenced */ }
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (fenced) { try { return JSON.parse(fenced[1]); } catch { /* not JSON */ } }
+    return null;
   }),
 }));
 
@@ -156,6 +162,26 @@ describe('haiku-client.mjs', () => {
         vi.useRealTimers();
       }
     });
+
+    it('on timeout salvages a complete-but-```json-fenced partial (#8605)', async () => {
+      // Haiku almost always wraps JSON in ```json fences. The old brace check
+      // (startsWith '{' && endsWith '}') rejected a complete-but-fenced buffer, so
+      // the already-emitted JSON was discarded on timeout. parseJsonFromLLM strips
+      // fences before validating — the fenced buffer is now salvaged.
+      vi.useFakeTimers();
+      try {
+        const fenced = '```json\n{"variants":["a","b"]}\n```';
+        const child = makeFakeChild();
+        vi.mocked(spawn).mockReturnValue(child);
+        const p = callModelCLIAsync('x', 'haiku', { timeout: 50 });
+        child.stdout.emit('data', Buffer.from(fenced));
+        vi.advanceTimersByTime(60);
+        await expect(p).resolves.toEqual({ text: fenced });
+        expect(child.kill).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   // ─── callModelJSONAsync (fully-async dispatch — no blocking CLI fallback) ──
@@ -211,6 +237,43 @@ describe('haiku-client.mjs', () => {
       await expect(p).resolves.toEqual({ variants: ['b'] });
       expect(spawn).toHaveBeenCalledTimes(1);      // async CLI fallback used
       expect(execFileSync).not.toHaveBeenCalled(); // KEY: provider outage does NOT block the event loop
+    });
+  });
+
+  // ─── CLI timeout salvage (fenced JSON, #8605) ────────────────────────────
+  // execFileSync throws on timeout with partial stdout attached. Haiku wraps JSON
+  // in ```json fences, so the old raw brace check discarded a complete-but-fenced
+  // payload → the emitted JSON was lost. Salvage now runs the buffer through
+  // parseJsonFromLLM (strips fences) and returns it for the caller to re-parse.
+  describe('CLI timeout salvage', () => {
+    const timeoutErr = (stdout) => Object.assign(new Error('ETIMEDOUT'), { stdout });
+
+    it('callHaiku (callHaikuCLI) salvages a fenced JSON partial on timeout', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      const fenced = '```json\n{"title":"Fixed FTS corruption","lesson_learned":"wrap writes in try/catch"}\n```';
+      vi.mocked(execFileSync).mockImplementation(() => { throw timeoutErr(fenced); });
+
+      const result = await callHaiku('p');
+      expect(result).toEqual({ text: fenced });
+    });
+
+    it('callLLMWithModel (callModelCLI) salvages a fenced JSON partial on timeout', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      const fenced = '```json\n{"variants":["a","b"]}\n```';
+      vi.mocked(execFileSync).mockImplementation(() => { throw timeoutErr(fenced); });
+
+      const result = await callLLMWithModel('p', 'sonnet');
+      expect(result).toEqual({ text: fenced });
+    });
+
+    it('still returns null when the timeout partial is not recoverable JSON', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      vi.mocked(execFileSync).mockImplementation(() => { throw timeoutErr('```json\n{"truncated par'); });
+
+      expect(await callHaiku('p')).toBeNull();
     });
   });
 

@@ -89,7 +89,16 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // failure leaves the marker unset and retries on the next open. New TABLE via
 // CORE_SCHEMA on the forced pass; LATEST_MIGRATION_COLUMN unchanged (no new
 // column) — same pattern as v35/v36/v38.
-export const CURRENT_SCHEMA_VERSION = 39;
+// v40 (round-5 audit HIGH): forces one migration pass so the now column-aware ensureFTS
+// widens any STALE FTS table on existing DBs. Early-adopter stores created before a column
+// was added to an FTS list (session_summaries_fts predates `remaining_items`, v2.2.0) carried
+// a narrow FTS table forever — the old ensureFTS only created a table when absent, never
+// widened it — while its triggers were rebuilt with the current wider column list, so every
+// session_summaries UPDATE threw "no column named remaining_items" and was silently swallowed
+// (Haiku summary enrichment lost every session). Pure index reheal (no data migration, no
+// column drop); idempotent. New behavior via the forced pass; LATEST_MIGRATION_COLUMN
+// unchanged (no new column) — same pattern as v35/v36/v38/v39.
+export const CURRENT_SCHEMA_VERSION = 40;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
@@ -981,8 +990,32 @@ export function ensureFTS(db, ftsName, tableName, columns) {
   const newVals = columns.map(c => `new.${c}`).join(', ');
   const oldVals = columns.map(c => `old.${c}`).join(', ');
 
-  const ftsExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
-  if (!ftsExists) {
+  // Column-aware (re)creation. An existing FTS table is never silently reused when its
+  // indexed-column set has drifted from `columns`. Root cause of a silent-write bug class:
+  // a DB created before a column was added to an FTS list (session_summaries_fts predates
+  // `remaining_items`, added v2.2.0) kept the OLD narrow table forever, because ensureFTS
+  // only created the table when it was absent. The triggers below, however, are rebuilt
+  // from the CURRENT (wider) column list, so every UPDATE fired a trigger that INSERTed
+  // into a column the stale FTS table lacked and threw "no column named <X>", silently
+  // failing the write (session-summary Haiku enrichment was discarded every session for the
+  // early-adopter cohort, and the new column stayed unindexed). On drift, drop the triggers +
+  // table and fall through to CREATE + repopulate. Generalizes the one-off observations_fts
+  // guard in ensureDb so ALL three ensureFTS-managed tables self-heal on any column addition.
+  const ftsRow = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(ftsName);
+  let recreated = false;
+  if (ftsRow) {
+    let existingCols = [];
+    try { existingCols = db.prepare(`PRAGMA table_info(${ftsName})`).all().map(c => c.name); } catch { /* unreadable → treat as drifted, recreate */ }
+    const drifted = existingCols.length !== columns.length || columns.some(c => !existingCols.includes(c));
+    if (drifted) {
+      db.exec(`DROP TRIGGER IF EXISTS ${tableName}_ai`);
+      db.exec(`DROP TRIGGER IF EXISTS ${tableName}_ad`);
+      db.exec(`DROP TRIGGER IF EXISTS ${tableName}_au`);
+      db.exec(`DROP TABLE IF EXISTS ${ftsName}`);
+      recreated = true;
+    }
+  }
+  if (!ftsRow || recreated) {
     db.exec(`CREATE VIRTUAL TABLE ${ftsName} USING fts5(${colList}, content='${tableName}', content_rowid='id')`);
   }
 
@@ -1008,4 +1041,15 @@ export function ensureFTS(db, ftsName, tableName, columns) {
       INSERT INTO ${ftsName}(rowid, ${colList}) VALUES (new.id, ${newVals});
     END;
   `);
+
+  // Repopulate a freshly (re)created external-content FTS index from its content table.
+  // An empty index otherwise returns 0 rows until each row is next written — and unlike
+  // observations_fts (rebuilt via the obsFtsRecreated flag in ensureDb), session_summaries_fts
+  // and user_prompts_fts have no other rebuild path, so a widened table must repopulate here.
+  if (recreated) {
+    try {
+      const cnt = db.prepare(`SELECT COUNT(*) AS c FROM ${tableName}`).get();
+      if (cnt.c > 0) db.exec(`INSERT INTO ${ftsName}(${ftsName}) VALUES('rebuild')`);
+    } catch { /* non-critical — index repopulates lazily on next write */ }
+  }
 }

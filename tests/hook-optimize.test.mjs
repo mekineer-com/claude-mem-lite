@@ -360,6 +360,78 @@ describe('re-enrich --scope wide (R-7)', () => {
     expect(obs.lesson_learned).toContain('timezone-aware helper');
     expect(obs.optimized_at).toBeGreaterThan(0);
   });
+
+  it('preserves existing concepts/facts/search_aliases when a wide re-enrich response omits them (preserve-on-empty)', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'bugfix',
+      title: 'Fix deadlock in balance deduction',
+      narrative: 'A race condition let two concurrent deductions read the same balance and double-spend; needed SELECT ... FOR UPDATE row locking to serialize them so the second reader waits.',
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    db.prepare("UPDATE observations SET concepts = 'race-condition locking', facts = 'SELECT FOR UPDATE needed', search_aliases = 'deadlock; concurrent deduct' WHERE id = ?").run(id);
+
+    // The LLM returns a good lesson/title but OMITS the metadata (empty arrays / missing key) —
+    // the common partial shape. Without preserve-on-empty this wipes the row's retrieval metadata
+    // AND sets optimized_at, locking it out of any future re-enrich (permanent loss).
+    callModelJSON.mockResolvedValue({
+      type: 'bugfix',
+      title: 'Serialize balance deductions with row locking',
+      narrative: 'Concurrent deductions double-spent; row locking serializes them.',
+      concepts: [],
+      facts: [],
+      importance: 2,
+      lesson_learned: 'Money-mutating reads need SELECT ... FOR UPDATE, not a plain SELECT',
+      // search_aliases omitted entirely
+    });
+
+    const result = await executeReenrich(db, 10, { scope: 'wide' });
+    expect(result.processed).toBe(1);
+
+    const obs = db.prepare('SELECT concepts, facts, search_aliases, lesson_learned FROM observations WHERE id = ?').get(id);
+    expect(obs.concepts, 'existing concepts must survive an empty LLM response').toBe('race-condition locking');
+    expect(obs.facts).toBe('SELECT FOR UPDATE needed');
+    expect(obs.search_aliases).toBe('deadlock; concurrent deduct');
+    expect(obs.lesson_learned).toContain('FOR UPDATE');
+  });
+
+  it('wide re-enrich clamps importance:0 to 1 (keeps the row visible) instead of hiding it at -1', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      type: 'decision',
+      title: 'Chose RRF over union-by-max for hybrid fusion',
+      narrative: 'Union-by-max let one strong lexical hit dominate the fused ranking; RRF blends rank positions so the vector and lexical signals contribute evenly. Kept RRF k=60 after measuring recall on the eval set.',
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+
+    callModelJSON.mockResolvedValue({
+      type: 'decision',
+      title: 'RRF chosen for hybrid fusion',
+      narrative: 'RRF blends rank positions evenly across signals.',
+      concepts: ['rrf', 'fusion'], facts: ['k=60'],
+      importance: 0,   // a single Haiku misjudgment on a substantive row
+      lesson_learned: 'none',
+    });
+
+    const result = await executeReenrich(db, 10, { scope: 'wide' });
+    expect(result.processed).toBe(1);
+
+    const obs = db.prepare('SELECT compressed_into, importance FROM observations WHERE id = ?').get(id);
+    expect(obs.compressed_into ?? 0, 'wide importance:0 must not hide a substantive row at -1').toBe(0);
+    expect(obs.importance).toBe(1);   // clampImportance floored 0 -> 1, row stays visible
+  });
+
+  it('narrow re-enrich still hides importance:0 rows at COMPRESSED_AUTO (unchanged behavior)', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'trivial log tweak', narrative: 'changed a log string' });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    callModelJSON.mockResolvedValue({ type: 'change', title: 'log tweak', narrative: 'x', importance: 0 });
+
+    const result = await executeReenrich(db, 10);   // narrow scope (default)
+    expect(result.processed).toBe(1);
+    const obs = db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id);
+    expect(obs.compressed_into).toBe(-1);   // COMPRESSED_AUTO — narrow auto-hide preserved
+  });
 });
 
 describe('normalize', () => {
@@ -498,6 +570,63 @@ describe('cluster-merge', () => {
     ).get(keeperId);
     expect(snap, 'keeper original must be snapshotted, not lost').toBeTruthy();
     expect(snap.narrative).toBe('irreplaceable repro steps');
+  });
+
+  it('preserves cluster lessons when the LLM returns merged_lesson:null (never-auto-GC)', async () => {
+    const { executeMergeCluster } = await import('../hook-optimize.mjs');
+    insertObs(db, { title: 'Fix FTS5 keeper', narrative: 'keeper narrative', importance: 2, accessCount: 5 });
+    insertObs(db, { title: 'Fix FTS5 other', narrative: 'other narrative', importance: 1, accessCount: 1 });
+    const rows = db.prepare('SELECT id FROM observations ORDER BY id').all();
+    const keeperId = rows[0].id, otherId = rows[1].id;
+    db.prepare("UPDATE observations SET lesson_learned = 'FTS5 special chars MUST be escaped' WHERE id = ?").run(keeperId);
+    db.prepare("UPDATE observations SET lesson_learned = 'parentheses need balancing too' WHERE id = ?").run(otherId);
+
+    const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
+    // LLM approves the merge but declines to synthesize a lesson — the prompt explicitly permits null.
+    callModelJSON.mockResolvedValue({
+      should_merge: true,
+      merged_title: 'Merged FTS5 sanitization',
+      merged_narrative: 'consolidated',
+      merged_concepts: ['x'], merged_facts: ['y'],
+      merged_lesson: null,
+      importance: 2,
+    });
+
+    const result = await executeMergeCluster(db, obs);
+    expect(result.merged).toBe(true);
+
+    // The keeper (the surviving live row) must still carry a lesson — the union of the members', never null.
+    const keeper = db.prepare('SELECT lesson_learned FROM observations WHERE id = ?').get(keeperId);
+    expect(keeper.lesson_learned, 'merge must not null out the lesson on merged_lesson:null').toBeTruthy();
+    expect(keeper.lesson_learned).toContain('FTS5 special chars');
+    expect(keeper.lesson_learned).toContain('parentheses need balancing');
+
+    // Invariant: at least one lesson stays on a LIVE (compressed_into=0) surface after the merge.
+    const liveLessons = db.prepare(
+      "SELECT COUNT(*) c FROM observations WHERE COALESCE(compressed_into,0)=0 AND lesson_learned IS NOT NULL AND lesson_learned != ''"
+    ).get().c;
+    expect(liveLessons).toBeGreaterThan(0);
+  });
+
+  it('excludes superseded members from merge clusters (no tombstoned-lesson resurrection)', async () => {
+    const { findMergeCandidates } = await import('../hook-optimize.mjs');
+    // Three similar-title rows; the third is tombstoned (auto-dedup superseded it) with a
+    // retired lesson. Without the superseded_at filter, findMergeCandidates returns it as a
+    // valid cluster member (auto-dedup sets superseded_at but not compressed_into/optimized_at),
+    // so the union-fallback would resurrect its retired lesson onto the keeper AND the keeper
+    // reduce could pick the invisible superseded row (whole-cluster data loss).
+    insertObs(db, { title: 'Fix FTS5 query sanitization bug in utils.mjs', narrative: 'n1' });
+    insertObs(db, { title: 'Fix FTS5 query sanitization edge case in utils.mjs', narrative: 'n2' });
+    insertObs(db, { title: 'Fix FTS5 query sanitization crash in utils.mjs', narrative: 'n3' });
+    const rows = db.prepare('SELECT id FROM observations ORDER BY id').all();
+    const supId = rows[2].id;
+    db.prepare("UPDATE observations SET lesson_learned = 'live lesson' WHERE id IN (?, ?)").run(rows[0].id, rows[1].id);
+    db.prepare("UPDATE observations SET lesson_learned = 'STALE retired lesson', superseded_at = ?, superseded_by = 'auto-dedup' WHERE id = ?").run(Date.now(), supId);
+
+    const members = findMergeCandidates(db, 5, {}).flat();
+    const memberIds = members.map(o => o.id);
+    expect(memberIds, 'a superseded (tombstoned) row must not be a merge candidate').not.toContain(supId);
+    expect(members.some(o => o.lesson_learned === 'STALE retired lesson')).toBe(false);
   });
 
   it('skips merge when LLM says should_merge=false', async () => {

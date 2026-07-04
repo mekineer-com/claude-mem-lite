@@ -29,9 +29,9 @@ export const SECRET_PATTERNS = [
   // excludes "Marker token: …". `secret` added so a bare SECRET=… with a mixed-alnum
   // value is covered (the hex-only assignment pattern below misses non-hex values).
   //   1a. `=` assignment → ALWAYS scrub (config syntax, never prose):
-  [/((?:\b|_)(?:password|passwd|token|bearer|secret)\s*=\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  [/((?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*=\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   //   1b. `:` separator → keep the prose lookbehind ("the token: alice" is prose):
-  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // access_token / refresh_token are the canonical OAuth2 field names — they were
   // missing from this KV list (drift vs the JSON list below). `(?:\b|_)` for the same
   // underscore-prefix reason.
@@ -55,8 +55,8 @@ export const SECRET_PATTERNS = [
   //   (a) bare credential nouns: `=` always scrubs; `:` keeps the prose lookbehind
   //       (mirrors the unquoted 1a/1b split — a quoted value doesn't turn `:` prose
   //       into config, but `<word> password="x"` is still a leak):
-  [/((?:\b|_)(?:password|passwd|token|bearer|secret)\s*=\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
-  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|token|bearer|secret)\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  [/((?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*=\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
   //   (b) structured keys + named env vars are unambiguous config even after a word
   //       (`see api_key: "x"` DOES scrub, mirroring the unquoted structured-key path):
   [/((?:\b|_)(?:pgpassword|pgpass|mysql_pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
@@ -121,6 +121,19 @@ export const SECRET_PATTERNS = [
   // `"token_count"` value (numeric, <6 non-quote chars after scrub) and prose
   // keys stay low-FP; over-scrub is the safe direction for at-rest memory.
   [/("\w*(?:password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key)\w*"\s*:\s*")[^"]{6,}(")/gi, '$1***$2'],
+  // Quoted-KEY credential values — Python dict reprs `{'api_key': '...'}`, single-quoted
+  // JS/JSON, and any mixed quoting. The quoted-VALUE patterns above match an UNQUOTED key
+  // (the key's closing quote sits between the key name and the `[=:]`, so `keyword\s*[=:]`
+  // never fires); the JSON patterns require BOTH key and value DOUBLE-quoted. So a single-
+  // quoted or mixed-quoted pair — the most common at-rest shape for opaque app secrets in
+  // stored LLM output / error payloads / code snippets — slipped through unredacted (#8805
+  // sibling). A quoted key is unambiguous config/data, so — like the JSON patterns — no prose
+  // guard is needed. Key quote and value quote are matched independently (`['"]` each); the
+  // value's close is a backref (\2) to its own opening quote. Same credential-noun set as the
+  // vendor-prefix JSON pattern above (bare `token`/`bearer` deliberately excluded to avoid
+  // `'token_count': 123456`); `passphrase` added here too (double-quoted JSON passphrase is
+  // subsumed by this pattern since `['"]` matches `"`). Over-scrub is the safe direction.
+  [/(['"]\w*(?:password|passwd|passphrase|secret|api[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key)\w*['"]\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
   // Session cookies in headers / urlencoded bodies (sessionid=, session_id=, JSESSIONID=, PHPSESSID=).
   // 16+ chars filters out short test fixtures like sessionid=abc.
   [/\b((?:session[_-]?id|sessionid|jsessionid|phpsessid)\s*[=:]\s*)[^\s,;'"}\]]{16,}/gi, '$1***'],

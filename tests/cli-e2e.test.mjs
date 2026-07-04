@@ -202,6 +202,11 @@ describe('CLI E2E: 2026-06-29 audit parsing/scoring guards', () => {
     expect(runCli(['compress', '--age-days', '30x']).stderr).toContain('Invalid --age-days');
     // a valid value is still accepted
     expect(runCli(['compress', '--age-days', '45']).exitCode).toBe(0);
+    // [30,365] floor/ceil = parity with mem_compress (previously any positive int passed,
+    // so `--age-days 1` compressed day-old rows while the MCP claimed the CLI rejects <30)
+    expect(runCli(['compress', '--age-days', '10']).stderr).toContain('Invalid --age-days');
+    expect(runCli(['compress', '--age-days', '400']).stderr).toContain('Invalid --age-days');
+    expect(runCli(['compress', '--age-days', '30']).exitCode).toBe(0);
   });
 
   it('LOW: a far-future created_at_epoch yields a FINITE score (no EXP overflow → null / rank #1 poison)', () => {

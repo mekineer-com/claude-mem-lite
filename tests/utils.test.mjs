@@ -896,6 +896,22 @@ describe('parseJsonFromLLM', () => {
     expect(parseJsonFromLLM(text)).toEqual({ type: 'feature', title: 'Add search' });
   });
 
+  it('does not catastrophically backtrack on a fence + long whitespace + no close (R2 ReDoS)', () => {
+    // The old /```(?:json)?\s*([\s\S]*?)\s*```/ was O(n²): a ~5KB partial buffer hung the
+    // CLI-timeout salvage 10+s. On the old regex this test TIMES OUT (vitest 5s); the
+    // ReDoS-safe /```(?:json)?([\s\S]*?)```/ returns instantly.
+    const redos = '```json' + ' '.repeat(50000);
+    const t0 = Date.now();
+    expect(parseJsonFromLLM(redos)).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(1000);   // O(n): milliseconds, not 10+ seconds
+  });
+
+  it('still strips fences with surrounding whitespace after the ReDoS-safe change', () => {
+    expect(parseJsonFromLLM('```json\n{"a":1}\n```')).toEqual({ a: 1 });
+    expect(parseJsonFromLLM('```{"b":2}```')).toEqual({ b: 2 });
+    expect(parseJsonFromLLM('```json   {"c":3}   ```')).toEqual({ c: 3 });
+  });
+
   it('parses JSON in unfenced code block', () => {
     const text = 'Result:\n```\n{"type":"refactor","title":"Clean up"}\n```';
     expect(parseJsonFromLLM(text)).toEqual({ type: 'refactor', title: 'Clean up' });

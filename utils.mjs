@@ -309,7 +309,11 @@ function firstBalancedJsonObject(text) {
 export function parseJsonFromLLM(text) {
   if (!text) return null;
   try { return JSON.parse(text); } catch {}
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  // No `\s*` around the lazy capture: `\s*([\s\S]*?)\s*` catastrophically backtracks
+  // (O(n²)) on a fence + long whitespace + no closing fence — a ~5KB partial buffer hung
+  // the CLI-timeout salvage path for 10+s (round-5 review). `([\s\S]*?)```` is a single
+  // O(n) lazy scan; JSON.parse tolerates the surrounding whitespace the trim used to strip.
+  const fenced = text.match(/```(?:json)?([\s\S]*?)```/);
   if (fenced) try { return JSON.parse(fenced[1]); } catch {}
   // First balanced object — survives unfenced output wrapped in brace-containing prose.
   const balanced = firstBalancedJsonObject(text);

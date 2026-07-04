@@ -605,21 +605,17 @@ function cmdTimeline(db, args) {
   // (nlp.mjs string ops on a boolean). No sensible default for a search anchor — reject
   // cleanly (#8470). (`--project` bare is absorbed by resolveProject's non-string guard.)
   if (rejectBareStringFlags(flags, ['query'])) return;
-  // parseInt('-5') === -5 is truthy, so `|| 5` doesn't rescue negative input.
-  // Match cmdSearch's warn-then-default pattern for consistency across CLI flags.
-  const parseWindow = (label, raw) => {
-    if (raw === undefined) return 5;
-    const n = parseInt(raw, 10);
-    // isNumericToken first: "2abc"→2 / "1e2"→1 are non-negative integers the bare check
-    // accepted silently; reject garbage tokens like the negative path already does.
-    if (!isNumericToken(raw) || !Number.isInteger(n) || n < 0) {
-      process.stderr.write(`[mem] Invalid --${label} "${raw}" (must be a non-negative integer); using default 5\n`);
-      return 5;
-    }
-    return n;
-  };
-  const before = parseWindow('before', flags.before);
-  const after = parseWindow('after', flags.after);
+  // Route --before/--after through the shared bounded parser, range [0,50] (mirrors MCP
+  // mem_timeline's before/after .min(0).max(50)). NOTE this is parseIntFlag's reject-to-default
+  // convention, NOT a clamp: an out-of-range value (e.g. `--before 100`) warns to stderr and
+  // falls back to the default 5 — same as recent/search/recall, so the behavior is consistent
+  // across the CLI (the user sees the valid range and can retry). The point is the UPPER bound:
+  // the old hand-rolled validator had none, so `--before 999999999` flowed straight into
+  // `LIMIT before+after+1` / the window fetch as a raw SQL LIMIT (whole-table dump) — the
+  // #8802 uncapped-LIMIT footgun. min:0 keeps a 0 window legal; parseIntFlag preserves the
+  // warn-then-default garbage handling (float truncation + "2abc"/"1e2" rejection).
+  const before = parseIntFlag(flags.before, { name: '--before', defaultValue: 5, min: 0, max: 50 });
+  const after = parseIntFlag(flags.after, { name: '--after', defaultValue: 5, min: 0, max: 50 });
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const jsonOutput = flags.json === true || flags.json === 'true';
 
@@ -1795,8 +1791,13 @@ function cmdCompress(db, args) {
     // isNumericToken (not bare parseInt) so "1e5"→1 and "30x"→30 are rejected rather than
     // silently mis-parsed into a far-too-broad cutoff — parity with recent/search/maintain.
     const parsed = Number(flags['age-days']);
-    if (!isNumericToken(flags['age-days']) || !Number.isInteger(parsed) || parsed < 1) {
-      fail(`[mem] Invalid --age-days "${flags['age-days']}". Must be a positive integer.`);
+    // [30,365] floor/ceil = parity with mem_compress (tool-schemas memCompressSchema
+    // .min(30).max(365)). The CLI previously accepted any positive int, so `--age-days 1`
+    // compressed day-old rows while the MCP description claimed the CLI "rejects <30 anyway"
+    // — a false parity claim (the candidate gate is the real data guard, but the age floor
+    // should match the tool the description promises equivalence with).
+    if (!isNumericToken(flags['age-days']) || !Number.isInteger(parsed) || parsed < 30 || parsed > 365) {
+      fail(`[mem] Invalid --age-days "${flags['age-days']}". Must be an integer between 30 and 365 (parity with mem_compress).`);
       return;
     }
     ageDays = parsed;

@@ -1,12 +1,13 @@
 // CJK precision filter — regression tests for the read-path parity bundle.
 //
-// Root cause: FTS5's default unicode61 tokenizer splits each CJK character
-// into its own token. Application-layer bigram queries (sanitizeFtsQuery
-// emits "我是 是完 完全 ..." for unknown compounds) degrade to single-char
-// AND at MATCH time, so any Chinese prose sharing common chars (我/是/的)
-// leaks as a hit. The `cjkPrecisionOk` post-filter requires ≥30% of the
-// query's bigrams/keywords to appear as contiguous substrings in the
-// candidate text — see nlp.mjs.
+// Root cause: this build's FTS5 unicode61 tokenizer indexes an entire CJK run
+// as ONE token (it does NOT split each CJK character). CJK text is made
+// searchable by the write path storing content + space-separated overlapping
+// bigrams; sanitizeFtsQuery likewise reduces a query to bigrams (emits "我是
+// 是完 完全 ..." for unknown compounds). After the AND→OR fallback, any Chinese
+// prose sharing even one common bigram leaks as a hit. The `cjkPrecisionOk`
+// post-filter requires a fraction of the query's bigrams/keywords to appear as
+// contiguous substrings in the candidate text — see nlp.mjs.
 //
 // This file covers:
 //   1. Unit behavior of cjkPrecisionOk (pass/fail matrix)

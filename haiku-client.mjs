@@ -421,9 +421,12 @@ function callModelCLI(prompt, model, { timeout }) {
     return text ? { text } : null;
   } catch (e) {
     const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
-    if (out && out.startsWith('{') && out.endsWith('}')) {
-      try { JSON.parse(out); return { text: out }; } catch {}
-    }
+    // Salvage a complete JSON payload from partial stdout on timeout. Haiku almost
+    // always wraps JSON in ```json fences (#8605), so a raw brace check rejects a
+    // complete-but-fenced buffer and the already-emitted JSON is discarded.
+    // parseJsonFromLLM strips fences before validating; return the raw text (the
+    // caller re-parses it identically) only when JSON is actually recoverable.
+    if (out && parseJsonFromLLM(out) !== null) return { text: out };
     debugCatch(e, `${model}-cli`);
     return null;
   }
@@ -471,9 +474,11 @@ export function callModelCLIAsync(prompt, model, { timeout }) {
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch { /* already gone */ }
       const t = stdout.trim();
-      if (t.startsWith('{') && t.endsWith('}')) {
-        try { JSON.parse(t); done({ text: t }); return; } catch { /* not complete JSON */ }
-      }
+      // Salvage fenced-or-bare JSON from partial stdout (mirrors callModelCLI). A raw
+      // brace check would discard a complete-but-```json-fenced payload (#8605);
+      // parseJsonFromLLM strips fences before validating, and the caller re-parses
+      // the returned text the same way.
+      if (t && parseJsonFromLLM(t) !== null) { done({ text: t }); return; }
       done(null);
     }, timeout);
     child.stdout?.setEncoding('utf8'); // decode multi-byte UTF-8 (CJK) across chunk boundaries
@@ -609,11 +614,12 @@ function callHaikuCLI(prompt, { timeout }) {
     const text = result.trim();
     return text ? { text } : null;
   } catch (e) {
-    // Try to extract partial output on timeout — validate JSON before returning
+    // Try to extract partial output on timeout — validate via parseJsonFromLLM
+    // (strips ```json fences per #8605) before returning. A raw brace check would
+    // discard a complete-but-fenced payload the caller could still parse, throwing
+    // away the JSON Haiku already emitted.
     const out = e.stdout?.toString?.()?.trim() || e.output?.[1]?.toString?.()?.trim();
-    if (out && out.startsWith('{') && out.endsWith('}')) {
-      try { JSON.parse(out); return { text: out }; } catch {}
-    }
+    if (out && parseJsonFromLLM(out) !== null) return { text: out };
     debugCatch(e, 'haiku-cli');
     return null;
   }

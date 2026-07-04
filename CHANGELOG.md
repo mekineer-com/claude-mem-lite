@@ -2,6 +2,72 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.37.0 — round-5 E2E audit: security + data-integrity fixes, adversarial-review-caught regressions
+
+Round 5 of the real-user E2E audit — six parallel read-only auditors over the previously
+un-audited surface (CLI/MCP, schema migrations, LLM ingestion, citation core, text pipeline,
+memory-mutation passes), then two independent adversarial reviewers over the whole diff before
+landing. The reviewers caught 5 regressions the author's own analysis missed — including a HIGH
+that silently killed FTS search for every non-Latin/non-Han script, and a ReDoS — reaffirming
+that a multi-fix sweep needs an independent skeptic before it ships. Suite 3482 → 3519, ESLint +
+knip clean.
+
+### Security / data-integrity (HIGH)
+- **secret-scrub**: quoted-KEY credential values (`{'api_key': '...'}` Python dict reprs,
+  single-quoted / mixed-quoted JS-JSON) leaked into stored memory — the quoted-value patterns
+  matched only an UNQUOTED key and the JSON patterns required both key AND value double-quoted.
+  Added a quoted-key pattern (either quote on key + value, matched independently); added
+  `passphrase` (SSH/GPG/keystore) to the credential nouns.
+- **schema (ensureFTS column-aware, user_version 40)**: `session_summaries_fts` was never widened
+  when a column was added to its FTS list (`remaining_items`, v2.2.0) — only observations_fts had
+  a recreation guard. An early-adopter DB kept a narrow FTS table while its triggers were rebuilt
+  wider, so every session_summaries UPDATE threw "no column named remaining_items" and was
+  silently swallowed (Haiku summary enrichment discarded every session, remaining_items
+  unindexed). ensureFTS is now column-aware (drops + recreates + repopulates any drifted FTS
+  table); a schema-version bump forces one idempotent reheal on existing DBs. Pure index rebuild —
+  no data migration, no column drop.
+- **hook-optimize (cluster-merge)**: on `merged_lesson:null` (the prompt permits it) the keeper's
+  lesson was overwritten with null and every non-keeper member hidden — all cluster lessons left
+  the live surface at once with no auto-recovery. Now preserves the union of the members' own
+  non-empty lessons. Also added `superseded_at IS NULL` to findMergeCandidates (adversarial-review
+  catch): a tombstoned row was a valid merge member, so its retired lesson could resurrect onto
+  the keeper, or it could be picked as an invisible keeper — whole-cluster data loss.
+
+### Correctness / recall
+- **nlp (out-of-dict CJK)**: a pure-CJK query token with no dictionary word was AND-joined as a
+  whole unsegmented run, so strict FTS returned 0 for every out-of-dict CJK term (recall salvaged
+  only by the OR fallback). Now emits the stored bigrams. The emoji/symbol drop now gates on
+  `\p{L}\p{N}` (any Unicode letter/number), NOT an ASCII+Han allowlist — the allowlist had
+  silently killed search for Cyrillic / Greek / kana / Hangul / Thai / accented Latin (review R1).
+- **hook-llm ingestion**: a non-string / empty / array-or-key-wrapped title discarded the whole
+  Haiku extraction incl. the lesson — now unwraps the envelope and degrades only the title,
+  keeping the lesson. handleLLMSummary persisted on `request` alone (dropping lessons +
+  key_decisions when request was empty) and threw when a prose field came back as an array — now
+  gates on any meaningful field and string-coerces array fields before bind (review R3).
+- **haiku-client**: the CLI timeout-salvage rejected fenced JSON (discarding a complete-but-fenced
+  buffer); routed the 3 sites through parseJsonFromLLM.
+- **utils (parseJsonFromLLM)**: the fence regex `\s*([\s\S]*?)\s*` catastrophically backtracked
+  (O(n²)) on a fence + long whitespace + no close — a ~5KB partial buffer hung 10+s (review R2).
+  Removed the ambiguous `\s*` (single O(n) lazy scan; JSON.parse still tolerates the surrounding
+  whitespace the trim used to strip).
+
+### Lower-severity
+- **mem-cli**: `timeline --before/--after` were uncapped (raw SQL LIMIT / whole-table dump, the
+  #8802 sibling) → bounded [0,50]. `compress --age-days` gains the [30,365] floor/ceil (parity
+  with mem_compress, whose description claimed the CLI rejected <30). **CLI behavior change**:
+  `compress --age-days <30` now fails loudly.
+- **hook (SIGTERM/SIGINT flush)**: the crash-path flush now splits interleaved concurrent sessions
+  via planEpisodeFlush (v3.35.2 parity — the normal + Stop-fallback paths already did).
+- **hook-optimize**: wide re-enrich preserves existing concepts/facts/search_aliases on a partial
+  LLM response (previously wiped, then locked out by optimized_at); wide `importance:0` clamps to
+  1 instead of hiding a substantive row at COMPRESSED_AUTO(-1).
+- **citation-tracker**: decay selectStmt filters `superseded_at IS NULL`; JSDoc floor corrected
+  0→1 (the never-bury-a-lesson guarantee depends on floor≥1).
+
+### Version bump
+package.json + package-lock.json + plugin.json + marketplace.json + CLAUDE.md → 3.37.0.
+DB schema user_version 39 → 40 (forces the one-time column-aware FTS reheal).
+
 ## v3.36.0 — four-round E2E audit: self-heal signing gap, parallel-path invariant closures, injection/registry hardening
 
 Four rounds of real-user E2E auditing (parallel read-only auditors + adversarial per-fix verification of every finding AND its proposed fix). The through-line: an invariant with a guard at *some* sites never means *all* sites — two invariants each gained a new enforcement-site fix, and the self-heal path was found bypassing the release-signing control entirely. Suite 3452 → 3482, ESLint + knip clean.
