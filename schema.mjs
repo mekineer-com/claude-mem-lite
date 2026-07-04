@@ -98,13 +98,19 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // (Haiku summary enrichment lost every session). Pure index reheal (no data migration, no
 // column drop); idempotent. New behavior via the forced pass; LATEST_MIGRATION_COLUMN
 // unchanged (no new column) — same pattern as v35/v36/v38/v39.
-export const CURRENT_SCHEMA_VERSION = 40;
+// v41 (cross-turn late-citation): adds observations.last_cited_session_id (additive,
+// nullable) — the promote idempotency key, split from last_decided_session_id so a
+// citation landing in a LATER turn of the same session can still upgrade a
+// previously-uncited obs (see applyCitationDecay). REAL new column, so unlike v38-v40
+// this DOES advance LATEST_MIGRATION_COLUMN (→ observations.last_cited_session_id);
+// existing DBs reach the ALTER because version 40 != 41 falls through the fast-path.
+export const CURRENT_SCHEMA_VERSION = 41;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
 // back (observed once in dev during v2.74.0). Update both the column AND
 // (if needed) the table when adding a new migration batch.
-const LATEST_MIGRATION_COLUMN = { table: 'user_prompts', column: 'cc_session_id' };
+const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'last_cited_session_id' };
 
 function hasLatestMigrationColumn(db) {
   try {
@@ -264,6 +270,14 @@ const MIGRATIONS = [
   // legacy rows + non-CC/no-stdin invocations read back NULL and the handoff falls
   // back to its legacy unfiltered query.
   'ALTER TABLE user_prompts ADD COLUMN cc_session_id TEXT DEFAULT NULL',
+  // v41 (cross-turn late-citation): promote-idempotency key, split from
+  // last_decided_session_id. applyCitationDecay guards the cited/promote branch on
+  // THIS column so a citation in a LATER turn of the same session can still upgrade a
+  // previously-uncited obs; the uncited/streak branch stays guarded on
+  // last_decided_session_id (so it never double-streaks within a session). Nullable:
+  // legacy rows read NULL and behave exactly as before until their first same-session
+  // late cite.
+  'ALTER TABLE observations ADD COLUMN last_cited_session_id TEXT DEFAULT NULL',
 ];
 
 /**

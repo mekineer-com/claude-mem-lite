@@ -2,6 +2,37 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.38.0 — cross-turn late-citation fix (citation-decay upgrade path)
+
+The citation-decay loop froze each injected observation's verdict at the FIRST main-thread Stop
+of a session — idempotency was keyed on `last_decided_session_id`, so a `#NN` citation that landed
+in a *later* turn of the same session was skipped as a no-op. But the CLAUDE.md contract is "cite
+NEXT time you produce user-visible text," which may be several turns after injection: a genuinely
+useful lesson cited a couple turns late every session accrued an uncited streak and could be
+falsely demoted. The `hasMainThreadAssistantText` gate only covered tool-only Stops, not this
+cross-turn case. Suite 3519 → 3528, ESLint clean; the v40→v41 migration was verified zero-loss on
+a 2097-row production DB copy.
+
+### Fixed
+- **citation-decay cross-turn late citation** (`lib/citation-tracker.mjs`): split the promote
+  idempotency key out into a new `last_cited_session_id` column. The cited/promote branch now
+  guards on `last_cited_session_id` — a citation in a later turn upgrades a previously-uncited obs
+  and, because promote resets the streak and lifts importance, naturally undoes any same-session
+  demotion. The uncited/streak branch keeps guarding on `last_decided_session_id`, so it still
+  never double-streaks within a session. Three counting invariants stop a late upgrade from
+  polluting the cite-rate: `touched`, `decay_seen_count`, and the funnel's `injected_n` bump only
+  on an obs's FIRST resolution, so a single injected-then-cited observation reads N/1 (not N/2).
+- **citation funnel** (`recordCitationFunnel`): a pure late-upgrade Stop contributes
+  `injectedDelta=0, citedDelta>0`. The no-op gate now skips only when BOTH deltas are 0, so the
+  numerator still folds onto the existing session row instead of being silently dropped by the
+  old `inj<=0` gate.
+
+### Schema
+- **v41** (additive, nullable): `observations.last_cited_session_id TEXT`. `LATEST_MIGRATION_COLUMN`
+  advances to it (a real column migration, unlike the v38–v40 forced-pass bumps); existing DBs
+  reach the ALTER because version 40 ≠ 41 falls through the fast-path. Legacy rows read NULL and
+  behave exactly as before until their first same-session late cite.
+
 ## v3.37.0 — round-5 E2E audit: security + data-integrity fixes, adversarial-review-caught regressions
 
 Round 5 of the real-user E2E audit — six parallel read-only auditors over the previously

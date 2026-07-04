@@ -45,9 +45,21 @@ describe('recordCitationFunnel', () => {
     expect(get('p2', 's1').injected_n).toBe(1);
   });
 
-  it('is a no-op when injectedDelta <= 0 (no noise rows)', () => {
+  it('writes no row when both deltas are 0 (nothing resolved, no noise)', () => {
     recordCitationFunnel(db, 'p1', 's1', 0, 0);
     expect(get('p1', 's1')).toBeUndefined();
+  });
+
+  it('records a cited-only delta from a cross-turn late upgrade (injected=0, cited>0)', () => {
+    // Turn 1 resolved 3 obs uncited → the session row exists with cited_n=0.
+    recordCitationFunnel(db, 'p1', 's1', 3, 0);
+    // Turn 3: one of those obs is cited late. applyCitationDecay returns touched=0
+    // (already in the denominator) but promoted=1. The numerator must still bump —
+    // the pre-fix `if (inj <= 0) return` dropped this, silently under-counting cites.
+    recordCitationFunnel(db, 'p1', 's1', 0, 1);
+    const row = get('p1', 's1');
+    expect(row.injected_n).toBe(3); // denominator unchanged — no double-count
+    expect(row.cited_n).toBe(1);    // numerator credited the late citation
   });
 
   it('does not throw on null db / empty args', () => {

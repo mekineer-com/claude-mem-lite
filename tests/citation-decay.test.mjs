@@ -319,6 +319,85 @@ describe('applyCitationDecay', () => {
   });
 });
 
+describe('applyCitationDecay — cross-turn late citation (uncited→cited upgrade within a session)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'p' });
+  });
+  afterEach(() => { try { db.close(); } catch {} });
+
+  function makeObs(overrides = {}) {
+    const id = insertObs(db, { sessionId: 'sess-1', project: 'p', type: 'bugfix', title: 't', importance: 2, ...overrides }).lastInsertRowid;
+    if (overrides.uncited_streak !== undefined || overrides.cited_count !== undefined || overrides.last_decided_session_id !== undefined) {
+      db.prepare(`UPDATE observations SET uncited_streak = ?, cited_count = ?, last_decided_session_id = ? WHERE id = ?`)
+        .run(overrides.uncited_streak ?? 0, overrides.cited_count ?? 0, overrides.last_decided_session_id ?? null, id);
+    }
+    return id;
+  }
+
+  it('a citation in a LATER turn of the same session promotes a previously-uncited obs', () => {
+    // Contract: "cite NEXT time you produce user-visible text" — may be several turns
+    // later. Pre-fix, the turn-1 uncited resolution froze the verdict (last_decided=S),
+    // and the turn-3 citation was skipped as an idempotent no-op → signal lost.
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    const r1 = applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');   // turn 1: not yet cited
+    expect(r1).toEqual({ promoted: 0, demoted: 0, touched: 1 });
+    expect(db.prepare('SELECT uncited_streak, importance FROM observations WHERE id=?').get(id).uncited_streak).toBe(1);
+
+    const r2 = applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1'); // turn 3: now cited
+    expect(r2.promoted).toBe(1);
+    expect(r2.touched).toBe(0); // already in the injected denominator from turn 1 — not re-counted
+    const row = db.prepare('SELECT importance, cited_count, uncited_streak, decay_seen_count, last_cited_session_id FROM observations WHERE id=?').get(id);
+    expect(row.importance).toBe(3);
+    expect(row.cited_count).toBe(1);
+    expect(row.uncited_streak).toBe(0);
+    expect(row.last_cited_session_id).toBe('sess-1');
+    expect(row.decay_seen_count).toBe(1); // counted ONCE (turn 1), not double-counted on the upgrade
+  });
+
+  it('a late citation undoes a same-session demotion (importance restored)', () => {
+    const id = makeObs({ importance: 2, uncited_streak: 2 }); // one more uncited → demote
+    const r1 = applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');
+    expect(r1.demoted).toBe(1);
+    expect(db.prepare('SELECT importance, uncited_streak FROM observations WHERE id=?').get(id).importance).toBe(1);
+
+    const r2 = applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1'); // late cite
+    expect(r2.promoted).toBe(1);
+    const row = db.prepare('SELECT importance, cited_count, uncited_streak FROM observations WHERE id=?').get(id);
+    expect(row.importance).toBe(2);   // restored 1 → 2
+    expect(row.cited_count).toBe(1);
+    expect(row.uncited_streak).toBe(0);
+  });
+
+  it('the promote upgrade is itself idempotent (guarded by last_cited_session_id)', () => {
+    const id = makeObs({ importance: 1, uncited_streak: 0 }); // start below cap so climb is visible
+    applyCitationDecay(db, 'p', new Set([id]), new Set(), 'sess-1');        // uncited
+    applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');    // upgrade → promote (imp 1→2)
+    const after1 = db.prepare('SELECT importance, cited_count FROM observations WHERE id=?').get(id);
+    expect(after1.importance).toBe(2);
+    expect(after1.cited_count).toBe(1);
+
+    const r3 = applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1'); // re-fire cited
+    expect(r3.promoted).toBe(0); // already promoted this session
+    const after2 = db.prepare('SELECT importance, cited_count FROM observations WHERE id=?').get(id);
+    expect(after2.importance).toBe(2);  // no further climb
+    expect(after2.cited_count).toBe(1); // NOT double-counted
+  });
+
+  it('first-resolution cited (injected + cited in one call) still counts touched AND promoted', () => {
+    // Regression guard: the common "cite it right away" path must be unchanged —
+    // it IS a first resolution, so it enters the injected denominator (touched=1).
+    const id = makeObs({ importance: 2, uncited_streak: 0 });
+    const r = applyCitationDecay(db, 'p', new Set([id]), new Set([id]), 'sess-1');
+    expect(r).toEqual({ promoted: 1, demoted: 0, touched: 1 });
+    const row = db.prepare('SELECT decay_seen_count, last_cited_session_id, last_decided_session_id FROM observations WHERE id=?').get(id);
+    expect(row.decay_seen_count).toBe(1);
+    expect(row.last_cited_session_id).toBe('sess-1');
+    expect(row.last_decided_session_id).toBe('sess-1');
+  });
+});
+
 describe('Stop hook integration — fixture transcript composition', () => {
   let db, tmp;
   beforeEach(() => {
