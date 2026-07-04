@@ -1979,30 +1979,52 @@ async function manualUpdate() {
 // latest code even when local install.mjs / hook-update.mjs are themselves
 // buggy on disk.
 async function repair() {
-  console.log('\nclaude-mem-lite repair — re-syncing from latest GitHub release\n');
+  console.log('\nclaude-mem-lite repair — re-syncing from the latest SIGNED GitHub release\n');
   const stagingDir = mkdtempSync(join(tmpdir(), 'claude-mem-lite-repair-'));
   try {
-    const tarballUrl = 'https://api.github.com/repos/sdsrss/claude-mem-lite/tarball';
+    // Resolve the latest RELEASE (tag) and cryptographically VERIFY it before running any
+    // downloaded code — parity with the auto-update path (hook-update.downloadAndInstall).
+    // The old code fetched `/tarball` (default-branch main HEAD, unreleased WIP) and ran its
+    // install.mjs UNVERIFIED, and this path is auto-triggered by hook-launcher on any
+    // ERR_MODULE_NOT_FOUND — so a drifted install silently self-healed onto main, and a
+    // repo/TLS-MITM compromise achieved RCE, bypassing the Ed25519 signed-release control that
+    // the manual `update` path enforces. Lazy import so a missing/broken hook-update dependency
+    // degrades to the manual fallback (fail-closed) rather than to unverified auto-install.
+    let fetchLatestRelease, verifyReleaseAuthenticity;
+    try {
+      ({ fetchLatestRelease, verifyReleaseAuthenticity } = await import('./hook-update.mjs'));
+    } catch (e) {
+      throw new Error(`cannot load the verified-update path (${e.message}) — refusing to auto-install unverified code`, { cause: e });
+    }
+    const rel = await fetchLatestRelease();
+    if (!rel || !rel.tarballUrl) throw new Error('could not resolve the latest release (network / rate-limit)');
+    // URL allow-list mirrors hook-update.downloadAndInstall — only github.com tarball URLs.
+    if (!/^https:\/\/(?:api\.)?github\.com\/[a-zA-Z0-9./_-]+$/.test(rel.tarballUrl)) {
+      throw new Error(`refusing suspicious tarball URL: ${rel.tarballUrl}`);
+    }
     const tarballPath = join(stagingDir, 'release.tgz');
-    log('Downloading latest release tarball...');
-    execFileSync('curl', ['-sL', '-f', '-H', 'Accept: application/vnd.github+json', tarballUrl, '-o', tarballPath],
+    log(`Downloading release v${rel.version}...`);
+    execFileSync('curl', ['-sL', '-f', '-H', 'Accept: application/vnd.github+json', rel.tarballUrl, '-o', tarballPath],
       { timeout: 60000, stdio: ['ignore', 'pipe', 'inherit'] });
     log('Extracting...');
     execFileSync('tar', ['xzf', tarballPath, '-C', stagingDir, '--strip-components=1'],
       { timeout: 30000, stdio: ['ignore', 'pipe', 'inherit'] });
+    // Verify the Ed25519 signature BEFORE running the downloaded install.mjs. Fail-closed:
+    // any tampering / missing-signature / fetch-failure aborts to the manual fallback.
+    log('Verifying release signature...');
+    const authentic = await verifyReleaseAuthenticity(stagingDir, rel.assets);
+    if (!authentic.ok) throw new Error(`release signature check failed (${authentic.action})`);
     const tarballInstaller = join(stagingDir, 'install.mjs');
-    if (!existsSync(tarballInstaller)) {
-      fail('Tarball missing install.mjs — repair aborted');
-      process.exit(1);
-    }
-    log('Re-running install from freshly-downloaded sources...');
+    if (!existsSync(tarballInstaller)) throw new Error('verified tarball missing install.mjs');
+    log('Re-running install from the verified release sources...');
     execFileSync(process.execPath, [tarballInstaller, 'install'],
       { stdio: 'inherit', timeout: 300000 });
-    ok('Repair complete — broken install resynced from latest release');
+    ok(`Repair complete — resynced from verified release v${rel.version}`);
   } catch (e) {
     fail(`Repair failed: ${e.message}`);
     console.log('');
-    console.log('  Manual fallback — run this in any shell:');
+    console.log('  Automatic repair fails closed rather than run unverified code.');
+    console.log('  Manual fallback — run this in any shell (you are choosing to trust it):');
     console.log('');
     console.log('  T=$(mktemp -d) && curl -sL https://api.github.com/repos/sdsrss/claude-mem-lite/tarball | tar xz -C "$T" --strip-components=1 && node "$T/install.mjs" install');
     console.log('');

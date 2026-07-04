@@ -118,7 +118,12 @@ const STALE_OBS_THRESHOLD_MS = 30 * 86400000;
  * @returns {string} `- [type] title[ | Lesson: X] (#id)[ [verify-before-use]]`
  */
 export function formatMemoryLine(obs) {
-  const lessonTag = obs.lesson_learned ? ` | Lesson: ${obs.lesson_learned}` : '';
+  // truncate (not raw): caps the per-hit token cost (an unbounded lesson bloated every
+  // memory-context line) AND collapses newlines — a multi-line lesson pushed the trailing
+  // "(#NN)" onto a later physical line that failed the "- [" prefix gate in
+  // citation-tracker's UserPromptSubmit extractor, so the obs never entered the
+  // citation-decay denominator (its promote/demote loop was silently dead).
+  const lessonTag = obs.lesson_learned ? ` | Lesson: ${truncate(obs.lesson_learned, 200)}` : '';
   let staleHint = '';
   if (typeof obs.created_at_epoch === 'number'
     && Date.now() - obs.created_at_epoch > STALE_OBS_THRESHOLD_MS
@@ -310,7 +315,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // Adaptive threshold: scales with corpus size to filter noise.
     // Each result must individually exceed the threshold (not just the top one).
     const obsCount = db.prepare(
-      'SELECT COUNT(*) as c FROM observations WHERE project = ? AND COALESCE(compressed_into, 0) = 0',
+      'SELECT COUNT(*) as c FROM observations WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL',
     ).get(project)?.c || 0;
     const { TINY, SMALL, MEDIUM, LARGE } = BM25_THRESHOLD;
     const threshold = obsCount < 5 ? TINY : obsCount < 100 ? SMALL : obsCount < 500 ? MEDIUM : LARGE;
@@ -422,6 +427,7 @@ export function selectImperativeLesson(db, userPrompt, project, excludeIds = [])
       FROM observations
       WHERE project = ?
         AND COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
         AND COALESCE(importance, 1) >= 2
         AND lesson_learned IS NOT NULL
         AND TRIM(lesson_learned) != ''

@@ -32,6 +32,20 @@ describe('formatMemoryLine', () => {
     expect(line).not.toContain('[verify-before-use]');
   });
 
+  it('caps the lesson and collapses newlines so (#id) stays on one physical line', () => {
+    // Regression: a raw multi-line lesson pushed the trailing (#NN) onto a later physical
+    // line, which failed the "- [" prefix gate in citation-tracker's UserPromptSubmit
+    // extractor → the obs never entered the citation-decay denominator (promote/demote dead).
+    const line = formatMemoryLine({
+      id: 777, type: 'bugfix', title: 'T',
+      lesson_learned: 'line one\nline two\nline three ' + 'x'.repeat(400),
+      created_at_epoch: fresh, files_modified: '[]',
+    });
+    expect(line.split('\n')).toHaveLength(1);        // single physical line
+    expect(line).toMatch(/\(#777\)/);                // id present and extractable
+    expect(line.length).toBeLessThan(300);           // capped, not the full 400+ char lesson
+  });
+
   it('appends [verify-before-use] for obs older than 30 days WITH files_modified', () => {
     const line = formatMemoryLine({
       id: 99, type: 'bugfix', title: 'Fixed dispatch race',

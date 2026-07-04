@@ -250,7 +250,7 @@ function main(argv) {
   if (Number.isFinite(opts.max)) entries = entries.slice(0, opts.max);
   process.stderr.write(`Running LongMemEval on ${entries.length} questions (turns=${opts.turns}${opts.temporal ? ', temporal' : ''}) …\n`);
 
-  const out = runLongMemEval(entries, { turns: opts.turns, ks: opts.ks, limit: opts.limit });
+  const out = runLongMemEval(entries, { turns: opts.turns, temporal: opts.temporal, ks: opts.ks, limit: opts.limit });
 
   const lines = [];
   lines.push(`\nLongMemEval — claude-mem-lite (lexical FTS5+TF-IDF+RRF, turns=${opts.turns}${opts.temporal ? ', temporal' : ''}, n=${out.n})`);

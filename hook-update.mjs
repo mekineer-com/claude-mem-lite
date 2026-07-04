@@ -187,7 +187,7 @@ function shouldCheck(state) {
 
 // ── GitHub API ─────────────────────────────────────────────
 // Try releases/latest first, fallback to tags (some repos only use tags)
-async function fetchLatestRelease() {
+export async function fetchLatestRelease() {
   const headers = {
     'Accept': 'application/vnd.github+json',
     'User-Agent': 'claude-mem-lite-updater/1.0',
