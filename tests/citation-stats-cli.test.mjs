@@ -136,6 +136,20 @@ describe('citation-stats CLI', () => {
     expect(output).toMatch(/cite rate|cited/i);
   });
 
+  it('surfaces the GC-durable funnel rate alongside the survivorship rate (Fix B)', async () => {
+    // Surviving obs looks great: cited 9 of 10 decay-resolutions = 90% (survivorship-biased).
+    obs({ title: 'survivor', importance: 2, cited_count: 9 });
+    testDb.prepare('UPDATE observations SET decay_seen_count = 10 WHERE project = ?').run('p1');
+    // But citation_log (GC-durable) holds the honest history: 5 cited of 100 injected = 5%.
+    testDb.prepare('INSERT INTO citation_log (project, memory_session_id, resolved_at, injected_n, cited_n) VALUES (?,?,?,?,?)')
+      .run('p1', 'hist1', Date.now(), 100, 5);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toContain('funnel');     // honest rate labelled
+    expect(output).toContain('surviving');  // biased rate labelled
+    expect(output).toContain('5.0%');       // honest funnel rate 5/100
+    expect(output).toContain('90.0%');      // survivorship rate 9/10
+  });
+
   it('--json flag emits machine-readable output', async () => {
     obs({ title: 'j', importance: 2, uncited_streak: 2 });
     const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));

@@ -2443,16 +2443,34 @@ function cmdCitationStats(db, args) {
   // as the per-project cite rate above; funnel.prior/delta_pt show the direction.
   const funnel = computeCitationFunnelTrend(db, { days });
 
+  // Survivorship-honesty: the per-project rate (cited_count/decay_seen_count over
+  // SURVIVING in-window obs) is doubly biased — GC drops uncited obs from the
+  // denominator and the window excludes older obs — so it overstates adoption (a
+  // project can read 91% while its true lifetime inject→cite is ~6%). citation_log
+  // rows persist across GC, so their per-project sum is the honest historical rate.
+  // Attach both to each row so the text + JSON surface the biased and honest numbers.
+  const funnelByProject = new Map(
+    db.prepare(`SELECT project, COALESCE(SUM(injected_n), 0) inj, COALESCE(SUM(cited_n), 0) cit
+                  FROM citation_log GROUP BY project`).all().map(r => [r.project, r])
+  );
+  for (const r of perProject) {
+    const f = funnelByProject.get(r.project);
+    r.funnel_injected = f ? f.inj : 0;
+    r.funnel_cited = f ? f.cit : 0;
+  }
+
   if (json) {
     out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote, funnel }, null, 2));
     return;
   }
 
   if (dataPollutionNote) out(`Note: ${dataPollutionNote}\n`);
-  out(`Cite rate by project (last ${days}d, cited / decay-resolutions):`);
+  out(`Cite rate by project (last ${days}d):`);
+  out(`  funnel = lifetime injected→cited (citation_log, GC-durable = honest) · surviving = cited/decay over in-window non-GC'd obs (survivorship-biased, reads high):`);
   for (const r of perProject) {
-    const rate = r.resolved > 0 ? (r.cited * 100 / r.resolved).toFixed(1) + '%' : '—';
-    out(`  ${r.project.padEnd(34)} ${String(rate).padStart(6)}   cited:${r.cited}/${r.resolved}   at_risk:${r.at_risk}`);
+    const funnelRate = r.funnel_injected > 0 ? (r.funnel_cited * 100 / r.funnel_injected).toFixed(1) + '%' : '—';
+    const survRate = r.resolved > 0 ? (r.cited * 100 / r.resolved).toFixed(1) + '%' : '—';
+    out(`  ${r.project.padEnd(30)} funnel ${String(funnelRate).padStart(6)} (${r.funnel_cited}/${r.funnel_injected}) · surviving ${String(survRate).padStart(6)} (${r.cited}/${r.resolved}) · at_risk:${r.at_risk}`);
   }
   out('');
 

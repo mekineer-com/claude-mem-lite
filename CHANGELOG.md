@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.38.1 — honest per-project cite rate (survivorship-bias fix in citation-stats)
+
+`citation-stats`' "Cite rate by project" reported `cited_count / decay_seen_count` over surviving,
+in-window observations — doubly biased: GC removes uncited obs from the denominator and the window
+excludes older obs, so a project could read 91% while its true lifetime inject→cite rate was ~6%.
+The display now shows the GC-durable funnel rate (lifetime injected→cited from citation_log, the
+honest adoption number) alongside the relabelled survivorship rate. Surfaced by the D#44
+investigation; the ranking-side "fix" was dropped per obs #8771 (retrieval/ranking is already
+solved at ~0 measured lift — the real lever is a forcing-function that makes the model ACT).
+
+### Fixed
+- **citation-stats per-project rate** (`mem-cli.mjs`): surface the lifetime `citation_log` funnel
+  rate (honest, GC-durable) next to the survivorship-biased `cited_count/decay_seen_count` rate,
+  each clearly labelled (e.g. a heavily-GC'd project now shows `funnel 6.1% · surviving 88.1%`
+  instead of a bare, misleading 88%). Telemetry-only; no scoring or injection behavior changes.
+
 ## v3.38.0 — cross-turn late-citation fix (citation-decay upgrade path)
 
 The citation-decay loop froze each injected observation's verdict at the FIRST main-thread Stop
