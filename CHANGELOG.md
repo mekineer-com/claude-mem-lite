@@ -2,6 +2,40 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.39.2 — code-review follow-up: vector-arm parity, `/lesson` save guard, multi-line save recognizer
+
+Three fixes from a code review of the v3.39.0→v3.39.1 changeset. The review found **no Critical
+issues and no data-corruption risk**; these are the correctness/UX gaps it surfaced. Each TDD'd,
+full suite green (191 files / 3609 tests), no runtime regression.
+
+### Fixed
+- **Vector text now includes `lesson_learned` + backfilled aliases** (`lib/save-observation.mjs`,
+  `hook-optimize.mjs`) — the TF-IDF vector for a manual save was fed only `title + content`,
+  omitting the lesson; and the `--scope aliases` backfill updated the FTS text but never rebuilt the
+  vector, so the newly generated aliases stayed invisible to the vector arm (finding #8, only
+  half-delivered). Both write paths now mirror the FTS-indexed content (`title + content + lesson`,
+  and the appended aliases) into the vector. Bounded impact: the vector arm is choke-point-gated OFF
+  by default (`CLAUDE_MEM_VECTORS`, 0 measured benchmark lift) — this is a correctness/consistency
+  fix, not a recall change. (Scoped out: the `[title, narrative, concepts]` parts at the
+  re-enrich/merge/summary `rebuildVector` callsites — a pre-existing broader pattern, lesson≈narrative
+  overlap, same default-off arm.)
+- **`/lesson` and `/bug` no longer risk aborting a save on a long lesson** (`commands/lesson.md`,
+  `commands/bug.md`) — the skill templates told the model to pass the full text into `--lesson`, but
+  `cli.mjs save` rejects a `--lesson` over 500 chars (the `lesson_learned` field contract), so a long
+  lesson aborted the whole save (nothing stored). The templates now direct the full text to the
+  positional content and a distilled ≤500-char insight to `--lesson`.
+- **Unsaved-bugfix nudge no longer over-fires after a multi-line save** (`lib/cite-back-hint.mjs`) —
+  the redirected-save recognizer used `[^\n]*` between `save` and `--lesson`, which can't span the
+  real newlines of the multi-line, backslash-continued command the `/bug` `/lesson` templates
+  document (the command carries real newlines after `JSON.parse`). It now uses `[\s\S]*?`
+  (newline-tolerant, lazy → nearest `--lesson`), so an explicit save is credited and the nudge stays
+  silent.
+
+### Docs
+- Corrected stale docstrings in `lib/activity.mjs` + `tests/activity-promote.test.mjs` that still
+  described the FK-unsafe `superseded_by_id → obs id` marking the v3.39.1 fix deliberately dropped
+  (it is left NULL — a self-FK to `events(id)`).
+
 ## v3.39.1 — `activity promote` hardening (low-signal exclusion + FK-safe marking)
 
 Two fixes to `activity promote`, both caught while running the v3.39.0 backfill against a real DB.

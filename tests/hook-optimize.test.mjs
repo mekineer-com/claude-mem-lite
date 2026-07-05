@@ -247,6 +247,53 @@ describe('rebuildVector (Bug #1)', () => {
   });
 });
 
+// I-1 (v3.39.2): the alias-only backfill APPENDs aliases to the FTS text but,
+// before the fix, never rebuilt the TF-IDF vector — so the newly generated
+// aliases (the whole point of the pass) were invisible to the vector arm. The
+// branch must refresh the vector like the narrow/wide branch does.
+describe('re-enrich --scope aliases rebuilds the vector (I-1)', () => {
+  let db;
+  let prevVec;
+  beforeEach(async () => {
+    prevVec = process.env.CLAUDE_MEM_VECTORS;
+    process.env.CLAUDE_MEM_VECTORS = '1';
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { type: 'bugfix', title: `Fix issue ${i} in module X`,
+        narrative: `Detailed narrative about issue ${i}: a concurrency bug in the handler released the lock before the side-effect finished, causing a race window that let the second caller overwrite state.`,
+        text: `concurrency lock race handler side-effect state issue-${i}` });
+    }
+    const { rebuildVocabulary, _resetVocabCache } = await import('../tfidf.mjs');
+    _resetVocabCache();
+    rebuildVocabulary(db);
+    callModelJSON.mockReset();
+  });
+  afterEach(() => {
+    db.close();
+    if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS;
+    else process.env.CLAUDE_MEM_VECTORS = prevVec;
+  });
+
+  it('writes an observation_vectors row for the alias-backfilled observation', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    // Alias-less, substantive row (narrative > 100 chars, real title) → qualifies
+    // for scope=aliases. insertObs writes no vector, so none exists yet.
+    const id = Number(insertObs(db, { type: 'bugfix',
+      title: 'Race in the credit deduction path',
+      narrative: 'IntegrityError under concurrent credit deduction: the balance was read then written without a row lock, so two in-flight requests overwrote each other. Fixed with SELECT FOR UPDATE inside the transaction.',
+      text: 'credit deduction race balance row lock integrityerror' }).lastInsertRowid);
+    expect(db.prepare('SELECT COUNT(*) c FROM observation_vectors WHERE observation_id = ?').get(id).c).toBe(0);
+
+    callModelJSON.mockResolvedValue({ search_aliases: ['concurrency race', 'double spend', 'lost update'] });
+    const r = await executeReenrich(db, 10, { scope: 'aliases' });
+    expect(r.processed).toBeGreaterThanOrEqual(1);
+
+    // The backfill must refresh the vector (before the fix: UPDATE ran but no rebuild).
+    expect(db.prepare('SELECT COUNT(*) c FROM observation_vectors WHERE observation_id = ?').get(id).c).toBe(1);
+  });
+});
+
 // R-7 micro: widened scope — target observations that have concepts/facts populated
 // but still no lesson_learned. These are the "Haiku filled in everything except the
 // lesson" cases that the narrow filter misses entirely.

@@ -36,13 +36,16 @@ Don't use for trivial fixes (typos, renames), for rules that belong in memdir
 
 ## Execution
 
-Run via Bash — pass the lesson text as the positional content and repeat it in
-`--lesson` so it lands in the high-weight `lesson_learned` field:
+Run via Bash — pass the full lesson text as the positional content, and a
+distilled version in `--lesson` so it lands in the high-weight `lesson_learned`
+field. `--lesson` is capped at 500 chars (longer values are rejected), so for a
+long lesson keep the full text in the positional content and trim `--lesson` to
+the core insight:
 
     node ${CLAUDE_PLUGIN_ROOT}/cli.mjs save "<full text>" \
       --type discovery \
       --title "<first 60 chars of text>" \
-      --lesson "<full text>" \
+      --lesson "<core insight, ≤500 chars>" \
       [--files f1,f2,...] \
       --importance <1|2|3>
 

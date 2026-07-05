@@ -171,6 +171,10 @@ Give 3-6 aliases: words a user might search for the SAME concept but that are NO
         const safe = scrubRecord('observations', { text: appendedText, search_aliases: searchAliases });
         db.prepare(`UPDATE observations SET search_aliases = ?, text = ? WHERE id = ?`)
           .run(safe.search_aliases, safe.text, cand.id);
+        // Refresh the TF-IDF vector from the just-updated FTS text so the new
+        // aliases reach the vector arm too — the narrow/wide branch rebuilds, this
+        // one must as well. No-ops when the vector arm is off / vocab unbuilt.
+        rebuildVector(db, cand.id, [safe.text]);
         processed++;
         continue;
       }

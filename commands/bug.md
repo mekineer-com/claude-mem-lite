@@ -43,13 +43,16 @@ Map severity to importance:
 Build the body as `<description>\n\nRepro:\n<repro-steps>` (or just
 `<description>` if `--repro` is absent).
 
-Run via Bash — the body is the positional content; the description goes in
-`--lesson` so it lands in the high-weight `lesson_learned` field:
+Run via Bash — the full body is the positional content; a distilled description
+goes in `--lesson` so it lands in the high-weight `lesson_learned` field.
+`--lesson` is capped at 500 chars (longer values are rejected), so keep the full
+body in the positional content and trim `--lesson` to the core description if
+longer:
 
     node ${CLAUDE_PLUGIN_ROOT}/cli.mjs save "<body>" \
       --type bugfix \
       --title "<first 60 chars of description>" \
-      --lesson "<description>" \
+      --lesson "<description, ≤500 chars>" \
       [--files f1,f2,...] \
       --importance <1|2|3>
 

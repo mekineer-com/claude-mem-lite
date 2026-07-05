@@ -2,8 +2,9 @@
 // The events table holds 2000+ high-value rows (bugfix/lesson/decision) that
 // mem_search / passive injection never read (finding #1). This one-time backfill
 // copies the insight-bearing subset (body present, importance>=2) into observations
-// and marks the source event promoted (superseded_at_epoch + superseded_by_id → the
-// new obs id) so re-runs are idempotent. No schema change — those columns exist.
+// and marks the source event promoted with superseded_at_epoch ONLY (superseded_by_id
+// is a self-FK → events(id), deliberately left NULL) so re-runs skip it. No schema
+// change — the column exists.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDb } from './test-helpers.mjs';
 import { saveEvent, promoteInsightEvents } from '../lib/activity.mjs';

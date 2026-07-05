@@ -360,6 +360,29 @@ describe('countUnsavedBugfixShape', () => {
     expect(r.unsaved).toBe(0);
   });
 
+  // The /bug /lesson skill templates document the save as a MULTI-LINE,
+  // backslash-continued command (save on line 1, --lesson several lines down).
+  // After JSON.parse the command carries real newlines, so a `[^\n]*` gap between
+  // `save` and `--lesson` cannot span them → the save goes uncredited and the
+  // unsaved-bugfix nudge over-fires. The recognizer must tolerate newlines.
+  it('credits the redirected save even when the command is multi-line (template shape)', () => {
+    const bashMultiLineSave = {
+      type: 'assistant',
+      message: { content: [
+        { type: 'tool_use', name: 'Bash', input: { command:
+          'node /root/.claude/plugins/cache/x/cli.mjs save "fixed the pool deadlock" \\\n'
+          + '  --type bugfix \\\n'
+          + '  --title "deadlock" \\\n'
+          + '  --lesson "reorder acquisition" \\\n'
+          + '  --importance 2' } },
+      ] },
+    };
+    const path = writeTranscript([bugfixShapeAttachment(), bashMultiLineSave]);
+    const r = countUnsavedBugfixShape(path);
+    expect(r.saved).toBe(1);
+    expect(r.unsaved).toBe(0);
+  });
+
   it('credits mem_save tool_use with type=lesson as a save', () => {
     const path = writeTranscript([
       bugfixShapeAttachment(),
