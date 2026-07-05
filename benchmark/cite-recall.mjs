@@ -68,11 +68,38 @@ const MEMCTX_MARKER = /<memory-context/;
 // routing would fold its #NN into :memory-context. Per-line routing (below) credits
 // it to a distinct :imperative bucket so its cite-recall is measurable on its own.
 const IMP_MARKER = /Memory — a past lesson applies to THIS task\. You must:/;
+// PostToolUse error-recall hint (hook.mjs triggerErrorRecall → post-tool-use.sh):
+// `[claude-mem-lite] Related memories found for this error:` then `  #NN [type] body`
+// rows. Routed to its own :error-recall bucket with row-anchored extraction — mirroring
+// production lib/citation-tracker.mjs INJECTED_ROW_RE — so the benchmark's injected
+// denominator matches the runtime's channel definition. Before D#51 the error-recall
+// #NN were mislabeled under the generic PostToolUse:Bash bucket and only counted
+// INCIDENTALLY when a co-located `[mem] episode flushed` line tripped the loose [mem]
+// marker; the broad ID_RE also swallowed a foreign plugin's code-comment #NN (e.g. a
+// code-graph grep echoing `// #123`), a lesson body quoting another obs, and the
+// trailing `mem_get(ids=[…])` bare numbers — never-cited ids that deflate the channel's
+// true recall by padding its denominator.
+const ERR_RECALL_MARKER = /Related memories found for this error/;
+// A genuine injected lesson row starts (after ≤6 spaces of indent) with `#NN [type]`.
+// Bounded type list mirrors observations.type CHECK; `.exec` (non-global) returns the
+// FIRST match, so a `#NN` quoted later in the same row's body is not captured.
+const INJECTED_ROW_RE = /^\s{0,6}#(\d{1,7})\s+\[(?:bugfix|decision|change|discovery|feature|refactor|lesson)\]/;
 
 function extractIds(text) {
   const ids = new Set();
   if (!text || typeof text !== 'string') return ids;
   for (const m of text.matchAll(ID_RE)) ids.add(m[1]);
+  return ids;
+}
+
+// Row-anchored id extraction for recall-style blocks: only lines that ARE an injected
+// lesson row (`#NN [type] …`) contribute, not every #NN token in the surrounding text.
+function extractRowIds(textLines) {
+  const ids = new Set();
+  for (const line of textLines) {
+    const m = INJECTED_ROW_RE.exec(line);
+    if (m) ids.add(m[1]);
+  }
   return ids;
 }
 
@@ -143,7 +170,7 @@ for (const file of candidateFiles) {
 
     if (entry.attachment) {
       const text = (entry.attachment.stdout || '') + '\n' + (entry.attachment.content || '');
-      if (INJECT_MARKER.test(text) || MEMCTX_MARKER.test(text) || IMP_MARKER.test(text)) {
+      if (INJECT_MARKER.test(text) || MEMCTX_MARKER.test(text) || IMP_MARKER.test(text) || ERR_RECALL_MARKER.test(text)) {
         const baseHook = entry.attachment.hookName || entry.attachment.hookEvent || 'unknown';
         const allLines = text.split('\n');
 
@@ -152,14 +179,30 @@ for (const file of candidateFiles) {
         const impIds = extractIds(allLines.filter((l) => IMP_MARKER.test(l)).join('\n'));
         if (impIds.size > 0) routeIds(sessionInjectionsByHook, `${baseHook}:imperative`, impIds, stats);
 
+        // PostToolUse error-recall hint → :error-recall, row-anchored (see ERR_RECALL_MARKER).
+        // Detected by its own marker (not the incidental [mem] one) so a block with no
+        // co-located flush line is still counted, and row-anchored so foreign/quoted/bare
+        // #NN never enter the injected denominator.
+        if (ERR_RECALL_MARKER.test(text)) {
+          const errIds = extractRowIds(allLines);
+          if (errIds.size > 0) routeIds(sessionInjectionsByHook, `${baseHook}:error-recall`, errIds, stats);
+        }
+
         // Split path B (<memory-context>) from path A ([mem] FYI) — both are
-        // UserPromptSubmit attachments. This makes path-B cite-recall measurable.
-        const restText = allLines.filter((l) => !IMP_MARKER.test(l)).join('\n');
-        if (INJECT_MARKER.test(restText) || MEMCTX_MARKER.test(restText)) {
-          const ids = extractIds(restText);
-          if (ids.size > 0) {
-            const hookName = MEMCTX_MARKER.test(restText) ? `${baseHook}:memory-context` : baseHook;
-            routeIds(sessionInjectionsByHook, hookName, ids, stats);
+        // UserPromptSubmit / SessionStart surfaces. PostToolUse mem #NN are error-recall
+        // ONLY (handled above), so exclude PostToolUse from this generic broad-extract
+        // path: otherwise it both double-counts the error-recall rows AND lets a foreign
+        // plugin's PostToolUse:Bash output (e.g. a code-graph grep echoing `// #123` or a
+        // `<memory-context` source literal) pollute a generic bucket via the loose text
+        // markers.
+        if (!baseHook.startsWith('PostToolUse')) {
+          const restText = allLines.filter((l) => !IMP_MARKER.test(l)).join('\n');
+          if (INJECT_MARKER.test(restText) || MEMCTX_MARKER.test(restText)) {
+            const ids = extractIds(restText);
+            if (ids.size > 0) {
+              const hookName = MEMCTX_MARKER.test(restText) ? `${baseHook}:memory-context` : baseHook;
+              routeIds(sessionInjectionsByHook, hookName, ids, stats);
+            }
           }
         }
       }
