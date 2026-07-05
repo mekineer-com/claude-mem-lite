@@ -68,6 +68,47 @@ describe('LLM-visible CLI hints advertise the resolvable path, not the tilde pat
   });
 });
 
+describe('steering-surface consistency + injection budget', () => {
+  // #8846: the four LLM-facing steering surfaces (MCP instructions BASE, the
+  // VERBOSE triggers, the adopt CLAUDE.md block, the detail doc) change together.
+  // The defer trio is exposed via tools/list and referenced in the block + doc,
+  // but the always-injected instructions roster once omitted it — this pins that
+  // gap closed so a future roster edit that forgets a surface fails here.
+  test('mem_defer roster appears in every LLM-facing steering surface', () => {
+    const surfaces = {
+      'instructions (full)': buildServerInstructions(false),
+      'instructions (quiet/BASE)': buildServerInstructions(true),
+      'CLAUDE.md block': buildClaudeMdBlock(),
+      'detail doc': getDetailDoc(),
+    };
+    for (const [name, text] of Object.entries(surfaces)) {
+      expect(text, `${name} omits mem_defer`).toContain('mem_defer');
+    }
+  });
+
+  test('the defer trio is both exposed (tools/list) and advertised (instructions)', () => {
+    const exposed = tools.map((t) => t.name);
+    const base = buildServerInstructions(true);
+    for (const n of ['mem_defer', 'mem_defer_list', 'mem_defer_drop']) {
+      expect(exposed, `${n} not exposed in tools`).toContain(n);
+      expect(base, `${n} not advertised in instructions BASE`).toContain(n);
+    }
+  });
+
+  // §7 metric-coupling: block + instructions are injected EVERY session; the
+  // detail doc is written verbatim into a user file. Guard against unbounded
+  // growth. Ceilings sit ~20-60% above the 2026-07 post-defer baseline
+  // (block 1226 / doc 5139 / instr-full 2866 / instr-BASE 1492) — a tripwire,
+  // not a straitjacket: if an intended addition trips one, RAISE it deliberately
+  // (and re-check the MCP instructions field against the harness cutoff).
+  test('steering surfaces stay within their injection budget', () => {
+    expect(buildClaudeMdBlock().length, 'CLAUDE.md block').toBeLessThan(2000);
+    expect(getDetailDoc().length, 'detail doc').toBeLessThan(8000);
+    expect(buildServerInstructions(false).length, 'instructions full').toBeLessThan(3500);
+    expect(buildServerInstructions(true).length, 'instructions BASE').toBeLessThan(2200);
+  });
+});
+
 describe('runtime recovery hints resolve `repair` by absolute path', () => {
   // #3: hook-launcher + native-binding-hint advised bare `claude-mem-lite repair`,
   // which is not on PATH for a plugin-only install. They must now emit an

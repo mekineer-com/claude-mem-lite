@@ -2,6 +2,39 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.38.4 — MCP instructions advertise the defer trio + steering-surface drift guards
+
+Fixes a steering-surface drift found while auditing the project's tool-guidance blocks. The
+`mem_defer`/`mem_defer_list`/`mem_defer_drop` trio is exposed via `tools/list` and referenced in the
+adopt CLAUDE.md block + detail doc, but the always-injected **MCP instructions field**
+(`INSTRUCTIONS_BASE` in `search-scoring.mjs`) omitted it — so a Claude Code session saw the defer
+tools in the roster but no guidance to use them. The four LLM-facing steering surfaces are meant to
+change together (mem #8846); this brings the instructions field back in line and adds a test so the
+invariant can't silently break again. The only runtime-visible change is the instructions string
+(takes effect on the next MCP server start); everything else is docs/tests/comments.
+
+### Changed
+- **`search-scoring.mjs`** — the MCP instructions roster (`INSTRUCTIONS_BASE`) now lists the defer
+  trio, and `INSTRUCTIONS_VERBOSE` gains a "deferring work to a future session → `mem_defer`" trigger,
+  mirroring the adopt block + detail doc. Instructions length grows ~195 chars (full 2671→2866,
+  BASE 1421→1492) — well within the injection budget.
+
+### Added
+- **`tests/cli-path-invocation.test.mjs`** — a steering-surface consistency + injection-budget suite:
+  (a) `mem_defer` must appear in all four surfaces (instructions full/BASE, adopt block, detail doc);
+  (b) the defer trio must be both exposed in `tools/list` and advertised in instructions BASE;
+  (c) each surface stays under an injection-budget ceiling (block <2000, doc <8000, instr-full <3500,
+  instr-BASE <2200 chars) so runaway growth of always-injected context trips a test.
+
+### Fixed
+- **`adopt-content.mjs`** — corrected a misleading header comment that claimed `needsRefresh()` only
+  compares the sentinel version tag; it actually diffs version **and** block body **and** detail-doc
+  content, which is why a template edit propagates without a version bump (the block stays `v1`).
+- **`CLAUDE.md`** (project doc) — the CLI command reference had drifted from `cli.mjs`'s `CLI_COMMANDS`
+  (missing `defer`/`activity`/`citation-stats`/`optimize`/`restore`/`adopt`/`unadopt` and more); synced
+  to the canonical set and collapsed the two hand-maintained lists into one enumeration + a categorical
+  pointer to remove the duplicate-drift source.
+
 ## v3.38.3 — idiom-independent adoption benchmark (dev tooling; runtime behavior unchanged)
 
 Adds an offline instrument (`benchmark/adoption-overlap.mjs` + modules) that measures whether Claude

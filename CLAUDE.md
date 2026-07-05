@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.38.3
+- **Version**: 3.38.4
 - **Package manager**: npm
 - **Test**: `npx vitest run` (187 test files / 3577 tests, vitest)
 - **Lint**: `npx eslint .`
@@ -38,7 +38,7 @@ as the floor; flag NEW unused exports as PR review signal.
 | Module | Role |
 |--------|------|
 | `cli.mjs` | CLI entry point — routes subcommands to mem-cli.mjs or install.mjs |
-| `mem-cli.mjs` | CLI commands: search, recent, recall, get, timeline, save, delete, update, export, compress, maintain, fts-check, stats, context, browse, registry |
+| `mem-cli.mjs` | CLI subcommand dispatch: retrieval / write / maintenance / data / insight / adopt families — full command list under Key Patterns |
 | `hook.mjs` | Main hook entry — handles session-start/stop/post-tool-use/user-prompt |
 | `hook-context.mjs` | CLAUDE.md context injection, adaptive time windows, token budgeting |
 | `hook-llm.mjs` | Haiku-based summarization and title generation |
@@ -63,7 +63,7 @@ as the floor; flag NEW unused exports as PR review signal.
 
 ## Key Patterns
 
-- CLI commands: `claude-mem-lite search|recent|recall|get|timeline|save|delete|update|export|compress|maintain|optimize|fts-check|stats|context|browse|registry`
+- CLI commands: `claude-mem-lite search|recent|recall|get|timeline|browse|context|save|update|delete|defer|compress|maintain|optimize|enrich|fts-check|restore|export|import|import-jsonl|stats|citation-stats|activity|registry|memdir-audit|adopt|unadopt` (canonical set = `CLI_COMMANDS` in `cli.mjs`; `claude-mem-lite help` for flags)
 - Tool name mapping: Claude Code Agent tool = `'Agent'` (not `'Task'`); Skill via `event.tool_input?.skill`
 - Tests use `:memory:` DB — schema changes must sync to test files
 - FTS5 search: sanitizeFtsQuery (synonym expansion) → BM25 scoring → OR fallback → concept co-occurrence

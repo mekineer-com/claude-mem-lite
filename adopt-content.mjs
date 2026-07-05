@@ -4,10 +4,13 @@
 // claudemd.mjs primitives so the strings are testable without side effects.
 //
 // CURRENT_SENTINEL_VERSION tags the managed block as `<!-- claude-mem-lite:begin
-// vN -->`. needsRefresh() only checks for *inequality* against the installed tag,
-// so any change triggers an in-place refresh (version change = intended content
-// change, overwritten rather than treated as a user edit) — the value need not be
-// monotonic. We deliberately use `v1` (not `v2`) so the version digit differs from
+// vN -->`. needsRefresh() (claudemd.mjs) compares the version tag AND the block
+// body AND the detail-doc content — ANY of the three differing triggers an
+// in-place refresh (drift = intended content change, overwritten rather than
+// treated as a user edit). So a template edit propagates on the next SessionStart
+// even WITHOUT a version bump; the tag need not be monotonic and, in practice,
+// need not change at all — we keep `v1` across content edits (see mem #8846).
+// We deliberately use `v1` (not `v2`) so the version digit differs from
 // the sibling code-graph-mcp plugin's `<!-- code-graph-mcp:begin v2 -->` block in
 // the same CLAUDE.md; the slug already scopes the two independently (claudemd.mjs),
 // so this is a cosmetic distinguisher, not a functional one. The pre-v3.13 legacy
