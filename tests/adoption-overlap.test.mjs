@@ -16,11 +16,11 @@
 // set internally but injected.length === 0 fails the push guard). Every
 // fixture below uses a realistic multi-digit observation id.
 import { describe, it, expect, afterEach } from 'vitest';
-import { writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { writeFileSync, readFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createTestDb, insertSession } from './test-helpers.mjs';
-import { computeAdoption } from '../benchmark/adoption-overlap.mjs';
+import { computeAdoption, floorCheck, emitLabels, scoreLabels } from '../benchmark/adoption-overlap.mjs';
 
 // Sandbox-artifact disposal: this file is the creating task for every
 // mkdtempSync'd fixture dir below, so it deletes them on exit too (own
@@ -46,13 +46,19 @@ function seed(db, rows) {
 // promptText/actionText default to the original hardcoded literals -- existing
 // call sites (5-arg) are byte-identical; Task 8's placebo-cutoff test is the
 // only caller that overrides them (needs per-session prompt/action content to
-// control which observations each session's ranker matches).
-function writeTranscript(dir, name, sessionId, ts, injectedMarkerLine, promptText = 'fix rrfAccumulate merge dedup', actionText = 'const r = rrfAccumulate(a, b); // merge dedup') {
+// control which observations each session's ranker matches). Task 9's cite-
+// check fix adds an optional 8th `citedProse` param -- when set, prepends a
+// `type: 'text'` content block to the assistant's turn so its OWN prose (not
+// just the tool_use action) carries the given string; existing 5/6/7-arg call
+// sites are unaffected (defaults to null -- no text block, byte-identical
+// assistant-content array to before).
+function writeTranscript(dir, name, sessionId, ts, injectedMarkerLine, promptText = 'fix rrfAccumulate merge dedup', actionText = 'const r = rrfAccumulate(a, b); // merge dedup', citedProse = null) {
+  const assistantContent = [{ type: 'tool_use', name: 'Edit', input: { new_string: actionText } }];
+  if (citedProse) assistantContent.unshift({ type: 'text', text: citedProse });
   writeFileSync(join(dir, name), [
     { type: 'user', sessionId, timestamp: ts, message: { role: 'user', content: promptText } },
     { sessionId, timestamp: ts, attachment: { hookName: 'UserPromptSubmit', content: injectedMarkerLine } },
-    { type: 'assistant', sessionId, timestamp: ts, message: { role: 'assistant', content: [
-      { type: 'tool_use', name: 'Edit', input: { new_string: actionText } } ] } },
+    { type: 'assistant', sessionId, timestamp: ts, message: { role: 'assistant', content: assistantContent } },
     { type: 'user', sessionId, timestamp: ts, message: { role: 'user', content: 'ok' } },
   ].map((l) => JSON.stringify(l)).join('\n'));
 }
@@ -222,5 +228,154 @@ describe('computeAdoption null controls (placebo)', () => {
     // must be byte-identical between the real and placebo-cutoff runs.
     expect(placeboBucket.effect).toBe(realBucket.effect);
     expect(placeboBucket.ci95).toEqual(realBucket.ci95);
+  });
+});
+
+// Task 9 (2026-07-05): cite-recall floor check + hand-label harness.
+//
+// DESIGN RESOLUTION (supersedes the task-9 brief's `perEventDeltas` helper):
+// the brief built a PER-EVENT IDF (`buildIdf([outputWindow.actions, ...shown,
+// ...nearMiss])`) for floorCheck/emitLabels. That IDF is NOT the one
+// computeAdoption's perBucket effects are built from -- computeAdoption
+// builds ONE run-wide IDF over the whole corpus (see its own file-header
+// comment: "per-event IDF would make cosine scores incomparable across
+// events"). A floor/label harness scored against a per-event IDF would
+// validate a DIFFERENT number than the metric actually reported. So
+// computeAdoption gained a `collectEvents` option that reuses its existing
+// per-event loop (and its existing run-wide `idf`) to also emit per-event
+// records -- floorCheck/emitLabels/scoreLabels consume THAT, never building
+// their own IDF.
+describe('computeAdoption collectEvents (Task 9 extension)', () => {
+  it('defaults to false -- default return is byte-identical to pre-Task-9 shape (no `events` key)', () => {
+    const { db, dir } = makeE2EFixture();
+    const res = computeAdoption(dir, db, { start: 0, end: Date.now() + 1e12, project: 'p', m: 3 });
+    expect(res.events).toBeUndefined();
+    expect(Object.keys(res)).toEqual(['perBucket']);
+  });
+
+  it('collectEvents:true exposes the SAME run-wide-IDF action-channel delta the action bucket reports -- not a per-event-IDF recompute', () => {
+    const { db, dir } = makeE2EFixture();
+    const res = computeAdoption(dir, db, { start: 0, end: Date.now() + 1e12, project: 'p', m: 3, collectEvents: true });
+    const actionBucket = res.perBucket.find((b) => b.surface === 'imperative' && b.channel === 'action');
+    expect(Array.isArray(res.events)).toBe(true);
+    expect(res.events).toHaveLength(1);
+    const row = res.events[0];
+    expect(row.surface).toBe('imperative');
+    // This fixture has exactly ONE event in the imperative:action bucket, so
+    // the bucket's cluster-bootstrap `effect` (a mean) reduces to that one
+    // event's own value -- if collectEvents built a per-event IDF instead of
+    // reusing the run-wide one, this cosine would differ numerically from
+    // the bucket's, and this equality would fail.
+    expect(row.actionDelta).toBe(actionBucket.effect);
+    expect(row.actionDelta).toBeGreaterThan(0); // sanity: not a degenerate 0/NaN
+    expect(row).toHaveProperty('cited');
+    expect(row).toHaveProperty('spec');
+    expect(['low', 'high']).toContain(row.spec);
+    expect(row).toHaveProperty('query');
+    expect(row).toHaveProperty('lessonText');
+    expect(row).toHaveProperty('outputActions');
+    expect(row).toHaveProperty('outputProse');
+  });
+});
+
+describe('floorCheck / emitLabels / scoreLabels (Task 9)', () => {
+  it('floorCheck partitions events by cite status, each with numeric effect + n', () => {
+    const { db, dir } = makeE2EFixture();
+    const result = floorCheck(dir, db, { start: 0, end: Date.now() + 1e12, project: 'p', m: 3 });
+    expect(typeof result.citePositive.effect).toBe('number');
+    expect(typeof result.citePositive.n).toBe('number');
+    expect(typeof result.citeSilent.effect).toBe('number');
+    expect(typeof result.citeSilent.n).toBe('number');
+    // Partition is exhaustive over the run's events (1 event in this fixture).
+    expect(result.citePositive.n + result.citeSilent.n).toBe(1);
+    // Fixed cite check (see benchmark/adoption-overlap.mjs's Task 9 fix
+    // comment): tests the id against the SESSION's assistant-PROSE-ONLY
+    // corpus, never the raw file/attachment. makeE2EFixture's assistant turn
+    // is Edit-only (no `text` block), so "#42" never appears in assistant
+    // prose here -- correctly citeSilent now. (Pre-fix, the whole-file check
+    // matched the injection attachment's own "(#42)" text and mislabeled
+    // this citePositive -- exactly the tautology the fix corrects; see the
+    // next test for the non-vacuous contrast proof.)
+    expect(result.citePositive).toEqual({ effect: 0, n: 0 });
+    expect(result.citeSilent).toEqual({ effect: expect.any(Number), n: 1 });
+  });
+
+  it('floorCheck contrast is non-vacuous: a session whose assistant later writes the injected id in its own prose is citePositive, a session that never does is citeSilent', () => {
+    // Regression guard for the Task 9 tautology: under the OLD whole-raw-file
+    // check, BOTH sessions below would be citePositive (each session's own
+    // injection attachment always contains its own "(#NN)" verbatim), so
+    // citeSilent.n would be 0 no matter what fixture was used -- the exact
+    // vacuity this test proves is gone.
+    const db = createTestDb();
+    seed(db, [
+      { title: 'rrfAccumulate', lesson: 'call rrfAccumulate for merge dedup', importance: 3, epoch: 1_700_000_000_000 },
+    ]);
+    const dir = tmpFixtureDir('adopt-floor-');
+    // s1: assistant's own `text` block later writes "#42" -- cite-positive
+    // under the fixed (assistant-prose-only) check.
+    writeTranscript(dir, 's1.jsonl', 's1', '2026-07-01T00:00:00.000Z',
+      'Memory — a past lesson applies to THIS task. You must: call rrfAccumulate for merge dedup (#42)',
+      'fix rrfAccumulate merge dedup', 'const r = rrfAccumulate(a, b); // merge dedup',
+      'Applied the past lesson (#42) as guidance.');
+    // s2: assistant turn is Edit-only, no `text` block -- "#77" never appears
+    // in ANY assistant prose in this session -- cite-silent.
+    writeTranscript(dir, 's2.jsonl', 's2', '2026-07-01T01:00:00.000Z',
+      'Memory — a past lesson applies to THIS task. You must: call rrfAccumulate for merge dedup (#77)');
+
+    const result = floorCheck(dir, db, { start: 0, end: Date.now() + 1e12, project: 'p', m: 3 });
+    expect(result.citePositive.n).toBeGreaterThanOrEqual(1);
+    expect(result.citeSilent.n).toBeGreaterThanOrEqual(1);
+    expect(result.citePositive.n + result.citeSilent.n).toBe(2);
+  });
+
+  it('emitLabels writes N stratified rows with null labels', () => {
+    const { db, dir } = makeE2EFixture();
+    const outDir = tmpFixtureDir('adopt-labels-');
+    const out = join(outDir, 'l.jsonl');
+    const n = emitLabels(dir, db, { N: 1, out, start: 0, end: Date.now() + 1e12, project: 'p', m: 3 });
+    expect(n).toBe(1);
+    const rows = readFileSync(out, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveProperty('label', null);
+    expect(rows[0]).toHaveProperty('lessonText');
+    expect(rows[0].surface).toBe('imperative');
+    expect(typeof rows[0].delta).toBe('number');
+  });
+
+  it('emitLabels caps at the number of available events when N exceeds the corpus', () => {
+    const { db, dir } = makeE2EFixture();
+    const outDir = tmpFixtureDir('adopt-labels-');
+    const out = join(outDir, 'l.jsonl');
+    const n = emitLabels(dir, db, { N: 50, out, start: 0, end: Date.now() + 1e12, project: 'p', m: 3 });
+    expect(n).toBe(1); // only 1 event exists in this fixture's corpus
+  });
+
+  it('scoreLabels: auc === 1 when every positive delta exceeds every negative delta', () => {
+    const outDir = tmpFixtureDir('adopt-score-');
+    const p = join(outDir, 'labels.jsonl');
+    writeFileSync(p, [
+      { delta: 0.9, label: 1 }, { delta: 0.8, label: 1 },
+      { delta: 0.2, label: 0 }, { delta: 0.1, label: 0 },
+    ].map((r) => JSON.stringify(r)).join('\n'));
+    expect(scoreLabels(p)).toEqual({ auc: 1, nPos: 2, nNeg: 2 });
+  });
+
+  it('scoreLabels: auc === 0.5 when positive/negative deltas are symmetric (no separation)', () => {
+    const outDir = tmpFixtureDir('adopt-score-');
+    const p = join(outDir, 'labels.jsonl');
+    writeFileSync(p, [
+      { delta: 0.1, label: 1 }, { delta: 0.5, label: 1 },
+      { delta: 0.1, label: 0 }, { delta: 0.5, label: 0 },
+    ].map((r) => JSON.stringify(r)).join('\n'));
+    expect(scoreLabels(p)).toEqual({ auc: 0.5, nPos: 2, nNeg: 2 });
+  });
+
+  it('scoreLabels excludes rows still carrying a null (un-hand-labeled) label', () => {
+    const outDir = tmpFixtureDir('adopt-score-');
+    const p = join(outDir, 'labels.jsonl');
+    writeFileSync(p, [
+      { delta: 0.9, label: 1 }, { delta: 0.1, label: 0 }, { delta: 0.5, label: null },
+    ].map((r) => JSON.stringify(r)).join('\n'));
+    expect(scoreLabels(p)).toEqual({ auc: 1, nPos: 1, nNeg: 1 });
   });
 });
