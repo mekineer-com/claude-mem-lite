@@ -47,7 +47,7 @@ import Database from 'better-sqlite3';
 import { extractInjectionEvents } from './adoption-replay.mjs';
 import { replayCandidates } from './adoption-rankers.mjs';
 import { buildIdf, textToBag, cosine, dualChannelBags } from './adoption-cosine.mjs';
-import { localLinearRdd, clusterBootstrap, mde } from './adoption-estimator.mjs';
+import { localLinearRdd, clusterBootstrap, mde, lcg } from './adoption-estimator.mjs';
 import { DB_PATH } from '../schema.mjs';
 
 // Running-var cutoff per surface: ups-fts's running var is |bm25 composite
@@ -60,10 +60,10 @@ const CUTOFF = { 'ups-fts': 50, imperative: 0, subagent: 0 };
 /**
  * @param {string} transcriptDir - directory of *.jsonl Claude Code transcripts
  * @param {import('better-sqlite3').Database} db
- * @param {{ start: number, end: number, project?: string, m?: number }} opts
+ * @param {{ start: number, end: number, project?: string, m?: number, placebo?: 'random'|'cutoff' }} opts
  * @returns {{ perBucket: Array<{ surface: string, channel: 'action'|'prose', nEvents: number, nSessions: number, effect: number, ci95: [number, number], rdd_jump: number, mde: number }> }}
  */
-export function computeAdoption(transcriptDir, db, { start, end, project = 'projects--mem', m = 3 } = {}) {
+export function computeAdoption(transcriptDir, db, { start, end, project = 'projects--mem', m = 3, placebo } = {}) {
   const files = readdirSync(transcriptDir).filter((n) => n.endsWith('.jsonl')).map((n) => join(transcriptDir, n));
   const events = [];
   for (const f of files) for (const e of extractInjectionEvents(f, { start, end })) events.push(e);
@@ -77,8 +77,25 @@ export function computeAdoption(transcriptDir, db, { start, end, project = 'proj
   const corpus = [];
   const resolved = [];
   for (const ev of events) {
-    const { shown, nearMiss } = replayCandidates(ev.surface, db, ev, { m, project });
+    let { shown, nearMiss } = replayCandidates(ev.surface, db, ev, { m, project });
     if (shown.length === 0) continue; // coverage loss -- no control/shown split
+    // Null control (placebo-random): swap each candidate's text for a
+    // deterministically-picked DB lesson (as-of ev.ts, seeded by
+    // sessionId+ts -- no Math.random) so any real shown/near-miss overlap
+    // collapses to chance. This targets the PRIMARY `effect`/`ci95` below
+    // (computed from perEvent, which is built from cosOf() over these
+    // swapped .text values) -- a sound estimator's ci95 must bracket 0.
+    if (placebo === 'random') {
+      const pool = db.prepare(
+        `SELECT title, lesson_learned FROM observations
+         WHERE lesson_learned IS NOT NULL AND created_at_epoch <= ? ORDER BY id`).all(ev.ts);
+      if (pool.length) {
+        const rnd = lcg(ev.sessionId + ':' + ev.ts);
+        const pickText = () => { const p = pool[Math.floor(rnd() * pool.length)]; return `${p.title || ''} ${p.lesson_learned || ''}`.trim(); };
+        shown = shown.map((c) => ({ ...c, text: pickText() }));
+        nearMiss = nearMiss.map((c) => ({ ...c, text: pickText() }));
+      }
+    }
     const { proseBag, actionBag } = dualChannelBags(ev.outputWindow);
     corpus.push(ev.outputWindow.prose, ev.outputWindow.actions, ...shown.map((c) => c.text), ...nearMiss.map((c) => c.text));
     resolved.push({ ev, shown, nearMiss, proseBag, actionBag });
@@ -112,7 +129,20 @@ export function computeAdoption(transcriptDir, db, { start, end, project = 'proj
   const perBucket = [];
   for (const [key, b] of buckets) {
     const [surface, channel] = key.split(':');
-    const { jump } = localLinearRdd(b.points, CUTOFF[surface] ?? 0);
+    let cutoff = CUTOFF[surface] ?? 0;
+    let points = b.points;
+    // Null control (placebo-cutoff): falsify the RDD by relabeling `shown`
+    // at the MEDIAN running-var instead of the real cutoff -- a sound
+    // estimator finds ~0 jump at a non-treatment boundary. This retargets
+    // the SECONDARY `rdd_jump` only; `effect`/`ci95` below come from
+    // `b.perEvent` (the per-event cosShown-cosNear delta, computed from the
+    // actual shown/near-miss split), untouched by this relabeling.
+    if (placebo === 'cutoff') {
+      const xs = points.map((p) => p.x).sort((a, z) => a - z);
+      cutoff = xs[Math.floor(xs.length / 2)] ?? 0;
+      points = points.map((p) => ({ ...p, shown: p.x >= cutoff }));
+    }
+    const { jump } = localLinearRdd(points, cutoff);
     const { mean, ci95 } = clusterBootstrap(b.perEvent, { seedTerms: key });
     // RMS around the bucket's OWN mean, not around zero -- centering on raw
     // zero folds a non-zero adoption signal's magnitude into the "noise" term,
@@ -140,8 +170,16 @@ function main() {
   const start = args.start ? new Date(args.start).getTime() : end - 30 * 86400000;
   const dbPath = args.db || DB_PATH;
   const db = new Database(dbPath, { readonly: true });
-  const res = computeAdoption(dir, db, { start, end, project: args.project });
+  // Null controls (falsification tests, not a normal run mode): --placebo-random
+  // neutralizes the PRIMARY effect (swaps candidate text for a random DB
+  // lesson -- ci95 should bracket 0); --placebo-cutoff falsifies the
+  // SECONDARY rdd_jump (relabels shown/near-miss at the median running-var
+  // instead of the real cutoff -- jump should be ~0). Mutually exclusive;
+  // --placebo-random wins if both are passed.
+  const placebo = args['placebo-random'] ? 'random' : args['placebo-cutoff'] ? 'cutoff' : undefined;
+  const res = computeAdoption(dir, db, { start, end, project: args.project, placebo });
   if (args.json) { console.log(JSON.stringify(res, null, 2)); return; }
+  if (placebo) console.log(`# NULL CONTROL: placebo-${placebo} active -- this run is a falsification test, not a real measurement`);
   console.log('# adoption-overlap (effect = cluster-bootstrap mean of control-subtracted cosine deltas; rdd_jump = RDD gradient-corrected view, informational for imperative/subagent)');
   console.log('  surface:channel        nEv  nSess    effect     95% CI              rdd_jump    MDE');
   for (const r of res.perBucket) {

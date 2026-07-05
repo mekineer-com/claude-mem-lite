@@ -22,7 +22,7 @@ export function localLinearRdd(points, cutoff) {
 }
 
 // seeded LCG so bootstrap is deterministic (Math.random is unavailable in this repo's harness)
-function lcg(seedStr) {
+export function lcg(seedStr) {
   let s = 2166136261 >>> 0;
   for (const ch of String(seedStr)) { s ^= ch.charCodeAt(0); s = Math.imul(s, 16777619) >>> 0; }
   return () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
