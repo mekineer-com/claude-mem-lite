@@ -2,6 +2,39 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.38.3 — idiom-independent adoption benchmark (dev tooling; runtime behavior unchanged)
+
+Adds an offline instrument (`benchmark/adoption-overlap.mjs` + modules) that measures whether Claude
+ACTED on an injected memory lesson, idiom-free — independent of the `#NN` cite idiom that biases
+`cite-recall` (5.6–39× rarer off-repo) — to inform future default-flip decisions for task-imperative
+(D#56) and subagent (D#58) injection. It replays the REAL hook ranker under a virtual clock
+(`created_at <= inject_time`), scores dual-channel (action primary / prose secondary) exact TF-IDF
+cosine of the post-injection output window against shown-vs-near-miss candidates, with a
+regression-discontinuity estimator at the injection score cutoff, session-cluster bootstrap CIs,
+placebo null controls, and a hand-label AUC harness. Validated on the dogfood corpus (255 injection
+events / 59 sessions): action-channel hand-label **AUC 0.698, 95% CI [0.557, 0.747], P(AUC≤0.5)=0** —
+significantly above chance (ups-fts surface 0.77). Net status: the instrument is GO, but the imperative
+surface has only n=13 events (effect < MDE) so D#56 stays blocked on data (not the instrument) and D#58
+stays held (parent-window proxy). Zero new deps, zero embeddings; the benchmark is dev-only and not
+wired into any runtime path.
+
+Two shipped modules were refactored to be importable by the benchmark **with no change to runtime
+behavior** (verified against the production hook path):
+
+### Changed
+- **`scripts/user-prompt-search.js`** — `searchByFts` gains optional `nowT`/`epochTo` replay params
+  (defaults preserve behavior); the module-level auto-run is now guarded by exported
+  `isDirectInvocation` so the file can be imported without side effects. `hook-launcher.mjs` rewrites
+  `process.argv[1]` to the target path and appends a `?t=…` cache-buster to the import URL on heal
+  retries — the guard strips the query before comparing, so the UserPromptSubmit search still fires on
+  every prompt (fresh and retry) exactly as in 3.38.2.
+- **`hook-memory.mjs`** — extracts `rankImperativeCandidates` (the scored candidate list);
+  `selectImperativeLesson` now returns its top-1. Selection output is byte-identical.
+
+### Added
+- `benchmark/adoption-{overlap,cosine,replay,rankers,estimator}.mjs` and their tests — the adoption
+  instrument (16 files, +1622 lines; dev-only).
+
 ## v3.38.2 — sidechain cite-recall sees prompt-embedded subagent injection (D#57)
 
 `citation-stats --sidechain` reported subagent (sidechain) cite-recall as a flat `injected 0 /
