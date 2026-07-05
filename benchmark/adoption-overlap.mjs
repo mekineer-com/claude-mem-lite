@@ -63,6 +63,14 @@ import { extractTechIdentifiers } from '../scripts/user-prompt-search.js';
 // prompt-search.js); imperative/subagent's running var is the ranker score
 // with no natural cutoff other than "top-1 wins", so 0 is a placeholder --
 // rdd_jump for those two surfaces is informational, not a calibrated effect.
+//
+// DISCLOSURE: subagent:* is a PARENT-WINDOW PROXY, not valid subagent
+// adoption -- the injection is baked into the CHILD's tool_input.prompt
+// (see adoption-replay.mjs's subagent event construction), but the
+// outputWindow scored here is the PARENT transcript's continuation after
+// the tool_use; the child transcript is never scored. Do NOT use these
+// buckets for the subagent default-flip decision until a child-transcript
+// join is added (v2).
 const CUTOFF = { 'ups-fts': 50, imperative: 0, subagent: 0 };
 
 // Task 9 correctness fix (2026-07-05, flagged by the implementer): the cite
@@ -198,6 +206,13 @@ export function computeAdoption(transcriptDir, db, { start, end, project = 'proj
       // is untouched.
       for (const c of shown) b.points.push({ x: c.runningVar, y: cosOf(c), shown: true });
       for (const c of nearMiss) b.points.push({ x: c.runningVar, y: cosOf(c), shown: false });
+      // DISCLOSURE: effect = cosShown - cosNear with shown = the ranker's
+      // argmax (systematically more query-overlapping than nearMiss), so
+      // under the null E[effect] > 0 for the top-1 surfaces (imperative/
+      // subagent) where rdd_jump's gradient-correction is uncalibrated
+      // (CUTOFF=0). A GO decision must therefore rest on the floorCheck
+      // contrast (citePositive vs citeSilent) and the hand-label AUC -- NOT
+      // on effect+CI alone.
       const value = cosShown - cosNear; // control-subtracted per-event delta
       b.perEvent.push({ sessionId: ev.sessionId, value });
       if (channel === 'action') actionDelta = value;
@@ -252,7 +267,7 @@ export function computeAdoption(transcriptDir, db, { start, end, project = 'proj
       effect: mean, // PRIMARY: cluster-bootstrap mean of control-subtracted deltas (consistent with ci95)
       ci95,
       rdd_jump: jump, // SECONDARY: RDD local-linear jump (calibrated cutoff for ups-fts only)
-      mde: mde(b.perEvent.length, sd, {}),
+      mde: mde(nSessions, sd, {}), // nSessions (not nEvents) to match the session-clustered CI -- conservative effective-n
     });
   }
   perBucket.sort((a, b) => (a.surface + a.channel).localeCompare(b.surface + b.channel));
@@ -382,6 +397,7 @@ function main() {
   if (args.json) { console.log(JSON.stringify(res, null, 2)); return; }
   if (placebo) console.log(`# NULL CONTROL: placebo-${placebo} active -- this run is a falsification test, not a real measurement`);
   console.log('# adoption-overlap (effect = cluster-bootstrap mean of control-subtracted cosine deltas; rdd_jump = RDD gradient-corrected view, informational for imperative/subagent)');
+  console.log('# NOTE: effect is selection-confounded for top-1 surfaces (imperative/subagent) -- trust floorCheck + hand-label AUC for a GO decision, not effect+CI alone. subagent:* is also a parent-window proxy (see CUTOFF comment above) -- exclude from the subagent default-flip decision.');
   console.log('  surface:channel        nEv  nSess    effect     95% CI              rdd_jump    MDE');
   for (const r of res.perBucket) {
     console.log(`  ${(`${r.surface}:${r.channel}`).padEnd(22)} ${String(r.nEvents).padStart(4)} ${String(r.nSessions).padStart(5)}   ${r.effect.toFixed(4).padStart(8)}  [${r.ci95[0].toFixed(4)}, ${r.ci95[1].toFixed(4)}]  ${r.rdd_jump.toFixed(4).padStart(8)}  ${r.mde.toFixed(4)}`);

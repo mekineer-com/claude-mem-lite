@@ -106,6 +106,16 @@ export function extractInjectionEvents(transcriptFile, { start, end }) {
     // one tool_use block per subagent — emit one event PER qualifying
     // tool_use (sharing this turn's output window) instead of overwriting
     // shared surface/query/injected and collapsing to the last one (Fix 4).
+    //
+    // DISCLOSURE: `outputWindow: getWindow()` below is the PARENT transcript's
+    // continuation after this tool_use, NOT the child subagent's transcript —
+    // the injected lesson is read by the CHILD (it lives in this Agent/Task
+    // call's own tool_input.prompt), but the child's transcript is a separate
+    // file/session never opened here. So `subagent:*` events measure whatever
+    // the PARENT does after dispatching, which is at best a proxy for whether
+    // the child adopted the lesson — do not use these buckets for the
+    // subagent default-flip decision until a child-transcript join is added
+    // (v2; see adoption-overlap.mjs's matching CUTOFF disclosure).
     if (!surface && role === 'assistant' && Array.isArray(e.message?.content)) {
       for (const c of e.message.content) {
         if (c?.type === 'tool_use' && (c.name === 'Agent' || c.name === 'Task') && SUBAGENT_MARKER.test(c.input?.prompt || '')) {

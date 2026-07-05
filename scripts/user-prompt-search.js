@@ -827,6 +827,21 @@ async function main() {
 // Import guard (mirrors benchmark/longmemeval.mjs): only auto-run when this file is
 // executed directly as the UserPromptSubmit hook, not when a benchmark/test harness
 // imports it to call searchByFts() offline (see tests/adoption-searchbyfts-snapshot.test.mjs).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+//
+// Exported as a pure predicate (side-effect-free) so a regression test can
+// exercise it directly without triggering main(). hook-launcher.mjs's
+// self-heal retry (runEntry({ bustCache: true })) re-imports this entry with
+// a cache-buster query appended (`?t=<ts>`) so Node's ESM cache doesn't
+// return the earlier ERR_MODULE_NOT_FOUND rejection, while process.argv[1]
+// stays query-less — a strict `===` here evaluated false on that retry,
+// silently skipping main() so the healed hook fire did no memory search.
+// Stripping the query before comparing fixes that without weakening the
+// normal-launcher / execFileSync direct-invocation checks (both still match
+// exactly, query or no query).
+export function isDirectInvocation(metaUrl, argv1) {
+  if (!argv1) return false;
+  return metaUrl.split('?')[0] === pathToFileURL(argv1).href;
+}
+if (isDirectInvocation(import.meta.url, process.argv[1])) {
   main().catch(() => {});
 }
