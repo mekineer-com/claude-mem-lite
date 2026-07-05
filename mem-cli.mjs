@@ -2349,10 +2349,10 @@ function _reportSidechainCiteRecall({ days, json }) {
   out(`  main        ${pct(mainRate).padStart(6)}   recalled ${main.recalled} / injected ${main.injected}   (${main.files} transcript(s))`);
   out(`  sidechain   ${pct(sideRate).padStart(6)}   recalled ${sidechain.recalled} / injected ${sidechain.injected}   (${sidechain.files} subagent file(s), ${sidechain.withInjections} with injections)`);
   if (sidechain.files > 0 && sidechain.injected === 0) {
-    out('  → subagent transcripts exist but received ZERO memory injections: claude-mem-lite');
-    out('    hooks do NOT fire inside subagents (no PreToolUse/PostToolUse recall, no');
-    out('    SessionStart block, no mem_* tools). Subagents are memory-blind — giving them');
-    out('    memory needs a NEW surface (inject at Agent/Task dispatch), not deepening.');
+    out('  → subagent transcripts exist but none carried a detectable memory injection in');
+    out('    this window. claude-mem-lite hooks do NOT fire inside subagents; the dispatch-');
+    out('    time surface (pre-agent-inject.js, CLAUDE_MEM_SUBAGENT_INJECT) prompt-injects');
+    out('    a lesson when enabled — a 0 here means it was off or selected none for these.');
   } else if (sidechain.files === 0) {
     out('  → no subagent transcripts in window.');
   }

@@ -2,6 +2,29 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.38.2 — sidechain cite-recall sees prompt-embedded subagent injection (D#57)
+
+`citation-stats --sidechain` reported subagent (sidechain) cite-recall as a flat `injected 0 /
+"subagents memory-blind"` — but the dispatch-time surface (`pre-agent-inject.js`,
+`CLAUDE_MEM_SUBAGENT_INJECT`) had been live for weeks, prompt-injecting a lesson into each spawned
+subagent's task prompt via `updatedInput`. The instrument only scanned for hook *attachment*
+injections (which never fire inside subagents), so it was structurally blind to the prompt-embedded
+block and its message falsely claimed subagents "need a NEW surface." Diagnostic-only: the
+citation-decay loop does not use these functions, so runtime injection/decay/search are unchanged.
+On the mem dogfood repo the sidechain rate goes from a false 0/0 to a real 2/11 (18.2%). Suite
+3531 → 3534, ESLint clean.
+
+### Fixed
+- **sidechain cite-recall** (`lib/citation-tracker.mjs`): new `extractInjectedFromSubagentPrompt`
+  detects the `formatSubagentContext` marker (`[Project memory — surfaced by ...]` + `#NN — `
+  lesson tag) prompt-embedded in a subagent's transcript and folds it into
+  `computeThreadCiteRecall`'s injected set. Row-anchored to the `#NN — ` tag so a `#NN` quoted in
+  the lesson body does not pollute the denominator. `extractAllInjected` (shared with the
+  citation-decay loop) is untouched — the fix is isolated to the `citation-stats --sidechain` report.
+- **misleading sidechain message** (`mem-cli.mjs`): the "subagents are memory-blind — need a NEW
+  surface" note was stale (the surface exists and injects); it now reads accurately (a 0 means the
+  surface was off or selected no lesson for those subagents).
+
 ## v3.38.1 — honest per-project cite rate (survivorship-bias fix in citation-stats)
 
 `citation-stats`' "Cite rate by project" reported `cited_count / decay_seen_count` over surviving,

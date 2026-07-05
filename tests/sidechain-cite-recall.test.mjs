@@ -22,6 +22,7 @@ import {
   extractInjectedFromPreToolUse,
 } from '../lib/citation-tracker.mjs';
 import { formatErrorRecallHints } from '../format-utils.mjs';
+import { formatSubagentContext } from '../lib/task-imperative.mjs';
 
 // pre-tool-recall injects `#NN [type]` lines via a hook_success attachment.
 const inject = (...idTypes) => ({
@@ -90,6 +91,54 @@ describe('aggregateProjectCiteRecall — splits main vs sidechain by FILE LOCATI
       main: { injected: 0, recalled: 0, files: 0 },
       sidechain: { injected: 0, recalled: 0, files: 0, withInjections: 0 },
     });
+  });
+});
+
+// D#57: pre-agent-inject.js APPENDS formatSubagentContext to a dispatched subagent's
+// task prompt (updatedInput) — NOT a hook attachment, so extractAllInjected (the
+// attachment path) reads 0 and the sidechain instrument was falsely blind ("subagents
+// memory-blind"). computeThreadCiteRecall must also detect the prompt-embedded marker.
+// Uses the real formatSubagentContext so the extractor can't drift from the emitter.
+describe('subagent prompt-embedded injection (D#57)', () => {
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'subagent-inj-')); });
+  afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch {} });
+
+  const userPrompt = (text) => ({ type: 'user', message: { role: 'user', content: text } });
+
+  it('computeThreadCiteRecall counts the prompt-embedded formatSubagentContext #NN as injected', () => {
+    const p = join(tmp, 'agent-x.jsonl');
+    writeJsonl(p, [
+      userPrompt('Do the task above.' + formatSubagentContext('recover children before delete', 8802)),
+      cite('per #8802 I recovered referencing rows first'),
+    ]);
+    const r = computeThreadCiteRecall(p);
+    expect(r.injected).toBe(1);   // #8802 from the appended marker (was 0 before D#57)
+    expect(r.recalled).toBe(1);   // subagent cited it
+  });
+
+  it('anchors to the "#NN —" tag: a #NN quoted in the lesson body is NOT injected', () => {
+    const p = join(tmp, 'agent-y.jsonl');
+    writeJsonl(p, [
+      userPrompt('Task.' + formatSubagentContext('same root cause as #9999 over there', 8802)),
+      cite('done — see #9999'),
+    ]);
+    const r = computeThreadCiteRecall(p);
+    expect(r.injected).toBe(1);   // only #8802 (the tag), NOT #9999 (quoted in body)
+    expect(r.recalled).toBe(0);   // #8802 uncited; #9999 was never injected
+  });
+
+  it('aggregateProjectCiteRecall surfaces subagent injection instead of a false 0', () => {
+    const subDir = join(tmp, 'sess1', 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    writeJsonl(join(subDir, 'agent-z.jsonl'), [
+      userPrompt('Review this.' + formatSubagentContext('use rrfMerge not naive union', 8703)),
+      cite('applied #8703'),
+    ]);
+    const { sidechain } = aggregateProjectCiteRecall(tmp, { cutoff: 0 });
+    expect(sidechain.injected).toBe(1);
+    expect(sidechain.recalled).toBe(1);
+    expect(sidechain.withInjections).toBe(1);
   });
 });
 
