@@ -9,6 +9,7 @@ import { citeFactorClause } from '../scoring-sql.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join, sep } from 'path';
+import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
 import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
@@ -265,14 +266,15 @@ export function rowMatchesIdentifier(row, idsLower) {
 // Each row includes `bm25_raw` (pre-multiplier bm25 magnitude) alongside the
 // composite `relevance`, so callers can distinguish raw-match strength from
 // importance/type/decay inflation.
-export function searchByFts(db, queryText, project, limit, typeFilter) {
+export function searchByFts(db, queryText, project, limit, typeFilter,
+                            { nowT = Date.now(), epochTo = null } = {}) {
   const ftsQuery = sanitizeFtsQuery(queryText);
   if (!ftsQuery) return { rows: [], mode: null };
 
-  const cutoff = Date.now() - LOOKBACK_MS;
+  const cutoff = nowT - LOOKBACK_MS;
 
   const typeClause = typeFilter ? 'AND o.type = ?' : '';
-  const now = Date.now();
+  const now = nowT;
   // R1: notLowSignalTitleClause() excludes hook-llm degraded titles
   // ("Modified X", "Worked on X", "Reviewed N files:", raw error logs).
   // v26 P0: noise penalty shrinks relevance magnitude for obs with high
@@ -298,6 +300,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter) {
       AND o.project = ?
       AND o.importance >= 1
       AND o.created_at_epoch > ?
+      AND (? IS NULL OR o.created_at_epoch <= ?)
       AND COALESCE(o.compressed_into, 0) = 0
       AND o.superseded_at IS NULL
       AND ${notLowSignalTitleClause('o')}
@@ -306,7 +309,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter) {
     LIMIT ?
   `;
 
-  const params = [now, ftsQuery, project, cutoff];
+  const params = [now, ftsQuery, project, cutoff, epochTo, epochTo];
   if (typeFilter) params.push(typeFilter);
   params.push(limit);
 
@@ -821,4 +824,9 @@ async function main() {
 // every sibling hook script upholds). Deliberately NOT `.finally(process.exit(0))` —
 // this hook detaches a background `claude -p` search and a forced exit would kill it;
 // letting the loop drain naturally exits 0 once the detached child is unref'd.
-main().catch(() => {});
+// Import guard (mirrors benchmark/longmemeval.mjs): only auto-run when this file is
+// executed directly as the UserPromptSubmit hook, not when a benchmark/test harness
+// imports it to call searchByFts() offline (see tests/adoption-searchbyfts-snapshot.test.mjs).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(() => {});
+}
