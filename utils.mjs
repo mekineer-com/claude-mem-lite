@@ -122,8 +122,13 @@ export function computeRuleImportance(episode) {
     lastWasError = entry.isError || sig?.isError;
 
     if (sig?.isError && (sig?.isTest || sig?.isBuild)) { importance = 3; break; }
-    if (files.some(f => /\.(env|pem|key)$|\/auth\.|\/credential|\/password/i.test(f))) { importance = 3; break; }
-    if (files.some(f => /migration|schema\.|prisma|alembic/i.test(f))) { importance = 3; break; }
+    // Sensitive-file → critical only when the file was EDITED, not merely read or
+    // referenced in a bash command (finding #7): reading auth.js / .env / schema.mjs
+    // incidentally during an unrelated task must not promote the whole memory to
+    // imp=3 and outrank genuine memories in top-K injection.
+    const isEdit = EDIT_TOOLS.has(entry.tool);
+    if (isEdit && files.some(f => /\.(env|pem|key)$|\/auth\.|\/credential|\/password/i.test(f))) { importance = 3; break; }
+    if (isEdit && files.some(f => /migration|schema\.|prisma|alembic/i.test(f))) { importance = 3; break; }
     if (sig?.isError && importance < 2) importance = 2;
     if (sig?.isGit && importance < 2) importance = 2;
     if (sig?.isDeploy && importance < 2) importance = 2;

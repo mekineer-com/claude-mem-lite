@@ -1,14 +1,17 @@
 ---
 name: bug
-description: "Use when: logging a known bug + repro steps you can't fix right now. Writes to the mem events table (NOT memdir). Skip for bugs you're actively fixing in the current turn — just fix them."
+description: "Use when: logging a known bug + repro steps you can't fix right now. Writes a searchable observation (findable via mem_search + surfaced by recall hooks; still NOT memdir). Skip for bugs you're actively fixing in the current turn — just fix them."
 ---
 
 # /bug
 
-Record a known bug + reproduction steps. Writes to the mem `events` table
-with `event_type='bug'`. Does NOT touch memdir. Useful for bugs you can't
-fix immediately but want future sessions (or yourself after `/clear`) to
-know about and avoid re-investigating.
+Record a known bug + reproduction steps. Writes a searchable **observation**
+(`type=bugfix`, description in `lesson_learned`) so future sessions can find it
+via `mem_search` and the PreToolUse recall hooks warn when the affected files
+are edited. Does NOT touch memdir. Useful for bugs you can't fix immediately
+but want future sessions (or yourself after `/clear`) to know about and avoid
+re-investigating. (Redirected v3.39: was the `events` table, which `mem_search`
+never read.)
 
 ## When to use
 
@@ -40,16 +43,17 @@ Map severity to importance:
 Build the body as `<description>\n\nRepro:\n<repro-steps>` (or just
 `<description>` if `--repro` is absent).
 
-Run via Bash:
+Run via Bash — the body is the positional content; the description goes in
+`--lesson` so it lands in the high-weight `lesson_learned` field:
 
-    node ${CLAUDE_PLUGIN_ROOT}/cli.mjs activity save \
-      --type bug \
+    node ${CLAUDE_PLUGIN_ROOT}/cli.mjs save "<body>" \
+      --type bugfix \
       --title "<first 60 chars of description>" \
-      --body "<body>" \
-      [--file <path> | --files f1,f2,...] \
+      --lesson "<description>" \
+      [--files f1,f2,...] \
       --importance <1|2|3>
 
-Confirm to user with: `Bug logged: activity #<id>`.
+Confirm to user with: `Bug logged: #<id>`.
 
 ## Examples
 

@@ -45,6 +45,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createTestDb } from '../tests/test-helpers.mjs';
 import { seedDatabase, seedVectors, runBenchmark } from './benchmark.mjs';
+import { runScriptGuard, MULTISCRIPT_FIXTURES } from './multiscript-guard.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(__dirname, 'fixtures');
@@ -73,12 +74,16 @@ function round(n) { return Math.round(n * 1e4) / 1e4; }
 export function runSnapshot(db, { mode = 'production_hybrid' } = {}) {
   const out = {};
   for (const s of SUITES) {
-    const r = runBenchmark(db, loadQueries(s.file), mode);
+    const queries = loadQueries(s.file);
+    const r = runBenchmark(db, queries, mode);
     out[s.name] = {
       recall_at_10: r.metrics.recall_at_10,
       precision_at_10: r.metrics.precision_at_10,
       ndcg_at_10: r.metrics.ndcg_at_10,
       mrr_at_10: r.metrics.mrr_at_10,
+      // Query count so summarizeTradeoff can disclose the single-query resolution
+      // (1/n) — a mean-of-per-query metric cannot resolve a move smaller than that.
+      n: queries.length,
       byCategory: r.byCategory,
     };
   }
@@ -96,6 +101,7 @@ export function summarizeTradeoff(before, after, { threshold = 0.02 } = {}) {
   const suites = [];
   const gains = [];
   const regressions = [];
+  const underResolved = [];
   for (const name of Object.keys(after)) {
     if (!before[name]) continue;
     const deltas = { name };
@@ -105,6 +111,15 @@ export function summarizeTradeoff(before, after, { threshold = 0.02 } = {}) {
       if (d >= threshold) gains.push(`${name}.${m} +${d}`);
       else if (d <= -threshold) regressions.push(`${name}.${m} ${d}`);
     }
+    // Single-query resolution: the mean-of-per-query metrics can only resolve a
+    // move of at least 1/n. If that floor is ABOVE the verdict threshold, a
+    // sub-threshold Δ is unresolvable noise — "NEUTRAL" there means "too few
+    // queries to tell", NOT "safe" (the "A/B NEUTRAL ≠ safe" trap).
+    const n = after[name].n ?? before[name].n ?? null;
+    const resolution = n ? round(1 / n) : null;
+    deltas.n = n;
+    deltas.resolution = resolution;
+    if (resolution !== null && resolution > threshold) underResolved.push(name);
     suites.push(deltas);
   }
   let verdict;
@@ -117,7 +132,13 @@ export function summarizeTradeoff(before, after, { threshold = 0.02 } = {}) {
   } else {
     verdict = `NEUTRAL — all |Δ| < ${threshold}`;
   }
-  return { suites, gains, regressions, verdict };
+  if (underResolved.length) {
+    const detail = underResolved
+      .map((nm) => `${nm} 1/n=${suites.find((s) => s.name === nm).resolution}`)
+      .join('; ');
+    verdict += ` [under-resolved: ${detail} > threshold ${threshold} — a sub-1/n Δ is unresolvable; NEUTRAL≠safe, pair with a behavioral probe]`;
+  }
+  return { suites, gains, regressions, underResolved, verdict };
 }
 
 function fmtSnapshot(snap) {
@@ -147,10 +168,24 @@ async function main() {
   seedDatabase(db, seedData);
   seedVectors(db);
   const snap = runSnapshot(db, { mode });
+
+  // Non-Latin regression gate on the SAME screen: a char-class/tokenizer/synonym
+  // change that zeroes an entire script is invisible to the ranking-delta suites
+  // above (they are 100% ASCII). Seed the planted per-script docs into the same DB
+  // and assert each is retrievable.
+  seedDatabase(db, { observations: MULTISCRIPT_FIXTURES.corpus });
+  const guard = runScriptGuard(db);
   db.close();
 
   console.error(`\n─── Denoise A/B snapshot (${mode}, ${SUITES.length} suites) ───`);
   console.error(fmtSnapshot(snap));
+
+  const zeroed = guard.filter((g) => !g.found);
+  console.error('\n─── Multi-script guard (planted doc per script) ───');
+  console.error(`  ${guard.map((g) => `${g.script}${g.found ? '✓' : '✗ZERO'}`).join('  ')}`);
+  if (zeroed.length) {
+    console.error(`  ⚠ FAIL — zero results for: ${zeroed.map((g) => `${g.script} ("${g.query}")`).join(', ')} — a non-Latin regression the ranking suites cannot see.`);
+  }
 
   if (comparePath) {
     const before = JSON.parse(readFileSync(comparePath, 'utf8'));

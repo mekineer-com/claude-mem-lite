@@ -474,25 +474,44 @@ describe('computeRuleImportance', () => {
     expect(computeRuleImportance(ep)).toBe(3);
   });
 
-  it('returns 3 for security files (.env)', () => {
-    const ep = mkEpisode([mkEntry({ files: ['/project/.env'] })]);
+  // These assert the sensitive-file → imp=3 heuristic, which now requires an EDIT
+  // (finding #7); the tool is set to Edit so they test that heuristic, not the
+  // read/bash-touch case (covered by 'does NOT return 3 … only READ' above).
+  it('returns 3 for edited security files (.env)', () => {
+    const ep = mkEpisode([mkEntry({ tool: 'Edit', files: ['/project/.env'] })]);
     expect(computeRuleImportance(ep)).toBe(3);
   });
 
-  it('returns 3 for security files (.pem, .key)', () => {
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/ssl/cert.pem'] })]))).toBe(3);
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/ssl/private.key'] })]))).toBe(3);
+  it('returns 3 for edited security files (.pem, .key)', () => {
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/ssl/cert.pem'] })]))).toBe(3);
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/ssl/private.key'] })]))).toBe(3);
   });
 
-  it('returns 3 for auth-related files', () => {
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/src/auth.js'] })]))).toBe(3);
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/config/credentials.json'] })]))).toBe(3);
+  it('returns 3 for edited auth-related files', () => {
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/src/auth.js'] })]))).toBe(3);
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/config/credentials.json'] })]))).toBe(3);
   });
 
-  it('returns 3 for migration files', () => {
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/db/migration_001.sql'] })]))).toBe(3);
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/prisma/schema.prisma'] })]))).toBe(3);
-    expect(computeRuleImportance(mkEpisode([mkEntry({ files: ['/alembic/versions/abc.py'] })]))).toBe(3);
+  it('returns 3 for edited migration files', () => {
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/db/migration_001.sql'] })]))).toBe(3);
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Write', files: ['/prisma/schema.prisma'] })]))).toBe(3);
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/alembic/versions/abc.py'] })]))).toBe(3);
+  });
+
+  // P3 (finding #7): the sensitive-file → imp=3 heuristic must require the file to
+  // be EDITED, not merely READ/bash-touched. Reading auth.js or .env while working on
+  // an unrelated task shouldn't promote the whole memory to critical and outrank
+  // genuine memories in top-K injection.
+  it('does NOT return 3 when a sensitive file is only READ (not edited)', () => {
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Read', files: ['/project/.env'] })]))).toBeLessThan(3);
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Read', files: ['/prisma/schema.prisma'] })]))).toBeLessThan(3);
+    // A bash command that merely references a sensitive path is not an edit either.
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Bash', files: ['/ssl/private.key'] })]))).toBeLessThan(3);
+  });
+
+  it('returns 3 when a sensitive file is EDITED', () => {
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Edit', files: ['/project/.env'] })]))).toBe(3);
+    expect(computeRuleImportance(mkEpisode([mkEntry({ tool: 'Write', files: ['/db/migration_001.sql'] })]))).toBe(3);
   });
 
   it('returns 2 for non-test/build errors', () => {
@@ -535,7 +554,7 @@ describe('computeRuleImportance', () => {
 
   it('short-circuits on importance=3', () => {
     const ep = mkEpisode([
-      mkEntry({ files: ['/project/.env'] }),  // importance=3, should break
+      mkEntry({ tool: 'Edit', files: ['/project/.env'] }),  // importance=3, should break
       mkEntry({ tool: 'Edit', files: ['/src/foo.js'] }),  // would be 1
     ]);
     expect(computeRuleImportance(ep)).toBe(3);

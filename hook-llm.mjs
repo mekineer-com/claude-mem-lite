@@ -119,6 +119,17 @@ function buildFtsTextField(obs) {
   return { conceptsText, factsText, textField: [conceptsText, factsText, aliasesText, bigramText, fallbackText].filter(Boolean).join(' ') };
 }
 
+// TF-IDF vector text. Must mirror the FTS-searchable content so the vector arm and
+// the BM25 arm rank on the same signal — including lesson_learned (highest FTS
+// weight) and search_aliases (finding #8: previously omitted, so even with vectors
+// enabled the paraphrase-bridge alias terms were invisible to cosine similarity).
+export function buildVecText(obs) {
+  const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : (obs.concepts || '');
+  const aliasesText = obs.searchAliases || '';
+  return [obs.title || '', obs.narrative || '', conceptsText, obs.lessonLearned || '', aliasesText]
+    .filter(Boolean).join(' ');
+}
+
 /**
  * Save an observation to the database with three-tier dedup.
  * @returns {number|null} The saved observation ID, or null if deduped.
@@ -256,8 +267,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
       });
 
       insertObservationFiles(db, id, obs.files);
-      const vecText = [obs.title || '', obs.narrative || '', (Array.isArray(obs.concepts) ? obs.concepts.join(' ') : '')].filter(Boolean).join(' ');
-      insertObservationVector(db, id, vecText);
+      insertObservationVector(db, id, buildVecText(obs));
 
       return id;
     })();

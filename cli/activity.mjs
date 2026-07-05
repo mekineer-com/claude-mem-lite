@@ -21,12 +21,12 @@ function formatActivityResults(rows) {
 export async function cmdActivity(db, args) {
   const sub = args[0];
   if (!sub) {
-    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show|delete> ...');
+    fail('[mem] Usage: claude-mem-lite activity <save|search|recent|show|delete|promote> ...');
     return;
   }
 
   const { positional, flags } = parseArgs(args.slice(1));
-  const { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES } = await import('../lib/activity.mjs');
+  const { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES, promoteInsightEvents } = await import('../lib/activity.mjs');
   const VALID_EVENT_TYPES = new Set(EVENT_TYPES);
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
@@ -169,6 +169,27 @@ export async function cmdActivity(db, args) {
 
     const result = db.prepare(`DELETE FROM events WHERE id IN (${placeholders})`).run(...ids);
     out(`[mem] Deleted ${result.changes} event(s).`);
+    return;
+  }
+
+  if (sub === 'promote') {
+    // P2(b): promote insight-bearing events (body present, importance>=N) into
+    // searchable observations. Preview by default; --execute applies. One-time
+    // backfill — the source events are marked promoted (idempotent re-runs).
+    const minImp = flags['min-importance'] !== undefined ? parseInt(flags['min-importance'], 10) : 2;
+    if (isNaN(minImp) || minImp < 1 || minImp > 3) {
+      fail('[mem] activity promote: --min-importance must be 1, 2, or 3.');
+      return;
+    }
+    const projectFilter = flags.project ? project : null;
+    const execute = flags.execute === true || flags.execute === 'true';
+    const r = promoteInsightEvents(db, { project: projectFilter, minImportance: minImp, execute });
+    if (!execute) {
+      out(`[mem] Preview: ${r.eligible} insight-bearing event(s) (body + importance>=${minImp})${projectFilter ? ` in ${projectFilter}` : ' across all projects'} would be promoted to searchable observations.`);
+      out('[mem] Run with --execute to apply. Source events are kept (marked promoted).');
+      return;
+    }
+    out(`[mem] Promoted ${r.promoted} event(s) to observations${r.deduped ? ` (${r.deduped} already had an equivalent observation)` : ''}.`);
     return;
   }
 

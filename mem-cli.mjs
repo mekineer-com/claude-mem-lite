@@ -747,7 +747,7 @@ function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
   const text = positional.join(' ');
   if (!text.trim()) {
-    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T] [--closes-deferred 1,D#42]');
+    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T] [--closes-deferred 1,D#42] [--supersedes 8754,8771]');
     return;
   }
 
@@ -804,6 +804,20 @@ function cmdSave(db, args) {
     }
   }
 
+  // --supersedes: comma-separated observation ids this save overturns. On save they
+  // are tombstoned (drop out of live search) + linked (superseded_by = the new id).
+  // Only same-project live rows are affected (enforced in saveObservation).
+  let supersedesIds = null;
+  if (flags.supersedes !== undefined && flags.supersedes !== false) {
+    const raw = String(flags.supersedes);
+    supersedesIds = raw.split(',').map(t => t.trim()).filter(Boolean)
+      .map(t => parseInt(t, 10)).filter(n => Number.isInteger(n) && n > 0);
+    if (supersedesIds.length === 0) {
+      fail('[mem] --supersedes requires at least one positive observation id (e.g. --supersedes 8754,8771)');
+      return;
+    }
+  }
+
   let result;
   let closesIds = null;
   try {
@@ -816,6 +830,7 @@ function cmdSave(db, args) {
         project,
         files: saveFiles,
         lesson_learned: rawLesson,
+        supersedes: supersedesIds || undefined,
       });
       // Skip closure on dedup short-circuit — the obs row already exists, so
       // the deferred item should NOT be re-closed by a duplicate save call.
@@ -847,7 +862,10 @@ function cmdSave(db, args) {
   const closedNote = closesIds && closesIds.length > 0
     ? ` Closed: ${closesIds.map(i => `D#${i}`).join(', ')}.`
     : '';
-  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}`);
+  const supersededNote = result.supersededIds && result.supersededIds.length > 0
+    ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
+    : '';
+  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}${supersededNote}`);
 }
 
 // ─── cmdDefer (sub-dispatch: add | list | drop) ──────────────────────────────
@@ -2634,7 +2652,10 @@ Commands:
     --run-all           Execute bypassing gates
     --task T            Comma-separated: re-enrich,normalize,cluster-merge,smart-compress
     --max N             Max items per task (1-100, default 15)
-    --scope S           re-enrich scope: narrow (default) or wide
+    --scope S           re-enrich scope: narrow (default) | wide | aliases
+                        (aliases: backfill search_aliases on substantive rows that
+                         lack them — incl. lesson-bearing manual saves — adds ONLY
+                         aliases, never rewrites title/narrative/lesson)
     --project P         Limit to a single project (.|current = inferProject())
     --verbose / -v      Preview also dumps cluster contents + re-enrich samples
 
@@ -2965,8 +2986,8 @@ async function cmdOptimize(db, args) {
   let reenrichScope = 'narrow';
   if (scopeIdx >= 0 && args[scopeIdx + 1] !== undefined) {
     const raw = args[scopeIdx + 1];
-    if (raw !== 'narrow' && raw !== 'wide') {
-      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide`);
+    if (raw !== 'narrow' && raw !== 'wide' && raw !== 'aliases') {
+      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide, aliases`);
       return;
     }
     reenrichScope = raw;
@@ -2985,7 +3006,7 @@ async function cmdOptimize(db, args) {
     const preview = optimizePreview(db, { project, detail: verbose });
     out('[mem] 🔍 LLM Optimization Preview:');
     if (project) out(`  Project filter: ${project}`);
-    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}`);
+    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}${preview.reenrichAliases ? `  (aliases scope: ${preview.reenrichAliases})` : ''}`);
     out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
     out(`  Cluster-merge: ${preview.clusterMerge} clusters`);
     out(`  Smart-compress: ${preview.smartCompress} clusters`);
@@ -3019,7 +3040,7 @@ async function cmdOptimize(db, args) {
     return;
   }
 
-  out(`[mem] Running LLM optimization${reenrichScope === 'wide' ? ' (scope: wide)' : ''}${project ? ` (project: ${project})` : ''}...`);
+  out(`[mem] Running LLM optimization${reenrichScope !== 'narrow' ? ` (scope: ${reenrichScope})` : ''}${project ? ` (project: ${project})` : ''}...`);
   const results = await optimizeRun(db, { tasks, maxItems, force: runAll, reenrichScope, project });
 
   if (results.reenrich) out(`  Re-enrich: ${results.reenrich.processed || 0} processed, ${results.reenrich.skipped || 0} skipped`);

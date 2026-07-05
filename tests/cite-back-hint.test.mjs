@@ -344,6 +344,22 @@ describe('countUnsavedBugfixShape', () => {
     expect(r.unsaved).toBe(0);
   });
 
+  // P2(a): /bug and /lesson now write searchable observations via `cli.mjs save …
+  // --lesson` (was `activity save --type lesson|bugfix`). The saved-signal counter
+  // must recognize the redirected command or it over-fires the unsaved nudge.
+  it('credits the redirected /bug /lesson save (cli.mjs save … --lesson) as a save', () => {
+    const bashObsInsightSave = {
+      type: 'assistant',
+      message: { content: [
+        { type: 'tool_use', name: 'Bash', input: { command: 'node /root/.claude/plugins/cache/x/cli.mjs save "fixed the pool deadlock" --type bugfix --title "deadlock" --lesson "reorder acquisition"' } },
+      ] },
+    };
+    const path = writeTranscript([bugfixShapeAttachment(), bashObsInsightSave]);
+    const r = countUnsavedBugfixShape(path);
+    expect(r.saved).toBe(1);
+    expect(r.unsaved).toBe(0);
+  });
+
   it('credits mem_save tool_use with type=lesson as a save', () => {
     const path = writeTranscript([
       bugfixShapeAttachment(),

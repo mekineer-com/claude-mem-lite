@@ -171,6 +171,15 @@ const coerceDeferredTokens = z.preprocess(
   ])).min(1).max(20)
 );
 
+// Coerce supersedes input — array of positive observation ids (accept numeric
+// strings from MCP bridges that JSON-stringify ints). Empty/other shapes reject.
+const coerceSupersedes = z.preprocess(
+  (v) => (Array.isArray(v)
+    ? v.map(x => (typeof x === 'string' && /^\d+$/.test(x.trim()) ? parseInt(x.trim(), 10) : x))
+    : v),
+  z.array(z.number().int().positive()).min(1).max(20)
+);
+
 export const memSaveSchema = {
   content: z.string().min(1).max(50000).describe('Memory content to save'),
   title: z.string().optional().describe('Short title'),
@@ -180,6 +189,7 @@ export const memSaveSchema = {
   files: coerceStringArray.optional().describe('File paths associated with this observation'),
   lesson_learned: z.string().max(500).optional().describe('Key lesson or takeaway (for bugfix: root cause & fix; for decision: rationale)'),
   closes_deferred: coerceDeferredTokens.optional().describe('Close one or more deferred_work items in the same project. Mixed array: bare integer = ordinal-within-project, "D#<n>" string = raw id. Transactional with the obs insert — a single invalid id rolls back the whole save.'),
+  supersedes: coerceSupersedes.optional().describe('Observation ids (same project) that this save overturns. They are marked superseded — dropped from live search — and linked to the new row (superseded_by). Use ONLY when this genuinely replaces a prior conclusion; do NOT use for merely-related or updated-but-still-valid memories.'),
 };
 
 export const memStatsSchema = {

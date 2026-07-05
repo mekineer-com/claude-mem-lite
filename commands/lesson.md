@@ -1,14 +1,17 @@
 ---
 name: lesson
-description: "Use when: capturing a non-obvious lesson/gotcha/workaround after a tricky fix or surprising behavior. Writes to the mem events table (NOT memdir). Skip for typos, renames, or user-preference rules."
+description: "Use when: capturing a non-obvious lesson/gotcha/workaround after a tricky fix or surprising behavior. Writes a searchable observation (findable via mem_search + surfaced by recall hooks; still NOT memdir/L1 prompt). Skip for typos, renames, or user-preference rules."
 ---
 
 # /lesson
 
-Record a lesson / gotcha / workaround. Writes to the mem `events` table
-with `event_type='lesson'`. Does NOT touch memdir — so lessons never end up
-in the L1 system-prompt memory section and do not conflict with the
-`WHAT_NOT_TO_SAVE` semantics sdscc enforces.
+Record a lesson / gotcha / workaround. Writes a searchable **observation**
+(`type=discovery` with the text as `lesson_learned`) so future sessions can
+find it via `mem_search` and the PreToolUse recall hooks surface it on the
+relevant files. Does NOT touch memdir — so lessons never end up in the L1
+system-prompt memory section and do not conflict with the `WHAT_NOT_TO_SAVE`
+semantics sdscc enforces. (Redirected v3.39: was the `events` table, which
+`mem_search` never read.)
 
 ## When to use
 
@@ -33,18 +36,17 @@ Don't use for trivial fixes (typos, renames), for rules that belong in memdir
 
 ## Execution
 
-Run via Bash — the CLI takes the lesson text as positional args and stores
-the full text as the title (the `activity save` command uses title-as-body
-when `--body` is absent):
+Run via Bash — pass the lesson text as the positional content and repeat it in
+`--lesson` so it lands in the high-weight `lesson_learned` field:
 
-    node ${CLAUDE_PLUGIN_ROOT}/cli.mjs activity save \
-      --type lesson \
+    node ${CLAUDE_PLUGIN_ROOT}/cli.mjs save "<full text>" \
+      --type discovery \
       --title "<first 60 chars of text>" \
-      --body "<full text>" \
-      [--file <path> | --files f1,f2,...] \
+      --lesson "<full text>" \
+      [--files f1,f2,...] \
       --importance <1|2|3>
 
-Confirm to user with: `Lesson saved: activity #<id>`.
+Confirm to user with: `Lesson saved: #<id>`.
 
 ## Examples
 

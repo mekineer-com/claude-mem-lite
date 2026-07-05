@@ -710,6 +710,7 @@ server.registerTool(
           project,
           files: args.files || [],
           lesson_learned: args.lesson_learned,
+          supersedes: args.supersedes,
         });
         if (r.kind === 'duplicate') return r; // dedup short-circuits BEFORE resolver — replay is idempotent
         // Resolve INSIDE tx + after dedup check so duplicate replays don't throw on
@@ -738,7 +739,10 @@ server.registerTool(
     const closedNote = closesIds && closesIds.length > 0
       ? ` Closed deferred: ${closesIds.map(i => `D#${i}`).join(', ')}.`
       : '';
-    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}` }] };
+    const supersededNote = result.supersededIds && result.supersededIds.length > 0
+      ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
+      : '';
+    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}` }] };
   })
 );
 

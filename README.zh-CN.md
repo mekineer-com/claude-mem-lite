@@ -99,7 +99,7 @@
 - **插件缓存 hook 自愈** -- Claude Code runtime 从 `~/.claude/plugins/cache/<mp>/<plugin>/<ver>/hooks/hooks.json` 读取插件 hook，而非 marketplace 源。当 `install.mjs` 写入 `settings.json` 的 hooks 与残留 cache `hooks.json` 同时存在（例如曾装过 marketplace 版本，或插件被 Claude Code 自动升级重建 cache），runtime 会注册两套 hook → 每次 SessionStart / UserPromptSubmit 都触发两份。`install.mjs` 和 `hook-update.mjs` 现在会清理每个 cache 版本目录下的 `hooks.json`；`hook.mjs session-start` 每次启动自愈（通过 `hasInstallManagedHooks` 门控，不影响纯插件模式用户）；`install.mjs status` 会报告 cache 污染状况（自 v2.31.1 / v2.31.2 起）。
 - **Git-SHA 延续锚点**（v2.31.0）-- handoff 记录包含 `git_sha_at_handoff` 字段，任何匹配当前 `HEAD` 的 handoff 都视为延续会话，不受 TTL 限制。代码状态比时钟时间更能反映上下文延续。
 - **启动面板**（v2.31.0）-- SessionStart hook 将 `git status` + `~/.claude/tasks/*.json` + `~/.claude/plans/*.md` + 最近 /exit 交接 + 最近事件数聚合为一个结构化块，通过 `hookSpecificOutput.additionalContext` 注入。
-- **活动命名空间**（v2.31.0）-- 为非 memdir 类型（`bugfix` / `lesson` / `bug` / `discovery` / `refactor` / `feature` / `observation` / `decision`）启用独立的 `events` 表 + FTS5，与 observations 表的 `WHAT_NOT_TO_SAVE` 语义解耦。CLI：`claude-mem-lite activity save|search|recent|show`；斜杠命令：`/lesson`、`/bug`。`hook-llm` 通过 `persistHaikuSummary` 路由非 memdir 摘要，observations → events 升级路径是事务原子的。
+- **活动命名空间**（v2.31.0）-- 为非 memdir 类型（`bugfix` / `lesson` / `bug` / `discovery` / `refactor` / `feature` / `observation` / `decision`）启用独立的 `events` 表 + FTS5，与 observations 表的 `WHAT_NOT_TO_SAVE` 语义解耦。CLI：`claude-mem-lite activity save|search|recent|show`。`hook-llm` 通过 `persistHaikuSummary` 路由非 memdir 摘要，observations → events 升级路径是事务原子的。（v3.39：`/lesson`、`/bug` 斜杠命令已从此 events 表重定向到可搜索的 **observations**——`mem_search` 从不读 events 表，显式保存因此搜不到；events 表仍作自动捕获活动日志。）
 
 ## 平台支持
 

@@ -121,6 +121,74 @@ describe('re-enrich', () => {
   });
 });
 
+// P1 alias-backfill (scope='aliases'): a lesson-bearing manual save (mem_save)
+// stores NO search_aliases (lib/save-observation.mjs), so it is paraphrase-
+// unfindable — yet BOTH re-enrich scopes skip it: narrow needs lesson IS NULL,
+// wide needs lesson IS NULL. This scope targets substantive rows missing
+// search_aliases REGARDLESS of lesson, and must add ONLY aliases — never rewrite
+// the user's curated title / narrative / lesson (the general re-enrich would).
+describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
+  let db;
+  const substantive = 'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained.';
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    callModelJSON.mockReset();
+  });
+  afterEach(() => { db.close(); });
+
+  it('selects a lesson-bearing, alias-less substantive row that narrow+wide both skip', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed deadlock in the connection pool', narrative: substantive,
+      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
+      searchAliases: null,
+    });
+    // narrow + wide both exclude it (it has a lesson); aliases must include it.
+    expect(findReenrichCandidates(db, 10, { scope: 'narrow' }).length).toBe(0);
+    expect(findReenrichCandidates(db, 10, { scope: 'wide' }).length).toBe(0);
+    const aliases = findReenrichCandidates(db, 10, { scope: 'aliases' });
+    expect(aliases.length).toBe(1);
+    expect(aliases[0].title).toBe('Fixed deadlock in the connection pool');
+  });
+
+  it('excludes rows that already have search_aliases', async () => {
+    const { findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Already enriched', narrative: substantive, type: 'bugfix',
+      lessonLearned: 'lesson', searchAliases: 'existing alias phrase',
+    });
+    expect(findReenrichCandidates(db, 10, { scope: 'aliases' }).length).toBe(0);
+  });
+
+  it('adds ONLY aliases and preserves title/narrative/lesson; appends aliases to FTS text', async () => {
+    const { executeReenrich } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed deadlock in the connection pool', narrative: substantive,
+      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
+      searchAliases: null,
+    });
+    // The alias-only mock deliberately omits title/narrative/lesson — the general
+    // re-enrich would skip on missing title; the aliases path must not need them.
+    callModelJSON.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
+
+    const result = await executeReenrich(db, 10, { scope: 'aliases' });
+    expect(result.processed).toBe(1);
+
+    const obs = db.prepare('SELECT * FROM observations LIMIT 1').get();
+    expect(obs.search_aliases).toContain('connection deadlock');
+    // Curated fields untouched.
+    expect(obs.title).toBe('Fixed deadlock in the connection pool');
+    expect(obs.narrative).toBe(substantive);
+    expect(obs.lesson_learned).toBe('Never acquire a second pool connection inside a callback holding the first');
+    // FTS text keeps original terms AND gains the alias terms (append, not rebuild).
+    expect(obs.text).toContain('deadlock');
+    expect(obs.text).toContain('pool hang');
+  });
+});
+
 // Bug #1: rebuildVector was writing to a non-existent column `computed_at`.
 // Every executeReenrich silently caught SqliteError: observation_vectors has no column named computed_at.
 // The catch is intentional (non-critical path), so the bug was invisible at runtime.

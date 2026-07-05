@@ -79,6 +79,27 @@ export function rebuildVector(db, obsId, textParts) {
  */
 export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', project } = {}) {
   const projectClause = project ? 'AND project = ?' : '';
+  if (scope === 'aliases') {
+    // P1 alias backfill: substantive rows missing search_aliases, REGARDLESS of
+    // lesson. Targets lesson-bearing manual saves (mem_save writes no aliases →
+    // paraphrase-unfindable) that narrow (needs lesson NULL) and wide (needs
+    // lesson NULL) both skip. Idempotent via search_aliases becoming non-null —
+    // deliberately NOT gated on optimized_at, so a lesson-less row can still be
+    // picked up by wide scope for lesson enrichment afterward.
+    const stmt = db.prepare(`
+      SELECT id, title, narrative, type, subtitle, concepts, facts, text, search_aliases, project
+      FROM observations
+      WHERE COALESCE(compressed_into, 0) = 0
+        AND superseded_at IS NULL
+        AND (search_aliases IS NULL OR search_aliases = '')
+        AND LENGTH(COALESCE(narrative, '')) > 100
+        AND ${notLowSignalTitleClause('')}
+        ${projectClause}
+      ORDER BY created_at_epoch DESC
+      LIMIT ?
+    `);
+    return project ? stmt.all(project, limit) : stmt.all(limit);
+  }
   if (scope === 'wide') {
     const stmt = db.prepare(`
       SELECT id, title, narrative, type, subtitle, concepts, facts, search_aliases, project
@@ -126,6 +147,33 @@ export async function executeReenrich(db, limit = 10, { scope = 'narrow', projec
     if (!gotSlot) { skipped++; continue; }
 
     try {
+      if (scope === 'aliases') {
+        // Alias-only backfill: generate search_aliases and APPEND them (plus any
+        // CJK bigrams) to the EXISTING FTS text. Never rebuild text from
+        // concepts/facts (empty on manual saves → would drop the original
+        // narrative terms and regress recall) and never touch the user's curated
+        // title / narrative / lesson / type / importance.
+        const aliasPrompt = `Generate alternative search terms so this memory is findable by paraphrase, synonym, or cross-language queries. Return ONLY valid JSON, no markdown fences.
+
+Title: ${truncate(cand.title || '(untitled)', 200)}
+Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
+
+JSON: {"search_aliases":["alt phrasing","synonym","spelled-out jargon","CJK term if the domain word has one"]}
+Give 3-6 aliases: words a user might search for the SAME concept but that are NOT already in the title (synonyms, the spelled-out form of an acronym, the jargon term for a described symptom, a CJK translation of a key domain term).`;
+        const parsed = await callModelJSON(aliasPrompt, 'haiku', { timeout: 15000, maxTokens: 300 });
+        const aliasArr = parsed && Array.isArray(parsed.search_aliases)
+          ? parsed.search_aliases.filter((a) => typeof a === 'string' && a.trim().length > 0)
+          : [];
+        if (!aliasArr.length) { skipped++; continue; }
+        const searchAliases = aliasArr.slice(0, 6).join(' ');
+        const aliasBigrams = cjkBigrams(searchAliases);
+        const appendedText = [cand.text || '', searchAliases, aliasBigrams].filter(Boolean).join(' ');
+        const safe = scrubRecord('observations', { text: appendedText, search_aliases: searchAliases });
+        db.prepare(`UPDATE observations SET search_aliases = ?, text = ? WHERE id = ?`)
+          .run(safe.search_aliases, safe.text, cand.id);
+        processed++;
+        continue;
+      }
       const prompt = `Re-enrich this observation with structured metadata. Return ONLY valid JSON, no markdown fences.
 
 Title: ${truncate(cand.title || '(untitled)', 200)}
@@ -780,6 +828,9 @@ export function optimizePreview(db, { project, detail = false } = {}) {
   // R-7: also report the widened-scope candidate count so users can see how many
   // bugfix/refactor/feature/decision observations are eligible for lesson backfill.
   const reenrichWide = findReenrichCandidates(db, 5000, { scope: 'wide', project }).length;
+  // P1: alias-backfill eligibility — substantive rows missing search_aliases
+  // (incl. lesson-bearing manual saves) that narrow+wide both skip.
+  const reenrichAliases = findReenrichCandidates(db, 5000, { scope: 'aliases', project }).length;
 
   const concepts = extractUniqueConcepts(db, 500, { project });
   const normalizeReady = shouldRunNormalize() && concepts.length >= 5;
@@ -794,6 +845,7 @@ export function optimizePreview(db, { project, detail = false } = {}) {
   const result = {
     reenrich,
     reenrichWide,
+    reenrichAliases,
     normalize: normalizeReady ? concepts.length : 0,
     normalizeGateOpen: shouldRunNormalize(),
     clusterMerge,
@@ -822,8 +874,10 @@ export function optimizePreview(db, { project, detail = false } = {}) {
  *   would silently waste 60% of the requested budget.
  * @param {number} [opts.maxItems=15] Total item budget across all selected tasks.
  * @param {boolean} [opts.force=false] Bypass time-based gates (e.g. normalize interval).
- * @param {'narrow'|'wide'} [opts.reenrichScope='narrow'] Scope for the re-enrich task.
+ * @param {'narrow'|'wide'|'aliases'} [opts.reenrichScope='narrow'] Scope for the re-enrich task.
  *   'wide' targets bugfix/refactor/feature/decision with narrative but no lesson (R-7).
+ *   'aliases' (P1) backfills search_aliases on substantive alias-less rows regardless
+ *   of lesson (lesson-bearing manual saves) — adds ONLY aliases, never rewrites content.
  * @param {string} [opts.project] Filter all tasks to a single project. Opt-in;
  *   absence preserves the prior all-projects default.
  */

@@ -2,6 +2,46 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.39.0 — storage/retrieval precision: eval-coverage, alias backfill, explicit supersession, searchable /bug /lesson
+
+A precision-focused release from a storage + retrieval + eval audit (2026-07-06). The through-line:
+lexical retrieval is already strong (LongMemEval recall_any@5 = 95.2%), so the leverage is in what
+gets **stored** and whether it's **reachable** — not in re-tuning ranking. Five changes, each
+TDD'd, full suite green (190 files / 3605 tests), no runtime regression.
+
+### Added
+- **Multi-script eval guard** (`benchmark/multiscript-guard.mjs`) — the A/B suites were 100%
+  ASCII/English, so a char-class/tokenizer/synonym change that silently zeroes an entire non-Latin
+  script (the emoji-filter allowlist regression class) read NEUTRAL. This plants one observation +
+  query per script (CJK, Cyrillic, Greek, Arabic, Hangul, Kana, Devanagari, emoji) and fails loudly
+  if any returns zero. Wired into `denoise-ab.mjs` output. Also fixes a harness-fidelity bug:
+  `seedDatabase` now mirrors the production CJK bigram FTS text (raw-inserted CJK was a single
+  un-queryable token → false zeros); English fixtures are byte-identical.
+- **`optimize --scope aliases`** — backfills `search_aliases` on substantive rows that lack them,
+  **including lesson-bearing manual saves** that both existing re-enrich scopes skip. Adds ONLY
+  aliases (appended to the existing FTS text), never rewriting the curated title/narrative/lesson.
+  Directly targets the paraphrase/vocab-mismatch recall gap.
+- **`mem_save` / CLI `save --supersedes <ids>` / MCP `supersedes`** — explicitly tombstone + link
+  prior observations a new save overturns (they drop out of live search; `superseded_by` records
+  the replacement). Fixes contradictory memories coexisting in results with no supersession link.
+  No schema change — the `superseded_by` column already existed.
+- **`activity promote`** — one-time backfill promoting insight-bearing events (body + importance≥2)
+  into searchable observations, preserving timestamps and marking the source event promoted
+  (idempotent). Preview by default; `--execute` applies.
+- **`buildVecText`** now includes `lesson_learned` + `search_aliases` (were omitted from the TF-IDF
+  vector text — the highest-weight fields were invisible to cosine similarity when vectors are on).
+
+### Changed
+- **`/bug` and `/lesson` now write searchable observations** instead of the `events` table, which
+  `mem_search` never read — so explicit saves were unfindable. They still stay out of memdir/the L1
+  prompt. The events table remains the auto-capture activity log; `cite-back-hint` recognizes the
+  redirected save command so the unsaved-bugfix nudge doesn't over-fire.
+- **Importance heuristic** (`computeRuleImportance`) — a sensitive file (`.env`/`schema`/`auth`/…)
+  now bumps importance to 3 only when it is EDITED, not merely read or referenced in a bash command,
+  so incidental reads no longer over-promote a memory and crowd top-K injection.
+- **`denoise-ab` verdict** discloses each suite's single-query resolution (1/n) and flags suites
+  whose resolution exceeds the threshold as "under-resolved" — a small-n NEUTRAL is not "safe".
+
 ## v3.38.4 — MCP instructions advertise the defer trio + steering-surface drift guards
 
 Fixes a steering-surface drift found while auditing the project's tool-guidance blocks. The

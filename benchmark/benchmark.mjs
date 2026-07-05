@@ -5,7 +5,7 @@
 import { readFileSync } from 'fs';
 import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
-import { sanitizeFtsQuery, estimateTokens } from '../utils.mjs';
+import { sanitizeFtsQuery, estimateTokens, cjkBigrams } from '../utils.mjs';
 import { searchObservationsHybrid } from '../search-engine.mjs';
 import { computePerSourceWindow } from '../lib/search-core.mjs';
 import { deepSearch } from '../deep-search.mjs';
@@ -46,8 +46,18 @@ export function seedDatabase(db, data) {
   const obsTransaction = db.transaction(() => {
     for (const obs of data.observations) {
       const epoch = now + (obs.epoch_offset_days * 86400000);
+      // Mirror the production write path (lib/save-observation.mjs, hook-llm.mjs::
+      // buildFtsTextField): the indexed text = content + space-separated CJK
+      // bigrams, because unicode61 indexes a whole CJK run as ONE token while the
+      // query is reduced to bigrams. Raw-inserting `text` left seeded CJK a single
+      // un-queryable token, so any CJK/multi-script fixture measured a false zero
+      // (#8826: build the corpus through the real save path). cjkBigrams is '' for
+      // pure-Latin text, so English fixtures are byte-identical.
+      const baseText = obs.text || '';
+      const bigrams = cjkBigrams([obs.title, obs.narrative, baseText, obs.concepts].filter(Boolean).join(' '));
+      const ftsText = bigrams ? `${baseText} ${bigrams}` : baseText;
       insertObs.run(
-        obs.id, obs.session_id, obs.project, obs.text, obs.type,
+        obs.id, obs.session_id, obs.project, ftsText, obs.type,
         obs.title, obs.narrative, obs.facts, obs.concepts, obs.files_modified,
         new Date(epoch).toISOString(), epoch, obs.importance
       );
