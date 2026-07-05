@@ -10,7 +10,13 @@ import { saveEvent, promoteInsightEvents } from '../lib/activity.mjs';
 
 describe('promoteInsightEvents', () => {
   let db;
-  beforeEach(() => { db = createTestDb(); });
+  beforeEach(() => {
+    db = createTestDb();
+    // Mirror the real DB connection: FK enforcement ON. Without this the events
+    // superseded_by_id self-FK is not enforced, which masked a FOREIGN KEY
+    // violation when promotion tried to store an observation id there.
+    db.pragma('foreign_keys = ON');
+  });
   afterEach(() => { db.close(); });
 
   const seedEvent = (over = {}) => saveEvent(db, {
@@ -39,8 +45,10 @@ describe('promoteInsightEvents', () => {
     expect(obs.created_at_epoch).toBe(1_600_000_000_000); // original timestamp preserved
 
     const ev = db.prepare('SELECT superseded_at_epoch, superseded_by_id FROM events WHERE id = ?').get(evId);
-    expect(ev.superseded_at_epoch).toBeGreaterThan(0);
-    expect(ev.superseded_by_id).toBe(obs.id); // linked to the promoted observation
+    expect(ev.superseded_at_epoch).toBeGreaterThan(0); // marked promoted (idempotency)
+    // superseded_by_id is a self-FK (REFERENCES events(id)) — deliberately left NULL,
+    // NOT set to the observation id (that would fail the FK on the real DB).
+    expect(ev.superseded_by_id).toBeNull();
   });
 
   it('skips low-importance and empty-body events', () => {
@@ -59,6 +67,19 @@ describe('promoteInsightEvents', () => {
     expect(r2.eligible).toBe(0);
     expect(r2.promoted).toBe(0);
     expect(db.prepare('SELECT COUNT(*) n FROM observations').get().n).toBe(1); // not duplicated
+  });
+
+  it('excludes low-signal-titled events (activity-log noise, not lessons)', () => {
+    // Real-DB sampling found ~6.5% of body+imp>=2 events carry low-signal titles
+    // (Modified X / Error while … / Worked on X / raw tool logs). Those are the
+    // activity-log noise the events split was meant to contain — promoting them
+    // would re-introduce noise into search. "lesson-bearing" must exclude them.
+    // Uses the project's canonical low-signal-title definition (same as re-enrich).
+    seedEvent({ title: 'Modified schema.mjs', body: 'ran a grep over the file', importance: 2 });
+    seedEvent({ title: 'Worked on prompt_mgr.py, migrations', body: 'grep -A 50 def get → stdout empty', importance: 3 });
+    const r = promoteInsightEvents(db, { execute: true });
+    expect(r.eligible).toBe(0);
+    expect(r.promoted).toBe(0);
   });
 
   it('maps non-observation event types to a valid obs type (bug → bugfix, observation → discovery)', () => {

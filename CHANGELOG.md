@@ -2,6 +2,25 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.39.1 — `activity promote` hardening (low-signal exclusion + FK-safe marking)
+
+Two fixes to `activity promote`, both caught while running the v3.39.0 backfill against a real DB.
+
+### Fixed
+- **Low-signal exclusion** (`lib/activity.mjs::promoteInsightEvents`) — the `body + importance>=2`
+  filter was too loose, sweeping in ~17% low-signal-titled events (`Modified X`, `Worked on X`, raw
+  tool logs) — exactly the activity-log noise the events/observations split exists to contain.
+  Promotion now applies the project's canonical `notLowSignalTitleClause` (same as the re-enrich
+  candidate query), so "lesson-bearing" excludes activity-log chatter. Dropped the maintainer's
+  promotable set from 1212 to 1009.
+- **FOREIGN KEY violation on the real DB** — promotion marked the source event with
+  `superseded_by_id = <observation id>`, but that column is a self-FK (`REFERENCES events(id)`), so it
+  failed a `SQLITE_CONSTRAINT_FOREIGNKEY` under the real connection's FK enforcement. The `:memory:`
+  test had FK enforcement OFF, which masked it. Promotion now marks with `superseded_at_epoch` only
+  (sufficient for idempotency), wraps each observation-insert + mark in one transaction (no orphan
+  observation on failure), and skips (rather than aborts on) a single bad event. The regression test
+  now runs with `PRAGMA foreign_keys = ON` so this class can't silently pass again.
+
 ## v3.39.0 — storage/retrieval precision: eval-coverage, alias backfill, explicit supersession, searchable /bug /lesson
 
 A precision-focused release from a storage + retrieval + eval audit (2026-07-06). The through-line:

@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.39.0
+- **Version**: 3.39.1
 - **Package manager**: npm
-- **Test**: `npx vitest run` (190 test files / 3605 tests, vitest)
+- **Test**: `npx vitest run` (190 test files / 3606 tests, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **Denoising A/B** (evaluate any precision/recall lever BEFORE shipping): `node benchmark/denoise-ab.mjs --save before.json` (control) → apply the change → `node benchmark/denoise-ab.mjs --compare before.json` (verdict). Runs BOTH the precision hard-negative AND vocab-mismatch paraphrase suites so a lever's precision gain and recall cost are weighed on one screen — the split that let an OR-BM25 floor ship-then-revert (2026-06-29). Verdict: REJECT / TRADEOFF / NET-POSITIVE / NEUTRAL.
