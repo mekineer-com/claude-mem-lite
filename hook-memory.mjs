@@ -408,17 +408,19 @@ export function recallForFile(db, filePath, project) {
 }
 
 /**
- * Phase-2 task-imperative selection (spec 2026-06-29 §4.1): the single highest-value
- * lesson relevant to THIS prompt, for delivery at the task-prompt position under the
- * imperative template. Own gate (importance>=2 + non-empty lesson + identifier overlap
- * with the prompt, top-1) — deliberately independent of searchRelevantMemories' coverage/
+ * Phase-2 task-imperative ranking (spec 2026-06-29 §4.1): score every candidate lesson
+ * relevant to THIS prompt (importance>=2 + non-empty lesson + identifier overlap with the
+ * prompt), sorted best-first — deliberately independent of searchRelevantMemories' coverage/
  * BM25 filters so a high-value lesson is not dropped by the context-list scoring.
- * @returns {{id:number, lesson_learned:string}|null}
+ * `epochTo` (optional) restricts the pool to observations created at/before that epoch —
+ * for offline point-in-time replay (benchmark use); a no-op at every production call site,
+ * which never passes it.
+ * @returns {Array<{id:number, lesson_learned:string, importance:number, overlap:number, score:number}>}
  */
-export function selectImperativeLesson(db, userPrompt, project, excludeIds = []) {
-  if (!db || !userPrompt) return null;
+export function rankImperativeCandidates(db, userPrompt, project, excludeIds = [], { epochTo = null } = {}) {
+  if (!db || !userPrompt) return [];
   const promptIdents = new Set(extractIdents(userPrompt));
-  if (promptIdents.size === 0) return null; // no symbol anchor → no imperative (precision-first)
+  if (promptIdents.size === 0) return []; // no symbol anchor → no imperative (precision-first)
   const exclude = new Set(excludeIds);
   let rows;
   try {
@@ -432,19 +434,34 @@ export function selectImperativeLesson(db, userPrompt, project, excludeIds = [])
         AND lesson_learned IS NOT NULL
         AND TRIM(lesson_learned) != ''
         AND LOWER(TRIM(lesson_learned)) != 'none'
+        AND (? IS NULL OR created_at_epoch <= ?)
       ORDER BY importance DESC, created_at_epoch DESC
       LIMIT 50
-    `).all(project);
-  } catch { return null; }
-  let best = null, bestScore = 0;
+    `).all(project, epochTo, epochTo);
+  } catch { return []; }
+  const out = [];
   for (const r of rows) {
     if (exclude.has(r.id)) continue;
     const overlap = extractIdents(`${r.lesson_learned} ${r.title || ''}`).filter((id) => promptIdents.has(id)).length;
     if (overlap === 0) continue;
     const score = (r.importance || 2) * overlap;
-    if (score > bestScore) { bestScore = score; best = r; }
+    out.push({ id: r.id, lesson_learned: r.lesson_learned, importance: r.importance || 2, overlap, score });
   }
-  return best ? { id: best.id, lesson_learned: best.lesson_learned } : null;
+  // Array.prototype.sort is spec-guaranteed stable (ES2019+) — ties keep the pool's
+  // ORDER BY importance DESC, created_at_epoch DESC relative order, matching the old
+  // loop's strict `score > bestScore` (first-max-wins) tie-break exactly.
+  out.sort((a, b) => b.score - a.score);
+  return out;
+}
+
+/**
+ * Phase-2 task-imperative selection: the single highest-value lesson relevant to THIS
+ * prompt — top-1 of rankImperativeCandidates, mapped to the pre-existing return shape.
+ * @returns {{id:number, lesson_learned:string}|null}
+ */
+export function selectImperativeLesson(db, userPrompt, project, excludeIds = []) {
+  const top = rankImperativeCandidates(db, userPrompt, project, excludeIds)[0];
+  return top ? { id: top.id, lesson_learned: top.lesson_learned } : null;
 }
 
 // P0 (2026-07-03): compose the subagent-dispatch injection. Given a PreToolUse
