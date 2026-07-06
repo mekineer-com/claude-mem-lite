@@ -390,11 +390,16 @@ const UPSERT_SQL = `
     capability_summary=CASE WHEN excluded.capability_summary != '' THEN excluded.capability_summary ELSE capability_summary END,
     input_type=CASE WHEN excluded.input_type != '' THEN excluded.input_type ELSE input_type END,
     output_type=CASE WHEN excluded.output_type != '' THEN excluded.output_type ELSE output_type END,
-    prerequisites=excluded.prerequisites,
+    -- Preserve-on-empty (same class as the FTS text columns above): a partial re-import
+    -- omits prerequisites/complexity, so upsertResource supplies their DEFAULTS ('{}' /
+    -- 'intermediate'). No CLI flag sets these (only a full re-index does), so treating the
+    -- default as the "absent" sentinel is safe: a real re-index sends non-default values,
+    -- which still overwrite; a metadata edit sends the default, which now preserves.
+    prerequisites=CASE WHEN excluded.prerequisites NOT IN ('', '{}') THEN excluded.prerequisites ELSE prerequisites END,
     keywords=CASE WHEN excluded.keywords != '' THEN excluded.keywords ELSE keywords END,
     tech_stack=CASE WHEN excluded.tech_stack != '' THEN excluded.tech_stack ELSE tech_stack END,
     use_cases=CASE WHEN excluded.use_cases != '' THEN excluded.use_cases ELSE use_cases END,
-    complexity=excluded.complexity,
+    complexity=CASE WHEN excluded.complexity NOT IN ('', 'intermediate') THEN excluded.complexity ELSE complexity END,
     indexed_at=excluded.indexed_at, updated_at=datetime('now')
 `;
 

@@ -1538,7 +1538,15 @@ function cmdUpdate(db, args) {
     }
     updates.push('title = ?'); params.push(scrubSecrets(flags.title));
   }
-  if (flags.narrative !== undefined) { updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative)); }
+  if (flags.narrative !== undefined) {
+    // Reject empty (mirror --title): an explicit '' would blank the narrative
+    // irrecoverably (update takes no snapshot). Omit the flag to leave it unchanged.
+    if (typeof flags.narrative === 'string' && flags.narrative.trim() === '') {
+      fail('[mem] --narrative cannot be empty. Omit the flag to leave it unchanged.');
+      return;
+    }
+    updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative));
+  }
   if (flags.type) {
     const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
     if (!validTypes.has(flags.type)) {
@@ -1566,13 +1574,23 @@ function cmdUpdate(db, args) {
       fail(`[mem] --lesson too long (${rawLesson.length} chars, max 500).`);
       return;
     }
+    if (typeof rawLesson === 'string' && rawLesson.trim() === '') {
+      fail('[mem] --lesson cannot be empty. Omit the flag to leave it unchanged.');
+      return;
+    }
     updates.push('lesson_learned = ?');
     params.push(scrubSecrets(rawLesson));
   }
   // Scrub like the sibling text fields above (title/narrative/lesson) and the MCP twin
   // mem_update — concepts is a scrub-target + FTS-indexed column, so a raw secret here
   // lands searchable + exportable (rebuildObservationDerived folds it into `text`).
-  if (flags.concepts !== undefined) { updates.push('concepts = ?'); params.push(scrubSecrets(flags.concepts)); }
+  if (flags.concepts !== undefined) {
+    if (typeof flags.concepts === 'string' && flags.concepts.trim() === '') {
+      fail('[mem] --concepts cannot be empty. Omit the flag to leave it unchanged.');
+      return;
+    }
+    updates.push('concepts = ?'); params.push(scrubSecrets(flags.concepts));
+  }
 
   if (updates.length === 0) {
     fail('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
@@ -1664,7 +1682,7 @@ function cmdExport(db, args) {
   // id + memory_session_id are informational (restore remaps id and buckets under
   // a restore session).
   const rows = db.prepare(`
-    SELECT id, memory_session_id, project, type, title, subtitle, narrative, concepts, facts,
+    SELECT id, memory_session_id, project, type, title, subtitle, narrative, text, concepts, facts,
            files_read, files_modified, lesson_learned, search_aliases, importance, branch,
            access_count, cited_count, uncited_streak, injection_count, decay_seen_count,
            last_accessed_at, created_at, created_at_epoch
@@ -1740,6 +1758,7 @@ function cmdRestore(db, argv) {
 
   const dupCheck = db.prepare('SELECT id FROM observations WHERE project = ? AND title = ? AND created_at_epoch = ? LIMIT 1');
   const signalUpdate = db.prepare(`UPDATE observations SET
+      text = COALESCE(?, text),
       subtitle = ?, concepts = ?, facts = ?, search_aliases = ?, files_read = ?, branch = COALESCE(?, branch),
       access_count = ?, cited_count = ?, uncited_streak = ?, injection_count = ?,
       decay_seen_count = ?, last_accessed_at = ?
@@ -1770,15 +1789,20 @@ function cmdRestore(db, argv) {
       });
       if (res.kind !== 'saved') { skipped++; continue; } // saveObservation Jaccard dedup
       // Re-apply the fields saveObservation zeros/derives so the backup is faithful.
-      // search_aliases is its own FTS5 column, so this UPDATE re-syncs the index
-      // (via the observations FTS triggers) and restored aliases stay searchable.
-      // Scrub the FTS-indexed text fields on the way in — the sibling ingest paths
-      // (import-jsonl, compress-core) scrub as defense-in-depth, and restore is the only
-      // rewrite path that skipped it. A backup made before a SECRET_PATTERNS entry existed
-      // would otherwise re-index an old secret in facts/concepts even though narrative
-      // (routed through saveObservation) gets re-scrubbed. files_read/branch are
-      // paths/identifiers, not scrub-target text — left as-is.
+      // `text` is the observation BODY and its own FTS5 column — import-jsonl / cold-start
+      // rows keep the body there with an empty narrative, so saveObservation (content =
+      // narrative || title) would collapse it to the bare title. COALESCE re-applies the
+      // exported body (NULL when absent → keep saveObservation's derived text, so old
+      // backups without the column degrade gracefully). search_aliases is its own FTS5
+      // column too, so this UPDATE re-syncs the index (via the observations FTS triggers)
+      // and restored body/aliases stay searchable. Scrub the FTS-indexed text fields on
+      // the way in — the sibling ingest paths (import-jsonl, compress-core) scrub as
+      // defense-in-depth, and restore is the only rewrite path that skipped it. A backup
+      // made before a SECRET_PATTERNS entry existed would otherwise re-index an old secret
+      // in text/facts/concepts. files_read/branch are paths/identifiers, not scrub-target
+      // text — left as-is.
       signalUpdate.run(
+        r.text ? scrubSecrets(r.text) : null,
         scrubSecrets(r.subtitle || ''), scrubSecrets(r.concepts || ''), scrubSecrets(r.facts || ''),
         r.search_aliases === null || r.search_aliases === undefined ? null : scrubSecrets(r.search_aliases),
         r.files_read || '[]', r.branch ?? null,

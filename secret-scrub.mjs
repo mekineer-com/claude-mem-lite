@@ -44,6 +44,11 @@ export const SECRET_PATTERNS = [
   // low-FP decision that `topsecret=` / `access_token_count:` are non-credentials
   // (#8283 + utils.test.mjs:1089-1100); bare `pwd` is omitted so `PWD=` (a path) survives.
   [/((?:\b|_)(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token|pgpassword|pgpass|mysql_pwd)\s*[=:]\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  // Space-separated credential CLI flag: `--password <value>` (long-form). The KV
+  // patterns above require `=`/`:`; the shell long-flag form uses a space. Long-form
+  // only — `-p`/`-u` short flags collide with unit/user/update flags (too FP-risky).
+  // `(?!-)` stops it eating a following `--flag` when --password has no value.
+  [/(--(?:password|passwd)[=\s]+)(?!-)[^\s'"]{6,}/gi, '$1***'],
   // Bare-key QUOTED values — `api_key="..."`, `password: '...'`. The unquoted KV
   // patterns above stop at `'`/`"` (excluded from their value class), so a quoted
   // value matched 0 chars and slipped through. Consumes the opening quote, the value,
@@ -68,35 +73,46 @@ export const SECRET_PATTERNS = [
   [/\bsk-(?:proj|ant|ant-api\d{2})-[a-zA-Z0-9_-]{8,}\b/g, '***'],
   [/\bsk-[a-zA-Z0-9_-]{20,}\b/g, '***'],
   // GitHub tokens (ghp_, gho_, github_pat_)
-  [/\b(?:ghp_|gho_|ghs_|ghr_)[a-zA-Z0-9_]{30,}\b/g, '***'],
+  [/\b(?:ghp_|gho_|ghs_|ghr_|ghu_)[a-zA-Z0-9_]{30,}\b/g, '***'],
   [/\bgithub_pat_[a-zA-Z0-9_]{22,}\b/g, '***'],
   // GitLab tokens (glpat-)
   [/\bglpat-[a-zA-Z0-9_-]{20,}\b/g, '***'],
-  // Slack tokens (xox[bpas]-)
-  [/\bxox[bpas]-[a-zA-Z0-9-]{10,}\b/g, '***'],
+  // Slack tokens (xox[bpasr]-, xapp-, xoxe-)
+  [/\b(?:xox[bpasr]|xapp|xoxe)-[a-zA-Z0-9-]{10,}\b/g, '***'],
+  // Slack incoming-webhook URL — the path after /services/ is the shared secret.
+  [/(https:\/\/hooks\.slack\.com\/services\/)[A-Za-z0-9/]+/g, '$1***'],
   // JWT tokens (eyJ...eyJ...)
   [/\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+\b/g, '***'],
   // PEM private key blocks. `[A-Z0-9 ]*` covers every armor label — RSA/EC/DSA/
   // OPENSSH plus ENCRYPTED and PGP (… PRIVATE KEY BLOCK) — that the fixed
   // alternation missed; the block delimiters make FP impossible.
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g, '***PEM_KEY***'],
-  // Long hex strings in assignments (e.g. SECRET_KEY=abc123def456...)
-  [/(\b(?:key|secret|token|hash)\s*[=:]\s*)[0-9a-f]{32,}\b/gi, '$1***'],
+  // Long hex strings in credential assignments (e.g. SECRET_KEY=abc123def456...).
+  // `hash` deliberately excluded: `hash: <40hex>` / `hash=<md5>` are git SHAs and
+  // checksums (real, preserved data in this hash-heavy repo), not credentials.
+  [/(\b(?:key|secret|token)\s*[=:]\s*)[0-9a-f]{32,}\b/gi, '$1***'],
   // Google Cloud API keys (AIza...)
   [/\bAIza[A-Za-z0-9_-]{35}\b/g, '***'],
-  // Generic Bearer tokens in Authorization headers
-  [/(Authorization:\s*Bearer\s+)[^\s,;'"}\]]+/gi, '$1***'],
+  // Authorization header credentials — Bearer (opaque), Basic (base64 user:pass),
+  // and GitHub's `token` scheme all carry secrets after the scheme word.
+  [/(Authorization:\s*(?:Bearer|Basic|token)\s+)[^\s,;'"}\]]+/gi, '$1***'],
   // Supabase / generic long base64 keys (40+ chars, common in env vars)
   [/(\b(?:SUPABASE_KEY|SUPABASE_ANON_KEY|SUPABASE_SERVICE_ROLE_KEY|DATABASE_URL|REDIS_URL)\s*[=:]\s*)[^\s,;'"}\]]+/gi, '$1***'],
   // Basic auth in URLs (https://user:password@host). ftp/ftps added — file-drop
-  // creds are a common leak shape the https-only form missed.
-  [/(https?|ftps?):\/\/[^@/\s]+:[^@/\s]+@/gi, '$1://***:***@'],
-  // Database connection strings (postgres, mysql, mongodb, redis, amqp)
-  [/\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp):\/\/[^\s,;'"}\]]+/gi, '$1://***'],
+  // creds are a common leak shape the https-only form missed. The userinfo run
+  // EXCLUDES `:` (`[^@/\s:]+`) so the two runs can't overlap on a colon — the
+  // overlapping form caused O(n²) catastrophic backtracking on a colon-heavy
+  // non-terminating input (an availability DoS on the synchronous prompt path).
+  [/(https?|ftps?):\/\/[^@/\s:]+:[^@/\s]+@/gi, '$1://***:***@'],
+  // Database connection strings (postgres, mysql, mariadb, mssql, mongodb, redis,
+  // amqp) incl. their TLS/alias variants (rediss/amqps/mssql/sqlserver) — managed
+  // cloud DBs almost always use the TLS scheme, which the base-only list leaked.
+  [/\b(postgres(?:ql)?|mysql|mariadb|mssql|sqlserver|mongodb(?:\+srv)?|rediss?|amqps?):\/\/[^\s,;'"}\]]+/gi, '$1://***'],
   // npm tokens (npm_...)
   [/\bnpm_[a-zA-Z0-9]{36,}\b/g, '***'],
-  // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_)
+  // Stripe keys (sk_live_, rk_live_, pk_live_, sk_test_, pk_test_) + webhook signing secret (whsec_)
   [/\b[srp]k_(?:live|test)_[a-zA-Z0-9]{20,}\b/g, '***'],
+  [/\bwhsec_[a-zA-Z0-9]{20,}\b/g, '***'],
   // SendGrid API keys: SG.<22>.<43> — two dots at fixed offsets make this
   // structurally unmistakable; near-zero false-positive risk.
   [/\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b/g, '***'],

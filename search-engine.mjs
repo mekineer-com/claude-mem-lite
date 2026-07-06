@@ -27,13 +27,13 @@ const FULL_SCORE = `${OBS_BM25}
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL))`;
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))`;
 
 export function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset, includeNoise } = {}) {
   const scoreExpr = scoring === 'full' ? FULL_SCORE : SIMPLE_SCORE;

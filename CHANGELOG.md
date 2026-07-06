@@ -2,6 +2,53 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.42.0 — E2E audit round 4: scrub hardening, backup fidelity, update/registry preserve-on-empty, retrieval polish
+
+A fourth end-to-end audit round — 5 parallel discovery agents over the subsystems rounds 1–3 hadn't deeply
+covered (retrieval core, the citation-decay/promotion loop, secret-scrubbing, the MCP server tool boundary,
+and CLI data-integrity paths) plus a self-review of the benchmark ship-gate — that found and fixed **14 real
+bugs**. Each fix is TDD'd; full suite green (209 files / 3690 tests), lint clean, and denoise-A/B is NEUTRAL
+with the multi-script guard passing (the default lexical retrieval path is unchanged). Three are HIGH
+severity: a ReDoS in the URL basic-auth scrub pattern (an availability stall on the synchronous prompt path),
+an `Authorization: Basic` credential that survived scrubbing, and a backup→restore that silently dropped the
+body of every imported observation.
+
+### Fixed
+- **HIGH — secret scrub no longer stalls on a colon-heavy URL (ReDoS)** (`secret-scrub.mjs`) — the URL
+  basic-auth pattern's two userinfo runs overlapped on `:`, causing O(n²) catastrophic backtracking (a
+  100k-char paste after an `http(s)://` token took ~1.8s, and scrubbing runs synchronously on the uncapped
+  UserPromptSubmit prompt). The first run now excludes `:`, making it linear.
+- **HIGH — `Authorization: Basic` credentials are now scrubbed** (`secret-scrub.mjs`) — only `Bearer` was
+  covered, so a Basic-auth header's base64 `user:password` persisted to the FTS-indexed DB and re-injected
+  into later sessions. `Basic` and GitHub's `token` scheme are scrubbed too.
+- **HIGH — backup→restore preserves the observation body** (`mem-cli.mjs`) — `export` omitted the `text`
+  column and `restore` rebuilt content from `narrative || title`. import-jsonl / cold-start-backfill rows
+  keep the body in `text` with an empty narrative, so a documented backup→restore collapsed each to its bare
+  title — unrecoverable and unsearchable. `export` now carries `text` and `restore` re-applies it (scrubbed).
+- **Secret scrub — closed several coverage gaps** (`secret-scrub.mjs`) — TLS/alias DB schemes
+  (`rediss`/`amqps`/`mariadb`/`mssql`), provider prefixes (`ghu_`/`xapp-`/`xoxe-`/`whsec_` and Slack webhook
+  URLs), and space-separated `--password <value>` flags now scrub; and a labeled git SHA / checksum
+  (`hash: <40hex>`) is no longer over-scrubbed to `***` (it is real data, not a credential).
+- **`mem_update` / `update` no longer blank a field on an explicit empty string** (`tool-schemas.mjs`,
+  `mem-cli.mjs`) — `narrative`/`lesson_learned`/`concepts` had no empty guard (unlike `title`) and
+  `mem_update` takes no snapshot, so `""` irrecoverably wiped content. Both paths now reject an empty value,
+  mirroring the title guard.
+- **`registry import` preserves prerequisites/complexity on a metadata-only re-import** (`registry.mjs`) —
+  both used bare `excluded.*` while every sibling column had preserve-on-empty, so a partial re-import (which
+  defaults them) silently reset a resource's prerequisites and complexity.
+- **Search fallback filters low-signal titles** (`lib/search-core.mjs`) — the MCP type-list fallback
+  (`obs_type` set + 0 FTS matches → list recent of that type) dropped the low-signal title filter every FTS
+  path applies, so degraded titles (`Modified X`, `Error: …`) led the results — worst for `obs_type=change`,
+  the noise band.
+- **Ranking no longer boosts `lesson_learned='none'`** (`search-engine.mjs`) — the 1.3× lesson boost fired
+  on the literal `'none'` (a legacy/default value), diverging from the canonical `NOT IN ('', 'none')`
+  predicate used elsewhere.
+- **import-jsonl tolerates a leading UTF-8 BOM** (`lib/import-jsonl.mjs`) — a BOM made line 1 fail
+  JSON.parse and get silently skipped.
+- **citation promote/demote hardening** (`lib/citation-tracker.mjs`) — a re-promote after a demote now
+  clears `demoted_at` (stale "recently demoted" telemetry), and promote/demote `COALESCE` importance so a
+  NULL-importance row floors instead of being written to NULL.
+
 ## v3.41.0 — E2E audit round 3: hook/settings safety, LLM-ops data integrity, handoff scoping, vector-arm parity
 
 A third end-to-end audit round — 5 parallel discovery agents over the vector, episode/handoff/session-
