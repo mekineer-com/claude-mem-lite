@@ -208,13 +208,26 @@ let _vocabCache = null;
 export function _resetVocabCache() { _vocabCache = null; }
 
 /**
+ * Canonical TF-IDF vector text for an observation ROW (snake_case DB fields). Single source for
+ * EVERY (re)build path — save, enrich, rebuild_vectors, cluster-merge, compress, normalize — so
+ * they encode the identical field set and can't drift (V-F1). Mirrors the FTS-searchable columns
+ * incl. lesson_learned + search_aliases (finding #8). `concepts` may be an array or a string.
+ */
+export function vecTextForRow(row) {
+  if (!row) return '';
+  const concepts = Array.isArray(row.concepts) ? row.concepts.join(' ') : (row.concepts || '');
+  return [row.title || '', row.narrative || '', concepts, row.lesson_learned || '', row.search_aliases || '']
+    .filter(Boolean).join(' ');
+}
+
+/**
  * Build global vocabulary (IDF table) from all active observations.
  * @param {object} db - better-sqlite3 database
  * @returns {{ terms: Map<string, {index: number, idf: number}>, version: string, dim: number } | null}
  */
 export function buildVocabulary(db, { dim = VOCAB_DIM } = {}) {
   const rows = db.prepare(`
-    SELECT title, narrative, concepts FROM observations
+    SELECT title, narrative, concepts, lesson_learned, search_aliases FROM observations
     WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
   `).all();
 
@@ -224,7 +237,10 @@ export function buildVocabulary(db, { dim = VOCAB_DIM } = {}) {
   // Count document frequency for each term
   const df = new Map();
   for (const row of rows) {
-    const text = [row.title || '', row.narrative || '', row.concepts || ''].join(' ');
+    // V-F2: include lesson_learned + search_aliases so terms living only there get a vocab
+    // dimension (else computeVector silently drops them — the exact paraphrase-bridge terms
+    // search_aliases exists to carry). Mirrors vecTextForRow's field set.
+    const text = [row.title || '', row.narrative || '', row.concepts || '', row.lesson_learned || '', row.search_aliases || ''].join(' ');
     const docTerms = new Set(tokenize(text));
     for (const term of docTerms) {
       df.set(term, (df.get(term) || 0) + 1);

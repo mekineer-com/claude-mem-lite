@@ -305,6 +305,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0
         AND superseded_at IS NULL
+        AND ${notLowSignalTitleClause('')}
         AND (
           (created_at_epoch > ? AND importance >= 1)
           OR (created_at_epoch > ? AND importance >= 2)

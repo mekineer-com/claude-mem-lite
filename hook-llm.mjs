@@ -11,7 +11,7 @@ import {
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
-import { getVocabulary, computeVector } from './tfidf.mjs';
+import { getVocabulary, computeVector, vecTextForRow } from './tfidf.mjs';
 import { insertObservationRow, insertObservationFiles, insertObservationVector } from './lib/observation-write.mjs';
 import { DEDUP_JACCARD_THRESHOLD, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
@@ -124,10 +124,12 @@ function buildFtsTextField(obs) {
 // weight) and search_aliases (finding #8: previously omitted, so even with vectors
 // enabled the paraphrase-bridge alias terms were invisible to cosine similarity).
 export function buildVecText(obs) {
-  const conceptsText = Array.isArray(obs.concepts) ? obs.concepts.join(' ') : (obs.concepts || '');
-  const aliasesText = obs.searchAliases || '';
-  return [obs.title || '', obs.narrative || '', conceptsText, obs.lessonLearned || '', aliasesText]
-    .filter(Boolean).join(' ');
+  // Single source (V-F1): map the camelCase obs onto vecTextForRow's row shape so save and
+  // every rebuild path encode the identical field set (title/narrative/concepts/lesson/aliases).
+  return vecTextForRow({
+    title: obs.title, narrative: obs.narrative, concepts: obs.concepts,
+    lesson_learned: obs.lessonLearned, search_aliases: obs.searchAliases,
+  });
 }
 
 /**
@@ -996,7 +998,8 @@ ${actionList}`;
           search_aliases: obs.searchAliases || null,
         });
         db.prepare(`
-          UPDATE observations SET type=?, title=?, subtitle=?, narrative=?, concepts=?, facts=?,
+          UPDATE observations SET type=?, title=?, subtitle=?,
+            narrative=COALESCE(NULLIF(?, ''), narrative), concepts=?, facts=?,
             text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?
           WHERE id = ?
         `).run(
@@ -1018,7 +1021,7 @@ ${actionList}`;
         try {
           const vocab = getVocabulary(db);
           if (vocab) {
-            const vecText = [obs.title || '', obs.narrative || '', conceptsText].filter(Boolean).join(' ');
+            const vecText = vecTextForRow({ title: obs.title, narrative: obs.narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
             const vec = computeVector(vecText, vocab);
             if (vec) {
               db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')

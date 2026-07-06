@@ -2,6 +2,65 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.41.0 — E2E audit round 3: hook/settings safety, LLM-ops data integrity, handoff scoping, vector-arm parity
+
+A third end-to-end audit round — 5 parallel discovery agents over the vector, episode/handoff/session-
+lifecycle, LLM-ops, tier/context-injection, and install/update subsystems that rounds 1–2 hadn't covered —
+that found and fixed **14 real bugs**. Each fix is TDD'd; full suite green (203 files / 3654 tests), lint
+and shellcheck clean, and denoise-A/B is NEUTRAL (the default lexical retrieval path is unchanged). Two are
+HIGH severity: install/uninstall could silently delete a user's own settings hooks, and the default-on
+re-enrich pass could permanently downgrade a user-set importance/type.
+
+### Fixed
+- **HIGH — install/uninstall no longer delete a user's own hooks** (`install.mjs`) — `isMemHook`'s
+  `hook.mjs` + event-word heuristic matched any user command like `node ~/.config/hook.mjs session-start`,
+  so `configureHooks` (install) and `cleanupMemHooksFromSettings` (uninstall) silently stripped it. Now
+  keyed on unambiguous install markers: the `hook-launcher.mjs` launcher every Node hook routes through,
+  the product-name path, or the bash prefilter.
+- **HIGH — re-enrich no longer silently downgrades importance or reclassifies type** (`hook-optimize.mjs`)
+  — the default-on wide re-enrich pass took the LLM's `importance` and `type` verbatim with no floor and
+  then set `optimized_at` (permanent, no snapshot), so a user's importance-3 bugfix could be rewritten to
+  importance-1 `change`. Importance is now floored at the stored value (upgrades still honored) and a
+  specific type is preserved from a downgrade to the generic `change`. (The candidate SELECTs were also
+  widened to actually carry `importance`, which the floor reads.)
+- **SessionStart "Recent" table no longer leads with cross-project noise** (`hook-context.mjs`) — the
+  thin-project `fallbackObs` query lacked the low-signal title filter its same-project sibling has, so
+  `Modified X` / `Error: …` / `npx …` rows from other projects (often the freshest) led the table.
+- **Cross-session handoff no longer hijacked at the same commit** (`hook-handoff.mjs`) — the git-commit
+  anchor auto-continued ANY ≥2-char prompt whenever HEAD matched a stored handoff, ignoring session and
+  prompt content, so a new task (or a parallel same-project session) inherited AND deleted another
+  session's handoff. Now scoped like the keyword stage (exit = cross-session, clear = same-session) and
+  gated on the same long-unrelated-prompt check; short cross-session resumes still work.
+- **cluster-merge preserves the keeper's metadata on a partial LLM response** (`hook-optimize.mjs`) — only
+  `merged_lesson` had preserve-on-empty; when the model omitted `merged_concepts`/`merged_facts`/
+  `merged_narrative`, the in-place merge blanked the keeper's live concepts/facts/narrative. Now falls back
+  to the keeper's own values (and `findMergeCandidates` selects them).
+- **handoff `working_on` filters more control phrases** (`utils.mjs`) — `怎么停了`, `go on`, `proceed`,
+  `keep going`, `再来一次` were treated as the work subject and leaked into the persisted handoff.
+- **handoff-injection window is per-CC-session** (`hook.mjs`) — it was gated on the project-scoped prompt
+  counter, shared across concurrent same-project sessions, so a parallel session's first prompt could
+  start past the window and never get its handoff injected.
+- **`setup.sh` no longer bricks on a legacy database** (`scripts/setup.sh`) — it copied the schema-v16
+  `~/.claude-mem/claude-mem.db` in as the ACTIVE db (which FATALs on first launch), and the guard re-copied
+  it on every delete (recovery loop). Now backs it up as `.legacy-backup-<ts>` and lets a fresh DB be
+  created, mirroring `install.mjs`.
+- **Vector arm encodes lesson/aliases end-to-end** (`tfidf.mjs`, `hook-optimize.mjs`, `hook-llm.mjs`,
+  `lib/maintain-core.mjs`) — the v3.39.2 parity fix added `lesson_learned`/`search_aliases` to the save
+  path's vector text, but `buildVocabulary` never gave those terms a dimension (so the fix was inert for
+  paraphrase-only terms) and six rebuild paths (incl. the documented `maintain rebuild_vectors` step) still
+  used a reduced field set. All vector text now flows through one `vecTextForRow` source and the vocabulary
+  counts the same fields. The vector arm is off by default, so default retrieval is unchanged (denoise-A/B NEUTRAL).
+- **`distributeBudget` respects a small `--max`** (`hook-optimize.mjs`) — for a total below 4 it returned
+  four 1's (sum 4), over-running the requested budget; it now allocates by priority up to the total.
+- **`normalize` rebuilds the vector after canonicalizing concepts/aliases** (`hook-optimize.mjs`) — it was
+  the only optimize task that mutated a vector field without refreshing the vector.
+- **In-place episode upgrade preserves a pre-saved narrative** (`hook-llm.mjs`) — when the enrich pass
+  returned a title/lesson but no narrative, the rule-based narrative was overwritten with empty; now kept
+  via `COALESCE(NULLIF(?,''), narrative)`.
+- **Lock-contended Stop flush gates each sub-episode on significance** (`hook.mjs`, `hook-shared.mjs`) — the
+  fallback saved (and spawned an LLM worker for) every sub-episode regardless of significance, diverging
+  from the normal path; the orphan sweep now also reclaims the `.claim-` file it can leak on a mid-flush crash.
+
 ## v3.40.0 — E2E audit: retrieval, secret-scrub, timeline, registry, release-signing, maintenance
 
 A two-round end-to-end audit (6 parallel discovery agents + user-simulation testing) that found and

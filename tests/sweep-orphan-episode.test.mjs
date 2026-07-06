@@ -63,6 +63,14 @@ describe('sweepOrphanEpisodeFiles', () => {
     expect(existsSync(stale)).toBe(false);
   });
 
+  it('sweeps a leaked lock-contended claim file (.claim-) older than ageMs, keeps fresh (R3 H-L1)', () => {
+    const stale = writeWithMtime('ep-myproj.json.claim-1234-9999', 2 * 3600 * 1000);
+    const fresh = writeWithMtime('ep-myproj.json.claim-5678-1111', 5 * 60 * 1000);
+    expect(sweepOrphanEpisodeFiles(dir, { ageMs: 60 * 60 * 1000 })).toBe(1);
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(fresh)).toBe(true);
+  });
+
   it('does NOT touch in-flight files (mtime newer than cutoff)', () => {
     const fresh = writeWithMtime('ep-flush-fresh.json', 5 * 60 * 1000); // 5 min old
     const stale = writeWithMtime('ep-flush-stale.json', 2 * 3600 * 1000); // 2h old

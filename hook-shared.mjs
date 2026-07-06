@@ -98,7 +98,9 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
   const readsCutoff = now - readsAgeMs;
   let count = 0;
   for (const f of entries) {
-    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-');
+    // `.claim-` = handleStop's lock-contended fallback claim file (ep-<project>.json.claim-<pid>-<ts>),
+    // which leaks if the process dies between rename and unlink; sweep it on the same 1h cutoff.
+    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-') || f.includes('.claim-');
     const isReads = f.startsWith('reads-') && f.endsWith('.txt');
     if (!isEpisode && !isReads) continue;
     const full = join(runtimeDir, f);

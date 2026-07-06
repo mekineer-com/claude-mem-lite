@@ -39,20 +39,18 @@ fi
 mkdir -p "$DATA_DIR"
 log_ok "Data directory: $DATA_DIR"
 
-# 3. Migrate from old ~/.claude-mem/ if needed
+# 3. Legacy ~/.claude-mem/ DB is schema-v16 (no memory_session_id) with no migration bridge to
+#    the current schema — activating it FATALs on first launch ("no such column: memory_session_id")
+#    and the "! -f claude-mem-lite.db" guard would re-copy it every time the user deletes the broken
+#    DB (recovery loop). Mirror install.mjs migrateLegacyClaudeMemData: back it up (don't activate)
+#    and let a fresh DB be created. Source ~/.claude-mem/ is left intact.
 OLD_DIR="$HOME/.claude-mem"
 if [[ -f "$OLD_DIR/claude-mem.db" && ! -f "$DATA_DIR/claude-mem-lite.db" && ! -f "$DATA_DIR/claude-mem.db" ]]; then
-  log_info "Migrating data from ~/.claude-mem/ → ~/.claude-mem-lite/..."
-  if cp "$OLD_DIR/claude-mem.db" "$DATA_DIR/claude-mem-lite.db" 2>/dev/null; then
-    # Main DB copied successfully, WAL/SHM are optional
-    cp "$OLD_DIR/claude-mem.db-wal" "$DATA_DIR/claude-mem-lite.db-wal" 2>/dev/null || true
-    cp "$OLD_DIR/claude-mem.db-shm" "$DATA_DIR/claude-mem-lite.db-shm" 2>/dev/null || true
-    if [[ -d "$OLD_DIR/runtime" && ! -d "$DATA_DIR/runtime" ]]; then
-      cp -r "$OLD_DIR/runtime" "$DATA_DIR/runtime" 2>/dev/null || true
-    fi
-    log_ok "Data migrated (old ~/.claude-mem/ preserved)"
+  BACKUP="$DATA_DIR/claude-mem-lite.db.legacy-backup-$(date +%s)"
+  if cp "$OLD_DIR/claude-mem.db" "$BACKUP" 2>/dev/null; then
+    log_info "Legacy ~/.claude-mem/ DB is schema-incompatible; backed up to $(basename "$BACKUP") (a fresh DB will be created). Old ~/.claude-mem/ preserved."
   else
-    log_warn "Migration failed — using fresh database"
+    log_warn "Legacy DB backup failed — a fresh database will be created"
   fi
 fi
 

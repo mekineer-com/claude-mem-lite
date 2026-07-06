@@ -404,7 +404,13 @@ export function isMetaTriggerPrompt(text) {
     .replace(/上次(到哪了|说到哪了)?/g, '')
     .replace(/总结一下|复盘一下/g, '')
     .replace(/前面(的)?(工作|话题|讨论|内容)/g, '')
+    // R3 H-M2: control phrases named in lesson #8287 / common continuations. Phrase-anchored
+    // (or bare suffix/prefix) so a real subject that merely contains one keeps its other tokens.
+    .replace(/停了|停不下来/g, '')
+    .replace(/怎么(回事|了|样了|停的)?/g, '')
+    .replace(/再来(一次|一遍|一下)?/g, '')
     .replace(/\/?(clear|exit)\b/gi, '')
+    .replace(/\b(go on|go ahead|keep going|carry on|proceed|why(?:'?d| did) you stop)\b/gi, '')
     .replace(/\b(commit|continue|resume|push|save|restart|exit|next)\b/gi, '')
     .replace(/[，,。.!！?？:：;；()（）【】[\]\s/\\-]+/g, '')
     .trim();

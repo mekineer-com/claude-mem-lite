@@ -12,7 +12,7 @@ import {
 import { callModelJSON } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
-import { getVocabulary, computeVector, cosineSimilarity } from './tfidf.mjs';
+import { getVocabulary, computeVector, cosineSimilarity, vecTextForRow } from './tfidf.mjs';
 import { MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { DB_DIR } from './schema.mjs';
 
@@ -25,9 +25,14 @@ export function distributeBudget(total = 15) {
   const reenrich = Math.max(1, Math.floor(total * 0.4));
   const clusterMerge = Math.max(1, Math.floor(total * 0.3));
   const smartCompress = Math.max(1, total - reenrich - normalize - clusterMerge);
-  // Clamp: if total is too small for 4 tasks, cap each so sum ≤ total
+  // Clamp: if total is too small for all 4 tasks, allocate 1 each by priority until `total`
+  // is exhausted so the returned sum is ≤ total (the old fallback returned {1,1,1,1}=4 for
+  // total≤3, over-running `optimize --max N`).
   if (reenrich + normalize + clusterMerge + smartCompress > total) {
-    return { reenrich: Math.max(1, total - 3), normalize: 1, clusterMerge: 1, smartCompress: 1 };
+    const alloc = { reenrich: 0, clusterMerge: 0, smartCompress: 0, normalize: 0 };
+    const order = ['reenrich', 'clusterMerge', 'smartCompress', 'normalize'];
+    for (let i = 0; i < total && i < order.length; i++) alloc[order[i]] = 1;
+    return alloc;
   }
   return { reenrich, normalize, clusterMerge, smartCompress };
 }
@@ -39,11 +44,16 @@ export function distributeBudget(total = 15) {
  * Exported for testing; also kept as the single source of vector-rebuild logic
  * for the optimize / re-enrich path to avoid drift with the hook-llm write path.
  */
-export function rebuildVector(db, obsId, textParts) {
+export function rebuildVector(db, obsId, textPartsOrRow) {
   try {
     const vocab = getVocabulary(db);
     if (!vocab) return;
-    const vec = computeVector(textParts.filter(Boolean).join(' '), vocab);
+    // Accept a legacy [parts] array OR an observation row (preferred — single-source field set
+    // incl. lesson_learned/search_aliases via vecTextForRow, so rebuilds match the save path).
+    const text = Array.isArray(textPartsOrRow)
+      ? textPartsOrRow.filter(Boolean).join(' ')
+      : vecTextForRow(textPartsOrRow);
+    const vec = computeVector(text, vocab);
     if (vec) {
       // Bug #1 fix: column is `created_at_epoch`, not `computed_at`. Every other
       // INSERT callsite (server.mjs, hook-llm.mjs, mem-cli.mjs) uses the correct
@@ -87,7 +97,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
     // deliberately NOT gated on optimized_at, so a lesson-less row can still be
     // picked up by wide scope for lesson enrichment afterward.
     const stmt = db.prepare(`
-      SELECT id, title, narrative, type, subtitle, concepts, facts, text, search_aliases, project
+      SELECT id, title, narrative, type, subtitle, concepts, facts, text, search_aliases, importance, project
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0
         AND superseded_at IS NULL
@@ -102,7 +112,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
   }
   if (scope === 'wide') {
     const stmt = db.prepare(`
-      SELECT id, title, narrative, type, subtitle, concepts, facts, search_aliases, project
+      SELECT id, title, narrative, type, subtitle, concepts, facts, search_aliases, importance, project
       FROM observations
       WHERE COALESCE(compressed_into, 0) = 0
         AND superseded_at IS NULL
@@ -120,7 +130,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
     return project ? stmt.all(project, limit) : stmt.all(limit);
   }
   const stmt = db.prepare(`
-    SELECT id, title, narrative, type, subtitle, project
+    SELECT id, title, narrative, type, subtitle, importance, project
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND (concepts IS NULL OR concepts = '')
@@ -205,7 +215,10 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
         continue;
       }
 
-      const type = validTypes.has(parsed.type) ? parsed.type : cand.type || 'change';
+      // Enrichment ("add a lesson") must not reclassify a specific type down to the generic
+      // 'change' (lower TYPE_QUALITY + faster decay); keep the stored type on that downgrade.
+      let type = validTypes.has(parsed.type) ? parsed.type : (cand.type || 'change');
+      if (type === 'change' && cand.type && cand.type !== 'change') type = cand.type;
       const concepts = Array.isArray(parsed.concepts) ? parsed.concepts.slice(0, 10) : [];
       const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 10) : [];
       // Preserve-on-empty: wide-scope candidates can already carry concepts/facts/aliases
@@ -227,7 +240,10 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
         ? parsed.search_aliases.slice(0, 6).join(' ') : (cand.search_aliases || null);
       const title = truncate(scrubSecrets(parsed.title || ''), 120);
       const narrative = truncate(scrubSecrets(parsed.narrative || cand.narrative || ''), 500);
-      const importance = clampImportance(parsed.importance);
+      // Floor at the stored importance: re-enrich adds a lesson, it must never silently downgrade
+      // a user-set/promoted importance (the UPDATE also sets optimized_at → the loss is permanent).
+      // Upgrades are still honored.
+      const importance = Math.max(clampImportance(parsed.importance), cand.importance || 1);
 
       const bigramText = cjkBigrams((title || '') + ' ' + (narrative || ''));
       const textField = [conceptsText, factsText, searchAliases || '', bigramText].filter(Boolean).join(' ');
@@ -250,7 +266,7 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
       `).run(type, safe.title, safe.narrative, safe.concepts, safe.facts, safe.text,
         importance, safe.lesson_learned, safe.search_aliases, minhashSig, Date.now(), cand.id);
 
-      rebuildVector(db, cand.id, [title, narrative, conceptsText]);
+      rebuildVector(db, cand.id, { title, narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
 
       processed++;
     } catch (e) {
@@ -362,7 +378,7 @@ export function applyNormalization(db, groups, { project = null } = {}) {
   // contamination the --project flag was added to prevent. NULL → all projects (legacy
   // unscoped run), matching the search-engine `(? IS NULL OR project = ?)` idiom.
   const rows = db.prepare(`
-    SELECT id, concepts, search_aliases FROM observations
+    SELECT id, title, narrative, concepts, search_aliases, lesson_learned FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND concepts IS NOT NULL AND concepts != ''
       AND (? IS NULL OR project = ?)
@@ -395,6 +411,9 @@ export function applyNormalization(db, groups, { project = null } = {}) {
         search_aliases: newAliases,
       });
       updateStmt.run(safe.concepts, safe.search_aliases, Date.now(), row.id);
+      // V-F3: normalize mutated concepts + search_aliases (both vector fields) — rebuild the
+      // vector so it reflects the canonicalized terms (no-op when the vector arm is disabled).
+      rebuildVector(db, row.id, { title: row.title, narrative: row.narrative, concepts: safe.concepts, search_aliases: safe.search_aliases, lesson_learned: row.lesson_learned });
       updated++;
     }
   }
@@ -433,7 +452,7 @@ export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const cutoff = Date.now() - MERGE_TIME_WINDOW_MS;
   const projectClause = project ? 'AND project = ?' : '';
   const stmt = db.prepare(`
-    SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig, lesson_learned
+    SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig, lesson_learned, concepts, facts
     FROM observations
     WHERE COALESCE(compressed_into, 0) = 0
       AND superseded_at IS NULL
@@ -520,12 +539,15 @@ Return ONLY valid JSON:
 
     const concepts = Array.isArray(parsed.merged_concepts) ? parsed.merged_concepts.slice(0, 10) : [];
     const facts = Array.isArray(parsed.merged_facts) ? parsed.merged_facts.slice(0, 10) : [];
-    const conceptsText = concepts.join(' ');
-    const factsText = facts.join(' ');
+    // Preserve-on-empty (mirror the merged_lesson guard below + the re-enrich path): the merge
+    // overwrites the keeper in place, so a partial LLM response that omits these must fall back to
+    // the keeper's own values, not blank its live concepts/facts (findMergeCandidates now selects them).
+    const conceptsText = concepts.length ? concepts.join(' ') : (keeper.concepts || '');
+    const factsText = facts.length ? facts.join(' ') : (keeper.facts || '');
     // Scrub BEFORE truncate (see re-enrich note): keep the boundary cut on
     // already-scrubbed text so a straddling secret can't leak a sub-floor head.
     const title = truncate(scrubSecrets(parsed.merged_title || ''), 120);
-    const narrative = truncate(scrubSecrets(parsed.merged_narrative || ''), 800);
+    const narrative = truncate(scrubSecrets(parsed.merged_narrative || keeper.narrative || ''), 800);
     // Preserve-on-empty. The merge overwrites the keeper in place and hides every non-keeper
     // member (compressed_into=keeper.id), so if the LLM returns merged_lesson:null (the prompt
     // at :429 explicitly permits it) every cluster lesson would leave all live surfaces at once
@@ -589,7 +611,7 @@ Return ONLY valid JSON:
         .run(keeper.id, ...otherIds);
     })();
 
-    rebuildVector(db, keeper.id, [title, narrative, conceptsText]);
+    rebuildVector(db, keeper.id, { title, narrative, concepts: conceptsText, lesson_learned: lessonLearned, search_aliases: keeper.search_aliases });
 
     debugLog('DEBUG', 'llm-optimize', `merged ${cluster.length} observations into #${keeper.id}`);
     return { merged: true, keeperId: keeper.id, mergedCount: others.length };
@@ -793,7 +815,7 @@ JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive sum
       return sId;
     })();
 
-    rebuildVector(db, summaryId, [title, narrative, conceptsText]);
+    rebuildVector(db, summaryId, { title, narrative, concepts: conceptsText });
 
     debugLog('DEBUG', 'llm-optimize', `smart-compressed ${observations.length} observations into #${summaryId}`);
     return { compressed: true, summaryId, count: observations.length };

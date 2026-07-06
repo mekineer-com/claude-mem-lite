@@ -484,6 +484,10 @@ async function handleStop() {
           for (const sub of planEpisodeFlush(episode)) {
             if (!sub.sessionId) sub.sessionId = sessionId;
             if (!sub.project) sub.project = project;
+            // Per-sub significance gate — parity with flushEpisodeGroup. The whole-episode check
+            // above can pass while an interleaved concurrent-session sub is pure noise (e.g. a lone
+            // Read); without this the fallback persists that noise sub AND spawns an LLM worker for it.
+            if (!episodeHasSignificantContent(sub)) continue;
             try {
               const obs = buildImmediateObservation(sub);
               const id = saveObservation(obs, sub.project, sub.sessionId);
@@ -1412,7 +1416,14 @@ async function handleUserPrompt() {
     );
 
     // Cross-session handoff injection (first 3 prompts window, before semantic memory).
-    if (promptNumber <= 3) {
+    // prompt_counter is project-scoped (shared across concurrent same-project CC sessions), so a
+    // parallel session would start past the window and never get its handoff injected. Count THIS
+    // cc_session's own prompts instead (the current one is already inserted above); legacy null cc
+    // id falls back to the shared counter.
+    const windowPos = ccSessionId
+      ? (db.prepare('SELECT COUNT(*) c FROM user_prompts WHERE cc_session_id = ?').get(ccSessionId)?.c || promptNumber)
+      : promptNumber;
+    if (windowPos <= 3) {
       try {
         if (detectContinuationIntent(db, promptText, project, ccSessionId)) {
           const picked = pickHandoffToInject(db, project, ccSessionId);

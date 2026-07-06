@@ -1688,12 +1688,18 @@ async function doctor() {
 
 // ─── Settings helpers ───────────────────────────────────────────────────────
 
-function isMemHook(cfg) {
+// Identify a settings hook as one of OURS (to replace on install / strip on uninstall).
+// Must be tight: the old `hook.mjs` + event-word test matched a user's OWN generic hook
+// (`node ~/.config/hook.mjs session-start`) and install/uninstall silently deleted it.
+// The launcher marker (`hook-launcher.mjs`, which every Node hook routes through since v2.84)
+// replaces that clause; the product-name substring (our install-dir / legacy-direct hooks)
+// and the bash prefilter round out the real markers.
+export function isMemHook(cfg) {
   if (!cfg.hooks) return false;
   return cfg.hooks.some(h => {
     const cmd = h.command || '';
     return cmd.includes('claude-mem-lite') ||
-      (cmd.includes('hook.mjs') && /\b(session-start|stop|user-prompt|pre-tool-use)\b/.test(cmd)) ||
+      cmd.includes('hook-launcher.mjs') ||
       cmd.includes('scripts/post-tool-use.sh');
   });
 }

@@ -271,13 +271,28 @@ export function detectContinuationIntent(db, promptText, project, currentCcSessi
   try {
     const currentSha = gitStateModule.readGitState({ cwd: process.cwd() }).headSha;
     if (currentSha) {
-      const anchor = db.prepare(`
-        SELECT created_at_epoch FROM session_handoffs
-        WHERE project = ? AND git_sha_at_handoff = ?
-        ORDER BY created_at_epoch DESC LIMIT 1
-      `).get(project, currentSha);
+      // Scope like Stage 2: an 'exit' anchor is cross-session (resume after /exit), but a 'clear'
+      // anchor is same-session only — else a parallel same-project session at the same commit
+      // would hijack (and then delete) another session's clear handoff.
+      const anchor = currentCcSessionId
+        ? db.prepare(`
+            SELECT created_at_epoch, match_keywords FROM session_handoffs
+            WHERE project = ? AND git_sha_at_handoff = ? AND (type = 'exit' OR session_id = ?)
+            ORDER BY created_at_epoch DESC LIMIT 1
+          `).get(project, currentSha, currentCcSessionId)
+        : db.prepare(`
+            SELECT created_at_epoch, match_keywords FROM session_handoffs
+            WHERE project = ? AND git_sha_at_handoff = ?
+            ORDER BY created_at_epoch DESC LIMIT 1
+          `).get(project, currentSha);
       if (anchor && (Date.now() - anchor.created_at_epoch <= HANDOFF_ANCHOR_MAX_AGE)) {
-        return true;
+        // Unmoved HEAD is a strong resume signal, but must not hijack a NEW task typed at the
+        // same commit: gate long prompts on keyword overlap (mirror Stage 0). Short prompts
+        // (resume nudges) auto-continue.
+        if (promptText.length < 40) return true;
+        const hTokens = anchor.match_keywords ? new Set(tokenizeHandoff(anchor.match_keywords)) : null;
+        if (!hTokens || tokenizeHandoff(promptText).some(t => hTokens.has(t))) return true;
+        // long prompt with zero keyword overlap → fall through to Stage 0/1/2
       }
     }
   } catch { /* git/DB failure must not break the rest of the pipeline */ }
