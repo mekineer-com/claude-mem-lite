@@ -133,6 +133,21 @@ describe('importFromGitHub', () => {
     expect(row.status).toBe('active');
   });
 
+  it('uses the repo default_branch when the URL omits /tree/ (master-default repo, no 404)', async () => {
+    // Regression: parseGitHubUrl defaults branch→'main'; a repo whose default is 'master'
+    // 404'd on the non-existent 'main' ref instead of importing. Fix: fall back to
+    // repoMeta.default_branch when the URL didn't specify /tree/<branch>.
+    const mockFetch = vi.fn(async (u) => {
+      if (u.includes('/git/trees/main')) return { ok: false, status: 404 };            // 'main' does not exist
+      if (u.includes('/git/trees/master')) return { ok: true, json: () => Promise.resolve({ tree: [{ path: 'SKILL.md', type: 'blob' }] }) };
+      if (u.includes('raw.githubusercontent.com')) return { ok: true, text: () => Promise.resolve('---\nname: master-skill\ndescription: d\n---\n# T\nbody') };
+      return { ok: true, json: () => Promise.resolve({ stargazers_count: 3, forks_count: 0, updated_at: '2026-01-01', default_branch: 'master' }) }; // repo metadata
+    });
+    const results = await importFromGitHub(db, 'https://github.com/user/repo', { fetchFn: mockFetch, managedDir: TMP });
+    expect(results.length).toBe(1);
+    expect(results[0].name).toBe('master-skill');
+  });
+
   it('preserves an enrichment-promoted quality_tier across a content re-import', async () => {
     // Regression: the post-upsert UPDATE hardcoded quality_tier='community', so a
     // re-import (changed upstream content → new file_hash) downgraded any tier that

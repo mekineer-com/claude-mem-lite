@@ -286,9 +286,15 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
     return { ...formatSearchOutput([], args, ftsQuery, 0), escalated: false, results: [], total: 0, variants: null };
   }
 
-  // obs_type ⇒ observations-only; deep is observations-only too (deepSearch fuses
-  // hybrid-obs lists). args.type is the source filter (observations|sessions|prompts).
-  const effectiveType = deepMode === 'deep' ? 'observations' : (args.type || (args.obs_type ? 'observations' : undefined));
+  // obs_type/importance/branch/tier ⇒ observations-only; deep is observations-only too
+  // (deepSearch fuses hybrid-obs lists). args.type is the source filter
+  // (observations|sessions|prompts). Forcing obs-only for the obs-exclusive fields
+  // matches the CLI (mem-cli.mjs:177): session/prompt tables have no importance/branch/tier
+  // column, so without the force those legs return UNFILTERED and leak rows that can't be
+  // scoped to the filter (branch/importance/tier previously leaked cross-source on MCP).
+  const effectiveType = deepMode === 'deep'
+    ? 'observations'
+    : (args.type || ((args.obs_type || args.importance || args.branch || args.tier) ? 'observations' : undefined));
 
   const r = await coreRunSearchPipeline(
     {
@@ -1402,7 +1408,15 @@ server.registerTool(
       }
       const IMPORT_STRING_FIELDS = ['repo_url', 'local_path', 'invocation_name', 'intent_tags',
         'domain_tags', 'trigger_patterns', 'capability_summary', 'keywords', 'tech_stack', 'use_cases'];
-      const fields = { name: args.name, type: args.resource_type, status: 'active', source: args.source || 'user' };
+      // Preserve provenance on a metadata-only re-import (parity with cmdRegistry): default
+      // source to 'user' only for a NEW resource — a partial re-upsert of an existing
+      // github/preinstalled row without `source` must not flip it to 'user'.
+      let source = args.source;
+      if (!source) {
+        const existing = rdb.prepare('SELECT source FROM resources WHERE type = ? AND name = ?').get(args.resource_type, args.name);
+        source = existing ? existing.source : 'user';
+      }
+      const fields = { name: args.name, type: args.resource_type, status: 'active', source };
       for (const f of IMPORT_STRING_FIELDS) fields[f] = args[f] || '';
       const id = upsertResource(rdb, fields);
       return { content: [{ type: 'text', text: `Imported: ${args.resource_type}:${args.name} (id=${id})` }] };

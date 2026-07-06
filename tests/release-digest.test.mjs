@@ -22,6 +22,7 @@ import {
   verifyReleaseFiles,
   verifyManifestSignature,
 } from '../lib/release-digest.mjs';
+import { RELEASE_SIGNED_FILES, HOOK_SCRIPT_FILES } from '../source-files.mjs';
 
 const dirs = [];
 function makeReleaseTree() {
@@ -114,5 +115,23 @@ describe('lib/release-digest', () => {
     const r = verifyReleaseFiles(dir, manifest);
     expect(r.ok).toBe(false);
     expect(r.missing).toContain('lib/x.mjs');
+  });
+});
+
+describe('release signature covers the executable hook scripts (supply-chain gap)', () => {
+  it('signs every HOOK_SCRIPT_FILE — copyReleaseIntoStaging installs them + they run on every hook', () => {
+    // Regression: buildReleaseManifest was fed SOURCE_FILES only, so the 8 hook scripts
+    // (post-tool-use.sh / hook-launcher.mjs / …) that install into the live dir were NEVER
+    // in the signed set — an attacker who could publish a release (no signing key) could
+    // swap one while every SOURCE_FILES hash still matched → fail-closed verify still passed.
+    const manifest = buildReleaseManifest(process.cwd(), RELEASE_SIGNED_FILES, 'test');
+    for (const name of HOOK_SCRIPT_FILES) {
+      const key = `scripts/${name}`;
+      expect(manifest.files[key], `${key} missing from the signed manifest`).toBeTruthy();
+      expect(manifest.files[key]).toMatch(/^[a-f0-9]{64}$/); // a real sha256, not a placeholder
+    }
+    // The signed set must still be a SUPERSET of the runtime .mjs (no accidental narrowing).
+    expect(RELEASE_SIGNED_FILES).toContain('server.mjs');
+    expect(RELEASE_SIGNED_FILES).toContain('hook.mjs');
   });
 });

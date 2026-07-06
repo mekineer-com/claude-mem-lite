@@ -1258,6 +1258,17 @@ describe('result-dedup cooldown', () => {
     writeFileSync(injectedFile, JSON.stringify({ ids: [99], ts: Date.now(), count: 15 }));
     expect(shouldSkipByDedup([1,2,3], injectedFile)).toBe(true);
   });
+
+  it('dedups across hooks despite number-vs-string id types', () => {
+    // Both hooks share runtime/.claude-mem-injected-<project>. pre-tool-recall's
+    // mergeCrossHookInjected persists ids as STRINGS (.map(String)); UPS's
+    // shouldSkipByDedup passes obs ids as NUMBERS. Without normalization Set.has(2)
+    // misses "2" → cross-hook dedup never fires → the same lesson double-injects
+    // within the 5-min window. (readCrossHookInjected already String-normalizes.)
+    const injectedFile = join(testDir, '.claude-mem-injected-xhook');
+    writeFileSync(injectedFile, JSON.stringify({ ids: ['1', '2', '3', '4', '5'], ts: Date.now() }));
+    expect(shouldSkipByDedup([1, 2, 3, 4, 6], injectedFile)).toBe(true);
+  });
 });
 
 // ─── T3 (v2.31): BM25 threshold + prompt-length gate ───────────────────────

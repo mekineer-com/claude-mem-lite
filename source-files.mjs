@@ -198,3 +198,16 @@ export const HOOK_SCRIPT_FILES = [
   // through this wrapper so any partial-install drift heals automatically.
   'hook-launcher.mjs',
 ];
+
+// The complete set of files the release signature MUST cover: every runtime .mjs
+// (SOURCE_FILES) PLUS the executable hook scripts (copyReleaseIntoStaging installs these
+// into the live dir and they run on every hook fire). HOOK_SCRIPT_FILES were historically
+// NOT in the signed manifest, so an attacker able to PUBLISH a release — but without the
+// signing key — could swap a hook script (e.g. post-tool-use.sh / hook-launcher.mjs) while
+// every SOURCE_FILES hash still matched, and fail-closed verification would still pass →
+// RCE on the next hook fire. Keys are ROOT-relative, matching the extracted-tarball layout
+// that verifyReleaseFiles hashes against.
+export const RELEASE_SIGNED_FILES = [
+  ...SOURCE_FILES,
+  ...HOOK_SCRIPT_FILES.map(name => `scripts/${name}`),
+];

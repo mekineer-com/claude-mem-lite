@@ -255,6 +255,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     try {
       const crossStmt = db.prepare(`
         SELECT o.id, o.type, o.title, o.subtitle, o.narrative, o.importance, o.lesson_learned, o.project,
+               o.created_at_epoch, o.files_modified,
                o.cited_count, o.uncited_streak,
                ${OBS_BM25} as relevance,
                ${noisePenaltyClause('o')} as noise_penalty

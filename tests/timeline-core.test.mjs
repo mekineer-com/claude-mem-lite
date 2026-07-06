@@ -69,6 +69,29 @@ describe('timeline-core', () => {
       expect(r.error.id).toBe(pruned);
     });
 
+    it('re-anchors a superseded observation to its live successor', () => {
+      // A superseded row is dropped from every other read path; anchoring ON it would
+      // surface a dead record, so mirror the compressed→parent redirect: hop to the
+      // numeric successor recorded in superseded_by.
+      const successor = addObs({ title: 'new decision' });
+      const old = addObs({ title: 'old decision', supersededAt: Date.now(), supersededBy: successor });
+      const r = resolveAnchorToken(db, `#${old}`, {});
+      expect(r.ok).toBe(true);
+      expect(r.anchorId).toBe(successor);
+      expect(r.anchorNote).toBe(`(anchored to #${successor}, #${old} was superseded by it)`);
+    });
+
+    it('does NOT re-anchor when superseded_by is a string sentinel (auto-dedup)', () => {
+      // hook.mjs auto-dedup writes superseded_by='auto-dedup' (a marker, not a numeric
+      // id) — there is no successor to redirect to, so the token must resolve to the row
+      // itself without throwing on a non-numeric hop target.
+      const dup = addObs({ title: 'dedup dup', supersededAt: Date.now(), supersededBy: 'auto-dedup' });
+      const r = resolveAnchorToken(db, `#${dup}`, {});
+      expect(r.ok).toBe(true);
+      expect(r.anchorId).toBe(dup);
+      expect(r.anchorNote).toBeNull();
+    });
+
     it('falls back from bare int to prompt when no such observation exists', () => {
       const obsId = addObs(); // obs #1
       insertPrompt(db, { contentSessionId: 'sess-tc', text: 'p1' });
@@ -163,6 +186,17 @@ describe('timeline-core', () => {
       // Superset column contract: both renderers need their fields.
       expect(rows[0]).toHaveProperty('project');
       expect(rows[0]).toHaveProperty('created_at_epoch');
+    });
+
+    it('excludes superseded observations (parity with the before/after window)', () => {
+      // The no-anchor fallback must drop superseded rows like every other read path
+      // (search/recent/browse) and like fetchTimelineWindow's own before/after legs —
+      // otherwise a stale, overturned memory leads the "most recent" timeline.
+      const live = addObs({ title: 'live', epochOffset: -1000 });
+      addObs({ title: 'stale', epochOffset: -500, supersededAt: Date.now(), supersededBy: live });
+      const titles = fetchRecentTimeline(db, { project: 'test', limit: 10 }).map(r => r.title);
+      expect(titles).toContain('live');
+      expect(titles).not.toContain('stale');
     });
   });
 

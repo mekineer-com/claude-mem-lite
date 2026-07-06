@@ -743,3 +743,31 @@ describe('v2.41: MEM_CROSS_PROJECT_BOOST env override', () => {
     expect(() => searchRelevantMemories(db, 'dispatch routing policy', 'main-proj', [])).not.toThrow();
   });
 });
+
+describe('cross-project rows: stale-hint field parity (parallel-path miss)', () => {
+  it('surfaces created_at_epoch + files_modified so formatMemoryLine can flag stale cross-project lessons', () => {
+    // The cross-project crossStmt previously omitted the two columns the same-project
+    // selectStmt provides, so formatMemoryLine's [verify-before-use] gate (needs
+    // created_at_epoch + files_modified) could never fire for a cross-project lesson
+    // that references files — even a 45-day-old one. Parallel-path miss (§9).
+    const db = createTestDb();
+    try {
+      insertSession(db, { id: 'cp-main', project: 'cp-main-proj' });
+      insertSession(db, { id: 'cp-other', project: 'cp-other-proj' });
+      const stale = insertObs(db, {
+        sessionId: 'cp-other', project: 'cp-other-proj', type: 'decision',
+        title: 'auth token refresh needs a mutex',
+        lessonLearned: 'auth token refresh must hold a mutex to avoid a thundering-herd refresh',
+        text: 'auth token refresh mutex thundering herd gotcha',
+        importance: 3, epochOffset: -45 * 86_400_000,
+        filesModified: JSON.stringify(['auth.mjs']),
+      });
+      const results = searchRelevantMemories(db, 'auth token refresh mutex gotcha', 'cp-main-proj', []);
+      const cross = results.find(r => r.id === Number(stale.lastInsertRowid));
+      expect(cross, 'stale cross-project obs not surfaced').toBeTruthy();
+      expect(typeof cross.created_at_epoch).toBe('number');
+      expect(cross.files_modified).toContain('auth.mjs');
+      expect(formatMemoryLine(cross)).toContain('[verify-before-use]');
+    } finally { db.close(); }
+  });
+});

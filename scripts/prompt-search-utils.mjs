@@ -164,8 +164,14 @@ export function shouldSkipByDedup(newIds, injectedFile) {
     if (count >= MAX_SESSION_INJECTIONS) return true;
     if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
     if (!Array.isArray(prevIds) || prevIds.length === 0) return false;
-    const prevSet = new Set(prevIds);
-    const overlapCount = newIds.filter(id => prevSet.has(id)).length;
+    // Normalize both sides to strings before comparing: UPS writes obs ids as numbers
+    // (rows.map(r => r.id)) while pre-tool-recall's mergeCrossHookInjected writes them as
+    // strings (.map(String)), and both hooks SHARE this file. Without normalization
+    // Set.has(8829) misses "8829" → cross-hook dedup never fires and the same lesson
+    // double-injects within the window. (pre-tool-recall's readCrossHookInjected already
+    // String-normalizes; this brings the UPS-side reader in line.)
+    const prevSet = new Set(prevIds.map(String));
+    const overlapCount = newIds.filter(id => prevSet.has(String(id))).length;
     return overlapCount / newIds.length >= 0.8;
   } catch { return false; }
 }

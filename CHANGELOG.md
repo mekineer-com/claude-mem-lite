@@ -2,6 +2,75 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.40.0 — E2E audit: retrieval, secret-scrub, timeline, registry, release-signing, maintenance
+
+A two-round end-to-end audit (6 parallel discovery agents + user-simulation testing) that found and
+fixed **14 real bugs** across retrieval, secret handling, the resource registry, the release-signing
+chain, and the maintenance pipelines. Each fix is TDD'd; full suite green (195 files / 3632 tests),
+lint clean, no runtime regression. Three are HIGH severity (one supply-chain, one at-rest secret leak,
+one core-recall).
+
+### Security
+- **Release signature now covers the executable hook scripts** (`scripts/sign-release.mjs`,
+  `source-files.mjs`) — the signed manifest was built over `SOURCE_FILES` only, but the installer also
+  copies the 8 executable `HOOK_SCRIPT_FILES` (`post-tool-use.sh`, `hook-launcher.mjs`, …) that run on
+  every hook fire. An attacker able to publish a release (but WITHOUT the signing key) could swap a
+  hook script while every `SOURCE_FILES` hash still matched, and the fail-closed verifier would still
+  pass → RCE on the next hook. Fixed by signing `RELEASE_SIGNED_FILES = [...SOURCE_FILES,
+  ...HOOK_SCRIPT_FILES]`; `verifyReleaseFiles` already hashes every manifest entry, so this is
+  backward-compatible (no verifier change, no brick).
+- **CLI `update --concepts` and `restore` now scrub secrets** (`mem-cli.mjs`) — `cmdUpdate --concepts`
+  wrote its value un-scrubbed while every sibling field (title/narrative/lesson) and the MCP twin
+  `mem_update` scrub it; `cmdRestore` wrote `subtitle`/`concepts`/`facts`/`search_aliases` un-scrubbed.
+  Both are FTS-indexed columns, so a credential passed through them became searchable + exportable.
+  Now routed through the scrub choke-point like the other write paths.
+
+### Fixed
+- **CJK+Latin recall** (`nlp.mjs`) — a whitespace-free mixed-script query like `redis缓存问题` extracted
+  the CJK words but fed the Latin remainder only to the CJK bigram path, silently dropping `redis`
+  (and grafana/oauth/…) — proper nouns with no CJK synonym — collapsing recall on the core
+  Chinese-developer input pattern. Now extracts embedded Latin identifiers too (mirrors
+  `registry-retriever`). Scoped to mixed CJK+Latin tokens only; denoise-A/B NEUTRAL on the ASCII suites
+  (no regression) + a behavioral probe confirms the gain.
+- **`timeline` no longer surfaces superseded memories** (`lib/timeline-core.mjs`) — the before/after
+  window filtered `superseded_at IS NULL` but the no-anchor "recent" fallback and the anchor resolver
+  did not, so an overturned memory could lead the timeline (CLI + MCP). The recent-fallback now filters
+  superseded, and anchoring on a superseded id re-anchors to its successor.
+- **Date `--from`/`--to` bounds are the user's local calendar day** (`lib/search-core.mjs`) — a
+  date-only bound was parsed as UTC midnight while `created_at_epoch` is local wall-clock, so a same-day
+  window shifted by the tz offset (8h for UTC+8), dropping early-morning rows and leaking the next day.
+  Date-only bounds now build in local time.
+- **MCP `mem_search` obs-only filters no longer leak cross-source rows** (`server.mjs`) —
+  `importance`/`branch`/`tier` forced observations-only on the CLI but not on MCP, so the session/prompt
+  legs (which have no such columns) returned unfiltered. MCP now forces obs-only for those, matching the
+  CLI.
+- **Registry partial re-import preserves un-passed columns** (`registry.mjs`, `mem-cli.mjs`,
+  `server.mjs`) — a metadata-only re-import (the only registry edit path) clobbered `local_path`
+  /`repo_url` with empty values and flipped `source` github→user, orphaning the resource (mem_use/enrich
+  read `local_path`). The UPSERT now preserves those on empty and the callers preserve `source` for an
+  existing resource.
+- **Registry GitHub import uses the repo's default branch** (`registry-importer.mjs`) — a repo whose
+  default is `master`/`develop` 404'd on the non-existent `main` (GitHub does not redirect a missing
+  ref). Now falls back to `repoMeta.default_branch` when the URL omits `/tree/<branch>`.
+- **`registry import --source <bad>` fails cleanly** (`mem-cli.mjs`) — an invalid `--source` reached the
+  INSERT and threw a raw SqliteError stacktrace; now validated against the enum like the MCP path.
+- **Cross-hook injection dedup no longer double-injects** (`scripts/prompt-search-utils.mjs`) — the
+  UserPromptSubmit and PreToolUse hooks share a dedup file but wrote ids as numbers vs strings, so the
+  Set comparison missed cross-hook overlap and re-injected the same lesson within the window.
+- **Cross-project memory lines can show the stale hint** (`hook-memory.mjs`) — the cross-project SELECT
+  omitted `created_at_epoch`/`files_modified`, so the `[verify-before-use]` hint never fired for a
+  cross-project lesson referencing files (parallel-path miss).
+- **`maintain scan` no longer over-forecasts stale/broken** (`lib/maintain-core.mjs`) — the scan stat
+  omitted the `lesson_learned` guard the decay/cleanup ops enforce ("lessons never auto-GC"), so it
+  counted lesson-bearing rows execute would refuse to touch.
+- **Project-scoped `optimize --task normalize` bypasses the global gate** (`hook-optimize.mjs`) — the
+  7-day normalize gate was a single global file but the mutation is per-project, so `--project B` was
+  skipped for 7 days after any project ran normalize. An explicit project now bypasses the gate and does
+  not advance it.
+- **`claudemd` block refresh is `$`-safe** (`claudemd.mjs`) — the in-place block replace used a string
+  replacement, so a future `$`-sequence in the template would be interpreted as a back-reference; now
+  uses a function replacer.
+
 ## v3.39.2 — code-review follow-up: vector-arm parity, `/lesson` save guard, multi-line save recognizer
 
 Three fixes from a code review of the v3.39.0→v3.39.1 changeset. The review found **no Critical

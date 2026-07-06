@@ -233,7 +233,7 @@ export async function importFromGitHub(db, url, opts = {}) {
   // 1. Parse GitHub URL
   const parsed = parseGitHubUrl(url);
   if (!parsed) throw new Error('Invalid GitHub URL');
-  const { owner, repo, branch, path: pathFilter } = parsed;
+  const { owner, repo, branch: parsedBranch, path: pathFilter } = parsed;
 
   // 2. Fetch repo metadata (stars, forks, updated_at)
   const repoResp = await fetchFn(buildRepoUrl(owner, repo), { headers });
@@ -246,6 +246,13 @@ export async function importFromGitHub(db, url, opts = {}) {
   const repoStars = repoMeta.stargazers_count || 0;
   const repoForks = repoMeta.forks_count || 0;
   const repoUpdatedAt = repoMeta.updated_at || null;
+
+  // parseGitHubUrl defaults branch to 'main' when the URL omits `/tree/<branch>`. Prefer the
+  // repo's ACTUAL default branch in that case: a repo defaulting to master/develop/trunk
+  // otherwise 404s on a non-existent 'main' (GitHub does not redirect a missing ref), failing
+  // a URL that opens fine in the browser. An explicit `/tree/<branch>` in the URL still wins.
+  const branchExplicit = /\/tree\//.test(url.split(/[?#]/)[0]);
+  const branch = branchExplicit ? parsedBranch : (repoMeta.default_branch || parsedBranch);
 
   // 3. Fetch file tree via GitHub API (recursive)
   const treeResp = await fetchFn(buildTreeUrl(owner, repo, branch), { headers });

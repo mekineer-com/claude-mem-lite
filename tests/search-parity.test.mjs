@@ -147,6 +147,26 @@ describe('CLI ↔ MCP search parity (audit P1-2 — one orchestrator)', () => {
   parity('sort=time', { query: 'parity', sort: 'time', deep: false }, ['parity', '--sort', 'time', '--no-deep']);
   parity('CJK query (prompt CJK fallback path)', { query: '缓存', deep: false }, ['缓存', '--no-deep']);
 
+  // Obs-only field filters (importance/branch/tier) must force observations-only on BOTH
+  // surfaces. The session/prompt legs have no importance/branch/tier column, so if the
+  // surface doesn't force obs-only they come back UNFILTERED — session/prompt rows that
+  // can't possibly be scoped to the filter leak in. The CLI forced this (mem-cli.mjs:177);
+  // MCP forced only for obs_type, so importance/branch/tier leaked cross-source rows.
+  parity('importance filter forces obs-only (no session/prompt leak)',
+    { query: 'parity', importance: 3, deep: false }, ['parity', '--importance', '3', '--no-deep']);
+  parity('branch filter forces obs-only (no session/prompt leak)',
+    { query: 'parity', branch: 'main', deep: false }, ['parity', '--branch', 'main', '--no-deep']);
+
+  // tier: full CLI/MCP parity is NOT assertable — tierPosition is a deliberate per-surface
+  // asymmetry (#8786: CLI 'early' filters inside the obs block so `total` drops; MCP 'late'
+  // post-filters after re-rank so `total` counts pre-tier). The M4 contract for tier is only
+  // that it forces obs-only so no session/prompt row (which has no tier column) leaks — those
+  // rows otherwise bypass applyTierFilter entirely (search-core.mjs:245) and survive.
+  test('tier filter forces observations-only on MCP (no session/prompt leak)', async () => {
+    const res = await handleSearchForTest(db, { query: 'parity', tier: 'working', deep: false }, {});
+    expect(res.results.some((r) => r.source === 'session' || r.source === 'prompt')).toBe(false);
+  });
+
   // Deep path: both surfaces route through the SAME injected deepSearch (LLM rewrite
   // → RRF fusion), so the fused obs set + order must match exactly. rerankPolicy
   // differs (mcp/cli) but converges here — both re-rank with the same project.

@@ -19,7 +19,7 @@ import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SOURCE_FILES } from '../source-files.mjs';
+import { RELEASE_SIGNED_FILES } from '../source-files.mjs';
 import { buildReleaseManifest, serializeManifest } from '../lib/release-digest.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -42,7 +42,11 @@ try {
   process.exit(1);
 }
 
-const manifest = buildReleaseManifest(ROOT, SOURCE_FILES, version);
+// Sign the executable hook scripts alongside the runtime .mjs (RELEASE_SIGNED_FILES): they
+// install into the live dir and run on every hook, so the signature must cover them —
+// verifyReleaseFiles hashes every manifest entry, so listing them here closes the gap with
+// no verifier change (backward-compatible: older verifiers hash whatever the manifest lists).
+const manifest = buildReleaseManifest(ROOT, RELEASE_SIGNED_FILES, version);
 const bytes = serializeManifest(manifest);
 writeFileSync(join(ROOT, 'release-manifest.json'), bytes);
 

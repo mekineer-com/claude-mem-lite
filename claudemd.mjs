@@ -143,7 +143,10 @@ export function writeManaged(cwd, { slug, version, block, doc }) {
     else next = raw + '\n\n' + section + '\n';
     action = 'created';
   } else {
-    next = raw.replace(m[0], section);
+    // Function replacer (not a string): a `$`-sequence in `section` (a future template with
+    // a shell example / regex / `$1`) would otherwise be interpreted as a replacement
+    // back-reference and corrupt the block on every SessionStart refresh. Matches line 153.
+    next = raw.replace(m[0], () => section);
     action = next !== raw ? 'updated' : 'unchanged';
   }
   // H2: collapse any DUPLICATE same-slug blocks (keep the first, drop the rest).

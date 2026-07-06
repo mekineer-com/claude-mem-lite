@@ -246,6 +246,26 @@ describe('maintenanceStats (scan preview must match what execute does)', () => {
     const { idleMarked } = decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY));
     expect(idleMarked).toBe(stats.stale);
   });
+
+  test('stale + broken counts exclude lesson-bearing rows (parity with the execute lesson guard)', () => {
+    // Same #8614 drift class, missed for lesson_learned: decayAndMarkIdle (:188) and
+    // cleanupBroken (:153) refuse to touch a lesson-bearing row ("lessons never auto-GC"),
+    // but the scan stat counted them → "Stale: N"/"Broken: N" over-forecast what execute does.
+    const db = freshDb();
+    add(db, { title: 'stale plain', importance: 1, injectionCount: 0 });                                // decay marks idle → stale
+    add(db, { title: 'stale w/ lesson', importance: 1, injectionCount: 0, lessonLearned: 'keep me' });  // decay PROTECTS → not stale
+    // importance:2 keeps these out of the stale bucket (imp=1) so they isolate the broken stat.
+    add(db, { title: '', narrative: '', importance: 2 });                                               // cleanup deletes → broken
+    add(db, { title: '', narrative: '', importance: 2, lessonLearned: 'synthesized lesson' });          // cleanup PROTECTS → not broken
+
+    const stats = maintenanceStats(db, ctx(Date.now() - 30 * DAY));
+    expect(stats.stale).toBe(1);  // only the lesson-less stale row (was 2 pre-fix)
+    expect(stats.broken).toBe(1); // only the lesson-less broken row (was 2 pre-fix)
+
+    // Parity: scan forecast == what execute actually touches.
+    expect(decayAndMarkIdle(db, ctx(Date.now() - 30 * DAY)).idleMarked).toBe(stats.stale);
+    expect(cleanupBroken(db, ctx(0))).toBe(stats.broken);
+  });
 });
 
 describe('execute ops', () => {

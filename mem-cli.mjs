@@ -1569,7 +1569,10 @@ function cmdUpdate(db, args) {
     updates.push('lesson_learned = ?');
     params.push(scrubSecrets(rawLesson));
   }
-  if (flags.concepts !== undefined) { updates.push('concepts = ?'); params.push(flags.concepts); }
+  // Scrub like the sibling text fields above (title/narrative/lesson) and the MCP twin
+  // mem_update — concepts is a scrub-target + FTS-indexed column, so a raw secret here
+  // lands searchable + exportable (rebuildObservationDerived folds it into `text`).
+  if (flags.concepts !== undefined) { updates.push('concepts = ?'); params.push(scrubSecrets(flags.concepts)); }
 
   if (updates.length === 0) {
     fail('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
@@ -1769,8 +1772,16 @@ function cmdRestore(db, argv) {
       // Re-apply the fields saveObservation zeros/derives so the backup is faithful.
       // search_aliases is its own FTS5 column, so this UPDATE re-syncs the index
       // (via the observations FTS triggers) and restored aliases stay searchable.
+      // Scrub the FTS-indexed text fields on the way in — the sibling ingest paths
+      // (import-jsonl, compress-core) scrub as defense-in-depth, and restore is the only
+      // rewrite path that skipped it. A backup made before a SECRET_PATTERNS entry existed
+      // would otherwise re-index an old secret in facts/concepts even though narrative
+      // (routed through saveObservation) gets re-scrubbed. files_read/branch are
+      // paths/identifiers, not scrub-target text — left as-is.
       signalUpdate.run(
-        r.subtitle || '', r.concepts || '', r.facts || '', r.search_aliases ?? null, r.files_read || '[]', r.branch ?? null,
+        scrubSecrets(r.subtitle || ''), scrubSecrets(r.concepts || ''), scrubSecrets(r.facts || ''),
+        r.search_aliases === null || r.search_aliases === undefined ? null : scrubSecrets(r.search_aliases),
+        r.files_read || '[]', r.branch ?? null,
         num(r.access_count), num(r.cited_count), num(r.uncited_streak), num(r.injection_count),
         num(r.decay_seen_count), r.last_accessed_at ?? null,
         res.id,
@@ -2239,7 +2250,22 @@ function cmdRegistry(_memDb, args) {
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry import --name N --resource-type skill|agent [--invocation-name I] [--capability-summary S]'); return; }
-      const fields = { name, type: resourceType, status: 'active', source: flags.source || 'user' };
+      // Validate --source against its CHECK enum (parity with memRegistrySchema.source on MCP):
+      // an invalid value otherwise reaches the INSERT and throws a raw SqliteError stacktrace
+      // (the dispatcher's catch only special-cases SQLITE_BUSY/LOCKED).
+      if (flags.source && !new Set(['preinstalled', 'user', 'github']).has(flags.source)) {
+        fail(`[mem] Invalid --source "${flags.source}". Valid: preinstalled, user, github`);
+        return;
+      }
+      // Preserve provenance on a metadata-only re-import: default source to 'user' only for
+      // a genuinely NEW resource. Re-importing an existing github/preinstalled row without
+      // --source must not flip it to 'user' (which also mis-grants the user-source rank boost).
+      let source = flags.source;
+      if (!source) {
+        const existing = rdb.prepare('SELECT source FROM resources WHERE type = ? AND name = ?').get(resourceType, name);
+        source = existing ? existing.source : 'user';
+      }
+      const fields = { name, type: resourceType, status: 'active', source };
       for (const f of ['repo-url', 'local-path', 'invocation-name', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
         const camel = f.replace(/-([a-z])/g, (_, c) => '_' + c);
         fields[camel] = flags[f] || '';

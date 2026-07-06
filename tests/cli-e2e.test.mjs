@@ -362,7 +362,12 @@ describe('CLI E2E: search', () => {
     const twoDaysAgo = -2 * 86400000;
     seedObs({ title: 'Old discovery', text: 'old discovery text', epochOffset: twoDaysAgo });
     seedObs({ title: 'Recent discovery', text: 'recent discovery text' });
-    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    // Compute yesterday's date in LOCAL time — created_at_epoch is stored at local wall-clock
+    // and a date-only --from is a LOCAL calendar day (v3.40.0). Using toISOString() here (UTC)
+    // made the boundary tz-dependent: for a UTC+N user near local midnight it resolved to the
+    // wrong calendar day and let the 2-day-old row leak in.
+    const y = new Date(Date.now() - 86400000);
+    const yesterday = `${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
     const { stdout } = runCli(['search', 'discovery', '--from', yesterday]);
     expect(stdout).toContain('Recent discovery');
     expect(stdout).not.toContain('Old discovery');

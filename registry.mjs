@@ -368,9 +368,15 @@ const UPSERT_SQL = `
     indexed_at, updated_at)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(type, name) DO UPDATE SET
-    status=excluded.status, source=excluded.source, repo_url=excluded.repo_url,
+    status=excluded.status, source=excluded.source,
+    -- Preserve-on-empty (mirror the FTS text columns below): a PARTIAL re-upsert defaults
+    -- repo_url/local_path to null/'' in the caller (import is the only edit path). Clobbering
+    -- them ORPHANS the resource — mem_use/enrich read local_path (NOT NULL, so '' passes the
+    -- constraint and silently breaks reads), and the scanner needs local_path to disable it.
+    repo_url=CASE WHEN excluded.repo_url != '' THEN excluded.repo_url ELSE repo_url END,
     repo_stars=CASE WHEN excluded.repo_stars > 0 THEN excluded.repo_stars ELSE repo_stars END,
-    local_path=excluded.local_path, file_hash=excluded.file_hash,
+    local_path=CASE WHEN excluded.local_path != '' THEN excluded.local_path ELSE local_path END,
+    file_hash=excluded.file_hash,
     invocation_name=CASE WHEN excluded.invocation_name != '' THEN excluded.invocation_name ELSE invocation_name END,
     -- Preserve-on-empty (mirror repo_stars/invocation_name above): a PARTIAL re-upsert --
     -- e.g. "registry import --name X --capability-summary ...", where mem-cli defaults every

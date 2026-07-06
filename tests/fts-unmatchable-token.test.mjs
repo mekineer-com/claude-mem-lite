@@ -65,6 +65,22 @@ describe('sanitizeFtsQuery — unmatchable-token strict-AND regressions (round-5
     expect(terms).not.toContain('不存');
   });
 
+  it('[HIGH] embedded latin identifier in a glued CJK token is preserved (not dropped)', () => {
+    // "redis缓存问题": extractCjkKeywords pulls 缓存/问题, and the Latin remainder "redis"
+    // was fed only to cjkBigrams (CJK-only) → silently dropped. redis/grafana/oauth are
+    // proper nouns with no CJK synonym, so losing them zeroed recall on whitespace-free
+    // mixed-script prompts (the core Chinese-developer input pattern). Mirrors the Latin
+    // extraction registry-retriever.mjs already applies to its mixed-script queries.
+    const strict = sanitizeFtsQuery('redis缓存问题');
+    expect(strict).not.toBeNull();
+    expect(strict.toLowerCase()).toContain('redis');
+
+    // End-to-end: a redis-specific doc becomes reachable — before the fix redis was
+    // absent from the query entirely, so only a generic 缓存问题 doc could match.
+    db.prepare('INSERT INTO t(content) VALUES (?)').run('redis 连接 调优 redis 连接 接调 调优');
+    expect(matchCount(relaxFtsQueryToOr(strict) || strict)).toBeGreaterThan(0);
+  });
+
   it('[LOW] emoji token is dropped, not phrase-quoted into a required term', () => {
     db.prepare('INSERT INTO t(content) VALUES (?)').run('payment timeout regression');
     const strict = sanitizeFtsQuery('payment 💥 timeout');

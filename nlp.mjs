@@ -314,6 +314,16 @@ export function sanitizeFtsQuery(query) {
             if (bg && !isCjkNoiseBigram(bg) && !matched.has(bg)) expandedTokens.push(bg);
           }
         }
+        // Preserve embedded Latin/English identifiers glued into the CJK token — e.g. the
+        // "redis" in "redis缓存问题". extractCjkKeywords + cjkBigrams only see CJK runs, so
+        // without this the Latin anchor (often the single most precise term — a proper noun
+        // like redis/grafana/oauth with no CJK synonym) was dropped, zeroing recall on
+        // whitespace-free mixed-script prompts. Mirrors registry-retriever.mjs's embedded-
+        // English extraction. Lowercased for parity with the write-path unicode61 folding.
+        for (const en of (remainder.match(/[a-zA-Z]{2,}/g) || [])) {
+          const low = en.toLowerCase();
+          if (!FTS_STOP_WORDS.has(low) && !expandedTokens.includes(low)) expandedTokens.push(low);
+        }
         continue;
       }
       // No dictionary word matched. For a PURE-CJK run, pushing the whole

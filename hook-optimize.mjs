@@ -282,7 +282,12 @@ export function _normalizeGateOpen(last, now) {
   return now - epoch >= NORMALIZE_INTERVAL_MS;
 }
 
-export function shouldRunNormalize() {
+export function shouldRunNormalize(project = null) {
+  // The 7-day gate rate-limits the UNSCOPED whole-store normalize. An explicit --project is
+  // targeted work: it must not be blocked by a prior global (or other-project) run, and it
+  // does not advance the shared timer (see executeNormalize). Without this, `optimize --run
+  // --task normalize --project B` returned skipped(gate) for 7 days if ANY project had run.
+  if (project) return true;
   try {
     const last = JSON.parse(readFileSync(NORMALIZE_GATE_FILE, 'utf8'));
     return _normalizeGateOpen(last, Date.now());
@@ -399,7 +404,7 @@ export function applyNormalization(db, groups, { project = null } = {}) {
 }
 
 export async function executeNormalize(db, force = false, { project } = {}) {
-  if (!force && !shouldRunNormalize()) return { skipped: true, reason: 'gate' };
+  if (!force && !shouldRunNormalize(project)) return { skipped: true, reason: 'gate' };
 
   const concepts = extractUniqueConcepts(db, 500, { project });
   if (concepts.length < 5) return { skipped: true, reason: 'too few concepts' };
@@ -409,7 +414,10 @@ export async function executeNormalize(db, force = false, { project } = {}) {
 
   const result = applyNormalization(db, groups, { project });
 
-  try { writeFileSync(NORMALIZE_GATE_FILE, JSON.stringify({ epoch: Date.now() })); } catch {}
+  // Only the UNSCOPED (whole-store) run advances the shared 7-day gate. A project-scoped run
+  // must not reset the global timer (it never consulted it — shouldRunNormalize(project) is
+  // always open), or one `--project X` run would silently block the next global normalize.
+  if (!project) { try { writeFileSync(NORMALIZE_GATE_FILE, JSON.stringify({ epoch: Date.now() })); } catch { /* best-effort */ } }
 
   return { processed: result.updated, groups: groups.length };
 }
@@ -837,7 +845,7 @@ export function optimizePreview(db, { project, detail = false } = {}) {
   const reenrichAliases = findReenrichCandidates(db, 5000, { scope: 'aliases', project }).length;
 
   const concepts = extractUniqueConcepts(db, 500, { project });
-  const normalizeReady = shouldRunNormalize() && concepts.length >= 5;
+  const normalizeReady = shouldRunNormalize(project) && concepts.length >= 5;
 
   const mergeClusters = findMergeCandidates(db, 50, { project });
   const clusterMerge = mergeClusters.length;
@@ -851,7 +859,7 @@ export function optimizePreview(db, { project, detail = false } = {}) {
     reenrichWide,
     reenrichAliases,
     normalize: normalizeReady ? concepts.length : 0,
-    normalizeGateOpen: shouldRunNormalize(),
+    normalizeGateOpen: shouldRunNormalize(project),
     clusterMerge,
     smartCompress,
     total: reenrich + (normalizeReady ? 1 : 0) + clusterMerge + smartCompress,

@@ -30,11 +30,13 @@ describe('search-core', () => {
   });
 
   describe('parseDateBounds', () => {
-    it('extends date-only `to` bound to end-of-day', () => {
+    it('extends date-only `to` bound to end-of-day (local calendar day)', () => {
       const r = parseDateBounds('2026-06-01', '2026-06-02');
       expect(r.ok).toBe(true);
-      expect(r.epochFrom).toBe(new Date('2026-06-01').getTime());
-      expect(r.epochTo).toBe(new Date('2026-06-02').getTime() + 86400000 - 1);
+      // Date-only bounds are the user's LOCAL calendar day — created_at_epoch is stored
+      // as Date.now() (local wall-clock), so a UTC-midnight parse would shift the window.
+      expect(r.epochFrom).toBe(new Date(2026, 5, 1, 0, 0, 0, 0).getTime());
+      expect(r.epochTo).toBe(new Date(2026, 5, 2, 23, 59, 59, 999).getTime());
     });
 
     it('keeps full ISO `to` timestamps un-extended', () => {
@@ -65,7 +67,7 @@ describe('search-core', () => {
       const now = 1_000_000_000_000;
       const r = parseDateBounds('2026-06-01', null, '7d', now);
       expect(r.ok).toBe(true);
-      expect(r.epochFrom).toBe(new Date('2026-06-01').getTime()); // not now-7d
+      expect(r.epochFrom).toBe(new Date(2026, 5, 1, 0, 0, 0, 0).getTime()); // local midnight, not now-7d
     });
 
     it('flags an invalid --since duration', () => {
