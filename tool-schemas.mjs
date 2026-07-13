@@ -75,7 +75,7 @@ const coerceMixedIdTokens = z.preprocess(
     }
     return v;
   },
-  z.array(z.string().regex(/^[PpSs]?#?\d+$/, 'Expected N, #N, P#N, or S#N')).min(1).max(20)
+  z.array(z.string().regex(/^[EePpSs]?#?\d+$/, 'Expected N, #N, P#N, S#N, or E#N')).min(1).max(20)
 );
 
 export const memSearchSchema = {
@@ -120,12 +120,12 @@ const coerceAnchor = z.preprocess(
   },
   z.union([
     z.number().int(),
-    z.string().regex(/^[PpSs]?#?\d+$/, 'Expected N, #N, P#N, or S#N'),
+    z.string().regex(/^[EePpSs]?#?\d+$/, 'Expected N, #N, P#N, S#N, or E#N'),
   ])
 );
 
 export const memTimelineSchema = {
-  anchor: coerceAnchor.optional().describe('Anchor as observation ID (int) or prefixed token string: "#123", "P#123" (prompt → nearest obs), "S#123" (session → nearest obs). Takes precedence over query.'),
+  anchor: coerceAnchor.optional().describe('Anchor as observation ID (int) or prefixed token string: "#123", "P#123" (prompt → nearest obs), "S#123" (session → nearest obs), "E#123" (event → nearest obs). Takes precedence over query.'),
   query: z.string().optional().describe('FTS5 query to auto-find anchor. Ignored when anchor is also given; use one or the other.'),
   before: coerceInt.pipe(z.number().int().min(0).max(50)).optional().describe('Items before anchor (default 5)'),
   after: coerceInt.pipe(z.number().int().min(0).max(50)).optional().describe('Items after anchor (default 5)'),
@@ -136,8 +136,8 @@ export const memGetSchema = {
   // Accepts mixed tokens so pasted search results work verbatim: [1], [1, "P#2"], "1,P#2,S#3",
   // or the JSON-stringified form ["1","P#2"]. Each token's prefix routes to its source bucket
   // in server.mjs via lib/id-routing.bucketIdTokens. An explicit `source` override still wins.
-  ids: coerceMixedIdTokens.describe('Mixed observation/prompt/session IDs — accepts N, #N, P#N, S#N; comma-strings and JSON arrays also coerced'),
-  source: z.enum(['obs', 'session', 'prompt']).optional().describe('Force all IDs to this source (overrides per-token prefixes). Omit to let P#/S#/# prefixes route individually.'),
+  ids: coerceMixedIdTokens.describe('Mixed observation/prompt/session/event IDs — accepts N, #N, P#N, S#N, E#N; comma-strings and JSON arrays also coerced'),
+  source: z.enum(['obs', 'session', 'prompt', 'event']).optional().describe('Force all IDs to this source (overrides per-token prefixes). Omit to let P#/S#/E#/# prefixes route individually.'),
   fields: coerceStringArray.optional().describe('Specific fields to return (default: all; validated against obs schema — session/prompt sources ignore this filter)'),
 };
 
@@ -355,7 +355,8 @@ export const tools = [
   {
     name: 'mem_search',
     description:
-      'Full-text search across observations, sessions, and user prompts (FTS5, BM25-ranked).\n' +
+      'Full-text search across observations, sessions, prompts, and events — the canonical\n' +
+      'bugfix/feature/decision/lesson history (FTS5, BM25-ranked).\n' +
       '\n' +
       'DO NOT use when:\n' +
       '  - The SessionStart context or hook-injected memory already shows #NN entries that answer the question\n' +
@@ -363,9 +364,8 @@ export const tools = [
       '  - You want everything about a specific file (use mem_recall — cheaper and file-scoped)\n' +
       '\n' +
       'USE when:\n' +
-      '  - Investigating a concrete error keyword with obs_type="bugfix"\n' +
+      '  - Investigating an error keyword with obs_type="bugfix" (matches observations AND events)\n' +
       '  - Looking for prior art on a module/feature before refactoring\n' +
-      '  - User asks "have we seen this before" or references something not in visible context\n' +
       '  - A normal search missed — weak results auto-escalate to deep (set deep=false to opt out)\n' +
       '\n' +
       'Equivalent CLI: ' + CLI_INVOKE + ' search "<query>" [--type bugfix] [--deep]',

@@ -2,6 +2,37 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.45.0 — Events are *consumable*: close the three review gaps on the v3.44.0 feature
+
+v3.44.0 made `events` a fourth `mem_search` source, but a code review found the feature silently failed at
+the point of consumption on its primary (MCP) surface in three ways. This release closes all three (TDD,
++10 tests; full suite 213 files / 3730 tests green, lint clean; verified end-to-end against a real file DB
+via the CLI). Behavior change on a released artifact + LLM-visible tool metadata, so a minor bump.
+
+### Fixed
+- **Events (and sessions/prompts) no longer vanish under auto-deep escalation** (`lib/search-core.mjs`) — the
+  MCP default `deep=auto` escalates whenever observation hits are weak, and deep search fuses observations
+  ONLY; the three cross-source legs were gated on `!isDeep`, so an escalated query returned zero events —
+  exactly the case (weak obs, strong event) events exist for. The gate is now `!isDeep || escalated`:
+  auto-escalation keeps the cross-source complement; explicit `deep=true` still dives observations-only.
+- **`E#N` rows are now fetchable and collision-safe** (`lib/id-routing.mjs`, `lib/timeline-core.mjs`,
+  `server.mjs`, `mem-cli.mjs`, `tool-schemas.mjs`, `cli/common.mjs`) — `mem_search` advertised `mem_get`/
+  `~Nt` on `E#` rows, but `parseIdToken` rejected the `E` prefix, so `mem_get`/`get`/`mem_timeline --anchor`
+  could not consume it, and a stripped prefix silently fetched the COLLIDING observation id. `E#`/`e` now
+  parse to an `event` source across `parseIdToken`/`bucketIdTokens`/`probeOtherSources`; `mem_get` (both
+  surfaces) renders the event body; `mem_timeline` anchors an event to its nearest observation by epoch
+  (mirroring prompt/session); `delete`/`update` reject `E#` cleanly (observations-only).
+- **`obs_type` now reaches the canonical bugfix store** (`lib/search-core.mjs`, `search-engine.mjs`,
+  `server.mjs`, `mem-cli.mjs`) — `mem_search(obs_type="bugfix")` forced observations-only, excluding the
+  `events` table (the canonical bugfix history); `type="events"` silently ignored `obs_type`. A new
+  `obsTypeScoped` mode scopes an `obs_type` search (no branch/tier) to observations **+** events — both
+  filtered on the shared type vocabulary (`observations.type` / `events.event_type`) and importance floor —
+  while skipping the type-less sessions/prompts legs; the "N of M" count stays in lockstep with the rows shown.
+
+### Changed
+- **`mem_search` tool description + `mem_get`/`mem_timeline` schemas mention events / `E#N`** (LLM-visible
+  metadata) so the model can discover `type="events"` and paste `E#` tokens verbatim.
+
 ## v3.44.0 — Events are searchable: the canonical bugfix/decision history joins mem_search
 
 The big one: **event-typed memories (bugfix / feature / decision / discovery / refactor / lesson) are now

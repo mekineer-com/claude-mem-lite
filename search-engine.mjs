@@ -167,7 +167,7 @@ export function countPromptFtsMatches(db, { ftsQuery, project = null, epochFrom 
   } catch { return 0; }
 }
 
-export function countEventFtsMatches(db, { ftsQuery, project = null, epochFrom = null, epochTo = null }) {
+export function countEventFtsMatches(db, { ftsQuery, project = null, epochFrom = null, epochTo = null, eventType = null, importance = null }) {
   if (!ftsQuery) return 0;
   try {
     const wheres = ['events_fts MATCH ?', 'e.superseded_at_epoch IS NULL'];
@@ -175,6 +175,10 @@ export function countEventFtsMatches(db, { ftsQuery, project = null, epochFrom =
     if (project) { wheres.push('e.project = ?'); params.push(project); }
     if (epochFrom) { wheres.push('e.created_at_epoch >= ?'); params.push(epochFrom); }
     if (epochTo) { wheres.push('e.created_at_epoch <= ?'); params.push(epochTo); }
+    // D#76: keep the count in lockstep with searchEventsFts's event_type/importance filters,
+    // else the "N of M" population diverges from the rows actually shown.
+    if (eventType) { wheres.push('e.event_type = ?'); params.push(eventType); }
+    if (importance) { wheres.push('COALESCE(e.importance, 1) >= ?'); params.push(importance); }
     const row = db.prepare(`
       SELECT COUNT(*) as c
       FROM events_fts
@@ -194,19 +198,22 @@ export function countEventFtsMatches(db, { ftsQuery, project = null, epochFrom =
 export function countSearchTotal(db, {
   effectiveSource = null, ftsQuery, obsFtsQuery = null,
   args = {}, project = null, epochFrom = null, epochTo = null, includeNoise = false,
+  obsTypeScoped = false,
 }) {
   let total = 0;
   if (!effectiveSource || effectiveSource === 'observations') {
     total += countObsFtsMatches(db, { ftsQuery: obsFtsQuery || ftsQuery, args, epochFrom, epochTo, includeNoise });
   }
-  if (!effectiveSource || effectiveSource === 'sessions') {
+  // D#76: obsTypeScoped (obs_type given, no branch/tier) counts obs + type-filtered events only —
+  // sessions/prompts have no type column, so they are excluded from both the results and the count.
+  if (!obsTypeScoped && (!effectiveSource || effectiveSource === 'sessions')) {
     total += countSessionFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
   }
-  if (!effectiveSource || effectiveSource === 'prompts') {
+  if (!obsTypeScoped && (!effectiveSource || effectiveSource === 'prompts')) {
     total += countPromptFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
   }
   if (!effectiveSource || effectiveSource === 'events') {
-    total += countEventFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
+    total += countEventFtsMatches(db, { ftsQuery, project, epochFrom, epochTo, eventType: args.obs_type || null, importance: args.importance || null });
   }
   return total;
 }

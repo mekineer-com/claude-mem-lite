@@ -289,15 +289,26 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
     return { ...formatSearchOutput([], args, ftsQuery, 0), escalated: false, results: [], total: 0, variants: null };
   }
 
-  // obs_type/importance/branch/tier ⇒ observations-only; deep is observations-only too
-  // (deepSearch fuses hybrid-obs lists). args.type is the source filter
-  // (observations|sessions|prompts). Forcing obs-only for the obs-exclusive fields
-  // matches the CLI (mem-cli.mjs:177): session/prompt tables have no importance/branch/tier
-  // column, so without the force those legs return UNFILTERED and leak rows that can't be
-  // scoped to the filter (branch/importance/tier previously leaked cross-source on MCP).
-  const effectiveType = deepMode === 'deep'
-    ? 'observations'
-    : (args.type || ((args.obs_type || args.importance || args.branch || args.tier) ? 'observations' : undefined));
+  // Source scoping. deep is observations-only (deepSearch fuses hybrid-obs lists). branch/tier are
+  // obs-EXCLUSIVE columns (sessions/prompts/events lack them) → force observations, else those legs
+  // return UNFILTERED and leak rows that can't be scoped (the pre-fix cross-source branch/tier leak).
+  // obs_type is DIFFERENT: events carry the same type vocabulary (events.event_type), so an obs_type
+  // filter maps to obs + events both — scope to those two and skip the type-less sessions/prompts
+  // legs (D#76). importance filters obs and events (both carry it), so it rides the obsTypeScoped path.
+  let effectiveType;
+  let obsTypeScoped = false;
+  if (deepMode === 'deep') {
+    effectiveType = 'observations';
+  } else if (args.type) {
+    effectiveType = args.type;
+  } else if (args.obs_type && !args.branch && !args.tier) {
+    effectiveType = undefined;   // cross-source gate open; obsTypeScoped narrows it to obs+events
+    obsTypeScoped = true;
+  } else if (args.importance || args.branch || args.tier) {
+    effectiveType = 'observations';
+  } else {
+    effectiveType = undefined;
+  }
 
   const r = await coreRunSearchPipeline(
     {
@@ -312,6 +323,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
       includeNoise: args.include_noise === true, epochFrom, epochTo,
       sort: args.sort || 'relevance', tier: args.tier ?? null,
       // ── MCP surface policy ──
+      obsTypeScoped,                     // D#76: obs_type ⇒ obs+events (skip type-less sessions/prompts)
       obsTypeFallback: true,             // list-recent-by-type when 0 matches
       crossSourceEpochSortNoFts: true,   // epoch-sort cross-source with no ftsQuery
       rerankPolicy: 'mcp',               // (ftsQuery||isDeep) gate; re-rank/re-sort on ftsQuery&&!reranked
@@ -497,9 +509,9 @@ server.registerTool(
     const { bySrc, invalid } = bucketIdTokens(args.ids, { explicit: args.source || null, defaultSource: 'obs' });
     if (invalid.length > 0) {
       // Should not happen — schema regex already rejected bad tokens — but guard defensively.
-      return { content: [{ type: 'text', text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, or S#N.` }] };
+      return { content: [{ type: 'text', text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, S#N, or E#N.` }] };
     }
-    const totalRequested = bySrc.obs.length + bySrc.session.length + bySrc.prompt.length;
+    const totalRequested = bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length;
     if (totalRequested === 0) {
       return { content: [{ type: 'text', text: 'No valid IDs provided.' }] };
     }
@@ -524,7 +536,7 @@ server.registerTool(
 
     // Per-source fetchers — each returns { rows, foundIds:Set, prefix }.
     const sections = [];
-    const foundBySource = { obs: new Set(), session: new Set(), prompt: new Set() };
+    const foundBySource = { obs: new Set(), session: new Set(), prompt: new Set(), event: new Set() };
 
     if (bySrc.obs.length > 0) {
       const ph = bySrc.obs.map(() => '?').join(',');
@@ -583,17 +595,37 @@ server.registerTool(
       }
     }
 
-    const totalFound = foundBySource.obs.size + foundBySource.session.size + foundBySource.prompt.size;
+    if (bySrc.event.length > 0) {
+      const ph = bySrc.event.map(() => '?').join(',');
+      const rows = db.prepare(`SELECT * FROM events WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.event);
+      // events carry the distilled lesson in `body` (persistHaikuSummary writes lesson_learned||narrative).
+      // No created_at ISO column (only *_epoch) — render the epoch as an ISO string for a scannable date.
+      for (const row of rows) {
+        foundBySource.event.add(row.id);
+        const lines = [`── E#${row.id} [${row.event_type}] ──`];
+        if (row.title) lines.push(`title: ${row.title}`);
+        if (row.body) lines.push(`body: ${row.body.length > 500 ? row.body.slice(0, 500) + '…' : row.body}`);
+        if (row.project) lines.push(`project: ${row.project}`);
+        if (row.importance !== null && row.importance !== undefined) lines.push(`importance: ${row.importance}`);
+        if (row.file_paths) lines.push(`file_paths: ${row.file_paths}`);
+        if (row.git_sha) lines.push(`git_sha: ${row.git_sha}`);
+        if (row.created_at_epoch) lines.push(`created_at: ${new Date(row.created_at_epoch).toISOString()}`);
+        sections.push(lines.join('\n'));
+      }
+    }
+
+    const totalFound = foundBySource.obs.size + foundBySource.session.size + foundBySource.prompt.size + foundBySource.event.size;
 
     if (totalFound === 0) {
       // Probe other sources so callers can retry with the right prefix/source override.
       const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
-      const allNumericIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt];
+      const allNumericIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt, ...bySrc.event];
       const probe = probeIdSources(db, allNumericIds, queried);
       const hints = [];
       if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs — use source='obs' or bare #N)`);
       if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session — use source='session' or S#N)`);
       if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt — use source='prompt' or P#N)`);
+      if (probe.event.length > 0)   hints.push(`E#${probe.event.join(', E#')} (event — use source='event' or E#N)`);
       const hint = hints.length > 0 ? ` Try: ${hints.join('; ')}.` : '';
       const queriedList = [...queried].join(', ');
       const msg = `No records found in source(s) [${queriedList}] for the given ID(s).${hint}`;
@@ -607,6 +639,7 @@ server.registerTool(
     missingHints.push(...miss(bySrc.obs, foundBySource.obs, '#'));
     missingHints.push(...miss(bySrc.session, foundBySource.session, 'S#'));
     missingHints.push(...miss(bySrc.prompt, foundBySource.prompt, 'P#'));
+    missingHints.push(...miss(bySrc.event, foundBySource.event, 'E#'));
 
     const parts = [];
     if (fieldsNote) parts.push(fieldsNote);

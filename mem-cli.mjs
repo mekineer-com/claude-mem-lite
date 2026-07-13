@@ -76,7 +76,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     fail(`[mem] Invalid --type "${type}". Valid: ${[...validObsTypes].join(', ')}`);
     return;
   }
-  const source = flags.source || null; // observations|sessions|prompts (null = all)
+  const source = flags.source || null; // observations|sessions|prompts|events (null = all)
   const project = flags.project ? resolveProject(db, flags.project) : null;
   const bounds = parseDateBounds(flags.from, flags.to, flags.since);
   if (!bounds.ok) {
@@ -176,9 +176,23 @@ async function cmdSearch(db, args, { llm } = {}) {
   if (deepMode === 'deep' && source && source !== 'observations') {
     process.stderr.write(`[mem] Note: --deep searches observations only; ignoring --source ${source}\n`);
   }
-  const effectiveSource = deepMode === 'deep'
-    ? 'observations'
-    : (source || ((type || tier || minImportance || branch) ? 'observations' : null));
+  // branch/tier are obs-exclusive columns → force observations. --type (obs_type) maps to both
+  // observations.type AND events.event_type, so scope to obs+events and skip the type-less
+  // sessions/prompts legs (D#76). --importance rides the obsTypeScoped path (events carry importance).
+  let effectiveSource;
+  let obsTypeScoped = false;
+  if (deepMode === 'deep') {
+    effectiveSource = 'observations';
+  } else if (source) {
+    effectiveSource = source;
+  } else if (type && !branch && !tier) {
+    effectiveSource = null;
+    obsTypeScoped = true;
+  } else if (minImportance || branch || tier) {
+    effectiveSource = 'observations';
+  } else {
+    effectiveSource = null;
+  }
 
   const res = await coreRunSearchPipeline(
     {
@@ -191,6 +205,7 @@ async function cmdSearch(db, args, { llm } = {}) {
       limit, offset, project: project || null, obsType: type, importance: minImportance,
       branch, includeNoise, epochFrom: dateFrom, epochTo: dateTo, sort, tier,
       // ── CLI surface policy ──
+      obsTypeScoped,                     // D#76: obs_type ⇒ obs+events (skip type-less sessions/prompts)
       obsTypeFallback: false,            // #8217 removed list-by-type fallback from the CLI
       crossSourceEpochSortNoFts: false,  // CLI never reaches cross-source with empty ftsQuery (fails earlier)
       rerankPolicy: 'cli',               // re-rank/supersede on any obs; re-sort gated on cross-source
@@ -532,12 +547,31 @@ function renderPromptRows(db, ids) {
   return { text: parts.join('\n\n'), count: rows.length };
 }
 
+function renderEventRows(db, ids) {
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT * FROM events WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  if (rows.length === 0) return null;
+  const parts = [];
+  for (const r of rows) {
+    // events store the distilled lesson in `body`; only *_epoch is available for the date.
+    const lines = [`E#${r.id} [${r.event_type}] ${r.created_at_epoch ? fmtDateShort(new Date(r.created_at_epoch).toISOString()) : ''}`];
+    if (r.title) lines.push(`Title: ${r.title}`);
+    if (r.body) lines.push(`Body: ${r.body}`);
+    if (r.project) lines.push(`Project: ${r.project}`);
+    if (r.importance !== null && r.importance !== undefined) lines.push(`Importance: ${r.importance}`);
+    if (r.file_paths) lines.push(`Files: ${r.file_paths}`);
+    if (r.git_sha) lines.push(`Git: ${r.git_sha}`);
+    parts.push(lines.join('\n'));
+  }
+  return { text: parts.join('\n\n'), count: rows.length };
+}
+
 function cmdGet(db, args) {
   const { positional, flags } = parseArgs(args);
   const idStr = positional.join(',');
   if (!idStr) {
-    fail('[mem] Usage: claude-mem-lite get <id1,id2,...> [--source obs|session|prompt] [--fields f1,f2,...]\n' +
-         '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session).');
+    fail('[mem] Usage: claude-mem-lite get <id1,id2,...> [--source obs|session|prompt|event] [--fields f1,f2,...]\n' +
+         '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session), E#123 (event).');
     return;
   }
 
@@ -545,18 +579,18 @@ function cmdGet(db, args) {
 
   // Explicit --source overrides any prefix; otherwise each token's prefix routes individually.
   const explicit = flags.source;
-  const validSources = new Set(['obs', 'session', 'prompt']);
+  const validSources = new Set(['obs', 'session', 'prompt', 'event']);
   if (explicit && !validSources.has(explicit)) {
-    fail(`[mem] Invalid --source "${explicit}". Use: obs, session, prompt`);
+    fail(`[mem] Invalid --source "${explicit}". Use: obs, session, prompt, event`);
     return;
   }
 
-  // Shared bucketing with MCP mem_get — single source of truth for P#/S#/# routing (#8050).
+  // Shared bucketing with MCP mem_get — single source of truth for P#/S#/E#/# routing (#8050).
   const { bySrc, invalid: unparseable } = bucketIdTokens(tokens, { explicit, defaultSource: 'obs' });
   if (unparseable.length > 0) {
     process.stderr.write(`[mem] Ignoring unparseable ID token(s): ${unparseable.join(', ')}\n`);
   }
-  if (bySrc.obs.length + bySrc.session.length + bySrc.prompt.length === 0) {
+  if (bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length === 0) {
     fail('[mem] No valid IDs provided');
     return;
   }
@@ -591,11 +625,15 @@ function cmdGet(db, args) {
     const s = renderPromptRows(db, bySrc.prompt);
     if (s) { sections.push(s.text); totalFound += s.count; }
   }
+  if (bySrc.event.length > 0) {
+    const s = renderEventRows(db, bySrc.event);
+    if (s) { sections.push(s.text); totalFound += s.count; }
+  }
 
   if (totalFound === 0) {
     // Probe the OTHER sources so the caller can retry with the right prefix.
     const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
-    const allIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt];
+    const allIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt, ...bySrc.event];
     const probe = probeIdSources(db, allIds, queried);
     const hits = formatProbeHints(probe);
     const hint = hits.length > 0 ? ` Try: ${hits.join('; ')}.` : '';
@@ -1437,10 +1475,10 @@ function cmdDelete(db, args) {
   // delete operates on observations only. Reject P#/S# explicitly so callers aren't
   // surprised by silent NaN filtering when they paste search-output IDs.
   const tokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
-  const nonObs = tokens.filter(t => /^[PpSs]#?\d+$/.test(t));
+  const nonObs = tokens.filter(t => /^[EePpSs]#?\d+$/.test(t));
   if (nonObs.length > 0) {
     fail(`[mem] delete only works on observations. Rejected: ${nonObs.join(', ')}. ` +
-         `Prompts and sessions are append-only — inspect with \`claude-mem-lite get P#N --source prompt\` / \`--source session\`.`);
+         `Prompts, sessions, and events are not deletable here — inspect with \`claude-mem-lite get P#N --source prompt\` / \`--source session\` / \`--source event\`.`);
     return;
   }
   const ids = tokens.map(t => {
@@ -1514,9 +1552,9 @@ function cmdDelete(db, args) {
 function cmdUpdate(db, args) {
   const { positional, flags } = parseArgs(args);
   const raw = positional[0];
-  if (raw && /^[PpSs]#?\d+$/.test(String(raw).trim())) {
+  if (raw && /^[EePpSs]#?\d+$/.test(String(raw).trim())) {
     fail(`[mem] update only works on observations. Rejected: ${raw}. ` +
-         `Prompts and sessions are append-only.`);
+         `Prompts, sessions, and events are not editable here.`);
     return;
   }
   // Strict parseIdToken gate (aligned with cmdDelete): a bare parseInt fallback

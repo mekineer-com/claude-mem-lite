@@ -209,5 +209,6 @@ export function formatProbeHints(probe) {
   if (probe.obs.length > 0)     hints.push(`#${probe.obs.join(', #')} (obs)`);
   if (probe.session.length > 0) hints.push(`S#${probe.session.join(', S#')} (session)`);
   if (probe.prompt.length > 0)  hints.push(`P#${probe.prompt.join(', P#')} (prompt)`);
+  if (probe.event?.length > 0)  hints.push(`E#${probe.event.join(', E#')} (event)`);
   return hints;
 }
