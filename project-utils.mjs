@@ -49,11 +49,19 @@ export function resolveProject(db, name) {
   ).get(`%--${name}%`);
   if (prefixed) { _cache.set(name, prefixed.project); return prefixed.project; }
 
-  // 3) Substring match: broader fallback for partial names
-  const substr = db.prepare(
-    'SELECT project FROM observations WHERE project LIKE ? GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1'
-  ).get(`%${name}%`);
-  if (substr) { _cache.set(name, substr.project); return substr.project; }
+  // 3) Whole-token match: the name is a complete hyphen-delimited component of the base
+  // (e.g. "graph" → "projects--code-graph-mcp", "mcp" → "…-mcp"). Steps 1/2 already cover
+  // the exact base and the base *prefix*; this adds interior/trailing whole tokens ONLY.
+  // v3.42 F3: the old `%name%` substring fallback matched mid-token ("test" inside
+  // "loop-testing") and returned the highest-COUNT unrelated project, so `--project test`
+  // silently queried the wrong project. Require a hyphen boundary: an interior token
+  // (`%-name-%`) or a trailing token (`%-name`) so "test" no longer matches "testing".
+  const token = db.prepare(
+    `SELECT project FROM observations
+       WHERE (project LIKE '%-' || ? || '-%' OR project LIKE '%-' || ?)
+       GROUP BY project ORDER BY COUNT(*) DESC LIMIT 1`
+  ).get(name, name);
+  if (token) { _cache.set(name, token.project); return token.project; }
 
   // 4) Fallback: synthesize canonical form from current directory
   const inferred = inferProject();

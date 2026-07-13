@@ -9,6 +9,7 @@ import {
   logShadowReco, logShadowAdoption, computeFunnel,
   recommendSkill, recordSkillAdoption, formatFunnel, readShadowLog,
   replayGate, computeSweep, formatSweep, gcOldShadowShards,
+  LIFT_MIN_PASS_SESSIONS,
 } from '../registry-recommend.mjs';
 import { mkdirSync, writeFileSync, existsSync } from 'fs';
 import { createRegistryTestDb } from './test-helpers.mjs';
@@ -162,13 +163,34 @@ describe('formatFunnel', () => {
   });
   it('renders matched precision + targeting lift when session data is present', () => {
     const out = formatFunnel({
-      reco: 4, pass: 2, blockByReason: {}, adopt: 3, passSkills: { tdd: 2 }, adoptSkills: { tdd: 2 },
-      sessions: 3, matched: { pass: 2, adopt: 1, precision: 0.5 },
-      lift: { tdd: { passSessions: 2, hitSessions: 1, adoptGivenPass: 0.5, baseRate: 0.6667, lift: 0.75 } },
+      reco: 6, pass: 4, blockByReason: {}, adopt: 3, passSkills: { tdd: 4 }, adoptSkills: { tdd: 2 },
+      sessions: 5, matched: { pass: 2, adopt: 1, precision: 0.5 },
+      // passSessions=4 ≥ LIFT_MIN_PASS_SESSIONS(3) → shown.
+      lift: { tdd: { passSessions: 4, hitSessions: 2, adoptGivenPass: 0.5, baseRate: 0.6667, lift: 0.75 } },
     });
-    expect(out).toContain('sessions=3');
+    expect(out).toContain('sessions=5');
     expect(out).toContain('1/2 (50%)');
     expect(out).toContain('lift 0.75');
+  });
+  it('hides a small-n lift (passSessions < min) and reports it as suppressed (F5)', () => {
+    const out = formatFunnel({
+      reco: 30, pass: 20, blockByReason: {}, adopt: 5, passSkills: { brainstorming: 1, tdd: 12 }, adoptSkills: { brainstorming: 1, tdd: 4 },
+      sessions: 20, matched: { pass: 13, adopt: 4, precision: 0.31 },
+      lift: {
+        brainstorming: { passSessions: 1, hitSessions: 1, adoptGivenPass: 1, baseRate: 0.14, lift: 7.0 },
+        tdd: { passSessions: 12, hitSessions: 6, adoptGivenPass: 0.5, baseRate: 0.12, lift: 4.2 },
+      },
+    });
+    // The n=1 skill's lift must NOT appear in the lift row (it may still show in the
+    // coarse PASS∩adopt overlap line, which is a separate count-only proxy).
+    expect(out).not.toContain('lift 7.00');
+    const liftRow = out.split('\n').find(l => l.includes('targeting lift'));
+    expect(liftRow).not.toContain('brainstorming');
+    // … the substantive n=12 skill is shown …
+    expect(out).toContain('lift 4.20');
+    // … and the suppression is disclosed, not silent (threshold from the source const).
+    expect(LIFT_MIN_PASS_SESSIONS).toBe(3);
+    expect(out).toContain(`1 hidden: passSessions<${LIFT_MIN_PASS_SESSIONS}`);
   });
   it('omits the matched/lift block for a session-less (back-compat) funnel object', () => {
     const out = formatFunnel({ reco: 1, pass: 0, blockByReason: {}, adopt: 0, passSkills: {}, adoptSkills: {} });

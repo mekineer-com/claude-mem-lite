@@ -23,6 +23,7 @@ import {
   verifyManifestSignature,
 } from '../lib/release-digest.mjs';
 import { RELEASE_SIGNED_FILES, HOOK_SCRIPT_FILES } from '../source-files.mjs';
+import { readFileSync } from 'node:fs';
 
 const dirs = [];
 function makeReleaseTree() {
@@ -133,5 +134,31 @@ describe('release signature covers the executable hook scripts (supply-chain gap
     // The signed set must still be a SUPERSET of the runtime .mjs (no accidental narrowing).
     expect(RELEASE_SIGNED_FILES).toContain('server.mjs');
     expect(RELEASE_SIGNED_FILES).toContain('hook.mjs');
+  });
+
+  // v3.42 audit HIGH-1: the manifest signed the 8 HOOK_SCRIPT_FILES but NOT the MCP
+  // launcher (scripts/launch.mjs — run as the server via .mcp.json) nor setup.sh (run on
+  // plugin SessionStart via hooks.json). install.mjs::dedupePluginCacheAndHooks copies
+  // launch.mjs/launch-preflight.mjs from the tarball into the plugin cache during repair(),
+  // so an attacker who could publish a release without the signing key could swap launch.mjs
+  // while every signed hash still matched → RCE as the MCP server. This generalized invariant
+  // asserts every scripts/* path EXECUTED by .mcp.json or hooks.json is in the signed set.
+  it('signs every scripts/* executed by .mcp.json or hooks.json (launcher RCE gap)', () => {
+    const root = process.cwd();
+    const raw = readFileSync(join(root, '.mcp.json'), 'utf8')
+      + '\n' + readFileSync(join(root, 'hooks', 'hooks.json'), 'utf8');
+    // Extract every scripts/<file>.(mjs|js|sh) token referenced as an executed command.
+    const executed = [...new Set([...raw.matchAll(/scripts\/[\w.-]+\.(?:mjs|js|sh)/g)].map(m => m[0]))];
+    expect(executed.length, 'expected to find executed scripts/* references').toBeGreaterThan(0);
+    const manifest = buildReleaseManifest(root, RELEASE_SIGNED_FILES, 'test');
+    const unsigned = executed.filter(rel => !manifest.files[rel]);
+    expect(unsigned, `\nexecuted but UNSIGNED scripts:\n  ${unsigned.join('\n  ')}\n`).toEqual([]);
+  });
+
+  // launch-preflight.mjs is imported+executed by launch.mjs (the MCP server) but is not
+  // itself referenced in .mcp.json, so the token scan above can't see it. Assert explicitly.
+  it('signs scripts/launch-preflight.mjs (imported+executed by the MCP launcher)', () => {
+    const manifest = buildReleaseManifest(process.cwd(), RELEASE_SIGNED_FILES, 'test');
+    expect(manifest.files['scripts/launch-preflight.mjs'], 'launch-preflight.mjs missing from signed manifest').toMatch(/^[a-f0-9]{64}$/);
   });
 });

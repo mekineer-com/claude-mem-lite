@@ -2,6 +2,49 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.43.0 — Full audit 2026-07-13: launcher signing (RCE), MCP export fidelity (data loss), + 6
+
+A full read-only audit over v3.42.0 (5 discovery agents plus signing/schema sub-audits) produced a defect
+list; this release fixes the two release-blocking HIGH findings plus six medium/low. Each fix is TDD'd
+(RED→GREEN); full suite green (211 files / 3702 tests), lint clean, and denoise-A/B is Δ=0 — the default
+lexical retrieval path is unchanged, so behavioral probes (not the ASCII A/B fixtures) are the evidence per
+the NEUTRAL≠safe rule. Both HIGH findings are the same "fix landed on one surface, its twin didn't migrate"
+class this audit series keeps surfacing; each fix here extracts a single shared source of truth to kill the
+drift at the root.
+
+### Fixed
+- **HIGH — launcher scripts now covered by release signing (integrity gap / RCE)** (`source-files.mjs`) —
+  `scripts/launch.mjs` and `launch-preflight.mjs` run as the MCP server entry (`.mcp.json`) and are
+  propagated into the plugin cache by `repair()`, yet were absent from `RELEASE_SIGNED_FILES`, so a party
+  with publish rights but no signing key could swap them and still pass verification (the same class as the
+  v3.36 hook-script RCE, reopened for the launcher). Added the launcher scripts and `setup.sh` to the signed
+  set, with a generalized invariant test asserting every executable referenced by `.mcp.json` / `hooks.json`
+  is in the manifest.
+- **HIGH — MCP `mem_export` no longer drops observation bodies (backup data loss)** (`server.mjs`,
+  `lib/export-columns.mjs`) — the MCP export SELECT listed 16 columns against the CLI's 24; the 8 missing
+  columns (`text`, `files_read`, `search_aliases`, `cited_count`, `uncited_streak`, `injection_count`,
+  `decay_seen_count`, `last_accessed_at`) are exactly the ones `restore` reads back, so an MCP
+  backup→restore of any import-jsonl / cold-start row (body in `text`, narrative empty) collapsed to a bare
+  title — unrecoverable and unsearchable. Extracted a single `EXPORT_COLUMNS` source of truth shared by the
+  MCP and CLI export paths.
+- **project resolution no longer fuzzy-leaks across sibling projects** (`project-utils.mjs`) — the step-3
+  substring fallback matched `%name%`, so a short `--project test` resolved to `projects--loop-testing`;
+  tightened to a whole-hyphen-token match (`graph`→`code-graph-mcp` preserved, `test`↛`loop-testing`). Also
+  fixes three test-isolation failures where the seam resolved project names against the real production DB.
+- **`optimize` re-enrich default scope now backfills manual-save aliases** (`hook-optimize.mjs`) — the
+  default `narrow` scope never ran the `aliases` pass, so manually-saved rows never gained search aliases
+  (the dominant vocab-mismatch recall gap); the default now splits its budget across the narrow and aliases
+  passes.
+- **`recommend-stats` lift suppressed below a small-sample floor** (`registry-recommend.mjs`) — per-skill
+  lift computed from `passSessions < 3` (e.g. an n=1 lift of 7.0) is now hidden from the funnel display with
+  a disclosed hidden-count, so small-sample noise no longer reads as signal.
+- **noise-gauge denominator now matches its numerator** (`lib/stats-quality.mjs`) — the ratio divided
+  low-value counts by a total that included compressed rows, diluting the gauge; the denominator is now the
+  live (non-compressed) count, shared via a `computeNoiseGauge` helper across the server and CLI stats paths.
+- **vector-arm fallback no longer drops `lesson_learned`** (`search-engine.mjs`) — under
+  `CLAUDE_MEM_VECTORS=1` the hit-fetch SELECT omitted `lesson_learned` though the renderer reads it; both
+  vector-hit branches now share a `VEC_HIT_OBS_COLS` constant.
+
 ## v3.42.0 — E2E audit round 4: scrub hardening, backup fidelity, update/registry preserve-on-empty, retrieval polish
 
 A fourth end-to-end audit round — 5 parallel discovery agents over the subsystems rounds 1–3 hadn't deeply

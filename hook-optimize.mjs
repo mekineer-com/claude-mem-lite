@@ -929,7 +929,23 @@ export async function optimizeRun(db, { tasks, maxItems = 15, force = false, ree
     try {
       switch (task) {
         case 're-enrich':
-          results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope, project });
+          if (reenrichScope === 'narrow') {
+            // P1-2: the default maintenance pass covers BOTH narrow (fill lesson/concepts on
+            // fully-degraded rows) AND aliases (backfill search_aliases on lesson-bearing
+            // manual saves that narrow+wide both skip — mem_save writes no aliases, so without
+            // this they stay paraphrase-unfindable). Split the budget so neither starves.
+            // An explicit --scope wide|aliases still runs exactly that one scope (below).
+            const aliasBudget = Math.max(1, Math.floor(budget.reenrich / 2));
+            const narrowRes = await executeReenrich(db, budget.reenrich - aliasBudget, { scope: 'narrow', project });
+            const aliasRes = await executeReenrich(db, aliasBudget, { scope: 'aliases', project });
+            results.reenrich = {
+              processed: (narrowRes.processed || 0) + (aliasRes.processed || 0),
+              skipped: (narrowRes.skipped || 0) + (aliasRes.skipped || 0),
+              byScope: { narrow: narrowRes, aliases: aliasRes },
+            };
+          } else {
+            results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope, project });
+          }
           break;
         case 'normalize':
           results.normalize = await executeNormalize(db, force, { project });

@@ -349,15 +349,28 @@ export function formatFunnel(s) {
   if (typeof s.sessions === 'number') {
     const mp = s.matched && s.matched.pass
       ? `${s.matched.adopt}/${s.matched.pass} (${(100 * s.matched.precision).toFixed(0)}%)` : 'n/a';
-    const liftRows = Object.entries(s.lift || {}).filter(([, v]) => Number.isFinite(v.lift))
+    // v3.42 F5: lift = adoptGivenPass / baseRate is a ratio over `passSessions` observations.
+    // Below LIFT_MIN_PASS_SESSIONS the numerator is 1-2 sessions of noise (a single
+    // pass→adopt yields lift 7.0 at passSessions=1) — displaying it top-ranked next to a
+    // 30-session skill misleads the shadow→live flip decision. Gate the DISPLAY on a minimum
+    // observation count and report how many were suppressed (never a silent cap).
+    const finite = Object.entries(s.lift || {}).filter(([, v]) => Number.isFinite(v.lift));
+    const shown = finite.filter(([, v]) => (v.passSessions || 0) >= LIFT_MIN_PASS_SESSIONS);
+    const suppressed = finite.length - shown.length;
+    const liftRows = shown
       .sort((a, b) => b[1].lift - a[1].lift).slice(0, 5)
       .map(([k, v]) => `${k}(lift ${v.lift.toFixed(2)}; ${v.hitSessions}/${v.passSessions} pass→adopt vs base ${(100 * v.baseRate).toFixed(0)}%)`)
       .join(', ') || '(none)';
+    const suppressNote = suppressed > 0 ? ` [${suppressed} hidden: passSessions<${LIFT_MIN_PASS_SESSIONS}]` : '';
     lines.push(`  sessions=${s.sessions}  matched precision (in-session PASS→adopt): ${mp}`);
-    lines.push(`  targeting lift (>1 = gate beats organic base rate): ${liftRows}`);
+    lines.push(`  targeting lift (>1 = gate beats organic base rate, min n=${LIFT_MIN_PASS_SESSIONS}): ${liftRows}${suppressNote}`);
   }
   return lines.join('\n');
 }
+
+// Minimum passSessions before a per-skill lift is trustworthy enough to display. Below this,
+// adoptGivenPass is computed over 1-2 sessions and the lift is noise (F5).
+export const LIFT_MIN_PASS_SESSIONS = 3;
 
 /** Human-readable threshold sweep for `registry recommend-stats --sweep`. */
 export function formatSweep(grid) {

@@ -4,7 +4,36 @@
 // and was silently dropped — and (V-F1) six REBUILD paths still used [title,narrative,concepts],
 // so the documented `maintain rebuild_vectors` step re-encoded every vector WITHOUT the lesson.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { VEC_HIT_OBS_COLS } from '../search-engine.mjs';
+
+// v3.42 F4 (MED, off-default vector arm): the FTS-empty/vector-hit fallback branch's SELECT
+// had dropped lesson_learned while its RRF-merge twin kept it, so a vector-only hit returned
+// lesson_learned: undefined (lost content + the 1.5× lesson scoring boost). The two branches
+// now share ONE column constant so they cannot drift. This path is off-default
+// (CLAUDE_MEM_VECTORS=1) AND near-unreachable at runtime (FTS-empty requires the query vector
+// to be zero too, except under FTS/vector tokenization divergence), so the guard is
+// structural: assert the shared constant carries the fields both branches read, and that no
+// vector-hit fetch keeps its own hardcoded column list.
+describe('vector-hit fetch column parity (F4)', () => {
+  it('VEC_HIT_OBS_COLS carries every field both branches build (lesson_learned + created_at)', () => {
+    for (const col of ['lesson_learned', 'created_at', 'created_at_epoch', 'title', 'importance', 'branch']) {
+      expect(VEC_HIT_OBS_COLS.split(/\s*,\s*/), `VEC_HIT_OBS_COLS must include ${col}`).toContain(col);
+    }
+  });
+
+  it('both vector-hit SELECTs use the shared constant — no hardcoded observation column list', () => {
+    const src = readFileSync(fileURLToPath(new URL('../search-engine.mjs', import.meta.url)), 'utf8');
+    // Both vector-hit fetches must read `SELECT ${VEC_HIT_OBS_COLS} FROM observations WHERE id = ?`.
+    const shared = (src.match(/SELECT \$\{VEC_HIT_OBS_COLS\} FROM observations WHERE id = \?/g) || []).length;
+    expect(shared, 'both vector-hit branches must fetch via VEC_HIT_OBS_COLS').toBe(2);
+    // And no vector-hit fetch may keep a literal `SELECT id, type, title … FROM observations WHERE id = ?`.
+    const literal = (src.match(/SELECT id, type, title[^`']*FROM observations WHERE id = \?/g) || []).length;
+    expect(literal, 'no hardcoded per-branch column list may remain').toBe(0);
+  });
+});
 
 describe('vector field-set: lesson/aliases reach vocab + rebuild paths (R3 V-F1/V-F2)', () => {
   let db, prevVec;

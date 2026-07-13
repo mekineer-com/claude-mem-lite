@@ -40,6 +40,8 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
+import { computeNoiseGauge } from './lib/stats-quality.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
@@ -1133,7 +1135,6 @@ async function cmdStats(db, args) {
       AND COALESCE(compressed_into, 0) = 0
       AND created_at_epoch < ? ${projectFilter}
   `).get(thirtyDaysAgo, ...baseParams);
-  const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
   // Low-signal-title population: template / tool-log titles (Modified, Worked on,
   // Error while working, Error:, node/npm/npx …) that the retrieval layer already
   // filters out by default. The imp=1 "Low-value" metric above structurally can't
@@ -1145,7 +1146,13 @@ async function cmdStats(db, args) {
     WHERE NOT ${buildNotLowSignalSql()}
       AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
   `).get(...baseParams);
-  const lowSignalRatio = obsTotal.c > 0 ? lowSignalTitle.c / obsTotal.c : 0;
+  // F7: both noise numerators exclude compressed rows → divide by the LIVE count, not
+  // obsTotal (all rows), so a compress-heavy store isn't reported cleaner than it is.
+  // Shared with the MCP mem_stats gauge via computeNoiseGauge (lib/stats-quality.mjs).
+  const liveTotal = db.prepare(
+    `SELECT COUNT(*) as c FROM observations WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}`
+  ).get(...baseParams);
+  const { noiseRatio, lowSignalRatio } = computeNoiseGauge({ liveTotal: liveTotal.c, lowValCount: lowVal.c, lowSignalCount: lowSignalTitle.c });
   const compressedCount = db.prepare(
     `SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}`
   ).get(...baseParams);
@@ -1677,15 +1684,12 @@ function cmdExport(db, args) {
   // content + value-signals (access/cited/uncited/injection/decay) + branch + timing.
   // `search_aliases` is an FTS5-indexed column (BM25 weight 5) — dropping it on
   // export silently lost the LLM-generated alternate query terms on restore, so a
-  // restored memory became unfindable by its aliases. Additive vs the pre-v2.90
-  // 13-col shape; existing `export | jq '.[].title'` consumers are unaffected.
-  // id + memory_session_id are informational (restore remaps id and buckets under
-  // a restore session).
+  // restored memory became unfindable by its aliases. id + memory_session_id are
+  // informational (restore remaps id and buckets under a restore session).
+  // EXPORT_COLUMNS_SQL is the single source of truth shared with the MCP mem_export
+  // tool (server.mjs) so the two export surfaces can never drift (v3.42 HIGH-2).
   const rows = db.prepare(`
-    SELECT id, memory_session_id, project, type, title, subtitle, narrative, text, concepts, facts,
-           files_read, files_modified, lesson_learned, search_aliases, importance, branch,
-           access_count, cited_count, uncited_streak, injection_count, decay_seen_count,
-           last_accessed_at, created_at, created_at_epoch
+    SELECT ${EXPORT_COLUMNS_SQL}
     FROM observations WHERE ${wheres.join(' AND ')}
     ORDER BY created_at_epoch DESC LIMIT ?
   `).all(...params, limit);

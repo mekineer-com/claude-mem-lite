@@ -35,6 +35,15 @@ const SIMPLE_SCORE = `${OBS_BM25}
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))`;
 
+// Shared column set for fetching an observation surfaced by the vector arm — used by BOTH
+// the RRF-merge branch (FTS also had results) and the FTS-empty fallback branch. Single
+// source so the two can't drift. v3.42 F4: the fallback branch's SELECT had dropped
+// lesson_learned while its RRF twin kept it, so a vector-only hit returned
+// lesson_learned: undefined — losing the lesson content AND the 1.5× lesson scoring boost
+// downstream. Both branches build `{ …, date: obs.created_at, lesson_learned: obs.lesson_learned }`
+// so the SELECT must carry created_at + lesson_learned.
+export const VEC_HIT_OBS_COLS = 'id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch, lesson_learned';
+
 export function buildObsFtsQuery(scoring, { multiplier, withSnippet, withOffset, includeNoise } = {}) {
   const scoreExpr = scoring === 'full' ? FULL_SCORE : SIMPLE_SCORE;
   const mult = multiplier ? ` * ${multiplier}` : '';
@@ -432,7 +441,7 @@ export function searchObservationsHybrid(db, ctx) {
       const resultMap = new Map(results.map(r => [r.id, r]));
       for (const vr of vecResults) {
         if (!resultMap.has(vr.id)) {
-          const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch, lesson_learned FROM observations WHERE id = ?').get(vr.id);
+          const obs = db.prepare(`SELECT ${VEC_HIT_OBS_COLS} FROM observations WHERE id = ?`).get(vr.id);
           if (!obs) continue;
           if (epochFrom !== null && obs.created_at_epoch < epochFrom) continue;
           if (epochTo !== null && obs.created_at_epoch > epochTo) continue;
@@ -450,7 +459,7 @@ export function searchObservationsHybrid(db, ctx) {
     } else {
       // FTS5 found nothing but vector found results
       for (const vr of vecResults) {
-        const obs = db.prepare('SELECT id, type, title, subtitle, project, created_at, created_at_epoch, importance, files_modified, branch FROM observations WHERE id = ?').get(vr.id);
+        const obs = db.prepare(`SELECT ${VEC_HIT_OBS_COLS} FROM observations WHERE id = ?`).get(vr.id);
         if (!obs) continue;
         if (epochFrom !== null && obs.created_at_epoch < epochFrom) continue;
         if (epochTo !== null && obs.created_at_epoch > epochTo) continue;

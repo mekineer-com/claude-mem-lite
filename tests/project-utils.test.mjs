@@ -59,6 +59,28 @@ describe('resolveProject', () => {
     expect(resolveProject(db, 'mem')).toBe('projects--mem');
   });
 
+  it('substring fallback matches whole hyphen tokens only, not mid-token (v3.42 F3)', () => {
+    // Regression: `resolveProject('test')` returned 'projects--loop-testing' because the
+    // substring fallback `%test%` matched "loop-testing" mid-token ("test" inside "testing").
+    // A short name that is NOT a whole hyphen-delimited component must NOT auto-resolve to an
+    // unrelated bigger project — that silently returned the wrong project's rows on
+    // `recent/search --project test`.
+    insertSession(db, { id: 's1', project: 'projects--loop-testing' });
+    for (let i = 0; i < 4; i++) {
+      insertObs(db, { sessionId: 's1', project: 'projects--loop-testing', title: `lt ${i}` });
+    }
+    // 'test' is a mid-token fragment of 'testing' → no match → falls through to bare name.
+    expect(resolveProject(db, 'test')).toBe('test');
+  });
+
+  it('substring fallback still resolves a whole interior token (graph → code-graph-mcp)', () => {
+    // The legitimate case the fallback exists for: a whole hyphen-delimited component that is
+    // neither the exact suffix (step 1) nor the base prefix (step 2).
+    insertSession(db, { id: 's1', project: 'projects--code-graph-mcp' });
+    insertObs(db, { sessionId: 's1', project: 'projects--code-graph-mcp', title: 'g' });
+    expect(resolveProject(db, 'graph')).toBe('projects--code-graph-mcp');
+  });
+
   it('caches resolved names across calls', () => {
     insertSession(db, { id: 's1', project: 'projects--cached' });
     insertObs(db, { sessionId: 's1', project: 'projects--cached', title: 'test' });

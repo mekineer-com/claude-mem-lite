@@ -44,6 +44,8 @@ import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
+import { computeNoiseGauge } from './lib/stats-quality.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
@@ -251,15 +253,14 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
 // Exported for tests: runs the full mem_search pipeline against an explicit db
 // with an optional injected llm (deepSearch dependency). The MCP tool handler
 // calls this with the module db and the default llm.
-// NOTE: resolveProject() inside runSearchPipeline closes over the module-level `db`,
-// not the injected one. Tests that pass a project: arg via this seam will trigger
-// resolveProject() against the real (module) DB, not the test DB.
+// v3.42 F3: resolveProject now runs against the injected `db` param (not the module db), so
+// a project: arg through this seam resolves against the TEST db — real test isolation.
 export async function handleSearchForTest(db, args, { llm, rerankLlm } = {}) {
   return runSearchPipeline(db, args, { llm, rerankLlm });
 }
 
 async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
-  if (args.project) args = { ...args, project: resolveProject(args.project) };
+  if (args.project) args = { ...args, project: _resolveProjectShared(db, args.project) };
   const limit = args.limit ?? 20;
   const offset = args.offset ?? 0;
   // args.or: force OR from the start (CLI `search --or` parity). The default path
@@ -352,15 +353,15 @@ server.registerTool(
 
 // ─── Tool: mem_recent ────────────────────────────────────────────────────────
 
-// In-process test seam (mirrors handleSearchForTest, #8743): threads an injected
-// db through the SAME body the registered handler runs. NOTE: a `project` arg is
-// still resolved via resolveProject() against the MODULE db, not the injected one.
+// In-process test seam (mirrors handleSearchForTest, #8743): threads an injected db through
+// the SAME body the registered handler runs. v3.42 F3: a `project` arg now resolves against
+// the injected db (not the module db), so :memory: test isolation is actually achieved.
 export async function handleRecentForTest(db, args) {
   return runRecent(db, args);
 }
 
 async function runRecent(db, args) {
-  if (args.project) args = { ...args, project: resolveProject(args.project) };
+  if (args.project) args = { ...args, project: _resolveProjectShared(db, args.project) };
   const limit = args.limit ?? 10;
   const project = args.project || inferProject();
 
@@ -906,7 +907,6 @@ server.registerTool(
         AND created_at_epoch < ? ${projectFilter}
     `).get(thirtyDaysAgo, ...baseParams);
 
-    const noiseRatio = obsTotal.c > 0 ? lowVal.c / obsTotal.c : 0;
     // Low-signal-title population (template / tool-log titles the read-side filter
     // already excludes). The imp=1 "Low-value" metric can't see these, so the
     // gauge under-reports real noise without it. See lib/low-signal-patterns.mjs.
@@ -915,7 +915,12 @@ server.registerTool(
       WHERE NOT ${buildNotLowSignalSql()}
         AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
     `).get(...baseParams);
-    const lowSignalRatio = obsTotal.c > 0 ? lowSignalTitle.c / obsTotal.c : 0;
+    // F7: both noise numerators exclude compressed rows → divide by the LIVE count, not
+    // obsTotal (all rows), so a compress-heavy store isn't reported cleaner than it is.
+    const liveTotal = db.prepare(
+      `SELECT COUNT(*) as c FROM observations WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}`
+    ).get(...baseParams);
+    const { noiseRatio, lowSignalRatio } = computeNoiseGauge({ liveTotal: liveTotal.c, lowValCount: lowVal.c, lowSignalCount: lowSignalTitle.c });
     const compressedCount = db.prepare(`
       SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}
     `).get(...baseParams);
@@ -1622,52 +1627,64 @@ server.registerTool(
 
 // ─── Tool: mem_export ────────────────────────────────────────────────────────
 
+// In-process test seam (mirrors handleRecentForTest, #8743): threads an injected db
+// through the SAME body the registered handler runs. NOTE: a `project` arg is still
+// resolved via resolveProject() against the MODULE db, not the injected one.
+export async function handleExportForTest(db, args) {
+  return runExport(db, args);
+}
+
+async function runExport(db, args) {
+  const wheres = [];
+  const params = [];
+  if (!args.include_compressed) wheres.push('COALESCE(compressed_into, 0) = 0');
+  wheres.push('superseded_at IS NULL');
+  if (args.project) { wheres.push('project = ?'); params.push(_resolveProjectShared(db, args.project)); }
+  if (args.type) { wheres.push('type = ?'); params.push(args.type); }
+  // T3-P1-A: surface invalid dates instead of silently dropping the filter — mirrors
+  // mem_search, which threw. A dropped filter can quietly expand the export blast radius.
+  if (args.date_from) {
+    const epoch = new Date(args.date_from).getTime();
+    if (isNaN(epoch)) throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
+    wheres.push('created_at_epoch >= ?');
+    params.push(epoch);
+  }
+  if (args.date_to) {
+    const d = args.date_to.length === 10 ? args.date_to + 'T23:59:59.999Z' : args.date_to;
+    const epoch = new Date(d).getTime();
+    if (isNaN(epoch)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
+    wheres.push('created_at_epoch <= ?');
+    params.push(epoch);
+  }
+
+  const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
+  const exportLimit = Math.min(args.limit ?? 200, 1000);
+  // T3-P2-B: probe limit+1 so we can tell "user hit their own limit with more waiting" from
+  // "user got exactly what existed". Trim to exportLimit before rendering.
+  // EXPORT_COLUMNS_SQL: shared with CLI cmdExport — the full round-trippable set restore
+  // reads back (v3.42 HIGH-2: this handler used to carry a narrower 16-col SELECT, silently
+  // dropping text/aliases/citation-signals on the advertised MCP backup→restore flow).
+  const probed = db.prepare(`SELECT ${EXPORT_COLUMNS_SQL} FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`).all(...params, exportLimit + 1);
+  const rows = probed.slice(0, exportLimit);
+  const moreAvailable = probed.length > exportLimit;
+
+  if (rows.length === 0) return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
+
+  const output = args.format === 'jsonl'
+    ? rows.map(r => JSON.stringify(r)).join('\n')
+    : JSON.stringify(rows, null, 2);
+
+  const cap = moreAvailable ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
+  return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
+}
+
 server.registerTool(
   'mem_export',
   {
     description: descriptionOf('mem_export'),
     inputSchema: memExportSchema,
   },
-  safeHandler(async (args) => {
-    const wheres = [];
-    const params = [];
-    if (!args.include_compressed) wheres.push('COALESCE(compressed_into, 0) = 0');
-    wheres.push('superseded_at IS NULL');
-    if (args.project) { wheres.push('project = ?'); params.push(resolveProject(args.project)); }
-    if (args.type) { wheres.push('type = ?'); params.push(args.type); }
-    // T3-P1-A: surface invalid dates instead of silently dropping the filter — mirrors
-    // mem_search, which threw. A dropped filter can quietly expand the export blast radius.
-    if (args.date_from) {
-      const epoch = new Date(args.date_from).getTime();
-      if (isNaN(epoch)) throw new Error(`Invalid date_from: "${args.date_from}" (use ISO 8601 or YYYY-MM-DD)`);
-      wheres.push('created_at_epoch >= ?');
-      params.push(epoch);
-    }
-    if (args.date_to) {
-      const d = args.date_to.length === 10 ? args.date_to + 'T23:59:59.999Z' : args.date_to;
-      const epoch = new Date(d).getTime();
-      if (isNaN(epoch)) throw new Error(`Invalid date_to: "${args.date_to}" (use ISO 8601 or YYYY-MM-DD)`);
-      wheres.push('created_at_epoch <= ?');
-      params.push(epoch);
-    }
-
-    const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
-    const exportLimit = Math.min(args.limit ?? 200, 1000);
-    // T3-P2-B: probe limit+1 so we can tell "user hit their own limit with more waiting" from
-    // "user got exactly what existed". Trim to exportLimit before rendering.
-    const probed = db.prepare(`SELECT id, project, type, title, subtitle, narrative, concepts, facts, lesson_learned, importance, files_modified, branch, access_count, memory_session_id, created_at, created_at_epoch FROM observations ${where} ORDER BY created_at_epoch DESC LIMIT ?`).all(...params, exportLimit + 1);
-    const rows = probed.slice(0, exportLimit);
-    const moreAvailable = probed.length > exportLimit;
-
-    if (rows.length === 0) return { content: [{ type: 'text', text: 'No observations found matching the criteria.' }] };
-
-    const output = args.format === 'jsonl'
-      ? rows.map(r => JSON.stringify(r)).join('\n')
-      : JSON.stringify(rows, null, 2);
-
-    const cap = moreAvailable ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
-    return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
-  })
+  safeHandler(async (args) => runExport(db, args))
 );
 
 // ─── Tool: mem_recall ────────────────────────────────────────────────────────

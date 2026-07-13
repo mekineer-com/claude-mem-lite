@@ -170,6 +170,10 @@ export const SOURCE_FILES = [
   // mem-cli.mjs::cmdImportJsonl; listed here so source-files-sync.test.mjs
   // and the npm tarball ship it on every release.
   'lib/import-jsonl.mjs',
+  // v3.42 HIGH-2: single source of truth for the export/restore round-trippable column
+  // set. Statically imported by server.mjs (mem_export) and mem-cli.mjs (cmdExport) so the
+  // two export surfaces can't drift. Must ship or auto-update breaks export on either.
+  'lib/export-columns.mjs',
 ];
 
 /**
@@ -199,15 +203,39 @@ export const HOOK_SCRIPT_FILES = [
   'hook-launcher.mjs',
 ];
 
+// Executable scripts that are NOT direct-install hook scripts (so they don't belong in
+// HOOK_SCRIPT_FILES, which install.mjs materializes into ~/.claude-mem-lite/scripts/) but
+// ARE run at runtime and MUST be signed:
+//   - launch.mjs / launch-preflight.mjs: the plugin MCP server (.mcp.json runs
+//     ${CLAUDE_PLUGIN_ROOT}/scripts/launch.mjs; launch.mjs imports launch-preflight.mjs).
+//     install.mjs::dedupePluginCacheAndHooks copies BOTH from the tarball into every plugin
+//     cache version dir during repair() — an unsigned launcher let a release published
+//     without the signing key (reusing the real manifest+sig) swap launch.mjs and gain RCE
+//     as the MCP server. v3.42 audit HIGH-1.
+//   - setup.sh: run on plugin SessionStart via hooks.json. Signed for defense-in-depth
+//     (no tarball→executed-path propagation today, but it ships in files[] and is executed).
+// These ship via package.json files[] directly, not via HOOK_SCRIPT_FILES' copy path, so
+// listing them here changes ONLY what is signed/verified, not what install materializes.
+// Module-internal (spread into RELEASE_SIGNED_FILES below); not exported — no external
+// consumer, and the signing test asserts coverage via the built manifest, not this list.
+const LAUNCHER_SCRIPT_FILES = [
+  'launch.mjs',
+  'launch-preflight.mjs',
+  'setup.sh',
+];
+
 // The complete set of files the release signature MUST cover: every runtime .mjs
 // (SOURCE_FILES) PLUS the executable hook scripts (copyReleaseIntoStaging installs these
-// into the live dir and they run on every hook fire). HOOK_SCRIPT_FILES were historically
-// NOT in the signed manifest, so an attacker able to PUBLISH a release — but without the
-// signing key — could swap a hook script (e.g. post-tool-use.sh / hook-launcher.mjs) while
-// every SOURCE_FILES hash still matched, and fail-closed verification would still pass →
-// RCE on the next hook fire. Keys are ROOT-relative, matching the extracted-tarball layout
-// that verifyReleaseFiles hashes against.
+// into the live dir and they run on every hook fire) PLUS the launcher/setup scripts.
+// HOOK_SCRIPT_FILES were historically NOT in the signed manifest, so an attacker able to
+// PUBLISH a release — but without the signing key — could swap a hook script (e.g.
+// post-tool-use.sh / hook-launcher.mjs) while every SOURCE_FILES hash still matched, and
+// fail-closed verification would still pass → RCE on the next hook fire. The MCP launcher
+// (LAUNCHER_SCRIPT_FILES) was the same gap reopened for the plugin+repair path (v3.42
+// HIGH-1). Keys are ROOT-relative, matching the extracted-tarball layout that
+// verifyReleaseFiles hashes against.
 export const RELEASE_SIGNED_FILES = [
   ...SOURCE_FILES,
   ...HOOK_SCRIPT_FILES.map(name => `scripts/${name}`),
+  ...LAUNCHER_SCRIPT_FILES.map(name => `scripts/${name}`),
 ];

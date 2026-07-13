@@ -187,6 +187,28 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
     expect(obs.text).toContain('deadlock');
     expect(obs.text).toContain('pool hang');
   });
+
+  // P1-2: the DEFAULT optimize run (no explicit scope) must ALSO backfill aliases on
+  // lesson-bearing manual saves. Before the fix, optimizeRun's default reenrichScope='narrow'
+  // ran narrow ONLY — which requires lesson_learned IS NULL — so a manual mem_save (narrative
+  // = body, lesson present, no aliases) was NEVER reached by any automatic path, leaving it
+  // paraphrase-unfindable (07-06-after new rows: only 11% had aliases). optimize is the async
+  // re-enrich channel; the default pass now covers narrow + aliases.
+  it('default-scope optimizeRun backfills aliases on a lesson-bearing manual save (P1-2)', async () => {
+    const { optimizeRun } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed deadlock in the connection pool', narrative: substantive,
+      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
+      searchAliases: null,
+    });
+    // narrow (the pre-fix default) has 0 candidates here → it never calls the model; only the
+    // aliases sub-pass does, so a single alias-shaped mock is unambiguous.
+    callModelJSON.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
+    await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10 }); // no reenrichScope → default
+    const obs = db.prepare('SELECT search_aliases FROM observations LIMIT 1').get();
+    expect(obs.search_aliases).toContain('connection deadlock');
+  });
 });
 
 // Bug #1: rebuildVector was writing to a non-existent column `computed_at`.
