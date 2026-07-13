@@ -2,6 +2,32 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.46.0 — Surface the hidden CLI write-command constraints so the model stops probing the save format
+
+Saving a memory is a high-frequency operation, but the model kept discovering the `save` CLI format by
+trial-and-error: its hard constraints (`--lesson` ≤500 chars, the required positional `<text>`) lived only
+in the Zod schema and `help` output — invisible before the call, so the first attempt errored. An audit
+found the same pattern across every write command (`defer add` title ≤200, `update --lesson` ≤500,
+`maintain --ops` / `activity save --type` enums): the steering detail doc actively recommends the CLI but
+documented only the five *read* commands, leaving the model no in-context reference for any mutating command.
+Docs / LLM-visible metadata only — no runtime behavior change; a steering-surface change, so a minor bump.
+
+### Changed
+- **New "CLI 速查（写入 / 记录）" table in the steering detail doc** (`adopt-content.mjs` `getDetailDoc()`) —
+  carries the write / maintain command signatures with their hard caps (`save` / `update` `--lesson` ≤500,
+  `defer add` title ≤200) and enums (`activity save --type`, `maintain --ops`, `--retain-days` ∈ [7,365]),
+  plus a pointer to `help` for the rest. Propagates to every adopted project on next SessionStart via the
+  content-based `needsRefresh` (`claudemd.mjs`) — no version-tag gate needed. The rendered
+  `.claude/plugin_claude_mem_lite.md` is git-ignored and regenerated per project, so only the template ships.
+- **`mem_save` `lesson_learned` description now states the ≤500-char cap** (`tool-schemas.mjs`) — the MCP-path
+  twin of the same constraint, so a direct tool call no longer trips the limit blind.
+
+### Fixed
+- **`adopt` CLI help no longer describes the removed MEMORY.md-sentinel scheme** (`mem-cli.mjs`) — it now
+  states that `adopt` writes the managed block into the project `CLAUDE.md` plus a `.claude/` detail doc and
+  runs automatically on every SessionStart, and that `--all` is a legacy MEMORY.md-sentinel cleanup sweep
+  that does *not* adopt (CLAUDE.md adoption is per-project, on each project's next SessionStart).
+
 ## v3.45.0 — Events are *consumable*: close the three review gaps on the v3.44.0 feature
 
 v3.44.0 made `events` a fourth `mem_search` source, but a code review found the feature silently failed at

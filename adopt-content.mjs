@@ -148,6 +148,19 @@ PreToolUse hook 在你 Read / Edit / Write 文件前已自动 \`mem_recall\` 该
 | \`${CLI_INVOKE} get 42,43\` | 按 ID 展开 |
 | \`${CLI_INVOKE} timeline --anchor 42\` | 时间线上下文 |
 
+## CLI 速查（写入 / 记录）
+
+写入类工具多从 \`tools/list\` 隐藏 → 只能走 CLI。下表带**硬上限**（超限直接报错，别撞了才知道）；完整 flag 见 \`${CLI_INVOKE} help\`。
+
+| 命令 | 签名（含硬约束） |
+|------|------------------|
+| 存观测 | \`${CLI_INVOKE} save "<text>" --type bugfix\\|decision --lesson "<≤500 字符>" [--importance 1-3] [--closes-deferred N]\` — \`<text>\` **必填定位参数**；\`--lesson\` 超 500 直接 fail |
+| 推迟工作 | \`${CLI_INVOKE} defer add "<title ≤200>" [--priority 1\\|2\\|3] [--detail "<约束+为何推迟>"]\` — 标题 >200 挪到 \`--detail\` |
+| 改某条 | \`${CLI_INVOKE} update <id> [--lesson "<≤500>"] [--title T] [--type T] [--importance 1-3] [--narrative T] [--concepts "a b c"]\` |
+| 事件日志 | \`${CLI_INVOKE} activity save --type <bugfix\\|lesson\\|bug\\|discovery\\|refactor\\|feature\\|observation\\|decision> "<title>" [--body T] [--files f1,f2]\` |
+
+\`maintain\` / \`optimize\` / \`compress\` 见上方「维护 / 管理类工具」；\`maintain --ops\` 取值 \`cleanup,decay,boost,demote_pinned,dedup,purge_stale,rebuild_vectors,vacuum\`，\`--retain-days\` ∈ [7,365]。
+
 ## 卸载 / 关闭
 
 - \`${CLI_INVOKE} unadopt\`：移除 CLAUDE.md 托管块 + \`.claude/plugin_claude_mem_lite.md\`；

@@ -2820,11 +2820,14 @@ Commands:
     --files (plural, comma-split) preferred; --file (singular) kept for back-compat.
     Use /lesson or /bug slash commands for faster capture (T8).
 
-  adopt                 Inject claude-mem-lite sentinel line into this project's
-                        ~/.claude/projects/<encoded>/memory/MEMORY.md so Claude Code
-                        auto-loads it as user-memory (higher instruction authority).
-    --all               Adopt every project under ~/.claude/projects/*/memory/
-    --force             Overwrite a sentinel block that was manually edited
+  adopt                 Write the claude-mem-lite managed block into this project's
+                        CLAUDE.md + a plugin_claude_mem_lite.md detail doc under
+                        .claude/ (loaded as project instructions). Runs automatically
+                        on each SessionStart; use this to force it now.
+    --all               Legacy sweep: strip old memory-dir (MEMORY.md) sentinels from
+                        known projects. Does NOT adopt — CLAUDE.md adoption is
+                        per-project, on each project's next SessionStart.
+    --force             Overwrite a manually-edited managed block
     --dry-run           Print intended writes without touching disk
     --status            List adopted projects + version
 
