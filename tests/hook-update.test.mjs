@@ -85,6 +85,25 @@ afterEach(() => {
   trackedDirs.clear();
 });
 
+describe('createUpdateTmpDir (P3-4: predictable-/tmp TOCTOU)', () => {
+  it('creates an owner-only (0700), unpredictably-named staging dir', async () => {
+    const { createUpdateTmpDir } = await loadModule();
+    const a = createUpdateTmpDir();
+    const b = createUpdateTmpDir();
+    try {
+      // Old code: join(tmpdir(), `claude-mem-lite-update-${Date.now()}`) — guessable, and two
+      // same-ms calls collide. mkdtempSync gives a random suffix, so a !== b always.
+      expect(a).not.toBe(b);
+      expect(a).toContain('claude-mem-lite-update-');
+      // 0700: no group/other permission bits (old mkdirSync(recursive) inherited ~0755).
+      expect(statSync(a).mode & 0o077).toBe(0);
+    } finally {
+      rmSync(a, { recursive: true, force: true });
+      rmSync(b, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('hook update lifecycle', () => {
   it('plugin mode only reports available updates and never installs them', async () => {
     const { home } = makeCodeHome('1.0.0');
@@ -521,6 +540,28 @@ describe('validateExtractedTarball', () => {
     const { validateExtractedTarball } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
     const dir = makeTarballDir({ name: 'forked-mem-lite', version: '1.0.0' });
     expect(validateExtractedTarball(dir, '1.0.0', 'forked-mem-lite')).toEqual({ ok: true });
+  });
+});
+
+describe('isRepairDowngrade (P3-3: signed-release rollback guard)', () => {
+  it('flags a strictly-older resolved release as a downgrade', async () => {
+    const { isRepairDowngrade } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    // Attacker replays v3.20.0 (validly signed, since-patched) as "latest" over installed v3.43.0.
+    expect(isRepairDowngrade('3.20.0', '3.43.0')).toBe(true);
+    expect(isRepairDowngrade('3.42.9', '3.43.0')).toBe(true);
+  });
+
+  it('allows same-or-newer releases (legitimate repair / self-heal)', async () => {
+    const { isRepairDowngrade } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    expect(isRepairDowngrade('3.43.0', '3.43.0')).toBe(false);   // re-sync same version
+    expect(isRepairDowngrade('3.44.0', '3.43.0')).toBe(false);   // forward
+  });
+
+  it('allows through when the local version is unknown (broken install still needs repair)', async () => {
+    const { isRepairDowngrade } = await loadModule({ CLAUDE_MEM_DIR: makeDataDir() });
+    expect(isRepairDowngrade('3.20.0', null)).toBe(false);
+    expect(isRepairDowngrade('3.20.0', undefined)).toBe(false);
+    expect(isRepairDowngrade(null, '3.43.0')).toBe(false);
   });
 });
 

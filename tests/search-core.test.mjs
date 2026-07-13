@@ -3,7 +3,7 @@ import { createTestDb, insertSession, insertPrompt } from './test-helpers.mjs';
 import { computeTier } from '../tier.mjs';
 import {
   buildSearchFtsQuery, parseDateBounds, parseDuration, computePerSourceWindow,
-  effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts,
+  effectiveObsFtsQuery, searchSessionsFts, searchPromptsFts, searchEventsFts,
   normalizeCrossSourceScores, applyUserSort, applyTierFilter,
 } from '../lib/search-core.mjs';
 
@@ -199,6 +199,35 @@ describe('search-core', () => {
       const again = searchPromptsFts(db, { query: '修复缓存', ftsQuery: '"zzznomatch"', perSourceLimit: 10 });
       expect(again).toHaveLength(1);
     });
+
+    // P1-3: events are the canonical event-typed store, previously unreachable by mem_search.
+    const addEvent = ({ title, body = '', project = 'test', event_type = 'bugfix', epochOffset = 0, superseded = false }) => db.prepare(`
+      INSERT INTO events (project, event_type, title, body, importance, created_at_epoch, superseded_at_epoch)
+      VALUES (?, ?, ?, ?, 2, ?, ?)
+    `).run(project, event_type, title, body, Date.now() + epochOffset, superseded ? Date.now() : null);
+
+    it('searchEventsFts matches FTS, respects project filter, excludes superseded', () => {
+      addEvent({ title: 'fix the zanzibar cache bug' });
+      addEvent({ title: 'zanzibar elsewhere', project: 'other' });
+      addEvent({ title: 'zanzibar retired', superseded: true });
+      const all = searchEventsFts(db, { ftsQuery: 'zanzibar', perSourceLimit: 10 });
+      expect(all).toHaveLength(2);                        // superseded row excluded
+      const scoped = searchEventsFts(db, { ftsQuery: 'zanzibar', project: 'test', perSourceLimit: 10 });
+      expect(scoped).toHaveLength(1);
+      expect(scoped[0].project).toBe('test');
+      expect(scoped[0].event_type).toBe('bugfix');
+      expect(scoped[0].score).toBeLessThan(0);           // BM25 negative scale
+    });
+
+    it('searchEventsFts matches body text (the distilled lesson) + boosts current project 2x', () => {
+      addEvent({ title: 'unrelated title', body: 'the zanzibar protocol was fixed here' });
+      addEvent({ title: 'zanzibar there', project: 'other' });
+      const rows = searchEventsFts(db, { ftsQuery: 'zanzibar', projectBoost: 'test', perSourceLimit: 10 });
+      const testRow = rows.find((r) => r.project === 'test');
+      const otherRow = rows.find((r) => r.project === 'other');
+      expect(testRow).toBeTruthy();                                          // body-only match surfaced
+      expect(Math.abs(testRow.score)).toBeGreaterThan(Math.abs(otherRow.score)); // 2x current-project boost
+    });
   });
 
   describe('normalizeCrossSourceScores', () => {
@@ -209,6 +238,12 @@ describe('search-core', () => {
       ];
       normalizeCrossSourceScores(results, '_source');
       expect(results.map((r) => r.score)).toEqual([-1, -0.5, -1, -0.5]);
+    });
+
+    it('normalizes the events source too (event in the loop)', () => {
+      const results = [{ source: 'event', score: -30 }, { source: 'event', score: -15 }];
+      normalizeCrossSourceScores(results, 'source');
+      expect(results.map((r) => r.score)).toEqual([-1, -0.5]);
     });
 
     it('skips single-row sources (no inflating a weak match to -1)', () => {

@@ -936,6 +936,25 @@ describe('parseJsonFromLLM', () => {
     expect(parseJsonFromLLM(text)).toEqual({ type: 'refactor', title: 'Clean up' });
   });
 
+  it('resolves the greedy last-resort span in O(n), not O(n²), on many unclosed braces (P3-2)', () => {
+    // firstBalancedJsonObject returns null (depth never returns to 0); the OLD last-resort
+    // /\{[\s\S]*\}/ then backtracked O(n²) across every `{` (each start re-scans to EOF looking
+    // for a `}` that never comes). The index-scan replacement is a single O(n) pass. On the old
+    // regex this input takes seconds→timeout; the fix returns instantly.
+    const pathological = '{'.repeat(200000);   // no closing brace anywhere
+    const t0 = Date.now();
+    expect(parseJsonFromLLM(pathological)).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(1000);   // O(n): milliseconds, not seconds
+  });
+
+  it('last-resort span stays behavior-identical to the old greedy /\\{[\\s\\S]*\\}/ (P3-2)', () => {
+    // first `{` .. last `}`, exactly what the greedy match returned.
+    expect(parseJsonFromLLM('note {"k":1}')).toEqual({ k: 1 });                 // trailing object
+    expect(parseJsonFromLLM('{"a":1} tail')).toEqual({ a: 1 });                 // leading object
+    expect(parseJsonFromLLM('} only a close {')).toBeNull();                    // close before open → no span
+    expect(parseJsonFromLLM('x {oops {"w":true} y}')).toBeNull();               // widest span unparseable → null
+  });
+
   it('extracts JSON object from mixed text', () => {
     const text = 'The observation is: {"type":"discovery","title":"Found pattern"} as shown above.';
     expect(parseJsonFromLLM(text)).toEqual({ type: 'discovery', title: 'Found pattern' });

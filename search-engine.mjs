@@ -167,6 +167,24 @@ export function countPromptFtsMatches(db, { ftsQuery, project = null, epochFrom 
   } catch { return 0; }
 }
 
+export function countEventFtsMatches(db, { ftsQuery, project = null, epochFrom = null, epochTo = null }) {
+  if (!ftsQuery) return 0;
+  try {
+    const wheres = ['events_fts MATCH ?', 'e.superseded_at_epoch IS NULL'];
+    const params = [ftsQuery];
+    if (project) { wheres.push('e.project = ?'); params.push(project); }
+    if (epochFrom) { wheres.push('e.created_at_epoch >= ?'); params.push(epochFrom); }
+    if (epochTo) { wheres.push('e.created_at_epoch <= ?'); params.push(epochTo); }
+    const row = db.prepare(`
+      SELECT COUNT(*) as c
+      FROM events_fts
+      JOIN events e ON events_fts.rowid = e.id
+      WHERE ${wheres.join(' AND ')}
+    `).get(...params);
+    return row?.c ?? 0;
+  } catch { return 0; }
+}
+
 /**
  * Sum true match counts across the sources that contribute to a cross-source (or
  * source-restricted) search. `obsFtsQuery` lets callers pass the OR-relaxed query
@@ -186,6 +204,9 @@ export function countSearchTotal(db, {
   }
   if (!effectiveSource || effectiveSource === 'prompts') {
     total += countPromptFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
+  }
+  if (!effectiveSource || effectiveSource === 'events') {
+    total += countEventFtsMatches(db, { ftsQuery, project, epochFrom, epochTo });
   }
   return total;
 }
@@ -235,6 +256,8 @@ export function attachBodyTokens(db, results) {
       parts = [r.title, r.subtitle, r.lesson_learned, row.narrative, row.facts, row.text];
     } else if (src === 'session') {
       parts = [r.request, r.completed, r.working_on];
+    } else if (src === 'event') {
+      parts = [r.title, r.lesson_learned];   // events carry title + body(=lesson_learned) on the row
     } else {
       parts = [r.text, r.prompt_text];
     }

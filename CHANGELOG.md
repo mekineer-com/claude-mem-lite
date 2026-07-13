@@ -2,6 +2,51 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.44.0 — Events are searchable: the canonical bugfix/decision history joins mem_search
+
+The big one: **event-typed memories (bugfix / feature / decision / discovery / refactor / lesson) are now
+reachable by `mem_search`.** These are the CANONICAL store for event-typed captures — when Haiku classifies a
+summary as an event type, `persistHaikuSummary` upgrade-deletes the pre-saved `observations` row and inserts
+into `events` — yet `events`/`events_fts` was never wired into the search pipeline, so on a mature DB the
+entire bugfix/decision history (thousands of rows) was silently unfindable. This release adds `events` as a
+first-class fourth search source alongside observations, sessions, and prompts, plus the P3 hardening batch
+from the same audit. Full suite green (212 files / 3720 tests), lint clean, denoise-A/B Δ=0 on the
+observation suites (events don't regress obs retrieval; the events-recall gain is covered by behavioral tests
++ a live-DB probe, since the A/B fixtures are observation-only).
+
+### Added
+- **`events` is a fourth `mem_search` source** (`lib/search-core.mjs`, `search-engine.mjs`, `server.mjs`,
+  `mem-cli.mjs`, `tool-schemas.mjs`, `scoring-sql.mjs`) — a new `searchEventsFts` leg (title-weighted BM25 +
+  recency decay + same-project boost, superseded events excluded) is merged into the shared
+  `coreRunSearchPipeline`, so both the MCP tool and the CLI surface events identically. Results render with an
+  `E#` prefix and carry the event's distilled body as `lesson_learned`; the event's `type` (bugfix/feature/…)
+  drives the icon. Restrict with `mem_search(type='events')` / `search --source events`. Total counts,
+  cross-source score normalization, and the `~Nt` token estimate all account for events.
+
+### Fixed
+- **events_fts joins the column-aware FTS self-heal (schema v42)** (`schema.mjs`) — `events_fts` was the one
+  FTS table outside `ensureFTS`'s drift-recreation (its DDL is non-standard: UNINDEXED columns, a custom
+  tokenizer, and `events_fts_*` trigger names, so it can't use the generic path). A dedicated
+  `ensureEventsFTS` now recreates a drifted (older, narrower) index and repopulates it, closing the latent gap
+  where a future events-column addition would leave a stale index whose triggers silently drop writes.
+- **P3 hardening batch (from the 2026-07-13 audit):**
+  - **dead code removed** — the unreferenced `_resetBranchCache` export (`utils.mjs`).
+  - **`parseJsonFromLLM` last-resort span is O(n), not O(n²)** (`utils.mjs`) — the greedy `/\{[\s\S]*\}/`
+    fallback backtracked O(n²) across k unclosed braces (a `{`-heavy synthetic input took ~8.7s); replaced
+    with a first-`{`/last-`}` index scan (behaviorally identical, instant). Not previously exploitable (LLM
+    outputs are bounded) — defense in depth.
+  - **`repair()` supply-chain hardening** (`install.mjs`, `hook-update.mjs`) — now validates the extracted
+    tarball (name/version/entry-points, parity with the auto-update path) and refuses a downgrade
+    (`isRepairDowngrade`): an attacker who can pin the "latest" API response to an older validly-signed
+    release can no longer roll a repaired install backward onto a since-patched version.
+  - **update staging dir is now private + unpredictable** (`hook-update.mjs`) — `downloadAndInstall` used a
+    guessable `/tmp/claude-mem-lite-update-<Date.now()>` created with `mkdirSync`; switched to `mkdtempSync`
+    (atomic, 0700, random suffix), closing a predictable-path TOCTOU in world-writable `/tmp`.
+  - **`deferred_work` FK-orphan self-heal** (`lib/maintain-core.mjs`) — a new idempotent
+    `sweepDeferredWorkOrphans` (wired into the CLI/hook/MCP maintain paths) nulls a `closed_by_obs_id` /
+    `source_prompt_id` whose referent was hard-deleted while `foreign_keys` was OFF, applying the
+    `ON DELETE SET NULL` the FK would have; closure state (status/closed_at) is preserved.
+
 ## v3.43.0 — Full audit 2026-07-13: launcher signing (RCE), MCP export fidelity (data loss), + 6
 
 A full read-only audit over v3.42.0 (5 discovery agents plus signing/schema sub-audits) produced a defect

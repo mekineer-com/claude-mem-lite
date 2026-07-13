@@ -51,6 +51,10 @@ export const OBS_BM25 = 'bm25(observations_fts, 10, 5, 5, 3, 3, 2, 8, 5)';
 /** session_summaries_fts BM25 weights: request=5, investigated=3, learned=3, completed=3, next_steps=2, notes=1, remaining_items=1 */
 export const SESS_BM25 = 'bm25(session_summaries_fts, 5, 3, 3, 3, 2, 1, 1)';
 
+/** events_fts BM25 weights: title=5, body=2 (event_type/project are UNINDEXED — weight irrelevant).
+ *  Title-weighted like OBS/SESS so a title hit outranks a body-only hit. */
+export const EVT_BM25 = 'bm25(events_fts, 5, 2)';
+
 /** FTS5 columns for observations (must match BM25 weight order) */
 export const OBS_FTS_COLUMNS = ['title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases'];
 

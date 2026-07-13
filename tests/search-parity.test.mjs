@@ -57,6 +57,12 @@ beforeAll(() => {
   // Prompts (sess-1 sdk_sessions row seeded above backs the FTS join).
   insertPrompt(db, { contentSessionId: 'sess-1', text: 'how do we keep search parity across surfaces?', promptNumber: 1, epochOffset: -1200 });
   insertPrompt(db, { contentSessionId: 'sess-1', text: '缓存 路径 parity 检查', promptNumber: 2, epochOffset: -2200 });
+
+  // Events — the canonical event-typed store (events_fts populated via the ai trigger). P1-3
+  // wired this as the 4th cross-source leg, so both surfaces must interleave events identically.
+  const insE = db.prepare(`INSERT INTO events (project, event_type, title, body, importance, created_at_epoch) VALUES (?, ?, ?, ?, ?, ?)`);
+  insE.run('test', 'bugfix', 'parity event: fixed cross-source count', 'the parity total now includes events', 2, Date.now() - 1800);
+  insE.run('test', 'decision', 'parity event: interleave events by score', 'parity ranking decision body', 2, Date.now() - 2800);
 });
 
 /** Run the MCP seam → normalized [{source,id,score}] + total + deepRan. */
@@ -143,6 +149,7 @@ describe('CLI ↔ MCP search parity (audit P1-2 — one orchestrator)', () => {
   parity('obs-only by type (bugfix)', { query: 'parity', obs_type: 'bugfix', deep: false }, ['parity', '--type', 'bugfix', '--no-deep']);
   parity('source=sessions', { query: 'parity', type: 'sessions', deep: false }, ['parity', '--source', 'sessions', '--no-deep']);
   parity('source=prompts', { query: 'parity', type: 'prompts', deep: false }, ['parity', '--source', 'prompts', '--no-deep']);
+  parity('source=events', { query: 'parity', type: 'events', deep: false }, ['parity', '--source', 'events', '--no-deep']);
   parity('paging (offset 1, limit 2)', { query: 'parity', offset: 1, limit: 2, deep: false }, ['parity', '--offset', '1', '--limit', '2', '--no-deep']);
   parity('sort=time', { query: 'parity', sort: 'time', deep: false }, ['parity', '--sort', 'time', '--no-deep']);
   parity('CJK query (prompt CJK fallback path)', { query: '缓存', deep: false }, ['缓存', '--no-deep']);
@@ -212,6 +219,36 @@ describe('date_since end-to-end (MCP date_since == CLI --since)', () => {
       // Invalid relative duration is rejected by the MCP handler.
       await expect(handleSearchForTest(fdb, { query: 'sincetoken', date_since: '7days' }, {}))
         .rejects.toThrow(/date_since/);
+    } finally {
+      fdb.close();
+    }
+  });
+});
+
+describe('P1-3: events are reachable by mem_search (canonical event-typed store)', () => {
+  test('cross-source search surfaces event rows that were previously unreachable', async () => {
+    const mcp = await runMcp({ query: 'parity', deep: false });
+    const events = mcp.rows.filter((r) => r.source === 'event');
+    expect(events.length).toBeGreaterThanOrEqual(1);        // seeded "parity event" rows now surface
+  });
+
+  test('source=events returns ONLY events (and the total counts them)', async () => {
+    const mcp = await runMcp({ query: 'parity', type: 'events', deep: false });
+    expect(mcp.rows.length).toBeGreaterThanOrEqual(1);
+    expect(mcp.rows.every((r) => r.source === 'event')).toBe(true);
+    expect(mcp.total).toBeGreaterThanOrEqual(mcp.rows.length);
+  });
+
+  test('superseded events stay out of search', async () => {
+    const fdb = createTestDb();
+    try {
+      insertSession(fdb, { id: 's-sup', project: 'sup' });
+      const insE = fdb.prepare(`INSERT INTO events (project, event_type, title, body, importance, created_at_epoch, superseded_at_epoch) VALUES (?, ?, ?, ?, 2, ?, ?)`);
+      insE.run('sup', 'bugfix', 'zebracrossing live event', 'body', Date.now(), null);
+      insE.run('sup', 'bugfix', 'zebracrossing retired event', 'body', Date.now(), Date.now());
+      const mcp = await handleSearchForTest(fdb, { query: 'zebracrossing', type: 'events', deep: false }, {});
+      expect(mcp.results.length).toBe(1);
+      expect(mcp.results[0].title).toContain('live');
     } finally {
       fdb.close();
     }

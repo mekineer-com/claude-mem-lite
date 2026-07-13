@@ -80,7 +80,7 @@ const coerceMixedIdTokens = z.preprocess(
 
 export const memSearchSchema = {
   query: z.string().optional().describe('Search query (FTS5 syntax supported)'),
-  type: z.enum(['observations', 'sessions', 'prompts']).optional().describe('Limit to one table'),
+  type: z.enum(['observations', 'sessions', 'prompts', 'events']).optional().describe('Limit to one source table (default: all). events = the canonical bugfix/feature/decision/lesson history (auto-captured event-typed memories)'),
   obs_type: OBS_TYPE_ENUM.optional().describe('Filter observation type'),
   project: z.string().optional().describe('Filter by project name'),
   date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),

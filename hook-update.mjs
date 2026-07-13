@@ -3,7 +3,7 @@
 // Skips in dev mode (symlinked installs). Silent on network failure.
 
 import { execSync, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, rmSync, renameSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, cpSync, readdirSync, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, renameSync, chmodSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir, homedir } from 'node:os';
@@ -305,12 +305,22 @@ async function loadReleaseManifest(sourceDir) {
   }
 }
 
+// Create a private (0700), unpredictably-named staging dir under the system tmpdir.
+// mkdtempSync is atomic and owner-only, closing the predictable-name TOCTOU the old
+// `join(tmpdir(), \`...-${Date.now()}\`)` + mkdirSync(recursive) left open: in a
+// world-writable /tmp a local user could pre-create or symlink that guessable path before
+// we downloaded the tarball / ran validate→install into it. mkdirSync(recursive) succeeds
+// on an existing (attacker-owned) dir; mkdtempSync fails closed unless it creates a fresh
+// one. Mirrors the repair() path (install.mjs) which already uses mkdtempSync. (P3-4)
+export function createUpdateTmpDir() {
+  return mkdtempSync(join(tmpdir(), 'claude-mem-lite-update-'));
+}
+
 // ── Download & Install ─────────────────────────────────────
 // Direct file copy instead of running old install.mjs (avoids symlink overwrite in dev)
 async function downloadAndInstall(tarballUrl, expectedVersion, assets = []) {
-  const tmpDir = join(tmpdir(), `claude-mem-lite-update-${Date.now()}`);
+  const tmpDir = createUpdateTmpDir();
   try {
-    mkdirSync(tmpDir, { recursive: true });
 
     // Download tarball via curl (available on all supported platforms)
     // Validate URL to prevent command injection via crafted tarball URLs
@@ -387,6 +397,19 @@ export function validateExtractedTarball(sourceDir, expectedVersion, expectedNam
   }
 
   return { ok: true };
+}
+
+// Pure downgrade-guard predicate (exported for unit testing). True when `relVersion` is
+// strictly OLDER than the installed `localVersion`. Under signing an attacker cannot forge a
+// release, but CAN replay an older validly-signed one (a since-patched version) by pinning the
+// GitHub "latest" API response — so repair(), which installs whatever fetchLatestRelease()
+// resolves, must refuse to move BACKWARD (parity with checkForUpdate, which only installs when
+// compareVersions(latest,current) > 0). A null/unknown local version (a broken install that
+// genuinely needs repair, or an unreadable package.json) is allowed through — fail toward
+// recoverability, since the signature check downstream still gates authenticity. (P3-3)
+export function isRepairDowngrade(relVersion, localVersion) {
+  if (!relVersion || !localVersion) return false;
+  return compareVersions(relVersion, localVersion) < 0;
 }
 
 // ── Release signature verification (P1 supply-chain hardening) ──────────────

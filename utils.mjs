@@ -9,7 +9,7 @@ import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
 // ─── Re-exports from extracted modules ──────────────────────────────────────
 // Backward compatibility: all consumers import from utils.mjs
 
-export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, OBS_FTS_COLUMNS, notLowSignalTitleClause, noisePenaltyClause } from './scoring-sql.mjs';
+export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, EVT_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, OBS_FTS_COLUMNS, notLowSignalTitleClause, noisePenaltyClause } from './scoring-sql.mjs';
 export { cjkBigrams, extractCjkSynonymTokens, extractCjkKeywords, extractCjkLikePatterns, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
 export { resolveProject, _resetProjectCache } from './project-utils.mjs';
 export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
@@ -323,9 +323,17 @@ export function parseJsonFromLLM(text) {
   // First balanced object — survives unfenced output wrapped in brace-containing prose.
   const balanced = firstBalancedJsonObject(text);
   if (balanced) try { return JSON.parse(balanced); } catch {}
-  // Last-resort greedy span (handles a payload that isn't the FIRST balanced object).
-  const obj = text.match(/\{[\s\S]*\}/);
-  if (obj) try { return JSON.parse(obj[0]); } catch {}
+  // Last-resort span from the first `{` to the last `}` — handles a payload that isn't the
+  // FIRST balanced object. Resolved via index scan (O(n)) rather than the greedy
+  // /\{[\s\S]*\}/, which backtracks O(n²) across k unclosed opening braces (a synthetic
+  // "{{{…" with no close made the regex O(n²); LLM outputs are bounded so it wasn't
+  // exploitable — defense in depth). Behaviorally identical: the greedy match anchors on the
+  // first `{` that has any `}` after it and, being greedy, ends at the last `}`.
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try { return JSON.parse(text.slice(firstBrace, lastBrace + 1)); } catch {}
+  }
   return null;
 }
 
@@ -456,6 +464,3 @@ export function getCurrentBranch() {
   _branchCacheTime = now;
   return _cachedBranch;
 }
-
-/** Reset cached branch (for testing or after git checkout) */
-export function _resetBranchCache() { _cachedBranch = undefined; _branchCacheTime = 0; }

@@ -47,7 +47,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
@@ -850,6 +850,11 @@ function runSessionStartAutoMaintain(db) {
       // Non-destructive (0→1 on lesson-bearing rows only); idempotent no-op once none remain.
       const lessonsHealed = recoverBuriedLessons(db, mctx);
       if (lessonsHealed > 0) debugLog('DEBUG', 'auto-maintain', `healed ${lessonsHealed} lesson rows buried at importance 0`);
+
+      // Heal deferred_work rows whose closing obs / source prompt was deleted while FK was OFF
+      // (dangling ref foreign_key_check flags). Applies the ON DELETE SET NULL the FK would.
+      const deferredHealed = sweepDeferredWorkOrphans(db, mctx);
+      if (deferredHealed > 0) debugLog('DEBUG', 'auto-maintain', `healed ${deferredHealed} deferred-work rows with dangling references`);
 
       const { decayed, idleMarked } = decayAndMarkIdle(db, mctx);
       if (decayed > 0) debugLog('DEBUG', 'auto-maintain', `decayed ${decayed} stale observations`);

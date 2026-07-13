@@ -18,7 +18,7 @@ import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from '
 import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
-  recoverOrphanedChildren, recoverBuriedLessons,
+  recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
@@ -135,8 +135,8 @@ async function cmdSearch(db, args, { llm } = {}) {
     process.stderr.write('[mem] Note: --rerank requires --deep (it reranks deep-search candidates); ignored\n');
   }
 
-  if (source && !['observations', 'sessions', 'prompts'].includes(source)) {
-    fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts`);
+  if (source && !['observations', 'sessions', 'prompts', 'events'].includes(source)) {
+    fail(`[mem] Invalid --source "${source}". Use: observations, sessions, prompts, events`);
     return;
   }
 
@@ -244,7 +244,7 @@ async function cmdSearch(db, args, { llm } = {}) {
 
   // "N of M" total when paged < total (paired-path with server.mjs formatSearchOutput, #8198).
   const showTime = sort === 'time';
-  const hasMixed = paged.some(r => r.source === 'session' || r.source === 'prompt');
+  const hasMixed = paged.some(r => r.source === 'session' || r.source === 'prompt' || r.source === 'event');
   // Suppressed when --or was explicit — user already asked for OR, no "fallback" there.
   const fallbackHint = orFallbackFired && !useOr ? ' (relaxed AND→OR)' : '';
 
@@ -290,7 +290,7 @@ async function cmdSearch(db, args, { llm } = {}) {
   const countLabel = total > paged.length ? `${paged.length} of ${total}` : `${paged.length}`;
   // Pluralize on total — "Found 1 of 44 result" reads wrong; the population (44) drives
   // grammatical number, not the page slice (1).
-  out(`[mem] Found ${countLabel} result${total !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}`);
+  out(`[mem] Found ${countLabel} result${total !== 1 ? 's' : ''} for "${query}"${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt, E# event)' : ''}`);
   // `~Nt` = est. tokens to fetch this row's full body via mem_get (attachBodyTokens, paired with
   // MCP). Conditional so a row that skipped enrichment renders cleanly, not "~undefinedt".
   const tok = r => (r.bodyTokens ? ` ~${r.bodyTokens}t` : '');
@@ -302,6 +302,12 @@ async function cmdSearch(db, args, { llm } = {}) {
     } else if (r.source === 'prompt') {
       const date = fmtDateShort(r.created_at);
       out(`P#${r.id} 💬 ${date}${timeStr} ${truncate(r.prompt_text || '(empty)', 80)}${tok(r)}`);
+    } else if (r.source === 'event') {
+      const date = fmtDateShort(r.created_at);
+      out(`E#${r.id} ${typeIcon(r.type)} ${date}${timeStr} ${truncate(r.title || '(untitled)', 80)}${tok(r)}`);
+      if (r.lesson_learned) {
+        out(`  -> ${truncate(r.lesson_learned, 80)}`);
+      }
     } else {
       const date = fmtDateShort(r.created_at);
       const title = truncate(r.title || r.subtitle || '(untitled)', 80);
@@ -2044,6 +2050,10 @@ function cmdMaintain(db, args) {
       // lesson-bearing rows only; idempotent no-op once none remain.
       const lessonsHealed = recoverBuriedLessons(db, mctx);
       if (lessonsHealed > 0) results.push(`Healed ${lessonsHealed} lesson rows buried at importance 0`);
+      // Heal deferred_work rows whose closing obs / source prompt was hard-deleted while FK was
+      // OFF (dangling ref foreign_key_check flags). Applies the ON DELETE SET NULL the FK would.
+      const deferredHealed = sweepDeferredWorkOrphans(db, mctx);
+      if (deferredHealed > 0) results.push(`Healed ${deferredHealed} deferred-work rows with dangling references`);
     }
 
     if (ops.includes('decay')) {

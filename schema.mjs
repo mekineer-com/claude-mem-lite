@@ -104,7 +104,15 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // previously-uncited obs (see applyCitationDecay). REAL new column, so unlike v38-v40
 // this DOES advance LATEST_MIGRATION_COLUMN (→ observations.last_cited_session_id);
 // existing DBs reach the ALTER because version 40 != 41 falls through the fast-path.
-export const CURRENT_SCHEMA_VERSION = 41;
+// v42 (events_fts self-heal): events_fts was the one FTS table outside ensureFTS's
+// column-aware recreation (its DDL is non-standard — UNINDEXED cols + custom tokenizer +
+// events_fts_* trigger names — so it can't use the generic ensureFTS). Adds a dedicated
+// ensureEventsFTS run in the migration body so a future events column addition self-heals
+// instead of leaving a stale narrow index whose (wider) triggers throw "no column" and
+// silently drop event writes. NO new column, so LATEST_MIGRATION_COLUMN is unchanged — the
+// forced pass alone carries it (same pattern as v35/v36/v38/v39/v40); existing DBs run it
+// because version 41 != 42 falls through the fast-path.
+export const CURRENT_SCHEMA_VERSION = 42;
 
 // Sentinel column for the LATEST migration set. The fast-path uses this to
 // self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
@@ -554,6 +562,12 @@ export function initSchema(db) {
       VALUES (new.id, COALESCE(new.title,''), COALESCE(new.body,''), new.event_type, new.project);
     END;
   `);
+
+  // v42: column-aware self-heal for events_fts (the one FTS table the generic ensureFTS can't
+  // manage — UNINDEXED cols + custom tokenizer + events_fts_* triggers). The CREATE ... IF NOT
+  // EXISTS above never widens a drifted (older, narrower) events_fts; this drops+recreates it on
+  // column drift and repopulates. No-op on a healthy DB.
+  ensureEventsFTS(db);
 
   // Observation files junction table for normalized file lookups (replaces LIKE scans on files_modified JSON)
   db.exec(`
@@ -1064,6 +1078,68 @@ export function ensureFTS(db, ftsName, tableName, columns) {
     try {
       const cnt = db.prepare(`SELECT COUNT(*) AS c FROM ${tableName}`).get();
       if (cnt.c > 0) db.exec(`INSERT INTO ${ftsName}(${ftsName}) VALUES('rebuild')`);
+    } catch { /* non-critical — index repopulates lazily on next write */ }
+  }
+}
+
+// Column-aware self-heal for events_fts — the events table's FTS index. events_fts is NOT
+// managed by the generic ensureFTS() above because its DDL is non-standard: event_type and
+// project are UNINDEXED, it uses a custom unicode61 tokenizer with '_-' tokenchars, and its
+// triggers are named events_fts_* (not events_*). Routing it through ensureFTS would recreate
+// it WITHOUT the UNINDEXED cols / tokenizer AND install a SECOND, differently-named trigger set
+// (events_*) that double-writes the index. This dedicated guard mirrors ensureFTS's drift
+// detection while preserving the exact events_fts DDL (schema.mjs events block) — closing the
+// F8/P2-4 gap: events_fts was the one FTS table outside self-heal, so a future events column
+// addition would leave a stale narrow index whose (wider) triggers throw "no column" and
+// silently drop event writes. Idempotent: a no-op once the column set matches.
+const EVENTS_FTS_COLUMNS = ['title', 'body', 'event_type', 'project']; // full set (drift check)
+export function ensureEventsFTS(db) {
+  const ftsRow = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='events_fts'`).get();
+  let recreated = false;
+  if (ftsRow) {
+    let existingCols = [];
+    try { existingCols = db.prepare(`PRAGMA table_info(events_fts)`).all().map(c => c.name); } catch { /* unreadable → recreate */ }
+    const drifted = existingCols.length !== EVENTS_FTS_COLUMNS.length || EVENTS_FTS_COLUMNS.some(c => !existingCols.includes(c));
+    if (drifted) {
+      db.exec(`DROP TRIGGER IF EXISTS events_fts_ai`);
+      db.exec(`DROP TRIGGER IF EXISTS events_fts_ad`);
+      db.exec(`DROP TRIGGER IF EXISTS events_fts_au`);
+      db.exec(`DROP TABLE IF EXISTS events_fts`);
+      recreated = true;
+    }
+  }
+  if (!ftsRow || recreated) {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+        title, body, event_type UNINDEXED, project UNINDEXED,
+        content='events', content_rowid='id',
+        tokenize="unicode61 remove_diacritics 2 tokenchars '_-'"
+      );
+    `);
+  }
+  // Triggers reinstated from the canonical template (INSERT all 4 columns; AFTER UPDATE OF the
+  // two INDEXED columns only, so non-indexed bumps don't thrash the index). IF NOT EXISTS so an
+  // unchanged definition is a no-op — byte-identical to the events block in initSchema.
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS events_fts_ai AFTER INSERT ON events BEGIN
+      INSERT INTO events_fts(rowid, title, body, event_type, project)
+      VALUES (new.id, COALESCE(new.title,''), COALESCE(new.body,''), new.event_type, new.project);
+    END;
+    CREATE TRIGGER IF NOT EXISTS events_fts_ad AFTER DELETE ON events BEGIN
+      INSERT INTO events_fts(events_fts, rowid, title, body, event_type, project)
+      VALUES ('delete', old.id, COALESCE(old.title,''), COALESCE(old.body,''), old.event_type, old.project);
+    END;
+    CREATE TRIGGER IF NOT EXISTS events_fts_au AFTER UPDATE OF title, body ON events BEGIN
+      INSERT INTO events_fts(events_fts, rowid, title, body, event_type, project)
+      VALUES ('delete', old.id, COALESCE(old.title,''), COALESCE(old.body,''), old.event_type, old.project);
+      INSERT INTO events_fts(rowid, title, body, event_type, project)
+      VALUES (new.id, COALESCE(new.title,''), COALESCE(new.body,''), new.event_type, new.project);
+    END;
+  `);
+  if (recreated) {
+    try {
+      const cnt = db.prepare(`SELECT COUNT(*) AS c FROM events`).get();
+      if (cnt.c > 0) db.exec(`INSERT INTO events_fts(events_fts) VALUES('rebuild')`);
     } catch { /* non-critical — index repopulates lazily on next write */ }
   }
 }

@@ -11,6 +11,7 @@ import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned,
   mergeDuplicates, purgeStale, purgeStalePreview, recoverChildrenOf, recoverOrphanedChildren,
   recoverBuriedLessons, selectFuzzyDedupeIds, maintenanceStats, hardDeleteCandidateCount,
+  sweepDeferredWorkOrphans,
 } from '../lib/maintain-core.mjs';
 
 const DAY = 86400000;
@@ -81,6 +82,60 @@ describe('recoverOrphanedChildren (self-heal legacy orphans — keeper deleted p
     Number(insertObs(db, { sessionId: 'sess-b', project: 'proj-b', epochOffset: OLD, title: 'orphan b', compressedInto: 55555 }).lastInsertRowid);
     const recovered = recoverOrphanedChildren(db, { projectFilter: 'AND project = ?', baseParams: ['proj-a'] });
     expect(recovered).toBe(1); // only the proj-a orphan
+    db.close();
+  });
+});
+
+describe('sweepDeferredWorkOrphans (P3-5: heal FK orphans left by FK-OFF deletes)', () => {
+  // Insert a deferred_work row directly (no test-helper for this table). To reproduce the real
+  // orphan end-state, dangling refs are written with foreign_keys OFF — mirroring the warm-start
+  // fast-path under which the referenced obs was hard-deleted without the ON DELETE SET NULL
+  // firing (createTestDb runs FK ON, which would otherwise reject a dangling ref at insert time).
+  const addDefer = (db, o) => {
+    db.pragma('foreign_keys = OFF');
+    const id = Number(db.prepare(`
+      INSERT INTO deferred_work (project, title, status, created_at_epoch, closed_at_epoch, closed_by_obs_id, source_prompt_id)
+      VALUES (@project, @title, @status, @created_at_epoch, @closed_at_epoch, @closed_by_obs_id, @source_prompt_id)
+    `).run({
+      project: 'proj-a', title: 't', status: 'open', created_at_epoch: 1,
+      closed_at_epoch: null, closed_by_obs_id: null, source_prompt_id: null, ...o,
+    }).lastInsertRowid);
+    db.pragma('foreign_keys = ON');
+    return id;
+  };
+  const defer = (db, id, col) => db.prepare(`SELECT ${col} AS v FROM deferred_work WHERE id = ?`).get(id).v;
+
+  test('nulls a dangling closed_by_obs_id / source_prompt_id; keeps valid refs + status', () => {
+    const db = freshDb();
+    const liveObs = add(db, { title: 'live obs' });
+    const valid = addDefer(db, { status: 'done', closed_at_epoch: 5, closed_by_obs_id: liveObs }); // obs exists → keep
+    const orphanObs = addDefer(db, { status: 'done', closed_at_epoch: 6, closed_by_obs_id: 99999 }); // obs gone → null
+    const orphanPrompt = addDefer(db, { source_prompt_id: 88888 });                                  // prompt gone → null
+
+    const healed = sweepDeferredWorkOrphans(db, ctx());
+
+    expect(healed).toBe(2);                                        // two dangling refs
+    expect(defer(db, orphanObs, 'closed_by_obs_id')).toBeNull();  // dangling ref dropped
+    expect(defer(db, orphanObs, 'status')).toBe('done');          // closure NOT reopened
+    expect(defer(db, orphanObs, 'closed_at_epoch')).toBe(6);      // closed_at preserved
+    expect(defer(db, orphanPrompt, 'source_prompt_id')).toBeNull();
+    expect(defer(db, valid, 'closed_by_obs_id')).toBe(liveObs);   // valid ref untouched
+    db.close();
+  });
+
+  test('is idempotent — a second pass heals nothing', () => {
+    const db = freshDb();
+    addDefer(db, { closed_by_obs_id: 77777 });
+    expect(sweepDeferredWorkOrphans(db, ctx())).toBe(1);
+    expect(sweepDeferredWorkOrphans(db, ctx())).toBe(0);
+    db.close();
+  });
+
+  test('respects projectFilter (only heals orphans in the scoped project)', () => {
+    const db = freshDb();
+    addDefer(db, { project: 'proj-a', closed_by_obs_id: 66666 });
+    addDefer(db, { project: 'proj-b', closed_by_obs_id: 55555 });
+    expect(sweepDeferredWorkOrphans(db, { projectFilter: 'AND project = ?', baseParams: ['proj-a'] })).toBe(1);
     db.close();
   });
 });

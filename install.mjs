@@ -1996,14 +1996,23 @@ async function repair() {
     // repo/TLS-MITM compromise achieved RCE, bypassing the Ed25519 signed-release control that
     // the manual `update` path enforces. Lazy import so a missing/broken hook-update dependency
     // degrades to the manual fallback (fail-closed) rather than to unverified auto-install.
-    let fetchLatestRelease, verifyReleaseAuthenticity;
+    let fetchLatestRelease, verifyReleaseAuthenticity, validateExtractedTarball, isRepairDowngrade, getCurrentVersion;
     try {
-      ({ fetchLatestRelease, verifyReleaseAuthenticity } = await import('./hook-update.mjs'));
+      ({ fetchLatestRelease, verifyReleaseAuthenticity, validateExtractedTarball, isRepairDowngrade, getCurrentVersion } = await import('./hook-update.mjs'));
     } catch (e) {
       throw new Error(`cannot load the verified-update path (${e.message}) — refusing to auto-install unverified code`, { cause: e });
     }
     const rel = await fetchLatestRelease();
     if (!rel || !rel.tarballUrl) throw new Error('could not resolve the latest release (network / rate-limit)');
+    // Rollback guard: refuse to repair BACKWARD onto an older validly-signed release replayed
+    // as "latest" (the only attack signing leaves open). Skipped when the local version is
+    // unreadable — a broken install still needs repair; the signature check below still gates
+    // authenticity either way.
+    let localVersion = null;
+    try { localVersion = getCurrentVersion(); } catch { /* broken install → allow repair */ }
+    if (isRepairDowngrade(rel.version, localVersion)) {
+      throw new Error(`refusing to repair BACKWARD: resolved release v${rel.version} is older than installed v${localVersion} (possible signed-release rollback)`);
+    }
     // URL allow-list mirrors hook-update.downloadAndInstall — only github.com tarball URLs.
     if (!/^https:\/\/(?:api\.)?github\.com\/[a-zA-Z0-9./_-]+$/.test(rel.tarballUrl)) {
       throw new Error(`refusing suspicious tarball URL: ${rel.tarballUrl}`);
@@ -2015,6 +2024,11 @@ async function repair() {
     log('Extracting...');
     execFileSync('tar', ['xzf', tarballPath, '-C', stagingDir, '--strip-components=1'],
       { timeout: 30000, stdio: ['ignore', 'pipe', 'inherit'] });
+    // Defense-in-depth on the extracted tarball (name + version === resolved tag + entry
+    // points) BEFORE the signature check — parity with hook-update.downloadAndInstall. Catches
+    // a wrong-version / truncated / squatter artifact whose package.json doesn't match the tag.
+    const tarballValid = validateExtractedTarball(stagingDir, rel.version);
+    if (!tarballValid.ok) throw new Error(`extracted tarball failed validation: ${tarballValid.reason}`);
     // Verify the Ed25519 signature BEFORE running the downloaded install.mjs. Fail-closed:
     // any tampering / missing-signature / fetch-failure aborts to the manual fallback.
     log('Verifying release signature...');

@@ -17,7 +17,7 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
-  recoverOrphanedChildren, recoverBuriedLessons,
+  recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   recoverChildrenOf, hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS,
@@ -218,7 +218,7 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
   const countLabel = totalCount > paginatedResults.length
     ? `${paginatedResults.length} of ${totalCount}`
     : `${paginatedResults.length}`;
-  const hasMixed = paginatedResults.some(r => r.source === 'session' || r.source === 'prompt');
+  const hasMixed = paginatedResults.some(r => r.source === 'session' || r.source === 'prompt' || r.source === 'event');
   // P2-6: empty/omitted query falls through to a "listing recent" path — label it explicitly
   // so callers don't mistake BM25-less results for relevance-ranked ones.
   const qLabel = args.query ? ` for "${args.query}"` : ' (no query — listing recent)';
@@ -226,7 +226,7 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
   // query actually matched only a subset of the terms. Suppressed when the caller
   // explicitly requested OR semantics — there's no "fallback" in that path.
   const fallbackHint = orFallbackFired && !args.or ? ' (relaxed AND→OR)' : '';
-  lines.push(`Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt)' : ''}\n`);
+  lines.push(`Found ${countLabel} result(s)${qLabel}${fallbackHint}:${hasMixed ? ' (# observation, S# session, P# prompt, E# event)' : ''}\n`);
 
   // `~Nt` = estimated tokens to fetch this row's full body via mem_get (attachBodyTokens).
   // Conditional so a result that skipped enrichment renders cleanly, not "~undefinedt".
@@ -241,6 +241,8 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
       lines.push(`S#${r.id} 📋 ${truncate(r.request || r.completed || '(no summary)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
     } else if (r.source === 'prompt') {
       lines.push(`P#${r.id} 💬 ${truncate(r.text)} | ${fmtDate(r.date)}${tok(r)}`);
+    } else if (r.source === 'event') {
+      lines.push(`E#${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)')} | ${r.project} | ${fmtDate(r.date)}${tok(r)}`);
     }
   }
 
@@ -1158,6 +1160,10 @@ server.registerTool(
           // lesson-bearing rows only; idempotent no-op once none remain.
           const lessonsHealed = recoverBuriedLessons(db, mctx);
           if (lessonsHealed > 0) results.push(`Healed ${lessonsHealed} lesson rows buried at importance 0`);
+          // Heal deferred_work rows whose closing obs / source prompt was deleted while FK was
+          // OFF (dangling ref foreign_key_check flags). Applies the ON DELETE SET NULL the FK would.
+          const deferredHealed = sweepDeferredWorkOrphans(db, mctx);
+          if (deferredHealed > 0) results.push(`Healed ${deferredHealed} deferred-work rows with dangling references`);
         }
 
         if (ops.includes('decay')) {
