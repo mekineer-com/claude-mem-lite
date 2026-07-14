@@ -10,6 +10,7 @@ import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
+import { fileMatchClause, fileMatchParams } from '../lib/file-edge-match.mjs';
 import { fileIntelFor } from '../lib/file-intel.mjs';
 import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
 import { recordMetric } from '../lib/metrics.mjs';
@@ -58,6 +59,23 @@ const STALE_MS = 10 * 60 * 1000;   // 10 minutes cleanup threshold for legacy fi
 // small reads carry no noise. Env names mirror schema.mjs CLAUDE_MEM_* convention (#8447).
 const FILE_INTEL_OFF = ['0', 'off', 'false', 'no'].includes(
   String(process.env.CLAUDE_MEM_FILE_INTEL || '').toLowerCase());
+// P2 (D#78): edge-level decay ENFORCEMENT — opt-in (default OFF, shadow-first).
+// When on, a (obs,file) edge whose miss_streak reached K consecutive uncited
+// injections stops firing on this surface; the lesson stays reachable via
+// search / UPS / error-recall. P1 counting (Stop-side attribution) is always
+// on regardless of this flag. Flip only after real-DB cite-rate evidence.
+const EDGE_DECAY_ON = ['1', 'on', 'true', 'yes'].includes(
+  String(process.env.CLAUDE_MEM_EDGE_DECAY || '').toLowerCase());
+// NaN-checked, not `|| 3`: an explicit K=0 is falsy and would silently become
+// the default instead of clamping to the declared minimum of 1 (review D#78).
+const EDGE_DECAY_K_RAW = parseInt(process.env.CLAUDE_MEM_EDGE_DECAY_K, 10);
+const EDGE_DECAY_K = Math.max(1, Number.isNaN(EDGE_DECAY_K_RAW) ? 3 : EDGE_DECAY_K_RAW);
+// P3 (D#78): scope filter — opt-in (default OFF, shadow-first). When on,
+// environment-scoped observations (tooling/CI/network gotchas that apply in
+// ANY project) stop firing on FILE-triggered recall; they stay reachable via
+// search / UPS / error-recall. NULL scope (legacy / manual rows) always passes.
+const SCOPE_FILTER_ON = ['1', 'on', 'true', 'yes'].includes(
+  String(process.env.CLAUDE_MEM_SCOPE_FILTER || '').toLowerCase());
 const FILE_INTEL_MIN_TOKENS = Math.max(1,
   parseInt(process.env.CLAUDE_MEM_FILE_INTEL_MIN_TOKENS, 10) || 800);
 // Feature ② (repeated-read guard): when the agent does a FULL re-read of a file
@@ -323,9 +341,14 @@ try {
   try {
     const project = inferProject();
     const fname = basename(filePath);
-    // Escape LIKE wildcards
+    // Escape LIKE wildcards (still needed below for the events file_paths arms)
     const escaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const likePattern = `%${escaped}`;
+    // P0 (D#78): path-boundary match — editing utils.mjs must NOT pull lessons
+    // stored under bash-utils.mjs (the old '%<basename>' suffix LIKE did).
+    // Clause + params come from lib/file-edge-match.mjs, byte-shared with the
+    // Stop-side edge attribution so trigger and resolver can never drift.
+    const fileMatch = fileMatchClause('of2');
+    const fileParams = fileMatchParams(filePath);
     // 60-day lookback to avoid surfacing ancient observations
     const cutoff = Date.now() - 60 * 86400000;
 
@@ -358,6 +381,30 @@ try {
     // merely-most-recent one. Single-match files unchanged (obsLimit=1 Read /
     // 2 Edit). Composes with v2.83.0 A1 to extend the citation-decay feedback
     // loop to the 85%-recall PreToolUse:Read/Edit path.
+    // P2 (D#78): decayed-edge filter. This readonly fast-path never migrates,
+    // so a pre-v43 DB has no miss_streak column and the filter would throw at
+    // prepare time — probe pragma_table_info and fall back to unfiltered
+    // (pre-v43 edges carry no counts anyway, so nothing would be filtered).
+    let edgeDecayFilter = '';
+    if (EDGE_DECAY_ON) {
+      try {
+        const hasCol = db.prepare(
+          `SELECT 1 FROM pragma_table_info('observation_files') WHERE name = 'miss_streak'`
+        ).get();
+        if (hasCol) edgeDecayFilter = `AND of2.miss_streak < ${EDGE_DECAY_K}`;
+      } catch { /* probe failure → unfiltered */ }
+    }
+    // P3 (D#78): environment-scope filter — same probe discipline (readonly
+    // fast-path may hit a pre-v43 DB where observations.scope doesn't exist).
+    let scopeFilter = '';
+    if (SCOPE_FILTER_ON) {
+      try {
+        const hasScope = db.prepare(
+          `SELECT 1 FROM pragma_table_info('observations') WHERE name = 'scope'`
+        ).get();
+        if (hasScope) scopeFilter = `AND (o.scope IS NULL OR o.scope != 'environment')`;
+      } catch { /* probe failure → unfiltered */ }
+    }
     const rows = db.prepare(`
       SELECT DISTINCT o.id, o.type, o.title, o.lesson_learned
       FROM observations o
@@ -367,14 +414,16 @@ try {
         AND COALESCE(o.compressed_into, 0) = 0
         AND o.superseded_at IS NULL
         AND o.created_at_epoch > ?
-        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+        AND ${fileMatch}
+        ${edgeDecayFilter}
+        ${scopeFilter}
         ${typeFallback}
       ORDER BY
         CASE WHEN o.lesson_learned IS NOT NULL AND o.lesson_learned != '' THEN 0 ELSE 1 END,
         ${citeFactorClause('o')} DESC,
         o.created_at_epoch DESC
       LIMIT ${obsLimit}
-    `).all(project, cutoff, filePath, likePattern);
+    `).all(project, cutoff, ...fileParams);
 
     // T9: also query the `events` table — after T9, bugfix/lesson/decision/etc.
     // route here instead of observations, so we must read both sources to keep
@@ -382,12 +431,21 @@ try {
     // patterns match both basename and full-path entries. JSON quoting
     // (`"<name>"`) prevents partial-match false positives like "foo.mjs"
     // matching "myfoo.mjs".
-    const fnameEscaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
     const filePathEscaped = filePath.replace(/%/g, '\\%').replace(/_/g, '\\_');
     // v2.34.6: Read also tightens the events query — only rows with a non-empty
-    // body (= lesson equivalent). Edit path keeps the wider net since the agent
-    // is about to change the file and benefits from any contextual signal.
-    const eventsBodyFilter = isRead ? "AND body IS NOT NULL AND body != ''" : '';
+    // body (= lesson equivalent). Edit path keeps a wider net, but P0 (D#78)
+    // closes the parallel-path drift vs the observations query: a bodyless row
+    // is admitted only when it is a lesson-bearing type (bugfix/decision — the
+    // obs fallback's set — plus events-only 'lesson') AND its title isn't a
+    // LOW_SIGNAL auto-fallback; body-bearing rows outrank bodyless ones
+    // (mirrors the obs lesson-first sort). Known tradeoff: a deliberately
+    // bodyless manual event whose title starts with a LOW_SIGNAL prefix
+    // ('npm …', 'Error: …') no longer fires here — it stays reachable via
+    // search / UPS; /bug and /lesson write bodies, so this is a rare shape.
+    const eventsBodyFilter = isRead
+      ? "AND body IS NOT NULL AND body != ''"
+      : `AND ((body IS NOT NULL AND body != '')
+          OR (event_type IN ('bugfix', 'decision', 'lesson') AND ${buildNotLowSignalSql('')}))`;
     const eventsLimit = isRead ? 1 : 2;
     let eventRows = [];
     try {
@@ -400,9 +458,11 @@ try {
           AND created_at_epoch > ?
           AND (file_paths LIKE ? ESCAPE '\\' OR file_paths LIKE ? ESCAPE '\\')
           ${eventsBodyFilter}
-        ORDER BY created_at_epoch DESC
+        ORDER BY
+          CASE WHEN body IS NOT NULL AND body != '' THEN 0 ELSE 1 END,
+          created_at_epoch DESC
         LIMIT ${eventsLimit}
-      `).all(project, cutoff, `%"${fnameEscaped}"%`, `%"${filePathEscaped}"%`);
+      `).all(project, cutoff, `%"${escaped}"%`, `%"${filePathEscaped}"%`);
     } catch { /* events table may not exist on pre-v2.31 DBs — silent */ }
 
     // A3 (v2.83): cross-hook dedup. UPS may have already injected some of
@@ -410,10 +470,17 @@ try {
     // (and inflates context). Drop ids found in the cross-hook injected file
     // inside the staleness window; keep file-cooldown unchanged (the same
     // file might also re-warrant a different lesson next session).
+    // P1 (D#78): tag each row's source table — events share the numeric id
+    // space with observations, and the Stop-side edge attribution must never
+    // feed an event id into observation_files updates.
     const crossHookSeen = readCrossHookInjected(project);
+    const sourcedRows = [
+      ...rows.map(r => ({ ...r, src: 'obs' })),
+      ...eventRows.map(r => ({ ...r, src: 'evt' })),
+    ];
     const dedupedRows = crossHookSeen.size > 0
-      ? [...rows, ...eventRows].filter(r => !crossHookSeen.has(String(r.id)))
-      : [...rows, ...eventRows];
+      ? sourcedRows.filter(r => !crossHookSeen.has(String(r.id)))
+      : sourcedRows;
 
     // Merge: observations first (they carry richer lesson_learned), then events.
     // Edit/Write caps at 3 total; Read caps at 1 (single most-actionable hit).
@@ -537,6 +604,10 @@ try {
     cooldown[filePath] = {
       ts: now,
       lessonIds: allRows.map(r => r.id),
+      // P1 (D#78): observation-sourced ids only — consumed by the Stop-side
+      // edge attribution (lib/edge-attribution.mjs). lessonIds stays mixed for
+      // the cite-back hint contract.
+      obsIds: allRows.filter(r => r.src === 'obs').map(r => r.id),
       mode: isRead ? 'read' : 'edit',
       ...(lessonIdents ? { lessonIdents } : {}),
       ...(rereadMeta ? { reread: { mtimeMs: rereadMeta.mtimeMs, tokens: rereadMeta.tokens, full: isFullRead } } : {}),

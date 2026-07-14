@@ -58,6 +58,7 @@ import {
   recordCitationFunnel,
   hasMainThreadAssistantText,
 } from './lib/citation-tracker.mjs';
+import { resolveEdgeAttribution, readPreRecallFileEdges } from './lib/edge-attribution.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine, selectImperativeLesson } from './hook-memory.mjs';
 import { formatTaskImperative } from './lib/task-imperative.mjs';
@@ -650,6 +651,27 @@ async function handleStop() {
                 // obs resolved this run (denominator), promoted = obs cited this run
                 // (numerator). Idempotent (touched is 0 on re-fire) + best-effort.
                 recordCitationFunnel(db, project, sessionId, r.touched, r.promoted);
+                // P1 (D#78): per-edge attribution. The session cooldown file
+                // (keyed by CC session id) records which FILE each obs was
+                // injected for; resolve those (obs,file) edges as hit/miss with
+                // the same citedMain set. Lives inside the same text-floor gate
+                // so a tool-only Stop can't lock edges as missed. Best-effort.
+                // Keying on ccSessionId (NOT the rotating memory sessionId)
+                // matches the cooldown file's lifetime — a memory-session
+                // rotation mid-CC-session must not re-resolve old injections as
+                // fresh misses. mainInjectedIds mirrors the mainOnly discipline
+                // above: sidechain-only injections in the cooldown never accrue
+                // misses (review D#78).
+                try {
+                  if (ccSessionId) {
+                    const edges = readPreRecallFileEdges(RUNTIME_DIR, ccSessionId);
+                    if (edges.length > 0) {
+                      const er = resolveEdgeAttribution(db, project, edges, citedMain, ccSessionId,
+                        { mainInjectedIds: injected });
+                      debugLog('DEBUG', 'handleStop', `edge-attribution: edges=${er.touchedEdges} hits=${er.hits} misses=${er.misses}`);
+                    }
+                  }
+                } catch (e) { debugCatch(e, 'handleStop-edge-attribution'); }
               }
             }
           } catch (e) { debugCatch(e, 'handleStop-citation-decay'); }

@@ -51,6 +51,7 @@ describe('MCP mem_export ↔ CLI export parity (v3.42 HIGH-2)', () => {
   it('EXPORT_COLUMNS covers the columns cmdRestore reads back', () => {
     const restoreReads = [
       'text', 'subtitle', 'concepts', 'facts', 'search_aliases', 'files_read', 'branch',
+      'scope',
       'access_count', 'cited_count', 'uncited_streak', 'injection_count', 'decay_seen_count',
       'last_accessed_at',
     ];

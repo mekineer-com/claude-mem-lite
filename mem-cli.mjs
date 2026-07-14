@@ -39,7 +39,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
-import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { rebuildObservationDerived, normalizeScope } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
 import { computeNoiseGauge } from './lib/stats-quality.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
@@ -1808,6 +1808,7 @@ function cmdRestore(db, argv) {
   const signalUpdate = db.prepare(`UPDATE observations SET
       text = COALESCE(?, text),
       subtitle = ?, concepts = ?, facts = ?, search_aliases = ?, files_read = ?, branch = COALESCE(?, branch),
+      scope = ?,
       access_count = ?, cited_count = ?, uncited_streak = ?, injection_count = ?,
       decay_seen_count = ?, last_accessed_at = ?
     WHERE id = ?`);
@@ -1854,6 +1855,9 @@ function cmdRestore(db, argv) {
         scrubSecrets(r.subtitle || ''), scrubSecrets(r.concepts || ''), scrubSecrets(r.facts || ''),
         r.search_aliases === null || r.search_aliases === undefined ? null : scrubSecrets(r.search_aliases),
         r.files_read || '[]', r.branch ?? null,
+        // v44 scope round-trip (review D#78): whitelist-validated; old backups
+        // without the column restore as NULL — same as pre-v44 behavior.
+        normalizeScope(r.scope),
         num(r.access_count), num(r.cited_count), num(r.uncited_streak), num(r.injection_count),
         num(r.decay_seen_count), r.last_accessed_at ?? null,
         res.id,

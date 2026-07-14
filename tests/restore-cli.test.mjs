@@ -98,6 +98,21 @@ describe('D#25 export → restore round-trip', () => {
     expect(row.created_at_epoch).toBeLessThan(Date.now() - 4 * 86400000);
   });
 
+  it('round-trips the v44 scope label (review D#78 — twin-drift guard)', () => {
+    // Stamp a scope on the seeded bugfix row, then export → restore into a fresh DB.
+    const src = new Database(join(srcDir, 'claude-mem-lite.db'));
+    src.prepare("UPDATE observations SET scope = 'environment' WHERE title = 'auth token refresh crash'").run();
+    src.close();
+    writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir).stdout);
+    runCli(['restore', expFile], dstDir);
+    const db = new Database(join(dstDir, 'claude-mem-lite.db'));
+    const scopes = db.prepare('SELECT title, scope FROM observations ORDER BY title').all();
+    db.close();
+    expect(scopes.find(r => r.title === 'auth token refresh crash').scope).toBe('environment');
+    // Row exported without a scope restores as NULL (old-backup degradation path).
+    expect(scopes.find(r => r.title === 'use redis for the cache layer').scope).toBeNull();
+  });
+
   it('is idempotent: re-restoring the same file skips duplicates (durable, not 5-min window)', () => {
     writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir).stdout);
     runCli(['restore', expFile], dstDir);

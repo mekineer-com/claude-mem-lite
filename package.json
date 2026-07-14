@@ -1,6 +1,6 @@
 {
   "name": "claude-mem-lite",
-  "version": "3.46.0",
+  "version": "3.47.0",
   "description": "Persistent long-term memory for Claude Code via MCP — captures coding decisions, bugfixes, and context across sessions. Hybrid FTS5 + TF-IDF search with episode batching. Single SQLite DB, no external services. A lighter, lower-cost alternative to claude-mem (episode batching + a smaller model; cost savings are an internal estimate, not a measured benchmark).",
   "type": "module",
   "packageManager": "npm@10.9.2",
@@ -61,6 +61,8 @@
     "lib/low-signal-patterns.mjs",
     "lib/private-strip.mjs",
     "lib/citation-tracker.mjs",
+    "lib/edge-attribution.mjs",
+    "lib/file-edge-match.mjs",
     "lib/cite-back-hint.mjs",
     "lib/tmp-fixture-sweep.mjs",
     "lib/summary-extractor.mjs",

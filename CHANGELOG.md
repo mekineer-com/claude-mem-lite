@@ -2,6 +2,48 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.47.0 — PreToolUse recall precision (D#78 P0–P3): path-boundary matching, per-edge citation decay, lesson scope labels
+
+The PreToolUse Read/Edit recall surface decides what to inject purely by a filename edge (`observation_files`),
+but ~89% of lessons never mention the file they are attached to — the edge records "touched during the episode,"
+not "about this file." A tooling/environment gotcha therefore gets bound to whatever files happened to be open
+when it surfaced, and re-fires on every future session that touches one of them (the top-bypassed class in the
+2026-07-11 spec-audit cite-recall data). This release tightens the trigger and adds a feedback loop so noisy edges
+can go quiet without burying the lesson on other surfaces. **Schema auto-migrates 42 → 44 on first open (additive
+columns only, no user action; verified zero-loss on a copy of the production DB).** All new *enforcement* is opt-in
+and default-off — the change to default behavior is the P0 bugfix (fewer wrong lessons injected).
+
+### Added
+- **Per-edge injection attribution** (schema v43 — 4 columns on `observation_files`: `inject_count`, `miss_streak`,
+  `last_resolved_session_id`, `last_cited_session_id`). At Stop, each `(observation, file)` edge that fired a
+  PreToolUse injection is resolved as a hit (cited) or miss (uncited), keyed on the Claude Code session id (the
+  cooldown file's own lifetime) with a sidechain gate so subagent-only injections don't accrue unrepayable misses.
+  Counting is always on; it only writes the new columns.
+- **Edge-level citation decay** (`CLAUDE_MEM_EDGE_DECAY=1`, default off; threshold `CLAUDE_MEM_EDGE_DECAY_K`, default 3).
+  A `(lesson, file)` edge with K consecutive uncited injections stops firing on this surface; the lesson body stays
+  reachable via search / UserPromptSubmit / error-recall. Shadow-first: flip only on real-DB cite-rate evidence.
+- **Lesson scope labels** (schema v44 — `observations.scope` ∈ `file | module | project | environment`, NULL for
+  legacy / manual / event rows). Haiku classifies where a lesson *applies* during enrichment. With
+  `CLAUDE_MEM_SCOPE_FILTER=1` (default off), `environment`-scoped lessons no longer fire on file-triggered recall.
+- **`lib/file-edge-match.mjs`** — single source for the trigger-edge match predicate, shared byte-for-byte by the
+  injection trigger (`scripts/pre-tool-recall.js`) and the Stop-side attribution (`lib/edge-attribution.mjs`) so the
+  two can never drift.
+
+### Fixed
+- **Suffix collision in file matching** — editing `utils.mjs` pulled lessons stored under `bash-utils.mjs` /
+  `format-utils.mjs` etc. The old `LIKE '%<basename>'` matched any shared suffix; the new predicate requires a path
+  boundary (exact full path / exact basename / `.../<basename>` on either separator) while preserving the old LIKE's
+  ASCII case-insensitivity, so case- and backslash-variant stored paths still match.
+- **Events Edit-path had no low-signal gate** — the sibling `events` query admitted any `importance>=2` row by pure
+  recency; it now mirrors the observations query (lesson-bearing types + non-LOW_SIGNAL title for bodyless rows,
+  body-bearing rows first).
+- **`scope` was missing from `EXPORT_COLUMNS` / `cmdRestore`** — an export→restore round-trip would have silently
+  dropped every scope label (the v3.42 HIGH-2 twin-drift class). Now round-tripped and covered by a parity test.
+- Edge-decay threshold `K=0` no longer falls through to the default 3 (falsy-zero trap); the in-place
+  re-summarization UPDATE preserves a stored `scope` on an empty enrichment pass (`COALESCE(?, scope)`); the schema
+  self-heal sentinel is now plural so a restore-resurrected pre-migration table shape on either v43/v44 table
+  re-heals instead of passing the fast-path forever.
+
 ## v3.46.0 — Surface the hidden CLI write-command constraints so the model stops probing the save format
 
 Saving a memory is a high-frequency operation, but the model kept discovering the `save` CLI format by

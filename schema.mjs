@@ -112,20 +112,44 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // silently drop event writes. NO new column, so LATEST_MIGRATION_COLUMN is unchanged — the
 // forced pass alone carries it (same pattern as v35/v36/v38/v39/v40); existing DBs run it
 // because version 41 != 42 falls through the fast-path.
-export const CURRENT_SCHEMA_VERSION = 42;
+// v43 (D#78 edge attribution): adds 4 columns to observation_files so each
+// (obs, file) trigger edge carries its own injection/citation record —
+// inject_count, miss_streak, last_resolved_session_id, last_cited_session_id.
+// Per-EDGE policy, deliberately separate from the per-obs decay counters on
+// observations (#8641: the two encode different policies — an edge that stops
+// firing must not bury the lesson on other surfaces). The ALTERs live NEXT TO
+// the observation_files CREATE (initSchema body), NOT in MIGRATIONS[] — that
+// array runs before the table exists on fresh DBs.
+// v44 (D#78 P3 scope label): observations.scope (file|module|project|
+// environment, NULL for legacy/manual rows) — where a lesson APPLIES,
+// decoupled from which files the episode touched. SEPARATE version from v43
+// on purpose: dev-mode hooks migrate the live DB between working-tree edits,
+// and a two-table batch under ONE version left a real DB at "43 with edge
+// columns, without scope" that the single sentinel could not detect (observed
+// 2026-07-14 on this machine's own DB). One version per migration batch keeps
+// the version number itself the detector. LATEST_MIGRATION_COLUMN advances to
+// observations.scope.
+export const CURRENT_SCHEMA_VERSION = 44;
 
-// Sentinel column for the LATEST migration set. The fast-path uses this to
-// self-heal half-migrated DBs — schema_version bumped but column ALTERs rolled
-// back (observed once in dev during v2.74.0). Update both the column AND
-// (if needed) the table when adding a new migration batch.
-const LATEST_MIGRATION_COLUMN = { table: 'observations', column: 'last_cited_session_id' };
+// Sentinel columns for the LATEST migration set(s). The fast-path uses these
+// to self-heal half-migrated DBs — schema_version bumped but column ALTERs
+// rolled back (observed once in dev during v2.74.0). Update the list when
+// adding a new migration batch. Plural since v44 (review D#78): v43 and v44
+// touch DIFFERENT tables, and a restore-from-old-backup can resurrect one
+// table's pre-migration shape while the version row and the other table stay
+// current — a single sentinel can't see that hole, so every recent batch
+// keeps a representative column here until it is ancient enough to retire.
+const LATEST_MIGRATION_COLUMNS = [
+  { table: 'observations', column: 'scope' },                      // v44
+  { table: 'observation_files', column: 'last_cited_session_id' }, // v43
+];
 
 function hasLatestMigrationColumn(db) {
   try {
-    const row = db.prepare(
+    const stmt = db.prepare(
       `SELECT 1 AS present FROM pragma_table_info(?) WHERE name = ?`
-    ).get(LATEST_MIGRATION_COLUMN.table, LATEST_MIGRATION_COLUMN.column);
-    return Boolean(row);
+    );
+    return LATEST_MIGRATION_COLUMNS.every(({ table, column }) => Boolean(stmt.get(table, column)));
   } catch {
     return false; // table itself missing → caller falls through to CORE_SCHEMA
   }
@@ -286,6 +310,12 @@ const MIGRATIONS = [
   // legacy rows read NULL and behave exactly as before until their first same-session
   // late cite.
   'ALTER TABLE observations ADD COLUMN last_cited_session_id TEXT DEFAULT NULL',
+  // v44 (D#78 P3): lesson applicability scope — file | module | project |
+  // environment, validated by lib/observation-write normalizeScope; NULL for
+  // legacy rows / manual saves / events. CLAUDE_MEM_SCOPE_FILTER=1 (opt-in)
+  // makes pre-tool-recall skip environment-scoped rows on file-triggered
+  // injection; NULL always passes the filter.
+  'ALTER TABLE observations ADD COLUMN scope TEXT DEFAULT NULL',
 ];
 
 /**
@@ -574,10 +604,28 @@ export function initSchema(db) {
     CREATE TABLE IF NOT EXISTS observation_files (
       obs_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
       filename TEXT NOT NULL,
+      inject_count INTEGER NOT NULL DEFAULT 0,
+      miss_streak INTEGER NOT NULL DEFAULT 0,
+      last_resolved_session_id TEXT DEFAULT NULL,
+      last_cited_session_id TEXT DEFAULT NULL,
       UNIQUE(obs_id, filename)
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_obsfiles_filename ON observation_files(filename)`);
+  // v43 (D#78): per-edge attribution columns for DBs whose observation_files
+  // predates them — CREATE IF NOT EXISTS above is a no-op on those (gotcha #1),
+  // so each column gets its own idempotent ALTER (swallow duplicate-column only,
+  // same discipline as MIGRATIONS[]). Fresh DBs hit the duplicate branch.
+  for (const sql of [
+    'ALTER TABLE observation_files ADD COLUMN inject_count INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE observation_files ADD COLUMN miss_streak INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE observation_files ADD COLUMN last_resolved_session_id TEXT DEFAULT NULL',
+    'ALTER TABLE observation_files ADD COLUMN last_cited_session_id TEXT DEFAULT NULL',
+  ]) {
+    try { db.exec(sql); } catch (e) {
+      if (!e.message?.includes('duplicate column name')) throw e;
+    }
+  }
 
   // Data migration: populate observation_files from existing observations.files_modified JSON
   // Only runs once: when observation_files is empty but observations has rows with files_modified

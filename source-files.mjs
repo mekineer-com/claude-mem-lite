@@ -49,6 +49,13 @@ export const SOURCE_FILES = [
   'lib/low-signal-patterns.mjs',
   'lib/private-strip.mjs',
   'lib/citation-tracker.mjs',
+  // v3.47 (D#78 P1): per-(obs,file) edge attribution. Imported by hook.mjs
+  // (handleStop edge resolution). Missing from manifest → tarball hook.mjs
+  // ERR_MODULE_NOT_FOUND on every Stop.
+  'lib/edge-attribution.mjs',
+  // v3.47 (D#78 P0): shared trigger-edge match predicate. Imported by BOTH
+  // scripts/pre-tool-recall.js (hook fast-path) and lib/edge-attribution.mjs.
+  'lib/file-edge-match.mjs',
   'lib/cite-back-hint.mjs',
   // v2.85: stale test-fixture sweeper. Imported by install.mjs (cleanup) + cli.mjs.
   // Missing from manifest → tarball ships install.mjs that ERR_MODULE_NOT_FOUND on cleanup.

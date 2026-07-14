@@ -1005,6 +1005,36 @@ describe('pre-tool-recall', () => {
       expect(entry.lessonIds).toEqual([]);
     });
 
+    // P1 (D#78): edge attribution needs to know which cooldown ids are
+    // OBSERVATION ids — events share the same numeric id space, and an event id
+    // fed into observation_files edge updates could hit an unrelated obs edge.
+    it('writes obsIds with observation-sourced ids only (events excluded)', async () => {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'lesson', ?, ?, ?, 2, ?)
+      `).run('parent--citeback', 'event lesson on foo', 'event body lesson',
+        JSON.stringify(['foo.mjs']), Date.now());
+      db.close();
+
+      await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'foo.mjs') },
+        session_id: 'sess-cb-obsids',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const cooldown = JSON.parse(readFileSync(
+        join(tmpRoot, 'runtime', 'pre-recall-cooldown-sess-cb-obsids.json'), 'utf8',
+      ));
+      const entry = cooldown[join(projectDir, 'foo.mjs')];
+      // lessonIds keeps the mixed set (cite-back hint contract, unchanged) …
+      expect(entry.lessonIds.length).toBeGreaterThanOrEqual(2);
+      // … obsIds carries only the observations-sourced id.
+      expect(entry.obsIds).toEqual([Number(lessonObsId)]);
+    });
+
     it('honors legacy number-schema cooldown on read path (back-compat)', async () => {
       // Seed the cooldown file with legacy `<path>: <number>` schema.
       mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
@@ -1457,6 +1487,282 @@ describe('pre-tool-recall', () => {
       const state = JSON.parse(readFileSync(file, 'utf8'));
       const idStrings = (state.ids || []).map(String);
       expect(idStrings).toContain(String(lessonObsId));
+    });
+  });
+
+  // ─── P2 (D#78): edge-level decay enforcement ───────────────────────────────
+  // A (lesson,file) edge whose miss_streak reached K consecutive uncited
+  // injections stops firing — the lesson body stays alive for every other
+  // surface (search / UPS / error-recall). Enforcement is OPT-IN via
+  // CLAUDE_MEM_EDGE_DECAY=1 (shadow-first discipline: P1 counting is always on,
+  // the filter flips only after real-DB cite-rate evidence).
+  describe('edge-level decay enforcement (P2 D#78)', () => {
+    let tmpRoot;
+    let projectDir;
+    let obsId;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-p2-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'p2test');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-p2', project: 'parent--p2test', memoryId: 'mem-p2' });
+      const r = insertObs(db, {
+        sessionId: 'mem-p2', project: 'parent--p2test',
+        type: 'bugfix', importance: 2,
+        title: 'decayable edge lesson',
+        lessonLearned: 'lesson behind a decaying edge',
+        filesModified: '["edgy.mjs"]',
+      });
+      obsId = Number(r.lastInsertRowid);
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function setStreak(streak) {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.prepare('UPDATE observation_files SET miss_streak = ? WHERE obs_id = ?').run(streak, obsId);
+      db.close();
+    }
+
+    function editFile(session, env = {}) {
+      return runScript({
+        tool_name: 'Edit',
+        session_id: session,
+        tool_input: { file_path: join(projectDir, 'edgy.mjs') },
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir, ...env });
+    }
+
+    it('flag ON: an edge at the default threshold (3 misses) stops firing', async () => {
+      setStreak(3);
+      const { stdout } = await editFile('sess-p2-off', { CLAUDE_MEM_EDGE_DECAY: '1' });
+      if (stdout) {
+        const ctx = JSON.parse(stdout).hookSpecificOutput?.additionalContext || '';
+        expect(ctx).not.toContain('lesson behind a decaying edge');
+      }
+    });
+
+    it('flag ON: an edge below the threshold still fires', async () => {
+      setStreak(2);
+      const { stdout } = await editFile('sess-p2-under', { CLAUDE_MEM_EDGE_DECAY: '1' });
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson behind a decaying edge');
+    });
+
+    it('flag OFF (default): a decayed edge still fires — shadow mode counts only', async () => {
+      setStreak(99);
+      const { stdout } = await editFile('sess-p2-shadow');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson behind a decaying edge');
+    });
+
+    it('flag ON: threshold is tunable via CLAUDE_MEM_EDGE_DECAY_K', async () => {
+      setStreak(1);
+      const { stdout } = await editFile('sess-p2-k1', {
+        CLAUDE_MEM_EDGE_DECAY: '1',
+        CLAUDE_MEM_EDGE_DECAY_K: '1',
+      });
+      if (stdout) {
+        const ctx = JSON.parse(stdout).hookSpecificOutput?.additionalContext || '';
+        expect(ctx).not.toContain('lesson behind a decaying edge');
+      }
+    });
+
+    it('flag ON: explicit K=0 clamps to the declared minimum 1, not the default 3 (falsy trap)', async () => {
+      setStreak(1);
+      const { stdout } = await editFile('sess-p2-k0', {
+        CLAUDE_MEM_EDGE_DECAY: '1',
+        CLAUDE_MEM_EDGE_DECAY_K: '0',
+      });
+      if (stdout) {
+        const ctx = JSON.parse(stdout).hookSpecificOutput?.additionalContext || '';
+        expect(ctx).not.toContain('lesson behind a decaying edge');
+      }
+    });
+  });
+
+  // ─── P0 (D#78): path-boundary file matching ────────────────────────────────
+  // The old `LIKE '%<basename>'` pattern matched any stored filename SHARING A
+  // SUFFIX with the edited file: editing utils.mjs pulled lessons attached to
+  // bash-utils.mjs / format-utils.mjs / prompt-search-utils.mjs. The fix
+  // requires a path boundary: exact full-path, exact basename, or '%/<basename>'.
+  describe('path-boundary file matching (P0 D#78)', () => {
+    let tmpRoot;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-p0-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'p0test');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-p0', project: 'parent--p0test', memoryId: 'mem-p0' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function seedObs(filesModified, lesson, title = 'seed') {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-p0', project: 'parent--p0test',
+        type: 'bugfix', importance: 2,
+        title, lessonLearned: lesson,
+        filesModified: JSON.stringify(filesModified),
+      });
+      db.close();
+    }
+
+    function editFile(name, session) {
+      return runScript({
+        tool_name: 'Edit',
+        session_id: session,
+        tool_input: { file_path: join(projectDir, name) },
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+    }
+
+    it('does NOT match a different basename sharing a suffix (bash-utils.mjs vs utils.mjs)', async () => {
+      seedObs(['bash-utils.mjs'], 'lesson about bash-utils only');
+      seedObs([join(projectDir, 'format-utils.mjs')], 'lesson about format-utils only');
+      const { stdout } = await editFile('utils.mjs', 'sess-p0-suffix');
+      if (stdout) {
+        const ctx = JSON.parse(stdout).hookSpecificOutput?.additionalContext || '';
+        expect(ctx).not.toContain('lesson about bash-utils only');
+        expect(ctx).not.toContain('lesson about format-utils only');
+      }
+    });
+
+    it('still matches exact bare basename (positive control)', async () => {
+      seedObs(['utils.mjs'], 'lesson stored under bare basename');
+      const { stdout } = await editFile('utils.mjs', 'sess-p0-bare');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson stored under bare basename');
+    });
+
+    it('still matches relative path via /basename boundary (positive control)', async () => {
+      seedObs(['scripts/utils.mjs'], 'lesson stored under relative path');
+      const { stdout } = await editFile('utils.mjs', 'sess-p0-rel');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson stored under relative path');
+    });
+
+    it('still matches exact full path (positive control)', async () => {
+      seedObs([join(projectDir, 'utils.mjs')], 'lesson stored under full path');
+      const { stdout } = await editFile('utils.mjs', 'sess-p0-full');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson stored under full path');
+    });
+
+    // Review D#78: the old suffix LIKE was ASCII-case-insensitive and matched
+    // either path separator; the boundary fix must not regress those recalls.
+    it('still matches a case-variant stored basename (old LIKE was NOCASE)', async () => {
+      seedObs(['Utils.mjs'], 'lesson stored under case-variant basename');
+      const { stdout } = await editFile('utils.mjs', 'sess-p0-case');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson stored under case-variant basename');
+    });
+
+    it('still matches a backslash-separated stored path', async () => {
+      seedObs(['lib\\utils.mjs'], 'lesson stored under backslash path');
+      const { stdout } = await editFile('utils.mjs', 'sess-p0-bslash');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('lesson stored under backslash path');
+    });
+  });
+
+  // ─── P0 (D#78): events Edit-path low-signal gate ───────────────────────────
+  // The events query on the Edit path admitted ANY imp>=2 row ordered by pure
+  // recency — no low-signal title gate (observations path has one), no
+  // body-first preference. Parallel-path drift: same class as §9 T-M1.
+  describe('events Edit-path low-signal gate (P0 D#78)', () => {
+    let tmpRoot;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-p0ev-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'p0evtest');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-p0ev', project: 'parent--p0evtest', memoryId: 'mem-p0ev' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function seedEvent({ title, body, files, epochOffset = 0 }) {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      db.prepare(`
+        INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+        VALUES (?, 'bugfix', ?, ?, ?, 2, ?)
+      `).run('parent--p0evtest', title, body, JSON.stringify(files), Date.now() + epochOffset);
+      db.close();
+    }
+
+    function editFile(name, session) {
+      return runScript({
+        tool_name: 'Edit',
+        session_id: session,
+        tool_input: { file_path: join(projectDir, name) },
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+    }
+
+    it('filters bodyless LOW_SIGNAL-titled events on Edit', async () => {
+      seedEvent({ title: 'Modified gated.mjs', body: null, files: ['gated.mjs'] });
+      seedEvent({ title: 'Error: raw stderr passthrough', body: '', files: ['gated.mjs'] });
+      const { stdout } = await editFile('gated.mjs', 'sess-p0ev-gate');
+      if (stdout) {
+        const ctx = JSON.parse(stdout).hookSpecificOutput?.additionalContext || '';
+        expect(ctx).not.toContain('Modified gated.mjs');
+        expect(ctx).not.toContain('raw stderr passthrough');
+      }
+    });
+
+    it('keeps a LOW_SIGNAL-titled event whose body carries the lesson', async () => {
+      seedEvent({
+        title: 'Modified keeper.mjs',
+        body: 'the body is the lesson: flush before rotate',
+        files: ['keeper.mjs'],
+      });
+      const { stdout } = await editFile('keeper.mjs', 'sess-p0ev-keep');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('flush before rotate');
+    });
+
+    it('orders body-bearing events above bodyless-but-substantive-titled ones', async () => {
+      // Newer bodyless row with a real title vs older row with a body — body wins.
+      seedEvent({ title: 'registry UPSERT preserve-on-empty drift', body: null, files: ['ordered.mjs'], epochOffset: 0 });
+      seedEvent({
+        title: 'older but body-bearing',
+        body: 'body-bearing lesson outranks bare title',
+        files: ['ordered.mjs'],
+        epochOffset: -60_000,
+      });
+      const { stdout } = await editFile('ordered.mjs', 'sess-p0ev-order');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      const bodyIdx = ctx.indexOf('body-bearing lesson outranks bare title');
+      const titleIdx = ctx.indexOf('registry UPSERT preserve-on-empty drift');
+      expect(bodyIdx).toBeGreaterThanOrEqual(0);
+      expect(titleIdx).toBeGreaterThanOrEqual(0);
+      expect(bodyIdx).toBeLessThan(titleIdx);
     });
   });
 });

@@ -12,7 +12,7 @@ import {
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, vecTextForRow } from './tfidf.mjs';
-import { insertObservationRow, insertObservationFiles, insertObservationVector } from './lib/observation-write.mjs';
+import { insertObservationRow, insertObservationFiles, insertObservationVector, normalizeScope } from './lib/observation-write.mjs';
 import { DEDUP_JACCARD_THRESHOLD, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
@@ -266,6 +266,10 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
         importance: obs.importance ?? 1, minhash_sig: minhashSig,
         lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases,
         branch: getCurrentBranch(), created_at: now.toISOString(), created_at_epoch: now.getTime(),
+        // P3 (D#78): re-validate at the write boundary — saveObservation is also
+        // reached by immediate-save / manual callers whose scope never saw the
+        // handleLLMEpisode whitelist.
+        scope: normalizeScope(obs.scope),
       });
 
       insertObservationFiles(db, id, obs.files);
@@ -298,6 +302,7 @@ function obsToSummary(obs) {
     importance: obs.importance,
     lesson_learned: obs.lessonLearned,
     search_aliases: obs.searchAliases,
+    scope: obs.scope,
   };
 }
 
@@ -366,6 +371,7 @@ export function persistHaikuSummary(db, summary, ctx) {
     importance: summary.importance ?? 1,
     lessonLearned: summary.lesson_learned || null,
     searchAliases: summary.search_aliases || null,
+    scope: summary.scope ?? null,
   }, ctx.project, ctx.session_id, db);
   return { table: 'observations', id };
 }
@@ -731,6 +737,7 @@ type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y b
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
 lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
+scope: where does the lesson APPLY (not where it was learned)? file = specific to the touched file(s)' own code. module = a directory/subsystem of this project. project = a project-wide convention, architecture, or workflow. environment = a tooling/OS/CI/network/registry/service quirk (proxy, npm, git, GitHub, shell, runner, editor) that would hold in ANY project — even though some project files were touched when it surfaced. When lesson_learned is null, still classify the episode's dominant subject.
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
 
   let prompt;
@@ -738,7 +745,7 @@ search_aliases: 2-6 alternative search terms someone might use to find this memo
     const e = episode.entries[0];
     const system = `Extract a structured observation from this code change. Return ONLY valid JSON, no markdown fences.
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"concise ≤80 char description","narrative":"what changed, why, and outcome (2-3 sentences)","concepts":["kw1","kw2"],"facts":["fact1","fact2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","scope":"file|module|project|environment","search_aliases":["alt query 1","alt query 2"]}
 ${SHARED_OBS_SCHEMA_TAIL}`;
     const user = `Tool: ${e.tool}
 File: ${episodeFiles.join(', ') || 'unknown'}
@@ -752,7 +759,7 @@ Error: ${e.isError ? 'yes' : 'no'}`;
 
     const system = `Summarize this coding episode as ONE coherent observation. Return ONLY valid JSON, no markdown fences.
 
-JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","search_aliases":["alt query 1","alt query 2"]}
+JSON: {"type":"decision|bugfix|feature|refactor|discovery|change","title":"coherent ≤80 char summary","narrative":"what was done, why, and outcome (3-5 sentences)","concepts":["keyword1","keyword2"],"facts":["specific fact 1","specific fact 2"],"importance":1,"lesson_learned":"non-obvious insight a future session needs, or null","scope":"file|module|project|environment","search_aliases":["alt query 1","alt query 2"]}
 ${SHARED_OBS_SCHEMA_TAIL}`;
     const user = `Project: ${episode.project}
 Files: ${fileList}
@@ -919,6 +926,8 @@ ${actionList}`;
           : Math.max(Math.min(ruleImportance, 2), clampImportance(parsed.importance)),
         lessonLearned,
         searchAliases,
+        // P3 (D#78): lesson applicability scope — whitelist-validated, invalid → null.
+        scope: normalizeScope(parsed.scope),
       };
 
       // v2.56.0 #1: paired-gate DROP. Haiku-titled `change` obs with null lesson
@@ -1000,7 +1009,8 @@ ${actionList}`;
         db.prepare(`
           UPDATE observations SET type=?, title=?, subtitle=?,
             narrative=COALESCE(NULLIF(?, ''), narrative), concepts=?, facts=?,
-            text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?
+            text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?,
+            scope=COALESCE(?, scope)
           WHERE id = ?
         `).run(
           obs.type, safe.title, safe.subtitle,
@@ -1011,6 +1021,7 @@ ${actionList}`;
           minhashSig,
           safe.lesson_learned,
           safe.search_aliases,
+          normalizeScope(obs.scope),
           episode.savedId
         );
         savedId = episode.savedId;
