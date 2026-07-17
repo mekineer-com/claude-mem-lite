@@ -162,6 +162,53 @@ describe('extractInjectedFromUserPromptSubmit', () => {
     expect(ids.has(7972)).toBe(true);
     expect(ids.size).toBe(1);
   });
+
+  it('does NOT extract E# event ids from the relevance="events" block (HIGH-1 id-space isolation)', () => {
+    // Events share the numeric id space with observations but live in a separate
+    // table. hook.mjs renders them `- E#<id>` in a relevance="events" block; the
+    // extractor must never read an event id as an obs id, or citation decay would
+    // mutate the unrelated observation carrying that same numeric id. Locks the
+    // invariant against a future widening of UPS_ID_RE / the `- [` line gate.
+    const path = writeTranscript([
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success',
+          command: 'node "/home/sds/.claude-mem-lite/hook.mjs" user-prompt',
+          stdout:
+            '<memory-context relevance="events">\n' +
+            '- E#42 [bugfix] redis timeout fix — raise pool size and add backoff\n' +
+            '- E#8154 [decision] chose WAL + busy_timeout\n' +
+            '</memory-context>\n',
+        },
+      },
+    ]);
+    const ids = extractInjectedFromUserPromptSubmit(path);
+    expect(ids.has(42)).toBe(false);
+    expect(ids.has(8154)).toBe(false);
+    expect(ids.size).toBe(0);
+  });
+
+  it('extracts the obs id but NOT a co-present E# event sharing the same numeric id', () => {
+    // Hardest case: observation #42 and event E#42 both carry id 42. The extractor
+    // must add 42 exactly once (the observation) and never be confused by E#42 —
+    // otherwise decay double-resolves obs #42 on an event it never showed.
+    const path = writeTranscript([
+      {
+        type: 'attachment',
+        attachment: {
+          type: 'hook_success',
+          command: 'node "/p/hook.mjs" user-prompt',
+          stdout:
+            '<memory-context relevance="high">\n- [bugfix] obs lesson (#42)\n</memory-context>\n' +
+            '<memory-context relevance="events">\n- E#42 [bugfix] event with the SAME numeric id\n</memory-context>\n',
+        },
+      },
+    ]);
+    const ids = extractInjectedFromUserPromptSubmit(path);
+    expect(ids.has(42)).toBe(true); // the observation #42
+    expect(ids.size).toBe(1);       // the E#42 event did NOT also enter the set
+  });
 });
 
 describe('extractInjectedFromErrorRecall', () => {
