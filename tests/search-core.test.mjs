@@ -246,24 +246,65 @@ describe('search-core', () => {
       expect(results.map((r) => r.score)).toEqual([-1, -0.5]);
     });
 
-    it('clamps single-row sources to the neutral mid (MED-5), not their raw magnitude', () => {
+    it('clamps a weak single-row source low, not to the neutral mid (audit 2026-07-17 MED-1)', () => {
       const results = [{ source: 'prompt', score: -0.2 }, { source: 'obs', score: -10 }, { source: 'obs', score: -5 }];
       normalizeCrossSourceScores(results, 'source');
-      expect(results[0].score).toBe(-0.5); // lone prompt clamped to neutral mid
+      // ratio 0.2/10 = 0.02 < 0.1 → weak band, sinks below the neutral mid
+      expect(results[0].score).toBe(-0.25);
       expect(results[1].score).toBe(-1);   // obs still normalized within-source
       expect(results[2].score).toBe(-0.5);
     });
 
     it('a lone large-magnitude event no longer outranks strong obs matches (MED-5)', () => {
       const results = [
-        { source: 'event', score: -30 }, // single incidental event match
+        { source: 'event', score: -30 }, // single event match, weaker than the obs page max
         { source: 'obs', score: -40 }, { source: 'obs', score: -20 },
       ];
       normalizeCrossSourceScores(results, 'source');
       // Mirror the pipeline's ascending (most-negative-first) merge sort.
       results.sort((a, b) => a.score - b.score);
       expect(results[0].source).toBe('obs'); // strong obs leads, not the lone event
-      expect(results.find((r) => r.source === 'event').score).toBe(-0.5);
+      // ratio 30/40 = 0.75 → comparable band (-0.75), below the obs best (-1)
+      expect(results.find((r) => r.source === 'event').score).toBe(-0.75);
+    });
+
+    // Audit 2026-07-17 MED-1: the flip side of MED-5. Events are the CANONICAL store
+    // for promoted bugfix/decision memories and a natural low-cardinality source, so
+    // "the best answer is one strong event" is a common shape. A magnitude-blind
+    // constant clamp buried it under weak multi-hit obs (whose best is pinned to -1
+    // by within-source max-normalization regardless of absolute strength).
+    it('a lone event that IS the global-strongest raw match ranks first (MED-1)', () => {
+      const results = [
+        { source: 'event', score: -32 },                    // exact title hit — global raw max
+        { source: 'obs', score: -1.2 }, { source: 'obs', score: -0.8 }, // weak body-only matches
+      ];
+      normalizeCrossSourceScores(results, 'source');
+      results.sort((a, b) => a.score - b.score);
+      expect(results[0].source).toBe('event'); // the strongest raw match leads
+    });
+
+    it('a comparable (≥0.5× global max) lone hit lands between neutral and best (MED-1)', () => {
+      const results = [
+        { source: 'session', score: -6 },
+        { source: 'obs', score: -10 }, { source: 'obs', score: -2 },
+      ];
+      normalizeCrossSourceScores(results, 'source');
+      // ratio 6/10 = 0.6 → -0.75: above the neutral mid, below the obs best
+      expect(results.find((r) => r.source === 'session').score).toBe(-0.75);
+    });
+
+    // Audit 2026-07-17 L3: the CJK LIKE-fallback prompt rows carry score 0 — the
+    // LOWEST confidence signal in the pipeline. The single-row clamp promoted a lone
+    // 0-score row to the neutral mid, floating it above weakly-matched real FTS hits.
+    it('a lone score-0 row (CJK LIKE fallback) is left at 0 and sinks (L3)', () => {
+      const results = [
+        { source: 'prompt', score: 0 },  // LIKE-fallback row — zero confidence
+        { source: 'obs', score: -4 }, { source: 'obs', score: -1 },
+      ];
+      normalizeCrossSourceScores(results, 'source');
+      results.sort((a, b) => a.score - b.score);
+      expect(results.find((r) => r.source === 'prompt').score).toBe(0); // untouched
+      expect(results[results.length - 1].source).toBe('prompt');        // sorts last
     });
   });
 

@@ -376,7 +376,7 @@ const UPSERT_SQL = `
     repo_url=CASE WHEN excluded.repo_url != '' THEN excluded.repo_url ELSE repo_url END,
     repo_stars=CASE WHEN excluded.repo_stars > 0 THEN excluded.repo_stars ELSE repo_stars END,
     local_path=CASE WHEN excluded.local_path != '' THEN excluded.local_path ELSE local_path END,
-    file_hash=excluded.file_hash,
+    file_hash=CASE WHEN excluded.file_hash IS NOT NULL AND excluded.file_hash != '' THEN excluded.file_hash ELSE file_hash END,
     invocation_name=CASE WHEN excluded.invocation_name != '' THEN excluded.invocation_name ELSE invocation_name END,
     -- Preserve-on-empty (mirror repo_stars/invocation_name above): a PARTIAL re-upsert --
     -- e.g. "registry import --name X --capability-summary ...", where mem-cli defaults every

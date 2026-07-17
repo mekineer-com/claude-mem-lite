@@ -15,7 +15,6 @@ import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { computeFunnel, formatFunnel, computeSweep, formatSweep, DEFAULT_SWEEP_FLOORS, DEFAULT_SWEEP_MARGINS } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
@@ -25,6 +24,9 @@ import {
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import { deleteObservations } from './lib/delete-core.mjs';
+import { OBS_TYPE_SET } from './lib/obs-types.mjs';
+import { computeStatsFeed } from './lib/stats-core.mjs';
+import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
@@ -42,7 +44,6 @@ import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatP
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived, normalizeScope } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
-import { computeNoiseGauge } from './lib/stats-quality.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
@@ -72,7 +73,7 @@ async function cmdSearch(db, args, { llm } = {}) {
 
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
   const type = flags.type || null;
-  const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+  const validObsTypes = OBS_TYPE_SET;
   if (type && !validObsTypes.has(type)) {
     fail(`[mem] Invalid --type "${type}". Valid: ${[...validObsTypes].join(', ')}`);
     return;
@@ -369,7 +370,7 @@ function cmdRecent(db, args) {
   // try this for "show recent bugfixes". Mirror cmdSearch's enum validation.
   const type = flags.type || null;
   if (type) {
-    const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+    const validObsTypes = OBS_TYPE_SET;
     if (!validObsTypes.has(type)) {
       fail(`[mem] Invalid --type "${type}". Valid: ${[...validObsTypes].join(', ')}`);
       return;
@@ -803,7 +804,7 @@ function cmdSave(db, args) {
   if (rejectBareStringFlags(flags, ['title', 'files', 'lesson', 'lesson-learned', 'project', 'type'])) return;
 
   const type = flags.type || 'discovery';
-  const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+  const validTypes = OBS_TYPE_SET;
   if (!validTypes.has(type)) {
     fail(`[mem] Invalid type "${type}". Valid: ${[...validTypes].join(', ')}`);
     return;
@@ -912,7 +913,7 @@ function cmdSave(db, args) {
   const supersededNote = result.supersededIds && result.supersededIds.length > 0
     ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
     : '';
-  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}${supersededNote}`);
+  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}${supersededNote}${buildLessonNudge({ type: result.type, id: result.id, lessonCaptured: result.lessonCaptured, surface: 'cli' })}`);
 }
 
 // ─── cmdDefer (sub-dispatch: add | list | drop) ──────────────────────────────
@@ -1112,115 +1113,18 @@ async function cmdStats(db, args) {
     return;
   }
 
-  const projectFilter = project ? 'AND project = ?' : '';
-  const baseParams = project ? [project] : [];
-
   const now = Date.now();
-  const cutoff = now - days * 86400000;
-
-  // Total counts (aligned with MCP mem_stats: use session_summaries, not sdk_sessions)
-  const obsTotal = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE 1=1 ${projectFilter}`
-  ).get(...baseParams);
-  const sessTotal = db.prepare(
-    `SELECT COUNT(*) as c FROM session_summaries WHERE 1=1 ${projectFilter}`
-  ).get(...baseParams);
-  const promptTotal = project
-    ? db.prepare('SELECT COUNT(*) as c FROM user_prompts p JOIN sdk_sessions s ON p.content_session_id = s.content_session_id WHERE s.project = ?').get(project)
-    : db.prepare('SELECT COUNT(*) as c FROM user_prompts').get();
-
-  // Recent counts
-  const obsRecent = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE created_at_epoch >= ? ${projectFilter}`
-  ).get(cutoff, ...baseParams);
-  const sessRecent = db.prepare(
-    `SELECT COUNT(*) as c FROM session_summaries WHERE created_at_epoch >= ? ${projectFilter}`
-  ).get(cutoff, ...baseParams);
-
-  // Type distribution (recent)
-  const types = db.prepare(`
-    SELECT type, COUNT(*) as c FROM observations
-    WHERE created_at_epoch >= ? ${projectFilter}
-    GROUP BY type ORDER BY c DESC
-  `).all(cutoff, ...baseParams);
-
-  // Top projects (global view — skipped when filtering by single project; aligned with MCP)
-  const projects = project ? [] : db.prepare(`
-    SELECT project, COUNT(*) as c FROM observations
-    GROUP BY project ORDER BY c DESC LIMIT 20
-  `).all();
-
-  // Daily activity (last 7 days; aligned with MCP mem_stats)
-  const daily = db.prepare(`
-    SELECT date(created_at) as day, COUNT(*) as c FROM observations
-    WHERE created_at_epoch >= ? ${projectFilter}
-    GROUP BY day ORDER BY day DESC LIMIT 7
-  `).all(now - 7 * 86400000, ...baseParams);
-
-  // Data health (aligned with MCP mem_stats)
-  const tokenEst = db.prepare(`
-    SELECT SUM(LENGTH(COALESCE(title,'')) + LENGTH(COALESCE(narrative,'')) + LENGTH(COALESCE(text,''))) / 4 as t
-    FROM observations WHERE 1=1 ${projectFilter}
-  `).get(...baseParams);
-  const avgImp = db.prepare(
-    `SELECT AVG(COALESCE(importance,1)) as v FROM observations WHERE 1=1 ${projectFilter}`
-  ).get(...baseParams);
-  const thirtyDaysAgo = now - 30 * 86400000;
-  // v3.23 noise-gauge de-blinding: the prior `importance = 1` predicate was
-  // structurally blind to imp=0 — decay's floor + the LLM low-signal filter push
-  // dormant rows to 0, which on a real store is ~half the live corpus. The gauge
-  // therefore reported "0.0% noise" while the store was dormant-heavy. `<= 1` makes
-  // imp=0 visible; injection_count=0 mirrors decay's NEVER-INJECTED guard so an
-  // injected-but-decayed row (pinned noise, tracked separately) is not miscounted
-  // as "never used".
-  const lowVal = db.prepare(`
-    SELECT COUNT(*) as c FROM observations
-    WHERE COALESCE(importance,1) <= 1 AND COALESCE(access_count,0) = 0
-      AND COALESCE(injection_count,0) = 0
-      AND COALESCE(compressed_into, 0) = 0
-      AND created_at_epoch < ? ${projectFilter}
-  `).get(thirtyDaysAgo, ...baseParams);
-  // Low-signal-title population: template / tool-log titles (Modified, Worked on,
-  // Error while working, Error:, node/npm/npx …) that the retrieval layer already
-  // filters out by default. The imp=1 "Low-value" metric above structurally can't
-  // see these — they often carry inflated importance and recent access — so the
-  // health gauge under-reports real noise without this line. Same LOW_SIGNAL
-  // pattern source as the read-side filter (lib/low-signal-patterns.mjs).
-  const lowSignalTitle = db.prepare(`
-    SELECT COUNT(*) as c FROM observations
-    WHERE NOT ${buildNotLowSignalSql()}
-      AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
-  `).get(...baseParams);
-  // F7: both noise numerators exclude compressed rows → divide by the LIVE count, not
-  // obsTotal (all rows), so a compress-heavy store isn't reported cleaner than it is.
-  // Shared with the MCP mem_stats gauge via computeNoiseGauge (lib/stats-quality.mjs).
-  const liveTotal = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}`
-  ).get(...baseParams);
-  const { noiseRatio, lowSignalRatio } = computeNoiseGauge({ liveTotal: liveTotal.c, lowValCount: lowVal.c, lowSignalCount: lowSignalTitle.c });
-  const compressedCount = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}`
-  ).get(...baseParams);
-  const supersededOnlyCount = db.prepare(
-    `SELECT COUNT(*) as c FROM observations WHERE superseded_at IS NOT NULL AND compressed_into IS NULL ${projectFilter}`
-  ).get(...baseParams);
+  const {
+    obsTotal, sessTotal, promptTotal, obsRecent, sessRecent,
+    types, projects, daily, tokenEst, avgImp, lowVal, lowSignalTitle,
+    noiseRatio, lowSignalRatio, compressedCount, supersededOnlyCount, tierMap,
+  } = computeStatsFeed(db, { project, days, now });
 
   // Hook self-observation: count PreToolUse / Skill-bridge script failures
   // recorded in the last 24h. Surfaces silent breakage (DB corruption,
   // CC upstream field rename) that would otherwise stay invisible — the
   // failure mode that left code-graph's matcher bug undetected for 10 sessions.
   const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - 86400000);
-
-  // Tier distribution (aligned with MCP mem_stats)
-  const tierCtx = { now, currentProject: project || inferProject(), currentSessionId: '' };
-  const tdParams = tierSqlParams(tierCtx);
-  const tierDist = db.prepare(`
-    SELECT tier, COUNT(*) as c FROM (
-      SELECT ${TIER_CASE_SQL} as tier FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
-    ) GROUP BY tier ORDER BY tier
-  `).all(...tdParams, ...baseParams);
-  const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));
 
   if (jsonOutput) {
     out(JSON.stringify({
@@ -1570,7 +1474,7 @@ function cmdUpdate(db, args) {
     updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative));
   }
   if (flags.type) {
-    const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+    const validTypes = OBS_TYPE_SET;
     if (!validTypes.has(flags.type)) {
       fail(`[mem] Invalid type "${flags.type}". Valid: ${[...validTypes].join(', ')}`);
       return;
@@ -1654,7 +1558,7 @@ function cmdExport(db, args) {
   if (flags.type) {
     // Reject unknown types — silently returning [] for `--type bogus` looked like a
     // legitimate empty filter result, hiding the typo. Mirrors cmdSearch / cmdSave / cmdUpdate.
-    const validObsTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+    const validObsTypes = OBS_TYPE_SET;
     if (!validObsTypes.has(flags.type)) {
       fail(`[mem] Invalid --type "${flags.type}". Valid: ${[...validObsTypes].join(', ')}`);
       return;

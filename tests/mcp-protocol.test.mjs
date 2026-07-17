@@ -124,6 +124,36 @@ describe('MCP protocol surface', () => {
     expect(afterCount).toBe(beforeCount);
   });
 
+  // Audit 2026-07-17 P4: mem_save on bugfix/decision without lesson_learned must
+  // nudge in the response text (naming mem_update with the new id) — the model
+  // still holds the debugging context at save time; a later backfill pass cannot
+  // reconstruct it. With a lesson, or for low-obligation types, no nudge.
+  it('mem_save nudges when a bugfix arrives without lesson_learned', async () => {
+    const res = await client.callTool({
+      name: 'mem_save',
+      arguments: { content: 'Fixed a race in the flush path', title: 'nudge-probe-bugfix', type: 'bugfix' },
+    });
+    const text = textOf(res);
+    expect(text).toMatch(/Saved as observation #\d+/);
+    expect(text).toContain('without lesson_learned');
+    expect(text).toMatch(/mem_update\(id=\d+/);
+  });
+
+  it('mem_save does NOT nudge with a lesson present or for discovery', async () => {
+    const withLesson = textOf(await client.callTool({
+      name: 'mem_save',
+      arguments: { content: 'Fixed a race', title: 'nudge-probe-lesson', type: 'bugfix', lesson_learned: 'Hold the lock until the side-effect commits' },
+    }));
+    expect(withLesson).toContain('lesson captured');
+    expect(withLesson).not.toContain('without lesson_learned');
+
+    const discovery = textOf(await client.callTool({
+      name: 'mem_save',
+      arguments: { content: 'Interesting corner', title: 'nudge-probe-discovery', type: 'discovery' },
+    }));
+    expect(discovery).not.toContain('without lesson_learned');
+  });
+
   // Regression guard for #7837: mem_search sort=time was a silent no-op
   // pre-v2.34.0. Calling with sort=time on an empty DB should at minimum
   // return a well-formed response (not throw), and not contradict its input.

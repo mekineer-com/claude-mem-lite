@@ -15,7 +15,16 @@ export default defineConfig({
     // per-file ("the dev/CI shell may export a real key"); force them empty GLOBALLY
     // so no test can leak a live call by forgetting to. Tests that exercise keyed
     // mode override locally via vi.stubEnv (which restores to '' after each test).
-    env: { CLAUDE_MEM_AUTO_DEEP_CLI: '0', ANTHROPIC_API_KEY: '', OPENROUTER_API_KEY: '' },
+    // Same systemic-scrub rationale for the two #8608-class leak vars (audit 2026-07-17
+    // MED-5): MEM_QUIET_HOOKS=1 in a dev shell leaks into every spawned hook subprocess
+    // (…process.env spread) and silently flips descriptive-stdout assertions; CLAUDE_MEM_DIR
+    // overrides the HOME-based data dir (resolveDataDir), so a dev who relocated their real
+    // DB would have e2e subprocesses read/write it. Tests that exercise these vars set them
+    // explicitly (vi.stubEnv or child env), which overrides this global ''.
+    env: {
+      CLAUDE_MEM_AUTO_DEEP_CLI: '0', ANTHROPIC_API_KEY: '', OPENROUTER_API_KEY: '',
+      MEM_QUIET_HOOKS: '', CLAUDE_MEM_DIR: '',
+    },
     // Reap test-fixture dirs leaked by prior interrupted/SIGKILL'd runs (afterEach
     // never reached). Runs once before the suite; 1h age guard never touches the
     // current run. See lib/tmp-fixture-sweep.mjs.

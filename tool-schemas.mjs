@@ -3,8 +3,9 @@
 
 import { z } from 'zod';
 import { CLI_INVOKE } from './cli-path.mjs';
+import { OBS_TYPES } from './lib/obs-types.mjs';
 
-export const OBS_TYPE_ENUM = z.enum(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+export const OBS_TYPE_ENUM = z.enum([...OBS_TYPES]);
 
 // LLM-friendly coercion: accept string numbers and normalize to proper types
 const coerceInt = z.preprocess(

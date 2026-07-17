@@ -176,7 +176,7 @@ const CORE_SCHEMA = `
     memory_session_id TEXT NOT NULL,
     project TEXT NOT NULL,
     text TEXT,
-    type TEXT NOT NULL CHECK(type IN ('decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change')),
+    type TEXT NOT NULL CHECK(type IN ('decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change')), -- keep in sync with lib/obs-types.mjs OBS_TYPES (locked by tests/obs-types-invariant.test.mjs)
     title TEXT,
     subtitle TEXT,
     facts TEXT,

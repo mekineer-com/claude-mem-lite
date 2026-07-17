@@ -292,4 +292,22 @@ describe('upsertResource preserve-on-empty (partial re-import keeps search metad
     expect(row.keywords).toBe('kubectl helm rollout');                // preserved, not blanked
     expect(row.intent_tags).toBe('deploy');                           // preserved, not blanked
   });
+
+  // Audit 2026-07-17 L1: file_hash was the last unprotected column in this UPSERT — a
+  // metadata-only re-import (no file_hash in fields) nulled the stored content hash,
+  // forcing a redundant re-index and false drift reports until the next full scan.
+  it('a partial re-import preserves file_hash (change-detection anchor) when not supplied', () => {
+    upsertResource(db, {
+      name: 'kube-deploy', type: 'skill', source: 'user', local_path: '/x/SKILL.md',
+      file_hash: 'abc123', capability_summary: 'deploy to kubernetes',
+    });
+    // Partial re-import: file_hash omitted → upsertResource passes null
+    upsertResource(db, {
+      name: 'kube-deploy', type: 'skill', source: 'user', local_path: '',
+      capability_summary: 'deploy to kubernetes (v2)',
+    });
+    const row = db.prepare("SELECT file_hash, capability_summary FROM resources WHERE name='kube-deploy'").get();
+    expect(row.capability_summary).toBe('deploy to kubernetes (v2)');
+    expect(row.file_hash).toBe('abc123'); // preserved, not nulled
+  });
 });

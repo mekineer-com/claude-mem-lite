@@ -162,6 +162,19 @@ export const SOURCE_FILES = [
   // (cmdDelete) — extracted to kill the byte-duplicated twin. Missing it from the
   // manifest would leave both delete surfaces unsigned/broken on auto-update.
   'lib/delete-core.mjs',
+  // Shared primary stats feed (audit 2026-07-17 MED-4) — statically imported by
+  // server.mjs (mem_stats) and mem-cli.mjs (cmdStats); killed the ~80-line
+  // byte-duplicated twin. Missing it breaks both stats surfaces on auto-update.
+  'lib/stats-core.mjs',
+  // Observation `type` vocabulary single source (audit 2026-07-17 MED-3) —
+  // statically imported by tool-schemas.mjs, mem-cli.mjs, hook-llm.mjs,
+  // hook-optimize.mjs, lib/activity.mjs. Missing it breaks every save/validate
+  // path on auto-update.
+  'lib/obs-types.mjs',
+  // Save-time lesson nudge (audit 2026-07-17 P4) — statically imported by server.mjs
+  // (mem_save) and mem-cli.mjs (cmdSave). Missing it breaks both save surfaces on
+  // auto-update.
+  'lib/save-nudge.mjs',
   // P10 dedup/merge threshold constants — single source of truth for the Jaccard
   // dedup/merge cutoffs. Statically imported by hook.mjs, hook-llm.mjs,
   // hook-optimize.mjs, mem-cli.mjs, server.mjs, and the save/maintain cores;

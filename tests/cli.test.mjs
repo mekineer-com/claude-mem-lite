@@ -814,6 +814,26 @@ describe('CLI save command', () => {
     expect(row.title).toBe('Cache architecture');
   });
 
+  // Audit 2026-07-17 P4: bugfix/decision saved WITHOUT --lesson get a save-time nudge
+  // naming the exact follow-up command — live data shows lessonless concentrates on
+  // exactly these types (14d: bugfix 18.8% / decision 28.7%), and the save response is
+  // the one moment the caller still has the context to write the lesson.
+  it('nudges when a bugfix is saved without --lesson', async () => {
+    const output = await captureStdout(() => run(['save', 'Fixed the race in the flush path', '--type', 'bugfix', '--title', 'Flush race fix']));
+    expect(output).toContain('[mem] Saved');
+    expect(output).toContain('without a lesson');
+    expect(output).toContain('--lesson');
+  });
+
+  it('does NOT nudge when the lesson is provided, or for low-obligation types', async () => {
+    const withLesson = await captureStdout(() => run(['save', 'Fixed the race', '--type', 'bugfix', '--title', 'Race fix 2', '--lesson', 'Hold the lock until the side-effect commits']));
+    expect(withLesson).toContain('💡lesson captured');
+    expect(withLesson).not.toContain('without a lesson');
+
+    const discovery = await captureStdout(() => run(['save', 'Interesting corner of the codebase', '--type', 'discovery']));
+    expect(discovery).not.toContain('without a lesson');
+  });
+
   it('rejects out-of-range importance (must be 1-3)', async () => {
     const out5 = await captureStdout(() => run(['save', 'Test importance high', '--importance', '5']));
     expect(out5).toContain('Invalid importance');

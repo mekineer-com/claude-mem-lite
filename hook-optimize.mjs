@@ -15,6 +15,7 @@ import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, cosineSimilarity, vecTextForRow } from './tfidf.mjs';
 import { MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { DB_DIR } from './schema.mjs';
+import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 
@@ -150,7 +151,7 @@ export async function executeReenrich(db, limit = 10, { scope = 'narrow', projec
   if (candidates.length === 0) return { processed: 0, skipped: 0 };
 
   let processed = 0, skipped = 0;
-  const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+  const validTypes = OBS_TYPE_SET;
 
   for (const cand of candidates) {
     const gotSlot = await acquireLLMSlot();
@@ -929,19 +930,28 @@ export async function optimizeRun(db, { tasks, maxItems = 15, force = false, ree
     try {
       switch (task) {
         case 're-enrich':
-          if (reenrichScope === 'narrow') {
-            // P1-2: the default maintenance pass covers BOTH narrow (fill lesson/concepts on
-            // fully-degraded rows) AND aliases (backfill search_aliases on lesson-bearing
-            // manual saves that narrow+wide both skip — mem_save writes no aliases, so without
-            // this they stay paraphrase-unfindable). Split the budget so neither starves.
-            // An explicit --scope wide|aliases still runs exactly that one scope (below).
-            const aliasBudget = Math.max(1, Math.floor(budget.reenrich / 2));
-            const narrowRes = await executeReenrich(db, budget.reenrich - aliasBudget, { scope: 'narrow', project });
-            const aliasRes = await executeReenrich(db, aliasBudget, { scope: 'aliases', project });
+          if (reenrichScope === 'narrow' || reenrichScope === 'wide') {
+            // P1-2 (v3.43) + audit 2026-07-17 P4: the maintenance pass covers BOTH the main
+            // scope (narrow = fill lesson/concepts on fully-degraded rows; wide = lesson
+            // backfill on substantive event-typed rows) AND aliases (backfill search_aliases
+            // on lesson-bearing manual saves that narrow+wide both skip — mem_save writes no
+            // aliases, so without this they stay paraphrase-unfindable). v3.43 hung the split
+            // only on the DEFAULT 'narrow' branch, but the DAILY auto path (handleLLMOptimize
+            // via auto-maintain) passes 'wide' explicitly — so aliases never had a cadence and
+            // live coverage crawled at ~15%. The split is ADAPTIVE: aliases takes at most half
+            // the budget and only what its candidate pool actually holds, so a zero-candidate
+            // aliases pass costs nothing and the main scope keeps its full budget.
+            // An explicit --scope aliases still runs exactly that one scope (below).
+            const half = Math.max(1, Math.floor(budget.reenrich / 2));
+            const aliasBudget = Math.min(half, findReenrichCandidates(db, half, { scope: 'aliases', project }).length);
+            const mainRes = await executeReenrich(db, budget.reenrich - aliasBudget, { scope: reenrichScope, project });
+            const aliasRes = aliasBudget > 0
+              ? await executeReenrich(db, aliasBudget, { scope: 'aliases', project })
+              : { processed: 0, skipped: 0 };
             results.reenrich = {
-              processed: (narrowRes.processed || 0) + (aliasRes.processed || 0),
-              skipped: (narrowRes.skipped || 0) + (aliasRes.skipped || 0),
-              byScope: { narrow: narrowRes, aliases: aliasRes },
+              processed: (mainRes.processed || 0) + (aliasRes.processed || 0),
+              skipped: (mainRes.skipped || 0) + (aliasRes.skipped || 0),
+              byScope: { [reenrichScope]: mainRes, aliases: aliasRes },
             };
           } else {
             results.reenrich = await executeReenrich(db, budget.reenrich, { scope: reenrichScope, project });

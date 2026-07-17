@@ -209,6 +209,48 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
     const obs = db.prepare('SELECT search_aliases FROM observations LIMIT 1').get();
     expect(obs.search_aliases).toContain('connection deadlock');
   });
+
+  // Audit 2026-07-17 P4: the DAILY auto path (handleLLMOptimize via auto-maintain)
+  // passes reenrichScope='wide' explicitly, which bypassed the v3.43 narrow+aliases
+  // split — so the aliases backfill NEVER had an automatic cadence and live alias
+  // coverage crawled at ~15%. The split must cover 'wide' too (adaptively: aliases
+  // takes at most half the budget and only what its candidate pool holds).
+  it("scope 'wide' (the daily auto path) also backfills aliases on a lesson-bearing manual save", async () => {
+    const { optimizeRun } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed deadlock in the connection pool', narrative: substantive,
+      text: 'deadlock connection pool worker timeout', type: 'bugfix', importance: 2,
+      lessonLearned: 'Never acquire a second pool connection inside a callback holding the first',
+      searchAliases: null,
+    });
+    // wide requires lesson_learned NULL → 0 wide candidates here; only the aliases
+    // sub-pass calls the model, so an alias-shaped mock is unambiguous.
+    callModelJSON.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang'] });
+    await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10, reenrichScope: 'wide' });
+    const obs = db.prepare('SELECT search_aliases FROM observations LIMIT 1').get();
+    expect(obs.search_aliases).toContain('connection deadlock');
+  });
+
+  // The adaptive half is a CAP, not a reservation: with zero aliases candidates the
+  // main scope keeps its full budget (guards the wide-throughput semantics of the
+  // maxItems:20 test below against the split).
+  it("scope 'wide' with no aliases candidates gives wide the full budget", async () => {
+    const { optimizeRun } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed race in scheduler', narrative: substantive,
+      text: 'race scheduler', type: 'bugfix', importance: 2,
+      searchAliases: 'already has aliases', // NOT an aliases candidate
+    });
+    db.prepare("UPDATE observations SET concepts = 'race', facts = 'scheduler'").run();
+    callModelJSON.mockResolvedValue({
+      type: 'bugfix', title: 'Race in scheduler', narrative: 'Race fixed.',
+      concepts: ['race'], facts: ['scheduler'], importance: 2,
+      lesson_learned: 'Hold the lock', search_aliases: ['race fix'],
+    });
+    const result = await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10, reenrichScope: 'wide' });
+    expect(result.reenrich.byScope.aliases.processed).toBe(0);
+    expect(result.reenrich.byScope.wide.processed).toBe(1);
+  });
 });
 
 // Bug #1: rebuildVector was writing to a non-existent column `computed_at`.

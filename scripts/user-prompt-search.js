@@ -787,8 +787,11 @@ async function main() {
       if (matched) {
         const cooldown = getSkillCooldown();
         if (!cooldown[matched]) {
+          // Registry skill names come from third-party repos (tools/adopt import) — an
+          // untrusted boundary like every other DB-derived string on this surface.
+          const safeName = neutralizeContextDelimiters(matched);
           process.stdout.write(
-            `\n[mem] Skill "${matched}" may apply — invoke via SkillTool or run: claude-mem-lite registry show ${matched}\n`
+            `\n[mem] Skill "${safeName}" may apply — invoke via SkillTool or run: claude-mem-lite registry show ${safeName}\n`
           );
           setSkillCooldown(matched);
         }

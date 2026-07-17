@@ -21,6 +21,7 @@ import {
 import { EVENT_TYPES, saveEvent } from './lib/activity.mjs';
 import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from './lib/low-signal-patterns.mjs';
 import { episodeHasSignificantContent } from './hook-episode.mjs';
+import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
@@ -771,7 +772,7 @@ ${actionList}`;
   const ruleImportance = computeRuleImportance(episode);
 
   let obs;
-  const validTypes = new Set(['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change']);
+  const validTypes = OBS_TYPE_SET;
 
   const gotSlot = await acquireLLMSlot();
   if (gotSlot) {

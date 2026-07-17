@@ -12,7 +12,6 @@ import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup, buildServerInstru
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import {
@@ -26,6 +25,8 @@ import { snapshotDb } from './lib/db-backup.mjs';
 import { deleteObservations } from './lib/delete-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
+import { computeStatsFeed } from './lib/stats-core.mjs';
+import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue } from './cli/common.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
@@ -46,7 +47,6 @@ import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-ro
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
-import { computeNoiseGauge } from './lib/stats-quality.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
@@ -750,7 +750,8 @@ server.registerTool(
     const supersededNote = result.supersededIds && result.supersededIds.length > 0
       ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
       : '';
-    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}` }] };
+    const nudge = buildLessonNudge({ type: result.type, id: result.id, lessonCaptured: result.lessonCaptured, surface: 'mcp' });
+    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}${nudge}` }] };
   })
 );
 
@@ -848,97 +849,11 @@ server.registerTool(
       return { content: [{ type: 'text', text: formatQualityReport(data) }] };
     }
 
-    const cutoff = Date.now() - days * 86400000;
-    const projectFilter = args.project ? 'AND project = ?' : '';
-    const baseParams = args.project ? [args.project] : [];
-
-    // Total counts
-    const obsTotal = db.prepare(`SELECT COUNT(*) as c FROM observations WHERE 1=1 ${projectFilter}`).get(...baseParams);
-    const sessTotal = db.prepare(`SELECT COUNT(*) as c FROM session_summaries WHERE 1=1 ${projectFilter}`).get(...baseParams);
-    const promptTotal = args.project
-      ? db.prepare(`SELECT COUNT(*) as c FROM user_prompts p JOIN sdk_sessions s ON p.content_session_id = s.content_session_id WHERE s.project = ?`).get(args.project)
-      : db.prepare(`SELECT COUNT(*) as c FROM user_prompts`).get();
-
-    // Recent counts
-    const obsRecent = db.prepare(`SELECT COUNT(*) as c FROM observations WHERE created_at_epoch >= ? ${projectFilter}`).get(cutoff, ...baseParams);
-    const sessRecent = db.prepare(`SELECT COUNT(*) as c FROM session_summaries WHERE created_at_epoch >= ? ${projectFilter}`).get(cutoff, ...baseParams);
-
-    // Type distribution (recent)
-    const types = db.prepare(`
-      SELECT type, COUNT(*) as c FROM observations
-      WHERE created_at_epoch >= ? ${projectFilter}
-      GROUP BY type ORDER BY c DESC
-    `).all(cutoff, ...baseParams);
-
-    // Projects (global view — skipped when filtering by single project)
-    const projects = args.project ? [] : db.prepare(`
-      SELECT project, COUNT(*) as c FROM observations
-      GROUP BY project ORDER BY c DESC
-      LIMIT 20
-    `).all();
-
-    // Daily activity (last 7 days)
-    const daily = db.prepare(`
-      SELECT date(created_at) as day, COUNT(*) as c FROM observations
-      WHERE created_at_epoch >= ? ${projectFilter}
-      GROUP BY day ORDER BY day DESC
-      LIMIT 7
-    `).all(Date.now() - 7 * 86400000, ...baseParams);
-
-    // Health metrics
-    const tokenEst = db.prepare(`
-      SELECT SUM(LENGTH(COALESCE(title,'')) + LENGTH(COALESCE(narrative,'')) + LENGTH(COALESCE(text,''))) / 4 as t
-      FROM observations WHERE 1=1 ${projectFilter}
-    `).get(...baseParams);
-
-    const avgImp = db.prepare(`
-      SELECT AVG(COALESCE(importance,1)) as v FROM observations WHERE 1=1 ${projectFilter}
-    `).get(...baseParams);
-
-    const thirtyDaysAgo = Date.now() - 30 * 86400000;
-    // v3.23 noise-gauge de-blinding (mirrors mem-cli cmdStats): `<= 1` makes the
-    // imp=0 dormant population visible (decay floor + LLM low-signal filter push
-    // ~half the live corpus to 0); injection_count=0 mirrors decay's NEVER-INJECTED
-    // guard so injected-but-decayed pinned noise isn't miscounted as "never used".
-    const lowVal = db.prepare(`
-      SELECT COUNT(*) as c FROM observations
-      WHERE COALESCE(importance,1) <= 1 AND COALESCE(access_count,0) = 0
-        AND COALESCE(injection_count,0) = 0
-        AND COALESCE(compressed_into, 0) = 0
-        AND created_at_epoch < ? ${projectFilter}
-    `).get(thirtyDaysAgo, ...baseParams);
-
-    // Low-signal-title population (template / tool-log titles the read-side filter
-    // already excludes). The imp=1 "Low-value" metric can't see these, so the
-    // gauge under-reports real noise without it. See lib/low-signal-patterns.mjs.
-    const lowSignalTitle = db.prepare(`
-      SELECT COUNT(*) as c FROM observations
-      WHERE NOT ${buildNotLowSignalSql()}
-        AND COALESCE(compressed_into, 0) = 0 ${projectFilter}
-    `).get(...baseParams);
-    // F7: both noise numerators exclude compressed rows → divide by the LIVE count, not
-    // obsTotal (all rows), so a compress-heavy store isn't reported cleaner than it is.
-    const liveTotal = db.prepare(
-      `SELECT COUNT(*) as c FROM observations WHERE COALESCE(compressed_into, 0) = 0 ${projectFilter}`
-    ).get(...baseParams);
-    const { noiseRatio, lowSignalRatio } = computeNoiseGauge({ liveTotal: liveTotal.c, lowValCount: lowVal.c, lowSignalCount: lowSignalTitle.c });
-    const compressedCount = db.prepare(`
-      SELECT COUNT(*) as c FROM observations WHERE compressed_into IS NOT NULL ${projectFilter}
-    `).get(...baseParams);
-    const supersededOnlyCount = db.prepare(`
-      SELECT COUNT(*) as c FROM observations WHERE superseded_at IS NOT NULL AND compressed_into IS NULL ${projectFilter}
-    `).get(...baseParams);
-
-    // Tier distribution
-    const tierCtx = { now: Date.now(), currentProject: args.project || inferProject(), currentSessionId: '' };
-    const tdParams = tierSqlParams(tierCtx);
-    const tierDist = db.prepare(`
-      SELECT tier, COUNT(*) as c FROM (
-        SELECT ${TIER_CASE_SQL} as tier FROM observations
-        WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL ${projectFilter}
-      ) GROUP BY tier ORDER BY tier
-    `).all(...tdParams, ...baseParams);
-    const tierMap = Object.fromEntries(tierDist.map(r => [r.tier, r.c]));
+    const {
+      obsTotal, sessTotal, promptTotal, obsRecent, sessRecent,
+      types, projects, daily, tokenEst, avgImp, lowVal, lowSignalTitle,
+      noiseRatio, lowSignalRatio, compressedCount, supersededOnlyCount, tierMap,
+    } = computeStatsFeed(db, { project: args.project || null, days });
 
     const lines = [
       `Memory Statistics${args.project ? ` (project: ${args.project})` : ''}:`,

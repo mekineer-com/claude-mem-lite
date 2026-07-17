@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.49.0 — full audit 2026-07-17 roadmap (P1–P4): cross-source ranking bands, save-time lesson nudge, alias-backfill cadence fix, twin de-duplication
+
+Follow-up to the v3.48.0 audit cycle: a fresh full audit of v3.48.0 (6 parallel read-only agents, every MED independently re-verified against source) found **0 HIGH — all seven v3.48.0 fixes held with no regression**. This release implements the audit's entire recommendation roadmap.
+
+**What changes for you:**
+1. **Strong single-source matches rank correctly.** `events` is the canonical store for promoted bugfix/decision memories and a low-cardinality source, so "the best answer is one strong event" is routine — and the v3.48.0 magnitude-blind clamp buried it under weak multi-hit observations. Lone matches are now banded by raw strength relative to the global raw max: the strongest raw match anywhere ranks first; grazing matches sink; the CJK LIKE-fallback (zero-confidence, score 0) always sorts last. Obs-only ranking is unchanged (denoise A/B NEUTRAL, Δ=0.000 on both suites; new cross-source CI probes are the behavioral evidence).
+2. **Saving a bugfix/decision without a lesson now nudges you.** The save response (MCP `mem_save` and CLI `save`) appends a one-line prompt naming the exact follow-up call (`mem_update(id=…, lesson_learned=…)` / `update N --lesson`) — live data shows lessonless writes concentrate on exactly these types (14d: bugfix 18.8% / decision 28.7%). No nudge when a lesson is provided or for low-obligation types.
+3. **Alias backfill finally has a cadence.** Root cause was not a missing scheduler: the daily `llm-optimize` worker always ran, but passed `reenrichScope:'wide'` explicitly, bypassing the v3.43 narrow+aliases budget split — so manual saves stayed paraphrase-unfindable (live alias coverage ~15%). The split now covers `wide` too, with an ADAPTIVE budget (aliases takes at most half, and only what its candidate pool holds — zero candidates cost nothing). **Opt-out:** the existing `CLAUDE_MEM_SKIP_OPTIMIZE=1` (skips the whole daily optimize worker; ~≤7 extra Haiku calls/day otherwise).
+
+### Fixed
+- **Ranking (audit MED-1 + L3)** — `normalizeCrossSourceScores` single-match banding (see above), locked by 5 unit band tests + 2 real-pipeline direction probes (`tests/search-cross-source-ranking.test.mjs`), including a MED-5-preservation guard (an incidental lone event still cannot outrank a strong obs page).
+- **Test isolation (audit MED-5)** — `vitest.config.mjs` globally scrubs `MEM_QUIET_HOOKS` (leaked from dev shells into spawned hook subprocesses — 5 leak lines reproduced in this audit's own baseline run) and `CLAUDE_MEM_DIR` (a relocated real DB could otherwise be read/written by e2e subprocesses).
+- **registry `file_hash` preserve-on-empty (audit L1)** — the last unprotected column in the registry UPSERT: a metadata-only `registry import` nulled the stored content hash, forcing redundant re-index + false drift reports.
+- **Skill-pointer defang (audit L2)** — the UserPromptSubmit skill-name pointer was the last injection surface emitting DB-derived text without `neutralizeContextDelimiters`; registry skill names come from third-party repos.
+
+### Changed
+- **obs-type vocabulary single-sourced (audit MED-3)** — the 6-type list was hardcoded in 11 sites (10 JS + the SQL CHECK); all validators now import `lib/obs-types.mjs`, locked by a 4-layer invariant test including a repo-wide "new hardcoded copy = red" scan.
+- **stats feed single-sourced (audit MED-4)** — the ~80-line byte-identical primary stats block in `server.mjs` (mem_stats) and `mem-cli.mjs` (cmdStats) is extracted to `lib/stats-core.mjs` (same twin class delete-core closed in v3.48.0).
+- Doc accuracy: `lib/events-injection.mjs` header now states path A is intentionally NOT wired (double-injection hazard); `lib/export-columns.mjs` documents the `related_ids`/`discovery_tokens` exclusions; CLAUDE.md knip baseline refreshed (53 → 47).
+
+New runtime modules (`lib/obs-types.mjs`, `lib/stats-core.mjs`, `lib/save-nudge.mjs`) are in the signed release manifest and npm `files` allowlist (the transitive-closure signing invariant test caught the first two on the spot). 3819 tests pass (+21), eslint clean, knip 46, denoise A/B NEUTRAL Δ=0.000.
+
 ## v3.48.0 — full audit 2026-07-16 (7 fixes): events reachable from passive injection (HIGH) + injection-defang, concurrency, latency, ranking, and delete-twin cleanups
 
 Full read-only audit (6 parallel agents, all HIGH/MED findings independently re-verified against source). No data-loss, RCE, or session-breaking defect — the signing chain, data-write choke points, and fail-open discipline all held. This release closes the one HIGH functional gap plus the P1 batch.
