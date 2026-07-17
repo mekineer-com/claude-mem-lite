@@ -20,7 +20,7 @@ Follow-up to the v3.48.0 audit cycle: a fresh full audit of v3.48.0 (6 parallel 
 ### Changed
 - **obs-type vocabulary single-sourced (audit MED-3)** — the 6-type list was hardcoded in 11 sites (10 JS + the SQL CHECK); all validators now import `lib/obs-types.mjs`, locked by a 4-layer invariant test including a repo-wide "new hardcoded copy = red" scan.
 - **stats feed single-sourced (audit MED-4)** — the ~80-line byte-identical primary stats block in `server.mjs` (mem_stats) and `mem-cli.mjs` (cmdStats) is extracted to `lib/stats-core.mjs` (same twin class delete-core closed in v3.48.0).
-- Doc accuracy: `lib/events-injection.mjs` header now states path A is intentionally NOT wired (double-injection hazard); `lib/export-columns.mjs` documents the `related_ids`/`discovery_tokens` exclusions; CLAUDE.md knip baseline refreshed (53 → 47).
+- Doc accuracy: `lib/events-injection.mjs` header now states path A is intentionally NOT wired (double-injection hazard); `lib/export-columns.mjs` documents the `related_ids`/`discovery_tokens` exclusions; CLAUDE.md knip baseline refreshed (53 → 46; the enum single-sourcing gave `OBS_TYPE_ENUM` its first real importers).
 
 New runtime modules (`lib/obs-types.mjs`, `lib/stats-core.mjs`, `lib/save-nudge.mjs`) are in the signed release manifest and npm `files` allowlist (the transitive-closure signing invariant test caught the first two on the spot). 3819 tests pass (+21), eslint clean, knip 46, denoise A/B NEUTRAL Δ=0.000.
 

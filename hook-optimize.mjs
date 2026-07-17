@@ -940,7 +940,11 @@ export async function optimizeRun(db, { tasks, maxItems = 15, force = false, ree
             // via auto-maintain) passes 'wide' explicitly — so aliases never had a cadence and
             // live coverage crawled at ~15%. The split is ADAPTIVE: aliases takes at most half
             // the budget and only what its candidate pool actually holds, so a zero-candidate
-            // aliases pass costs nothing and the main scope keeps its full budget.
+            // aliases pass costs nothing and the main scope keeps its full budget. Boundary:
+            // at budget.reenrich === 1, `half` floors to 1 (the whole budget), so with ≥1
+            // alias candidate the main scope gets 0 that cycle — pre-existing v3.43 semantics
+            // (reachable only via manual `optimize --max ≤4`; the daily path runs reenrich=6),
+            // and the starved scope self-corrects next cycle.
             // An explicit --scope aliases still runs exactly that one scope (below).
             const half = Math.max(1, Math.floor(budget.reenrich / 2));
             const aliasBudget = Math.min(half, findReenrichCandidates(db, half, { scope: 'aliases', project }).length);
