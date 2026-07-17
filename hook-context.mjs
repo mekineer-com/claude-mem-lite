@@ -8,8 +8,9 @@ import {
   debugLog, debugCatch, neutralizeContextDelimiters,
   DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
 } from './utils.mjs';
-import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet } from './hook-shared.mjs';
+import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, isQuietHooks } from './hook-shared.mjs';
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
+import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 
 /**
  * Infer the project directory from environment variables or cwd.
@@ -386,6 +387,24 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
       for (const o of recentObs) {
         summaryLines.push(`- ${truncate(o.title || '(untitled)', 80)}`);
       }
+      summaryLines.push('');
+    }
+  }
+
+  // HIGH-1 (full audit 2026-07-16): surface recent high-importance events — the
+  // canonical store for promoted bugfix/decision/lesson memories that
+  // persistHaikuSummary upgrade-deletes out of observations. Without this section
+  // SessionStart never shows them. E# prefix keeps citation extractors (bare-`#`
+  // anchored) from reading an event id as an observation id. Gated on isQuietHooks()
+  // ONLY (explicit low-noise opt-out), NOT effectiveQuiet: unlike Key Context, events
+  // never appear in the obs-only Recent table and are absent from the MEMORY.md
+  // sentinel, so an adopted project (the default) would otherwise have zero
+  // SessionStart surface for them. Never throws (recentInjectableEvents catches).
+  if (!isQuietHooks()) {
+    const keyEvents = recentInjectableEvents(db, { project, limit: 5 });
+    if (keyEvents.length > 0) {
+      summaryLines.push('### Key Events');
+      for (const e of keyEvents) summaryLines.push(`- ${renderInjectableEvent(e)}`);
       summaryLines.push('');
     }
   }

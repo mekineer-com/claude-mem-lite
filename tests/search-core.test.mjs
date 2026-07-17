@@ -246,10 +246,24 @@ describe('search-core', () => {
       expect(results.map((r) => r.score)).toEqual([-1, -0.5]);
     });
 
-    it('skips single-row sources (no inflating a weak match to -1)', () => {
+    it('clamps single-row sources to the neutral mid (MED-5), not their raw magnitude', () => {
       const results = [{ source: 'prompt', score: -0.2 }, { source: 'obs', score: -10 }, { source: 'obs', score: -5 }];
       normalizeCrossSourceScores(results, 'source');
-      expect(results[0].score).toBe(-0.2);
+      expect(results[0].score).toBe(-0.5); // lone prompt clamped to neutral mid
+      expect(results[1].score).toBe(-1);   // obs still normalized within-source
+      expect(results[2].score).toBe(-0.5);
+    });
+
+    it('a lone large-magnitude event no longer outranks strong obs matches (MED-5)', () => {
+      const results = [
+        { source: 'event', score: -30 }, // single incidental event match
+        { source: 'obs', score: -40 }, { source: 'obs', score: -20 },
+      ];
+      normalizeCrossSourceScores(results, 'source');
+      // Mirror the pipeline's ascending (most-negative-first) merge sort.
+      results.sort((a, b) => a.score - b.score);
+      expect(results[0].source).toBe('obs'); // strong obs leads, not the lone event
+      expect(results.find((r) => r.source === 'event').score).toBe(-0.5);
     });
   });
 

@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { computeMinHash } from '../utils.mjs';
 import { initSchema } from '../schema.mjs';
+import { saveEvent } from '../lib/activity.mjs';
 
 const HOOK_PATH = resolve('hook.mjs');
 const MOCK_CLAUDE = resolve('scripts/mock-claude.mjs');
@@ -66,6 +67,7 @@ function runHook(event, { stdin, env = {}, args = [] } = {}) {
     CLAUDE_MEM_SKIP_UPDATE: '1', // Skip auto-update network calls in tests
     CLAUDE_MEM_SKIP_COMPRESS: '1', // Skip auto-compress background spawn (tests call it explicitly)
     CLAUDE_MEM_SKIP_OPTIMIZE: '1', // Skip llm-optimize background worker in tests
+    CLAUDE_MEM_SKIP_MAINTAIN: '1', // Skip auto-maintain background spawn (tests call it explicitly)
     ...env,
   };
 
@@ -855,6 +857,54 @@ describe('Suite 5: User Prompt', () => {
     expect(prompts[0].prompt_text).toBe('Using the new prompt field name');
   });
 
+  it('user-prompt surfaces matching events in an E# memory-context block (HIGH-1 path B)', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+
+    // Seed an event (the canonical store for promoted bugfix memories) matching the prompt.
+    const db = openTestDb(tmpHome);
+    const evId = saveEvent(db, {
+      project: 'parent--testproj', event_type: 'bugfix',
+      title: 'redis connection timeout fix',
+      body: 'raise the pool size and add exponential backoff on connect',
+      importance: 2,
+    });
+    db.close();
+
+    const { stdout, exitCode } = runHook('user-prompt', {
+      stdin: JSON.stringify({ user_prompt: 'how did we fix the redis timeout' }),
+      env: { HOME: tmpHome },
+    });
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('<memory-context relevance="events">');
+    expect(stdout).toContain(`E#${evId}`);
+    expect(stdout).toContain('backoff');
+    // id-space discipline: rendered as E#, never a bare #<id> that citation decay
+    // would mis-read as an observation id.
+    expect(stdout).not.toContain(`(#${evId})`);
+  });
+
+  it('SessionStart surfaces recent high-importance events in a Key Events section (HIGH-1 SessionStart)', () => {
+    // First session-start creates the DB + session; seed an event; the next
+    // session-start emits the context block including the Key Events section.
+    // MEM_QUIET_HOOKS is cleared: the dev shell may export it (=1), and runHook
+    // spreads ...process.env, which would suppress the descriptive sections (#8608).
+    const nonQuiet = { HOME: tmpHome, MEM_QUIET_HOOKS: '' };
+    runHook('session-start', { env: nonQuiet });
+    const db = openTestDb(tmpHome);
+    const evId = saveEvent(db, {
+      project: 'parent--testproj', event_type: 'decision',
+      title: 'chose WAL + busy_timeout for concurrent sessions',
+      body: 'immediate transactions serialize writers across sessions',
+      importance: 3,
+    });
+    db.close();
+
+    const { stdout } = runHook('session-start', { env: nonQuiet });
+    expect(stdout).toContain('### Key Events');
+    expect(stdout).toContain(`E#${evId}`);
+    expect(stdout).not.toContain(`(#${evId})`); // E#, not a bare obs-id form
+  });
+
   it('task-notification prompts are silently dropped (not stored)', () => {
     runHook('session-start', { env: { HOME: tmpHome } });
     const sessionId = getSessionIdFromFile(tmpHome);
@@ -928,6 +978,17 @@ describe('Suite 6: Error Recall', () => {
     expect(stdout).toContain('Start the dev server before curling the health endpoint.');
     // ② precision-half: low-signal 'Modified %' obs is gated out despite matching FTS
     expect(stdout).not.toContain('Modified netcfg.json');
+
+    // MED-3: the hint must ride the JSON envelope, not raw stdout. A raw multi-line
+    // text write corrupts a co-emitted episode-flush receipt (both land on stdout)
+    // and is silently dropped on CC variants that ignore plain-text PostToolUse
+    // stdout. Every non-empty stdout line must therefore be a parseable JSON object.
+    const lines = stdout.split('\n').filter(Boolean);
+    expect(lines.length).toBeGreaterThan(0);
+    const parsed = lines.map((l) => JSON.parse(l)); // throws (RED) if any line is raw text
+    const hint = parsed.find((p) => p.hookSpecificOutput?.additionalContext?.includes('Related memories found for this error'));
+    expect(hint).toBeTruthy();
+    expect(hint.hookSpecificOutput.hookEventName).toBe('PostToolUse');
   });
 });
 
@@ -1241,7 +1302,12 @@ describe('Suite 8a: Additional E2E', () => {
     ins.run('parent--testproj', 'clear', 's-clr', 'old clear', now - 2 * 86400000); // 2d → GC (clear 6h+1d)
     db.close();
 
+    // MED-4: the maintenance pass (incl. handoff-GC) now runs in the detached
+    // auto-maintain worker, not synchronously in SessionStart. In production
+    // SessionStart spawns it; here it is skipped (CLAUDE_MEM_SKIP_MAINTAIN) and
+    // invoked directly, mirroring the auto-compress worker tests.
     runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('auto-maintain', { env: { HOME: tmpHome } });
 
     const db2 = openTestDb(tmpHome);
     const surviving = db2.prepare('SELECT session_id FROM session_handoffs ORDER BY session_id').all().map(r => r.session_id);
@@ -1307,6 +1373,30 @@ describe('Suite 8a: Additional E2E', () => {
     ).get(summary.id);
     expect(compressed.c).toBe(4);
     db2.close();
+  });
+
+  it('auto-maintain worker runs the snapshot pass off the boot path (MED-4)', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    // A broken row (empty title AND narrative) is a cleanup candidate, so
+    // hardDeleteCandidateCount() > 0 and the maintenance pass takes a pre-delete
+    // snapshot. That snapshot is the audit's named boot-path blocker (VACUUM INTO).
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'orphan body', 'change', '', '', '', '', '', '[]', '[]', 1, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    db.close();
+    // Make maintenance due for the worker's internal 24h gate.
+    try { unlinkSync(join(tmpHome, '.claude-mem-lite', 'runtime', 'last-auto-maintain.json')); } catch { /* absent */ }
+
+    // The heavy pass now runs in the detached worker, not synchronously in SessionStart.
+    runHook('auto-maintain', { env: { HOME: tmpHome } });
+
+    const memDir = join(tmpHome, '.claude-mem-lite');
+    const snaps = readdirSync(memDir).filter((n) => n.includes('.pre-maintain-') && n.endsWith('.bak'));
+    expect(snaps.length).toBeGreaterThan(0); // worker took the snapshot
   });
 
   it('CLAUDE.md is NOT created when none exists (context goes to stdout only)', () => {

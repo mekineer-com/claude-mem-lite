@@ -749,6 +749,10 @@ function runHookCmd(event, { home, stdin = '', cwd = home }) {
         CLAUDE_MEM_SKIP_UPDATE: '1',
         CLAUDE_MEM_SKIP_COMPRESS: '1',
         CLAUDE_MEM_SKIP_OPTIMIZE: '1',
+        // MED-4: maintenance moved to the detached auto-maintain worker. Skip the
+        // SessionStart spawn so tests deterministically drive it via an explicit
+        // runHookCmd('auto-maintain', ...) call instead of racing a background proc.
+        CLAUDE_MEM_SKIP_MAINTAIN: '1',
         MEM_NO_AUTO_ADOPT: '1',
         MEM_QUIET_HOOKS: '1',
         CLAUDE_MEM_HOOK_RUNNING: undefined,
@@ -804,9 +808,11 @@ describe('T4-P1-A: auto-maintain 7-day retention (hook.mjs)', () => {
     insertObsRaw.run('audit--t4', 'row C body', 'row C (20d, unmarked)', null, new Date(now - 20 * DAY_MS).toISOString(), now - 20 * DAY_MS);
     db.close();
 
-    // SessionStart triggers the auto-maintain cycle (no prior maintain gate file).
+    // SessionStart schedules the auto-maintain cycle; MED-4 runs it in a detached
+    // worker (skipped here), so drive it explicitly for a deterministic result.
     const stdinPayload = JSON.stringify({ session_id: 'cc-t4-uuid' });
     runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: stdinPayload });
+    runHookCmd('auto-maintain', { home: tmpHome, cwd: projDir });
 
     const db2 = new Database(dbPath, { readonly: true });
     try {
@@ -840,6 +846,7 @@ describe('T4-P1-A: auto-maintain 7-day retention (hook.mjs)', () => {
     db.close();
 
     runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-t4-orph' }) });
+    runHookCmd('auto-maintain', { home: tmpHome, cwd: projDir });
 
     const db2 = new Database(dbPath, { readonly: true });
     try {
@@ -892,6 +899,7 @@ describe('Fuzzy auto-dedup (hook auto-maintain)', () => {
 
     const stdinPayload = JSON.stringify({ session_id: 'cc-fuzzy-uuid' });
     runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: stdinPayload });
+    runHookCmd('auto-maintain', { home: tmpHome, cwd: projDir }); // MED-4: maintenance runs in the worker
 
     const db2 = new Database(dbPath, { readonly: true });
     try {
@@ -926,9 +934,10 @@ describe('Fuzzy auto-dedup (hook auto-maintain)', () => {
     insertObsRaw.run('Modified B.mjs, A.mjs', new Date(now - 3 * DAY_MS).toISOString(), now - 3 * DAY_MS);
     db.close();
 
-    // Run hook with the skip env set
+    // Run the maintenance worker directly (MED-4: maintenance moved off SessionStart)
+    // with the fuzzy-dedup opt-out set, and assert the worker honors it.
     try {
-      execFileSync(process.execPath, [HOOK_PATH, 'session-start'], {
+      execFileSync(process.execPath, [HOOK_PATH, 'auto-maintain'], {
         input: JSON.stringify({ session_id: 'cc-fuzzy-skip' }),
         timeout: 10000,
         encoding: 'utf8',
@@ -1560,6 +1569,7 @@ describe('v2.56.0 #4: injection_count protects from auto-maintain decay/mark-idl
     db.close();
 
     runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-decay-uuid' }) });
+    runHookCmd('auto-maintain', { home: tmpHome, cwd: projDir }); // MED-4: decay/mark-idle runs in the worker
 
     const db2 = new Database(dbPath, { readonly: true });
     try {

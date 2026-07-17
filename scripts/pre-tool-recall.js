@@ -15,6 +15,7 @@ import { fileIntelFor } from '../lib/file-intel.mjs';
 import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
 import { recordMetric } from '../lib/metrics.mjs';
 import { presentIdents } from '../lib/lesson-idents.mjs';
+import { neutralizeContextDelimiters } from '../format-utils.mjs';
 
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
 // whole system. CLAUDE_MEM_DB_PATH / CLAUDE_MEM_RUNTIME_DIR remain as
@@ -519,7 +520,14 @@ try {
       // when the model misreads passive lesson context as a closing note.
       lines.push(`[mem] PreToolUse recall — system-injected context, continue your planned action:`);
     }
-    if (fileIntelLine) lines.push(fileIntelLine);
+    // MED-1 (full audit 2026-07-16): defang the injection-block delimiters in
+    // all DB/file-derived text before it enters additionalContext (which CC wraps
+    // in <system-reminder>). Stored text is raw — a lesson/title/summary carrying
+    // a literal </system-reminder> or forged <invoke ...> would break the wrapper
+    // and inject a privileged instruction. Mirrors formatErrorRecallHints, which
+    // already applies the same guard on the parallel error-recall surface. The
+    // `#id [type]` prefix is agent-generated (numeric id + type enum) — no defang.
+    if (fileIntelLine) lines.push(neutralizeContextDelimiters(fileIntelLine));
     if (hasLessons) {
       lines.push(`[mem] Lessons for ${fname}:`);
       for (const r of allRows) {
@@ -527,12 +535,12 @@ try {
           const lesson = r.lesson_learned.length > LESSON_MAX
             ? r.lesson_learned.slice(0, LESSON_MAX - 3) + '...'
             : r.lesson_learned;
-          lines.push(`  #${r.id} [${r.type}] ${lesson}`);
+          lines.push(`  #${r.id} [${r.type}] ${neutralizeContextDelimiters(lesson)}`);
         } else {
           const title = (r.title || '').length > LESSON_MAX
             ? r.title.slice(0, LESSON_MAX - 3) + '...'
             : (r.title || '');
-          lines.push(`  #${r.id} [${r.type}] ${title}`);
+          lines.push(`  #${r.id} [${r.type}] ${neutralizeContextDelimiters(title)}`);
         }
       }
       // v2.98 salience: Edit/Write is the action point — close the block with an
@@ -544,7 +552,7 @@ try {
         const changeText = [toolInput?.old_string, toolInput?.new_string, toolInput?.content]
           .filter(Boolean).join('\n');
         const bridged = await bridgeTopLesson(allRows, changeText);
-        if (bridged) lines.push(`[mem] ⚠ #${bridged.id} → this edit must: ${bridged.check}. Confirm your new code satisfies it.`);
+        if (bridged) lines.push(`[mem] ⚠ #${bridged.id} → this edit must: ${neutralizeContextDelimiters(bridged.check)}. Confirm your new code satisfies it.`);
         else lines.push(`[mem] ⚠ Before this edit: ${ACTIVE_DIRECTIVE}`);
       }
     } else if (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1') {

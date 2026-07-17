@@ -152,6 +152,16 @@ export const SOURCE_FILES = [
   // server.mjs, and hook.mjs before their destructive purge/cleanup — missing it
   // would crash maintain on auto-update with an unresolved import.
   'lib/db-backup.mjs',
+  // HIGH-1 events-injection: surfaces the `events` canonical store into the passive
+  // injection surfaces. Statically imported by hook.mjs (UserPromptSubmit) and
+  // hook-context.mjs (SessionStart) — missing it from the manifest would break both
+  // hooks on auto-update.
+  'lib/events-injection.mjs',
+  // Shared delete orchestration (snapshot + related_ids cleanup + child recovery
+  // + delete txn). Statically imported by server.mjs (mem_delete) and mem-cli.mjs
+  // (cmdDelete) — extracted to kill the byte-duplicated twin. Missing it from the
+  // manifest would leave both delete surfaces unsigned/broken on auto-update.
+  'lib/delete-core.mjs',
   // P10 dedup/merge threshold constants — single source of truth for the Jaccard
   // dedup/merge cutoffs. Statically imported by hook.mjs, hook-llm.mjs,
   // hook-optimize.mjs, mem-cli.mjs, server.mjs, and the save/maintain cores;

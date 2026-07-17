@@ -20,10 +20,11 @@ import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
-  recoverChildrenOf, hardDeleteCandidateCount,
+  hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
+import { deleteObservations } from './lib/delete-core.mjs';
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
@@ -1508,43 +1509,13 @@ function cmdDelete(db, args) {
     return;
   }
 
-  // Snapshot before the irreversible hard-delete so a wrong-id delete has a pre-image,
-  // matching the maintain purge/cleanup hard-delete paths (audit MED-2). Best-effort
-  // (never throws, skips :memory:); rows here are confirmed + non-empty, so the delete
-  // always removes something worth backing up. Must run OUTSIDE the transaction (VACUUM).
-  snapshotDb(db, { tag: 'pre-delete' });
-
-  // Transaction: clean up related_ids references + delete (aligned with MCP mem_delete)
-  const deletedIds = new Set(ids);
-  const deleteTx = db.transaction(() => {
-    const likeConditions = ids.map(() => `related_ids LIKE ?`).join(' OR ');
-    const likeParams = ids.map(id => `%${id}%`);
-    const referencing = db.prepare(`
-      SELECT id, related_ids FROM observations
-      WHERE related_ids IS NOT NULL AND related_ids != '[]' AND (${likeConditions})
-    `).all(...likeParams);
-    for (const r of referencing) {
-      let refIds;
-      try { refIds = JSON.parse(r.related_ids); } catch { continue; }
-      if (!Array.isArray(refIds)) continue;
-      const filtered = refIds.filter(id => !deletedIds.has(id));
-      if (filtered.length !== refIds.length) {
-        db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
-      }
-    }
-    // Resurface any rows merged/compressed INTO the doomed keepers before deleting,
-    // else they dangle behind a missing parent (compressed_into has no FK) — invisible
-    // to every COALESCE(compressed_into,0)=0 view and unrecoverable. Same guard the
-    // maintain hard-delete paths use (recoverChildrenOf); the interactive delete path
-    // was missing it. Returned in the result so the user sees the recovery count.
-    const recovered = recoverChildrenOf(db, ids);
-    const deleted = db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...ids);
-    return { changes: deleted.changes, recovered };
-  });
-  const result = deleteTx();
+  // Full delete orchestration (snapshot + related_ids cleanup + child recovery + delete
+  // transaction) lives in lib/delete-core.mjs — single source of truth shared with the MCP
+  // mem_delete path (was inlined here + kept in sync by parity comments, the #1 drift risk).
+  const result = deleteObservations(db, ids);
   const missing = ids.filter(id => !rows.some(r => r.id === id));
-  const recoveredNote = result.recovered > 0 ? ` Recovered ${result.recovered} merged/compressed child observation(s) to live.` : '';
-  out(`[mem] Deleted ${result.changes} observation(s).${recoveredNote}${missing.length > 0 ? ` Note: ID(s) ${missing.join(', ')} not found.` : ''}`);
+  const recoveredNote = result.recoveredChildren > 0 ? ` Recovered ${result.recoveredChildren} merged/compressed child observation(s) to live.` : '';
+  out(`[mem] Deleted ${result.deleted} observation(s).${recoveredNote}${missing.length > 0 ? ` Note: ID(s) ${missing.join(', ')} not found.` : ''}`);
 }
 
 // ─── Update ──────────────────────────────────────────────────────────────────

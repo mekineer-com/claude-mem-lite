@@ -19,10 +19,11 @@ import {
   cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, mergeDuplicates,
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
-  recoverChildrenOf, hardDeleteCandidateCount,
+  hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS,
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
+import { deleteObservations } from './lib/delete-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { formatObsFieldValue } from './cli/common.mjs';
@@ -680,49 +681,14 @@ server.registerTool(
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
 
-    // Snapshot before the irreversible hard-delete so a wrong-id delete has a pre-image,
-    // matching the CLI delete + maintain purge/cleanup paths (audit MED-2). Best-effort
-    // (never throws, skips :memory:). Must run OUTSIDE the transaction below (VACUUM).
-    snapshotDb(db, { tag: 'pre-delete' });
-
-    // Wrap cleanup + deletion in a transaction for consistency
-    const deletedIds = new Set(args.ids);
-    const deleteTx = db.transaction(() => {
-      // Clean up stale references in other observations' related_ids
-      // Use LIKE filter to avoid O(N) full-table scan — only fetch rows that may reference deleted IDs.
-      // NOTE: LIKE %id% has false positives (e.g. %1% matches [10], [21]). This is intentional —
-      // the LIKE is a coarse pre-filter; the JSON parse + Set.has below is the precise filter.
-      // Acceptable because observation count per user is typically <10K.
-      const likeConditions = args.ids.map(() => `related_ids LIKE ?`).join(' OR ');
-      const likeParams = args.ids.map(id => `%${id}%`);
-      const referencing = db.prepare(`
-        SELECT id, related_ids FROM observations
-        WHERE related_ids IS NOT NULL AND related_ids != '[]'
-          AND (${likeConditions})
-      `).all(...likeParams);
-      for (const r of referencing) {
-        let ids;
-        try { ids = JSON.parse(r.related_ids); } catch (e) { debugCatch(e, 'deleteRelatedIds'); continue; }
-        if (!Array.isArray(ids) || !ids.every(id => Number.isInteger(id))) continue;
-        const filtered = ids.filter(id => !deletedIds.has(id));
-        if (filtered.length !== ids.length) {
-          db.prepare('UPDATE observations SET related_ids = ? WHERE id = ?').run(JSON.stringify(filtered), r.id);
-        }
-      }
-      // Resurface rows merged/compressed INTO the doomed keepers before deleting, else
-      // they dangle behind a now-missing parent (compressed_into has no FK) — invisible
-      // to every COALESCE(compressed_into,0)=0 view and unrecoverable. Mirrors the CLI
-      // delete path + the maintain hard-delete guard (recoverChildrenOf).
-      const recovered = recoverChildrenOf(db, args.ids);
-      // Execute deletion (FTS5 cleanup handled by observations_ad trigger)
-      const deleted = db.prepare(`DELETE FROM observations WHERE id IN (${placeholders})`).run(...args.ids);
-      return { changes: deleted.changes, recovered };
-    });
-    const result = deleteTx();
+    // Full delete orchestration (snapshot + related_ids cleanup + child recovery +
+    // delete transaction) lives in lib/delete-core.mjs — single source of truth shared
+    // with the CLI `delete` path (was inlined + kept in sync by parity comments).
+    const result = deleteObservations(db, args.ids);
 
     const missing = args.ids.filter(id => !rows.some(r => r.id === id));
-    const msg = [`Deleted ${result.changes} observation(s).`];
-    if (result.recovered > 0) msg.push(`Recovered ${result.recovered} merged/compressed child observation(s) to live.`);
+    const msg = [`Deleted ${result.deleted} observation(s).`];
+    if (result.recoveredChildren > 0) msg.push(`Recovered ${result.recoveredChildren} merged/compressed child observation(s) to live.`);
     if (missing.length > 0) msg.push(`Note: ID(s) ${missing.join(', ')} not found.`);
     return { content: [{ type: 'text', text: msg.join(' ') }] };
   })

@@ -2,6 +2,22 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.48.0 — full audit 2026-07-16 (7 fixes): events reachable from passive injection (HIGH) + injection-defang, concurrency, latency, ranking, and delete-twin cleanups
+
+Full read-only audit (6 parallel agents, all HIGH/MED findings independently re-verified against source). No data-loss, RCE, or session-breaking defect — the signing chain, data-write choke points, and fail-open discipline all held. This release closes the one HIGH functional gap plus the P1 batch.
+
+**What changes for you:** promoted memories now surface at prompt/session time again. When Haiku classifies a memory as an event type (bugfix/decision/lesson/discovery/…), it is upgrade-deleted out of `observations` into the `events` table. Since v3.44 those events were searchable via `mem_search` and PreToolUse recall, but the three PASSIVE injection surfaces still read only `observations`, so the highest-value memories silently stopped appearing at UserPromptSubmit and SessionStart. They are now surfaced there, rendered with an `E#` id prefix (distinct from observation `#` ids, so citation decay can never mis-attribute an event id to an observation).
+
+- **HIGH-1 — events reachable from passive injection.** New `lib/events-injection.mjs` feeds two surfaces: the UserPromptSubmit `<memory-context>` block (hook.mjs, FTS-matched events, importance ≥ 2) and the SessionStart context block (hook-context.mjs, a new `### Key Events` section of recent high-importance events). Events are a separate `E#`-tagged block, so observation ranking is unchanged. **Opt-out:** the SessionStart `### Key Events` section respects `MEM_QUIET_HOOKS=1`; the UserPromptSubmit events block respects the existing "ignore memory" / 不要用记忆 prompt override. Superseded and below-importance events are excluded.
+- **MED-1 (security) — PreToolUse recall now defangs DB text.** Injected lesson/title/event-body/file-intel strings are passed through `neutralizeContextDelimiters` before entering `additionalContext` (which Claude Code wraps in `<system-reminder>`), closing an indirect prompt-injection vector through poisoned observations. Mirrors the guard the error-recall path already applied.
+- **MED-2 (concurrency) — citation decay uses an IMMEDIATE transaction.** The per-session decay pass took a read snapshot then wrote; under concurrent same-project sessions the second writer hit `SQLITE_BUSY_SNAPSHOT` (which `busy_timeout` cannot resolve) and silently dropped its whole decay/funnel pass. Taking the write lock up front lets `busy_timeout` serialize the sessions.
+- **MED-3 — error-recall rides the JSON envelope.** The PostToolUse error-recall hint was the last surface writing raw text to stdout; it now emits `hookSpecificOutput.additionalContext` so it can't corrupt a co-emitted episode-flush receipt and is delivered on CC variants that drop plain-text PostToolUse stdout.
+- **MED-4 (latency) — maintenance moved off the SessionStart boot path.** The daily maintenance pass (VACUUM-INTO snapshot + purge/cleanup/decay/dedup) ran synchronously at session start; it now runs in a detached `auto-maintain` worker. Session start does a cheap 24h-gate check and spawns. Opt-out for tooling: `CLAUDE_MEM_SKIP_MAINTAIN=1`.
+- **MED-5 (ranking) — cross-source single-match normalization.** A source with exactly one FTS match kept its raw BM25 magnitude and could outrank an entire page of strongly-matched, normalized rows from another source (more likely now that `events` is a low-cardinality source). Lone matches are clamped to a neutral mid-band value. Retrieval benchmark unchanged (R@10 0.900 / 0.341).
+- **L1 (maintainability) — delete orchestration de-duplicated.** The ~40-line byte-duplicated delete path in `server.mjs` (mem_delete) and `mem-cli.mjs` (cmdDelete) is extracted to `lib/delete-core.mjs` (`deleteObservations`), removing the manual-parity twin that was the project's #1 historical drift class. One edge-case tightening: a malformed `related_ids` value is now left verbatim on both surfaces instead of being reshaped on the CLI path.
+
+Both new runtime modules (`lib/delete-core.mjs`, `lib/events-injection.mjs`) are added to the signed release manifest and the npm `files` allowlist. 3796 tests pass, eslint + shellcheck clean, denoise A/B NEUTRAL.
+
 ## v3.47.0 — PreToolUse recall precision (D#78 P0–P3): path-boundary matching, per-edge citation decay, lesson scope labels
 
 The PreToolUse Read/Edit recall surface decides what to inject purely by a filename edge (`observation_files`),

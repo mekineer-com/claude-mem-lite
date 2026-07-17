@@ -61,6 +61,7 @@ import {
 import { resolveEdgeAttribution, readPreRecallFileEdges } from './lib/edge-attribution.mjs';
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine, selectImperativeLesson } from './hook-memory.mjs';
+import { searchInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
 import { gcOldMetricShards } from './lib/metrics.mjs';
@@ -87,7 +88,7 @@ import { getVocabulary } from './tfidf.mjs';
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize']);
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize', 'auto-maintain']);
 
 // Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
 // install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin
@@ -420,7 +421,18 @@ function triggerErrorRecall(db, toolInput, response) {
     `).all(ftsQuery, project, nowR);
 
     const out = formatErrorRecallHints(rows);
-    if (out) process.stdout.write(out);
+    if (out) {
+      // MED-3 (full audit 2026-07-16): emit via the JSON envelope (trailing '\n'),
+      // NOT raw stdout. A raw multi-line write corrupts a co-emitted episode-flush
+      // receipt (both write to PostToolUse stdout in the same call → `<text>{json}`)
+      // and is silently dropped on CC variants that ignore plain-text PostToolUse
+      // stdout. This is the same suppressOutput+additionalContext channel
+      // flushEpisode uses; two separate JSON lines each parse independently.
+      process.stdout.write(JSON.stringify({
+        suppressOutput: true,
+        hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: out },
+      }) + '\n');
+    }
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }
 
@@ -975,6 +987,29 @@ function runSessionStartAutoMaintain(db) {
   }
 }
 
+// SessionStart boot path (MED-4): cheap 24h gate pre-check only. When maintenance is
+// due, the heavy pass (VACUUM-INTO snapshot + purge/cleanup/decay/dedup) is handed to
+// a detached `auto-maintain` worker via spawnBackground so it never blocks interactive
+// session start. The worker re-checks the same gate (idempotent) before doing the work.
+function scheduleSessionStartAutoMaintain() {
+  const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
+  try {
+    const last = JSON.parse(readFileSync(maintainFile, 'utf8'));
+    if (Date.now() - last.epoch < 24 * 3600000) return; // not due — no spawn
+  } catch { /* no gate file → due */ }
+  if (!process.env.CLAUDE_MEM_SKIP_MAINTAIN) spawnBackground('auto-maintain');
+}
+
+// Detached `auto-maintain` worker entry: opens its own DB and runs the maintenance
+// pass off the interactive boot path. runSessionStartAutoMaintain still owns the 24h
+// gate + the compress/optimize spawns at its tail.
+function handleAutoMaintain() {
+  const db = openDb();
+  if (!db) return;
+  try { runSessionStartAutoMaintain(db); }
+  finally { try { db.close(); } catch { /* ignore */ } }
+}
+
 function saveHandoffAndFastSummary(db, { prevSessionId, prevProject, project, ccSessionId, episodeSnapshot, now }) {
   // Shared clear handoff reference — queried once, used by fast summary + working state
   let prevClearHandoff = null;
@@ -1285,7 +1320,7 @@ async function handleSessionStart() {
 
     runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now });
 
-    runSessionStartAutoMaintain(db);
+    scheduleSessionStartAutoMaintain();
 
     // ── Non-transactional operations (side effects, background work) ──
 
@@ -1520,6 +1555,21 @@ async function handleUserPrompt() {
         lines.push('</memory-context>');
         process.stdout.write(lines.join('\n') + '\n');
       }
+      // HIGH-1 (full audit 2026-07-16): surface FTS-matched events — the canonical
+      // store for promoted bugfix/decision/lesson memories that persistHaikuSummary
+      // upgrade-deletes out of observations. Without this leg they are unreachable at
+      // prompt time. Separate E#-tagged block so it doesn't perturb observation
+      // ranking and citation extractors (bare-`#` anchored) never read an event id as
+      // an obs id. Nested try so an events failure can't suppress the imperative pick.
+      try {
+        const events = searchInjectableEvents(db, { prompt: promptText, project });
+        if (events.length > 0) {
+          const elines = ['<memory-context relevance="events">'];
+          for (const e of events) elines.push(`- ${renderInjectableEvent(e)}`);
+          elines.push('</memory-context>');
+          process.stdout.write(elines.join('\n') + '\n');
+        }
+      } catch (e) { debugCatch(e, 'handleUserPrompt-events'); }
       if (imperativePick) {
         // Guard the write on a non-empty return — formatTaskImperative yields '' for a
         // lesson that strips to empty (e.g. "."), which would otherwise emit a bare line.
@@ -1639,6 +1689,7 @@ try {
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
     case 'auto-compress':    handleAutoCompress(); break;
+    case 'auto-maintain':    handleAutoMaintain(); break;
     case 'llm-optimize':   await handleLLMOptimize(); break;
     // Detached update refresh spawned by handleSessionStart (audit P3d) — does the
     // GitHub fetch + (non-plugin) install off the SessionStart critical path,
