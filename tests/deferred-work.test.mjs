@@ -197,3 +197,134 @@ describe('deferred_work closure', () => {
     db.close();
   });
 });
+
+// ─── D# read surface (get D#N) — RED-first for the deferred-detail gap ───────
+// Motivation (2026-07-18): D#92 detail held the design-doc pointer, but every
+// surface (defer list / mem_defer_list / dashboard) rendered title-only and no
+// `get D#N` existed — a write-only field. These lock the data-layer half.
+import * as dw from '../lib/deferred-work.mjs';
+
+describe('getDeferredByIds + formatDeferredDetail (D# read surface)', () => {
+  it('getDeferredByIds returns full rows incl detail/files for any status, input order, missing omitted', () => {
+    const db = createTestDb();
+    const a = insertDeferred(db, {
+      project: 'p', title: 'env precheck design', priority: 2,
+      detail: 'design doc: docs/specs/env-precheck.md\nexit codes 0/5/6',
+      files: ['scripts/osn_precheck.py'],
+    });
+    const b = insertDeferred(db, { project: 'p', title: 'other item', priority: 1 });
+    dropDeferred(db, b.id, 'obsolete');
+    expect(typeof dw.getDeferredByIds).toBe('function');
+    const rows = dw.getDeferredByIds(db, [a.id, b.id, 99999]);
+    expect(rows.map(r => r.id)).toEqual([a.id, b.id]);
+    expect(rows[0].detail).toContain('exit codes 0/5/6');
+    expect(JSON.parse(rows[0].files)).toEqual(['scripts/osn_precheck.py']);
+    expect(rows[1].status).toBe('dropped');
+    db.close();
+  });
+
+  it('formatDeferredDetail renders FULL untruncated detail + status + priority', () => {
+    const db = createTestDb();
+    const longDetail = 'design pointer: docs/specs/env-precheck-design.md — ' + 'x'.repeat(400);
+    const a = insertDeferred(db, { project: 'p', title: 'env precheck step', detail: longDetail, priority: 2 });
+    const rows = dw.getDeferredByIds(db, [a.id]);
+    expect(typeof dw.formatDeferredDetail).toBe('function');
+    const text = dw.formatDeferredDetail(rows[0]);
+    expect(text).toContain(`D#${a.id}`);
+    expect(text).toContain('env precheck step');
+    // The whole point of this surface: detail must NOT be truncated.
+    expect(text).toContain(longDetail);
+    expect(text).toMatch(/open/);
+    expect(text).toMatch(/P2/);
+    db.close();
+  });
+
+  it('formatDeferredDetail on a detail-less row degrades gracefully', () => {
+    const db = createTestDb();
+    const a = insertDeferred(db, { project: 'p', title: 'bare item', priority: 3 });
+    const text = dw.formatDeferredDetail(dw.getDeferredByIds(db, [a.id])[0]);
+    expect(text).toContain('bare item');
+    expect(text).not.toMatch(/undefined|null/);
+    db.close();
+  });
+});
+
+// ─── P2: searchDeferredWork — deferred items reachable from search ───────────
+// The D#92 failure's last gap: keyword searches ("环境自检") surfaced obs/prompts
+// but never the deferred row that held the answer. Matching is JS-substring
+// (no SQL LIKE → wildcard injection is structurally impossible), open-only for
+// keywords, any-status for explicit D#N refs, project-scoped, capped.
+describe('searchDeferredWork (P2 search leg)', () => {
+  function seed(db) {
+    const a = insertDeferred(db, {
+      project: 'p', title: '实施环境自检步（设计已定稿，待批准）', priority: 2,
+      detail: '设计文档：docs/specs/env-precheck-design.md，exit codes 0/5/6',
+    });
+    const b = insertDeferred(db, { project: 'p', title: 'progress 50%_done marker', priority: 1, detail: 'literal wildcard chars' });
+    const c = insertDeferred(db, { project: 'other', title: '环境自检 foreign twin', priority: 2 });
+    return { a, b, c };
+  }
+
+  it('CJK substring match on title hits the open item', () => {
+    const db = createTestDb();
+    const { a } = seed(db);
+    expect(typeof dw.searchDeferredWork).toBe('function');
+    const rows = dw.searchDeferredWork(db, '环境自检', 'p');
+    expect(rows.map(r => r.id)).toContain(a.id);
+    db.close();
+  });
+
+  it('detail text is searchable too', () => {
+    const db = createTestDb();
+    const { a } = seed(db);
+    const rows = dw.searchDeferredWork(db, 'env-precheck-design.md', 'p');
+    expect(rows.map(r => r.id)).toContain(a.id);
+    db.close();
+  });
+
+  it('multi-token query needs ceil(n/2) matches — one generic hit is excluded', () => {
+    const db = createTestDb();
+    seed(db);
+    // 4 tokens, only "marker" appears in item b → 1/4 < need(2) → no hit
+    const rows = dw.searchDeferredWork(db, 'totally unrelated ranking marker', 'p');
+    expect(rows.length).toBe(0);
+    db.close();
+  });
+
+  it('keyword match is open-only; explicit D#N ref reaches any status', () => {
+    const db = createTestDb();
+    const { a } = seed(db);
+    dropDeferred(db, a.id, 'testing closed reachability');
+    expect(dw.searchDeferredWork(db, '环境自检', 'p').map(r => r.id)).not.toContain(a.id);
+    const byRef = dw.searchDeferredWork(db, `D#${a.id} 相关背景`, 'p');
+    expect(byRef.map(r => r.id)).toContain(a.id);
+    expect(byRef.find(r => r.id === a.id).status).toBe('dropped');
+    db.close();
+  });
+
+  it('is project-scoped for both refs and keywords', () => {
+    const db = createTestDb();
+    const { c } = seed(db);
+    expect(dw.searchDeferredWork(db, '环境自检', 'p').map(r => r.id)).not.toContain(c.id);
+    expect(dw.searchDeferredWork(db, `D#${c.id}`, 'p').length).toBe(0);
+    db.close();
+  });
+
+  it('treats %/_ as literal characters (no wildcard semantics)', () => {
+    const db = createTestDb();
+    const { a, b } = seed(db);
+    const rows = dw.searchDeferredWork(db, '50%_done', 'p');
+    expect(rows.map(r => r.id)).toEqual([b.id]);
+    expect(rows.map(r => r.id)).not.toContain(a.id);
+    db.close();
+  });
+
+  it('caps at the limit', () => {
+    const db = createTestDb();
+    for (let i = 0; i < 5; i++) {
+      insertDeferred(db, { project: 'p', title: `shared keyword alpha item ${i}`, priority: 2 });
+    }
+    expect(dw.searchDeferredWork(db, 'alpha', 'p', { limit: 3 }).length).toBe(3);
+    db.close();
+  });
+});

@@ -218,3 +218,30 @@ export function extractFiles(text) {
     !/^\d+\.\d+$/.test(m)  // Exclude pure version numbers like "3.14" (not paths like "1.0/config.json")
   );
 }
+
+// ─── Deferred-work references (D#N) ──────────────────────────────────────────
+
+// Cap injected deferred items per prompt — a batch approval ("D#1 D#2 D#3 全部
+// 批准") gets the first three; more would blow the injection noise budget.
+export const MAX_DEFERRED_REFS = 3;
+
+/**
+ * Extract deferred_work ids the prompt explicitly references as D#N (case-
+ * insensitive). Requires the `#` — bare "D92" is prose (chip names, model
+ * numbers), not a token. Deduped, input order, capped at MAX_DEFERRED_REFS.
+ * @param {string} text
+ * @returns {number[]}
+ */
+export function extractDeferredRefs(text) {
+  const out = [];
+  const re = /\bD#(\d+)\b/gi;
+  let m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    const id = parseInt(m[1], 10);
+    if (id > 0 && !out.includes(id)) {
+      out.push(id);
+      if (out.length >= MAX_DEFERRED_REFS) break;
+    }
+  }
+  return out;
+}

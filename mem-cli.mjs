@@ -33,7 +33,7 @@ import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { aggregateProjectCiteRecall } from './lib/citation-tracker.mjs';
-import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
+import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { join, sep, dirname } from 'path';
 import { readFileSync, existsSync, readdirSync } from 'fs';
 
@@ -54,6 +54,8 @@ import { aggregateMetrics } from './lib/metrics.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
+  getDeferredByIds, formatDeferredDetail,
+  searchDeferredWork, formatDeferredSearchTrailer,
 } from './lib/deferred-work.mjs';
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -142,6 +144,20 @@ async function cmdSearch(db, args, { llm } = {}) {
     return;
   }
 
+  // P2: deferred trailer — open deferred items matching the query, appended
+  // after (and never counted in) the main results. Unfiltered first-page text
+  // searches only; --json keeps its documented shape (deliberate asymmetry,
+  // locked by tests). Defined before the sanitize-empty early-return so a pure
+  // "D#92" query (which sanitizes to no FTS terms) still reaches the item.
+  const wantDeferredTrailer = !jsonOutput && !source && !type && !branch && !tier && !minImportance && offset === 0;
+  const emitDeferredTrailer = () => {
+    if (!wantDeferredTrailer) return;
+    try {
+      const rows = searchDeferredWork(db, query, project || inferProject());
+      for (const line of formatDeferredSearchTrailer(rows, 'claude-mem-lite get D#<id>')) out(line);
+    } catch { /* trailer is best-effort; never break search */ }
+  };
+
   const ftsQuery = buildSearchFtsQuery(query, { or: useOr });
   // --deep proceeds even when the literal query sanitizes to nothing — its LLM
   // rewrite may still produce searchable variants (F3, parity with server.mjs).
@@ -153,6 +169,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     if (jsonOutput) {
       out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep: false, results: [] }));
     } else {
+      emitDeferredTrailer();
       fail(`[mem] No valid search terms in "${query}"`);
     }
     return;
@@ -246,6 +263,9 @@ async function cmdSearch(db, args, { llm } = {}) {
       out(JSON.stringify({ query, total: 0, returned: 0, offset, limit, deep: isDeep, variants: isDeep ? deepVariants : undefined, results: [] }));
     } else {
       out(`[mem] No results for "${query}"`);
+      // The zero-result path is where the trailer earns its keep — the D#92
+      // failure chain was exactly "searched, found nothing, item was deferred".
+      emitDeferredTrailer();
     }
     return;
   }
@@ -334,6 +354,7 @@ async function cmdSearch(db, args, { llm } = {}) {
       }
     }
   }
+  emitDeferredTrailer();
 }
 
 function cmdRecent(db, args) {
@@ -573,7 +594,7 @@ function cmdGet(db, args) {
   const idStr = positional.join(',');
   if (!idStr) {
     fail('[mem] Usage: claude-mem-lite get <id1,id2,...> [--source obs|session|prompt|event] [--fields f1,f2,...]\n' +
-         '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session), E#123 (event).');
+         '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session), E#123 (event), D#123 (deferred item, full detail).');
     return;
   }
 
@@ -587,12 +608,16 @@ function cmdGet(db, args) {
     return;
   }
 
+  // D#N deferred tokens are peeled off BEFORE bucketing/source-forcing — they
+  // always read deferred_work (get-only surface; delete/timeline keep rejecting).
+  const { deferredIds, rest } = splitDeferredTokens(tokens);
+
   // Shared bucketing with MCP mem_get — single source of truth for P#/S#/E#/# routing (#8050).
-  const { bySrc, invalid: unparseable } = bucketIdTokens(tokens, { explicit, defaultSource: 'obs' });
+  const { bySrc, invalid: unparseable } = bucketIdTokens(rest, { explicit, defaultSource: 'obs' });
   if (unparseable.length > 0) {
     process.stderr.write(`[mem] Ignoring unparseable ID token(s): ${unparseable.join(', ')}\n`);
   }
-  if (bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length === 0) {
+  if (bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length + deferredIds.length === 0) {
     fail('[mem] No valid IDs provided');
     return;
   }
@@ -615,6 +640,21 @@ function cmdGet(db, args) {
 
   const sections = [];
   let totalFound = 0;
+  // Deferred sections render first: explicit D# requests are rare and the
+  // FULL detail (never truncated) is the whole point of this surface.
+  let deferredMissing = [];
+  if (deferredIds.length > 0) {
+    const dRows = getDeferredByIds(db, deferredIds);
+    const found = new Set(dRows.map(r => r.id));
+    deferredMissing = deferredIds.filter(id => !found.has(id));
+    if (dRows.length > 0) {
+      sections.push(dRows.map(formatDeferredDetail).join('\n\n'));
+      totalFound += dRows.length;
+    }
+    if (deferredMissing.length > 0) {
+      process.stderr.write(`[mem] Deferred item(s) not found: ${deferredMissing.map(i => `D#${i}`).join(', ')}\n`);
+    }
+  }
   if (bySrc.obs.length > 0) {
     const s = renderObsRows(db, bySrc.obs, requestedFields);
     if (s) { sections.push(s.text); totalFound += s.count; }
@@ -633,6 +673,12 @@ function cmdGet(db, args) {
   }
 
   if (totalFound === 0) {
+    // Deferred-only request that found nothing — the source-probe below is
+    // about obs/session/prompt/event and would print an empty source list.
+    if (deferredMissing.length > 0 && bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length === 0) {
+      fail(`[mem] Deferred item(s) not found: ${deferredMissing.map(i => `D#${i}`).join(', ')}. List open items: claude-mem-lite defer list`);
+      return;
+    }
     // Probe the OTHER sources so the caller can retry with the right prefix.
     const queried = new Set(Object.entries(bySrc).filter(([, v]) => v.length > 0).map(([k]) => k));
     const allIds = [...bySrc.obs, ...bySrc.session, ...bySrc.prompt, ...bySrc.event];
@@ -994,6 +1040,9 @@ function cmdDeferList(db, args) {
     const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
     out(`  ${r.ordinal}. ${pTag} [P${r.priority}] ${r.title} (D#${r.id})`);
   }
+  // Affordance for the detail field — list stays title-only by design (it is
+  // mirrored into the SessionStart dashboard, where detail would be noise).
+  out(`  Full detail: claude-mem-lite get D#<id>`);
 }
 
 function cmdDeferDrop(db, args) {
@@ -2550,9 +2599,11 @@ Commands:
     --json              Output as JSON: {file,limit,include_noise,total,results:[…]}
 
   get <id1,id2,...>     Get full details by ID
-    IDs accept search-output prefixes: #123 (obs), P#123 (prompt), S#123 (session).
+    IDs accept search-output prefixes: #123 (obs), P#123 (prompt), S#123 (session),
+    D#123 (deferred item — FULL detail; defer list is title-only).
     Bare N defaults to obs. Mixed prefixes in one call route each token correctly.
-    --source S          Force record type (obs|session|prompt); overrides prefixes.
+    --source S          Force record type (obs|session|prompt); overrides prefixes
+                        (D# tokens exempt — they always read deferred_work).
     --fields f1,f2,...  Select specific fields to return (observations only).
 
   timeline              Show observations around an anchor (shows recent if no anchor)
@@ -2584,7 +2635,7 @@ Commands:
       --detail T        Constraint + why deferred
       --files f1,f2     Comma-separated file paths
       --project P       Project name
-    list                List open deferred items
+    list                List open deferred items (title-only; full detail via get D#N)
       --limit N         Max results (default 10)
       --project P       Filter by project
     drop <D#N|ordinal>[,...]  Drop one or more deferred items (no fix needed)

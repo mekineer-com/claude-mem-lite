@@ -43,7 +43,7 @@ import { join, sep } from 'path';
 import { homedir } from 'os';
 import { ensureRegistryDb, upsertResource } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
-import { probeOtherSources as probeIdSources, bucketIdTokens } from './lib/id-routing.mjs';
+import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
@@ -52,6 +52,8 @@ import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
+  getDeferredByIds, formatDeferredDetail,
+  searchDeferredWork, formatDeferredSearchTrailer,
 } from './lib/deferred-work.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { createRequire } from 'module';
@@ -283,11 +285,30 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
   const deepMode = resolveDeepMode(args.deep, { surface: 'mcp' });
   const rerank = args.rerank === true && deepMode === 'deep';
 
+  // P2: deferred trailer — open deferred items matching the query, appended to
+  // the text blob AFTER (and never counted in) the main results/total. Parity
+  // with CLI cmdSearch's emitDeferredTrailer; unfiltered first-page searches
+  // only. Structured fields (results/total) stay untouched — the trailer is a
+  // text affordance, not a result source.
+  const wantDeferredTrailer = !args.type && !args.obs_type && !args.branch && !args.tier && !args.importance && offset === 0;
+  const appendDeferredTrailer = (result) => {
+    if (!wantDeferredTrailer) return result;
+    try {
+      const rows = searchDeferredWork(db, args.query || '', args.project || currentProject);
+      const lines = formatDeferredSearchTrailer(rows, 'mem_get ids=["D#<id>"]');
+      if (lines.length > 0 && result.content?.[0]?.type === 'text') {
+        result.content[0].text += `\n\n${lines.join('\n')}`;
+      }
+    } catch { /* trailer is best-effort; never break search */ }
+    return result;
+  };
+
   // Early return when query was provided but sanitized to nothing (all FTS5
   // keywords/special chars). Skipped for deep/auto (the LLM rewrite may still
   // produce variants) and for filter-only listings (date/obs_type/importance).
+  // A pure "D#92" query lands here — the trailer still reaches the item.
   if (args.query && !ftsQuery && !epochFrom && !epochTo && !args.obs_type && !args.importance && deepMode === 'normal') {
-    return { ...formatSearchOutput([], args, ftsQuery, 0), escalated: false, results: [], total: 0, variants: null };
+    return { ...appendDeferredTrailer(formatSearchOutput([], args, ftsQuery, 0)), escalated: false, results: [], total: 0, variants: null };
   }
 
   // Source scoping. deep is observations-only (deepSearch fuses hybrid-obs lists). branch/tier are
@@ -349,6 +370,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
   if (r.reranked && output.content?.[0]?.type === 'text') {
     output.content[0].text += '\n\n[deep search: LLM-reranked the top candidates by relevance]';
   }
+  appendDeferredTrailer(output);
 
   // Expose structured fields for tests + the MCP content blob.
   return { ...output, results: r.page, total: r.total, escalated: r.escalated, variants: r.variants, reranked: r.reranked };
@@ -505,14 +527,18 @@ server.registerTool(
     inputSchema: memGetSchema,
   },
   safeHandler(async (args) => {
+    // D#N deferred tokens are peeled off BEFORE bucketing/source-forcing —
+    // get-only read surface into deferred_work (parity with CLI cmdGet; the
+    // fetch+render live in lib/deferred-work.mjs so the twins cannot drift).
+    const { deferredIds, rest } = splitDeferredTokens(args.ids);
     // Bucket by per-token prefix (or force all to `args.source` when explicit).
     // coerceMixedIdTokens has already stringified + regex-validated each token.
-    const { bySrc, invalid } = bucketIdTokens(args.ids, { explicit: args.source || null, defaultSource: 'obs' });
+    const { bySrc, invalid } = bucketIdTokens(rest, { explicit: args.source || null, defaultSource: 'obs' });
     if (invalid.length > 0) {
       // Should not happen — schema regex already rejected bad tokens — but guard defensively.
-      return { content: [{ type: 'text', text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, S#N, or E#N.` }] };
+      return { content: [{ type: 'text', text: `Invalid ID token(s): ${invalid.join(', ')}. Expected N, #N, P#N, S#N, E#N, or D#N.` }] };
     }
-    const totalRequested = bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length;
+    const totalRequested = bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length + deferredIds.length;
     if (totalRequested === 0) {
       return { content: [{ type: 'text', text: 'No valid IDs provided.' }] };
     }
@@ -615,7 +641,26 @@ server.registerTool(
       }
     }
 
-    const totalFound = foundBySource.obs.size + foundBySource.session.size + foundBySource.prompt.size + foundBySource.event.size;
+    // Deferred sections — prepended below (explicit D# requests are rare; the
+    // FULL untruncated detail is the point of this surface).
+    let deferredSections = [];
+    let deferredFound = 0;
+    let deferredMissing = [];
+    if (deferredIds.length > 0) {
+      const dRows = getDeferredByIds(db, deferredIds);
+      const found = new Set(dRows.map(r => r.id));
+      deferredMissing = deferredIds.filter(id => !found.has(id));
+      deferredSections = dRows.map(formatDeferredDetail);
+      deferredFound = dRows.length;
+    }
+
+    const totalFound = foundBySource.obs.size + foundBySource.session.size + foundBySource.prompt.size + foundBySource.event.size + deferredFound;
+
+    if (totalFound === 0 && deferredIds.length > 0 && bySrc.obs.length + bySrc.session.length + bySrc.prompt.length + bySrc.event.length === 0) {
+      // Deferred-only request, nothing found — the source-probe below is about
+      // obs/session/prompt/event and would render an empty source list.
+      return { content: [{ type: 'text', text: `Deferred item(s) not found: ${deferredMissing.map(i => `D#${i}`).join(', ')}. List open items: mem_defer_list.` }] };
+    }
 
     if (totalFound === 0) {
       // Probe other sources so callers can retry with the right prefix/source override.
@@ -629,7 +674,8 @@ server.registerTool(
       if (probe.event.length > 0)   hints.push(`E#${probe.event.join(', E#')} (event — use source='event' or E#N)`);
       const hint = hints.length > 0 ? ` Try: ${hints.join('; ')}.` : '';
       const queriedList = [...queried].join(', ');
-      const msg = `No records found in source(s) [${queriedList}] for the given ID(s).${hint}`;
+      const deferredNote = deferredMissing.length > 0 ? ` Deferred item(s) not found: ${deferredMissing.map(i => `D#${i}`).join(', ')}.` : '';
+      const msg = `No records found in source(s) [${queriedList}] for the given ID(s).${deferredNote}${hint}`;
       return { content: [{ type: 'text', text: fieldsNote ? `${msg}\n\n${fieldsNote}` : msg }] };
     }
 
@@ -641,10 +687,11 @@ server.registerTool(
     missingHints.push(...miss(bySrc.session, foundBySource.session, 'S#'));
     missingHints.push(...miss(bySrc.prompt, foundBySource.prompt, 'P#'));
     missingHints.push(...miss(bySrc.event, foundBySource.event, 'E#'));
+    missingHints.push(...deferredMissing.map(id => `D#${id}`));
 
     const parts = [];
     if (fieldsNote) parts.push(fieldsNote);
-    parts.push(...sections);
+    parts.push(...deferredSections, ...sections);
     if (missingHints.length > 0) {
       parts.push(`Note: ID(s) ${missingHints.join(', ')} not found.`);
     }
@@ -802,6 +849,8 @@ server.registerTool(
       const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
       lines.push(`${r.ordinal}. ${pTag} [P${r.priority}] ${r.title} (D#${r.id})`);
     }
+    // Affordance for the detail field — list stays title-only by design.
+    lines.push(`Full detail: mem_get ids=["D#<id>"]`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   })
 );

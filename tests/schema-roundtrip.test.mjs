@@ -86,3 +86,23 @@ describe('schema round-trip parity (#8127)', () => {
     });
   });
 });
+
+// ─── D#N deferred tokens: get-only read surface (2026-07-18) ─────────────────
+// defer list has always rendered "(D#92)"; mem_get must accept it back
+// (round-trip rule above). Destructive/timeline schemas intentionally reject.
+describe('D#N deferred tokens (get-only read surface)', () => {
+  it('mem_get.ids accepts D#N / d#N / mixed arrays / comma-strings', () => {
+    expect(parse(memGetSchema, { ids: ['D#92'] }).success).toBe(true);
+    expect(parse(memGetSchema, { ids: ['d#92'] }).success).toBe(true);
+    expect(parse(memGetSchema, { ids: [1, '#2', 'D#3'] }).success).toBe(true);
+    expect(parse(memGetSchema, { ids: '1,D#2,P#3' }).success).toBe(true);
+  });
+
+  it('mem_delete.ids still rejects D#N (destructive stays int-only)', () => {
+    expect(parse(memDeleteSchema, { ids: ['D#1'], confirm: false }).success).toBe(false);
+  });
+
+  it('mem_timeline.anchor rejects D#N loudly (deferred rows are not on the obs timeline)', () => {
+    expect(parse(memTimelineSchema, { anchor: 'D#1' }).success).toBe(false);
+  });
+});

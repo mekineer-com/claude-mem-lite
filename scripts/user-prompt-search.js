@@ -11,7 +11,8 @@ import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join, sep } from 'path';
 import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
-import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
+import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, extractDeferredRefs, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
+import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -580,14 +581,67 @@ async function main() {
   // into the FTS MATCH query terms. Mirrors hook.mjs handleUserPrompt.
   const promptText = stripPrivate(rawPrompt);
 
-  // Skip short/confirmation/slash-command/simple-op prompts
-  if (shouldSkip(promptText)) return;
-
   // P0: User-explicit "ignore memory" override (mirrors CC built-in
-  // memoryTypes.ts:215). When the prompt directly tells Claude to skip
-  // memory recall, we short-circuit before FTS — no FTS budget burn,
-  // no .claude-mem-injected-* state churn, no surface emission.
+  // memoryTypes.ts:215). Moved ABOVE the deterministic D# path so it
+  // short-circuits ALL injection surfaces (previously ran after shouldSkip —
+  // same outcome there, both return without output).
   if (detectMemOverride(promptText)) return;
+
+  // ─── Deterministic D#N deferred-detail injection (v3.50) ──────────────────
+  // A prompt naming D#N ("D#92 批准，进 writing-plans") is the highest-precision
+  // trigger this hook has: the user is resuming a deferred item whose FULL
+  // detail no list surface renders (defer list / dashboard are title-only —
+  // the 2026-07-18 D#92 post-/clear failure chain). Runs BEFORE shouldSkip /
+  // length gates: short approval prompts are the common case here, and the
+  // trigger is exact-reference, not relevance-scored.
+  let db = null;
+  try {
+    const deferredRefs = extractDeferredRefs(promptText);
+    if (deferredRefs.length > 0) {
+      db = ensureDb();
+      const project = inferProject();
+      const openRows = getDeferredByIds(db, deferredRefs)
+        .filter(r => r.status === 'open' && r.project === project);
+      // Namespace dedup ids as "D<id>" (parity with the "P<id>" prompt-corpus
+      // convention) so obs ids can't collide in the shared injected-ids file.
+      const dedupIds = openRows.map(r => `D${r.id}`);
+      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, INJECTED_IDS_FILE)) {
+        const lines = ['[mem] Deferred work referenced in prompt (open items, full detail):'];
+        for (const r of openRows) {
+          const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
+          lines.push(`D#${r.id} ${pTag} [P${r.priority}] ${neutralizeContextDelimiters(r.title || '')}`);
+          if (r.detail) {
+            // Full detail, defanged, never truncated — the point of this surface.
+            for (const dl of neutralizeContextDelimiters(r.detail).split('\n')) lines.push(`  ${dl}`);
+          }
+        }
+        process.stdout.write(lines.join('\n') + '\n');
+        // Merge into the dedup file so a re-referencing prompt within the stale
+        // window skips re-injection. A later FTS-path write replaces ids wholesale
+        // (accepted: worst case is one cheap re-injection after an obs-emitting
+        // prompt inside the same 5-min window).
+        try {
+          let prevIds = [];
+          let prevCount = 0;
+          try {
+            const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
+            if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS) {
+              prevIds = Array.isArray(prev.ids) ? prev.ids : [];
+              prevCount = prev.count || 0;
+            }
+          } catch {}
+          writeFileSync(INJECTED_IDS_FILE, JSON.stringify({
+            ids: [...new Set([...prevIds.map(String), ...dedupIds])],
+            ts: Date.now(),
+            count: prevCount + 1,
+          }));
+        } catch {}
+      }
+    }
+  } catch { /* deterministic path must never block the main flow */ }
+
+  // Skip short/confirmation/slash-command/simple-op prompts
+  if (shouldSkip(promptText)) { try { db?.close(); } catch {} return; }
 
   // T3 (v2.31): additional raw-length gate on top of shouldSkip's CJK-weighted
   // effective-length check. Suppresses medium-short Latin prompts ("run tests",
@@ -596,13 +650,15 @@ async function main() {
   // short continuations ("前面那个?", "does it work?") depend on prior context.
   const followUp = isFollowUpSession();
   const promptMinLen = followUp ? FOLLOWUP_PROMPT_MIN_LENGTH : PROMPT_MIN_LENGTH;
-  if (computeEffectiveLen(promptText.trim()) < promptMinLen) return;
+  if (computeEffectiveLen(promptText.trim()) < promptMinLen) { try { db?.close(); } catch {} return; }
   const bm25Floor = followUp ? FOLLOWUP_BM25_MIN_SCORE : BM25_MIN_SCORE;
 
-  let db;
-  try {
-    db = ensureDb();
-  } catch { return; }
+  // db may already be open from the deterministic D# path above.
+  if (!db) {
+    try {
+      db = ensureDb();
+    } catch { return; }
+  }
 
   try {
     const project = inferProject();

@@ -2,6 +2,29 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.50.0 — D# read surface: deferred detail reachable from get, prompt injection, and search
+
+Root cause release. A real cross-session failure (2026-07-18: post-`/clear` resume of deferred item D#92) showed `deferred_work.detail` was a **write-only field**: the design pointer was saved correctly, but every surface — `defer list`, `mem_defer_list`, the SessionStart dashboard — rendered title-only, no reader existed, and search could not reach the row. The agent burned 10+ tool calls (including a wrong-path raw-sqlite fallback) without recovering data that was one field away. This release opens three read paths; the write side needed no change.
+
+**What changes for you:**
+1. **`get D#N` reads a deferred item in full** (CLI `claude-mem-lite get D#92` and MCP `mem_get ids=["D#92"]`). Renders the complete, never-truncated detail plus status/priority/files. Mixed calls route per token (`get D#1,#77,P#3`); `defer list` (both surfaces) now ends with a hint line naming this reader. D#N is **get-only**: `mem_delete` and `mem_timeline` keep rejecting it (locked by round-trip tests), and `source` forcing never applies to D# tokens.
+2. **A prompt naming D#N gets the detail injected automatically.** The UserPromptSubmit hook detects `D#N` references ("D#92 批准，进 writing-plans"), and injects the referenced open items' full detail before Claude sees the prompt — deterministic exact-reference trigger, so it fires even on short approval prompts that normal relevance gates skip. Project-scoped, open-items-only, capped at 3, defanged, deduped within the 5-minute window, and it respects the existing "ignore memory" prompt override.
+3. **Search reaches deferred work.** `mem_search` / CLI `search` append an uncounted "Deferred work matches" trailer on unfiltered first-page searches: explicit `D#N` refs hit directly (any status), keywords match open items' title+detail (JS substring — CJK-native, wildcard-proof; multi-token queries need half the tokens to hit). The zero-result path also carries the trailer — exactly the "searched, found nothing, answer was deferred" failure. `--json` output shape is unchanged by design.
+
+**Revert path:** no behavior flag — pin the prior version (`npm i -g claude-mem-lite@3.49.0`) to drop all three surfaces; the per-prompt "ignore memory / 不要用记忆" override suppresses the injection surface case-by-case.
+
+### Added
+- `lib/deferred-work.mjs`: `getDeferredByIds` / `formatDeferredDetail` (shared by CLI+MCP so the twin surfaces cannot drift) and `searchDeferredWork` / `formatDeferredSearchTrailer` (direct-ref + keyword channels, ceil(n/2) token threshold against single-generic-token noise).
+- `lib/id-routing.mjs`: `splitDeferredTokens` — D# peeled BEFORE `bucketIdTokens`/source-forcing; the #10253 consumption-path sweep reduces to asserting delete/timeline reject the token.
+- `scripts/prompt-search-utils.mjs`: `extractDeferredRefs` (requires the `#`; bare "D92" stays prose).
+- `mem_get` schema accepts `D#N`/`d#N` (tolerant-input funnel per #8134); `tests/schema-roundtrip.test.mjs` locks accept-on-get + reject-on-delete/timeline.
+
+### Notes
+- Deferred trailer lines are never counted in the search total — the server/CLI count twin is untouched.
+- Verified against the originating failure on the real DB: `get D#92`, the original prompt "D#92 批准，进 writing-plans" (hook probe), and the original searches "环境自检" / "D#92" all reach the item now.
+
+3856 tests pass (+37 across the three increments), eslint clean.
+
 ## v3.49.0 — full audit 2026-07-17 roadmap (P1–P4): cross-source ranking bands, save-time lesson nudge, alias-backfill cadence fix, twin de-duplication
 
 Follow-up to the v3.48.0 audit cycle: a fresh full audit of v3.48.0 (6 parallel read-only agents, every MED independently re-verified against source) found **0 HIGH — all seven v3.48.0 fixes held with no regression**. This release implements the audit's entire recommendation roadmap.

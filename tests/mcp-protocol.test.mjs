@@ -287,3 +287,64 @@ describe('MCP protocol surface', () => {
     expect(textOf(getRes)).not.toContain('LLLLLLLL');
   });
 });
+
+// ─── D#N over real stdio: mem_get deferred routing + defer_list hint ─────────
+// (2026-07-18) Protocol-layer guard per the #8127 lesson: schema acceptance
+// alone doesn't prove the registered surface routes D# tokens.
+describe('mem_get D#N deferred read surface (stdio)', () => {
+  const DETAIL = 'stdio-detail: docs/specs/deferred-read-surface.md, three-state exit contract';
+  let deferredId;
+
+  it('mem_defer → mem_get D#N returns full detail', async () => {
+    const added = await client.callTool({
+      name: 'mem_defer',
+      arguments: { title: 'stdio deferred read test', detail: DETAIL, priority: 2 },
+    });
+    const addedText = added.content?.map(c => c.text).join('\n') || '';
+    const m = /D#(\d+)/.exec(addedText);
+    expect(m).toBeTruthy();
+    deferredId = m[1];
+
+    const res = await client.callTool({
+      name: 'mem_get',
+      arguments: { ids: [`D#${deferredId}`] },
+    });
+    const text = res.content?.map(c => c.text).join('\n') || '';
+    expect(text).toContain(`D#${deferredId}`);
+    expect(text).toContain('stdio deferred read test');
+    expect(text).toContain(DETAIL);
+  });
+
+  it('mem_defer_list carries the detail-hint line', async () => {
+    const res = await client.callTool({ name: 'mem_defer_list', arguments: {} });
+    const text = res.content?.map(c => c.text).join('\n') || '';
+    expect(text).toMatch(/D#/);
+    expect(text).toMatch(/mem_get|get D#/);
+  });
+});
+
+// ─── P2: mem_search surfaces deferred items (stdio) ──────────────────────────
+describe('mem_search deferred trailer (stdio)', () => {
+  it('keyword search over deferred title reaches the item', async () => {
+    await client.callTool({
+      name: 'mem_defer',
+      arguments: { title: 'stdio deferred search probe item', detail: 'trailer reachability check', priority: 2 },
+    });
+    const res = await client.callTool({
+      name: 'mem_search',
+      arguments: { query: 'deferred search probe' },
+    });
+    const text = res.content?.map(c => c.text).join('\n') || '';
+    expect(text).toContain('stdio deferred search probe item');
+    expect(text).toMatch(/D#\d+/);
+  });
+
+  it('obs_type-filtered search skips the trailer', async () => {
+    const res = await client.callTool({
+      name: 'mem_search',
+      arguments: { query: 'deferred search probe', obs_type: 'bugfix' },
+    });
+    const text = res.content?.map(c => c.text).join('\n') || '';
+    expect(text).not.toContain('stdio deferred search probe item');
+  });
+});

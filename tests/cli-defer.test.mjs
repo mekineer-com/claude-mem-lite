@@ -228,3 +228,85 @@ describe('claude-mem-lite defer CLI', () => {
     expect(prio).toBe(2);
   });
 });
+
+// ─── get D#N — deferred detail read surface (2026-07-18) ─────────────────────
+// RED-first: `defer list` is title-only by design (dashboard noise budget);
+// `get D#N` is the full-detail reader. Locks CLI routing + render + hint line.
+describe('get D#N — deferred detail read surface', () => {
+  const DETAIL = 'design doc: docs/specs/precheck.md; exit codes 0/5/6 baked into gen_script';
+
+  it('get D#N prints full detail + status', () => {
+    runCli(['defer', 'add', 'env precheck design', '--priority', '2', '--detail', DETAIL]);
+    const { stdout, exitCode } = runCli(['get', 'D#1']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain('D#1');
+    expect(stdout).toContain('env precheck design');
+    expect(stdout).toContain(DETAIL);
+    expect(stdout).toMatch(/open/);
+  });
+
+  it('lowercase d#N routes the same', () => {
+    runCli(['defer', 'add', 'env precheck design', '--detail', DETAIL]);
+    const { stdout, exitCode } = runCli(['get', 'd#1']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(DETAIL);
+  });
+
+  it('get D#999 reports not-found instead of silence', () => {
+    const { stdout, stderr } = runCli(['get', 'D#999']);
+    expect(stdout + stderr).toMatch(/not found|no deferred/i);
+  });
+
+  it('mixed get D#1,#77 renders the deferred section and still exits 0', () => {
+    // Partial-missing obs ids are silently absent by pre-existing design (the
+    // probe hint only fires when ALL sources come back empty) — this test locks
+    // only the new contract: D# and obs buckets coexist in one call.
+    runCli(['defer', 'add', 'env precheck design', '--detail', DETAIL]);
+    const { stdout, exitCode } = runCli(['get', 'D#1,#77']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain(DETAIL);
+  });
+
+  it('defer list ends with a detail-hint line pointing at get D#N', () => {
+    runCli(['defer', 'add', 'item A']);
+    const { stdout } = runCli(['defer', 'list']);
+    expect(stdout).toMatch(/get D#/);
+  });
+});
+
+// ─── P2: search surfaces open deferred items (trailer) ───────────────────────
+describe('search — deferred trailer (P2)', () => {
+  const TITLE = '实施环境自检步设计定稿';
+  const DET = '设计文档 docs/specs/env-precheck-design.md';
+
+  beforeEach(() => {
+    runCli(['defer', 'add', TITLE, '--priority', '2', '--detail', DET]);
+  });
+
+  it('keyword search shows the trailer even when the main search has no results', async () => {
+    const { stdout } = runCli(['search', '环境自检']);
+    expect(stdout).toContain('D#1');
+    expect(stdout).toContain(TITLE);
+    expect(stdout).toMatch(/get D#/);
+    // Main population is empty (no obs seeded) — the trailer must not be
+    // counted as a search result.
+    expect(stdout).toMatch(/No results/);
+  });
+
+  it('explicit D#N query hits via direct ref', () => {
+    const { stdout } = runCli(['search', 'D#1']);
+    expect(stdout).toContain(TITLE);
+  });
+
+  it('obs-filtered searches skip the trailer', () => {
+    const { stdout, stderr } = runCli(['search', '环境自检', '--type', 'bugfix']);
+    expect(stdout + stderr).not.toContain(TITLE);
+  });
+
+  it('--json output stays trailer-free (documented asymmetry)', () => {
+    const { stdout } = runCli(['search', '环境自检', '--json']);
+    const parsed = JSON.parse(stdout.trim().split('\n').pop());
+    expect(parsed.deferred).toBeUndefined();
+    expect(JSON.stringify(parsed)).not.toContain(TITLE);
+  });
+});

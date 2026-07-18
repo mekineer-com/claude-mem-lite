@@ -52,7 +52,7 @@ const coerceStringArray = z.preprocess(
   z.array(z.string())
 );
 
-// Coerce mixed ID tokens (#N / P#N / S#N / bare N) for mem_get. Accepts:
+// Coerce mixed ID tokens (#N / P#N / S#N / D#N / bare N) for mem_get. Accepts:
 //   - native arrays: [1, "P#2", "#3"]
 //   - single number: 1
 //   - single/comma string: "1,P#2,S#3"
@@ -76,7 +76,10 @@ const coerceMixedIdTokens = z.preprocess(
     }
     return v;
   },
-  z.array(z.string().regex(/^[EePpSs]?#?\d+$/, 'Expected N, #N, P#N, S#N, or E#N')).min(1).max(20)
+  // D#N (deferred_work) requires the `#` — bare "D92" is prose, not a token.
+  // Round-trip rule: `defer list` renders "(D#92)", so mem_get must accept it
+  // back (tests/schema-roundtrip.test.mjs). Delete/timeline keep rejecting D#.
+  z.array(z.string().regex(/^(?:[Dd]#|[EePpSs]?#?)\d+$/, 'Expected N, #N, P#N, S#N, E#N, or D#N')).min(1).max(20)
 );
 
 export const memSearchSchema = {
@@ -137,8 +140,8 @@ export const memGetSchema = {
   // Accepts mixed tokens so pasted search results work verbatim: [1], [1, "P#2"], "1,P#2,S#3",
   // or the JSON-stringified form ["1","P#2"]. Each token's prefix routes to its source bucket
   // in server.mjs via lib/id-routing.bucketIdTokens. An explicit `source` override still wins.
-  ids: coerceMixedIdTokens.describe('Mixed observation/prompt/session/event IDs — accepts N, #N, P#N, S#N, E#N; comma-strings and JSON arrays also coerced'),
-  source: z.enum(['obs', 'session', 'prompt', 'event']).optional().describe('Force all IDs to this source (overrides per-token prefixes). Omit to let P#/S#/E#/# prefixes route individually.'),
+  ids: coerceMixedIdTokens.describe('Mixed observation/prompt/session/event/deferred IDs — accepts N, #N, P#N, S#N, E#N, D#N; comma-strings and JSON arrays also coerced. D#N reads a deferred_work item with FULL detail (defer list is title-only)'),
+  source: z.enum(['obs', 'session', 'prompt', 'event']).optional().describe('Force all IDs to this source (overrides per-token prefixes). Omit to let P#/S#/E#/# prefixes route individually. D#N tokens are exempt — they always read deferred_work.'),
   fields: coerceStringArray.optional().describe('Specific fields to return (default: all; validated against obs schema — session/prompt sources ignore this filter)'),
 };
 
