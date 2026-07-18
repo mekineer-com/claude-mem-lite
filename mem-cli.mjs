@@ -50,7 +50,7 @@ import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipel
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
 import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
-import { aggregateMetrics } from './lib/metrics.mjs';
+import { aggregateMetrics, readMetrics } from './lib/metrics.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
   resolveDeferredIds, closeDeferredItems,
@@ -1254,6 +1254,18 @@ async function cmdStats(db, args) {
   const rrN = featAgg.reread_warn?.count ?? 0;
   const metricsOn = process.env.CLAUDE_MEM_METRICS === '1';
   out(`  Feature injections (7d): 📄 file-intel ${fiN} · 🔁 reread-warn ${rrN}${(!metricsOn && fiN + rrN === 0) ? '  (set CLAUDE_MEM_METRICS=1 to record)' : ''}`);
+  // G13: surface the recall/enrich metering so "did the worker succeed" is
+  // readable from stats, not just raw jsonl. enrich-save shows ok/total; the
+  // per-reason split (llm-null vs txn-failed …) stays a jq query on the jsonl.
+  const prN = featAgg.pretool_recall?.count ?? 0;
+  const erN = featAgg.error_recall?.count ?? 0;
+  let esOk = 0, esN = 0;
+  for (const r of readMetrics(DB_DIR, 7)) {
+    if (r.event === 'enrich_save') { esN++; if (r.enriched) esOk++; }
+  }
+  if (prN + erN + esN > 0 || metricsOn) {
+    out(`  Recall metering (7d): 🧠 pretool ${prN} · ⛑ error-recall ${erN} · ✚ enrich-save ${esOk}/${esN} ok`);
+  }
   if (noiseRatio > 0.6 || lowSignalRatio > 0.3) out('  ⚠️ High noise ratio — consider running mem maintain / compress');
   out('');
   // Tier counts only live (uncompressed, non-superseded) observations — surface the

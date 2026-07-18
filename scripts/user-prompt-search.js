@@ -4,7 +4,7 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate, neutralizeContextDelimiters } from '../utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
@@ -446,11 +446,12 @@ function readStdin() {
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', chunk => {
       data += chunk;
-      // Cap at 64KB — user prompts shouldn't be huge
-      if (data.length > 65536) {
+      // Cap the prompt (#9494 huge-prompt guard) — deliberately tighter than the
+      // 256KB full-payload tier; both tiers live in utils.mjs (G19).
+      if (data.length > MAX_UPS_PROMPT_BYTES) {
         process.stdin.destroy();
         clearTimeout(timeout);
-        resolve(data.slice(0, 65536));
+        resolve(data.slice(0, MAX_UPS_PROMPT_BYTES));
       }
     });
     process.stdin.on('end', () => { clearTimeout(timeout); resolve(data); });

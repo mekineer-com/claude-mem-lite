@@ -93,6 +93,14 @@ export function clampImportance(val) {
 // Tools that produce file edits (used for significance detection, feedback, importance)
 export const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit']);
 
+// Stdin caps for the hook entry points (G19). Two DELIBERATE tiers, not drift:
+// full hook payloads carry tool_response bodies (256KB), while the UserPromptSubmit
+// search surface caps the prompt itself at 64KB (#9494 huge-prompt guard — search
+// relevance gains nothing past that). scripts/pre-agent-inject.js repeats the
+// 256KB literal by design: its default-off path must stay import-free.
+export const MAX_HOOK_STDIN_BYTES = 256 * 1024;
+export const MAX_UPS_PROMPT_BYTES = 64 * 1024;
+
 // Low-signal degraded title patterns — shared by hook-llm.mjs (dedup + importance cap) and hook-handoff.mjs (decision filter)
 // Two top-level alternatives:
 //   1. ^(prefix1|prefix2|...) — title starts with one of the hook-llm fallback prefixes

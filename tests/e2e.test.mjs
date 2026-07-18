@@ -98,6 +98,22 @@ function makeToolPayload(toolName, input, response) {
   return JSON.stringify({ tool_name: toolName, tool_input: input, tool_response: response });
 }
 
+// G13: parse every metric row written under this test's isolated HOME.
+// recordMetric targets join(RUNTIME_DIR, '..') → tmpHome/.claude-mem-lite/metrics/.
+function readMetricRows(tmpHome) {
+  const dir = join(tmpHome, '.claude-mem-lite', 'metrics');
+  if (!existsSync(dir)) return [];
+  const rows = [];
+  for (const f of readdirSync(dir)) {
+    if (!f.endsWith('.jsonl')) continue;
+    for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
+      if (!line) continue;
+      try { rows.push(JSON.parse(line)); } catch { /* skip malformed */ }
+    }
+  }
+  return rows;
+}
+
 function getSessionFile(tmpHome) {
   const runtimeDir = join(tmpHome, '.claude-mem-lite', 'runtime');
   const files = readdirSync(runtimeDir).filter(f => f.startsWith('session-'));
@@ -969,10 +985,16 @@ describe('Suite 6: Error Recall', () => {
       stdin: makeToolPayload('Bash', {
         command: 'curl http://localhost:3000/api/health',
       }, 'Error: connect ECONNREFUSED 127.0.0.1:3000\n    at TCPConnectWrap.afterConnect [as oncomplete] (net.js:1141:16)'),
-      env: { HOME: tmpHome },
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
     });
 
     expect(stdout).toContain('[claude-mem-lite] Related memories found for this error');
+
+    // G13: each fired error-recall injection must be metered — the G8 gate change
+    // (isError→isHardError) had no post-fix volume signal in metrics before this.
+    const erRows = readMetricRows(tmpHome).filter(r => r.event === 'error_recall');
+    expect(erRows.length).toBe(1);
+    expect(erRows[0].returned).toBeGreaterThanOrEqual(1);
     expect(stdout).toContain('ECONNREFUSED');
     // ② precision-half: top-1 lesson_learned is inlined (agent acts with no follow-up mem_get)
     expect(stdout).toContain('Start the dev server before curling the health endpoint.');
@@ -1018,10 +1040,13 @@ describe('Suite 6: Error Recall', () => {
       stdin: makeToolPayload('Bash', {
         command: 'node scripts/health-report.mjs',
       }, 'Health report: 2 endpoints degraded, last error ECONNREFUSED on port 3000 (recovered), overall status OK'),
-      env: { HOME: tmpHome },
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
     });
 
     expect(stdout).not.toContain('Related memories found for this error');
+    // G13 negative: no injection → no error_recall metric row (metrics enabled,
+    // so absence proves the gate, not a disabled sink).
+    expect(readMetricRows(tmpHome).filter(r => r.event === 'error_recall').length).toBe(0);
   });
 });
 
@@ -2023,7 +2048,7 @@ describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => 
 
     runHook('enrich-save', {
       args: [String(id)],
-      env: { HOME: tmpHome, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      env: { HOME: tmpHome, CLAUDE_MEM_HOOK_RUNNING: '1', CLAUDE_MEM_METRICS: '1' },
     });
 
     const db2 = openTestDb(tmpHome);
@@ -2033,6 +2058,14 @@ describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => 
     expect(o.search_aliases).toContain('mock alias one');
     expect(o.search_aliases).toContain('模拟别名');
     expect(o.optimized_at).toBeNull();
+
+    // G13: the worker's outcome must land in metrics — pre-fix handleEnrichSave
+    // discarded executeSaveEnrich's reason and the jsonl had zero enrich rows.
+    const enrichRows = readMetricRows(tmpHome).filter(r => r.event === 'enrich_save');
+    expect(enrichRows.length).toBe(1);
+    expect(enrichRows[0].id).toBe(id);
+    expect(enrichRows[0].enriched).toBe(true);
+    expect(enrichRows[0].reason).toBe('enriched');
   });
 });
 

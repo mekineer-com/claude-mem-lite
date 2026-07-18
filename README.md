@@ -684,41 +684,43 @@ and `benchmark/longmemeval-rerank.mjs` (rerank).
 
 | Retriever (zero embeddings) | @1 | @5 | @10 |
 |---|---|---|---|
-| Lexical hybrid — FTS5 + TF-IDF + RRF | 76.8% | 90.6% | 95.2% |
-| + one top-20 LLM rerank pass | **92.8%** | **96.8%** | **97.4%** |
+| Lexical hybrid — FTS5 + TF-IDF + RRF | **83.4%** | **95.2%** | **96.0%** |
+| + one top-20 LLM rerank pass † | 92.8% | 96.8% | 97.4% |
 
-*n = 500 questions; 99.8% JSON parse-rate at concurrency 3.* The rerank pass
-hands the top 20 lexical candidates to a single Haiku call (~1.4 s/query) that
-reorders them. It is **never worse than the lexical baseline by construction** —
-any LLM or parse failure falls back to the original candidate order.
+*n = 500 questions.* The lexical row was re-measured 2026-07-18: the v3.39–v3.45
+alias/synonym-pipeline work lifted it from the previously published 76.8/90.6/95.2
+on the **same harness and dataset** (both unchanged since that run — the gain is
+engine-side, not metric drift). † The rerank row is the 2026-06 measurement taken
+against the *older* lexical baseline; with lexical now at 95.2 @5 its remaining
+headroom is ~1.6pt and a re-measurement is pending. The rerank pass hands the top
+20 lexical candidates to a single Haiku call (~1.4 s/query) that reorders them; it
+is **never worse than the lexical baseline by construction** — any LLM or parse
+failure falls back to the original candidate order.
 
 **Stricter metric, for the record.** The rows above are `recall_any@k` — does *any*
 gold session reach the top *k* — the metric agentmemory and MemPalace publish, so the
 comparison is like-for-like. Under the stricter **standard recall@k** (`|gold ∩ top-k| /
 |gold|`, the *fraction* of all gold sessions retrieved), the lexical stack scores
-@1 = 46.9% / @5 = 84.4% / @10 = 91.9%. The whole gap is the 65% of questions with
+@1 = 52.9% / @5 = 87.8% / @10 = 91.0%. The whole gap is the 65% of questions with
 multiple gold sessions — any-hit needs one, fractional needs them all, and @1 is capped
 at 1/|gold| there; single-gold question types score identically under both.
 `benchmark/longmemeval.mjs` reports both columns (the rerank row's fractional is not yet
 measured).
 
-**On embeddings, honestly.** With no LLM in the loop, both a dense-embedding
-baseline (MemPalace, ~96.6% @5) and a BM25 + vector + graph hybrid (agentmemory,
-95.2% @5) out-recall our zero-embedding lexical stack (90.6% @5) at the same
-retrieval stage — dense and graph signal genuinely help raw recall, and most of
-our remaining gap is paraphrase (single-session-preference is our lowest category
-at 63%). The rerank row's point is that a *single cheap LLM call closes it*:
-reordering the top-20 lexical candidates reaches 96.8% @5 — matching the dense raw
-number and edging the hybrid's retrieval score — because the lexical candidate set
-is already rich enough (recall@20 = 97.8%) that ranking, not recall, is the
-bottleneck. An embedding-plus-rerank stack still leads when both sides spend an LLM
-call; the takeaway is that claude-mem-lite reaches embedding-competitive precision
-with **no vector model, no knowledge graph, no Python, and no external service**.
+**On embeddings, honestly.** With no LLM in the loop, our zero-embedding lexical
+stack now **ties** the BM25 + vector + graph hybrid (agentmemory, 95.2% @5) at the
+same retrieval stage; a dense-embedding baseline (MemPalace, ~96.6% @5) still leads
+by ~1.4pt. The remaining gap concentrates in paraphrase (single-session-preference
+is our lowest category at 80.0% @5). The rerank row's point stands: a *single cheap
+LLM call* reorders the top-20 lexical candidates because the candidate set is
+already rich enough that ranking, not recall, is the bottleneck. An
+embedding-plus-rerank stack still leads when both sides spend an LLM call; the
+takeaway is that claude-mem-lite reaches embedding-competitive recall with **no
+vector model, no knowledge graph, no Python, and no external service**.
 
-Per-category @5 (lexical → +rerank): knowledge-update 98.7 → 100.0 ·
-single-session-user 91.4 → 98.6 · temporal-reasoning 89.5 → 97.7 · multi-session
-95.5 → 97.7 · single-session-assistant 83.9 → 94.6 · single-session-preference
-63.3 → 80.0. Every category improves; none regress.
+Per-category any@5, lexical (2026-07-18 run): knowledge-update 100.0 ·
+single-session-user 100.0 · multi-session 94.7 · single-session-assistant 94.6 ·
+temporal-reasoning 94.0 · single-session-preference 80.0.
 
 ## Development
 

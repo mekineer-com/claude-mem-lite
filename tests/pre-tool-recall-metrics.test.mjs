@@ -10,7 +10,7 @@ import { resolve, join } from 'path';
 import { writeFileSync, mkdirSync, rmSync, mkdtempSync, existsSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { initSchema } from '../schema.mjs';
-import { insertSession } from './test-helpers.mjs';
+import { insertSession, insertObs } from './test-helpers.mjs';
 import Database from 'better-sqlite3';
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js');
@@ -79,6 +79,41 @@ describe('pre-tool-recall firing metrics (tier-1)', () => {
     await runScript(read(fp, 's2'), env({ CLAUDE_MEM_METRICS: '1' })); // first read → file_intel
     await runScript(read(fp, 's2'), env({ CLAUDE_MEM_METRICS: '1' })); // repeat full read of unchanged file → reread_warn
     expect(metricEvents()).toContain('reread_warn');
+  });
+
+  it('records a pretool_recall event with counts when a lesson injects (G13)', async () => {
+    // Pre-fix, obs/event lesson recall — the largest injected_n contributor —
+    // had NO firing counter while file_intel/reread_warn were metered.
+    const fp = join(projectDir, 'm4.mjs');
+    writeFileSync(fp, BIG);
+    const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+    insertObs(db, {
+      sessionId: 'mem-m', project: 'parent--metricstest',
+      type: 'bugfix', importance: 2, title: 'm4 FTS regression',
+      lessonLearned: 'Rebuild the FTS index after schema edits to m4.',
+      filesModified: '["m4.mjs"]',
+    });
+    db.close();
+    await runScript(read(fp, 's4'), env({ CLAUDE_MEM_METRICS: '1' }));
+    const p = join(tmpRoot, 'metrics', `${today()}.jsonl`);
+    const rows = readFileSync(p, 'utf8').trim().split('\n').map(l => JSON.parse(l));
+    const recall = rows.filter(r => r.event === 'pretool_recall');
+    expect(recall.length).toBe(1);
+    expect(recall[0].injected).toBe(1);
+    expect(recall[0].obs).toBe(1);
+    expect(recall[0].evt).toBe(0);
+    expect(recall[0].mode).toBe('read');
+  });
+
+  it('records NO pretool_recall event when nothing injects (metrics enabled)', async () => {
+    const fp = join(projectDir, 'm5.mjs');
+    writeFileSync(fp, BIG);
+    await runScript(read(fp, 's5'), env({ CLAUDE_MEM_METRICS: '1' })); // no obs seeded → file_intel only
+    const p = join(tmpRoot, 'metrics', `${today()}.jsonl`);
+    const events = existsSync(p)
+      ? readFileSync(p, 'utf8').trim().split('\n').map(l => JSON.parse(l).event) : [];
+    expect(events).toContain('file_intel');
+    expect(events).not.toContain('pretool_recall');
   });
 
   it('records nothing when CLAUDE_MEM_METRICS is unset (default off)', async () => {

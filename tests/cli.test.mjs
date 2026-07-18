@@ -1848,6 +1848,19 @@ describe('CLI stats command extended', () => {
     expect(output).toContain('Tier distribution');
   });
 
+  it('shows Recall metering line when metrics are enabled (G13)', async () => {
+    const prev = process.env.CLAUDE_MEM_METRICS;
+    process.env.CLAUDE_MEM_METRICS = '1';
+    try {
+      const output = await captureStdout(() => run(['stats']));
+      expect(output).toContain('Recall metering (7d):');
+      expect(output).toContain('enrich-save');
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_MEM_METRICS;
+      else process.env.CLAUDE_MEM_METRICS = prev;
+    }
+  });
+
   it('shows daily activity', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'discovery',

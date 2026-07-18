@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.54.0 — three-face audit Phase A: recall/enrich telemetry + reminder counting fix + LongMemEval baseline refresh
+
+Phase A of the 2026-07-18 three-face (storage/retrieval/injection) audit plan (G13/G18/G19/G20). Theme: the audit found the failure class has shifted from correctness to **observability** — the save-enrich worker, PreToolUse recall, and error-recall all ran unmetered, so "did it work" was unanswerable. This release makes them readable; no ranking or injection behavior changes.
+
+**What changes for you:**
+1. **Three new metric events under `CLAUDE_MEM_METRICS=1`** (G13): `enrich_save` (the background worker's outcome + reason code — previously discarded, leaving the 32%-alias-coverage gap undiagnosable between LLM failure / timeout / txn loss), `pretool_recall` (the largest injected_n contributor — obs/event split + read/edit mode; previously the only unmetered injection surface), and `error_recall` (fires-per-injection count — the v3.51.0 isHardError gate change is now volume-verifiable from metrics). `stats` grows one `Recall metering (7d)` line showing all three, including enrich-save ok/total.
+2. **The unpersisted-decision reminder recognizes skill-path persistence** (G18). A session that finalized a decision and persisted it via `/lesson`, `/memory`, `/bug`, or a memory-dir file write still got the "nothing persisted" reminder — those paths now count as deliberate persistence alongside `mem_save`/`mem_defer`/CLI.
+3. **README LongMemEval numbers refreshed to the current engine** (G20): lexical recall_any @1/@5/@10 = 83.4/95.2/96.0 (re-measured 2026-07-18; harness and dataset unchanged since the published 76.8/90.6/95.2 run — the lift is the v3.39–v3.45 alias/synonym work, and zero-embedding lexical now ties agentmemory's hybrid at @5). Fractional and per-category tables updated; the rerank row is flagged as an older-baseline measurement pending re-run.
+
+### Fixed / cleaned (G19)
+- The two UserPromptSubmit stdin caps are now shared constants in `utils.mjs` (`MAX_HOOK_STDIN_BYTES` 256KB full payloads / `MAX_UPS_PROMPT_BYTES` 64KB prompt guard, #9494) instead of divergence-prone magic numbers; `pre-agent-inject.js` keeps its literal by design (import-free off path) with a pointer comment.
+- `normalizeCrossSourceScores` comments no longer claim the prompts CJK LIKE fallback is the only score=0 producer (the obs type-list fallback also emits 0 — both gated so behavior is unaffected; comment-only fix).
+- Real-DB hygiene (backed up first): 5 `tmp--mem-dogfood` deferred-work test-residue rows deleted.
+- `DEFER_STALE_DAYS` un-exported (zero external importers since its v3.51.0 birth) — knip unused-exports baseline stays at 46.
+- Noise-gauge audit note: `file_intel`/`reread_warn` counters were verified to be OUTSIDE the Low-value noise denominator already (display-only "Feature injections" line) — no change needed.
+
+3910 tests pass (+4: pretool_recall metering ×2, stats metering line ×1, skill-path persistence ×1; plus assertions added to existing e2e enrich-save/error-recall tests), eslint clean, knip 46 (baseline).
+
 ## v3.53.0 — citation-metering fixes (G10): concurrent-session decay undercount + superseded keeper credit
 
 Phase 2 opener from the 2026-07-18 roadmap — both fixes repair the measurement layer the upcoming injection-funnel decisions read from. No new surfaces.

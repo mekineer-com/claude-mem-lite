@@ -24,7 +24,8 @@ function readStdin() {
       data += c;
       // cap: agent prompts can be large. destroy() so the loop can drain and exit on
       // its own (see the no-forced-exit note at the bottom) rather than streaming to
-      // the 1.5s timeout.
+      // the 1.5s timeout. 262144 = MAX_HOOK_STDIN_BYTES (utils.mjs) repeated as a
+      // literal ON PURPOSE: the default-off fast path above must stay import-free.
       if (data.length > 262144) { clearTimeout(timer); try { process.stdin.destroy(); } catch { /* */ } resolve(data.slice(0, 262144)); }
     });
     process.stdin.on('end', () => { clearTimeout(timer); resolve(data); });

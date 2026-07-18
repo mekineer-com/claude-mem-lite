@@ -27,6 +27,7 @@ import {
   extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
   COMPRESSED_AUTO, OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
+  MAX_HOOK_STDIN_BYTES,
 } from './utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
@@ -64,7 +65,7 @@ import { searchRelevantMemories, formatMemoryLine, selectImperativeLesson } from
 import { searchInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
-import { gcOldMetricShards } from './lib/metrics.mjs';
+import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -433,6 +434,10 @@ function triggerErrorRecall(db, toolInput, response) {
 
     const out = formatErrorRecallHints(rows);
     if (out) {
+      // G13: this surface feeds the citation denominator but had zero metering —
+      // the G8 gate change (isError→isHardError) could not be volume-verified
+      // from metrics. Counter only; no latency (query is bundled in the hook).
+      recordMetric(join(RUNTIME_DIR, '..'), { event: 'error_recall', returned: rows.length });
       // MED-3 (full audit 2026-07-16): emit via the JSON envelope (trailing '\n'),
       // NOT raw stdout. A raw multi-line write corrupts a co-emitted episode-flush
       // receipt (both write to PostToolUse stdout in the same call → `<text>{json}`)
@@ -1627,8 +1632,19 @@ async function handleEnrichSave(rawId) {
   if (!db) return;
   try {
     const { executeSaveEnrich } = await import('./lib/save-enrich.mjs');
-    await executeSaveEnrich(db, id);
+    const result = await executeSaveEnrich(db, id);
+    // G13: the worker's outcome was previously discarded — "spawned but did it
+    // work" was invisible (32% alias coverage with 3 indistinguishable failure
+    // causes). reason 'filled-concurrently' = txn ran but a concurrent optimize/
+    // update had already filled every empty field.
+    recordMetric(join(RUNTIME_DIR, '..'), {
+      event: 'enrich_save',
+      id,
+      enriched: result.enriched,
+      reason: result.reason ?? (result.enriched ? 'enriched' : 'filled-concurrently'),
+    });
   } catch (e) {
+    recordMetric(join(RUNTIME_DIR, '..'), { event: 'enrich_save', id, enriched: false, reason: 'worker-error' });
     debugCatch(e, 'enrich-save');
   } finally {
     try { db.close(); } catch {}
@@ -1672,7 +1688,7 @@ function handleAutoCompress() {
 // ─── Utilities ──────────────────────────────────────────────────────────────
 
 function readStdin() {
-  const MAX_STDIN = 256 * 1024; // 256KB — large tool responses are truncated
+  const MAX_STDIN = MAX_HOOK_STDIN_BYTES; // large tool responses are truncated (shared tier, utils.mjs)
   return new Promise((resolve, reject) => {
     let data = '';
     const timeout = setTimeout(() => { debugLog('WARN', 'readStdin', 'stdin timeout after 3s — event dropped'); process.stdin.destroy(); reject(new Error('timeout')); }, 3000);

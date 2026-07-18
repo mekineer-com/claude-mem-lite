@@ -512,6 +512,19 @@ try {
     // unreadable files. When present (first Read of a sizable file this session),
     // it leads the injection, above any lessons.
     const hasLessons = allRows.length > 0;
+    // G13: obs/event lesson recall is the largest injected_n contributor
+    // (session max observed: 105) yet had no firing counter — file_intel/
+    // reread_warn were metered while the actual #NN injections were invisible.
+    // Source split lets the D#78 per-surface attribution read obs vs events.
+    if (hasLessons) {
+      recordMetric(DATA_DIR, {
+        event: 'pretool_recall',
+        injected: allRows.length,
+        obs: allRows.filter(r => r.src === 'obs').length,
+        evt: allRows.filter(r => r.src === 'evt').length,
+        mode: isRead ? 'read' : 'edit',
+      });
+    }
     const showFraming = hasLessons || Boolean(fileIntelLine)
       || (!isRead && process.env.CLAUDE_MEM_PRETOOL_NUDGE === '1');
     if (showFraming) {

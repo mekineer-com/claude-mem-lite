@@ -61,6 +61,23 @@ describe('countDeliberatePersistence (transcript scan)', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('counts Skill lesson/memory/bug and memdir Write/Edit paths (G18)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'persist-rem-'));
+    const p = writeTranscript(dir, [
+      assistantToolUse('Skill', { skill: 'claude-mem-lite:lesson', args: 'x' }),
+      assistantToolUse('Skill', { skill: 'memory' }),
+      assistantToolUse('Skill', { skill: 'claude-mem-lite:bug' }),
+      assistantToolUse('Write', { file_path: '/home/u/.claude/projects/-x-y/memory/project_foo.md', content: 'f' }),
+      assistantToolUse('Edit', { file_path: '/home/u/.claude/projects/-x-y/memory/MEMORY.md', old_string: 'a', new_string: 'b' }),
+      // NOT persistence: unrelated skill, non-memdir write, memdir-adjacent path
+      assistantToolUse('Skill', { skill: 'claude-mem-lite:mem' }),
+      assistantToolUse('Write', { file_path: '/home/u/project/notes.md', content: 'n' }),
+      assistantToolUse('Write', { file_path: '/home/u/.claude/projects/-x-y/tasks/t.md', content: 't' }),
+    ]);
+    expect(countDeliberatePersistence(p)).toBe(5);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('does not count a search command that merely mentions save', () => {
     const dir = mkdtempSync(join(tmpdir(), 'persist-rem-'));
     const p = writeTranscript(dir, [
