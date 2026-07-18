@@ -215,6 +215,37 @@ export const SYNONYM_PAIRS = [
   ['历史', 'history'], ['描述', 'description'],
   ['推荐', 'recommend'], ['建议', 'suggestion'],
   ['智能', 'smart'], ['智能', 'intelligent'],
+  // ─── G15 bilingual bridge (three-face audit 2026-07-18) ───
+  // Real-DB gap: obs bodies are Haiku ENGLISH summaries, so Chinese queries for
+  // the user's WORKING vocabulary scored zero ('钳制' 0 hits vs 'clamp' 9 — the
+  // audit's canonical case). Pairs curated from (a) 90d prompt mining of
+  // frequent uncovered CJK terms (注入/发版/报告/目录/路径/覆盖/规范/默认…) and
+  // (b) the memory/search/release domain vocabulary this corpus actually stores.
+  // English→Chinese direction is near-free (CJK terms rarely match EN docs);
+  // the win is Chinese→English. Gated by denoise-ab A/B (g15 control snapshot).
+  ['钳制', 'clamp'], ['富集', 'enrich'], ['富集', 'enrichment'],
+  ['注入', 'inject'], ['注入', 'injection'],
+  ['召回', 'recall'], ['检索', 'retrieval'], ['检索', 'search'],
+  ['衰减', 'decay'], ['去重', 'dedup'],
+  ['幂等', 'idempotent'], ['幂等', 'idempotency'],
+  ['回填', 'backfill'], ['降级', 'degrade'],
+  ['兜底', 'fallback'], ['回退', 'rollback'], ['回退', 'revert'],
+  ['探针', 'probe'], ['遥测', 'telemetry'],
+  ['基线', 'baseline'], ['审计', 'audit'],
+  ['路线图', 'roadmap'], ['词表', 'vocabulary'],
+  ['命名空间', 'namespace'], ['残留', 'residue'],
+  ['门控', 'gate'], ['阈值', 'threshold'],
+  ['快照', 'snapshot'], ['签名', 'signature'], ['签名', 'signing'],
+  ['备份', 'backup'], ['漏斗', 'funnel'],
+  ['发版', 'release'], ['报告', 'report'],
+  ['目录', 'directory'], ['路径', 'path'],
+  ['覆盖', 'coverage'], ['覆盖', 'overwrite'],
+  ['规范', 'spec'], ['默认', 'default'],
+  ['场景', 'scenario'], ['质量', 'quality'],
+  ['逻辑', 'logic'], ['规则', 'rule'],
+  ['墓碑', 'tombstone'], ['噪音', 'noise'], ['噪声', 'noise'],
+  ['精度', 'precision'], ['精准', 'precision'], ['稀释', 'dilution'],
+  ['延后', 'defer'], ['挂账', 'deferred'], ['可观测', 'observability'],
 ];
 
 // ─── Bidirectional SYNONYM_MAP (case-insensitive) ──────────────────────────────
@@ -272,6 +303,15 @@ export const CJK_COMPOUNDS = new Set([
   // improves, and real compounds cannot create boundary-straddle bigrams.
   '工作', '用户', '完成', '计划', '命令', '工具', '插件', '实施', '处理',
   '清理', '显示', '本地', '改动', '确认', '直接', '开始',
+  // G15 bilingual-bridge terms — keep cjkBigrams (CJK_SORTED reads ONLY this
+  // set) segmenting the same words the synonym map expands, so index-side and
+  // query-side tokenization agree. Real compounds are monotonically safe (above).
+  '钳制', '富集', '召回', '检索', '衰减', '去重', '幂等', '回填', '降级',
+  '兜底', '回退', '探针', '遥测', '基线', '审计', '路线图', '词表', '命名空间',
+  '残留', '门控', '阈值', '快照', '签名', '备份', '漏斗', '发版', '报告',
+  '目录', '路径', '覆盖', '规范', '默认', '场景', '质量', '逻辑', '规则',
+  '墓碑', '噪音', '噪声', '精度', '精准', '稀释', '延后', '挂账', '可观测',
+  '注入',
 ]);
 
 // ─── Dispatch Synonyms (unidirectional, broader groupings) ──────────────────

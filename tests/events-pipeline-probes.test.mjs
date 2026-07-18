@@ -1,0 +1,44 @@
+// G16: events end-to-end pipeline probes — healthy-pass + archaeology-replay
+// teeth. The probes' value claim is "a FTS/shape-layer events regression that
+// reads NEUTRAL on every metric suite turns PROBE-FAIL here"; that claim is
+// only evidence if a replayed historical breakage actually flips them red.
+// Replayed state: v3.44-era "events rows exist but events_fts is empty/broken"
+// (the audit's canonical events-unsearchable face).
+
+import { describe, it, expect } from 'vitest';
+import { createTestDb } from './test-helpers.mjs';
+import { runEventsPipelineProbes, seedEventsPipelineCorpus } from '../benchmark/events-pipeline-probes.mjs';
+
+describe('events pipeline probes (G16)', () => {
+  it('all probes pass on a healthy seeded corpus', async () => {
+    const probes = await runEventsPipelineProbes();
+    const failed = probes.filter((p) => !p.pass);
+    expect(failed.map((p) => `${p.name}: ${p.detail}`)).toEqual([]);
+    expect(probes.length).toBe(6);
+  });
+
+  it('TEETH: wiping events_fts turns the reachability probe red (archaeology replay)', async () => {
+    const db = createTestDb();
+    seedEventsPipelineCorpus(db);
+    // Replay the events-unsearchable state: FTS index emptied while the events
+    // rows remain (what a broken trigger / skipped backfill produces).
+    db.exec(`DELETE FROM events_fts`);
+    const probes = await runEventsPipelineProbes(db);
+    db.close();
+    const byName = Object.fromEntries(probes.map((p) => [p.name, p]));
+    expect(byName['event-reachable-via-fts'].pass).toBe(false);
+    expect(byName['strong-event-outranks-weak-obs'].pass).toBe(false);
+    expect(byName['event-type-filter-maps'].pass).toBe(false);
+  });
+
+  it('TEETH: a broken events_fts face THROWS into the probe (tolerateMissingFts=false), not silent-degrades', async () => {
+    const db = createTestDb();
+    seedEventsPipelineCorpus(db);
+    db.exec(`DROP TABLE events_fts`);
+    const probes = await runEventsPipelineProbes(db);
+    db.close();
+    const reach = probes.find((p) => p.name === 'event-reachable-via-fts');
+    expect(reach.pass).toBe(false);
+    expect(reach.detail).toContain('threw');
+  });
+});

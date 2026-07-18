@@ -39,6 +39,11 @@
 // by flipping the OR_TOP_BM25_FLOOR row-selection — zero metric movement). Evaluate
 // those on the UPS/PTR path directly; cite_factor additionally needs a corpus with
 // real citation history (cited_count / uncited_streak), which the fixtures lack.
+// The events/cross-source MERGE face is likewise outside the metric suites, but as
+// of G16 it is DIRECTION-covered by behavioral probes (events-pipeline-probes.mjs
+// drives the real coreRunSearchPipeline; cross-source-probes.mjs the banding math) —
+// a break there reads PROBE-FAIL, not NEUTRAL. Ranking-quality DELTAS on events
+// remain unscored (no events metric suite).
 
 import { readFileSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -48,6 +53,7 @@ import { seedDatabase, seedVectors, runBenchmark } from './benchmark.mjs';
 import { runScriptGuard, MULTISCRIPT_FIXTURES } from './multiscript-guard.mjs';
 import { runCrossSourceProbes } from './cross-source-probes.mjs';
 import { runDeferredProbes } from './deferred-probes.mjs';
+import { runEventsPipelineProbes } from './events-pipeline-probes.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(__dirname, 'fixtures');
@@ -73,6 +79,13 @@ export const SUITES = [
  * are unaffected — control and treatment score the same corpus. Snapshots saved
  * BEFORE v3.51.0 are stale: re-save the control after upgrading, do not read
  * the corpus step as a lever regression.
+ *
+ * SECOND BASELINE STEP (G15): six ENGLISH-only docs (90211-90216) joined the CJK
+ * corpus for the cjk_xlang face (Chinese query → English doc via the synonym
+ * bridge; suite n 12→15). Measured shift vs the pre-G15 control: all |Δ| < 0.02
+ * (largest: precision MRR −0.017 — corpus-IDF noise below 1/n resolution).
+ * Teeth: reverting the synonyms.mjs bridge drops cjk_xlang R@10 1.0 → 0.333,
+ * so a future bridge regression reads as a suite REJECT, not NEUTRAL.
  */
 export function seedAllFixtures(db) {
   for (const f of ['seed-data.json', 'seed-data-cjk.json']) {
@@ -216,19 +229,25 @@ async function main() {
   const crossProbes = runCrossSourceProbes();
   const deferredProbes = runDeferredProbes(db);
   db.close();
+  // G16: events end-to-end probes drive the REAL coreRunSearchPipeline (FTS
+  // query construction → shapeEvent → cross-source merge) over their own seeded
+  // corpus — the face the obs-only suites AND the isolated cross-source probes
+  // both miss (07-17 audit MED-2, second half).
+  const eventsProbes = await runEventsPipelineProbes();
 
   const probeFailures = [
     ...guard.filter((g) => !g.found).map((g) => `multiscript:${g.script}`),
     ...crossProbes.filter((p) => !p.pass).map((p) => `cross-source:${p.name}`),
     ...deferredProbes.filter((p) => !p.pass).map((p) => `deferred:${p.kind}:"${p.query}"`),
+    ...eventsProbes.filter((p) => !p.pass).map((p) => `events:${p.name}`),
   ];
 
   console.error(`\n─── Denoise A/B snapshot (${mode}, ${SUITES.length} suites) ───`);
   console.error(fmtSnapshot(snap));
 
-  console.error('\n─── Behavioral probes (multiscript / cross-source / deferred) ───');
+  console.error('\n─── Behavioral probes (multiscript / cross-source / deferred / events) ───');
   console.error(`  ${guard.map((g) => `${g.script}${g.found ? '✓' : '✗ZERO'}`).join('  ')}`);
-  console.error(`  cross-source: ${crossProbes.filter((p) => p.pass).length}/${crossProbes.length} ✓   deferred: ${deferredProbes.filter((p) => p.pass).length}/${deferredProbes.length} ✓`);
+  console.error(`  cross-source: ${crossProbes.filter((p) => p.pass).length}/${crossProbes.length} ✓   deferred: ${deferredProbes.filter((p) => p.pass).length}/${deferredProbes.length} ✓   events-pipeline: ${eventsProbes.filter((p) => p.pass).length}/${eventsProbes.length} ✓`);
   if (probeFailures.length) {
     console.error(`  ⚠ PROBE-FAIL — ${probeFailures.join(', ')} — a face regression the ranking suites cannot see.`);
     process.exitCode = 1;

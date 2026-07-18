@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.55.0 — audit Phase B (partial): bilingual synonym bridge + events end-to-end probes
+
+Phase B of the 2026-07-18 three-face audit plan: the retrieval items (G15/G16). G14 (session injection budget) intentionally waits for a few days of the v3.54.0 `pretool_recall` metering to calibrate its threshold.
+
+**What changes for you:**
+1. **Chinese queries now reach English-bodied memories** (G15). Observation bodies are Haiku English summaries, so searching your working vocabulary in Chinese scored zero — the audit's canonical case: `钳制` 0 hits while `clamp` had 9. ~50 curated CJK↔EN term pairs joined the synonym bridge (钳制↔clamp, 富集↔enrich, 注入↔inject, 召回↔recall, 回填↔backfill, 探针↔probe, 遥测↔telemetry, 基线↔baseline, 快照↔snapshot, 漏斗↔funnel, …), mined from 90d of real prompts plus the memory/search/release domain vocabulary this corpus stores. The same terms joined the CJK segmentation dictionary so index-side and query-side tokenization agree. Live spot-check: `钳制` 0 → 31 results with the clamp bugfix event ranked; `富集 成功率` reaches the English roadmap observation.
+2. **The events search pipeline is no longer benchmark-blind** (G16, closes the second half of the 07-17 audit MED-2). Six end-to-end probes drive the real `coreRunSearchPipeline` (FTS query construction → shapeEvent → cross-source merge) over a seeded events+obs corpus: reachability, strong-event-outranks-weak-obs, supersession invisibility, event_type filter mapping, shape contract (body ⇒ lesson_learned + text), project scoping. They ride the denoise-ab screen — a break there now reads PROBE-FAIL instead of NEUTRAL. Teeth locked by archaeology replay: wiping `events_fts` (the v3.44-era events-unsearchable state) flips three probes red in the test suite.
+
+### Measurement notes
+- denoise A/B verdict for the bridge: NEUTRAL (all |Δ| < 0.02; largest shift precision MRR −0.017, below 1/n resolution) — the win is on the live-DB face the suites don't score, which is exactly why the new `cjk_xlang` fixture face (3 Chinese queries whose only relevant docs are English, in hard-negative pairs) was added: reverting the bridge drops its R@10 1.0 → 0.333, so future regressions read REJECT.
+- ONE-TIME baseline step (second, after v3.51.0's): the CJK corpus grew by 6 English docs (suite n 12→15). Snapshots saved before v3.55.0 are stale — re-save your control.
+
+3913 tests pass (+3: G16 healthy-pass + two teeth replays), eslint clean, knip 46.
+
 ## v3.54.0 — three-face audit Phase A: recall/enrich telemetry + reminder counting fix + LongMemEval baseline refresh
 
 Phase A of the 2026-07-18 three-face (storage/retrieval/injection) audit plan (G13/G18/G19/G20). Theme: the audit found the failure class has shifted from correctness to **observability** — the save-enrich worker, PreToolUse recall, and error-recall all ran unmetered, so "did it work" was unanswerable. This release makes them readable; no ranking or injection behavior changes.
