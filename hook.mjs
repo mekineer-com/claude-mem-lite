@@ -72,6 +72,7 @@ import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt } from './adopt-cli.mjs';
 import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
 import { loadCiteBackForEpisode, extractCiteBackSignals, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
+import { detectUnpersistedDecision } from './lib/persist-reminder.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
 // from an older hook-update.mjs SOURCE_FILES (which did not list this module) would
 // crash on static import. Degrade gracefully to no-op when the module is absent.
@@ -88,7 +89,12 @@ import { getVocabulary } from './tfidf.mjs';
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize', 'auto-maintain']);
+// Events allowed to run under CLAUDE_MEM_HOOK_RUNNING=1 (the recursion guard at
+// the dispatch below exits everything else). EVERY spawnBackground/queue* event
+// MUST be listed here — a missing entry makes the detached worker exit(0)
+// silently, which looks identical to "worker ran and found nothing" from the
+// outside (live-probe catch, 2026-07-18: enrich-save no-oped on this line).
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize', 'auto-maintain', 'enrich-save']);
 
 // Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
 // install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin
@@ -711,7 +717,21 @@ async function handleStop() {
             let priorStreak = 0;
             try { priorStreak = JSON.parse(readFileSync(dest, 'utf8')).lowStreak || 0; } catch {}
             const lowStreak = nextCiteLowStreak(priorStreak, stats);
-            const payload = { ...stats, ...bugfixStats, lowStreak, project, savedAt: Date.now() };
+            // G3: finalized-in-conversation + zero deliberate persistence →
+            // decisionSignal rides the payload; next SessionStart reminds once.
+            let decisionSignal = null;
+            try {
+              const promptRows = db.prepare(`
+                SELECT prompt_text FROM user_prompts
+                WHERE content_session_id = ? ORDER BY prompt_number ASC LIMIT 200
+              `).all(sessionId);
+              const d = detectUnpersistedDecision({
+                prompts: promptRows.map((r) => r.prompt_text),
+                transcriptPath,
+              });
+              if (d.fire) decisionSignal = d.signal;
+            } catch (e) { debugCatch(e, 'handleStop-persist-reminder'); }
+            const payload = { ...stats, ...bugfixStats, lowStreak, decisionSignal, project, savedAt: Date.now() };
             writeFileSync(dest, JSON.stringify(payload), { mode: 0o600 });
           } catch (e) { debugCatch(e, 'handleStop-cite-recall-persist'); }
         }
@@ -1587,6 +1607,28 @@ async function handleUserPrompt() {
   }
 }
 
+// ─── Save-Enrich (Background Worker, G1+G2) ─────────────────────────────────
+
+/**
+ * Detached worker spawned by the save surfaces (lib/save-enrich.mjs
+ * queueSaveEnrich): one Haiku call backfills lesson (obligated types) +
+ * search_aliases, fill-only-empty. Silent on any failure.
+ */
+async function handleEnrichSave(rawId) {
+  const id = parseInt(rawId, 10);
+  if (!Number.isInteger(id) || id <= 0) return;
+  const db = openDb();
+  if (!db) return;
+  try {
+    const { executeSaveEnrich } = await import('./lib/save-enrich.mjs');
+    await executeSaveEnrich(db, id);
+  } catch (e) {
+    debugCatch(e, 'enrich-save');
+  } finally {
+    try { db.close(); } catch {}
+  }
+}
+
 // ─── Auto-Compress (Background Worker) ───────────────────────────────────────
 
 /**
@@ -1694,6 +1736,7 @@ try {
     case 'llm-episode':      await handleLLMEpisode(); break;
     case 'llm-summary':      await handleLLMSummary(); break;
     case 'auto-compress':    handleAutoCompress(); break;
+    case 'enrich-save':      await handleEnrichSave(process.argv[3]); break;
     case 'auto-maintain':    handleAutoMaintain(); break;
     case 'llm-optimize':   await handleLLMOptimize(); break;
     // Detached update refresh spawned by handleSessionStart (audit P3d) — does the

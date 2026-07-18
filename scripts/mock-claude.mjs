@@ -27,6 +27,12 @@ process.stdin.on('end', () => {
       // Mock returns a realistic lesson so e2e tests exercise the save path.
       lesson_learned: 'Mock lesson — extracted insight that justifies persisting this observation.',
     }));
+  } else if (prompt.includes('A coding memory was just saved')) {
+    // Save-time enrichment prompt (lib/save-enrich.mjs, G1+G2)
+    process.stdout.write(JSON.stringify({
+      lesson_learned: 'Mock distilled lesson — root cause plus fix in one sentence.',
+      search_aliases: ['mock alias one', 'mock alias two', '模拟别名'],
+    }));
   } else if (prompt.includes('"request":"what the user was working on"')) {
     // Session summary prompt
     process.stdout.write(JSON.stringify({

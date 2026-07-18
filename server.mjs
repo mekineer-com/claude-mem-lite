@@ -56,6 +56,7 @@ import {
   searchDeferredWork, formatDeferredSearchTrailer,
   formatDeferListRow, countStaleOpen, formatDeferStaleHint,
 } from './lib/deferred-work.mjs';
+import { shouldQueueSaveEnrich, queueSaveEnrich } from './lib/save-enrich.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { createRequire } from 'module';
 
@@ -799,7 +800,11 @@ server.registerTool(
       ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
       : '';
     const nudge = buildLessonNudge({ type: result.type, id: result.id, lessonCaptured: result.lessonCaptured, surface: 'mcp' });
-    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}${nudge}` }] };
+    // G1+G2: detached backfill worker (lesson for obligated types + aliases for
+    // every save) — fill-only-empty, so an agent acting on the nudge still wins.
+    const enrichNote = shouldQueueSaveEnrich(result) && queueSaveEnrich(result.id)
+      ? ' (background enrichment queued)' : '';
+    return { content: [{ type: 'text', text: `Saved as observation #${result.id} [${result.type}] in project "${project}".${lessonNote}${closedNote}${supersededNote}${enrichNote}${nudge}` }] };
   })
 );
 

@@ -1946,3 +1946,92 @@ describe('Suite 11: first-run auto-adopt', () => {
     expect(adopted(projectDir)).toBe(true); // new block written
   });
 });
+
+describe('Suite: G3 unpersisted-decision reminder (Stop → payload → next SessionStart)', () => {
+  function writeTranscript(entries) {
+    const p = join(tmpHome, `transcript-${randomUUID().slice(0, 8)}.jsonl`);
+    writeFileSync(p, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return p;
+  }
+  const bashToolUse = (command) => ({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Bash', input: { command } }] },
+  });
+
+  it('finalization prompt + zero persistence → reminder on next session start', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('user-prompt', {
+      stdin: JSON.stringify({ user_prompt: '方案就这样，拍板了，进实现' }),
+      env: { HOME: tmpHome },
+    });
+    const transcript = writeTranscript([bashToolUse('npx vitest run')]);
+    runHook('stop', {
+      stdin: JSON.stringify({ session_id: randomUUID(), transcript_path: transcript }),
+      env: { HOME: tmpHome },
+    });
+
+    const payloadFile = join(tmpHome, '.claude-mem-lite', 'runtime', 'cite-recall-parent--testproj.json');
+    const payload = JSON.parse(readFileSync(payloadFile, 'utf8'));
+    expect(payload.decisionSignal).toBe('拍板');
+
+    const { stdout } = runHook('session-start', { env: { HOME: tmpHome } });
+    expect(stdout).toContain('finalized decision');
+    expect(stdout).toContain('拍板');
+  });
+
+  it('finalization prompt + a mem_defer call → NO reminder', () => {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('user-prompt', {
+      stdin: JSON.stringify({ user_prompt: '这个设计定稿了' }),
+      env: { HOME: tmpHome },
+    });
+    const transcript = writeTranscript([
+      bashToolUse('ls'),
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'mcp__plugin_claude-mem-lite_mem-lite__mem_defer', input: { title: 'the decision' } }] } },
+    ]);
+    runHook('stop', {
+      stdin: JSON.stringify({ session_id: randomUUID(), transcript_path: transcript }),
+      env: { HOME: tmpHome },
+    });
+
+    const payloadFile = join(tmpHome, '.claude-mem-lite', 'runtime', 'cite-recall-parent--testproj.json');
+    const payload = JSON.parse(readFileSync(payloadFile, 'utf8'));
+    expect(payload.decisionSignal).toBeNull();
+
+    const { stdout } = runHook('session-start', { env: { HOME: tmpHome } });
+    expect(stdout).not.toContain('finalized decision');
+  });
+});
+
+describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => {
+  it('worker runs under CLAUDE_MEM_HOOK_RUNNING=1 (BG_EVENTS membership) and backfills', () => {
+    // queueSaveEnrich spawns the worker with CLAUDE_MEM_HOOK_RUNNING=1 (every
+    // background spawn does). hook.mjs's recursion guard exits ANY event not in
+    // BG_EVENTS under that env — the live probe caught enrich-save silently
+    // no-oping on exactly this line. This test runs the worker in the spawned
+    // env; pre-fix it exits(0) before touching the row.
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'FTS trigger stale body fix', 'bugfix', 'Fixed stale FTS trigger body', '', 'Trigger body was not updated by CREATE IF NOT EXISTS', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    const id = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    db.close();
+
+    runHook('enrich-save', {
+      args: [String(id)],
+      env: { HOME: tmpHome, CLAUDE_MEM_HOOK_RUNNING: '1' },
+    });
+
+    const db2 = openTestDb(tmpHome);
+    const o = db2.prepare('SELECT lesson_learned, search_aliases, optimized_at FROM observations WHERE id = ?').get(id);
+    db2.close();
+    expect(o.lesson_learned).toContain('Mock distilled lesson');
+    expect(o.search_aliases).toContain('mock alias one');
+    expect(o.search_aliases).toContain('模拟别名');
+    expect(o.optimized_at).toBeNull();
+  });
+});

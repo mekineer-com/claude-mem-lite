@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.52.0 — roadmap Phase 1: save-time enrichment worker + unpersisted-decision reminder
+
+Write-side source treatment (Phase 1 of the 2026-07-18 roadmap). Phase 0 removed false signals; this release stops the two write-side leaks that make memories unfindable or lost entirely.
+
+**What changes for you:**
+1. **Every manual save now queues a background enrichment worker** (`mem_save` / CLI `save`; the receipt shows `(background enrichment queued)`). One detached Haiku call distills `lesson_learned` (bugfix/decision types only) and `search_aliases` (every save — the paraphrase bridge that previously waited for the next daily optimize pass), then backfills **fill-only-empty**: a lesson you wrote yourself, or aliases a concurrent optimize pass already filled, are never overwritten (re-checked inside a `BEGIN IMMEDIATE` transaction). Title/narrative/type/importance are untouched, `optimized_at` stays unset so the daily wide pass remains the safety net, and any failure (no LLM, bad JSON) degrades silently to today's behavior. The save call itself is zero-latency — the worker is detached.
+2. **A session that finalizes a decision but persists nothing gets one reminder next session.** The Stop hook scans the session's user prompts for finalization word forms (定稿/拍板/敲定/批准/采纳/approved/sign-off/finalized/writing-plans) and the transcript for deliberate persistence calls (`mem_save`/`mem_defer`/CLI `save`/`defer add`); signal + zero writes → the next SessionStart shows one line naming the trigger word. Remind-only — nothing is auto-written. This is the write-side half of the v3.50.0 D#92 fix: that incident was recoverable only because the session happened to write a defer detail voluntarily.
+
+**Opt-out / revert:** `CLAUDE_MEM_SKIP_SAVE_ENRICH=1` disables the worker; `CLAUDE_MEM_NO_CITE_NUDGE=1` (existing) silences the reminder surface; pin `claude-mem-lite@3.51.0` to drop both.
+
+### Fixed
+- **`BG_EVENTS` recursion-guard gap** (caught by a live probe during development, not by unit tests): background workers spawn with `CLAUDE_MEM_HOOK_RUNNING=1`, and hook.mjs exits any event not whitelisted in `BG_EVENTS` under that env — the new `enrich-save` worker silently no-oped until listed. Locked by an e2e that runs the worker in the spawned env (pre-fix RED: no backfill).
+
+### Notes
+- New shipped modules `lib/save-enrich.mjs` + `lib/persist-reminder.mjs` are registered in `package.json#files` and `SOURCE_FILES` (signing).
+- Namespace-split damage scan (roadmap G12①, analysis only): 3459 observations across 24 project namespaces show ≤3 split-suspect rows (0.09%) — git-root normalization (G12②③) is NOT justified by current damage; decision recorded, no code change.
+- Vitest is gated out of the worker spawn (`VITEST` env) — e2e suites run hundreds of saves and would otherwise fire real LLM calls on dev machines.
+
+3901 tests pass (+26: save-enrich ×13, persist-reminder ×10, e2e integration ×3), eslint clean.
+
 ## v3.51.0 — roadmap Phase 0: error-recall hard gate, defer aging, denoise blind-face probes
 
 First release of the 2026-07-18 optimization roadmap ("trust and measurement first"). Everything here either removes a false signal or opens a measurement face that was structurally blind.

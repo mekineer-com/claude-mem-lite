@@ -58,6 +58,7 @@ import {
   searchDeferredWork, formatDeferredSearchTrailer,
   formatDeferListRow, countStaleOpen, formatDeferStaleHint,
 } from './lib/deferred-work.mjs';
+import { shouldQueueSaveEnrich, queueSaveEnrich } from './lib/save-enrich.mjs';
 
 // ─── Commands ────────────────────────────────────────────────────────────────
 
@@ -960,7 +961,11 @@ function cmdSave(db, args) {
   const supersededNote = result.supersededIds && result.supersededIds.length > 0
     ? ` Superseded: ${result.supersededIds.map(i => `#${i}`).join(', ')}.`
     : '';
-  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}${supersededNote}${buildLessonNudge({ type: result.type, id: result.id, lessonCaptured: result.lessonCaptured, surface: 'cli' })}`);
+  // G1+G2: detached backfill worker (lesson for obligated types + aliases for
+  // every save) — fill-only-empty, so an agent acting on the nudge still wins.
+  const enrichNote = shouldQueueSaveEnrich(result) && queueSaveEnrich(result.id)
+    ? ' (background enrichment queued)' : '';
+  out(`[mem] Saved #${result.id} [${result.type}] "${truncate(result.title, 80)}" (project: ${result.project})${lessonNote}${closedNote}${supersededNote}${enrichNote}${buildLessonNudge({ type: result.type, id: result.id, lessonCaptured: result.lessonCaptured, surface: 'cli' })}`);
 }
 
 // ─── cmdDefer (sub-dispatch: add | list | drop) ──────────────────────────────

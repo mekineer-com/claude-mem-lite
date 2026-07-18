@@ -175,6 +175,8 @@ export const SOURCE_FILES = [
   // (mem_save) and mem-cli.mjs (cmdSave). Missing it breaks both save surfaces on
   // auto-update.
   'lib/save-nudge.mjs',
+  'lib/save-enrich.mjs',
+  'lib/persist-reminder.mjs',
   // P10 dedup/merge threshold constants — single source of truth for the Jaccard
   // dedup/merge cutoffs. Statically imported by hook.mjs, hook-llm.mjs,
   // hook-optimize.mjs, mem-cli.mjs, server.mjs, and the save/maintain cores;
