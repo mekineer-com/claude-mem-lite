@@ -2,6 +2,20 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.53.0 — citation-metering fixes (G10): concurrent-session decay undercount + superseded keeper credit
+
+Phase 2 opener from the 2026-07-18 roadmap — both fixes repair the measurement layer the upcoming injection-funnel decisions read from. No new surfaces.
+
+**What changes for you:**
+1. **Concurrent same-project sessions no longer undercount citation decay** (D#60, deferred from the R4 audit). The decay idempotency key was the project-scoped memory session id — shared by concurrent Claude Code sessions in one project, so the second session's Stop pass read "already decided this session" and silently skipped every obs the first session had resolved (lost streaks, lost `decay_seen_count`, deflated adoption denominators). The key is now the CC session UUID from Stop stdin (distinct per session; legacy stdin-less invocations keep the old key). Locked by an e2e reproducing two sessions sharing the memory-session file. One-time note: rows resolved under the old key may re-resolve once after upgrade (a single extra `decay_seen_count` bump — the safe direction vs. chronic undercount).
+2. **Citing a mid-session-superseded lesson now credits its keeper** (D#61). A lesson injected live and then superseded before Stop (auto-dedup or `supersedes=`) left its `#NN` citation crediting nobody — the decay pass excludes superseded rows by design, and the keeper carrying the lesson went unpromoted. Cited/injected ids now redirect one hop to a NUMERIC `superseded_by` keeper (polymorphism-guarded, self-reference/junk-safe); the tombstone itself stays untouched.
+
+### Notes
+- **G7 stall investigation** (analysis, no code): replaying 13d of real prompts (n=91) through the imperative gates shows the symbol-anchor gate kills 75% (CJK/short prompts carry no code identifiers), overlap kills 10%, pick rate ≈1.1/day — matching observed accumulation. This is the precision-first design ceiling, not a regression; the gate stays untouched mid-measurement (changing it would contaminate the n≥30 flip arm). Re-read at n≥30 (~2-4 weeks).
+- Real-DB hygiene (one-off, backed up first): 12 test-residue `deferred_work` rows (dropped/done, `defer-test`/`edge`/… projects) deleted; obs #10084 re-homed from the split namespace `super-skill--docs` to `projects--super-skill` (G12① finding).
+
+3906 tests pass (+5: superseded-redirect ×4, concurrent-decay e2e ×1), eslint clean.
+
 ## v3.52.0 — roadmap Phase 1: save-time enrichment worker + unpersisted-decision reminder
 
 Write-side source treatment (Phase 1 of the 2026-07-18 roadmap). Phase 0 removed false signals; this release stops the two write-side leaks that make memories unfindable or lost entirely.

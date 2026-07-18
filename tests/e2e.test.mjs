@@ -2035,3 +2035,64 @@ describe('Suite: G1+G2 enrich-save worker (spawned-env recursion guard)', () => 
     expect(o.optimized_at).toBeNull();
   });
 });
+
+describe('Suite: D#60 concurrent-session decay idempotency (G10)', () => {
+  it('two CC sessions sharing the memory session file both resolve the same obs', () => {
+    // The decay idempotency key was getSessionId() — a PROJECT-scoped file id
+    // shared by concurrent same-project CC sessions. Session A resolving obs X
+    // uncited stamped last_decided_session_id with the shared id, so session B's
+    // pass saw "already decided" and skipped — chronic undercount of
+    // decay_seen_count / uncited_streak / adoption denominators. The key must be
+    // the CC session UUID from Stop stdin (distinct per session).
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'decay probe row', 'bugfix', 'Decay probe observation', '', '', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    const obsId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    db.close();
+
+    const mkTranscript = (tag) => {
+      const p = join(tmpHome, `transcript-${tag}.jsonl`);
+      writeFileSync(p, [
+        // Injection surface the decay scan recognizes (error-recall hint shape).
+        {
+          type: 'attachment',
+          attachment: {
+            type: 'hook_success',
+            command: 'bash "/home/x/.claude-mem-lite/scripts/post-tool-use.sh"',
+            stdout: `[claude-mem-lite] Related memories found for this error:\n  #${obsId} [bugfix] Decay probe observation\n`,
+          },
+        },
+        // Main-thread assistant text WITHOUT a #NN citation (text-floor gate).
+        { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'still investigating the failure' }] } },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+      return p;
+    };
+
+    const sessionFilePath = join(tmpHome, '.claude-mem-lite', 'runtime', 'session-parent--testproj');
+    const sessionFileRaw = readFileSync(sessionFilePath, 'utf8');
+
+    runHook('stop', {
+      stdin: JSON.stringify({ session_id: 'cc-session-A', transcript_path: mkTranscript('A') }),
+      env: { HOME: tmpHome },
+    });
+    // Stop unlinks the session file; concurrent session B still holds the SAME
+    // memory session id — restore the file to reproduce the shared-key state.
+    writeFileSync(sessionFilePath, sessionFileRaw);
+    runHook('stop', {
+      stdin: JSON.stringify({ session_id: 'cc-session-B', transcript_path: mkTranscript('B') }),
+      env: { HOME: tmpHome },
+    });
+
+    const db2 = openTestDb(tmpHome);
+    const o = db2.prepare('SELECT uncited_streak, decay_seen_count FROM observations WHERE id = ?').get(obsId);
+    db2.close();
+    // Pre-fix: session B is skipped (streak 1, seen 1). Post-fix: both resolve.
+    expect(o.uncited_streak).toBe(2);
+    expect(o.decay_seen_count).toBe(2);
+  });
+});

@@ -668,7 +668,13 @@ async function handleStop() {
               } else {
                 const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
                 for (const id of citeBackIds) citedMain.add(id);
-                const r = applyCitationDecay(db, project, injected, citedMain, sessionId);
+                // D#60: the idempotency key must be the CC session UUID, NOT the
+                // project-scoped memory sessionId — concurrent same-project CC
+                // sessions share the latter, so the second session's decay pass
+                // read "already decided" and silently undercounted decay_seen /
+                // streaks / adoption denominators. Fallback keeps legacy
+                // stdin-less invocations on the old key.
+                const r = applyCitationDecay(db, project, injected, citedMain, ccSessionId || sessionId);
                 debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
                 // R1: persist this session's invocation→cite funnel row. touched =
                 // obs resolved this run (denominator), promoted = obs cited this run

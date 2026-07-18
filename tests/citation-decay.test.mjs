@@ -644,3 +644,68 @@ describe('regression: extractor + decay defensive paths (D#21)', () => {
     expect(ghost).toBeUndefined();
   });
 });
+
+// ─── D#61 (G10, roadmap Phase 2): superseded → keeper credit redirect ─────────
+
+describe('applyCitationDecay — superseded keeper redirect (D#61)', () => {
+  let db;
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'p' });
+  });
+  afterEach(() => { try { db.close(); } catch {} });
+
+  function obs(over = {}) {
+    return insertObs(db, { sessionId: 'sess-1', project: 'p', type: 'bugfix', title: 't', importance: 2, ...over }).lastInsertRowid;
+  }
+  function supersede(oldId, keeperId) {
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?')
+      .run(Date.now(), keeperId, oldId);
+  }
+  const row = (id) => db.prepare('SELECT importance, cited_count, uncited_streak, decay_seen_count FROM observations WHERE id=?').get(id);
+
+  it('citing a mid-session-superseded lesson credits the keeper', () => {
+    const oldId = obs();
+    const keeper = obs();
+    supersede(oldId, keeper);
+    // Injected live as oldId, then auto-dedup superseded it before Stop resolved.
+    const r = applyCitationDecay(db, 'p', new Set([oldId]), new Set([oldId]), 'sess-1');
+    expect(r.promoted).toBe(1);
+    const k = row(keeper);
+    expect(k.cited_count).toBe(1);
+    expect(k.importance).toBe(3);
+    // The tombstone itself stays untouched (defense-in-depth parity holds).
+    expect(row(oldId).cited_count).toBe(0);
+  });
+
+  it('an uncited superseded injection streaks the keeper (denominator follows content)', () => {
+    const oldId = obs();
+    const keeper = obs();
+    supersede(oldId, keeper);
+    const r = applyCitationDecay(db, 'p', new Set([oldId]), new Set(), 'sess-1');
+    expect(r.touched).toBe(1);
+    expect(row(keeper).uncited_streak).toBe(1);
+    expect(row(oldId).uncited_streak).toBe(0);
+  });
+
+  it('non-numeric / self-referential superseded_by credits nobody and does not throw', () => {
+    const a = obs();
+    db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'sess-string-junk' WHERE id = ?`).run(Date.now(), a);
+    const b = obs();
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?').run(Date.now(), b, b);
+    const r = applyCitationDecay(db, 'p', new Set([a, b]), new Set([a, b]), 'sess-1');
+    expect(r.promoted).toBe(0);
+    expect(r.touched).toBe(0);
+  });
+
+  it('redirect dedups: old id and keeper both injected → keeper resolved once', () => {
+    const oldId = obs();
+    const keeper = obs();
+    supersede(oldId, keeper);
+    const r = applyCitationDecay(db, 'p', new Set([oldId, keeper]), new Set([oldId]), 'sess-1');
+    expect(r.touched).toBe(1);
+    const k = row(keeper);
+    expect(k.cited_count).toBe(1);
+    expect(k.decay_seen_count).toBe(1);
+  });
+});
