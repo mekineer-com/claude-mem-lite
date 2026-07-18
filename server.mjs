@@ -54,6 +54,7 @@ import {
   resolveDeferredIds, closeDeferredItems,
   getDeferredByIds, formatDeferredDetail,
   searchDeferredWork, formatDeferredSearchTrailer,
+  formatDeferListRow, countStaleOpen, formatDeferStaleHint,
 } from './lib/deferred-work.mjs';
 import { _resetVocabCache } from './tfidf.mjs';
 import { createRequire } from 'module';
@@ -846,9 +847,10 @@ server.registerTool(
     }
     const lines = [`Open deferred items (project "${project}"):`];
     for (const r of list) {
-      const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
-      lines.push(`${r.ordinal}. ${pTag} [P${r.priority}] ${r.title} (D#${r.id})`);
+      lines.push(formatDeferListRow(r));
     }
+    const staleHint = formatDeferStaleHint(countStaleOpen(db, project));
+    if (staleHint) lines.push(staleHint);
     // Affordance for the detail field — list stays title-only by design.
     lines.push(`Full detail: mem_get ids=["D#<id>"]`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
@@ -907,6 +909,8 @@ server.registerTool(
     const lines = [
       `Memory Statistics${args.project ? ` (project: ${args.project})` : ''}:`,
       '',
+      // Env-aware data dir — parity with CLI cmdStats (D#92 wrong-path chain).
+      `Data dir: ${DB_DIR}`,
       `Total: ${obsTotal.c} observations | ${sessTotal.c} sessions | ${promptTotal.c} prompts`,
       `Last ${days}d: ${obsRecent.c} observations | ${sessRecent.c} sessions`,
       '',

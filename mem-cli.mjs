@@ -56,6 +56,7 @@ import {
   resolveDeferredIds, closeDeferredItems,
   getDeferredByIds, formatDeferredDetail,
   searchDeferredWork, formatDeferredSearchTrailer,
+  formatDeferListRow, countStaleOpen, formatDeferStaleHint,
 } from './lib/deferred-work.mjs';
 
 // ─── Commands ────────────────────────────────────────────────────────────────
@@ -1037,9 +1038,10 @@ function cmdDeferList(db, args) {
   }
   out(`[mem] Open deferred items (project "${project}"):`);
   for (const r of list) {
-    const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
-    out(`  ${r.ordinal}. ${pTag} [P${r.priority}] ${r.title} (D#${r.id})`);
+    out(`  ${formatDeferListRow(r)}`);
   }
+  const staleHint = formatDeferStaleHint(countStaleOpen(db, project));
+  if (staleHint) out(`  ${staleHint}`);
   // Affordance for the detail field — list stays title-only by design (it is
   // mirrored into the SessionStart dashboard, where detail would be noise).
   out(`  Full detail: claude-mem-lite get D#<id>`);
@@ -1212,6 +1214,9 @@ async function cmdStats(db, args) {
   }
 
   out(`[mem] Stats${project ? ` (${project})` : ''}:`);
+  // Env-aware data dir (CLAUDE_MEM_DIR || ~/.claude-mem-lite) — stated so any
+  // raw-db fallback can't guess a co-located-with-the-CLI path (D#92 chain).
+  out(`Data dir: ${DB_DIR}`);
   out(`Total: ${obsTotal.c.toLocaleString()} observations | ${sessTotal.c} sessions | ${promptTotal.c} prompts`);
   out(`Last ${days}d: ${obsRecent.c} observations | ${sessRecent.c} sessions`);
   out('');

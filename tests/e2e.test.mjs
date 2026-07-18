@@ -990,6 +990,39 @@ describe('Suite 6: Error Recall', () => {
     expect(hint).toBeTruthy();
     expect(hint.hookSpecificOutput.hookEventName).toBe('PostToolUse');
   });
+
+  it('soft error text in successful command output does NOT trigger recall (hard gate)', () => {
+    // G8 (roadmap 2026-07-18): the recall gate was bashSig?.isError — any "error"
+    // wording in a non-search command's output fired "Related memories found for
+    // this error" on exit-0 commands (live: 5+ false fires in one session, and
+    // self-recursive since the hint itself contains 'error'). The gate must be
+    // isHardError: a genuine failure fingerprint (stack frame / TypeError: /
+    // ENOENT / panic), not the word "error" in benign report output.
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+
+    // Seed an obs that MATCHES the output keywords — so absence of the hint below
+    // proves the gate blocked recall, not that FTS found nothing.
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'ECONNREFUSED connection refused port 3000', 'bugfix', 'Fixed ECONNREFUSED on port 3000', '', '', 'Start the dev server before curling the health endpoint.', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    db.close();
+
+    // Non-search command (node → no isReadOnlyCommand exemption), output contains
+    // "error" + a matching keyword but NO hard-error fingerprint: no stack "at "
+    // line, no TypeError:/ENOENT/panic → isError=true, isHardError=false.
+    const { stdout } = runHook('post-tool-use', {
+      stdin: makeToolPayload('Bash', {
+        command: 'node scripts/health-report.mjs',
+      }, 'Health report: 2 endpoints degraded, last error ECONNREFUSED on port 3000 (recovered), overall status OK'),
+      env: { HOME: tmpHome },
+    });
+
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
 });
 
 describe('Suite 7: Secret Scrubbing E2E', () => {

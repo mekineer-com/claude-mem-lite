@@ -125,3 +125,109 @@ describe('runSnapshot (integration over both suites)', () => {
     db.close();
   });
 });
+
+// ─── G5 (roadmap 2026-07-18): CJK suite + cross-source/deferred probes ────────
+// The three faces the ASCII-only suites were structurally blind to (07-17 audit).
+// Each probe module takes an injectable fn so teeth-tests can replay the
+// historical regression and prove the probe judges it non-NEUTRAL.
+
+import { composeVerdict, seedAllFixtures } from '../benchmark/denoise-ab.mjs';
+import { runCrossSourceProbes } from '../benchmark/cross-source-probes.mjs';
+import { runDeferredProbes, DEFERRED_FIXTURES } from '../benchmark/deferred-probes.mjs';
+import { searchProductionHybrid } from '../benchmark/benchmark.mjs';
+
+describe('cjk_mixed suite (G5 ①)', () => {
+  it('SUITES includes the cjk_mixed suite', () => {
+    expect(SUITES.map((s) => s.name)).toContain('cjk_mixed');
+  });
+
+  it('runSnapshot over seedAllFixtures scores the CJK suite with real recall', () => {
+    const db = createTestDb();
+    seedAllFixtures(db);
+    const snap = runSnapshot(db);
+    expect(snap.cjk_mixed).toBeDefined();
+    expect(snap.cjk_mixed.n).toBeGreaterThanOrEqual(10);
+    // Floor locks the face open: a tokenizer/synonym change that zeroes CJK
+    // drops this toward 0 and fails loudly (exact ranking moves are the A/B's job).
+    expect(snap.cjk_mixed.recall_at_10).toBeGreaterThanOrEqual(0.5);
+    db.close();
+  });
+
+  it('archaeology: no-space CJK+Latin query keeps the latin token (redis case)', () => {
+    // v3.40 regression class: "redis缓存问题" dropped the "redis" token → the
+    // redis doc became unreachable. Locked here as a named replay.
+    const db = createTestDb();
+    seedAllFixtures(db);
+    const ids = searchProductionHybrid(db, 'redis缓存问题', { limit: 10 }).map((r) => r.id);
+    expect(ids).toContain(90201);
+    db.close();
+  });
+});
+
+describe('cross-source direction probes (G5 ②)', () => {
+  it('all probes pass on the current normalizeCrossSourceScores', () => {
+    const results = runCrossSourceProbes();
+    expect(results.length).toBeGreaterThanOrEqual(10);
+    const failures = results.filter((p) => !p.pass);
+    expect(failures.map((p) => p.name)).toEqual([]);
+  });
+
+  it('archaeology MED-5→bands: constant −0.5 lone clamp (v3.48) fails the band probes', () => {
+    // Replay the v3.48 behavior: every lone hit → constant −0.5, magnitude-blind.
+    const constantClamp = (results, sourceKey) => {
+      for (const src of ['obs', 'session', 'prompt', 'event']) {
+        const srcResults = results.filter((r) => r[sourceKey] === src && r.score);
+        if (srcResults.length === 1) { srcResults[0].score = -0.5; continue; }
+        const maxAbs = Math.max(0, ...srcResults.map((r) => Math.abs(r.score)));
+        if (maxAbs > 0) for (const r of srcResults) r.score = r.score / maxAbs;
+      }
+    };
+    const failures = runCrossSourceProbes({ normalize: constantClamp }).filter((p) => !p.pass);
+    expect(failures.length).toBeGreaterThan(0);
+    expect(failures.map((p) => p.name)).toContain('lone-strongest-ranks-first');
+  });
+
+  it('archaeology pre-MED-5: lone hit pinned to −1 fails the grazing probe', () => {
+    const pinToMinus1 = (results, sourceKey) => {
+      for (const src of ['obs', 'session', 'prompt', 'event']) {
+        const srcResults = results.filter((r) => r[sourceKey] === src && r.score);
+        const maxAbs = Math.max(0, ...srcResults.map((r) => Math.abs(r.score)));
+        if (maxAbs > 0) for (const r of srcResults) r.score = r.score / maxAbs;
+      }
+    };
+    const failures = runCrossSourceProbes({ normalize: pinToMinus1 }).filter((p) => !p.pass);
+    expect(failures.map((p) => p.name)).toContain('lone-grazing-sinks');
+  });
+});
+
+describe('deferred reachability probes (G5 ③)', () => {
+  it('positives reach the planted item and negatives stay silent', () => {
+    const db = createTestDb();
+    const results = runDeferredProbes(db);
+    expect(results.length).toBeGreaterThanOrEqual(10);
+    expect(results.filter((p) => !p.pass).map((p) => `${p.kind}:${p.query}`)).toEqual([]);
+    db.close();
+  });
+
+  it('teeth: a search that returns nothing fails every positive probe', () => {
+    const db = createTestDb();
+    const results = runDeferredProbes(db, { searchFn: () => [] });
+    const positives = results.filter((p) => p.kind === 'positive');
+    expect(positives.length).toBe(DEFERRED_FIXTURES.positives.length);
+    expect(positives.every((p) => !p.pass)).toBe(true);
+    db.close();
+  });
+});
+
+describe('composeVerdict (probe → verdict folding)', () => {
+  it('passes the base verdict through when no probe failed', () => {
+    expect(composeVerdict('NEUTRAL — all |Δ| < 0.02', [])).toBe('NEUTRAL — all |Δ| < 0.02');
+  });
+
+  it('a probe failure makes the verdict non-NEUTRAL even at zero metric delta', () => {
+    const v = composeVerdict('NEUTRAL — all |Δ| < 0.02', ['multiscript:cjk', 'cross-source:lone-grazing-sinks']);
+    expect(v).toMatch(/^PROBE-FAIL/);
+    expect(v).toContain('lone-grazing-sinks');
+    expect(v).toContain('NEUTRAL');
+  });
+});

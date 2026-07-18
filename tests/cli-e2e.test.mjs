@@ -637,6 +637,9 @@ describe('CLI E2E: stats', () => {
     const { stdout, exitCode } = runCli(['stats']);
     expect(exitCode).toBe(0);
     expect(stdout).toContain('[mem] Stats');
+    // Data dir line — names the env-aware DB_DIR so a raw-db fallback can never
+    // guess the wrong path again (2026-07-18 D#92 chain: agent assumed repo dir).
+    expect(stdout).toMatch(/Data dir: \S+/);
     expect(stdout).toContain('Total:');
     expect(stdout).toContain('observations');
     expect(stdout).toContain('sessions');

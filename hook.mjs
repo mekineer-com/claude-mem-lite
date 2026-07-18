@@ -344,8 +344,13 @@ async function handlePostToolUse() {
   let db = null;
   const getDb = () => { if (!db) db = openDb(); return db; };
 
-  // Tier 2 G: Error-triggered recall
-  if (bashSig?.isError) {
+  // Tier 2 G: Error-triggered recall. Gated on isHardError (genuine failure
+  // fingerprint), NOT isError — the loose gate fired "Related memories found for
+  // this error" on exit-0 commands whose output merely contained the word "error"
+  // (G8, roadmap 2026-07-18), and was self-recursive: the hint string itself
+  // contains 'error', so a later command echoing it re-triggered recall.
+  // entry.isError above keeps the loose semantics on purpose (episode narrative).
+  if (bashSig?.isHardError) {
     const d = getDb();
     if (d) triggerErrorRecall(d, toolInput, resp);
   }

@@ -310,3 +310,31 @@ describe('search — deferred trailer (P2)', () => {
     expect(JSON.stringify(parsed)).not.toContain(TITLE);
   });
 });
+
+// ─── G11 (roadmap 2026-07-18): list age tag + >30d stale refresh hint ─────────
+
+describe('defer list age + stale hint (CLI)', () => {
+  const DAY = 86_400_000;
+
+  it('list rows carry an age tag and stale items trigger the refresh hint', () => {
+    runCli(['defer', 'add', 'fresh item', '--priority', '3']);
+    runCli(['defer', 'add', 'stale item', '--priority', '2']);
+    // Backdate the second row 40 days via direct DB write (subprocess CLI has
+    // no backdate flag by design).
+    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE title = 'stale item'`)
+      .run(Date.now() - 40 * DAY);
+    const { stdout, exitCode } = runCli(['defer', 'list']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/fresh item \(D#\d+, 0d\)/);
+    expect(stdout).toMatch(/stale item \(D#\d+, 40d\)/);
+    expect(stdout).toMatch(/1 .*30 days/);
+  });
+
+  it('no stale hint when all items are fresh', () => {
+    runCli(['defer', 'add', 'fresh only', '--priority', '2']);
+    const { stdout } = runCli(['defer', 'list']);
+    expect(stdout).not.toMatch(/30 days/);
+    // Detail affordance line must survive the G11 change.
+    expect(stdout).toContain('Full detail:');
+  });
+});

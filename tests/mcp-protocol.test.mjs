@@ -315,11 +315,14 @@ describe('mem_get D#N deferred read surface (stdio)', () => {
     expect(text).toContain(DETAIL);
   });
 
-  it('mem_defer_list carries the detail-hint line', async () => {
+  it('mem_defer_list carries the detail-hint line and per-row age tag (G11)', async () => {
     const res = await client.callTool({ name: 'mem_defer_list', arguments: {} });
     const text = res.content?.map(c => c.text).join('\n') || '';
-    expect(text).toMatch(/D#/);
+    // Row created in the previous test this session → age is 0d.
+    expect(text).toMatch(/\(D#\d+, 0d\)/);
     expect(text).toMatch(/mem_get|get D#/);
+    // Fresh-only DB: the >30d stale refresh hint must NOT render.
+    expect(text).not.toMatch(/30 days/);
   });
 });
 
@@ -346,5 +349,14 @@ describe('mem_search deferred trailer (stdio)', () => {
     });
     const text = res.content?.map(c => c.text).join('\n') || '';
     expect(text).not.toContain('stdio deferred search probe item');
+  });
+});
+
+// ─── Data dir line in mem_stats (stdio) ──────────────────────────────────────
+describe('mem_stats names the data dir', () => {
+  it('output contains the resolved Data dir path', async () => {
+    const res = await client.callTool({ name: 'mem_stats', arguments: {} });
+    const text = res.content?.map(c => c.text).join('\n') || '';
+    expect(text).toMatch(/Data dir: \S+/);
   });
 });

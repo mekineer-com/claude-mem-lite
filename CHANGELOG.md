@@ -2,6 +2,27 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.51.0 — roadmap Phase 0: error-recall hard gate, defer aging, denoise blind-face probes
+
+First release of the 2026-07-18 optimization roadmap ("trust and measurement first"). Everything here either removes a false signal or opens a measurement face that was structurally blind.
+
+**What changes for you:**
+1. **Error-recall stops firing on successful commands** (fix). The PostToolUse recall gate keyed on `isError` — any "error" wording in a non-search command's output — so exit-0 commands (report scripts, stats output) triggered "Related memories found for this error", 5+ false fires observed in a single live session, and the hint was self-recursive (its own text contains "error"). The gate now requires `isHardError`: a genuine failure fingerprint (stack frame, `TypeError:`, ENOENT, panic). Real failures still recall; benign mentions of "error" no longer do. Episode narrative semantics (`entry.isError`) are unchanged on purpose. Baseline for the follow-up funnel re-read: this face injected 220 unique / 765 occurrences over the last 30d at 10.9% cite-recall.
+2. **`defer list` shows age and nags on stale items.** Every row carries its age (`(D#44, 13d)`, CLI + MCP via one shared formatter), and when any OPEN item is older than 30 days a tail line says so. The stale count queries the full open set, not the displayed page — low-priority items sunk past the list limit are exactly the ones it exists for. Nudge-only by design: no auto-demote, no auto-drop.
+3. **`stats` prints `Data dir:`** (CLI + MCP) — closes the last D#92-class hole where an agent guessing the DB path descended to raw sqlite against the wrong file.
+
+### Added (dev tooling — not shipped in the npm tarball)
+- **`cjk_mixed` denoise suite** (12 queries / 25-doc CJK corpus with background padding against IDF collapse): pure-CJK, no-space CJK+Latin ("redis缓存问题" — the v3.40 regression class, locked as a named archaeology replay), and paraphrase categories with five hard-negative pairs. Baseline: R@10 1.000, P@10 0.925.
+- **Cross-source direction probes** (11): execute the real `normalizeCrossSourceScores` and assert the invariants each historical fix established — lone-strongest-ranks-first (v3.49 bands), grazing-lone-hit-sinks (v3.48 MED-5), zero-score-stays-last (v3.49 audit L3), band boundaries, never-inflate-small-sources. Teeth-tested: replaying the v3.48 constant clamp and the pre-MED-5 pin-to-−1 both fail the probes.
+- **Deferred reachability probes** (10): positives must reach planted bilingual items through the real `searchDeferredWork`, noise queries must stay silent.
+- **`PROBE-FAIL` verdict**: any probe failure overrides the A/B verdict (and exits 1) even at zero metric delta — the "A/B NEUTRAL ≠ safe" trap, mechanized.
+
+### Notes
+- Denoise corpus is now the union of the ASCII and CJK seeds; CJK docs legitimately share vocabulary (kafka/docker/redis) with ASCII queries, so precision-suite absolutes step once (P@10 0.860→0.828, MRR 0.961→0.922; vocab-mismatch R@10 unchanged at 0.341). Snapshots saved before v3.51.0 are stale — re-save the control after upgrading. Within-version before/after deltas are unaffected.
+- Task-imperative emitter status (roadmap G7①, no code change): already enabled in-project since 07-02; within-mem `:imperative` inject_unique 13→15 over 13 days with cite-recall 13.3% (2/15) — both flip gates (n≥30, recall ≥ path-B) currently unmet; keep accumulating.
+
+3875 tests pass (+19: error-recall probe ×1, defer aging ×7, denoise faces ×10, stats Data-dir ×1), eslint clean.
+
 ## v3.50.0 — D# read surface: deferred detail reachable from get, prompt injection, and search
 
 Root cause release. A real cross-session failure (2026-07-18: post-`/clear` resume of deferred item D#92) showed `deferred_work.detail` was a **write-only field**: the design pointer was saved correctly, but every surface — `defer list`, `mem_defer_list`, the SessionStart dashboard — rendered title-only, no reader existed, and search could not reach the row. The agent burned 10+ tool calls (including a wrong-path raw-sqlite fallback) without recovering data that was one field away. This release opens three read paths; the write side needed no change.

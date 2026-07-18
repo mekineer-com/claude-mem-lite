@@ -46,15 +46,53 @@ import { fileURLToPath } from 'url';
 import { createTestDb } from '../tests/test-helpers.mjs';
 import { seedDatabase, seedVectors, runBenchmark } from './benchmark.mjs';
 import { runScriptGuard, MULTISCRIPT_FIXTURES } from './multiscript-guard.mjs';
+import { runCrossSourceProbes } from './cross-source-probes.mjs';
+import { runDeferredProbes } from './deferred-probes.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(__dirname, 'fixtures');
 
-// The two query populations a denoising lever pulls in opposite directions.
+// The two query populations a denoising lever pulls in opposite directions,
+// plus the CJK/mixed-script face the ASCII suites were structurally blind to
+// (G5, roadmap 2026-07-18 — "A/B NEUTRAL ≠ safe" bit twice on this face).
 export const SUITES = [
   { name: 'precision_hard_negatives', file: 'test-queries.json' },
   { name: 'vocab_mismatch_paraphrase', file: 'test-queries-vocab-mismatch.json' },
+  { name: 'cjk_mixed', file: 'test-queries-cjk.json' },
 ];
+
+/**
+ * Seed every corpus the suites score against (main ASCII + CJK) into one DB,
+ * then build vectors over the union. Single entry point for main() and tests —
+ * a suite whose corpus is missing scores 0 recall and reads as a regression.
+ *
+ * ONE-TIME BASELINE STEP (v3.51.0): the CJK docs legitimately share vocabulary
+ * with ASCII queries (kafka/docker/redis), so union seeding shifts the ASCII
+ * precision-suite absolutes (measured: P@10 0.860→0.828, MRR 0.961→0.922;
+ * vocab-mismatch R@10 unchanged at 0.341). Within-version before/after deltas
+ * are unaffected — control and treatment score the same corpus. Snapshots saved
+ * BEFORE v3.51.0 are stale: re-save the control after upgrading, do not read
+ * the corpus step as a lever regression.
+ */
+export function seedAllFixtures(db) {
+  for (const f of ['seed-data.json', 'seed-data-cjk.json']) {
+    seedDatabase(db, JSON.parse(readFileSync(join(FIXTURES, f), 'utf8')));
+  }
+  seedVectors(db);
+}
+
+/**
+ * Fold behavioral-probe failures into the tradeoff verdict. The metric suites
+ * can read NEUTRAL while an entire face (a script, a source, the deferred
+ * trailer) silently breaks — a probe failure must therefore override NEUTRAL
+ * on the same screen.
+ * @param {string} verdict summarizeTradeoff verdict
+ * @param {string[]} failures probe failure labels (empty → verdict unchanged)
+ */
+export function composeVerdict(verdict, failures) {
+  if (!failures || failures.length === 0) return verdict;
+  return `PROBE-FAIL(${failures.length}) — ${failures.join(', ')} | metric verdict: ${verdict}`;
+}
 
 const METRICS = ['recall_at_10', 'precision_at_10', 'ndcg_at_10', 'mrr_at_10'];
 
@@ -164,27 +202,36 @@ async function main() {
   const mode = get('--mode') || 'production_hybrid';
 
   const db = createTestDb();
-  const seedData = JSON.parse(readFileSync(join(FIXTURES, 'seed-data.json'), 'utf8'));
-  seedDatabase(db, seedData);
-  seedVectors(db);
+  seedAllFixtures(db);
   const snap = runSnapshot(db, { mode });
 
-  // Non-Latin regression gate on the SAME screen: a char-class/tokenizer/synonym
-  // change that zeroes an entire script is invisible to the ranking-delta suites
-  // above (they are 100% ASCII). Seed the planted per-script docs into the same DB
-  // and assert each is retrievable.
+  // Behavioral probes on the SAME screen (G5): faces the ranking-delta suites
+  // cannot see. Multi-script guard — a char-class/tokenizer change that zeroes an
+  // entire script produces no candidates, hence no ranking delta. Cross-source
+  // probes — the single-hit clamp/band and 0-score invariants live in the
+  // cross-source merge the obs-only suites never execute. Deferred probes — the
+  // search-trailer leg (v3.50.0) is likewise outside the metric path.
   seedDatabase(db, { observations: MULTISCRIPT_FIXTURES.corpus });
   const guard = runScriptGuard(db);
+  const crossProbes = runCrossSourceProbes();
+  const deferredProbes = runDeferredProbes(db);
   db.close();
+
+  const probeFailures = [
+    ...guard.filter((g) => !g.found).map((g) => `multiscript:${g.script}`),
+    ...crossProbes.filter((p) => !p.pass).map((p) => `cross-source:${p.name}`),
+    ...deferredProbes.filter((p) => !p.pass).map((p) => `deferred:${p.kind}:"${p.query}"`),
+  ];
 
   console.error(`\n─── Denoise A/B snapshot (${mode}, ${SUITES.length} suites) ───`);
   console.error(fmtSnapshot(snap));
 
-  const zeroed = guard.filter((g) => !g.found);
-  console.error('\n─── Multi-script guard (planted doc per script) ───');
+  console.error('\n─── Behavioral probes (multiscript / cross-source / deferred) ───');
   console.error(`  ${guard.map((g) => `${g.script}${g.found ? '✓' : '✗ZERO'}`).join('  ')}`);
-  if (zeroed.length) {
-    console.error(`  ⚠ FAIL — zero results for: ${zeroed.map((g) => `${g.script} ("${g.query}")`).join(', ')} — a non-Latin regression the ranking suites cannot see.`);
+  console.error(`  cross-source: ${crossProbes.filter((p) => p.pass).length}/${crossProbes.length} ✓   deferred: ${deferredProbes.filter((p) => p.pass).length}/${deferredProbes.length} ✓`);
+  if (probeFailures.length) {
+    console.error(`  ⚠ PROBE-FAIL — ${probeFailures.join(', ')} — a face regression the ranking suites cannot see.`);
+    process.exitCode = 1;
   }
 
   if (comparePath) {
@@ -194,7 +241,7 @@ async function main() {
     for (const d of suites) {
       console.error(`  ${d.name.padEnd(28)} ΔR@10=${fmtDelta(d.recall_at_10)}  ΔP@10=${fmtDelta(d.precision_at_10)}  ΔnDCG=${fmtDelta(d.ndcg_at_10)}  ΔMRR=${fmtDelta(d.mrr_at_10)}`);
     }
-    console.error(`\n  VERDICT: ${verdict}\n`);
+    console.error(`\n  VERDICT: ${composeVerdict(verdict, probeFailures)}\n`);
   }
 
   if (savePath) {

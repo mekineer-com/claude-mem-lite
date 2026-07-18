@@ -1,0 +1,17 @@
+{
+  "comment": "G5 cjk_mixed suite — 12 queries over seed-data-cjk.json. Categories: cjk_pure (all-CJK), cjk_mixed (CJK+Latin in one query — the 2026-07-06 'redis缓存问题 掉 redis' archaeology class), cjk_paraphrase (query wording differs from doc title wording; matches ride narrative/bigram). Hard-negative pairs (90201/90202, 90203/90204, 90205/90206, 90207/90208, 90209/90210) make precision_at_10 meaningful.",
+  "queries": [
+    { "id": "cjk1", "query": "缓存击穿 数据库压力", "desc": "paraphrase: 穿透→击穿 rides narrative", "category": "cjk_paraphrase", "project": null, "type": null, "relevant_ids": [90201] },
+    { "id": "cjk2", "query": "redis缓存问题", "desc": "archaeology: no-space CJK+Latin must keep the latin token (v3.40 regression class)", "category": "cjk_mixed", "project": null, "type": null, "relevant_ids": [90201] },
+    { "id": "cjk3", "query": "redis 公网 加固", "desc": "hard-negative pair discrimination vs 90201", "category": "cjk_mixed", "project": null, "type": null, "relevant_ids": [90202] },
+    { "id": "cjk4", "query": "中文搜索 没有结果", "desc": "paraphrase of 中文查询空结果", "category": "cjk_paraphrase", "project": null, "type": null, "relevant_ids": [90203] },
+    { "id": "cjk5", "query": "触发器 不生效 重建", "desc": "hard-negative pair discrimination vs 90203", "category": "cjk_pure", "project": null, "type": null, "relevant_ids": [90204] },
+    { "id": "cjk6", "query": "订单 重复入账", "desc": "pure CJK target with 支付 hard-negative sibling", "category": "cjk_pure", "project": null, "type": null, "relevant_ids": [90205] },
+    { "id": "cjk7", "query": "对账 全表扫描 慢", "desc": "hard-negative pair discrimination vs 90205", "category": "cjk_pure", "project": null, "type": null, "relevant_ids": [90206] },
+    { "id": "cjk8", "query": "容器 日志时间 错乱", "desc": "narrative-carried CJK match", "category": "cjk_pure", "project": null, "type": null, "relevant_ids": [90207] },
+    { "id": "cjk9", "query": "docker 端口冲突", "desc": "CJK+Latin mixed, hard-negative sibling 90207", "category": "cjk_mixed", "project": null, "type": null, "relevant_ids": [90208] },
+    { "id": "cjk10", "query": "kafka 积压", "desc": "CJK+Latin mixed", "category": "cjk_mixed", "project": null, "type": null, "relevant_ids": [90209] },
+    { "id": "cjk11", "query": "消息丢失 acks", "desc": "CJK+Latin mixed, hard-negative sibling 90209", "category": "cjk_mixed", "project": null, "type": null, "relevant_ids": [90210] },
+    { "id": "cjk12", "query": "消费者 rebalance 频繁", "desc": "CJK+Latin mixed rides narrative", "category": "cjk_mixed", "project": null, "type": null, "relevant_ids": [90209] }
+  ]
+}

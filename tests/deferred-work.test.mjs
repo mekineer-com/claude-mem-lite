@@ -328,3 +328,68 @@ describe('searchDeferredWork (P2 search leg)', () => {
     db.close();
   });
 });
+
+// ─── G11 (roadmap 2026-07-18): list age tag + >30d stale refresh hint ─────────
+
+describe('defer list age + stale hint (G11)', () => {
+  const DAY = 86_400_000;
+
+  it('formatDeferListRow appends age in days to the id tag', () => {
+    const db = createTestDb();
+    const { id } = insertDeferred(db, { project: 'p', title: 'aged item', priority: 2 });
+    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE id = ?`)
+      .run(Date.now() - 12 * DAY, id);
+    const [row] = listOpenWithOrdinal(db, 'p');
+    const line = dw.formatDeferListRow(row);
+    expect(line).toContain(`(D#${id}, 12d)`);
+    expect(line).toContain('🟡 [P2] aged item');
+    expect(line).toMatch(/^1\. /);
+    db.close();
+  });
+
+  it('formatDeferListRow shows 0d for a row created today', () => {
+    const db = createTestDb();
+    const { id } = insertDeferred(db, { project: 'p', title: 'fresh item', priority: 3 });
+    const [row] = listOpenWithOrdinal(db, 'p');
+    expect(dw.formatDeferListRow(row)).toContain(`(D#${id}, 0d)`);
+    db.close();
+  });
+
+  it('countStaleOpen counts only open rows older than 30d in the project', () => {
+    const db = createTestDb();
+    const now = Date.now();
+    const stale1 = insertDeferred(db, { project: 'p', title: 'stale open', priority: 1 });
+    const stale2 = insertDeferred(db, { project: 'p', title: 'stale dropped', priority: 2 });
+    const staleOther = insertDeferred(db, { project: 'q', title: 'stale other project', priority: 2 });
+    insertDeferred(db, { project: 'p', title: 'fresh open', priority: 2 });
+    for (const { id } of [stale1, stale2, staleOther]) {
+      db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE id = ?`).run(now - 45 * DAY, id);
+    }
+    dropDeferred(db, stale2.id, 'closing for stale-count test');
+    expect(dw.countStaleOpen(db, 'p')).toBe(1);
+    expect(dw.countStaleOpen(db, 'q')).toBe(1);
+    db.close();
+  });
+
+  it('countStaleOpen sees stale rows beyond the list LIMIT (P1 sink case)', () => {
+    const db = createTestDb();
+    const now = Date.now();
+    // 3 fresh P3 rows fill a limit-3 list; the stale P1 row sorts last and is
+    // cut from display — the hint must still count it.
+    for (let i = 0; i < 3; i++) insertDeferred(db, { project: 'p', title: `fresh urgent ${i}`, priority: 3 });
+    const sunk = insertDeferred(db, { project: 'p', title: 'sunk low-priority item', priority: 1 });
+    db.prepare(`UPDATE deferred_work SET created_at_epoch = ? WHERE id = ?`).run(now - 60 * DAY, sunk.id);
+    const list = listOpenWithOrdinal(db, 'p', 3);
+    expect(list.map(r => r.id)).not.toContain(sunk.id);
+    expect(dw.countStaleOpen(db, 'p')).toBe(1);
+    db.close();
+  });
+
+  it('formatDeferStaleHint renders for n>0 and is null at 0', () => {
+    expect(dw.formatDeferStaleHint(0)).toBeNull();
+    const hint = dw.formatDeferStaleHint(2);
+    expect(hint).toContain('2');
+    expect(hint).toMatch(/30/);
+    expect(hint.toLowerCase()).toMatch(/refresh|drop/);
+  });
+});
