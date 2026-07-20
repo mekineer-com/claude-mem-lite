@@ -2,6 +2,12 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.56.1 — smoke-tarball.mjs: parse both `npm pack --json` shapes (npm 10 array / npm 12 object)
+
+Dev/CI-only follow-up to v3.56.0 — no user-facing or shipped-package change. The release gate's tarball smoke test (`scripts/smoke-tarball.mjs`, not in the published `files`) read `JSON.parse(npm pack --json)[0].filename`, but npm 12 changed that output from an array `[{filename, …}]` to an object keyed by package name `{"claude-mem-lite": {…}}` with no `filename` field — so the script crashed with `Cannot read properties of undefined (reading 'filename')`. It now normalizes both shapes and derives the canonical pack name (`<name>-<version>.tgz`, scope `@` dropped, `/` → `-`) when `filename` is absent. CI still runs npm 10 so this was invisible on the release gate; the fix keeps that gate working once CI moves to npm 12 and unbreaks running the smoke test locally on npm 12. Same npm-12 default-script-block root cause as v3.56.0's `-32000` fix.
+
+3915 tests unchanged (this touches only a standalone CI script no test imports), eslint clean.
+
 ## v3.56.0 — npm 12 self-heal: better-sqlite3 rebuild bypasses the default install-script block (fixes MCP -32000)
 
 npm 12 blocks package lifecycle/install scripts by default (the `allow-scripts` allowlist ships empty). better-sqlite3's install step (`prebuild-install || node-gyp rebuild`) is what produces its native `better_sqlite3.node` binding, so a fresh plugin-cache install lays down `node_modules/better-sqlite3/` with **no compiled binding**. `require()` still succeeds (the binding loads lazily), but the MCP server FATALs the instant it opens the DB — dying *before* the `initialize` handshake, so Claude Code only surfaces a generic `Failed to reconnect to plugin:… -32000`. Uninstall/reinstall didn't help: every `npm install` / `npm rebuild` hit the same block **and still exited 0** (`rebuilt dependencies successfully`), silently defeating the launcher's own self-heal probe, which then `process.exit(1)`'d on every start.

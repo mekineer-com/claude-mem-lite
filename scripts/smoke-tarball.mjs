@@ -47,8 +47,16 @@ try {
   // 1. Build the real publishable tarball (same artifact `npm publish` ships).
   log('npm pack …');
   const packJson = sh('npm', ['pack', '--json', '--pack-destination', work], { cwd: REPO_ROOT });
-  const tgz = join(work, JSON.parse(packJson)[0].filename);
-  log(`packed ${JSON.parse(packJson)[0].filename}`);
+  // npm 10 `npm pack --json` returns an array [{filename,…}]; npm 12 returns an
+  // object keyed by package name {"<name>": {…}} with NO filename field. Handle
+  // both: normalize to the single entry, then use its filename or derive the
+  // canonical pack name (scope '@' dropped, '/' → '-').
+  const packOut = JSON.parse(packJson);
+  const packInfo = Array.isArray(packOut) ? packOut[0] : Object.values(packOut)[0];
+  const packName = packInfo.filename
+    || `${packInfo.name.replace(/^@/, '').replace(/\//g, '-')}-${packInfo.version}.tgz`;
+  const tgz = join(work, packName);
+  log(`packed ${packName}`);
 
   // 2. Install into a clean throwaway project. This is where better-sqlite3 is
   //    fetched/rebuilt for the target runtime — the step --dev installs skip.
