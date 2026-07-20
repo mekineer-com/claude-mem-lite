@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.56.0 — npm 12 self-heal: better-sqlite3 rebuild bypasses the default install-script block (fixes MCP -32000)
+
+npm 12 blocks package lifecycle/install scripts by default (the `allow-scripts` allowlist ships empty). better-sqlite3's install step (`prebuild-install || node-gyp rebuild`) is what produces its native `better_sqlite3.node` binding, so a fresh plugin-cache install lays down `node_modules/better-sqlite3/` with **no compiled binding**. `require()` still succeeds (the binding loads lazily), but the MCP server FATALs the instant it opens the DB — dying *before* the `initialize` handshake, so Claude Code only surfaces a generic `Failed to reconnect to plugin:… -32000`. Uninstall/reinstall didn't help: every `npm install` / `npm rebuild` hit the same block **and still exited 0** (`rebuilt dependencies successfully`), silently defeating the launcher's own self-heal probe, which then `process.exit(1)`'d on every start.
+
+**What changes for you:**
+1. **Fresh installs on npm ≥ 12 self-heal instead of looping `-32000`.** `ensureBetterSqlite3Working` (in `lib/binding-probe.mjs`, shared by `scripts/launch.mjs` and `install.mjs`) now runs its rebuild as `npm rebuild better-sqlite3 --dangerously-allow-all-scripts` — scoped to this one vetted dependency, so the blast radius is better-sqlite3 alone — with a plain-rebuild fallback for older npm that rejects the flag.
+2. **Already stuck?** A one-time machine fix clears it for every future install too: `npm config set allow-scripts=better-sqlite3 --location=user`, then reconnect (`/mcp`) or restart. (One-off repair of a single broken dir: `cd <plugin-version-dir> && npm rebuild better-sqlite3 --dangerously-allow-all-scripts`.)
+
+Note: npm records script approvals **per-project** in each dir's `package.json` `allowScripts`, so an older cached version that compiled pre-npm-12 kept working while each new version dir started blocked — which is why reinstalling reproduced the failure.
+
+3915 tests pass (+2: bypass-flag present + older-npm fallback ordering), eslint clean, knip 46.
+
 ## v3.55.0 — audit Phase B (partial): bilingual synonym bridge + events end-to-end probes
 
 Phase B of the 2026-07-18 three-face audit plan: the retrieval items (G15/G16). G14 (session injection budget) intentionally waits for a few days of the v3.54.0 `pretool_recall` metering to calibrate its threshold.

@@ -70,3 +70,37 @@ describe('Bug 3: ensureBetterSqlite3Working — probe → rebuild → re-probe',
     expect(result.error).toContain('npm rebuild crashed');
   });
 });
+
+// npm >= 12 blocks lifecycle scripts by default, so a plain
+// `npm rebuild better-sqlite3` exits 0 without compiling the native binding and
+// the launcher's self-heal silently no-ops (server then dies pre-handshake →
+// MCP -32000). The default rebuild must re-enable scripts for this one vetted
+// dep, and fall back to a plain rebuild if an older npm rejects the flag.
+describe('Bug: npm 12 allow-scripts block defeats the self-heal rebuild', () => {
+  it('default rebuild re-enables install scripts (--dangerously-allow-all-scripts)', async () => {
+    const cmds = [];
+    let probeCount = 0;
+    const result = await ensureBetterSqlite3Working('/some/dir', {
+      probe: async () => { probeCount++; return probeCount === 1 ? { ok: false, error: 'bindings missing' } : { ok: true }; },
+      exec: (cmd) => { cmds.push(cmd); }, // capture; simulate a successful build
+    });
+    expect(result).toEqual({ ok: true, action: 'rebuilt' });
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0]).toContain('npm rebuild better-sqlite3');
+    expect(cmds[0]).toContain('--dangerously-allow-all-scripts');
+  });
+
+  it('falls back to a plain rebuild when the bypass flag errors (older npm)', async () => {
+    const cmds = [];
+    let probeCount = 0;
+    const result = await ensureBetterSqlite3Working('/some/dir', {
+      probe: async () => { probeCount++; return probeCount === 1 ? { ok: false, error: 'x' } : { ok: true }; },
+      exec: (cmd) => { cmds.push(cmd); if (cmd.includes('--dangerously-allow-all-scripts')) throw new Error('unknown flag'); },
+    });
+    expect(result).toEqual({ ok: true, action: 'rebuilt' });
+    expect(cmds).toEqual([
+      'npm rebuild better-sqlite3 --dangerously-allow-all-scripts',
+      'npm rebuild better-sqlite3',
+    ]);
+  });
+});
