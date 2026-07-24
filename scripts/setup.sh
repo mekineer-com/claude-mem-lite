@@ -136,13 +136,9 @@ fi
 #     stat, a new plugin-cache version dir (fresh node_modules) re-probes, and
 #     a Node upgrade (new ABI) re-probes. While broken, every SessionStart
 #     retries the rebuild until it heals.
-if [[ -d "$ROOT/node_modules/better-sqlite3" ]]; then
-  NODE_ABI="$(node -p 'process.versions.modules' 2>/dev/null || echo 0)"
-  BINDING_MARKER="$ROOT/node_modules/.mem-binding-ok-$NODE_ABI"
-  if [[ -f "$BINDING_MARKER" ]]; then
-    mark_deps_ok
-  # shellcheck disable=SC2016  # node script single-quoted on purpose; ROOT passed via env, not shell expansion
-  elif PROBE_ROOT="$ROOT" node --input-type=module -e '
+# shellcheck disable=SC2016  # node script single-quoted on purpose; ROOT passed via env, not shell expansion
+probe_binding() {
+  PROBE_ROOT="$ROOT" node --input-type=module -e '
     // NOTE: this whole script sits in a single-quoted bash string — no
     // apostrophes anywhere in it.
     const { pathToFileURL } = await import("node:url");
@@ -198,7 +194,15 @@ if [[ -d "$ROOT/node_modules/better-sqlite3" ]]; then
     }
     if (!r.ok) { process.stderr.write(`[claude-mem-lite] binding probe: ${r.error}\n`); process.exit(1); }
     if (r.action === "rebuilt") process.stderr.write("[claude-mem-lite] rebuilt better-sqlite3 binding for current Node ABI\n");
-  '; then
+  '
+}
+
+if [[ -d "$ROOT/node_modules/better-sqlite3" ]]; then
+  NODE_ABI="$(node -p 'process.versions.modules' 2>/dev/null || echo 0)"
+  BINDING_MARKER="$ROOT/node_modules/.mem-binding-ok-$NODE_ABI"
+  if [[ -f "$BINDING_MARKER" ]]; then
+    mark_deps_ok
+  elif probe_binding; then
     rm -f "$ROOT/node_modules/.mem-binding-ok-"* 2>/dev/null || true
     touch "$BINDING_MARKER" 2>/dev/null || true
     mark_deps_ok

@@ -2,6 +2,12 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.58.1 — files[] must list npm-shrinkwrap.json or npm pack silently drops it
+
+Completes v3.58.0's "registry installs locked" item, which shipped inert: both release jobs ran `npm shrinkwrap` (CI logs confirm the rename), but the published 3.58.0 tarball still had no `npm-shrinkwrap.json` — with a `files[]` whitelist, npm 10's packlist drops the shrinkwrap unless it is EXPLICITLY listed (verified against npm 10.9.2 with a minimal fixture; the always-included set covers `package.json`/README/LICENSE but NOT the shrinkwrap). `files[]` now lists `npm-shrinkwrap.json` (harmless in dev, where the file never exists), and the drift-guard test additionally pins the `files[]` entry. Also verified: npm 12 removed the `npm shrinkwrap` command entirely, so a future CI npm bump fails the workflow step loudly instead of silently unlocking installs again.
+
+No runtime code change; plugin/marketplace installs unaffected (git clone carries `package-lock.json`).
+
 ## v3.58.0 — install/update/self-heal/uninstall audit batch: npm-12 hooks false-green, update-path binding gate, shared WAL recovery, locked registry installs
 
 Seven fixes from the lifecycle audit (install / update / self-heal / uninstall). All are `fix:` — restoring documented self-heal and cleanup behavior; no contract changes.

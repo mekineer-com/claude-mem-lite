@@ -136,6 +136,14 @@ test('release workflow generates npm-shrinkwrap before smoke and publish', () =>
   const shrinkwrapSteps = wf.match(/run: npm shrinkwrap/g) || [];
   expect(shrinkwrapSteps.length, 'both validate and publish jobs must shrinkwrap').toBeGreaterThanOrEqual(2);
   expect(wf.indexOf('npm shrinkwrap')).toBeLessThan(wf.indexOf('scripts/smoke-tarball.mjs'));
+  // v3.58.0 shipped WITHOUT the shrinkwrap despite the workflow step running:
+  // with a files[] whitelist, npm 10's packlist drops npm-shrinkwrap.json
+  // unless it is EXPLICITLY listed (verified against npm 10.9.2; npm 12
+  // removed the shrinkwrap command entirely, so a CI npm bump breaks the
+  // workflow step loudly rather than silently unlocking installs). The entry
+  // is harmless in dev where the file never exists.
+  const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8'));
+  expect(pkg.files, 'files[] must list npm-shrinkwrap.json or npm pack drops it').toContain('npm-shrinkwrap.json');
 });
 
 // Blind-spot closer: the SOURCE_FILES coverage test above only walks the 5 main

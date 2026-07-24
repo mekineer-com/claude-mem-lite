@@ -73,8 +73,13 @@ test('every module statically or dynamically imported by an entry point is shipp
 });
 
 test('no stale entry in package.json files points at a non-existent path', () => {
+  // npm-shrinkwrap.json exists ONLY at release time (`npm shrinkwrap` runs in
+  // publish.yml; npm packs it solely when files[] lists it — v3.58.1). Never
+  // present in the dev tree, so it is release-generated, not stale.
+  const RELEASE_GENERATED = new Set(['npm-shrinkwrap.json']);
   const dangling = [];
   for (const f of FILES) {
+    if (RELEASE_GENERATED.has(f)) continue;
     const abs = resolve(ROOT, f);
     if (!existsSync(abs)) dangling.push(f);
   }
