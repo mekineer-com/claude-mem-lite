@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.58.2 — CI regression net for the npm >= 12 heal chain (dev/CI-only)
+
+No user-facing or shipped-package change — the runtime artifact is identical to v3.58.1. New `smoke-npm12` CI job runs the tarball smoke on a pristine npm 12 (node 24 + `npm i -g npm@^12`), where install scripts are blocked by default: the job REQUIRES the block to occur (`SMOKE_EXPECT_SCRIPT_BLOCK=1` fails loudly if npm defaults ever change, instead of silently duplicating the npm-10 smoke) and then REQUIRES the INSTALLED package's own `lib/binding-probe.mjs::ensureBetterSqlite3Working` — the exact code `launch.mjs` runs — to heal the uncompiled binding before the re-probe. First CI run confirmed the full chain: block occurred → heal reported `rebuilt` → re-probe passed. This closes the "npm 12 end-to-end never reproduced in CI" gap from the v3.58.0 audit: every push now replays a fresh-user npm-12 install.
+
+Details that made it work: npm 12 rejects `--allow-scripts` as a flag/env for project-scoped installs (`EALLOWSCRIPTS`), so the block is pinned via the throwaway project's `.npmrc` (`allow-scripts=none` — sanctioned, beats ambient allowlists, unknown-key no-op on npm 10). The smoke also now asserts `npm-shrinkwrap.json` lands in the packed tarball whenever the release pipeline generated it (the v3.58.0 packlist-drop class); the check self-skips in dev/CI where the file never exists.
+
+4013 tests unchanged (smoke script is dev-only, not in `files[]`), eslint clean.
+
 ## v3.58.1 — files[] must list npm-shrinkwrap.json or npm pack silently drops it
 
 Completes v3.58.0's "registry installs locked" item, which shipped inert: both release jobs ran `npm shrinkwrap` (CI logs confirm the rename), but the published 3.58.0 tarball still had no `npm-shrinkwrap.json` — with a `files[]` whitelist, npm 10's packlist drops the shrinkwrap unless it is EXPLICITLY listed (verified against npm 10.9.2 with a minimal fixture; the always-included set covers `package.json`/README/LICENSE but NOT the shrinkwrap). `files[]` now lists `npm-shrinkwrap.json` (harmless in dev, where the file never exists), and the drift-guard test additionally pins the `files[]` entry. Also verified: npm 12 removed the `npm shrinkwrap` command entirely, so a future CI npm bump fails the workflow step loudly instead of silently unlocking installs again.
