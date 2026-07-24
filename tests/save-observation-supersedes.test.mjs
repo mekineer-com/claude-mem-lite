@@ -65,6 +65,41 @@ describe('saveObservation supersedes', () => {
     expect(r.supersededIds).toEqual([]);
   });
 
+  // Atomicity: the tombstone UPDATE used to run AFTER the insert transaction
+  // committed, so a failure (or a kill) between the two left the new correcting
+  // row live while the rows it overturns stayed live too — both surface together
+  // through the `superseded_at IS NULL` filter, which is exactly the contradiction
+  // supersession exists to prevent. Insert + tombstone must commit as one unit.
+  it('rolls the whole save back when the supersession UPDATE fails (atomicity)', () => {
+    const oldId = Number(seedOld().lastInsertRowid);
+    const before = db.prepare('SELECT COUNT(*) AS c FROM observations').get().c;
+
+    // Fail only the tombstone UPDATE; every other statement runs for real.
+    const failingDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === 'prepare') {
+          return (sql) => {
+            if (/UPDATE observations SET superseded_at/.test(sql)) {
+              return { run: () => { throw new Error('simulated failure mid-supersession'); } };
+            }
+            return target.prepare(sql);
+          };
+        }
+        const v = target[prop];
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    expect(() => saveObservation(failingDb, {
+      content: 'Fresh measurement overturns the old rerank verdict: paraphrase gap closed',
+      title: 'Rerank verdict reversed', type: 'decision', project: 'test', supersedes: [oldId],
+    })).toThrow(/simulated failure mid-supersession/);
+
+    // Neither half may survive: no orphan new row, and the old row is untouched.
+    expect(db.prepare('SELECT COUNT(*) AS c FROM observations').get().c).toBe(before);
+    expect(db.prepare('SELECT superseded_at FROM observations WHERE id = ?').get(oldId).superseded_at).toBeNull();
+  });
+
   it('is a no-op when supersedes is omitted (back-compat)', () => {
     const oldId = Number(seedOld().lastInsertRowid);
     const r = saveObservation(db, { content: 'Plain save with no supersedes field at all here', title: 'Plain', project: 'test' });

@@ -109,7 +109,10 @@ export function writeEpisode(episode) {
   const target = episodeFile();
   const tmp = target + `.tmp-${process.pid}`;
   const { _fileSet, ...serializable } = episode;
-  writeFileSync(tmp, JSON.stringify(serializable));
+  // 0600 on the tmp file, not on `target`: mode applies at creation and rename
+  // carries it over, so the buffer is never briefly world-readable. The buffer
+  // holds captured file paths + scrubbed activity — owner-only like the DB.
+  writeFileSync(tmp, JSON.stringify(serializable), { mode: 0o600 });
   try {
     renameSync(tmp, target);
   } catch (err) {
@@ -196,7 +199,7 @@ export function writePendingEntry(entry, sessionId, project) {
   const pendingFile = join(RUNTIME_DIR, `pending-${ts}-${rand}.json`);
   const tmp = pendingFile + '.tmp';
   try {
-    writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts }));
+    writeFileSync(tmp, JSON.stringify({ entry, sessionId, project, ts }), { mode: 0o600 });
     renameSync(tmp, pendingFile);
   } catch {
     try { unlinkSync(tmp); } catch {}

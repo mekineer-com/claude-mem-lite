@@ -118,6 +118,23 @@ describe('buildVocabulary', () => {
     expect(commonIdx).toBeLessThan(rareIdx);
   });
 
+  it('reserves a quota so the rare high-IDF tail survives truncation (audit P2-11)', () => {
+    // 5 docs each carrying 11 mid-frequency terms (df=5, high IG) plus a rare term in
+    // exactly 2 docs (df=2, highest IDF, LOWEST IG). With dim small enough to truncate,
+    // pure df×idf ranking cuts the rare term FIRST — but it is exactly the discriminative
+    // identifier the vector arm needs. The rare-term quota must retain it.
+    const mid = 'alpha beta gamma delta epsilon zeta eta theta iota kappa lambda';
+    for (let i = 0; i < 5; i++) {
+      insertObs(db, { title: 'note', narrative: mid + (i < 2 ? ' raretokenxyz' : ''), importance: 1 });
+    }
+    // 12 candidate terms (11 mid @df=5 + note @df=5 + raretokenxyz @df=2); dim=8 forces a cut.
+    const vocab = buildVocabulary(db, { dim: 8 });
+    expect(vocab).not.toBeNull();
+    expect(vocab.dim).toBe(8);
+    // The rare, most-discriminative term keeps a dimension despite its low IG.
+    expect(vocab.terms.has('raretokenxyz')).toBe(true);
+  });
+
   it('excludes hapax legomena (df=1 terms)', () => {
     insertObs(db, { title: 'common shared term', narrative: 'shared content data' });
     insertObs(db, { title: 'common shared info', narrative: 'shared content here' });

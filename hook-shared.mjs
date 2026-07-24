@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDb, DB_DIR } from './schema.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
@@ -114,8 +114,17 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
   return count;
 }
 
-// Ensure runtime directory exists
-try { if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
+// Ensure runtime directory exists AND is owner-only (0700), matching the DB dir
+// (schema.mjs). Runtime aux files carry captured file paths + scrubbed activity; on a
+// shared host a 0755 dir would let another local user read them. hardenRuntimeFiles()
+// (server.mjs) sweeps at MCP-server startup, but hooks routinely run before any server
+// exists, so harden here too: create 0700, and chmod a pre-existing dir a prior version
+// created at the default umask. A 0700 dir blocks traversal to every file inside,
+// current and future, regardless of individual file mode (audit sec P3-2 2026-07-24).
+try {
+  if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+  else chmodSync(RUNTIME_DIR, 0o700);
+} catch {}
 
 // ─── Session ID Management ───────────────────────────────────────────────────
 
@@ -136,7 +145,7 @@ export function createSessionId() {
   const id = `hook-${project}-${randomUUID().slice(0, 8)}`;
   const file = sessionFile();
   const tmp = file + `.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify({ id, startedAt: Date.now(), project }));
+  writeFileSync(tmp, JSON.stringify({ id, startedAt: Date.now(), project }), { mode: 0o600 });
   renameSync(tmp, file);
   return id;
 }

@@ -1,4 +1,8 @@
 // claude-mem-lite CLAUDE.md context injection and token budgeting
+// SHARED ENGINE — the `hook-` prefix is historical, not a scope. buildSessionContextLines
+// is imported by hook.mjs (SessionStart), mem-cli.mjs (`context` command) and
+// hook-precompact.mjs, so it runs outside the hook pipeline too. Do not assume
+// hook-pipeline session lifecycle or single-writer concurrency here.
 // Handles adaptive time windows, token-budgeted selection, and legacy CLAUDE.md cleanup.
 
 import { basename, join } from 'path';

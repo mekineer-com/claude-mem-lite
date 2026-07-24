@@ -136,6 +136,10 @@ export const SOURCE_FILES = [
   // `timeline`/`search` and mem_timeline/mem_search on auto-update.
   'lib/timeline-core.mjs',
   'lib/search-core.mjs',
+  // Shared `recent` core (live-row filter + ORDER BY created_at DESC LIMIT).
+  // Statically imported by mem-cli.mjs AND server.mjs — same single-source pattern;
+  // missing it from the manifest would break `recent` and mem_recent on auto-update.
+  'lib/recent-core.mjs',
   // Reciprocal Rank Fusion core (D#42 single source-of-truth); transitively
   // reached via tfidf.mjs (rrfMerge) and deep-search.mjs (rrfFuseN).
   'lib/rrf.mjs',

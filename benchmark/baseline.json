@@ -1,14 +1,14 @@
 {
-  "timestamp": "2026-06-21T17:24:34.083Z",
+  "timestamp": "2026-07-24T03:17:35.789Z",
   "mode": "production_hybrid",
   "queryCount": 30,
   "metrics": {
-    "recall_at_10": 0.8963,
-    "precision_at_10": 0.7885,
-    "ndcg_at_10": 0.968,
-    "mrr_at_10": 0.9667,
-    "avg_tokens_injected": 114,
-    "p95_search_latency_ms": 2.9734
+    "recall_at_10": 0.8998,
+    "precision_at_10": 0.8597,
+    "ndcg_at_10": 0.9712,
+    "mrr_at_10": 0.9611,
+    "avg_tokens_injected": 106,
+    "p95_search_latency_ms": 1.7385
   },
   "perQuery": [
     {
@@ -20,8 +20,8 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        15,
         63,
+        15,
         37,
         75,
         114,
@@ -49,22 +49,22 @@
       "mrr": 1,
       "result_ids": [
         18,
-        95,
         36,
-        63,
-        64,
+        95,
         7,
         39,
-        9,
         88,
-        170
+        187,
+        83,
+        63,
+        64
       ],
       "relevant_ids": [
         18,
         36,
         95
       ],
-      "tokens": 132
+      "tokens": 128
     },
     {
       "id": "q4",
@@ -76,15 +76,15 @@
       "mrr": 1,
       "result_ids": [
         190,
-        47,
         11,
-        193,
+        47,
+        177,
         4,
-        174,
-        48,
-        138,
         106,
-        58
+        107,
+        48,
+        2,
+        186
       ],
       "relevant_ids": [
         2,
@@ -106,7 +106,7 @@
         190,
         193
       ],
-      "tokens": 122
+      "tokens": 124
     },
     {
       "id": "q5",
@@ -117,14 +117,14 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        25,
         56,
-        28,
         116,
-        23,
+        25,
         43,
-        65,
-        109
+        23,
+        109,
+        28,
+        65
       ],
       "relevant_ids": [
         23,
@@ -143,19 +143,17 @@
       "query": "cache",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 0.5556,
-      "ndcg_at_10": 0.9747,
+      "precision_at_10": 0.7143,
+      "ndcg_at_10": 0.9435,
       "mrr": 1,
       "result_ids": [
         141,
         18,
-        77,
         78,
+        77,
         51,
-        138,
         35,
-        124,
-        34
+        138
       ],
       "relevant_ids": [
         18,
@@ -164,27 +162,27 @@
         138,
         141
       ],
-      "tokens": 121
+      "tokens": 93
     },
     {
       "id": "q7",
       "query": "migration",
       "category": "standard",
-      "recall_at_10": 0.4,
-      "precision_at_10": 0.8,
-      "ndcg_at_10": 0.8669,
+      "recall_at_10": 0.45,
+      "precision_at_10": 0.9,
+      "ndcg_at_10": 0.9364,
       "mrr": 1,
       "result_ids": [
+        64,
         40,
         42,
+        16,
+        129,
         41,
-        79,
         58,
         52,
-        115,
-        193,
-        46,
-        187
+        17,
+        193
       ],
       "relevant_ids": [
         16,
@@ -220,15 +218,15 @@
       "mrr": 1,
       "result_ids": [
         11,
-        60,
-        126,
-        153,
         104,
+        126,
+        175,
+        60,
+        153,
         98,
         40,
-        175,
-        21,
-        90
+        130,
+        100
       ],
       "relevant_ids": [
         11,
@@ -258,16 +256,16 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        13,
-        90,
+        71,
         105,
-        19,
-        174,
-        124,
-        163,
+        13,
         2,
         107,
-        71
+        174,
+        193,
+        183,
+        19,
+        52
       ],
       "relevant_ids": [
         2,
@@ -288,7 +286,7 @@
         183,
         193
       ],
-      "tokens": 130
+      "tokens": 129
     },
     {
       "id": "q10",
@@ -299,10 +297,10 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        181,
-        51,
         20,
+        181,
         185,
+        51,
         49,
         17,
         124
@@ -323,17 +321,15 @@
       "query": "notification",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 0.7143,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
         7,
-        149,
         39,
         48,
-        169,
-        24,
-        99
+        149,
+        169
       ],
       "relevant_ids": [
         7,
@@ -342,7 +338,7 @@
         149,
         169
       ],
-      "tokens": 89
+      "tokens": 67
     },
     {
       "id": "q12",
@@ -354,8 +350,8 @@
       "mrr": 1,
       "result_ids": [
         99,
-        73,
         24,
+        73,
         88,
         171
       ],
@@ -373,20 +369,19 @@
       "query": "testing",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 0.9,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        76,
-        126,
-        199,
-        27,
-        133,
         102,
         157,
+        199,
+        126,
+        76,
+        133,
         28,
-        200,
-        1
+        27,
+        200
       ],
       "relevant_ids": [
         27,
@@ -399,7 +394,7 @@
         199,
         200
       ],
-      "tokens": 130
+      "tokens": 118
     },
     {
       "id": "q15",
@@ -411,8 +406,8 @@
       "mrr": 1,
       "result_ids": [
         20,
-        152,
         108,
+        152,
         145,
         123
       ],
@@ -432,13 +427,13 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        130,
         199,
-        21,
+        130,
         112,
         165,
-        74,
-        192
+        21,
+        192,
+        74
       ],
       "relevant_ids": [
         21,
@@ -455,21 +450,21 @@
       "id": "q18",
       "query": "API",
       "category": "standard",
-      "recall_at_10": 0.3889,
-      "precision_at_10": 0.7,
-      "ndcg_at_10": 0.5915,
-      "mrr": 0.5,
+      "recall_at_10": 0.4444,
+      "precision_at_10": 0.8,
+      "ndcg_at_10": 0.641,
+      "mrr": 0.3333,
       "result_ids": [
         14,
-        176,
         106,
+        71,
         114,
-        92,
-        188,
         57,
+        176,
+        34,
+        175,
         84,
-        129,
-        150
+        98
       ],
       "relevant_ids": [
         34,
@@ -491,7 +486,7 @@
         176,
         196
       ],
-      "tokens": 131
+      "tokens": 128
     },
     {
       "id": "q19",
@@ -503,11 +498,11 @@
       "mrr": 1,
       "result_ids": [
         72,
+        91,
         197,
         133,
-        91,
-        169,
-        120
+        120,
+        169
       ],
       "relevant_ids": [
         72,
@@ -524,16 +519,15 @@
       "query": "security",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 0.8333,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
         1,
         104,
-        17,
         89,
-        166,
-        106
+        17,
+        166
       ],
       "relevant_ids": [
         1,
@@ -542,7 +536,7 @@
         104,
         166
       ],
-      "tokens": 81
+      "tokens": 68
     },
     {
       "id": "q22",
@@ -553,16 +547,16 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        37,
-        109,
-        154,
-        55,
-        46,
         5,
+        37,
+        94,
+        154,
         35,
+        109,
+        27,
+        55,
         79,
-        146,
-        94
+        146
       ],
       "relevant_ids": [
         5,
@@ -578,25 +572,24 @@
         154,
         200
       ],
-      "tokens": 132
+      "tokens": 131
     },
     {
       "id": "q23",
       "query": "image",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 0.875,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
         3,
-        51,
         158,
-        35,
+        51,
         44,
-        95,
+        35,
         142,
-        132
+        95
       ],
       "relevant_ids": [
         3,
@@ -607,7 +600,7 @@
         142,
         158
       ],
-      "tokens": 108
+      "tokens": 98
     },
     {
       "id": "q24",
@@ -618,16 +611,16 @@
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        70,
-        4,
+        20,
         3,
         11,
-        20,
+        4,
+        10,
         45,
-        193,
-        97,
+        70,
         96,
-        122
+        97,
+        76
       ],
       "relevant_ids": [
         3,
@@ -645,7 +638,7 @@
         137,
         193
       ],
-      "tokens": 130
+      "tokens": 127
     },
     {
       "id": "q25",
@@ -653,18 +646,18 @@
       "category": "standard",
       "recall_at_10": 1,
       "precision_at_10": 0.8889,
-      "ndcg_at_10": 1,
+      "ndcg_at_10": 0.9672,
       "mrr": 1,
       "result_ids": [
         161,
-        49,
-        171,
         67,
-        166,
+        49,
+        36,
         191,
         95,
-        188,
-        36
+        166,
+        171,
+        188
       ],
       "relevant_ids": [
         49,
@@ -683,20 +676,19 @@
       "query": "queue",
       "category": "standard",
       "recall_at_10": 1,
-      "precision_at_10": 0.9,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
-        39,
         5,
-        198,
-        94,
-        184,
-        159,
+        39,
         10,
+        94,
+        198,
         113,
+        159,
         195,
-        197
+        184
       ],
       "relevant_ids": [
         5,
@@ -709,7 +701,7 @@
         195,
         198
       ],
-      "tokens": 115
+      "tokens": 104
     },
     {
       "id": "q28",
@@ -721,15 +713,15 @@
       "mrr": 1,
       "result_ids": [
         12,
-        48,
         20,
-        147,
-        70,
-        127,
-        45,
         4,
+        45,
+        48,
         51,
-        69
+        127,
+        70,
+        87,
+        147
       ],
       "relevant_ids": [
         4,
@@ -744,7 +736,7 @@
         127,
         147
       ],
-      "tokens": 127
+      "tokens": 128
     },
     {
       "id": "q29",
@@ -760,11 +752,11 @@
         22,
         75,
         68,
-        63,
         136,
         14,
         181,
-        105
+        172,
+        38
       ],
       "relevant_ids": [
         9,
@@ -772,7 +764,7 @@
         56,
         75
       ],
-      "tokens": 129
+      "tokens": 127
     },
     {
       "id": "q30",
@@ -792,7 +784,7 @@
         32,
         102,
         57,
-        72
+        78
       ],
       "relevant_ids": [
         33,
@@ -800,7 +792,7 @@
         113,
         121
       ],
-      "tokens": 136
+      "tokens": 134
     },
     {
       "id": "q31",
@@ -808,18 +800,18 @@
       "category": "hard_negative_abbreviation",
       "recall_at_10": 1,
       "precision_at_10": 0.8889,
-      "ndcg_at_10": 1,
+      "ndcg_at_10": 0.9672,
       "mrr": 1,
       "result_ids": [
         161,
-        49,
-        171,
         67,
-        166,
+        49,
+        36,
         191,
         95,
-        188,
-        36
+        166,
+        171,
+        188
       ],
       "relevant_ids": [
         49,
@@ -838,20 +830,15 @@
       "query": "React hooks",
       "category": "hard_negative_precision",
       "recall_at_10": 1,
-      "precision_at_10": 0.5,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
         2,
-        66,
-        11,
         186,
+        11,
         47,
-        131,
-        20,
-        191,
-        92,
-        31
+        66
       ],
       "relevant_ids": [
         2,
@@ -860,27 +847,22 @@
         66,
         186
       ],
-      "tokens": 127
+      "tokens": 60
     },
     {
       "id": "q33",
       "query": "error handling",
       "category": "hard_negative_precision",
       "recall_at_10": 1,
-      "precision_at_10": 0.5,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr": 1,
       "result_ids": [
         93,
-        87,
         42,
+        87,
         79,
-        150,
-        178,
-        6,
-        165,
-        46,
-        77
+        150
       ],
       "relevant_ids": [
         42,
@@ -889,7 +871,7 @@
         93,
         150
       ],
-      "tokens": 135
+      "tokens": 68
     },
     {
       "id": "q34",
@@ -897,16 +879,16 @@
       "category": "hard_negative_cross_project",
       "recall_at_10": 0.8333,
       "precision_at_10": 0.5,
-      "ndcg_at_10": 0.6077,
+      "ndcg_at_10": 0.6807,
       "mrr": 0.5,
       "result_ids": [
         10,
         77,
+        60,
+        108,
+        17,
         103,
         162,
-        17,
-        108,
-        60,
         76,
         169,
         131
@@ -931,11 +913,11 @@
       "mrr": 1,
       "result_ids": [
         72,
+        91,
         197,
         133,
-        91,
-        169,
-        120
+        120,
+        169
       ],
       "relevant_ids": [
         72,
@@ -951,22 +933,22 @@
   "byCategory": {
     "standard": {
       "count": 25,
-      "recall_at_10": 0.8822,
-      "precision_at_10": 0.8107,
-      "ndcg_at_10": 0.9773,
-      "mrr_at_10": 0.98
+      "recall_at_10": 0.8865,
+      "precision_at_10": 0.8561,
+      "ndcg_at_10": 0.9795,
+      "mrr_at_10": 0.9733
     },
     "hard_negative_abbreviation": {
       "count": 2,
       "recall_at_10": 1,
       "precision_at_10": 0.9444,
-      "ndcg_at_10": 1,
+      "ndcg_at_10": 0.9836,
       "mrr_at_10": 1
     },
     "hard_negative_precision": {
       "count": 2,
       "recall_at_10": 1,
-      "precision_at_10": 0.5,
+      "precision_at_10": 1,
       "ndcg_at_10": 1,
       "mrr_at_10": 1
     },
@@ -974,7 +956,7 @@
       "count": 1,
       "recall_at_10": 0.8333,
       "precision_at_10": 0.5,
-      "ndcg_at_10": 0.6077,
+      "ndcg_at_10": 0.6807,
       "mrr_at_10": 0.5
     }
   }

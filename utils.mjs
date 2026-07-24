@@ -11,7 +11,7 @@ import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
 
 export { DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, OBS_BM25, SESS_BM25, EVT_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, OBS_FTS_COLUMNS, notLowSignalTitleClause, noisePenaltyClause } from './scoring-sql.mjs';
 export { cjkBigrams, extractCjkSynonymTokens, extractCjkKeywords, extractCjkLikePatterns, SYNONYM_MAP, expandToken, sanitizeFtsQuery, relaxFtsQueryToOr, FTS_STOP_WORDS, CJK_COMPOUNDS } from './nlp.mjs';
-export { resolveProject, _resetProjectCache } from './project-utils.mjs';
+export { inferProject, resolveProject, _resetProjectCache } from './project-utils.mjs';
 export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
 export { stripPrivate } from './lib/private-strip.mjs';
 export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey, formatErrorRecallHints, neutralizeContextDelimiters } from './format-utils.mjs';
@@ -42,6 +42,21 @@ export function isPathConfined(candidate, allowedBase) {
   const resolved = resolve(candidate);
   const base = resolve(allowedBase);
   return resolved === base || resolved.startsWith(base + sep);
+}
+
+/**
+ * Basename that treats BOTH '/' and '\' as separators on every host OS.
+ * `path.basename` follows the HOST's rules, so on POSIX it returns a Windows
+ * path unchanged. Hook payloads carry the CLIENT's paths and
+ * observation_files.filename stores either separator (lib/file-edge-match.mjs),
+ * so DB search keys derived from them must be host-independent.
+ * Not for filesystem access — '\' is a legal POSIX filename character.
+ * @param {string} p Path in any separator style
+ * @returns {string} Last segment, trailing separators ignored; '' if none
+ */
+export function basenameAnySep(p) {
+  const s = String(p ?? '').replace(/[/\\]+$/, '');
+  return s.slice(Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\')) + 1);
 }
 
 // ─── Token Estimation ─────────────────────────────────────────────────────
@@ -149,23 +164,6 @@ export function computeRuleImportance(episode) {
   if ((episode.files || []).length >= 8 && importance < 2) importance = 2;
 
   return importance;
-}
-
-// ─── Project Inference ───────────────────────────────────────────────────────
-
-/**
- * Infer a sanitized project name from CLAUDE_PROJECT_DIR, PWD, or cwd.
- * Format: "parent--basename" with non-alphanumeric chars replaced by hyphens.
- * @returns {string} Sanitized project identifier safe for use in filenames
- */
-export function inferProject() {
-  const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-  const base = basename(p);
-  const parent = basename(dirname(p));
-  const raw = parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;
-  // Sanitize to prevent path traversal when used in filenames (ep-<project>.json)
-  // Truncate to 100 chars to avoid exceeding filesystem name limits (255 bytes)
-  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
 }
 
 // ─── Episode Logic ───────────────────────────────────────────────────────────

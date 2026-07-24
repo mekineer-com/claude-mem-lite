@@ -48,6 +48,7 @@ import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
+import { fetchRecent } from './lib/recent-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
@@ -65,7 +66,7 @@ const { version: PKG_VERSION } = require('./package.json');
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-import { rmSync, existsSync, readFileSync, appendFileSync, mkdirSync } from 'fs';
+import { rmSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, chmodSync } from 'fs';
 
 let db;
 try {
@@ -404,27 +405,19 @@ async function runRecent(db, args) {
   const limit = args.limit ?? 10;
   const project = args.project || inferProject();
 
-  const params = [];
-  const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
-  if (project) { wheres.push('project = ?'); params.push(project); }
-  // obs_type: observation-type filter (CLI `recent --type` parity). The zod enum
-  // already rejected an invalid value before the handler ran.
-  if (args.obs_type) { wheres.push('type = ?'); params.push(args.obs_type); }
   // date_since: relative lower bound on created_at (CLI `recent --since` parity).
+  // Parsed here rather than in the core because the surfaces reject a bad duration
+  // in their own dialect — MCP throws, CLI fail()s.
+  let since = null;
   if (args.date_since !== undefined) {
     const d = parseDuration(args.date_since);
     if (!d.ok) throw new Error(`Invalid date_since: "${args.date_since}" (use <N><unit>, e.g. 7d, 24h, 90m, 2w)`);
-    wheres.push('created_at_epoch >= ?'); params.push(Date.now() - d.ms);
+    since = Date.now() - d.ms;
   }
-  params.push(limit);
 
-  const rows = db.prepare(`
-    SELECT id, type, title, subtitle, project, created_at, created_at_epoch
-    FROM observations
-    WHERE ${wheres.join(' AND ')}
-    ORDER BY created_at_epoch DESC
-    LIMIT ?
-  `).all(...params);
+  // Shared core with CLI `recent`: live-rows filter + ordering (lib/recent-core.mjs).
+  // obs_type is already enum-validated by zod before the handler runs.
+  const rows = fetchRecent(db, { project, type: args.obs_type || null, since, limit });
 
   if (rows.length === 0) {
     return { content: [{ type: 'text', text: `No recent observations${project ? ` (${project})` : ''}.` }] };
@@ -745,6 +738,34 @@ server.registerTool(
 
 // ─── Tool: mem_save ─────────────────────────────────────────────────────────
 
+// Sanity ceilings on the free-text fields that reach unbounded TEXT columns. zod
+// validates TYPES; before this, `title` had no size bound at all
+// (`z.string().optional()`), so one runaway summarizer write stored a multi-KB title
+// verbatim and every later FTS rebuild, minhash and vector recompute paid for that row
+// forever. Truncate rather than reject: rejection would be a breaking contract change
+// on a published MCP tool, and a caller that over-writes still wants its memory saved.
+//
+// Numbers: `title` at 500 is ~5× the longest form any read path renders (titles are
+// truncate()'d to 80–100 chars on display) and 5× saveObservation's own
+// content.slice(0, 100) fallback — generous headroom, still a bound. `content` (50000)
+// and `lesson_learned` (500) mirror the zod maxima already published in
+// tool-schemas.mjs, so the advertised contract is not narrowed; applying them here
+// converts a hard zod REJECT into graceful truncation for any caller that reaches this
+// path without schema validation.
+export const SAVE_TEXT_LIMITS = { content: 50000, title: 500, lesson_learned: 500 };
+
+/**
+ * Cap one free-text field at `limit`, marking the loss in-band so the truncation is
+ * visible in the stored row (a silently shortened memory is worse than a marked one).
+ * The marker names the ORIGINAL length, and the result never exceeds `limit`.
+ * Non-strings (absent optional fields) pass through untouched.
+ */
+export function clampSaveText(value, limit) {
+  if (typeof value !== 'string' || value.length <= limit) return value;
+  const marker = ` … [truncated from ${value.length} chars]`;
+  return value.slice(0, Math.max(0, limit - marker.length)) + marker;
+}
+
 server.registerTool(
   'mem_save',
   {
@@ -760,13 +781,15 @@ server.registerTool(
     try {
       result = db.transaction(() => {
         const r = saveObservation(db, {
-          content: args.content,
-          title: args.title,
+          // Size ceiling applied here rather than in lib/save-observation.mjs so the
+          // shared pipeline keeps its "caller validates" contract (see its header).
+          content: clampSaveText(args.content, SAVE_TEXT_LIMITS.content),
+          title: clampSaveText(args.title, SAVE_TEXT_LIMITS.title),
           type: args.type || 'discovery',
           importance: args.importance,
           project,
           files: args.files || [],
-          lesson_learned: args.lesson_learned,
+          lesson_learned: clampSaveText(args.lesson_learned, SAVE_TEXT_LIMITS.lesson_learned),
           supersedes: args.supersedes,
         });
         if (r.kind === 'duplicate') return r; // dedup short-circuits BEFORE resolver — replay is idempotent
@@ -1890,6 +1913,69 @@ process.on('SIGTERM', () => shutdown(0));
 process.on('uncaughtException', (err) => { debugCatch(err, 'uncaughtException'); shutdown(1); });
 process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'); shutdown(1); });
 
+// ─── Runtime Dir Retention + Permissions ────────────────────────────────────
+
+/** Spawn-log retention window — same 14 days as every sibling JSONL sink. */
+export const SPAWN_LOG_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+/** Hard ceiling for pathological spawn churn inside the retention window. */
+export const SPAWN_LOG_MAX_LINES = 2000;
+
+/**
+ * Trim mcp-spawns.log to the retention window. The sibling sinks (lib/metrics,
+ * lib/err-sampler, lib/hook-telemetry) shard per day and unlink old shards; this
+ * sink is one flat file at a documented path, so the same 14-day window is applied
+ * line-wise instead. Records without a parseable `ts` are dropped — the log is
+ * append-only JSONL, so a malformed line is truncated telemetry, not data.
+ * Only rewrites when something actually expires. Never throws.
+ *
+ * @param {string} path   Absolute path to mcp-spawns.log
+ * @param {number} [nowMs]
+ * @returns {number} lines removed
+ */
+export function pruneSpawnLog(path, nowMs = Date.now()) {
+  try {
+    if (!existsSync(path)) return 0;
+    const lines = readFileSync(path, 'utf8').split('\n').filter(Boolean);
+    // ISO-8601 sorts lexically = chronologically, so no Date.parse per line
+    // (same trick as hook-telemetry.countRecentHookErrors).
+    const cutoffIso = new Date(nowMs - SPAWN_LOG_RETENTION_MS).toISOString();
+    let kept = lines.filter((l) => {
+      try {
+        const { ts } = JSON.parse(l);
+        return typeof ts === 'string' && ts >= cutoffIso;
+      } catch { return false; }
+    });
+    if (kept.length > SPAWN_LOG_MAX_LINES) kept = kept.slice(-SPAWN_LOG_MAX_LINES);
+    if (kept.length === lines.length) return 0;
+    writeFileSync(path, kept.length ? kept.join('\n') + '\n' : '', { mode: 0o600 });
+    return lines.length - kept.length;
+  } catch { return 0; }
+}
+
+/**
+ * Restrict the runtime dir and its files to owner-only. Directory 0700 is the
+ * load-bearing part (without +x another local user cannot traverse in); the
+ * per-file 0600 is defense in depth and remediates files created before this fix.
+ * Subdirectories are skipped — they are created with `{mode: 0o700}` by their own
+ * sinks. Symlinks are skipped (Dirent.isFile() is false) so this never chmods
+ * through to a target outside the runtime dir. Idempotent, never throws.
+ *
+ * @param {string} dir  Absolute path to RUNTIME_DIR
+ * @returns {number} files chmod'ed
+ */
+export function hardenRuntimeFiles(dir) {
+  try {
+    if (!existsSync(dir)) return 0;
+    chmodSync(dir, 0o700);
+    let touched = 0;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      try { chmodSync(join(dir, entry.name), 0o600); touched++; } catch { /* per-entry, silent */ }
+    }
+    return touched;
+  } catch { return 0; }
+}
+
 // ─── Start Server ───────────────────────────────────────────────────────────
 
 // Spawn telemetry — appends one JSON line per process start so we can diagnose
@@ -1898,14 +1984,13 @@ process.on('unhandledRejection', (err) => { debugCatch(err, 'unhandledRejection'
 // the same ppid is the smoking gun. Never throws — telemetry must not block
 // startup. Disable with MEM_DISABLE_SPAWN_LOG=1.
 //
-// File mode: no explicit chmod. Payload is `{ts, pid, ppid, argv1, version}` —
-// no secrets, no project content. Pre-v2.79.1 passed `{mode: 0o600}` to
-// appendFileSync but that only applies on file creation (umask-default after
-// the first append), so the "0600" claim was misleading honesty-wise. Honest
-// comment > misleading code.
+// File mode: `{mode: 0o600}` on appendFileSync only applies on file creation
+// (umask-default after the first append) — pre-v2.79.1 relied on it alone, so
+// the "0600" claim was misleading. hardenRuntimeFiles below sets the mode for
+// real, on every start, including logs created before this fix.
 if (process.env.MEM_DISABLE_SPAWN_LOG !== '1') {
   try {
-    if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true });
+    if (!existsSync(RUNTIME_DIR)) mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
     const line = JSON.stringify({
       ts: new Date().toISOString(),
       pid: process.pid,
@@ -1913,9 +1998,20 @@ if (process.env.MEM_DISABLE_SPAWN_LOG !== '1') {
       argv1: process.argv[1] || '',
       version: PKG_VERSION,
     }) + '\n';
-    appendFileSync(join(RUNTIME_DIR, 'mcp-spawns.log'), line);
+    const spawnLog = join(RUNTIME_DIR, 'mcp-spawns.log');
+    appendFileSync(spawnLog, line, { mode: 0o600 });
+    // Lazy GC on append, mirroring lib/hook-telemetry.pruneOldShards. Single-file
+    // sink (not day-sharded) so retention is applied line-wise instead.
+    pruneSpawnLog(spawnLog);
   } catch { /* never block startup on telemetry failure */ }
 }
+
+// Owner-only for the whole runtime dir. Sibling aux files carry captured file
+// paths (reads-<project>.txt) and scrubbed activity (ep-<project>.json), but were
+// written at the default umask (0644) while the DB itself is 0600 / DB_DIR 0700
+// (schema.mjs). The hooks that create them set the mode at creation; this sweep
+// is what remediates files already on disk from before the fix.
+hardenRuntimeFiles(RUNTIME_DIR);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

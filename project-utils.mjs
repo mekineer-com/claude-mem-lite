@@ -1,9 +1,28 @@
 // claude-mem-lite shared project resolution
 // Extracted from server.mjs and mem-cli.mjs to eliminate duplication
 
-import { inferProject } from './utils.mjs';
+import { basename, dirname } from 'path';
+
+// Leaf module: imports nothing from utils.mjs. utils.mjs re-exports this module's
+// symbols as a backward-compat barrel, so importing the barrel back from here
+// would close a cycle (v3.56 P2-9). Keep this file dependency-free of the barrel.
 
 const _cache = new Map();
+
+/**
+ * Infer a sanitized project name from CLAUDE_PROJECT_DIR, PWD, or cwd.
+ * Format: "parent--basename" with non-alphanumeric chars replaced by hyphens.
+ * @returns {string} Sanitized project identifier safe for use in filenames
+ */
+export function inferProject() {
+  const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
+  const base = basename(p);
+  const parent = basename(dirname(p));
+  const raw = parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;
+  // Sanitize to prevent path traversal when used in filenames (ep-<project>.json)
+  // Truncate to 100 chars to avoid exceeding filesystem name limits (255 bytes)
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
+}
 
 /**
  * Resolve short project name to canonical "parent--base" form.

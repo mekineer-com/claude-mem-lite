@@ -146,24 +146,41 @@ describe('extractPRFTerms', () => {
   });
 });
 
-// ─── extractPRFTerms stemming ────────────────────────────────────────────────
+// ─── extractPRFTerms surface forms (audit P2-24 / P3-9, 2026-07-24) ──────────
+// The PRF terms are fed back into `observations_fts MATCH` (search-engine.mjs), and
+// that index uses FTS5's DEFAULT unicode61 tokenizer — NO porter stemming (verified:
+// MATCH "cach" returns zero rows; only "caching"/"cache" match). So emitting a bare
+// porter STEM ("cach") silently matches nothing and kills expansion recall. The stem is
+// still used to BUCKET morphological variants for the ">= 2 docs" discriminativeness
+// bar, but the SELECTED term must be a surface form that actually occurs in the index.
 
-describe('extractPRFTerms stemming', () => {
-  it('should stem PRF terms to align with FTS5 porter tokenizer', () => {
-    const results = [
-      { title: 'Implementing the caching layer', narrative: 'Implemented a caching mechanism for database queries' },
-      { title: 'Cache implementation details', narrative: 'The implementation uses Redis for distributed caching' },
-      { title: 'Testing caching behavior', narrative: 'Verified the caching implementation works correctly' },
-    ];
+describe('extractPRFTerms surface forms', () => {
+  const results = [
+    { title: 'Implementing the caching layer', narrative: 'Implemented a caching mechanism for database queries' },
+    { title: 'Cache implementation details', narrative: 'The implementation uses Redis for distributed caching' },
+    { title: 'Testing caching behavior', narrative: 'Verified the caching implementation works correctly' },
+  ];
+
+  it('emits only surface forms that occur verbatim in the source docs (unstemmed index is matchable)', () => {
     const terms = extractPRFTerms(results, 'database query');
-    // All forms of "implement*" should be stemmed to the same root
-    // "cach" is the porter stem of "caching"/"cache"
-    const hasStemmedTerms = terms.some(t => t === 'implement' || t === 'cach');
-    expect(hasStemmedTerms).toBe(true);
-    // Should NOT contain unstemmed forms
-    expect(terms).not.toContain('implementing');
-    expect(terms).not.toContain('implementation');
-    expect(terms).not.toContain('implemented');
+    expect(terms.length).toBeGreaterThan(0);
+    const corpusTokens = new Set(
+      results.map(r => (r.title + ' ' + r.narrative).toLowerCase()).join(' ')
+        .replace(/[^a-z0-9_-]/g, ' ').split(/\s+/)
+    );
+    for (const t of terms) expect(corpusTokens.has(t)).toBe(true);
+  });
+
+  it('does NOT emit bare porter stems that the unicode61 index cannot match', () => {
+    const terms = extractPRFTerms(results, 'database query');
+    expect(terms).not.toContain('cach');       // porter stem of caching/cache → 0 FTS hits
+    expect(terms).not.toContain('implement');  // porter stem of implementation/implementing → 0 FTS hits
+  });
+
+  it('still merges morphological variants so the family clears the >=2-doc bar', () => {
+    const terms = extractPRFTerms(results, 'database query');
+    // caching-family and/or implementation-family selected via their shared stem
+    expect(terms.some(t => t.startsWith('cach') || t.startsWith('implement'))).toBe(true);
   });
 });
 

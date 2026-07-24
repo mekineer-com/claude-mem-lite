@@ -265,7 +265,7 @@ function flushEpisodeGroup(ep) {
 
   const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
   try {
-    writeFileSync(flushFile, JSON.stringify(ep));
+    writeFileSync(flushFile, JSON.stringify(ep), { mode: 0o600 }); // captured paths + scrubbed activity — owner-only (sec P3-2)
   } catch {
     return 'writefail';
   }
@@ -523,7 +523,7 @@ async function handleStop() {
               if (id) sub.savedId = id;
             } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
             const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-            writeFileSync(flushFile, JSON.stringify(sub));
+            writeFileSync(flushFile, JSON.stringify(sub), { mode: 0o600 }); // captured paths + scrubbed activity — owner-only (sec P3-2)
             spawnBackground('llm-episode', flushFile);
           }
         }

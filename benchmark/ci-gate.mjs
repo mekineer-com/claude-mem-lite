@@ -17,7 +17,7 @@
 // Exit codes: 0 = pass, 1 = regression detected (or stale baseline in strict mode)
 
 import { readFileSync, statSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
 
@@ -41,8 +41,14 @@ const STRICT = process.argv.includes('--strict') ||
 const BASELINE_STALE_AGE_DAYS = 30;
 const DAY_MS = 86400000;
 
-// Load baseline
-const baselinePath = join(__dirname, 'baseline.json');
+// Load baseline. The path is overridable (--baseline <file> / CI_GATE_BASELINE) so
+// the stale-detection branches can be exercised against a fixture with a known
+// timestamp. Without it, any test of the freshness logic has to lean on the
+// committed baseline's real age — which decays into a red suite on a calendar
+// rather than on a regression.
+const baselineIdx = process.argv.indexOf('--baseline');
+const baselineOverride = baselineIdx !== -1 ? process.argv[baselineIdx + 1] : process.env.CI_GATE_BASELINE;
+const baselinePath = baselineOverride ? resolve(baselineOverride) : join(__dirname, 'baseline.json');
 let baseline;
 let baselineAgeDays = 0;
 try {

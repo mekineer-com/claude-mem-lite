@@ -480,7 +480,16 @@ async function fetchAssetBuffer(url) {
 // The CLAUDE_MEM_SKIP_SIG_VERIFY escape hatch still forces a skip. publicKey is a
 // param (defaulting to the embedded constant) only so tests can exercise both regimes.
 export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey = RELEASE_PUBLIC_KEY) {
-  if (process.env.CLAUDE_MEM_SKIP_SIG_VERIFY) return { ok: true, action: 'skipped-env' };
+  if (process.env.CLAUDE_MEM_SKIP_SIG_VERIFY) {
+    // Loud on stderr, not via debugLog: this disables the strongest control in the
+    // update path, and debugLog is gated behind CLAUDE_MEM_DEBUG — the one case
+    // where silence is exactly wrong. An operator who set the var sees it; an
+    // attacker who set it in someone's environment loses the quiet.
+    process.stderr.write(
+      '[claude-mem-lite] WARNING: CLAUDE_MEM_SKIP_SIG_VERIFY is set — installing this release WITHOUT signature verification.\n'
+    );
+    return { ok: true, action: 'skipped-env' };
+  }
   if (!publicKey) return { ok: true, action: 'skipped-no-pubkey' };
 
   const list = Array.isArray(assets) ? assets : [];
@@ -518,6 +527,79 @@ export async function verifyReleaseAuthenticity(extractedDir, assets, publicKey 
 // Undo a (partial or complete) file swap: delete the freshly-installed files, then
 // rename each backup back into place. Shared by the error path and the MED-5
 // post-install smoke gate so there is ONE rollback implementation.
+// Swap-window marker. The rename loop is atomic per FILE, not per file SET, so a
+// hook process that starts mid-loop can resolve hook.mjs from vN and one of its
+// imports from vN+1 — the install.lock only excludes concurrent WRITERS, not
+// readers. scripts/hook-launcher.mjs skips a fire while this marker is live;
+// hooks are best-effort, so losing one fire beats importing a mixed module graph.
+// Carries pid + ts because the launcher must never be muted permanently by an
+// updater that was killed mid-swap (it applies the same staleness bound).
+const SWAP_MARKER = join(STATE_DIR, 'runtime', 'swap-in-progress');
+// Intent journal, written INSIDE the backup dir before each rename. On a hard kill
+// the backup dir survives (every normal exit deletes it) and this file says exactly
+// which paths were in flight, so the next entry can finish the rollback at the right
+// granularity — a bare directory walk cannot tell a nested relPath from a directory
+// relPath like `node_modules`.
+const SWAP_JOURNAL = '.swap-journal.json';
+
+function markSwapStart() {
+  try {
+    mkdirSync(dirname(SWAP_MARKER), { recursive: true });
+    writeFileSync(SWAP_MARKER, JSON.stringify({ pid: process.pid, ts: Date.now() }));
+  } catch (e) { debugCatch(e, 'markSwapStart'); }
+}
+
+function clearSwapMarker() {
+  try { rmSync(SWAP_MARKER, { force: true }); } catch (e) { debugCatch(e, 'clearSwapMarker'); }
+}
+
+// Write-ahead: journal the INTENT before the rename, never after. Journalling after
+// a successful rename leaves a window where the file has already moved into the
+// backup dir but nothing records it — recovery would then delete the backup dir with
+// the only copy of that file inside it. rollbackInstall guards every entry with
+// existsSync/force, so an intent that never happened is a harmless no-op.
+function journalSwap(backupDir, backedUp, installed) {
+  try {
+    writeFileSync(join(backupDir, SWAP_JOURNAL), JSON.stringify({ backedUp, installed }));
+  } catch (e) { debugCatch(e, 'journalSwap'); }
+}
+
+/**
+ * Finish any swap a previous process was killed in the middle of, then clear its
+ * residue. Called on every install entry, under the install lock, BEFORE a new
+ * staging/backup pair is created.
+ * @returns {number} number of interrupted swaps rolled back
+ */
+export function recoverInterruptedSwaps(targetDir = INSTALL_DIR) {
+  let entries;
+  try { entries = readdirSync(targetDir, { withFileTypes: true }); } catch { return 0; }
+
+  let recovered = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(targetDir, entry.name);
+
+    // Staging holds only copies — nothing was switched out of it, so it is residue,
+    // not a torn swap.
+    if (entry.name.startsWith('.update-staging-')) {
+      try { rmSync(dir, { recursive: true, force: true }); } catch (e) { debugCatch(e, 'recover-staging'); }
+      continue;
+    }
+    if (!entry.name.startsWith('.update-backup-')) continue;
+
+    let journal;
+    try { journal = JSON.parse(readFileSync(join(dir, SWAP_JOURNAL), 'utf8')); } catch { journal = null; }
+    const backedUp = Array.isArray(journal?.backedUp) ? journal.backedUp : [];
+    const installed = Array.isArray(journal?.installed) ? journal.installed : [];
+    // Copies: rollbackInstall reverses the arrays in place.
+    rollbackInstall([...installed], [...backedUp], dir, targetDir);
+    try { rmSync(dir, { recursive: true, force: true }); } catch (e) { debugCatch(e, 'recover-backup'); }
+    recovered++;
+    debugLog('WARN', 'hook-update', `Recovered an interrupted update swap: restored ${backedUp.length} path(s) from ${entry.name}`);
+  }
+  return recovered;
+}
+
 function rollbackInstall(installed, backedUp, backupDir, targetDir) {
   for (const relPath of installed.reverse()) {
     try { rmSync(join(targetDir, relPath), { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -581,6 +663,11 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
   const switchablePaths = buildSwitchablePaths(manifest.SOURCE_FILES);
 
   try {
+    // Finish a prior swap that was hard-killed mid-rename before starting another
+    // one — otherwise this install stacks on top of a mixed-version tree and its
+    // own backup can no longer restore a coherent state.
+    recoverInterruptedSwaps(targetDir);
+
     mkdirSync(stagingDir, { recursive: true });
     mkdirSync(backupDir, { recursive: true });
 
@@ -593,23 +680,30 @@ export async function installExtractedRelease(sourceDir, targetDir = INSTALL_DIR
       });
     }
 
-    for (const relPath of switchablePaths) {
-      const stagedPath = join(stagingDir, relPath);
-      if (!existsSync(stagedPath)) continue;
+    markSwapStart();
+    try {
+      for (const relPath of switchablePaths) {
+        const stagedPath = join(stagingDir, relPath);
+        if (!existsSync(stagedPath)) continue;
 
-      const targetPath = join(targetDir, relPath);
-      const backupPath = join(backupDir, relPath);
+        const targetPath = join(targetDir, relPath);
+        const backupPath = join(backupDir, relPath);
 
-      mkdirSync(dirname(targetPath), { recursive: true });
-      mkdirSync(dirname(backupPath), { recursive: true });
+        mkdirSync(dirname(targetPath), { recursive: true });
+        mkdirSync(dirname(backupPath), { recursive: true });
 
-      if (existsSync(targetPath)) {
-        renameSync(targetPath, backupPath);
-        backedUp.push(relPath);
+        if (existsSync(targetPath)) {
+          backedUp.push(relPath);
+          journalSwap(backupDir, backedUp, installed);
+          renameSync(targetPath, backupPath);
+        }
+
+        installed.push(relPath);
+        journalSwap(backupDir, backedUp, installed);
+        renameSync(stagedPath, targetPath);
       }
-
-      renameSync(stagedPath, targetPath);
-      installed.push(relPath);
+    } finally {
+      clearSwapMarker();
     }
 
     // MED-5: before discarding the rollback backup, prove the switched code boots.

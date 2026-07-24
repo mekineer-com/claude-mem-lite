@@ -35,6 +35,60 @@ describe('vector-hit fetch column parity (F4)', () => {
   });
 });
 
+// Row-shape parity, behavioral twin of the structural check above: VEC_HIT_OBS_COLS
+// SELECTs created_at + created_at_epoch, but the two vector-hit row CONSTRUCTORS only
+// copied `date`. A vector-only hit therefore reached consumers with created_at
+// undefined — the CLI prints its date as undefined (mem-cli.mjs fmtDateShort) and
+// applyUserSort reads `created_at_epoch ?? 0`, sinking the row to the bottom under
+// --sort time. The FTS twin (ftsRowToResult) carries all three keys.
+describe('vector-hit row shape carries the date keys the FTS row does', () => {
+  let db, prevVec;
+  beforeEach(() => {
+    prevVec = process.env.CLAUDE_MEM_VECTORS;
+    process.env.CLAUDE_MEM_VECTORS = '1';
+    db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+  });
+  afterEach(() => {
+    db.close();
+    if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS; else process.env.CLAUDE_MEM_VECTORS = prevVec;
+  });
+
+  it('a vector-only hit (RRF-merge branch) has created_at and created_at_epoch', async () => {
+    // ftsOnly carries BOTH query terms → matches the AND query. vecOnly carries only
+    // the shared term → no FTS match, but a strong cosine to the query vector, so it
+    // enters results exclusively through the vector-hit constructor.
+    insertObs(db, { title: 'zylphqax quorumbeta rollout', narrative: 'zylphqax quorumbeta staged rollout across the fleet', text: 'zylphqax quorumbeta rollout' });
+    insertObs(db, { title: 'zylphqax capacity note', narrative: 'zylphqax capacity planning across the fleet', text: 'zylphqax capacity note' });
+    // filler so the shared terms clear the df>=2 vocabulary floor
+    insertObs(db, { title: 'fleet capacity review', narrative: 'capacity planning rollout across the fleet', text: 'fleet capacity review' });
+
+    const { getVocabulary, _resetVocabCache, computeVector } = await import('../tfidf.mjs');
+    const { searchObservationsHybrid } = await import('../search-engine.mjs');
+    _resetVocabCache();
+    const vocab = getVocabulary(db);
+    expect(vocab, 'vocabulary builds from the seeded corpus').toBeTruthy();
+    for (const o of db.prepare('SELECT id, title, narrative FROM observations').all()) {
+      const vec = computeVector(`${o.title} ${o.narrative}`, vocab);
+      if (vec) {
+        db.prepare('INSERT INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+          .run(o.id, Buffer.from(vec.buffer), vocab.version, Date.now());
+      }
+    }
+
+    const rows = searchObservationsHybrid(db, {
+      ftsQuery: 'zylphqax AND quorumbeta', args: { project: 'test' },
+      epochFrom: null, epochTo: null,
+      perSourceLimit: 10, perSourceOffset: 0, currentProject: 'test', limit: 10,
+    });
+
+    const vecOnly = rows.find(r => r.title === 'zylphqax capacity note');
+    expect(vecOnly, 'vector arm surfaced the row FTS could not match').toBeTruthy();
+    expect(vecOnly.created_at, 'vector-hit row must carry created_at like the FTS row').toBeTruthy();
+    expect(typeof vecOnly.created_at_epoch, 'vector-hit row must carry created_at_epoch for --sort time').toBe('number');
+  });
+});
+
 describe('vector field-set: lesson/aliases reach vocab + rebuild paths (R3 V-F1/V-F2)', () => {
   let db, prevVec;
   beforeEach(() => {

@@ -68,6 +68,38 @@ if (!entryArg) {
 
 const entryAbs = entryArg.startsWith('/') ? entryArg : join(INSTALL_DIR, entryArg);
 
+// Swap barrier. An auto-update / repair renames files into the install dir one at
+// a time — atomic per file, not per file SET — so a hook process that starts
+// mid-swap can resolve its entry from the old version and an import from the new
+// one. hook-update.mjs marks that window; skip the fire instead of importing a
+// mixed module graph. Hooks are best-effort and the swap lasts ~a second, so the
+// next fire runs against a settled install.
+//
+// Stale-guarded on BOTH pid and ts: an updater killed mid-swap leaves the marker
+// behind, and a marker that outlives its writer must never mute hooks permanently.
+// Anything unreadable/torn/expired reads as "no swap" — fail-open, like the rest
+// of this launcher. Inline (not lib/proc-lock.mjs) per the pure-node: charter.
+const SWAP_MARKER = join(RUNTIME_DIR, 'swap-in-progress');
+const SWAP_MAX_MS = 2 * 60 * 1000;
+
+function swapInProgress() {
+  try {
+    const { pid, ts } = JSON.parse(readFileSync(SWAP_MARKER, 'utf8'));
+    if (typeof ts !== 'number' || Date.now() - ts > SWAP_MAX_MS) return false;
+    if (typeof pid !== 'number' || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);   // signal 0 = existence probe
+      return true;
+    } catch (e) {
+      return e.code === 'EPERM';   // alive, owned by another user
+    }
+  } catch {
+    return false;   // no marker / unreadable / torn JSON → not a swap
+  }
+}
+
+if (swapInProgress()) process.exit(0);
+
 async function runEntry({ bustCache = false } = {}) {
   // Mirror direct invocation: process.argv[1] is the entry, [2..] are its args.
   process.argv = [process.argv[0], entryAbs, ...rest];

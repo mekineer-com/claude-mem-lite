@@ -7,7 +7,7 @@ import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { truncate, typeIcon, inferProject, scrubSecrets } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
-import { _resetVocabCache } from './tfidf.mjs';
+import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
 import { autoBoostIfNeeded, reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
@@ -42,9 +42,10 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
-import { rebuildObservationDerived, normalizeScope } from './lib/observation-write.mjs';
+import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
+import { fetchRecent, RECENT_MAX } from './lib/recent-core.mjs';
 import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentTimeline, fetchTimelineWindow } from './lib/timeline-core.mjs';
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
@@ -368,9 +369,8 @@ function cmdRecent(db, args) {
   // this cap, so `recent 999999` issued an uncapped `LIMIT 999999` full-table dump
   // while `recent --limit 999999` correctly rejected → default — exactly the
   // "none capped --limit dumps the whole set" footgun parseIntFlag was extracted
-  // to close (lib/cli-flags.mjs). Keep the literal in one place so the two paths
-  // can't drift apart again.
-  const RECENT_MAX = 1000;
+  // to close (lib/cli-flags.mjs). The literal now lives in lib/recent-core.mjs so
+  // the MCP surface is capped by the same number.
   // isNumericToken first: "2abc"→2 / "1e2"→1 are positive integers that the bare check
   // accepted silently; the positional path must reject garbage like the --limit flag does.
   const isValid = rawArg !== undefined && isNumericToken(rawArg) && Number.isInteger(rawLimit) && rawLimit > 0 && rawLimit <= RECENT_MAX;
@@ -400,25 +400,18 @@ function cmdRecent(db, args) {
     }
   }
 
-  const params = [];
-  const wheres = ['COALESCE(compressed_into, 0) = 0', 'superseded_at IS NULL'];
-  if (project) { wheres.push('project = ?'); params.push(project); }
-  if (type) { wheres.push('type = ?'); params.push(type); }
   // --since: relative lower bound on created_at (e.g. "recent 1000 --since 24h").
+  // Parsed here (not in the core) because the two surfaces reject a bad duration
+  // in their own dialect — CLI fail(), MCP throw.
+  let since = null;
   if (flags.since !== undefined) {
     const d = parseDuration(flags.since);
     if (!d.ok) { fail(`[mem] Invalid --since "${flags.since}". Use <N><unit>, e.g. 7d, 24h, 90m, 2w.`); return; }
-    wheres.push('created_at_epoch >= ?'); params.push(Date.now() - d.ms);
+    since = Date.now() - d.ms;
   }
-  params.push(limit);
 
-  const rows = db.prepare(`
-    SELECT id, type, title, subtitle, importance, created_at_epoch, created_at
-    FROM observations
-    WHERE ${wheres.join(' AND ')}
-    ORDER BY created_at_epoch DESC
-    LIMIT ?
-  `).all(...params);
+  // Shared core with MCP mem_recent: live-rows filter + ordering (lib/recent-core.mjs)
+  const rows = fetchRecent(db, { project, type, since, limit });
 
   if (jsonOutput) {
     out(JSON.stringify({
@@ -1704,6 +1697,9 @@ function cmdExport(db, args) {
   if (limitGiven && rows.length >= limit) {
     process.stderr.write(`[mem] Note: Results capped at ${limit}. Raise --limit or narrow --from/--to to export more.\n`);
   }
+  // Fidelity caveat at backup-creation time (mirrors the restore-side note). stderr,
+  // so stdout stays a clean JSON/JSONL stream for `export > backup.json`.
+  process.stderr.write('[mem] Note: export omits related_ids and supersession links (superseded rows are excluded) — content and value-signals round-trip, the relationship graph does not.\n');
 }
 
 // ─── Restore ───────────────────────────────────────────────────────────────
@@ -1751,6 +1747,8 @@ function cmdRestore(db, argv) {
   const num = (v) => Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : 0;
 
   const dupCheck = db.prepare('SELECT id FROM observations WHERE project = ? AND title = ? AND created_at_epoch = ? LIMIT 1');
+  // Final field state of a restored row, for the post-signalUpdate vector rebuild below.
+  const vecRow = db.prepare('SELECT title, narrative, concepts, lesson_learned, search_aliases FROM observations WHERE id = ?');
   const signalUpdate = db.prepare(`UPDATE observations SET
       text = COALESCE(?, text),
       subtitle = ?, concepts = ?, facts = ?, search_aliases = ?, files_read = ?, branch = COALESCE(?, branch),
@@ -1808,6 +1806,15 @@ function cmdRestore(db, argv) {
         num(r.decay_seen_count), r.last_accessed_at ?? null,
         res.id,
       );
+      // The FTS `text` column re-syncs through the observations _au trigger, but the
+      // TF-IDF vector has no trigger: saveObservation vectorized title+content+lesson,
+      // so every field signalUpdate just applied (concepts, search_aliases) was missing
+      // from the restored row's vector. Rebuild from the row's FINAL state through the
+      // canonical vecTextForRow — the same text every other (re)build path uses. Reading
+      // the row back (rather than reusing the locals) keeps this identical to
+      // maintain-core's rebuildVectors. Skipped entirely while the vector arm is off,
+      // which is the default (lib/observation-write.mjs).
+      if (vectorsEnabled()) insertObservationVector(db, res.id, vecTextForRow(vecRow.get(res.id)));
       restored++;
     } catch (e) {
       malformed++;
@@ -1820,6 +1827,13 @@ function cmdRestore(db, argv) {
   const totalMalformed = malformed + parseFailures;
   const totalLines = rows.length + parseFailures;
   out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
+  // Name the lossiness where the user meets it. Export omits related_ids and drops
+  // superseded rows, and restore re-inserts under fresh AUTOINCREMENT ids — so no
+  // cross-link can survive the round-trip. That is a deliberate format tradeoff (stored
+  // ids would be stale after the remap), but "N restored" alone reads as full fidelity.
+  if (restored > 0) {
+    out('[mem] Note: related_ids and supersession links are not carried across export/restore (ids are remapped on restore) — restored rows have no cross-links.');
+  }
 }
 
 // ─── Compress ────────────────────────────────────────────────────────────────

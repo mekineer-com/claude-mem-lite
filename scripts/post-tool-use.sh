@@ -7,6 +7,34 @@
 # Prevent recursive hooks
 [[ -n "$CLAUDE_MEM_HOOK_RUNNING" ]] && exit 0
 
+# Claude Code plugin-disable guard (audit P3-4).
+# install.mjs writes DIRECT hook entries into ~/.claude/settings.json, so disabling the
+# plugin in the Claude UI leaves them firing. hook.mjs exits 0 for that case, but the
+# Read fast-path below never reaches Node: it kept appending to reads-<project>.txt on
+# EVERY Read, while the 24h sweep that reaps those files (sweepOrphanEpisodeFiles, via
+# runSessionStartAutoMaintain) sits behind that same Node-side exit — unbounded growth
+# in runtime/ for a plugin the user believes is off.
+# MUST agree with hook.mjs isPluginExplicitlyDisabled(): same $HOME/.claude/settings.json
+# (NOT CLAUDE_CONFIG_DIR — hook.mjs resolves it via homedir()), same plugin key, and the
+# same fail-open-on-unreadable semantics (its try/catch returns false). Parity pinned by
+# tests/post-tool-use-disabled.test.mjs.
+# Cheap by construction: no `node`, no external command on this ~5ms per-tool-call path.
+# `-r` covers missing/unreadable in one builtin test, and `$(<file)` slurps the whole file
+# for ONE regex — measured +0.4ms/call vs +4.0ms for a `while read` loop over the same
+# 239-line settings.json (bash pays a syscall + a regex per line there).
+# The ERE (not a `==` glob) is what keeps a MINIFIED single-line settings.json from
+# matching `"<key>": true, … "other": false` as a false positive: the pattern is anchored
+# to the key, so only that key's own value can satisfy it.
+# Deliberately NOT applied to the Node handoff at the tail: hook.mjs already self-guards
+# there, so a bash false positive could only lose data, never save work.
+_mem_settings_file="${HOME}/.claude/settings.json"
+_mem_plugin_disabled() {
+  [[ -r "$_mem_settings_file" ]] || return 1
+  local _settings
+  _settings=$(<"$_mem_settings_file")
+  [[ "$_settings" =~ \"claude-mem-lite@sdsrss\"[[:space:]]*:[[:space:]]*false ]]
+}
+
 # Read stdin (tool hook JSON)
 input=$(head -c 262144)
 
@@ -19,6 +47,10 @@ fi
 
 # Read tool: track file path for episode context, then exit (no Node needed)
 if [[ "$tool" == "Read" ]]; then
+  # Disabled plugin → write nothing; nothing would ever sweep the file (see guard above).
+  # 2>/dev/null: a settings.json unlinked between the -r test and the read must stay
+  # silent — Claude Code surfaces hook stderr.
+  _mem_plugin_disabled 2>/dev/null && exit 0
   if [[ "$input" =~ \"file_path\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]]; then
     file_path="${BASH_REMATCH[1]}"
     _dir="${CLAUDE_PROJECT_DIR:-$PWD}"
@@ -46,6 +78,13 @@ if [[ "$tool" == "Read" ]]; then
     # bash fast-path wrote to $HOME unconditionally, a relocated install would drop all
     # Read context from episodes AND grow an uncollected reads file in $HOME forever.
     runtime_dir="${CLAUDE_MEM_DIR:-$HOME/.claude-mem-lite}/runtime"
+    # Owner-only (0700 dir / 0600 file): reads-<project>.txt lists captured file
+    # paths, so on a shared host the default umask leaked them to every local user.
+    # umask is a shell builtin — no extra process on this ~5ms per-tool-call path
+    # (a chmod would be a spawn). It only applies at creation; server.mjs
+    # hardenRuntimeFiles() remediates files that predate this fix. Scoped safely:
+    # this branch always exits before the node handoff below.
+    umask 077
     mkdir -p "$runtime_dir" 2>/dev/null
     # Use printf to avoid shell interpretation of special characters in file paths
     printf '%s\n' "$file_path" >> "${runtime_dir}/reads-${project}.txt"

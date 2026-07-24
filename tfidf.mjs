@@ -9,6 +9,13 @@ import { createHash } from 'crypto';
 import { rrfAccumulate } from './lib/rrf.mjs';
 
 export const VOCAB_DIM = 512;
+// Fraction of the vocab dimension reserved for the highest-IDF (rarest) terms when the
+// candidate set exceeds `dim` and must be truncated. df×idf ("information gain") ranking
+// peaks at MID document-frequency, so a pure-IG cut drops the rare freq≈2 / high-IDF tail
+// FIRST — but those are exactly the discriminative identifiers (a filename / proper noun in
+// 2-3 memories) a high-precision query needs. The quota guarantees that tail a slot budget;
+// the rest fill by IG. No effect when candidates <= dim (audit P2-11 2026-07-24).
+const VOCAB_RARE_TERM_FRACTION = 0.25;
 export const MIN_COSINE_SIMILARITY = 0.05;
 export const VECTOR_SCAN_LIMIT = 500;
 // Reciprocal Rank Fusion constant. Higher k flattens the rank-position weighting
@@ -37,7 +44,12 @@ const VOCAB_STOP_WORDS = new Set([
 ]);
 
 // ─── Porter Stemmer ──────────────────────────────────────────────────────────
-// Minimal Porter stemmer (1980) aligned with SQLite FTS5's built-in porter tokenizer.
+// Minimal Porter stemmer (1980). Used to normalize tokens for the TF-IDF vocabulary and
+// vectors (query + doc are BOTH stemmed here, so the vector arm is internally consistent).
+// NOTE: this does NOT align with the FTS5 side — observations_fts uses FTS5's DEFAULT
+// unicode61 tokenizer (no stemming). Anything that stems a term and then feeds it into an
+// FTS5 MATCH must emit a SURFACE form, not a stem, or it matches nothing (see
+// extractPRFTerms in search-scoring.mjs, audit P2-24 2026-07-24).
 
 const step2map = {
   ational:'ate', tional:'tion', enci:'ence', anci:'ance', izer:'ize',
@@ -247,13 +259,37 @@ export function buildVocabulary(db, { dim = VOCAB_DIM } = {}) {
     }
   }
 
-  // Compute IDF and sort by information gain (df × idf) for balanced discriminativeness
+  // Compute IDF; rank by information gain (df × idf) for balanced discriminativeness.
   const idf = (freq) => Math.log(1 + N / (1 + freq));
-  const sortedTerms = [...df.entries()]
+  const candidates = [...df.entries()]
     .filter(([term, freq]) => !isNoiseTerm(term) && freq >= 2)
-    .map(([term, freq]) => ({ term, df: freq, idf: idf(freq), ig: freq * idf(freq) }))
-    .sort((a, b) => b.ig - a.ig)
-    .slice(0, dim);
+    .map(([term, freq]) => ({ term, df: freq, idf: idf(freq), ig: freq * idf(freq) }));
+
+  // SELECTION (which terms survive when candidates exceed `dim`): a pure df×idf cut drops
+  // the rarest, highest-IDF terms first (IG peaks at mid-df), blinding the arm to the
+  // discriminative tail. Reserve VOCAB_RARE_TERM_FRACTION of the budget for the highest-IDF
+  // terms, fill the rest by IG (audit P2-11). No-op when candidates <= dim.
+  let selected;
+  if (candidates.length <= dim) {
+    selected = candidates;
+  } else {
+    const igBudget = dim - Math.floor(dim * VOCAB_RARE_TERM_FRACTION);
+    const pick = new Map();
+    for (const e of [...candidates].sort((a, b) => b.ig - a.ig)) {
+      if (pick.size >= igBudget) break;
+      pick.set(e.term, e);
+    }
+    for (const e of [...candidates].sort((a, b) => b.idf - a.idf)) {
+      if (pick.size >= dim) break;
+      if (!pick.has(e.term)) pick.set(e.term, e);
+    }
+    selected = [...pick.values()];
+  }
+
+  // INDEX ORDERING is by IG desc. Index order is cosmetic for retrieval — cosine is
+  // permutation-invariant as long as query + doc share this mapping — but keeping the
+  // frequent workhorses at low indices preserves the historical slot layout.
+  const sortedTerms = selected.sort((a, b) => b.ig - a.ig).slice(0, dim);
 
   // Build terms map with index and IDF
   const terms = new Map();

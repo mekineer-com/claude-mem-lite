@@ -149,36 +149,57 @@ export const PRF_STOP_WORDS = new Set([
  * @returns {string[]} Array of discriminative terms for query expansion
  */
 export function extractPRFTerms(results, ftsQuery, limit = 3) {
-  // Extract query tokens for exclusion (stemmed to match FTS5 porter tokenizer)
+  // Query tokens to exclude from expansion — stemmed so morphological variants of a
+  // query term (e.g. "authenticate" when the user searched "authentication") are also
+  // excluded, not just the exact surface form.
   const queryTokens = new Set(
     ftsQuery.replace(/["()]/g, ' ').split(/\s+/)
       .map(t => porterStem(t.toLowerCase()))
       .filter(t => t.length > 1 && t !== 'or' && t !== 'and')
   );
 
-  // Count term frequencies across top results' full text (stemmed)
-  const termFreq = {};
+  // Bucket morphological variants by porter STEM so "cache"/"caching"/"cached" jointly
+  // clear the ">= 2 docs" discriminativeness bar. But the SELECTED term must be a SURFACE
+  // form: the emitted terms are fed back into `observations_fts MATCH` (search-engine.mjs),
+  // and that index uses FTS5's DEFAULT unicode61 tokenizer — NO stemming (verified: MATCH
+  // "cach" returns zero rows, only "caching"/"cache" match). Emitting a bare stem would
+  // silently match nothing and kill expansion recall. Track each stem's surface forms with
+  // their occurrence counts and emit the most frequent (best-matchable) surface.
+  const stemDocCount = {};      // stem -> # of top docs it appears in (the >=2 bar)
+  const stemSurfaces = {};      // stem -> Map(surface -> total occurrences)
   const docCount = Math.min(results.length, 8);
   for (let i = 0; i < docCount; i++) {
     const r = results[i];
     const text = ((r.title || '') + ' ' + (r.narrative || '')).toLowerCase();
-    const tokens = text.replace(/[^a-z0-9_-]/g, ' ').split(/\s+/)
-      .map(t => porterStem(t))
-      .filter(t => t.length >= 3 && !PRF_STOP_WORDS.has(t) && !queryTokens.has(t));
-    const seen = new Set();
-    for (const t of tokens) {
-      if (seen.has(t)) continue;
-      seen.add(t);
-      termFreq[t] = (termFreq[t] || 0) + 1;
+    const surfaces = text.replace(/[^a-z0-9_-]/g, ' ').split(/\s+/).filter(t => t.length >= 3);
+    const docStems = new Set();
+    for (const surface of surfaces) {
+      // Stop-word filter at BOTH surface and stem level: PRF_STOP_WORDS lists surface
+      // inflections ("changed"/"updated"/"files") whose porter stem ("chang"/"updat") is
+      // not itself listed, so a stem-only check would let the surface through to emission.
+      if (PRF_STOP_WORDS.has(surface)) continue;
+      const stem = porterStem(surface);
+      if (stem.length < 3 || PRF_STOP_WORDS.has(stem) || queryTokens.has(stem)) continue;
+      const sm = (stemSurfaces[stem] ||= new Map());
+      sm.set(surface, (sm.get(surface) || 0) + 1);
+      docStems.add(stem);
     }
+    for (const stem of docStems) stemDocCount[stem] = (stemDocCount[stem] || 0) + 1;
   }
 
-  // Select terms appearing in >= 2 top docs (discriminative, not noise)
-  return Object.entries(termFreq)
+  // Select stems appearing in >= 2 top docs (discriminative, not noise), emitting the
+  // most frequent surface form of each so the term actually matches the unstemmed index.
+  return Object.entries(stemDocCount)
     .filter(([, count]) => count >= 2)
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit)
-    .map(([term]) => term);
+    .map(([stem]) => {
+      let best = null, bestN = -1;
+      for (const [surface, n] of stemSurfaces[stem]) {
+        if (n > bestN) { best = surface; bestN = n; }
+      }
+      return best;
+    });
 }
 
 // ─── Concept Co-occurrence Query Expansion ─────────────────────────────────

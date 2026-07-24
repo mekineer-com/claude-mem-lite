@@ -2,6 +2,25 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.57.0 — multi-face audit batch: retrieval/scoring correctness, runtime hardening, data-layer atomicity
+
+Lands the accumulated fixes from the five-face audit (algo / security / data / prod / arch). No breaking changes; the retrieval fixes only alter behavior on paths described below.
+
+**Retrieval / scoring (algo).**
+- PRF expansion now emits FTS-matchable **surface forms**, not porter **stems** (`search-scoring.mjs::extractPRFTerms`). `observations_fts` uses FTS5's default `unicode61` tokenizer (no stemming — verified: `MATCH "cach"` returns 0 rows), so the old stemmed terms fed into `observations_fts MATCH` silently matched nothing and quietly lost pseudo-relevance-feedback recall on the **default** search path. Stems still bucket morphological variants for the ≥2-doc discriminativeness bar; the selected term is the most frequent surface form. Stop-words now filter at both surface and stem level. denoise-ab A/B: NEUTRAL, all behavioral probes green.
+- TF-IDF vocabulary truncation reserves a quota (`VOCAB_RARE_TERM_FRACTION`) for the highest-IDF rare tail so `df×idf` ranking (which peaks at mid-frequency) can no longer drop the discriminative low-frequency identifiers first when the candidate set exceeds `VOCAB_DIM`. Vector arm is default-off; index order unchanged.
+- Cross-source lone-hit banding no longer mis-scales the vector obs leg: RRF-fused (`≈1/(60+rank)`) and raw-cosine obs scores are tagged `scoreScale:'vector'`, excluded from the BM25 `globalMaxAbs`, and a lone vector hit is banded neutrally instead of being sunk by an incomparable near-zero ratio. Vector arm default-off.
+
+**Security hardening.** `RUNTIME_DIR` is now created `0o700` and a pre-existing world-readable dir is chmod-tightened at the hook layer (not only at MCP-server startup), and the session + episode-flush files that carry captured paths + scrubbed activity are written `0o600`. Closes the shared-host local-read gap for runtime aux files. The `CLAUDE_MEM_SKIP_SIG_VERIFY` bypass now emits a loud session-visible warning.
+
+**Data layer.** Explicit supersession runs inside the insert transaction (`lib/save-observation.mjs`) so "write correction, retire predecessors" commits atomically. The registry DB gained a `schema_version` guard + `resources_fts` column-drift self-heal, closing the silent-write bug class the memory DB already fixed. Restore rebuilds the FTS/vector derived columns; export/restore now prints an explicit note that the relationship graph does not round-trip.
+
+**Production / operability.** `mcp-spawns.log` gained a 14-day retention window matching the sibling JSONL sinks; POSIX-only path splitting that mis-handled Windows paths is fixed (file-history recall); `mem_save` content size caps and WAL-recovery paths gained coverage.
+
+**Architecture.** `recent` now flows through a shared core (`lib/recent-core.mjs`) instead of CLI and MCP building the SQL independently; the `utils.mjs` ↔ `project-utils.mjs` circular import is broken (`project-utils.mjs` is now a leaf), guarded by `tests/import-graph.test.mjs`.
+
+4006 tests pass (233 files), eslint clean, knip at its intentional 30-export floor.
+
 ## v3.56.1 — smoke-tarball.mjs: parse both `npm pack --json` shapes (npm 10 array / npm 12 object)
 
 Dev/CI-only follow-up to v3.56.0 — no user-facing or shipped-package change. The release gate's tarball smoke test (`scripts/smoke-tarball.mjs`, not in the published `files`) read `JSON.parse(npm pack --json)[0].filename`, but npm 12 changed that output from an array `[{filename, …}]` to an object keyed by package name `{"claude-mem-lite": {…}}` with no `filename` field — so the script crashed with `Cannot read properties of undefined (reading 'filename')`. It now normalizes both shapes and derives the canonical pack name (`<name>-<version>.tgz`, scope `@` dropped, `/` → `-`) when `filename` is absent. CI still runs npm 10 so this was invisible on the release gate; the fix keeps that gate working once CI moves to npm 12 and unbreaks running the smoke test locally on npm 12. Same npm-12 default-script-block root cause as v3.56.0's `-32000` fix.

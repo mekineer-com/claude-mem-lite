@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters } from './utils.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters, basenameAnySep } from './utils.mjs';
 import { citeFactorJs } from './scoring-sql.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
@@ -376,7 +376,9 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
 export function recallForFile(db, filePath, project) {
   if (!db || !filePath) return [];
   try {
-    const basename = filePath.split('/').pop();
+    // Both separators: filePath comes from a hook payload written by the
+    // CLIENT's OS, so a Windows path can reach a POSIX host (and vice versa).
+    const basename = basenameAnySep(filePath);
     const cutoff = Date.now() - FILE_RECALL_LOOKBACK_MS;
     // Escape SQL LIKE wildcards in filename to prevent injection
     const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');

@@ -3,7 +3,7 @@
 
 import { execSync, execFileSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, mkdtempSync, copyFileSync, cpSync, renameSync, symlinkSync, unlinkSync, readdirSync, statSync, lstatSync } from 'fs';
-import { join, resolve, dirname, isAbsolute } from 'path';
+import { join, resolve, dirname, isAbsolute, basename } from 'path';
 import { homedir, tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { createRequire } from 'node:module';
@@ -433,7 +433,7 @@ if (IS_DEV) {
   try {
     const pruned = pruneStaleInstallFiles(DATA_DIR, SOURCE_FILES);
     if (pruned.length > 0) {
-      ok(`Pruned ${pruned.length} stale file(s): ${pruned.map(p => p.split('/').pop()).join(', ')}`);
+      ok(`Pruned ${pruned.length} stale file(s): ${pruned.map(p => basename(p)).join(', ')}`);
     }
   } catch (e) { /* prune is best-effort — never block install */ void e; }
 }

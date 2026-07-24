@@ -3,7 +3,7 @@
 // CLAUDE_MEM_DIR temp dirs, so export (DB-A) → restore (DB-B) exercises the true
 // cross-DB round-trip the pre-fix codebase had no command for.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
@@ -29,17 +29,14 @@ function initDb(dataDir) {
   return db;
 }
 
-function runCli(args, dataDir) {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI_PATH, ...args], {
-      encoding: 'utf8', timeout: 15000,
-      env: { ...process.env, CLAUDE_MEM_DIR: dataDir, CLAUDE_PROJECT_DIR: dataDir, CLAUDE_MEM_HOOK_RUNNING: undefined },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return { stdout, stderr: '', exitCode: 0 };
-  } catch (e) {
-    return { stdout: e.stdout?.toString() || '', stderr: e.stderr?.toString() || '', exitCode: e.status ?? 1 };
-  }
+// spawnSync (not execFileSync): stderr must be readable on SUCCESS too, since the
+// backup-fidelity caveat rides stderr so stdout stays a clean JSON/JSONL stream.
+function runCli(args, dataDir, extraEnv = {}) {
+  const r = spawnSync(process.execPath, [CLI_PATH, ...args], {
+    encoding: 'utf8', timeout: 15000,
+    env: { ...process.env, CLAUDE_MEM_DIR: dataDir, CLAUDE_PROJECT_DIR: dataDir, CLAUDE_MEM_HOOK_RUNNING: undefined, ...extraEnv },
+  });
+  return { stdout: r.stdout || '', stderr: r.stderr || '', exitCode: r.status ?? 1 };
 }
 
 describe('D#25 export → restore round-trip', () => {
@@ -171,6 +168,73 @@ describe('D#25 export → restore round-trip', () => {
     expect(r.stdout).toMatch(/2 restored/);
   });
 
+  // P3-8: restore saves via saveObservation (vector text = title + content + lesson),
+  // then re-applies concepts / facts / search_aliases / text with a raw UPDATE. The FTS
+  // `text` column re-syncs through the _au trigger, but nothing rebuilt the TF-IDF
+  // vector — so a restored row's vector silently omitted every field applied by that
+  // second write. Here "zqxwombat" lives ONLY in search_aliases, so the stored vector
+  // can match the canonical vector for the row's final field state only if the rebuild
+  // fires. Vectors are off by default, so the arm is switched on for this test.
+  it('rebuilds the TF-IDF vector after the restored signal fields are applied', async () => {
+    const { rebuildVocabulary, getVocabulary, computeVector, vecTextForRow, _resetVocabCache } = await import('../tfidf.mjs');
+    const prevVec = process.env.CLAUDE_MEM_VECTORS;
+    process.env.CLAUDE_MEM_VECTORS = '1';
+    try {
+      // Seed the DESTINATION db with a vocabulary: 8 docs so "deadlock" (df=5) and
+      // "zqxwombat" (df=3) both land in vocab with non-zero IDF.
+      const seed = initDb(dstDir);
+      insertSession(seed, { id: 'vocab-sess', project: 'vocabfill', memoryId: 'vocab-sess' });
+      for (let i = 0; i < 8; i++) {
+        insertObs(seed, {
+          sessionId: 'vocab-sess', project: 'vocabfill', type: 'discovery',
+          title: `filler ${i}`,
+          narrative: `${i < 5 ? 'deadlock' : 'filler'} ${i < 3 ? 'zqxwombat' : 'otherterm'} in the pool handler ${i}`,
+        });
+      }
+      _resetVocabCache();
+      rebuildVocabulary(seed);
+      seed.close();
+
+      // Backup row: alias term appears in NEITHER title nor narrative.
+      const vecFile = join(dstDir, 'vec.jsonl');
+      writeFileSync(vecFile, JSON.stringify({
+        title: 'restored vector row', type: 'bugfix', project: 'restoredproj',
+        narrative: 'deadlock occurred in the pool', search_aliases: 'zqxwombat',
+        importance: 2, created_at_epoch: Date.now(),
+      }) + '\n');
+
+      const r = runCli(['restore', vecFile], dstDir, { CLAUDE_MEM_VECTORS: '1' });
+      expect(r.stdout).toMatch(/1 restored/);
+
+      const db = new Database(join(dstDir, 'claude-mem-lite.db'));
+      const row = db.prepare(`SELECT id, title, narrative, concepts, lesson_learned, search_aliases
+                              FROM observations WHERE title = 'restored vector row'`).get();
+      const stored = db.prepare('SELECT vector FROM observation_vectors WHERE observation_id = ?').get(row.id)?.vector;
+      _resetVocabCache();
+      const vocab = getVocabulary(db);
+      db.close();
+
+      expect(row.search_aliases).toBe('zqxwombat');
+      expect(stored, 'restored row has no vector at all').toBeDefined();
+      const canonical = Buffer.from(computeVector(vecTextForRow(row), vocab).buffer);
+      // Pre-fix the stored vector was built from title+narrative only → mismatch.
+      expect(Buffer.compare(stored, canonical)).toBe(0);
+    } finally {
+      if (prevVec === undefined) delete process.env.CLAUDE_MEM_VECTORS;
+      else process.env.CLAUDE_MEM_VECTORS = prevVec;
+      _resetVocabCache();
+    }
+  });
+
+  it('leaves observation_vectors untouched when the vector arm is disabled (default)', () => {
+    writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir).stdout);
+    runCli(['restore', expFile], dstDir);
+    const db = new Database(join(dstDir, 'claude-mem-lite.db'));
+    const count = db.prepare('SELECT COUNT(*) c FROM observation_vectors').get().c;
+    db.close();
+    expect(count).toBe(0);
+  });
+
   it('rejects a non-export file gracefully (no crash)', () => {
     const bad = join(dstDir, 'bad.txt');
     writeFileSync(bad, 'this is not an export\n');
@@ -194,6 +258,29 @@ describe('D#25 export → restore round-trip', () => {
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toMatch(/2 restored/);
     expect(r.stdout).toMatch(/1 malformed\/failed from 3 row\(s\)/);
+  });
+
+  // P3-6: export/restore is framed as "backup" in the README and in cmdRestore's own
+  // header, but the format deliberately drops the relationship graph — export filters
+  // superseded rows and omits related_ids, and restore re-inserts under fresh
+  // AUTOINCREMENT ids, so no cross-link could survive even if it were exported. The
+  // omission is a documented design tradeoff (id remap makes stored ids stale); the
+  // defect is that nothing at the point of use says so, so a user reasonably reads
+  // "2 restored" as full fidelity.
+  it('restore output states that related_ids / supersession links are not carried across', () => {
+    writeFileSync(expFile, runCli(['export', '--format', 'jsonl'], srcDir).stdout);
+    const r = runCli(['restore', expFile], dstDir);
+    const all = r.stdout + r.stderr;
+    expect(all).toMatch(/related_ids/);
+    expect(all).toMatch(/supersession|superseded/i);
+    expect(all).toMatch(/not carried|not preserved|dropped/i);
+  });
+
+  it('export warns at backup-creation time that the relationship graph is omitted', () => {
+    const exp = runCli(['export', '--format', 'jsonl'], srcDir);
+    // stdout must stay a clean machine-readable stream — the caveat rides stderr.
+    expect(exp.stdout).not.toMatch(/related_ids/);
+    expect(exp.stderr).toMatch(/related_ids/);
   });
 
   it('remaps ids — no PK collision when restoring into a DB that already has rows', () => {

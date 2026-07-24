@@ -1,4 +1,8 @@
 // claude-mem-lite: LLM-powered database optimization
+// SHARED ENGINE — the `hook-` prefix is historical, not a scope. All three entry
+// surfaces import this: hook.mjs (handleLLMOptimize), server.mjs and mem-cli.mjs
+// (optimizePreview/optimizeRun), plus a lazy import from lib/save-enrich.mjs. Do not
+// assume hook-pipeline session lifecycle or single-writer concurrency here.
 // Background worker for intelligent maintenance: re-enrich, normalize, cluster-merge, smart-compress
 // Triggered from auto-maintain (24h) or manually via mem_optimize MCP tool / CLI
 

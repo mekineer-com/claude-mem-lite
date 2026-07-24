@@ -220,3 +220,51 @@ describe('hook-launcher self-heal', () => {
     expect(existsSync(join(root, 'runtime', 'hook-launcher-broken'))).toBe(false);
   });
 });
+
+// The updater renames files into the install dir one at a time — atomic per file,
+// not per file SET. A hook process that starts mid-loop can resolve hook.mjs from
+// the old version and one of its imports from the new one. The updater marks that
+// window; the launcher skips the fire rather than import a mixed module graph.
+describe('hook-launcher swap barrier (audit P2-4)', () => {
+  const writeMarker = (root, payload) => {
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(join(root, 'runtime', 'swap-in-progress'), JSON.stringify(payload));
+  };
+
+  it('skips the fire (exit 0, entry never imported) while a swap is in progress', () => {
+    const root = makeInstall('cml-launcher-swap');
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-RAN\\n");\n');
+    writeMarker(root, { pid: process.pid, ts: Date.now() });   // live holder
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).not.toContain('ENTRY-RAN');
+  });
+
+  it('runs normally when the marker is stale — a killed updater cannot mute hooks forever', () => {
+    const root = makeInstall('cml-launcher-swap-stale');
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-RAN\\n");\n');
+    writeMarker(root, { pid: process.pid, ts: Date.now() - 10 * 60 * 1000 });
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-RAN');
+  });
+
+  it('runs normally when the marker names a dead pid', () => {
+    const root = makeInstall('cml-launcher-swap-dead');
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-RAN\\n");\n');
+    writeMarker(root, { pid: 0x7ffffffe, ts: Date.now() });   // not a live process
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-RAN');
+  });
+
+  it('runs normally when the marker is truncated or unparseable', () => {
+    const root = makeInstall('cml-launcher-swap-torn');
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-RAN\\n");\n');
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(join(root, 'runtime', 'swap-in-progress'), '{"pid":12');
+    const r = runLauncher(root, ['entry.mjs']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-RAN');
+  });
+});

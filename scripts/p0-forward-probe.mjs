@@ -9,7 +9,7 @@ import { readdirSync, statSync, createReadStream, copyFileSync, unlinkSync } fro
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { homedir, tmpdir } from 'node:os';
-import { noisePenaltyClause } from '/mnt/data_ssd/dev/projects/mem/scoring-sql.mjs';
+import { noisePenaltyClause } from '../scoring-sql.mjs';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 
 const MEM_DB = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'claude-mem-lite.db');

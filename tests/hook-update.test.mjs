@@ -894,3 +894,58 @@ describe('release signature verification (P1 supply-chain)', () => {
   });
 });
 
+
+// A hard kill (SIGKILL / power loss) inside the rename loop leaves the install
+// half-swapped: the try/catch rollback and the MED-5 smoke gate only run on paths
+// the process survives to reach. The backup dir is the evidence — every normal exit
+// (success, smoke-fail, error) deletes it — so finding one on the next install entry
+// means a prior swap was interrupted and must be finished before another one starts.
+describe('interrupted-swap recovery (audit P2-5)', () => {
+  it('finishes the rollback of a leftover backup dir, restoring the pre-swap files', async () => {
+    const { recoverInterruptedSwaps } = await loadModule();
+    const target = makeDir('mem-swap-target');
+    mkdirSync(join(target, 'lib'), { recursive: true });
+    // Half-applied state: hook.mjs already switched to the new version, lib/late.mjs
+    // was backed up but the process died before its replacement landed.
+    writeFileSync(join(target, 'hook.mjs'), '// NEW hook');
+    const backupDir = join(target, '.update-backup-1700000000000-4242');
+    mkdirSync(join(backupDir, 'lib'), { recursive: true });
+    writeFileSync(join(backupDir, 'hook.mjs'), '// OLD hook');
+    writeFileSync(join(backupDir, 'lib', 'late.mjs'), '// OLD late');
+    writeFileSync(join(backupDir, '.swap-journal.json'), JSON.stringify({
+      backedUp: ['hook.mjs', 'lib/late.mjs'], installed: ['hook.mjs'],
+    }));
+
+    expect(recoverInterruptedSwaps(target)).toBe(1);
+
+    expect(readFileSync(join(target, 'hook.mjs'), 'utf8')).toBe('// OLD hook');
+    expect(readFileSync(join(target, 'lib', 'late.mjs'), 'utf8')).toBe('// OLD late');
+    expect(existsSync(backupDir)).toBe(false);
+  });
+
+  it('sweeps orphan staging dirs and is a no-op on a clean install dir', async () => {
+    const { recoverInterruptedSwaps } = await loadModule();
+    const target = makeDir('mem-swap-clean');
+    writeFileSync(join(target, 'hook.mjs'), '// current');
+    const staging = join(target, '.update-staging-1700000000000-4242');
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(join(staging, 'hook.mjs'), '// staged');
+
+    expect(recoverInterruptedSwaps(target)).toBe(0);   // staging alone is not a torn swap
+    expect(existsSync(staging)).toBe(false);
+    expect(readFileSync(join(target, 'hook.mjs'), 'utf8')).toBe('// current');
+    expect(recoverInterruptedSwaps(target)).toBe(0);   // idempotent
+  });
+
+  it('tolerates a backup dir with no journal (killed before the first rename)', async () => {
+    const { recoverInterruptedSwaps } = await loadModule();
+    const target = makeDir('mem-swap-nojournal');
+    writeFileSync(join(target, 'hook.mjs'), '// current');
+    const backupDir = join(target, '.update-backup-1700000000000-99');
+    mkdirSync(backupDir, { recursive: true });
+
+    expect(recoverInterruptedSwaps(target)).toBe(1);
+    expect(existsSync(backupDir)).toBe(false);
+    expect(readFileSync(join(target, 'hook.mjs'), 'utf8')).toBe('// current');
+  });
+});

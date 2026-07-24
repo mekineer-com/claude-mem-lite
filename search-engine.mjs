@@ -478,12 +478,14 @@ export function searchObservationsHybrid(db, ctx) {
           if (args.importance && (obs.importance ?? 1) < args.importance) continue;
           if (args.branch && obs.branch !== args.branch) continue;
           if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
-          resultMap.set(vr.id, { source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, lesson_learned: obs.lesson_learned, snippet: '' });
+          resultMap.set(vr.id, { source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, created_at: obs.created_at, created_at_epoch: obs.created_at_epoch, importance: obs.importance, files_modified: obs.files_modified, lesson_learned: obs.lesson_learned, snippet: '' });
         }
       }
+      // The WHOLE obs leg is now on the RRF scale (score = -rrfScore ≈ 1/(60+rank)), not
+      // BM25 — tag every row so cross-source lone-hit banding treats it correctly (P2-12).
       const reordered = rrfRanking
         .filter(rr => resultMap.has(rr.id))
-        .map(rr => ({ ...resultMap.get(rr.id), score: -rr.rrfScore }));
+        .map(rr => ({ ...resultMap.get(rr.id), score: -rr.rrfScore, scoreScale: 'vector' }));
       results.length = 0;
       results.push(...reordered);
     } else {
@@ -496,7 +498,8 @@ export function searchObservationsHybrid(db, ctx) {
         if (args.importance && (obs.importance ?? 1) < args.importance) continue;
         if (args.branch && obs.branch !== args.branch) continue;
         if (!includeNoise && obs.title && LOW_SIGNAL_TITLE.test(obs.title)) continue;
-        results.push({ source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, importance: obs.importance, files_modified: obs.files_modified, lesson_learned: obs.lesson_learned, score: -vr.similarity, snippet: '' });
+        // Raw cosine similarity scale (≈0.1-1), also not BM25-comparable → tag it (P2-12).
+        results.push({ source: 'obs', id: obs.id, type: obs.type, title: obs.title, subtitle: obs.subtitle, project: obs.project, date: obs.created_at, created_at: obs.created_at, created_at_epoch: obs.created_at_epoch, importance: obs.importance, files_modified: obs.files_modified, lesson_learned: obs.lesson_learned, score: -vr.similarity, snippet: '', scoreScale: 'vector' });
       }
     }
   } catch (e) { debugCatch(e, 'searchObservationsHybrid-vector'); }

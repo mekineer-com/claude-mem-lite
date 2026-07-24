@@ -133,6 +133,13 @@ const INVOCATIONS_SCHEMA = `
     ON invocations(created_at);
 `;
 
+// Canonical indexed-column list for resources_fts, in FTS5_SCHEMA order (see the BM25
+// weight note above — order is load-bearing). Drift from this list triggers a rebuild.
+const FTS5_COLUMNS = [
+  'trigger_patterns', 'keywords', 'capability_summary', 'intent_tags',
+  'use_cases', 'domain_tags', 'tech_stack', 'name',
+];
+
 const PREINSTALLED_SCHEMA = `
   CREATE TABLE IF NOT EXISTS preinstalled (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +158,73 @@ const PREINSTALLED_SCHEMA = `
   CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_type_name
     ON preinstalled(type, name);
 `;
+
+// ─── Schema version ──────────────────────────────────────────────────────────
+
+// Registry DB schema version. Tracked independently of schema.mjs's
+// CURRENT_SCHEMA_VERSION — resource-registry.db is a separate file with its own
+// migration history. v1 = the shape at the time version tracking was introduced; every
+// pre-existing (un-versioned) registry in the wild ADOPTS v1 on first open, keeping its
+// data. Bump when a migration below changes a layout an older binary would mis-handle.
+export const REGISTRY_SCHEMA_VERSION = 1;
+
+/**
+ * Forward-incompatibility guard, mirroring initSchema's in schema.mjs. If a NEWER
+ * claude-mem-lite wrote this registry, this (older) build re-applying its own migrations
+ * over the newer layout corrupts it silently. Throw instead. MUST run before any DDL so
+ * a newer DB is left untouched.
+ * @param {Database} db
+ */
+function assertRegistryNotNewer(db) {
+  let row;
+  try {
+    row = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+  } catch {
+    return; // table absent = pre-version DB → adopted (stamped) at the end of init
+  }
+  if (row && typeof row.version === 'number' && row.version > REGISTRY_SCHEMA_VERSION) {
+    throw new Error(
+      `Registry DB schema is v${row.version} but this claude-mem-lite binary supports up to v${REGISTRY_SCHEMA_VERSION}. ` +
+      `A newer version wrote this DB; upgrade claude-mem-lite (npm i -g claude-mem-lite@latest) or point CLAUDE_MEM_DIR to a fresh directory.`
+    );
+  }
+}
+
+/**
+ * Column-drift self-heal for resources_fts. Deliberately NOT routed through the exported
+ * ensureFTS in schema.mjs: that helper creates the index without this one's `tokenize=`
+ * clause, and installs `<table>_ai/_ad/_au` triggers that would double-write alongside
+ * the res_fts_* set here. Its drift check also compares column SETS, while resources_fts
+ * is order-sensitive (registry-retriever's bm25(resources_fts, 3,3,3,2,2,1,1,1) weights
+ * by position). Mirrors ensureEventsFTS in schema.mjs, which exists for the same reason.
+ *
+ * Without this, widening FTS5_SCHEMA leaves existing DBs on the NARROW index while
+ * TRIGGERS_SCHEMA is re-exec'd from the wider list on every open — so every
+ * `INSERT INTO resources` throws "no column named X" and the write is silently lost.
+ * @param {Database} db
+ * @returns {boolean} true if the index was recreated (caller must repopulate it)
+ */
+function ensureResourcesFts(db) {
+  const ftsRow = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_fts'`).get();
+  let recreated = false;
+  if (ftsRow) {
+    let existingCols = [];
+    try { existingCols = db.prepare(`PRAGMA table_info(resources_fts)`).all().map(c => c.name); }
+    catch { /* unreadable → treat as drifted, recreate */ }
+    // Element-wise so additions, removals AND reordering all count as drift.
+    const drifted = existingCols.length !== FTS5_COLUMNS.length
+      || FTS5_COLUMNS.some((c, i) => existingCols[i] !== c);
+    if (drifted) {
+      db.exec(`DROP TRIGGER IF EXISTS res_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS res_fts_update`);
+      db.exec(`DROP TRIGGER IF EXISTS res_fts_delete`);
+      db.exec(`DROP TABLE IF EXISTS resources_fts`);
+      recreated = true;
+    }
+  }
+  if (!ftsRow || recreated) db.exec(FTS5_SCHEMA);
+  return recreated;
+}
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
@@ -172,6 +246,10 @@ export function ensureRegistryDb(dbPath) {
   db.pragma('busy_timeout = 5000');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
+
+  // Before ANY DDL: refuse a registry written by a newer client (see assertRegistryNotNewer).
+  // Close the handle on the way out so the caller isn't left leaking an open file.
+  try { assertRegistryNotNewer(db); } catch (e) { db.close(); throw e; }
 
   db.exec(RESOURCES_SCHEMA);
 
@@ -243,20 +321,21 @@ export function ensureRegistryDb(dbPath) {
     }
   } catch (e) { debugCatch(e, 'resources-source-check-migration'); }
 
-  // FTS5: create if not exists
-  const hasFts = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='resources_fts'`).get();
-  if (!hasFts) {
-    db.exec(FTS5_SCHEMA);
-  }
-  // Triggers: always ensure (IF NOT EXISTS) — fixes DBs where FTS5 was created without triggers
+  // FTS5: create if absent, or drop+recreate if the indexed columns have drifted from
+  // FTS5_COLUMNS (a stale narrow index silently kills every resources write — audit P2-6).
+  const ftsRecreated = ensureResourcesFts(db);
+  // Triggers: always ensure (IF NOT EXISTS) — fixes DBs where FTS5 was created without
+  // triggers, and reinstates the set ensureResourcesFts drops on drift.
   db.exec(TRIGGERS_SCHEMA);
 
   // The source-CHECK migration replaced the `resources` content table out from under
   // the external-content FTS index (content=resources), leaving resources_fts stale.
   // Rebuild it so a later DELETE's res_fts_delete trigger doesn't throw "database disk
   // image is malformed" against the mismatched index. Gated on the migration actually
-  // having run so we don't rebuild on every open.
-  if (resourcesRebuilt) {
+  // having run so we don't rebuild on every open. A drift-recreated index needs the same
+  // repopulation for the opposite reason: it starts EMPTY, so rows written before the
+  // drift would be unreachable through search forever.
+  if (resourcesRebuilt || ftsRecreated) {
     try { db.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')"); }
     catch (e) { debugCatch(e, 'resources-fts-rebuild-after-source-check'); }
   }
@@ -351,6 +430,15 @@ export function ensureRegistryDb(dbPath) {
   // Pre-existing DBs keep their old idx_invocations_resource_created; it's harmless.)
 
   db.exec(PREINSTALLED_SCHEMA);
+
+  // Stamp the version LAST — only after every table + migration above succeeded. This is
+  // also the ADOPTION path for pre-version DBs: they are stamped in place, never wiped or
+  // refused. Rewritten each open so exactly one row exists and it reflects this build.
+  db.exec('CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)');
+  db.transaction(() => {
+    db.exec('DELETE FROM schema_version');
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(REGISTRY_SCHEMA_VERSION);
+  })();
 
   return db;
 }
