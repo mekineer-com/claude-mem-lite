@@ -635,6 +635,32 @@ function smokeInstalledRelease(targetDir) {
       const p = join(targetDir, entry);
       if (existsSync(p)) execSync(`${q(process.execPath)} --check ${q(p)}`, { timeout: 10000, stdio: 'ignore' });
     }
+    // `cli.mjs help` exits without opening the DB, so it cannot see a
+    // present-but-unusable better-sqlite3 binding: npm >= 12 blocks
+    // install/lifecycle scripts by default, so the staging `npm install`
+    // above exits 0 with the native .node never compiled (a Node major bump
+    // strands a stale ABI the same way). Direct installs register server.mjs
+    // without the launch.mjs probe, so this gate is their only check. Probe
+    // in a child process (execSync so the unit-test mock intercepts, and so
+    // the running old-version process's require cache can't mask it); on
+    // failure rebuild with scripts enabled for just this dep — plain-rebuild
+    // fallback for older npm — then re-probe. A still-broken binding throws
+    // out of the try, smoke fails, and the caller rolls back to the old
+    // (working) install.
+    if (existsSync(join(targetDir, 'node_modules', 'better-sqlite3'))) {
+      const probeSrc = 'const{createRequire}=require("node:module");const D=createRequire(process.argv[1])("better-sqlite3");new D(":memory:").close();';
+      const probeCmd = `${q(process.execPath)} -e ${q(probeSrc)} ${q(join(targetDir, 'package.json'))}`;
+      try {
+        execSync(probeCmd, { timeout: 20000, stdio: 'ignore' });
+      } catch {
+        try {
+          execSync('npm rebuild better-sqlite3 --dangerously-allow-all-scripts', { cwd: targetDir, timeout: 120000, stdio: 'ignore' });
+        } catch {
+          execSync('npm rebuild better-sqlite3', { cwd: targetDir, timeout: 120000, stdio: 'ignore' });
+        }
+        execSync(probeCmd, { timeout: 20000, stdio: 'ignore' });
+      }
+    }
     return true;
   } catch (e) {
     debugLog('WARN', 'hook-update', `post-install smoke failed (rolling back): ${e.message}`);

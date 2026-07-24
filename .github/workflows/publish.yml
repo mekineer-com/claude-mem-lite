@@ -64,6 +64,16 @@ jobs:
           fi
           echo "All versions consistent: $VERSION"
 
+      - name: Generate npm-shrinkwrap (lock the publishable tarball)
+        # npm NEVER packs package-lock.json (even when listed in files[]), so
+        # bare `npx` / `npm i` installs of the registry tarball resolved the
+        # dependency tree UNLOCKED (only the overrides pins held). npm DOES
+        # pack npm-shrinkwrap.json — generate it from the lockfile at release
+        # time (not committed) so registry installs get the exact tested tree
+        # while dev flow keeps package-lock.json. Marketplace installs were
+        # already locked (git clone carries package-lock.json).
+        run: npm shrinkwrap
+
       - name: Smoke-test the publishable tarball
         # Gate the release on the riskiest path: npm pack → real npm install of the
         # tarball → better-sqlite3 native rebuild → import entry points → open a DB.
@@ -71,6 +81,8 @@ jobs:
         # install), hook-update mocks tarball I/O, completeness is static-only. A
         # missing files[] entry or a native ABI break would otherwise publish a
         # tarball that bricks every fresh `npx`/`npm i` install. (audit MED-4)
+        # Runs AFTER npm shrinkwrap so the smoked tarball is the locked shape
+        # that publish ships.
         run: node scripts/smoke-tarball.mjs
 
   publish:
@@ -89,6 +101,11 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Generate npm-shrinkwrap (lock the published tarball)
+        # Mirrors the validate job — see the rationale there. Must run before
+        # `npm publish` (each job has its own checkout).
+        run: npm shrinkwrap
 
       - name: Publish to npm
         # --provenance requires an OIDC-capable token (npm >=9.5). A legacy/classic

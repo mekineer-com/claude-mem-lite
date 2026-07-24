@@ -22,6 +22,7 @@ import {
 } from './memdir.mjs';
 import {
   writeManaged, removeManaged, isAdopted as claudeMdIsAdopted,
+  hasResidue as claudeMdHasResidue,
   needsRefresh, migrateLegacyMemoryDir, hasLegacyMemdirSentinel,
   claudeMdPath, detailDocPath,
 } from './claudemd.mjs';
@@ -311,8 +312,8 @@ function statusAll() {
 
   const known = listKnownProjectDirs();
   let adoptedCount = 0;
-  for (const dir of known) if (claudeMdIsAdopted(dir, PLUGIN_SLUG)) adoptedCount++;
-  log(`[adopt --status] known projects (~/.claude.json): ${known.length} scanned, ${adoptedCount} with a CLAUDE.md managed block.`);
+  for (const dir of known) if (claudeMdHasResidue(dir, PLUGIN_SLUG)) adoptedCount++;
+  log(`[adopt --status] known projects (~/.claude.json): ${known.length} scanned, ${adoptedCount} with a CLAUDE.md managed block or partial residue (detail doc/state).`);
   if (adoptedCount > 0) log('[adopt --status] run `claude-mem-lite unadopt --all` to remove every CLAUDE.md block.');
 
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT ? 'set' : 'unset';
@@ -347,16 +348,20 @@ function unadoptAll(args) {
 
   // 1. New scheme: scrub CLAUDE.md managed blocks across known project paths.
   const projectDirs = listKnownProjectDirs();
-  let blocks = 0;
+  let blocks = 0, partial = 0;
   for (const dir of projectDirs) {
-    if (!claudeMdIsAdopted(dir, PLUGIN_SLUG)) continue;
+    // hasResidue, not isAdopted: the sweep must also catch PARTIAL residue
+    // (block without detail doc, or an orphaned doc/state sidecar) —
+    // isAdopted's block-AND-doc gate skipped those projects forever.
+    if (!claudeMdHasResidue(dir, PLUGIN_SLUG)) continue;
     if (dryRun) {
-      log(`[unadopt --all --dry-run] ${dir} → would-remove CLAUDE.md block + detail doc`);
+      log(`[unadopt --all --dry-run] ${dir} → would-remove plugin residue (CLAUDE.md block and/or detail doc/state)`);
       blocks++;
       continue;
     }
     const r = removeManaged(dir, PLUGIN_SLUG);
     if (r.action === 'removed') { log(`[unadopt --all] ${dir} → removed`); blocks++; }
+    else { log(`[unadopt --all] ${dir} → cleaned partial residue (detail doc/state, no block)`); partial++; }
   }
 
   // 2. Legacy memory-dir cleanup across every memdir (foreign-content guarded).
@@ -372,7 +377,8 @@ function unadoptAll(args) {
   }
 
   log('');
-  log(`[unadopt --all] ${dryRun ? 'would remove' : 'removed'} ${blocks} CLAUDE.md block(s) across ${projectDirs.length} known project(s); ${legacy} legacy memory-dir sentinel(s) ${dryRun ? 'pending' : 'cleaned'}.`);
+  const partialNote = partial > 0 ? ` (+${partial} partial-residue cleanup(s))` : '';
+  log(`[unadopt --all] ${dryRun ? 'would remove' : 'removed'} ${blocks} CLAUDE.md block(s)${partialNote} across ${projectDirs.length} known project(s); ${legacy} legacy memory-dir sentinel(s) ${dryRun ? 'pending' : 'cleaned'}.`);
   if (projectDirs.length === 0) {
     log('[unadopt --all] no known projects found in ~/.claude.json — if a project was adopted but never opened in Claude Code, run `claude-mem-lite unadopt` from inside it.');
   }
@@ -389,7 +395,7 @@ export function cmdUnadopt(args = []) {
 
   const cwd = detectCwd();
   if (dryRun) {
-    const blockState = claudeMdIsAdopted(cwd, PLUGIN_SLUG) ? 'would-remove CLAUDE.md block + detail doc' : 'no CLAUDE.md block';
+    const blockState = claudeMdHasResidue(cwd, PLUGIN_SLUG) ? 'would-remove CLAUDE.md block + detail doc' : 'no CLAUDE.md block';
     const legacy = hasLegacyMemdirSentinel(cwd, PLUGIN_SLUG) ? 'would-clean legacy memory-dir sentinel' : 'no legacy residue';
     log(`[unadopt --dry-run] ${cwd}`);
     log(`  ${blockState}`);

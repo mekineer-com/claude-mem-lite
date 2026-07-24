@@ -114,12 +114,28 @@ test('package.json files array ships source-files.mjs and every SOURCE_FILES ent
   const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8'));
   const files = new Set(pkg.files);
   expect(files.has('source-files.mjs')).toBe(true);
-  // package.json and package-lock.json are implicitly included by npm in every
-  // tarball regardless of the files[] array — SOURCE_FILES lists them because
-  // install.mjs copies them to INSTALL_DIR so `npm install` can run there.
-  const IMPLICITLY_SHIPPED = new Set(['package.json', 'package-lock.json']);
-  const missingFromPkg = SOURCE_FILES.filter(f => !files.has(f) && !IMPLICITLY_SHIPPED.has(f));
+  // package.json is implicitly included by npm in every tarball. package-lock.json
+  // is the OPPOSITE: npm NEVER packs it, even when listed in files[] — registry
+  // installs are locked via npm-shrinkwrap.json instead, generated from the
+  // lockfile by `npm shrinkwrap` in the release workflow (see the guard test
+  // below) rather than committed. SOURCE_FILES still lists both because
+  // install.mjs copies them to INSTALL_DIR so `npm install` can run there —
+  // a DIRECTORY install does honor package-lock.json.
+  const NOT_PACKED_VIA_FILES = new Set(['package.json', 'package-lock.json']);
+  const missingFromPkg = SOURCE_FILES.filter(f => !files.has(f) && !NOT_PACKED_VIA_FILES.has(f));
   expect(missingFromPkg, `\npackage.json files missing SOURCE_FILES entries:\n  ${missingFromPkg.join('\n  ')}\n`).toEqual([]);
+});
+
+// Drift guard for the lockless-registry-install fix: npm refuses to pack
+// package-lock.json, so the ONLY way `npx claude-mem-lite` gets a locked
+// dependency tree is the release workflow generating npm-shrinkwrap.json
+// before pack/publish. If someone drops that step, installs silently float
+// their transitive tree again with no local test failing.
+test('release workflow generates npm-shrinkwrap before smoke and publish', () => {
+  const wf = readFileSync(resolve(ROOT, '.github/workflows/publish.yml'), 'utf8');
+  const shrinkwrapSteps = wf.match(/run: npm shrinkwrap/g) || [];
+  expect(shrinkwrapSteps.length, 'both validate and publish jobs must shrinkwrap').toBeGreaterThanOrEqual(2);
+  expect(wf.indexOf('npm shrinkwrap')).toBeLessThan(wf.indexOf('scripts/smoke-tarball.mjs'));
 });
 
 // Blind-spot closer: the SOURCE_FILES coverage test above only walks the 5 main

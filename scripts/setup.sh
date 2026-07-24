@@ -80,20 +80,22 @@ mkdir -p "$DATA_DIR/runtime" 2>/dev/null || true
 
 mark_deps_broken() {
   local reason="$1"
+  local repair="${2:-npm install --omit=dev}"
   # Embed reason + repair command so hook.mjs renders a complete error without
   # having to re-derive them. Delegate JSON serialization to node so embedded
   # quotes / shell metachars in $ROOT or $reason can't produce an invalid file
   # (bash `printf '"..%s.."'` cannot escape arbitrary strings safely; v2.79.1 fix).
   # shellcheck disable=SC2016  # node script single-quoted on purpose; vars passed via env (MARK_*), not shell expansion
-  MARK_REASON="$reason" MARK_ROOT="$ROOT" MARK_FLAG="$DEPS_FLAG" node -e '
+  MARK_REASON="$reason" MARK_ROOT="$ROOT" MARK_FLAG="$DEPS_FLAG" MARK_REPAIR="$repair" node -e '
     const fs = require("fs");
     const reason = process.env.MARK_REASON || "unknown";
     const root = process.env.MARK_ROOT || "";
+    const repair = process.env.MARK_REPAIR || "npm install --omit=dev";
     fs.writeFileSync(process.env.MARK_FLAG, JSON.stringify({
       ts: new Date().toISOString(),
       reason,
       root,
-      repair: `cd ${JSON.stringify(root)} && npm install --omit=dev`,
+      repair: `cd ${JSON.stringify(root)} && ${repair}`,
     }) + "\n");
   ' 2>/dev/null || true
 }
@@ -107,7 +109,6 @@ if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
   if [[ -d "$DATA_DIR/node_modules/better-sqlite3" ]]; then
     if ln -sfn "$DATA_DIR/node_modules" "$ROOT/node_modules" 2>/dev/null; then
       log_ok "Dependencies linked from $DATA_DIR"
-      mark_deps_ok
     fi
   fi
   # Slow path: npm install (first-time only, ~10-20s for native addon)
@@ -115,15 +116,96 @@ if [[ ! -d "$ROOT/node_modules/better-sqlite3" ]]; then
     log_info "Installing dependencies (first-time setup)..."
     if (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund 2>&1) >&2; then
       log_ok "Dependencies installed"
-      mark_deps_ok
     else
       log_warn "Dependency install failed — hooks may have limited functionality (flag: $DEPS_FLAG)"
       mark_deps_broken "npm install --omit=dev failed in plugin cache root"
     fi
   fi
-else
-  # Deps already present — make sure we don't keep stale broken flag around
-  mark_deps_ok
+fi
+
+# 6b. Binding probe: node_modules/better-sqlite3 PRESENT is not node binding
+#     WORKING. npm >= 12 blocks install/lifecycle scripts by default, so the
+#     `npm install` above exits 0 with the native .node binding never compiled
+#     (and a Node major upgrade strands a stale-ABI binding the same way) —
+#     pre-v3.58 this branch called mark_deps_ok on directory presence alone,
+#     leaving every hook dead with a false-green flag until the MCP server's
+#     own probe ran. Probe via the shared fix point lib/binding-probe.mjs
+#     (opens a :memory: DB; auto-rebuilds with --dangerously-allow-all-scripts,
+#     plain-rebuild fallback for older npm). The ABI-keyed marker lives inside
+#     node_modules/ — WITH the tree it certifies — so healthy sessions cost one
+#     stat, a new plugin-cache version dir (fresh node_modules) re-probes, and
+#     a Node upgrade (new ABI) re-probes. While broken, every SessionStart
+#     retries the rebuild until it heals.
+if [[ -d "$ROOT/node_modules/better-sqlite3" ]]; then
+  NODE_ABI="$(node -p 'process.versions.modules' 2>/dev/null || echo 0)"
+  BINDING_MARKER="$ROOT/node_modules/.mem-binding-ok-$NODE_ABI"
+  if [[ -f "$BINDING_MARKER" ]]; then
+    mark_deps_ok
+  # shellcheck disable=SC2016  # node script single-quoted on purpose; ROOT passed via env, not shell expansion
+  elif PROBE_ROOT="$ROOT" node --input-type=module -e '
+    // NOTE: this whole script sits in a single-quoted bash string — no
+    // apostrophes anywhere in it.
+    const { pathToFileURL } = await import("node:url");
+    const { join } = await import("node:path");
+    const root = process.env.PROBE_ROOT;
+    const libUrl = (f) => pathToFileURL(join(root, "lib", f)).href;
+    let helpers = null;
+    try {
+      const [probeMod, lockMod, dirMod] = await Promise.all(
+        ["binding-probe.mjs", "proc-lock.mjs", "resolve-data-dir.mjs"].map((f) => import(libUrl(f))));
+      helpers = { ...probeMod, ...lockMod, ...dirMod };
+    } catch {
+      // Probe helpers missing (half-installed tree) — fall back to a bare
+      // probe with no rebuild: a WORKING binding must still clear the flag,
+      // and a helperless broken tree is repaired by the hook-launcher path.
+      const { createRequire } = await import("node:module");
+      try {
+        const D = createRequire(join(root, "package.json"))("better-sqlite3");
+        new D(":memory:").close();
+        process.exit(0);
+      } catch (e) {
+        process.stderr.write(`[claude-mem-lite] binding probe: ${e.message}\n`);
+        process.exit(1);
+      }
+    }
+    // Probe first — read-only, no lock needed. Healthy binding exits here.
+    const first = await helpers.probeBetterSqlite3Binding(root);
+    if (first.ok) process.exit(0);
+    // Broken: rebuild ONLY under the shared install.lock (a second MCP launch
+    // or install.mjs repair rebuilding the same node_modules concurrently can
+    // tear the .node), and with the exec bounded to 20s — this script runs
+    // under the SessionStart hook cap (hooks.json timeout 30), and letting the
+    // hook SIGKILL a mid-flight node-gyp leaves a partial .node with no flag
+    // written. On lock-miss or timeout: mark broken and defer the heal to the
+    // MCP launch path (no hook cap, same lock).
+    const lockPath = join(helpers.resolveDataDir(process.env.CLAUDE_MEM_DIR), "runtime", "install.lock");
+    const release = helpers.acquireLock(lockPath);
+    if (!release) {
+      const firstLine = String(first.error).split("\n")[0];
+      process.stderr.write(`[claude-mem-lite] binding probe: ${firstLine} (another install/repair in flight — deferring heal)\n`);
+      process.exit(1);
+    }
+    let r;
+    try {
+      const { execSync } = await import("node:child_process");
+      r = await helpers.ensureBetterSqlite3Working(root, {
+        exec: (cmd, opts) => execSync(cmd, { ...opts, timeout: 20000 }),
+      });
+    } finally {
+      // process.exit skips finally blocks — exits live BELOW this so the
+      // lock is always released.
+      release();
+    }
+    if (!r.ok) { process.stderr.write(`[claude-mem-lite] binding probe: ${r.error}\n`); process.exit(1); }
+    if (r.action === "rebuilt") process.stderr.write("[claude-mem-lite] rebuilt better-sqlite3 binding for current Node ABI\n");
+  '; then
+    rm -f "$ROOT/node_modules/.mem-binding-ok-"* 2>/dev/null || true
+    touch "$BINDING_MARKER" 2>/dev/null || true
+    mark_deps_ok
+  else
+    log_warn "better-sqlite3 native binding unusable — hooks degraded until repaired (flag: $DEPS_FLAG)"
+    mark_deps_broken "better-sqlite3 binding probe/rebuild failed (npm >= 12 blocks compile scripts by default)" "npm rebuild better-sqlite3 --dangerously-allow-all-scripts"
+  fi
 fi
 
 # 7. MCP cleanup: one-shot purge of stale global MCP registrations.

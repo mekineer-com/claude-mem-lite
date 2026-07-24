@@ -207,6 +207,75 @@ describe('hook update lifecycle', () => {
     expect(readdirSync(dataDir).filter(name => name.startsWith('.update-'))).toHaveLength(0);
   });
 
+  // D#8 regression: `cli.mjs help` exits without opening the DB, so the smoke
+  // gate passed with a present-but-uncompiled better-sqlite3 (npm >= 12 blocks
+  // lifecycle scripts and exits 0 without producing the .node binding). The
+  // smoke gate now probes the binding in a child process when the switched-in
+  // node_modules contains better-sqlite3, rebuilding with scripts enabled on
+  // failure. Fixtures without node_modules/better-sqlite3 skip the probe.
+  describe('post-install smoke: native binding probe', () => {
+    // npm install lays down node_modules/better-sqlite3 in staging so the
+    // switched-in tree triggers the probe branch.
+    const installWithBinding = (extra) => (cmd, opts = {}) => {
+      const c = String(cmd);
+      if (c.startsWith('npm install')) {
+        mkdirSync(join(opts.cwd, 'node_modules', 'better-sqlite3'), { recursive: true });
+        return '';
+      }
+      return extra(c);
+    };
+
+    it('probes the binding after the swap and passes a healthy install', async () => {
+      const dataDir = makeDataDir();
+      const releaseDir = makeReleaseDir();
+      let probes = 0;
+      mockedExecSync.mockImplementation(installWithBinding((c) => {
+        if (c.includes('createRequire')) probes++;
+        return '';
+      }));
+      const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+      expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
+      expect(probes).toBe(1);
+    });
+
+    it('rebuilds with scripts enabled when the probe fails, then re-probes (npm >= 12 heal)', async () => {
+      const dataDir = makeDataDir();
+      const releaseDir = makeReleaseDir();
+      let probes = 0;
+      const rebuilds = [];
+      mockedExecSync.mockImplementation(installWithBinding((c) => {
+        if (c.includes('createRequire')) {
+          probes++;
+          if (probes === 1) throw new Error('Could not locate the bindings file');
+          return '';
+        }
+        if (c.startsWith('npm rebuild')) { rebuilds.push(c); return ''; }
+        return '';
+      }));
+      const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+      expect(await installExtractedRelease(releaseDir, dataDir)).toBe(true);
+      expect(probes).toBe(2);
+      expect(rebuilds).toEqual(['npm rebuild better-sqlite3 --dangerously-allow-all-scripts']);
+    });
+
+    it('rolls back when the binding stays broken after rebuild', async () => {
+      const dataDir = makeDataDir();
+      const releaseDir = makeReleaseDir();
+      mockedExecSync.mockImplementation(installWithBinding((c) => {
+        if (c.includes('createRequire')) throw new Error('Could not locate the bindings file');
+        if (c.startsWith('npm rebuild')) return '';
+        return '';
+      }));
+      const { installExtractedRelease } = await loadModule({ CLAUDE_MEM_DIR: dataDir });
+
+      expect(await installExtractedRelease(releaseDir, dataDir)).toBe(false);
+      expect(readFileSync(join(dataDir, 'hook.mjs'), 'utf8')).toContain('old hook');
+      expect(readdirSync(dataDir).filter(name => name.startsWith('.update-'))).toHaveLength(0);
+    });
+  });
+
   // Regression: scripts/ is curated to HOOK_SCRIPT_FILES only — dev-only
   // helpers (mock-claude.mjs, extract-repos.mjs, p0-forward-probe.mjs…) and
   // any future subdirectories MUST NOT leak into ~/.claude-mem-lite/scripts/.

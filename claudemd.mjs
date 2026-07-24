@@ -99,6 +99,20 @@ export function isAdopted(cwd, slug) {
 }
 
 /**
+ * Any trace of adoption that unadopt should clean: managed block OR detail doc
+ * OR state sidecar. Deliberately weaker than isAdopted (whose AND lets a
+ * half-written adopt self-heal on the next SessionStart): the unadopt sweep
+ * gated on isAdopted skipped partial residue forever — e.g. a user deleted the
+ * detail doc but the CLAUDE.md block remained, and `unadopt --all` never
+ * removed it. removeManaged cleans all three pieces, so sweep on any of them.
+ */
+export function hasResidue(cwd, slug) {
+  return readBlock(cwd, slug).body !== null
+    || existsSync(detailDocPath(cwd, slug))
+    || existsSync(stateFilePath(cwd, slug));
+}
+
+/**
  * Whether the installed block/doc has drifted from the shipped content — i.e.
  * a version bump or a template edit means we should refresh. Returns true when
  * the block is missing, the version differs, the block body differs, or the

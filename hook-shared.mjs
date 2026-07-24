@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
-import { ensureDb, DB_DIR } from './schema.mjs';
+import { ensureDbWithWalRecovery, DB_DIR } from './schema.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
 // fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
@@ -154,7 +154,9 @@ export function createSessionId() {
 
 export function openDb() {
   try {
-    return ensureDb();
+    // WAL-corruption self-heal (was server.mjs-only): without it, hooks stayed
+    // silently dead (null DB) on a corrupt WAL until the next MCP server start.
+    return ensureDbWithWalRecovery();
   } catch {
     return null;
   }

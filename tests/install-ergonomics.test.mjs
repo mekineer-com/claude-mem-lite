@@ -5,7 +5,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdirSync, writeFileSync, rmSync, existsSync, symlinkSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, symlinkSync, copyFileSync, readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -30,13 +30,29 @@ function envWithoutPluginRoot(extra = {}) {
   return { ...rest, ...extra };
 }
 
-describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
+describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 fix)', () => {
   // v2.80: each test asserts existsSync(REPO_NODE_MODULES) at entry so the
   // symlink-from-data-dir path can't silently fall back to the slow
   // npm-install branch when the test runner lacks node_modules (test-only
   // Docker stage, etc.). A dangling symlink would otherwise exercise the
   // wrong code path and report a false pass.
-  it('clears stale .deps-broken when node_modules/better-sqlite3 is already present (symlink path)', () => {
+  //
+  // D#6 contract change: directory PRESENCE alone no longer clears the flag —
+  // a PASSING binding probe (or a prior-probe ABI marker) does. npm >= 12
+  // blocks lifecycle scripts, so `npm install` exits 0 with better-sqlite3
+  // present but its native .node never compiled; the old presence-check
+  // cleared .deps-broken on exactly that broken state (false green).
+  // Fixtures get a hermetic node_modules: a real dir holding a symlink to the
+  // repo's better-sqlite3 (working binding), so probe passes and the ABI
+  // marker lands inside the fixture, never in the repo tree.
+  function makeWorkingNodeModules(parentDir) {
+    const nm = join(parentDir, 'node_modules');
+    mkdirSync(nm, { recursive: true });
+    symlinkSync(join(REPO_NODE_MODULES, 'better-sqlite3'), join(nm, 'better-sqlite3'));
+    return nm;
+  }
+
+  it('clears stale .deps-broken when a WORKING binding arrives via the symlink path (bare-probe fallback, no lib/)', () => {
     expect(existsSync(REPO_NODE_MODULES)).toBe(true);
     const home = makeTmpDir();
     try {
@@ -44,14 +60,17 @@ describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
       const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
       mkdirSync(join(dataDir, 'runtime'), { recursive: true });
       mkdirSync(pluginRoot, { recursive: true });
+      writeFileSync(join(pluginRoot, 'package.json'), '{"name":"fixture"}\n');
 
       // Seed a stale flag from a previous failing session
       const flag = join(dataDir, 'runtime', '.deps-broken');
       writeFileSync(flag, '{"ts":"old","reason":"prev"}\n');
       expect(existsSync(flag)).toBe(true);
 
-      // Symlink path: deps live in DATA_DIR/node_modules, setup.sh symlinks into pluginRoot
-      symlinkSync(REPO_NODE_MODULES, join(dataDir, 'node_modules'));
+      // Symlink path: deps live in DATA_DIR/node_modules, setup.sh symlinks into
+      // pluginRoot. No lib/binding-probe.mjs in the fixture root → exercises the
+      // bare-probe fallback (half-installed tree with a working binding).
+      makeWorkingNodeModules(dataDir);
 
       execFileSync('bash', [SETUP_PATH], {
         encoding: 'utf8',
@@ -65,16 +84,17 @@ describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
     }
   });
 
-  it('clears stale .deps-broken when node_modules already exists at pluginRoot (no-op path)', () => {
+  it('clears stale .deps-broken when pluginRoot deps probe healthy (helper path), and stamps the ABI marker', () => {
     expect(existsSync(REPO_NODE_MODULES)).toBe(true);
     const home = makeTmpDir();
     try {
       const dataDir = join(home, '.claude-mem-lite');
       const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
       mkdirSync(join(dataDir, 'runtime'), { recursive: true });
-      mkdirSync(pluginRoot, { recursive: true });
-      // Place better-sqlite3 directly in pluginRoot so the entire setup #6 block short-circuits
-      symlinkSync(REPO_NODE_MODULES, join(pluginRoot, 'node_modules'));
+      mkdirSync(join(pluginRoot, 'lib'), { recursive: true });
+      writeFileSync(join(pluginRoot, 'package.json'), '{"name":"fixture"}\n');
+      copyFileSync(resolve('lib/binding-probe.mjs'), join(pluginRoot, 'lib', 'binding-probe.mjs'));
+      const nm = makeWorkingNodeModules(pluginRoot);
 
       const flag = join(dataDir, 'runtime', '.deps-broken');
       writeFileSync(flag, '{"ts":"old","reason":"prev"}\n');
@@ -86,10 +106,53 @@ describe('setup.sh deps-broken flag round-trip (v2.79)', () => {
       });
 
       expect(existsSync(flag)).toBe(false);
+      // ABI-keyed marker certifies THIS node_modules tree; next SessionStart
+      // takes the stat-only fast path.
+      const abi = process.versions.modules;
+      expect(existsSync(join(nm, `.mem-binding-ok-${abi}`))).toBe(true);
     } finally {
       try { rmSync(home, { recursive: true, force: true }); } catch {}
     }
   });
+
+  // D#6 regression: the npm >= 12 false green. better-sqlite3 dir PRESENT but
+  // unusable (no compiled binding) — pre-fix setup.sh called mark_deps_ok on
+  // presence alone and every hook died silently with a green flag. Now the
+  // probe fails, the flag is (re)written with the scripts-enabled rebuild as
+  // the repair command, and no ABI marker is stamped.
+  it('marks deps-broken (with allow-scripts rebuild repair) when better-sqlite3 is present but unusable', () => {
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+      mkdirSync(join(pluginRoot, 'lib'), { recursive: true });
+      mkdirSync(join(pluginRoot, 'node_modules', 'better-sqlite3'), { recursive: true });
+      writeFileSync(join(pluginRoot, 'package.json'), '{"name":"fixture"}\n');
+      // All three probe helpers so the test exercises the REAL locked-rebuild
+      // path, not the bare-probe fallback.
+      for (const f of ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs']) {
+        copyFileSync(resolve('lib', f), join(pluginRoot, 'lib', f));
+      }
+
+      const flag = join(dataDir, 'runtime', '.deps-broken');
+
+      execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 60000,
+      });
+
+      expect(existsSync(flag)).toBe(true);
+      const written = JSON.parse(readFileSync(flag, 'utf8'));
+      expect(written.reason).toContain('binding probe/rebuild failed');
+      expect(written.repair).toContain('npm rebuild better-sqlite3 --dangerously-allow-all-scripts');
+      expect(existsSync(join(pluginRoot, 'node_modules', `.mem-binding-ok-${process.versions.modules}`))).toBe(false);
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  }, 60000);
 });
 
 describe('collectOrphanHookPaths (v2.79)', () => {

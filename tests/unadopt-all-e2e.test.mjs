@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
@@ -15,7 +15,7 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_CLAUDE_MD = join(REPO, 'CLAUDE.md');
 const USER_MD = '# proj\n\nMy notes.\n\n## Conventions\n- spaces\n';
 
-let HOME, projA, projB, projGone, BASE_ENV, repoSnapshot;
+let HOME, projA, projB, projC, projGone, BASE_ENV, repoSnapshot;
 
 function run(args, { cwd, allowFail = false } = {}) {
   try {
@@ -41,7 +41,7 @@ function hasBlock(dir) {
 describe('unadopt --all scans known projects (~/.claude.json)', () => {
   beforeAll(() => {
     HOME = mkdtempSync(join(tmpdir(), 'mem-unadopt-all-'));
-    projA = join(HOME, 'a'); projB = join(HOME, 'b'); projGone = join(HOME, 'gone-deleted');
+    projA = join(HOME, 'a'); projB = join(HOME, 'b'); projC = join(HOME, 'c'); projGone = join(HOME, 'gone-deleted');
     repoSnapshot = existsSync(REPO_CLAUDE_MD) ? readFileSync(REPO_CLAUDE_MD, 'utf8') : null;
 
     BASE_ENV = { ...process.env, HOME, CLAUDE_MEM_SKIP_REPOS: '1' };
@@ -50,14 +50,20 @@ describe('unadopt --all scans known projects (~/.claude.json)', () => {
     delete BASE_ENV.PWD;
 
     mkdirSync(join(HOME, '.claude'), { recursive: true });
-    for (const d of [projA, projB]) { mkdirSync(d, { recursive: true }); writeFileSync(join(d, 'CLAUDE.md'), USER_MD); }
-    // ~/.claude.json lists A, B, and a now-deleted path (must be filtered out).
+    for (const d of [projA, projB, projC]) { mkdirSync(d, { recursive: true }); writeFileSync(join(d, 'CLAUDE.md'), USER_MD); }
+    // ~/.claude.json lists A, B, C, and a now-deleted path (must be filtered out).
     writeFileSync(join(HOME, '.claude.json'), JSON.stringify({
-      projects: { [projA]: {}, [projB]: {}, [projGone]: {} },
+      projects: { [projA]: {}, [projB]: {}, [projC]: {}, [projGone]: {} },
     }, null, 2));
 
     run(['adopt'], { cwd: projA });
     run(['adopt'], { cwd: projB });
+    // C = PARTIAL residue: adopted, then the user deleted the detail doc while
+    // the CLAUDE.md block remains. The old isAdopted (block AND doc) gate made
+    // `unadopt --all` skip this project forever — regression case for the
+    // hasResidue fix.
+    run(['adopt'], { cwd: projC });
+    rmSync(join(projC, '.claude', 'plugin_claude_mem_lite.md'));
   }, 60000);
 
   afterAll(() => {
@@ -65,27 +71,33 @@ describe('unadopt --all scans known projects (~/.claude.json)', () => {
     try { execFileSync('rm', ['-rf', HOME]); } catch { /* best-effort */ }
   });
 
-  it('adopt wrote a managed block into both known projects', () => {
+  it('adopt wrote a managed block into all known projects (C kept block-only)', () => {
     expect(hasBlock(projA)).toBe(true);
     expect(hasBlock(projB)).toBe(true);
+    expect(hasBlock(projC)).toBe(true);
+    expect(existsSync(join(projC, '.claude', 'plugin_claude_mem_lite.md'))).toBe(false);
   });
 
-  it('--all --dry-run reports both but removes nothing', () => {
+  it('--all --dry-run reports all three (incl. partial-residue C) but removes nothing', () => {
     const r = run(['unadopt', '--all', '--dry-run'], { cwd: HOME });
     expect(r.out).toMatch(/would-remove/);
     expect(r.out).toContain(projA);
     expect(r.out).toContain(projB);
+    expect(r.out).toContain(projC);
     expect(hasBlock(projA)).toBe(true);
     expect(hasBlock(projB)).toBe(true);
+    expect(hasBlock(projC)).toBe(true);
   });
 
   it('--all removes the block from every known project, preserving user content', () => {
     const r = run(['unadopt', '--all'], { cwd: HOME });
-    expect(r.out).toMatch(/removed 2 CLAUDE\.md block/);
+    expect(r.out).toMatch(/removed 3 CLAUDE\.md block/);
     expect(hasBlock(projA)).toBe(false);
     expect(hasBlock(projB)).toBe(false);
+    // C had block-but-no-doc — the pre-hasResidue gate skipped it forever.
+    expect(hasBlock(projC)).toBe(false);
     // User content survives the slug-scoped removal.
-    for (const d of [projA, projB]) {
+    for (const d of [projA, projB, projC]) {
       const md = readFileSync(join(d, 'CLAUDE.md'), 'utf8');
       expect(md).toContain('My notes.');
       expect(md).toContain('- spaces');

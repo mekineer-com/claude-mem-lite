@@ -36,11 +36,37 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
 // intact but the .node binary stale → server FATALs with "Could not locate
 // the bindings file" on first DB open. Probe + auto-rebuild before launching.
 try {
-  const { ensureBetterSqlite3Working } = await import('../lib/binding-probe.mjs');
-  const verify = await ensureBetterSqlite3Working(ROOT);
+  const { ensureBetterSqlite3Working, probeBetterSqlite3Binding } = await import('../lib/binding-probe.mjs');
+  // The rebuild inside ensureBetterSqlite3Working mutates node_modules — the
+  // same write class as install/repair/update, and this was the ONE rebuild
+  // path outside the shared install.lock: a second MCP launch or a concurrent
+  // `install.mjs repair` (hook-launcher heal) could clobber the .node
+  // mid-compile. Take the lock for the rebuild-capable path; a live peer →
+  // wait up to 10s, then degrade to a probe-only pass (healthy binding
+  // proceeds; a broken one defers to the peer instead of racing it).
+  const { acquireLock } = await import('../lib/proc-lock.mjs');
+  const { resolveDataDir } = await import('../lib/resolve-data-dir.mjs');
+  const lockPath = join(resolveDataDir(process.env.CLAUDE_MEM_DIR), 'runtime', 'install.lock');
+  let release = null;
+  for (let i = 0; i < 20 && !(release = acquireLock(lockPath)); i++) {
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  let verify;
+  try {
+    if (release) {
+      verify = await ensureBetterSqlite3Working(ROOT);
+    } else {
+      const probe = await probeBetterSqlite3Binding(ROOT);
+      verify = probe.ok
+        ? { ok: true, action: 'verified' }
+        : { ok: false, error: `${probe.error} (another install/repair holds the lock — not rebuilding concurrently; reconnect with /mcp once it finishes)` };
+    }
+  } finally {
+    if (release) release();
+  }
   if (!verify.ok) {
     process.stderr.write(`[claude-mem-lite] better-sqlite3 binding unusable: ${verify.error}\n`);
-    process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm rebuild better-sqlite3 --build-from-source\n`);
+    process.stderr.write(`[claude-mem-lite] Repair: cd "${ROOT}" && npm rebuild better-sqlite3 --dangerously-allow-all-scripts\n`);
     process.exit(1);
   }
   if (verify.action === 'rebuilt') {

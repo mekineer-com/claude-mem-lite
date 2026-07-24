@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.58.0 — install/update/self-heal/uninstall audit batch: npm-12 hooks false-green, update-path binding gate, shared WAL recovery, locked registry installs
+
+Seven fixes from the lifecycle audit (install / update / self-heal / uninstall). All are `fix:` — restoring documented self-heal and cleanup behavior; no contract changes.
+
+**Install (npm ≥ 12 hooks false-green).** `scripts/setup.sh` no longer treats `node_modules/better-sqlite3` directory PRESENCE as deps-OK. npm ≥ 12 blocks lifecycle scripts and `npm install` exits 0 with the native binding never compiled — pre-fix, setup.sh called `mark_deps_ok` on exactly that broken state, so every hook died silently behind a green flag until the MCP server's own probe ran (never, if MCP was disabled). SessionStart now probes via the shared fix point `lib/binding-probe.mjs` (real `:memory:` open; auto-rebuild with `--dangerously-allow-all-scripts`, plain fallback for older npm), with a bare-probe fallback when the helper itself is missing (half-installed tree). An ABI-keyed marker inside `node_modules/` keeps healthy sessions at one `stat`; a new plugin-cache version dir or a Node major upgrade re-probes; while broken, every SessionStart retries the heal. `.deps-broken` now carries the correct scripts-enabled rebuild as its repair command.
+
+**Repair hints unbricked.** The manual repair commands printed by `scripts/launch.mjs` and `install.mjs` said `npm rebuild better-sqlite3 --build-from-source` — which on npm ≥ 12 hits the same script block and exits 0 without compiling, so the copy-paste repair silently no-oped on the exact npm version the self-heal targets. Both now print `--dangerously-allow-all-scripts`.
+
+**Auto-update binding gate.** `hook-update.mjs`'s post-swap smoke ran `cli.mjs help`, which never opens a DB — a direct-install auto-update could swap in an uncompiled/ABI-stale better-sqlite3 and pass the gate (plugin-mode users were protected by launch.mjs's per-launch probe; direct installs register `server.mjs` without launch.mjs). The smoke gate now probes the binding in a child process, rebuilds scripts-enabled on failure, re-probes, and rolls back to the old working install if still broken.
+
+**Rebuild race closed.** `scripts/launch.mjs`'s binding rebuild was the one `npm rebuild` path outside the shared `install.lock`; a second MCP launch or a concurrent `install.mjs repair` could clobber the `.node` mid-compile. The rebuild-capable path now takes the lock (waits up to 10 s, then degrades to probe-only and defers to the peer).
+
+**WAL recovery shared.** The corruption-gated WAL recovery (delete `-wal`/`-shm` + retry, ONLY on corruption signatures — transient errors keep the WAL intact) was inlined in `server.mjs`, so hooks blind-nulled and the CLI raw-threw on a corrupt WAL until the next MCP start. It now lives in `schema.mjs::ensureDbWithWalRecovery` and all three openers (server, hook `openDb`, CLI) route through it; a failed retry is tagged so the server's fatal hint stays accurate.
+
+**`unadopt --all` no longer skips partial residue.** The sweep gated on `isAdopted` (managed block AND detail doc), so a project where the user had deleted the detail doc kept its orphaned CLAUDE.md block forever. It now sweeps on `hasResidue` (block OR doc OR state sidecar); `--status` and single-project `--dry-run` report the same truth.
+
+**Registry installs locked.** npm never packs `package-lock.json` (even when listed in `files[]`), so bare `npx` / `npm i` installs resolved the dependency tree unlocked — the guarding test's "implicitly included in every tarball" rationale was factually wrong. The release workflow now runs `npm shrinkwrap` before smoke and publish, so the registry tarball carries `npm-shrinkwrap.json` (the exact tested tree); dev flow keeps `package-lock.json`; marketplace installs were already locked (git clone). A drift-guard test pins the workflow steps.
+
+Test-infra hardening from the same batch: the CLI test files' `vi.mock('../schema.mjs')` stubs now cover every exported DB opener — an `ensureDb`-only stub let the suite escape to the developer's real `~/.claude-mem-lite` DB the moment mem-cli switched openers (caught because it purged 4 real rows; restored from the pre-maintain snapshot).
+
+4013 tests pass (233 files, +7: 3 hook-update binding-probe, 2 shared-WAL-recovery, 1 npm-12 false-green regression, 1 shrinkwrap drift guard), eslint clean, `scripts/smoke-tarball.mjs` PASS locally (pack → clean install → native rebuild → DB open).
+
 ## v3.57.0 — multi-face audit batch: retrieval/scoring correctness, runtime hardening, data-layer atomicity
 
 Lands the accumulated fixes from the five-face audit (algo / security / data / prod / arch). No breaking changes; the retrieval fixes only alter behavior on paths described below.

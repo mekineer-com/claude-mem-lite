@@ -273,3 +273,64 @@ describe('non-corruption open failure', () => {
     expect(stderr).toMatch(/DB schema is v\d+/);
   }, 30000);
 });
+
+// ─── 4. Recovery is SHARED, not server.mjs-only (audit P3 fix) ────────────────
+// Pre-fix, the corruption-gated recovery was inlined in server.mjs: hooks
+// (openDb → silent null) and the CLI (raw throw) left a corrupt WAL in place
+// until the next MCP server start. Now schema.mjs owns ensureDbWithWalRecovery
+// and all three openers route through it. Child processes because schema.mjs
+// freezes DB_PATH from CLAUDE_MEM_DIR at import time.
+
+describe('shared WAL recovery (schema.ensureDbWithWalRecovery / hook openDb)', () => {
+  it('ensureDbWithWalRecovery enters the recovery arm and tags a failed retry', () => {
+    const dir = fixtureDir('shared-fn');
+    plantCorruptWal(dir);
+    const out = execFileSync(process.execPath, [
+      '-e',
+      `import('${resolve(import.meta.dirname, '../schema.mjs')}').then((m) => {
+         const msgs = [];
+         try {
+           const db = m.ensureDbWithWalRecovery({ warn: (x) => msgs.push(x) });
+           db.close();
+           console.log(JSON.stringify({ opened: true, msgs }));
+         } catch (e) {
+           console.log(JSON.stringify({ opened: false, attempted: !!e.walRecoveryAttempted, msgs }));
+         }
+       })`,
+    ], { env: { ...process.env, CLAUDE_MEM_DIR: dir }, encoding: 'utf8' });
+    const r = JSON.parse(out.trim());
+    expect(r.msgs.some((m) => m.includes('DB corruption detected, attempting WAL recovery'))).toBe(true);
+    // Same pinned outcome as the server-process test above: this fixture's
+    // retry does not complete a recovery — the throw must carry the marker so
+    // callers word their fatal hint accurately.
+    expect(r.opened).toBe(false);
+    expect(r.attempted).toBe(true);
+  }, 30000);
+
+  it('hook openDb() attempts WAL recovery instead of blind-nulling on a corrupt WAL', () => {
+    const dir = fixtureDir('hook-open');
+    const dbPath = plantCorruptWal(dir);
+    const plantedWalSize = readFileSync(dbPath + '-wal').length;
+    expect(plantedWalSize).toBeGreaterThan(1000); // real frames on disk
+
+    const out = execFileSync(process.execPath, [
+      '-e',
+      `Promise.all([import('${resolve(import.meta.dirname, '../hook-shared.mjs')}'), import('node:fs')]).then(([m, fs]) => {
+         const db = m.openDb();
+         if (db) { try { db.close(); } catch {} }
+         const p = ${JSON.stringify(dbPath + '-wal')};
+         console.log(JSON.stringify({
+           isNull: db === null,
+           walSize: fs.existsSync(p) ? fs.statSync(p).size : -1,
+         }));
+       })`,
+    ], { env: { ...process.env, CLAUDE_MEM_DIR: dir }, encoding: 'utf8' });
+    const r = JSON.parse(out.trim());
+    // Contract unchanged for callers: unrecoverable → null, hooks degrade.
+    expect(r.isNull).toBe(true);
+    // But the corrupt WAL must be GONE (or a fresh ~0-byte one recreated by the
+    // retry's reopen) — pre-fix openDb left the planted frames untouched, so
+    // every subsequent hook fire hit the same corruption until MCP restarted.
+    expect(r.walSize).toBeLessThan(100);
+  }, 30000);
+});

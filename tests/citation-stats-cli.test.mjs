@@ -60,18 +60,16 @@ function captureStdoutOnly(fn) {
 // Mock ensureDb to return our test DB
 vi.mock('../schema.mjs', async (importOriginal) => {
   const original = await importOriginal();
-  return {
-    ...original,
-    ensureDb: () => {
-      // Return a proxy that intercepts close() to prevent the CLI from closing our test DB
-      return new Proxy(testDb, {
-        get(target, prop) {
-          if (prop === 'close') return () => {};
-          return target[prop];
-        },
-      });
+  // Proxy intercepts close() so the CLI can't close our test DB. Stub BOTH
+  // openers — mem-cli routes through ensureDbWithWalRecovery since the
+  // WAL-recovery hoist; an unstubbed opener escapes to the real user DB.
+  const stub = () => new Proxy(testDb, {
+    get(target, prop) {
+      if (prop === 'close') return () => {};
+      return target[prop];
     },
-  };
+  });
+  return { ...original, ensureDb: stub, ensureDbWithWalRecovery: stub };
 });
 
 // Mock inferProject to return a consistent value

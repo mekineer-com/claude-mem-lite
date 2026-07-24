@@ -107,12 +107,14 @@ let testDb;
 
 vi.mock('../schema.mjs', async (importOriginal) => {
   const original = await importOriginal();
-  return {
-    ...original,
-    ensureDb: () => new Proxy(testDb, {
-      get(t, p) { if (p === 'close') return () => {}; return t[p]; },
-    }),
-  };
+  const stub = () => new Proxy(testDb, {
+    get(t, p) { if (p === 'close') return () => {}; return t[p]; },
+  });
+  // Stub EVERY exported opener, not just ensureDb: mem-cli routes through
+  // ensureDbWithWalRecovery since the WAL-recovery hoist, and an unstubbed
+  // opener silently escapes to the REAL ~/.claude-mem-lite DB (this exact
+  // hole let a test run write to and purge the developer's live DB).
+  return { ...original, ensureDb: stub, ensureDbWithWalRecovery: stub };
 });
 
 vi.mock('../utils.mjs', async (importOriginal) => {

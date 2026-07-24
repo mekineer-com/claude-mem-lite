@@ -3,7 +3,7 @@
 // No MCP SDK or heavy deps — only imports schema.mjs and utils.mjs
 
 import { homedir } from 'os';
-import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
+import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { truncate, typeIcon, inferProject, scrubSecrets } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
@@ -3156,14 +3156,16 @@ export async function run(argv) {
   }
 
   // adopt / unadopt do pure filesystem work on ~/.claude/projects/<encoded>/memory/ —
-  // no DB needed. Route them before ensureDb() so an unbootable DB doesn't block.
+  // no DB needed. Route them before the DB open so an unbootable DB doesn't block.
   if (cmd === 'adopt') { cmdAdopt(cmdArgs); return; }
   if (cmd === 'unadopt') { cmdUnadopt(cmdArgs); return; }
   if (cmd === 'memdir-audit') { cmdMemdirAudit(cmdArgs); return; }
 
   let db;
   try {
-    db = ensureDb();
+    // Corruption-gated WAL recovery (shared with server/hooks) — a corrupt WAL
+    // previously threw here with no auto-repair until the next MCP start.
+    db = ensureDbWithWalRecovery({ warn: (m) => process.stderr.write(`[mem] ${m}\n`) });
   } catch (e) {
     out(`[mem] Error: Cannot open database: ${e.message}`);
     out(`[mem] DB path: ${DB_PATH}`);

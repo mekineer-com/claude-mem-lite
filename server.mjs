@@ -7,7 +7,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
-import { ensureDb, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
+import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
@@ -66,36 +66,25 @@ const { version: PKG_VERSION } = require('./package.json');
 
 // ─── Database ───────────────────────────────────────────────────────────────
 
-import { rmSync, existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, chmodSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, chmodSync } from 'fs';
 
 let db;
 try {
-  db = ensureDb();
-} catch (firstErr) {
-  // WAL-delete recovery is ONLY safe for genuine corruption. On a transient
-  // error (SQLITE_BUSY) or the forward-version guard throw, deleting the WAL
-  // would discard committed-but-uncheckpointed transactions — silent data loss.
-  // Restrict the rm to corruption signatures; otherwise fail fast, WAL intact.
-  const sig = `${firstErr.code || ''} ${firstErr.message || ''}`;
-  const isCorruption = /SQLITE_CORRUPT|SQLITE_NOTADB|malformed|not a database|disk image/i.test(sig);
-  if (!isCorruption) {
-    console.error(`[claude-mem-lite] FATAL: Database cannot be opened: ${firstErr.message}`);
-    console.error(`[claude-mem-lite] Left WAL/SHM intact (not a corruption error). If this persists, retry or reinstall: node install.mjs install`);
-    process.exit(1);
-  }
-  // Recovery: remove WAL/SHM files (corrupt WAL is the most common cause) and retry
-  debugLog('WARN', 'server', `DB corruption detected, attempting WAL recovery: ${firstErr.message}`);
-  try { rmSync(DB_PATH + '-wal', { force: true }); } catch {}
-  try { rmSync(DB_PATH + '-shm', { force: true }); } catch {}
-  try {
-    db = ensureDb();
-    debugLog('INFO', 'server', 'DB recovered after WAL cleanup');
-  } catch (retryErr) {
-    // Fatal: log and exit with descriptive message (Claude Code shows stderr)
-    console.error(`[claude-mem-lite] FATAL: Database cannot be opened: ${retryErr.message}`);
+  // Corruption-gated WAL recovery lives in schema.mjs (shared with hooks/CLI
+  // since the D#8-adjacent P3 fix); the server keeps only its exit semantics.
+  db = ensureDbWithWalRecovery({
+    warn: (m) => debugLog('WARN', 'server', m),
+    info: (m) => debugLog('INFO', 'server', m),
+  });
+} catch (err) {
+  // Fatal: log and exit with descriptive message (Claude Code shows stderr)
+  console.error(`[claude-mem-lite] FATAL: Database cannot be opened: ${err.message}`);
+  if (err.walRecoveryAttempted) {
     console.error(`[claude-mem-lite] Try: rm "${DB_PATH}-wal" "${DB_PATH}-shm" or reinstall with: node install.mjs install`);
-    process.exit(1);
+  } else {
+    console.error(`[claude-mem-lite] Left WAL/SHM intact (not a corruption error). If this persists, retry or reinstall: node install.mjs install`);
   }
+  process.exit(1);
 }
 // Server process uses longer busy_timeout for concurrent MCP requests
 db.pragma('busy_timeout = 5000');

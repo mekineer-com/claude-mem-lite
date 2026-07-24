@@ -1001,6 +1001,49 @@ export function ensureDb() {
 }
 
 /**
+ * Whether an open/init error carries a genuine corruption signature. WAL-delete
+ * recovery is ONLY safe for these: on a transient error (SQLITE_BUSY) or the
+ * forward-version guard throw, deleting the WAL would discard committed-but-
+ * uncheckpointed transactions — silent data loss.
+ */
+export function isDbCorruptionError(err) {
+  return /SQLITE_CORRUPT|SQLITE_NOTADB|malformed|not a database|disk image/i
+    .test(`${err?.code || ''} ${err?.message || ''}`);
+}
+
+/**
+ * ensureDb with corruption-gated WAL recovery. Was inlined in server.mjs only,
+ * so hooks (openDb → silent null) and the CLI (raw throw) stayed degraded on a
+ * corrupt WAL until the next MCP server start. One shared implementation now
+ * serves all three openers.
+ *
+ * Non-corruption failure → rethrows the original error, WAL/SHM left intact.
+ * Corruption → deletes -wal/-shm, retries once; a still-failing retry rethrows
+ * with `err.walRecoveryAttempted = true` so callers can word their fatal hint
+ * accurately (recovery already tried vs WAL deliberately preserved).
+ *
+ * @param {{warn?: (msg: string) => void, info?: (msg: string) => void}} [opts]
+ */
+export function ensureDbWithWalRecovery({ warn, info } = {}) {
+  try {
+    return ensureDb();
+  } catch (firstErr) {
+    if (!isDbCorruptionError(firstErr)) throw firstErr;
+    warn?.(`DB corruption detected, attempting WAL recovery: ${firstErr.message}`);
+    try { rmSync(DB_PATH + '-wal', { force: true }); } catch { /* best-effort */ }
+    try { rmSync(DB_PATH + '-shm', { force: true }); } catch { /* best-effort */ }
+    try {
+      const db = ensureDb();
+      info?.('DB recovered after WAL cleanup');
+      return db;
+    } catch (retryErr) {
+      try { retryErr.walRecoveryAttempted = true; } catch { /* frozen error — fine */ }
+      throw retryErr;
+    }
+  }
+}
+
+/**
  * Create FTS5 virtual table + sync triggers for a content table.
  * Idempotent: skips if already exists. Exported for test helpers.
  */

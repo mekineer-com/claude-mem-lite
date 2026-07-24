@@ -466,7 +466,7 @@ if (IS_DEV) {
     ok(`better-sqlite3: ${verify.action}`);
   } else {
     fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
-    log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --build-from-source');
+    log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --dangerously-allow-all-scripts');
     process.exit(1);
   }
 }
