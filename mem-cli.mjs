@@ -40,7 +40,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
-import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
+import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
@@ -65,16 +65,18 @@ import { shouldQueueSaveEnrich, queueSaveEnrich } from './lib/save-enrich.mjs';
 
 async function cmdSearch(db, args, { llm } = {}) {
   const { positional, flags } = parseArgs(args);
-  const query = positional.join(' ');
-  if (!query) {
-    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--since DUR] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep] [--rerank]');
-    return;
-  }
 
   // Bare string flags parse to boolean `true`; without this guard `--branch` reaches
   // the SQLite bind and crashes, while `--to`/`--project` silently change results
   // (epoch-1 upper bound → zero rows; unscoped search). (audit P1 #3)
-  if (rejectBareStringFlags(flags, ['source', 'project', 'from', 'to', 'branch'])) return;
+  if (rejectBareStringFlags(flags, ['query', 'source', 'project', 'from', 'to', 'branch'])) return;
+
+  const query = resolvePositionalAlias(positional.join(' '), flags, ['query']);
+  if (query === null) return;
+  if (!query) {
+    fail('[mem] Usage: claude-mem-lite search <query> [--type TYPE] [--source SOURCE] [--limit N] [--project P] [--from DATE] [--to DATE] [--since DUR] [--importance N] [--branch B] [--offset N] [--sort relevance|time|importance] [--include-noise] [--deep] [--no-deep] [--rerank] — query may also be passed via --query "<query>"');
+    return;
+  }
 
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
   const type = flags.type || null;
@@ -446,9 +448,11 @@ function cmdRecent(db, args) {
 
 function cmdRecall(db, args) {
   const { positional, flags } = parseArgs(args);
-  const file = positional.join(' ');
+  if (rejectBareStringFlags(flags, ['file'])) return;
+  const file = resolvePositionalAlias(positional.join(' '), flags, ['file']);
+  if (file === null) return;
   if (!file) {
-    fail('[mem] Usage: claude-mem-lite recall <file> [--limit N] [--include-noise] [--json]');
+    fail('[mem] Usage: claude-mem-lite recall <file> [--limit N] [--include-noise] [--json] — file may also be passed via --file <file>');
     return;
   }
 
@@ -586,9 +590,11 @@ function renderEventRows(db, ids) {
 
 function cmdGet(db, args) {
   const { positional, flags } = parseArgs(args);
-  const idStr = positional.join(',');
+  if (rejectBareStringFlags(flags, ['ids'])) return;
+  const idStr = resolvePositionalAlias(positional.join(','), flags, ['ids']);
+  if (idStr === null) return;
   if (!idStr) {
-    fail('[mem] Usage: claude-mem-lite get <id1,id2,...> [--source obs|session|prompt|event] [--fields f1,f2,...]\n' +
+    fail('[mem] Usage: claude-mem-lite get <id1,id2,...> [--source obs|session|prompt|event] [--fields f1,f2,...] — ids may also be passed via --ids 1,2\n' +
          '        IDs accept prefix from search output: #123 (obs), P#123 (prompt), S#123 (session), E#123 (event), D#123 (deferred item, full detail).');
     return;
   }
@@ -834,15 +840,22 @@ function cmdTimeline(db, args) {
 
 function cmdSave(db, args) {
   const { positional, flags } = parseArgs(args);
-  const text = positional.join(' ');
-  if (!text.trim()) {
-    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T] [--closes-deferred 1,D#42] [--supersedes 8754,8771]');
-    return;
-  }
 
   // Reject value-less string flags before they reach .split()/saveObservation as a
   // boolean `true` (#8470): bare --files/--title/--lesson crashed with a raw stacktrace.
-  if (rejectBareStringFlags(flags, ['title', 'files', 'lesson', 'lesson-learned', 'project', 'type'])) return;
+  // Runs before content resolution so a bare --text gets this clean error, not the usage line.
+  if (rejectBareStringFlags(flags, ['text', 'content', 'title', 'files', 'lesson', 'lesson-learned', 'project', 'type'])) return;
+
+  // Content: positional, or --text/--content as flags-only aliases (--content is the
+  // literal MCP mem_save field name, #233). Callers coming from the MCP schema map
+  // every field to a named flag and omit the positional — the usage error then lands
+  // on stderr and reads as "CLI doesn't support save".
+  const text = resolvePositionalAlias(positional.join(' '), flags, ['text', 'content']);
+  if (text === null) return;
+  if (!text.trim()) {
+    fail('[mem] Usage: claude-mem-lite save "<text>" [--type T] [--title T] [--importance N] [--project P] [--files f1,f2] [--lesson T] [--closes-deferred 1,D#42] [--supersedes 8754,8771] — content may also be passed via --text/--content "<text>"');
+    return;
+  }
 
   const type = flags.type || 'discovery';
   const validTypes = OBS_TYPE_SET;
@@ -980,9 +993,16 @@ function cmdDefer(db, args) {
 
 function cmdDeferAdd(db, args) {
   const { positional, flags } = parseArgs(args);
-  const title = positional.join(' ').trim();
+  // Reject bare --files/--detail/--project before .split()/bind sees a boolean true (#8470).
+  // Runs before title resolution so a bare --title gets this clean error, not the usage line.
+  if (rejectBareStringFlags(flags, ['title', 'files', 'detail', 'project'])) return;
+  // --title alias: the MCP mem_defer schema's required field IS `title` (#233), so
+  // flags-only callers emit `defer add --title "..." --detail "..."` with no positional.
+  const resolvedTitle = resolvePositionalAlias(positional.join(' '), flags, ['title']);
+  if (resolvedTitle === null) return;
+  const title = resolvedTitle.trim();
   if (!title) {
-    fail('[mem] Usage: claude-mem-lite defer add "<title>" [--priority 1|2|3] [--detail T] [--files f1,f2] [--project P]');
+    fail('[mem] Usage: claude-mem-lite defer add "<title>" [--priority 1|2|3] [--detail T] [--files f1,f2] [--project P] — title may also be passed via --title "<title>"');
     return;
   }
   // Mirror MCP memDeferSchema.title (z.string().min(1).max(200)). CLI used to
@@ -992,8 +1012,6 @@ function cmdDeferAdd(db, args) {
     fail(`[mem] defer add: title too long (${title.length} chars, max 200). Move detail to --detail "<text>".`);
     return;
   }
-  // Reject bare --files/--detail/--project before .split()/bind sees a boolean true (#8470).
-  if (rejectBareStringFlags(flags, ['files', 'detail', 'project'])) return;
   const priority = flags.priority !== undefined ? parseInt(flags.priority, 10) : 2;
   // isNumericToken first: bare parseInt would coerce "3xyz"→3 and silently escalate a
   // deferred item's urgency. Float literals still truncate (#8277).
@@ -1047,8 +1065,12 @@ function cmdDeferList(db, args) {
 
 function cmdDeferDrop(db, args) {
   const { positional, flags } = parseArgs(args);
-  if (positional.length === 0) {
-    fail('[mem] Usage: claude-mem-lite defer drop <id-or-D#N>[,id2,...] --reason "<reason>" [--project P]');
+  // --id alias (MCP mem_defer_drop.id field shape, #233).
+  if (rejectBareStringFlags(flags, ['id'])) return;
+  const idStr = resolvePositionalAlias(positional.join(' '), flags, ['id']);
+  if (idStr === null) return;
+  if (!idStr.trim()) {
+    fail('[mem] Usage: claude-mem-lite defer drop <id-or-D#N>[,id2,...] --reason "<reason>" [--project P] — id may also be passed via --id D#N');
     return;
   }
   const reason = flags.reason;
@@ -1060,7 +1082,7 @@ function cmdDeferDrop(db, args) {
   // already accepts the batch form (cmdSave uses resolveDeferredIds on a split list);
   // drop now mirrors that ergonomic so users can prune multiple items in one call
   // without N shell invocations.
-  const rawTokens = positional.join(' ').split(',').map(s => s.trim()).filter(Boolean);
+  const rawTokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
   const tokens = rawTokens.map(t => /^\d+$/.test(t) ? parseInt(t, 10) : t);
   const project = flags.project ? resolveProject(db, flags.project) : inferProject();
 
@@ -1435,9 +1457,11 @@ function getActiveSessionId(db, project) {
 
 function cmdDelete(db, args) {
   const { positional, flags } = parseArgs(args);
-  const idStr = positional.join(',');
+  if (rejectBareStringFlags(flags, ['ids'])) return;
+  const idStr = resolvePositionalAlias(positional.join(','), flags, ['ids']);
+  if (idStr === null) return;
   if (!idStr) {
-    fail('[mem] Usage: claude-mem-lite delete <id1,id2,...> [--confirm]');
+    fail('[mem] Usage: claude-mem-lite delete <id1,id2,...> [--confirm] — ids may also be passed via --ids 1,2');
     return;
   }
 
@@ -1490,7 +1514,11 @@ function cmdDelete(db, args) {
 
 function cmdUpdate(db, args) {
   const { positional, flags } = parseArgs(args);
-  const raw = positional[0];
+  // --id alias (MCP mem_update.id field shape, #233). Bare --id → resolved as absent
+  // here (boolean true is not a string), falling through to the usage line below.
+  const resolvedId = resolvePositionalAlias(positional[0] ?? '', flags, ['id']);
+  if (resolvedId === null) return;
+  const raw = resolvedId || undefined;
   if (raw && /^[EePpSs]#?\d+$/.test(String(raw).trim())) {
     fail(`[mem] update only works on observations. Rejected: ${raw}. ` +
          `Prompts, sessions, and events are not editable here.`);
@@ -1502,7 +1530,7 @@ function cmdUpdate(db, args) {
   const parsed = raw ? parseIdToken(raw) : null;
   const id = parsed && parsed.source === null ? parsed.id : NaN;
   if (!id || isNaN(id)) {
-    fail('[mem] Usage: claude-mem-lite update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T]');
+    fail('[mem] Usage: claude-mem-lite update <id> [--title T] [--type T] [--importance N] [--lesson T] [--narrative T] [--concepts T] — id may also be passed via --id N');
     return;
   }
 
@@ -2606,6 +2634,7 @@ function cmdHelp() {
 
 Commands:
   search <query>        FTS5 search across observations, sessions, and prompts
+    --query Q           Query as a flag (alias for the positional; use one, not both)
     --source S          Table: observations|sessions|prompts (default: all)
     --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
     --limit N           Max results (default 20)
@@ -2630,6 +2659,7 @@ Commands:
     --json              Output as JSON: {project,limit,type,total,results:[…]}
 
   recall <file>         Show observations related to a file
+    --file F            File as a flag (alias for the positional)
     --limit N           Max results (default 10)
     --include-noise     Include hook-llm fallback titles ("Modified X", raw error logs)
     --json              Output as JSON: {file,limit,include_noise,total,results:[…]}
@@ -2638,6 +2668,7 @@ Commands:
     IDs accept search-output prefixes: #123 (obs), P#123 (prompt), S#123 (session),
     D#123 (deferred item — FULL detail; defer list is title-only).
     Bare N defaults to obs. Mixed prefixes in one call route each token correctly.
+    --ids 1,2           IDs as a flag (alias for the positional list)
     --source S          Force record type (obs|session|prompt); overrides prefixes
                         (D# tokens exempt — they always read deferred_work).
     --fields f1,f2,...  Select specific fields to return (observations only).
@@ -2657,6 +2688,8 @@ Commands:
                         (or {anchor:null,fallback:"recent",results:[…]} when no anchor)
 
   save "<text>"         Save a new observation
+    --text T            Content as a flag (alias for the positional; use one, not both)
+    --content T         Same alias under the MCP mem_save field name
     --type T            Observation type (default: discovery)
     --title T           Title (auto-generated if omitted)
     --importance N      1=routine, 2=notable, 3=critical (default: 2)
@@ -2667,6 +2700,7 @@ Commands:
 
   defer <action>        First-class deferred work (v2.70+)
     add "<title>"       Mark deferred work for next session (≤200 chars)
+      --title T         Title as a flag (alias for the positional)
       --priority N      1=low, 2=normal, 3=urgent (default: 2)
       --detail T        Constraint + why deferred
       --files f1,f2     Comma-separated file paths
@@ -2675,14 +2709,17 @@ Commands:
       --limit N         Max results (default 10)
       --project P       Filter by project
     drop <D#N|ordinal>[,...]  Drop one or more deferred items (no fix needed)
+      --id D#N          ID as a flag (alias for the positional)
       --reason "..."    Required audit trail
       --project P       Project for ordinal resolution (default: current; must
                         match the "defer list --project P" you read ordinals from)
 
   delete <id1,id2,...>  Delete observations by ID
+    --ids 1,2           IDs as a flag (alias for the positional list)
     --confirm           Execute deletion (preview by default)
 
   update <id>           Update an existing observation
+    --id N              ID as a flag (alias for the positional)
     --title T           New title
     --type T            New type
     --importance N      New importance (1=routine, 2=notable, 3=critical)

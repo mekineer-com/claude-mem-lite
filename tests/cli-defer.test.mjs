@@ -116,6 +116,31 @@ describe('claude-mem-lite defer CLI', () => {
     expect(list.stdout).toMatch(/No open deferred items/);
   });
 
+  // ── MCP-field flag aliases (#233 family): mem_defer.title → --title,
+  // mem_defer_drop.id → --id. Flags-only invocations previously fell to a
+  // stderr-only usage line (same shape as the save --text incident).
+  it('defer add accepts --title as alias for the positional title', () => {
+    const { stdout, exitCode } = runCli(['defer', 'add', '--title', 'alias-shaped item', '--detail', 'came in MCP field shape']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/D#\d+/);
+    const list = runCli(['defer', 'list']);
+    expect(list.stdout).toMatch(/alias-shaped item/);
+  });
+
+  it('defer add rejects title given both positionally and via --title', () => {
+    const { stderr, exitCode } = runCli(['defer', 'add', 'positional title', '--title', 'flag title']);
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/once/);
+  });
+
+  it('defer drop accepts --id as alias for the positional id', () => {
+    runCli(['defer', 'add', 'drop me', '--priority', '2']);
+    const { stdout, exitCode } = runCli(['defer', 'drop', '--id', '1', '--reason', 'obsolete']);
+    expect(exitCode).toBe(0);
+    expect(stdout).toMatch(/Dropped D#\d+/);
+    expect(runCli(['defer', 'list']).stdout).toMatch(/No open deferred items/);
+  });
+
   // ── Folded from Task 4 review (M-1): save --closes-deferred roundtrip ──────
   it('save --closes-deferred 1 closes the deferred item', () => {
     runCli(['defer', 'add', 'fix the FTS leak', '--priority', '2']);

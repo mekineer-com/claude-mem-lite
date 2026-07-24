@@ -2,6 +2,18 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.59.0 — MCP-field flag aliases: flags-only CLI invocations now work
+
+Additive CLI change, no behavior change for existing invocation shapes. LLM callers (Claude Code itself included) map the MCP tool schemas onto named flags and omit the positional argument — a real transcript showed `save --type decision --title … --lesson …` (no positional) failing with a stderr-only usage line that, behind the caller's own `2>/dev/null`, read as "CLI doesn't support save". Every command with a required positional now accepts the matching MCP field name as a flag alias:
+
+- `save --text` / `save --content` (content; `content` is the literal MCP `mem_save` field name)
+- `search --query` · `recall --file` · `get --ids` · `delete --ids` · `update --id`
+- `defer add --title` · `defer drop --id`
+
+Semantics via one shared helper (`cli/common.mjs resolvePositionalAlias`): positional AND alias both given → explicit error, nothing persisted; two aliases at once (`--text` + `--content`) → same; bare alias flag (no value) → clean `requires a value` error (#8470 class). `content`/`id`/`ids` joined `KNOWN_CLI_FLAGS`, which also retires the misleading typo suggestions those shapes used to get (`--ids` → "did you mean --has?", `--id` → "--or?"). Usage lines and `help` advertise each alias. Side fix: `defer drop`'s token split now reads the resolved id string, so the alias path can't silently no-op.
+
+Tests 4013 → 4029 (+16: 4 for `--text`, 12 for the alias batch), eslint clean.
+
 ## v3.58.2 — CI regression net for the npm >= 12 heal chain (dev/CI-only)
 
 No user-facing or shipped-package change — the runtime artifact is identical to v3.58.1. New `smoke-npm12` CI job runs the tarball smoke on a pristine npm 12 (node 24 + `npm i -g npm@^12`), where install scripts are blocked by default: the job REQUIRES the block to occur (`SMOKE_EXPECT_SCRIPT_BLOCK=1` fails loudly if npm defaults ever change, instead of silently duplicating the npm-10 smoke) and then REQUIRES the INSTALLED package's own `lib/binding-probe.mjs::ensureBetterSqlite3Working` — the exact code `launch.mjs` runs — to heal the uncompiled binding before the re-probe. First CI run confirmed the full chain: block occurred → heal reported `rebuilt` → re-probe passed. This closes the "npm 12 end-to-end never reproduced in CI" gap from the v3.58.0 audit: every push now replays a fresh-user npm-12 install.

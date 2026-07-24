@@ -881,11 +881,123 @@ describe('CLI save command', () => {
     expect(output).toContain('Usage');
   });
 
+  // 2026-07-24: flags-only save. Callers coming from the MCP mem_save schema map every
+  // field to a named flag (--title/--lesson/--type) and omit the positional; the usage
+  // error lands on stderr and the whole shape reads as "CLI doesn't support save".
+  // --text is the positional-content alias so the flags-only invocation just works.
+  it('saves with --text as flags-only alias for positional content', async () => {
+    const output = await captureStdout(() => run(['save', '--text', 'Keepalive audit: three residual gaps', '--type', 'decision', '--title', 'Keepalive audit', '--lesson', 'Half-open detection has two blind spots']));
+    expect(output).toContain('[mem] Saved');
+    const row = testDb.prepare('SELECT * FROM observations ORDER BY id DESC LIMIT 1').get();
+    expect(row.text).toBe('Keepalive audit: three residual gaps');
+    expect(row.type).toBe('decision');
+    expect(row.title).toBe('Keepalive audit');
+  });
+
+  it('rejects when content is given both positionally and via --text', async () => {
+    const output = await captureStdout(() => run(['save', 'positional content', '--text', 'flag content']));
+    expect(output).toContain('both');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+    expect(testDb.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(0); // nothing persisted
+  });
+
+  it('rejects bare --text with a clean error (no stacktrace)', async () => {
+    const output = await captureStdout(() => run(['save', '--text']));
+    expect(output).toContain('--text requires a value');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+  });
+
+  it('advertises --text in the no-content usage line', async () => {
+    const output = await captureStdout(() => run(['save']));
+    expect(output).toContain('--text');
+    process.exitCode = undefined;
+  });
+
   it('creates a session for FK constraint', async () => {
     await captureStdout(() => run(['save', 'New observation via CLI']));
     const sessions = testDb.prepare("SELECT * FROM sdk_sessions WHERE content_session_id LIKE 'manual-%'").all();
     expect(sessions.length).toBe(1);
     expect(sessions[0].status).toBe('active');
+  });
+});
+
+// ─── MCP-field flag aliases (#233 family) ────────────────────────────────────
+// LLM callers map MCP tool schemas onto flags: mem_save.content → --content,
+// mem_search.query → --query, mem_recall.file → --file, mem_get/mem_delete.ids
+// → --ids, mem_update.id → --id. Each previously fell to a stderr-only usage
+// line that a `2>/dev/null` caller reads as "CLI doesn't support this".
+
+describe('CLI MCP-field flag aliases', () => {
+  beforeEach(() => {
+    testDb = createTestDb();
+    insertSession(testDb, { id: 's1', project: 'test--project', memoryId: 'mem-s1' });
+  });
+  afterEach(() => { testDb.close(); });
+
+  it('search accepts --query as alias for the positional query', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Alias probe hit', text: 'uniquealiastoken payload' });
+    const output = await captureStdout(() => run(['search', '--query', 'uniquealiastoken']));
+    expect(output).not.toContain('Usage');
+    expect(output).toContain('Alias probe hit');
+  });
+
+  it('recall accepts --file as alias for the positional file', async () => {
+    insertObs(testDb, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'change',
+      title: 'Touched hook entry', text: 'x', filesModified: '["hook.mjs"]',
+    });
+    const output = await captureStdout(() => run(['recall', '--file', 'hook.mjs']));
+    expect(output).toContain('History for hook.mjs');
+    expect(output).toContain('Touched hook entry');
+  });
+
+  it('get accepts --ids as alias for the positional id list', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Get alias target', text: 'full detail body' });
+    const output = await captureStdout(() => run(['get', '--ids', '1']));
+    expect(output).toContain('Get alias target');
+  });
+
+  it('delete accepts --ids as alias for the positional id list', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Delete alias target', text: 'x' });
+    await captureStdout(() => run(['delete', '--ids', '1', '--confirm']));
+    expect(testDb.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(0);
+  });
+
+  it('update accepts --id as alias for the positional id', async () => {
+    insertObs(testDb, { sessionId: 'mem-s1', project: 'test--project', title: 'Old title', text: 'x' });
+    await captureStdout(() => run(['update', '--id', '1', '--title', 'New title']));
+    expect(testDb.prepare('SELECT title FROM observations WHERE id = 1').get().title).toBe('New title');
+  });
+
+  it('save accepts --content (MCP mem_save field name) as content alias', async () => {
+    const output = await captureStdout(() => run(['save', '--content', 'MCP-field-shaped content', '--type', 'decision']));
+    expect(output).toContain('[mem] Saved');
+    expect(testDb.prepare('SELECT text FROM observations ORDER BY id DESC LIMIT 1').get().text).toBe('MCP-field-shaped content');
+  });
+
+  it('rejects two content aliases at once (--text + --content)', async () => {
+    const output = await captureStdout(() => run(['save', '--text', 'one', '--content', 'two']));
+    expect(output).toContain('once');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+    expect(testDb.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(0);
+  });
+
+  it('rejects the alias flag when the positional is also given', async () => {
+    const output = await captureStdout(() => run(['search', 'positional terms', '--query', 'flag terms']));
+    expect(output).toContain('once');
+    expect(process.exitCode).toBe(1);
+    process.exitCode = undefined;
+  });
+
+  it('usage lines advertise the alias flags', async () => {
+    const s = await captureStdout(() => run(['search'])); expect(s).toContain('--query'); process.exitCode = undefined;
+    const r = await captureStdout(() => run(['recall'])); expect(r).toContain('--file'); process.exitCode = undefined;
+    const g = await captureStdout(() => run(['get'])); expect(g).toContain('--ids'); process.exitCode = undefined;
+    const d = await captureStdout(() => run(['delete'])); expect(d).toContain('--ids'); process.exitCode = undefined;
+    const u = await captureStdout(() => run(['update'])); expect(u).toContain('--id'); process.exitCode = undefined;
   });
 });
 

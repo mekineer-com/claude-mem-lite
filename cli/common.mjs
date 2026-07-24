@@ -89,6 +89,37 @@ export function rejectBareStringFlags(flags, keys) {
   return false;
 }
 
+/**
+ * Resolve a required value that may arrive positionally or via an MCP-field flag alias.
+ * LLM callers map the MCP tool schema onto flags (#233): mem_save.content → `--content`,
+ * mem_defer.title → `defer add --title`, mem_search.query → `--query`, mem_get.ids →
+ * `--ids` — each previously fell to a stderr-only usage line that a `2>/dev/null`
+ * caller reads as "CLI doesn't support this".
+ *
+ * Returns the resolved string ('' when neither shape is present — caller emits its own
+ * usage). On ambiguity (positional AND an alias, or two aliases at once) emits fail()
+ * and returns null — caller must `return` on null. Bare alias flags (boolean true) are
+ * ignored here; guard them with rejectBareStringFlags BEFORE calling.
+ *
+ * @param {string} positionalStr Joined positional tokens (caller picks the separator).
+ * @param {object} flags Parsed flags from parseArgs.
+ * @param {string[]} aliasKeys Alias flag names, first match wins (without dashes).
+ * @returns {string|null} Resolved value, or null after a conflict fail().
+ */
+export function resolvePositionalAlias(positionalStr, flags, aliasKeys) {
+  const given = aliasKeys.filter(k => typeof flags[k] === 'string' && flags[k].trim() !== '');
+  if (given.length > 1) {
+    fail(`[mem] Both --${given[0]} and --${given[1]} provided — pass the value once.`);
+    return null;
+  }
+  const flagVal = given.length === 1 ? flags[given[0]] : '';
+  if (positionalStr.trim() !== '' && flagVal.trim() !== '') {
+    fail(`[mem] Value given both positionally and via --${given[0]} — pass it once.`);
+    return null;
+  }
+  return positionalStr.trim() !== '' ? positionalStr : flagVal;
+}
+
 // ─── Unknown-flag typo guard ─────────────────────────────────────────────────
 
 /**
@@ -103,12 +134,12 @@ export const KNOWN_CLI_FLAGS = new Set([
   'after', 'age-days', 'all', 'anchor', 'batch', 'before', 'benchmark', 'body', 'branch',
   'capability-summary', 'category', 'closes-deferred', 'concepts', 'confirm', 'days', 'deep',
   'detail', 'domain-tags', 'dry-run', 'enrich', 'execute', 'fields', 'file', 'files', 'floors',
-  'force', 'format', 'from', 'has', 'help', 'importance', 'include-compressed', 'include-noise',
+  'force', 'format', 'from', 'has', 'help', 'id', 'ids', 'content', 'importance', 'include-compressed', 'include-noise',
   'intent-tags', 'invocation-name', 'json', 'key', 'keywords', 'lesson', 'lesson-learned', 'limit',
   'local-path', 'margins', 'max', 'memdir', 'merge-ids', 'metrics', 'name', 'narrative', 'no-deep',
   'offset', 'ops', 'or', 'out', 'priority', 'project', 'quality', 'query', 'reason', 'repo-url',
   'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'session-audit',
-  'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'tier', 'title',
+  'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'text', 'tier', 'title',
   'to', 'trigger-patterns', 'type', 'use-cases', 'verbose',
 ]);
 
