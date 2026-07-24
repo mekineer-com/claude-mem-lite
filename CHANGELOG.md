@@ -2,6 +2,16 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.59.1 — read-side lesson escape + memdir-audit sees frontmatter-typed memories
+
+Two fixes from a 2026-07-24 memory-quality audit, both restoring intended behavior.
+
+**fix: lesson-bearing observations are no longer hidden by the low-signal title filter.** The write-side noise gates (`isNoiseObservation`/`capNoiseImportance`) deliberately KEEP a LOW_SIGNAL-titled row when it carries a real `lesson_learned`, but the read-side SQL chain (`notLowSignalTitleClause`) hid it unconditionally — three live observations (all importance≥2 with lessons, titles starting `npm `, including the npm-12 → better-sqlite3 → MCP -32000 lesson) were stored-but-unretrievable across search, recall, error-recall, and every injection surface except PreToolUse (whose filter already had its own lesson disjunct). `buildNotLowSignalSql` gains an opt-in `lessonEscape` (`title chain OR lesson non-empty/non-'none'`, mirroring the write-side test); `notLowSignalTitleClause` enables it for all 14 observation-retrieval consumers. Events-table queries (`lib/activity.mjs`, pre-tool-recall events fallback — no `lesson_learned` column) and the noise-title metrics (`lib/stats-quality.mjs`, `lib/stats-core.mjs`) stay on the pure title-only builder, so activity search and the stats "Low-signal titles" count are unchanged. Escape is lesson-only by design: an importance≥2 escape would resurrect pre-v2.47 Haiku-inflated noise on legacy DBs. Denoise A/B: NEUTRAL (all Δ=0.000 across the three suites; fixtures contain no low-signal-titled rows), probes 27/27; the behavioral pin is the new end-to-end regression (lesson-bearing `npm `-titled obs found, lesson-less sibling still hidden).
+
+**fix: `memdir-audit` now sees the current CC harness memory layer.** Selection was filename-prefix-only (`feedback_*`/`project_*`), but the harness writes kebab-case files (`ship-runbook.md`) with the type in frontmatter `metadata.type` — the audit reported `Total: 0 file(s)` against a populated memdir. Selection is now two-path: known legacy prefixes win (`user_*`/`reference_*` stay excluded even if frontmatter disagrees), otherwise frontmatter `type: feedback|project` selects the file (anchored extractor; `node_type:` cannot false-match). First real run audited 2 files, flagged both non-compliant, and both were fixed — the tool found real drift the moment it could see.
+
+Pre-ship review by a fresh-context subagent: no P1/P2; two theoretical P3s deferred (D#13). Tests 4029 → 4040 (+11: 6 lesson-escape incl. the end-to-end pin, 5 memdir frontmatter-type), eslint clean.
+
 ## v3.59.0 — MCP-field flag aliases: flags-only CLI invocations now work
 
 Additive CLI change, no behavior change for existing invocation shapes. LLM callers (Claude Code itself included) map the MCP tool schemas onto named flags and omit the positional argument — a real transcript showed `save --type decision --title … --lesson …` (no positional) failing with a stderr-only usage line that, behind the caller's own `2>/dev/null`, read as "CLI doesn't support save". Every command with a required positional now accepts the matching MCP field name as a flag alias:

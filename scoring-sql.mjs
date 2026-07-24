@@ -152,8 +152,17 @@ export function noisePenaltyClause(alias = 'o') {
 // The SQL path (this), the regex path (utils.mjs::LOW_SIGNAL_TITLE), and the
 // pre-tool-recall.js inline SQL now all derive from one authoritative
 // pattern list. Previously hand-mirrored with "keep in sync" comments.
+//
+// lessonEscape (2026-07-24 audit P1, D#11): every consumer of THIS clause is an
+// observations-table retrieval surface (search, recall, error-recall, context/
+// handoff/UPS injection, optimize candidates), so all get the read-side lesson
+// escape — a low-signal TITLE no longer hides a row with a real lesson_learned.
+// Consumers that must stay title-only import buildNotLowSignalSql directly:
+// events-table queries (lib/activity.mjs, pre-tool-recall.js events fallback —
+// no lesson_learned column) and noise-title metrics (lib/stats-core.mjs,
+// lib/stats-quality.mjs — they COUNT pattern-titled rows, not filter them).
 export function notLowSignalTitleClause(alias = 'o') {
-  return buildNotLowSignalSql(alias);
+  return buildNotLowSignalSql(alias, { lessonEscape: true });
 }
 
 // ─── Cite-history factor (A1, v2.83) ────────────────────────────────────────

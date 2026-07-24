@@ -304,8 +304,29 @@ export function removePluginDoc(memdir, slug) {
 // noise.
 
 const AUDIT_FILE_RE = /^(feedback|project)_[A-Za-z0-9_-]+\.md$/;
+// Legacy skip prefixes: user_*/reference_* have no Why/How requirement. A known
+// filename prefix wins over frontmatter type (a user_*.md stays excluded even if
+// its frontmatter says feedback).
+const SKIP_FILE_RE = /^(user|reference)_[A-Za-z0-9_-]+\.md$/;
 const WHY_RE = /^\s*\*\*Why:\*\*/m;
 const HOW_RE = /^\s*\*\*How to apply:\*\*/m;
+
+/**
+ * Extract the memory type from a file's YAML frontmatter (2026-07-24 audit P2).
+ * The current CC harness writes kebab-case filenames (ship-runbook.md) and puts
+ * the type in frontmatter — either top-level `type: X` or nested under
+ * `metadata:` as `  type: X`. Anchored `^\s*type:` cannot match `node_type:`.
+ *
+ * @param {string} raw Full file content
+ * @returns {string|null} Lowercased type, or null when absent/no frontmatter
+ */
+function frontmatterType(raw) {
+  if (!raw.startsWith('---\n') && !raw.startsWith('---\r\n')) return null;
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n|$)/);
+  if (!m) return null;
+  const t = m[1].match(/^\s*type:\s*([A-Za-z]+)\s*$/m);
+  return t ? t[1].toLowerCase() : null;
+}
 
 /**
  * Strip the leading YAML frontmatter block (between `---` fences) so audit
@@ -339,13 +360,29 @@ export function auditMemdir(memdir) {
   let entries;
   try { entries = readdirSync(memdir); } catch { return result; }
 
-  const targets = entries.filter(n => AUDIT_FILE_RE.test(n)).sort();
-  for (const name of targets) {
-    let body = '';
-    try {
-      const raw = readFileSync(join(memdir, name), 'utf8');
-      body = stripFrontmatter(raw);
-    } catch { /* unreadable — count as missingBoth */ }
+  // Two selection paths (2026-07-24 audit P2):
+  //   1. legacy filename prefix — feedback_*/project_* audited, user_*/reference_* skipped
+  //   2. kebab-case (current harness) — frontmatter type ∈ {feedback, project}
+  // Path 2 needs the file content; read once and reuse for the body check.
+  const candidates = entries
+    .filter(n => n.endsWith('.md') && n !== 'MEMORY.md' && !n.startsWith('.'))
+    .sort();
+  let total = 0;
+  for (const name of candidates) {
+    const legacyAudit = AUDIT_FILE_RE.test(name);
+    if (!legacyAudit && SKIP_FILE_RE.test(name)) continue;
+
+    let raw = null;
+    try { raw = readFileSync(join(memdir, name), 'utf8'); } catch { /* unreadable */ }
+
+    if (!legacyAudit) {
+      // Frontmatter decides; unreadable or untyped files carry no Why/How contract.
+      const type = raw === null ? null : frontmatterType(raw);
+      if (type !== 'feedback' && type !== 'project') continue;
+    }
+    // Legacy-prefixed unreadable file keeps the old behavior: counted as missingBoth.
+    const body = raw === null ? '' : stripFrontmatter(raw);
+    total += 1;
 
     const hasWhy = WHY_RE.test(body);
     const hasHow = HOW_RE.test(body);
@@ -354,6 +391,6 @@ export function auditMemdir(memdir) {
     else if (!hasWhy) result.missingWhy.push(name);
     else result.missingHowToApply.push(name);
   }
-  result.total = targets.length;
+  result.total = total;
   return result;
 }

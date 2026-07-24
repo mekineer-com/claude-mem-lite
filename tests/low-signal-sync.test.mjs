@@ -11,6 +11,8 @@ import { readFileSync } from 'fs';
 import { LOW_SIGNAL_PATTERNS, buildLowSignalRegex, buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { LOW_SIGNAL_TITLE } from '../utils.mjs';
 import { notLowSignalTitleClause } from '../scoring-sql.mjs';
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { searchObservationsHybrid } from '../search-engine.mjs';
 
 // Sample titles that cover every pattern + a set of legitimate titles that
 // must NOT be flagged. Seeded to make the test deterministic and exhaustive
@@ -66,26 +68,30 @@ describe('LOW_SIGNAL patterns — 3-way equivalence', () => {
 
   // Build an in-memory DB with a `titles(title)` table seeded with SAMPLES,
   // then run the SQL NOT LIKE clause against it to check equivalence.
-  function sqlSignalsMatch(title) {
+  // lesson_learned column: notLowSignalTitleClause now carries the read-side
+  // lesson escape, so the fixture table must expose the column it references.
+  // Rows are inserted with lesson NULL — with no lesson, escaped SQL must be
+  // equivalent to the pure title chain, which is what the sync tests assert.
+  function sqlSignalsMatch(title, lesson = null) {
     if (!db) {
       db = new Database(':memory:');
-      db.exec('CREATE TABLE t (title TEXT)');
+      db.exec('CREATE TABLE t (title TEXT, lesson_learned TEXT)');
     }
     db.prepare('DELETE FROM t').run();
-    db.prepare('INSERT INTO t(title) VALUES (?)').run(title);
+    db.prepare('INSERT INTO t(title, lesson_learned) VALUES (?, ?)').run(title, lesson);
     // title is LOW_SIGNAL iff NOT (notLowSignalTitleClause) evaluates true
     const row = db.prepare(`SELECT NOT ${notLowSignalTitleClause('t')} AS is_low FROM t`).get();
     return row.is_low === 1;
   }
 
-  function moduleSqlMatches(title) {
+  function moduleSqlMatches(title, lesson = null, opts = undefined) {
     if (!db) {
       db = new Database(':memory:');
-      db.exec('CREATE TABLE t (title TEXT)');
+      db.exec('CREATE TABLE t (title TEXT, lesson_learned TEXT)');
     }
     db.prepare('DELETE FROM t').run();
-    db.prepare('INSERT INTO t(title) VALUES (?)').run(title);
-    const row = db.prepare(`SELECT NOT ${buildNotLowSignalSql('t')} AS is_low FROM t`).get();
+    db.prepare('INSERT INTO t(title, lesson_learned) VALUES (?, ?)').run(title, lesson);
+    const row = db.prepare(`SELECT NOT ${buildNotLowSignalSql('t', opts)} AS is_low FROM t`).get();
     return row.is_low === 1;
   }
 
@@ -148,5 +154,76 @@ describe('LOW_SIGNAL patterns — 3-way equivalence', () => {
       }
     }
     expect(coverage.size).toBe(LOW_SIGNAL_PATTERNS.length);
+  });
+
+  // ── Read-side lesson escape (2026-07-24 audit P1, D#11) ────────────────────
+  //
+  // The write-side gates (isNoiseObservation / capNoiseImportance) keep a
+  // LOW_SIGNAL-titled row when it carries real signal (lesson_learned), but the
+  // read-side SQL chain hid it unconditionally — a substantive "npm pack drops
+  // npm-shrinkwrap.json …" bugfix was invisible to search/recall/injection
+  // because its title starts with 'npm '. The escape restores symmetry: a
+  // low-signal TITLE no longer hides a row whose lesson_learned is set.
+  const LESSON = 'verify the published tarball contents, not just the step ran';
+
+  it('lessonEscape option: low-signal title + real lesson is NOT hidden', () => {
+    expect(moduleSqlMatches('npm pack drops npm-shrinkwrap.json on files[] whitelist', LESSON, { lessonEscape: true })).toBe(false);
+    expect(moduleSqlMatches('Error: FTS5 column mismatch', LESSON, { lessonEscape: true })).toBe(false);
+  });
+
+  it('lessonEscape option: low-signal title without real lesson stays hidden', () => {
+    for (const lesson of [null, '', 'none', ' None ', '  ']) {
+      expect(moduleSqlMatches('npm install --save', lesson, { lessonEscape: true })).toBe(true);
+    }
+  });
+
+  it('lessonEscape option: legitimate titles are unaffected either way', () => {
+    expect(moduleSqlMatches('Fix weak regex in makeEntryDesc', null, { lessonEscape: true })).toBe(false);
+    expect(moduleSqlMatches('Fix weak regex in makeEntryDesc', LESSON, { lessonEscape: true })).toBe(false);
+  });
+
+  it('default (no option) stays title-only — events/stats consumers unchanged', () => {
+    // events table has no lesson_learned column; the pure builder must not
+    // reference it. Guard: SQL contains no lesson_learned identifier.
+    expect(buildNotLowSignalSql('o')).not.toContain('lesson_learned');
+    expect(moduleSqlMatches('npm install --save', LESSON)).toBe(true);
+  });
+
+  it('scoring-sql notLowSignalTitleClause carries the lesson escape', () => {
+    expect(sqlSignalsMatch('npm pack drops npm-shrinkwrap.json on files[] whitelist', LESSON)).toBe(false);
+    expect(sqlSignalsMatch('npm pack drops npm-shrinkwrap.json on files[] whitelist', null)).toBe(true);
+  });
+});
+
+describe('read-side lesson escape — end-to-end search regression (obs #229 shape)', () => {
+  it('finds a lesson-bearing obs whose title starts with a LOW_SIGNAL prefix', () => {
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1' });
+    insertObs(db, {
+      project: 'test',
+      type: 'bugfix',
+      title: 'npm pack drops npm-shrinkwrap.json when package.json has a files[] whitelist',
+      narrative: 'npm packlist always-include set covers package.json but not the shrinkwrap',
+      lessonLearned: 'verify the PUBLISHED tarball contents (npm pack + tar -tzf), not just that the generating step ran',
+      importance: 2,
+    });
+    // Same low-signal title shape, no lesson → must stay hidden from search.
+    insertObs(db, {
+      project: 'test',
+      type: 'change',
+      title: 'npm pack drops warnings on stale shrinkwrap fixture',
+      narrative: '',
+      importance: 1,
+    });
+
+    const rows = searchObservationsHybrid(db, {
+      ftsQuery: 'shrinkwrap', args: {},
+      epochFrom: null, epochTo: null,
+      perSourceLimit: 10, perSourceOffset: 0, currentProject: 'test', limit: 10,
+    });
+    const titles = rows.map(r => r.title);
+    expect(titles).toContain('npm pack drops npm-shrinkwrap.json when package.json has a files[] whitelist');
+    expect(titles).not.toContain('npm pack drops warnings on stale shrinkwrap fixture');
+    db.close();
   });
 });

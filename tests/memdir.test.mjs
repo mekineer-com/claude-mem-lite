@@ -488,4 +488,54 @@ describe('auditMemdir', () => {
     const r = auditMemdir(memdir);
     expect(r.missingBoth).toEqual(['feedback_frontmatter_only.md']);
   });
+
+  // ─── kebab-case files: type comes from frontmatter (2026-07-24 audit P2) ────
+  // The current CC harness writes memories as kebab-case names (ship-runbook.md)
+  // with the type in frontmatter `metadata.type:` — the filename-prefix
+  // convention no longer applies. Rule: known filename prefixes win (legacy);
+  // otherwise frontmatter type ∈ {feedback, project} selects the file for audit.
+
+  function writeKebab(name, type, body) {
+    writeFileSync(join(memdir, name),
+      ['---', `name: ${name.replace(/\.md$/, '')}`, 'description: "d"', 'metadata: ',
+       '  node_type: memory', `  type: ${type}`, '---', '', body].join('\n'));
+  }
+
+  it('audits a kebab-case file whose metadata.type is project', () => {
+    writeKebab('ship-runbook.md', 'project',
+      'Release flow.\n**Why:** repeatable releases.\n**How to apply:** follow the 5-file sync.\n');
+    const r = auditMemdir(memdir);
+    expect(r.compliant).toEqual(['ship-runbook.md']);
+    expect(r.total).toBe(1);
+  });
+
+  it('flags a kebab-case project file missing both fields', () => {
+    writeKebab('npm12-binding.md', 'project', 'Prose without structure lines.\n');
+    const r = auditMemdir(memdir);
+    expect(r.missingBoth).toEqual(['npm12-binding.md']);
+  });
+
+  it('audits a kebab-case file with top-level frontmatter type: feedback', () => {
+    writeFileSync(join(memdir, 'cite-lessons.md'),
+      ['---', 'name: cite-lessons', 'type: feedback', '---', '',
+       '**Why:** decay.\n**How to apply:** cite #NN.\n'].join('\n'));
+    const r = auditMemdir(memdir);
+    expect(r.compliant).toEqual(['cite-lessons.md']);
+  });
+
+  it('skips kebab-case files typed user/reference and files with no type', () => {
+    writeKebab('who-i-am.md', 'user', 'role prose\n');
+    writeKebab('dashboard-link.md', 'reference', 'url pointer\n');
+    writeFileSync(join(memdir, 'untyped-notes.md'), 'no frontmatter at all\n');
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(0);
+  });
+
+  it('node_type: memory in frontmatter is not mistaken for the type field', () => {
+    // regression guard: the `type:` extractor must not match `node_type:`.
+    writeFileSync(join(memdir, 'only-nodetype.md'),
+      ['---', 'name: x', 'metadata: ', '  node_type: project', '---', '', 'body\n'].join('\n'));
+    const r = auditMemdir(memdir);
+    expect(r.total).toBe(0);
+  });
 });
