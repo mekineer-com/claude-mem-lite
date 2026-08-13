@@ -36,7 +36,7 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
 // intact but the .node binary stale → server FATALs with "Could not locate
 // the bindings file" on first DB open. Probe + auto-rebuild before launching.
 try {
-  const { ensureBetterSqlite3Working, probeBetterSqlite3Binding } = await import('../lib/binding-probe.mjs');
+  const { ensureBetterSqlite3Working, probeBindingInFreshProcess } = await import('../lib/binding-probe.mjs');
   // The rebuild inside ensureBetterSqlite3Working mutates node_modules — the
   // same write class as install/repair/update, and this was the ONE rebuild
   // path outside the shared install.lock: a second MCP launch or a concurrent
@@ -56,7 +56,11 @@ try {
     if (release) {
       verify = await ensureBetterSqlite3Working(ROOT);
     } else {
-      const probe = await probeBetterSqlite3Binding(ROOT);
+      // Out of process, like the rebuild-capable branch above: this process goes
+      // on to import the MCP server, and a stale .node loaded here would leave a
+      // dead module handle cached for it. Also keeps the exit(1) guidance below
+      // reachable — an in-process load of a stale binding can SIGSEGV instead.
+      const probe = probeBindingInFreshProcess(ROOT);
       verify = probe.ok
         ? { ok: true, action: 'verified' }
         : { ok: false, error: `${probe.error} (another install/repair holds the lock — not rebuilding concurrently; reconnect with /mcp once it finishes)` };

@@ -250,6 +250,9 @@ export const HOOK_SCRIPT_FILES = [
 //     as the MCP server. v3.42 audit HIGH-1.
 //   - setup.sh: run on plugin SessionStart via hooks.json. Signed for defense-in-depth
 //     (no tarball→executed-path propagation today, but it ships in files[] and is executed).
+//   - binding-probe-cli.mjs: setup.sh spawns it on every SessionStart that misses the ABI
+//     marker, and it runs `npm rebuild` — an unsigned copy would be arbitrary code executed
+//     at session start with a build step attached. Same class as setup.sh itself.
 // These ship via package.json files[] directly, not via HOOK_SCRIPT_FILES' copy path, so
 // listing them here changes ONLY what is signed/verified, not what install materializes.
 // Module-internal (spread into RELEASE_SIGNED_FILES below); not exported — no external
@@ -258,6 +261,7 @@ const LAUNCHER_SCRIPT_FILES = [
   'launch.mjs',
   'launch-preflight.mjs',
   'setup.sh',
+  'binding-probe-cli.mjs',
 ];
 
 // The complete set of files the release signature MUST cover: every runtime .mjs

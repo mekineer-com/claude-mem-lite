@@ -145,8 +145,17 @@ describe('release signature covers the executable hook scripts (supply-chain gap
   // asserts every scripts/* path EXECUTED by .mcp.json or hooks.json is in the signed set.
   it('signs every scripts/* executed by .mcp.json or hooks.json (launcher RCE gap)', () => {
     const root = process.cwd();
-    const raw = readFileSync(join(root, '.mcp.json'), 'utf8')
-      + '\n' + readFileSync(join(root, 'hooks', 'hooks.json'), 'utf8');
+    // Manifests declare the FIRST-order entry points; the scripts they spawn are
+    // second-order and invisible to a manifest-only scan. scripts/setup.sh
+    // spawning scripts/binding-probe-cli.mjs (which runs `npm rebuild`) is
+    // exactly that shape — signed by hand in v3.60.1 with nothing enforcing it.
+    // Scanning the executed scripts themselves makes the invariant transitive.
+    const raw = [
+      join(root, '.mcp.json'),
+      join(root, 'hooks', 'hooks.json'),
+      join(root, 'scripts', 'setup.sh'),
+      join(root, 'scripts', 'launch.mjs'),
+    ].map((p) => readFileSync(p, 'utf8')).join('\n');
     // Extract every scripts/<file>.(mjs|js|sh) token referenced as an executed command.
     const executed = [...new Set([...raw.matchAll(/scripts\/[\w.-]+\.(?:mjs|js|sh)/g)].map(m => m[0]))];
     expect(executed.length, 'expected to find executed scripts/* references').toBeGreaterThan(0);

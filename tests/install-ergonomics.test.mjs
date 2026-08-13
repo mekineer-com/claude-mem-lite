@@ -68,8 +68,13 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       expect(existsSync(flag)).toBe(true);
 
       // Symlink path: deps live in DATA_DIR/node_modules, setup.sh symlinks into
-      // pluginRoot. No lib/binding-probe.mjs in the fixture root → exercises the
-      // bare-probe fallback (half-installed tree with a working binding).
+      // pluginRoot. The probe entry point IS present but lib/ is not, so the
+      // helper import fails and the bare-probe fallback runs — a half-installed
+      // tree with a working binding. (Omitting the entry point entirely would
+      // instead skip the probe and coast on setup.sh's binding_usable fallback,
+      // testing nothing about bareProbe.)
+      mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
+      copyFileSync(resolve('scripts/binding-probe-cli.mjs'), join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'));
       makeWorkingNodeModules(dataDir);
 
       execFileSync('bash', [SETUP_PATH], {
@@ -92,8 +97,16 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
       mkdirSync(join(dataDir, 'runtime'), { recursive: true });
       mkdirSync(join(pluginRoot, 'lib'), { recursive: true });
+      mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
       writeFileSync(join(pluginRoot, 'package.json'), '{"name":"fixture"}\n');
-      copyFileSync(resolve('lib/binding-probe.mjs'), join(pluginRoot, 'lib', 'binding-probe.mjs'));
+      // The probe ENTRY POINT plus all three helpers: setup.sh delegates to
+      // scripts/binding-probe-cli.mjs, and a fixture missing it silently falls
+      // through to setup.sh's binding_usable fallback instead of testing the
+      // probe at all.
+      for (const f of ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs']) {
+        copyFileSync(resolve('lib', f), join(pluginRoot, 'lib', f));
+      }
+      copyFileSync(resolve('scripts/binding-probe-cli.mjs'), join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'));
       const nm = makeWorkingNodeModules(pluginRoot);
 
       const flag = join(dataDir, 'runtime', '.deps-broken');
@@ -115,6 +128,47 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
     }
   });
 
+  // v3.60.1 regression: the false RED. The probe used to be an inline
+  // `node --input-type=module -e` string that SIGSEGV'd in native teardown AFTER
+  // a verified-good rebuild — exit 139 read as "still broken", so setup.sh wrote
+  // .deps-broken over a healthy install and hook.mjs rendered a "hooks degraded"
+  // banner into the session. Extracting the probe to a module removed that
+  // trigger; setup.sh's binding_usable fallback makes the VERDICT independent of
+  // the probe's exit code, so any future crash cannot resurrect the false red.
+  // Simulated here by a probe that dies on SIGSEGV while the tree is healthy.
+  it('a probe that crashes does not mark deps broken when the binding is actually usable', () => {
+    expect(existsSync(REPO_NODE_MODULES)).toBe(true);
+    const home = makeTmpDir();
+    try {
+      const dataDir = join(home, '.claude-mem-lite');
+      const pluginRoot = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite');
+      mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+      mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
+      writeFileSync(join(pluginRoot, 'package.json'), '{"name":"fixture"}\n');
+      const nm = makeWorkingNodeModules(pluginRoot);
+      // Healthy tree, crashing probe: exactly the shape that produced the bug.
+      writeFileSync(
+        join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'),
+        'process.kill(process.pid, "SIGSEGV");\n',
+      );
+
+      const flag = join(dataDir, 'runtime', '.deps-broken');
+      const out = execFileSync('bash', [SETUP_PATH], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 60000,
+      });
+
+      expect(existsSync(flag), '.deps-broken written despite a usable binding').toBe(false);
+      expect(existsSync(join(nm, `.mem-binding-ok-${process.versions.modules}`))).toBe(true);
+      // SessionStart stdout is a JSON envelope — a crashing child must not reach it.
+      expect(out).toBe('');
+    } finally {
+      try { rmSync(home, { recursive: true, force: true }); } catch {}
+    }
+  });
+
   // D#6 regression: the npm >= 12 false green. better-sqlite3 dir PRESENT but
   // unusable (no compiled binding) — pre-fix setup.sh called mark_deps_ok on
   // presence alone and every hook died silently with a green flag. Now the
@@ -129,11 +183,15 @@ describe('setup.sh deps-broken flag round-trip (v2.79, binding-probe since D#6 f
       mkdirSync(join(pluginRoot, 'lib'), { recursive: true });
       mkdirSync(join(pluginRoot, 'node_modules', 'better-sqlite3'), { recursive: true });
       writeFileSync(join(pluginRoot, 'package.json'), '{"name":"fixture"}\n');
-      // All three probe helpers so the test exercises the REAL locked-rebuild
-      // path, not the bare-probe fallback.
+      // The probe entry point AND all three helpers, so the test exercises the
+      // REAL locked-rebuild path — not the bare-probe fallback, and not
+      // setup.sh's binding_usable fallback (which is what an absent
+      // scripts/binding-probe-cli.mjs silently degrades to).
+      mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
       for (const f of ['binding-probe.mjs', 'proc-lock.mjs', 'resolve-data-dir.mjs']) {
         copyFileSync(resolve('lib', f), join(pluginRoot, 'lib', f));
       }
+      copyFileSync(resolve('scripts/binding-probe-cli.mjs'), join(pluginRoot, 'scripts', 'binding-probe-cli.mjs'));
 
       const flag = join(dataDir, 'runtime', '.deps-broken');
 

@@ -136,65 +136,38 @@ fi
 #     stat, a new plugin-cache version dir (fresh node_modules) re-probes, and
 #     a Node upgrade (new ABI) re-probes. While broken, every SessionStart
 #     retries the rebuild until it heals.
-# shellcheck disable=SC2016  # node script single-quoted on purpose; ROOT passed via env, not shell expansion
+# Delegates to scripts/binding-probe-cli.mjs — a real module file, NOT an inline
+# `node -e` string. That inline form SIGSEGV'd during exit after a verified-good
+# rebuild (Node v24.18, ~50% of runs), so a successful heal returned 139 and this
+# branch recorded .deps-broken over a healthy install; it also could not contain
+# an apostrophe without truncating the shell command. See that file's header.
+# Contract: exit 0 = binding usable now.
 probe_binding() {
-  PROBE_ROOT="$ROOT" node --input-type=module -e '
-    // NOTE: this whole script sits in a single-quoted bash string — no
-    // apostrophes anywhere in it.
-    const { pathToFileURL } = await import("node:url");
-    const { join } = await import("node:path");
-    const root = process.env.PROBE_ROOT;
-    const libUrl = (f) => pathToFileURL(join(root, "lib", f)).href;
-    let helpers = null;
-    try {
-      const [probeMod, lockMod, dirMod] = await Promise.all(
-        ["binding-probe.mjs", "proc-lock.mjs", "resolve-data-dir.mjs"].map((f) => import(libUrl(f))));
-      helpers = { ...probeMod, ...lockMod, ...dirMod };
-    } catch {
-      // Probe helpers missing (half-installed tree) — fall back to a bare
-      // probe with no rebuild: a WORKING binding must still clear the flag,
-      // and a helperless broken tree is repaired by the hook-launcher path.
-      const { createRequire } = await import("node:module");
-      try {
-        const D = createRequire(join(root, "package.json"))("better-sqlite3");
-        new D(":memory:").close();
-        process.exit(0);
-      } catch (e) {
-        process.stderr.write(`[claude-mem-lite] binding probe: ${e.message}\n`);
-        process.exit(1);
-      }
-    }
-    // Probe first — read-only, no lock needed. Healthy binding exits here.
-    const first = await helpers.probeBetterSqlite3Binding(root);
-    if (first.ok) process.exit(0);
-    // Broken: rebuild ONLY under the shared install.lock (a second MCP launch
-    // or install.mjs repair rebuilding the same node_modules concurrently can
-    // tear the .node), and with the exec bounded to 20s — this script runs
-    // under the SessionStart hook cap (hooks.json timeout 30), and letting the
-    // hook SIGKILL a mid-flight node-gyp leaves a partial .node with no flag
-    // written. On lock-miss or timeout: mark broken and defer the heal to the
-    // MCP launch path (no hook cap, same lock).
-    const lockPath = join(helpers.resolveDataDir(process.env.CLAUDE_MEM_DIR), "runtime", "install.lock");
-    const release = helpers.acquireLock(lockPath);
-    if (!release) {
-      const firstLine = String(first.error).split("\n")[0];
-      process.stderr.write(`[claude-mem-lite] binding probe: ${firstLine} (another install/repair in flight — deferring heal)\n`);
-      process.exit(1);
-    }
-    let r;
-    try {
-      const { execSync } = await import("node:child_process");
-      r = await helpers.ensureBetterSqlite3Working(root, {
-        exec: (cmd, opts) => execSync(cmd, { ...opts, timeout: 20000 }),
-      });
-    } finally {
-      // process.exit skips finally blocks — exits live BELOW this so the
-      // lock is always released.
-      release();
-    }
-    if (!r.ok) { process.stderr.write(`[claude-mem-lite] binding probe: ${r.error}\n`); process.exit(1); }
-    if (r.action === "rebuilt") process.stderr.write("[claude-mem-lite] rebuilt better-sqlite3 binding for current Node ABI\n");
-  '
+  # Absent on a truncated tree: without this guard node prints a full
+  # MODULE_NOT_FOUND stack onto SessionStart stderr on every marker-miss.
+  [[ -f "$ROOT/scripts/binding-probe-cli.mjs" ]] || return 1
+  # stdout muted: this child runs `npm rebuild`, and SessionStart stdout is a
+  # JSON envelope Claude Code parses. Nothing writes there today (verified) —
+  # this keeps a future non-piped exec from being able to.
+  PROBE_ROOT="$ROOT" node "$ROOT/scripts/binding-probe-cli.mjs" >/dev/null
+}
+
+# Ground truth about the binding, independent of how the healer above exited.
+# Belt-and-braces: moving the probe out of the inline `node -e` string removed
+# the observed SIGSEGV, but the healer's exit code is a PROXY for the question
+# that actually matters, and a proxy can lie again (a future crash, a partial
+# state, a kill at the hook cap). So ask the real question in a fresh process:
+# can we open a DB right now? A false .deps-broken here is not cosmetic — it
+# renders a "hooks degraded" banner into the user's session over a healthy
+# install. Costs one ~50ms spawn, and only off the marker fast-path.
+# shellcheck disable=SC2016  # node script single-quoted on purpose; ROOT passed via env, not shell expansion
+binding_usable() {
+  VERIFY_ROOT="$ROOT" node -e '
+    const { createRequire } = require("node:module");
+    const { join } = require("node:path");
+    const D = createRequire(join(process.env.VERIFY_ROOT, "package.json"))("better-sqlite3");
+    new D(":memory:").close();
+  ' >/dev/null 2>&1
 }
 
 if [[ -d "$ROOT/node_modules/better-sqlite3" ]]; then
@@ -202,7 +175,7 @@ if [[ -d "$ROOT/node_modules/better-sqlite3" ]]; then
   BINDING_MARKER="$ROOT/node_modules/.mem-binding-ok-$NODE_ABI"
   if [[ -f "$BINDING_MARKER" ]]; then
     mark_deps_ok
-  elif probe_binding; then
+  elif probe_binding || binding_usable; then
     rm -f "$ROOT/node_modules/.mem-binding-ok-"* 2>/dev/null || true
     touch "$BINDING_MARKER" 2>/dev/null || true
     mark_deps_ok

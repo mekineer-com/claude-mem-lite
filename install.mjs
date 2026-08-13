@@ -40,7 +40,7 @@ const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
-import { probeBetterSqlite3Binding, ensureBetterSqlite3Working, NATIVE_BINDING_REBUILD_CMD } from './lib/binding-probe.mjs';
+import { probeBetterSqlite3Binding, probeBindingInFreshProcess, ensureBetterSqlite3Working, NATIVE_BINDING_REBUILD_CMD } from './lib/binding-probe.mjs';
 import { clearNativeBindingBreakage, readNativeBindingBreakage } from './lib/native-binding-hint.mjs';
 import { sweepStaleTestFixtures } from './lib/tmp-fixture-sweep.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
@@ -1396,14 +1396,17 @@ async function doctor() {
     issues++;
   }
 
-  // Dependencies
-  try {
-    const Database = (await import('better-sqlite3')).default;
-    const probe = new Database(':memory:');
-    probe.close();
+  // Dependencies. Out of process: an in-process open of a STALE .node caches a
+  // dead module handle for the rest of doctor and can SIGSEGV on teardown —
+  // truncating the report of the very run the user started because things are
+  // broken. This is also what makes the native-binding check further down
+  // (which reads the same tree) honest rather than answering from a poisoned
+  // process.
+  const depProbe = probeBindingInFreshProcess(bindingHostDir());
+  if (depProbe.ok) {
     ok('better-sqlite3: verified (import + open OK)');
-  } catch (e) {
-    fail(`better-sqlite3: import/init failed (${e.message})`);
+  } else {
+    fail(`better-sqlite3: import/init failed (${String(depProbe.error).split('\n')[0]})`);
     issues++;
   }
 
@@ -1454,7 +1457,9 @@ async function doctor() {
   // right now". A Node upgrade breaks every DB-touching path at once, so this is
   // the single highest-value line in doctor when it fires.
   const breakage = readNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
-  const bindingProbe = await probeBetterSqlite3Binding(bindingHostDir());
+  // Reuses the dependency probe above — same tree, same question, and doctor
+  // should not pay for two child spawns to ask it twice.
+  const bindingProbe = depProbe;
   if (!bindingProbe.ok) {
     fail(`Native DB binding: unusable (${String(bindingProbe.error).split('\n')[0]}) — run \`node ${join(PROJECT_DIR, 'cli.mjs')} rebuild-binding\``);
     issues++;

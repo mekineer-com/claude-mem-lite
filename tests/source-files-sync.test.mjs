@@ -13,7 +13,7 @@
 // entry points, catching any future file added without being shipped.
 
 import { test, expect } from 'vitest';
-import { SOURCE_FILES, HOOK_SCRIPT_FILES } from '../source-files.mjs';
+import { SOURCE_FILES, HOOK_SCRIPT_FILES, RELEASE_SIGNED_FILES } from '../source-files.mjs';
 import { readFileSync, existsSync } from 'fs';
 import { dirname, resolve, relative } from 'path';
 
@@ -124,6 +124,23 @@ test('package.json files array ships source-files.mjs and every SOURCE_FILES ent
   const NOT_PACKED_VIA_FILES = new Set(['package.json', 'package-lock.json']);
   const missingFromPkg = SOURCE_FILES.filter(f => !files.has(f) && !NOT_PACKED_VIA_FILES.has(f));
   expect(missingFromPkg, `\npackage.json files missing SOURCE_FILES entries:\n  ${missingFromPkg.join('\n  ')}\n`).toEqual([]);
+});
+
+// Signed-but-unshipped bricks the npm shape. verifyReleaseFiles fail-CLOSES on a
+// file listed in the manifest but absent from the extracted tarball
+// (lib/release-digest.mjs), so a launcher/setup script added to
+// RELEASE_SIGNED_FILES without also landing in package.json files[] would make
+// every auto-update refuse to verify. Nothing enforced this pairing before
+// v3.60.1 — scripts/binding-probe-cli.mjs got both by hand.
+test('package.json files array ships every RELEASE_SIGNED_FILES entry', () => {
+  const pkg = JSON.parse(readFileSync(resolve(ROOT, 'package.json'), 'utf8'));
+  const files = new Set(pkg.files);
+  // Same carve-out as the SOURCE_FILES assertion above: npm packs package.json
+  // implicitly and refuses to pack package-lock.json at all.
+  const NOT_PACKED_VIA_FILES = new Set(['package.json', 'package-lock.json']);
+  const signedButUnshipped = RELEASE_SIGNED_FILES
+    .filter(f => !files.has(f) && !NOT_PACKED_VIA_FILES.has(f));
+  expect(signedButUnshipped, `\nsigned but missing from package.json files[]:\n  ${signedButUnshipped.join('\n  ')}\n`).toEqual([]);
 });
 
 // Drift guard for the lockless-registry-install fix: npm refuses to pack
