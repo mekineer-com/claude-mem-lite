@@ -3192,7 +3192,9 @@ export async function run(argv) {
   // when a flag looks like a misspelling of a real one; stdout + exit code stay untouched,
   // so JSON/text consumers are unaffected. Mirrors the unknown-COMMAND suggester in cli.mjs.
   for (const { flag, suggestion } of suggestUnknownFlags(parseArgs(cmdArgs).flags)) {
-    process.stderr.write(`[mem] Unknown flag --${flag}; did you mean --${suggestion}?\n`);
+    process.stderr.write(suggestion
+      ? `[mem] Unknown flag --${flag}; did you mean --${suggestion}?\n`
+      : `[mem] Unknown flag --${flag} — ignored (it filtered nothing). Run "claude-mem-lite help" for this command's flags.\n`);
   }
 
   // adopt / unadopt do pure filesystem work on ~/.claude/projects/<encoded>/memory/ —

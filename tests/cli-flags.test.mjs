@@ -142,11 +142,15 @@ describe('suggestUnknownFlags', () => {
     }
   });
 
-  it('stays silent for a truly-novel flag with no close match', () => {
-    // No close match => could be a valid flag we did not catalogue; silence beats a
-    // confusing wrong suggestion.
-    expect(suggestUnknownFlags({ xyzzy: '1' })).toEqual([]);
-    expect(suggestUnknownFlags({ 'completely-different-flag': true })).toEqual([]);
+  it('reports a far-from-anything unknown flag WITHOUT inventing a suggestion', () => {
+    // Was: stay silent, on the theory that no close match might mean "a valid flag we
+    // did not catalogue". But silence is what let a dropped filter pass for an applied
+    // one — `--obs_type bugfix` (distance 4 from `type`) returned rows of every type
+    // with zero output. Report it; suggestion stays null so no wrong name is invented.
+    // The catalogue was audited against every code-read flag when this flipped.
+    expect(suggestUnknownFlags({ xyzzy: '1' })).toEqual([{ flag: 'xyzzy', suggestion: null }]);
+    expect(suggestUnknownFlags({ 'completely-different-flag': true }))
+      .toEqual([{ flag: 'completely-different-flag', suggestion: null }]);
   });
 
   it('ignores the empty-string key from a bare `--`', () => {

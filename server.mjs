@@ -28,6 +28,7 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue } from './cli/common.mjs';
+import { neutralizeContextDelimiters } from './format-utils.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
 // Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
@@ -157,14 +158,76 @@ const server = new McpServer(
 let lastMcpRequestTime = Date.now();
 let idleCleanupRan = false;
 
-function safeHandler(fn) {
+/**
+ * Defang structural context delimiters in every text block of a tools/call result.
+ *
+ * A tools/call payload IS model context — unlike CLI stdout there is no human between
+ * the DB row and the transcript. Observations are stored raw on purpose (defense lives
+ * at the injection boundary, not at save), and every HOOK surface already neutralizes
+ * before writing to the model (buildSessionContextLines / formatMemoryLine /
+ * formatErrorRecallHints / renderHandoffFromRow / pre-tool-recall). The MCP read tools
+ * were the one model-facing family left raw, so a memory carrying a forged
+ * `<system-reminder>` replayed verbatim into a mem_search result — reinstating exactly
+ * the channel the hook-side defang closes. Applied at the single handler chokepoint so
+ * a newly registered tool is covered by construction (§9 parallel-path completeness).
+ *
+ * Error payloads go through it too: `err.message` can echo caller-supplied text.
+ *
+ * @param {object} result Tool result ({ content: [{type,text}], … }).
+ * @returns {object} Same shape with text blocks neutralized.
+ */
+/**
+ * Fold CLI-flag aliases onto their canonical MCP field names.
+ *
+ * The schemas declare both spellings (see tool-schemas.mjs); this is where the alias
+ * actually takes effect. Canonical wins when both are present — an explicit canonical
+ * value is the more specific intent, and silently letting an alias override it would
+ * reintroduce the same class of surprise the aliases exist to remove.
+ *
+ * @param {object} args Raw validated tool arguments.
+ * @param {Record<string,string>} pairs alias → canonical field name.
+ * @returns {object} New args object (never mutates the caller's).
+ */
+function applyArgAliases(args, pairs) {
+  if (!args || typeof args !== 'object') return args;
+  let next = args;
+  for (const [alias, canonical] of Object.entries(pairs)) {
+    if (next[alias] !== undefined && next[canonical] === undefined) {
+      if (next === args) next = { ...args };
+      next[canonical] = next[alias];
+    }
+  }
+  return next;
+}
+
+function defangResult(result) {
+  if (!result || !Array.isArray(result.content)) return result;
+  return {
+    ...result,
+    content: result.content.map(c =>
+      c && c.type === 'text' && typeof c.text === 'string'
+        ? { ...c, text: neutralizeContextDelimiters(c.text) }
+        : c
+    ),
+  };
+}
+
+/**
+ * @param {Function} fn Tool handler.
+ * @param {object} [opts]
+ * @param {boolean} [opts.verbatim=false] Skip the defang pass. Only for payloads that
+ *   must round-trip byte-exact — `mem_export` feeds `restore`, so neutralizing it would
+ *   silently corrupt backups of any memory that legitimately discusses these tags.
+ */
+function safeHandler(fn, { verbatim = false } = {}) {
   return async (args, extra) => {
     try {
       lastMcpRequestTime = Date.now();
       idleCleanupRan = false;
-      return await fn(args, extra);
+      const result = await fn(args, extra);
+      return verbatim ? result : defangResult(result);
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+      return defangResult({ content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true });
     }
   };
 }
@@ -258,6 +321,10 @@ export async function handleSearchForTest(db, args, { llm, rerankLlm } = {}) {
 
 async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
   if (args.project) args = { ...args, project: _resolveProjectShared(db, args.project) };
+  // CLI-flag aliases: --source/--from/--to/--since. Folded before any read of the
+  // canonical names below, so every downstream filter sees them.
+  args = applyArgAliases(args, { source: 'type', from: 'date_from', to: 'date_to', since: 'date_since' });
+
   const limit = args.limit ?? 20;
   const offset = args.offset ?? 0;
   // args.or: force OR from the start (CLI `search --or` parity). The default path
@@ -390,6 +457,8 @@ export async function handleRecentForTest(db, args) {
 }
 
 async function runRecent(db, args) {
+  // CLI-flag aliases: `recent --type` is the OBSERVATION type here, `--since` the window.
+  args = applyArgAliases(args, { type: 'obs_type', since: 'date_since' });
   if (args.project) args = { ...args, project: _resolveProjectShared(db, args.project) };
   const limit = args.limit ?? 10;
   const project = args.project || inferProject();
@@ -1674,7 +1743,9 @@ server.registerTool(
     description: descriptionOf('mem_export'),
     inputSchema: memExportSchema,
   },
-  safeHandler(async (args) => runExport(db, args))
+  // verbatim: the export payload feeds `restore` — defanging it would silently
+  // rewrite backed-up rows whose text legitimately contains these tags.
+  safeHandler(async (args) => runExport(db, args), { verbatim: true })
 );
 
 // ─── Tool: mem_recall ────────────────────────────────────────────────────────

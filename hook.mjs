@@ -71,7 +71,7 @@ import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, 
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
 import { silentAutoAdopt } from './adopt-cli.mjs';
-import { emitV270UpgradeBanner } from './lib/upgrade-banner.mjs';
+import { emitV270UpgradeBanner, hasPreV270Data } from './lib/upgrade-banner.mjs';
 import { loadCiteBackForEpisode, extractCiteBackSignals, buildUnsavedBugfixHint, countUnsavedBugfixShape, buildCiteRecallNudge as libBuildCiteRecallNudge, nextCiteLowStreak } from './lib/cite-back-hint.mjs';
 import { detectUnpersistedDecision } from './lib/persist-reminder.mjs';
 // plugin-cache-guard.mjs loaded dynamically — pre-2.31.2 installs that auto-upgraded
@@ -1389,11 +1389,16 @@ async function handleSessionStart() {
     // deferred_work table (was: high-importance observations in v2.69.x).
     // Idempotent via marker file; subsequent SessionStarts are silent.
     try {
-      // Gate on prior data: a brand-new install never had v2.69.x deferred-block
-      // semantics, so the migration notice is wrong noise (it fired for every
-      // fresh install since v2.70). Only genuine upgraders with observations see it.
-      const obsCount = db.prepare('SELECT COUNT(*) AS c FROM observations WHERE project = ?').get(project)?.c || 0;
-      emitV270UpgradeBanner({ project, runtimeDir: RUNTIME_DIR, hasPriorData: obsCount > 0 });
+      // Gate on prior data OLDER THAN v2.70.0: a brand-new install never had
+      // v2.69.x deferred-block semantics, so the migration notice is wrong noise.
+      // "Any observations at all" still misfired for someone who installed today
+      // and saved a few memories before their first SessionStart — age is what
+      // actually identifies an upgrader (see lib/upgrade-banner.mjs).
+      emitV270UpgradeBanner({
+        project,
+        runtimeDir: RUNTIME_DIR,
+        hasPriorData: hasPreV270Data(db, project),
+      });
     } catch (e) { debugCatch(e, 'session-start-v270-banner'); }
 
     // Pre-load TF-IDF vocabulary cache for this session (from DB, ~1ms)

@@ -259,6 +259,37 @@ let flags = new Set(process.argv.slice(3));
 
 function log(msg) { console.log(`  ${msg}`); }
 function ok(msg) { console.log(`  ✓ ${msg}`); }
+
+/**
+ * Recursive on-disk size of `dir`, in bytes. Bounded by `maxEntries` so a
+ * surprise-large tree can never turn a progress line into a long stat storm —
+ * returns `{ bytes, truncated }` and callers render truncated sums as "≥ N MB".
+ *
+ * @param {string} dir Directory to measure (missing dir → 0 bytes).
+ * @param {number} [maxEntries=50000] Stat budget.
+ * @returns {{bytes: number, truncated: boolean}}
+ */
+function dirSizeBytes(dir, maxEntries = 50000) {
+  let bytes = 0, seen = 0, truncated = false;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    let entries;
+    try { entries = readdirSync(cur, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (++seen > maxEntries) { truncated = true; return { bytes, truncated }; }
+      const p = join(cur, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (e.isFile()) { try { bytes += statSync(p).size; } catch { /* raced away */ } }
+    }
+  }
+  return { bytes, truncated };
+}
+
+/** Render a byte count as a short human string ("148 MB"). */
+function fmtMB(bytes, truncated = false) {
+  return `${truncated ? '≥' : ''}${Math.round(bytes / 1048576)} MB`;
+}
 function warn(msg) { console.log(`  ⚠ ${msg}`); }
 function fail(msg) { console.log(`  ✗ ${msg}`); }
 
@@ -797,6 +828,23 @@ if (process.env.CLAUDE_MEM_SKIP_REPOS) {
         repos.get(r.repo).push(r);
       }
 
+      // Disclose the cost BEFORE spending it. This step is the single largest
+      // thing `install` does — N shallow git clones over the network, ~150 MB on
+      // disk for the default manifest — and it used to announce itself only after
+      // the fact ("Repos: 15 cloned"). A first-time user on a metered link or a
+      // small disk had no warning and no visible way out; the opt-out existed but
+      // lived only in an env var no output ever mentioned.
+      // Count only repos not already on disk — a re-run/update clones nothing, and
+      // announcing "cloning 15 repos" every time would be false.
+      const repoDirName = (repoUrl) =>
+        repoUrl.split('/').slice(-2).join('-').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const pendingClones = [...repos.keys()]
+        .filter(repoUrl => !existsSync(join(managedDir, 'repos', repoDirName(repoUrl)))).length;
+      if (pendingClones > 0) {
+        log(`Skill/agent registry: cloning ${pendingClones} repo(s) — network + ~150 MB on disk.`);
+        log('  Skip with CLAUDE_MEM_SKIP_REPOS=1 (memory features work without it).');
+      }
+
       let cloned = 0, updated = 0;
       const deadRepos = new Set(); // repos that no longer exist (404)
 
@@ -907,8 +955,10 @@ if (process.env.CLAUDE_MEM_SKIP_REPOS) {
           }
         }
       }
+      const managedSize = dirSizeBytes(managedDir);
       ok(`Repos: ${cloned} cloned, ${updated} updated, ${repos.size - deadRepos.size} active` +
-         (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : ''));
+         (deadRepos.size > 0 ? `, ${deadRepos.size} dead removed` : '') +
+         ` (${fmtMB(managedSize.bytes, managedSize.truncated)} in ${managedDir})`);
 
       // 6b. Init registry DB and record preinstalled entries
       const { ensureRegistryDb } = await importFromInstall('registry.mjs');

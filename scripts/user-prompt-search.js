@@ -114,6 +114,60 @@ const OR_TOP_BM25_FLOOR = TOP_REL_FLOOR === 0
   ? 0
   : Number(process.env.CLAUDE_MEM_UPS_OR_BM25_MIN || 30);
 
+// ─── Corpus-size normalization of the absolute floors (v3.60.2) ─────────────
+//
+// Both floors above are ABSOLUTE magnitudes, but the quantity they gate is not
+// scale-free: FTS5 bm25 carries an IDF term ≈ ln(N/df), so the SAME hit scores
+// higher on a bigger index. Measured on one fixed query + one fixed target row,
+// padding the corpus with distinct filler (2026-08-13 dogfood):
+//
+//   totalObs   10     40     100    300
+//   top|bm25|  10.0   18.6   24.2   30.7      ← same row, same query
+//
+// The floors were calibrated at `projects--mem, 584 obs` (CHANGELOG v2.43.x /
+// v2.34.3). Comparing a log-N quantity against that constant therefore does not
+// mean "weak match" on a small index — it means "small index". A brand-new
+// install measured 0/8 injections on a realistic first-day corpus (10 memories,
+// 8 recall questions whose correct target ranked #1 in 4/5 scored cases): every
+// one was dropped by the OR floor at |bm25| 3.8–15.2 < 30. The plugin is inert
+// during exactly the window where a new user decides whether it earns its keep.
+//
+// Fix: scale both floors by ln(N+1)/ln(N_REF+1), capped at 1.0 — the same log
+// shape the IDF term has, so the SIGNAL↔NOISE separation the maintainer measured
+// (signal ≥41, noise ≤22 at N_REF) is preserved proportionally at any N. At
+// N ≥ N_REF the factor is exactly 1.0, so every established install keeps
+// byte-identical behavior; only genuinely-new installs relax.
+//
+// N counts the WHOLE observations table, not the project: FTS5 computes IDF over
+// the entire index and `o.project = ?` is a post-MATCH filter. Verified — a
+// 2-row project on a 302-row install scores 31.5, matching the 300-row global
+// baseline, not the 10-row one. So a new project on an established install is
+// (correctly) unaffected by this ramp.
+const FLOOR_REF_CORPUS = Number(process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS || 584);
+
+/**
+ * Scale factor in (0, 1] for the absolute score floors, by total corpus size.
+ *
+ * Short-circuits with a bounded probe: if a row exists at offset N_REF-1 the
+ * corpus is at or above the reference and the factor is 1.0 — no COUNT scan on
+ * the large corpora where the answer is always 1.0 anyway.
+ *
+ * @param {object} db Open better-sqlite3 handle.
+ * @returns {number} Multiplier for TOP_REL_FLOOR / OR_TOP_BM25_FLOOR.
+ */
+export function corpusFloorScale(db) {
+  if (FLOOR_REF_CORPUS <= 1) return 1;
+  try {
+    const atRef = db.prepare('SELECT 1 FROM observations LIMIT 1 OFFSET ?').get(FLOOR_REF_CORPUS - 1);
+    if (atRef) return 1;
+    const { c = 0 } = db.prepare('SELECT count(*) AS c FROM observations').get() || {};
+    return Math.min(1, Math.log(c + 1) / Math.log(FLOOR_REF_CORPUS + 1));
+  } catch {
+    // Any probe failure → behave exactly as before the ramp existed.
+    return 1;
+  }
+}
+
 function isFollowUpSession() {
   try {
     const raw = readFileSync(INJECTED_IDS_FILE, 'utf8');
@@ -735,9 +789,14 @@ async function main() {
       // is a precision signal and routinely produces legitimate AND hits
       // below raw |bm25|=20 that we do not want to drop (see GOOD-narrow
       // probe). Skip gate when OR_TOP_BM25_FLOOR is set to 0 (test hook).
-      if (ftsMode === 'OR' && OR_TOP_BM25_FLOOR > 0 && ftsRows.length > 0) {
+      // Both absolute floors are normalized by corpus size (corpusFloorScale) —
+      // factor 1.0 for any install at/above the calibration corpus, so this is a
+      // no-op for established users and a proportional relaxation for new ones.
+      const floorScale = corpusFloorScale(db);
+      const orFloor = OR_TOP_BM25_FLOOR * floorScale;
+      if (ftsMode === 'OR' && orFloor > 0 && ftsRows.length > 0) {
         const topBm25 = Math.abs(ftsRows[0].bm25_raw || 0);
-        if (topBm25 < OR_TOP_BM25_FLOOR) ftsRows = [];
+        if (topBm25 < orFloor) ftsRows = [];
       }
 
       // v2.34.3: top-|rel| sanity gate. Per-row filtering above leaves noise
@@ -746,7 +805,7 @@ async function main() {
       // whole FTS set — noise prompts should produce no FTS injection.
       // Query orders by `relevance` ASC; negative values → ftsRows[0] has the
       // largest magnitude (strongest match) in this scoring expression.
-      if (ftsRows.length > 0 && Math.abs(ftsRows[0].relevance) < TOP_REL_FLOOR) {
+      if (ftsRows.length > 0 && Math.abs(ftsRows[0].relevance) < TOP_REL_FLOOR * floorScale) {
         ftsRows = [];
       }
 

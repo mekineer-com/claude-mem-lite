@@ -17,6 +17,36 @@
 export function parseArgs(argv) {
   const positional = [];
   const flags = {};
+  // Canonical flag name for a raw `--key`. Two normalizations, both aimed at the
+  // same failure: a flag nobody reads is DROPPED, and the command then answers the
+  // unfiltered question with no signal.
+  //   1. `_` → `-`: every reader in the codebase spells multi-word flags with a
+  //      hyphen (`flags['include-noise']`), so `--include_noise` was inert.
+  //   2. MCP field name → CLI flag: v3.59.0 taught the CLI to accept MCP names for
+  //      the required values (--content/--query/--ids) so a model can map a tool
+  //      schema onto flags; the FILTER fields were left out, so `--obs_type bugfix`
+  //      returned rows of every type (verified: `search redis --obs_type bugfix`
+  //      surfaced the decision row that `--type bugfix` correctly excluded).
+  // An explicitly-passed canonical flag always wins over its alias.
+  const FLAG_ALIASES = {
+    'obs-type': 'type',
+    'date-from': 'from',
+    'date-to': 'to',
+    'date-since': 'since',
+    'file-path': 'file',
+  };
+  const canonicalFlag = (raw) => {
+    const hyphenated = raw.replace(/_/g, '-');
+    return FLAG_ALIASES[hyphenated] || hyphenated;
+  };
+  const setFlag = (raw, value) => {
+    const key = canonicalFlag(raw);
+    // Alias must not clobber an explicit canonical flag; a repeated canonical flag
+    // keeps last-wins (pre-existing behavior).
+    if (key !== raw.replace(/_/g, '-') && flags[key] !== undefined) return;
+    flags[key] = value;
+  };
+
   let i = 0;
   while (i < argv.length) {
     const arg = argv[i];
@@ -29,17 +59,17 @@ export function parseArgs(argv) {
       // applied — a save landed in the wrong project / type with no error.
       const eq = body.indexOf('=');
       if (eq >= 0) {
-        flags[body.slice(0, eq)] = body.slice(eq + 1);
+        setFlag(body.slice(0, eq), body.slice(eq + 1));
         i++;
         continue;
       }
       const key = body;
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith('--') && (!next.startsWith('-') || /^-\d/.test(next))) {
-        flags[key] = next;
+        setFlag(key, next);
         i += 2;
       } else {
-        flags[key] = true;
+        setFlag(key, true);
         i++;
       }
     } else if (arg === '-h') {
@@ -141,6 +171,11 @@ export const KNOWN_CLI_FLAGS = new Set([
   'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'session-audit',
   'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'text', 'tier', 'title',
   'to', 'trigger-patterns', 'type', 'use-cases', 'verbose',
+  // Catalogued 2026-08-13 when suggestUnknownFlags started reporting EVERY unknown
+  // flag: these are real, code-read flags that the old edit-distance gate happened to
+  // stay silent about (`adopt --disable/--enable`, `activity --min-importance`,
+  // `save --supersedes`). Verified by running each command and checking for a warning.
+  'disable', 'enable', 'min-importance', 'supersedes',
 ]);
 
 /** Levenshtein distance, early-exit past `max` (cheap enough for a handful of flags). */
@@ -181,7 +216,13 @@ export function suggestUnknownFlags(flags) {
       const d = editDistance(key, known);
       if (d < bestDist) { bestDist = d; best = known; }
     }
-    if (best && bestDist <= 2) result.push({ flag: key, suggestion: best });
+    // Report EVERY unknown flag; the suggestion is a bonus when a near-miss exists.
+    // Previously an unknown flag with no neighbour within distance 2 produced no
+    // output at all — the silent case, and the dangerous one: `--obs_type bugfix`
+    // (distance 4 from `type`) parsed, matched no reader, and the command answered
+    // the unfiltered question. A dropped filter that looks applied is worse than a
+    // typo, because the wider result set reads as the answer.
+    result.push({ flag: key, suggestion: best && bestDist <= 2 ? best : null });
   }
   return result;
 }

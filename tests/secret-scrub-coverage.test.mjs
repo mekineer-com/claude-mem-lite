@@ -442,3 +442,48 @@ describe('scrubSecrets — quoted-key + passphrase (round-5 #8805 sibling)', () 
     expect(rec.narrative).not.toContain(V);
   });
 });
+
+// ─── Mid-prose `password:` leak (R5 dogfood, 2026-08-13) ────────────────────
+//
+// The `:` arm of the bare-noun patterns carries a prose lookbehind
+// `(?<![A-Za-z][ \t])` so conversational English survives ("Marker token: xyz",
+// "the bearer: alice" — #8283). That guard was applied to the WHOLE noun class,
+// so any credential noun preceded by a word escaped: a session narrative like
+// "deployed to staging, the db password: hunter2correct" persisted the password
+// in plaintext and re-injected it into every later context block.
+//
+// `password|passwd|passphrase` are not prose-ambiguous the way `token`/`bearer`/
+// `secret` are — an English sentence that writes "<word> password: <6+ chars>"
+// is naming a credential, not using the word conversationally. Split them out of
+// the lookbehind arm; `token|bearer|secret` keep it (the pinned #8283 cases below
+// all use those nouns, and stay green).
+describe('scrubSecrets — password/passwd/passphrase scrub mid-prose on the `:` separator', () => {
+  const V = 'hunter2correct';
+
+  it('scrubs a bare `password:` preceded by a prose word (unquoted)', () => {
+    expect(scrubSecrets(`Deployed with password: ${V}`)).toBe('Deployed with password: ***');
+    expect(scrubSecrets(`note the db password: ${V} here`)).toBe('note the db password: *** here');
+    expect(scrubSecrets(`AWS_KEY=abc123456789 and password: ${V}`)).not.toContain(V);
+  });
+
+  it('scrubs mid-prose passwd/passphrase too', () => {
+    expect(scrubSecrets(`the passwd: ${V}`)).not.toContain(V);
+    expect(scrubSecrets(`rotate the passphrase: ${V}`)).not.toContain(V);
+  });
+
+  it('scrubs a QUOTED mid-prose password value', () => {
+    expect(scrubSecrets(`config has password: "${V}" set`)).not.toContain(V);
+    expect(scrubSecrets(`config has password: '${V}' set`)).not.toContain(V);
+  });
+
+  it('keeps the #8283 prose protection for token/bearer/secret', () => {
+    expect(scrubSecrets('Marker token: xyzpdq-round3.')).toBe('Marker token: xyzpdq-round3.');
+    expect(scrubSecrets('the bearer: "alicewashere"')).toBe('the bearer: "alicewashere"');
+    expect(scrubSecrets('the token: somemarkervalue')).toBe('the token: somemarkervalue');
+  });
+
+  it('keeps letter-glued non-keywords unscrubbed (no \\b/_ before the noun)', () => {
+    expect(scrubSecrets(`mypassword: ${V}`)).toBe(`mypassword: ${V}`);
+    expect(scrubSecrets('I forgot my password yesterday')).toBe('I forgot my password yesterday');
+  });
+});

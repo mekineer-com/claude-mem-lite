@@ -139,27 +139,32 @@ describe('server.mjs instructions-mode stderr trace', () => {
     }
   });
 
+  // Hermetic HOME: memdirPath is derived from HOME, and the sentinel this case needs
+  // lives under `<HOME>/.claude/projects/<encoded>/memory`. Writing that into the real
+  // HOME made the test mutate the developer's own memory tree — junk dirs survive any
+  // crash between mkdir and the cleanup rmSync, and the write fails outright wherever
+  // `~/.claude/projects` is read-only. The server subprocess already takes HOME from
+  // this env object, so a temp HOME keeps the assertion identical and the blast radius
+  // inside tmpdir().
   it('emits BASE reason=adopted when project has claude-mem-lite sentinel', async () => {
     const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
+    const fakeHome = mkdtempSync(join(tmpdir(), 'mem-home-'));
     try {
       // Mirror memdirPath encoding: every non-alphanumeric → '-'.
       const encoded = fresh.replace(/[^a-zA-Z0-9]/g, '-');
-      const mdir = join(process.env.HOME, '.claude', 'projects', encoded, 'memory');
+      const mdir = join(fakeHome, '.claude', 'projects', encoded, 'memory');
       mkdirSync(mdir, { recursive: true });
       const fs = await import('fs');
       fs.writeFileSync(
         join(mdir, 'MEMORY.md'),
         '# Index\n<!-- claude-mem-lite:begin v1 -->\n## 插件契约\n- stub\n<!-- claude-mem-lite:end -->\n',
       );
-      try {
-        const env = { HOME: process.env.HOME, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
-        const r = await runServer(env);
-        expect(r.stderr).toContain('[mem] instructions: BASE reason=adopted:steering');
-      } finally {
-        try { rmSync(join(process.env.HOME, '.claude', 'projects', encoded), { recursive: true, force: true }); } catch {}
-      }
+      const env = { HOME: fakeHome, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
+      const r = await runServer(env);
+      expect(r.stderr).toContain('[mem] instructions: BASE reason=adopted:steering');
     } finally {
       try { rmSync(fresh, { recursive: true, force: true }); } catch {}
+      try { rmSync(fakeHome, { recursive: true, force: true }); } catch {}
     }
   });
 

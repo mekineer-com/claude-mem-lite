@@ -100,6 +100,17 @@ export const memSearchSchema = {
   or: coerceBool.optional().describe('Force OR semantics between query terms from the start (default: AND with automatic OR-fallback when AND returns 0). Aligns with CLI --or.'),
   deep: coerceBool.optional().describe('Tri-state LLM multi-query/HyDE deep search (observations-only). true=force; false=never; omit=AUTO (default ON for mem_search): a normal search that returns weak/few results auto-escalates with ONE Haiku call (query rewritten to keyword/concept/HyDE variants, RRF-fused). Set CLAUDE_MEM_AUTO_DEEP=0 to disable AUTO. Passive recall stays single-query.'),
   rerank: coerceBool.optional().describe('Opt-in: LLM-rerank the deep-search candidates for ranking precision (one extra Haiku call, ~1.4s). Requires deep=true (no effect on AUTO/normal). Reserve for hard, ranking-sensitive queries where the right memory is likely retrieved but mis-ranked — skip for routine search. Default off.'),
+  // ── CLI-flag aliases (v3.60.2) ──────────────────────────────────────────────
+  // A property the schema doesn't declare is STRIPPED by the validator, so a caller
+  // using the CLI vocabulary (`--source` / `--from` / `--to` / `--since`) previously
+  // got the UNFILTERED answer with nothing marking the filter as dropped — a wider
+  // result set that reads as filtered. Declaring the aliases makes the filter apply;
+  // the canonical name wins when both are supplied. Mirror of v3.59.0, which taught
+  // the CLI to accept MCP field names.
+  source: z.enum(['observations', 'sessions', 'prompts', 'events']).optional().describe('Alias for `type` (CLI `search --source`). Note: CLI `--type` is the OBSERVATION type — that is `obs_type` here.'),
+  from: z.string().optional().describe('Alias for `date_from` (CLI `search --from`)'),
+  to: z.string().optional().describe('Alias for `date_to` (CLI `search --to`)'),
+  since: z.string().optional().describe('Alias for `date_since` (CLI `search --since`)'),
 };
 
 export const memRecentSchema = {
@@ -107,6 +118,11 @@ export const memRecentSchema = {
   project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
   obs_type: OBS_TYPE_ENUM.optional().describe('Filter observation type (e.g. bugfix, decision) — CLI `recent --type` parity'),
   date_since: z.string().optional().describe('Relative lower bound from now: 7d/24h/90m/2w/30s. Only items newer than the window (pair with a high limit for "everything since X")'),
+  // CLI-flag aliases — see the note on memSearchSchema. `recent --type` IS the
+  // observation type here (unlike `search --type`, which the CLI spells `--source`),
+  // so `type` maps to obs_type on this tool.
+  type: OBS_TYPE_ENUM.optional().describe('Alias for `obs_type` (CLI `recent --type`)'),
+  since: z.string().optional().describe('Alias for `date_since` (CLI `recent --since`)'),
 };
 
 // Anchor accepts plain int, "123" string-int, or prefixed token from search output:

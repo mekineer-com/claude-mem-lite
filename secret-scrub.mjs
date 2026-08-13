@@ -30,8 +30,18 @@ export const SECRET_PATTERNS = [
   // value is covered (the hex-only assignment pattern below misses non-hex values).
   //   1a. `=` assignment → ALWAYS scrub (config syntax, never prose):
   [/((?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*=\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
-  //   1b. `:` separator → keep the prose lookbehind ("the token: alice" is prose):
-  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  //   1b. `:` separator, PASSWORD nouns → always scrub. The prose lookbehind below
+  //       was originally applied to the whole noun class, which meant any credential
+  //       noun preceded by an English word escaped — so a session narrative like
+  //       "deployed to staging, the db password: hunter2correct" persisted the
+  //       password in plaintext and re-injected it into every later context block
+  //       (R5 dogfood, 2026-08-13). Unlike `token`/`bearer`/`secret`, the pinned
+  //       prose set (#8283) contains no `password|passwd|passphrase` case: writing
+  //       "<word> password: <6+ chars>" names a credential, it is not conversational
+  //       usage. Letter-glued non-keywords (`mypassword:`) still miss via `(?:\b|_)`.
+  [/((?:\b|_)(?:password|passwd|passphrase)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  //   1c. `:` separator, prose-ambiguous nouns → keep the lookbehind ("the token: alice"):
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:token|bearer|secret)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // access_token / refresh_token are the canonical OAuth2 field names — they were
   // missing from this KV list (drift vs the JSON list below). `(?:\b|_)` for the same
   // underscore-prefix reason.
@@ -61,7 +71,8 @@ export const SECRET_PATTERNS = [
   //       (mirrors the unquoted 1a/1b split — a quoted value doesn't turn `:` prose
   //       into config, but `<word> password="x"` is still a leak):
   [/((?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*=\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
-  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  [/((?:\b|_)(?:password|passwd|passphrase)\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:token|bearer|secret)\s*:\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
   //   (b) structured keys + named env vars are unambiguous config even after a word
   //       (`see api_key: "x"` DOES scrub, mirroring the unquoted structured-key path):
   [/((?:\b|_)(?:pgpassword|pgpass|mysql_pwd|api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)(['"])[^'"]{6,}\2/gi, '$1$2***$2'],
