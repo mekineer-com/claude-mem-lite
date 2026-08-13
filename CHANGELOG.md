@@ -18,6 +18,8 @@ All notable changes to claude-mem-lite are documented in this file.
 
 End-to-end verification against a genuinely corrupted `.node` (backed up + restored), all four legs: CLI heals + re-execs + prints real output; the guard blocks the loop and exits 1; PreToolUse `pre-tool-recall` records the marker WITHOUT rebuilding; session-start rebuilds and clears the marker. Independent pre-tag review by a fresh-context subagent found three P1s — an unbounded rebuild under the 15s hook cap, a false-success exit code that made the cooldown unreachable, and installer stdout leaking into the SessionStart JSON envelope — all fixed above and pinned by tests (a non-blocking assertion, a cooldown-suppression assertion, and one that parses the envelope). Two CHANGELOG claims it falsified are corrected in this entry. Tests 4040 → 4073 (+33), eslint clean, knip shows no new unused exports.
 
+Lockfile-only side fix, forced by the release `validate` gate: `npm audit --omit=dev` had gone red on three advisories published since v3.59.1, all in transitive deps of `@modelcontextprotocol/sdk` — `hono` 4.12.31 → 4.13.2, `ip-address` 10.2.0 → 10.5.0, `fast-uri` 3.1.4 → 3.1.5. Patch/minor inside the existing ranges; `package.json` is untouched and no declared dependency changed. Audit is back to 0 vulnerabilities.
+
 ## v3.59.1 — read-side lesson escape + memdir-audit sees frontmatter-typed memories
 
 Two fixes from a 2026-07-24 memory-quality audit, both restoring intended behavior.
