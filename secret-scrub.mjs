@@ -30,16 +30,45 @@ export const SECRET_PATTERNS = [
   // value is covered (the hex-only assignment pattern below misses non-hex values).
   //   1a. `=` assignment → ALWAYS scrub (config syntax, never prose):
   [/((?:\b|_)(?:password|passwd|passphrase|token|bearer|secret)\s*=\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
-  //   1b. `:` separator, PASSWORD nouns → always scrub. The prose lookbehind below
-  //       was originally applied to the whole noun class, which meant any credential
-  //       noun preceded by an English word escaped — so a session narrative like
-  //       "deployed to staging, the db password: hunter2correct" persisted the
-  //       password in plaintext and re-injected it into every later context block
-  //       (R5 dogfood, 2026-08-13). Unlike `token`/`bearer`/`secret`, the pinned
-  //       prose set (#8283) contains no `password|passwd|passphrase` case: writing
-  //       "<word> password: <6+ chars>" names a credential, it is not conversational
-  //       usage. Letter-glued non-keywords (`mypassword:`) still miss via `(?:\b|_)`.
-  [/((?:\b|_)(?:password|passwd|passphrase)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  //   1b. `:` separator, PASSWORD nouns. Position decides how permissive the value
+  //       class may be, because the two positions have opposite error costs.
+  //
+  //       CONFIG position (start of line, or not preceded by an English word +
+  //       space) is unambiguous assignment syntax → scrub any value, exactly as
+  //       before. Pinned by the `  password: hunter2` indent cases.
+  //
+  //       PROSE position ("<word> password: …") is where v3.61.0 first removed the
+  //       lookbehind outright, to stop "deployed to staging, the db password:
+  //       hunter2correct" from persisting a credential. That closed a leak by
+  //       trading it for something worse: scrubbing runs on the WRITE path, and the
+  //       value class matches ordinary English, so "Reset the password: instructions
+  //       are in the onboarding doc" was stored irreversibly as "password: *** are
+  //       in the onboarding doc" (caught by independent pre-tag review). The claim
+  //       that "<word> password: <6+ chars>" always names a credential was simply
+  //       false. So in prose position the VALUE must look like a credential: not a
+  //       run of lowercase letters. A digit, any uppercase, or a symbol qualifies —
+  //       `hunter2correct`, `S3cretValue`, `correct-horse-battery-staple` all scrub,
+  //       while `instructions` / `rotation` / `yesterday` are left alone.
+  //
+  //       "Credential-shaped" is spelled as: NOT a single run of ≤15 letters. The
+  //       patterns carry `i`, so the letter class is case-insensitive by
+  //       construction — deliberately, because prose capitalizes ("Reset the
+  //       password: Instructions are in the doc" must survive, and a
+  //       lowercase-only test would corrupt it). The length bound is what still
+  //       catches a letters-only secret: English words in prose run short, secrets
+  //       do not, so `aVeryLongOpaqueSecretToken` (26) scrubs while `instructions`
+  //       (12) does not.
+  //
+  //       Two known, accepted gaps: a short letters-only password in prose position
+  //       ("the password: hunter") survives, and an English word longer than 15
+  //       letters is over-scrubbed. Config position still catches the former; the
+  //       latter is rare in prose and errs toward protecting a secret. A value
+  //       indistinguishable from an English word cannot be told from one without
+  //       corrupting prose — which is exactly the error this arm exists to undo.
+  //       Both arms emit `***` (3 chars, under the {6,} floor), so they cannot
+  //       double-apply.
+  [/((?<![A-Za-z][ \t])(?:\b|_)(?:password|passwd|passphrase)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
+  [/((?:\b|_)(?:password|passwd|passphrase)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)(?![A-Za-z]{1,15}(?=[\s,;'"}\]]|$))[^\s,;'"}\]]{6,}/gi, '$1***'],
   //   1c. `:` separator, prose-ambiguous nouns → keep the lookbehind ("the token: alice"):
   [/((?<![A-Za-z][ \t])(?:\b|_)(?:token|bearer|secret)\s*:\s*)(?!process\.env\.)(?!new\s)(?!\w+\()(?!(?:null|undefined|true|false|None|nil|empty|""|''|0)\b)[^\s,;'"}\]]{6,}/gi, '$1***'],
   // access_token / refresh_token are the canonical OAuth2 field names — they were

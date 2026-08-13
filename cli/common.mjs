@@ -176,6 +176,11 @@ export const KNOWN_CLI_FLAGS = new Set([
   // stay silent about (`adopt --disable/--enable`, `activity --min-importance`,
   // `save --supersedes`). Verified by running each command and checking for a warning.
   'disable', 'enable', 'min-importance', 'supersedes',
+  // `doctor --benchmark --prompts-limit N` — read off raw argv in cli/doctor.mjs, so
+  // it never appeared in a `flags.x` grep. Caught by independent review after the
+  // warn-on-every-unknown-flag flip turned the omission into a false warning on a
+  // documented, working command.
+  'prompts-limit',
 ]);
 
 /** Levenshtein distance, early-exit past `max` (cheap enough for a handful of flags). */

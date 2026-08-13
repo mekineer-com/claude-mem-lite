@@ -51,9 +51,12 @@ describe('corpusFloorScale', () => {
     expect(30 * s10).toBeLessThan(30);
   });
 
-  it('never returns 0 (an empty corpus still yields a positive, tiny factor)', () => {
+  it('returns 0 on an empty corpus — no floor, and nothing for it to gate', () => {
+    // ln(1)=0, so both floors collapse to 0. Unreachable in effect: the two gates in
+    // main() are guarded by `ftsRows.length > 0`, and an empty observations table
+    // produces no FTS rows. Asserted so a future change to that guard is caught here.
     const s = corpusFloorScale(open(0));
-    expect(s).toBe(0); // ln(1)=0 → no floor at all when there is nothing to rank
+    expect(s).toBe(0);
     expect(Number.isFinite(s)).toBe(true);
   });
 

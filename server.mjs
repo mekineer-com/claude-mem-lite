@@ -1745,7 +1745,10 @@ server.registerTool(
   },
   // verbatim: the export payload feeds `restore` — defanging it would silently
   // rewrite backed-up rows whose text legitimately contains these tags.
-  safeHandler(async (args) => runExport(db, args), { verbatim: true })
+  safeHandler(
+    async (args) => runExport(db, applyArgAliases(args, { from: 'date_from', to: 'date_to' })),
+    { verbatim: true },
+  )
 );
 
 // ─── Tool: mem_recall ────────────────────────────────────────────────────────

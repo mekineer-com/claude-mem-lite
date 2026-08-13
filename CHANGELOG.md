@@ -2,6 +2,27 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.61.1 — the review that arrived after the tag; a leak fix that had started corrupting prose
+
+v3.61.0 shipped with `No independent pre-tag review` in its notes because two review subagents ran without returning anything. The report landed 40 minutes after the tag: 0 BLOCKER, 4 SHOULD-FIX, 6 NIT. Two of the four were regressions v3.61.0 itself introduced. This ships all four plus the substantive nits, and every finding below was independently reproduced before it was touched.
+
+**fix: the prose-leak fix was corrupting ordinary English, irreversibly, at save time.** v3.61.0 dropped the prose lookbehind from `password|passwd|passphrase` on `:` so a credential in a sentence would stop being persisted in plaintext. Its load-bearing claim — "writing `<word> password: <6+ chars>` names a credential, it is not conversational usage" — is simply false, and `scrubSecrets` runs on the WRITE path:
+
+    "Reset the password: instructions are in the onboarding doc"
+      stored as -> "password: *** are in the onboarding doc"
+
+Four such sentences were found; the release's own new tests missed all of them because every value they used was credential-shaped (`hunter2correct`). Position now decides the value class. **Config position** (start of line, or not preceded by a word) scrubs any value — unchanged, pinned by the indent cases. **Prose position** scrubs only a credential-SHAPED value: not a single run of ≤15 letters. The letter class is case-insensitive on purpose, because prose capitalizes after a colon and a lowercase-only test would corrupt `password: Instructions are …`; the length bound is what still catches a letters-only secret, so `aVeryLongOpaqueSecretToken` (26) scrubs while `instructions` (12) does not. Two gaps are accepted and documented in place: a short letters-only password in prose position survives (config position still catches it), and an English word longer than 15 letters over-scrubs. ReDoS re-checked at 140 KB — 2 ms.
+
+**fix: `doctor --benchmark --prompts-limit N` printed a false warning about a flag it honors.** v3.61.0 made `suggestUnknownFlags` report every unknown flag; `prompts-limit` is read off raw argv in `cli/doctor.mjs`, so it never appeared in the `flags.x` grep used to audit the catalogue, and the old edit-distance gate had kept the omission invisible. Two false statements in one line, on a documented command. Catalogued. The message also hardcoded "(it filtered nothing)", wrong for any non-filter flag — now "it had no effect".
+
+**fix: `mem_export` was left out of the alias pass — the same silent drop, the widest blast radius.** CLI `export` reads `flags.from`/`flags.to`; `memExportSchema` declared only `date_from`/`date_to`. Measured against the working-tree server: `{from: '2099-01-01'}` returned 1652 bytes (the whole DB), `{date_from: '2099-01-01'}` returned 44. An ignored bound on the one tool that is also exempt from defang. §9 parallel path, again.
+
+**fix: three sibling tests were still opening the developer's real production DB.** The v3.61.0 fix gave one `quiet-hooks` case a temp HOME; its three siblings build `env` as a literal with no `CLAUDE_MEM_DIR`, and `server.mjs` opens the DB unconditionally at module load (schema init, index creation, WAL recovery). So every `vitest run` opened and migrated `~/.claude-mem-lite/claude-mem-lite.db` three times. All four now route through one `hermeticEnv()` helper. Verified: the real DB's mtime is unchanged across a run of that file.
+
+**Test-quality fixes from the same review, because two of the pins could not have failed.** `stays silent for every documented flag` built its input *from* `KNOWN_CLI_FLAGS` — the catalogue it was checking — so it was vacuous, and it is exactly the assertion that would have caught `prompts-limit`. It now derives the flag set from what the code reads (`flags.x`, `flags['x']`, and raw-argv `includes('--x')`) across all seven CLI entry points, with an explicit deny-list for scan artifacts. The two `since` alias cases asserted only `viaCli === viaMcp`, which both satisfy when the alias is dropped on both sides; they now also assert a 1-second window excludes rows seeded seconds ago. One test's title claimed "never returns 0" while its body asserted `toBe(0)` — retitled, with the reachability argument written down. Both new MCP suites moved off hardcoded `/tmp` to `tmpdir()`.
+
+Not fixed, recorded instead: the corpus-floor ramp under-corrects at the small end (measured — `ln` is the right shape but empirical bm25 falls 0.326× from N=300→10 while the ramp falls 0.420×, so 2 of 3 blocked hits are recovered, not 3); MCP still accepts and silently ignores unknown *fields*, the mirror of the CLI's now-loud behavior; and a repeated alias is first-wins while a repeated canonical flag is last-wins. The reviewer independently confirmed the v3.61.0 ramp is a real gain with no precision cost (signal 2/8 → 4/8 at N=10, false positives 0/8 on both, and byte-identical at N=610).
+
 ## v3.61.0 — four surfaces that answered a narrower question than they were asked, and answered it silently
 
 Found by dogfooding the product as a new user would meet it — install into a throwaway `HOME`, save a first day's memories, ask the questions that first day would produce — rather than by reading code. Three rounds, everything below reproduced against a sandbox DB before it was touched.

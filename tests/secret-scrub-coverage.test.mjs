@@ -487,3 +487,60 @@ describe('scrubSecrets — password/passwd/passphrase scrub mid-prose on the `:`
     expect(scrubSecrets('I forgot my password yesterday')).toBe('I forgot my password yesterday');
   });
 });
+
+// ─── Mid-prose password: value must LOOK like a credential (v3.61.1) ────────
+//
+// v3.61.0 dropped the prose lookbehind for password|passwd|passphrase on `:` so
+// "Deployed with password: hunter2correct" would stop persisting a plaintext
+// credential. That closed the leak by trading it for a worse defect: the value
+// class `[^\s,;'"}\]]{6,}` matches ordinary English, and scrubSecrets runs on the
+// WRITE path, so an ordinary sentence was corrupted irreversibly at save time —
+// "Reset the password: instructions are in the onboarding doc" stored as
+// "password: *** are in the onboarding doc" (independent pre-tag review, 2026-08-13).
+//
+// Position decides which rule applies:
+//   • config position (start of line / not preceded by a word) → scrub any value,
+//     unchanged from before v3.61.0 and pinned by the indent cases below;
+//   • prose position (preceded by an English word + space) → scrub only when the
+//     value is credential-SHAPED: a digit, mixed case, a symbol, or one long
+//     unbroken token. English words carry none of those.
+describe('scrubSecrets — mid-prose password scrubs credentials, not English', () => {
+  it('does NOT corrupt ordinary prose (the v3.61.0 regression)', () => {
+    const prose = [
+      'Reset the password: instructions are in the onboarding doc',
+      'Changed the passphrase: rotation policy from 90 to 180 days',
+      'I forgot the password: yesterday I had to reset it again',
+      'the user reported password: prompts appearing twice on mobile',
+      'we store the password: hashed with bcrypt and never logged',
+      // Capitalized — a sentence continuing after the colon. The letter class is
+      // case-insensitive precisely so this survives.
+      'Reset the password: Instructions are in the onboarding doc',
+    ];
+    for (const p of prose) expect(scrubSecrets(p), p).toBe(p);
+  });
+
+  it('STILL scrubs a credential-shaped value mid-prose (the leak this closed)', () => {
+    expect(scrubSecrets('Deployed with password: hunter2correct')).toBe('Deployed with password: ***');
+    expect(scrubSecrets('the db password: S3cretValue')).not.toContain('S3cretValue');
+    expect(scrubSecrets('rotate the passphrase: correct-horse-battery-staple'))
+      .not.toContain('correct-horse-battery-staple');
+    expect(scrubSecrets('note the password: Tr0ub4dor here')).not.toContain('Tr0ub4dor');
+    expect(scrubSecrets('set password: aVeryLongOpaqueSecretToken')).not.toContain('aVeryLongOpaqueSecretToken');
+  });
+
+  it('scrubs a QUOTED value mid-prose regardless of shape (quoting IS the signal)', () => {
+    expect(scrubSecrets('config has password: "instructions"')).toBe('config has password: "***"');
+    expect(scrubSecrets("config has password: 'onboarding'")).toBe("config has password: '***'");
+  });
+
+  it('config position still scrubs any value (pre-v3.61.0 behavior preserved)', () => {
+    expect(scrubSecrets('  password: hunter2')).toBe('  password: ***');
+    expect(scrubSecrets('\tpassword=hunter2')).toBe('\tpassword=***');
+    expect(scrubSecrets('password: instructions')).toBe('password: ***');
+  });
+
+  it('keeps the #8283 prose protection for token/bearer/secret', () => {
+    expect(scrubSecrets('Marker token: xyzpdq-round3.')).toBe('Marker token: xyzpdq-round3.');
+    expect(scrubSecrets('the bearer: "alicewashere"')).toBe('the bearer: "alicewashere"');
+  });
+});

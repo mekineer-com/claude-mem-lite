@@ -100,7 +100,7 @@ export const memSearchSchema = {
   or: coerceBool.optional().describe('Force OR semantics between query terms from the start (default: AND with automatic OR-fallback when AND returns 0). Aligns with CLI --or.'),
   deep: coerceBool.optional().describe('Tri-state LLM multi-query/HyDE deep search (observations-only). true=force; false=never; omit=AUTO (default ON for mem_search): a normal search that returns weak/few results auto-escalates with ONE Haiku call (query rewritten to keyword/concept/HyDE variants, RRF-fused). Set CLAUDE_MEM_AUTO_DEEP=0 to disable AUTO. Passive recall stays single-query.'),
   rerank: coerceBool.optional().describe('Opt-in: LLM-rerank the deep-search candidates for ranking precision (one extra Haiku call, ~1.4s). Requires deep=true (no effect on AUTO/normal). Reserve for hard, ranking-sensitive queries where the right memory is likely retrieved but mis-ranked — skip for routine search. Default off.'),
-  // ── CLI-flag aliases (v3.60.2) ──────────────────────────────────────────────
+  // ── CLI-flag aliases (v3.61.0) ──────────────────────────────────────────────
   // A property the schema doesn't declare is STRIPPED by the validator, so a caller
   // using the CLI vocabulary (`--source` / `--from` / `--to` / `--since`) previously
   // got the UNFILTERED answer with nothing marking the filter as dropped — a wider
@@ -274,6 +274,11 @@ export const memExportSchema = {
   format: z.enum(['json', 'jsonl']).optional().describe('Output format (default: json)'),
   date_from: z.string().optional().describe('Start date (ISO 8601 or YYYY-MM-DD)'),
   date_to: z.string().optional().describe('End date (ISO 8601 or YYYY-MM-DD)'),
+  // CLI-flag aliases — `export` reads flags.from / flags.to (mem-cli.mjs). Same
+  // silent-drop defect the search/recent aliases fix, and the widest blast radius of
+  // the three: an ignored bound exports the whole DB instead of a date slice.
+  from: z.string().optional().describe('Alias for `date_from` (CLI `export --from`)'),
+  to: z.string().optional().describe('Alias for `date_to` (CLI `export --to`)'),
   include_compressed: coerceBool.optional().describe('Include compressed observations (default: false)'),
   limit: coerceInt.pipe(z.number().int().min(1).max(1000)).optional().describe('Max observations to export (default: 200, max: 1000)'),
 };

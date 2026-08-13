@@ -3194,7 +3194,7 @@ export async function run(argv) {
   for (const { flag, suggestion } of suggestUnknownFlags(parseArgs(cmdArgs).flags)) {
     process.stderr.write(suggestion
       ? `[mem] Unknown flag --${flag}; did you mean --${suggestion}?\n`
-      : `[mem] Unknown flag --${flag} — ignored (it filtered nothing). Run "claude-mem-lite help" for this command's flags.\n`);
+      : `[mem] Unknown flag --${flag} — ignored, it had no effect. Run "claude-mem-lite help" for this command's flags.\n`);
   }
 
   // adopt / unadopt do pure filesystem work on ~/.claude/projects/<encoded>/memory/ —

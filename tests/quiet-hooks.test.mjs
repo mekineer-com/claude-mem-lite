@@ -99,6 +99,20 @@ describe('buildServerInstructions(quiet)', () => {
 describe('server.mjs instructions-mode stderr trace', () => {
   const serverPath = join(process.cwd(), 'server.mjs');
 
+  // server.mjs opens the DB UNCONDITIONALLY at module load (ensureDbWithWalRecovery:
+  // schema init, index creation, WAL recovery). These cases build `env` as a literal
+  // rather than spreading process.env, so an outer CLAUDE_MEM_DIR cannot reach the
+  // subprocess — which meant every `vitest run` opened and migrated the developer's
+  // REAL ~/.claude-mem-lite DB three times. Point both HOME and CLAUDE_MEM_DIR at
+  // throwaway dirs; every assertion here is about stderr framing, not stored data.
+  function hermeticEnv(base, home) {
+    return {
+      HOME: home || join(base, 'home'),
+      PATH: process.env.PATH,
+      CLAUDE_MEM_DIR: join(base, 'memdir'),
+    };
+  }
+
   async function runServer(env) {
     const { spawnSync } = await import('child_process');
     return spawnSync('node', [serverPath], {
@@ -114,7 +128,7 @@ describe('server.mjs instructions-mode stderr trace', () => {
     try {
       // Minimal env — strip MEM_QUIET_HOOKS + point CLAUDE_PROJECT_DIR at a clean dir
       // so effectiveQuiet returns false.
-      const env = { HOME: process.env.HOME, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
+      const env = { ...hermeticEnv(fresh), CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
       const r = await runServer(env);
       expect(r.stderr).toContain('[mem] instructions: BASE+VERBOSE reason=none');
     } finally {
@@ -126,8 +140,7 @@ describe('server.mjs instructions-mode stderr trace', () => {
     const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
     try {
       const env = {
-        HOME: process.env.HOME,
-        PATH: process.env.PATH,
+        ...hermeticEnv(fresh),
         MEM_QUIET_HOOKS: '1',
         CLAUDE_PROJECT_DIR: fresh,
         PWD: fresh,
@@ -159,7 +172,7 @@ describe('server.mjs instructions-mode stderr trace', () => {
         join(mdir, 'MEMORY.md'),
         '# Index\n<!-- claude-mem-lite:begin v1 -->\n## 插件契约\n- stub\n<!-- claude-mem-lite:end -->\n',
       );
-      const env = { HOME: fakeHome, PATH: process.env.PATH, CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
+      const env = { ...hermeticEnv(fresh, fakeHome), CLAUDE_PROJECT_DIR: fresh, PWD: fresh };
       const r = await runServer(env);
       expect(r.stderr).toContain('[mem] instructions: BASE reason=adopted:steering');
     } finally {
@@ -172,8 +185,7 @@ describe('server.mjs instructions-mode stderr trace', () => {
     const fresh = mkdtempSync(join(tmpdir(), 'mem-trace-'));
     try {
       const env = {
-        HOME: process.env.HOME,
-        PATH: process.env.PATH,
+        ...hermeticEnv(fresh),
         CLAUDE_MEM_QUIET_TRACE: '0',
         CLAUDE_PROJECT_DIR: fresh,
         PWD: fresh,

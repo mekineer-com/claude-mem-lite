@@ -25,10 +25,11 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdirSync, rmSync } from 'fs';
-import { resolve } from 'path';
+import { tmpdir } from 'os';
+import { resolve, join } from 'path';
 
 const SERVER_PATH = resolve(import.meta.dirname, '../server.mjs');
-const DB_DIR = `/tmp/mem-alias-test-${process.pid}`;
+const DB_DIR = join(tmpdir(), `mem-alias-test-${process.pid}`);
 
 let client, transport;
 
@@ -88,6 +89,12 @@ describe('mem_recent honors CLI filter names', () => {
     const viaCli = idsOf(textOf(await client.callTool({ name: 'mem_recent', arguments: { limit: 10, since: '30s' } })));
     const viaMcp = idsOf(textOf(await client.callTool({ name: 'mem_recent', arguments: { limit: 10, date_since: '30s' } })));
     expect(viaCli).toEqual(viaMcp);
+    // Equality alone passes when BOTH sides drop the filter. A window that excludes
+    // everything is what proves the alias is honored.
+    const excluded = textOf(await client.callTool({ name: 'mem_recent', arguments: { limit: 10, since: '1s' } }));
+    await new Promise(r => setTimeout(r, 1100));
+    const stillExcluded = idsOf(textOf(await client.callTool({ name: 'mem_recent', arguments: { limit: 10, since: '1s' } })));
+    expect(stillExcluded, `a 1s window must exclude rows seeded seconds ago (got: ${excluded.slice(0, 80)})`).toEqual([]);
   });
 
   it('rejects a bad `since` instead of ignoring it', async () => {
@@ -118,6 +125,10 @@ describe('mem_search honors CLI filter names', () => {
     const viaCli = idsOf(textOf(await client.callTool({ name: 'mem_search', arguments: { query: 'fixed', since: '30s' } })));
     const viaMcp = idsOf(textOf(await client.callTool({ name: 'mem_search', arguments: { query: 'fixed', date_since: '30s' } })));
     expect(viaCli).toEqual(viaMcp);
+    // Narrowing proof (see the mem_recent sibling): a 1s window must drop everything.
+    await new Promise(r => setTimeout(r, 1100));
+    const narrowed = idsOf(textOf(await client.callTool({ name: 'mem_search', arguments: { query: 'fixed', since: '1s' } })));
+    expect(narrowed, 'a 1s window must exclude rows seeded seconds ago').toEqual([]);
   });
 
   it('`from`/`to` (CLI `search --from/--to`) filter, and match date_from/date_to', async () => {

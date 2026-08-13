@@ -18,6 +18,7 @@
 //   search fixed --date_from 2099-01-01 → 2 results (filter dropped)
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
 import { parseArgs, suggestUnknownFlags, KNOWN_CLI_FLAGS } from '../cli/common.mjs';
 
 describe('parseArgs — MCP field names normalize onto CLI flags', () => {
@@ -69,9 +70,32 @@ describe('suggestUnknownFlags — no unknown flag is silently dropped', () => {
     expect(hits).toEqual([{ flag: 'tpye', suggestion: 'type' }]);
   });
 
-  it('stays silent for every documented flag', () => {
-    const flags = Object.fromEntries([...KNOWN_CLI_FLAGS].map(f => [f, 'v']));
-    expect(suggestUnknownFlags(flags)).toEqual([]);
+  // Driven from the flags the CODE reads, NOT from KNOWN_CLI_FLAGS — a pin built out
+  // of the catalogue it is checking can never fail. This exact vacuity let
+  // `--prompts-limit` (read off raw argv in cli/doctor.mjs) reach v3.61.0 uncatalogued,
+  // where warn-on-every-unknown-flag turned it into a false warning on a working
+  // command. Independent pre-tag review, 2026-08-13.
+  it('stays silent for every flag the CLI actually reads', () => {
+    const roots = ['mem-cli.mjs', 'cli/common.mjs', 'cli/activity.mjs', 'cli/doctor.mjs',
+      'cli/fts-check.mjs', 'adopt-cli.mjs', 'cli.mjs'];
+    const read = new Set();
+    for (const f of roots) {
+      const src = readFileSync(new URL(`../${f}`, import.meta.url), 'utf8');
+      for (const m of src.matchAll(/flags\.([a-zA-Z][a-zA-Z0-9]*)/g)) read.add(m[1]);
+      for (const m of src.matchAll(/flags\['([^']+)'\]/g)) read.add(m[1]);
+      // raw-argv reads: args.includes('--x') / argv.indexOf('--x')
+      for (const m of src.matchAll(/(?:includes|indexOf)\('--([a-z][a-z0-9-]*)'\)/g)) read.add(m[1]);
+    }
+    // Scan artifacts, not flag reads: `length`; `help` (handled by the `-h` branch and
+    // short-circuited before the warning loop); `mjs` from the import path
+    // `lib/cli-flags.mjs`; `x` from the placeholder in comments that say "a `flags.x`
+    // grep". Kept as an explicit deny-list so a real flag can never hide behind a
+    // silently-widened filter.
+    const notFlags = new Set(['length', 'help', 'mjs', 'x']);
+    const uncatalogued = [...read]
+      .filter(f => !notFlags.has(f) && !KNOWN_CLI_FLAGS.has(f) && !KNOWN_CLI_FLAGS.has(f.replace(/_/g, '-')));
+    expect(uncatalogued, `flags read by code but missing from KNOWN_CLI_FLAGS`).toEqual([]);
+    expect(read.size, 'sanity: the scan found flag reads at all').toBeGreaterThan(40);
   });
 
   it('stays silent for the normalized MCP field names', () => {

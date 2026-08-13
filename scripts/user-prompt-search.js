@@ -114,7 +114,7 @@ const OR_TOP_BM25_FLOOR = TOP_REL_FLOOR === 0
   ? 0
   : Number(process.env.CLAUDE_MEM_UPS_OR_BM25_MIN || 30);
 
-// ─── Corpus-size normalization of the absolute floors (v3.60.2) ─────────────
+// ─── Corpus-size normalization of the absolute floors (v3.61.0) ─────────────
 //
 // Both floors above are ABSOLUTE magnitudes, but the quantity they gate is not
 // scale-free: FTS5 bm25 carries an IDF term ≈ ln(N/df), so the SAME hit scores

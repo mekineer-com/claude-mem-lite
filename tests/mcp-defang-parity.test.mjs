@@ -21,10 +21,11 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { mkdirSync, rmSync } from 'fs';
-import { resolve } from 'path';
+import { tmpdir } from 'os';
+import { resolve, join } from 'path';
 
 const SERVER_PATH = resolve(import.meta.dirname, '../server.mjs');
-const DB_DIR = `/tmp/mem-defang-test-${process.pid}`;
+const DB_DIR = join(tmpdir(), `mem-defang-test-${process.pid}`);
 
 // Structural tags that must never reach the model with their brackets intact.
 const RAW_CLOSE = '</claude-mem-context>';
