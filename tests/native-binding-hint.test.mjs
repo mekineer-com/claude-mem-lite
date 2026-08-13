@@ -69,8 +69,10 @@ describe('formatHookError', () => {
     const line = formatHookError(err, 'stop', { now: NOW });
     expect(line).toContain('[WARN] stop:');
     expect(line).toContain('native DB binding');
-    // resolvable absolute path, not bare `claude-mem-lite` (off-PATH on plugin installs)
-    expect(line).toContain('cli.mjs repair');
+    // resolvable absolute path, not bare `claude-mem-lite` (off-PATH on plugin
+    // installs); `rebuild-binding`, not `repair` — see the rationale on
+    // CLI_REBUILD_BINDING in lib/native-binding-hint.mjs
+    expect(line).toContain('cli.mjs rebuild-binding');
     expect(line).not.toContain('claude-mem-lite repair');
     // the verbose original message must NOT leak through
     expect(line).not.toContain('NODE_MODULE_VERSION');

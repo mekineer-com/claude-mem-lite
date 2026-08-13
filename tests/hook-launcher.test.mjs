@@ -221,6 +221,197 @@ describe('hook-launcher self-heal', () => {
   });
 });
 
+// An ABI-stale better-sqlite3 (Node upgrade) does NOT throw at import time — the
+// .node is dlopen'd lazily at the first `new Database()`, deep inside hook.mjs,
+// which catches it. So the ERR_MODULE_NOT_FOUND path above never sees it and, in
+// the field, nothing healed for 4 days (79 failed fires in one day). hook.mjs now
+// records a breakage marker on every such fire; the launcher heals from it at
+// session-start — off the per-tool hot path, in a process that has not yet
+// dlopen'd the stale binary.
+describe('hook-launcher native-binding self-heal (session-start)', () => {
+  const BROKEN = (root) => join(root, 'runtime', 'native-binding-broken');
+  const COOLDOWN = (root) => join(root, 'runtime', 'native-binding-lastheal');
+  const RAN = (root) => join(root, 'rebuild-ran');
+  const writeBroken = (root, reason = 'NODE_MODULE_VERSION 127 vs 137') => {
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(BROKEN(root), JSON.stringify({ reason, event: 'user-prompt', ts: Date.now() }));
+  };
+  // The rebuild is spawned DETACHED with stdio ignored (it must not block a
+  // 15s-capped hook, and its stdout would corrupt the SessionStart JSON
+  // envelope), so it cannot be observed through the launcher's own streams —
+  // the stub records itself on disk and the test waits for that.
+  const stubInstaller = (root, { exitCode = 0, clearsMarker = true } = {}) => writeFileSync(
+    join(root, 'install.mjs'),
+    `import { writeFileSync, unlinkSync } from 'fs';\n` +
+    `writeFileSync(${JSON.stringify(RAN(root))}, process.argv[2] || '');\n` +
+    (clearsMarker && exitCode === 0
+      ? `try { unlinkSync(${JSON.stringify(BROKEN(root))}); } catch {}\n`
+      : '') +
+    `process.exit(${exitCode});\n`,
+  );
+  // Synchronous poll — the assertions are about a DETACHED child, so the test
+  // has to wait for the filesystem rather than for the launcher's exit.
+  const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+  const waitFor = (pred, ms = 5000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (pred()) return true;
+      sleepSync(25);
+    }
+    return pred();
+  };
+
+  it('spawns install.mjs rebuild-binding in the background; the child clears the marker', () => {
+    const root = makeInstall('cml-launcher-nb-heal');
+    stubInstaller(root);
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    writeBroken(root);
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-OK');
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+    expect(readFileSync(RAN(root), 'utf8')).toBe('rebuild-binding');
+    expect(waitFor(() => !existsSync(BROKEN(root)))).toBe(true);
+  });
+
+  it('never blocks the fire on the rebuild — the entry runs regardless of the child', () => {
+    // Under the 15s SessionStart cap, waiting on npm would trade a stale binding
+    // for a SIGKILL'd fire (no memory context at all) plus a half-written .node.
+    const root = makeInstall('cml-launcher-nb-nonblocking');
+    writeFileSync(
+      join(root, 'install.mjs'),
+      `import { writeFileSync } from 'fs';\n` +
+      `writeFileSync(${JSON.stringify(RAN(root))}, 'slow');\n` +
+      `setTimeout(() => process.exit(0), 8000);\n`,   // outlives the 15s cap's useful budget
+    );
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    writeBroken(root);
+
+    const t0 = Date.now();
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-OK');
+    // A synchronous wait would have cost the full 8s here.
+    expect(Date.now() - t0).toBeLessThan(5000);
+  });
+
+  it('keeps the SessionStart stdout envelope clean — installer output must not leak into it', () => {
+    // hook.mjs session-start writes a JSON envelope Claude Code parses; install.mjs
+    // logs to STDOUT, so an inherited child stdout corrupts the fire.
+    const root = makeInstall('cml-launcher-nb-stdout');
+    writeFileSync(
+      join(root, 'install.mjs'),
+      `import { writeFileSync } from 'fs';\n` +
+      `console.log('  ✓ better-sqlite3 binding rebuilt');\n` +
+      `writeFileSync(${JSON.stringify(RAN(root))}, 'x');\n` +
+      `process.exit(0);\n`,
+    );
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write(JSON.stringify({ok:true}) + "\\n");\n');
+    writeBroken(root);
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+    expect(r.stdout.trim()).toBe('{"ok":true}');
+    expect(r.stdout).not.toMatch(/better-sqlite3 binding rebuilt/);
+    expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true });
+  });
+
+  it('does NOT rebuild on the per-tool hot path — only session-start pays anything', () => {
+    const root = makeInstall('cml-launcher-nb-hotpath');
+    stubInstaller(root);
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    writeBroken(root);
+
+    const r = runLauncher(root, ['entry.mjs', 'post-tool-use']);
+    expect(r.status).toBe(0);
+    expect(existsSync(RAN(root))).toBe(false);
+    expect(existsSync(BROKEN(root))).toBe(true);
+  });
+
+  it('honors a cooldown when the child does not resolve the fault', () => {
+    // A rebuild that cannot succeed (no prebuild, no compiler, offline) must not
+    // re-spawn npm on every session start.
+    const root = makeInstall('cml-launcher-nb-fail');
+    stubInstaller(root, { exitCode: 1, clearsMarker: false });
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    writeBroken(root);
+
+    const first = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(first.status).toBe(0);
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+    expect(existsSync(BROKEN(root))).toBe(true);     // unresolved → next session retries
+    expect(existsSync(COOLDOWN(root))).toBe(true);
+    rmSync(RAN(root), { force: true });
+
+    const second = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(second.status).toBe(0);
+    expect(existsSync(RAN(root))).toBe(false);       // suppressed by the cooldown
+  });
+
+  it('drops a stale cooldown once the binding is healthy again', () => {
+    // Otherwise a heal at T+0 would block an UNRELATED break at T+1h for 6h.
+    const root = makeInstall('cml-launcher-nb-cooldown-reset');
+    stubInstaller(root);
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    mkdirSync(join(root, 'runtime'), { recursive: true });
+    writeFileSync(COOLDOWN(root), String(Date.now()));   // recent heal, no breakage
+
+    runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(existsSync(COOLDOWN(root))).toBe(false);
+
+    // …so a fresh breakage heals immediately instead of waiting out the window.
+    writeBroken(root);
+    runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+  });
+
+  it('heals AFTER the entry too — the fire that first breaks also writes the marker', () => {
+    // Without the post-entry check the session that DISCOVERS the breakage would
+    // end without healing, and every later fire in it stays dead.
+    const root = makeInstall('cml-launcher-nb-postentry');
+    stubInstaller(root);
+    writeFileSync(
+      join(root, 'entry.mjs'),
+      `import { writeFileSync, mkdirSync } from 'fs';\n` +
+      `import { join } from 'path';\n` +
+      `mkdirSync(join(process.env.CLAUDE_MEM_DIR, 'runtime'), { recursive: true });\n` +
+      `writeFileSync(join(process.env.CLAUDE_MEM_DIR, 'runtime', 'native-binding-broken'), JSON.stringify({ reason: 'abi', ts: Date.now() }));\n` +
+      `process.stdout.write("ENTRY-OK\\n");\n`,
+    );
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('ENTRY-OK');
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+  });
+
+  it('is a no-op with no marker — a healthy install pays nothing at session-start', () => {
+    const root = makeInstall('cml-launcher-nb-noop');
+    stubInstaller(root);
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    const r = runLauncher(root, ['entry.mjs', 'session-start']);
+    expect(r.status).toBe(0);
+    expect(existsSync(RAN(root))).toBe(false);
+  });
+
+  it('reads the marker dir the standalone hook scripts write to (CLAUDE_MEM_RUNTIME_DIR)', () => {
+    // pre-tool-recall.js / pre-skill-bridge.js honor CLAUDE_MEM_RUNTIME_DIR and
+    // wrote 78 of the 79 field markers; a launcher reading only CLAUDE_MEM_DIR
+    // would look in the wrong place and never heal.
+    const root = makeInstall('cml-launcher-nb-runtimedir');
+    stubInstaller(root);
+    writeFileSync(join(root, 'entry.mjs'), 'process.stdout.write("ENTRY-OK\\n");\n');
+    const altRuntime = join(root, 'alt-runtime');
+    mkdirSync(altRuntime, { recursive: true });
+    writeFileSync(join(altRuntime, 'native-binding-broken'), JSON.stringify({ reason: 'abi', ts: Date.now() }));
+
+    const r = runLauncher(root, ['entry.mjs', 'session-start'], { CLAUDE_MEM_RUNTIME_DIR: altRuntime });
+    expect(r.status).toBe(0);
+    expect(waitFor(() => existsSync(RAN(root)))).toBe(true);
+  });
+});
+
 // The updater renames files into the install dir one at a time — atomic per file,
 // not per file SET. A hook process that starts mid-loop can resolve hook.mjs from
 // the old version and one of its imports from the new one. The updater marks that

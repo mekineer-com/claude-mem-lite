@@ -40,7 +40,8 @@ const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
-import { probeBetterSqlite3Binding, ensureBetterSqlite3Working } from './lib/binding-probe.mjs';
+import { probeBetterSqlite3Binding, ensureBetterSqlite3Working, NATIVE_BINDING_REBUILD_CMD } from './lib/binding-probe.mjs';
+import { clearNativeBindingBreakage, readNativeBindingBreakage } from './lib/native-binding-hint.mjs';
 import { sweepStaleTestFixtures } from './lib/tmp-fixture-sweep.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
 import { atomicWriteFileSync } from './lib/atomic-write.mjs';
@@ -1447,6 +1448,23 @@ async function doctor() {
     ok('Hook self-heal: no recent silent hook breakage');
   }
 
+  // Native DB binding. Two signals, because they answer different questions:
+  // the marker says "hooks have been failing" (possibly for days, since the hint
+  // is 6h-rate-limited stderr nobody reads), the live probe says "is it broken
+  // right now". A Node upgrade breaks every DB-touching path at once, so this is
+  // the single highest-value line in doctor when it fires.
+  const breakage = readNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
+  const bindingProbe = await probeBetterSqlite3Binding(bindingHostDir());
+  if (!bindingProbe.ok) {
+    fail(`Native DB binding: unusable (${String(bindingProbe.error).split('\n')[0]}) — run \`node ${join(PROJECT_DIR, 'cli.mjs')} rebuild-binding\``);
+    issues++;
+  } else if (breakage) {
+    const ageH = Math.round((Date.now() - (breakage.ts || 0)) / 3600000);
+    dwarn(`Native DB binding: healthy now, but a fire failed ~${ageH}h ago (${breakage.reason || 'unknown'}) — stale marker clears on the next successful rebuild-binding`);
+  } else {
+    ok(`Native DB binding: loadable on Node ${process.version}`);
+  }
+
   // Plugin/hook lifecycle state
   const settings = readSettings();
   const hasHooks = hasMemHooksConfigured(settings);
@@ -2129,6 +2147,51 @@ function regenerateLockfile() {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+// An install can own MORE THAN ONE better-sqlite3 tree (dev repo, ~/.claude-mem-lite,
+// the plugin cache), each with its own .node — and only the one the RUNNING code
+// resolves matters, i.e. the one next to this file. Rebuilding the wrong tree
+// reports success while every hook keeps failing. Fall back to INSTALL_DIR when
+// this file sits in a source-only layout with no deps of its own.
+function bindingHostDir() {
+  return existsSync(join(PROJECT_DIR, 'node_modules', 'better-sqlite3')) ? PROJECT_DIR : INSTALL_DIR;
+}
+
+// Local, network-free repair for an unusable native DB binding — the Node-upgrade
+// fault (ABI 127 → 137) that `repair` is the wrong size for: repair re-downloads
+// and signature-verifies a whole GitHub release and fails closed offline, while
+// this recompiles one module in place. Named in the hook hint, run unattended by
+// scripts/hook-launcher.mjs at session-start, and usable by hand.
+//
+// Takes the same install.lock as the install write phase and launch.mjs's rebuild:
+// two concurrent rebuilds can clobber the .node mid-compile. A live peer → report
+// and exit 0 (it is doing this very work), never race it.
+async function rebuildBinding() {
+  const host = bindingHostDir();
+  const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock'));
+  if (!release) {
+    // NOT exit 0: skipping is not healing. Callers key their state on the exit
+    // code — a false success would let the launcher drop its cooldown and the
+    // CLI re-exec into the same broken binding.
+    console.error('[install] Another install/repair is in progress — it owns the rebuild; skipping.');
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const verify = await ensureBetterSqlite3Working(host);
+    if (verify.ok) {
+      ok(`better-sqlite3 binding ${verify.action} for Node ${process.version} (${host})`);
+      // The fault is gone → drop the marker so session-start stops retrying.
+      clearNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
+    } else {
+      fail(`better-sqlite3 binding still unusable: ${verify.error}`);
+      log(`Try manually: cd ${host} && ${NATIVE_BINDING_REBUILD_CMD}`);
+      process.exitCode = 1;
+    }
+  } finally {
+    release();
+  }
+}
+
 // Cross-process gate around the install write phase. repair() is intentionally
 // NOT locked here: it spawns `install.mjs install` as a child, which takes this
 // lock — locking the parent too would deadlock. A live peer (another session's
@@ -2173,6 +2236,9 @@ export async function main(argv = process.argv.slice(2)) {
     case 'repair':
       await repair();
       break;
+    case 'rebuild-binding':
+      await rebuildBinding();
+      break;
     case 'release':
       syncVersions();
       if (!flags.has('--no-lock')) regenerateLockfile();
@@ -2203,6 +2269,7 @@ Usage:
   node install.mjs cleanup-hooks      Remove only claude-mem-lite hooks from settings.json
   node install.mjs self-update         Check for and install updates
   node install.mjs repair             Recover a broken install: download latest tarball, re-run install
+  node install.mjs rebuild-binding    Recompile better-sqlite3 for the running Node (fixes "NODE_MODULE_VERSION" after a Node upgrade)
   node install.mjs release            Sync versions (plugin/marketplace/CLAUDE.md) + regen lockfile via npm@10.9.2 (use --no-lock to skip lock regen)
 
   npx claude-mem-lite                 Install via npx (one-liner)

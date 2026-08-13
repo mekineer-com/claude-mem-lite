@@ -25,7 +25,7 @@
 // install.
 
 import { existsSync, mkdirSync, writeFileSync, statSync, unlinkSync, readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { dirname, join, isAbsolute } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
@@ -46,6 +46,34 @@ const HEAL_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 // to exit 0, cleared once the install is confirmed healthy. `doctor` reads it so
 // the intentional silence (no stack trace per fire) stays detectable. (#4/#8)
 const BROKEN_MARKER = join(RUNTIME_DIR, 'hook-launcher-broken');
+
+// ── Native-binding (ABI) self-heal ──────────────────────────────────────────
+// A stale better_sqlite3.node after a Node upgrade does NOT throw at import time
+// — better-sqlite3 dlopen's it lazily at the first `new Database()`, deep inside
+// the hook script, whose own catch swallows it. So it never reaches the
+// ERR_MODULE_NOT_FOUND path below.
+//
+// scripts/setup.sh has probed + rebuilt the binding at SessionStart since v3.58,
+// but ONLY on plugin-manifest installs: hooks/hooks.json registers setup.sh,
+// while an install.mjs-managed settings.json does NOT — it wires the launcher
+// alone. On that install shape nothing healed. Field result (2026-08-13): 4 days
+// with a dead memory system, 79 failed fires in one day.
+//
+// The hook scripts now drop a marker on every such fire (via
+// lib/hook-telemetry.mjs and lib/native-binding-hint.mjs); this heals from it at
+// SESSION-START only — never on the per-tool hot path, where an npm run would
+// stall the user's edit.
+// Marker dir mirrors the standalone hook scripts (pre-tool-recall /
+// pre-skill-bridge), which honor CLAUDE_MEM_RUNTIME_DIR — they write 78 of every
+// 79 of these markers, so reading a different dir would mean never healing.
+const NB_RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || RUNTIME_DIR;
+const NB_BROKEN_MARKER = join(NB_RUNTIME_DIR, 'native-binding-broken');
+const NB_HEAL_MARKER = join(NB_RUNTIME_DIR, 'native-binding-lastheal');
+// Literal, not imported: the pure-`node:` charter above forbids importing lib/
+// here (this file must survive a broken install). Kept in sync with
+// lib/binding-probe.mjs::NATIVE_BINDING_REBUILD_CMD, which is the single home
+// everywhere the charter allows an import.
+const NB_MANUAL_CMD = 'npm rebuild better-sqlite3 --dangerously-allow-all-scripts';
 
 // Resolvable invocation of the bundled CLI's repair path. Absolute via
 // INSTALL_DIR (import.meta.url) so it works on a plugin-only install, where
@@ -248,6 +276,62 @@ async function attemptHeal(reason) {
 // falls through to the normal entry import. The dynamic import keeps this
 // launcher's pure-`node:` static-import charter intact (it must survive a broken
 // install even if hook-update.mjs is unimportable).
+// → the function this describes is trySyncDataDirFromCache(), below.
+
+// Rebuild the native binding when a prior fire recorded it as unusable.
+//
+// DETACHED, never awaited. This hook runs under a 15s Claude Code cap
+// (hooks/hooks.json) while a rebuild can take far longer — prebuild-install has
+// to fetch, and a node-gyp fallback is minutes. Waiting would trade a broken
+// binding for a SIGKILL'd session-start (no memory context at all) plus a
+// half-written .node, the exact hazard scripts/setup.sh's 20s exec cap documents.
+// Detaching costs one fire: the rebuild lands within seconds and the NEXT hook
+// fire — usually the same session's first PreToolUse — is already healthy.
+// stdio is fully ignored: install.mjs logs to STDOUT, and SessionStart stdout is
+// a JSON envelope Claude Code parses, so inheriting it corrupts the fire.
+//
+// Bounded by its own 6h cooldown so an unfixable case (no prebuild for this Node,
+// no compiler, offline) does not re-spawn npm every session. The cooldown is
+// dropped once the binding is confirmed healthy, so a LATER unrelated break heals
+// immediately instead of waiting out a stale window.
+// Best-effort throughout — a heal failure must never stop the hook fire.
+function healNativeBindingIfBroken() {
+  try {
+    if (!existsSync(NB_BROKEN_MARKER)) {
+      // Healthy (or already healed by the child) → reset the cooldown.
+      try { unlinkSync(NB_HEAL_MARKER); } catch { /* nothing to reset */ }
+      return;
+    }
+    try {
+      if (Date.now() - statSync(NB_HEAL_MARKER).mtimeMs < HEAL_COOLDOWN_MS) return;
+    } catch { /* no marker → not on cooldown */ }
+    try {
+      mkdirSync(NB_RUNTIME_DIR, { recursive: true });
+      writeFileSync(NB_HEAL_MARKER, String(Date.now()));
+    } catch { /* best-effort */ }
+
+    const installer = join(INSTALL_DIR, 'install.mjs');
+    if (!existsSync(installer)) {
+      process.stderr.write(
+        `[claude-mem-lite] native DB binding unusable and install.mjs is missing — run: cd "${INSTALL_DIR}" && ${NB_MANUAL_CMD}\n`,
+      );
+      return;
+    }
+    // The CHILD clears the breakage marker, and only on a verified-good rebuild
+    // (install.mjs::rebuildBinding). Clearing it here would mean a rebuild that
+    // silently did nothing — lock contention, a no-op npm — still reads as
+    // "healed", dropping the cooldown and re-spawning npm on every session.
+    process.stderr.write(
+      '[claude-mem-lite] native DB binding unusable (Node version change?) — rebuilding in the background\n',
+    );
+    const child = spawn(process.execPath, [installer, 'rebuild-binding'], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+  } catch { /* best-effort — never block the hook fire */ }
+}
+
 async function trySyncDataDirFromCache() {
   try {
     const { syncDataDirFromCache } = await import(
@@ -257,15 +341,27 @@ async function trySyncDataDirFromCache() {
   } catch { /* best-effort — proceed to the normal entry regardless */ }
 }
 
-if (rest.includes('session-start')) {
+const IS_SESSION_START = rest.includes('session-start');
+
+if (IS_SESSION_START) {
+  // Before the entry: this process has not dlopen'd better-sqlite3 yet, so the
+  // freshly built .node is picked up by the very fire that follows. (After a
+  // failed dlopen, only a NEW process can load the replacement — the module
+  // handle is cached and an in-process retry dies with "did not self-register".)
+  healNativeBindingIfBroken();
   await trySyncDataDirFromCache();
 }
+
 
 try {
   await runEntry();
   // A clean session-start fire confirms the install is healthy → clear any stale
   // breakage marker. Gated to session-start so the per-tool hot path pays nothing.
-  if (rest.includes('session-start')) clearBreakage();
+  if (IS_SESSION_START) clearBreakage();
+  // After the entry too: the fire that DISCOVERS the breakage is the one that
+  // records it, so a pre-entry-only check would leave the whole session dead and
+  // heal one session late.
+  if (IS_SESSION_START) healNativeBindingIfBroken();
 } catch (e) {
   if (!isLocalModuleErr(e)) throw e;
   const reason = describeFailure(e);

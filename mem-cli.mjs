@@ -35,11 +35,14 @@ import { auditMemdir, memdirPath } from './memdir.mjs';
 import { aggregateProjectCiteRecall } from './lib/citation-tracker.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { join, sep, dirname } from 'path';
+import { spawnSync } from 'child_process';
 import { readFileSync, existsSync, readdirSync } from 'fs';
 
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
+import { isNativeBindingError, healAndReexec } from './lib/binding-probe.mjs';
+import { CLI_PATH, CLI_INVOKE } from './cli-path.mjs';
 import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
@@ -3204,6 +3207,37 @@ export async function run(argv) {
     // previously threw here with no auto-repair until the next MCP start.
     db = ensureDbWithWalRecovery({ warn: (m) => process.stderr.write(`[mem] ${m}\n`) });
   } catch (e) {
+    // A Node upgrade leaves better_sqlite3.node compiled for the old ABI, and
+    // every DB-touching path fails at once. Pre-v3.60 this printed the raw
+    // multi-line NODE_MODULE_VERSION error with no repair named, and the only
+    // healer was an MCP server start the user might never perform — the shape of
+    // the 4-day outage on 2026-08-13. Heal in place, then RE-EXEC: this process
+    // has already dlopen'd the stale binary, so it cannot use the new one.
+    if (isNativeBindingError(e)) {
+      const healed = await healAndReexec({
+        // Delegate the actual rebuild to `cli.mjs rebuild-binding` so there is
+        // ONE healer: it takes install.lock, resolves which node_modules tree
+        // the running code uses, and clears the hooks' breakage marker.
+        ensure: async () => {
+          // Child stdout is DISCARDED, not inherited: install.mjs logs progress
+          // to stdout, and this CLI's stdout is a data channel (`search --json`
+          // is piped into jq). Progress still reaches the user via stderr.
+          const r = spawnSync(process.execPath, [CLI_PATH, 'rebuild-binding'], {
+            stdio: ['ignore', 'ignore', 'inherit'],
+            timeout: 300_000,
+          });
+          return r.status === 0
+            ? { ok: true, action: 'rebuilt' }
+            : { ok: false, error: `rebuild-binding exited ${r.status ?? 'on signal'}` };
+        },
+        log: (m) => process.stderr.write(`[mem] ${m}\n`),
+      });
+      if (healed.healed) { process.exitCode = healed.exitCode; return; }
+      out(`[mem] Error: native DB binding unusable on Node ${process.version}${healed.error ? ` — ${healed.error}` : ''}`);
+      out(`[mem] Fix: ${CLI_INVOKE} rebuild-binding`);
+      process.exitCode = 1;
+      return;
+    }
     out(`[mem] Error: Cannot open database: ${e.message}`);
     out(`[mem] DB path: ${DB_PATH}`);
     process.exitCode = 1;
