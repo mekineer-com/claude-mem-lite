@@ -311,6 +311,28 @@ export function obsFieldLabel(field) {
   return OBS_FIELD_LABELS[field] || field;
 }
 
+/**
+ * The `maintain scan` pending-purge line, shared by the CLI (mem-cli.mjs cmdMaintain) and
+ * the MCP mem_maintain handler (server.mjs) so the two cannot drift — same reason
+ * obsFieldLabel lives here.
+ *
+ * The count is `compressed_into = COMPRESSED_PENDING_PURGE` (lib/maintain-core.mjs:443),
+ * and the ONLY writers of that sentinel are the two idle/decay passes — decayAndMarkIdle
+ * (maintain-core.mjs:201) and runIdleCleanup (search-scoring.mjs:303). Compression writes
+ * COMPRESSED_AUTO (-1) or a positive parent id, and those rows are NOT counted. The CLI
+ * used to render this as "compressed originals awaiting cleanup", which told an operator
+ * about to run `maintain execute --ops purge_stale --confirm` that they were deleting
+ * compression leftovers when they were deleting decay-marked live originals (audit
+ * 2026-08-14 A4). Say what the rows are and what deletes them — and say nothing about
+ * compression, which is a different sentinel with a different lifecycle.
+ *
+ * @param {number} n stats.pendingPurge
+ * @returns {string} the full indented line, identical on both surfaces.
+ */
+export function formatPendingPurgeLine(n) {
+  return `  Pending purge (idle-marked): ${n} (live originals marked idle by decay — purge_stale deletes them)`;
+}
+
 // Pure formatter — null/undefined/non-time pass through; integer time fields
 // render as `<raw> (<relative>)` so callers get both an audit value and a
 // human/LLM-scannable hint, mirroring `recent`/`timeline`/`recall`.

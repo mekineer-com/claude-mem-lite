@@ -529,7 +529,13 @@ describe('CLI feature sweep: maintenance commands', () => {
 
     const after = ok(['maintain', 'scan', '--project', 'sweep-maintain']);
     expect(after.stdout).toContain('Total active: 0');
-    expect(after.stdout).toMatch(/Pending purge: 3/);
+    // Converged with the MCP spelling (audit 2026-08-14 A4): the CLI used to print
+    // "Pending purge: 3 (compressed originals awaiting cleanup)", which described the wrong
+    // sentinel — these 3 rows were marked by the DECAY pass one line above
+    // ("marked 3 idle as pending-purge"), not by compression. Same string on both surfaces
+    // now (tests/feature-sweep-mcp.test.mjs:480 pins the twin).
+    expect(after.stdout).toMatch(/Pending purge \(idle-marked\): 3/);
+    expect(after.stdout).not.toMatch(/compressed originals/);
   });
 
   itCmd('optimize', () => {

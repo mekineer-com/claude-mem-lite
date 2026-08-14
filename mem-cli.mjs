@@ -43,7 +43,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { isNativeBindingError, healAndReexec } from './lib/binding-probe.mjs';
 import { CLI_PATH, CLI_INVOKE } from './cli-path.mjs';
-import { parseArgs, out, outVerbatim, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
+import { parseArgs, out, outVerbatim, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
@@ -1982,7 +1982,7 @@ function cmdMaintain(db, args) {
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
     out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — run: maintain execute --ops demote_pinned`);
-    out(`  Pending purge: ${stats.pendingPurge} (compressed originals awaiting cleanup)`);
+    out(formatPendingPurgeLine(stats.pendingPurge));
     if (duplicates.length > 0) {
       const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
       const manualReview = duplicates.filter(d => parseFloat(d.similarity) < AUTO_MERGE_THRESHOLD);

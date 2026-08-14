@@ -410,3 +410,106 @@ describe('A2 — mem_export can back up a store larger than the old 1000-row cei
     expect(mcpRows.map((r) => r.title)).toEqual(cliRows.map((r) => r.title));
   }, 60000);
 });
+
+// ─── A4 — `maintain scan` explained pending-purge rows as the opposite of what they are ──
+// mem-cli.mjs:1974 printed `Pending purge: N (compressed originals awaiting cleanup)`;
+// server.mjs:1116 printed `Pending purge (idle-marked): N`. Same stats.pendingPurge, two
+// spellings — and the CLI's explanation is factually WRONG. maintenanceStats counts
+// `compressed_into = COMPRESSED_PENDING_PURGE` (lib/maintain-core.mjs:443), and the only
+// writers of that sentinel are the two idle/decay passes (decayAndMarkIdle at
+// maintain-core.mjs:201 and runIdleCleanup at search-scoring.mjs:303). Compression writes
+// COMPRESSED_AUTO (-1) or a positive parent id, and those rows are NOT counted. So an
+// operator reading the CLI line before `maintain execute --ops purge_stale --confirm`
+// believed they were deleting compression leftovers when they were deleting decay-marked
+// live originals. Both surfaces now print the accurate line, from one shared formatter.
+
+describe('A4 — the pending-purge line says what the counted rows actually are', () => {
+  let dataDir, cwd, client, transport;
+  const PROJECT = 'a4-purge';
+
+  /** The pending-purge line of a maintain-scan output, trimmed. */
+  const purgeLine = (text) => text.split('\n').map((l) => l.trim()).find((l) => l.startsWith('Pending purge'));
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('data-a4');
+    cwd = sandboxDir('work', 'a4');
+
+    const [{ default: Database }, { initSchema }, { insertObs, insertSession }] = await Promise.all([
+      import('better-sqlite3'), import('../schema.mjs'), import('./test-helpers.mjs'),
+    ]);
+    const db = initSchema(new Database(join(dataDir, 'claude-mem-lite.db')));
+    try {
+      insertSession(db, { id: 'a4-sess', project: PROJECT });
+      // Two rows the decay pass already marked idle (the sentinel the scan counts) …
+      for (const i of [1, 2]) {
+        insertObs(db, { sessionId: 'a4-sess', project: PROJECT, title: `Idle-marked row ${i}`, text: `idle ${i}`, compressedInto: -2 });
+      }
+      // … and one the COMPRESSION path marked, which the line used to claim was the subject.
+      insertObs(db, { sessionId: 'a4-sess', project: PROJECT, title: 'Auto-compressed row', text: 'compressed', compressedInto: -1 });
+    } finally { db.close(); }
+
+    ({ client, transport } = await startMcp(dataDir, cwd));
+  }, 60000);
+
+  afterAll(async () => {
+    try { await client?.close(); } catch { /* already gone */ }
+    try { await transport?.close(); } catch { /* already gone */ }
+  });
+
+  // The fact the wording rests on, checked against the real functions rather than against
+  // the prose: the counted set is what the DECAY pass marks, and a compression-marked row
+  // is not in it.
+  // FAILS IF: the sentinel semantics ever change so that compression leftovers ARE counted
+  // (then the "idle-marked" wording would be the wrong one) — a compressed row would push
+  // the count to 2 in the first assertion, or decayAndMarkIdle would stop moving it in the
+  // second.
+  it('pendingPurge counts decay-marked rows and not compression leftovers', async () => {
+    const [{ maintenanceStats, decayAndMarkIdle, STALE_AGE_MS }, { createTestDb, insertObs, insertSession }] =
+      await Promise.all([import('../lib/maintain-core.mjs'), import('./test-helpers.mjs')]);
+    const db = createTestDb();
+    try {
+      insertSession(db, { id: 'a4-unit', project: 'a4-unit' });
+      const mctx = { projectFilter: '', baseParams: [], staleAge: Date.now() - STALE_AGE_MS };
+      // A compression leftover: auto-compressed (-1) and compressed into a parent (positive).
+      insertObs(db, { sessionId: 'a4-unit', project: 'a4-unit', title: 'auto-compressed', compressedInto: -1 });
+      insertObs(db, { sessionId: 'a4-unit', project: 'a4-unit', title: 'merged into parent', compressedInto: 1 });
+      expect(maintenanceStats(db, mctx).pendingPurge,
+        'a compression leftover is counted as pending-purge — then "idle-marked" would be the wrong label')
+        .toBe(0);
+
+      // A live original the decay pass marks: stale, importance 1, never accessed, no lesson.
+      insertObs(db, {
+        sessionId: 'a4-unit', project: 'a4-unit', title: 'stale never-accessed original',
+        text: 'body', importance: 1, epochOffset: -(STALE_AGE_MS + 86400000),
+      });
+      expect(maintenanceStats(db, mctx).pendingPurge).toBe(0);
+      expect(decayAndMarkIdle(db, mctx).idleMarked).toBe(1);
+      expect(maintenanceStats(db, mctx).pendingPurge,
+        'the decay pass is what fills the pending-purge bucket — that is what the label must say')
+        .toBe(1);
+    } finally { db.close(); }
+  });
+
+  // FAILS IF: the CLI reverts to "(compressed originals awaiting cleanup)" — the negative
+  // assertion reds — or either surface changes the line alone: the two lines are read from
+  // two independently produced real outputs, so neither can be edited into agreement on its
+  // own. (Pre-fix this reds with "Pending purge: 2 (compressed originals awaiting cleanup)"
+  // vs "Pending purge (idle-marked): 2".)
+  it('both surfaces print the same, accurate pending-purge line', async () => {
+    const cli = await fire(process.execPath, [CLI_PATH, 'maintain', 'scan', '--project', PROJECT],
+      { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+    expect(cli.code, cli.stderr).toBe(0);
+    const mcp = textOf(await client.callTool({ name: 'mem_maintain', arguments: { action: 'scan', project: PROJECT } }));
+
+    const cliLine = purgeLine(cli.stdout);
+    const mcpLine = purgeLine(mcp);
+    expect(cliLine, `no pending-purge line in the CLI scan:\n${cli.stdout}`).toBeTruthy();
+    expect(mcpLine, `no pending-purge line in the MCP scan:\n${mcp}`).toBeTruthy();
+    // The seeded count is real, so the line was not read off an empty store.
+    expect(cliLine).toMatch(/\b2\b/);
+    expect(cliLine).toBe(mcpLine);
+    expect(cliLine, 'the line still tells the operator these are compression leftovers')
+      .not.toMatch(/compress/i);
+    expect(cliLine, 'the line does not say what actually marked these rows').toMatch(/idle/i);
+  }, 60000);
+});

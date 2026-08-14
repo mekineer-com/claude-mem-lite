@@ -27,7 +27,7 @@ import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
-import { formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
+import { formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
 // The partial-export warning points the caller at the CLI twin, which exports the complete
 // set by default — the invocation has to be the one that actually works on this install.
 import { CLI_INVOKE } from './cli-path.mjs';
@@ -1116,7 +1116,7 @@ server.registerTool(
         `  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`,
         `  Broken (no title/narrative): ${stats.broken}`,
         `  Boostable (accessed>3, imp<3): ${stats.boostable}`,
-        `  Pending purge (idle-marked): ${stats.pendingPurge}`,
+        formatPendingPurgeLine(stats.pendingPurge),
       ];
       if (duplicates.length > 0) {
         const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
