@@ -2,6 +2,61 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.62.0 — three surfaces nobody had ever tested end to end, and the twelve defects that were waiting there
+
+**Upgrading from 3.61.x — what changes for you.** Four behaviors you may notice. Each is a fix, each has an escape hatch, and none requires you to do anything:
+
+| Change | If it bothers you |
+|---|---|
+| `mem_use` no longer loads a *different* skill when the name you asked for does not exist. It returns the closest names for you to pick from. | Ask for the exact name the response suggests. |
+| CLI commands that print stored text now neutralize `<`/`>` in it, the way the MCP tools already did. This is every command whose output goes through `out()` — the read family, `stats`, `citation-stats`, `activity`, `maintain scan`, and **all `--json` envelopes** (still valid JSON; `<`/`>` are not JSON-structural). `export` and `context` are exempt and still emit raw bytes. | Use `export` for anything that must round-trip byte-exactly. It always could; now it is the only one that does. |
+| The 24h GitHub release **check** now actually runs — it never has, on any install, since v2.85.0. It reports an available update; it does **not** self-install this release, on any install type. | `CLAUDE_MEM_SKIP_UPDATE=1`, or dev-mode, both skip it entirely. |
+| `scripts/post-tool-recall.js` is registered on `Edit`/`Write`/`NotebookEdit`. It returns immediately unless you opted into `CLAUDE_MEM_SALIENCE=bind`. | Unset `CLAUDE_MEM_SALIENCE` (the default) keeps it inert. |
+
+Revert path: `npm i claude-mem-lite@3.61.1`. No schema change, no migration, no state-file shape moved — a downgrade is clean.
+
+---
+
+This release started as a test-writing exercise, not a bug hunt. Three feature faces had no single end-to-end check: every CLI subcommand, every MCP tool, every hook entry point. Building those three sweeps — `tests/feature-sweep-cli.test.mjs` (28 commands through the real `cli.mjs` subprocess), `tests/feature-sweep-mcp.test.mjs` (all 20 tools over real stdio JSON-RPC), `tests/feature-sweep-hooks.test.mjs` (18 hook surfaces as real subprocesses) — found the product **clean on routing, flag parsing, and output shape**. Then two targeted audits, aimed at the disease classes this project keeps reopening, found twelve real defects. They cluster into three.
+
+### The guard was wired to one face and missing on its twin
+
+**fix: every MCP read tool neutralized structural delimiters; no CLI read command did.** `server.mjs` has neutralized `<claude-mem-context>`, `<system-reminder>` and friends at the `safeHandler` chokepoint since v3.61.1, with a comment stating the intent: "the MCP read tools were the one model-facing family left raw." The CLI family was never counted — and the CLI is model-facing too. `commands/mem.md` routes `/mem search|get|recall|timeline` to `node cli.mjs … via Bash`, and the server's own instructions tell the agent the Bash CLI is the *cheaper* path. So the channel the MCP defang closes stood open on the twin the agent was being steered toward. Now closed at one chokepoint, `cli/common.mjs::out()`, with `outVerbatim()` for the two paths that must stay raw: `export` (a defanged backup is silent corruption on restore) and `context` (whose job is to emit a real `<claude-mem-context>` wrapper).
+
+**fix: and the defang itself was not a fixpoint.** The independent pre-tag review caught this before the tag. Both neutralizers stripped brackets in a single pass, so `<<system-reminder>>` had its *inner* pair removed and came back out as a live `<system-reminder>` — through the new CLI chokepoint, through the MCP tools, and through the `mem_use` echo the fix above had just bounded. Two characters defeated it. The strip now iterates to a fixpoint: each pass removes at least one `<`, so it is self-terminating, and a 32-pass cap bounds the adversarial cost (a crafted 200k-char nesting took 4921 ms unbounded, under 10 ms capped) with every remaining bracket removed if the cap is ever reached, so the cap cannot itself become the bypass. Nesting is inert at depths 2 through 200, as is the interleaved form that a merely-wider single regex would still pass.
+
+**fix: `mem_use` handed back a different skill's full body, and told the agent to execute it.** On an exact-name miss it fell through to an FTS search and returned whatever ranked first, wrapped in `<skill-loaded>`, followed by "Follow the instructions above to execute this skill." — with nothing indicating a substitution had happened. With only `deploy-rollback-runbook` installed, asking for `deploy-notes`, `rollback-checklist`, or `runbook-index` each returned its full text. An agent asking for skill A received skill B's instructions and was told to run them. It now returns candidate *names* and loads nothing.
+
+**fix: the name you pass to `mem_use` was echoed back verbatim,** so a crafted `name` could forge an entire `<skill-loaded>` block and the execute-imperative inside the response. The echo is now length-bounded and its skill-block delimiters neutralized — the real wrapper on the legitimate load path is deliberately left alone.
+
+### Work that disappeared without a trace
+
+**fix: a DB-open failure destroyed the session's captured work while all three self-checks reported green.** `openDb()` swallowed every failure and returned `null` with no telemetry; handlers then no-op'd, but the Stop path still deleted the episode buffer unconditionally. With an unopenable DB: exit 0, empty stdout, empty stderr, buffer gone, `runtime/hook-errors/` never created, `stats` reporting zero hook errors, and `doctor` printing "no recent silent hook breakage." The failure is now recorded through `recordHookError`, and all three buffer-deletion sites are gated on a DB that actually opened — including the Stop lock-contended path, which had already moved the file and now renames it back rather than unlinking it.
+
+**fix: the background update-check worker exited before it ever ran.** `spawnBackground('update-check')` sets `CLAUDE_MEM_HOOK_RUNNING=1` on the child, and the recursion guard exits any event not listed in `BG_EVENTS` — where `update-check` was missing. Two-run proof with the network stubbed: without the env var, 2 fetches and a written state file; with it, zero. And because `isUpdateCheckDue()` reads that never-written state, every SessionStart respawned a worker that immediately died. This is the exact class the `BG_EVENTS` comment warns about; a structural test now fails if any detached-spawn event is missing from the set.
+
+Because that path had been dormant for ten weeks, this release restores only half of it. `checkForUpdate()` is now dispatched with `allowInstall: false`, so every install type gets the check and the banner and none gets the self-replacing install — which, on direct (non-plugin) installs, is what `allowInstall` would otherwise have defaulted to. The installer itself is unchanged and well-guarded (signature verification fail-closed, cross-process lock, write-ahead journal with rollback, post-install smoke gate); it simply does not fire from this hook yet. Re-enabling it is a one-line follow-up once the check path has proven itself in production, and splitting the two means a failure in either is attributable.
+
+**fix: a non-string `tool_name` threw, was swallowed, and dropped the observation** at exit 0 with clean stdout. Guarded, and the drop is now recorded.
+
+**fix: `scripts/post-tool-recall.js` was shipped, signed, installed, and tested — and registered in no hook registry.** The only thing that wired it was the benchmark harness, so bind-salience component 2 worked in measurement and was inert in production. **fix: `install.mjs` never registered `PreCompact`,** which `hooks/hooks.json` did — so settings.json installs silently lost the memory block meant to survive compaction, while `doctor` reported hooks healthy. Both registries are now diffed against each other by a test that compares two *produced* artifacts, not two hand-maintained lists.
+
+### The superseded invariant, reopened for the Nth time
+
+**fix: `recall` served retracted lessons as current — and re-promoted them.** `recallByFile` filtered `compressed_into` but not `superseded_at`, then bumped `access_count` on the rows it returned, pushing tombstones back up the decay and tier system. `mem_recall` is one of the tools this project's own guidance tells agents to consult before editing.
+
+**fix: error-recall injected the retracted lesson, inlined, as the top hit.** The PostToolUse hint block filtered neither column. Worse, it inlines the lesson body for `rows[0]` only — and a retracted lesson shares its correction's keywords, so it outranks its own replacement on BM25 and takes that slot. The agent got the withdrawn advice in full and the current advice as a bare title. **fix: `hook-handoff.mjs` replayed retracted decisions to the next session under `## Key Decisions`,** as standing policy — while its own sibling nine lines away already filtered them. `## Completed` still carries them, because a decision that was later overturned did still happen.
+
+### Smaller, but wrong
+
+**fix: `mem_export` could not back up a store larger than 1000 rows.** It defaulted to 200 and hard-rejected any higher limit, while its own description recommends it for "backing up memory before a migration or reinstall" — and the CLI twin had been fixed for precisely this two versions ago. The ceiling is gone; the default 200 remains, but a capped export now says, loudly, that it is not a complete backup — and leads with a file redirect rather than telling the caller to raise `limit` until the whole store lands in the transcript, which was the review's second catch.
+
+**fix: `maintain scan` told CLI users that pending-purge rows were "compressed originals awaiting cleanup."** They are decay-marked *live* originals; compression writes a different sentinel entirely. An operator reading that line before `purge_stale --confirm` believed they were deleting leftovers. **fix: `debugLog` was called with two arguments at three sites** against a three-parameter signature, so the write-side noise-gate diagnostics rendered with a literal `undefined` and could not be filtered by level. **fix: the attached-file list renders as `files`, not `files_modified`** — a file that was only read was being reported as modified.
+
+### Tests
+
++122 tests (4132 → 4254 at the fix boundary, 4259 with the final three). Every fix landed RED-first, and every guard was verified by mutation — broken deliberately, confirmed failing, reverted — rather than by reading it. That discipline caught two unfalsifiable assertions and one coverage guard that compared two hand-maintained literals and could be edited into passing. Three coverage holes in the new sweeps were closed the same way.
+
 ## v3.61.1 — the review that arrived after the tag; a leak fix that had started corrupting prose
 
 v3.61.0 shipped with `No independent pre-tag review` in its notes because two review subagents ran without returning anything. The report landed 40 minutes after the tag: 0 BLOCKER, 4 SHOULD-FIX, 6 NIT. Two of the four were regressions v3.61.0 itself introduced. This ships all four plus the substantive nits, and every finding below was independently reproduced before it was touched.
