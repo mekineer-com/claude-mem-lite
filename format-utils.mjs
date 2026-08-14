@@ -59,6 +59,25 @@ export function neutralizeContextDelimiters(s) {
   return String(s ?? '').replace(CONTEXT_DELIMITER_RE, (m) => m.slice(1, -1));
 }
 
+// <skill-loaded> is deliberately NOT in CONTEXT_DELIMITER_RE above: mem_use's legitimate
+// load path has to emit a REAL one, and that result goes through the same handler-wide
+// defang, which would strip it. So the tag is neutralized here instead — per call site,
+// on the untrusted text only. Attribute-bearing openers and the bare closer both match,
+// same "strip the brackets, keep the text" treatment as the class above.
+const SKILL_BLOCK_RE = /<\/?skill-loaded(?:\s[^>]*)?>/gi;
+
+/**
+ * Defang a literal `<skill-loaded>` opener/closer in text that is about to be echoed
+ * INSIDE a mem_use response. A caller-supplied name interpolated raw could otherwise
+ * forge a whole skill block (plus its execute imperative) in a message the caller
+ * controls end to end — audit F7, 2026-08-14. Never apply this to the real load path.
+ * @param {string} s Input string (any type; coerced)
+ * @returns {string} Text with skill-block delimiters defanged
+ */
+export function neutralizeSkillDelimiters(s) {
+  return String(s ?? '').replace(SKILL_BLOCK_RE, (m) => m.slice(1, -1));
+}
+
 /**
  * Render the PostToolUse error-recall hint block (hook.mjs::triggerErrorRecall).
  * The single most-relevant hit (rows[0]) that carries a lesson_learned gets its

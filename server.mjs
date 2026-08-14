@@ -28,7 +28,7 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
-import { neutralizeContextDelimiters } from './format-utils.mjs';
+import { neutralizeContextDelimiters, neutralizeSkillDelimiters } from './format-utils.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
 // Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
@@ -1567,6 +1567,11 @@ server.registerTool(
 
 // ─── Tool: mem_use ──────────────────────────────────────────────────────────
 
+// Cap on the caller-supplied name echoed back in a miss message. Well past any real
+// skill/agent name (the longest registered one here is 23 chars), short enough that an
+// unbounded argument cannot pad the response — the echo appears twice.
+const ECHO_NAME_MAX = 80;
+
 server.registerTool(
   'mem_use',
   {
@@ -1603,15 +1608,24 @@ server.registerTool(
       let candidates = [];
       try { candidates = searchResources(rdb, name, { type, limit: 5 }).map((r) => r.name).filter(Boolean); }
       catch { /* a suggestion is best-effort; the miss message below still stands */ }
-      const head = `No ${type} found for "${name}".`;
-      const browse = `mem_registry(action="search", query="${name}")`;
+      // Every echo of the caller's own name below is bounded + delimiter-inert (audit F7):
+      // raw interpolation let a crafted `name` forge a <skill-loaded> block and the execute
+      // imperative inside this message, and the handler-wide defangResult cannot catch it —
+      // <skill-loaded> is off CONTEXT_DELIMITER_RE precisely so the real load path can emit
+      // it. `truncate` also folds newlines, so a multi-line name cannot fake block structure.
+      // Registered names are defanged too (a crafted one can be imported), but NOT truncated:
+      // the suggestion tells the caller to load one by its exact name, so it must stay exact.
+      const echoed = neutralizeSkillDelimiters(truncate(name, ECHO_NAME_MAX));
+      const echoedCandidates = candidates.map((n) => neutralizeSkillDelimiters(n));
+      const head = `No ${type} found for "${echoed}".`;
+      const browse = `mem_registry(action="search", query="${echoed}")`;
       if (candidates.length === 0) {
         return { content: [{ type: 'text', text: `${head} Try ${browse} to browse.` }] };
       }
-      const list = candidates.map((n) => `  - ${n}`).join('\n');
+      const list = echoedCandidates.map((n) => `  - ${n}`).join('\n');
       return { content: [{ type: 'text', text:
         `${head} Closest ${type}s by search (NOT loaded — none matched the name you asked for):\n${list}\n\n` +
-        `Load one deliberately with its exact name, e.g. mem_use(name="${candidates[0]}"${type === 'skill' ? '' : `, type="${type}"`}), or browse with ${browse}.` }] };
+        `Load one deliberately with its exact name, e.g. mem_use(name="${echoedCandidates[0]}"${type === 'skill' ? '' : `, type="${type}"`}), or browse with ${browse}.` }] };
     }
 
     // 3. Resolve path: directory skills → SKILL.md (agents always have full .md paths)
