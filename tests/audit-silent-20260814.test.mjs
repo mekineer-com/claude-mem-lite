@@ -17,7 +17,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, chmodSync, rmSync } from 'fs';
 import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -28,6 +28,7 @@ import { recallByFile } from '../lib/recall-core.mjs';
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = join(REPO, 'cli.mjs');
 const INSTALL_PATH = join(REPO, 'install.mjs');
+const HOOK_PATH = join(REPO, 'hook.mjs');
 
 // ─── Sandbox shared by the subprocess-driven cases ─────────────────────────────────
 
@@ -463,5 +464,130 @@ describe('B6 — post-tool-recall is registered, and inert unless CLAUDE_MEM_SAL
     });
     expect(off.code, off.stderr).toBe(0);
     expect(off.stdout, 'an opt-in surface must add nothing to the default hook chain').toBe('');
+  }, 60000);
+});
+
+// ─── B1 — a DB that will not open destroyed the session's captured work ────────────
+// hook-shared.mjs's openDb() swallowed EVERY failure and returned null with zero
+// telemetry (8 call sites in hook.mjs share it). Handlers then no-op'd — but
+// flushEpisode's `unlinkSync(episodeFile())` ran unconditionally at the tail, so the
+// buffered episode was deleted anyway. All three self-checks stayed green: nothing was
+// written to runtime/hook-errors/, so `stats` reported 0 and install.mjs's doctor printed
+// "Hook self-heal: no recent silent hook breakage". The hook must still never crash the
+// host session — exit 0 and silence on stdout are preserved; what changes is that the
+// failure is RECORDED and the buffer SURVIVES for the next run.
+
+describe('B1 — an unopenable DB is recorded, and does not destroy the episode buffer', () => {
+  let dataDir, cwd, project, runtimeDir;
+
+  const post = (payload) => fire(process.execPath, [HOOK_PATH, 'post-tool-use'], {
+    cwd, stdin: JSON.stringify(payload), env: { CLAUDE_MEM_DIR: dataDir },
+  });
+  const stop = () => fire(process.execPath, [HOOK_PATH, 'stop'], {
+    cwd, stdin: JSON.stringify({ session_id: 'cc-b1' }), env: { CLAUDE_MEM_DIR: dataDir },
+  });
+
+  const episodeFile = () => join(runtimeDir, `ep-${project}.json`);
+  const hookErrorRecords = () => {
+    const dir = join(runtimeDir, 'hook-errors');
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((f) => f.endsWith('.jsonl'))
+      .flatMap((f) => readFileSync(join(dir, f), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)));
+  };
+
+  /**
+   * Two buffered entries, below the 10-entry auto-flush threshold. The `db-schema.sql`
+   * Write carries rule importance 2 via the filename heuristic, so on a HEALTHY DB the
+   * flush leaves a durable row instead of being dropped as auto-capture noise — that is
+   * what makes the counter-case below able to distinguish "persisted" from "no-op'd".
+   */
+  async function bufferTwoEntries() {
+    const payloads = [
+      {
+        session_id: 'cc-b1', tool_name: 'Write',
+        tool_input: { file_path: join(cwd, 'db-schema.sql'), content: 'CREATE TABLE widgets (id INTEGER);\n' },
+        tool_response: `File created successfully at: ${join(cwd, 'db-schema.sql')}`,
+      },
+      {
+        session_id: 'cc-b1', tool_name: 'Edit',
+        tool_input: { file_path: join(cwd, 'widget-cache.mjs'), old_string: 'a', new_string: 'b' },
+        tool_response: 'The file has been updated successfully with the new content applied.',
+      },
+    ];
+    for (const p of payloads) {
+      const r = await post(p);
+      expect(r.code, `post-tool-use exited ${r.code}\n${r.stderr}`).toBe(0);
+    }
+  }
+
+  function makeSandbox(slug) {
+    dataDir = sandboxDir('data-' + slug);
+    cwd = sandboxDir('work', slug);
+    project = 'work--' + slug;
+    runtimeDir = join(dataDir, 'runtime');
+  }
+
+  /** Replace the DB file with a DIRECTORY: every open fails with SQLITE_CANTOPEN. */
+  function breakDb() {
+    const dbPath = join(dataDir, 'claude-mem-lite.db');
+    if (existsSync(dbPath)) rmSync(dbPath, { force: true });
+    mkdirSync(dbPath, { recursive: true });
+  }
+
+  // FAILS IF: flushEpisode goes back to unlinking the buffer regardless of whether the
+  // flush could persist anything — the file is gone and the two captured entries with it.
+  it('keeps the buffered episode when the DB cannot be opened', async () => {
+    makeSandbox('b1broken');
+    breakDb();
+    await bufferTwoEntries();
+    const buffered = JSON.parse(readFileSync(episodeFile(), 'utf8'));
+    expect(buffered.entries, 'the buffer must exist before Stop, else this proves nothing').toHaveLength(2);
+
+    const r = await stop();
+    expect(r.code, `stop exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(r.stdout, 'a broken DB must not put anything on the host-visible channel').toBe('');
+    expect(r.stderr).not.toMatch(/SQLITE_CANTOPEN|at Object\.<anonymous>/);
+
+    expect(existsSync(episodeFile()), 'the episode buffer was destroyed by a flush that saved nothing').toBe(true);
+    expect(JSON.parse(readFileSync(episodeFile(), 'utf8')).entries).toHaveLength(2);
+  }, 60000);
+
+  // FAILS IF: openDb() reverts to `catch { return null; }` — hook-errors/ is never created,
+  // countRecentHookErrors stays 0 and doctor keeps printing "no recent silent hook breakage".
+  it('records the db-open failure in the unsampled hook-error log', async () => {
+    makeSandbox('b1telem');
+    breakDb();
+    await bufferTwoEntries();
+    await stop();
+
+    const records = hookErrorRecords();
+    const dbOpen = records.filter((x) => /db-open/.test(x.scope));
+    expect(dbOpen.length, `no db-open record was written:\n${JSON.stringify(records)}`).toBeGreaterThan(0);
+    expect(dbOpen[0].msg, 'the record must name the failure, else it is unactionable')
+      .toMatch(/unable to open|SQLITE_CANTOPEN|directory/i);
+  }, 60000);
+
+  // The counter-case, and the reason neither assertion above can be satisfied by "never
+  // delete the buffer" or "always record": on a HEALTHY DB the same sequence must still
+  // consume the buffer, persist the work, and write no db-open record.
+  // FAILS IF: the fix short-circuits flushEpisode (buffer never consumed / nothing saved)
+  // or records unconditionally.
+  it('a healthy DB still consumes the buffer, saves the work, and logs nothing', async () => {
+    makeSandbox('b1healthy');
+    await bufferTwoEntries();
+    expect(existsSync(episodeFile())).toBe(true);
+
+    const r = await stop();
+    expect(r.code, `stop exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(existsSync(episodeFile()), 'a successful flush must still remove the buffer').toBe(false);
+
+    const db = new Database(join(dataDir, 'claude-mem-lite.db'), { readonly: true });
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS c FROM observations').get();
+      expect(row.c, 'the flush persisted nothing').toBeGreaterThan(0);
+    } finally { db.close(); }
+
+    expect(hookErrorRecords().filter((x) => /db-open/.test(x.scope))).toEqual([]);
   }, 60000);
 });

@@ -7,6 +7,9 @@ import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'fs';
 import { inferProject, debugCatch } from './utils.mjs';
 import { ensureDbWithWalRecovery, DB_DIR } from './schema.mjs';
+// Pure-`node:`/local module (it imports only binding-probe + native-binding-hint, and
+// neither imports this file) — no cycle.
+import { recordHookError } from './lib/hook-telemetry.mjs';
 import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
 // fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
@@ -157,7 +160,17 @@ export function openDb() {
     // WAL-corruption self-heal (was server.mjs-only): without it, hooks stayed
     // silently dead (null DB) on a corrupt WAL until the next MCP server start.
     return ensureDbWithWalRecovery();
-  } catch {
+  } catch (e) {
+    // Still null, still no throw — a hook must never crash the host session, and all
+    // eight call sites in hook.mjs are written to no-op on null. But "returned null"
+    // used to be the ONLY trace: nothing reached runtime/hook-errors/, so `stats`
+    // reported 0 and doctor printed "no recent silent hook breakage" while every
+    // capture path was dead (audit B1, 2026-08-14 — the same blindness that hid the
+    // v3.60 binding outage for four days). recordHookError is the established sink;
+    // scripts/pre-tool-recall.js already logs its own db-open failures this way, and
+    // routing through it also flags the native-binding family for the session-start
+    // self-heal. The recorder swallows its own errors, so this cannot throw.
+    recordHookError('hook-shared:db-open', e, RUNTIME_DIR);
     return null;
   }
 }

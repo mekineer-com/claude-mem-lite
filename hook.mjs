@@ -146,8 +146,19 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
           // sessions into one garbled row. planEpisodeFlush returns [ep] by reference when
           // there is ≤1 CC session (the common case → identical to before), else one sub
           // per session. Pure/sync → safe inside the signal handler.
-          for (const sub of planEpisodeFlush(ep)) saveEpisodeImmediate(sub);
-          try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
+          // Same B1 gate as flushEpisode: without an openable DB every save below is a
+          // no-op, so deleting the buffer afterwards would destroy the very episode this
+          // handler exists to salvage. openDb is sync (safe here) and records its own
+          // failure; leaving the file untouched lets the next fire retry it.
+          const db = openDb();
+          if (db) {
+            try {
+              for (const sub of planEpisodeFlush(ep)) saveEpisodeImmediate(sub, db);
+              try { unlinkSync(join(RUNTIME_DIR, `ep-${inferProject()}.json`)); } catch {}
+            } finally {
+              try { db.close(); } catch { /* already gone */ }
+            }
+          }
         }
       } catch {}
       process.exit(0);
@@ -171,6 +182,25 @@ const RECEIPT_EVENTS = new Set(['PostToolUse', 'SessionStart', 'UserPromptSubmit
 function flushEpisode(episode, hookEventName = 'PostToolUse') {
   if (!episode || episode.entries.length === 0) return;
 
+  // Acquire the DB ONCE, up front, and bail before touching anything destructive when it
+  // will not open. Every persistence step below is a no-op without it (saveObservation
+  // returns null on a null db; the detached llm-episode worker hits the same wall), yet
+  // the `unlinkSync(episodeFile())` at the tail used to run regardless — so a DB that
+  // could not be opened deleted the session's captured work while the hook exited 0 with
+  // empty stdout AND empty stderr (audit B1, 2026-08-14). Returning here leaves the
+  // buffer on disk for the next fire to retry; openDb() has already recorded the failure
+  // under `hook-shared:db-open`. Reusing the handle for the immediate saves also drops
+  // this path from one open per sub-episode to one per flush.
+  const db = openDb();
+  if (!db) return;
+  try {
+    flushEpisodeWithDb(db, episode, hookEventName);
+  } finally {
+    try { db.close(); } catch { /* already closed / gone */ }
+  }
+}
+
+function flushEpisodeWithDb(db, episode, hookEventName) {
   // Collect Read file paths tracked by post-tool-use.sh
   // Use rename to atomically collect — prevents losing concurrent appends
   const readsFile = join(RUNTIME_DIR, `reads-${episode.project || inferProject()}.txt`);
@@ -192,7 +222,7 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
   const subs = planEpisodeFlush(episode);
   let anySignificant = false;
   for (const sub of subs) {
-    const r = flushEpisodeGroup(sub);
+    const r = flushEpisodeGroup(sub, db);
     if (r === 'writefail') {
       // Single-group: preserve the original early return — buffer left un-unlinked
       // for a later retry, no receipt. Multi-group: skip only the failed group and
@@ -257,7 +287,7 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
 // 'significant' | 'insignificant' | 'writefail'. CLAUDE_MEM_SKIP_EPISODE_LLM
 // suppresses the detached enrichment spawn (test determinism; sibling of
 // CLAUDE_MEM_SKIP_COMPRESS / _OPTIMIZE) — the synchronous immediate obs still lands.
-function flushEpisodeGroup(ep) {
+function flushEpisodeGroup(ep, db) {
   const isSignificant = episodeHasSignificantContent(ep);
 
   // Immediate save: rule-based observation for instant visibility; the LLM
@@ -265,7 +295,9 @@ function flushEpisodeGroup(ep) {
   if (isSignificant) {
     try {
       const obs = buildImmediateObservation(ep);
-      const id = saveObservation(obs, ep.project, ep.sessionId);
+      // `db` is flushEpisode's handle — passed in so the caller owns open/close and the
+      // whole flush is gated on one availability check (B1).
+      const id = saveObservation(obs, ep.project, ep.sessionId, db);
       if (id) ep.savedId = id;
     } catch (e) { debugCatch(e, 'flushEpisode-immediateSave'); }
   }
@@ -521,10 +553,17 @@ async function handleStop() {
     // Prevents data loss from concurrent PostToolUse writes between read and delete.
     const epFile = episodeFile();
     const claimFile = epFile + `.claim-${process.pid}-${Date.now()}`;
+    // Third instance of the B1 gate (flushEpisode and the SIGTERM salvage are the other
+    // two): this path already MOVED the buffer out of the way, so with no openable DB the
+    // `unlinkSync(claimFile)` below would destroy it just as surely — and the 1h orphan
+    // sweep would have eaten a restored-but-unnoticed claim file anyway. Open once, and
+    // put the buffer back under its real name when the save cannot happen.
+    let claimDb;
     try {
       renameSync(epFile, claimFile);
+      claimDb = openDb();
       try {
-        const episode = JSON.parse(readFileSync(claimFile, 'utf8'));
+        const episode = claimDb ? JSON.parse(readFileSync(claimFile, 'utf8')) : null;
         if (episode && episode.entries && episode.entries.length > 0 && episodeHasSignificantContent(episode)) {
           if (!episode.sessionId) episode.sessionId = sessionId;
           if (!episode.project) episode.project = project;
@@ -543,7 +582,7 @@ async function handleStop() {
             if (!episodeHasSignificantContent(sub)) continue;
             try {
               const obs = buildImmediateObservation(sub);
-              const id = saveObservation(obs, sub.project, sub.sessionId);
+              const id = saveObservation(obs, sub.project, sub.sessionId, claimDb);
               if (id) sub.savedId = id;
             } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
             const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
@@ -552,7 +591,15 @@ async function handleStop() {
           }
         }
       } finally {
-        try { unlinkSync(claimFile); } catch {}
+        if (claimDb) {
+          try { unlinkSync(claimFile); } catch {}
+          try { claimDb.close(); } catch { /* already gone */ }
+        } else {
+          // Nothing was (or could be) persisted — restore the buffer under its real name
+          // so the next fire retries it. If even the rename fails, the claim file stays
+          // and the 1h orphan sweep collects it, which is the pre-B1 behaviour.
+          try { renameSync(claimFile, epFile); } catch { /* leave it for sweepOrphanEpisodeFiles */ }
+        }
       }
     } catch (e) { debugCatch(e, 'handleStop-fallback'); }
   }
