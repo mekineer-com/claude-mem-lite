@@ -120,9 +120,20 @@ describe('E2E: Plugin install mode', () => {
     });
   });
 
-  it('hooks/hooks.json declares all 5 hook events', () => {
+  // Shape of the plugin-manifest registry only. Its PARITY with install.mjs's
+  // settings.json registry (event set, matchers, entries) is pinned separately in
+  // tests/audit-silent-20260814.test.mjs, which diffs this file against a real
+  // `install --dev` run — this case never noticed that install.mjs was missing an
+  // entire event (audit B3, 2026-08-14).
+  it('hooks/hooks.json declares all 6 hook events', () => {
     const hooks = readJson('hooks/hooks.json');
     expect(hooks.hooks).toBeTruthy();
+    expect(Object.keys(hooks.hooks).sort()).toEqual(
+      ['PostToolUse', 'PreCompact', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit'],
+    );
+
+    // PreCompact — re-emits the memory block BEFORE compaction rewrites the transcript.
+    expect(hooks.hooks.PreCompact[0].hooks[0].command).toContain('hook.mjs pre-compact');
 
     // SessionStart
     const sessionStart = hooks.hooks.SessionStart?.[0]?.hooks?.map(h => h.command) || [];
@@ -146,9 +157,16 @@ describe('E2E: Plugin install mode', () => {
     const agentInject = preToolUse.find(h => h.matcher === 'Agent|Task');
     expect(agentInject.hooks[0].command).toContain('pre-agent-inject.js');
 
-    // PostToolUse
-    expect(hooks.hooks.PostToolUse).toHaveLength(1);
-    expect(hooks.hooks.PostToolUse[0].hooks[0].command).toContain('post-tool-use.sh');
+    // PostToolUse — the '*' bash prefilter plus the edit-only bind-salience companion
+    // (audit B6, 2026-08-14: post-tool-recall.js shipped signed + tested but was
+    // registered nowhere, so bind-salience component 2 could never fire).
+    const postToolUse = hooks.hooks.PostToolUse;
+    expect(postToolUse).toHaveLength(2);
+    const prefilter = postToolUse.find(h => h.matcher === '*');
+    expect(prefilter.hooks[0].command).toContain('post-tool-use.sh');
+    const postRecall = postToolUse.find(h => h.matcher === 'Edit|Write|NotebookEdit');
+    expect(postRecall, 'post-tool-recall.js must be registered on the edit tools').toBeTruthy();
+    expect(postRecall.hooks[0].command).toContain('post-tool-recall.js');
 
     // Stop
     expect(hooks.hooks.Stop).toHaveLength(1);

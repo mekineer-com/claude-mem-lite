@@ -216,25 +216,71 @@ describe('B2 — recall does not serve, or re-promote, a superseded observation'
 // ACTUALLY produces — a real `install --dev` run's settings.json against the shipped
 // hooks.json — so neither can be edited into agreement on its own.
 
+/**
+ * Run a real `install.mjs install --dev` into the sandbox once per file and return what
+ * it produced: the generated settings.json hooks, the shipped manifest hooks, and the
+ * paths the install used. `--dev` symlinks this repo instead of running npm install, so
+ * the run is offline; a no-op `claude` shim on PATH keeps registerMcpServer() from
+ * reaching the developer's real CLI, and HOME/CLAUDE_MEM_DIR/cwd all point into the
+ * sandbox. Memoized: B3 and B6 both read the same produced artifact.
+ */
+let _installPromise = null;
+function installedRegistries() {
+  if (_installPromise) return _installPromise;
+  _installPromise = (async () => {
+    const { isMemHook } = await import('../install.mjs');
+    const installHome = sandboxDir('inst-home');
+    const dataDir = sandboxDir('inst-data');
+    const cwd = sandboxDir('work', 'inst');
+    mkdirSync(join(installHome, '.claude'), { recursive: true });
+
+    const binDir = sandboxDir('inst-bin');
+    const shim = join(binDir, 'claude');
+    writeFileSync(shim, '#!/bin/sh\nexit 0\n');
+    chmodSync(shim, 0o755);
+
+    const out = await fire(process.execPath, [INSTALL_PATH, 'install', '--dev'], {
+      cwd,
+      env: {
+        HOME: installHome,
+        CLAUDE_MEM_DIR: dataDir,
+        CLAUDE_MEM_SKIP_REPOS: '1',
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      timeout: 120000,
+    });
+    expect(out.code, `install failed:\n${out.stdout}\n${out.stderr}`).toBe(0);
+
+    return {
+      isMemHook,
+      installOut: out,
+      installHome, dataDir, cwd,
+      settingsHooks: JSON.parse(readFileSync(join(installHome, '.claude', 'settings.json'), 'utf8')).hooks,
+      manifestHooks: JSON.parse(readFileSync(join(REPO, 'hooks', 'hooks.json'), 'utf8')).hooks,
+    };
+  })();
+  return _installPromise;
+}
+
+/**
+ * Reduce a hook command to the entry it invokes, dropping the interpreter and the
+ * install-shape-specific absolute path / ${CLAUDE_PLUGIN_ROOT} prefix:
+ *   node "<any>/scripts/hook-launcher.mjs" hook.mjs session-start → "hook.mjs session-start"
+ *   bash "<any>/scripts/post-tool-use.sh"                        → "scripts/post-tool-use.sh"
+ */
+function entryToken(command) {
+  const unpathed = String(command)
+    .replace(/"[^"]*\/(scripts\/[^"]+)"/g, '$1')
+    .replace(/"[^"]*\/([^/"]+)"/g, '$1');
+  return unpathed
+    .split(/\s+/)
+    .filter((t) => t && t !== 'node' && t !== 'bash' && t !== 'scripts/hook-launcher.mjs')
+    .join(' ');
+}
+
 describe('B3 — install.mjs and hooks/hooks.json register the same hook events', () => {
   let settingsHooks, manifestHooks, isMemHook;
-  let installHome, dataDir, cwd, installOut;
-
-  /**
-   * Reduce a hook command to the entry it invokes, dropping the interpreter and the
-   * install-shape-specific absolute path / ${CLAUDE_PLUGIN_ROOT} prefix:
-   *   node "<any>/scripts/hook-launcher.mjs" hook.mjs session-start → "hook.mjs session-start"
-   *   bash "<any>/scripts/post-tool-use.sh"                        → "scripts/post-tool-use.sh"
-   */
-  function entryToken(command) {
-    const unpathed = String(command)
-      .replace(/"[^"]*\/(scripts\/[^"]+)"/g, '$1')
-      .replace(/"[^"]*\/([^/"]+)"/g, '$1');
-    return unpathed
-      .split(/\s+/)
-      .filter((t) => t && t !== 'node' && t !== 'bash' && t !== 'scripts/hook-launcher.mjs')
-      .join(' ');
-  }
+  let dataDir, cwd, installOut;
 
   /** event → sorted "matcher :: entry" strings, for the mem-owned configs only. */
   function registryShape(hooks) {
@@ -254,36 +300,9 @@ describe('B3 — install.mjs and hooks/hooks.json register the same hook events'
   // assertion below pins the divergence to exactly this, so any NEW divergence reds.
   const PLUGIN_ONLY = ['startup|clear|compact :: scripts/setup.sh'];
 
+  let installHome;
   beforeAll(async () => {
-    ({ isMemHook } = await import('../install.mjs'));
-
-    installHome = sandboxDir('b3-home');
-    dataDir = sandboxDir('b3-data');
-    cwd = sandboxDir('work', 'b3');
-    mkdirSync(join(installHome, '.claude'), { recursive: true });
-
-    // `claude` is invoked by registerMcpServer(); a no-op shim keeps the install offline
-    // and stops it from reaching the developer's real CLI.
-    const binDir = sandboxDir('b3-bin');
-    const shim = join(binDir, 'claude');
-    writeFileSync(shim, '#!/bin/sh\nexit 0\n');
-    chmodSync(shim, 0o755);
-
-    // --dev symlinks the repo instead of running npm install: no network, no LLM spend.
-    installOut = await fire(process.execPath, [INSTALL_PATH, 'install', '--dev'], {
-      cwd,
-      env: {
-        HOME: installHome,
-        CLAUDE_MEM_DIR: dataDir,
-        CLAUDE_MEM_SKIP_REPOS: '1',
-        PATH: `${binDir}:${process.env.PATH}`,
-      },
-      timeout: 120000,
-    });
-    expect(installOut.code, `install failed:\n${installOut.stdout}\n${installOut.stderr}`).toBe(0);
-
-    settingsHooks = JSON.parse(readFileSync(join(installHome, '.claude', 'settings.json'), 'utf8')).hooks;
-    manifestHooks = JSON.parse(readFileSync(join(REPO, 'hooks', 'hooks.json'), 'utf8')).hooks;
+    ({ isMemHook, settingsHooks, manifestHooks, installOut, installHome, dataDir, cwd } = await installedRegistries());
   }, 180000);
 
   // FAILS IF: either registry gains or loses an event the other has — e.g. deleting
@@ -343,5 +362,106 @@ describe('B3 — install.mjs and hooks/hooks.json register the same hook events'
     expect(r.stdout.startsWith('<claude-mem-context>'), `stdout was:\n${r.stdout}`).toBe(true);
     // The rendered table truncates long titles, so match the head of the seeded row.
     expect(r.stdout).toContain('Traced the compaction memory loss to the missing');
+  }, 60000);
+});
+
+// ─── B6 — a shipped, signed, tested hook script was wired into no registry ─────────
+// scripts/post-tool-recall.js is listed in package.json's `files`, signed via
+// source-files.mjs, installed by copyHookScripts, and covered by two test files — but it
+// had ZERO hits in hooks/hooks.json and install.mjs. The only thing that invoked it was
+// benchmark/efficacy-harness.mjs. It is component 2 of the bind-salience forcing function
+// (component 1 = the pre-edit directive from scripts/pre-tool-recall.js), so a user who
+// set CLAUDE_MEM_SALIENCE=bind got component 1 and, silently, nothing else: the post-edit
+// "you dropped the identifier the lesson named" nudge could not fire in production at all.
+// It is opt-in, so the default path must stay silent — that half is asserted here too,
+// and tests/feature-sweep-hooks.test.mjs pins it independently at the script level.
+
+describe('B6 — post-tool-recall is registered, and inert unless CLAUDE_MEM_SALIENCE=bind', () => {
+  let settingsHooks, manifestHooks, isMemHook, installHome, dataDir;
+  const SESSION = 'cc-b6-bind';
+  let cwd, target;
+
+  beforeAll(async () => {
+    ({ isMemHook, settingsHooks, manifestHooks, installHome, dataDir } = await installedRegistries());
+    cwd = sandboxDir('work', 'b6');
+    target = join(cwd, 'widget-cache.mjs');
+  }, 180000);
+
+  /** The registered command string for `entry`, from a produced registry. */
+  function registeredCommand(hooks, event, entry) {
+    return (hooks[event] || [])
+      .filter((cfg) => isMemHook(cfg))
+      .flatMap((cfg) => (cfg.hooks || []).map((h) => ({ matcher: cfg.matcher, command: h.command })))
+      .find((h) => entryToken(h.command) === entry);
+  }
+
+  // FAILS IF: the script is dropped from either registry (this is the pre-fix state:
+  // `find` returns undefined on both sides), or wired under a matcher that never fires on
+  // an edit.
+  it('is registered as a PostToolUse hook in BOTH registries, on the edit tools', () => {
+    for (const [label, hooks] of [['hooks/hooks.json', manifestHooks], ['settings.json install', settingsHooks]]) {
+      const hit = registeredCommand(hooks, 'PostToolUse', 'scripts/post-tool-recall.js');
+      expect(hit, `${label} does not register scripts/post-tool-recall.js:\n${JSON.stringify(hooks.PostToolUse)}`)
+        .toBeTruthy();
+      // The pre-edit half is matched on Edit|Write|NotebookEdit|Read; the post-edit half
+      // only makes sense where an edit happened, so Read is deliberately absent.
+      expect(hit.matcher, `${label} matcher`).toBe('Edit|Write|NotebookEdit');
+    }
+  });
+
+  // The functional claim: driven through the command strings the INSTALLER wrote (not a
+  // hand-built `node scripts/…` invocation), the bind pair now works end to end in the
+  // shape production runs it.
+  // FAILS IF: the registered command points at a wrong path or entry — the launcher exits
+  // without emitting, so the envelope assertion reds.
+  it('the registered command emits the post-edit nudge under bind salience', async () => {
+    writeFileSync(target, 'export function writeWidget() {\n  invalidateWidgetCache();\n}\n');
+    const saved = await fire(process.execPath, [CLI_PATH, 'save',
+      'Fixed the widget cache invalidation race',
+      '--type', 'bugfix', '--importance', '3', '--files', target,
+      '--lesson', 'Always call invalidateWidgetCache after a write, never on read'],
+    { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+    expect(saved.code, saved.stderr).toBe(0);
+    const id = Number(saved.stdout.match(/#(\d+)/)[1]);
+
+    const stdin = JSON.stringify({
+      session_id: SESSION, tool_name: 'Edit',
+      tool_input: { file_path: target, old_string: 'invalidateWidgetCache()', new_string: 'noop()' },
+    });
+    const bindEnv = { HOME: installHome, CLAUDE_MEM_DIR: dataDir, CLAUDE_MEM_SALIENCE: 'bind' };
+
+    // Component 1 records which identifiers the lesson names AND the file still has.
+    const preCmd = registeredCommand(settingsHooks, 'PreToolUse', 'scripts/pre-tool-recall.js');
+    const pre = await fire('/bin/sh', ['-c', preCmd.command], { cwd, stdin, env: bindEnv });
+    expect(pre.code, pre.stderr).toBe(0);
+
+    // Now make the edit the lesson warns about: the flagged identifier is gone.
+    writeFileSync(target, 'export function writeWidget() {\n  noop();\n}\n');
+
+    const postCmd = registeredCommand(settingsHooks, 'PostToolUse', 'scripts/post-tool-recall.js');
+    const post = await fire('/bin/sh', ['-c', postCmd.command], { cwd, stdin, env: bindEnv });
+    expect(post.code, `post-tool-recall exited ${post.code}\n${post.stderr}`).toBe(0);
+    const envelope = JSON.parse(post.stdout.trim());
+    expect(envelope.hookSpecificOutput.hookEventName).toBe('PostToolUse');
+    expect(envelope.hookSpecificOutput.additionalContext).toContain('dropped `invalidateWidgetCache`');
+    expect(envelope.hookSpecificOutput.additionalContext).toContain(`#${id}`);
+  }, 60000);
+
+  // Wiring an opt-in surface into the default hook chain must not make the default noisy.
+  // Runs AFTER the bind case, so the cooldown state that WOULD produce a nudge is present
+  // — silence here is the salience gate, not an empty fixture.
+  // FAILS IF: the CLAUDE_MEM_SALIENCE gate at the top of post-tool-recall.js is removed —
+  // the same stdin then emits the same envelope with no env var set.
+  it('the registered command stays silent at default salience', async () => {
+    const stdin = JSON.stringify({
+      session_id: SESSION, tool_name: 'Edit',
+      tool_input: { file_path: target, old_string: 'invalidateWidgetCache()', new_string: 'noop()' },
+    });
+    const postCmd = registeredCommand(settingsHooks, 'PostToolUse', 'scripts/post-tool-recall.js');
+    const off = await fire('/bin/sh', ['-c', postCmd.command], {
+      cwd, stdin, env: { HOME: installHome, CLAUDE_MEM_DIR: dataDir },
+    });
+    expect(off.code, off.stderr).toBe(0);
+    expect(off.stdout, 'an opt-in surface must add nothing to the default hook chain').toBe('');
   }, 60000);
 });

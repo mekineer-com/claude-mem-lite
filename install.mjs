@@ -679,6 +679,24 @@ const memPostToolUse = {
   }]
 };
 
+// Component 2 of the bind-salience forcing function: after an Edit/Write, flag an
+// identifier the file's own lesson named that the edit just removed (component 1 is the
+// pre-edit directive from scripts/pre-tool-recall.js, which also records the identifiers
+// this one checks). Shipped, signed and tested since it was written, but registered in
+// NEITHER registry — so `CLAUDE_MEM_SALIENCE=bind` delivered half the mechanism and
+// nothing said so (audit B6, 2026-08-14). Matched on the edit tools only, NOT Read: there
+// is no post-edit state to compare after a read. Inert (returns before touching stdin)
+// unless CLAUDE_MEM_SALIENCE=bind, so the default chain pays one short-circuit spawn per
+// edit and emits nothing.
+const memPostToolRecall = {
+  matcher: 'Edit|Write|NotebookEdit',
+  hooks: [{
+    type: 'command',
+    command: nodeHook('scripts/post-tool-recall.js'),
+    timeout: 3
+  }]
+};
+
 const memSessionStart = {
   matcher: 'startup|clear|compact',
   hooks: [{
@@ -775,7 +793,7 @@ const memPreAgentInject = {
 // settings.json against the shipped manifest and reds on any new divergence.
 const hookConfigs = {
   PreToolUse: [memPreToolRecall, memPreSkillBridge, memPreAgentInject],
-  PostToolUse: [memPostToolUse],
+  PostToolUse: [memPostToolUse, memPostToolRecall],
   PreCompact: [memPreCompact],
   SessionStart: [memSessionStart],
   Stop: [memStop],
