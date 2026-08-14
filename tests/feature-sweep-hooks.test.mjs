@@ -122,6 +122,12 @@ function registeredEntries() {
 // here would install packages mid-suite. Its behavior is covered by tests/install-e2e,
 // tests/install-lifecycle and tests/native-binding-selfheal.
 const UNSWEPT_BY_DESIGN = new Set(['scripts/setup.sh']);
+// …and this set is the one hole the other guards cannot see. "every registered entry has a
+// case" skips whatever is listed here, so moving a REAL entry into this set and deleting its
+// case leaves all three coverage guards green (verified: 21 → 20 cases, no failure) — the
+// sweep would just cover less. The size is therefore pinned below: growing the list must be a
+// deliberate edit to a number, visible in the diff, with the justification written above.
+const UNSWEPT_COUNT = 1;
 
 // ─── Surface registry ──────────────────────────────────────────────────────────────
 // Every case registers through itHook, so the coverage guards below compare the REGISTERED
@@ -361,8 +367,15 @@ describe('hook feature sweep: registered surface', () => {
     const registered = [...registeredEntries()].filter((e) => !UNSWEPT_BY_DESIGN.has(e)).sort();
     const missing = registered.filter((e) => !SWEPT.has(e));
     expect(missing, 'registered hook entries with no sweep case').toEqual([]);
-    // The exclusion cannot silently grow: every name in it must still be registered.
+    // The exclusion cannot silently grow: every name in it must still be registered…
     for (const skipped of UNSWEPT_BY_DESIGN) expect([...registeredEntries()]).toContain(skipped);
+    // …and there must still be exactly one of them. FAILS IF: a second entry is added to
+    // UNSWEPT_BY_DESIGN (e.g. moving 'scripts/post-tool-use.sh' there and deleting its case,
+    // which every other guard in this describe accepts silently).
+    expect(UNSWEPT_BY_DESIGN.size,
+      `the sweep's exclusion list grew to [${[...UNSWEPT_BY_DESIGN].join(', ')}] — each name in it is a registered hook entry point NOBODY fires here`)
+      .toBe(UNSWEPT_COUNT);
+    expect([...UNSWEPT_BY_DESIGN]).toEqual(['scripts/setup.sh']);
   });
 
   it('every sweep case names a real entry point (no phantom coverage)', () => {
