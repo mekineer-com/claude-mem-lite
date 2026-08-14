@@ -47,6 +47,7 @@ import {
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation, saveEpisodeImmediate } from './hook-llm.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
+import { recordHookError } from './lib/hook-telemetry.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
@@ -300,6 +301,23 @@ async function handlePostToolUse() {
 
   const { tool_name, tool_input, tool_response } = hookData;
   if (!tool_name) return;
+  // A non-string tool_name is a host-protocol violation, not a payload we can handle:
+  // `tool_name.startsWith(p)` two lines down threw a TypeError that the top-level catch
+  // absorbed, so the observation was dropped with nothing attributable behind it. Guard the
+  // type (parity with scripts/pre-skill-bridge.js:43) and RECORD it rather than dropping
+  // quietly: PostToolUse is the plugin's whole capture path, so a host field-shape change
+  // would kill every observation, and hook-errors/ is the only window into that — the same
+  // blindness that let the v3.60 binding outage run for 4 days. Volume is bounded by the
+  // recorder's 14-day retention and one short line per fire.
+  if (typeof tool_name !== 'string') {
+    recordHookError(
+      'post-tool-use:tool_name-type',
+      new TypeError(`tool_name is ${Array.isArray(tool_name) ? 'array' : typeof tool_name}, expected string`),
+      RUNTIME_DIR,
+      { toolNameType: Array.isArray(tool_name) ? 'array' : typeof tool_name },
+    );
+    return;
+  }
 
   // Skip noise (source of truth: skip-tools.mjs)
   if (SKIP_TOOLS.has(tool_name)) return;

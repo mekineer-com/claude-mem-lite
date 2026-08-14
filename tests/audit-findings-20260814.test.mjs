@@ -16,9 +16,81 @@
 // sandbox, and a cwd inside it, so nothing can reach the live ~/.claude-mem-lite DB or
 // write into this repo. The sandbox is removed in an afterAll `finally`.
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import { spawn } from 'child_process';
+import { mkdtempSync, mkdirSync, readFileSync, existsSync, rmSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { tmpdir } from 'os';
 import { createTestDb, insertSession } from './test-helpers.mjs';
 import { saveObservation } from '../hook-llm.mjs';
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
+const HOOK_PATH = join(REPO, 'hook.mjs');
+
+// ─── Sandbox shared by the subprocess-driven cases ─────────────────────────────────
+
+let ROOT, HOME_DIR, BASE_ENV;
+
+beforeAll(() => {
+  ROOT = mkdtempSync(join(tmpdir(), 'mem-audit0814-'));
+  HOME_DIR = join(ROOT, 'home');
+  mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
+
+  BASE_ENV = { ...process.env };
+  // The developer's own plugin flags would otherwise flip default-OFF surfaces on in the
+  // child (the #8608 leak class). Everything needed is set explicitly below.
+  for (const k of Object.keys(BASE_ENV)) {
+    if (/^(CLAUDE_MEM_|MEM_|CLAUDE_PLUGIN_)/.test(k)) delete BASE_ENV[k];
+  }
+  Object.assign(BASE_ENV, {
+    HOME: HOME_DIR,
+    CLAUDE_CODE_PATH: join(ROOT, 'no-such-claude-binary'),   // no LLM spend, no network
+    ANTHROPIC_API_KEY: '',
+    OPENROUTER_API_KEY: '',
+    CLAUDE_MEM_SKIP_UPDATE: '1',
+    CLAUDE_MEM_SKIP_EPISODE_LLM: '1',
+    CLAUDE_MEM_SKIP_COMPRESS: '1',
+    CLAUDE_MEM_SKIP_OPTIMIZE: '1',
+    CLAUDE_MEM_SKIP_MAINTAIN: '1',
+    CLAUDE_MEM_SKIP_SAVE_ENRICH: '1',
+    CLAUDE_MEM_SKIP_REPOS: '1',
+    CLAUDE_MEM_NO_DELAY: '1',
+  });
+  delete BASE_ENV.CLAUDE_PROJECT_DIR;   // cwd is the only project source
+  delete BASE_ENV.PWD;
+});
+
+afterAll(async () => {
+  await new Promise((r) => setTimeout(r, 300));   // let any detached worker settle
+  try { rmSync(ROOT, { recursive: true, force: true }); } catch { /* best-effort */ }
+});
+
+/** A sandbox dir under ROOT (cwd / data dir), created on demand. */
+function sandboxDir(...parts) {
+  const d = join(ROOT, ...parts);
+  mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function fire(cmd, args, { cwd, stdin = '', env = {}, timeout = 30000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const childEnv = { ...BASE_ENV, ...env };
+    for (const k of Object.keys(childEnv)) if (childEnv[k] === undefined) delete childEnv[k];
+    const child = spawn(cmd, args, { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`${cmd} ${args.join(' ')} did not exit within ${timeout}ms`));
+    }, timeout);
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.stdin.on('error', () => {});   // a hook that returns before reading stdin: EPIPE is fine
+    child.stdin.end(stdin);
+  });
+}
 
 // ─── F4 — hook-llm's three write-side noise diagnostics ────────────────────────────
 // utils.mjs debugLog(level, context, msg) takes THREE args. hook-llm.mjs:159/175/185
@@ -97,5 +169,89 @@ describe('F4 — write-side noise-gate diagnostics log at a real level with a re
     expect(level).toBe('DEBUG');
     expect(context).toBe('saveObservation');
     expect(message).toBe('capped imp 3→1: Modified transport.mjs');
+  });
+});
+
+// ─── F5 — a non-string tool_name in the PostToolUse payload ────────────────────────
+// hook.mjs:302 guarded `if (!tool_name) return;` (falsiness only), then called
+// tool_name.startsWith(p) two lines down. A number/object/array tool_name therefore threw
+// a TypeError that the top-level catch absorbed: exit 0, clean stdout, and NO attributable
+// record — a host field-shape change would have silently killed every observation with
+// nothing to find. The guard now matches scripts/pre-skill-bridge.js:43 (typeof check) and
+// routes the case to the telemetry log instead of a swallowed throw.
+
+describe('F5 — a non-string tool_name is recorded, not thrown-and-swallowed', () => {
+  const HOOK_ERROR_SCOPE = 'post-tool-use:tool_name-type';
+  let dataDir, runtimeDir, cwd;
+
+  /** All hook-error records written under this case's runtime dir. */
+  function hookErrorRecords() {
+    const dir = join(runtimeDir, 'hook-errors');
+    if (!existsSync(dir)) return [];
+    const shard = join(dir, new Date().toISOString().slice(0, 10) + '.jsonl');
+    if (!existsSync(shard)) return [];
+    return readFileSync(shard, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  }
+
+  const post = (payload) => fire(process.execPath, [HOOK_PATH, 'post-tool-use'], {
+    cwd, stdin: JSON.stringify(payload), env: { CLAUDE_MEM_DIR: dataDir },
+  });
+
+  beforeEach(() => {
+    // Own data dir per case so the hook-errors shard holds only this case's records.
+    const slug = 'f5-' + Math.random().toString(36).slice(2, 8);
+    dataDir = sandboxDir('data-' + slug);
+    runtimeDir = join(dataDir, 'runtime');
+    cwd = sandboxDir('work', slug);
+  });
+
+  // FAILS IF: the typeof guard is removed — tool_name.startsWith then throws, the top-level
+  // catch prints "[ERROR] post-tool-use: tool_name.startsWith is not a function" to stderr
+  // and writes no record, so BOTH the stderr assertion and the record assertion red.
+  it('records the malformed field instead of throwing a TypeError into the void', async () => {
+    const r = await post({
+      session_id: 'cc-f5-number', tool_name: 42,
+      tool_input: { file_path: join(cwd, 'widget-cache.mjs') },
+      tool_response: 'The file has been updated successfully with the new content applied.',
+    });
+    expect(r.code, `hook exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(r.stdout).toBe('');                                   // host-visible channel stays clean
+    expect(r.stderr).not.toMatch(/is not a function|TypeError/); // the throw is gone
+
+    const records = hookErrorRecords();
+    expect(records.map((x) => x.scope), `no ${HOOK_ERROR_SCOPE} record:\n${JSON.stringify(records)}`)
+      .toContain(HOOK_ERROR_SCOPE);
+    const rec = records.find((x) => x.scope === HOOK_ERROR_SCOPE);
+    expect(rec.ctx, 'the record must name the type that arrived, else it is unactionable')
+      .toMatch(/number/);
+  });
+
+  // Array and object shapes take the same path (an array's .startsWith is also undefined),
+  // so the guard cannot be a number-only special case.
+  // FAILS IF: the guard is narrowed to `typeof tool_name === 'number'`.
+  it('covers the array and object shapes too', async () => {
+    for (const shape of [['Edit'], { name: 'Edit' }]) {
+      const r = await post({ session_id: 'cc-f5-shape', tool_name: shape, tool_input: {}, tool_response: 'ok' });
+      expect(r.code).toBe(0);
+      expect(r.stderr).not.toMatch(/is not a function|TypeError/);
+    }
+    expect(hookErrorRecords().filter((x) => x.scope === HOOK_ERROR_SCOPE)).toHaveLength(2);
+  });
+
+  // The counter-case: a well-formed payload must NOT produce a telemetry record. Without
+  // this, an unconditional recordHookError call would pass the two cases above.
+  // FAILS IF: the guard is written without the typeof test (e.g. always record).
+  it('a well-formed string tool_name writes no hook-error record', async () => {
+    const r = await post({
+      session_id: 'cc-f5-ok', tool_name: 'Edit',
+      tool_input: { file_path: join(cwd, 'widget-cache.mjs'), old_string: 'a', new_string: 'b' },
+      tool_response: 'The file has been updated successfully with the new content applied.',
+    });
+    expect(r.code, `hook exited ${r.code}\n${r.stderr}`).toBe(0);
+    // Proof the payload really reached the capture path (so the "no record" claim is about a
+    // handled payload, not about a payload the hook ignored for some other reason).
+    const episode = JSON.parse(readFileSync(join(runtimeDir, `ep-${'work--' + cwd.split('/').pop()}.json`), 'utf8'));
+    expect(episode.entries.map((e) => e.tool)).toEqual(['Edit']);
+    expect(hookErrorRecords()).toEqual([]);
   });
 });
