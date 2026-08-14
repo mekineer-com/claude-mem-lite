@@ -482,6 +482,17 @@ function triggerErrorRecall(db, toolInput, response) {
       FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
       WHERE observations_fts MATCH ? AND o.project = ?
+        -- Live-row invariant, same as every other model-facing retrieval path
+        -- (hook-context obsPool/fallbackObs/keyObs, hook-memory, search-engine,
+        -- recent/search/timeline/recall-core, pre-tool-recall, user-prompt-search).
+        -- This surface INLINES rows[0].lesson_learned into the model context, so an
+        -- unfiltered SELECT handed a retracted lesson to the agent verbatim while its
+        -- correction trailed as a bare pointer. compressed_into is filtered too, not
+        -- only for symmetry: the block's own footer is a mem_get(ids=...) pointer, and a
+        -- COMPRESSED_PENDING_PURGE row is queued for deletion by maintain purge_stale,
+        -- so that pointer would resolve to nothing.
+        AND COALESCE(o.compressed_into, 0) = 0
+        AND o.superseded_at IS NULL
         AND ${notLowSignalTitleClause('o')}
       ORDER BY ${OBS_BM25}
         * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))

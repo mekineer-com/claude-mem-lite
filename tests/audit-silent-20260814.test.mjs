@@ -8,6 +8,12 @@
 //   B3  npm/settings.json installs never registered PreCompact (MED)
 //   B6  scripts/post-tool-recall.js was shipped + signed but wired into no registry (MED)
 //
+// B2's closing clause ("check whether any OTHER retrieval path regressed too") was swept
+// wrongly the first time; the re-sweep found two more, pinned here under the checker's
+// labels:
+//   F1  PostToolUse error-recall injected the RETRACTED lesson, inlined, as the top hit (HIGH)
+//   F4  the next session's handoff replayed a retracted decision as a standing one (LOW-MED)
+//
 // Every case states, in a comment, the input that makes it fail — an assertion whose
 // failing input nobody can name is not a test.
 //
@@ -590,4 +596,117 @@ describe('B1 — an unopenable DB is recorded, and does not destroy the episode 
 
     expect(hookErrorRecords().filter((x) => /db-open/.test(x.scope))).toEqual([]);
   }, 60000);
+});
+
+// ─── F1 — error-recall injected the retracted lesson, inlined, as the top hit ──────
+// hook.mjs::triggerErrorRecall is a LIVE model-context surface: on a hard Bash failure it
+// writes a PostToolUse `additionalContext` envelope, and formatErrorRecallHints inlines the
+// lesson BODY of rows[0]. Its SELECT filtered low-signal titles but neither
+// `superseded_at IS NULL` nor `compressed_into` — so a lesson a later save explicitly
+// retracted could lead the block and be handed to the model verbatim, while the correction
+// that replaced it trailed as a bare `#ID` pointer. Every sibling model-facing retrieval
+// path (hook-context obsPool/fallbackObs/keyObs, hook-memory ×4, search-engine's FTS +
+// vector legs, recent/search/timeline/recall-core, pre-tool-recall, user-prompt-search)
+// already filters BOTH columns; error-recall was the outlier that the first B2 sweep missed.
+//
+// `compressed_into` is included in the fix, not just `superseded_at`, for two reasons:
+// (a) it is half of the same live-row invariant every sibling applies, and (b) the block's
+// own footer is `→ Use mem_get(ids=[…])`, so a COMPRESSED_PENDING_PURGE row (decay-marked,
+// queued for deletion by `maintain purge_stale`) yields a pointer that resolves to nothing.
+
+describe('F1 — PostToolUse error-recall serves neither retracted nor compressed rows', () => {
+  const HARD_FAIL = {
+    command: 'quicksilver migrate --compaction-flag',
+    response: 'Error: quicksilver migration failed\n'
+      + 'TypeError: compaction segment is undefined\n'
+      + '    at migrateQuicksilver (/srv/app/migrate.mjs:88:11)\n',
+  };
+
+  /**
+   * A fresh sandbox seeded through the real CLI, then fired at the real hook.
+   * `mark` optionally rewrites the first row's tombstone columns directly (the
+   * compressed-original case has no CLI verb).
+   */
+  async function seedAndFire(slug, { supersede = false, mark = null } = {}) {
+    const dataDir = sandboxDir('data-' + slug);
+    const cwd = sandboxDir('work', slug);
+    const run = (args) => fire(process.execPath, [CLI_PATH, ...args], { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+
+    const first = await run(['save', 'The quicksilver migration kept failing on the compaction segment',
+      '--type', 'bugfix', '--importance', '3',
+      '--lesson', 'RETRACTED-ADVICE run quicksilver migrate with the compaction flag disabled']);
+    expect(first.code, first.stderr).toBe(0);
+    const staleId = Number(first.stdout.match(/#(\d+)/)[1]);
+
+    const secondArgs = ['save', 'Re-tested quicksilver: the compaction flag was never the migration failure cause',
+      '--type', 'bugfix', '--importance', '3',
+      '--lesson', 'CURRENT-ADVICE leave the compaction flag on; the migration failure was a stale segment index'];
+    if (supersede) secondArgs.push('--supersedes', String(staleId));
+    const second = await run(secondArgs);
+    expect(second.code, second.stderr).toBe(0);
+    const liveId = Number(second.stdout.match(/#(\d+)/)[1]);
+
+    const dbPath = join(dataDir, 'claude-mem-lite.db');
+    const raw = new Database(dbPath);
+    try {
+      if (mark) raw.prepare(`UPDATE observations SET ${mark.col} = ? WHERE id = ?`).run(mark.value, staleId);
+      // The tombstone really landed — otherwise the case would pass on a store where the
+      // stale row was simply never marked, proving nothing.
+      const col = mark ? mark.col : 'superseded_at';
+      expect(raw.prepare(`SELECT ${col} AS v FROM observations WHERE id = ?`).get(staleId).v,
+        `${col} was not set on the stale row`).toBeTruthy();
+    } finally { raw.close(); }
+
+    const r = await fire(process.execPath, [HOOK_PATH, 'post-tool-use'], {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-' + slug, tool_name: 'Bash',
+        tool_input: { command: HARD_FAIL.command },
+        tool_response: HARD_FAIL.response,
+      }),
+      env: { CLAUDE_MEM_DIR: dataDir },
+    });
+    expect(r.code, `post-tool-use exited ${r.code}\n${r.stderr}`).toBe(0);
+
+    // stdout is one JSON envelope per line (episode receipt + error-recall each parse alone).
+    const block = r.stdout.split('\n').filter(Boolean)
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .map((e) => e?.hookSpecificOutput?.additionalContext)
+      .find((c) => typeof c === 'string' && c.includes('Related memories found for this error'));
+    return { staleId, liveId, block, stdout: r.stdout };
+  }
+
+  // FAILS IF: `superseded_at IS NULL` is dropped from triggerErrorRecall's WHERE — the
+  // retracted row outranks its own correction on BM25 (it carries the error's keywords in
+  // both title and lesson), lands at rows[0], and formatErrorRecallHints inlines exactly
+  // the advice that was withdrawn.
+  it('a retracted lesson reaches neither the inlined slot nor the pointer list', async () => {
+    const { staleId, liveId, block, stdout } = await seedAndFire('f1sup', { supersede: true });
+
+    // The surface fired at all — "no envelope" must not be able to satisfy this case.
+    expect(block, `no error-recall envelope on stdout:\n${stdout}`).toBeTruthy();
+    expect(block, 'the replacement lesson must still be inlined for the model')
+      .toContain('CURRENT-ADVICE leave the compaction flag on');
+    expect(block).toContain(`#${liveId}`);
+
+    expect(block, 'a retracted lesson was injected into the model context verbatim')
+      .not.toContain('RETRACTED-ADVICE');
+    expect(block, 'the retracted row must not even be offered as a mem_get pointer')
+      .not.toContain(`#${staleId}`);
+  }, 90000);
+
+  // FAILS IF: only `superseded_at` is added and `compressed_into` is left out — the
+  // decay-marked original still leads the block and the `→ Use mem_get(ids=[…])` footer
+  // points at a row that `maintain execute --ops purge_stale` is about to delete.
+  it('a compressed / purge-marked original is not served either', async () => {
+    const { staleId, liveId, block, stdout } = await seedAndFire('f1comp', {
+      mark: { col: 'compressed_into', value: -2 },   // COMPRESSED_PENDING_PURGE
+    });
+
+    expect(block, `no error-recall envelope on stdout:\n${stdout}`).toBeTruthy();
+    expect(block).toContain(`#${liveId}`);
+    expect(block, 'a row queued for purge must not be handed to the model')
+      .not.toContain('RETRACTED-ADVICE');
+    expect(block).not.toContain(`#${staleId}`);
+  }, 90000);
 });
