@@ -812,13 +812,66 @@ describe('hook feature sweep: hook.mjs background workers', () => {
     const stateFile = join(RUNTIME_DIR, 'update-state.json');
     expect(existsSync(stateFile)).toBe(false);
 
-    const r = await hookEvent('update-check', { cwd, stdin: '', env: BG, timeout: 60000 });
+    // Every fetch in these arms is refused IN-PROCESS: a CJS preload replaces globalThis.fetch
+    // with a stub that records the URL and throws. Nothing leaves the machine — the stub IS
+    // the network boundary — and that recording is what makes "did the release lookup happen?"
+    // an observable question offline, which is what this case previously could not answer.
+    const fetchLog = join(ROOT, 'update-check-fetches.txt');
+    const offlineFetch = join(ROOT, 'offline-fetch.cjs');
+    writeFileSync(offlineFetch, [
+      "const fs = require('fs');",
+      'globalThis.fetch = async (url) => {',
+      "  try { fs.appendFileSync(process.env.SWEEP_FETCH_LOG, String(url) + '\\n'); } catch { /* best-effort */ }",
+      "  throw new Error('offline: this sweep refuses every fetch');",
+      '};',
+      '',
+    ].join('\n'));
+    const OFFLINE = { SWEEP_FETCH_LOG: fetchLog, NODE_OPTIONS: `--require "${offlineFetch}"` };
+
+    // DISCLOSURE (read before adding an assertion here): this event is spawned in production
+    // as `spawnBackground('update-check')`, i.e. with CLAUDE_MEM_HOOK_RUNNING=1 — and
+    // `update-check` is NOT in hook.mjs's BG_EVENTS, so hook.mjs:116 exits the process before
+    // the dispatch switch. Firing it with `env: BG` therefore measures the recursion guard,
+    // not the handler: that is why this case stayed green with its handler deleted. The two
+    // arms below drop BG so the handler actually runs; the guard/BG_EVENTS mismatch itself is
+    // a product finding reported separately and deliberately NOT pinned here (an assertion
+    // either way would freeze one side of an open question).
+    //
+    // (a) Skip flag honored: CLAUDE_MEM_SKIP_UPDATE=1 (set for the whole sweep) must suppress
+    // the check — no release lookup at all, so no update-state.json and no banner.
+    // FAILS IF: the `isDevMode() || CLAUDE_MEM_SKIP_UPDATE` early return goes away — the stub
+    // then records the GitHub URLs and the state file appears.
+    const r = await hookEvent('update-check', { cwd, stdin: '', env: OFFLINE, timeout: 60000 });
     expectSilentWorker('hook.mjs update-check', r);
-    // Functional (the arm this suite can own): CLAUDE_MEM_SKIP_UPDATE must suppress the
-    // GitHub fetch entirely — no release lookup, so no update-state.json is written and no
-    // banner can appear. The fetch arm itself is deliberately NOT exercised here (network);
-    // tests/hook-update.test.mjs covers checkForUpdate's parsing and 24h gating in-process.
+    expect(existsSync(fetchLog), 'update-check attempted a release lookup despite CLAUDE_MEM_SKIP_UPDATE=1').toBe(false);
     expect(existsSync(stateFile), 'update-check wrote update-state.json despite CLAUDE_MEM_SKIP_UPDATE=1').toBe(false);
+
+    // (b) The behavioral arm: flag CLEARED, so the handler runs its real no-release path.
+    const live = await hookEvent('update-check', {
+      cwd, stdin: '', timeout: 60000,
+      env: { ...OFFLINE, CLAUDE_MEM_SKIP_UPDATE: undefined },   // childEnv drops undefined keys
+    });
+    expectSilentWorker('hook.mjs update-check (offline)', live);
+
+    // It reached hook-update's release lookup — the releases/latest call first, then the
+    // tags fallback the null result triggers. FAILS IF: the dispatch case is deleted or
+    // stops calling checkForUpdate (no file at all), or the lookup changes endpoint.
+    expect(existsSync(fetchLog),
+      'update-check made no release lookup at all — the handler never ran (deleted case? recursion guard?)').toBe(true);
+    const urls = readFileSync(fetchLog, 'utf8').trim().split('\n');
+    expect(urls[0]).toBe('https://api.github.com/repos/sdsrss/claude-mem-lite/releases/latest');
+    expect(urls[1]).toMatch(/^https:\/\/api\.github\.com\/repos\/sdsrss\/claude-mem-lite\/tags\b/);
+    expect(urls).toHaveLength(2);
+    // …and persisted the attempt into the SANDBOX state file (absent one assertion earlier),
+    // with a timestamp from this run. FAILS IF: the no-release path stops stamping lastCheck
+    // — every session would then re-fetch, the 24h throttle silently dead.
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    expect(Date.now() - new Date(state.lastCheck).getTime(),
+      `update-state.json carries no fresh lastCheck: ${JSON.stringify(state)}`).toBeLessThan(120000);
+    // No install may have been attempted off a failed lookup (the worker CAN install when it
+    // is not in plugin mode, and this arm runs with CLAUDE_PLUGIN_ROOT unset).
+    expect(existsSync(join(HOME_DIR, '.claude-mem-lite', 'package.json')),
+      'a failed release lookup still touched the install dir').toBe(false);
 
     await expectMalformedResilience(
       'hook.mjs update-check',
