@@ -280,7 +280,12 @@ describe('MCP feature sweep: public tools', () => {
     expect(text).toContain(`── #${SEED_BUGFIX_ID} ──`);
     expect(text).toContain(`lesson_learned: ${SEED_LESSON}`);
     expect(text).toContain('importance: 3');
-    expect(text).toMatch(/^files_modified: .*lib\/widget-cache\.mjs/m);   // `files` reaches the row
+    // `files` reaches the row, and is rendered under the `files` label — the raw
+    // `files_modified` column name claimed a modification for a path the caller may only
+    // have read (audit 2026-08-14 F3); tests/audit-findings-20260814.test.mjs pins the CLI
+    // half of the same label, so the two `get` surfaces agree.
+    expect(text).toMatch(/^files: .*lib\/widget-cache\.mjs/m);
+    expect(text).not.toMatch(/^files_modified:/m);
     // Missing ids are reported, not silently dropped from the answer.
     expect(text).toContain('Note: ID(s) #999999 not found.');
   });

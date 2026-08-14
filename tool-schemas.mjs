@@ -206,7 +206,7 @@ export const memSaveSchema = {
   type: OBS_TYPE_ENUM.optional().describe('Observation type (default: discovery)'),
   project: z.string().optional().describe('Project name (default: inferred from CWD)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 2 for explicit saves)'),
-  files: coerceStringArray.optional().describe('File paths associated with this observation'),
+  files: coerceStringArray.optional().describe('File paths associated with this observation. Stored in the `files_modified` column and rendered as `files` — passing a path here does not assert the file was edited; a file you only read belongs here too'),
   lesson_learned: z.string().max(500).optional().describe('Key lesson or takeaway, ≤500 chars (for bugfix: root cause & fix; for decision: rationale)'),
   closes_deferred: coerceDeferredTokens.optional().describe('Close one or more deferred_work items in the same project. Mixed array: bare integer = ordinal-within-project, "D#<n>" string = raw id. Transactional with the obs insert — a single invalid id rolls back the whole save.'),
   supersedes: coerceSupersedes.optional().describe('Observation ids (same project) that this save overturns. They are marked superseded — dropped from live search — and linked to the new row (superseded_by). Use ONLY when this genuinely replaces a prior conclusion; do NOT use for merely-related or updated-but-still-valid memories.'),

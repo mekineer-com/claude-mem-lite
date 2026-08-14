@@ -27,7 +27,7 @@ import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
-import { formatObsFieldValue } from './cli/common.mjs';
+import { formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
 import { neutralizeContextDelimiters } from './format-utils.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
@@ -638,7 +638,7 @@ server.registerTool(
           // gets a scannable hint instead of a bare millisecond integer.
           const display = formatObsFieldValue(f, val);
           const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
-          lines.push(`${f}: ${typeof display === 'string' && display.length > maxLen ? display.slice(0, maxLen) + '…' : display}`);
+          lines.push(`${obsFieldLabel(f)}: ${typeof display === 'string' && display.length > maxLen ? display.slice(0, maxLen) + '…' : display}`);
         }
         sections.push(lines.join('\n'));
       }

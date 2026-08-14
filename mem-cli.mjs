@@ -43,7 +43,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { isNativeBindingError, healAndReexec } from './lib/binding-probe.mjs';
 import { CLI_PATH, CLI_INVOKE } from './cli-path.mjs';
-import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue } from './cli/common.mjs';
+import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
@@ -533,7 +533,7 @@ function renderObsRows(db, ids, requestedFields) {
       const formatted = formatObsFieldValue(f, val);
       const maxLen = f === 'narrative' ? 1000 : f === 'lesson_learned' ? 500 : f === 'text' ? 500 : 200;
       const display = typeof formatted === 'string' && formatted.length > maxLen ? formatted.slice(0, maxLen) + '…' : formatted;
-      lines.push(`${f}: ${display}`);
+      lines.push(`${obsFieldLabel(f)}: ${display}`);
     }
     parts.push(lines.join('\n'));
   }

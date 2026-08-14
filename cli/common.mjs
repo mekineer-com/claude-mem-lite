@@ -260,6 +260,21 @@ export function fmtDateShort(iso) {
 // because the formatter lived only in mem-cli.mjs.
 export const OBS_TIME_FIELDS = ['superseded_at', 'last_accessed_at'];
 
+// Display labels for observation columns whose NAME misdescribes their contents.
+// `files_modified` holds whatever file list the writer attached: hook-captured rows fill
+// it from Edit/Write, but an explicit mem_save / `save --files` puts any associated path
+// there — including a file that was only read. Rendering the raw column name told the
+// reader those files were modified (audit 2026-08-14 F3). The label is `files` — the name
+// of the input parameter that fills it. The COLUMN is untouched, so `--fields
+// files_modified` / `fields:["files_modified"]` still select it. Shared by the CLI `get`
+// and MCP `mem_get` renderers so the two cannot drift.
+const OBS_FIELD_LABELS = { files_modified: 'files' };
+
+/** Reader-facing label for an observation column (identity for everything unmapped). */
+export function obsFieldLabel(field) {
+  return OBS_FIELD_LABELS[field] || field;
+}
+
 // Pure formatter — null/undefined/non-time pass through; integer time fields
 // render as `<raw> (<relative>)` so callers get both an audit value and a
 // human/LLM-scannable hint, mirroring `recent`/`timeline`/`recall`.

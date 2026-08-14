@@ -626,14 +626,18 @@ describe('CLI get command', () => {
     expect(output).toMatch(/No records found.*\[obs\]/);
   });
 
-  it('shows files from files_modified', async () => {
+  it('shows files from files_modified under the `files` label', async () => {
     insertObs(testDb, {
       sessionId: 'mem-s1', project: 'test--project', type: 'change',
       title: 'Updated configs', text: 'config changes',
       filesModified: '["src/config.ts", "src/db.ts"]',
     });
     const output = await captureStdout(() => run(['get', '1']));
-    expect(output).toContain('files_modified: ["src/config.ts", "src/db.ts"]');
+    // Label is `files`, not the raw column name: the column also holds paths a caller only
+    // read (audit 2026-08-14 F3). The column itself is unchanged — this row was seeded via
+    // filesModified above and still renders.
+    expect(output).toContain('files: ["src/config.ts", "src/db.ts"]');
+    expect(output).not.toMatch(/^files_modified:/m);
   });
 
   it('shows lesson when present', async () => {

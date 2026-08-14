@@ -255,3 +255,68 @@ describe('F5 — a non-string tool_name is recorded, not thrown-and-swallowed', 
     expect(hookErrorRecords()).toEqual([]);
   });
 });
+
+// ─── F3 — `files` was described as "associated", rendered as "modified" ────────────
+// tool-schemas.mjs:209 described mem_save's `files` as "File paths associated with this
+// observation", but lib/save-observation.mjs:117 stores it in `files_modified` and both
+// `get` paths rendered the raw column name — so a file the caller only READ came back
+// labelled as modified. Per the F3 decision this is a prose/label fix: no column rename,
+// no new field, no migration. The label the reader sees is now `files`, matching the
+// input parameter's own name; `--fields files_modified` still selects it by column.
+
+describe('F3 — an attached file is not rendered as a modification', () => {
+  let dataDir, cwd;
+  const CLI_PATH = join(REPO, 'cli.mjs');
+  const readOnlyFile = () => join(cwd, 'widget-cache.mjs');
+
+  const run = (args) => fire(process.execPath, [CLI_PATH, ...args], {
+    cwd, env: { CLAUDE_MEM_DIR: dataDir },
+  });
+
+  beforeEach(() => {
+    const slug = 'f3-' + Math.random().toString(36).slice(2, 8);
+    dataDir = sandboxDir('data-' + slug);
+    cwd = sandboxDir('work', slug);
+  });
+
+  // FAILS IF: the render label goes back to the raw column name — `files_modified: [...]`
+  // matches the negative assertion, and the `files: [...]` line the positive one looks for
+  // is not emitted.
+  it('CLI get labels an attached path `files`, never `files_modified`', async () => {
+    const saved = await run(['save', 'Reviewed the retry backoff implementation before touching it',
+      '--type', 'discovery', '--files', readOnlyFile()]);
+    expect(saved.code, saved.stderr).toBe(0);
+    const id = Number(saved.stdout.match(/Saved #(\d+)/)[1]);
+
+    const got = await run(['get', String(id)]);
+    expect(got.code, got.stderr).toBe(0);
+    expect(got.stdout).toContain(`files: ["${readOnlyFile()}"]`);
+    expect(got.stdout, 'a file that was only read must not be labelled modified')
+      .not.toMatch(/^files_modified:/m);
+  });
+
+  // The column name stays the selector (no rename, per the F3 decision), so a caller who
+  // asks for it by column still gets the row — under the honest label.
+  // FAILS IF: the fix renamed the column or dropped it from OBS_FIELDS — `--fields
+  // files_modified` would then be rejected as an unknown field and print nothing.
+  it('--fields files_modified still selects the column and renders the new label', async () => {
+    const saved = await run(['save', 'Read through the transport module to map its retries',
+      '--type', 'discovery', '--files', readOnlyFile()]);
+    const id = Number(saved.stdout.match(/Saved #(\d+)/)[1]);
+
+    const got = await run(['get', String(id), '--fields', 'files_modified']);
+    expect(got.code, got.stderr).toBe(0);
+    expect(got.stderr).not.toMatch(/Unknown field/);
+    expect(got.stdout).toContain(`files: ["${readOnlyFile()}"]`);
+  });
+
+  // FAILS IF: the schema description reverts to "File paths associated with this
+  // observation" — it then names neither the column the value lands in nor the fact that
+  // passing a path is not a claim the file was edited.
+  it('the mem_save schema says where the value lands and what it does not claim', async () => {
+    const { memSaveSchema } = await import('../tool-schemas.mjs');
+    const description = memSaveSchema.files.description;
+    expect(description).toContain('files_modified');
+    expect(description).toMatch(/not assert|does not claim|not a claim/i);
+  });
+});
