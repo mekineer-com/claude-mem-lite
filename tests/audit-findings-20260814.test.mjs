@@ -20,7 +20,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawn } from 'child_process';
-import { mkdtempSync, mkdirSync, readFileSync, existsSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
+import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
@@ -409,5 +410,104 @@ describe('F2 — the optimize preview reads the same on the CLI and over MCP', (
     // …and the seeded rows really are counted, so the labels above were not read off an
     // all-zero block that any spelling would satisfy.
     expect(Number(pick(cliFields, 'Re-enrich candidates').split(/\s+/)[0])).toBeGreaterThan(0);
+  }, 60000);
+});
+
+// ─── F1 — mem_use served a DIFFERENT skill's body on a name miss ───────────────────
+// server.mjs:1594-1600 fell through an exact-name miss to searchResources(…, {limit:1})
+// and rendered whatever FTS ranked first as `<skill-loaded name=…>` + "Follow the
+// instructions above to execute this skill." — no marker that a substitution happened.
+// With only `deploy-rollback-runbook` registered, `deploy-notes` / `rollback-checklist` /
+// `runbook-index` each returned its full body, so an agent that asked for skill A was
+// handed skill B's instructions and told to run them. Per the F1 decision the fuzzy search
+// stays (it is what produces the candidate list) but its result is now a SUGGESTION: names
+// plus a mem_registry pointer, never a body and never the execute imperative.
+
+describe('F1 — a name miss suggests candidates instead of loading a different skill', () => {
+  const REGISTERED = 'deploy-rollback-runbook';
+  const BODY = 'F1SKILLBODY — drain the queue, flip the router, then roll the old release back.';
+  let dataDir, cwd, client, transport;
+
+  const use = async (name) => textOf(await client.callTool({ name: 'mem_use', arguments: { name } }));
+
+  /** Invocations recorded against the one registered skill (the adoption signal). */
+  const invocationCount = () => {
+    const db = new Database(join(dataDir, 'resource-registry.db'));
+    try {
+      return db.prepare(`SELECT COUNT(*) c FROM invocations i JOIN resources r ON r.id = i.resource_id
+                         WHERE r.name = ?`).get(REGISTERED).c;
+    } finally { db.close(); }
+  };
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('data-f1');
+    cwd = sandboxDir('work', 'f1');
+    // Under dataDir so mem_use's path confinement passes; this is the ONLY registered skill,
+    // so anything a miss returns as a body can only be this one's.
+    const skillDir = join(dataDir, 'managed', 'skills', REGISTERED);
+    mkdirSync(skillDir, { recursive: true });
+    const skillPath = join(skillDir, 'SKILL.md');
+    writeFileSync(skillPath, `---\nname: ${REGISTERED}\ndescription: audit fixture skill\n---\n\n${BODY}\n`);
+
+    ({ client, transport } = await startMcp(dataDir, cwd));
+    const imported = textOf(await client.callTool({
+      name: 'mem_registry',
+      arguments: {
+        action: 'import', name: REGISTERED, resource_type: 'skill',
+        local_path: skillPath, capability_summary: 'deploy rollback runbook for release notes',
+      },
+    }));
+    expect(imported, `registry import failed: ${imported}`).toContain(REGISTERED);
+  }, 60000);
+
+  afterAll(async () => {
+    try { await client?.close(); } catch { /* already gone */ }
+    try { await transport?.close(); } catch { /* already gone */ }
+  });
+
+  // FAILS IF: the fuzzy fallback goes back to loading the top FTS hit — the response then
+  // carries `<skill-loaded`, the BODY marker and the execute imperative, and all three
+  // negative assertions red. It ALSO fails if the fuzzy search itself is deleted: the three
+  // names below share tokens with the registered skill, so the candidate assertion needs a
+  // real search result to be satisfied.
+  it('a token-sharing miss names the candidate but returns no body and no imperative', async () => {
+    for (const miss of ['deploy-notes', 'rollback-checklist', 'runbook-index']) {
+      const text = await use(miss);
+      expect(text, `mem_use("${miss}") wrapped another skill as loaded:\n${text}`).not.toContain('<skill-loaded');
+      expect(text, `mem_use("${miss}") returned another skill's body:\n${text}`).not.toContain('F1SKILLBODY');
+      expect(text, `mem_use("${miss}") told the agent to execute a skill it did not ask for:\n${text}`)
+        .not.toMatch(/Follow the instructions above/);
+      // …but the near-miss is still surfaced, by name, with the browse pointer.
+      expect(text, `mem_use("${miss}") dropped the candidate list:\n${text}`).toContain(REGISTERED);
+      expect(text).toContain('mem_registry(action="search"');
+      expect(text).toContain(miss);   // the response says which name was asked for
+    }
+    // A suggestion is not a use: nothing may be recorded as invoked/adopted for a skill the
+    // caller never asked for. FAILS IF: the miss path records an invocation (pre-fix it
+    // recorded one per substituted load — 3 here).
+    expect(invocationCount(), 'a name miss recorded an invocation of the substituted skill').toBe(0);
+  }, 60000);
+
+  // The counter-case: the legitimate path must survive the fix. This one passed BEFORE the
+  // fix too — it is here so a future "just delete the load path" cannot pass F1.
+  // FAILS IF: the exact-name branch stops loading the body or stops recording the invocation.
+  it('an exact name still loads the body, the imperative and the invocation record', async () => {
+    const text = await use(REGISTERED);
+    expect(text).toContain(`<skill-loaded name="${REGISTERED}" type="skill"`);
+    expect(text).toContain(BODY);
+    expect(text).toContain('</skill-loaded>');
+    expect(text).toMatch(/Follow the instructions above to execute this skill\./);
+    expect(invocationCount()).toBe(1);
+  }, 60000);
+
+  // A name sharing NO token with anything registered keeps the plain miss message — the
+  // suggestion path must not invent candidates out of an empty search.
+  // FAILS IF: the miss message stops naming the asked-for name, or starts listing a
+  // "closest match" that the search did not return (it would name REGISTERED here).
+  it('a miss with no candidates says so without naming an unrelated skill', async () => {
+    const text = await use('zqxwvrunk');
+    expect(text).toContain('No skill found for "zqxwvrunk"');
+    expect(text).not.toContain(REGISTERED);
+    expect(text).not.toContain('<skill-loaded');
   }, 60000);
 });

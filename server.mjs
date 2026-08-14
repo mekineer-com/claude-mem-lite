@@ -1582,8 +1582,8 @@ server.registerTool(
     const name = args.name.trim();
     const type = args.type || 'skill';
 
-    // 1. Exact match by name or invocation_name
-    let row = rdb.prepare(`
+    // 1. Exact match by name or invocation_name — the ONLY path that loads content.
+    const row = rdb.prepare(`
       SELECT id, name, type, local_path, invocation_name, capability_summary
       FROM resources
       WHERE status = 'active' AND type = ?
@@ -1591,16 +1591,27 @@ server.registerTool(
       LIMIT 1
     `).get(type, name, name);
 
-    // 2. Fuzzy fallback: FTS5 search, take top result
+    // 2. Name miss → SUGGEST, never substitute. The FTS5 search still runs (it is what
+    // produces the candidate list), but its result is only ever rendered as names: loading
+    // the top hit under the caller's requested name shipped a different skill's body inside
+    // <skill-loaded> plus "Follow the instructions above to execute this <type>." — with
+    // nothing marking the swap, so an agent that asked for A executed B (audit F1,
+    // 2026-08-14: with only `deploy-rollback-runbook` registered, `deploy-notes` /
+    // `rollback-checklist` / `runbook-index` each returned its full body). Loading stays an
+    // exact-name decision the caller makes.
     if (!row) {
-      const results = searchResources(rdb, name, { type, limit: 1 });
-      if (results.length > 0) {
-        row = rdb.prepare(`SELECT id, name, type, local_path, invocation_name, capability_summary FROM resources WHERE name = ? AND type = ? AND status = 'active'`).get(results[0].name, results[0].type);
+      let candidates = [];
+      try { candidates = searchResources(rdb, name, { type, limit: 5 }).map((r) => r.name).filter(Boolean); }
+      catch { /* a suggestion is best-effort; the miss message below still stands */ }
+      const head = `No ${type} found for "${name}".`;
+      const browse = `mem_registry(action="search", query="${name}")`;
+      if (candidates.length === 0) {
+        return { content: [{ type: 'text', text: `${head} Try ${browse} to browse.` }] };
       }
-    }
-
-    if (!row) {
-      return { content: [{ type: 'text', text: `No ${type} found for "${name}". Try mem_registry(action="search", query="${name}") to browse.` }] };
+      const list = candidates.map((n) => `  - ${n}`).join('\n');
+      return { content: [{ type: 'text', text:
+        `${head} Closest ${type}s by search (NOT loaded — none matched the name you asked for):\n${list}\n\n` +
+        `Load one deliberately with its exact name, e.g. mem_use(name="${candidates[0]}"${type === 'skill' ? '' : `, type="${type}"`}), or browse with ${browse}.` }] };
     }
 
     // 3. Resolve path: directory skills → SKILL.md (agents always have full .md paths)

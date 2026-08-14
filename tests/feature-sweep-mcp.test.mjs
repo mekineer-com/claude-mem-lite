@@ -570,9 +570,10 @@ describe('MCP feature sweep: hidden tools', () => {
     `).get('mcpsweep-use-skill').c);
     expect(invocations).toBe(1);
 
-    // A name that shares no token with any registered resource reports a miss instead of
-    // loading something else. (A name containing a real token — e.g. "…-skill-…" — is
-    // DOCUMENTED to fall through to the FTS fuzzy match, so it cannot be used here.)
+    // A name that shares no token with any registered resource reports a miss. A name that
+    // DOES share a token now gets the closest-match SUGGESTION instead (audit F1 — it used
+    // to get the top hit's body); that path is pinned in tests/audit-findings-20260814, so
+    // this case stays on the no-candidate arm.
     expect(await call('mem_use', { name: 'zqxwvrunk' })).toContain('No skill found for "zqxwvrunk"');
   });
 });

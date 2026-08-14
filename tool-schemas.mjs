@@ -589,7 +589,8 @@ export const tools = [
   {
     name: 'mem_use',
     description:
-      'Load and activate a skill or agent from the registry by name (exact or fuzzy).\n' +
+      'Load and activate a skill or agent from the registry by EXACT name or invocation_name.\n' +
+      'A name that matches nothing returns closest-match names to pick from — never another resource\'s content.\n' +
       '\n' +
       'DO NOT use when:\n' +
       '  - You have not confirmed the skill exists (run mem_registry action="list" first)\n' +
