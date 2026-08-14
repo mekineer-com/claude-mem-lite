@@ -17,7 +17,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, chmodSync, rmSync } from 'fs';
 import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -27,6 +27,7 @@ import { recallByFile } from '../lib/recall-core.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = join(REPO, 'cli.mjs');
+const INSTALL_PATH = join(REPO, 'install.mjs');
 
 // ─── Sandbox shared by the subprocess-driven cases ─────────────────────────────────
 
@@ -202,5 +203,145 @@ describe('B2 — recall does not serve, or re-promote, a superseded observation'
     expect(recalled.stdout).toContain('CURRENT carry the backoff across redirect hops');
     expect(recalled.stdout, 'a retracted lesson must not be served as current')
       .not.toContain('RETRACTED reset the backoff on every redirect hop');
+  }, 60000);
+});
+
+// ─── B3 — the npm/settings.json install never registered PreCompact ────────────────
+// hooks/hooks.json (the plugin-manifest registry) declares six events; install.mjs's
+// `hookConfigs` map declared five — PreCompact was missing. A settings.json install
+// therefore never fired `hook.mjs pre-compact`, so the memory block that exists to
+// survive compaction was silently absent, and `doctor` still printed "All critical
+// checks passed" (it tests presence-of-any-mem-hook and file existence, never
+// event-set completeness). The guard below diffs the two registries by what each
+// ACTUALLY produces — a real `install --dev` run's settings.json against the shipped
+// hooks.json — so neither can be edited into agreement on its own.
+
+describe('B3 — install.mjs and hooks/hooks.json register the same hook events', () => {
+  let settingsHooks, manifestHooks, isMemHook;
+  let installHome, dataDir, cwd, installOut;
+
+  /**
+   * Reduce a hook command to the entry it invokes, dropping the interpreter and the
+   * install-shape-specific absolute path / ${CLAUDE_PLUGIN_ROOT} prefix:
+   *   node "<any>/scripts/hook-launcher.mjs" hook.mjs session-start → "hook.mjs session-start"
+   *   bash "<any>/scripts/post-tool-use.sh"                        → "scripts/post-tool-use.sh"
+   */
+  function entryToken(command) {
+    const unpathed = String(command)
+      .replace(/"[^"]*\/(scripts\/[^"]+)"/g, '$1')
+      .replace(/"[^"]*\/([^/"]+)"/g, '$1');
+    return unpathed
+      .split(/\s+/)
+      .filter((t) => t && t !== 'node' && t !== 'bash' && t !== 'scripts/hook-launcher.mjs')
+      .join(' ');
+  }
+
+  /** event → sorted "matcher :: entry" strings, for the mem-owned configs only. */
+  function registryShape(hooks) {
+    const shape = {};
+    for (const [event, configs] of Object.entries(hooks || {})) {
+      const rows = (configs || [])
+        .filter((cfg) => isMemHook(cfg))
+        .flatMap((cfg) => (cfg.hooks || []).map((h) => `${cfg.matcher} :: ${entryToken(h.command)}`));
+      if (rows.length > 0) shape[event] = rows.sort();
+    }
+    return shape;
+  }
+
+  // scripts/setup.sh bootstraps the PLUGIN CACHE (node_modules symlink, stale-MCP
+  // cleanup) — a directory that only exists in a plugin install. install.mjs does that
+  // work itself at install time, so this one entry is legitimately manifest-only. The
+  // assertion below pins the divergence to exactly this, so any NEW divergence reds.
+  const PLUGIN_ONLY = ['startup|clear|compact :: scripts/setup.sh'];
+
+  beforeAll(async () => {
+    ({ isMemHook } = await import('../install.mjs'));
+
+    installHome = sandboxDir('b3-home');
+    dataDir = sandboxDir('b3-data');
+    cwd = sandboxDir('work', 'b3');
+    mkdirSync(join(installHome, '.claude'), { recursive: true });
+
+    // `claude` is invoked by registerMcpServer(); a no-op shim keeps the install offline
+    // and stops it from reaching the developer's real CLI.
+    const binDir = sandboxDir('b3-bin');
+    const shim = join(binDir, 'claude');
+    writeFileSync(shim, '#!/bin/sh\nexit 0\n');
+    chmodSync(shim, 0o755);
+
+    // --dev symlinks the repo instead of running npm install: no network, no LLM spend.
+    installOut = await fire(process.execPath, [INSTALL_PATH, 'install', '--dev'], {
+      cwd,
+      env: {
+        HOME: installHome,
+        CLAUDE_MEM_DIR: dataDir,
+        CLAUDE_MEM_SKIP_REPOS: '1',
+        PATH: `${binDir}:${process.env.PATH}`,
+      },
+      timeout: 120000,
+    });
+    expect(installOut.code, `install failed:\n${installOut.stdout}\n${installOut.stderr}`).toBe(0);
+
+    settingsHooks = JSON.parse(readFileSync(join(installHome, '.claude', 'settings.json'), 'utf8')).hooks;
+    manifestHooks = JSON.parse(readFileSync(join(REPO, 'hooks', 'hooks.json'), 'utf8')).hooks;
+  }, 180000);
+
+  // FAILS IF: either registry gains or loses an event the other has — e.g. deleting
+  // `PreCompact` from install.mjs's hookConfigs (the original defect) reds with
+  // ['PostToolUse','PreToolUse','SessionStart','Stop','UserPromptSubmit'] against the
+  // manifest's six.
+  it('both registries cover the same event set', () => {
+    const installEvents = Object.keys(registryShape(settingsHooks)).sort();
+    const manifestEvents = Object.keys(registryShape(manifestHooks)).sort();
+    expect(installEvents.length, `no mem hooks in the generated settings.json:\n${installOut.stdout}`)
+      .toBeGreaterThan(5);
+    expect(installEvents).toEqual(manifestEvents);
+    expect(installEvents).toContain('PreCompact');
+  });
+
+  // Event keys alone would not catch "registered the event but pointed it at nothing" or
+  // a script wired into one registry only (the B6 class). Both sides here are read from
+  // real artifacts — a generated settings.json and the shipped manifest.
+  // FAILS IF: an entry is added to one registry only, or a matcher drifts (e.g. wiring
+  // post-tool-recall.js into hooks.json but not install.mjs).
+  it('both registries invoke the same entries under the same matchers', () => {
+    const installShape = registryShape(settingsHooks);
+    const manifestShape = registryShape(manifestHooks);
+    for (const event of Object.keys(manifestShape)) {
+      const manifestRows = manifestShape[event].filter((r) => !PLUGIN_ONLY.includes(r));
+      expect(installShape[event], `${event} missing from the settings.json install`).toEqual(manifestRows);
+    }
+    // …and the exclusion really is only that one bootstrap line.
+    const excluded = Object.values(manifestShape).flat().filter((r) => PLUGIN_ONLY.includes(r));
+    expect(excluded).toEqual(PLUGIN_ONLY);
+  });
+
+  // Registration is only half the claim: run the command string the installer actually
+  // wrote, exactly as Claude Code would, and check the block comes out.
+  // FAILS IF: the registered PreCompact command points at a wrong path/subcommand, or
+  // the entry is absent (the lookup below finds nothing and reds before spawning).
+  it('the registered PreCompact command emits the memory block it exists to preserve', async () => {
+    const seeded = await fire(process.execPath, [CLI_PATH, 'save',
+      'Traced the compaction memory loss to the missing PreCompact registration',
+      '--type', 'discovery', '--importance', '3',
+      '--lesson', 'Compaction drops context unless PreCompact re-emits it'],
+    { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+    expect(seeded.code, seeded.stderr).toBe(0);
+
+    const command = (settingsHooks.PreCompact || [])
+      .flatMap((cfg) => (cfg.hooks || []).map((h) => h.command))
+      .find((c) => /pre-compact/.test(c));
+    expect(command, `no PreCompact command in the generated settings.json: ${JSON.stringify(settingsHooks.PreCompact)}`)
+      .toBeTruthy();
+
+    const r = await fire('/bin/sh', ['-c', command], {
+      cwd,
+      stdin: JSON.stringify({ session_id: 'cc-b3-precompact', trigger: 'auto' }),
+      env: { HOME: installHome, CLAUDE_MEM_DIR: dataDir },
+    });
+    expect(r.code, `registered PreCompact command exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(r.stdout.startsWith('<claude-mem-context>'), `stdout was:\n${r.stdout}`).toBe(true);
+    // The rendered table truncates long titles, so match the head of the seeded row.
+    expect(r.stdout).toContain('Traced the compaction memory loss to the missing');
   }, 60000);
 });

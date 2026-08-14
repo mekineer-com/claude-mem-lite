@@ -697,6 +697,21 @@ const memStop = {
   }]
 };
 
+// Fires immediately BEFORE auto-compaction, re-emitting <claude-mem-context> so the
+// summarizer that rewrites the transcript still has memory in scope (SessionStart's
+// compact matcher fires AFTER, when the context is already gone). Parity with
+// hooks/hooks.json: omitting it here made every settings.json install lose exactly the
+// block that exists to survive compaction, invisibly — doctor only ever asked "are ANY
+// mem hooks present", never "which events" (audit B3, 2026-08-14).
+const memPreCompact = {
+  matcher: '*',
+  hooks: [{
+    type: 'command',
+    command: nodeHook('hook.mjs', 'pre-compact'),
+    timeout: 5
+  }]
+};
+
 const memUserPrompt = {
   matcher: '*',
   hooks: [
@@ -754,9 +769,14 @@ const memPreAgentInject = {
 
 // Filter out existing mem hooks, then append fresh ones
 // PreToolUse has three separate matchers, so we register all three
+// Event set MUST stay equal to hooks/hooks.json's (minus scripts/setup.sh, which
+// bootstraps the plugin cache and has no settings.json counterpart) —
+// tests/audit-silent-20260814.test.mjs diffs a real `install --dev` run's
+// settings.json against the shipped manifest and reds on any new divergence.
 const hookConfigs = {
   PreToolUse: [memPreToolRecall, memPreSkillBridge, memPreAgentInject],
   PostToolUse: [memPostToolUse],
+  PreCompact: [memPreCompact],
   SessionStart: [memSessionStart],
   Stop: [memStop],
   UserPromptSubmit: [memUserPrompt],
@@ -768,7 +788,10 @@ for (const [event, configs] of Object.entries(hookConfigs)) {
 }
 
 writeSettings(settings);
-ok('Hooks configured (PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit)');
+// Derived from the map, not a parallel literal: the pre-B3 line said five events and
+// kept saying five after the map changed, which is how a missing registration reads as
+// a successful one.
+ok(`Hooks configured (${Object.keys(hookConfigs).join(', ')})`);
 }
 
 function backupLegacyClaudeMemData() {
