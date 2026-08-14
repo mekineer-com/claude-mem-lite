@@ -550,8 +550,10 @@ describe('CLI feature sweep: maintenance commands', () => {
       return Number(m[1]);
     };
     const reenrich = num(/^\s*Re-enrich candidates: (\d+)/m);
-    const clusterMerge = num(/^\s*Cluster-merge: (\d+) clusters/m);
-    const smartCompress = num(/^\s*Smart-compress: (\d+) clusters/m);
+    // Same spelling as the MCP surface (audit 2026-08-14 F2 converged the CLI onto it);
+    // tests/audit-findings-20260814.test.mjs pins that the two agree.
+    const clusterMerge = num(/^\s*Cluster-merge candidates: (\d+) clusters/m);
+    const smartCompress = num(/^\s*Smart-compress candidates: (\d+) clusters/m);
     const normalizeLine = preview.stdout.match(/^\s*Normalize: (?:(\d+) unique concepts|gate closed .*)$/m);
     expect(normalizeLine, `no parseable Normalize line in:\n${preview.stdout}`).toBeTruthy();
     const normalizeUnits = Number(normalizeLine[1] || 0) > 0 ? 1 : 0;

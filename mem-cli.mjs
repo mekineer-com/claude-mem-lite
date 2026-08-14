@@ -3119,8 +3119,12 @@ async function cmdOptimize(db, args) {
     if (project) out(`  Project filter: ${project}`);
     out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}${preview.reenrichAliases ? `  (aliases scope: ${preview.reenrichAliases})` : ''}`);
     out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
-    out(`  Cluster-merge: ${preview.clusterMerge} clusters`);
-    out(`  Smart-compress: ${preview.smartCompress} clusters`);
+    // "candidates" matches the MCP wording (server.mjs mem_optimize preview) AND the
+    // Re-enrich line just above, which already read that way on both surfaces. The two
+    // surfaces render one optimizePreview() result — tests/audit-findings-20260814.test.mjs
+    // drives both and compares the label lists, so the drift cannot reopen.
+    out(`  Cluster-merge candidates: ${preview.clusterMerge} clusters`);
+    out(`  Smart-compress candidates: ${preview.smartCompress} clusters`);
     out(`  Total: ${preview.total} items`);
     if (verbose) {
       out('');

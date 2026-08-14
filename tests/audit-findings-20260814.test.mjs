@@ -17,6 +17,8 @@
 // write into this repo. The sandbox is removed in an afterAll `finally`.
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawn } from 'child_process';
 import { mkdtempSync, mkdirSync, readFileSync, existsSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
@@ -27,6 +29,8 @@ import { saveObservation } from '../hook-llm.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK_PATH = join(REPO, 'hook.mjs');
+const CLI_PATH = join(REPO, 'cli.mjs');
+const SERVER_PATH = join(REPO, 'server.mjs');
 
 // ─── Sandbox shared by the subprocess-driven cases ─────────────────────────────────
 
@@ -91,6 +95,23 @@ function fire(cmd, args, { cwd, stdin = '', env = {}, timeout = 30000 } = {}) {
     child.stdin.end(stdin);
   });
 }
+
+/**
+ * Spawn server.mjs over the real JSON-RPC stdio transport, pointed at `dataDir` with
+ * `cwd` as its only project source. Caller closes both handles.
+ */
+async function startMcp(dataDir, cwd) {
+  const env = { ...BASE_ENV, CLAUDE_MEM_DIR: dataDir, MEM_QUIET_HOOKS: '1', CLAUDE_MEM_AUTO_DEEP: '0' };
+  delete env.CLAUDE_MEM_HOOK_RUNNING;
+  for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+  const transport = new StdioClientTransport({ command: process.execPath, args: [SERVER_PATH], cwd, env });
+  const client = new Client({ name: 'mem-audit0814-client', version: '0.0.0' });
+  await client.connect(transport);
+  return { client, transport };
+}
+
+/** Join the text blocks of a tools/call result (isError results included, for F1). */
+const textOf = (res) => (res?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n');
 
 // ─── F4 — hook-llm's three write-side noise diagnostics ────────────────────────────
 // utils.mjs debugLog(level, context, msg) takes THREE args. hook-llm.mjs:159/175/185
@@ -266,7 +287,6 @@ describe('F5 — a non-string tool_name is recorded, not thrown-and-swallowed', 
 
 describe('F3 — an attached file is not rendered as a modification', () => {
   let dataDir, cwd;
-  const CLI_PATH = join(REPO, 'cli.mjs');
   const readOnlyFile = () => join(cwd, 'widget-cache.mjs');
 
   const run = (args) => fire(process.execPath, [CLI_PATH, ...args], {
@@ -319,4 +339,75 @@ describe('F3 — an attached file is not rendered as a modification', () => {
     expect(description).toContain('files_modified');
     expect(description).toMatch(/not assert|does not claim|not a claim/i);
   });
+});
+
+// ─── F2 — one preview, two spellings ───────────────────────────────────────────────
+// server.mjs:1305-1306 printed "Cluster-merge candidates: N clusters" /
+// "Smart-compress candidates: N clusters" while mem-cli.mjs:3122-3123 printed
+// "Cluster-merge: N clusters" / "Smart-compress: N clusters" — the same optimizePreview()
+// numbers under two labels, so a doc, a grep or a user's mental model that fits one
+// surface misses the other. Converged on the MCP spelling: the sibling line
+// "Re-enrich candidates: N" already read that way on BOTH surfaces.
+
+describe('F2 — the optimize preview reads the same on the CLI and over MCP', () => {
+  let dataDir, cwd, client, transport;
+
+  /** The indented body lines of a preview block, as [label, rest] pairs. */
+  function previewFields(text) {
+    return text.split('\n')
+      .filter((l) => /^\s{2,}\S/.test(l) && l.includes(':'))
+      .map((l) => {
+        const i = l.indexOf(':');
+        return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
+      });
+  }
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('data-f2');
+    cwd = sandboxDir('work', 'f2');
+    // Rows the preview can count: re-enrich candidates are lesson-free bugfixes with a
+    // narrative over 100 chars, so the numbers below are non-zero on both surfaces and a
+    // label assertion cannot pass against an empty block.
+    for (const text of [
+      'Reworked the queue drain sequence so the flush waits for in-flight acknowledgements before closing the socket, which removed the intermittent truncation on shutdown.',
+      'Traced the retry backoff reset to every redirect hop, so a long redirect chain never backed off and hammered the upstream until the circuit breaker tripped open.',
+    ]) {
+      const r = await fire(process.execPath, [CLI_PATH, 'save', text, '--type', 'bugfix'],
+        { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+      expect(r.code, r.stderr).toBe(0);
+    }
+    ({ client, transport } = await startMcp(dataDir, cwd));
+  }, 60000);
+
+  afterAll(async () => {
+    try { await client?.close(); } catch { /* already gone */ }
+    try { await transport?.close(); } catch { /* already gone */ }
+  });
+
+  // FAILS IF: either surface changes a label without the other — the two label lists are
+  // read from two independently produced real outputs, so neither side can be edited into
+  // agreement on its own. (Verified by mutation: reverting mem-cli.mjs to "Cluster-merge:"
+  // reds this with ['Cluster-merge'] vs ['Cluster-merge candidates'].)
+  it('both surfaces label the preview identically, using the `candidates` spelling', async () => {
+    const cliRun = await fire(process.execPath, [CLI_PATH, 'optimize'], { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+    expect(cliRun.code, cliRun.stderr).toBe(0);
+    const mcpRun = textOf(await client.callTool({ name: 'mem_optimize', arguments: { action: 'preview' } }));
+
+    const cliFields = previewFields(cliRun.stdout);
+    const mcpFields = previewFields(mcpRun);
+    expect(cliFields.length, `no preview body parsed from the CLI output:\n${cliRun.stdout}`).toBeGreaterThan(3);
+    expect(cliFields.map(([label]) => label)).toEqual(mcpFields.map(([label]) => label));
+    expect(cliFields.map(([label]) => label)).toContain('Cluster-merge candidates');
+    expect(cliFields.map(([label]) => label)).toContain('Smart-compress candidates');
+
+    // The two drift-prone lines carry no surface-specific decoration, so their VALUES must
+    // match too — same optimizePreview() data, same rendering.
+    const pick = (fields, label) => fields.find(([l]) => l === label)?.[1];
+    for (const label of ['Cluster-merge candidates', 'Smart-compress candidates', 'Total']) {
+      expect(pick(cliFields, label), `${label} disagrees across surfaces`).toBe(pick(mcpFields, label));
+    }
+    // …and the seeded rows really are counted, so the labels above were not read off an
+    // all-zero block that any spelling would satisfy.
+    expect(Number(pick(cliFields, 'Re-enrich candidates').split(/\s+/)[0])).toBeGreaterThan(0);
+  }, 60000);
 });
