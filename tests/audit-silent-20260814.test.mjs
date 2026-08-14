@@ -146,7 +146,21 @@ describe('B2 — recall does not serve, or re-promote, a superseded observation'
     expect(rows.map((r) => r.id)).toEqual([liveId]);
     expect(rows.map((r) => r.lesson_learned).join('\n'))
       .not.toContain('Reset the backoff on every redirect hop');
-    expect(staleId).not.toBe(liveId);   // the pair really is two rows, not one
+
+    // The single-row result above is only evidence of FILTERING if the file really had two
+    // candidate rows to filter, one of them tombstoned. `staleId !== liveId` used to stand
+    // here and could not fail — both come from sequential lastInsertRowid.
+    // FAILS IF: the fixture stops posing the question — the stale row loses its
+    // filesModified link (the junction query returns one row), or its supersededAt /
+    // the live row's null superseded_at drifts.
+    const linked = db.prepare(`
+      SELECT o.id, o.superseded_at FROM observations o
+      JOIN observation_files f ON f.obs_id = o.id
+      WHERE f.filename = ? ORDER BY o.id
+    `).all('/repo/src/transport.mjs');
+    expect(linked.map((r) => r.id)).toEqual([staleId, liveId]);
+    expect(linked.find((r) => r.id === staleId).superseded_at).toBeTruthy();
+    expect(linked.find((r) => r.id === liveId).superseded_at).toBeNull();
   });
 
   // The second half of the defect: lines 37-38 bump access_count over exactly the rows the

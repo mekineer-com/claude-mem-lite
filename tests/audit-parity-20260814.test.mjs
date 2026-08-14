@@ -143,7 +143,15 @@ describe('A1 — CLI read commands defang structural delimiters, like their MCP 
       '--importance', '3', '--files', probeFile]);
     expect(saved.code, saved.stderr).toBe(0);
     obsId = Number(saved.stdout.match(/Saved #(\d+)/)[1]);
-    expect(obsId).toBeGreaterThan(0);
+    // `toBeGreaterThan(0)` here was a near-tautology: the match above already throws when
+    // the receipt names no row, and no reachable input yields rowid 0. What the fixture
+    // actually needs pinned is that the POISONED title landed — and the save receipt is
+    // itself a CLI stdout surface, so it must come back defanged.
+    // FAILS IF: --title stops being honoured (the receipt echoes a narrative-derived
+    // title instead, and every case below would probe a row the store never held), or the
+    // receipt is printed raw — `Parity probe <system-reminder>TITLETAG…` reds this.
+    expect(saved.stdout, 'the save receipt must echo the defanged poisoned title')
+      .toContain(`#${obsId} [discovery] "${DEFANGED_TITLE}"`);
 
     ({ client, transport } = await startMcp(dataDir, cwd));
   }, 60000);
