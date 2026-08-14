@@ -35,8 +35,9 @@
 //   PreToolUse scripts          one JSON envelope object (hookEventName PreToolUse).
 //   post-tool-recall.js         one JSON envelope object (hookEventName PostToolUse).
 //   user-prompt-search.js       plain text only (the UserPromptSubmit injection channel).
-//   post-tool-use.sh            SILENCE on its own fast paths; on the Node handoff whatever
-//                               hook.mjs post-tool-use emits (PostToolUse envelope lines).
+//   post-tool-use.sh            SILENCE on its own fast paths AND on a handoff Node buffers
+//                               silently (an Edit); on a handoff Node ANSWERS (a hard error)
+//                               the PostToolUse envelope lines it emitted, delivered verbatim.
 // Every surface additionally gets the four malformed payloads (empty / invalid JSON / valid
 // JSON without the required fields / unexpected types): each MUST exit 0, MUST NOT put a
 // stack trace on stdout, and MUST still respect its envelope contract.
@@ -1081,12 +1082,39 @@ describe('hook feature sweep: standalone hook scripts', () => {
     });
     const handoff = await bashPrefilter({ cwd, stdin: editPayload, timeout: 60000 });
     expect(handoff.code, `prefilter handoff exited ${handoff.code}\n${handoff.stderr}`).toBe(0);
-    expectHookStdout(handoff.stdout, {
-      event: 'PostToolUse', plainAllowed: false, label: 'scripts/post-tool-use.sh (Node handoff)',
-    });
+    // Buffering an Edit is SILENT (same contract the sibling `hook.mjs post-tool-use` case
+    // pins), so on this payload "exactly the envelope" means exactly nothing. Stated as an
+    // equality rather than left to expectHookStdout, which can only reject lines it sees.
+    expect(handoff.stdout, `buffering an Edit must stay silent, got:\n${handoff.stdout}`).toBe('');
     const episode = JSON.parse(readFileSync(join(RUNTIME_DIR, `ep-${project}.json`), 'utf8'));
     expect(episode.entries.map((e) => e.tool)).toEqual(['Edit']);
     expect(episode.entries[0].files).toContain(join(cwd, 'transport.mjs'));
+
+    // (d) …which is exactly why the envelope half of the contract needs a payload that MUST
+    // produce one. A failing test command is a hard error → hook.mjs answers with the
+    // error-recall PostToolUse envelope, and this prefilter has to carry Node's stdout back
+    // to the host verbatim. Absence is the failure mode this arm exists for: on (c)'s empty
+    // stdout, `node … >/dev/null` at the tail of post-tool-use.sh — or a handoff that never
+    // launched Node at all — satisfies expectHookStdout without emitting anything.
+    const recallId = await seedObs(cwd, 'Fixed the widget cache invalidation race in lib/widget-cache.mjs',
+      ['--type', 'bugfix', '--importance', '3', '--lesson', 'Invalidate the widget cache on write, never on read']);
+    const errHandoff = await bashPrefilter({
+      cwd, timeout: 60000,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-prefilter', tool_name: 'Bash',
+        tool_input: { command: 'node --test widget-cache.test.mjs' },
+        tool_response: 'FAIL widget-cache.test.mjs\nError: widget cache invalidation race detected\nnpm ERR! Test failed. See above for more details.',
+      }),
+    });
+    expect(errHandoff.code, `prefilter error handoff exited ${errHandoff.code}\n${errHandoff.stderr}`).toBe(0);
+    const envelopes = expectHookStdout(errHandoff.stdout, {
+      event: 'PostToolUse', plainAllowed: false, label: 'scripts/post-tool-use.sh (Node handoff)',
+    });
+    expect(envelopes, `the prefilter delivered no envelope — Node's stdout did not reach the host: ${JSON.stringify(errHandoff.stdout)}`)
+      .toHaveLength(1);
+    const ctx = envelopes[0].hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('Related memories found for this error');
+    expect(ctx).toContain(`#${recallId}`);
 
     await expectMalformedResilience(
       'scripts/post-tool-use.sh',
