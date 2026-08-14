@@ -22,7 +22,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawn } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, chmodSync } from 'fs';
 import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -655,6 +655,174 @@ describe('F6 — update-check reaches its handler under the recursion guard', ()
     expect([...spawned].filter((e) => !listed.has(e)),
       'these events are spawned detached (CLAUDE_MEM_HOOK_RUNNING=1) but absent from BG_EVENTS, so hook.mjs:116 exits them before dispatch')
       .toEqual([]);
+  });
+});
+
+// ─── F6b (pre-tag review) — the resurrected worker CHECKS, it does not self-install ─
+// F6 brings a path back from the dead: `update-check` has not reached its handler since
+// v2.85.0 (2026-06-03), because it was missing from BG_EVENTS. What it dispatches is
+// `checkForUpdate()` with NO options, and hook-update.mjs:44 reads
+// `allowInstall = options.allowInstall ?? !pluginMode` — so on a direct / settings.json
+// install (no CLAUDE_PLUGIN_ROOT) allowInstall defaults to TRUE and the path proceeds into
+// downloadAndInstall: curl the tarball, `npm install` in staging, per-file renameSync swap
+// of ~/.claude-mem-lite. Fixing F6 would therefore switch a ten-week-dormant self-installer
+// back on for every direct-install user in the same release that resurrects it.
+// Staged instead (user decision): this release restores the CHECK + banner only, by passing
+// `allowInstall: false` at this ONE dispatch. hook-update.mjs's own default and the
+// installer's guards are untouched — `install.mjs` still passes allowInstall:true for the
+// explicit, user-invoked update.
+//
+// NETWORK: none, twice over. A CJS preload replaces globalThis.fetch with a stub that
+// serves a fabricated v999.0.0 release for the releases/latest URL and throws on anything
+// else, and a fake `curl` earlier on PATH stands in for the installer's only network call
+// (execFileSync('curl', …), which a JS preload cannot intercept). Both are proven live by
+// preflight probes before the arm that depends on them runs, so a stub that failed to load
+// REDS the preflight instead of letting a real request out.
+
+describe('F6b — the restored update-check checks for a release but does not install it', () => {
+  const LATEST_URL = 'https://api.github.com/repos/sdsrss/claude-mem-lite/releases/latest';
+  let dataDir, runtimeDir, cwd, binDir, fetchLog, curlLog, releaseFetch;
+
+  const lines = (f) => (existsSync(f) ? readFileSync(f, 'utf8').trim().split('\n').filter(Boolean) : []);
+  /** Child env: a DIRECT install (no CLAUDE_PLUGIN_ROOT ⇒ allowInstall defaults to true). */
+  const childEnv = (extra = {}) => ({
+    CLAUDE_MEM_DIR: dataDir,
+    CLAUDE_MEM_HOOK_RUNNING: '1',        // what spawnBackground sets on the detached child
+    CLAUDE_MEM_SKIP_UPDATE: undefined,   // BASE_ENV sets it; drop it so the handler runs
+    CLAUDE_PLUGIN_ROOT: undefined,       // the install shape where the installer was reachable
+    AUDIT_FETCH_LOG: fetchLog,
+    AUDIT_CURL_LOG: curlLog,
+    NODE_OPTIONS: `--require "${releaseFetch}"`,
+    PATH: `${binDir}:${process.env.PATH}`,
+    ...extra,
+  });
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('data-f6b');
+    runtimeDir = join(dataDir, 'runtime');
+    cwd = sandboxDir('work', 'f6b');
+    binDir = sandboxDir('f6b-bin');
+    fetchLog = join(ROOT, 'f6b-fetches.txt');
+    curlLog = join(ROOT, 'f6b-curl.txt');
+
+    releaseFetch = join(ROOT, 'release-fetch.cjs');
+    writeFileSync(releaseFetch, [
+      "const fs = require('fs');",
+      `const LATEST = ${JSON.stringify(LATEST_URL)};`,
+      'globalThis.fetch = async (url) => {',
+      "  try { fs.appendFileSync(process.env.AUDIT_FETCH_LOG, String(url) + '\\n'); } catch { /* best-effort */ }",
+      '  if (String(url) === LATEST) {',
+      '    return { ok: true, status: 200, json: async () => ({',
+      "      tag_name: 'v999.0.0',",
+      "      tarball_url: 'https://api.github.com/repos/sdsrss/claude-mem-lite/tarball/v999.0.0',",
+      "      html_url: 'https://github.com/sdsrss/claude-mem-lite/releases/tag/v999.0.0',",
+      '      assets: [],',
+      '    }) };',
+      '  }',
+      "  throw new Error('offline: this audit refuses every other fetch');",
+      '};',
+      '',
+    ].join('\n'));
+
+    // The installer's download is execFileSync('curl', …) — a separate process, so the JS
+    // preload cannot see it. Shadow `curl` on PATH with a recorder that never opens a
+    // socket and exits non-zero, which is also what makes downloadAndInstall bail early.
+    const fakeCurl = join(binDir, 'curl');
+    writeFileSync(fakeCurl, '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$AUDIT_CURL_LOG"\nexit 1\n');
+    chmodSync(fakeCurl, 0o755);
+
+    // Preflight 1: the fetch stub really intercepts, in a child spawned exactly like the
+    // arm below. FAILS IF: NODE_OPTIONS is ignored / the preload throws — the fabricated
+    // release never appears and the arm's "the check ran" reading would be unfounded (and a
+    // real request could reach api.github.com).
+    const probeLog = join(ROOT, 'f6b-preflight-fetch.txt');
+    const probe = await fire(process.execPath,
+      ['-e', `fetch(${JSON.stringify(LATEST_URL)}).then((r) => r.json()).then((j) => console.log(j.tag_name), (e) => console.log('ERR ' + e.message))`],
+      { cwd, env: childEnv({ AUDIT_FETCH_LOG: probeLog }) });
+    expect(probe.stdout.trim(), `the release fetch stub did not load: ${probe.stderr}`).toBe('v999.0.0');
+    expect(lines(probeLog)).toEqual([LATEST_URL]);
+
+    // Preflight 2: the fake curl really shadows the real one. FAILS IF: PATH ordering stops
+    // working — the arm's "no curl ran" reading would then be about a curl that was never
+    // recorded rather than one that never ran.
+    const curlProbeLog = join(ROOT, 'f6b-preflight-curl.txt');
+    const curlProbe = await fire('curl', ['-sL', 'https://stub-probe.invalid/preflight'],
+      { cwd, env: childEnv({ AUDIT_CURL_LOG: curlProbeLog }) });
+    expect(curlProbe.code, 'the shadowing curl is not the one that ran').toBe(1);
+    expect(lines(curlProbeLog).join(' '), 'the fake curl on PATH did not record the invocation')
+      .toContain('stub-probe.invalid');
+  }, 60000);
+
+  // FAILS IF: the dispatch goes back to a bare `await checkForUpdate()` — allowInstall then
+  // defaults to true on this (non-plugin) install shape, downloadAndInstall runs, and the
+  // curl log carries the v999.0.0 tarball URL. Verified by mutation: reverting hook.mjs to
+  // `await checkForUpdate()` reds the curl assertion with
+  // ['-sL -H Accept: application/vnd.github+json https://api.github.com/repos/sdsrss/claude-mem-lite/tarball/v999.0.0 -o …'].
+  it('runs the release lookup and writes the banner state without entering the installer', async () => {
+    const r = await fire(process.execPath, [HOOK_PATH, 'update-check'],
+      { cwd, env: childEnv(), timeout: 60000 });
+    expect(r.code, `update-check exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(r.stdout, "background workers run stdio:'ignore'; stdout must stay empty").toBe('');
+
+    // 1. The CHECK half still happens — this is what F6 restored, and staging must not
+    //    silently disable it too.
+    expect(lines(fetchLog), `update-check made no release lookup: ${JSON.stringify(lines(fetchLog))}`)
+      .toEqual([LATEST_URL]);
+
+    // 2. The banner half lands: an update WAS found and recorded for the next SessionStart.
+    const state = JSON.parse(readFileSync(join(runtimeDir, 'update-state.json'), 'utf8'));
+    expect(state.latestVersion, `no release recorded in ${JSON.stringify(state)}`).toBe('999.0.0');
+    expect(state.updateAvailable, 'an available update was not flagged for the banner').toBe(true);
+    expect(Date.now() - new Date(state.lastCheck).getTime()).toBeLessThan(120000);
+
+    // 3. …and the self-replacing install half does NOT. curl is the installer's first
+    //    action, so an empty log means downloadAndInstall was never entered.
+    expect(lines(curlLog), 'the dispatched update-check entered the self-replacing installer')
+      .toEqual([]);
+    // Nothing was staged or swapped into the install dir either.
+    expect(existsSync(join(HOME_DIR, '.claude-mem-lite', 'package.json')),
+      'the update path wrote into the install dir').toBe(false);
+  }, 60000);
+
+  // The staging is at the DISPATCH, not in hook-update.mjs: an explicit caller that asks to
+  // install must still be able to (install.mjs passes allowInstall:true for the user-invoked
+  // update, and that path is unchanged by this fix).
+  // FAILS IF: the default in hook-update.mjs is flipped instead of the dispatch — the
+  // installer would then be unreachable even when a caller explicitly asks for it, and the
+  // curl log stays empty here.
+  it('an explicit allowInstall:true caller still reaches the installer', async () => {
+    const explicitLog = join(ROOT, 'f6b-curl-explicit.txt');
+    const explicitData = sandboxDir('data-f6b-explicit');
+    const r = await fire(process.execPath, [
+      '--input-type=module', '-e',
+      "const { checkForUpdate } = await import(process.env.AUDIT_UPDATE_MODULE); await checkForUpdate({ force: true, allowInstall: true });",
+    ], {
+      cwd,
+      env: childEnv({
+        AUDIT_UPDATE_MODULE: join(REPO, 'hook-update.mjs'),
+        AUDIT_CURL_LOG: explicitLog,
+        AUDIT_FETCH_LOG: join(ROOT, 'f6b-fetches-explicit.txt'),
+        CLAUDE_MEM_DIR: explicitData,
+      }),
+      timeout: 60000,
+    });
+    expect(r.code, `explicit update call exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(lines(explicitLog).join(' '),
+      'an explicit allowInstall:true call no longer reaches the download — the fix was applied to the module default, not the dispatch')
+      .toContain('/tarball/v999.0.0');
+  }, 60000);
+
+  // The staging is meant to be temporary and attributable, so it has to be visible in the
+  // source rather than an unexplained literal.
+  // FAILS IF: the option is dropped, or re-enabled without saying so.
+  it('the dispatch states why the install half is staged off', () => {
+    const src = readFileSync(HOOK_PATH, 'utf8');
+    const dispatch = src.match(/case 'update-check':[\s\S]{0,120}/)?.[0] || '';
+    expect(dispatch, `the update-check dispatch no longer passes allowInstall: ${dispatch}`)
+      .toMatch(/checkForUpdate\(\{[^}]*allowInstall:\s*false/);
+    const preamble = src.slice(Math.max(0, src.indexOf("case 'update-check':") - 700), src.indexOf("case 'update-check':"));
+    expect(preamble, 'the staging carries no explanation of why install is off or when it comes back')
+      .toMatch(/v2\.85\.0|follow-up/);
   });
 });
 

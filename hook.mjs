@@ -1849,9 +1849,19 @@ try {
     case 'auto-maintain':    handleAutoMaintain(); break;
     case 'llm-optimize':   await handleLLMOptimize(); break;
     // Detached update refresh spawned by handleSessionStart (audit P3d) — does the
-    // GitHub fetch + (non-plugin) install off the SessionStart critical path,
-    // writing update-state.json so the NEXT session's cached banner is fresh.
-    case 'update-check':     await checkForUpdate(); break;
+    // GitHub fetch off the SessionStart critical path, writing update-state.json so
+    // the NEXT session's cached banner is fresh.
+    //
+    // F6 staging: the detached update-check worker has not run since v2.85.0
+    // (missing from BG_EVENTS). Restore the check + banner first; re-enable the
+    // self-replacing install in a follow-up once this path has proven itself, so a
+    // failure in either half is attributable. Without the option, hook-update.mjs's
+    // `allowInstall = options.allowInstall ?? !pluginMode` defaults to TRUE on a
+    // direct / settings.json install, so fixing F6 would switch a ten-week-dormant
+    // self-installer back on in the same release that resurrects the worker. The
+    // module default and the installer's own guards are unchanged — install.mjs
+    // still passes allowInstall:true for the explicit, user-invoked update.
+    case 'update-check':     await checkForUpdate({ allowInstall: false }); break;
   }
 } catch (err) {
   // Log fatal errors (ungated) with structured format. ERR_DLOPEN_FAILED (an
