@@ -23,8 +23,13 @@
 //      the runner, so a spawned child with no explicit value falls back to the LIVE
 //      ~/.claude DB. The mem_stats case asserts `Data dir: <sandbox>` over the wire,
 //      which is the one assertion that fails loudly if that ever leaks.
-//   2. cwd + PWD + CLAUDE_PROJECT_DIR → a sandbox dir, so inferProject() resolves to
-//      a sandbox-derived name (asserted by mem_recent) and nothing writes into the repo.
+//   2. cwd → a sandbox dir, and CLAUDE_PROJECT_DIR + PWD are DELETED from the child
+//      env (the runner's PWD is this repo). project-utils.mjs:18 resolves
+//      CLAUDE_PROJECT_DIR || PWD || process.cwd(), so with both vars gone the server's
+//      project name is derived from its cwd ALONE — which is what makes the
+//      `Recent observations (work--mcpsweep)` assertion in the mem_recent case a real
+//      pin on the spawned server's cwd. (Setting the two vars instead would leave that
+//      assertion green even if the cwd option were dropped and the server ran here.)
 //   3. No LLM, no network. CLAUDE_CODE_PATH points at a path that cannot exist, so
 //      haiku-client's CLI mode fails fast instead of spawning a real `claude`; the API
 //      keys stay empty; CLAUDE_MEM_SKIP_SAVE_ENRICH=1 stops mem_save from queueing a
@@ -77,8 +82,10 @@ function itTool(tool, fn, timeout) {
 let ROOT, DATA_DIR, WORK_DIR, client, transport;
 
 // inferProject() derives "<parent>--<dir>" from the project dir; WORK_DIR is
-// <sandbox>/work/mcpsweep, so this is deterministic. The mem_recent case asserts it,
-// which is also the proof that the server really ran with the sandbox cwd.
+// <sandbox>/work/mcpsweep, so this is deterministic. With CLAUDE_PROJECT_DIR and PWD
+// removed from the child env (see isolation contract #2), the server can only reach
+// this name through its own process.cwd() — so the mem_recent assertion is the proof
+// that it really ran with the sandbox cwd.
 const PROJECT = 'work--mcpsweep';
 
 /** Join the text blocks of a tools/call result. */
@@ -152,8 +159,6 @@ beforeAll(async () => {
     ...process.env,
     HOME: join(ROOT, 'home'),
     CLAUDE_MEM_DIR: DATA_DIR,
-    CLAUDE_PROJECT_DIR: WORK_DIR,
-    PWD: WORK_DIR,
     // haiku-client detectMode() falls back to 'cli' with no API key and would spawn the
     // real `claude`. Point it at a path that cannot exist → fail fast, no spend.
     CLAUDE_CODE_PATH: join(ROOT, 'no-such-claude-binary'),
@@ -166,6 +171,12 @@ beforeAll(async () => {
     CLAUDE_MEM_QUIET_TRACE: '0',
   };
   delete env.CLAUDE_MEM_HOOK_RUNNING;
+  // Both project-dir env vars are removed so the transport's `cwd` is the ONLY source
+  // inferProject() can read (isolation contract #2). The runner inherits PWD=<this repo>,
+  // so leaving it in place would both hide a cwd leak and put the sweep's rows under the
+  // repo's own project name.
+  delete env.CLAUDE_PROJECT_DIR;
+  delete env.PWD;
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
 
   transport = new StdioClientTransport({
