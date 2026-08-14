@@ -156,7 +156,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     // (no lesson, importance<2, empty facts, thin narrative) is dropped before
     // dedup/MinHash/vector work. Opt-out: CLAUDE_MEM_KEEP_LOW_SIGNAL=1.
     if (isNoiseObservation(obs)) {
-      debugLog('saveObservation', `dropped noise: ${truncate(obs.title || '', 60)}`);
+      debugLog('DEBUG', 'saveObservation', `dropped noise: ${truncate(obs.title || '', 60)}`);
       return null;
     }
 
@@ -172,7 +172,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     // pre-save is not lost on LLM success — that path clean-inserts a fresh row — but it loses
     // those three.) capNoiseImportance then caps any title-noise survivor to imp=1 as before.
     if (isLowYieldChangeObs(obs)) {
-      debugLog('saveObservation', `dropped low-yield change: ${truncate(obs.title || '', 60)}`);
+      debugLog('DEBUG', 'saveObservation', `dropped low-yield change: ${truncate(obs.title || '', 60)}`);
       return null;
     }
 
@@ -182,7 +182,7 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     // enter the 7-day accelerated auto-compress window in hook.mjs.
     const capped = capNoiseImportance(obs);
     if (capped !== (obs.importance ?? 1)) {
-      debugLog('saveObservation', `capped imp ${obs.importance}→${capped}: ${truncate(obs.title || '', 60)}`);
+      debugLog('DEBUG', 'saveObservation', `capped imp ${obs.importance}→${capped}: ${truncate(obs.title || '', 60)}`);
       obs.importance = capped;
     }
 
