@@ -1,0 +1,1084 @@
+// Feature sweep: every hook entry point of the plugin, fired as a REAL subprocess with a
+// synthetic Claude Code stdin payload. No handler is imported and called directly — the
+// wiring (argv dispatch, stdin read, stdout envelope, exit code) IS the thing under test.
+//
+// WHY THIS FILE EXISTS (it does not duplicate the hook tests already here):
+//   tests/e2e.test.mjs            — hook.mjs lifecycle, but only the events a past bug
+//                                   touched, and never the standalone scripts.
+//   tests/pre-tool-recall*.test.mjs / pre-skill-bridge / pre-agent-inject /
+//   post-tool-recall / user-prompt-search — one script each, deep on that script's own
+//                                   feature (bind mode, file-intel, defang, re-read guard).
+//   tests/lifecycle-e2e.test.mjs  — install → adopt → uninstall, not per-event I/O.
+//   tests/quiet-hooks.test.mjs    — MEM_QUIET_HOOKS text shaping, in-process.
+//   tests/hook-telemetry.test.mjs — the error recorder, in-process.
+//   tests/install-hook-scripts.test.mjs / hooks-pretool-whitelist-sync.test.mjs — the
+//                                   manifest + matcher literals, no execution.
+// None of them answers "does EVERY hook surface still exit 0 and emit a well-formed
+// envelope — including on a payload Claude Code should never send but sometimes does?"
+// A hook that crashes or prints stray prose degrades the user's session silently: there is
+// no error surface, the context just stops arriving. That is this file's only job — one
+// case per surface, named after the surface, so a failure names it immediately.
+//
+// PER-SURFACE STDOUT CONTRACT (asserted by expectHookStdout, per Claude Code's hook I/O
+// rules and the shapes tests/e2e.test.mjs + the source comments pin):
+//   hook.mjs session-start      JSON envelope line(s) (hookEventName SessionStart) AND the
+//                               plain <claude-mem-context> block — both are context channels.
+//   hook.mjs post-tool-use      JSON envelope line(s) ONLY (hookEventName PostToolUse).
+//                               Plain text here is the shipped `<text>{json}` corruption bug
+//                               (MED-3, audit 2026-07-16) — one stray line makes Claude Code's
+//                               line-based parser drop the whole receipt.
+//   hook.mjs stop               SILENCE. Stop's schema rejects hookSpecificOutput at the root
+//                               (v2.33.4), so RECEIPT_EVENTS excludes it.
+//   hook.mjs user-prompt        plain text only (<memory-context> blocks).
+//   hook.mjs pre-compact        plain <claude-mem-context> only.
+//   background workers          SILENCE (spawnBackground gives them stdio:'ignore').
+//   PreToolUse scripts          one JSON envelope object (hookEventName PreToolUse).
+//   post-tool-recall.js         one JSON envelope object (hookEventName PostToolUse).
+//   user-prompt-search.js       plain text only (the UserPromptSubmit injection channel).
+//   post-tool-use.sh            SILENCE on its own fast paths; on the Node handoff whatever
+//                               hook.mjs post-tool-use emits (PostToolUse envelope lines).
+// Every surface additionally gets the four malformed payloads (empty / invalid JSON / valid
+// JSON without the required fields / unexpected types): each MUST exit 0, MUST NOT put a
+// stack trace on stdout, and MUST still respect its envelope contract.
+//
+// ISOLATION CONTRACT (all five are load-bearing):
+//   1. CLAUDE_MEM_DIR → a mkdtempSync sandbox for EVERY spawned process. vitest.config.mjs
+//      sets it to '' for the runner, so a child that inherited it would resolve the LIVE
+//      ~/.claude-mem-lite DB. Load-bearing check: every DB assertion opens
+//      <sandbox>/claude-mem-lite.db directly — if the override ever leaked, that file would
+//      have no `observations` table and the cases would fail loudly rather than pass while
+//      reading the real memory store.
+//   2. HOME → a sandbox home (second layer: hook-update, the plugin-disabled probe and
+//      snapshotDb all resolve homedir()), and cwd → a per-surface sandbox dir. PWD and
+//      CLAUDE_PROJECT_DIR are DELETED from the child env: project-utils.mjs:18 resolves
+//      CLAUDE_PROJECT_DIR || PWD || process.cwd(), so with both gone the project name each
+//      case asserts ("work--hs-…") is derived from the sandbox cwd ALONE. The runner's PWD
+//      is this repo, so leaving it set would both hide a cwd leak and file the sweep's rows
+//      under the repo's own project.
+//   3. No network, no LLM spend. CLAUDE_CODE_PATH points at a path that cannot exist, so
+//      haiku-client's CLI mode (its default with no API key) fails fast instead of spawning
+//      a real `claude`; the four background workers that exist to CALL the LLM opt in to
+//      scripts/mock-claude.mjs instead — a local deterministic stub, still no network.
+//      CLAUDE_MEM_SKIP_UPDATE=1 disables the GitHub release check on both the SessionStart
+//      banner and the update-check worker.
+//   4. Nothing writes into this repo. SessionStart auto-adopts, which writes <cwd>/CLAUDE.md
+//      — the `hook.mjs session-start` case asserts that write landed in ITS sandbox dir, and
+//      afterAll asserts this repo's own CLAUDE.md is byte-identical.
+//   5. afterAll removes the sandbox in a `finally` (so a failing assertion cannot leak it),
+//      after a short grace period for the detached llm-summary worker Stop spawns. The dir
+//      prefix is `mem-` so tests/global-setup.mjs reaps it even after a SIGKILL.
+
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { spawn } from 'child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import { tmpdir } from 'os';
+import Database from 'better-sqlite3';
+import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
+const HOOK_PATH = join(REPO, 'hook.mjs');
+const CLI_PATH = join(REPO, 'cli.mjs');
+const HOOKS_JSON = join(REPO, 'hooks', 'hooks.json');
+const MOCK_CLAUDE = join(REPO, 'scripts', 'mock-claude.mjs');
+const REPO_CLAUDE_MD = join(REPO, 'CLAUDE.md');
+
+// ─── Coverage-guard sources (both read REAL artifacts, never a second literal) ──────
+
+/** Every event hook.mjs's argv dispatcher can route, read out of its own `switch (event)`. */
+function dispatchedEvents() {
+  const src = readFileSync(HOOK_PATH, 'utf8');
+  const block = src.match(/switch \(event\) \{([\s\S]*?)\n\s*\}\n\} catch/);
+  if (!block) throw new Error('hook.mjs dispatch switch not found — the parser needs updating');
+  const events = [...block[1].matchAll(/^\s*case '([a-z-]+)':/gm)].map((m) => m[1]);
+  if (events.length === 0) throw new Error('hook.mjs dispatch switch parsed to zero events');
+  return events;
+}
+
+/** Every hook entry point hooks/hooks.json registers, as "<entry>[ <arg>]" ids. */
+function registeredEntries() {
+  const cfg = JSON.parse(readFileSync(HOOKS_JSON, 'utf8'));
+  const out = new Set();
+  for (const matchers of Object.values(cfg.hooks || {})) {
+    for (const m of matchers) {
+      for (const h of m.hooks || []) {
+        const cmd = h.command || '';
+        // `node "${CLAUDE_PLUGIN_ROOT}/scripts/hook-launcher.mjs" <entry> [event]`
+        const viaLauncher = cmd.match(/hook-launcher\.mjs"\s+(\S+)(?:\s+(\S+))?/);
+        if (viaLauncher) { out.add(viaLauncher[2] ? `${viaLauncher[1]} ${viaLauncher[2]}` : viaLauncher[1]); continue; }
+        // `bash "${CLAUDE_PLUGIN_ROOT}/scripts/<name>.sh"`
+        const viaBash = cmd.match(/\$\{CLAUDE_PLUGIN_ROOT\}\/(scripts\/[\w.-]+\.sh)/);
+        if (viaBash) { out.add(viaBash[1]); continue; }
+        throw new Error(`unrecognized hook command shape in hooks.json: ${cmd}`);
+      }
+    }
+  }
+  return out;
+}
+
+// scripts/setup.sh is the ONLY registered entry this sweep does not fire. It is the
+// dependency installer: it runs `npm install` and rewrites the runtime dir, so driving it
+// here would install packages mid-suite. Its behavior is covered by tests/install-e2e,
+// tests/install-lifecycle and tests/native-binding-selfheal.
+const UNSWEPT_BY_DESIGN = new Set(['scripts/setup.sh']);
+
+// ─── Surface registry ──────────────────────────────────────────────────────────────
+// Every case registers through itHook, so the coverage guards below compare the REGISTERED
+// artifacts against the set of cases really handed to vitest — not against a second
+// hand-maintained list, which could be edited into greenness without writing a case.
+// Collection runs every describe callback before the first test body, so SWEPT is complete
+// by the time any assertion runs.
+const SWEPT = new Set();
+function itHook(surface, fn, timeout = 60000) {
+  if (SWEPT.has(surface)) throw new Error(`duplicate sweep case for "${surface}"`);
+  SWEPT.add(surface);
+  return it(surface, fn, timeout);
+}
+
+// ─── Sandbox ───────────────────────────────────────────────────────────────────────
+
+let ROOT, DATA_DIR, RUNTIME_DIR, HOME_DIR, BASE_ENV, repoClaudeMdSnapshot;
+
+/** A per-surface cwd. inferProject() turns <sandbox>/work/<name> into "work--<name>". */
+function workDir(name) {
+  const d = join(ROOT, 'work', name);
+  mkdirSync(d, { recursive: true });
+  return d;
+}
+const projectOf = (name) => `work--${name}`;
+
+function childEnv(extra = {}) {
+  const env = { ...BASE_ENV, ...extra };
+  for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+  return env;
+}
+
+/** Fire one entry point as a subprocess, feeding `stdin` and capturing both streams. */
+function fire(cmd, args, { cwd, stdin = '', env = {}, timeout = 30000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { cwd, env: childEnv(env), stdio: ['pipe', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`${cmd} ${args.join(' ')} did not exit within ${timeout}ms`));
+    }, timeout);
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    // A hook that returns before reading stdin closes the pipe first — EPIPE here is the
+    // hook doing its job, not a failure.
+    child.stdin.on('error', () => {});
+    child.stdin.end(stdin);
+  });
+}
+
+const hookEvent = (event, opts = {}) => fire(process.execPath, [HOOK_PATH, ...event.split(' ')], opts);
+const hookScript = (name, opts = {}) => fire(process.execPath, [join(REPO, 'scripts', name)], opts);
+const bashPrefilter = (opts = {}) => fire('bash', [join(REPO, 'scripts', 'post-tool-use.sh')], opts);
+
+/** Seed rows through the real CLI (the sweep never hand-writes schema). */
+async function cli(args, cwd) {
+  const r = await fire(process.execPath, [CLI_PATH, ...args], { cwd });
+  expect(r.code, `cli ${args.join(' ')} exited ${r.code}\n${r.stdout}\n${r.stderr}`).toBe(0);
+  return r.stdout;
+}
+async function seedObs(cwd, text, flags = []) {
+  const out = await cli(['save', text, ...flags], cwd);
+  const m = out.match(/Saved #(\d+)/);
+  expect(m, `expected a "Saved #N" confirmation, got: ${out}`).toBeTruthy();
+  return Number(m[1]);
+}
+
+/** Open the sandbox memory DB for verification independent of the hook's own read path. */
+function withDb(fn) {
+  const db = new Database(join(DATA_DIR, 'claude-mem-lite.db'));
+  try { return fn(db); } finally { try { db.close(); } catch { /* already closed */ } }
+}
+/** Backdate a project's rows so the age-gated workers (compress / maintain) engage. */
+function ageProject(project, days) {
+  return withDb((db) => {
+    const epoch = Date.now() - days * 86400000;
+    return db.prepare('UPDATE observations SET created_at_epoch = ?, created_at = ? WHERE project = ?')
+      .run(epoch, new Date(epoch).toISOString(), project).changes;
+  });
+}
+
+// ─── Envelope contract ─────────────────────────────────────────────────────────────
+
+const STACK_TRACE = /^\s+at .+:\d+:\d+|^\w*(?:Type|Reference|Syntax|Range)Error: |^Error: /m;
+
+/**
+ * Structural check of one hook fire's stdout.
+ *
+ * @param {string} out raw stdout
+ * @param {object} spec
+ *   spec.event        hookEventName every JSON line must carry, or null when this surface
+ *                     may not emit a JSON envelope at all.
+ *   spec.plainAllowed whether non-JSON lines are a legal channel here. false = any prose is
+ *                     the `<text>{json}` corruption class.
+ *   spec.label        surface name, for the failure message.
+ * @returns {object[]} the parsed envelopes, for content assertions in the caller.
+ */
+function expectHookStdout(out, { event = null, plainAllowed = false, label }) {
+  const jsonLines = [], plainLines = [];
+  for (const line of out.split('\n')) {
+    if (line === '') continue;
+    // An envelope that does not START its line is invisible to Claude Code's line-based
+    // parser — and takes the rest of the line with it. This is the exact shape of the
+    // PostToolUse error-recall bug fixed in v3.48 (raw text + JSON in one write).
+    expect(
+      /^[^{].*[{,]\s*"(?:suppressOutput|hookSpecificOutput)"/.test(line),
+      `${label}: JSON envelope is not at the start of its line — the host drops it:\n${line}`,
+    ).toBe(false);
+    (line.startsWith('{') ? jsonLines : plainLines).push(line);
+  }
+
+  if (event === null) {
+    expect(jsonLines, `${label}: emitted a JSON envelope on a plain-text/silent surface`).toEqual([]);
+  }
+  const parsed = [];
+  for (const line of jsonLines) {
+    let obj;
+    try { obj = JSON.parse(line); } catch (e) {
+      throw new Error(`${label}: stdout line is not parseable JSON (${e.message}):\n${line}`, { cause: e });
+    }
+    expect(obj.hookSpecificOutput?.hookEventName, `${label}: wrong hookEventName in ${line}`).toBe(event);
+    parsed.push(obj);
+  }
+
+  if (!plainAllowed) {
+    expect(plainLines, `${label}: stray non-envelope stdout`).toEqual([]);
+  }
+  return parsed;
+}
+
+// The four payload shapes a hook must survive. Claude Code should never send the last two,
+// but a truncated pipe, a protocol change or a third-party wrapper can — and a non-zero exit
+// or a crash here degrades the user's session with no error surface.
+const MALFORMED = [
+  ['empty stdin', ''],
+  ['invalid JSON', 'not json at all {{{'],
+  ['valid JSON, required fields missing', '{}'],
+  ['unexpected types', JSON.stringify({
+    session_id: [], tool_name: 42, tool_input: 'not-an-object', tool_response: { a: 1 },
+    prompt: { b: 2 }, transcript_path: 17, source: false,
+  })],
+];
+
+/**
+ * Fire the four malformed payloads at one surface (in parallel — each gets its own cwd, so
+ * they share no episode buffer or session file) and assert the resilience contract.
+ *
+ * @param {string} label   surface name
+ * @param {object} spec    the surface's envelope contract (see expectHookStdout)
+ * @param {(payload: string, cwd: string) => Promise<object>} run
+ */
+async function expectMalformedResilience(label, spec, run) {
+  const slug = label.replace(/[^a-z0-9]/gi, '').slice(0, 24);
+  const results = await Promise.all(MALFORMED.map(([name, payload], i) =>
+    run(payload, workDir(`mal-${slug}-${i}`)).then((r) => [name, r])));
+  for (const [name, r] of results) {
+    const where = `${label} — ${name}`;
+    expect(r.code, `${where}: exited ${r.code} (a non-zero hook exit degrades the host session)\nstdout: ${r.stdout}\nstderr: ${r.stderr}`).toBe(0);
+    expect(STACK_TRACE.test(r.stdout), `${where}: stack trace reached stdout:\n${r.stdout}`).toBe(false);
+    expectHookStdout(r.stdout, { ...spec, label: where });
+  }
+}
+
+// ─── Setup / teardown ──────────────────────────────────────────────────────────────
+
+beforeAll(() => {
+  ROOT = mkdtempSync(join(tmpdir(), 'mem-hooksweep-'));
+  DATA_DIR = join(ROOT, 'data');
+  RUNTIME_DIR = join(DATA_DIR, 'runtime');
+  HOME_DIR = join(ROOT, 'home');
+  mkdirSync(join(HOME_DIR, '.claude'), { recursive: true });
+  mkdirSync(DATA_DIR, { recursive: true });
+  repoClaudeMdSnapshot = existsSync(REPO_CLAUDE_MD) ? readFileSync(REPO_CLAUDE_MD, 'utf8') : null;
+
+  BASE_ENV = { ...process.env };
+  // Scrub the developer's OWN plugin flags before setting ours. A dev shell running this
+  // plugin exports CLAUDE_MEM_SUBAGENT_INJECT / CLAUDE_MEM_TASK_IMPERATIVE / MEM_QUIET_HOOKS
+  // etc., and `...process.env` hands every one of them to the spawned hook — which silently
+  // flips default-OFF surfaces on (the #8608 leak class vitest.config.mjs scrubs for the
+  // runner, but children get their env from here). Everything this sweep depends on is set
+  // explicitly below; anything else must be at its shipped default.
+  for (const k of Object.keys(BASE_ENV)) {
+    if (/^(CLAUDE_MEM_|MEM_|CLAUDE_PLUGIN_)/.test(k)) delete BASE_ENV[k];
+  }
+  Object.assign(BASE_ENV, {
+    HOME: HOME_DIR,
+    CLAUDE_MEM_DIR: DATA_DIR,
+    // No reachable LLM by default: haiku-client's detectMode() falls back to 'cli' with no
+    // API key and would spawn the real `claude`. The four worker cases that need an LLM
+    // answer override this with scripts/mock-claude.mjs.
+    CLAUDE_CODE_PATH: join(ROOT, 'no-such-claude-binary'),
+    ANTHROPIC_API_KEY: '',
+    OPENROUTER_API_KEY: '',
+    CLAUDE_MEM_SKIP_UPDATE: '1',        // no GitHub release fetch (banner + update-check)
+    CLAUDE_MEM_SKIP_EPISODE_LLM: '1',   // no detached llm-episode worker on a flush
+    CLAUDE_MEM_SKIP_COMPRESS: '1',      // no detached auto-compress from SessionStart
+    CLAUDE_MEM_SKIP_OPTIMIZE: '1',      // no detached llm-optimize from SessionStart
+    CLAUDE_MEM_SKIP_MAINTAIN: '1',      // no detached auto-maintain from SessionStart
+    CLAUDE_MEM_SKIP_SAVE_ENRICH: '1',   // no detached enrich-save from a CLI seed
+    CLAUDE_MEM_SKIP_REPOS: '1',
+    CLAUDE_MEM_NO_DELAY: '1',           // background workers skip their 0.5-5s jitter
+  });
+  // See isolation contract #2: cwd must be the ONLY project source.
+  delete BASE_ENV.CLAUDE_PROJECT_DIR;
+  delete BASE_ENV.PWD;
+});
+
+afterAll(async () => {
+  // The Stop handler spawns a detached llm-summary worker; give it a moment to finish so it
+  // cannot recreate the data dir after rmSync (it would resolve CLAUDE_MEM_DIR and mkdir it).
+  await new Promise((r) => setTimeout(r, 500));
+  try {
+    // Isolation contract #4: no hook fire may have touched this repo's own CLAUDE.md.
+    // Inside the try so that FIRING it still removes the sandbox.
+    if (repoClaudeMdSnapshot !== null) {
+      expect(readFileSync(REPO_CLAUDE_MD, 'utf8')).toBe(repoClaudeMdSnapshot);
+    }
+  } finally {
+    try { rmSync(ROOT, { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+});
+
+// ─── Coverage guards ───────────────────────────────────────────────────────────────
+
+describe('hook feature sweep: registered surface', () => {
+  it('every event hook.mjs dispatches has a sweep case', () => {
+    // Parsed out of hook.mjs's own switch, so adding `case 'foo':` without an
+    // itHook('hook.mjs foo', …) case fails here — and cannot be silenced by editing a list.
+    const dispatched = dispatchedEvents().map((e) => `hook.mjs ${e}`).sort();
+    const swept = [...SWEPT].filter((s) => s.startsWith('hook.mjs ')).sort();
+    expect(swept).toEqual(dispatched);
+  });
+
+  it('every hook entry hooks/hooks.json registers has a sweep case', () => {
+    const registered = [...registeredEntries()].filter((e) => !UNSWEPT_BY_DESIGN.has(e)).sort();
+    const missing = registered.filter((e) => !SWEPT.has(e));
+    expect(missing, 'registered hook entries with no sweep case').toEqual([]);
+    // The exclusion cannot silently grow: every name in it must still be registered.
+    for (const skipped of UNSWEPT_BY_DESIGN) expect([...registeredEntries()]).toContain(skipped);
+  });
+
+  it('every sweep case names a real entry point (no phantom coverage)', () => {
+    const dispatched = dispatchedEvents();
+    for (const surface of SWEPT) {
+      if (surface.startsWith('hook.mjs ')) {
+        expect(dispatched, `sweep case "${surface}" names an event hook.mjs does not dispatch`)
+          .toContain(surface.slice('hook.mjs '.length));
+      } else {
+        expect(existsSync(join(REPO, surface)), `sweep case "${surface}" names a missing file`).toBe(true);
+      }
+    }
+  });
+});
+
+// ─── hook.mjs: the five foreground Claude Code events ──────────────────────────────
+
+describe('hook feature sweep: hook.mjs foreground events', () => {
+  itHook('hook.mjs session-start', async () => {
+    const NAME = 'hs-session';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const TITLE = 'Fixed the widget cache invalidation race in lib/widget-cache.mjs';
+    await seedObs(cwd, TITLE, ['--type', 'bugfix', '--importance', '3',
+      '--lesson', 'Invalidate the widget cache on write, never on read']);
+    await cli(['activity', 'save', '--type', 'lesson', 'Session start sweep event', '--body', 'event body'], cwd);
+
+    const r = await hookEvent('session-start', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-hooksweep-session', source: 'startup' }),
+    });
+    expect(r.code, `session-start exited ${r.code}\n${r.stderr}`).toBe(0);
+
+    const envelopes = expectHookStdout(r.stdout, {
+      event: 'SessionStart', plainAllowed: true, label: 'hook.mjs session-start',
+    });
+    // The startup dashboard rides the JSON channel and must name the one event seeded above
+    // (a dashboard computed over the wrong project — or over the live DB — says "0 entries"
+    // or nothing at all).
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].hookSpecificOutput.additionalContext).toContain('mem events: 1 entries');
+    expect(envelopes[0].suppressOutput).toBe(true);
+    // …and the context block rides the plain channel, carrying the seeded memory.
+    expect(r.stdout).toContain('<claude-mem-context>');
+    expect(r.stdout).toContain('</claude-mem-context>');
+    expect(r.stdout).toContain('Session start sweep event');
+    expect(r.stdout).toContain('Fixed the widget cache invalidation race');
+
+    // Side effects landed in the SANDBOX, under the project derived from the sandbox cwd.
+    expect(withDb((db) => db.prepare('SELECT status FROM sdk_sessions WHERE project = ?').get(project)))
+      .toMatchObject({ status: 'active' });
+    expect(existsSync(join(RUNTIME_DIR, `session-${project}`))).toBe(true);
+    // SessionStart auto-adopts, which writes <cwd>/CLAUDE.md — here, and never the repo's
+    // (afterAll asserts the negative half).
+    expect(readFileSync(join(cwd, 'CLAUDE.md'), 'utf8')).toContain('<!-- claude-mem-lite:begin');
+
+    await expectMalformedResilience(
+      'hook.mjs session-start',
+      { event: 'SessionStart', plainAllowed: true },
+      (stdin, malCwd) => hookEvent('session-start', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('hook.mjs user-prompt', async () => {
+    const NAME = 'hs-uprompt';
+    const cwd = workDir(NAME);
+    const LESSON = 'Invalidate the widget cache on write, never on read';
+    const targetId = await seedObs(cwd, 'Fixed the widget cache invalidation race in lib/widget-cache.mjs',
+      ['--type', 'bugfix', '--importance', '3', '--lesson', LESSON]);
+    // handleUserPrompt excludes the 5 most recent importance>=2 rows (its "key context" set)
+    // from the <memory-context> block. Five later, unrelated importance-2 rows fill that set
+    // so the target stays eligible — without them the case would assert an injection the
+    // handler suppresses by design.
+    for (const filler of [
+      'Chose postgres over sqlite for the billing ledger store',
+      'Renamed the deployment runbook chapter headings',
+      'Documented the nightly export window change',
+      'Split the retry helper out of the transport module',
+      'Trimmed the onboarding screenshot set',
+    ]) await cli(['save', filler, '--type', 'decision', '--importance', '2'], cwd);
+
+    const PROMPT = 'why does the widget cache invalidation race happen and how do we fix it';
+    const r = await hookEvent('user-prompt', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-hooksweep-prompt', prompt: PROMPT }),
+    });
+    expect(r.code, `user-prompt exited ${r.code}\n${r.stderr}`).toBe(0);
+    expectHookStdout(r.stdout, { event: null, plainAllowed: true, label: 'hook.mjs user-prompt' });
+
+    // Functional: the matching memory is injected, by id and with its lesson.
+    expect(r.stdout).toContain('<memory-context relevance="high">');
+    expect(r.stdout).toContain('</memory-context>');
+    expect(r.stdout).toContain(`(#${targetId})`);
+    expect(r.stdout).toContain(LESSON);
+
+    // …and the prompt is persisted to the sandbox DB under the cwd-derived project.
+    const prompt = withDb((db) => db.prepare(`
+      SELECT p.prompt_text, s.project FROM user_prompts p
+      JOIN sdk_sessions s ON s.content_session_id = p.content_session_id
+      WHERE p.prompt_text = ?
+    `).get(PROMPT));
+    expect(prompt).toMatchObject({ prompt_text: PROMPT, project: projectOf(NAME) });
+
+    await expectMalformedResilience(
+      'hook.mjs user-prompt',
+      { event: null, plainAllowed: true },
+      (stdin, malCwd) => hookEvent('user-prompt', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('hook.mjs post-tool-use', async () => {
+    const NAME = 'hs-posttool';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const recallId = await seedObs(cwd, 'Fixed the widget cache invalidation race in lib/widget-cache.mjs',
+      ['--type', 'bugfix', '--importance', '3', '--lesson', 'Invalidate the widget cache on write, never on read']);
+
+    // (a) A failing test command is a hard error → error-triggered recall, delivered on the
+    // JSON channel (MED-3: it used to be a raw multi-line write that corrupted a co-emitted
+    // episode receipt).
+    const errFire = await hookEvent('post-tool-use', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-post', tool_name: 'Bash',
+        tool_input: { command: 'node --test widget-cache.test.mjs' },
+        tool_response: 'FAIL widget-cache.test.mjs\nError: widget cache invalidation race detected\nnpm ERR! Test failed. See above for more details.',
+      }),
+    });
+    expect(errFire.code, `post-tool-use exited ${errFire.code}\n${errFire.stderr}`).toBe(0);
+    const [recall] = expectHookStdout(errFire.stdout, {
+      event: 'PostToolUse', plainAllowed: false, label: 'hook.mjs post-tool-use (error recall)',
+    });
+    expect(recall, `no error-recall envelope emitted:\n${errFire.stdout}`).toBeTruthy();
+    expect(recall.hookSpecificOutput.additionalContext).toContain('Related memories found for this error');
+    expect(recall.hookSpecificOutput.additionalContext).toContain(`#${recallId}`);
+
+    // (b) An Edit is buffered into the episode file — the surface's real job between flushes.
+    const editFire = await hookEvent('post-tool-use', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-post', tool_name: 'Edit',
+        tool_input: { file_path: join(cwd, 'widget-cache.mjs'), old_string: 'readPath()', new_string: 'writePath()' },
+        tool_response: 'The file has been updated successfully with the new content applied.',
+      }),
+    });
+    expect(editFire.code).toBe(0);
+    expect(editFire.stdout).toBe('');   // buffering is silent; only a flush emits a receipt
+
+    const episode = JSON.parse(readFileSync(join(RUNTIME_DIR, `ep-${project}.json`), 'utf8'));
+    expect(episode.project).toBe(project);
+    expect(episode.entries.map((e) => e.tool)).toEqual(['Bash', 'Edit']);
+    expect(episode.entries[0].isHardError).toBe(true);
+    expect(episode.entries[1].files).toContain(join(cwd, 'widget-cache.mjs'));
+    expect(episode.entries[1].ccSession).toBe('cc-hooksweep-post');
+
+    await expectMalformedResilience(
+      'hook.mjs post-tool-use',
+      { event: 'PostToolUse', plainAllowed: false },
+      (stdin, malCwd) => hookEvent('post-tool-use', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('hook.mjs stop', async () => {
+    const NAME = 'hs-stop';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    // A Write to a schema file: significant (an edit), and substantive enough to clear the
+    // write-side noise gate (rule importance 2 from the `schema.` filename heuristic), so the
+    // flush leaves a durable row rather than being dropped as auto-capture noise.
+    const schemaFile = join(cwd, 'db-schema.sql');
+    const post = await hookEvent('post-tool-use', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-stop', tool_name: 'Write',
+        tool_input: { file_path: schemaFile, content: 'CREATE TABLE widgets (id INTEGER, cache_epoch INTEGER);\n' },
+        tool_response: `File created successfully at: ${schemaFile}`,
+      }),
+    });
+    expect(post.code).toBe(0);
+    expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(true);
+
+    const r = await hookEvent('stop', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-hooksweep-stop', transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+    });
+    expect(r.code, `stop exited ${r.code}\n${r.stderr}`).toBe(0);
+    // Stop's schema rejects hookSpecificOutput at the root (v2.33.4) — silence is the contract.
+    expect(r.stdout).toBe('');
+    expectHookStdout(r.stdout, { event: null, plainAllowed: false, label: 'hook.mjs stop' });
+
+    // Functional: the buffered episode was flushed to a readable observation, and the
+    // session was closed out.
+    expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(false);
+    const row = withDb((db) => db.prepare(
+      'SELECT title, type, importance, files_modified FROM observations WHERE project = ?').get(project));
+    expect(row, `Stop did not flush an observation for ${project}`).toBeTruthy();
+    expect(row.title).toBe('Modified db-schema.sql');
+    expect(row.files_modified).toContain('db-schema.sql');
+    expect(withDb((db) => db.prepare('SELECT status FROM sdk_sessions WHERE project = ?').get(project)))
+      .toMatchObject({ status: 'completed' });
+
+    await expectMalformedResilience(
+      'hook.mjs stop',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('stop', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('hook.mjs pre-compact', async () => {
+    const NAME = 'hs-precompact';
+    const cwd = workDir(NAME);
+    await seedObs(cwd, 'Traced the retry backoff reset to every redirect hop',
+      ['--type', 'discovery', '--importance', '3', '--lesson', 'Reset the backoff only on a fresh request, not per hop']);
+
+    const r = await hookEvent('pre-compact', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-hooksweep-compact', trigger: 'auto' }),
+    });
+    expect(r.code, `pre-compact exited ${r.code}\n${r.stderr}`).toBe(0);
+    expectHookStdout(r.stdout, { event: null, plainAllowed: true, label: 'hook.mjs pre-compact' });
+    // Functional: memory is re-emitted BEFORE compaction so the summarizer sees it.
+    expect(r.stdout.startsWith('<claude-mem-context>')).toBe(true);
+    expect(r.stdout.trimEnd().endsWith('</claude-mem-context>')).toBe(true);
+    expect(r.stdout).toContain('Traced the retry backoff reset to every redirect hop');
+
+    await expectMalformedResilience(
+      'hook.mjs pre-compact',
+      { event: null, plainAllowed: true },
+      (stdin, malCwd) => hookEvent('pre-compact', { cwd: malCwd, stdin }),
+    );
+  });
+});
+
+// ─── hook.mjs: the background workers (spawnBackground / detached) ──────────────────
+// These run under CLAUDE_MEM_HOOK_RUNNING=1 — the recursion guard exits every other event
+// immediately, so without it each case would assert "exit 0, no output" against a process
+// that never ran its handler. They are spawned with stdio:'ignore' in production, so their
+// stdout contract is silence.
+
+describe('hook feature sweep: hook.mjs background workers', () => {
+  const BG = { CLAUDE_MEM_HOOK_RUNNING: '1' };
+  const WITH_MOCK_LLM = { ...BG, CLAUDE_CODE_PATH: MOCK_CLAUDE };
+
+  /** Every worker: exit 0, silent stdout, no network signature. */
+  function expectSilentWorker(label, r) {
+    expect(r.code, `${label} exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(r.stdout, `${label} wrote to stdout; background workers are stdio:'ignore'`).toBe('');
+    expect(r.stdout + r.stderr, `${label} attempted network I/O`).not.toMatch(/ENOTFOUND|ETIMEDOUT|fetch failed/);
+    expectHookStdout(r.stdout, { event: null, plainAllowed: false, label });
+  }
+
+  itHook('hook.mjs llm-episode', async () => {
+    const NAME = 'hs-episode';
+    const cwd = workDir(NAME);
+    const savedId = await seedObs(cwd, 'Immediate observation the episode worker upgrades', ['--type', 'change', '--importance', '1']);
+    mkdirSync(RUNTIME_DIR, { recursive: true });
+    const flushFile = join(RUNTIME_DIR, 'ep-flush-hooksweep.json');
+    writeFileSync(flushFile, JSON.stringify({
+      sessionId: 'hook-hooksweep-episode', project: projectOf(NAME), savedId,
+      entries: [{
+        tool: 'Edit', desc: 'transport.mjs: split the retry helper out of the transport module',
+        files: [join(cwd, 'transport.mjs')], ts: Date.now(), isError: false, isSignificant: true,
+      }],
+      files: [join(cwd, 'transport.mjs')], filesRead: [], startedAt: Date.now(), lastAt: Date.now(),
+    }));
+
+    // Fired exactly as spawnBackground('llm-episode', flushFile) does — the flush file is
+    // argv[3], and without it the worker is a no-op.
+    const r = await fire(process.execPath, [HOOK_PATH, 'llm-episode', flushFile], { cwd, env: WITH_MOCK_LLM, timeout: 60000 });
+    expectSilentWorker('hook.mjs llm-episode', r);
+    // Functional: the pre-saved row is upgraded IN PLACE from the LLM answer, and the flush
+    // file is consumed (a leaked one is retried forever — the v2.x guard in handleLLMEpisode).
+    const row = withDb((db) => db.prepare('SELECT title, narrative, lesson_learned, concepts FROM observations WHERE id = ?').get(savedId));
+    expect(row.title).toBe('Mock single observation');
+    expect(row.narrative).toBe('Mock narrative from LLM extraction describing what happened.');
+    expect(row.lesson_learned).toContain('Mock lesson');
+    expect(row.concepts).toContain('mock-concept');
+    expect(existsSync(flushFile)).toBe(false);
+
+    await expectMalformedResilience(
+      'hook.mjs llm-episode',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('llm-episode', { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+
+  itHook('hook.mjs llm-summary', async () => {
+    const NAME = 'hs-summary';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const SESSION = 'hook-hooksweep-summary';
+    // The worker summarizes a session's own observations (memory_session_id keyed) plus its
+    // prompts, so the fixture is a completed session with one of each.
+    withDb((db) => {
+      const now = Date.now();
+      db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+                  VALUES (?, ?, ?, ?, ?, 'completed')`).run(SESSION, SESSION, project, new Date(now).toISOString(), now);
+      db.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+                  VALUES (?, ?, ?, ?, ?)`).run(SESSION, 'trace the widget cache invalidation race', 1, new Date(now).toISOString(), now);
+      db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, narrative, text, importance, created_at, created_at_epoch)
+                  VALUES (?, ?, 'bugfix', ?, ?, ?, 2, ?, ?)`).run(
+        SESSION, project, 'Fixed the widget cache invalidation race',
+        'Traced the race to a read-path invalidation and moved it to the write path.',
+        'Traced the race to a read-path invalidation and moved it to the write path.',
+        new Date(now).toISOString(), now);
+    });
+
+    // handleLLMSummary takes its session id + project from argv — fired the way
+    // spawnBackground('llm-summary', sessionId, project) does.
+    const r = await fire(process.execPath, [HOOK_PATH, 'llm-summary', SESSION, project],
+      { cwd, env: WITH_MOCK_LLM, timeout: 60000 });
+    expectSilentWorker('hook.mjs llm-summary', r);
+    // Functional: the session now has a persisted summary built from the LLM answer.
+    const summary = withDb((db) => db.prepare(
+      'SELECT request, completed, next_steps, project FROM session_summaries WHERE memory_session_id = ?').get(SESSION));
+    expect(summary, 'llm-summary wrote no session_summaries row').toBeTruthy();
+    expect(summary).toMatchObject({
+      request: 'Mock session request description',
+      completed: 'Mock accomplishments',
+      next_steps: 'Mock suggested follow-up',
+      project,
+    });
+
+    await expectMalformedResilience(
+      'hook.mjs llm-summary',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('llm-summary', { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+
+  itHook('hook.mjs llm-optimize', async () => {
+    const NAME = 'hs-optimize';
+    const cwd = workDir(NAME);
+    // A wide-scope re-enrich candidate: bugfix, no lesson, narrative > 100 chars
+    // (hook-optimize.mjs findReenrichCandidates). The daily worker passes scope 'wide'.
+    const id = await seedObs(cwd,
+      'Reworked the queue drain sequence so the flush waits for in-flight acknowledgements before closing the socket, which removed the intermittent truncation on shutdown.',
+      ['--type', 'bugfix', '--project', 'hooksweep-optimize']);
+    expect(withDb((db) => db.prepare('SELECT optimized_at FROM observations WHERE id = ?').get(id)).optimized_at).toBeNull();
+
+    const r = await hookEvent('llm-optimize', { cwd, stdin: '', env: WITH_MOCK_LLM, timeout: 60000 });
+    expectSilentWorker('hook.mjs llm-optimize', r);
+    // Functional: the candidate was re-enriched and stamped, so a later pass skips it.
+    const row = withDb((db) => db.prepare('SELECT lesson_learned, concepts, optimized_at FROM observations WHERE id = ?').get(id));
+    expect(row.lesson_learned).toContain('Mock lesson');
+    expect(row.concepts).toContain('mock-concept');
+    expect(typeof row.optimized_at).toBe('number');
+
+    await expectMalformedResilience(
+      'hook.mjs llm-optimize',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('llm-optimize', { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+
+  itHook('hook.mjs enrich-save', async () => {
+    const NAME = 'hs-enrich';
+    const cwd = workDir(NAME);
+    const id = await seedObs(cwd, 'Traced a flaky upload to an unclosed multipart stream in the uploader',
+      ['--type', 'bugfix', '--project', 'hooksweep-enrich']);
+    expect(withDb((db) => db.prepare('SELECT lesson_learned, search_aliases FROM observations WHERE id = ?').get(id)))
+      .toMatchObject({ lesson_learned: null, search_aliases: null });
+
+    const r = await fire(process.execPath, [HOOK_PATH, 'enrich-save', String(id)], { cwd, env: WITH_MOCK_LLM, timeout: 60000 });
+    expectSilentWorker('hook.mjs enrich-save', r);
+    // Functional: the fill-only-empty backfill landed on the row the id names.
+    const row = withDb((db) => db.prepare('SELECT lesson_learned, search_aliases FROM observations WHERE id = ?').get(id));
+    expect(row.lesson_learned).toContain('Mock distilled lesson');
+    expect(row.search_aliases).toContain('mock alias one');
+
+    // The id arrives as argv, so the malformed arm covers a non-numeric id too.
+    const badId = await fire(process.execPath, [HOOK_PATH, 'enrich-save', 'not-a-number'], { cwd, env: BG });
+    expectSilentWorker('hook.mjs enrich-save (non-numeric id)', badId);
+    await expectMalformedResilience(
+      'hook.mjs enrich-save',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => fire(process.execPath, [HOOK_PATH, 'enrich-save', String(id)], { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+
+  itHook('hook.mjs auto-compress', async () => {
+    const NAME = 'hs-compress';
+    const cwd = workDir(NAME);
+    const P = 'hooksweep-compress';
+    // Compression needs >=3 rows of one project-week, >=60d old, importance <=1, lesson-free.
+    for (const text of [
+      'Renamed the changelog heading ahead of the quarterly audit',
+      'Bumped the linter rule covering trailing commas in vendor files',
+      'Removed an obsolete screenshot from the onboarding docs folder',
+    ]) await cli(['save', text, '--importance', '1', '--project', P], cwd);
+    expect(ageProject(P, 90)).toBe(3);
+
+    const r = await hookEvent('auto-compress', { cwd, stdin: '', env: BG, timeout: 60000 });
+    expectSilentWorker('hook.mjs auto-compress', r);
+    // Functional: the three originals now point at one weekly summary row.
+    const rows = withDb((db) => db.prepare('SELECT id, title, compressed_into FROM observations WHERE project = ?').all(P));
+    const compressed = rows.filter((o) => o.compressed_into);
+    const survivors = rows.filter((o) => !o.compressed_into);
+    expect(compressed).toHaveLength(3);
+    expect(survivors).toHaveLength(1);
+    expect(new Set(compressed.map((o) => o.compressed_into))).toEqual(new Set([survivors[0].id]));
+    expect(survivors[0].title).toMatch(/^Weekly summary:/);
+
+    await expectMalformedResilience(
+      'hook.mjs auto-compress',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('auto-compress', { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+
+  itHook('hook.mjs auto-maintain', async () => {
+    const NAME = 'hs-maintain';
+    const cwd = workDir(NAME);
+    const P = 'hooksweep-maintain';
+    const id = await seedObs(cwd, 'Stale row awaiting the idle decay sweep in maintenance', ['--importance', '1', '--project', P]);
+    expect(ageProject(P, 90)).toBe(1);
+
+    const r = await hookEvent('auto-maintain', { cwd, stdin: '', env: BG, timeout: 60000 });
+    expectSilentWorker('hook.mjs auto-maintain', r);
+    // Functional: the idle row is marked pending-purge, and the 24h gate file is stamped so
+    // the next SessionStart does not re-run the sweep.
+    expect(withDb((db) => db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id)).compressed_into)
+      .toBe(COMPRESSED_PENDING_PURGE);
+    const gate = JSON.parse(readFileSync(join(RUNTIME_DIR, 'last-auto-maintain.json'), 'utf8'));
+    expect(Date.now() - gate.epoch).toBeLessThan(120000);
+
+    await expectMalformedResilience(
+      'hook.mjs auto-maintain',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('auto-maintain', { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+
+  itHook('hook.mjs update-check', async () => {
+    const NAME = 'hs-update';
+    const cwd = workDir(NAME);
+    const stateFile = join(RUNTIME_DIR, 'update-state.json');
+    expect(existsSync(stateFile)).toBe(false);
+
+    const r = await hookEvent('update-check', { cwd, stdin: '', env: BG, timeout: 60000 });
+    expectSilentWorker('hook.mjs update-check', r);
+    // Functional (the arm this suite can own): CLAUDE_MEM_SKIP_UPDATE must suppress the
+    // GitHub fetch entirely — no release lookup, so no update-state.json is written and no
+    // banner can appear. The fetch arm itself is deliberately NOT exercised here (network);
+    // tests/hook-update.test.mjs covers checkForUpdate's parsing and 24h gating in-process.
+    expect(existsSync(stateFile), 'update-check wrote update-state.json despite CLAUDE_MEM_SKIP_UPDATE=1').toBe(false);
+
+    await expectMalformedResilience(
+      'hook.mjs update-check',
+      { event: null, plainAllowed: false },
+      (stdin, malCwd) => hookEvent('update-check', { cwd: malCwd, stdin, env: BG }),
+    );
+  });
+});
+
+// ─── The standalone hook scripts (these never go through hook.mjs) ──────────────────
+// v3.60.0 shipped a self-heal that only covered hook.mjs, because these five entry points
+// bypass it entirely — which is exactly why they get their own per-surface pass here.
+
+describe('hook feature sweep: standalone hook scripts', () => {
+  itHook('scripts/pre-tool-recall.js', async () => {
+    const NAME = 'hs-pretool';
+    const cwd = workDir(NAME);
+    const target = join(cwd, 'widget-cache.mjs');
+    writeFileSync(target, 'export function writeWidget() {\n  invalidateWidgetCache();\n}\n');
+    const LESSON = 'Always call invalidateWidgetCache after a write, never on read';
+    const id = await seedObs(cwd, 'Fixed the widget cache invalidation race', [
+      '--type', 'bugfix', '--importance', '3', '--lesson', LESSON, '--files', target,
+    ]);
+
+    const r = await hookScript('pre-tool-recall.js', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-pretool', tool_name: 'Edit',
+        tool_input: { file_path: target, old_string: 'invalidateWidgetCache()', new_string: 'noop()' },
+      }),
+    });
+    expect(r.code, `pre-tool-recall exited ${r.code}\n${r.stderr}`).toBe(0);
+    const [envelope] = expectHookStdout(r.stdout, {
+      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-tool-recall.js',
+    });
+    expect(envelope, `no PreToolUse envelope emitted:\n${r.stdout}`).toBeTruthy();
+    // Functional: the file's own lesson reaches the agent before the edit, with its id.
+    const ctx = envelope.hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('Lessons for widget-cache.mjs');
+    expect(ctx).toContain(`#${id}`);
+    expect(ctx).toContain(LESSON);
+    // …and the session-scoped cooldown was written to the SANDBOX runtime dir, carrying the
+    // ids the episode-flush cite-back hint later reads.
+    const cooldown = JSON.parse(readFileSync(join(RUNTIME_DIR, 'pre-recall-cooldown-cc-hooksweep-pretool.json'), 'utf8'));
+    expect(cooldown[target].lessonIds).toContain(id);
+    expect(cooldown[target].mode).toBe('edit');
+
+    await expectMalformedResilience(
+      'scripts/pre-tool-recall.js',
+      { event: 'PreToolUse', plainAllowed: false },
+      (stdin, malCwd) => hookScript('pre-tool-recall.js', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('scripts/post-tool-recall.js', async () => {
+    const NAME = 'hs-postrecall';
+    const cwd = workDir(NAME);
+    const target = join(cwd, 'widget-cache.mjs');
+    writeFileSync(target, 'export function writeWidget() {\n  invalidateWidgetCache();\n}\n');
+    const id = await seedObs(cwd, 'Fixed the widget cache invalidation race', [
+      '--type', 'bugfix', '--importance', '3',
+      '--lesson', 'Always call invalidateWidgetCache after a write, never on read', '--files', target,
+    ]);
+    const BIND = { CLAUDE_MEM_SALIENCE: 'bind' };
+    const stdin = JSON.stringify({
+      session_id: 'cc-hooksweep-bind', tool_name: 'Edit',
+      tool_input: { file_path: target, old_string: 'invalidateWidgetCache()', new_string: 'noop()' },
+    });
+
+    // The pre-edit half records which identifiers the lesson names AND the file still has;
+    // driving the real sibling (not a hand-written cooldown) is what makes this a check of
+    // the pair rather than of this script's parser.
+    const pre = await hookScript('pre-tool-recall.js', { cwd, stdin, env: BIND });
+    expect(pre.code).toBe(0);
+    // Now perform the edit the lesson warns about: the flagged identifier is gone.
+    writeFileSync(target, 'export function writeWidget() {\n  noop();\n}\n');
+
+    const r = await hookScript('post-tool-recall.js', { cwd, stdin, env: BIND });
+    expect(r.code, `post-tool-recall exited ${r.code}\n${r.stderr}`).toBe(0);
+    const [envelope] = expectHookStdout(r.stdout, {
+      event: 'PostToolUse', plainAllowed: false, label: 'scripts/post-tool-recall.js',
+    });
+    expect(envelope, `no PostToolUse envelope emitted:\n${r.stdout}`).toBeTruthy();
+    expect(envelope.hookSpecificOutput.additionalContext).toContain('dropped `invalidateWidgetCache`');
+    expect(envelope.hookSpecificOutput.additionalContext).toContain(`#${id}`);
+
+    // Default salience is not `bind`, and the whole surface is off then — silence, not noise.
+    const off = await hookScript('post-tool-recall.js', { cwd, stdin });
+    expect(off.code).toBe(0);
+    expect(off.stdout).toBe('');
+
+    await expectMalformedResilience(
+      'scripts/post-tool-recall.js',
+      { event: 'PostToolUse', plainAllowed: false },
+      (stdinPayload, malCwd) => hookScript('post-tool-recall.js', { cwd: malCwd, stdin: stdinPayload, env: BIND }),
+    );
+  });
+
+  itHook('scripts/pre-skill-bridge.js', async () => {
+    const NAME = 'hs-skill';
+    const cwd = workDir(NAME);
+    const BODY = 'HOOKSWEEPSKILLBODY — the managed skill body must reach the caller verbatim.';
+    const skillDir = join(DATA_DIR, 'managed', 'skills', 'hooksweep-skill');
+    mkdirSync(skillDir, { recursive: true });
+    const skillPath = join(skillDir, 'SKILL.md');
+    writeFileSync(skillPath, `---\nname: hooksweep-skill\ndescription: hook sweep fixture skill\n---\n\n${BODY}\n`);
+    await cli(['registry', 'import', '--name', 'hooksweep-skill', '--resource-type', 'skill',
+      '--local-path', skillPath, '--capability-summary', 'hook sweep fixture skill'], cwd);
+
+    const r = await hookScript('pre-skill-bridge.js', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-hooksweep-skill', tool_name: 'Skill', tool_input: { skill: 'hooksweep-skill' } }),
+    });
+    expect(r.code, `pre-skill-bridge exited ${r.code}\n${r.stderr}`).toBe(0);
+    const [envelope] = expectHookStdout(r.stdout, {
+      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-skill-bridge.js',
+    });
+    expect(envelope, `no PreToolUse envelope emitted:\n${r.stdout}`).toBeTruthy();
+    const ctx = envelope.hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('<skill-bridge name="hooksweep-skill" source="managed">');
+    expect(ctx).toContain(BODY);                      // file contents, not just a pointer
+    expect(ctx).toContain('</skill-bridge>');
+
+    // A skill the registry does not know must stay silent — the bridge only intercepts
+    // managed skills, and a stray envelope here would shadow Claude Code's own Skill load.
+    const unknown = await hookScript('pre-skill-bridge.js', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-hooksweep-skill', tool_name: 'Skill', tool_input: { skill: 'zqxwvrunk' } }),
+    });
+    expect(unknown.code).toBe(0);
+    expect(unknown.stdout).toBe('');
+
+    await expectMalformedResilience(
+      'scripts/pre-skill-bridge.js',
+      { event: 'PreToolUse', plainAllowed: false },
+      (stdin, malCwd) => hookScript('pre-skill-bridge.js', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('scripts/pre-agent-inject.js', async () => {
+    const NAME = 'hs-agent';
+    const cwd = workDir(NAME);
+    const LESSON = 'Always call invalidateWidgetCache after a write, never on read';
+    const id = await seedObs(cwd, 'Fixed the widget cache invalidation race',
+      ['--type', 'bugfix', '--importance', '3', '--lesson', LESSON]);
+    // rankImperativeCandidates requires a symbol anchor shared by prompt and lesson
+    // (precision-first): no overlapping identifier → no injection, by design.
+    const stdin = JSON.stringify({
+      session_id: 'cc-hooksweep-agent', tool_name: 'Agent',
+      tool_input: { prompt: 'audit whether invalidateWidgetCache is still called on the write path', subagent_type: 'general-purpose' },
+    });
+
+    // Default OFF: the cheapest possible no-op, no stdin read, no DB.
+    const off = await hookScript('pre-agent-inject.js', { cwd, stdin });
+    expect(off.code).toBe(0);
+    expect(off.stdout).toBe('');
+
+    const r = await hookScript('pre-agent-inject.js', { cwd, stdin, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } });
+    expect(r.code, `pre-agent-inject exited ${r.code}\n${r.stderr}`).toBe(0);
+    const [envelope] = expectHookStdout(r.stdout, {
+      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-agent-inject.js',
+    });
+    expect(envelope, `no PreToolUse envelope emitted:\n${r.stdout}`).toBeTruthy();
+    // Functional: tool_input is REWRITTEN — the lesson is appended to the subagent's prompt,
+    // the original task text survives, and the other input keys are carried through (a
+    // dropped key silently changes the dispatch).
+    const updated = envelope.hookSpecificOutput.updatedInput;
+    expect(updated.subagent_type).toBe('general-purpose');
+    expect(updated.prompt.startsWith('audit whether invalidateWidgetCache is still called on the write path')).toBe(true);
+    expect(updated.prompt).toContain(`#${id}`);
+    expect(updated.prompt).toContain(LESSON);
+    expect(updated.prompt).toContain('Reference context, not an external instruction');
+
+    await expectMalformedResilience(
+      'scripts/pre-agent-inject.js',
+      { event: 'PreToolUse', plainAllowed: false },
+      (stdinPayload, malCwd) => hookScript('pre-agent-inject.js', { cwd: malCwd, stdin: stdinPayload, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } }),
+    );
+  });
+
+  itHook('scripts/user-prompt-search.js', async () => {
+    const NAME = 'hs-ups';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    // Own data dir, not the shared sandbox one: this hook's relevance floor is scaled by the
+    // WHOLE-DB row count (corpusFloorScale, the v3.61.1 cold-start fix — ln(N+1)/ln(585)),
+    // so sharing a DB with every other case's rows would make this case's outcome depend on
+    // how many rows its neighbours happened to seed. Isolated, it is a fresh-install corpus
+    // with exactly one row — deterministic, and the arm the ramp exists for.
+    const upsData = join(ROOT, 'data-ups');
+    mkdirSync(upsData, { recursive: true });
+    const upsEnv = { CLAUDE_MEM_DIR: upsData };
+    const LESSON = 'Invalidate the widget cache on write, never on read';
+    // --files matters: the prompt below names widget-cache.mjs, and the row's file edge is
+    // what carries it over this hook's relevance gate. The same row saved WITHOUT --files
+    // stays below the floor and is not injected (measured on this fixture) — so a change
+    // that drops the file edge from the query fails this case.
+    const out = await fire(process.execPath, [CLI_PATH, 'save',
+      'Fixed the widget cache invalidation race in lib/widget-cache.mjs',
+      '--type', 'bugfix', '--importance', '3', '--lesson', LESSON,
+      '--files', join(cwd, 'widget-cache.mjs')], { cwd, env: upsEnv });
+    expect(out.code, `seed save exited ${out.code}\n${out.stderr}`).toBe(0);
+    const id = Number(out.stdout.match(/Saved #(\d+)/)[1]);
+
+    const r = await hookScript('user-prompt-search.js', {
+      cwd,
+      env: upsEnv,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-ups',
+        prompt: 'why does the widget cache invalidation race happen in widget-cache.mjs',
+      }),
+    });
+    expect(r.code, `user-prompt-search exited ${r.code}\n${r.stderr}`).toBe(0);
+    // UserPromptSubmit delivers on the plain-text channel; a JSON envelope here would be a
+    // channel change, not a formatting one.
+    expectHookStdout(r.stdout, { event: null, plainAllowed: true, label: 'scripts/user-prompt-search.js' });
+    expect(r.stdout).toContain('[mem] FYI — Related memories');
+    expect(r.stdout).toContain(`#${id}`);
+    expect(r.stdout).toContain('Invalidate the widget cache on write');
+    // The injected ids are recorded so the sibling hook.mjs user-prompt pass and the next
+    // prompt inside the dedup window do not re-inject the same rows.
+    const injected = JSON.parse(readFileSync(join(upsData, 'runtime', `.claude-mem-injected-${project}`), 'utf8'));
+    expect(injected.ids).toContain(id);
+
+    await expectMalformedResilience(
+      'scripts/user-prompt-search.js',
+      { event: null, plainAllowed: true },
+      (stdin, malCwd) => hookScript('user-prompt-search.js', { cwd: malCwd, stdin, env: upsEnv }),
+    );
+  });
+
+  itHook('scripts/post-tool-use.sh', async () => {
+    const NAME = 'hs-prefilter';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+
+    // (a) Read: the ~5ms fast path records the file for episode context and returns without
+    // ever launching Node. The path lands in the SANDBOX runtime dir (CLAUDE_MEM_DIR-aware),
+    // under the project bash derives the same way inferProject() does.
+    const read = await bashPrefilter({
+      cwd, stdin: JSON.stringify({ tool_name: 'Read', tool_input: { file_path: '/repo/lib/widget-cache.mjs' } }),
+    });
+    expect(read.code).toBe(0);
+    expect(read.stdout).toBe('');
+    expect(readFileSync(join(RUNTIME_DIR, `reads-${project}.txt`), 'utf8').trim().split('\n'))
+      .toContain('/repo/lib/widget-cache.mjs');
+
+    // (b) A skip-listed tool costs nothing and reaches neither Node nor the episode buffer.
+    const skipped = await bashPrefilter({
+      cwd, stdin: JSON.stringify({ tool_name: 'Glob', tool_input: { pattern: '**/*.mjs' }, tool_response: 'a.mjs\nb.mjs' }),
+    });
+    expect(skipped.code).toBe(0);
+    expect(skipped.stdout).toBe('');
+    expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(false);
+
+    // (c) A non-skipped tool hands the SAME stdin off to Node — the handoff this prefilter
+    // exists to make, and the one place a shell-quoting slip would silently drop every
+    // observation. Proof it arrived: the episode buffer now holds the entry.
+    const editPayload = JSON.stringify({
+      session_id: 'cc-hooksweep-prefilter', tool_name: 'Edit',
+      tool_input: { file_path: join(cwd, 'transport.mjs'), old_string: 'retry()', new_string: 'retryWithBackoff()' },
+      tool_response: 'The file has been updated successfully with the new content applied.',
+    });
+    const handoff = await bashPrefilter({ cwd, stdin: editPayload, timeout: 60000 });
+    expect(handoff.code, `prefilter handoff exited ${handoff.code}\n${handoff.stderr}`).toBe(0);
+    expectHookStdout(handoff.stdout, {
+      event: 'PostToolUse', plainAllowed: false, label: 'scripts/post-tool-use.sh (Node handoff)',
+    });
+    const episode = JSON.parse(readFileSync(join(RUNTIME_DIR, `ep-${project}.json`), 'utf8'));
+    expect(episode.entries.map((e) => e.tool)).toEqual(['Edit']);
+    expect(episode.entries[0].files).toContain(join(cwd, 'transport.mjs'));
+
+    await expectMalformedResilience(
+      'scripts/post-tool-use.sh',
+      { event: 'PostToolUse', plainAllowed: false },
+      (stdin, malCwd) => bashPrefilter({ cwd: malCwd, stdin }),
+    );
+  });
+});
