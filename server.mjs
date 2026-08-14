@@ -1770,12 +1770,23 @@ async function runExport(db, args) {
   // A truncated backup is the failure mode this tool must never produce quietly: the old
   // note ("Results capped at N … increase limit (max 1000)") never said how much was
   // missing, and its advice was a dead end on a store past the ceiling. Name the real
-  // total, the number of rows left out, and the exact re-run that returns all of them.
+  // total, the number of rows left out, and a remedy that actually returns all of them.
+  //
+  // The remedy has to lead with a FILE REDIRECT (pre-tag review, 2026-08-14). Removing the
+  // 1000-row ceiling took away the only bound on an MCP export's size, and the 200 default
+  // is kept precisely because an MCP result IS model context — so "re-run with
+  // limit: <total>", the previous first suggestion, told the caller to put the entire store
+  // into one tool result (thin fixture rows measure ~612 bytes each, so a few-thousand-row
+  // store is megabytes in a single message), and a bare `cli.mjs export` had the same
+  // property unredirected. The limit re-run stays mentioned but demoted, with its cost
+  // stated: it is occasionally what the caller actually wants, and silently dropping it
+  // would send them back to guessing.
   let cap = '';
   if (moreAvailable) {
     const total = db.prepare(`SELECT COUNT(*) AS c FROM observations ${where}`).get(...params).c;
     cap = `\nWARNING — PARTIAL EXPORT, NOT A COMPLETE BACKUP: capped at ${exportLimit} of ${total} matching observations; ${total - exportLimit} rows are missing from this payload and restoring it would lose them.` +
-      `\nFor the complete set: re-run with limit: ${total}, or run \`${CLI_INVOKE} export\` (the CLI exports everything by default). Narrowing with date_from/date_to also works.`;
+      `\nFor a complete backup, write it to a FILE instead of pulling it through this conversation: \`${CLI_INVOKE} export --format jsonl > backup.jsonl\` (the CLI exports the complete set by default). Narrowing with date_from/date_to also works.` +
+      `\nRaising \`limit\` here is the last resort, not the first: this result is model context, so all ${total} rows would be loaded into the transcript.`;
   }
   return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
 }

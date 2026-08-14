@@ -601,9 +601,26 @@ describe('A2 — mem_export can back up a store larger than the old 1000-row cei
       .toContain(String(SEEDED));
     expect(text, 'the warning does not name how many rows were dropped')
       .toContain(String(SEEDED - 200));
-    // …and it must point at a re-run that actually returns everything (the old text pointed
-    // at "max 1000", which on a >1000-row store is a dead end).
+    // …and it must point at a way to actually get everything (the old text pointed at
+    // "max 1000", which on a >1000-row store is a dead end).
     expect(text).toMatch(/limit/);
+
+    // R2 (pre-tag review): but the FIRST remedy has to be a file redirect. The removed
+    // 1000-row ceiling was the only bound on an MCP export's size, and the 200 default is
+    // retained precisely because an MCP result IS model context — so "re-run with
+    // limit: <total>" instructs the caller to put the entire store into one tool result
+    // (measured on thin fixture rows: ~612 bytes/row, i.e. ≥2.2 MB for a ~3,700-row store,
+    // in one message). The bare `export` suggestion had the same property unredirected.
+    // FAILS IF: the remedy goes back to leading with the limit re-run — pre-fix, verbatim:
+    // "For the complete set: re-run with limit: 260, or run `… export` (the CLI exports
+    // everything by default)." That text reds all three assertions below.
+    expect(text, 'the capped warning offers no file redirect, so every remedy it names ends in the transcript')
+      .toMatch(/export --format jsonl > \S+/);
+    expect(text, 'the caller is still told to re-run with the whole store as the limit')
+      .not.toMatch(new RegExp(`limit:?\\s*\`?${SEEDED}`));
+    expect(text.indexOf('--format jsonl >'),
+      `a transcript-sized remedy is named before the file redirect:\n${text.slice(0, 700)}`)
+      .toBeLessThan(text.indexOf('limit'));
     // The warning precedes the payload, so a truncated read still sees it.
     expect(text.indexOf('PARTIAL')).toBeLessThan(text.indexOf('['));
   }, 60000);
