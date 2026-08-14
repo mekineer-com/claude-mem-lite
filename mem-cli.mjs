@@ -43,7 +43,7 @@ import { readFileSync, existsSync, readdirSync } from 'fs';
 // move each cmdXxx into its own cli/<cmd>.mjs; mem-cli.mjs becomes pure dispatch.
 import { isNativeBindingError, healAndReexec } from './lib/binding-probe.mjs';
 import { CLI_PATH, CLI_INVOKE } from './cli-path.mjs';
-import { parseArgs, out, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
+import { parseArgs, out, outVerbatim, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
 import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
@@ -1327,7 +1327,13 @@ function cmdContext(db, args) {
     }
     out(JSON.stringify(result, null, 2));
   } else {
-    out(`<claude-mem-context>\n${block}\n</claude-mem-context>`);
+    // outVerbatim: `context` is the one CLI command that must EMIT a real
+    // <claude-mem-context> wrapper — it prints the same block the SessionStart hook
+    // injects, so `out`'s defang would strip the delimiters this command exists to
+    // produce (the CLI twin of why <skill-loaded> is excluded from CONTEXT_DELIMITER_RE).
+    // The untrusted half is already neutralized one layer up: buildSessionContextLines
+    // defangs every row it renders, so only the trusted wrapper is written raw here.
+    outVerbatim(`<claude-mem-context>\n${block}\n</claude-mem-context>`);
   }
 }
 
@@ -1714,15 +1720,20 @@ function cmdExport(db, args) {
     //   jsonl → 0 lines (valid empty file)
     // The friendly note goes to stderr so it doesn't poison stdout for callers
     // piping to a parser.
-    if (format === 'json') out('[]');
+    if (format === 'json') outVerbatim('[]');
     process.stderr.write('[mem] No observations found matching criteria\n');
     return;
   }
 
+  // outVerbatim, NOT out: `out` neutralizes structural context delimiters (cli/common.mjs)
+  // because CLI stdout is model context — but this stream is a BACKUP that `restore` reads
+  // back, so defanging it would silently rewrite any row whose text legitimately contains
+  // `<system-reminder>`/`</claude-mem-context>` and persist the rewrite on restore. Mirrors
+  // safeHandler(mem_export, { verbatim: true }) on the MCP side (audit 2026-08-14 A1).
   if (format === 'jsonl') {
-    for (const r of rows) out(JSON.stringify(r));
+    for (const r of rows) outVerbatim(JSON.stringify(r));
   } else {
-    out(JSON.stringify(rows, null, 2));
+    outVerbatim(JSON.stringify(rows, null, 2));
   }
 
   if (limitGiven && rows.length >= limit) {

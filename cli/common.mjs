@@ -2,10 +2,13 @@
 // Extracted from mem-cli.mjs (v2.41) as first step in the god-module split.
 //
 // Scope: pure utilities only. No DB, no imports from other cli/ files; only
-// `lib/` leaf utilities may be re-exported through here (currently:
-// parseIdToken). This module is the single source of truth for stdout/stderr
-// framing, arg parsing, ID-token parsing, and relative-time formatting —
-// every command imports from here so the CLI stays consistent.
+// leaf utilities from `lib/` and the repo root may be pulled in (currently:
+// parseIdToken, neutralizeContextDelimiters). This module is the single source
+// of truth for stdout/stderr framing, arg parsing, ID-token parsing, and
+// relative-time formatting — every command imports from here so the CLI stays
+// consistent.
+
+import { neutralizeContextDelimiters } from '../format-utils.mjs';
 
 // ─── Argument Parsing ────────────────────────────────────────────────────────
 
@@ -85,8 +88,41 @@ export function parseArgs(argv) {
 
 // ─── Output Helpers ──────────────────────────────────────────────────────────
 
-/** Write a line to stdout. */
+/**
+ * Write a line to stdout, with structural context delimiters neutralized.
+ *
+ * CLI stdout IS model context, not just a human channel: commands/mem.md routes
+ * `/mem search|get|recall|timeline` to `node cli.mjs … via Bash`, and
+ * buildServerInstructions actively tells the agent the Bash CLI is the CHEAPER path
+ * than the MCP tool. The MCP read family has been defanged since v3.61 at its own
+ * chokepoint (server.mjs safeHandler), but the CLI twins printed stored text raw —
+ * so the exact indirect-prompt-injection channel the MCP defang closes stayed open on
+ * the surface the instructions recommend (audit 2026-08-14 A1). Observations are
+ * stored raw on purpose (defense lives at the injection boundary, not at save), so it
+ * has to happen here, at the write.
+ *
+ * `out` is the single stdout writer for every command in mem-cli.mjs and cli/*.mjs,
+ * so a NEW read command is covered by construction (§9 parallel-path completeness).
+ * Payloads that must round-trip byte-exact use `outVerbatim` instead — see below.
+ * The transform is idempotent (it strips brackets, it does not re-add them), so a
+ * path that already defanged upstream — `context` → buildSessionContextLines — is
+ * unaffected.
+ */
 export function out(text) {
+  // String() first: neutralizeContextDelimiters coerces nullish to '', which would turn
+  // a pre-existing `out(undefined)` line from "undefined" into an empty line.
+  outVerbatim(neutralizeContextDelimiters(String(text)));
+}
+
+/**
+ * Write a line to stdout with NO defang. The CLI mirror of
+ * `safeHandler(fn, { verbatim: true })` on the MCP side, and for the same single
+ * reason: `export` is the backup half of backup/restore, so neutralizing its payload
+ * would silently rewrite every backed-up row whose text legitimately contains these
+ * tags — and `restore` would write the rewritten text back. Only use this for bytes
+ * that must survive a round trip; anything a model reads goes through `out`.
+ */
+export function outVerbatim(text) {
   process.stdout.write(text + '\n');
 }
 
