@@ -30,6 +30,7 @@ import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { recallByFile } from '../lib/recall-core.mjs';
+import { buildAndSaveHandoff, renderHandoffInjection } from '../hook-handoff.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI_PATH = join(REPO, 'cli.mjs');
@@ -709,4 +710,92 @@ describe('F1 — PostToolUse error-recall serves neither retracted nor compresse
       .not.toContain('RETRACTED-ADVICE');
     expect(block).not.toContain(`#${staleId}`);
   }, 90000);
+});
+
+// ─── F4 — the handoff replayed a retracted decision as a standing one ──────────────
+// hook-handoff.mjs's key_decisions query filtered compressed_into but not
+// superseded_at, so a decision a later save explicitly overturned was written into the
+// handoff row and then rendered into the NEXT session's injected block under the
+// heading "## Key Decisions" — i.e. presented as standing, current policy. The
+// invariant was already applied unevenly inside this one file: the carry-forward
+// working_on fallback (:78) filters superseded_at; key_decisions did not.
+//
+// Deliberately NOT changed: `completed` (:110) and `files_modified` (:168). Those are
+// "what happened in this session" — a decision that was later overturned still happened,
+// and erasing it from the session's own record would misreport the session. Only
+// key_decisions is re-presented to a LATER session as current standing policy. The
+// third case below pins that distinction, so the fix cannot be silently widened.
+
+describe('F4 — handoff key_decisions excludes a retracted decision', () => {
+  let db;
+  const PROJECT = 'test-f4';
+  const SESSION = 'sess-f4';
+
+  const RETRACTED = 'Adopt the dual-write ledger for cross-region ordering';
+  const CURRENT = 'Reverted to single-writer ordering; the dual-write ledger deadlocked';
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertSession(db, { id: SESSION, project: PROJECT });
+    db.prepare(`INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+                VALUES (?, ?, ?, datetime('now'), ?)`)
+      .run(SESSION, 'work out the cross-region write ordering', 1, Date.now());
+
+    insertObs(db, {
+      sessionId: SESSION, project: PROJECT, type: 'decision', importance: 3,
+      epochOffset: -60000, title: RETRACTED,
+      supersededAt: Date.now(), supersededBy: 999,
+    });
+    insertObs(db, {
+      sessionId: SESSION, project: PROJECT, type: 'decision', importance: 3,
+      title: CURRENT,
+    });
+  });
+  afterEach(() => db.close());
+
+  const handoffRow = () =>
+    db.prepare('SELECT * FROM session_handoffs WHERE project = ? AND type = ?').get(PROJECT, 'exit');
+
+  // FAILS IF: the `superseded_at IS NULL` clause is dropped from the key_decisions
+  // SELECT — the retracted decision is stored in the handoff row alongside the one that
+  // replaced it, with nothing marking which is which.
+  it('the stored handoff row carries the current decision only', () => {
+    buildAndSaveHandoff(db, SESSION, PROJECT, 'exit', null);
+    const row = handoffRow();
+    expect(row, 'no handoff row was written — the case would prove nothing').toBeTruthy();
+    expect(row.key_decisions, 'the surviving decision must still be handed off').toContain(CURRENT);
+    expect(row.key_decisions, 'a retracted decision was handed off as standing policy')
+      .not.toContain(RETRACTED);
+  });
+
+  // The surface half: what the next session's UserPromptSubmit block actually renders.
+  // Scoped to the "## Key Decisions" section on purpose — the retracted title legitimately
+  // still appears under "## Completed" (the session's history, see the third case), so a
+  // whole-block assertion would conflate the two and could only be satisfied by also
+  // erasing the history.
+  // FAILS IF: the filter is dropped — "## Key Decisions" lists the withdrawn decision as
+  // a bullet, indistinguishable from live policy.
+  it('the injected handoff block does not render the retracted decision', () => {
+    buildAndSaveHandoff(db, SESSION, PROJECT, 'exit', null);
+    const block = renderHandoffInjection(db, PROJECT, 'cc-f4-next');
+    expect(block, 'nothing was injected — the case would prove nothing').toBeTruthy();
+    expect(block).toContain('## Key Decisions');
+    const section = block.split('## Key Decisions')[1].split(/\n##\s|<\/session-handoff>/)[0];
+    expect(section, 'the surviving decision must still be rendered').toContain(CURRENT);
+    expect(section, 'a retracted decision was rendered to the next session as standing policy')
+      .not.toContain(RETRACTED);
+  });
+
+  // Scope guard: `completed` is the session's own history, not standing policy, so the
+  // overturned decision must STILL appear there. Without this, "filter superseded_at
+  // everywhere in this file" would also pass — and would quietly delete work from the
+  // record of the session that did it.
+  // FAILS IF: the superseded filter is copied onto the `completed` SELECT at :110.
+  it('the session history still records the decision that was later overturned', () => {
+    buildAndSaveHandoff(db, SESSION, PROJECT, 'exit', null);
+    const row = handoffRow();
+    expect(row.completed, 'the session did make that decision; its own history must say so')
+      .toContain(RETRACTED);
+    expect(row.completed).toContain(CURRENT);
+  });
 });

@@ -173,11 +173,20 @@ export function buildAndSaveHandoff(db, sessionId, project, type, episodeSnapsho
     try { JSON.parse(row.files_modified).filter(isValidFile).forEach(f => fileSet.add(f)); } catch {}
   }
 
-  // 5. Key decisions — high importance observations (skip low-signal degraded titles)
+  // 5. Key decisions — high importance observations (skip low-signal degraded titles).
+  //
+  // superseded_at IS NULL, unlike `completed` and `files_modified` above: those two are
+  // the session's own history ("what happened here"), where an overturned decision still
+  // happened and erasing it would misreport the session. key_decisions is different — it
+  // is replayed to the NEXT session under "## Key Decisions" as standing policy, so a
+  // retracted decision rendered there is indistinguishable from live policy. The
+  // carry-forward fallback at the top of this function already filters the same column;
+  // this is the sibling that did not.
   const decisions = db.prepare(`
     SELECT title FROM observations
     WHERE memory_session_id = ? AND COALESCE(importance, 1) >= 2
-      AND COALESCE(compressed_into, 0) = 0 ${obsWindowClause}
+      AND COALESCE(compressed_into, 0) = 0
+      AND superseded_at IS NULL ${obsWindowClause}
     ORDER BY created_at_epoch DESC LIMIT 10
   `).all(sessionId, ...obsWindowParams).filter(d => d.title && !LOW_SIGNAL_TITLE.test(d.title)).slice(0, 5);
 
