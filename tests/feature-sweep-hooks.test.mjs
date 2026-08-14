@@ -828,14 +828,14 @@ describe('hook feature sweep: hook.mjs background workers', () => {
     ].join('\n'));
     const OFFLINE = { SWEEP_FETCH_LOG: fetchLog, NODE_OPTIONS: `--require "${offlineFetch}"` };
 
-    // DISCLOSURE (read before adding an assertion here): this event is spawned in production
-    // as `spawnBackground('update-check')`, i.e. with CLAUDE_MEM_HOOK_RUNNING=1 — and
-    // `update-check` is NOT in hook.mjs's BG_EVENTS, so hook.mjs:116 exits the process before
-    // the dispatch switch. Firing it with `env: BG` therefore measures the recursion guard,
-    // not the handler: that is why this case stayed green with its handler deleted. The two
-    // arms below drop BG so the handler actually runs; the guard/BG_EVENTS mismatch itself is
-    // a product finding reported separately and deliberately NOT pinned here (an assertion
-    // either way would freeze one side of an open question).
+    // This event is spawned in production as `spawnBackground('update-check')`, i.e. with
+    // CLAUDE_MEM_HOOK_RUNNING=1. That used to kill it: `update-check` was missing from
+    // hook.mjs's BG_EVENTS, so hook.mjs:116 exited the process before the dispatch switch,
+    // which is why this case once stayed green with its handler deleted. Fixed as audit F6
+    // (2026-08-14) — the production env is now pinned by
+    // `tests/audit-findings-20260814.test.mjs` ("F6 — update-check reaches its handler under
+    // the recursion guard"), which fires this event WITH the env var set. The arms below run
+    // without BG and cover the handler's own behavior.
     //
     // (a) Skip flag honored: CLAUDE_MEM_SKIP_UPDATE=1 (set for the whole sweep) must suppress
     // the check — no release lookup at all, so no update-state.json and no banner.

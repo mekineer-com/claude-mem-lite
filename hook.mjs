@@ -95,8 +95,14 @@ const event = process.argv[2];
 // the dispatch below exits everything else). EVERY spawnBackground/queue* event
 // MUST be listed here — a missing entry makes the detached worker exit(0)
 // silently, which looks identical to "worker ran and found nothing" from the
-// outside (live-probe catch, 2026-07-18: enrich-save no-oped on this line).
-const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize', 'auto-maintain', 'enrich-save']);
+// outside (live-probe catch, 2026-07-18: enrich-save no-oped on this line;
+// audit F6, 2026-08-14: update-check had been dead the same way, so the 24h
+// release check never ran and every SessionStart respawned a worker that
+// exit(0)'d before its handler).
+// `tests/audit-findings-20260814.test.mjs` scans BOTH detached spawners
+// (spawnBackground here, spawn(node,[HOOK_PATH,…]) in lib/save-enrich.mjs) and
+// reds when a spawned event is missing from this list.
+const BG_EVENTS = new Set(['llm-episode', 'llm-summary', 'auto-compress', 'llm-optimize', 'auto-maintain', 'enrich-save', 'update-check']);
 
 // Respect Claude Code plugin disable state even when legacy settings.json hooks remain.
 // install.mjs writes direct hooks into ~/.claude/settings.json, so disabling the plugin

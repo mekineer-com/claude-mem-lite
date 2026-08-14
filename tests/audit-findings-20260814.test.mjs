@@ -2,12 +2,13 @@
 // (tests/feature-sweep-{cli,mcp,hooks}.test.mjs found them; this file is where each
 // FIXED behavior is nailed down so it cannot silently reopen).
 //
-// One describe per finding, named F1..F5 after the audit report:
+// One describe per finding, named F1..F6 after the audit report:
 //   F1  mem_use substituted a DIFFERENT skill's body on a name miss (HIGH)
 //   F2  optimize preview printed two spellings of the same line (MCP vs CLI)
 //   F3  mem_save `files` was described as "associated" but rendered as "modified"
 //   F4  three hook-llm debugLog calls passed 2 args to a 3-arg signature
 //   F5  a non-string tool_name threw a swallowed TypeError in the PostToolUse hook
+//   F6  the detached update-check worker exited on the recursion guard before dispatch
 //
 // Every case states, in a comment, the input that makes it fail — an assertion whose
 // failing input nobody can name is not a test.
@@ -411,6 +412,150 @@ describe('F2 — the optimize preview reads the same on the CLI and over MCP', (
     // all-zero block that any spelling would satisfy.
     expect(Number(pick(cliFields, 'Re-enrich candidates').split(/\s+/)[0])).toBeGreaterThan(0);
   }, 60000);
+});
+
+// ─── F6 — the detached update-check worker exited before its handler ───────────────
+// hook.mjs:1432 spawns `update-check` via spawnBackground(), which sets
+// CLAUDE_MEM_HOOK_RUNNING=1 on the child (hook-shared.mjs:212). The recursion guard at
+// hook.mjs:116 exits every event that is not in BG_EVENTS — and `update-check` was not in
+// it, so the worker died before the dispatch case at :1790. isUpdateCheckDue() reads the
+// update-state.json that worker was supposed to write, so every SessionStart respawned a
+// worker that immediately exit(0)'d: a dead 24h release check that looked, from the
+// outside, exactly like "the worker ran and found nothing".
+//
+// NETWORK: none. A CJS preload (--require) replaces globalThis.fetch with a stub that
+// records the URL and throws, and a preflight probe proves the stub is installed before
+// the arm that depends on it runs — so a stub that failed to load REDS the preflight
+// instead of quietly letting a request reach api.github.com.
+
+describe('F6 — update-check reaches its handler under the recursion guard', () => {
+  let dataDir, runtimeDir, cwd, fetchLog, offlineFetch;
+
+  /** Env that makes every fetch in the child an in-process, recorded, thrown refusal. */
+  const offlineEnv = (log) => ({ AUDIT_FETCH_LOG: log, NODE_OPTIONS: `--require "${offlineFetch}"` });
+  const fetched = (log) => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []);
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('data-f6');
+    runtimeDir = join(dataDir, 'runtime');
+    cwd = sandboxDir('work', 'f6');
+    fetchLog = join(ROOT, 'f6-fetches.txt');
+    offlineFetch = join(ROOT, 'offline-fetch.cjs');
+    writeFileSync(offlineFetch, [
+      "const fs = require('fs');",
+      'globalThis.fetch = async (url) => {',
+      "  try { fs.appendFileSync(process.env.AUDIT_FETCH_LOG, String(url) + '\\n'); } catch { /* best-effort */ }",
+      "  throw new Error('offline: this audit refuses every fetch');",
+      '};',
+      '',
+    ].join('\n'));
+
+    // Preflight: the stub must actually intercept in a child spawned exactly like the arms
+    // below. FAILS IF: NODE_OPTIONS is ignored / the preload throws — the probe URL is then
+    // absent and every later "no fetch happened" reading would be unfounded.
+    const probeLog = join(ROOT, 'f6-preflight.txt');
+    const probe = await fire(process.execPath,
+      ['-e', "fetch('https://stub-probe.invalid/preflight').then(() => {}, () => {})"],
+      { cwd, env: offlineEnv(probeLog) });
+    expect(probe.code, probe.stderr).toBe(0);
+    expect(fetched(probeLog), 'the offline fetch stub did not load — no arm below can claim the network was untouched')
+      .toEqual(['https://stub-probe.invalid/preflight']);
+  }, 60000);
+
+  // FAILS IF: 'update-check' is dropped from BG_EVENTS again — hook.mjs:116 then exits before
+  // the dispatch case, so NO fetch is recorded and update-state.json is never written (that is
+  // exactly the pre-fix reading: 0 URLs, no state file).
+  it('the detached worker performs the release lookup with CLAUDE_MEM_HOOK_RUNNING=1', async () => {
+    const r = await fire(process.execPath, [HOOK_PATH, 'update-check'], {
+      cwd,
+      env: {
+        CLAUDE_MEM_DIR: dataDir,
+        CLAUDE_MEM_HOOK_RUNNING: '1',        // what spawnBackground sets on the child
+        CLAUDE_MEM_SKIP_UPDATE: undefined,   // BASE_ENV sets it; drop it so the handler runs
+        ...offlineEnv(fetchLog),
+      },
+      timeout: 60000,
+    });
+    expect(r.code, `update-check exited ${r.code}\n${r.stderr}`).toBe(0);
+    expect(r.stdout, "background workers run stdio:'ignore'; stdout must stay empty").toBe('');
+
+    const urls = fetched(fetchLog);
+    expect(urls[0], `update-check made no release lookup: ${JSON.stringify(urls)}`)
+      .toBe('https://api.github.com/repos/sdsrss/claude-mem-lite/releases/latest');
+    expect(urls[1]).toMatch(/^https:\/\/api\.github\.com\/repos\/sdsrss\/claude-mem-lite\/tags\b/);
+    expect(urls).toHaveLength(2);
+
+    // …and the 24h throttle it feeds was stamped, which is the whole reason the worker exists.
+    const state = JSON.parse(readFileSync(join(runtimeDir, 'update-state.json'), 'utf8'));
+    expect(Date.now() - new Date(state.lastCheck).getTime(),
+      `update-state.json carries no fresh lastCheck: ${JSON.stringify(state)}`).toBeLessThan(120000);
+    // A failed lookup must not have tried to install anything.
+    expect(existsSync(join(HOME_DIR, '.claude-mem-lite', 'package.json')),
+      'a failed release lookup still touched the install dir').toBe(false);
+  }, 60000);
+
+  // The counter-case: the fix must not be "delete the recursion guard". A foreground event
+  // under CLAUDE_MEM_HOOK_RUNNING=1 still has to die before doing any work.
+  // FAILS IF: hook.mjs:116 is removed, or BG_EVENTS is widened to everything — the guarded
+  // arm then captures the episode entry the unguarded arm proves this payload produces.
+  it('a non-background event under the same env is still refused', async () => {
+    const payload = (project) => ({
+      session_id: 'cc-f6-guard', tool_name: 'Edit',
+      tool_input: { file_path: join(project, 'widget-cache.mjs'), old_string: 'a', new_string: 'b' },
+      tool_response: 'The file has been updated successfully with the new content applied.',
+    });
+    const episodeFile = (data, project) =>
+      join(data, 'runtime', `ep-${'work--' + project.split('/').pop()}.json`);
+
+    const guardedData = sandboxDir('data-f6-guarded');
+    const guardedCwd = sandboxDir('work', 'f6-guarded');
+    const guarded = await fire(process.execPath, [HOOK_PATH, 'post-tool-use'], {
+      cwd: guardedCwd, stdin: JSON.stringify(payload(guardedCwd)),
+      env: { CLAUDE_MEM_DIR: guardedData, CLAUDE_MEM_HOOK_RUNNING: '1' },
+    });
+    expect(guarded.code, guarded.stderr).toBe(0);
+    expect(existsSync(episodeFile(guardedData, guardedCwd)),
+      'post-tool-use ran its handler under CLAUDE_MEM_HOOK_RUNNING=1 — the recursion guard is gone').toBe(false);
+
+    // Same payload, guard env removed: proof the "no episode file" above is the guard's doing
+    // and not an inert payload.
+    const openData = sandboxDir('data-f6-open');
+    const openCwd = sandboxDir('work', 'f6-open');
+    const open = await fire(process.execPath, [HOOK_PATH, 'post-tool-use'], {
+      cwd: openCwd, stdin: JSON.stringify(payload(openCwd)),
+      env: { CLAUDE_MEM_DIR: openData },
+    });
+    expect(open.code, open.stderr).toBe(0);
+    const episode = JSON.parse(readFileSync(episodeFile(openData, openCwd), 'utf8'));
+    expect(episode.entries.map((e) => e.tool)).toEqual(['Edit']);
+  }, 60000);
+
+  // The structural guard against reintroduction: BG_EVENTS is a hand-maintained list that a
+  // new detached spawn must be added to, and the failure mode (silent exit 0) is invisible.
+  // Both detached spawners are scanned — spawnBackground() in hook.mjs and the direct
+  // `spawn(node, [HOOK_PATH, '<event>'])` in lib/save-enrich.mjs — since both set
+  // CLAUDE_MEM_HOOK_RUNNING=1 on the child.
+  // FAILS IF: any event is spawned detached without being listed (the F6 defect itself:
+  // pre-fix this reds with ['update-check']).
+  it('every detached worker event is listed in BG_EVENTS', () => {
+    const hookSrc = readFileSync(HOOK_PATH, 'utf8');
+    const declared = hookSrc.match(/const BG_EVENTS = new Set\(\[([\s\S]*?)\]\)/);
+    expect(declared, 'BG_EVENTS is no longer a literal Set — this guard cannot read it').toBeTruthy();
+    const listed = new Set([...declared[1].matchAll(/'([^']+)'/g)].map((m) => m[1]));
+
+    const spawned = new Set();
+    for (const file of [HOOK_PATH, join(REPO, 'lib', 'save-enrich.mjs')]) {
+      const src = readFileSync(file, 'utf8');
+      for (const m of src.matchAll(/spawnBackground\(\s*'([\w-]+)'/g)) spawned.add(m[1]);
+      for (const m of src.matchAll(/HOOK_PATH,\s*'([\w-]+)'/g)) spawned.add(m[1]);
+    }
+    // Guard the guard: if the scan matches nothing, the assertion below is vacuous.
+    expect(spawned.size, 'the detached-spawn scan found no call sites — the patterns went stale')
+      .toBeGreaterThanOrEqual(6);
+    expect([...spawned].filter((e) => !listed.has(e)),
+      'these events are spawned detached (CLAUDE_MEM_HOOK_RUNNING=1) but absent from BG_EVENTS, so hook.mjs:116 exits them before dispatch')
+      .toEqual([]);
+  });
 });
 
 // ─── F1 — mem_use served a DIFFERENT skill's body on a name miss ───────────────────
