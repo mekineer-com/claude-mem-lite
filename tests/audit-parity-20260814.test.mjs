@@ -261,3 +261,152 @@ describe('A1 — CLI read commands defang structural delimiters, like their MCP 
     expect(JSON.parse(readFileSync(backup, 'utf8'))[0].narrative).toBe(NARRATIVE);
   }, 60000);
 });
+
+// ─── A2 — mem_export could not back up a store bigger than 1000 rows ───────────────
+// server.mjs:1745 clamped with `Math.min(args.limit ?? 200, 1000)` and the schema
+// hard-rejected limit>1000, while the CLI twin exports the COMPLETE matching set by
+// default — mem-cli.mjs:1680-1690 records the CLI-side fix for exactly this failure ("a
+// bare `export > backup.json` on a >200-row store silently wrote a truncated backup that
+// lost rows on restore"); the mirror was never applied. mem_export's own description says
+// "USE when: Backing up memory before a migration or reinstall", so on any store past
+// 1000 rows the tool could not do the thing it advertises.
+//
+// Decision (stated in the fix): the CEILING is gone — an explicit limit is honoured at any
+// size, so a complete backup is always reachable. The DEFAULT stays 200, because an MCP
+// result is model context and a bare exploratory call must not dump a whole store into the
+// transcript. What changes for that default is honesty: a capped result now says it is a
+// PARTIAL backup, names the true total and the number of omitted rows, and gives the exact
+// re-run that returns everything.
+
+describe('A2 — mem_export can back up a store larger than the old 1000-row ceiling', () => {
+  const SEEDED = 260;              // > the 200 default, < a payload that would slow the suite
+  let dataDir, cwd, client, transport;
+
+  const exportTool = async (args) => textOf(await client.callTool({ name: 'mem_export', arguments: args }));
+  /** The JSON payload that follows the header/warning lines. */
+  const payloadOf = (text) => JSON.parse(text.slice(text.indexOf('[')));
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('data-a2');
+    cwd = sandboxDir('work', 'a2');
+
+    // Seed straight into the sandbox DB file: 260 CLI spawns would dominate the suite.
+    const [{ default: Database }, { initSchema }, { insertObs, insertSession }] = await Promise.all([
+      import('better-sqlite3'), import('../schema.mjs'), import('./test-helpers.mjs'),
+    ]);
+    const db = initSchema(new Database(join(dataDir, 'claude-mem-lite.db')));
+    try {
+      insertSession(db, { id: 'a2-sess', project: 'a2-bulk' });
+      db.transaction(() => {
+        for (let i = 0; i < SEEDED; i++) {
+          insertObs(db, {
+            sessionId: 'a2-sess', project: 'a2-bulk', type: 'discovery',
+            title: `Bulk backup row ${i}`,
+            text: `Bulk backup row ${i} body`,
+            narrative: `Row ${i} of the bulk export fixture, long enough to be a realistic payload.`,
+            importance: 2, epochOffset: -i * 1000,
+          });
+        }
+      })();
+      expect(db.prepare('SELECT COUNT(*) c FROM observations').get().c).toBe(SEEDED);
+    } finally { db.close(); }
+
+    ({ client, transport } = await startMcp(dataDir, cwd));
+  }, 60000);
+
+  afterAll(async () => {
+    try { await client?.close(); } catch { /* already gone */ }
+    try { await transport?.close(); } catch { /* already gone */ }
+  });
+
+  // The ceiling itself, at the layer that enforced it: the zod field rejected the value
+  // before any handler ran, so no MCP caller could ask for a >1000-row backup at all.
+  // FAILS IF: `.max(1000)` (or any other ceiling) comes back — safeParse(5000) reds.
+  it('the schema accepts a limit past 1000, and still rejects a non-positive one', async () => {
+    const { memExportSchema } = await import('../tool-schemas.mjs');
+    expect(memExportSchema.limit.safeParse(5000).success,
+      'the 1000-row ceiling is back — a bigger store cannot be backed up over MCP').toBe(true);
+    expect(memExportSchema.limit.safeParse(1001).success).toBe(true);
+    // The lower bound is NOT collateral of removing the upper one.
+    expect(memExportSchema.limit.safeParse(0).success).toBe(false);
+    expect(memExportSchema.limit.safeParse(-1).success).toBe(false);
+  });
+
+  // End to end over the real transport: pre-fix this call came back as
+  // `MCP error -32602 … "maximum":1000` instead of a backup.
+  // FAILS IF: the clamp in runExport returns — Math.min(1500, 1000) would cut the result to
+  // 260 rows anyway here, so the assertion that matters is the one on the WARNING: a clamped
+  // response would still be flagged partial while the caller asked for more than exists.
+  it('an explicit limit past the old ceiling returns the complete set, unflagged', async () => {
+    const text = await exportTool({ limit: 1500, format: 'json' });
+    expect(text, `mem_export refused a >1000 limit:\n${text}`).not.toMatch(/error|Invalid/i);
+    expect(text).toMatch(new RegExp(`Exported ${SEEDED} observations`));
+    expect(text, 'a complete export must not be announced as partial').not.toMatch(/PARTIAL/);
+    expect(payloadOf(text)).toHaveLength(SEEDED);
+  }, 60000);
+
+  // The default-cap arm: still capped (an MCP result is model context), but no longer
+  // quiet about it. The old text said only "Results capped at 200 … (max 1000)" — it never
+  // named the total, so a caller could not tell how much was missing, and the advice it did
+  // give ("increase limit (max 1000)") was unreachable on a bigger store.
+  // FAILS IF: the warning stops naming the true total / the omitted count / the word PARTIAL
+  // — each is a separate assertion below, and a silent truncation reds all of them.
+  it('a bare call is capped at 200 and says loudly that it is a partial backup', async () => {
+    const text = await exportTool({ format: 'json' });
+    expect(payloadOf(text), 'the default cap changed — this case measures the capped arm')
+      .toHaveLength(200);
+    expect(text, `a truncated backup did not announce itself:\n${text.slice(0, 400)}`)
+      .toMatch(/PARTIAL/);
+    expect(text, 'the warning does not name the true total, so the caller cannot size the gap')
+      .toContain(String(SEEDED));
+    expect(text, 'the warning does not name how many rows were dropped')
+      .toContain(String(SEEDED - 200));
+    // …and it must point at a re-run that actually returns everything (the old text pointed
+    // at "max 1000", which on a >1000-row store is a dead end).
+    expect(text).toMatch(/limit/);
+    // The warning precedes the payload, so a truncated read still sees it.
+    expect(text.indexOf('PARTIAL')).toBeLessThan(text.indexOf('['));
+  }, 60000);
+
+  // The handler-side clamp, at the only size that can observe it. The transport case above
+  // cannot: with 260 rows seeded, Math.min(1500, 1000) still returns everything, so the
+  // clamp is only visible on a store past 1000 rows. That store is built in memory and
+  // driven through the same body the registered handler runs (handleExportForTest).
+  // FAILS IF: `Math.min(args.limit ?? 200, 1000)` comes back — the export returns 1000 of
+  // 1005 rows and is flagged PARTIAL, which is precisely "cannot back up a >1000-row store".
+  it('a store past 1000 rows exports completely through the handler', async () => {
+    const [{ handleExportForTest }, { createTestDb, insertObs, insertSession }] = await Promise.all([
+      import('../server.mjs'), import('./test-helpers.mjs'),
+    ]);
+    const BIG = 1005;
+    const db = createTestDb();
+    try {
+      insertSession(db, { id: 'a2-big', project: 'a2-big' });
+      db.transaction(() => {
+        for (let i = 0; i < BIG; i++) {
+          insertObs(db, { sessionId: 'a2-big', project: 'a2-big', title: `Big row ${i}`, text: `big ${i}`, epochOffset: -i * 1000 });
+        }
+      })();
+      const text = textOf(await handleExportForTest(db, { limit: 1200, format: 'jsonl' }));
+      expect(text, `the >1000 export came back partial:\n${text.slice(0, 300)}`).not.toMatch(/PARTIAL/);
+      expect(text).toMatch(new RegExp(`Exported ${BIG} observations`));
+      expect(text.split('\n').filter((l) => l.startsWith('{'))).toHaveLength(BIG);
+    } finally { db.close(); }
+  }, 60000);
+
+  // The parity claim: the CLI twin already exports the complete set with no --limit, and
+  // after the fix the MCP tool can reach the same number.
+  // FAILS IF: the two surfaces disagree on what "everything" is (a filter or a clamp on
+  // one side only) — the row counts diverge.
+  it('CLI export and mem_export can both reach the complete set', async () => {
+    const cli = await fire(process.execPath, [CLI_PATH, 'export', '--format', 'json'],
+      { cwd, env: { CLAUDE_MEM_DIR: dataDir }, timeout: 60000 });
+    expect(cli.code, cli.stderr).toBe(0);
+    const cliRows = JSON.parse(cli.stdout);
+    expect(cliRows).toHaveLength(SEEDED);
+    expect(cli.stderr, 'the CLI default must not be capped').not.toMatch(/capped/);
+
+    const mcpRows = payloadOf(await exportTool({ limit: SEEDED, format: 'json' }));
+    expect(mcpRows.map((r) => r.title)).toEqual(cliRows.map((r) => r.title));
+  }, 60000);
+});

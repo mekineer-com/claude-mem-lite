@@ -280,7 +280,13 @@ export const memExportSchema = {
   from: z.string().optional().describe('Alias for `date_from` (CLI `export --from`)'),
   to: z.string().optional().describe('Alias for `date_to` (CLI `export --to`)'),
   include_compressed: coerceBool.optional().describe('Include compressed observations (default: false)'),
-  limit: coerceInt.pipe(z.number().int().min(1).max(1000)).optional().describe('Max observations to export (default: 200, max: 1000)'),
+  // No upper bound: this is the BACKUP tool ("USE when: Backing up memory before a
+  // migration or reinstall"), and a 1000-row ceiling made a complete backup of a bigger
+  // store impossible over MCP while the CLI twin exported everything (audit 2026-08-14 A2).
+  // The default stays 200 because an MCP result is model context — a bare exploratory call
+  // must not dump a whole store into the transcript — but a capped result now announces
+  // itself as PARTIAL and names the limit that would return all of it.
+  limit: coerceInt.pipe(z.number().int().min(1)).optional().describe('Max observations to export (default: 200 — a capped result is flagged PARTIAL and names the total; pass that total for a complete backup, no upper bound)'),
 };
 
 export const memRecallSchema = {

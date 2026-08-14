@@ -28,6 +28,9 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue, obsFieldLabel } from './cli/common.mjs';
+// The partial-export warning points the caller at the CLI twin, which exports the complete
+// set by default — the invocation has to be the one that actually works on this install.
+import { CLI_INVOKE } from './cli-path.mjs';
 import { neutralizeContextDelimiters, neutralizeSkillDelimiters } from './format-utils.mjs';
 import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
@@ -1742,7 +1745,13 @@ async function runExport(db, args) {
   }
 
   const where = wheres.length > 0 ? 'WHERE ' + wheres.join(' AND ') : '';
-  const exportLimit = Math.min(args.limit ?? 200, 1000);
+  // No clamp (audit 2026-08-14 A2): `Math.min(args.limit ?? 200, 1000)` made an MCP-driven
+  // backup of a >1000-row store impossible, on the tool whose own description says "USE
+  // when: Backing up memory before a migration or reinstall" — while the CLI twin exported
+  // the complete matching set (mem-cli.mjs cmdExport, fixed there for the same reason). The
+  // DEFAULT stays 200: an MCP result is model context, so a bare exploratory call must not
+  // dump a whole store into the transcript. An explicit limit is now honoured at any size.
+  const exportLimit = args.limit ?? 200;
   // T3-P2-B: probe limit+1 so we can tell "user hit their own limit with more waiting" from
   // "user got exactly what existed". Trim to exportLimit before rendering.
   // EXPORT_COLUMNS_SQL: shared with CLI cmdExport — the full round-trippable set restore
@@ -1758,7 +1767,16 @@ async function runExport(db, args) {
     ? rows.map(r => JSON.stringify(r)).join('\n')
     : JSON.stringify(rows, null, 2);
 
-  const cap = moreAvailable ? `\nNote: Results capped at ${exportLimit}. Use date_from/date_to or increase limit (max 1000) to export more.` : '';
+  // A truncated backup is the failure mode this tool must never produce quietly: the old
+  // note ("Results capped at N … increase limit (max 1000)") never said how much was
+  // missing, and its advice was a dead end on a store past the ceiling. Name the real
+  // total, the number of rows left out, and the exact re-run that returns all of them.
+  let cap = '';
+  if (moreAvailable) {
+    const total = db.prepare(`SELECT COUNT(*) AS c FROM observations ${where}`).get(...params).c;
+    cap = `\nWARNING — PARTIAL EXPORT, NOT A COMPLETE BACKUP: capped at ${exportLimit} of ${total} matching observations; ${total - exportLimit} rows are missing from this payload and restoring it would lose them.` +
+      `\nFor the complete set: re-run with limit: ${total}, or run \`${CLI_INVOKE} export\` (the CLI exports everything by default). Narrowing with date_from/date_to also works.`;
+  }
   return { content: [{ type: 'text', text: `Exported ${rows.length} observations:${cap}\n${output}` }] };
 }
 
