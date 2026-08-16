@@ -32,7 +32,7 @@ const INSTRUCTIONS_BASE = [
   `  ${CLI_INVOKE} get 42,43  — full details by ID`,
   `  ${CLI_INVOKE} timeline --anchor 42  — chronological context`,
   '',
-  'MCP tools: mem_search, mem_recent, mem_save, mem_get, mem_recall, mem_timeline (plus mem_defer/mem_defer_list/mem_defer_drop for cross-session TODOs). If already loaded, call directly (warm server, fastest path). In tool-heavy sessions these are deferred behind ToolSearch — if using one would cost a ToolSearch load first, run the Bash CLI above instead: one call, not two. Neither needs a PATH/CLI install.',
+  'MCP tools: mem_search, mem_search_feedback, mem_recent, mem_save, mem_get, mem_recall, mem_timeline (plus mem_defer/mem_defer_list/mem_defer_drop for cross-session TODOs). If already loaded, call directly (warm server, fastest path). In tool-heavy sessions these are deferred behind ToolSearch — if using one would cost a ToolSearch load first, run the Bash CLI above instead: one call, not two. Neither needs a PATH/CLI install.',
   'mem_save: Save non-obvious insights (bugfix lessons, architecture decisions).',
   'Search tips: short keywords (2-3 words), filter with obs_type when relevant.',
 ];

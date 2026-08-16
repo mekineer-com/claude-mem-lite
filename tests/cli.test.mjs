@@ -2,6 +2,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { seedVectors } from '../benchmark/benchmark.mjs';
+import { rateSearchResults, recordSearch } from '../lib/search-telemetry.mjs';
 // _resetVocabCache is imported below via the post-mock dynamic import (line ~101).
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
@@ -1042,6 +1043,20 @@ describe('CLI stats command', () => {
     const output = await captureStdout(() => run(['stats']));
     expect(output).toContain('[mem] Stats');
     expect(output).toContain('Total: 0 observations');
+  });
+
+  it('routes stats --search-telemetry in text and JSON modes', async () => {
+    const searchId = recordSearch(testDb, {
+      project: 'test--project', query: 'widget', surface: 'mcp_search',
+      corpusCounts: { obs: 3 }, matchedCount: 1, client: 'cli-test',
+      results: [{ source: 'obs', id: 99, title: 'Widget decision' }],
+    });
+    rateSearchResults(testDb, { searchId, relevant: ['#99'], ratedBy: 'cli-test' });
+    const text = await captureStdoutOnly(() => run(['stats', '--search-telemetry', '--project', 'test--project']));
+    expect(text).toContain('Search telemetry (test--project)');
+    expect(text).toContain('Relevance coverage: 1/1 (100.0%)');
+    const json = JSON.parse(await captureStdoutOnly(() => run(['stats', '--search-telemetry', '--project', 'test--project', '--json'])));
+    expect(json).toMatchObject({ search_count: 1, rated_count: 1, relevance_coverage: 1 });
   });
 
   // Round1-P2: the low-value ("noise") count pre-fix omitted `compressed_into IS NULL`,

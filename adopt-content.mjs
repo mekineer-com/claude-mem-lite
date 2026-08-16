@@ -78,8 +78,8 @@ PreToolUse hook 在你 Read / Edit / Write 文件前已自动 \`mem_recall\` 该
 
 ## 何时主动调用 MCP 工具
 
-\`tools/list\` 默认暴露 6 个核心工具 + 3 个 defer 工具：
-\`mem_search\` / \`mem_recent\` / \`mem_recall\` / \`mem_get\` / \`mem_save\` / \`mem_timeline\` +
+\`tools/list\` 默认暴露 7 个核心工具 + 3 个 defer 工具：
+\`mem_search\` / \`mem_search_feedback\` / \`mem_recent\` / \`mem_recall\` / \`mem_get\` / \`mem_save\` / \`mem_timeline\` +
 \`mem_defer\` / \`mem_defer_list\` / \`mem_defer_drop\`。
 
 ### 选 MCP 还是 CLI：按 round-trip,不是执行毫秒

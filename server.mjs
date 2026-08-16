@@ -5,7 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
+import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined, stripPrivate } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
@@ -28,11 +28,13 @@ import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
+import { countMcpEligibleCorpus, rateSearchResults, recordSearch } from './lib/search-telemetry.mjs';
+import { recordHookError } from './lib/hook-telemetry.mjs';
 // The partial-export warning points the caller at the CLI twin, which exports the complete
 // set by default — the invocation has to be the one that actually works on this install.
 import { CLI_INVOKE } from './cli-path.mjs';
 import { neutralizeContextDelimiters, neutralizeSkillDelimiters } from './format-utils.mjs';
-import { memSearchSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
+import { memSearchSchema, memSearchFeedbackSchema, memRecentSchema, memTimelineSchema, memGetSchema, memDeleteSchema, memSaveSchema, memStatsSchema, memCompressSchema, memMaintainSchema, memOptimizeSchema, memUpdateSchema, memExportSchema, memRecallSchema, memFtsCheckSchema, memRegistrySchema, memBrowseSchema, memUseSchema, memDeferSchema, memDeferListSchema, memDeferDropSchema, tools as TOOL_DEFS } from './tool-schemas.mjs';
 
 // Lookup helper: all user-facing tool descriptions live in tool-schemas.mjs
 // (discouragement-style, Task 5). This keeps server.mjs from drifting.
@@ -318,11 +320,11 @@ function formatSearchOutput(paginatedResults, args, ftsQuery, totalCount, orFall
 // calls this with the module db and the default llm.
 // v3.42 F3: resolveProject now runs against the injected `db` param (not the module db), so
 // a project: arg through this seam resolves against the TEST db — real test isolation.
-export async function handleSearchForTest(db, args, { llm, rerankLlm } = {}) {
-  return runSearchPipeline(db, args, { llm, rerankLlm });
+export async function handleSearchForTest(db, args, { llm, rerankLlm, clientIdentity = 'test-client' } = {}) {
+  return runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity });
 }
 
-async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
+async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'unknown-mcp-client' } = {}) {
   if (args.project) args = { ...args, project: _resolveProjectShared(db, args.project) };
   // CLI-flag aliases: --source/--from/--to/--since. Folded before any read of the
   // canonical names below, so every downstream filter sees them.
@@ -434,8 +436,48 @@ async function runSearchPipeline(db, args, { llm, rerankLlm } = {}) {
   }
   appendDeferredTrailer(output);
 
+  let searchId = null;
+  try {
+    const corpusCounts = countMcpEligibleCorpus(db, {
+      effectiveSource: r.effectiveSource,
+      obsTypeScoped,
+      project: args.project ?? null,
+      obsType: args.obs_type ?? null,
+      importance: args.importance ?? null,
+      branch: args.branch ?? null,
+      includeNoise: args.include_noise === true,
+      epochFrom,
+      epochTo,
+      tier: args.tier ?? null,
+      currentProject: args.project || currentProject,
+    });
+    searchId = recordSearch(db, {
+      project: args.project || currentProject,
+      query: stripPrivate(args.query || ''),
+      surface: 'mcp_search',
+      searchMode: r.isDeep ? (r.escalated ? 'auto_deep' : 'deep') : 'normal',
+      corpusCounts,
+      matchedCount: r.total,
+      results: r.page,
+      pageOffset: offset,
+      client: clientIdentity,
+    });
+    if (r.page.length > 0 && output.content?.[0]?.type === 'text') {
+      output.content[0].text += `\n\nSearch ${searchId} — rate relevance with mem_search_feedback; omit any result you cannot judge honestly.`;
+    }
+  } catch (e) {
+    recordHookError('search-telemetry:mcp_search', e, RUNTIME_DIR);
+  }
+
   // Expose structured fields for tests + the MCP content blob.
-  return { ...output, results: r.page, total: r.total, escalated: r.escalated, variants: r.variants, reranked: r.reranked };
+  return { ...output, results: r.page, total: r.total, escalated: r.escalated, variants: r.variants, reranked: r.reranked, search_id: searchId };
+}
+
+function mcpClientIdentity() {
+  const client = server.server.getClientVersion?.();
+  return client?.name
+    ? `${client.name}${client.version ? `/${client.version}` : ''}`
+    : 'unknown-mcp-client';
 }
 
 server.registerTool(
@@ -445,8 +487,30 @@ server.registerTool(
     inputSchema: memSearchSchema,
   },
   safeHandler(async (args) => {
-    const result = await runSearchPipeline(db, args, {});
+    const result = await runSearchPipeline(db, args, { clientIdentity: mcpClientIdentity() });
     return { content: result.content };
+  })
+);
+
+export function handleSearchFeedbackForTest(db, args, { clientIdentity = 'test-client' } = {}) {
+  return rateSearchResults(db, {
+    searchId: args.search_id,
+    relevant: args.relevant,
+    partiallyRelevant: args.partially_relevant,
+    irrelevant: args.irrelevant,
+    ratedBy: clientIdentity,
+  });
+}
+
+server.registerTool(
+  'mem_search_feedback',
+  {
+    description: descriptionOf('mem_search_feedback'),
+    inputSchema: memSearchFeedbackSchema,
+  },
+  safeHandler(async (args) => {
+    const count = handleSearchFeedbackForTest(db, args, { clientIdentity: mcpClientIdentity() });
+    return { content: [{ type: 'text', text: `Recorded relevance for ${count} result(s) from search ${args.search_id}.` }] };
   })
 );
 
@@ -1941,9 +2005,9 @@ server.registerTool(
 // response. Hiding the maintenance/admin tools keeps Claude Code's startup
 // context small while preserving the contract that the plugin dogfoods (see
 // the CLAUDE.md managed block + adopt-content.mjs detail doc).
-// Surface counts as of v2.70.0: 9 core (mem_search/recent/timeline/get/save/
+// Surface counts: 10 core (mem_search/search_feedback/recent/timeline/get/save/
 // recall + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden (maintenance/
-// admin/specialized) = 20 registered; tests/tool-schemas.test.mjs is the
+// admin/specialized) = 21 registered; tests/tool-schemas.test.mjs is the
 // authoritative count.
 //
 // Safe because:

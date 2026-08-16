@@ -187,7 +187,7 @@ Source files stay in the cloned repo. Update via `git pull && node install.mjs i
 ### What happens during installation
 
 1. **Install dependencies** -- `npm install --omit=dev` (compiles native `better-sqlite3`)
-2. **Register MCP server** -- `mem-lite` server with 20 tools (9 core exposed via `tools/list` + 11 hidden-but-callable; see the Usage section for the full table). The pre-v2.78 generic server name `mem` is renamed to `mem-lite` for namespace hygiene; the tool names themselves (`mem_search`, `mem_recall`, ...) are unchanged.
+2. **Register MCP server** -- `mem-lite` server with 21 tools (10 core exposed via `tools/list` + 11 hidden-but-callable; see the Usage section for the full table). The pre-v2.78 generic server name `mem` is renamed to `mem-lite` for namespace hygiene; the tool names themselves (`mem_search`, `mem_recall`, ...) are unchanged.
 3. **Configure hooks** -- `PostToolUse`, `SessionStart`, `Stop`, `UserPromptSubmit` lifecycle hooks
 4. **Create data directory** -- `~/.claude-mem-lite/` (hidden) for database, runtime, and managed resource files
 5. **Auto-migrate** -- If `~/.claude-mem/` (original claude-mem) or `~/claude-mem-lite/` (pre-v0.5 unhidden) exists, migrates database and runtime files to `~/.claude-mem-lite/`, preserving the original untouched
@@ -237,18 +237,19 @@ rm -rf ~/claude-mem-lite/   # pre-v0.5 unhidden (if not auto-moved)
 
 ### MCP Tools (used automatically by Claude)
 
-As of v2.70.0, the server registers 20 tools in total but only the 9 **core**
+The server registers 21 tools in total but only the 10 **core**
 tools appear in `tools/list`. The 11 **hidden** tools remain callable at the
 protocol layer (`tools/call` by exact name still routes normally); they're
 omitted from the list response so Claude Code sessions don't load 11 extra
 tool schemas at startup. Hidden tools are the maintenance / admin / browser
 surface — reach them through the CLI column in the second table.
 
-**Core (9, exposed to Claude Code)**
+**Core (10, exposed to Claude Code)**
 
 | Tool | Description |
 |------|-------------|
 | `mem_search` | FTS5 full-text search with BM25 ranking. Filters by type, project, date range, importance level. |
+| `mem_search_feedback` | Record sparse relevance labels for results from a search that printed a Search ID. |
 | `mem_recent` | Show most recent observations, ordered by time. Quick snapshot of latest activity. |
 | `mem_recall` | Recall observations related to a file. Use before editing to surface past bugfixes and context. |
 | `mem_timeline` | Browse observations chronologically around an anchor point. |

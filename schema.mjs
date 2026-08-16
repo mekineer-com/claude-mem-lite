@@ -129,7 +129,10 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // 2026-07-14 on this machine's own DB). One version per migration batch keeps
 // the version number itself the detector. LATEST_MIGRATION_COLUMN advances to
 // observations.scope.
-export const CURRENT_SCHEMA_VERSION = 44;
+// v45 (search-quality telemetry): search_runs records the two explicit search
+// surfaces and search_results records each exposed ranked item plus its optional
+// relevance judgment. Additive tables only; no source-memory counters change.
+export const CURRENT_SCHEMA_VERSION = 45;
 
 // Sentinel columns for the LATEST migration set(s). The fast-path uses these
 // to self-heal half-migrated DBs — schema_version bumped but column ALTERs
@@ -140,6 +143,8 @@ export const CURRENT_SCHEMA_VERSION = 44;
 // current — a single sentinel can't see that hole, so every recent batch
 // keeps a representative column here until it is ancient enough to retire.
 const LATEST_MIGRATION_COLUMNS = [
+  { table: 'search_runs', column: 'search_id' },                  // v45
+  { table: 'search_results', column: 'relevance' },              // v45
   { table: 'observations', column: 'scope' },                      // v44
   { table: 'observation_files', column: 'last_cited_session_id' }, // v43
 ];
@@ -247,6 +252,39 @@ const CORE_SCHEMA = `
     name TEXT PRIMARY KEY,
     done_at_epoch INTEGER NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS search_runs (
+    search_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT,
+    query TEXT NOT NULL,
+    surface TEXT NOT NULL CHECK(surface IN ('user_prompt_hook', 'mcp_search')),
+    search_mode TEXT NOT NULL,
+    corpus_counts_json TEXT NOT NULL DEFAULT '{}',
+    matched_count INTEGER NOT NULL DEFAULT 0,
+    returned_count INTEGER NOT NULL DEFAULT 0,
+    client TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_at_epoch INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS search_results (
+    search_id INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('obs', 'session', 'prompt', 'event')),
+    result_id INTEGER NOT NULL,
+    returned_rank INTEGER NOT NULL,
+    page_offset INTEGER NOT NULL DEFAULT 0,
+    snapshot_label TEXT,
+    relevance TEXT CHECK(relevance IN ('relevant', 'partial', 'irrelevant')),
+    rated_by TEXT,
+    rated_at TEXT,
+    rated_at_epoch INTEGER,
+    PRIMARY KEY (search_id, source, result_id),
+    FOREIGN KEY(search_id) REFERENCES search_runs(search_id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_search_runs_time ON search_runs(created_at_epoch DESC);
+  CREATE INDEX IF NOT EXISTS idx_search_runs_project_time ON search_runs(project, created_at_epoch DESC);
+  CREATE INDEX IF NOT EXISTS idx_search_results_identity ON search_results(source, result_id);
 `;
 
 // Column migrations (idempotent — only swallow "duplicate column" errors)

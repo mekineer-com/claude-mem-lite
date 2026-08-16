@@ -113,6 +113,17 @@ export const memSearchSchema = {
   since: z.string().optional().describe('Alias for `date_since` (CLI `search --since`)'),
 };
 
+const searchFeedbackIds = coerceStringArray.pipe(
+  z.array(z.string().regex(/^(?:#|[SsPpEe]#)\d+$/, 'Expected #N, S#N, P#N, or E#N')).max(20)
+);
+
+export const memSearchFeedbackSchema = {
+  search_id: coerceInt.pipe(z.number().int().positive()).describe('Search ID printed by mem_search or the Claude Code search-results hook'),
+  relevant: searchFeedbackIds.optional().describe('Returned result IDs that directly addressed the query'),
+  partially_relevant: searchFeedbackIds.optional().describe('Returned result IDs that were related but incomplete or indirect'),
+  irrelevant: searchFeedbackIds.optional().describe('Returned result IDs that did not address the query'),
+};
+
 export const memRecentSchema = {
   limit: coerceInt.pipe(z.number().int().min(1).max(100)).optional().describe('Max results (default 10)'),
   project: z.string().optional().describe('Filter by project (default: inferred from CWD)'),
@@ -368,8 +379,8 @@ export const memDeferDropSchema = {
 // 40-60% vs. encouragement-style ("use this to..."). See tests/tool-schemas.test.mjs
 // for the invariants this list must satisfy.
 //
-// Core vs hidden (v2.34.0, expanded v2.70.0): only 9 tools are exposed via MCP
-// `tools/list` (the original 6 + mem_defer/mem_defer_list/mem_defer_drop). The
+// Core vs hidden (v2.34.0, expanded v2.70.0): only 10 tools are exposed via MCP
+// `tools/list` (the original 6 + search feedback + the defer trio). The
 // remaining 11 stay registered — and are still callable by name at the MCP
 // protocol level (`tools/call` by exact name) — but are omitted from the list
 // response so they don't bloat every agent's startup context. The core set
@@ -401,6 +412,24 @@ export const tools = [
       '\n' +
       'Equivalent CLI: ' + CLI_INVOKE + ' search "<query>" [--type bugfix] [--deep]',
     inputSchema: memSearchSchema,
+  },
+  {
+    name: 'mem_search_feedback',
+    description:
+      'Rate the relevance of results from one recorded search. Omitted results remain unrated.\n' +
+      '\n' +
+      'DO NOT use when:\n' +
+      '  - The search output did not include a Search ID\n' +
+      '  - A visible card is too vague to judge honestly (open it with mem_get first)\n' +
+      '  - Rating usefulness, correctness, or novelty rather than query relevance\n' +
+      '\n' +
+      'USE when:\n' +
+      '  - mem_search or the Claude Code search hook asks for relevance feedback\n' +
+      '  - You can label any returned #N, S#N, P#N, or E#N result\n' +
+      '  - Supplying sparse feedback; unrated results may be omitted\n' +
+      '\n' +
+      'MCP only',
+    inputSchema: memSearchFeedbackSchema,
   },
   {
     name: 'mem_recent',

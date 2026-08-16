@@ -16,6 +16,7 @@ import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
+import { countHookEligibleCorpus, recordSearch } from '../lib/search-telemetry.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -735,6 +736,8 @@ async function main() {
     const project = inferProject();
     const intent = detectIntent(promptText);
     let rows = [];
+    let searchExecuted = false;
+    let searchMode = 'hook';
 
     // A (v2.32.8): precision pass for named errors. When the prompt contains
     // a typed exception signature (TypeError/ValueError/ReferenceError/...),
@@ -747,6 +750,7 @@ async function main() {
           typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor
         )
       : [];
+    if (errSig) { searchExecuted = true; searchMode = 'error'; }
 
     // v2.57.x explicit-signal gate. Compute files once for both the gate and
     // the file-recall path below — extractFiles is regex over the prompt,
@@ -761,6 +765,8 @@ async function main() {
 
     if (intent?.useRecent) {
       // Recall intent: show recent observations
+      searchExecuted = true;
+      searchMode = 'recent';
       rows = searchRecent(db, project, intent.limit);
     } else if (REQUIRE_EXPLICIT_SIGNAL && !signalPresent) {
       // No explicit signal — skip FTS pipeline + prompt-fallback. sigRows
@@ -769,6 +775,7 @@ async function main() {
       rows = [];
     } else {
       // FTS search: use the prompt as query, optionally type-filtered
+      searchExecuted = true;
       const files = filesForGate;
       let ftsResult = searchByFts(db, promptText, project, intent?.limit || MAX_RESULTS, intent?.type || null);
       // Fallback: if typed search returned nothing, retry without type filter
@@ -777,7 +784,9 @@ async function main() {
       }
       let ftsRows = ftsResult.rows;
       const ftsMode = ftsResult.mode;
+      searchMode = ftsMode === 'OR' ? 'or_fallback' : 'normal';
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
+      if (fileRows.length > 0) searchMode = 'file';
 
       // T3 (v2.31): BM25 magnitude threshold — drop FTS hits whose relevance
       // magnitude doesn't clear the floor. This targets OR-fallback leakage
@@ -865,18 +874,55 @@ async function main() {
     let promptRows = [];
     if (rows.length === 0 && (!REQUIRE_EXPLICIT_SIGNAL || signalPresent)) {
       promptRows = searchByUserPrompts(db, promptText, project, PROMPT_FALLBACK_LIMIT);
+      if (promptRows.length > 0) searchMode = 'prompt_fallback';
     }
 
     const candidateIds = rows.length > 0
       ? rows.map(r => r.id)
       : promptRows.map(r => `P${r.id}`);
-    const dedupSkip = shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE, hookData.session_id);
+    if (candidateIds.length === 0 && searchExecuted) {
+      try {
+        recordSearch(db, {
+          project,
+          query: sanitizeFtsQuery(promptText) || '',
+          surface: 'user_prompt_hook',
+          searchMode,
+          corpusCounts: countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS),
+          matchedCount: 0,
+          results: [],
+          client: 'user_prompt_hook',
+        });
+      } catch (e) {
+        recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
+      }
+    }
+    const dedupSkip = candidateIds.length > 0
+      && shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE, hookData.session_id);
 
     const output = !dedupSkip
       ? (rows.length > 0 ? formatResults(rows) : formatPromptResults(promptRows))
       : null;
     if (output) {
-      process.stdout.write(output + '\n');
+      let rendered = output;
+      try {
+        const telemetryRows = rows.length > 0
+          ? rows.map(r => ({ ...r, source: 'obs' }))
+          : promptRows.map(r => ({ ...r, source: 'prompt', text: r.prompt_text }));
+        const searchId = recordSearch(db, {
+          project,
+          query: sanitizeFtsQuery(promptText) || '',
+          surface: 'user_prompt_hook',
+          searchMode,
+          corpusCounts: countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS),
+          matchedCount: telemetryRows.length,
+          results: telemetryRows,
+          client: 'user_prompt_hook',
+        });
+        rendered += `\nSearch ${searchId} — rate relevance with mem_search_feedback; omit any result you cannot judge honestly.`;
+      } catch (e) {
+        recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
+      }
+      process.stdout.write(rendered + '\n');
       // Write injected IDs for dedup with hook.mjs handleUserPrompt + self-dedup
       try {
         let prevCount = 0;

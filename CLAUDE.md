@@ -49,7 +49,7 @@ as the floor; flag NEW unused exports as PR review signal.
 | `hook-semaphore.mjs` | Concurrency control for hook execution |
 | `hook-update.mjs` | Auto-update via GitHub Releases (24h check, dev-mode skip) |
 | `hook-optimize.mjs` | LLM-powered optimization: re-enrich, normalize, cluster-merge, smart-compress |
-| `server.mjs` | MCP server — 20 tools total: 9 core exposed via `tools/list` (mem_search/mem_recent/mem_recall/mem_get/mem_save/mem_timeline + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden-but-callable (mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_optimize/mem_fts_check/mem_stats/mem_registry/mem_use/mem_browse). Hidden tools stay routable by exact-name `tools/call`; Claude Code agents reach them via the `claude-mem-lite <cmd>` CLI. Split flag lives in `tool-schemas.mjs`. |
+| `server.mjs` | MCP server — 21 tools total: 10 core exposed via `tools/list` (mem_search/mem_search_feedback/mem_recent/mem_recall/mem_get/mem_save/mem_timeline + mem_defer/mem_defer_list/mem_defer_drop) + 11 hidden-but-callable (mem_delete/mem_update/mem_export/mem_compress/mem_maintain/mem_optimize/mem_fts_check/mem_stats/mem_registry/mem_use/mem_browse). Hidden tools stay routable by exact-name `tools/call`; Claude Code agents reach them via the `claude-mem-lite <cmd>` CLI. Split flag lives in `tool-schemas.mjs`. |
 | `registry.mjs` | Resource registry DB schema + CRUD |
 | `registry-retriever.mjs` | FTS5 search + BM25 composite scoring + domain filtering |
 | `registry-indexer.mjs` | Resource indexing pipeline |

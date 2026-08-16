@@ -53,12 +53,12 @@ import { tools as DECLARED_TOOLS } from '../tool-schemas.mjs';
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SERVER_PATH = join(REPO, 'server.mjs');
 
-// The 9 tools `tools/list` promises. Pinned as a literal ON PURPOSE: comparing the
+// The 10 tools `tools/list` promises. Pinned as a literal ON PURPOSE: comparing the
 // wire response against tool-schemas' own `hidden` flags would pass right through a
 // flag flip (both sides move together). This literal is what makes a tool silently
 // appearing in — or vanishing from — every agent's startup context a test failure.
 const PUBLIC_TOOLS = [
-  'mem_search', 'mem_recent', 'mem_recall', 'mem_get', 'mem_save', 'mem_timeline',
+  'mem_search', 'mem_search_feedback', 'mem_recent', 'mem_recall', 'mem_get', 'mem_save', 'mem_timeline',
   'mem_defer', 'mem_defer_list', 'mem_defer_drop',
 ];
 // The 11 hidden-but-callable tools: absent from tools/call-time discovery, still
@@ -237,11 +237,11 @@ describe('MCP feature sweep: registered surface', () => {
     const declared = DECLARED_TOOLS.map(t => t.name).sort();
     expect(declared).toEqual([...SWEPT_TOOLS].sort());
     expect(declared).toEqual([...PUBLIC_TOOLS, ...HIDDEN_TOOLS].sort());
-    expect(declared).toHaveLength(20);
+    expect(declared).toHaveLength(21);
   });
 });
 
-// ─── Public tools (the 9 in tools/list) ─────────────────────────────────────
+// ─── Public tools (the 10 in tools/list) ────────────────────────────────────
 
 describe('MCP feature sweep: public tools', () => {
   itTool('mem_search', async () => {
@@ -254,6 +254,23 @@ describe('MCP feature sweep: public tools', () => {
     const narrowed = await call('mem_search', { query: 'widget', project: PROJECT, obs_type: 'decision' });
     const narrowedIds = [...narrowed.matchAll(/^#(\d+) /gm)].map(m => Number(m[1]));
     expect(narrowedIds).toEqual([SEED_DECISION_ID]);
+  });
+
+  itTool('mem_search_feedback', async () => {
+    const search = await call('mem_search', { query: 'widget', project: PROJECT });
+    const searchId = Number(search.match(/Search (\d+) — rate relevance/)?.[1]);
+    expect(searchId).toBeGreaterThan(0);
+    const result = await call('mem_search_feedback', {
+      search_id: searchId,
+      relevant: [`#${SEED_BUGFIX_ID}`],
+      partially_relevant: [`#${SEED_DECISION_ID}`],
+    });
+    expect(result).toContain(`Recorded relevance for 2 result(s) from search ${searchId}`);
+    const rows = withDb(db => db.prepare('SELECT result_id, relevance FROM search_results WHERE search_id = ? ORDER BY result_id').all(searchId));
+    expect(rows).toEqual([
+      { result_id: SEED_BUGFIX_ID, relevance: 'relevant' },
+      { result_id: SEED_DECISION_ID, relevance: 'partial' },
+    ]);
   });
 
   itTool('mem_recent', async () => {

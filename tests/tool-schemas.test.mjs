@@ -21,11 +21,11 @@ const MAX_AUTHORED_DESCRIPTION = 760;
 const authoredLength = (desc) => desc.split(CLI_INVOKE).join('').length;
 
 describe('MCP tool descriptions use discouragement style', () => {
-  test('there are exactly 20 tools (9 core + 11 hidden)', () => {
-    expect(tools).toHaveLength(20);
+  test('there are exactly 21 tools (10 core + 11 hidden)', () => {
+    expect(tools).toHaveLength(21);
     const core = tools.filter((t) => !t.hidden);
     const hidden = tools.filter((t) => t.hidden === true);
-    expect(core, 'core count').toHaveLength(9);
+    expect(core, 'core count').toHaveLength(10);
     expect(hidden, 'hidden count').toHaveLength(11);
   });
 
@@ -37,7 +37,7 @@ describe('MCP tool descriptions use discouragement style', () => {
     // and CLAUDE.md in the same PR.
     expect(coreNames).toEqual(
       ['mem_defer', 'mem_defer_drop', 'mem_defer_list',
-       'mem_get', 'mem_recall', 'mem_recent', 'mem_save', 'mem_search', 'mem_timeline'],
+       'mem_get', 'mem_recall', 'mem_recent', 'mem_save', 'mem_search', 'mem_search_feedback', 'mem_timeline'],
     );
   });
 
@@ -71,7 +71,7 @@ describe('MCP tool descriptions use discouragement style', () => {
   test.each(
     // vitest .each wants an array; map to [name, tool] pairs for nicer labels
     [
-      'mem_search', 'mem_recent', 'mem_timeline', 'mem_get', 'mem_delete',
+      'mem_search', 'mem_search_feedback', 'mem_recent', 'mem_timeline', 'mem_get', 'mem_delete',
       'mem_save', 'mem_stats', 'mem_compress', 'mem_maintain', 'mem_optimize',
       'mem_registry', 'mem_use', 'mem_update', 'mem_export', 'mem_recall',
       'mem_fts_check', 'mem_browse',

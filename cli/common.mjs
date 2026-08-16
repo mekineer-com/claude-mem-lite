@@ -204,7 +204,7 @@ export const KNOWN_CLI_FLAGS = new Set([
   'intent-tags', 'invocation-name', 'json', 'key', 'keywords', 'lesson', 'lesson-learned', 'limit',
   'local-path', 'margins', 'max', 'memdir', 'merge-ids', 'metrics', 'name', 'narrative', 'no-deep',
   'offset', 'ops', 'or', 'out', 'priority', 'project', 'quality', 'query', 'reason', 'repo-url',
-  'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'session-audit',
+  'rerank', 'resource-type', 'retain-days', 'retry', 'run', 'run-all', 'scope', 'search-telemetry', 'session-audit',
   'sidechain', 'since', 'sort', 'source', 'status', 'sweep', 'task', 'tech-stack', 'text', 'tier', 'title',
   'to', 'trigger-patterns', 'type', 'use-cases', 'verbose',
   // Catalogued 2026-08-13 when suggestUnknownFlags started reporting EVERY unknown

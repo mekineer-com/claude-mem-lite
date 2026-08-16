@@ -1,6 +1,6 @@
 // Guards the MCP tool surface against silent drift:
-//   - Core set must be exactly the 9 tools promised by the invited-memory
-//     contract (6 retrieval/save + 3 defer, v2.70+); extending it bloats every
+//   - Core set must be exactly the 10 tools promised by the invited-memory
+//     contract (retrieval/save + search feedback + defer); extending it bloats every
 //     agent's startup context.
 //   - "Equivalent CLI:" lines in descriptions must match the actual CLI
 //     (caught by issue: maintain/compress/optimize doc drift, fixed with
@@ -12,11 +12,11 @@ import { tools } from '../tool-schemas.mjs';
 
 const CORE_TOOLS = [
   'mem_search', 'mem_recent', 'mem_timeline', 'mem_get', 'mem_save', 'mem_recall',
-  'mem_defer', 'mem_defer_list', 'mem_defer_drop',
+  'mem_search_feedback', 'mem_defer', 'mem_defer_list', 'mem_defer_drop',
 ];
 
 describe('MCP tools surface', () => {
-  it('exposes exactly 9 core tools via tools/list', () => {
+  it('exposes exactly 10 core tools via tools/list', () => {
     const exposed = tools.filter(t => !t.hidden).map(t => t.name).sort();
     expect(exposed).toEqual([...CORE_TOOLS].sort());
   });
@@ -42,10 +42,9 @@ describe('MCP tools surface', () => {
     }
   });
 
-  it('every tool description carries an Equivalent CLI line (except mem_use, MCP-only)', () => {
+  it('every tool description carries an Equivalent CLI line or is explicitly MCP-only', () => {
     for (const t of tools) {
-      if (t.name === 'mem_use') continue; // no CLI equivalent
-      expect(t.description, `${t.name} missing "Equivalent CLI:" line`).toMatch(/Equivalent CLI:/);
+      expect(t.description, `${t.name} missing CLI contract`).toMatch(/Equivalent CLI:|MCP only/);
     }
   });
 
@@ -77,6 +76,7 @@ describe('MCP tools surface', () => {
     expect(exposed).toMatchInlineSnapshot(`
       [
         "mem_search",
+        "mem_search_feedback",
         "mem_recent",
         "mem_timeline",
         "mem_get",
