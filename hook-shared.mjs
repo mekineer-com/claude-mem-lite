@@ -203,11 +203,13 @@ export async function callLLM(prompt, timeoutMs = 15000) {
 
   const { cli: modelName } = resolveModelShared();
   try {
-    const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName], {
+    // Same headless-tax flags as haiku-client.mjs#callModelCLI (rationale
+    // there): no transcript persistence, no claudemd hook fan-out.
+    const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName, '--no-session-persistence'], {
       input: _flattenForCLI(prompt),
       timeout: timeoutMs,
       encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: '/tmp', // Prevent ghost sessions in user's /resume list
     });

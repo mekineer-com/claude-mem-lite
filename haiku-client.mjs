@@ -409,11 +409,20 @@ async function callModelAPI(prompt, model, { timeout, maxTokens, temperature = D
 function callModelCLI(prompt, model, { timeout }) {
   const modelName = MODEL_MAP[model] ? model : 'haiku';
   try {
-    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName], {
+    // --no-session-persistence + DISABLE_CLAUDEMD_HOOKS (2026-08-16): these
+    // headless calls were paying the full interactive-session tax — 1,004
+    // transcripts piled up in ~/.claude/projects/-tmp/, and every spawn ran
+    // the claudemd plugin's whole hook fan-out (its SessionStart banner alone
+    // logged 682 rows in 3 days, drowning that project's telemetry). The
+    // persistence flag is OAuth-safe (probed); `--bare`/CLAUDE_CODE_SIMPLE are
+    // NOT (they hard-require ANTHROPIC_API_KEY — "Not logged in" on OAuth
+    // machines). The user's global CLAUDE.md injection has no OAuth-safe
+    // opt-out; accepted (haiku + prompt caching keeps it cheap).
+    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName, '--no-session-persistence'], {
       input: flattenForCLI(prompt),
       timeout,
       encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: '/tmp',
     });
@@ -453,8 +462,9 @@ export function callModelCLIAsync(prompt, model, { timeout }) {
     const modelName = MODEL_MAP[model] ? model : 'haiku';
     let child;
     try {
-      child = spawn(getClaudePath(), ['-p', '--model', modelName], {
-        env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      // Same headless-tax flags as callModelCLI (rationale there).
+      child = spawn(getClaudePath(), ['-p', '--model', modelName, '--no-session-persistence'], {
+        env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
         cwd: '/tmp',
         stdio: ['pipe', 'pipe', 'pipe'],
       });
@@ -603,11 +613,12 @@ async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens, temperature
 function callHaikuCLI(prompt, { timeout }) {
   const { cli: modelName } = resolveModel();
   try {
-    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName], {
+    // Same headless-tax flags as callModelCLI (rationale there).
+    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName, '--no-session-persistence'], {
       input: flattenForCLI(prompt),
       timeout,
       encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1' },
+      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: '/tmp', // Prevent ghost sessions in user's /resume list
     });

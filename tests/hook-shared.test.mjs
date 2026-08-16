@@ -104,8 +104,11 @@ describe('hook-shared callLLM — provider routing', () => {
     expect(callHaikuMock).not.toHaveBeenCalled();
     expect(execFileSync).toHaveBeenCalledWith(
       '/usr/bin/claude',
-      ['-p', '--model', 'haiku'],
-      expect.objectContaining({ encoding: 'utf8' }),
+      ['-p', '--model', 'haiku', '--no-session-persistence'],
+      expect.objectContaining({
+        encoding: 'utf8',
+        env: expect.objectContaining({ DISABLE_CLAUDEMD_HOOKS: '1' }),
+      }),
     );
   });
 });

@@ -93,7 +93,7 @@ describe('haiku-client.mjs', () => {
       await p;
       expect(spawn).toHaveBeenCalledWith(
         expect.any(String),
-        ['-p', '--model', 'sonnet'],
+        ['-p', '--model', 'sonnet', '--no-session-persistence'],
         expect.objectContaining({ cwd: '/tmp' }),
       );
       expect(child.stdin.write).toHaveBeenCalledWith('the prompt');
@@ -108,7 +108,7 @@ describe('haiku-client.mjs', () => {
       await p;
       expect(spawn).toHaveBeenCalledWith(
         expect.any(String),
-        ['-p', '--model', 'haiku'],
+        ['-p', '--model', 'haiku', '--no-session-persistence'],
         expect.anything(),
       );
     });
@@ -352,10 +352,13 @@ describe('haiku-client.mjs', () => {
       expect(result).toEqual({ text: 'hello world' });
       expect(execFileSync).toHaveBeenCalledWith(
         expect.any(String),
-        ['-p', '--model', 'haiku'],
+        ['-p', '--model', 'haiku', '--no-session-persistence'],
         expect.objectContaining({
           input: 'test prompt',
           encoding: 'utf8',
+          // Headless enrichment must not pay the interactive-session tax:
+          // claudemd's hook fan-out is silenced via its own kill-switch.
+          env: expect.objectContaining({ DISABLE_CLAUDEMD_HOOKS: '1' }),
         })
       );
     });
@@ -470,7 +473,7 @@ describe('haiku-client.mjs', () => {
       expect(result).toEqual({ text: 'response text' });
       expect(execFileSync).toHaveBeenCalledWith(
         expect.any(String),
-        ['-p', '--model', 'haiku'],
+        ['-p', '--model', 'haiku', '--no-session-persistence'],
         expect.objectContaining({ input: 'test prompt' })
       );
     });
@@ -484,7 +487,7 @@ describe('haiku-client.mjs', () => {
       expect(result).toEqual({ text: 'sonnet response' });
       expect(execFileSync).toHaveBeenCalledWith(
         expect.any(String),
-        ['-p', '--model', 'sonnet'],
+        ['-p', '--model', 'sonnet', '--no-session-persistence'],
         expect.objectContaining({ input: 'test prompt' })
       );
     });
@@ -1009,7 +1012,7 @@ describe('haiku-client.mjs', () => {
       expect(result).toEqual({ text: 'cli sonnet' });
       expect(execFileSync).toHaveBeenCalledWith(
         expect.any(String),
-        ['-p', '--model', 'sonnet'],
+        ['-p', '--model', 'sonnet', '--no-session-persistence'],
         expect.objectContaining({ input: 'p' }),
       );
     });
