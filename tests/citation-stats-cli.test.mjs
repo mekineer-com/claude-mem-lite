@@ -218,4 +218,43 @@ describe('citation-stats CLI', () => {
     expect(parsed.funnel.window.injected).toBe(9);
     expect(parsed.funnel.window.cited).toBe(6);
   });
+
+  // v45 per-face split. The section must (a) show each face's own rate and
+  // (b) say out loud that the faces overlap — a reader who sums them and
+  // compares to the funnel total would otherwise conclude the numbers are broken.
+  const seedSurface = (surface, inj, cited, session = 'fs1') =>
+    testDb.prepare(
+      `INSERT INTO citation_surface_log (project, session_id, surface, resolved_at, injected_n, cited_n)
+       VALUES (?,?,?,?,?,?)`
+    ).run('p1', session, surface, Date.now(), inj, cited);
+
+  it('renders the per-injection-face section with each face rate', async () => {
+    seedSurface('pretool', 20, 2);
+    seedSurface('error_recall', 5, 4);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/injection face/i);
+    expect(output).toMatch(/PreToolUse recall.*inj\s+20\s+cited\s+2\s+10\.0%/);
+    expect(output).toMatch(/error-recall.*inj\s+5\s+cited\s+4\s+80\.0%/);
+  });
+
+  it('states that faces overlap so the rows are not a partition', async () => {
+    seedSurface('pretool', 3, 1);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/not a partition/i);
+  });
+
+  it('labels keyctx as promotion-only (it can never demote)', async () => {
+    seedSurface('keyctx', 10, 1);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/Key Context.*promotion-only/s);
+  });
+
+  it('--json includes the surface_funnel breakdown', async () => {
+    seedSurface('ups', 8, 3);
+    const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
+    const parsed = JSON.parse(output);
+    expect(parsed.surface_funnel.surfaces).toHaveLength(1);
+    expect(parsed.surface_funnel.surfaces[0]).toMatchObject({ surface: 'ups', injected: 8, cited: 3 });
+    expect(parsed.surface_funnel.surfaces[0].rate).toBeCloseTo(0.375, 5);
+  });
 });

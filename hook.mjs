@@ -53,12 +53,14 @@ import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, h
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
-  extractAllInjected,
+  extractInjectedBySurface,
+  unionSurfaces,
   extractInjectedFromKeyContext,
   bumpCitationAccess,
   computeCiteRecall,
   applyCitationDecay,
   recordCitationFunnel,
+  recordCitationSurfaces,
   hasMainThreadAssistantText,
 } from './lib/citation-tracker.mjs';
 import { resolveEdgeAttribution, readPreRecallFileEdges } from './lib/edge-attribution.mjs';
@@ -741,7 +743,14 @@ async function handleStop() {
             // filter as citedMain (the numerator, below) — an obs injected only
             // inside a subagent (sidechain) would otherwise enter the denominator
             // but never the numerator and streak-demote despite being used there.
-            const injected = extractAllInjected(transcriptPath, { mainOnly: true });
+            // v45: take the per-FACE breakdown and union it, instead of asking
+            // for the union directly. Same ids (extractAllInjected IS this union
+            // — see unionSurfaces), same single transcript walk, but the split
+            // survives to citation_surface_log below so "which face earns its
+            // budget" becomes answerable. Before this, every face was merged
+            // before anything was recorded and no lever had a target.
+            const injectedBySurface = extractInjectedBySurface(transcriptPath, { mainOnly: true });
+            const injected = unionSurfaces(injectedBySurface);
             // P5 ①: cite-back signals — observations whose warned file the agent
             // edited this session. Union into injected so they're resolved (they
             // were injected via pre-tool-recall) and, below, into cited so the
@@ -789,6 +798,19 @@ async function handleStop() {
                 // obs resolved this run (denominator), promoted = obs cited this run
                 // (numerator). Idempotent (touched is 0 on re-fire) + best-effort.
                 recordCitationFunnel(db, project, sessionId, r.touched, r.promoted);
+                // v45: the same funnel split by injection FACE. Keyed on
+                // ccSessionId — the SAME D#60 reasoning as applyCitationDecay
+                // above, and load-bearing here for a second reason: this table
+                // OVERWRITES rather than accumulates, and the memory sessionId
+                // is one file per PROJECT, so two concurrent CC sessions in one
+                // project would share a row and the later Stop would erase the
+                // earlier session's counts outright. citation_log survives the
+                // shared key only because it adds deltas.
+                // keyctx rides along for VISIBILITY only — it is a separate
+                // telemetry table, so recording it here cannot widen the decay
+                // denominator the way v3.66.0's union did.
+                recordCitationSurfaces(db, project, ccSessionId || sessionId,
+                  { ...injectedBySurface, keyctx: keyCtxIds }, citedMain);
                 // P1 (D#78): per-edge attribution. The session cooldown file
                 // (keyed by CC session id) records which FILE each obs was
                 // injected for; resolve those (obs,file) edges as hit/miss with

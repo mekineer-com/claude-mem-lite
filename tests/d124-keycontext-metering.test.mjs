@@ -169,10 +169,23 @@ describe('extractAllInjected must NOT carry the Key Context face', () => {
 describe('the Stop handler wires Key Context as promotion-only', () => {
   const src = readFileSync(join(ROOT, 'hook.mjs'), 'utf8');
 
-  it('does not pass marker coordinates into extractAllInjected', () => {
-    const call = src.match(/extractAllInjected\(transcriptPath,\s*\{[^}]*\}/s);
-    expect(call, 'extractAllInjected call site not found').not.toBeNull();
-    expect(call[0]).not.toContain('runtimeDir');
+  // The query-conditioned extraction — whichever of the two entry points the
+  // Stop handler uses (v45 swapped extractAllInjected for its per-face
+  // primitive extractInjectedBySurface, which it then unions) — must never be
+  // handed the marker coordinates. Receiving them is how Key Context would slide
+  // back into the decay denominator.
+  it('does not pass marker coordinates into the query-conditioned extraction', () => {
+    // EVERY call site, not the first one. `src.match()` returns only the first
+    // occurrence, and v45 widened this pattern to a two-name alternation — so a
+    // clean call of either name appearing earlier in the file would shadow a
+    // dirty one below it. At HEAD that was unreachable (one name, one site);
+    // "keep extractAllInjected for a non-mainOnly path" makes it reachable.
+    const calls = [...src.matchAll(/(?:extractAllInjected|extractInjectedBySurface)\(transcriptPath,\s*\{[^}]*\}/gs)];
+    expect(calls.length, 'query-conditioned extraction call site not found').toBeGreaterThan(0);
+    for (const [call] of calls) {
+      expect(call, 'marker coordinates must not reach the query-conditioned extraction').not.toContain('runtimeDir');
+      expect(call).not.toContain('keyCtx');
+    }
   });
 
   it('resolves the marker with runtimeDir + project + sessionId', () => {

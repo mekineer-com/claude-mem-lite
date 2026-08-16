@@ -55,7 +55,18 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
-import { computeCitationFunnelTrend } from './lib/citation-tracker.mjs';
+import { computeCitationFunnelTrend, computeSurfaceFunnel } from './lib/citation-tracker.mjs';
+
+// Human labels for citation_surface_log.surface. Padded to a common width so
+// the citation-stats face table lines up; the enum itself lives in
+// lib/citation-tracker.mjs (CITATION_SURFACES).
+const SURFACE_LABELS = {
+  pretool:      'PreToolUse recall  ',
+  ups:          'UserPromptSubmit   ',
+  error_recall: 'error-recall       ',
+  fyi:          'FYI (prompt-search)',
+  keyctx:       'Key Context        ',
+};
 import { aggregateMetrics, readMetrics } from './lib/metrics.mjs';
 import {
   insertDeferred, listOpenWithOrdinal, dropDeferred,
@@ -2524,6 +2535,8 @@ function cmdCitationStats(db, args) {
   // R1: per-session invocation→cite funnel trend (citation_log). Same `days` window
   // as the per-project cite rate above; funnel.prior/delta_pt show the direction.
   const funnel = computeCitationFunnelTrend(db, { days });
+  // v45: per-injection-face split of the same funnel (citation_surface_log).
+  const surfaceFunnel = computeSurfaceFunnel(db, { days });
 
   // Survivorship-honesty: the per-project rate (cited_count/decay_seen_count over
   // SURVIVING in-window obs) is doubly biased — GC drops uncited obs from the
@@ -2542,7 +2555,7 @@ function cmdCitationStats(db, args) {
   }
 
   if (json) {
-    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote, funnel }, null, 2));
+    out(JSON.stringify({ window_days: days, per_project: perProject, decay_queue: decayQueue, promoted, demoted, data_pollution_note: dataPollutionNote, funnel, surface_funnel: surfaceFunnel }, null, 2));
     return;
   }
 
@@ -2576,6 +2589,25 @@ function cmdCitationStats(db, args) {
     trendLine += `  (prior ${days}d ${(funnel.prior.rate * 100).toFixed(1)}%)  ${arrow} ${sign}${funnel.delta_pt}pt`;
   }
   out(trendLine);
+  out('');
+
+  // v45: the same funnel split by INJECTION FACE. The aggregate above says
+  // whether effectiveness is rising; this says WHICH face to aim a lever at.
+  out(`Cite rate by injection face (last ${days}d):`);
+  out('  a per-face VIEW, not a partition — do NOT reconcile against the funnel above: faces overlap (an obs carried by two counts in both) and the funnel also counts cite-back signals that belong to no face:');
+  if (surfaceFunnel.surfaces.length === 0) {
+    // Deliberately does NOT claim "no data yet": the reader swallows a query
+    // error, so an absent or unreadable citation_surface_log renders exactly
+    // like an empty one. Say what is true (nothing came back) and name the
+    // check, rather than assert the benign cause (pre-tag review b4).
+    out('  (nothing returned for this window — rows accrue at Stop; if this stays empty after a few sessions, check the table exists: claude-mem-lite fts-check)');
+  } else {
+    for (const s of surfaceFunnel.surfaces) {
+      const pct = (s.rate * 100).toFixed(1) + '%';
+      const note = s.surface === 'keyctx' ? '  (promotion-only: never demotes)' : '';
+      out(`  ${SURFACE_LABELS[s.surface] || s.surface}  inj ${String(s.injected).padStart(4)}  cited ${String(s.cited).padStart(4)}  ${pct.padStart(6)}  over ${s.sessions} session(s)${note}`);
+    }
+  }
   out('');
   out('Active decay queue (uncited_streak >= 2, next miss → demote):');
   if (decayQueue.length === 0) out('  (none)');

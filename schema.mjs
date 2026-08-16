@@ -129,7 +129,30 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // 2026-07-14 on this machine's own DB). One version per migration batch keeps
 // the version number itself the detector. LATEST_MIGRATION_COLUMN advances to
 // observations.scope.
-export const CURRENT_SCHEMA_VERSION = 44;
+// v45 (per-surface funnel): citation_surface_log — the same invocation→cite
+// funnel as citation_log (v38) but split by INJECTION FACE. citation_log answers
+// "is effectiveness rising or falling" for a project; it cannot answer "which
+// face is burning the budget", because hook.mjs unions all four
+// query-conditioned faces (pre-tool-recall / UserPromptSubmit <memory-context> /
+// PostToolUse error-recall / user-prompt-search FYI) before anything is
+// recorded. Without per-face cite-rate there is no evidence to aim any
+// precision lever at, which is what gated D#44 and D#129's remaining legs.
+// The two tables are NOT comparable in either direction and the readers say so
+// out loud: an obs carried by two faces is counted in both rows (pushes the
+// surface sum UP), while cite-back signals join citation_log's denominator
+// without belonging to any face and without the mainOnly filter (pushes the
+// aggregate UP). Neither is a partition of the other.
+// Keyed on the CC session id, NOT the memory session id — see the DDL comment.
+// The column was renamed memory_session_id -> session_id BEFORE v45 ever
+// shipped (pre-tag review), so no released database carries the old shape and
+// no rename migration exists; the sentinel stays on `surface`, which is a
+// table-presence check either way.
+// New TABLE (not a column) reached via CORE_SCHEMA's CREATE TABLE IF NOT EXISTS
+// on the forced migration pass. UNLIKE v38/v39 this DOES register a sentinel
+// (citation_surface_log.surface) in LATEST_MIGRATION_COLUMNS: a table that only
+// the forced pass can create is unreachable forever once the version row says
+// "done", which is not a hypothetical — see the note there.
+export const CURRENT_SCHEMA_VERSION = 45;
 
 // Sentinel columns for the LATEST migration set(s). The fast-path uses these
 // to self-heal half-migrated DBs — schema_version bumped but column ALTERs
@@ -139,7 +162,18 @@ export const CURRENT_SCHEMA_VERSION = 44;
 // table's pre-migration shape while the version row and the other table stay
 // current — a single sentinel can't see that hole, so every recent batch
 // keeps a representative column here until it is ancient enough to retire.
+// A new TABLE needs an entry here just as much as a new COLUMN does, and v38/v39
+// not having one is a latent hole, not a precedent: CORE_SCHEMA is reached ONLY
+// on the forced pass, so if anything stamps the version without running it (a
+// half-applied dev tree, an interrupted migration, a peer on a newer build), the
+// fast-path returns forever and the table can never appear. Observed live during
+// v45 development — the version bump and the CREATE landed in two edits, a hook
+// fired between them, and the DB sat at v45 with no citation_surface_log while
+// every reader silently swallowed "no such table" as "no data yet".
+// pragma_table_info on a missing table returns zero rows (it does not throw), so
+// naming any column of the new table is a table-presence check.
 const LATEST_MIGRATION_COLUMNS = [
+  { table: 'citation_surface_log', column: 'surface' },            // v45
   { table: 'observations', column: 'scope' },                      // v44
   { table: 'observation_files', column: 'last_cited_session_id' }, // v43
 ];
@@ -241,6 +275,34 @@ const CORE_SCHEMA = `
     injected_n INTEGER NOT NULL DEFAULT 0,
     cited_n INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, memory_session_id)
+  );
+
+  -- v45: per-INJECTION-FACE twin of citation_log. One row per
+  -- (project, session, surface); the surface column is one of the
+  -- CITATION_SURFACES enum in lib/citation-tracker.mjs
+  -- (pretool | ups | error_recall | fyi | keyctx).
+  --
+  -- session_id is the CLAUDE CODE session id, NOT the memory session id that
+  -- keys citation_log. The two tables therefore do NOT join, on purpose. The
+  -- memory session id lives in one file per PROJECT (hook-shared session-<project>,
+  -- 12h), so two concurrent CC sessions in one project share it -- which is
+  -- survivable for citation_log because that table ACCUMULATES deltas, and
+  -- destructive here because this one OVERWRITES: the second session's Stop
+  -- would erase the first's counts. Same reasoning that moved applyCitationDecay
+  -- onto the CC session id in D#60.
+  --
+  -- Overwrite (not accumulate) is correct for this table because its source --
+  -- ONE CC session's transcript -- only ever grows, so a Stop re-fire recomputes
+  -- the same-or-larger sets: idempotent by construction, and a cross-turn late
+  -- citation raises cited_n without touching injected_n.
+  CREATE TABLE IF NOT EXISTS citation_surface_log (
+    project TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    surface TEXT NOT NULL,
+    resolved_at INTEGER,
+    injected_n INTEGER NOT NULL DEFAULT 0,
+    cited_n INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, session_id, surface)
   );
 
   CREATE TABLE IF NOT EXISTS migration_cleanups (
@@ -904,11 +966,13 @@ const DEFERRED_CLEANUPS = [
             // Rename the short project to canonical on EVERY project-scoped table.
             // Originally only the first three were rewritten, so a short-named
             // project's deferred TODOs (deferred_work), activity (events), citation
-            // history (citation_log), and /clear-/exit handoffs (session_handoffs)
-            // were stranded on the old name — invisible to every project-scoped query
-            // after normalization. All seven carry a `project` column (verified).
+            // history (citation_log + v45 citation_surface_log), and /clear-/exit
+            // handoffs (session_handoffs) were stranded on the old name — invisible to
+            // every project-scoped query after normalization. All eight carry a
+            // `project` column (verified).
             for (const table of ['observations', 'sdk_sessions', 'session_summaries',
-                                 'session_handoffs', 'citation_log', 'events', 'deferred_work']) {
+                                 'session_handoffs', 'citation_log', 'citation_surface_log',
+                                 'events', 'deferred_work']) {
               db.prepare(`UPDATE ${table} SET project = ? WHERE project = ?`).run(canonical.project, shortName);
             }
           }
