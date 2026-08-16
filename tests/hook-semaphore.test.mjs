@@ -5,6 +5,7 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, readdirSync, mkdir
 import {
   acquireLLMSlot,
   releaseLLMSlot,
+  _setLocalHeldAt,
   LLM_SEM_MAX,
   LLM_SEM_TIMEOUT,
   LLM_SEM_STALE_MS,
@@ -242,6 +243,40 @@ describe('hook-semaphore.mjs', () => {
       await expect(secondPromise).resolves.toBe(true);
       releaseLLMSlot();
       expect(existsSync(slotFile())).toBe(false);
+    });
+    // The OTHER half of the same-process gate, and the half a post-tag review
+    // found untested: replacing `localHeldAt && age < LLM_SEM_STALE_MS` with a
+    // bare `if (localHeldAt)` — deleting the self-heal entirely — left this file
+    // 16/16 green. The escape hatch is what keeps one caller that acquired and
+    // never released from deadlocking every later LLM call in a long-lived MCP
+    // server; the review measured that blast radius at 181s for this file alone.
+    // A record older than LLM_SEM_STALE_MS cannot be produced by waiting, hence
+    // the test-only setter.
+    it('a local hold record older than the stale threshold falls through instead of queueing', async () => {
+      // Simulate a caller that acquired and never released, long ago.
+      _setLocalHeldAt(Date.now() - LLM_SEM_STALE_MS - 1000);
+
+      const t0 = Date.now();
+      const got = await acquireLLMSlot();
+      const elapsed = Date.now() - t0;
+
+      expect(got, 'a stale local record must not block acquisition').toBe(true);
+      // FAILS IF the gate drops its age check: acquire then queues behind a
+      // holder that does not exist and only returns after LLM_SEM_TIMEOUT.
+      expect(elapsed, 'stale record was queued behind rather than reclaimed').toBeLessThan(2000);
+      expect(existsSync(slotFile())).toBe(true);
+    });
+
+    it('a FRESH local hold record still queues (the gate is not simply gone)', async () => {
+      _setLocalHeldAt(Date.now());
+      let settled = false;
+      const pending = acquireLLMSlot().then((v) => { settled = true; return v; });
+
+      await sleepMs(300);
+      expect(settled, 'a live sibling hold must make a second acquire wait').toBe(false);
+
+      releaseLLMSlot();               // sibling finishes
+      await expect(pending).resolves.toBe(true);
     });
   });
 });

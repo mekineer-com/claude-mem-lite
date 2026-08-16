@@ -878,8 +878,15 @@ async function handleStop() {
     }
   }
 
-  // Spawn background for session summary (pass sessionId and project)
-  spawnBackground('llm-summary', sessionId, project);
+  // Spawn background for session summary (pass sessionId and project).
+  // CLAUDE_MEM_SKIP_SUMMARY brings this in line with every other background
+  // worker (auto-compress / llm-optimize / auto-maintain all have one). It was
+  // the only ungated spawnBackground, which made Stop untestable end-to-end
+  // without residue: the detached child outlives the parent process an e2e test
+  // waits on, then recreates the sandbox tree behind the test's cleanup. Any
+  // grace period for that is a race, not a barrier — the post-tag review timed a
+  // recreate at 432ms and watched a 300ms grace lose.
+  if (!process.env.CLAUDE_MEM_SKIP_SUMMARY) spawnBackground('llm-summary', sessionId, project);
 
   // Clean session file AFTER spawning background
   try { unlinkSync(sessionFile()); } catch {}

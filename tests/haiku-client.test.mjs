@@ -1552,5 +1552,44 @@ describe('haiku-client.mjs', () => {
       child.emit('close', 0);
       await expect(p).resolves.toEqual({ text: 'plain prose answer' });
     });
+    // The other half of the callHaikuJSONAsync fix: it must inherit callHaiku's
+    // 10s/500 budgets, not callModelJSONAsync's 15s/1000. A post-tag review
+    // reverted these defaults and the file stayed 119/119 green — the model-tier
+    // half was pinned, the budget half was not.
+    it('callHaikuJSONAsync defaults to callHaiku budgets, not callModelJSONAsync ones', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      const child = makeFakeChild();
+      vi.mocked(spawn).mockReturnValue(child);
+      vi.useFakeTimers();
+      try {
+        const p = callHaikuJSONAsync('prompt with no opts'); // no opts → defaults
+        await vi.advanceTimersByTimeAsync(9_900);
+        expect(child.kill, 'killed before the 10s budget elapsed').not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(200);
+        // FAILS IF the default reverts to 15000: nothing has fired at 10.1s.
+        expect(child.kill, 'timeout budget is not callHaiku\'s 10s').toHaveBeenCalled();
+        await p;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('callHaikuJSONAsync sends callHaiku\'s 500-token cap on the API leg', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-test');
+      _resetMode();
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ content: [{ type: 'text', text: '{"capability_summary":"x"}' }] }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      await callHaikuJSONAsync('prompt with no opts'); // no opts → defaults
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+      // FAILS IF the default reverts to 1000.
+      expect(body.max_tokens, 'maxTokens default is not callHaiku\'s 500').toBe(500);
+    });
   });
 });

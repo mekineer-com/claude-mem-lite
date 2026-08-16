@@ -12,12 +12,15 @@
 // real transcript, and read the table back. This is the only assertion in the
 // repo that the four faces survive an actual Stop.
 //
-// ISOLATION: HOME / CLAUDE_MEM_DIR point at a mkdtemp sandbox; nothing touches
-// the live ~/.claude-mem-lite, and CLAUDE_CODE_PATH points at a nonexistent
-// binary so no LLM spend or network can occur.
+// ISOLATION: HOME *and* CLAUDE_MEM_DIR are pointed at a mkdtemp sandbox, and
+// CLAUDE_CODE_PATH at a nonexistent binary so no LLM spend or network can occur.
+// CLAUDE_MEM_DIR is set explicitly rather than left to HOME: the env strip below
+// removes the developer's own value, after which resolution falls back to
+// os.homedir(), which honours HOME only on POSIX — on Windows it reads
+// USERPROFILE and this suite would write to the real ~/.claude-mem-lite.
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'fs';
 import Database from 'better-sqlite3';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -35,15 +38,16 @@ const att = (command, stdout) => ({
   attachment: { type: 'hook_success', command, stdout },
 });
 
+// Each takes a LIST of ids so a face can carry a distinct count (see FACE_SIZES).
 const faceAttachment = {
-  pretool: (id) => att('node "/home/sds/.claude-mem-lite/scripts/pre-tool-recall.js"',
-    `[mem] Lessons for utils.mjs:\n  #${id} [bugfix] boundary match beats suffix LIKE\n`),
-  ups: (id) => att('node "/home/sds/.claude-mem-lite/hook.mjs" user-prompt',
-    `<memory-context relevance="high">\n- [decision] picked X | Lesson: Y (#${id})\n</memory-context>\n`),
-  error_recall: (id) => att('bash "/home/sds/.claude-mem-lite/scripts/post-tool-use.sh"',
-    `[claude-mem-lite] Related memories found for this error:\n  #${id} [bugfix] EPIPE on forced exit\n`),
-  fyi: (id) => att('node "/home/sds/.claude-mem-lite/scripts/user-prompt-search.js"',
-    `[mem] FYI — Related memories (continue your task):\n#${id} 🔴 superseded invariant reopened\n`),
+  pretool: (ids) => att('node "/home/sds/.claude-mem-lite/scripts/pre-tool-recall.js"',
+    `[mem] Lessons for utils.mjs:\n${ids.map((id) => `  #${id} [bugfix] boundary match beats suffix LIKE\n`).join('')}`),
+  ups: (ids) => att('node "/home/sds/.claude-mem-lite/hook.mjs" user-prompt',
+    `<memory-context relevance="high">\n${ids.map((id) => `- [decision] picked X | Lesson: Y (#${id})\n`).join('')}</memory-context>\n`),
+  error_recall: (ids) => att('bash "/home/sds/.claude-mem-lite/scripts/post-tool-use.sh"',
+    `[claude-mem-lite] Related memories found for this error:\n${ids.map((id) => `  #${id} [bugfix] EPIPE on forced exit\n`).join('')}`),
+  fyi: (ids) => att('node "/home/sds/.claude-mem-lite/scripts/user-prompt-search.js"',
+    `[mem] FYI — Related memories (continue your task):\n${ids.map((id) => `#${id} 🔴 superseded invariant reopened\n`).join('')}`),
 };
 
 /** Main-thread assistant text — both the text floor and the citation numerator. */
@@ -65,9 +69,25 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
   // best-effort and its failure is swallowed. Same shape as the fix in
   // tests/audit-fixes-20260816.test.mjs.
   beforeAll(() => { root = mkdtempSync(join(tmpdir(), 'mem-stop-e2e-')); });
+
+  // A fixed grace is a RACE, not a barrier, and the post-tag review observed it
+  // lose: handleStop's spawnBackground('llm-summary') is gated by no
+  // CLAUDE_MEM_SKIP_* this test sets, and on a busy machine that detached child
+  // recreated the tree 432ms after rmSync — past a 300ms sleep. Delete in a
+  // bounded loop until it stays gone, then ASSERT it is gone: rmSync is
+  // best-effort and its failure is swallowed, so without the assertion the leak
+  // is invisible and comes back as the 13 stray dirs this file already once left.
   afterAll(async () => {
-    await new Promise((r) => setTimeout(r, 300)); // let detached workers exit first
-    try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline) {
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* retry */ }
+      if (!existsSync(root)) {
+        await new Promise((r) => setTimeout(r, 200)); // give a straggler time to recreate
+        if (!existsSync(root)) break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(existsSync(root), `sandbox root leaked: ${root}`).toBe(false);
   });
 
   beforeEach(() => {
@@ -97,6 +117,7 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
     }
     Object.assign(baseEnv, {
       HOME: home,
+      CLAUDE_MEM_DIR: dbDir,
       CLAUDE_PROJECT_DIR: projDir,
       CLAUDE_CODE_PATH: join(home, 'no-such-claude-binary'), // no LLM spend, no network
       ANTHROPIC_API_KEY: '',
@@ -107,6 +128,7 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
       CLAUDE_MEM_SKIP_OPTIMIZE: '1',
       CLAUDE_MEM_SKIP_MAINTAIN: '1',
       CLAUDE_MEM_SKIP_SAVE_ENRICH: '1',
+      CLAUDE_MEM_SKIP_SUMMARY: '1',   // the detached worker that recreated the sandbox behind cleanup
       CLAUDE_MEM_NO_DELAY: '1',
       MEM_QUIET_HOOKS: '1',
       MEM_NO_AUTO_ADOPT: '1',
@@ -114,18 +136,32 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
     delete baseEnv.CLAUDE_MEM_HOOK_RUNNING;
   });
 
-  /** Seed one observation per face; returns { face: id }. */
+  // Distinct COUNTS per face, deliberately: with one obs each, the uncited rows
+  // are interchangeable and a swapped attribution is undetectable. Post-tag
+  // review proved it — relabelling ups<->fyi at hook.mjs's recordCitationSurfaces
+  // call left this file 3/3 and citation-surface-funnel.test.mjs 32/32 green.
+  // A per-face funnel exists to answer "which face", so the counts must identify
+  // the label.
+  const FACE_SIZES = { pretool: 2, ups: 3, error_recall: 1, fyi: 4 };
+
+  /** Seed FACE_SIZES[face] observations per face; returns { face: [ids] }. */
   function seedObservations() {
     const db = new Database(dbPath);
     const now = Date.now();
     const ids = {};
-    for (const face of ['pretool', 'ups', 'error_recall', 'fyi']) {
-      ids[face] = Number(db.prepare(`
-        INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
-          concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
-        VALUES ('mem-stop-e2e', ?, ?, 'bugfix', ?, '', '', '', '', '[]', '[]', 2, 0, ?, ?)
-      `).run(PROJECT, `${face} body text`, `Observation for the ${face} face`,
-        new Date(now).toISOString(), now).lastInsertRowid);
+    const stmt = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+        concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+      VALUES ('mem-stop-e2e', ?, ?, 'bugfix', ?, '', '', '', '', '[]', '[]', 2, 0, ?, ?)
+    `);
+    for (const [face, n] of Object.entries(FACE_SIZES)) {
+      ids[face] = [];
+      for (let i = 0; i < n; i++) {
+        ids[face].push(Number(stmt.run(
+          PROJECT, `${face} body text ${i}`, `Observation ${i} for the ${face} face`,
+          new Date(now).toISOString(), now,
+        ).lastInsertRowid));
+      }
     }
     db.close();
     return ids;
@@ -140,6 +176,10 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
 
   function surfaceRows() {
     const db = new Database(dbPath, { readonly: true });
+    // A detached background worker may still hold a write txn. WAL makes readers
+    // non-blocking today, but a busy_timeout costs nothing and removes the
+    // dependency on that staying true.
+    db.pragma('busy_timeout = 2000');
     try {
       return db.prepare(
         'SELECT surface, session_id, injected_n, cited_n FROM citation_surface_log WHERE project = ? ORDER BY surface'
@@ -148,10 +188,10 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
   }
 
   // FAILS IF: the table is never created, the recorder is never reached from
-  // Stop, the row key is wrong, or a swallowed error turns the write into a
-  // no-op. Every one of those keeps tests/citation-surface-funnel.test.mjs's
-  // source-text wiring assertions green.
-  it('writes one row per injected face, with the cited face counted', () => {
+  // Stop, the row key is wrong, a swallowed error turns the write into a no-op,
+  // or ANY TWO FACES ARE ATTRIBUTED TO EACH OTHER. Every one of those keeps
+  // tests/citation-surface-funnel.test.mjs's source-text wiring assertions green.
+  it('writes one row per injected face, attributed to the right face, with cites counted', () => {
     const ids = seedObservations();
     const transcriptPath = join(home, 'transcript.jsonl');
     writeFileSync(transcriptPath, [
@@ -159,9 +199,11 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
       faceAttachment.ups(ids.ups),
       faceAttachment.error_recall(ids.error_recall),
       faceAttachment.fyi(ids.fyi),
-      // Cites the pretool obs only — so `cited` must differentiate the faces
-      // rather than mirroring `injected` for all four.
-      assistantText(`Applying the boundary-match fix from #${ids.pretool} to the query builder.`),
+      // Cite one obs from TWO different faces. With a single cited face, cited_n
+      // is 1/0/0/0 and any pair of the three zeros can trade places unnoticed.
+      assistantText(
+        `Applying the boundary-match fix from #${ids.pretool[0]}, and #${ids.error_recall[0]} explains the EPIPE.`,
+      ),
     ].map((e) => JSON.stringify(e)).join('\n'));
 
     runStop(transcriptPath);
@@ -169,10 +211,12 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
     const rows = surfaceRows();
     expect(rows.map((r) => r.surface)).toEqual(['error_recall', 'fyi', 'pretool', 'ups']);
     const by = Object.fromEntries(rows.map((r) => [r.surface, r]));
-    expect(by.pretool).toMatchObject({ injected_n: 1, cited_n: 1 });
-    expect(by.ups).toMatchObject({ injected_n: 1, cited_n: 0 });
-    expect(by.error_recall).toMatchObject({ injected_n: 1, cited_n: 0 });
-    expect(by.fyi).toMatchObject({ injected_n: 1, cited_n: 0 });
+    // Distinct (injected_n, cited_n) per face — no two rows share a pair, so a
+    // relabelled attribution cannot satisfy this set.
+    expect(by.pretool).toMatchObject({ injected_n: 2, cited_n: 1 });
+    expect(by.ups).toMatchObject({ injected_n: 3, cited_n: 0 });
+    expect(by.error_recall).toMatchObject({ injected_n: 1, cited_n: 1 });
+    expect(by.fyi).toMatchObject({ injected_n: 4, cited_n: 0 });
   });
 
   // The counterpart to the recorder's overwrite-idempotency unit test, at the
@@ -182,7 +226,7 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
     const transcriptPath = join(home, 'transcript.jsonl');
     writeFileSync(transcriptPath, [
       faceAttachment.pretool(ids.pretool),
-      assistantText(`Cited #${ids.pretool} while fixing the builder.`),
+      assistantText(`Cited #${ids.pretool[0]} while fixing the builder.`),
     ].map((e) => JSON.stringify(e)).join('\n'));
 
     runStop(transcriptPath);
@@ -190,7 +234,8 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
 
     const rows = surfaceRows();
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ surface: 'pretool', injected_n: 1, cited_n: 1 });
+    // injected_n stays at the seeded 2, not 4: the row is overwritten, not summed.
+    expect(rows[0]).toMatchObject({ surface: 'pretool', injected_n: 2, cited_n: 1 });
   });
 
   // Text-floor gate: a tool-only Stop must record nothing, so an unfinished turn

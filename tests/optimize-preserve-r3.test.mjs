@@ -11,7 +11,6 @@ vi.mock('../hook-semaphore.mjs', () => ({
 }));
 vi.mock('../haiku-client.mjs', () => ({
   callModelJSONAsync: vi.fn(),
-  callLLMWithModel: vi.fn(),
   // Real export consumed by hook-optimize's LLM call sites; a mock without it
   // throws before any branch under test runs.
   BG_LLM_TIMEOUT_MS: 45000,

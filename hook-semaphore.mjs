@@ -57,6 +57,17 @@ export const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
 let localHeldAt = 0;
 
 /**
+ * Test-only: force the local hold record to an arbitrary age. The staleness
+ * escape hatch above is otherwise unreachable in a test — it needs a record
+ * older than LLM_SEM_STALE_MS (120s), and a suite cannot wait that long. It was
+ * shipped untested in v3.68.0 and a post-tag review showed the gate still passed
+ * 16/16 when the escape hatch was deleted outright. Mirrors the `_resetMode` /
+ * `_resetHeadlessFlag` hooks in haiku-client.mjs.
+ * @param {number} ts epoch ms, or 0 for "not held"
+ */
+export function _setLocalHeldAt(ts) { localHeldAt = ts; }
+
+/**
  * Acquire a file-based semaphore slot for LLM calls.
  * Uses acquire-then-verify: atomically creates a slot file, then checks total count.
  * At most one slot per process; a concurrent same-process caller queues behind it.
