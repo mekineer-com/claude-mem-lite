@@ -128,6 +128,11 @@ export const SOURCE_FILES = [
   // search-engine.mjs AND the standalone hook scripts — missing it from the
   // manifest kills every retrieval surface on auto-update.
   'lib/inject-search-core.mjs',
+  // P2-12 twin cores: get/browse shared data collection for the CLI/MCP pairs
+  // (update lives in observation-write, delete-preview in delete-core, registry
+  // stats/list in registry.mjs — all already listed).
+  'lib/get-core.mjs',
+  'lib/browse-core.mjs',
   // v2.61 dedup refactor: shared "save one observation" pipeline used by both
   // mem-cli.mjs::cmdSave and server.mjs::mem_save. Statically imported from both
   // entry points; missing it from the manifest broke MCP saves on auto-update.

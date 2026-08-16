@@ -84,6 +84,8 @@
     "lib/mem-override.mjs",
     "lib/injected-ids.mjs",
     "lib/inject-search-core.mjs",
+    "lib/get-core.mjs",
+    "lib/browse-core.mjs",
     "lib/save-observation.mjs",
     "lib/observation-write.mjs",
     "lib/recall-core.mjs",

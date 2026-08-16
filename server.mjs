@@ -5,10 +5,10 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { truncate, typeIcon, inferProject, scrubSecrets, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
+import { truncate, typeIcon, inferProject, fmtDate, debugLog, debugCatch, isPathConfined } from './utils.mjs';
 import { resolveProject as _resolveProjectShared } from './project-utils.mjs';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { reRankWithContext, autoBoostIfNeeded, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
+import { reRankWithContext, runIdleCleanup, buildServerInstructions } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -22,9 +22,10 @@ import {
   OP_CAP, STALE_AGE_MS,
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
-import { deleteObservations } from './lib/delete-core.mjs';
+import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
+import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS } from './lib/get-core.mjs';
+import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
-import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
 import { formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
@@ -45,11 +46,11 @@ function descriptionOf(name) {
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { ensureRegistryDb, upsertResource, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
-import { rebuildObservationDerived } from './lib/observation-write.mjs';
+import { applyObsUpdate } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { fetchRecent } from './lib/recent-core.mjs';
@@ -599,8 +600,6 @@ server.registerTool(
       return { content: [{ type: 'text', text: 'No valid IDs provided.' }] };
     }
 
-    const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
-
     // `fields` filter only makes sense for obs rows; session/prompt ignore it.
     // Validate when obs is queried — throw on all-invalid, note on partial-invalid.
     let fieldsNote = '';
@@ -622,12 +621,8 @@ server.registerTool(
     const foundBySource = { obs: new Set(), session: new Set(), prompt: new Set(), event: new Set() };
 
     if (bySrc.obs.length > 0) {
-      const ph = bySrc.obs.map(() => '?').join(',');
-      try {
-        db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${ph})`).run(Date.now(), ...bySrc.obs);
-        autoBoostIfNeeded(db, bySrc.obs);
-      } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-      const rows = db.prepare(`SELECT * FROM observations WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.obs);
+      // Access-bump + fetch via the shared get-core (P2-12) — single source with CLI get.
+      const rows = fetchObsDetail(db, bySrc.obs);
       const renderFields = obsFieldFilter || OBS_FIELDS;
       for (const row of rows) {
         foundBySource.obs.add(row.id);
@@ -650,7 +645,9 @@ server.registerTool(
     if (bySrc.session.length > 0) {
       const ph = bySrc.session.map(() => '?').join(',');
       const rows = db.prepare(`SELECT * FROM session_summaries WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.session);
-      const sessFields = ['id', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'files_read', 'files_edited', 'notes', 'project', 'created_at', 'memory_session_id', 'prompt_number'];
+      // SESSION_DETAIL_FIELDS (get-core, P2-12): shared full set — adds remaining_items
+      // (searchable via FTS but previously unrendered on BOTH detail faces).
+      const sessFields = SESSION_DETAIL_FIELDS;
       for (const row of rows) {
         foundBySource.session.add(row.id);
         const lines = [`── S#${row.id} ──`];
@@ -765,21 +762,15 @@ server.registerTool(
     inputSchema: memDeleteSchema,
   },
   safeHandler(async (args) => {
-    const placeholders = args.ids.map(() => '?').join(',');
-    const rows = db.prepare(`
-      SELECT id, type, title, project FROM observations WHERE id IN (${placeholders})
-    `).all(...args.ids);
+    // Shared preview body (lib/delete-core, P2-12) — single source with CLI delete.
+    const { rows, lines: previewLines } = previewDeleteRows(db, args.ids);
 
     if (rows.length === 0) {
       return { content: [{ type: 'text', text: 'No observations found for given IDs.' }] };
     }
 
     if (!args.confirm) {
-      // Preview mode
-      const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`];
-      for (const r of rows) {
-        lines.push(`  #${r.id} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${r.project}`);
-      }
+      const lines = [`Preview: ${rows.length} observation(s) will be deleted:\n`, ...previewLines];
       lines.push(`\nCall mem_delete(ids=[...], confirm=true) to execute.`);
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     }
@@ -1425,51 +1416,27 @@ server.registerTool(
     }
 
     if (action === 'list') {
-      const typeFilter = args.type;
-      const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
-      const params = typeFilter ? [typeFilter, 'active'] : ['active'];
-      // T3-P2-A: order by adoption then recommendation (CLI parity), and coalesce NULL counts
-      // so the output shows "adopt:0" rather than the jarring "adopt:null".
-      const resources = rdb.prepare(`
-        SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
-        FROM resources ${where}
-        ORDER BY COALESCE(adopt_count, 0) DESC, COALESCE(recommend_count, 0) DESC, type, name
-      `).all(...params);
-
+      // Shared ranked query + row line (registry.mjs, P2-12) — single source with CLI list.
+      const resources = listResourcesRanked(rdb, { type: args.type });
       if (resources.length === 0) return { content: [{ type: 'text', text: 'No resources found.' }] };
-
-      const lines = resources.map(r =>
-        `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count ?? 0} adopt:${r.adopt_count ?? 0} — ${truncate(r.capability_summary || '', 80)}`
-      );
+      const lines = resources.map(formatRegistryListLine);
       return { content: [{ type: 'text', text: `Resources (${resources.length}):\n${lines.join('\n')}` }] };
     }
 
     if (action === 'stats') {
-      const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
-      const topAdopted = rdb.prepare(`
-        SELECT name, type, adopt_count, recommend_count
-        FROM resources WHERE status = ? AND adopt_count > 0
-        ORDER BY adopt_count DESC LIMIT 10
-      `).all('active');
-      const zeroAdopt = rdb.prepare(`
-        SELECT COUNT(*) as c FROM resources
-        WHERE status = ? AND recommend_count > 0 AND adopt_count = 0
-      `).get('active');
-      const userAdded = rdb.prepare(`
-        SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'
-      `).get('active');
-
+      // Shared collection (registry.mjs collectRegistryStats, P2-12) — single
+      // source with the CLI registry stats action.
+      const s = collectRegistryStats(rdb);
       const lines = [
         `Registry Stats:`,
-        `  Total active: ${total.c}`,
-        ...byType.map(t => `  ${t.type}: ${t.c}`),
-        `  User-added: ${userAdded.c}`,
-        `  Zero adoption (recommended but never adopted): ${zeroAdopt.c}`,
+        `  Total active: ${s.total}`,
+        ...s.byType.map(t => `  ${t.type}: ${t.c}`),
+        `  User-added: ${s.userAdded}`,
+        `  Zero adoption (recommended but never adopted): ${s.zeroAdopt}`,
       ];
-      if (topAdopted.length > 0) {
+      if (s.topAdopted.length > 0) {
         lines.push('', 'Top adopted:');
-        for (const r of topAdopted) {
+        for (const r of s.topAdopted) {
           lines.push(`  ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
         }
       }
@@ -1696,26 +1663,15 @@ server.registerTool(
     const obs = db.prepare('SELECT id, title FROM observations WHERE id = ?').get(args.id);
     if (!obs) return { content: [{ type: 'text', text: `Observation #${args.id} not found` }], isError: true };
 
-    const updates = [];
-    const params = [];
-    for (const [key, col] of [['title','title'],['narrative','narrative'],['type','type'],['importance','importance'],['lesson_learned','lesson_learned'],['concepts','concepts']]) {
-      if (args[key] !== undefined) {
-        updates.push(`${col} = ?`);
-        params.push(typeof args[key] === 'string' ? scrubSecrets(args[key]) : args[key]);
-      }
-    }
-    if (updates.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
+    // Shared mutation (lib/observation-write applyObsUpdate, P2-12): scrub + UPDATE +
+    // derived-column rebuild in one transaction — single source with CLI cmdUpdate.
+    const updatedCols = applyObsUpdate(db, args.id, {
+      title: args.title, narrative: args.narrative, type: args.type,
+      importance: args.importance, lesson_learned: args.lesson_learned, concepts: args.concepts,
+    });
+    if (updatedCols.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }], isError: true };
 
-    params.push(args.id);
-
-    // Atomic: update fields + rebuild derived columns (FTS text + vector) via the
-    // shared core — single source with CLI cmdUpdate (lib/observation-write.mjs).
-    db.transaction(() => {
-      db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-      rebuildObservationDerived(db, args.id);
-    })();
-
-    return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updates.map(u => u.split(' =')[0]).join(', ')}` }] };
+    return { content: [{ type: 'text', text: `Updated observation #${args.id}: ${updatedCols.join(', ')}` }] };
   })
 );
 
@@ -1869,33 +1825,18 @@ server.registerTool(
     const limit = args.limit ?? (tierFilter ? 20 : 5);
     const now = Date.now();
 
-    // Get active session for tier classification
-    const activeSession = db.prepare(
-      "SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND status = 'active' ORDER BY started_at_epoch DESC LIMIT 1"
-    ).get(project);
-
-    const ctx = { now, currentProject: project, currentSessionId: activeSession?.memory_session_id ?? '' };
-    const params = tierSqlParams(ctx);
-
-    const tiers = ['working', 'active', 'archive'];
-    const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
-    const showTiers = tierFilter ? [tierFilter] : tiers;
+    // Shared collection (lib/browse-core, P2-12) — single source with CLI browse.
+    const { showTiers, tierData, tierCounts, grandTotal } = collectBrowseTiers(db, {
+      project, tierFilter, limit, now,
+      currentSessionId: getActiveMemorySessionId(db, project),
+    });
+    const tiers = BROWSE_TIERS;
+    const tierLabels = BROWSE_TIER_LABELS;
 
     const lines = [`Memory Dashboard (${project})\n`];
-    let grandTotal = 0;
-    const tierCounts = {};
 
     for (const tier of showTiers) {
-      const countRow = db.prepare(`
-        SELECT COUNT(*) as c FROM (
-          SELECT ${TIER_CASE_SQL} as tier FROM observations
-          WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-        ) WHERE tier = ?
-      `).get(...params, project, tier);
-      const count = countRow?.c ?? 0;
-      tierCounts[tier] = count;
-      grandTotal += count;
-
+      const { count, rows } = tierData[tier];
       lines.push(`${tierLabels[tier]} (${count})`);
 
       if (tier === 'archive' && !tierFilter) {
@@ -1904,16 +1845,6 @@ server.registerTool(
       }
 
       if (count === 0) { lines.push(''); continue; }
-
-      const rows = db.prepare(`
-        SELECT * FROM (
-          SELECT id, type, title, created_at, created_at_epoch, ${TIER_CASE_SQL} as tier
-          FROM observations
-          WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-        ) WHERE tier = ?
-        ORDER BY created_at_epoch DESC
-        LIMIT ?
-      `).all(...params, project, tier, limit);
 
       for (const r of rows) {
         lines.push(`  #${r.id} ${typeIcon(r.type)} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${fmtDate(r.created_at)}`);

@@ -6,12 +6,13 @@ import { homedir } from 'os';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { truncate, typeIcon, inferProject, scrubSecrets, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
-import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
-import { autoBoostIfNeeded, reRankWithContext } from './search-scoring.mjs';
+import { reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
+import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS } from './lib/get-core.mjs';
+import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
-import { ensureRegistryDb, upsertResource } from './registry.mjs';
+import { ensureRegistryDb, upsertResource, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { computeFunnel, formatFunnel, computeSweep, formatSweep, DEFAULT_SWEEP_FLOORS, DEFAULT_SWEEP_MARGINS } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -23,7 +24,7 @@ import {
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
 } from './lib/maintain-core.mjs';
 import { snapshotDb, listSnapshots, backupBudgetBytes } from './lib/db-backup.mjs';
-import { deleteObservations } from './lib/delete-core.mjs';
+import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
 import { buildLessonNudge } from './lib/save-nudge.mjs';
@@ -45,7 +46,7 @@ import { isNativeBindingError, healAndReexec } from './lib/binding-probe.mjs';
 import { CLI_PATH, CLI_INVOKE } from './cli-path.mjs';
 import { parseArgs, out, outVerbatim, fail, relativeTime, fmtDateShort, parseIdToken, formatProbeHints, rejectBareStringFlags, resolvePositionalAlias, suggestUnknownFlags, OBS_TIME_FIELDS, formatObsFieldValue, obsFieldLabel, formatPendingPurgeLine } from './cli/common.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
-import { rebuildObservationDerived, normalizeScope, insertObservationVector } from './lib/observation-write.mjs';
+import { normalizeScope, insertObservationVector, applyObsUpdate } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { fetchRecent, RECENT_MAX } from './lib/recent-core.mjs';
@@ -500,7 +501,6 @@ function cmdRecall(db, args) {
   }
 }
 
-const OBS_FIELDS = ['id', 'type', 'title', 'subtitle', 'narrative', 'text', 'facts', 'concepts', 'lesson_learned', 'search_aliases', 'files_read', 'files_modified', 'project', 'created_at', 'memory_session_id', 'prompt_number', 'importance', 'related_ids', 'access_count', 'branch', 'superseded_at', 'superseded_by', 'last_accessed_at'];
 
 // Time-field formatting moved to cli/common.mjs so the CLI `get` and the MCP
 // `mem_get` (server.mjs) share one source and can't drift (the drift bug:
@@ -513,13 +513,8 @@ export { OBS_TIME_FIELDS, formatObsFieldValue };
 export async function cmdSearchForTest(db, args, opts) { return cmdSearch(db, args, opts); }
 
 function renderObsRows(db, ids, requestedFields) {
-  const placeholders = ids.map(() => '?').join(',');
-  try {
-    db.prepare(`UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id IN (${placeholders})`).run(Date.now(), ...ids);
-    autoBoostIfNeeded(db, ids);
-  } catch { /* non-critical: FTS5 trigger may fail on corrupted index */ }
-
-  const rows = db.prepare(`SELECT * FROM observations WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  // Access-bump + fetch via the shared get-core (P2-12) — single source with mem_get.
+  const rows = fetchObsDetail(db, ids);
   if (rows.length === 0) return null;
   const fields = requestedFields || OBS_FIELDS;
   const parts = [];
@@ -547,12 +542,15 @@ function renderSessionRows(db, ids) {
   const parts = [];
   for (const r of rows) {
     const lines = [`S#${r.id} ${fmtDateShort(r.created_at)}`];
-    if (r.request) lines.push(`Request: ${r.request}`);
-    if (r.completed) lines.push(`Completed: ${r.completed}`);
-    if (r.investigated) lines.push(`Investigated: ${r.investigated}`);
-    if (r.learned) lines.push(`Learned: ${r.learned}`);
-    if (r.next_steps) lines.push(`Next steps: ${r.next_steps}`);
-    if (r.project) lines.push(`Project: ${r.project}`);
+    // SESSION_DETAIL_FIELDS (get-core, P2-12): the FULL render set — the old
+    // 6-field subset made remaining_items/notes/files_* searchable-but-invisible.
+    for (const f of SESSION_DETAIL_FIELDS) {
+      if (f === 'id' || f === 'created_at') continue;   // already in the header
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      const label = f[0].toUpperCase() + f.slice(1).replace(/_/g, ' ');
+      lines.push(`${label}: ${val}`);
+    }
     parts.push(lines.join('\n'));
   }
   return { text: parts.join('\n\n'), count: rows.length };
@@ -1366,53 +1364,13 @@ function cmdBrowse(db, args) {
   const jsonOutput = flags.json === true || flags.json === 'true';
   const now = Date.now();
 
-  const ctx = {
-    now,
-    currentProject: project,
-    currentSessionId: getActiveSessionId(db, project),
-  };
-  const params = tierSqlParams(ctx);
-
-  const tiers = ['working', 'active', 'archive'];
-  const tierLabels = { working: '🔴 Working Memory', active: '🟡 Active Memory', archive: '🔵 Archive' };
-  const showTiers = tierFilter ? [tierFilter] : tiers;
-
-  // Collect data first (for JSON), then format. The text path also prints
-  // tier headers as it walks; refactored to two passes so the JSON shape can
-  // include row arrays alongside totals.
-  const tierData = {};
-  const tierCounts = {};
-  let grandTotal = 0;
-
-  for (const tier of showTiers) {
-    const countRow = db.prepare(`
-      SELECT COUNT(*) as c FROM (
-        SELECT ${TIER_CASE_SQL} as tier FROM observations
-        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-      ) WHERE tier = ?
-    `).get(...params, project, tier);
-    const count = countRow?.c ?? 0;
-    tierCounts[tier] = count;
-    grandTotal += count;
-
-    // Archive in unfiltered view: keep count but skip row fetch (matches text path).
-    const skipRows = tier === 'archive' && !tierFilter;
-    if (count === 0 || skipRows) {
-      tierData[tier] = { count, rows: [] };
-      continue;
-    }
-
-    const rows = db.prepare(`
-      SELECT * FROM (
-        SELECT id, type, title, importance, created_at_epoch, created_at, ${TIER_CASE_SQL} as tier
-        FROM observations
-        WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
-      ) WHERE tier = ?
-      ORDER BY created_at_epoch DESC
-      LIMIT ?
-    `).all(...params, project, tier, limit);
-    tierData[tier] = { count, rows };
-  }
+  // Shared collection (lib/browse-core, P2-12) — single source with mem_browse.
+  const { showTiers, tierData, tierCounts, grandTotal } = collectBrowseTiers(db, {
+    project, tierFilter, limit, now,
+    currentSessionId: getActiveMemorySessionId(db, project),
+  });
+  const tiers = BROWSE_TIERS;
+  const tierLabels = BROWSE_TIER_LABELS;
 
   if (jsonOutput) {
     const tiersOut = {};
@@ -1470,13 +1428,6 @@ function cmdBrowse(db, args) {
   }
 }
 
-function getActiveSessionId(db, project) {
-  const row = db.prepare(
-    "SELECT memory_session_id FROM sdk_sessions WHERE project = ? AND status = 'active' ORDER BY started_at_epoch DESC LIMIT 1"
-  ).get(project);
-  return row?.memory_session_id ?? '';
-}
-
 // ─── Delete ──────────────────────────────────────────────────────────────────
 
 function cmdDelete(db, args) {
@@ -1508,8 +1459,8 @@ function cmdDelete(db, args) {
   }
 
   const confirm = flags.confirm === true || flags.confirm === 'true';
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT id, type, title, project FROM observations WHERE id IN (${placeholders})`).all(...ids);
+  // Shared preview body (lib/delete-core, P2-12) — single source with mem_delete.
+  const { rows, lines: previewLines } = previewDeleteRows(db, ids);
 
   if (rows.length === 0) {
     fail('[mem] No observations found for given IDs');
@@ -1518,9 +1469,7 @@ function cmdDelete(db, args) {
 
   if (!confirm) {
     out(`[mem] Preview: ${rows.length} observation(s) will be deleted:`);
-    for (const r of rows) {
-      out(`  #${r.id} [${r.type}] ${truncate(r.title || '(untitled)', 80)} | ${r.project}`);
-    }
+    for (const line of previewLines) out(line);
     out('[mem] Run with --confirm to execute deletion.');
     return;
   }
@@ -1569,8 +1518,7 @@ function cmdUpdate(db, args) {
   // (#8470). Reject cleanly via the shared guard — single source with the other commands.
   if (rejectBareStringFlags(flags, ['title', 'narrative', 'lesson', 'lesson-learned', 'concepts'])) return;
 
-  const updates = [];
-  const params = [];
+  const fields = {};
   if (flags.title !== undefined) {
     // Reject empty title — clears the observation's identifier and would render it
     // as `(untitled)` in every listing. Almost always an accidental shell-stripped arg.
@@ -1578,7 +1526,7 @@ function cmdUpdate(db, args) {
       fail('[mem] --title cannot be empty. Pass a non-empty string or omit the flag to leave the title unchanged.');
       return;
     }
-    updates.push('title = ?'); params.push(scrubSecrets(flags.title));
+    fields.title = flags.title;
   }
   if (flags.narrative !== undefined) {
     // Reject empty (mirror --title): an explicit '' would blank the narrative
@@ -1587,7 +1535,7 @@ function cmdUpdate(db, args) {
       fail('[mem] --narrative cannot be empty. Omit the flag to leave it unchanged.');
       return;
     }
-    updates.push('narrative = ?'); params.push(scrubSecrets(flags.narrative));
+    fields.narrative = flags.narrative;
   }
   if (flags.type) {
     const validTypes = OBS_TYPE_SET;
@@ -1595,7 +1543,7 @@ function cmdUpdate(db, args) {
       fail(`[mem] Invalid type "${flags.type}". Valid: ${[...validTypes].join(', ')}`);
       return;
     }
-    updates.push('type = ?'); params.push(flags.type);
+    fields.type = flags.type;
   }
   if (flags.importance) {
     const imp = parseInt(flags.importance, 10);
@@ -1605,7 +1553,7 @@ function cmdUpdate(db, args) {
       fail(`[mem] Invalid importance "${flags.importance}". Must be 1, 2, or 3.`);
       return;
     }
-    updates.push('importance = ?'); params.push(imp);
+    fields.importance = imp;
   }
   if (flags.lesson !== undefined || flags['lesson-learned'] !== undefined) {
     const rawLesson = flags.lesson ?? flags['lesson-learned'] ?? '';
@@ -1620,8 +1568,7 @@ function cmdUpdate(db, args) {
       fail('[mem] --lesson cannot be empty. Omit the flag to leave it unchanged.');
       return;
     }
-    updates.push('lesson_learned = ?');
-    params.push(scrubSecrets(rawLesson));
+    fields.lesson_learned = rawLesson;
   }
   // Scrub like the sibling text fields above (title/narrative/lesson) and the MCP twin
   // mem_update — concepts is a scrub-target + FTS-indexed column, so a raw secret here
@@ -1631,24 +1578,18 @@ function cmdUpdate(db, args) {
       fail('[mem] --concepts cannot be empty. Omit the flag to leave it unchanged.');
       return;
     }
-    updates.push('concepts = ?'); params.push(scrubSecrets(flags.concepts));
+    fields.concepts = flags.concepts;
   }
 
-  if (updates.length === 0) {
+  // Shared mutation (lib/observation-write applyObsUpdate, P2-12): scrub + UPDATE +
+  // derived-column rebuild in one transaction — single source with MCP mem_update.
+  const updatedCols = applyObsUpdate(db, id, fields);
+  if (updatedCols.length === 0) {
     fail('[mem] No fields to update. Use --title, --type, --importance, --lesson/--lesson-learned, --narrative, --concepts');
     return;
   }
 
-  params.push(id);
-
-  // Atomic: update fields + rebuild derived columns (FTS text + vector) via the
-  // shared core — single source with MCP mem_update (lib/observation-write.mjs).
-  db.transaction(() => {
-    db.prepare(`UPDATE observations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-    rebuildObservationDerived(db, id);
-  })();
-
-  out(`[mem] Updated #${id}: ${updates.map(u => u.split(' =')[0]).join(', ')}`);
+  out(`[mem] Updated #${id}: ${updatedCols.join(', ')}`);
 }
 
 // ─── Export ──────────────────────────────────────────────────────────────────
@@ -2308,18 +2249,13 @@ function cmdRegistry(_memDb, args) {
     if (action === 'list') {
       const typeFilter = flags.type;
       const listLimit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
-      const where = typeFilter ? 'WHERE type = ? AND status = ?' : 'WHERE status = ?';
-      const params = typeFilter ? [typeFilter, 'active'] : ['active'];
-      const allResources = rdb.prepare(`
-        SELECT name, type, invocation_name, recommend_count, adopt_count, capability_summary
-        FROM resources ${where} ORDER BY adopt_count DESC, recommend_count DESC, type, name
-      `).all(...params);
+      // Shared ranked query + row line (registry.mjs, P2-12): COALESCE ordering and
+      // the 80-char/adopt:0 row shape had drifted between the faces.
+      const allResources = listResourcesRanked(rdb, { type: typeFilter });
       if (allResources.length === 0) { out('[mem] No resources found.'); return; }
       const resources = allResources.slice(0, listLimit);
       out(`[mem] Resources (showing ${resources.length} of ${allResources.length}):`);
-      for (const r of resources) {
-        out(`  ${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count} adopt:${r.adopt_count} — ${truncate(r.capability_summary || '', 50)}`);
-      }
+      for (const r of resources) out(`  ${formatRegistryListLine(r)}`);
       if (allResources.length > listLimit) {
         out(`[mem] Use --limit N to see more, or "registry search <query>" to find specific resources.`);
       }
@@ -2327,25 +2263,17 @@ function cmdRegistry(_memDb, args) {
     }
 
     if (action === 'stats') {
-      const total = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      const byType = rdb.prepare('SELECT type, COUNT(*) as c FROM resources WHERE status = ? GROUP BY type').all('active');
-      const topAdopted = rdb.prepare(
-        'SELECT name, type, adopt_count, recommend_count FROM resources WHERE status = ? AND adopt_count > 0 ORDER BY adopt_count DESC LIMIT 10'
-      ).all('active');
-      const zeroAdopt = rdb.prepare(
-        'SELECT COUNT(*) as c FROM resources WHERE status = ? AND recommend_count > 0 AND adopt_count = 0'
-      ).get('active');
-      const userAdded = rdb.prepare(
-        "SELECT COUNT(*) as c FROM resources WHERE status = ? AND source = 'user'"
-      ).get('active');
+      // Shared collection (registry.mjs collectRegistryStats, P2-12) — single
+      // source with the MCP mem_registry stats action.
+      const s = collectRegistryStats(rdb);
       out(`[mem] Registry Stats:`);
-      out(`  Total active: ${total.c}`);
-      for (const t of byType) out(`  ${t.type}: ${t.c}`);
-      out(`  User-added: ${userAdded.c}`);
-      out(`  Zero adoption (recommended but never adopted): ${zeroAdopt.c}`);
-      if (topAdopted.length > 0) {
+      out(`  Total active: ${s.total}`);
+      for (const t of s.byType) out(`  ${t.type}: ${t.c}`);
+      out(`  User-added: ${s.userAdded}`);
+      out(`  Zero adoption (recommended but never adopted): ${s.zeroAdopt}`);
+      if (s.topAdopted.length > 0) {
         out('  Top adopted:');
-        for (const r of topAdopted) out(`    ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
+        for (const r of s.topAdopted) out(`    ${r.name} (${r.type}): ${r.adopt_count}/${r.recommend_count}`);
       }
       return;
     }
