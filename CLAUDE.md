@@ -23,7 +23,7 @@ Used by `/health` skill (gstack). Persisted here so detection skips runtime prob
 - deadcode: ./node_modules/.bin/knip
 - shell: shellcheck scripts/post-tool-use.sh scripts/pre-commit.sh scripts/setup.sh
 
-Knip baseline (2026-08-14): 0 unused files, 31 unused exports (down from 46 on 2026-07-17, itself down from 53 on 2026-06-29 — dead code cleaned in the v3.43 P3 batch, then OBS_TYPE_ENUM gained real importers in v3.49.0; re-measured on 2026-08-14 and all 31 fall in the intentional categories below — no invocation-stats/dispatch name is in the list). Two categories:
+Knip baseline (2026-08-16): 0 unused files, 32 unused exports (31 on 2026-08-14, +1 = `BACKUP_EVICTION_GRACE_MS` from the v3.63.0 M-9 batch — intentional named constant, category (a); down from 46 on 2026-07-17, itself down from 53 on 2026-06-29 — dead code cleaned in the v3.43 P3 batch, then OBS_TYPE_ENUM gained real importers in v3.49.0; all 32 fall in the intentional categories below — no invocation-stats/dispatch name is in the list). Two categories:
 (a) intentional — v2.21 utils.mjs split backward-compat re-exports + test-only
 exports (search-engine.mjs FTS/count helpers, ftsRowToResult) used internally and
 by tests; do NOT remove without audit. (b) NOT intentional — the v3 dispatch/

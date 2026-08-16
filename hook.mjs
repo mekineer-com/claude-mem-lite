@@ -68,6 +68,7 @@ import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
 import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
+import { injectedIdsFileName } from './lib/injected-ids.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
@@ -866,7 +867,11 @@ function gcStalePreRecallCooldowns() {
   try {
     const now = Date.now();
     for (const name of readdirSync(RUNTIME_DIR)) {
-      if (!name.startsWith('pre-recall-cooldown-') || !name.endsWith('.json')) continue;
+      // D#120: the injected-ids marker is also per-session now — same growth
+      // shape as the cooldown files, same 24h GC (dedup window is 5 min).
+      const isCooldown = name.startsWith('pre-recall-cooldown-') && name.endsWith('.json');
+      const isInjectedMarker = name.startsWith('.claude-mem-injected-');
+      if (!isCooldown && !isInjectedMarker) continue;
       try {
         const p = join(RUNTIME_DIR, name);
         const st = statSync(p);
@@ -1661,12 +1666,14 @@ async function handleUserPrompt() {
 
       // Read IDs already injected by user-prompt-search.js to avoid duplicate injection
       try {
-        const injectedFile = join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
+        // D#120: the marker file is session-keyed (no ccSessionId → legacy
+        // project-keyed name), so a concurrent session's write can no longer
+        // replace this session's payload between the UPS write and this read.
+        const injectedFile = join(RUNTIME_DIR, injectedIdsFileName(project, ccSessionId));
         const raw = readFileSync(injectedFile, 'utf8');
         const { ids, ts, session } = JSON.parse(raw);
         // Only use if written within last 10 seconds (same prompt cycle) AND by this
-        // CC session — the file is project-keyed, so a concurrent session's write
-        // would otherwise dedup-suppress OUR injection (M-6, audit 2026-08-14).
+        // CC session (M-6 payload gate, still load-bearing for legacy files).
         // Legacy payloads without `session` keep the old time-window-only behavior.
         if (ts && Date.now() - ts < 10000 && Array.isArray(ids)
             && !(session && ccSessionId && session !== ccSessionId)) {

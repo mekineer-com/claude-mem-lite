@@ -33,7 +33,7 @@
 // tooling only — not shipped in SOURCE_FILES, no release impact.
 
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync, rmSync } from 'fs';
+import { readFileSync, readdirSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { RUNTIME_DIR } from '../hook-shared.mjs';
@@ -53,14 +53,24 @@ function argVal(flag, def) {
 const queryFile = argVal('--queries', join(__dirname, 'fixtures', 'ups-identifier-queries.json'));
 const SUITE = JSON.parse(readFileSync(queryFile, 'utf8'));
 const PROJECT = inferProject();
-const DEDUP_FILE = join(RUNTIME_DIR, `.claude-mem-injected-${PROJECT}`);
+// D#120: the dedup marker is session-keyed (`.claude-mem-injected-<project>-<session>`),
+// and this harness's synthetic session ids can collide across same-length prompts —
+// clear every marker for the project so no run suppresses another.
+const DEDUP_FILE_PREFIX = `.claude-mem-injected-${PROJECT}`;
+function clearDedupFiles() {
+  try {
+    for (const name of readdirSync(RUNTIME_DIR)) {
+      if (name.startsWith(DEDUP_FILE_PREFIX)) { try { rmSync(join(RUNTIME_DIR, name)); } catch { /* ignore */ } }
+    }
+  } catch { /* runtime dir may not exist */ }
+}
 
 // Inject ids the script surfaced for one prompt under one arm. Clears the per-project
 // dedup cache first so back-to-back queries don't suppress each other (the cache
 // regenerates on the next real hook fire — harmless to clear). Parses obs lines
 // (^#NNN); ignores P#/S# (prompt/session) and all other output.
 function injectedFor(prompt, bypass) {
-  if (DEDUP_FILE && existsSync(DEDUP_FILE)) { try { rmSync(DEDUP_FILE); } catch { /* ignore */ } }
+  clearDedupFiles();
   let out = '';
   try {
     out = execFileSync('node', [SCRIPT], {

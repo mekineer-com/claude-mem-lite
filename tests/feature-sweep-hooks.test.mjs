@@ -1091,7 +1091,8 @@ describe('hook feature sweep: standalone hook scripts', () => {
     expect(r.stdout).toContain('Invalidate the widget cache on write');
     // The injected ids are recorded so the sibling hook.mjs user-prompt pass and the next
     // prompt inside the dedup window do not re-inject the same rows.
-    const injected = JSON.parse(readFileSync(join(upsData, 'runtime', `.claude-mem-injected-${project}`), 'utf8'));
+    // D#120: the marker file is session-keyed — one file per CC session.
+    const injected = JSON.parse(readFileSync(join(upsData, 'runtime', `.claude-mem-injected-${project}-cc-hooksweep-ups`), 'utf8'));
     expect(injected.ids).toContain(id);
 
     await expectMalformedResilience(

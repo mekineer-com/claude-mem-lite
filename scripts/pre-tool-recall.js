@@ -8,6 +8,7 @@ import { existsSync, readFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
+import { injectedIdsFileName } from '../lib/injected-ids.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
@@ -153,11 +154,14 @@ function entryTimestamp(v) {
 }
 
 // A3 (v2.83): cross-hook injected-IDs store. UPS writes
-// `runtime/.claude-mem-injected-<project>` with {ids, ts, count}. We read
-// inside the staleness window, filter overlaps from PreToolUse output, then
-// merge back so the next UPS sees what we emitted too.
-function crossHookInjectedFile(project) {
-  return join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
+// `runtime/.claude-mem-injected-<project>-<session>` with {ids, ts, count}. We
+// read inside the staleness window, filter overlaps from PreToolUse output,
+// then merge back so the next UPS sees what we emitted too.
+// D#120: the file is keyed per SESSION (payload-only keying let two concurrent
+// windows clobber each other's marker). Derivation shared via lib/injected-ids.mjs
+// (pure, no deps — within the standalone fast-path budget, #8447).
+function crossHookInjectedFile(project, sessionId) {
+  return join(RUNTIME_DIR, injectedIdsFileName(project, sessionId));
 }
 
 // M-6 (audit 2026-08-14): the marker file is keyed by PROJECT, so two concurrent
@@ -168,7 +172,7 @@ function crossHookInjectedFile(project) {
 // session-key fix. Legacy payloads without `session` keep the old behavior.
 function readCrossHookInjected(project, sessionId) {
   try {
-    const raw = readFileSync(crossHookInjectedFile(project), 'utf8');
+    const raw = readFileSync(crossHookInjectedFile(project, sessionId), 'utf8');
     const { ids, ts, session } = JSON.parse(raw);
     if (session && sessionId && session !== sessionId) return new Set();
     if (!ts || Date.now() - ts > CROSS_HOOK_DEDUP_MS) return new Set();
@@ -181,7 +185,7 @@ function mergeCrossHookInjected(project, newIds, sessionId) {
   if (!newIds || newIds.length === 0) return;
   try {
     mkdirSync(RUNTIME_DIR, { recursive: true });
-    const file = crossHookInjectedFile(project);
+    const file = crossHookInjectedFile(project, sessionId);
     let prev = { ids: [], ts: 0, count: 0 };
     try {
       const raw = readFileSync(file, 'utf8');

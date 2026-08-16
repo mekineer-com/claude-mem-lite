@@ -104,7 +104,9 @@ try {
     let additionalContext;
     if (content.length > 16000) {
       const summary = defang(content.slice(0, 800));
-      additionalContext = `<skill-bridge name="${safeName}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${portablePath}") to load full content.`;
+      // D#122 ③: the path interpolates OUTSIDE the wrapper — defang it too (a
+      // locally-created managed dir can carry delimiter chars in its name).
+      additionalContext = `<skill-bridge name="${safeName}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${defang(portablePath)}") to load full content.`;
     } else {
       additionalContext = `<skill-bridge name="${safeName}" source="managed">\n${defang(content)}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`;
     }

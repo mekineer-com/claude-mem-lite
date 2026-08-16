@@ -1425,15 +1425,17 @@ describe('pre-tool-recall', () => {
       try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
     });
 
-    function seedUpsInjected(ids, ageMs = 0) {
-      // Path mirrors user-prompt-search.js INJECTED_IDS_FILE construction.
-      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test`);
-      writeFileSync(file, JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1 }));
+    function seedUpsInjected(ids, sessionId, ageMs = 0) {
+      // Path mirrors user-prompt-search.js injectedIdsFileFor construction —
+      // D#120: session-keyed file name, so the seed must carry the same session
+      // id the script receives on stdin or the read side derives another path.
+      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test-${sessionId}`);
+      writeFileSync(file, JSON.stringify({ ids: ids.map(String), ts: Date.now() - ageMs, count: 1, session: sessionId }));
       return file;
     }
 
     it('drops a lesson row whose ID was just injected by UPS', async () => {
-      seedUpsInjected([lessonObsId]);
+      seedUpsInjected([lessonObsId], 'sess-a3-1');
       const { stdout } = await runScript({
         tool_name: 'Edit',
         tool_input: { file_path: join(projectDir, 'shared.mjs') },
@@ -1451,7 +1453,7 @@ describe('pre-tool-recall', () => {
 
     it('keeps the lesson when UPS state is older than DEDUP_STALE_MS', async () => {
       // 10 minutes old — stale, should be ignored. Lesson should surface.
-      seedUpsInjected([lessonObsId], 10 * 60_000);
+      seedUpsInjected([lessonObsId], 'sess-a3-2', 10 * 60_000);
       const { stdout } = await runScript({
         tool_name: 'Edit',
         tool_input: { file_path: join(projectDir, 'shared.mjs') },
@@ -1483,7 +1485,7 @@ describe('pre-tool-recall', () => {
         session_id: 'sess-a3-4',
       }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
 
-      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test`);
+      const file = join(tmpRoot, 'runtime', `.claude-mem-injected-parent--a3test-sess-a3-4`);
       const state = JSON.parse(readFileSync(file, 'utf8'));
       const idStrings = (state.ids || []).map(String);
       expect(idStrings).toContain(String(lessonObsId));

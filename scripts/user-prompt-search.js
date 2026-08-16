@@ -12,6 +12,7 @@ import { join, sep } from 'path';
 import { pathToFileURL } from 'url';
 import Database from 'better-sqlite3';
 import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, extractDeferredRefs, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
+import { injectedIdsFileName } from '../lib/injected-ids.mjs';
 import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
@@ -22,7 +23,12 @@ import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
 // Telemetry sink (lib/hook-telemetry.mjs contract): env override for tests, else
 // <data-dir>/runtime — the same dir the sibling hook scripts + `stats` read.
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DB_DIR, 'runtime');
-const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
+// D#120: one marker file per CC session — payload-only session keying (M-6) let
+// two concurrent windows full-replace each other's marker, killing dedup between
+// them and resetting `count` on every alternation. Derived per invocation once
+// the session id is parsed from stdin; no session id → legacy project-keyed file.
+const injectedIdsFileFor = (sessionId) =>
+  join(DB_DIR, 'runtime', injectedIdsFileName(inferProject(), sessionId));
 // Per-prompt UPS cap. Cut from 5 → 3 after the 2026-05-09 per-hook recall
 // scan (#8255): UPS contributed 74% of silent injected IDs (131/177) at 26%
 // recall, vs PreToolUse:Read at 94% recall on a tighter file-keyed set.
@@ -66,7 +72,7 @@ const PROMPT_MIN_LENGTH = 15;
 // v2.33.1: follow-up prompts ("前面那个", "继续 X", "再看看 Y") are short by
 // nature but semantically depend on prior turns. Once a session has injected
 // memory at least once, relax gates so short follow-ups still get recall.
-// Detection: INJECTED_IDS_FILE count > 0 within DEDUP_STALE_MS window.
+// Detection: injected-ids marker count > 0 within DEDUP_STALE_MS window.
 const FOLLOWUP_PROMPT_MIN_LENGTH = 8;
 const FOLLOWUP_BM25_MIN_SCORE = Number(process.env.CLAUDE_MEM_UPS_BM25_MIN_FOLLOWUP || 5e-6);
 
@@ -173,9 +179,9 @@ export function corpusFloorScale(db) {
   }
 }
 
-function isFollowUpSession() {
+function isFollowUpSession(injectedIdsFile) {
   try {
-    const raw = readFileSync(INJECTED_IDS_FILE, 'utf8');
+    const raw = readFileSync(injectedIdsFile, 'utf8');
     const { ts, count = 0 } = JSON.parse(raw);
     if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
     return count > 0;
@@ -636,6 +642,9 @@ async function main() {
   // would never legitimately be wrapped in <private>).
   if (rawPrompt.startsWith('<task-notification>')) return;
 
+  // D#120: session-keyed dedup marker — every read/write below uses this path.
+  const injectedIdsFile = injectedIdsFileFor(hookData.session_id);
+
   // Strip <private>...</private> blocks before length gates and FTS query
   // construction — private content must not pad effective length nor leak
   // into the FTS MATCH query terms. Mirrors hook.mjs handleUserPrompt.
@@ -665,7 +674,7 @@ async function main() {
       // Namespace dedup ids as "D<id>" (parity with the "P<id>" prompt-corpus
       // convention) so obs ids can't collide in the shared injected-ids file.
       const dedupIds = openRows.map(r => `D${r.id}`);
-      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, INJECTED_IDS_FILE, hookData.session_id)) {
+      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, injectedIdsFile, hookData.session_id)) {
         const lines = ['[mem] Deferred work referenced in prompt (open items, full detail):'];
         for (const r of openRows) {
           const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
@@ -684,7 +693,7 @@ async function main() {
           let prevIds = [];
           let prevCount = 0;
           try {
-            const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
+            const prev = JSON.parse(readFileSync(injectedIdsFile, 'utf8'));
             // M-6: inherit only same-session (or legacy) state — another session's
             // ids/count must not carry over. Atomic write below: a torn concurrent
             // write left the shared marker as invalid JSON (dedup silently off).
@@ -694,7 +703,7 @@ async function main() {
               prevCount = prev.count || 0;
             }
           } catch {}
-          atomicWriteFileSync(INJECTED_IDS_FILE, JSON.stringify({
+          atomicWriteFileSync(injectedIdsFile, JSON.stringify({
             ids: [...new Set([...prevIds.map(String), ...dedupIds])],
             ts: Date.now(),
             count: prevCount + 1,
@@ -713,7 +722,7 @@ async function main() {
   // "fix bug now") that carry too few content tokens for a meaningful FTS lookup.
   // v2.33.1: follow-up prompts in an already-active session get a lower gate —
   // short continuations ("前面那个?", "does it work?") depend on prior context.
-  const followUp = isFollowUpSession();
+  const followUp = isFollowUpSession(injectedIdsFile);
   const promptMinLen = followUp ? FOLLOWUP_PROMPT_MIN_LENGTH : PROMPT_MIN_LENGTH;
   if (computeEffectiveLen(promptText.trim()) < promptMinLen) { try { db?.close(); } catch {} return; }
   const bm25Floor = followUp ? FOLLOWUP_BM25_MIN_SCORE : BM25_MIN_SCORE;
@@ -870,7 +879,7 @@ async function main() {
     const candidateIds = rows.length > 0
       ? rows.map(r => r.id)
       : promptRows.map(r => `P${r.id}`);
-    const dedupSkip = shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE, hookData.session_id);
+    const dedupSkip = shouldSkipByDedup(candidateIds, injectedIdsFile, hookData.session_id);
 
     const output = !dedupSkip
       ? (rows.length > 0 ? formatResults(rows) : formatPromptResults(promptRows))
@@ -881,14 +890,14 @@ async function main() {
       try {
         let prevCount = 0;
         try {
-          const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
+          const prev = JSON.parse(readFileSync(injectedIdsFile, 'utf8'));
           // M-6: same-session (or legacy) count only; atomic write (torn-write guard).
           if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS
               && !(prev.session && hookData.session_id && prev.session !== hookData.session_id)) {
             prevCount = prev.count || 0;
           }
         } catch {}
-        atomicWriteFileSync(INJECTED_IDS_FILE, JSON.stringify({
+        atomicWriteFileSync(injectedIdsFile, JSON.stringify({
           ids: candidateIds,
           ts: Date.now(),
           count: prevCount + 1,

@@ -82,6 +82,7 @@
     "lib/atomic-write.mjs",
     "lib/release-digest.mjs",
     "lib/mem-override.mjs",
+    "lib/injected-ids.mjs",
     "lib/save-observation.mjs",
     "lib/observation-write.mjs",
     "lib/recall-core.mjs",

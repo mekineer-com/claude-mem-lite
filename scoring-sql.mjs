@@ -23,10 +23,11 @@ import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 // Where a multiplier reads 0 it is a benchmark-MISMATCH artifact (the instrument
 // can't vary that axis), NOT proven dead weight. Decision: KEEP them; do NOT
 // delete on "0 lift". Guardrail: the ci-gate `hybrid_over_bm25 >= -0.05` floor
-// (benchmark/ci-gate.mjs) covers the full modelled chain
-// (decay/type/project/importance/access/lesson); cite + noise live on the
-// injection path (hook-memory.mjs) with no recall-benchmark coverage. Genuine
-// validation of the prior-encoding axes needs a labeled real-dev-memory eval.
+// (benchmark/ci-gate.mjs) covers the full modelled chain — D#121: cite + noise
+// joined the matrix MULT_EXPR after M-3 put them in FULL_SCORE (fixture carries
+// zero cite/noise state, so both read 0 by construction, same caveat as lesson;
+// their real-SQL direction pins live in benchmark/events-pipeline-probes.mjs).
+// Genuine validation of the prior-encoding axes needs a labeled real-dev-memory eval.
 
 // ─── Type-Differentiated Recency Decay ──────────────────────────────────────
 

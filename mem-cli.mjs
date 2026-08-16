@@ -4,7 +4,7 @@
 
 import { homedir } from 'os';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
-import { truncate, typeIcon, inferProject, scrubSecrets } from './utils.mjs';
+import { truncate, typeIcon, inferProject, scrubSecrets, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
 import { TIER_CASE_SQL, tierSqlParams } from './tier.mjs';
 import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
@@ -1822,7 +1822,10 @@ function cmdRestore(db, argv) {
     // weekly-summary keeper already absorbed (duplicate search hits, and the marker's
     // target id is meaningless in this store). Reject rather than remap; the content
     // lives on in the keeper.
-    if (r.compressed_into) { tombstoned++; continue; }
+    // D#122: COMPRESSED_PENDING_PURGE (-2) is NOT keeper-absorbed — those rows have
+    // no keeper, so rejecting them silently loses their only copy. Restore them
+    // live; the maintain decay pipeline will re-evaluate them like any other row.
+    if (r.compressed_into && r.compressed_into !== COMPRESSED_PENDING_PURGE) { tombstoned++; continue; }
     const project = projOverride || r.project || inferProject();
     const createdEpoch = Number.isFinite(Number(r.created_at_epoch)) ? Number(r.created_at_epoch) : Date.now();
     // Durable exact-dup guard — saveObservation's 5-min Jaccard window can't catch a

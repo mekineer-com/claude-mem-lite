@@ -44,11 +44,16 @@ const FULL_SCORE = `${OBS_BM25}
   * ${noisePenaltyClause('o')}
   * ${citeFactorClause('o')}`;
 
+// D#121: noisePenalty joins SIMPLE (an entrenched-noise row demoted 0.2× on every
+// direct surface re-entered concept/PRF expansion at full magnitude); citeFactor
+// stays OUT deliberately — it can amplify 3×, and SIMPLE exists precisely to avoid
+// amplifying already-loose expansion matches. Noise only shrinks: safe direction.
 const SIMPLE_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))`;
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))
+  * ${noisePenaltyClause('o')}`;
 
 // Shared column set for fetching an observation surfaced by the vector arm — used by BOTH
 // the RRF-merge branch (FTS also had results) and the FTS-empty fallback branch. Single
@@ -467,8 +472,12 @@ export function searchObservationsHybrid(db, ctx) {
   // rescued rows now (they are the only relevance evidence available).
   if (results.length > 0 && results.length < Math.ceil(limit / 2)) {
     const existingIds = new Set(results.map(r => r.id));
+    // D#122 ②: capture the PRIMARY count before concept expansion mutates
+    // `results` — PRF's >=3 gate is meant to read direct-match evidence, not
+    // rows the concept pass just added.
+    const primaryCount = results.length;
     expandObsByConceptCo(db, ctx, now, existingIds, results, includeNoise);
-    expandObsByPRF(db, ctx, now, results.length, existingIds, results, includeNoise);
+    expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includeNoise);
   }
 
   // Vector search + RRF hybrid merge

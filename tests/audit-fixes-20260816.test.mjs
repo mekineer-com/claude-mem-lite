@@ -587,9 +587,11 @@ describe('M-8 — restore rejects compressed members instead of reviving them', 
     const memberId = Number(member.stdout.match(/#(\d+)/)[1]);
 
     // Mark the member compressed (absorbed by a keeper) directly — the state
-    // hook-llm's weekly compression produces.
+    // hook-llm's weekly compression produces. D#122: a POSITIVE keeper id, not -2 —
+    // COMPRESSED_PENDING_PURGE rows have no keeper and must restore live (below).
+    const liveId = Number(live.stdout.match(/#(\d+)/)[1]);
     const raw = new Database(join(srcDir, 'claude-mem-lite.db'));
-    try { raw.prepare('UPDATE observations SET compressed_into = -2 WHERE id = ?').run(memberId); }
+    try { raw.prepare('UPDATE observations SET compressed_into = ? WHERE id = ?').run(liveId, memberId); }
     finally { raw.close(); }
 
     const exp = await runSrc(['export', '--include-compressed']);
@@ -600,7 +602,7 @@ describe('M-8 — restore rejects compressed members instead of reviving them', 
     const backupRows = JSON.parse(exp.stdout);
     const memberRow = backupRows.find((r) => r.title === 'M8 compressed member row');
     expect(memberRow, 'member missing from --include-compressed export').toBeTruthy();
-    expect(memberRow.compressed_into, 'backup lost the compressed_into tombstone').toBe(-2);
+    expect(memberRow.compressed_into, 'backup lost the compressed_into tombstone').toBe(liveId);
 
     const res = await runDst(['restore', backupFile]);
     expect(res.code, res.stderr).toBe(0);
@@ -611,6 +613,41 @@ describe('M-8 — restore rejects compressed members instead of reviving them', 
       const titles = dst.prepare('SELECT title FROM observations').all().map((r) => r.title);
       expect(titles).toContain('M8 live survivor row');
       expect(titles, 'tombstoned member resurrected as a live row').not.toContain('M8 compressed member row');
+    } finally { dst.close(); }
+  }, 90000);
+
+  // FAILS IF: the rejection guard reverts to `if (r.compressed_into)` — a pending-
+  // purge row (-2, NO keeper) is then rejected with the keeper-absorbed message and
+  // its only copy is silently lost on the restore surface (D#122 ①).
+  it('a COMPRESSED_PENDING_PURGE (-2) row restores LIVE — it has no keeper', async () => {
+    const srcDir = sandboxDir('m8b-src');
+    const dstDir = sandboxDir('m8b-dst');
+    const cwd = sandboxDir('m8b-work');
+    const home = sandboxDir('m8b-home');
+    const runSrc = (args) => fire(process.execPath, [CLI_PATH, ...args], { cwd, env: { CLAUDE_MEM_DIR: srcDir, HOME: home } });
+    const runDst = (args) => fire(process.execPath, [CLI_PATH, ...args], { cwd, env: { CLAUDE_MEM_DIR: dstDir, HOME: home } });
+
+    const pending = await runSrc(['save', 'M8b purge-pending row', '--type', 'bugfix']);
+    expect(pending.code, pending.stderr).toBe(0);
+    const pendingId = Number(pending.stdout.match(/#(\d+)/)[1]);
+    const raw = new Database(join(srcDir, 'claude-mem-lite.db'));
+    try { raw.prepare('UPDATE observations SET compressed_into = -2 WHERE id = ?').run(pendingId); }
+    finally { raw.close(); }
+
+    const exp = await runSrc(['export', '--include-compressed']);
+    expect(exp.code, exp.stderr).toBe(0);
+    const backupFile = join(sandboxDir('m8b'), 'backup.json');
+    writeFileSync(backupFile, exp.stdout);
+
+    const res = await runDst(['restore', backupFile]);
+    expect(res.code, res.stderr).toBe(0);
+    expect(res.stdout, 'pending-purge row must not be counted as keeper-rejected')
+      .not.toMatch(/compressed member\(s\) rejected/);
+
+    const dst = new Database(join(dstDir, 'claude-mem-lite.db'), { readonly: true });
+    try {
+      const titles = dst.prepare('SELECT title FROM observations').all().map((r) => r.title);
+      expect(titles, 'pending-purge row silently lost on restore').toContain('M8b purge-pending row');
     } finally { dst.close(); }
   }, 90000);
 });
@@ -728,5 +765,130 @@ describe('P-2 — declaration files in RELEASE_SIGNED_FILES', () => {
     for (const f of DECLARATIONS) {
       expect(packed.has(f), `${f} is signed but not in package.json files[] — never packed`).toBe(true);
     }
+  });
+});
+
+// ─── D#120 — the injected-ids marker FILE is session-keyed ─────────────────────────
+// M-6 session-keyed the PAYLOAD of `.claude-mem-injected-<project>` but kept ONE file
+// per project. Two concurrent CC windows then full-replace each other's marker: each
+// writer sees the OTHER session's payload, discards it, and starts over — so within-
+// session dedup never survives an interleaved write and `count` resets on every
+// alternation (MAX_SESSION_INJECTIONS unreachable). Fix = one file per session,
+// mirroring pre-recall-cooldown-<session>.json in the same runtime dir.
+
+describe('D#120 — per-session injected-ids file survives interleaved sessions', () => {
+  let dataDir, workDir, project, defA, defB;
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), 'mem-d120-'));
+    workDir = join(dataDir, 'parent', 'd120');
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(join(dataDir, 'runtime'), { recursive: true });
+    project = 'parent--d120';
+
+    const db = new Database(join(dataDir, 'claude-mem-lite.db'));
+    initSchema(db);
+    const ins = db.prepare(
+      'INSERT INTO deferred_work (project, title, detail, priority, status, created_at_epoch) VALUES (?, ?, ?, 2, \'open\', ?)'
+    );
+    defA = Number(ins.run(project, 'first deferred item', 'detail body A', Date.now()).lastInsertRowid);
+    defB = Number(ins.run(project, 'second deferred item', 'detail body B', Date.now()).lastInsertRowid);
+    db.close();
+  });
+
+  afterEach(() => {
+    try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
+  });
+
+  function ups(sessionId, prompt) {
+    return fire(process.execPath, [UPS_PATH], {
+      cwd: workDir,
+      stdin: JSON.stringify({ session_id: sessionId, prompt }),
+      env: { CLAUDE_MEM_DIR: dataDir, HOME: dataDir },
+    });
+  }
+
+  // FAILS IF: both sessions share one marker file — session B's write replaces
+  // session A's payload, so A's third run no longer sees its own first injection
+  // and re-injects inside the 5-minute dedup window.
+  it("a session's D# dedup survives an interleaved write from another session", async () => {
+    const a1 = await ups('cc-d120-a', `D#${defA} 继续`);
+    expect(a1.code).toBe(0);
+    expect(a1.stdout, 'precondition: session A first run must inject').toContain(`D#${defA}`);
+
+    const b1 = await ups('cc-d120-b', `D#${defA} 继续`);
+    expect(b1.code).toBe(0);
+    expect(b1.stdout, 'precondition: session B is independent and must inject').toContain(`D#${defA}`);
+
+    const a2 = await ups('cc-d120-a', `D#${defA} 继续`);
+    expect(a2.code).toBe(0);
+    expect(a2.stdout, 'session A re-reference within the window must be suppressed').not.toContain(`D#${defA}`);
+  });
+
+  // FAILS IF: the marker file is shared — A's second write inherits nothing (other-
+  // session payload discarded), so its count restarts at 1 and the
+  // MAX_SESSION_INJECTIONS cap can never be reached while two windows alternate.
+  it("a session's injection count accumulates across an interleaved write", async () => {
+    await ups('cc-d120-a', `D#${defA} 继续`);
+    await ups('cc-d120-b', `D#${defA} 继续`);
+    await ups('cc-d120-a', `D#${defB} 继续`);
+
+    const marker = join(dataDir, 'runtime', `.claude-mem-injected-${project}-cc-d120-a`);
+    expect(existsSync(marker), `expected session-keyed marker at ${marker}`).toBe(true);
+    const state = JSON.parse(readFileSync(marker, 'utf8'));
+    expect(state.count, 'session A made 2 injections — count must not reset on alternation').toBe(2);
+    expect(state.session).toBe('cc-d120-a');
+  });
+});
+
+// ─── D#121 — expansion paths respect the noise penalty ─────────────────────────────
+// SIMPLE_SCORE (concept/PRF expansion arms) omitted noisePenaltyClause: an
+// entrenched-noise row (injection_count>=8, ratio>5 → 0.2×) demoted on every direct
+// FTS surface re-entered expansion results at FULL magnitude. citeFactor stays out
+// deliberately — SIMPLE exists to avoid amplifying already-loose matches, and cite
+// can amplify 3× (noise only shrinks: the safe direction).
+
+describe('D#121 — SIMPLE_SCORE carries the noise penalty on expansion rows', () => {
+  // FAILS IF: noisePenaltyClause is dropped from SIMPLE_SCORE — the noisy row's
+  // stronger BM25 (doubled title term) then outranks the clean row again.
+  it('an entrenched-noise expansion row sinks below a clean expansion row', async () => {
+    const { sanitizeFtsQuery } = await import('../utils.mjs');
+    const { searchObservationsHybrid } = await import('../search-engine.mjs');
+    const db = createTestDb();
+    insertSession(db, { id: 'd121-s', project: 'p' });
+
+    // OR-rescue docs: match 'zebra' + share co-term 'minotaur' (PRF seeds).
+    const rescueNarratives = [
+      'minotaur backlog observed overnight',
+      'minotaur latency rising steadily',
+      'minotaur alerts firing loudly',
+    ];
+    for (let i = 0; i < 3; i++) {
+      insertObs(db, { sessionId: 'd121-s', project: 'p', type: 'bugfix',
+        title: `zebra stall ${['one', 'two', 'three'][i]}`,
+        narrative: rescueNarratives[i] });
+    }
+    // Expansion-only targets: carry the co-term, NEITHER query term.
+    // Noisy row: STRONGER match (term twice in the weight-10 title) + entrenched-
+    // noise counters (inj=9 > acc=1 × 5 → the 0.2× tier).
+    const noisyId = Number(insertObs(db, { sessionId: 'd121-s', project: 'p', type: 'bugfix',
+      title: 'minotaur minotaur queue saturation',
+      narrative: 'the minotaur queue saturates when consumers detach' }).lastInsertRowid);
+    db.prepare('UPDATE observations SET injection_count = 9, access_count = 1 WHERE id = ?').run(noisyId);
+    const cleanId = Number(insertObs(db, { sessionId: 'd121-s', project: 'p', type: 'bugfix',
+      title: 'minotaur queue saturation root cause',
+      narrative: 'the minotaur queue backlog grows when consumers detach' }).lastInsertRowid);
+
+    const ftsQuery = sanitizeFtsQuery('zebra quokka');   // strict AND: zero hits → OR rescue → PRF
+    const ctx = { ftsQuery, args: {}, epochFrom: null, epochTo: null,
+      perSourceLimit: 10, perSourceOffset: 0, currentProject: 'p', limit: 10 };
+    const results = searchObservationsHybrid(db, ctx);
+    const ids = results.map((r) => r.id);
+
+    expect(ids, 'precondition: both expansion rows must be reachable').toContain(noisyId);
+    expect(ids, 'precondition: both expansion rows must be reachable').toContain(cleanId);
+    expect(ids.indexOf(cleanId), 'clean row must outrank the 0.2×-penalized noisy row')
+      .toBeLessThan(ids.indexOf(noisyId));
+    db.close();
   });
 });

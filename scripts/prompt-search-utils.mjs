@@ -149,6 +149,9 @@ export function extractErrorSignature(text) {
 
 export const MAX_SESSION_INJECTIONS = 15;
 export const DEDUP_STALE_MS = 300_000; // 5 minutes
+// Marker file-name derivation lives in lib/injected-ids.mjs (D#120) — lib/, not
+// here, so hook.mjs can import it (scripts/ static imports from hook.mjs break
+// under the installExtractedRelease scripts-dir rename).
 
 /**
  * Check if injection should be skipped based on deduplication state.

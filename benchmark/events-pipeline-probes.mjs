@@ -172,6 +172,67 @@ export async function runEventsPipelineProbes(dbIn = null) {
     return { pass: !evt, detail: evt ? `leaked ${evt.project}` : 'no foreign rows' };
   });
 
+  // ── D#121: cite/noise behavior factors vs the cross-source lone-hit banding ──
+  // M-3 joined citeFactor (0.4–3.0) × noisePenalty (0.2–1.0) into FULL_SCORE, so
+  // obs raw magnitudes now widen with behavior state while events carry neither
+  // column. The synthetic cross-source probes feed constructed scores and the
+  // metric suites carry zero cite/noise state — these three run the REAL SQL.
+  // Decision (2026-08-16): the widening is ACCEPTED direction — cite is genuine
+  // relevance evidence — and it is BOUNDED: citeFactor caps at 3.0, so a lone
+  // event that was the raw max keeps ratio >= 1/3 → band never sinks below the
+  // -0.5 neutral mid; noise only shrinks obs, which can only IMPROVE the event.
+
+  // Fresh per-scenario DB (cite/noise mutations must not leak into the probes
+  // above, which run against the shared corpus).
+  const withMutatedCorpus = async (mutateSql, fn) => {
+    const mdb = createTestDb();
+    seedEventsPipelineCorpus(mdb);
+    if (mutateSql) mdb.prepare(mutateSql).run();
+    try { return await fn(mdb); } finally { mdb.close(); }
+  };
+
+  await probe('cite-widening-bounded-3x-real-sql', async () => {
+    // The same obs row's raw FULL_SCORE at cited_count=10 must be exactly the
+    // 3.0× cap of its baseline — pins that the cite clause reaches the real SQL
+    // AND that the widening the banding faces is bounded by CITE_FACTOR_MAX.
+    const rawScores = (mdb) => {
+      const ctx = { ftsQuery: buildSearchFtsQuery('chronograph'), args: { project: PROJECT },
+        epochFrom: null, epochTo: null, perSourceLimit: 10, perSourceOffset: 0,
+        currentProject: PROJECT, limit: 10 };
+      return new Map(searchObservationsHybrid(mdb, ctx).map((r) => [r.id, r.score]));
+    };
+    const base = await withMutatedCorpus(null, async (mdb) => rawScores(mdb));
+    const cited = await withMutatedCorpus('UPDATE observations SET cited_count = 10', async (mdb) => rawScores(mdb));
+    if (base.size === 0) return { pass: false, detail: 'no baseline obs rows' };
+    for (const [id, s] of base) {
+      const ratio = cited.get(id) / s;
+      if (!(Math.abs(ratio - 3.0) < 1e-9)) return { pass: false, detail: `obs#${id} ratio=${ratio}` };
+    }
+    return { pass: true, detail: `${base.size} rows widened exactly 3.0×` };
+  });
+
+  await probe('decisive-lone-event-survives-max-cite', async () => {
+    // The strong lone event (raw max by a decisive margin) must keep the -1.05
+    // top band even when every obs carries maximum cite state.
+    return withMutatedCorpus('UPDATE observations SET cited_count = 10', async (mdb) => {
+      const page = await runPipeline(mdb, 'chronograph');
+      const first = page[0];
+      const pass = first?.source === 'event' && first.score === -1.05;
+      return { pass, detail: `first=${first?.source}@${first?.score}` };
+    });
+  });
+
+  await probe('noise-shrink-never-demotes-lone-event', async () => {
+    // Entrenched-noise obs (0.2×) SHRINK — the lone event's relative band can
+    // only improve, never drop out of -1.05.
+    return withMutatedCorpus('UPDATE observations SET injection_count = 9, access_count = 1', async (mdb) => {
+      const page = await runPipeline(mdb, 'chronograph');
+      const first = page[0];
+      const pass = first?.source === 'event' && first.score === -1.05;
+      return { pass, detail: `first=${first?.source}@${first?.score}` };
+    });
+  });
+
   if (!dbIn) db.close();
   return probes;
 }
