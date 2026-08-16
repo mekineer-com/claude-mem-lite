@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.67.0
+- **Version**: 3.68.0
 - **Package manager**: npm
-- **Test**: `npx vitest run` (255 test files / 4483 tests, vitest)
+- **Test**: `npx vitest run` (257 test files / 4504 tests, vitest)
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **Denoising A/B** (evaluate any precision/recall lever BEFORE shipping): `node benchmark/denoise-ab.mjs --save before.json` (control) → apply the change → `node benchmark/denoise-ab.mjs --compare before.json` (verdict). Runs the precision hard-negative, vocab-mismatch paraphrase, AND cjk_mixed suites so a lever's precision gain and recall cost are weighed on one screen — the split that let an OR-BM25 floor ship-then-revert (2026-06-29). Behavioral probes ride the same screen (multiscript guard + cross-source direction + deferred reachability + events end-to-end pipeline); any probe failure overrides the verdict to PROBE-FAIL and exits 1 — "A/B NEUTRAL ≠ safe" on faces the metric suites can't see. Verdict: REJECT / TRADEOFF / NET-POSITIVE / NEUTRAL / PROBE-FAIL.
@@ -23,7 +23,7 @@ Used by `/health` skill (gstack). Persisted here so detection skips runtime prob
 - deadcode: ./node_modules/.bin/knip
 - shell: shellcheck scripts/post-tool-use.sh scripts/pre-commit.sh scripts/setup.sh
 
-Knip baseline (2026-08-16, post-v45): 0 unused files, 31 unused exports (32 earlier the same day; the v45 per-surface-funnel batch added ZERO new unused exports — a HEAD-worktree name-set diff showed the single delta is `extractInjectedFromSubagentPrompt` LEAVING the list, i.e. knip now resolves it as used. 32 came from 31 on 2026-08-14, +1 = `BACKUP_EVICTION_GRACE_MS` from the v3.63.0 M-9 batch — intentional named constant, category (a); down from 46 on 2026-07-17, itself down from 53 on 2026-06-29 — dead code cleaned in the v3.43 P3 batch, then OBS_TYPE_ENUM gained real importers in v3.49.0; all 31 fall in the intentional categories below — no invocation-stats/dispatch name is in the list). Two categories:
+Knip baseline (2026-08-16, post-v3.68.0): 0 unused files, **32** unused exports. Measured, not carried forward: the v3.68.0 batch scored 32 against **33** on the v3.67.0 tag, and a name-set diff between a clean-HEAD worktree and the working tree showed zero ADDITIONS — the single delta is `identifySynonymGroups` LEAVING the list (the new `tests/mcp-nonblocking-llm.test.mjs` imports it). Note the v3.67.0 line below recorded 31 while HEAD actually measured 33; prefer a fresh `npx knip` count over any number written here, and diff NAME SETS rather than counts when attributing drift. Earlier trail: 31→32 on 2026-08-14 (+1 = `BACKUP_EVICTION_GRACE_MS`, v3.63.0 M-9, intentional named constant, category (a)); down from 46 on 2026-07-17, itself down from 53 on 2026-06-29 — dead code cleaned in the v3.43 P3 batch, then OBS_TYPE_ENUM gained real importers in v3.49.0. No invocation-stats/dispatch name is in the list. Two categories:
 (a) intentional — v2.21 utils.mjs split backward-compat re-exports + test-only
 exports (search-engine.mjs FTS/count helpers, ftsRowToResult) used internally and
 by tests; do NOT remove without audit. (b) NOT intentional — the v3 dispatch/

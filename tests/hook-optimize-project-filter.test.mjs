@@ -18,7 +18,7 @@ vi.mock('../hook-semaphore.mjs', () => ({
   releaseLLMSlot: vi.fn(),
 }));
 vi.mock('../haiku-client.mjs', () => ({
-  callModelJSON: vi.fn(),
+  callModelJSONAsync: vi.fn(),
   callLLMWithModel: vi.fn(),
   // Real export consumed by hook-optimize's LLM call sites; a mock without it
   // throws before any branch under test runs.

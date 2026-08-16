@@ -1749,12 +1749,20 @@ async function handleUserPrompt() {
         }
       } catch { /* file may not exist — that's fine */ }
 
-      // Phase-2 task-imperative (default OFF — CLAUDE_MEM_TASK_IMPERATIVE): the single
-      // highest-value lesson relevant to THIS prompt, delivered at the prompt position under
-      // an imperative template. Excluded from the <memory-context> list so it is never
-      // injected twice. Channel-isolation measure (efficacy arm U, 2026-06-29): task-prompt
-      // 6-8/8 vs PreToolUse hook 0/8. Flipping the default ON is a separate L3 decision
-      // gated on the live cite-recall canary.
+      // Phase-2 task-imperative (EXPERIMENTAL, default OFF — CLAUDE_MEM_TASK_IMPERATIVE):
+      // the single highest-value lesson relevant to THIS prompt, delivered at the prompt
+      // position under an imperative template. Excluded from the <memory-context> list so it
+      // is never injected twice. Channel-isolation measure (efficacy arm U, 2026-06-29):
+      // task-prompt 6-8/8 vs PreToolUse hook 0/8.
+      //
+      // The default flip is ABANDONED (D#137, 2026-08-16). rankImperativeCandidates requires
+      // identifier overlap between the prompt and the lesson body/title, and over the last 400
+      // real prompts that gate opened 76 times = 19.0% (CJK prompts 57/352 = 16.2%, ASCII
+      // 19/48 = 39.6%). With 88% of prompts on this install in Chinese, the emitter fires
+      // roughly once every six prompts — the canary can never accumulate n, because the
+      // ceiling is the gate's DESIGN (precision-first symbol anchoring), not a defect.
+      // Reviving the flip needs a CJK-viable anchor proven in A/B without a precision loss;
+      // until then this stays experimental and off.
       const taskImperativeOn = process.env.CLAUDE_MEM_TASK_IMPERATIVE === 'on'
         || process.env.CLAUDE_MEM_TASK_IMPERATIVE === '1';
       // Exclude only ids path-A (user-prompt-search.js) already injected — NOT the

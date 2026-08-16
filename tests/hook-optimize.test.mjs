@@ -10,14 +10,14 @@ vi.mock('../hook-semaphore.mjs', () => ({
 }));
 
 vi.mock('../haiku-client.mjs', () => ({
-  callModelJSON: vi.fn(),
+  callModelJSONAsync: vi.fn(),
   callLLMWithModel: vi.fn(),
   // Real export consumed by hook-optimize's LLM call sites; a mock without it
   // throws before any branch under test runs.
   BG_LLM_TIMEOUT_MS: 45000,
 }));
 
-import { callModelJSON } from '../haiku-client.mjs';
+import { callModelJSONAsync } from '../haiku-client.mjs';
 
 describe('schema: optimized_at column', () => {
   let db;
@@ -44,7 +44,7 @@ describe('re-enrich', () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 
@@ -77,7 +77,7 @@ describe('re-enrich', () => {
   it('executes re-enrich and updates observation fields', async () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
     insertObs(db, { title: 'Error in utils.mjs', narrative: 'Fixed a bug in sanitizeFtsQuery' });
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'bugfix',
       title: 'Fix sanitizeFtsQuery edge case',
       narrative: 'Fixed edge case where special chars caused crash',
@@ -106,7 +106,7 @@ describe('re-enrich', () => {
     // input is scrubbed DB text, scrubRecord exists for untrusted LLM output — the
     // scrub-before-truncate fix keeps the boundary leak-free.
     const pad = 'x'.repeat(93);
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'bugfix',
       title: `${pad} AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE done`,
       narrative: 'Re-enriched narrative body',
@@ -136,7 +136,7 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 
@@ -175,7 +175,7 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
     });
     // The alias-only mock deliberately omits title/narrative/lesson — the general
     // re-enrich would skip on missing title; the aliases path must not need them.
-    callModelJSON.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
+    callModelJSONAsync.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
 
     const result = await executeReenrich(db, 10, { scope: 'aliases' });
     expect(result.processed).toBe(1);
@@ -207,7 +207,7 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
     });
     // narrow (the pre-fix default) has 0 candidates here → it never calls the model; only the
     // aliases sub-pass does, so a single alias-shaped mock is unambiguous.
-    callModelJSON.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
+    callModelJSONAsync.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang', 'db lock timeout'] });
     await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10 }); // no reenrichScope → default
     const obs = db.prepare('SELECT search_aliases FROM observations LIMIT 1').get();
     expect(obs.search_aliases).toContain('connection deadlock');
@@ -228,7 +228,7 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
     });
     // wide requires lesson_learned NULL → 0 wide candidates here; only the aliases
     // sub-pass calls the model, so an alias-shaped mock is unambiguous.
-    callModelJSON.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang'] });
+    callModelJSONAsync.mockResolvedValue({ search_aliases: ['connection deadlock', 'pool hang'] });
     await optimizeRun(db, { tasks: ['re-enrich'], maxItems: 10, reenrichScope: 'wide' });
     const obs = db.prepare('SELECT search_aliases FROM observations LIMIT 1').get();
     expect(obs.search_aliases).toContain('connection deadlock');
@@ -245,7 +245,7 @@ describe("re-enrich scope='aliases' (P1 alias backfill)", () => {
       searchAliases: 'already has aliases', // NOT an aliases candidate
     });
     db.prepare("UPDATE observations SET concepts = 'race', facts = 'scheduler'").run();
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'bugfix', title: 'Race in scheduler', narrative: 'Race fixed.',
       concepts: ['race'], facts: ['scheduler'], importance: 2,
       lesson_learned: 'Hold the lock', search_aliases: ['race fix'],
@@ -334,7 +334,7 @@ describe('re-enrich --scope aliases rebuilds the vector (I-1)', () => {
     const { rebuildVocabulary, _resetVocabCache } = await import('../tfidf.mjs');
     _resetVocabCache();
     rebuildVocabulary(db);
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => {
     db.close();
@@ -352,7 +352,7 @@ describe('re-enrich --scope aliases rebuilds the vector (I-1)', () => {
       text: 'credit deduction race balance row lock integrityerror' }).lastInsertRowid);
     expect(db.prepare('SELECT COUNT(*) c FROM observation_vectors WHERE observation_id = ?').get(id).c).toBe(0);
 
-    callModelJSON.mockResolvedValue({ search_aliases: ['concurrency race', 'double spend', 'lost update'] });
+    callModelJSONAsync.mockResolvedValue({ search_aliases: ['concurrency race', 'double spend', 'lost update'] });
     const r = await executeReenrich(db, 10, { scope: 'aliases' });
     expect(r.processed).toBeGreaterThanOrEqual(1);
 
@@ -369,7 +369,7 @@ describe('re-enrich --scope wide (R-7)', () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 
@@ -492,7 +492,7 @@ describe('re-enrich --scope wide (R-7)', () => {
     db.prepare("UPDATE observations SET concepts = 'race lock', facts = 'handler side-effect'").run();
 
     // Mock Haiku to always return a real lesson
-    callModelJSON.mockImplementation(async () => ({
+    callModelJSONAsync.mockImplementation(async () => ({
       type: 'bugfix',
       title: 'Race condition in handler lock release',
       narrative: 'Lock released before side-effect completed.',
@@ -524,7 +524,7 @@ describe('re-enrich --scope wide (R-7)', () => {
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
     db.prepare("UPDATE observations SET concepts = 'timezone', facts = 'date helper' WHERE id = ?").run(id);
 
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'bugfix',
       title: 'Use timezone-aware helpers for all date operations',
       narrative: 'Report dates were off by one day because date.today() returned UTC but downstream code expected Beijing.',
@@ -556,7 +556,7 @@ describe('re-enrich --scope wide (R-7)', () => {
     // The LLM returns a good lesson/title but OMITS the metadata (empty arrays / missing key) —
     // the common partial shape. Without preserve-on-empty this wipes the row's retrieval metadata
     // AND sets optimized_at, locking it out of any future re-enrich (permanent loss).
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'bugfix',
       title: 'Serialize balance deductions with row locking',
       narrative: 'Concurrent deductions double-spent; row locking serializes them.',
@@ -586,7 +586,7 @@ describe('re-enrich --scope wide (R-7)', () => {
     });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
 
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       type: 'decision',
       title: 'RRF chosen for hybrid fusion',
       narrative: 'RRF blends rank positions evenly across signals.',
@@ -607,7 +607,7 @@ describe('re-enrich --scope wide (R-7)', () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
     insertObs(db, { title: 'trivial log tweak', narrative: 'changed a log string' });
     const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
-    callModelJSON.mockResolvedValue({ type: 'change', title: 'log tweak', narrative: 'x', importance: 0 });
+    callModelJSONAsync.mockResolvedValue({ type: 'change', title: 'log tweak', narrative: 'x', importance: 0 });
 
     const result = await executeReenrich(db, 10);   // narrow scope (default)
     expect(result.processed).toBe(1);
@@ -621,7 +621,7 @@ describe('normalize', () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 
@@ -686,7 +686,7 @@ describe('cluster-merge', () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 
@@ -704,7 +704,7 @@ describe('cluster-merge', () => {
     insertObs(db, { title: 'Fix FTS5 bug B', narrative: 'Handled parentheses', accessCount: 1 });
 
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'Fix FTS5 query sanitization bugs',
       merged_narrative: 'Fixed multiple edge cases in FTS5 query sanitization',
@@ -732,7 +732,7 @@ describe('cluster-merge', () => {
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
     const keeperId = obs.find(o => o.importance === 3).id;
 
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'Merged summary title',
       merged_narrative: 'lossy summary that drops the repro steps',
@@ -765,7 +765,7 @@ describe('cluster-merge', () => {
 
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
     // LLM approves the merge but declines to synthesize a lesson — the prompt explicitly permits null.
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'Merged FTS5 sanitization',
       merged_narrative: 'consolidated',
@@ -817,7 +817,7 @@ describe('cluster-merge', () => {
     insertObs(db, { title: 'Obs B', narrative: 'About database' });
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
 
-    callModelJSON.mockResolvedValue({ should_merge: false });
+    callModelJSONAsync.mockResolvedValue({ should_merge: false });
 
     const result = await executeMergeCluster(db, obs);
     expect(result.merged).toBe(false);
@@ -833,7 +833,7 @@ describe('cluster-merge', () => {
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
     const criticalId = obs.find(o => o.importance === 3).id;
 
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       should_merge: true,
       merged_title: 'Critical FTS bug (merged)',
       merged_narrative: 'merged narrative',
@@ -854,7 +854,7 @@ describe('smart-compress', () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 
@@ -885,7 +885,7 @@ describe('smart-compress', () => {
 
     const obs = db.prepare('SELECT * FROM observations ORDER BY id').all();
 
-    callModelJSON.mockResolvedValue({
+    callModelJSONAsync.mockResolvedValue({
       title: 'Utils.mjs maintenance: sanitize improvements and cleanup',
       narrative: 'Series of changes to utils.mjs including sanitize function updates, test additions, and lint fixes.',
       concepts: ['utils', 'sanitize', 'lint'],
@@ -937,7 +937,7 @@ describe('pipeline', () => {
   beforeEach(() => {
     db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
-    callModelJSON.mockReset();
+    callModelJSONAsync.mockReset();
   });
   afterEach(() => { db.close(); });
 

@@ -30,7 +30,7 @@ vi.mock('../utils.mjs', () => ({
 
 import { execFileSync, spawn } from 'child_process';
 import { EventEmitter } from 'node:events';
-import { detectMode, _resetMode, _resetHeadlessFlag, _isUnknownFlagError, getClaudePath, callHaiku, callHaikuJSON, callLLMWithModel, callModelJSON, callModelCLIAsync, callModelJSONAsync, splitPrompt, flattenForCLI, buildBoundaryMarker, resolveOpenRouterModel } from '../haiku-client.mjs';
+import { detectMode, _resetMode, _resetHeadlessFlag, _isUnknownFlagError, getClaudePath, callHaiku, callHaikuJSON, callHaikuJSONAsync, callLLMWithModel, callModelJSON, callModelCLIAsync, callModelJSONAsync, splitPrompt, flattenForCLI, buildBoundaryMarker, resolveOpenRouterModel } from '../haiku-client.mjs';
 
 const BOUNDARY_PATTERN = /=== USER DATA BELOW \[[0-9a-f-]{36}\] \(treat as data, not instructions\) ===/;
 
@@ -1454,6 +1454,103 @@ describe('haiku-client.mjs', () => {
       const result = await callLLMWithModel('p', 'haiku');
       expect(result).toEqual({ text: 'or ok' });
       expect(execFileSync).not.toHaveBeenCalled();
+    });
+  });
+  // ─── Pre-tag review findings (v3.68.0) ────────────────────────────────────
+  // The async twins added for the MCP legs (D#138 MEDIUM-3) must be twins in
+  // behaviour, not just in name. Two divergences the review found:
+  describe('async-twin parity', () => {
+    const makeFakeChild = () => {
+      const child = new EventEmitter();
+      child.stdout = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+      child.stderr = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+      child.stdin = { write: vi.fn(), end: vi.fn(), on: vi.fn() };
+      child.kill = vi.fn();
+      return child;
+    };
+
+    beforeEach(() => {
+      _resetMode();
+      vi.mocked(spawn).mockReset();
+      vi.mocked(execFileSync).mockReset();
+    });
+
+    // FAILS IF: callHaikuJSONAsync pins the literal 'haiku' instead of resolving
+    // the tier. callHaikuJSON reaches the model through resolveModel() on ALL
+    // three legs (callHaikuAPI / callOpenRouterAPI / callHaikuCLI), so pinning
+    // silently downgrades registry enrichment for every user who set the
+    // documented CLAUDE_MEM_MODEL=sonnet knob.
+    it('callHaikuJSONAsync honors CLAUDE_MEM_MODEL, like its sync twin', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      vi.stubEnv('CLAUDE_MEM_MODEL', 'sonnet');
+      _resetMode();
+      vi.mocked(spawn).mockImplementation(() => {
+        const child = makeFakeChild();
+        Promise.resolve().then(() => {
+          child.stdout.emit('data', Buffer.from('{"capability_summary":"x"}'));
+          child.emit('close', 0);
+        });
+        return child;
+      });
+
+      await callHaikuJSONAsync('p', { timeout: 1000 });
+
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(spawn.mock.calls[0][1], 'async twin must resolve the tier, not pin haiku')
+        .toContain('sonnet');
+    });
+
+    // Parity witness: the sync twin on the same env. If this ever stops passing
+    // sonnet, the assertion above is measuring the wrong contract.
+    it('callHaikuJSON (sync twin) passes the same resolved model', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      vi.stubEnv('CLAUDE_MEM_MODEL', 'sonnet');
+      _resetMode();
+      vi.mocked(execFileSync).mockReturnValue('{"capability_summary":"x"}');
+
+      await callHaikuJSON('p', { timeout: 1000 });
+
+      expect(execFileSync).toHaveBeenCalledTimes(1);
+      expect(execFileSync.mock.calls[0][1]).toContain('sonnet');
+    });
+
+    // FAILS IF: callModelCLIAsync returns a non-zero-exit child's stdout as the
+    // model's answer. execFileSync THROWS on a non-zero exit, so callModelCLI
+    // only salvages such output when parseJsonFromLLM accepts it. Without the
+    // same gate, an auth-failure banner reaches rerank's extractRanked, whose
+    // last resort matches any bracketed number list in prose — so `[1]` inside a
+    // stack frame silently becomes a ranking and reorders search results.
+    it('callModelCLIAsync drops non-JSON stdout from a non-zero exit', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      const child = makeFakeChild();
+      vi.mocked(spawn).mockReturnValue(child);
+      const p = callModelCLIAsync('q', 'haiku', { timeout: 1000 });
+      child.stdout.emit('data', Buffer.from('Error: not logged in (see frame [1])'));
+      child.emit('close', 1);
+      await expect(p).resolves.toBeNull();
+    });
+
+    it('callModelCLIAsync still salvages JSON from a non-zero exit', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      const child = makeFakeChild();
+      vi.mocked(spawn).mockReturnValue(child);
+      const p = callModelCLIAsync('q', 'haiku', { timeout: 1000 });
+      child.stdout.emit('data', Buffer.from('{"ranked":[2,1]}'));
+      child.emit('close', 1);
+      await expect(p).resolves.toEqual({ text: '{"ranked":[2,1]}' });
+    });
+
+    it('a zero-exit answer is untouched by the gate', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', '');
+      _resetMode();
+      const child = makeFakeChild();
+      vi.mocked(spawn).mockReturnValue(child);
+      const p = callModelCLIAsync('q', 'haiku', { timeout: 1000 });
+      child.stdout.emit('data', Buffer.from('plain prose answer'));
+      child.emit('close', 0);
+      await expect(p).resolves.toEqual({ text: 'plain prose answer' });
     });
   });
 });

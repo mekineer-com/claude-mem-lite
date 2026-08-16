@@ -69,10 +69,13 @@ export async function llmRerankOrder(query, cand /* [{sid,text}] */, llm) {
 }
 
 // Default provider — lazy import so stub-injected callers never load the client.
-// Uses callLLMWithModel (returns {text}) rather than callModelJSONAsync (which
+// Uses the {text}-envelope dispatcher rather than callModelJSONAsync (which
 // JSON-parses internally and nulls on any non-{...} output) so extractRanked can
-// recover bare-array answers the strict JSON parse drops.
+// recover bare-array answers the strict JSON parse drops. The Async variant is
+// load-bearing: rerank runs inside the mem_search MCP handler (deep + rerank), so
+// the blocking callLLMWithModel froze the server event loop whenever a keyed
+// provider was down and the call degraded to the CLI (D#138 MEDIUM-3).
 export async function defaultRerankLLM(prompt) {
-  const { callLLMWithModel } = await import('./haiku-client.mjs');
-  return callLLMWithModel(prompt, 'haiku', { timeout: 20000, maxTokens: 300 });
+  const { callLLMWithModelAsync } = await import('./haiku-client.mjs');
+  return callLLMWithModelAsync(prompt, 'haiku', { timeout: 20000, maxTokens: 300 });
 }

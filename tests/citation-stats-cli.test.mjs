@@ -257,4 +257,30 @@ describe('citation-stats CLI', () => {
     expect(parsed.surface_funnel.surfaces[0]).toMatchObject({ surface: 'ups', injected: 8, cited: 3 });
     expect(parsed.surface_funnel.surfaces[0].rate).toBeCloseTo(0.375, 5);
   });
+
+  // b4: the two zero-row states must READ differently. Pre-b4 both printed the
+  // same line, so a table that was never created (#10650) was indistinguishable
+  // from a fresh install — for as long as the surface stayed unmetered.
+  it('an empty window reads as "no rows yet", never as a failure', async () => {
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/no rows in this window yet/i);
+    expect(output).not.toMatch(/UNAVAILABLE/);
+  });
+
+  it('an unreadable table reads as UNAVAILABLE, not as an empty window', async () => {
+    testDb.prepare('DROP TABLE citation_surface_log').run();
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/UNAVAILABLE/);
+    expect(output).toMatch(/citation_surface_log/);       // names the actual failure
+    expect(output).toMatch(/fts-check/);                  // and the repair
+    expect(output).not.toMatch(/no rows in this window yet/i);
+  });
+
+  it('--json carries `unavailable` so a scripted reader is not misled either', async () => {
+    testDb.prepare('DROP TABLE citation_surface_log').run();
+    const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
+    const parsed = JSON.parse(output);
+    expect(parsed.surface_funnel.surfaces).toEqual([]);
+    expect(parsed.surface_funnel.unavailable).toBeTruthy();
+  });
 });

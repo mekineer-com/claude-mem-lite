@@ -2595,12 +2595,15 @@ function cmdCitationStats(db, args) {
   // whether effectiveness is rising; this says WHICH face to aim a lever at.
   out(`Cite rate by injection face (last ${days}d):`);
   out('  a per-face VIEW, not a partition — do NOT reconcile against the funnel above: faces overlap (an obs carried by two counts in both) and the funnel also counts cite-back signals that belong to no face:');
-  if (surfaceFunnel.surfaces.length === 0) {
-    // Deliberately does NOT claim "no data yet": the reader swallows a query
-    // error, so an absent or unreadable citation_surface_log renders exactly
-    // like an empty one. Say what is true (nothing came back) and name the
-    // check, rather than assert the benign cause (pre-tag review b4).
-    out('  (nothing returned for this window — rows accrue at Stop; if this stays empty after a few sessions, check the table exists: claude-mem-lite fts-check)');
+  if (surfaceFunnel.unavailable) {
+    // The read FAILED — a missing/unreadable citation_surface_log. Pre-b4 this
+    // rendered identically to an empty window, so the #10650 shape (table never
+    // created, `no such table` swallowed into the debug log) read as "no data
+    // yet" for as long as the surface stayed unmetered.
+    out(`  (UNAVAILABLE — the per-face table could not be read: ${surfaceFunnel.unavailable})`);
+    out('  this is a failure, not an empty window: run `claude-mem-lite fts-check` to repair the schema');
+  } else if (surfaceFunnel.surfaces.length === 0) {
+    out('  (no rows in this window yet — rows accrue at Stop, one per injection face per session)');
   } else {
     for (const s of surfaceFunnel.surfaces) {
       const pct = (s.rate * 100).toFixed(1) + '%';

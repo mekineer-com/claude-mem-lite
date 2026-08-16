@@ -286,6 +286,29 @@ export async function callHaikuJSON(prompt, opts) {
   return parseJsonFromLLM(result.text);
 }
 
+/**
+ * Non-blocking sibling of callHaikuJSON for callers reachable from an MCP request
+ * handler (registry enrichment: mem_registry `enrich` / `import_url`). Same
+ * provider priority; the CLI leg — primary AND post-provider-failure fallback —
+ * is the async spawn, so a keyed-provider outage cannot freeze the server event
+ * loop for BG_LLM_TIMEOUT_MS (D#138 MEDIUM-3).
+ *
+ * `resolveModel().cli`, NOT the literal 'haiku': despite the name, callHaikuJSON
+ * reaches the model through resolveModel() on ALL three legs (callHaikuAPI,
+ * callOpenRouterAPI, callHaikuCLI), so it honours the documented CLAUDE_MEM_MODEL
+ * knob. Pinning 'haiku' here would silently downgrade registry enrichment for
+ * every user who set CLAUDE_MEM_MODEL=sonnet — pre-tag review finding, v3.68.0.
+ *
+ * Defaults also mirror callHaiku (10s / 500 tokens), not callModelJSONAsync's
+ * 15s / 1000: a caller that omits opts must get the sync twin's budget.
+ * @param {string|{system?:string,user:string}} prompt
+ * @param {{timeout?:number,maxTokens?:number,temperature?:number}} [opts]
+ * @returns {Promise<object|null>} Parsed JSON or null
+ */
+export async function callHaikuJSONAsync(prompt, { timeout = 10000, maxTokens = 500, temperature = DEFAULT_LLM_TEMPERATURE } = {}) {
+  return callModelJSONAsync(prompt, resolveModel().cli, { timeout, maxTokens, temperature });
+}
+
 // ─── Model-Selectable API ────────────────────────────────────────────────────
 
 /**
@@ -326,6 +349,44 @@ export async function callLLMWithModel(prompt, model = 'haiku', { timeout = 1500
   debugLog('WARN', 'haiku-client', `${mode} call failed, falling back to claude CLI (${resolvedModel})`);
   try { return callModelCLI(prompt, resolvedModel, { timeout }); }
   catch (e) { debugCatch(e, `callLLMWithModel:cli-fallback:${resolvedModel}`); return null; }
+}
+
+/**
+ * Non-blocking sibling of callLLMWithModel — returns the RAW {text} envelope
+ * without JSON-parsing it. For MCP-reachable callers whose answer is not
+ * guaranteed to be an object: rerank accepts a bare `[2,1,3]` array, which a
+ * JSON-parsing dispatcher would keep but whose contract (rerank.mjs:72) is the
+ * envelope, not the parse. Both CLI legs use the async spawn, so a keyed-provider
+ * outage cannot freeze the server event loop (D#138 MEDIUM-3).
+ *
+ * Behaviourally identical to callLLMWithModel otherwise — same `if (primary)`
+ * test, same headless-flag compat retry and budget arithmetic, same timeout
+ * salvage. Only the CLI transport differs.
+ * @param {string|{system?:string,user:string}} prompt
+ * @param {'haiku'|'sonnet'} model
+ * @param {{timeout?:number,maxTokens?:number,temperature?:number}} [opts]
+ * @returns {Promise<{text: string}|null>} Response or null on failure
+ */
+export async function callLLMWithModelAsync(prompt, model = 'haiku', { timeout = 15000, maxTokens = 1000, temperature = DEFAULT_LLM_TEMPERATURE } = {}) {
+  if (!prompt) return null;
+  const resolvedModel = MODEL_MAP[model] ? model : 'haiku';
+  const mode = detectMode();
+
+  // CLI is terminal — no provider to fall back to.
+  if (mode === 'cli') return callModelCLIAsync(prompt, resolvedModel, { timeout });
+
+  let primary = null;
+  try {
+    primary = mode === 'api'
+      ? await callModelAPI(prompt, resolvedModel, { timeout, maxTokens, temperature })
+      : await callOpenRouterAPI(prompt, resolvedModel, { timeout, maxTokens, temperature });
+  } catch (e) {
+    debugCatch(e, `callLLMWithModelAsync:${mode}:${resolvedModel}`);
+  }
+  if (primary) return primary;
+
+  debugLog('WARN', 'haiku-client', `${mode} call failed, falling back to async claude CLI (${resolvedModel})`);
+  return callModelCLIAsync(prompt, resolvedModel, { timeout });
 }
 
 /**
@@ -628,6 +689,20 @@ export async function callModelCLIAsync(prompt, model, { timeout }) {
     child.on('error', (e) => { debugCatch(e, `${model}-cli-async`); done({ result: null, stderr: '', stdout: '', code: null }); });
     child.on('close', (code) => {
       const t = stdout.trim();
+      // Parity with callModelCLI: execFileSync THROWS on a non-zero exit, so the
+      // sync leg only ever returns such output when parseJsonFromLLM accepts it
+      // (its catch-salvage). Without the same gate, a CLI that prints a
+      // diagnostic to stdout and dies — auth failure, overload banner, wrapper
+      // error — has that diagnostic returned as the model's ANSWER. rerank is the
+      // first caller to consume the raw {text}: extractRanked's last resort
+      // matches any bracketed number list in prose, so a `[1]` inside a stack
+      // frame becomes a ranking and silently reorders search results. The
+      // flag-compat probe below reads stderr/stdout/code directly, not `result`,
+      // so nulling here does not cost it its retry.
+      if (t && typeof code === 'number' && code !== 0 && parseJsonFromLLM(t) === null) {
+        done({ result: null, stderr, stdout, code });
+        return;
+      }
       done({ result: t ? { text: t } : null, stderr, stdout, code });
     });
     // EPIPE guard: the child may exit before we finish writing stdin.

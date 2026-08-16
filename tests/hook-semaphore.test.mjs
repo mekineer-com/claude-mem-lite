@@ -31,10 +31,18 @@ function cleanupSemFiles() {
 describe('hook-semaphore.mjs', () => {
   beforeEach(() => {
     try { mkdirSync(RUNTIME_DIR, { recursive: true }); } catch {}
+    // acquireLLMSlot keeps MODULE-level bookkeeping of whether this process holds
+    // the slot (so a concurrent same-process acquire cannot unlink a live
+    // sibling's file). Several cases below acquire without releasing, and unlinking
+    // the file does not clear that record — the next case would then queue behind a
+    // holder that no longer exists. Reset through the real API rather than a
+    // test-only export, so this stays honest about the contract it is resetting.
+    releaseLLMSlot();
     cleanupSemFiles();
   });
 
   afterEach(() => {
+    releaseLLMSlot();
     cleanupSemFiles();
   });
 
@@ -204,6 +212,36 @@ describe('hook-semaphore.mjs', () => {
       const info2 = JSON.parse(readFileSync(slotFile(), 'utf8'));
 
       expect(info2.ts).toBeGreaterThanOrEqual(info1.ts);
+    });
+    // ─── Pre-tag review, v3.68.0 (D#138 MEDIUM-3 follow-on) ──────────────────
+    // The slot file is named per PROCESS. Before the MCP LLM legs went async,
+    // two acquires could not overlap inside one process — execFileSync held the
+    // event loop, so a second tools/call was not even read from stdio while the
+    // first was in its LLM call. The EEXIST branch encodes exactly that
+    // assumption ("we are inside acquire and therefore do NOT hold a slot, so it
+    // is always stale") and unlinks unconditionally. De-blocking makes the
+    // overlap the normal case for two concurrent mem_optimize calls.
+    it('a concurrent acquire in the SAME process does not delete the live holder\'s slot', async () => {
+      const first = await acquireLLMSlot();
+      expect(first).toBe(true);
+      const held = JSON.parse(readFileSync(slotFile(), 'utf8'));
+
+      // Second acquire while the first is still held — the shape two concurrent
+      // MCP handlers now produce. FAILS IF the EEXIST branch unlinks: the live
+      // holder's file disappears, so the cross-process `active` count no longer
+      // sees it (more than LLM_SEM_MAX concurrent `claude -p`), and the first
+      // holder's later release unlinks the SECOND holder's file.
+      const secondPromise = acquireLLMSlot();
+      await sleepMs(250);
+      expect(existsSync(slotFile()), 'live holder\'s slot was unlinked by a sibling acquire').toBe(true);
+      const still = JSON.parse(readFileSync(slotFile(), 'utf8'));
+      expect(still.ts, 'the live holder\'s slot was replaced, not preserved').toBe(held.ts);
+
+      // Once the holder releases, the waiter proceeds.
+      releaseLLMSlot();
+      await expect(secondPromise).resolves.toBe(true);
+      releaseLLMSlot();
+      expect(existsSync(slotFile())).toBe(false);
     });
   });
 });

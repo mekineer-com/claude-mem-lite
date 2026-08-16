@@ -34,9 +34,32 @@ export const LLM_SEM_STALE_MS = BG_LLM_TIMEOUT_MS * 2 + 30000; // 120s
 
 export const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
 
+// Does THIS process currently hold the (single, pid-named) slot?
+//
+// The slot file is one per process, and until the MCP LLM legs went async in
+// v3.68.0 two acquires could not overlap inside one: execFileSync held the event
+// loop, so a second tools/call was not even read from stdio while the first was
+// in its LLM call. The EEXIST branch below encodes that era's assumption — "we
+// are inside acquire and therefore do NOT hold a slot, so it is always stale" —
+// and unlinks unconditionally. With two concurrent mem_optimize handlers that
+// unlink would delete a LIVE sibling's slot: the cross-process count stops
+// seeing it (so more than LLM_SEM_MAX `claude -p` children run at once), and the
+// first holder's release then unlinks the second holder's file. This bookkeeping
+// makes the EEXIST branch's claim true again by keeping same-process acquires out
+// of it — they wait for the holder instead.
+//
+// A TIMESTAMP, not a boolean, and the difference is load-bearing: a boolean has no
+// self-heal, so one caller that acquired and never released would deadlock every
+// later LLM call in a long-lived MCP server for the life of the process — strictly
+// worse than the race it fixes. Past LLM_SEM_STALE_MS the local record is treated
+// as broken bookkeeping and we fall through to the file-side logic, which is the
+// same age escape hatch the reaper applies to other processes' slots. 0 = not held.
+let localHeldAt = 0;
+
 /**
  * Acquire a file-based semaphore slot for LLM calls.
  * Uses acquire-then-verify: atomically creates a slot file, then checks total count.
+ * At most one slot per process; a concurrent same-process caller queues behind it.
  * @returns {Promise<boolean>} true if slot acquired, false on timeout
  */
 export async function acquireLLMSlot() {
@@ -44,6 +67,12 @@ export async function acquireLLMSlot() {
   const slotFile = join(RUNTIME_DIR, `llm-sem-${process.pid}`);
 
   while (Date.now() < deadline) {
+    // A sibling call in this process holds the slot — queue, do not race. The
+    // file cannot be re-created without destroying the holder's.
+    if (localHeldAt && Date.now() - localHeldAt < LLM_SEM_STALE_MS) {
+      await sleepMs(200 + Math.random() * 800);
+      continue;
+    }
     // Acquire-then-verify: atomically create our slot first, then check total count
     let created;
     try {
@@ -59,8 +88,9 @@ export async function acquireLLMSlot() {
     } catch {
       // Our own pid-named slot file already exists: a leftover from a prior acquire
       // that never released (crash between acquire and releaseLLMSlot, or PID reuse).
-      // We are inside acquire and therefore do NOT currently hold a slot, so it is
-      // always stale — remove it and retry. The await is essential: a bare `continue`
+      // `localHeldAt` was checked above, so this process either holds nothing right
+      // now or its record is past the stale threshold — either way the file is not
+      // a live sibling's. Remove it and retry. The await is essential: a bare `continue`
       // here re-hits the same EEXIST every iteration, a synchronous tight loop that
       // pins a core until the 30s deadline (the age-based cleanup below is unreachable
       // on this path — it only runs after a successful create).
@@ -106,7 +136,7 @@ export async function acquireLLMSlot() {
       }
     } catch {}
 
-    if (active <= LLM_SEM_MAX) return true; // Slot acquired
+    if (active <= LLM_SEM_MAX) { localHeldAt = Date.now(); return true; } // Slot acquired
 
     // Too many concurrent — release our slot and back off
     try { unlinkSync(slotFile); } catch {}
@@ -119,5 +149,6 @@ export async function acquireLLMSlot() {
  * Release the file-based semaphore slot for the current process.
  */
 export function releaseLLMSlot() {
+  localHeldAt = 0;
   try { unlinkSync(join(RUNTIME_DIR, `llm-sem-${process.pid}`)); } catch {}
 }

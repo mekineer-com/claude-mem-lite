@@ -371,6 +371,27 @@ describe('computeSurfaceFunnel', () => {
     expect(() => computeSurfaceFunnel(null, { days: 7 })).not.toThrow();
     expect(computeSurfaceFunnel(null, { days: 7 }).surfaces).toEqual([]);
   });
+
+  // b4: "the query could not run" and "the query returned nothing" used to be the
+  // same value — surfaces: []. That is the #10650 shape: the table was never
+  // created, the reader swallowed `no such table`, and the CLI printed it as
+  // "no data yet" for as long as the surface stayed unmetered. The caller must be
+  // able to tell the two apart WITHOUT reading the debug log.
+  it('an empty table reports no failure — absence of data is not an error', () => {
+    expect(computeSurfaceFunnel(db, { days: 7 }).unavailable).toBeUndefined();
+  });
+
+  it('a missing table reports `unavailable`, not a benign empty result', () => {
+    db.prepare('DROP TABLE citation_surface_log').run();
+    const r = computeSurfaceFunnel(db, { days: 7 });
+    expect(r.surfaces).toEqual([]);
+    expect(r.unavailable, 'a query that could not run must say so').toBeTruthy();
+    expect(String(r.unavailable)).toMatch(/citation_surface_log/);
+  });
+
+  it('a null db reports `unavailable` — no handle is not an empty window', () => {
+    expect(computeSurfaceFunnel(null, { days: 7 }).unavailable).toBeTruthy();
+  });
 });
 
 describe('hook.mjs Stop wiring', () => {

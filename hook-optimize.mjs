@@ -13,7 +13,7 @@ import {
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity, clampImportance, cjkBigrams,
   notLowSignalTitleClause, scrubSecrets,
 } from './utils.mjs';
-import { callModelJSON, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
+import { callModelJSONAsync, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, cosineSimilarity, vecTextForRow } from './tfidf.mjs';
@@ -175,7 +175,7 @@ Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
 
 JSON: {"search_aliases":["alt phrasing","synonym","spelled-out jargon","CJK term if the domain word has one"]}
 Give 3-6 aliases: words a user might search for the SAME concept but that are NOT already in the title (synonyms, the spelled-out form of an acronym, the jargon term for a described symptom, a CJK translation of a key domain term).`;
-        const parsed = await callModelJSON(aliasPrompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 300 });
+        const parsed = await callModelJSONAsync(aliasPrompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 300 });
         const aliasArr = parsed && Array.isArray(parsed.search_aliases)
           ? parsed.search_aliases.filter((a) => typeof a === 'string' && a.trim().length > 0)
           : [];
@@ -204,7 +204,7 @@ importance: 0=no value, 1=routine, 2=notable non-obvious insight, 3=critical. De
 lesson_learned: State what was learned. If routine, write "none".
 search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
 
-      const parsed = await callModelJSON(prompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 500 });
+      const parsed = await callModelJSONAsync(prompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 500 });
       if (!parsed || !parsed.title) { skipped++; continue; }
 
       // Auto-hide on importance:0 targets fully-degraded NARROW rows (this branch predates
@@ -356,7 +356,7 @@ Rules:
 - Include CJK ↔ English equivalents if present
 - Skip terms that have no synonyms in the list`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
+    const parsed = await callModelJSONAsync(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed?.groups || !Array.isArray(parsed.groups)) return [];
     return parsed.groups.filter(g => g.canonical && Array.isArray(g.aliases) && g.aliases.length > 0);
   } catch (e) {
@@ -524,7 +524,7 @@ Return ONLY valid JSON:
 - If they should NOT be merged: {"should_merge":false}
 - If they SHOULD be merged: {"should_merge":true,"merged_title":"≤120 char comprehensive title","merged_narrative":"comprehensive ≤800 char summary preserving all key details","merged_concepts":["kw1","kw2"],"merged_facts":["specific fact 1"],"merged_lesson":"synthesized non-obvious lesson or null","importance":2}`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
+    const parsed = await callModelJSONAsync(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed || !parsed.should_merge) return { merged: false };
 
     // Keeper = highest importance, then highest access_count. Previously access_count
@@ -758,7 +758,7 @@ ${obsDescriptions}
 
 JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive summary ≤800 chars preserving key decisions and lessons","concepts":["kw1","kw2"],"facts":["all specific facts preserved"],"lesson_learned":"most important synthesized lesson or 'none'","search_aliases":["alt search 1","alt search 2"]}`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
+    const parsed = await callModelJSONAsync(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed || !parsed.title) return { compressed: false };
 
     // Scrub BEFORE truncate (see re-enrich note): boundary cut on scrubbed text.
