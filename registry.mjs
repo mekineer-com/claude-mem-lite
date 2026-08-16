@@ -4,7 +4,7 @@
 import Database from 'better-sqlite3';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import { debugCatch } from './utils.mjs';
+import { debugCatch, truncate } from './utils.mjs';
 
 // ─── Schema ──────────────────────────────────────────────────────────────────
 
@@ -558,10 +558,10 @@ export function listResourcesRanked(rdb, { type } = {}) {
   `).all(...params);
 }
 
-/** One list row, shared shape: `S name (invocation) — rec:N adopt:N — summary…` (80-char summary cap). */
+/** One list row, shared shape: `S name (invocation) — rec:N adopt:N — summary…` (80-char summary cap).
+ *  truncate(), not a hand-rolled slice (adversarial review 2026-08-16): the shared
+ *  helper flattens newlines (this is a one-row-per-resource listing) and never
+ *  splits a UTF-16 surrogate pair — a bare slice emitted lone surrogates. */
 export function formatRegistryListLine(r) {
-  const summary = (r.capability_summary || '').length > 80
-    ? (r.capability_summary || '').slice(0, 80) + '…'
-    : (r.capability_summary || '');
-  return `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count ?? 0} adopt:${r.adopt_count ?? 0} — ${summary}`;
+  return `${r.type === 'skill' ? 'S' : 'A'} ${r.name}${r.invocation_name ? ` (${r.invocation_name})` : ''} — rec:${r.recommend_count ?? 0} adopt:${r.adopt_count ?? 0} — ${truncate(r.capability_summary || '', 80)}`;
 }

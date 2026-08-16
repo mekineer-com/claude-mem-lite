@@ -856,10 +856,11 @@ function buildCiteRecallNudge(project) {
   return libBuildCiteRecallNudge(project, RUNTIME_DIR);
 }
 
-// GC pre-recall cooldown files older than 24h. Pulled out of pre-tool-recall.js
-// (where it ran on every Edit, costing 15-30 disk stats per call on long-lived
-// projects) and consolidated here — once per SessionStart is enough to keep
-// RUNTIME_DIR from growing unbounded across stale sessions.
+// GC stale per-session runtime files older than 24h: pre-recall cooldowns AND
+// (D#120) the per-session injected-ids markers — both grow one file per session.
+// Pulled out of pre-tool-recall.js (where it ran on every Edit, costing 15-30
+// disk stats per call on long-lived projects) and consolidated here — once per
+// SessionStart is enough to keep RUNTIME_DIR from growing unbounded.
 const PRE_RECALL_COOLDOWN_STALE_MS = 24 * 60 * 60 * 1000;
 function gcStalePreRecallCooldowns() {
   try {
@@ -1039,10 +1040,8 @@ function runSessionStartAutoMaintain(db) {
         JOIN observations b ON a.title = b.title AND a.project = b.project
           AND a.id < b.id
           AND ABS(a.created_at_epoch - b.created_at_epoch) < 3600000
-          AND COALESCE(a.compressed_into, 0) = 0
-          AND COALESCE(b.compressed_into, 0) = 0
-          AND a.superseded_at IS NULL
-          AND b.superseded_at IS NULL
+          AND ${liveObsFilterSql('a')}
+          AND ${liveObsFilterSql('b')}
         LIMIT 20
       `).all();
       if (dupPairs.length > 0) {

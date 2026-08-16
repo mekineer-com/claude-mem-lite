@@ -13,13 +13,20 @@
 // only the data collection, field sets, and drift-prone row shapes are shared.
 
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'child_process';
+import { mkdtempSync, rmSync } from 'fs';
+import { join, dirname } from 'path';
+import { tmpdir } from 'os';
+import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
+import { initSchema } from '../schema.mjs';
 import { ensureRegistryDb, upsertResource } from '../registry.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 import { OBS_FIELDS, SESSION_DETAIL_FIELDS, fetchObsDetail } from '../lib/get-core.mjs';
 import { applyObsUpdate } from '../lib/observation-write.mjs';
 import { previewDeleteRows } from '../lib/delete-core.mjs';
 import { collectBrowseTiers } from '../lib/browse-core.mjs';
-import { collectRegistryStats, formatRegistryListLine } from '../registry.mjs';
+import { collectRegistryStats, formatRegistryListLine, listResourcesRanked } from '../registry.mjs';
 
 function seededDb() {
   const db = createTestDb();
@@ -32,14 +39,20 @@ describe('lib/get-core.mjs', () => {
     const db = createTestDb();
     const cols = new Set(db.prepare("SELECT name FROM pragma_table_info('observations')").all().map((r) => r.name));
     for (const f of OBS_FIELDS) expect(cols.has(f), `OBS_FIELDS names unknown column "${f}"`).toBe(true);
+    // Floor pins the OTHER direction (review 2026-08-16): a field silently
+    // REMOVED from OBS_FIELDS vanishes from both faces' default `get` render —
+    // the 16-vs-24-column shape this core exists to prevent.
+    expect(OBS_FIELDS.length, 'OBS_FIELDS shrank below the 23-column baseline').toBeGreaterThanOrEqual(23);
     db.close();
   });
 
   // FAILS IF: the CLI session detail reverts to its old 6-field subset — a
   // remaining_items/notes/files_* hit found via FTS became a dead end in the CLI
   // detail view (searchable but never rendered).
-  it('SESSION_DETAIL_FIELDS carries the full render set incl. remaining_items-adjacent fields', () => {
-    for (const f of ['request', 'investigated', 'learned', 'completed', 'next_steps', 'notes', 'files_read', 'files_edited', 'project']) {
+  it('SESSION_DETAIL_FIELDS carries the full render set incl. remaining_items', () => {
+    // remaining_items FIRST — it is the audited dead-end field, and the original
+    // version of this loop managed to omit it (review 2026-08-16, mutation-verified).
+    for (const f of ['remaining_items', 'request', 'investigated', 'learned', 'completed', 'next_steps', 'notes', 'files_read', 'files_edited', 'project']) {
       expect(SESSION_DETAIL_FIELDS, `session detail lost "${f}"`).toContain(f);
     }
   });
@@ -57,7 +70,10 @@ describe('lib/get-core.mjs', () => {
 });
 
 describe('lib/observation-write.mjs applyObsUpdate', () => {
-  it('updates fields atomically, scrubs strings, rebuilds derived text', () => {
+  // Scrub coverage lives in tests/cli-write-scrub.test.mjs ("update --concepts
+  // scrubs secrets"), which exercises this same applyObsUpdate choke point
+  // end-to-end — this test pins atomicity + derived rebuild only.
+  it('updates fields atomically and rebuilds derived text', () => {
     const db = seededDb();
     const id = Number(insertObs(db, { sessionId: 's1', project: 'p', type: 'bugfix', title: 'before title' }).lastInsertRowid);
     const updated = applyObsUpdate(db, id, { title: 'after title', importance: 3 });
@@ -143,6 +159,75 @@ describe('registry.mjs stats + list twins', () => {
     expect(line).toContain('rec:0');
     expect(line).toContain('adopt:0');
     expect(line).not.toContain('null');
-    expect(line.length).toBeLessThan(140);
+    // Pin the cap AT 80 (review 2026-08-16: the original `< 140` bound also
+    // passed at the audited-drift value 50 — mutation-verified hole). truncate()
+    // yields 79 kept chars + '…' = exactly 80.
+    const summarySegment = line.split(' — ')[2];
+    expect(summarySegment, 'summary segment must be truncate(…, 80)-shaped').toBe('y'.repeat(79) + '…');
+  });
+
+  // truncate() semantics, not a bare slice (adversarial review 2026-08-16, all
+  // three runtime-proven): newlines flatten (one row per resource), no lone
+  // UTF-16 surrogate at the cut, and ≤80-char summaries pass through untouched.
+  it('formatRegistryListLine flattens newlines and never splits a surrogate pair', () => {
+    const multiline = formatRegistryListLine({
+      name: 'n', type: 'skill', recommend_count: 1, adopt_count: 1,
+      capability_summary: 'line one\nline two',
+    });
+    expect(multiline).toContain('line one line two');
+    expect(multiline).not.toContain('\n');
+
+    const emoji = formatRegistryListLine({
+      name: 'n', type: 'skill', recommend_count: 1, adopt_count: 1,
+      capability_summary: 'x'.repeat(78) + '🚀🚀🚀',   // surrogate pair straddles the cut
+    });
+    expect(emoji.isWellFormed(), 'lone surrogate emitted at the truncation cut').toBe(true);
+  });
+
+  // FAILS IF: the COALESCE ordering fix regresses — NULL-count rows then sort
+  // apart from 0-count rows and the un-adopted tail interleaves wrongly
+  // (mutation-verified: dropping COALESCE survived every other suite).
+  it('listResourcesRanked sorts NULL counts as 0 (adoption desc, then recommendation)', () => {
+    const rdb = regDb();
+    upsertResource(rdb, { name: 'gamma-skill', type: 'skill', status: 'active', source: 'user', local_path: '/tmp/gamma' });
+    rdb.prepare("UPDATE resources SET adopt_count = NULL, recommend_count = NULL WHERE name = 'gamma-skill'").run();
+    rdb.prepare("UPDATE resources SET adopt_count = 0, recommend_count = 3 WHERE name = 'beta-agent'").run();
+    const names = listResourcesRanked(rdb).map((r) => r.name);
+    // alpha (5 adopts) first; beta (0 adopts, 3 recs) beats gamma (NULL≡0 adopts, NULL≡0 recs).
+    expect(names).toEqual(['alpha-skill', 'beta-agent', 'gamma-skill']);
+    rdb.close();
+  });
+});
+
+// ─── Face-level pin: the session-detail dead end is actually fixed ─────────────────
+// The core constant test above pins SESSION_DETAIL_FIELDS; this pins the FACE — the
+// CLI `get S#N` render loop actually walks that list (review 2026-08-16: the audited
+// motivation "remaining_items searchable-but-unrendered" had no face-level test).
+
+describe('CLI get S#N renders remaining_items (the audited dead-end field)', () => {
+  it('a session summary with remaining_items shows it in the detail view', () => {
+    const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
+    const dataDir = mkdtempSync(join(tmpdir(), 'twin-sget-'));
+    try {
+      const db = new Database(join(dataDir, 'claude-mem-lite.db'));
+      initSchema(db);
+      db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+                  VALUES ('cs1', 'ms1', 'p', datetime('now'), ?, 'active')`).run(Date.now());
+      const sid = Number(db.prepare(`INSERT INTO session_summaries
+          (memory_session_id, project, request, remaining_items, created_at, created_at_epoch)
+          VALUES ('ms1', 'p', 'do the thing', 'finish the widget migration', datetime('now'), ?)`)
+        .run(Date.now()).lastInsertRowid);
+      db.close();
+
+      const stdout = execFileSync(process.execPath, [join(REPO, 'cli.mjs'), 'get', `S#${sid}`], {
+        encoding: 'utf8', timeout: 30000,
+        env: { ...process.env, CLAUDE_MEM_DIR: dataDir, MEM_QUIET_HOOKS: '1' },
+      });
+      expect(stdout).toContain(`S#${sid}`);
+      expect(stdout, 'remaining_items still unrendered on the CLI detail face')
+        .toContain('finish the widget migration');
+    } finally {
+      try { rmSync(dataDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   });
 });

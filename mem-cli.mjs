@@ -1766,6 +1766,10 @@ function cmdRestore(db, argv) {
     // D#122: COMPRESSED_PENDING_PURGE (-2) is NOT keeper-absorbed — those rows have
     // no keeper, so rejecting them silently loses their only copy. Restore them
     // live; the maintain decay pipeline will re-evaluate them like any other row.
+    // COMPRESSED_AUTO (-1) stays REJECTED by design (review 2026-08-16): those rows
+    // were deliberately retired by the quality pipeline (idle-cleanup/optimize mark
+    // importance-1 aged rows) — restoring them live would resurrect adjudicated
+    // noise, unlike -2 (a purge QUEUE the user may still be racing to undo).
     if (r.compressed_into && r.compressed_into !== COMPRESSED_PENDING_PURGE) { tombstoned++; continue; }
     const project = projOverride || r.project || inferProject();
     const createdEpoch = Number.isFinite(Number(r.created_at_epoch)) ? Number(r.created_at_epoch) : Date.now();
@@ -1833,7 +1837,7 @@ function cmdRestore(db, argv) {
   // ones that parsed.
   const totalMalformed = malformed + parseFailures;
   const totalLines = rows.length + parseFailures;
-  const tombstoneNote = tombstoned > 0 ? `, ${tombstoned} compressed member(s) rejected (already absorbed by their summary keeper)` : '';
+  const tombstoneNote = tombstoned > 0 ? `, ${tombstoned} compressed member(s) rejected (keeper-absorbed or auto-retired tombstones)` : '';
   out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped${tombstoneNote}, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
   // Name the lossiness where the user meets it. Export omits related_ids and drops
   // superseded rows, and restore re-inserts under fresh AUTOINCREMENT ids — so no

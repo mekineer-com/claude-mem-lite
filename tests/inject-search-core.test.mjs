@@ -80,14 +80,20 @@ describe('consumer ledger — no inlined live-filter pairs in the five converted
     'hook.mjs',
     'search-engine.mjs',
   ];
-  // Retrieval-shape pair: COALESCE(<o.|bare>compressed_into, 0) = 0 followed
-  // within a few lines by <o.|bare>superseded_at IS NULL.
-  const PAIR_RE = /COALESCE\((?:o\.)?compressed_into,\s*0\)\s*=\s*0[\s\S]{0,200}?(?:o\.)?superseded_at IS NULL/g;
+  // Retrieval-shape pair: COALESCE(<alias.|bare>compressed_into, 0) = 0 within a
+  // few lines of <alias.|bare>superseded_at IS NULL — EITHER order (review
+  // 2026-08-16: the original o.-only, one-direction regex let an aliased or
+  // reversed hand-rolled pair slip; the H-1 a./b. dedup join was converted to
+  // liveObsFilterSql so any-alias scanning has no legitimate hits left).
+  const PAIR_RES = [
+    /COALESCE\((?:\w+\.)?compressed_into,\s*0\)\s*=\s*0[\s\S]{0,200}?(?:\w+\.)?superseded_at IS NULL/g,
+    /(?:\w+\.)?superseded_at IS NULL[\s\S]{0,200}?COALESCE\((?:\w+\.)?compressed_into,\s*0\)\s*=\s*0/g,
+  ];
 
   for (const f of FILES) {
     it(`${f} contains no hand-rolled live-filter pair`, () => {
       const src = readFileSync(join(REPO, f), 'utf8');
-      const hits = [...src.matchAll(PAIR_RE)].map((m) => {
+      const hits = PAIR_RES.flatMap((re) => [...src.matchAll(re)]).map((m) => {
         const line = src.slice(0, m.index).split('\n').length;
         return `${f}:${line}`;
       });
