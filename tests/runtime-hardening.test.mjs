@@ -137,15 +137,25 @@ describe('P2-7 spawn-log retention', () => {
     proc.stderr.on('data', () => {});
 
     try {
-      // The append+prune happens at module scope; poll until the stale records go.
+      // The append+prune and the hardenRuntimeFiles sweep are separate statements
+      // at server.mjs module scope (~2063 and ~2075). Polling only for the prune
+      // and then asserting the MODE reads across a boundary this test does not
+      // control: the mode comes from the later sweep, not from the writes — the
+      // test seeds `log` with a plain writeFileSync, so its permissions start at
+      // 0666 & ~umask (0644 under CI's umask 0022), and a `mode:` option on a
+      // write to an EXISTING file is ignored. On a loaded 2-core runner the
+      // server can be descheduled between the two statements, so the poll exits
+      // on a pruned-but-not-yet-hardened file. Wait for both conditions.
       let rows = [];
       for (let i = 0; i < 100; i++) {
         await new Promise(r => setTimeout(r, 100));
         rows = readFileSync(log, 'utf8').split('\n').filter(Boolean);
-        if (rows.length === 1) break;
+        if (rows.length === 1 && mode(log) === 0o600) break;
       }
       expect(rows).toHaveLength(1);
       expect(JSON.parse(rows[0]).pid).toBe(proc.pid);
+      // Still a real assertion: if the sweep never runs, the loop above spends its
+      // full 10s and this fails with the seeded umask-derived mode.
       expect(mode(log)).toBe(0o600);
     } finally {
       proc.kill('SIGKILL');
