@@ -3,6 +3,7 @@
 /node_modules
 /coverage
 /managed
+/.data/
 /resource-registry.db*
 .tmp/
 .claude-mem-lite/
