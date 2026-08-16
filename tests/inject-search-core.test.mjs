@@ -155,3 +155,44 @@ describe('consumer ledger — no inlined live-filter pairs in the converted file
     }
   });
 });
+
+// ─── mem_export's live-row filter, behaviourally ────────────────────────────
+// The ledger above pins the SHAPE (server.mjs composes the core). It did not pin
+// the OUTCOME: inverting runExport's ternary — so the default export leaks
+// retracted rows and hides compressed ones — passed the whole suite (independent
+// review, 2026-08-16). Export feeds `restore`, and "superseded rows escaped a
+// read surface" is the invariant this repo has re-opened seven times, so it is
+// driven through the real handler body rather than asserted against SQL text.
+describe('mem_export default excludes retracted AND compressed rows', () => {
+  it('drives runExport: default = live only, include_compressed adds compressed but never retracted', async () => {
+    const [{ handleExportForTest }, { createTestDb }, { saveObservation }] = await Promise.all([
+      import('../server.mjs'),
+      import('./test-helpers.mjs'),
+      import('../lib/save-observation.mjs'),
+    ]);
+    const db = createTestDb();
+    const P = 'export--live-filter';
+    const live = saveObservation(db, { project: P, type: 'bugfix', content: 'live row about FTS triggers not firing', title: 'LIVEROW marker' }).id;
+    const gone = saveObservation(db, { project: P, type: 'bugfix', content: 'retracted row about proxy CONNECT tunnels', title: 'GONEROW marker' }).id;
+    const zipped = saveObservation(db, { project: P, type: 'bugfix', content: 'compressed row about vector vocabulary gaps', title: 'ZIPROW marker' }).id;
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?').run(Date.now(), live, gone);
+    db.prepare('UPDATE observations SET compressed_into = 999 WHERE id = ?').run(zipped);
+
+    const idsOf = async (args) => {
+      const res = await handleExportForTest(db, { project: P, format: 'jsonl', limit: 100, ...args });
+      const text = res.content.map((c) => c.text).join('\n');
+      return text.split('\n').filter((l) => l.trim().startsWith('{')).map((l) => JSON.parse(l).id);
+    };
+
+    const byDefault = await idsOf({});
+    expect(byDefault).toContain(live);
+    expect(byDefault, 'a retracted row must never reach export').not.toContain(gone);
+    expect(byDefault, 'compressed rows are opt-in').not.toContain(zipped);
+
+    const withCompressed = await idsOf({ include_compressed: true });
+    expect(withCompressed).toContain(live);
+    expect(withCompressed).toContain(zipped);
+    expect(withCompressed, 'include_compressed must not un-hide retractions').not.toContain(gone);
+    db.close();
+  });
+});

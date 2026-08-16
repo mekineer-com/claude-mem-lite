@@ -1,20 +1,30 @@
-// D#124 — Key Context rows were shown but never counted.
+// D#124 — Key Context rows were shown but never reachable by citation decay.
 //
 // SessionStart (and PreCompact) render up to 10 obs into the
-// <claude-mem-context> File Lessons / Key Context sections. Those rows got
-// NEITHER an injection_count bump (unlike the UPS surface, hook-memory.mjs:350)
-// NOR a citation extractor (extractAllInjected covered 4 faces). So an entire
-// injection surface was invisible to the promote/demote loop: rows shown every
-// single session could never accrue a denominator, and a row the agent DID cite
-// off the SessionStart block could never be promoted for it.
+// <claude-mem-context> File Lessons / Key Context sections. No extractor
+// matched them, so a row the agent DID cite off that block could never be
+// promoted for it. v3.65.0 already persists the ACTUALLY-rendered ids to a
+// per-session marker (the D#123 review C-1 fix); this reads that same list.
 //
-// v3.65.0 already persists the ACTUALLY-rendered ids to a per-session marker
-// (the D#123 review C-1 fix). This wires that same list into both halves:
-//   ① bump at render time, from the rendered list — not from a re-run query;
-//   ② a 5th extractor face reading the marker, session-gated.
+// TWO corrections landed in v3.66.1 after an independent pre-tag review arrived
+// late (findings HIGH-2 / HIGH-3), and both are pinned below:
 //
-// Both writers go through ONE recorder so the SessionStart / PreCompact pair
-// cannot drift — the twin-drift class this repo has re-opened repeatedly.
+//   • NO injection_count bump. v3.66.0 added one "mirroring the UPS bump".
+//     The mechanics matched; the semantics did not. injection_count is a NOISE
+//     signal — noisePenaltyClause scores a row x0.5 at >=4 and x0.2 at >=8 when
+//     access_count trails it, and nothing bumps access_count for a rendered row.
+//     The UPS bump is query-conditioned ("injected on a match and never used");
+//     an unconditional Key Context render measures only elapsed sessions, so the
+//     bump deprioritised the highest-importance rows over time.
+//
+//   • PROMOTION-ONLY. The ids are NOT part of extractAllInjected's denominator.
+//     keyObs gates on `importance >= 2`, so one demotion takes the common
+//     importance-2 row to 1 and evicts it from Key Context permanently — each
+//     departure promoting the next row into the same grinder. A cited row still
+//     gets credited; an ignored one is left alone.
+//
+// Both render surfaces go through ONE recorder so the SessionStart / PreCompact
+// pair cannot drift — the twin-drift class this repo has re-opened repeatedly.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
@@ -72,31 +82,28 @@ function markerPath(session = SESSION) {
   return join(runtimeDir, keyContextIdsFileName(PROJECT, session));
 }
 
-describe('recordKeyContextInjection — render-time metering', () => {
-  it('bumps injection_count and last_injected_at for exactly the rendered ids', () => {
-    const [a, b, c] = seed(3);
-    const before = db.prepare('SELECT id, injection_count FROM observations').all();
-    expect(before.every((r) => !r.injection_count)).toBe(true);
-
-    recordKeyContextInjection(db, { runtimeDir, project: PROJECT, sessionId: SESSION, ids: [a, c] });
-
-    const rows = Object.fromEntries(
-      db.prepare('SELECT id, injection_count, last_injected_at FROM observations').all().map((r) => [r.id, r])
-    );
-    expect(rows[a].injection_count).toBe(1);
-    expect(rows[c].injection_count).toBe(1);
-    // The un-rendered row must stay at zero — bumping the QUERY rather than the
-    // rendered list is exactly the mistake D#123's review reversed.
-    expect(rows[b].injection_count ?? 0).toBe(0);
-    expect(rows[a].last_injected_at).toBeGreaterThan(0);
-    expect(rows[b].last_injected_at ?? null).toBeNull();
+describe('recordKeyContextInjection — marker only, never a counter', () => {
+  it('does NOT touch injection_count (v3.66.1 revert)', () => {
+    const [a, b] = seed(2);
+    recordKeyContextInjection(db, { runtimeDir, project: PROJECT, sessionId: SESSION, ids: [a, b] });
+    const rows = db.prepare('SELECT id, injection_count, last_injected_at FROM observations').all();
+    // FAILS-IF the bump is reintroduced. injection_count feeds noisePenaltyClause
+    // (scoring-sql.mjs: x0.5 at >=4, x0.2 at >=8 when access_count stays 0), and
+    // nothing bumps access_count for a rendered row — so counting renders here
+    // deprioritises the highest-importance rows purely as a function of elapsed
+    // sessions. scoring-sql.mjs states the invariant: injection_count is bumped
+    // ONLY on UserPromptSubmit / hook-memory auto-inject.
+    for (const r of rows) {
+      expect(r.injection_count ?? 0, `id ${r.id} injection_count`).toBe(0);
+      expect(r.last_injected_at ?? null, `id ${r.id} last_injected_at`).toBeNull();
+    }
   });
 
-  it('accumulates across renders (SessionStart then PreCompact)', () => {
-    const [a] = seed(1);
-    recordKeyContextInjection(db, { runtimeDir, project: PROJECT, sessionId: SESSION, ids: [a] });
-    recordKeyContextInjection(db, { runtimeDir, project: PROJECT, sessionId: SESSION, ids: [a] });
-    expect(db.prepare('SELECT injection_count FROM observations WHERE id = ?').get(a).injection_count).toBe(2);
+  it('writes the marker with exactly the rendered ids', () => {
+    const [a, b, c] = seed(3);
+    recordKeyContextInjection(db, { runtimeDir, project: PROJECT, sessionId: SESSION, ids: [a, c] });
+    expect(JSON.parse(readFileSync(markerPath(), 'utf8')).ids.sort()).toEqual([a, c].sort());
+    expect(JSON.parse(readFileSync(markerPath(), 'utf8')).ids).not.toContain(b);
   });
 
   it('writes the marker even when nothing rendered (quiet/adopted project)', () => {
@@ -110,8 +117,16 @@ describe('recordKeyContextInjection — render-time metering', () => {
     expect(() => recordKeyContextInjection(db, {
       runtimeDir: '/nonexistent-dir-for-keyctx-test', project: PROJECT, sessionId: SESSION, ids: [a],
     })).not.toThrow();
-    // The bump still lands: a marker-write failure must not cost the metering.
-    expect(db.prepare('SELECT injection_count FROM observations WHERE id = ?').get(a).injection_count).toBe(1);
+  });
+
+  it('drops non-id junk before it reaches the marker', () => {
+    // The recorder's own sanitiser, not the extractor's — pinned separately
+    // because a caller could hand it anything the collector picked up.
+    recordKeyContextInjection(db, {
+      runtimeDir, project: PROJECT, sessionId: SESSION,
+      ids: [7, 'abc', -1, 0, 1e9, null, 3.5],
+    });
+    expect(JSON.parse(readFileSync(markerPath(), 'utf8')).ids).toEqual([7]);
   });
 });
 
@@ -139,20 +154,41 @@ describe('extractInjectedFromKeyContext — the 5th extractor face', () => {
   });
 });
 
-describe('extractAllInjected wiring', () => {
-  it('unions the Key Context face when the caller supplies the marker coordinates', () => {
-    writeFileSync(markerPath(), JSON.stringify({ ids: [4242], ts: Date.now(), session: SESSION }));
-    const withCoords = extractAllInjected(null, {
-      mainOnly: true, runtimeDir, project: PROJECT, sessionId: SESSION,
-    });
-    expect(withCoords.has(4242)).toBe(true);
+describe('extractAllInjected must NOT carry the Key Context face', () => {
+  it('ignores marker coordinates entirely (promotion-only lives at the call site)', () => {
+    writeFileSync(markerPath(), JSON.stringify({ ids: [4242], ts: 1, session: SESSION }));
+    // FAILS-IF the face is unioned back into the denominator. Every other face is
+    // query-conditioned, so an uncited appearance is evidence; an unconditional
+    // Key Context render is not, and keyObs gates on importance >= 2 so one
+    // demotion evicts the row permanently.
+    const all = extractAllInjected(null, { mainOnly: true, runtimeDir, project: PROJECT, sessionId: SESSION });
+    expect(all.has(4242)).toBe(false);
+  });
+});
+
+describe('the Stop handler wires Key Context as promotion-only', () => {
+  const src = readFileSync(join(ROOT, 'hook.mjs'), 'utf8');
+
+  it('does not pass marker coordinates into extractAllInjected', () => {
+    const call = src.match(/extractAllInjected\(transcriptPath,\s*\{[^}]*\}/s);
+    expect(call, 'extractAllInjected call site not found').not.toBeNull();
+    expect(call[0]).not.toContain('runtimeDir');
   });
 
-  it('does NOT read any marker when the caller supplies no coordinates', () => {
-    writeFileSync(markerPath(), JSON.stringify({ ids: [4242], ts: Date.now(), session: SESSION }));
-    // Callers like computeCiteRecall analyse an arbitrary transcript with no
-    // session context; they must stay on the four transcript-derived faces.
-    expect(extractAllInjected(null, { mainOnly: true }).has(4242)).toBe(false);
+  it('resolves the marker with runtimeDir + project + sessionId', () => {
+    const call = src.match(/extractInjectedFromKeyContext\(\{[^}]*\}/s);
+    expect(call, 'extractInjectedFromKeyContext call site not found').not.toBeNull();
+    for (const arg of ['runtimeDir', 'project', 'sessionId']) {
+      // sessionId was unpinned in v3.66.0: dropping it makes the reader look for
+      // `.claude-mem-keyctx-<project>` while the writer wrote `...-<session>`,
+      // so the face silently returns empty forever.
+      expect(call[0], `missing ${arg}`).toContain(arg);
+    }
+  });
+
+  it('adds Key Context ids only where they were cited', () => {
+    // The whole of the promotion-only contract in one line of production code.
+    expect(src).toMatch(/for \(const id of keyCtxIds\) if \(citedMain\.has\(id\)\) injected\.add\(id\);/);
   });
 });
 
@@ -178,11 +214,4 @@ describe('both render surfaces go through the one recorder', () => {
     });
   }
 
-  it('the Stop handler passes the marker coordinates into extractAllInjected', () => {
-    const src = read('hook.mjs');
-    const call = src.match(/extractAllInjected\(transcriptPath,\s*\{[^}]*\}/s);
-    expect(call, 'extractAllInjected call site not found').not.toBeNull();
-    expect(call[0]).toContain('runtimeDir');
-    expect(call[0]).toContain('project');
-  });
 });

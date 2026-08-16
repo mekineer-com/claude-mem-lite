@@ -69,9 +69,32 @@ describe('background LLM call sites use the shared constant, not a bare literal'
     'hook-shared.mjs',
   ];
 
+  // Per-file floor on how many LLM calls must carry the constant. Raise when a
+  // file gains a call; never lower without saying why.
+  const BG_TIMEOUT_USE_COUNTS = {
+    'lib/save-enrich.mjs': 1,
+    'hook-optimize.mjs': 5,
+    'registry-enricher.mjs': 1,
+    'hook-llm.mjs': 2,
+    'hook-shared.mjs': 1,
+  };
+
   for (const file of BACKGROUND_SITES) {
-    it(`${file} references BG_LLM_TIMEOUT_MS`, () => {
-      expect(read(file)).toContain('BG_LLM_TIMEOUT_MS');
+    it(`${file} passes BG_LLM_TIMEOUT_MS at every LLM call it makes`, () => {
+      const src = read(file);
+      // A bare `toContain('BG_LLM_TIMEOUT_MS')` was satisfied by the IMPORT line:
+      // deleting `timeout: BG_LLM_TIMEOUT_MS` from registry-enricher or from all
+      // five hook-optimize sites left the suite green while each call silently
+      // fell back to its dispatcher default (10s / 15s) — the exact regression
+      // this release exists to fix, and no numeric literal appears so the
+      // sub-floor scan below cannot see it either.
+      // Two call shapes carry it: an options object (`timeout: BG_...`) and
+      // hook-shared's positional `callLLM(prompt, BG_...)`.
+      const uses = (src.match(/timeout(?:Ms)?\s*[:=]\s*BG_LLM_TIMEOUT_MS/g) || []).length
+        + (src.match(/\bcallLLM\([^)]*?,\s*BG_LLM_TIMEOUT_MS\s*\)/g) || []).length;
+      expect(uses, `${file} has ${uses} timeout:BG_LLM_TIMEOUT_MS uses`).toBeGreaterThanOrEqual(
+        BG_TIMEOUT_USE_COUNTS[file]
+      );
     });
 
     it(`${file} hands no sub-floor literal to an LLM call`, () => {

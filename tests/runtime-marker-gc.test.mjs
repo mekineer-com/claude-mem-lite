@@ -21,8 +21,10 @@ import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
+import { readdirSync as _rd } from 'fs';
 import {
   sweepStaleProjectMarkers,
+  sentinelPrefixesFromShell,
   STALE_PROJECT_MARKER_AGE_MS,
   GC_PROJECT_MARKER_PREFIXES,
   GC_PRESERVED_MARKER_PREFIXES,
@@ -132,6 +134,49 @@ describe('sweepStaleProjectMarkers — the age gate', () => {
     for (const p of ['reads-', 'ep-flush-', 'pending-', 'ep-']) {
       expect(GC_PROJECT_MARKER_PREFIXES).not.toContain(p);
     }
+  });
+});
+
+describe('shell-written one-shot sentinels are never GC-able (v3.66.1 HIGH-1)', () => {
+  // The regression this replaces: `.mcp-dedup-` was put in the GC list because a
+  // grep for its writer used `--include=*.mjs --include=*.js`, and the writer is
+  // scripts/setup.sh. Deleting it re-ran a migration that strips
+  // mcpServers.mem / mcpServers["mem-lite"] from the user's ~/.claude.json with a
+  // raw writeFileSync — a config file this project does not own. Its mtime never
+  // refreshes (the gate skips the block once the file exists), so every install
+  // older than 30 days would lose it on the first SessionStart after upgrading.
+  //
+  // Deriving the list FROM the shell source is the point: a new sentinel added to
+  // setup.sh tomorrow is covered without anyone remembering to update a list.
+  const shell = _rd(join(ROOT, 'scripts'))
+    .filter((f) => f.endsWith('.sh'))
+    .map((f) => readFileSync(join(ROOT, 'scripts', f), 'utf8'))
+    .join('\n');
+
+  const prefixes = sentinelPrefixesFromShell(shell);
+
+  it('finds the sentinels it is supposed to guard', () => {
+    // Anti-vacuity: an extractor that returns [] would make the guard below pass
+    // no matter what the GC list contains.
+    expect(prefixes.length).toBeGreaterThanOrEqual(2);
+    expect(prefixes).toContain('.mcp-dedup-');
+    expect(prefixes).toContain('.residue-warned-');
+  });
+
+  it('none of them is in the GC list', () => {
+    const leaked = prefixes.filter((p) => GC_PROJECT_MARKER_PREFIXES.includes(p));
+    expect(leaked).toEqual([]);
+  });
+
+  it('each is explicitly preserved', () => {
+    const unprotected = prefixes.filter((p) => !GC_PRESERVED_MARKER_PREFIXES.includes(p));
+    expect(unprotected).toEqual([]);
+  });
+
+  it('a sentinel survives the sweep at any age', () => {
+    for (const pre of prefixes) put(`${pre}v9.9.9`, 400);
+    expect(sweepStaleProjectMarkers(dir)).toBe(0);
+    expect(_rd(dir).length).toBe(prefixes.length);
   });
 });
 

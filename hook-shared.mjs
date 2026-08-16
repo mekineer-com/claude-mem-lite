@@ -148,12 +148,6 @@ export const GC_PROJECT_MARKER_PREFIXES = Object.freeze([
   'cite-recall-',             // last session's cite-recall snapshot (nudge input)
   '.skill-cooldown-',         // suggestion throttle timestamp
   '.skill-reco-cooldown-',    // recommendation throttle timestamp
-  // These two have NO writer and NO reader left in the tree (verified by grep,
-  // 2026-08-16) — they are version-keyed one-time markers from retired code
-  // paths (live dir holds `.mcp-dedup-v2.10`, `.residue-warned-v2.55`). Nothing
-  // recreates them, so sweeping them is a one-shot cleanup, not a policy.
-  '.mcp-dedup-',
-  '.residue-warned-',
 ]);
 
 // Records of a completed side effect — never age out. `ep-`/`ep-flush-`/
@@ -164,7 +158,44 @@ export const GC_PRESERVED_MARKER_PREFIXES = Object.freeze([
   '.auto-adopt-',
   '.deferred-block-migrated-',
   '.legacy-claude-md-cleaned-',
+  // v3.66.1: these two shipped in the GC list for one release and had to come
+  // out. Both are version-keyed one-shot migration sentinels written by
+  // scripts/setup.sh, and their gate is `! -f <marker>` — deleting one re-runs
+  // its migration. `.mcp-dedup-v2.78` gates a block that removes
+  // mcpServers.mem / mcpServers["mem-lite"] from the user's ~/.claude.json with
+  // a raw writeFileSync (no tmp+rename, no backup), which the repo's own test
+  // documents as intentionally one-shot: "If a user later runs `claude mcp add
+  // mem ...` themselves, the gate intentionally lets it stand." A 30-day sweep
+  // turned that into a recurring purge of a config file we do not own.
+  // The mtime never refreshes (the gate skips the block once the file exists),
+  // so every install older than 30 days would have lost it on the first
+  // SessionStart after upgrading.
+  //
+  // Why it was missed: the search for writers used `grep --include=*.mjs
+  // --include=*.js`, and the writer is a SHELL script. `sentinelPrefixesFromShell`
+  // below now derives this class from scripts/*.sh instead of from memory.
+  '.mcp-dedup-',
+  '.residue-warned-',
 ]);
+
+/**
+ * Marker-name prefixes that scripts/*.sh treats as one-shot sentinels, derived
+ * from the shell source rather than restated here. `tests/runtime-marker-gc`
+ * asserts none of them is GC-able: a shell-written sentinel is invisible to a
+ * JS-only grep, which is exactly how `.mcp-dedup-` reached the GC list.
+ *
+ * @param {string} shellSource concatenated contents of scripts/*.sh
+ * @returns {string[]} prefixes like `.mcp-dedup-`
+ */
+export function sentinelPrefixesFromShell(shellSource) {
+  const out = new Set();
+  // Matches `"$DATA_DIR/runtime/.mcp-dedup-v2.78"` and friends: a dotfile under
+  // runtime/ whose name carries a version-ish suffix.
+  for (const m of String(shellSource || '').matchAll(/runtime\/(\.[a-z0-9-]*?-)v?[0-9][0-9.]*/gi)) {
+    out.add(m[1]);
+  }
+  return [...out];
+}
 
 /**
  * Sweep per-project runtime markers older than `ageMs`. fs-only, best-effort,

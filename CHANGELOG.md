@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.66.1 — the review landed after the tag, and it was right three times
+
+**Upgrade from 3.66.0 immediately.** The independent pre-tag review of v3.66.0 arrived ~40 minutes after that tag was pushed (the same delay that forced v3.61.1). It found three HIGH defects in v3.66.0's own new code, all confirmed. If you are on 3.66.0, this release is not optional.
+
+| What 3.66.0 did wrong | Fix |
+|---|---|
+| **It deleted a one-shot migration sentinel and let the migration re-run.** The 30-day marker sweep listed `.mcp-dedup-`, which is not a cache: `scripts/setup.sh` writes `.mcp-dedup-v2.78` to gate a block that removes `mcpServers.mem` and `mcpServers["mem-lite"]` from **your `~/.claude.json`** with a raw `writeFileSync` — no temp-and-rename, no backup. That block is deliberately one-shot; the repo's own test says "if a user later runs `claude mcp add mem …` themselves, the gate intentionally lets it stand." Sweeping the marker turned that into a purge every 30 days. The marker's mtime never refreshes, so **any install older than 30 days would have lost it on the first SessionStart after upgrading** — immediate, not eventual. `.residue-warned-` is the same shape and had the same problem. | Both are now in the preserved list. More usefully, the guard is structural: `sentinelPrefixesFromShell()` derives this class **from `scripts/*.sh`**, and a test asserts none of them is GC-able. The original miss was a `grep --include=*.mjs --include=*.js` for a writer that lives in a shell script; a list-based fix would have repeated it. |
+| **It made the highest-importance rows score worse over time.** The new Key Context metering bumped `injection_count`, which is not a neutral counter: `noisePenaltyClause` reads it as a noise signal and multiplies a row's score by **0.5** once `injection_count >= 4` and by **0.2** at `>= 8`, whenever `access_count` trails it — and nothing bumps `access_count` for a rendered row. `scoring-sql.mjs` states the invariant the change broke: bumped **only** on UserPromptSubmit / hook-memory auto-inject. That bump is query-conditioned (a row counted because it *matched*); an unconditional SessionStart render measures nothing but elapsed sessions, so Key Context rows were being deprioritised in `mem_search`, UPS ranking and `injectionRelevanceSql` on a clock. | The bump is gone. D#124's actual requirement — decay reachability — never needed it: decay reads `decay_seen_count` / `uncited_streak` / `cited_count`, never `injection_count`. |
+| **It made the Key Context block eat its own contents.** Those ids went into citation decay's *denominator*, and `keyObs` gates on `importance >= 2`. Three uncited sessions demote a row by one, so the common importance-2 row crossed the gate on its **first** demotion and left Key Context permanently — each departure promoting the next row into the same grinder. Projects that cite at all (rate ≥2%) are exactly the ones not covered by the adoption suppression. | Key Context is now **promotion-only**: its ids are no longer part of `extractAllInjected`, and the Stop handler adds them to the decay set only where they were actually cited. A cited row still gets credited; an ignored one is untouched. An unconditional render is not evidence of irrelevance. |
+
+Test hardening from the same review (three assertions that passed while holding nothing):
+
+- The `BG_LLM_TIMEOUT_MS` scan was satisfied by the **import line** — deleting `timeout: BG_LLM_TIMEOUT_MS` from `registry-enricher.mjs`, or from all five `hook-optimize.mjs` sites, left the suite green while each call silently fell back to its dispatcher default. Now counted per file, both call shapes.
+- The Stop handler's `sessionId` was unpinned; dropping it makes the reader look for `.claude-mem-keyctx-<project>` while the writer wrote `…-<session>`, so the whole face returns empty forever. Now asserted.
+- `runExport`'s filter had a shape pin but no behavioural one: inverting the ternary — default export leaking **retracted** rows — passed all 4398 tests. Now driven through the real handler, both branches.
+
+Known and deliberately not fixed here (tracked): `--no-session-persistence` is an unguarded dependency on a recent Claude Code CLI. On an older binary the spawn exits non-zero, the error is swallowed, and every CLI-leg LLM call fails silently with no telemetry. `package.json` declares no Claude Code floor. A probe-and-cache or retry-without-flag belongs in the next release, not in a hotfix that is already touching three subsystems.
+
+4405/4405 tests (252 files), eslint + shellcheck clean, knip at the 32-export baseline. Every fix above is mutation-verified: reverting it turns the suite red.
+
 ## v3.66.0 — the headless calls stop paying an interactive tax, the enrichment stops timing out, and the last uncounted injection surface joins the ledger
 
 **Upgrading from 3.65.0 — what changes for you.** Four behaviors you may notice. Each has an escape hatch; none requires action.

@@ -54,6 +54,7 @@ import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
   extractAllInjected,
+  extractInjectedFromKeyContext,
   bumpCitationAccess,
   computeCiteRecall,
   applyCitationDecay,
@@ -740,19 +741,26 @@ async function handleStop() {
             // filter as citedMain (the numerator, below) — an obs injected only
             // inside a subagent (sidechain) would otherwise enter the denominator
             // but never the numerator and streak-demote despite being used there.
-            // runtimeDir + project enable the 5th (Key Context) face — see
-            // extractInjectedFromKeyContext: it is marker-derived, because the
-            // SessionStart block leaves no hook attachment to parse.
-            const injected = extractAllInjected(transcriptPath, {
-              mainOnly: true, runtimeDir: RUNTIME_DIR, project, sessionId: ccSessionId,
-            });
+            const injected = extractAllInjected(transcriptPath, { mainOnly: true });
             // P5 ①: cite-back signals — observations whose warned file the agent
             // edited this session. Union into injected so they're resolved (they
             // were injected via pre-tool-recall) and, below, into cited so the
             // edit promotes them even without a literal #NN in text.
             const citeBackIds = extractCiteBackSignals(transcriptPath);
             for (const id of citeBackIds) injected.add(id);
-            if (injected.size > 0) {
+            // D#124, promotion-only (v3.66.1): the SessionStart Key Context block
+            // leaves no hook attachment, so its ids come from the per-session
+            // marker. They are added to the decay set ONLY where they were
+            // actually cited (below), never as bare denominator: the block
+            // re-renders the same fixed top-10 unconditionally, so an uncited
+            // render says nothing about relevance — and since keyObs gates on
+            // `importance >= 2`, one demotion evicts the common importance-2 row
+            // from Key Context for good. v3.66.0 fed them in as denominator and
+            // that made the block eat its own contents.
+            const keyCtxIds = extractInjectedFromKeyContext({
+              runtimeDir: RUNTIME_DIR, project, sessionId: ccSessionId,
+            });
+            if (injected.size > 0 || keyCtxIds.size > 0) {
               // Text-floor gate: skip decay on tool-only Stops. Without this,
               // a turn that ends on tool_use locks every injected obs as
               // uncited (last_decided_session_id set), so a later turn that
@@ -765,6 +773,10 @@ async function handleStop() {
               } else {
                 const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
                 for (const id of citeBackIds) citedMain.add(id);
+                // The promotion-only half: a Key Context row the agent actually
+                // cited joins the decay set (and takes the promote branch); one
+                // it ignored is never entered, so it cannot streak or demote.
+                for (const id of keyCtxIds) if (citedMain.has(id)) injected.add(id);
                 // D#60: the idempotency key must be the CC session UUID, NOT the
                 // project-scoped memory sessionId — concurrent same-project CC
                 // sessions share the latter, so the second session's decay pass
