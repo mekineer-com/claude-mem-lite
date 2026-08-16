@@ -73,15 +73,19 @@ describe('search telemetry v45', () => {
       results: [
         { source: 'obs', id: 7, title: 'Alpha' },
         { source: 'session', id: 8, request: 'Beta' },
+        { source: 'prompt', id: 9, prompt_text: 'Gamma' },
+        { source: 'event', id: 10, title: 'Delta' },
       ],
     });
     expect(rateSearchResults(db, {
-      searchId, relevant: ['#7'], partiallyRelevant: ['S#8'], ratedBy: 'codex/1', now: 2000,
-    })).toBe(2);
+      searchId, relevant: ['#7', 'P#9'], partiallyRelevant: ['S#8', 'E#10'], ratedBy: 'codex/1', now: 2000,
+    })).toBe(4);
     rateSearchResults(db, { searchId, irrelevant: ['#7'], ratedBy: 'codex/1', now: 3000 });
     expect(db.prepare('SELECT result_id, snapshot_label, relevance, rated_by FROM search_results ORDER BY returned_rank').all()).toEqual([
       { result_id: 7, snapshot_label: 'Alpha', relevance: 'irrelevant', rated_by: 'codex/1' },
       { result_id: 8, snapshot_label: 'Beta', relevance: 'partial', rated_by: 'codex/1' },
+      { result_id: 9, snapshot_label: 'Gamma', relevance: 'relevant', rated_by: 'codex/1' },
+      { result_id: 10, snapshot_label: 'Delta', relevance: 'partial', rated_by: 'codex/1' },
     ]);
     db.close();
   });
@@ -136,6 +140,50 @@ describe('search telemetry v45', () => {
     expect(report.relevance_distribution.relevant).toBe(1);
     expect(formatSearchTelemetryReport(report)).toContain('Relevance coverage: 1/1 (100.0%)');
     db.close();
+  });
+
+  it('keeps rank precision surface-local and gates it by surface coverage', () => {
+    const db = openDb();
+    for (let i = 1; i <= 30; i++) {
+      const searchId = recordSearch(db, {
+        query: `mcp ${i}`, surface: 'mcp_search', client: 'test',
+        results: [{ source: 'obs', id: i, title: `MCP ${i}` }], now: i,
+      });
+      rateSearchResults(db, { searchId, relevant: [`#${i}`], ratedBy: 'test', now: i });
+    }
+    const hookId = recordSearch(db, {
+      query: 'hook', surface: 'user_prompt_hook', client: 'test',
+      results: [{ source: 'obs', id: 100, title: 'Hook' }], now: 31,
+    });
+    rateSearchResults(db, { searchId: hookId, irrelevant: ['#100'], ratedBy: 'test', now: 31 });
+
+    const report = computeSearchTelemetry(db, { now: 32 });
+    expect(Object.keys(report.by_rank).sort()).toEqual(['mcp_search:1', 'user_prompt_hook:1']);
+    const text = formatSearchTelemetryReport(report);
+    expect(text).toContain('mcp_search #1: 30/30 relevant');
+    expect(text).toContain('user_prompt_hook #1: suppressed (surface: 1 ratings');
+    db.close();
+  });
+
+  it('keeps MCP search output when telemetry cannot acquire the writer lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-search-telemetry-mcp-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'test.db');
+    const writer = openDb(path);
+    seedObservation(writer);
+    writer.pragma('wal_checkpoint(FULL)');
+    const contender = new Database(path);
+    writer.exec('BEGIN IMMEDIATE');
+    const result = await handleSearchForTest(contender, {
+      query: 'alpha telemetry lesson', project: 'telemetry-test', deep: false,
+    });
+    expect(result.results.length).toBeGreaterThan(0);
+    expect(result.search_id).toBeNull();
+    expect(result.content[0].text).toContain('Alpha telemetry lesson');
+    expect(result.content[0].text).not.toContain('rate relevance');
+    writer.exec('ROLLBACK');
+    contender.close();
+    writer.close();
   });
 
   it('records genuine zero-result searches but not queries filtered to no terms', async () => {

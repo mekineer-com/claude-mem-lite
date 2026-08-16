@@ -772,6 +772,75 @@ describe('user-prompt-search subprocess integration', () => {
       prompt: 'How do I implement the new feature for data visualization?',
     });
     expect(stdout).toBe('');
+    expect(db.prepare('SELECT returned_count FROM search_runs').get()).toEqual({ returned_count: 0 });
+  });
+
+  it('records only the exposed three results and skips a deduplicated repeat', async () => {
+    for (let i = 1; i <= 5; i++) {
+      insertObs(db, {
+        sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+        title: `Authentication middleware token expiry fix ${i}`,
+        text: 'authentication middleware token expiry validation refresh fix bug',
+        importance: 3,
+      });
+    }
+    db.pragma('wal_checkpoint(FULL)');
+    const payload = {
+      session_id: 'telemetry-dedup',
+      prompt: 'how do I fix the authentication middleware token expiry validation',
+    };
+    const first = await runScript(payload);
+    const searchId = Number(first.stdout.match(/Search (\d+) — rate relevance/)?.[1]);
+    expect(searchId).toBeGreaterThan(0);
+    expect(db.prepare('SELECT returned_count FROM search_runs WHERE search_id = ?').get(searchId))
+      .toEqual({ returned_count: 3 });
+    expect(db.prepare('SELECT COUNT(*) c FROM search_results WHERE search_id = ?').get(searchId).c).toBe(3);
+
+    const second = await runScript(payload);
+    expect(second.stdout).toBe('');
+    expect(db.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(1);
+  });
+
+  it('does not record results suppressed by the session injection cap', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved authentication middleware token expiry',
+      text: 'authentication middleware token expiry validation refresh fix bug',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    const runtimeDir = join(testDir, 'runtime');
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, '.claude-mem-injected-test--project'), JSON.stringify({
+      ids: [], ts: Date.now(), count: 15, session: 'telemetry-cap',
+    }));
+    const { stdout } = await runScript({
+      session_id: 'telemetry-cap',
+      prompt: 'how do I fix the authentication middleware token expiry validation',
+    });
+    expect(stdout).toBe('');
+    expect(db.prepare('SELECT COUNT(*) c FROM search_runs').get().c).toBe(0);
+  });
+
+  it('emits the original results when the telemetry insert fails', async () => {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Resolved authentication middleware token expiry',
+      text: 'authentication middleware token expiry validation refresh fix bug',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+    db.exec(`
+      CREATE TRIGGER reject_search_telemetry
+      BEFORE INSERT ON search_runs
+      BEGIN SELECT RAISE(ABORT, 'telemetry unavailable'); END;
+    `);
+    const { stdout } = await runScript({
+      session_id: 'telemetry-busy',
+      prompt: 'how do I fix the authentication middleware token expiry validation',
+    });
+    expect(stdout).toContain('Resolved authentication middleware token expiry');
+    expect(stdout).not.toContain('rate relevance');
   });
 
   it('accepts both "prompt" and "user_prompt" fields', async () => {

@@ -877,17 +877,17 @@ async function main() {
       if (promptRows.length > 0) searchMode = 'prompt_fallback';
     }
 
+    let telemetrySearchId = null;
     const candidateIds = rows.length > 0
       ? rows.map(r => r.id)
       : promptRows.map(r => `P${r.id}`);
     if (candidateIds.length === 0 && searchExecuted) {
       try {
-        recordSearch(db, {
+        telemetrySearchId = recordSearch(db, {
           project,
           query: sanitizeFtsQuery(promptText) || '',
           surface: 'user_prompt_hook',
           searchMode,
-          corpusCounts: countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS),
           matchedCount: 0,
           results: [],
           client: 'user_prompt_hook',
@@ -908,17 +908,16 @@ async function main() {
         const telemetryRows = rows.length > 0
           ? rows.map(r => ({ ...r, source: 'obs' }))
           : promptRows.map(r => ({ ...r, source: 'prompt', text: r.prompt_text }));
-        const searchId = recordSearch(db, {
+        telemetrySearchId = recordSearch(db, {
           project,
           query: sanitizeFtsQuery(promptText) || '',
           surface: 'user_prompt_hook',
           searchMode,
-          corpusCounts: countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS),
           matchedCount: telemetryRows.length,
           results: telemetryRows,
           client: 'user_prompt_hook',
         });
-        rendered += `\nSearch ${searchId} — rate relevance with mem_search_feedback; omit any result you cannot judge honestly.`;
+        rendered += `\nSearch ${telemetrySearchId} — rate relevance with mem_search_feedback; omit any result you cannot judge honestly.`;
       } catch (e) {
         recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
       }
@@ -999,6 +998,19 @@ async function main() {
         finally { rdb.close(); }
       }
     } catch { /* silent — never block on recommendation failure */ }
+
+    // Corpus counts are diagnostic only. Run their full-table scans after all
+    // user-visible output and functional state writes so the 2s hook deadline
+    // cannot suppress memory injection.
+    if (telemetrySearchId !== null) {
+      try {
+        const corpusCounts = countHookEligibleCorpus(db, project, Date.now() - LOOKBACK_MS);
+        db.prepare('UPDATE search_runs SET corpus_counts_json = ? WHERE search_id = ?')
+          .run(JSON.stringify(corpusCounts), telemetrySearchId);
+      } catch (e) {
+        recordHookError('search-telemetry:user_prompt_hook', e, RUNTIME_DIR);
+      }
+    }
   } catch (e) {
     // Hooks must never break Claude Code — swallow, but RECORD: this catch wraps
     // every FTS query on the surface, so a schema/FTS drift here would zero out
