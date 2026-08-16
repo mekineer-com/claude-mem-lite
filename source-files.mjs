@@ -123,6 +123,11 @@ export const SOURCE_FILES = [
   // scripts/user-prompt-search.js + scripts/pre-tool-recall.js. Under lib/ for
   // the same scripts-dir-rename reason as mem-override.mjs above.
   'lib/injected-ids.mjs',
+  // P2-11: injection-side shared SQL core (live-row filter / clamped decay /
+  // injection relevance chain). Statically imported by hook.mjs, hook-memory.mjs,
+  // search-engine.mjs AND the standalone hook scripts — missing it from the
+  // manifest kills every retrieval surface on auto-update.
+  'lib/inject-search-core.mjs',
   // v2.61 dedup refactor: shared "save one observation" pipeline used by both
   // mem-cli.mjs::cmdSave and server.mjs::mem_save. Statically imported from both
   // entry points; missing it from the manifest broke MCP saves on auto-update.

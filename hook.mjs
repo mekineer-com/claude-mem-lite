@@ -69,6 +69,7 @@ import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs
 import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { injectedIdsFileName } from './lib/injected-ids.mjs';
+import { liveObsFilterSql, recencyDecaySql } from './lib/inject-search-core.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
@@ -492,15 +493,12 @@ function triggerErrorRecall(db, toolInput, response) {
         -- only for symmetry: the block's own footer is a mem_get(ids=...) pointer, and a
         -- COMPRESSED_PENDING_PURGE row is queued for deletion by maintain purge_stale,
         -- so that pointer would resolve to nothing.
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND ${notLowSignalTitleClause('o')}
-      -- MAX(0, …) clamps recency age to >= 0 (parity with search-engine FULL_SCORE):
-      -- a far-future created_at (reachable via restore/import-jsonl, which accept
-      -- arbitrary epochs) made the exponent large-positive → EXP overflow → that row
-      -- pinned #1 for every error until its "future" passed (audit 2026-08-14 M-1).
+      -- Decay via the shared core (P2-11): the M-1 MAX(0,…) age clamp lives there.
+      -- Fixed 14d half-life (error recency matters more than obs type here).
       ORDER BY ${OBS_BM25}
-        * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / 1209600000.0))
+        * ${recencyDecaySql({ tsExpr: 'o.created_at_epoch', halfLifeSql: '1209600000.0' })}
       LIMIT 3
     `).all(ftsQuery, project, nowR);
 
@@ -1067,8 +1065,7 @@ function runSessionStartAutoMaintain(db) {
         const recent = db.prepare(`
           SELECT id, title, importance, created_at_epoch, narrative, text
           FROM observations
-          WHERE COALESCE(compressed_into, 0) = 0
-            AND superseded_at IS NULL
+          WHERE ${liveObsFilterSql('')}
             AND created_at_epoch > ?
             AND title IS NOT NULL AND title != ''
           ORDER BY created_at_epoch DESC LIMIT ${SCAN_LIMIT}

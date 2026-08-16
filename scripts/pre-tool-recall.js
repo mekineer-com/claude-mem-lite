@@ -9,6 +9,7 @@ import { basename, join } from 'path';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
 import { injectedIdsFileName } from '../lib/injected-ids.mjs';
+import { liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
@@ -432,8 +433,7 @@ try {
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE o.project = ?
         AND o.importance >= 2
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND o.created_at_epoch > ?
         AND ${fileMatch}
         ${edgeDecayFilter}

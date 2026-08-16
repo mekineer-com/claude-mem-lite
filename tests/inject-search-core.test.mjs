@@ -1,0 +1,104 @@
+// P2-11 (audit 2026-08-14): lib/inject-search-core.mjs — the injection-side shared
+// core. Three SQL atoms kept drifting across hand-copied twins (M-1: the MAX(0,…)
+// decay clamp reached search-engine but not UPS/error-recall; M-3: cite/noise
+// reached every auto surface but not FULL_SCORE; the live-row filter pair missed
+// its 7th surface in H-1): this suite pins BOTH the atoms' semantics AND that the
+// five consumer files actually compose them instead of re-inlining copies.
+
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+import Database from 'better-sqlite3';
+import { initSchema } from '../schema.mjs';
+import {
+  liveObsFilterSql, recencyDecaySql, injectionRelevanceSql,
+} from '../lib/inject-search-core.mjs';
+
+const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+describe('shared atoms — semantics', () => {
+  it('liveObsFilterSql pairs compressed + superseded for both alias forms', () => {
+    expect(liveObsFilterSql('o')).toContain('COALESCE(o.compressed_into, 0) = 0');
+    expect(liveObsFilterSql('o')).toContain('o.superseded_at IS NULL');
+    expect(liveObsFilterSql('')).toContain('COALESCE(compressed_into, 0) = 0');
+    expect(liveObsFilterSql('')).toContain('superseded_at IS NULL');
+  });
+
+  // FAILS IF: the MAX(0,…) clamp is dropped — the M-1 overflow (future epoch →
+  // EXP(+huge) → ±Infinity → row pins #1 for every query) comes back at the
+  // single home and silently reaches every derived surface at once.
+  it('recencyDecaySql carries the M-1 age clamp', () => {
+    const sql = recencyDecaySql({ tsExpr: 'o.created_at_epoch' });
+    expect(sql).toContain('MAX(0, ? - o.created_at_epoch)');
+    expect(sql).toContain('EXP(-0.693');
+  });
+
+  // FAILS IF: cite or noise is dropped from the injection relevance chain — the
+  // M-3 class (behavior signal wired on some surfaces, missing on others) reopens.
+  it('injectionRelevanceSql composes decay + type-quality + importance + noise + cite', () => {
+    const sql = injectionRelevanceSql('o');
+    expect(sql).toContain('MAX(0, ? - o.created_at_epoch)');   // clamped decay
+    expect(sql).toContain("CASE o.type");                       // type quality/decay cases
+    expect(sql).toContain('0.5 + 0.5 * COALESCE(o.importance, 1)');
+    expect(sql).toContain('injection_count');                   // noise penalty
+    expect(sql).toContain('cited_count');                       // cite factor
+  });
+
+  // Functional M-1 pin at the core level: a far-future created_at row must score
+  // FINITE (clamp reads it as age 0), not ±Infinity.
+  it('a future-epoch row scores finite through injectionRelevanceSql (real SQL)', () => {
+    const db = new Database(':memory:');
+    initSchema(db);
+    db.prepare(`INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+                VALUES ('s1', 'm1', 'p', datetime('now'), ?, 'active')`).run(Date.now());
+    db.prepare(`INSERT INTO observations (memory_session_id, project, type, title, text, created_at, created_at_epoch)
+                VALUES ('m1', 'p', 'bugfix', 'quasar flux regression', 'quasar body', datetime('now'), ?)`)
+      .run(Date.now() + 10 * 365 * 86400000);
+    const row = db.prepare(`
+      SELECT ${injectionRelevanceSql('o')} AS relevance
+      FROM observations_fts JOIN observations o ON o.id = observations_fts.rowid
+      WHERE observations_fts MATCH 'quasar'
+    `).get(Date.now());
+    expect(row, 'seed row must be FTS-reachable').toBeTruthy();
+    expect(Number.isFinite(row.relevance), `relevance=${row.relevance}`).toBe(true);
+    db.close();
+  });
+});
+
+// ─── The ledger: consumers must COMPOSE the core, not re-inline copies ─────────────
+// The whole point of P2-11 — a new retrieval query hand-rolling the live-filter
+// pair inside these files is the exact drift this module exists to end. Write-side
+// guards (H-1 dedup joins use a./b. aliases; UPDATE guards use the bare column
+// without the compressed pair) do not match this shape and stay untouched.
+
+describe('consumer ledger — no inlined live-filter pairs in the five converted files', () => {
+  const FILES = [
+    'scripts/user-prompt-search.js',
+    'scripts/pre-tool-recall.js',
+    'hook-memory.mjs',
+    'hook.mjs',
+    'search-engine.mjs',
+  ];
+  // Retrieval-shape pair: COALESCE(<o.|bare>compressed_into, 0) = 0 followed
+  // within a few lines by <o.|bare>superseded_at IS NULL.
+  const PAIR_RE = /COALESCE\((?:o\.)?compressed_into,\s*0\)\s*=\s*0[\s\S]{0,200}?(?:o\.)?superseded_at IS NULL/g;
+
+  for (const f of FILES) {
+    it(`${f} contains no hand-rolled live-filter pair`, () => {
+      const src = readFileSync(join(REPO, f), 'utf8');
+      const hits = [...src.matchAll(PAIR_RE)].map((m) => {
+        const line = src.slice(0, m.index).split('\n').length;
+        return `${f}:${line}`;
+      });
+      expect(hits, `inline the shared core instead: ${hits.join(', ')}`).toEqual([]);
+    });
+  }
+
+  it('every consumer imports the shared core', () => {
+    for (const f of FILES) {
+      const src = readFileSync(join(REPO, f), 'utf8');
+      expect(src.includes('inject-search-core.mjs'), `${f} does not import the core`).toBe(true);
+    }
+  });
+});

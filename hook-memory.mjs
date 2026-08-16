@@ -3,6 +3,7 @@
 
 import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters, basenameAnySep } from './utils.mjs';
 import { citeFactorJs } from './scoring-sql.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
 import { extractIdents } from './lib/lesson-idents.mjs';
@@ -218,8 +219,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         AND o.project = ?
         AND o.importance >= 1
         AND o.created_at_epoch > ?
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND ${notLowSignalTitleClause('o')}
       ORDER BY ${OBS_BM25}
       LIMIT 10
@@ -266,8 +266,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
           AND o.type IN ('decision', 'discovery')
           AND o.importance >= 2
           AND o.created_at_epoch > ?
-          AND COALESCE(o.compressed_into, 0) = 0
-          AND o.superseded_at IS NULL
+          AND ${liveObsFilterSql('o')}
           AND ${notLowSignalTitleClause('o')}
         ORDER BY ${OBS_BM25}
         LIMIT 5
@@ -316,7 +315,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // Adaptive threshold: scales with corpus size to filter noise.
     // Each result must individually exceed the threshold (not just the top one).
     const obsCount = db.prepare(
-      'SELECT COUNT(*) as c FROM observations WHERE project = ? AND COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL',
+      `SELECT COUNT(*) as c FROM observations WHERE project = ? AND ${liveObsFilterSql('')}`,
     ).get(project)?.c || 0;
     const { TINY, SMALL, MEDIUM, LARGE } = BM25_THRESHOLD;
     const threshold = obsCount < 5 ? TINY : obsCount < 100 ? SMALL : obsCount < 500 ? MEDIUM : LARGE;
@@ -389,8 +388,7 @@ export function recallForFile(db, filePath, project) {
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE o.project = ?
         AND o.importance >= 2
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND o.created_at_epoch > ?
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
       ORDER BY o.created_at_epoch DESC
@@ -431,8 +429,7 @@ export function rankImperativeCandidates(db, userPrompt, project, excludeIds = [
       SELECT id, title, lesson_learned, importance
       FROM observations
       WHERE project = ?
-        AND COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+        AND ${liveObsFilterSql('')}
         AND COALESCE(importance, 1) >= 2
         AND lesson_learned IS NOT NULL
         AND TRIM(lesson_learned) != ''

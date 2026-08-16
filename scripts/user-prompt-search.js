@@ -4,8 +4,8 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, TYPE_DECAY_CASE, TYPE_QUALITY_CASE, notLowSignalTitleClause, noisePenaltyClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
-import { citeFactorClause } from '../scoring-sql.mjs';
+import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, notLowSignalTitleClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
+import { liveObsFilterSql, injectionRelevanceSql } from '../lib/inject-search-core.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join, sep } from 'path';
@@ -354,12 +354,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter,
   const sql = `
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25} as bm25_raw,
-           ${OBS_BM25}
-             * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
-             * ${TYPE_QUALITY_CASE}
-             * (0.5 + 0.5 * COALESCE(o.importance, 1))
-             * ${noisePenaltyClause('o')}
-             * ${citeFactorClause('o')} as relevance
+           ${injectionRelevanceSql('o')} as relevance
     FROM observations_fts
     JOIN observations o ON o.id = observations_fts.rowid
     WHERE observations_fts MATCH ?
@@ -367,8 +362,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter,
       AND o.importance >= 1
       AND o.created_at_epoch > ?
       AND (? IS NULL OR o.created_at_epoch <= ?)
-      AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+      AND ${liveObsFilterSql('o')}
       AND ${notLowSignalTitleClause('o')}
       ${typeClause}
     ORDER BY relevance
@@ -414,8 +408,7 @@ function searchByFile(db, files, project, limit) {
       JOIN observation_files of2 ON of2.obs_id = o.id
       WHERE o.project = ?
         AND o.importance >= 1
-        AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+        AND ${liveObsFilterSql('o')}
         AND o.created_at_epoch > ?
         AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
         AND ${notLowSignalTitleClause('o')}
@@ -490,8 +483,7 @@ function searchRecent(db, project, limit) {
     FROM observations
     WHERE project = ?
       AND importance >= 1
-      AND COALESCE(compressed_into, 0) = 0
-      AND superseded_at IS NULL
+      AND ${liveObsFilterSql('')}
       AND created_at_epoch > ?
       AND ${notLowSignalTitleClause('')}
     ORDER BY created_at_epoch DESC

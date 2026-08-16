@@ -83,6 +83,7 @@
     "lib/release-digest.mjs",
     "lib/mem-override.mjs",
     "lib/injected-ids.mjs",
+    "lib/inject-search-core.mjs",
     "lib/save-observation.mjs",
     "lib/observation-write.mjs",
     "lib/recall-core.mjs",
