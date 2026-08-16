@@ -4,9 +4,10 @@
 // and the pure-data lib/low-signal-patterns.mjs (zero runtime deps, ~1ms overhead).
 // Safety: readonly DB, exit 0 always, 3s timeout
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, mkdirSync } from 'fs';
 import { basename, join } from 'path';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
+import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
@@ -159,17 +160,24 @@ function crossHookInjectedFile(project) {
   return join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
 }
 
-function readCrossHookInjected(project) {
+// M-6 (audit 2026-08-14): the marker file is keyed by PROJECT, so two concurrent
+// CC sessions in the same project shared one suppression state — session A's
+// injections silently deduped session B's, and B inherited A's count cap. Both
+// read and merge now carry the CC session id: a payload written by a DIFFERENT
+// session is ignored (read) / replaced (merge), mirroring the v3.35.2 episode
+// session-key fix. Legacy payloads without `session` keep the old behavior.
+function readCrossHookInjected(project, sessionId) {
   try {
     const raw = readFileSync(crossHookInjectedFile(project), 'utf8');
-    const { ids, ts } = JSON.parse(raw);
+    const { ids, ts, session } = JSON.parse(raw);
+    if (session && sessionId && session !== sessionId) return new Set();
     if (!ts || Date.now() - ts > CROSS_HOOK_DEDUP_MS) return new Set();
     if (!Array.isArray(ids)) return new Set();
     return new Set(ids.map(String));
   } catch { return new Set(); }
 }
 
-function mergeCrossHookInjected(project, newIds) {
+function mergeCrossHookInjected(project, newIds, sessionId) {
   if (!newIds || newIds.length === 0) return;
   try {
     mkdirSync(RUNTIME_DIR, { recursive: true });
@@ -178,8 +186,10 @@ function mergeCrossHookInjected(project, newIds) {
     try {
       const raw = readFileSync(file, 'utf8');
       const parsed = JSON.parse(raw);
-      // Within the staleness window: union. Outside: replace (fresh session).
-      if (parsed.ts && Date.now() - parsed.ts < CROSS_HOOK_DEDUP_MS) {
+      // Within the staleness window AND same session (or legacy): union.
+      // Outside / other session: replace.
+      if (parsed.ts && Date.now() - parsed.ts < CROSS_HOOK_DEDUP_MS
+          && !(parsed.session && sessionId && parsed.session !== sessionId)) {
         prev = parsed;
       }
     } catch { /* fresh file */ }
@@ -187,10 +197,13 @@ function mergeCrossHookInjected(project, newIds) {
       ...(Array.isArray(prev.ids) ? prev.ids.map(String) : []),
       ...newIds.map(String),
     ])];
-    writeFileSync(file, JSON.stringify({
+    // Atomic (tmp+rename, M-6): a plain write torn by a concurrent hook left the
+    // shared marker as invalid JSON, silently disabling cross-hook dedup.
+    atomicWriteFileSync(file, JSON.stringify({
       ids,
       ts: Date.now(),
       count: (prev.count || 0) + 1,
+      ...(sessionId ? { session: sessionId } : {}),
     }));
   } catch { /* silent — dedup is best-effort */ }
 }
@@ -209,7 +222,10 @@ function writeCooldown(cooldownPath, data, isSessionScoped) {
         if (ts && now - ts < STALE_MS) cleaned[k] = v;
       }
     }
-    writeFileSync(cooldownPath, JSON.stringify(cleaned));
+    // Atomic (tmp+rename, M-6): the cooldown carries lessonIdents that the
+    // PostToolUse bind-salience check reads back — a torn write turned that
+    // check into a zero-trace no-op.
+    atomicWriteFileSync(cooldownPath, JSON.stringify(cleaned));
   } catch { /* silent */ }
 }
 
@@ -474,7 +490,7 @@ try {
     // P1 (D#78): tag each row's source table — events share the numeric id
     // space with observations, and the Stop-side edge attribution must never
     // feed an event id into observation_files updates.
-    const crossHookSeen = readCrossHookInjected(project);
+    const crossHookSeen = readCrossHookInjected(project, sessionId);
     const sourcedRows = [
       ...rows.map(r => ({ ...r, src: 'obs' })),
       ...eventRows.map(r => ({ ...r, src: 'evt' })),
@@ -638,7 +654,7 @@ try {
     // file so the next UPS prompt skips them too. Always write, even on
     // empty allRows, so the file's ts stays fresh for the no-op case where
     // we'd otherwise drift outside the dedup window.
-    mergeCrossHookInjected(project, allRows.map(r => r.id));
+    mergeCrossHookInjected(project, allRows.map(r => r.id), sessionId);
   } catch (e) {
     // Silent failure — never block editing, but record for self-observation.
     recordHookError('pre-recall:query', e, RUNTIME_DIR, { filePath });

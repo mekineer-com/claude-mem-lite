@@ -499,6 +499,29 @@ describe('MCP T2 audit fixes (stdio)', () => {
     expect(c).toBe(4);
   });
 
+  // M-7 (audit 2026-08-14): the OLD unconfirmed path was an early return that skipped
+  // EVERY requested op, while the CLI twin ran the non-destructive ones and previewed
+  // only the purge — same op list, different amount of work done, both "successful".
+  // FAILS IF: the early return is reintroduced — the response then carries only the
+  // preview, with no "Cleaned up"/"Decayed" lines.
+  it('M-7: unconfirmed purge_stale previews the purge but still RUNS cleanup/decay (CLI parity)', async () => {
+    await initialize(proc);
+    const resp = await callTool('mem_maintain', {
+      action: 'execute',
+      operations: ['cleanup', 'decay', 'purge_stale'],
+    });
+    const text = resp.result?.content?.[0]?.text || '';
+    expect(text).toMatch(/preview \(confirm=false\)/);
+    expect(text, 'cleanup must run despite the unconfirmed purge').toMatch(/Cleaned up \d+ broken/);
+    expect(text, 'decay must run despite the unconfirmed purge').toMatch(/Decayed \d+ stale/);
+
+    // Nothing was deleted: cleanup had no broken rows to remove, purge only previewed.
+    const db = new Database(join(tmp, 'claude-mem-lite.db'));
+    const count = db.prepare('SELECT COUNT(*) AS c FROM observations').get().c;
+    db.close();
+    expect(count).toBe(4);
+  });
+
   it('T2-P0-A: confirm=false is explicit dry-run (same as omitted)', async () => {
     await initialize(proc);
     const resp = await callTool('mem_maintain', {

@@ -264,9 +264,37 @@ const LAUNCHER_SCRIPT_FILES = [
   'binding-probe-cli.mjs',
 ];
 
+// Plugin/marketplace DECLARATION files (audit 2026-08-14 P-2). Not executable
+// themselves, but they NAME what gets executed: hooks/hooks.json declares the
+// command lines Claude Code runs on every hook fire, .mcp.json declares the MCP
+// server launch command, plugin.json/marketplace.json steer the install source,
+// commands/*.md are model-visible skill bodies, registry/preinstalled.json seeds
+// the resource registry. All ship in the tarball; none were signed — the same
+// shape as the two closed RCE gaps (hook scripts v3.40, launch.mjs v3.42): a
+// release published without the signing key could swap hooks.json to point a
+// hook event at an arbitrary command while every signed hash still matched.
+// Additive: buildReleaseManifest skips entries absent at sign time, and
+// verifyReleaseFiles needs no change to enforce whatever the manifest carries.
+const PLUGIN_DECLARATION_FILES = [
+  'hooks/hooks.json',
+  '.mcp.json',
+  '.claude-plugin/plugin.json',
+  '.claude-plugin/marketplace.json',
+  'registry/preinstalled.json',
+  'commands/mem.md',
+  'commands/memory.md',
+  'commands/update.md',
+  'commands/tools.md',
+  'commands/adopt.md',
+  'commands/unadopt.md',
+  'commands/lesson.md',
+  'commands/bug.md',
+];
+
 // The complete set of files the release signature MUST cover: every runtime .mjs
 // (SOURCE_FILES) PLUS the executable hook scripts (copyReleaseIntoStaging installs these
-// into the live dir and they run on every hook fire) PLUS the launcher/setup scripts.
+// into the live dir and they run on every hook fire) PLUS the launcher/setup scripts
+// PLUS the plugin declaration files above.
 // HOOK_SCRIPT_FILES were historically NOT in the signed manifest, so an attacker able to
 // PUBLISH a release — but without the signing key — could swap a hook script (e.g.
 // post-tool-use.sh / hook-launcher.mjs) while every SOURCE_FILES hash still matched, and
@@ -278,4 +306,5 @@ export const RELEASE_SIGNED_FILES = [
   ...SOURCE_FILES,
   ...HOOK_SCRIPT_FILES.map(name => `scripts/${name}`),
   ...LAUNCHER_SCRIPT_FILES.map(name => `scripts/${name}`),
+  ...PLUGIN_DECLARATION_FILES,
 ];

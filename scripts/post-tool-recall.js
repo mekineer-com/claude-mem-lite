@@ -16,6 +16,7 @@
 import { existsSync, readFileSync } from 'fs';
 import { basename, join } from 'path';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
+import { recordHookError } from '../lib/hook-telemetry.mjs';
 
 const SALIENCE_BIND = process.env.CLAUDE_MEM_SALIENCE === 'bind';
 
@@ -45,7 +46,13 @@ async function main() {
   const cdPath = cooldownPathFor(sessionId);
   if (!existsSync(cdPath)) return;
   let entry;
-  try { entry = JSON.parse(readFileSync(cdPath, 'utf8'))[filePath]; } catch { return; }
+  try { entry = JSON.parse(readFileSync(cdPath, 'utf8'))[filePath]; } catch (e) {
+    // A corrupt cooldown file (torn concurrent write — audit 2026-08-14 M-6) turns
+    // the bind-salience check into a zero-trace no-op; record it so `stats` can see
+    // the surface die instead of silently reading zero errors (M-5).
+    recordHookError('post-recall:cooldown-parse', e, RUNTIME_DIR, { file: basename(cdPath) });
+    return;
+  }
   const idents = entry && entry.lessonIdents;
   if (!idents || typeof idents !== 'object') return;
 
@@ -77,4 +84,7 @@ async function main() {
 // stream emits 'error' — without the (now-removed) forced exit, an unhandled one would
 // surface as a non-zero exit + stack. A hook must never fail loud on a dropped pipe.
 process.stdout.on('error', () => {});
-main().catch(() => {});
+// Record what slips past main()'s early returns before the mandatory swallow —
+// this script had zero telemetry (audit 2026-08-14 M-5). Recorder never throws;
+// the outer catch keeps the exit code 0 regardless.
+main().catch((e) => { try { recordHookError('post-recall:main', e, RUNTIME_DIR); } catch { /* never */ } });

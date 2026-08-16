@@ -8,6 +8,9 @@ import { join, resolve, sep } from 'path';
 import { homedir } from 'os';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
+// format-utils.mjs is import-free — pulling three defang helpers keeps this script
+// inside its "lightweight standalone" budget (no heavy transitive deps).
+import { neutralizeContextDelimiters, neutralizeSkillDelimiters, neutralizeSkillBridgeDelimiters } from '../format-utils.mjs';
 
 // CLAUDE_MEM_DIR mirrors pre-tool-recall.js — one env var sandboxes everything.
 const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
@@ -88,12 +91,22 @@ try {
     // console.log() form would render on stock CC but no-op on those variants.
     // Token budget: ~4 chars per token, 4000 token limit = 16000 chars.
     const portablePath = resolvedPath.startsWith(homedir()) ? '~' + resolvedPath.slice(homedir().length) : resolvedPath;
+    // Defang the untrusted skill body + name before wrapping (audit 2026-08-14 M-4):
+    // registry rows come from third-party repos, and this was the one AUTO injection
+    // surface of that data with zero neutralization — a body carrying a literal
+    // `</skill-bridge>` + forged <system-reminder> (or a `<skill-loaded>` execute
+    // block) escaped the wrapper verbatim. Name additionally drops quote/bracket
+    // chars: it lands in an ATTRIBUTE position, where `"` breaks out of the wrapper
+    // tag itself. Applied to the truncated summary too (a cut can't be trusted to
+    // land mid-tag).
+    const defang = (s) => neutralizeSkillBridgeDelimiters(neutralizeSkillDelimiters(neutralizeContextDelimiters(s)));
+    const safeName = String(row.name).replace(/["'<>]/g, '');
     let additionalContext;
     if (content.length > 16000) {
-      const summary = content.slice(0, 800);
-      additionalContext = `<skill-bridge name="${row.name}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${portablePath}") to load full content.`;
+      const summary = defang(content.slice(0, 800));
+      additionalContext = `<skill-bridge name="${safeName}" source="managed" truncated="true">\n${summary}\n...\n</skill-bridge>\n\nSkill content truncated. Read("${portablePath}") to load full content.`;
     } else {
-      additionalContext = `<skill-bridge name="${row.name}" source="managed">\n${content}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`;
+      additionalContext = `<skill-bridge name="${safeName}" source="managed">\n${defang(content)}\n</skill-bridge>\n\nThis skill was loaded from the managed registry. Follow the instructions above.`;
     }
     process.stdout.write(JSON.stringify({
       suppressOutput: true,

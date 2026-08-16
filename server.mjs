@@ -1162,32 +1162,22 @@ server.registerTool(
       const staleAge = Date.now() - STALE_AGE_MS;
       const mctx = { projectFilter, baseParams, staleAge, opCap: OP_CAP };
 
-      // T2-P0-A: purge_stale is the only DELETE in this handler. Require confirm=true;
-      // a first call without confirm returns a dry-run preview so callers know the blast radius.
-      const purgeRequested = ops.includes('purge_stale');
-      if (purgeRequested && args.confirm !== true) {
-        const retainDays = args.retain_days ?? 30;
-        const retainCutoff = Date.now() - retainDays * 86400000;
-        const previewRow = purgeStalePreview(db, mctx, retainCutoff);
-        const lines = [
-          'purge_stale preview (confirm=false):',
-          `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`,
-        ];
-        if (previewRow.candidates > 0) {
-          lines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
-          lines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
-        }
-        lines.push('');
-        lines.push('Nothing was deleted. To execute, re-run with confirm=true:');
-        lines.push(`  mem_maintain(action="execute", operations=${JSON.stringify(ops)}, confirm=true${args.retain_days ? `, retain_days=${args.retain_days}` : ''}${args.project ? `, project="${args.project}"` : ''})`);
-        return { content: [{ type: 'text', text: lines.join('\n') }] };
-      }
+      // T2-P0-A: purge_stale is the only op gated on confirm=true — cleanupBroken also
+      // hard-deletes (broken rows only) but always ran unconfirmed on both surfaces, and
+      // the pre-transaction snapshot above covers it. An unconfirmed call gets a dry-run
+      // preview of the purge INSTEAD OF the purge.
+      // M-7 (audit 2026-08-14): preview-instead-of-early-return — the old
+      // `return`-on-unconfirmed skipped EVERY requested op, while the CLI twin ran the
+      // non-destructive ones (cleanup/decay/boost) and previewed only the purge. Same
+      // op list, two different amounts of work done, both reporting success. Aligned
+      // to the CLI semantics (the safer surface changed less: nothing destructive
+      // runs unconfirmed on either surface now or before).
+      const purgeConfirmed = args.confirm === true;
 
       // MED-2: snapshot the DB before the irreversible cleanup/purge hard-deletes —
       // only when rows will actually be removed, and OUTSIDE the transaction below
-      // (VACUUM cannot run inside one). purge_stale is already confirmed by here (the
-      // preview branch returned above otherwise). Best-effort; snapshotDb never throws.
-      if (hardDeleteCandidateCount(db, mctx, { cleanup: ops.includes('cleanup'), purge: ops.includes('purge_stale') }) > 0) {
+      // (VACUUM cannot run inside one). Best-effort; snapshotDb never throws.
+      if (hardDeleteCandidateCount(db, mctx, { cleanup: ops.includes('cleanup'), purge: ops.includes('purge_stale') && purgeConfirmed }) > 0) {
         snapshotDb(db, { tag: 'pre-maintain' });
       }
 
@@ -1201,8 +1191,25 @@ server.registerTool(
         if (ops.includes('purge_stale')) {
           const retainDays = args.retain_days ?? 30;
           const retainCutoff = Date.now() - retainDays * 86400000;
-          const purged = purgeStale(db, mctx, retainCutoff);
-          results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)` + (purged >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+          if (!purgeConfirmed) {
+            // Dry-run preview (parity with CLI `maintain` without --confirm): the other
+            // requested non-destructive ops still run below.
+            const previewRow = purgeStalePreview(db, mctx, retainCutoff);
+            const lines = [
+              'purge_stale preview (confirm=false):',
+              `  Candidates (pending-purge, older than ${retainDays}d): ${previewRow.candidates}`,
+            ];
+            if (previewRow.candidates > 0) {
+              lines.push(`  Oldest: ${new Date(previewRow.oldest).toISOString().slice(0, 10)}`);
+              lines.push(`  Newest: ${new Date(previewRow.newest).toISOString().slice(0, 10)}`);
+            }
+            lines.push('  Nothing was deleted. To delete, re-run with confirm=true:');
+            lines.push(`  mem_maintain(action="execute", operations=${JSON.stringify(ops)}, confirm=true${args.retain_days ? `, retain_days=${args.retain_days}` : ''}${args.project ? `, project="${args.project}"` : ''})`);
+            results.push(lines.join('\n'));
+          } else {
+            const purged = purgeStale(db, mctx, retainCutoff);
+            results.push(`Purged ${purged} stale observations (retained last ${retainDays} days)` + (purged >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+          }
         }
 
         if (ops.includes('cleanup')) {

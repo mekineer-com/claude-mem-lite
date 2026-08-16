@@ -529,6 +529,32 @@ Notes:
 - Direct install / npx mode keeps auto-update enabled and uses staged replacement with rollback on install failure.
 - If you disabled the plugin but still have old mem hooks in `~/.claude/settings.json`, run `node install.mjs cleanup-hooks`.
 
+#### Trust model per install path
+
+The three install paths do **not** carry the same supply-chain guarantees — pick the one that matches your threat model:
+
+| Path | Update mechanism | Ed25519 release-signature verification |
+|------|------------------|----------------------------------------|
+| npm / npx / git-clone direct install | auto-update from GitHub Releases | **Yes** — every runtime file (140 entries incl. hook scripts, MCP launcher, plugin declaration files) is hash-pinned in a signed manifest; verification is fail-closed |
+| `/plugin install` (marketplace) | manual `/plugin marketplace update` + reinstall | **No** — Claude Code installs from a git clone of the marketplace repo; the plugin's own signature chain is not consulted on this path. You are trusting GitHub + the repo's branch protection, not the release signing key |
+
+**Rollback recipe (plugin path).** If an update misbehaves, pin the marketplace clone to the previous release tag and reinstall from it:
+
+```bash
+# 1. Find the local marketplace clone
+ls ~/.claude/plugins/marketplaces/          # e.g. sdsrss
+
+# 2. Pin it to the previous good tag (tags mirror npm versions, e.g. v3.62.0)
+cd ~/.claude/plugins/marketplaces/sdsrss
+git fetch --tags && git checkout v3.62.0
+
+# 3. Reinstall from the pinned clone — inside Claude Code:
+#    /plugin install claude-mem-lite@sdsrss
+# 4. To leave the pin later: git checkout main, then the normal update flow.
+```
+
+Your data directory (`~/.claude-mem-lite/`) is untouched by install/rollback; schema migrations are forward-only, so after rolling back more than one minor version check `node install.mjs doctor` before trusting search results.
+
 ### doctor
 
 Checks Node.js version, dependencies, server/hook files, database integrity, FTS5 indexes, and stale processes.

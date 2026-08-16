@@ -494,8 +494,12 @@ function triggerErrorRecall(db, toolInput, response) {
         AND COALESCE(o.compressed_into, 0) = 0
         AND o.superseded_at IS NULL
         AND ${notLowSignalTitleClause('o')}
+      -- MAX(0, …) clamps recency age to >= 0 (parity with search-engine FULL_SCORE):
+      -- a far-future created_at (reachable via restore/import-jsonl, which accept
+      -- arbitrary epochs) made the exponent large-positive → EXP overflow → that row
+      -- pinned #1 for every error until its "future" passed (audit 2026-08-14 M-1).
       ORDER BY ${OBS_BM25}
-        * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))
+        * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / 1209600000.0))
       LIMIT 3
     `).all(ftsQuery, project, nowR);
 
@@ -1017,6 +1021,15 @@ function runSessionStartAutoMaintain(db) {
 
       // Auto-dedup (exact): merge identical-title observations within 1h.
       // Catches rapid duplicate writes (same hook firing twice, race conditions).
+      // BOTH join sides must be live (audit 2026-08-14 H-1): without the
+      // superseded_at filters (which the fuzzy channel below always had), a row the
+      // fuzzy pass had tombstoned could come back as `a` (a.id < b.id) and tombstone
+      // the LIVE keeper `b` — both copies gone from every read path. Worse, a user
+      // correction saved with supersedes=[#A] (A.superseded_by = B's NUMERIC id) has
+      // the same title as A, so the pair (A, B) tombstoned the correction B itself
+      // and the string 'auto-dedup' write clobbered numeric supersession chains that
+      // citation-tracker decay hand-off and timeline re-anchoring both follow. The
+      // UPDATE repeats the guard so a concurrent writer can't re-stamp a chain.
       const dupPairs = db.prepare(`
         SELECT a.id as keep_id, b.id as remove_id
         FROM observations a
@@ -1025,12 +1038,14 @@ function runSessionStartAutoMaintain(db) {
           AND ABS(a.created_at_epoch - b.created_at_epoch) < 3600000
           AND COALESCE(a.compressed_into, 0) = 0
           AND COALESCE(b.compressed_into, 0) = 0
+          AND a.superseded_at IS NULL
+          AND b.superseded_at IS NULL
         LIMIT 20
       `).all();
       if (dupPairs.length > 0) {
         const removeIds = dupPairs.map(p => p.remove_id);
         const ph = removeIds.map(() => '?').join(',');
-        db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph})`).run(Date.now(), ...removeIds);
+        db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph}) AND superseded_at IS NULL`).run(Date.now(), ...removeIds);
         debugLog('DEBUG', 'auto-maintain', `auto-deduped ${dupPairs.length} near-identical observations`);
       }
 
@@ -1648,9 +1663,13 @@ async function handleUserPrompt() {
       try {
         const injectedFile = join(RUNTIME_DIR, `.claude-mem-injected-${project}`);
         const raw = readFileSync(injectedFile, 'utf8');
-        const { ids, ts } = JSON.parse(raw);
-        // Only use if written within last 10 seconds (same prompt cycle)
-        if (ts && Date.now() - ts < 10000 && Array.isArray(ids)) {
+        const { ids, ts, session } = JSON.parse(raw);
+        // Only use if written within last 10 seconds (same prompt cycle) AND by this
+        // CC session — the file is project-keyed, so a concurrent session's write
+        // would otherwise dedup-suppress OUR injection (M-6, audit 2026-08-14).
+        // Legacy payloads without `session` keep the old time-window-only behavior.
+        if (ts && Date.now() - ts < 10000 && Array.isArray(ids)
+            && !(session && ccSessionId && session !== ccSessionId)) {
           for (const id of ids) { keyContextIds.push(id); pathAInjectedIds.push(id); }
         }
       } catch { /* file may not exist — that's fine */ }
@@ -1871,6 +1890,11 @@ try {
   // lib/native-binding-hint.mjs.
   const line = formatHookError(err, event, { runtimeDir: RUNTIME_DIR });
   if (line) console.error(line);
+  // stderr alone is invisible to `stats` self-observation — only the native-binding
+  // family was persisted, so a non-binding fatal (schema drift, bad stdin shape)
+  // could kill every dispatch-routed surface while the hook-errors log read zero
+  // (audit 2026-08-14 M-5; same blindness one layer up from the v3.60 outage).
+  recordHookError(`hook:${event}`, err, RUNTIME_DIR);
 }
 
 process.exit(0);

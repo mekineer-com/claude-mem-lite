@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.63.0 — the 2026-08-14 audit's P0+P1 batch: a write-side tombstone bug, two unclamped clocks, and the guards that never reached the explicit surfaces
+
+**Upgrading from 3.62.0 — what changes for you.** Four behaviors you may notice. Each has an escape hatch; none requires action.
+
+| Change | If it bothers you |
+|---|---|
+| `mem_search` / CLI `search` ranking now applies the citation + noise factors the automatic surfaces have used for months: rows you cited get boosted, rows injected often but never used get dampened. Both factors are hard-bounded (×0.4–3.0 / ×0.2–1.0), so they reorder, never dominate. | Pin the prior version (rollback recipe in README → *Trust model per install path*). |
+| Backup snapshots (`*.bak` next to the DB) now have a **total** 256MB budget across all tags — oldest evicted first. Never evicted: the newest snapshot, anything younger than 7 days (protects a fresh `pre-delete` undo pre-image), and any `.bak` this system did not write itself. Before: per-tag retention let one-shot tags live forever (real install measured: 360MB of orphaned snapshots against a 59MB DB). | `CLAUDE_MEM_BACKUP_BUDGET_MB=<n>` sets the budget; a huge value effectively disables eviction. |
+| MCP `mem_maintain` without `confirm:true` now matches the CLI: it **runs** the non-destructive ops you asked for (cleanup/decay/boost) and previews only the purge. Before it silently skipped everything. | Pass only `purge_stale` in `operations` to get the old preview-only response. |
+| `restore` refuses rows that were compressed into a weekly summary (`--include-compressed` exports now carry the tombstone) and reports the rejected count. Before, restoring such a backup resurrected members alongside the keeper that had absorbed them. | Nothing to do — the members' content lives in their summary keeper. |
+
+Fixes (all 12 findings of the 2026-08-14 full audit, each pinned by a mutation-verified regression test):
+
+- **fix(dedup):** exact auto-dedup joins and stamps only live rows (`superseded_at IS NULL` on both sides + in the UPDATE) — a fuzzy-tombstoned corpse could reverse-tombstone the live keeper, and a `--supersedes` correction could be tombstoned by the very row it retracted (H-1, the invariant's first write-side breach).
+- **fix(scoring):** recency-age clamp `MAX(0,…)` reached the two remaining twins — UPS `searchByFts` and error-recall — so a far-future `created_at` (restore/import-jsonl accept arbitrary epochs) can no longer pin a row at #1 (M-1).
+- **fix(search):** concept/PRF expansion now fires when only the OR fallback matched, and PRF seeds from the query that actually produced rows (M-2); fixed a latent `extractPRFTerms` crash on prototype-key tokens (`constructor`) exposed by that gate.
+- **fix(skill-bridge):** the automatic skill-injection surface defangs third-party skill bodies (`</skill-bridge>` escape, forged `<system-reminder>`, `<skill-loaded>` blocks) and strips quotes from the attribute-position name (M-4).
+- **fix(telemetry):** `hook.mjs` dispatch catch and the three previously-blind standalone hooks (user-prompt-search, post-tool-recall, pre-agent-inject) record failures to the hook-errors log — a dead DB can no longer kill prompt-time injection while `stats` reads zero errors (M-5).
+- **fix(dedup-state):** the shared injected-ids marker and cooldown files are written atomically (tmp+rename) and keyed by CC session — concurrent sessions in one project no longer suppress each other's injections or inherit each other's count caps (M-6).
+- **feat(signing):** the 13 plugin declaration files (`hooks/hooks.json`, `.mcp.json`, `plugin.json`, `marketplace.json`, `registry/preinstalled.json`, `commands/*.md`) joined `RELEASE_SIGNED_FILES` — they name what gets executed, same shape as the two closed RCE gaps (P-2).
+- **feat(observability):** `stats` gained a Disk line (DB size, snapshot count/bytes) and `doctor` a Disk-footprint check (M-9); README documents the per-install-path trust model and a plugin-face rollback recipe (P-1).
+
 ## v3.62.0 — three surfaces nobody had ever tested end to end, and the twelve defects that were waiting there
 
 **Upgrading from 3.61.x — what changes for you.** Four behaviors you may notice. Each is a fix, each has an escape hatch, and none requires you to do anything:

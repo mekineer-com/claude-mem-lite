@@ -22,7 +22,7 @@ import {
   hardDeleteCandidateCount,
   OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
 } from './lib/maintain-core.mjs';
-import { snapshotDb } from './lib/db-backup.mjs';
+import { snapshotDb, listSnapshots, backupBudgetBytes } from './lib/db-backup.mjs';
 import { deleteObservations } from './lib/delete-core.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
@@ -36,7 +36,7 @@ import { aggregateProjectCiteRecall } from './lib/citation-tracker.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { join, sep, dirname } from 'path';
 import { spawnSync } from 'child_process';
-import { readFileSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, readdirSync, statSync } from 'fs';
 
 // v2.41: shared CLI helpers extracted to cli/common.mjs. Keep this file as the
 // router + remaining-command bodies during the incremental split. Future work:
@@ -1200,6 +1200,15 @@ async function cmdStats(db, args) {
   // failure mode that left code-graph's matcher bug undetected for 10 sessions.
   const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - 86400000);
 
+  // M-9 (audit 2026-08-14): disk footprint — a "lite" store had accumulated 360MB of
+  // pre-maintain snapshots against a 59MB DB with nothing reporting it. Cheap probes
+  // only (DB file + .bak aggregate), no recursive tree walk.
+  let dbBytes = 0;
+  try { dbBytes = statSync(join(DB_DIR, 'claude-mem-lite.db')).size; } catch { /* fresh */ }
+  const snaps = listSnapshots(join(DB_DIR, 'claude-mem-lite.db'));
+  const backupBytes = snaps.reduce((s, x) => s + x.size, 0);
+  const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+
   if (jsonOutput) {
     out(JSON.stringify({
       project,
@@ -1226,6 +1235,9 @@ async function cmdStats(db, args) {
         compressed: compressedCount.c,
         superseded_only: supersededOnlyCount.c,
         hook_errors_24h: hookErrors24h,
+        db_bytes: dbBytes,
+        backup_count: snaps.length,
+        backup_bytes: backupBytes,
       },
       tier_distribution: {
         working: tierMap.working ?? 0,
@@ -1265,6 +1277,9 @@ async function cmdStats(db, args) {
   out(`  Low-signal titles (Modified/Error/Worked on…): ${lowSignalTitle.c} (${(lowSignalRatio * 100).toFixed(1)}%)`);
   out(`  Compressed: ${compressedCount.c}`);
   out(`  Hook errors (last 24h): ${hookErrors24h}${hookErrors24h > 0 ? `  ← tail ${join(DB_DIR, 'runtime/hook-errors')}` : ''}`);
+  // Hint threshold = the REAL eviction budget (pre-release review 2026-08-16: a
+  // hardcoded 3×-DB heuristic promised an eviction that fires only past the budget).
+  out(`  Disk: DB ${mb(dbBytes)}MB | ${snaps.length} backup snapshot(s) ${mb(backupBytes)}MB${backupBytes > backupBudgetBytes() ? `  ← over the ${mb(backupBudgetBytes())}MB backup budget; next maintain/save snapshot evicts oldest (>7d old)` : ''}`);
   // Tier-1 firing counters for ① file-intel + ② reread-guard (recorded by
   // pre-tool-recall.js via lib/metrics.mjs; CLAUDE_MEM_METRICS=1 to enable).
   const featAgg = aggregateMetrics(DB_DIR, 7);
@@ -1799,9 +1814,15 @@ function cmdRestore(db, argv) {
       decay_seen_count = ?, last_accessed_at = ?
     WHERE id = ?`);
 
-  let restored = 0, skipped = 0, malformed = 0;
+  let restored = 0, skipped = 0, malformed = 0, tombstoned = 0;
   for (const r of rows) {
     if (!r || typeof r !== 'object' || !r.type || !r.title) { malformed++; continue; }
+    // M-8 (audit 2026-08-14): a row exported with --include-compressed carries its
+    // compressed_into tombstone. Restoring it as a live row resurrects a member its
+    // weekly-summary keeper already absorbed (duplicate search hits, and the marker's
+    // target id is meaningless in this store). Reject rather than remap; the content
+    // lives on in the keeper.
+    if (r.compressed_into) { tombstoned++; continue; }
     const project = projOverride || r.project || inferProject();
     const createdEpoch = Number.isFinite(Number(r.created_at_epoch)) ? Number(r.created_at_epoch) : Date.now();
     // Durable exact-dup guard — saveObservation's 5-min Jaccard window can't catch a
@@ -1868,7 +1889,8 @@ function cmdRestore(db, argv) {
   // ones that parsed.
   const totalMalformed = malformed + parseFailures;
   const totalLines = rows.length + parseFailures;
-  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
+  const tombstoneNote = tombstoned > 0 ? `, ${tombstoned} compressed member(s) rejected (already absorbed by their summary keeper)` : '';
+  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped${tombstoneNote}, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
   // Name the lossiness where the user meets it. Export omits related_ids and drops
   // superseded rows, and restore re-inserts under fresh AUTOINCREMENT ids — so no
   // cross-link can survive the round-trip. That is a deliberate format tradeoff (stored

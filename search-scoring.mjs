@@ -165,8 +165,13 @@ export function extractPRFTerms(results, ftsQuery, limit = 3) {
   // "cach" returns zero rows, only "caching"/"cache" match). Emitting a bare stem would
   // silently match nothing and kill expansion recall. Track each stem's surface forms with
   // their occurrence counts and emit the most frequent (best-matchable) surface.
-  const stemDocCount = {};      // stem -> # of top docs it appears in (the >=2 bar)
-  const stemSurfaces = {};      // stem -> Map(surface -> total occurrences)
+  // Prototype-less: doc text tokenizes to arbitrary identifiers, and a stem that
+  // collides with an Object.prototype property ("constructor" — common in code
+  // narratives) made `stemSurfaces[stem] ||= new Map()` read the INHERITED function
+  // as truthy, skip the assignment, and crash on sm.get (surfaced 2026-08-16 when
+  // the M-2 gate fix first ran PRF over OR-rescued rows).
+  const stemDocCount = Object.create(null);   // stem -> # of top docs it appears in (the >=2 bar)
+  const stemSurfaces = Object.create(null);   // stem -> Map(surface -> total occurrences)
   const docCount = Math.min(results.length, 8);
   for (let i = 0; i < docCount; i++) {
     const r = results[i];

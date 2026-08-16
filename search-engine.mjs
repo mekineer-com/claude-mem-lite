@@ -10,7 +10,9 @@ import {
   DEFAULT_DECAY_HALF_LIFE_MS,
   notLowSignalTitleClause, LOW_SIGNAL_TITLE,
   relaxFtsQueryToOr, debugLog, debugCatch, estimateTokens,
+  noisePenaltyClause,
 } from './utils.mjs';
+import { citeFactorClause } from './scoring-sql.mjs';
 import { getVocabulary, computeVector, vectorSearch, rrfMerge, vectorsEnabled } from './tfidf.mjs';
 import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
 
@@ -21,13 +23,26 @@ import { extractPRFTerms, expandQueryByConcepts } from './search-scoring.mjs';
 // exponent large-positive → EXP overflowed to +Infinity → score -Infinity → that row sorted
 // #1 for any match AND JSON.stringify emitted `"score": null` (numeric-contract break). A
 // future row now reads as age 0 = max (finite) recency, not Infinity.
+// M-3 (audit 2026-08-14): cite/noise behavior factors joined FULL_SCORE — they had
+// shipped for months on every AUTO surface (UPS / pre-tool-recall / hook-memory)
+// while the EXPLICIT surfaces (mem_search / CLI search) discarded the accumulated
+// citation + noise signal (the mirror image of "guards wired on the auto face,
+// missing on the explicit face"). Both factors are hard-bounded (cite ∈ [0.4, 3.0],
+// noise ∈ {0.2, 0.5, 1.0}), so they reorder, never dominate. algo-F6 note: the
+// access-count LN bonus below stays — noisePenalty uses access_count only inside a
+// ratio GUARD (never as a bonus) and citeFactor reads cited/uncited columns, so no
+// term is counted twice as a reward. Denoise A/B 2026-08-16: NEUTRAL (suite rows
+// carry zero cite/noise state); the behavioral pin lives in
+// tests/audit-fixes-20260816.test.mjs (M-3).
 const FULL_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
   * ${TYPE_QUALITY_CASE}
   * (CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)
   * (0.5 + 0.5 * COALESCE(o.importance, 1))
   * (1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))
-  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))`;
+  * (1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))
+  * ${noisePenaltyClause('o')}
+  * ${citeFactorClause('o')}`;
 
 const SIMPLE_SCORE = `${OBS_BM25}
   * (1.0 + EXP(-0.693 * MAX(0, ? - MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))) / ${TYPE_DECAY_CASE}))
@@ -294,6 +309,10 @@ function expandObsByConceptCo(db, ctx, now, existingIds, results, includeNoise =
 function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includeNoise = false) {
   const { ftsQuery, args, epochFrom, epochTo, limit } = ctx;
   if (primaryCount < 3) return;
+  // effectiveFtsQuery = the query that actually matched (OR-relaxed when the strict
+  // AND missed and the fallback rescued rows — M-2). The strict query here returned
+  // zero top docs in that case, silently disabling PRF where it helps most.
+  const seedQuery = ctx.effectiveFtsQuery || ftsQuery;
   const topResults = db.prepare(`
     SELECT o.title, o.narrative FROM observations_fts
     JOIN observations o ON observations_fts.rowid = o.id
@@ -302,7 +321,7 @@ function expandObsByPRF(db, ctx, now, primaryCount, existingIds, results, includ
       AND (? IS NULL OR o.project = ?)
     ORDER BY ${OBS_BM25}
     LIMIT 8
-  `).all(ftsQuery, args.project ?? null, args.project ?? null);
+  `).all(seedQuery, args.project ?? null, args.project ?? null);
   const prfTerms = extractPRFTerms(topResults, ftsQuery);
   if (prfTerms.length === 0) return;
   const prfFts = prfTerms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
@@ -428,17 +447,28 @@ export function searchObservationsHybrid(db, ctx) {
       try {
         const orRows = db.prepare(buildObsFtsQuery('full', { multiplier: 0.5, withSnippet: true, withOffset: true, includeNoise }))
           .all(...buildObsFtsParams({ now, projectBoost, ftsQuery: orQuery, args, epochFrom, epochTo, limit: perSourceLimit, offset: perSourceOffset }));
-        if (orRows.length > 0) ctx.orFallbackFired = true;
+        if (orRows.length > 0) {
+          ctx.orFallbackFired = true;
+          // M-2: PRF's top-doc probe re-queries FTS itself — with the strict-AND
+          // query it reads 0 docs in exactly the OR-rescue case, keeping PRF inert.
+          // Record the query that actually produced the evidence rows.
+          ctx.effectiveFtsQuery = orQuery;
+        }
         for (const r of orRows) results.push(ftsRowToResult(r, { snippet: true }));
       } catch (e) { debugCatch(e, 'searchObservationsHybrid-or-fallback'); }
     }
   }
 
-  // Two-phase query expansion (only when well below limit)
-  if (rows.length > 0 && results.length < Math.ceil(limit / 2)) {
+  // Two-phase query expansion (only when well below limit). Gate on results.length,
+  // NOT rows.length (M-2, audit 2026-08-14): `rows` is the strict-AND set only, so
+  // when strict-AND missed and the OR fallback rescued a few rows — exactly the
+  // vocab-mismatch shape where expansion helps most — the old gate read rows.length
+  // === 0 and skipped concept/PRF expansion entirely. PRF likewise seeds from the
+  // rescued rows now (they are the only relevance evidence available).
+  if (results.length > 0 && results.length < Math.ceil(limit / 2)) {
     const existingIds = new Set(results.map(r => r.id));
     expandObsByConceptCo(db, ctx, now, existingIds, results, includeNoise);
-    expandObsByPRF(db, ctx, now, rows.length, existingIds, results, includeNoise);
+    expandObsByPRF(db, ctx, now, results.length, existingIds, results, includeNoise);
   }
 
   // Vector search + RRF hybrid merge

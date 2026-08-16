@@ -14,9 +14,14 @@ import Database from 'better-sqlite3';
 import { shouldSkip, computeEffectiveLen, detectIntent, shouldSkipByDedup, extractFiles, extractErrorSignature, extractDeferredRefs, DEDUP_STALE_MS, matchRegistrySkillName, detectMemOverride } from './prompt-search-utils.mjs';
 import { getDeferredByIds } from '../lib/deferred-work.mjs';
 import { recommendSkill } from '../registry-recommend.mjs';
+import { recordHookError } from '../lib/hook-telemetry.mjs';
+import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
+// Telemetry sink (lib/hook-telemetry.mjs contract): env override for tests, else
+// <data-dir>/runtime — the same dir the sibling hook scripts + `stats` read.
+const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DB_DIR, 'runtime');
 const INJECTED_IDS_FILE = join(DB_DIR, 'runtime', `.claude-mem-injected-${inferProject()}`);
 // Per-prompt UPS cap. Cut from 5 → 3 after the 2026-05-09 per-hook recall
 // scan (#8255): UPS contributed 74% of silent injected IDs (131/177) at 26%
@@ -344,7 +349,7 @@ export function searchByFts(db, queryText, project, limit, typeFilter,
     SELECT o.id, o.type, o.title, o.lesson_learned,
            ${OBS_BM25} as bm25_raw,
            ${OBS_BM25}
-             * (1.0 + EXP(-0.693 * (? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
+             * (1.0 + EXP(-0.693 * MAX(0, ? - o.created_at_epoch) / ${TYPE_DECAY_CASE}))
              * ${TYPE_QUALITY_CASE}
              * (0.5 + 0.5 * COALESCE(o.importance, 1))
              * ${noisePenaltyClause('o')}
@@ -660,7 +665,7 @@ async function main() {
       // Namespace dedup ids as "D<id>" (parity with the "P<id>" prompt-corpus
       // convention) so obs ids can't collide in the shared injected-ids file.
       const dedupIds = openRows.map(r => `D${r.id}`);
-      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, INJECTED_IDS_FILE)) {
+      if (openRows.length > 0 && !shouldSkipByDedup(dedupIds, INJECTED_IDS_FILE, hookData.session_id)) {
         const lines = ['[mem] Deferred work referenced in prompt (open items, full detail):'];
         for (const r of openRows) {
           const pTag = r.priority === 3 ? '🔴' : r.priority === 1 ? '⚪' : '🟡';
@@ -680,15 +685,20 @@ async function main() {
           let prevCount = 0;
           try {
             const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
-            if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS) {
+            // M-6: inherit only same-session (or legacy) state — another session's
+            // ids/count must not carry over. Atomic write below: a torn concurrent
+            // write left the shared marker as invalid JSON (dedup silently off).
+            if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS
+                && !(prev.session && hookData.session_id && prev.session !== hookData.session_id)) {
               prevIds = Array.isArray(prev.ids) ? prev.ids : [];
               prevCount = prev.count || 0;
             }
           } catch {}
-          writeFileSync(INJECTED_IDS_FILE, JSON.stringify({
+          atomicWriteFileSync(INJECTED_IDS_FILE, JSON.stringify({
             ids: [...new Set([...prevIds.map(String), ...dedupIds])],
             ts: Date.now(),
             count: prevCount + 1,
+            ...(hookData.session_id ? { session: hookData.session_id } : {}),
           }));
         } catch {}
       }
@@ -712,7 +722,13 @@ async function main() {
   if (!db) {
     try {
       db = ensureDb();
-    } catch { return; }
+    } catch (e) {
+      // A failed DB open silently kills EVERY prompt-time injection while `stats`
+      // reads zero errors (audit 2026-08-14 M-5) — record before the mandatory
+      // swallow. Exact blindness class of the 2026-08-13 pre-recall:db-open outage.
+      recordHookError('ups:db-open', e, RUNTIME_DIR);
+      return;
+    }
   }
 
   try {
@@ -854,7 +870,7 @@ async function main() {
     const candidateIds = rows.length > 0
       ? rows.map(r => r.id)
       : promptRows.map(r => `P${r.id}`);
-    const dedupSkip = shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE);
+    const dedupSkip = shouldSkipByDedup(candidateIds, INJECTED_IDS_FILE, hookData.session_id);
 
     const output = !dedupSkip
       ? (rows.length > 0 ? formatResults(rows) : formatPromptResults(promptRows))
@@ -866,12 +882,17 @@ async function main() {
         let prevCount = 0;
         try {
           const prev = JSON.parse(readFileSync(INJECTED_IDS_FILE, 'utf8'));
-          if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS) prevCount = prev.count || 0;
+          // M-6: same-session (or legacy) count only; atomic write (torn-write guard).
+          if (prev.ts && Date.now() - prev.ts < DEDUP_STALE_MS
+              && !(prev.session && hookData.session_id && prev.session !== hookData.session_id)) {
+            prevCount = prev.count || 0;
+          }
         } catch {}
-        writeFileSync(INJECTED_IDS_FILE, JSON.stringify({
+        atomicWriteFileSync(INJECTED_IDS_FILE, JSON.stringify({
           ids: candidateIds,
           ts: Date.now(),
           count: prevCount + 1,
+          ...(hookData.session_id ? { session: hookData.session_id } : {}),
         }));
       } catch {}
       // v26 P0: bump injection_count for obs-based emits only (prompt-corpus
@@ -932,8 +953,11 @@ async function main() {
         finally { rdb.close(); }
       }
     } catch { /* silent — never block on recommendation failure */ }
-  } catch {
-    // Hooks must never break Claude Code — swallow all errors
+  } catch (e) {
+    // Hooks must never break Claude Code — swallow, but RECORD: this catch wraps
+    // every FTS query on the surface, so a schema/FTS drift here would zero out
+    // prompt-time injection with no trace anywhere (audit 2026-08-14 M-5).
+    recordHookError('ups:search', e, RUNTIME_DIR);
   } finally {
     try { db.close(); } catch {}
   }
@@ -962,5 +986,8 @@ export function isDirectInvocation(metaUrl, argv1) {
   return metaUrl.split('?')[0] === pathToFileURL(argv1).href;
 }
 if (isDirectInvocation(import.meta.url, process.argv[1])) {
-  main().catch(() => {});
+  // Last-resort telemetry for anything that escapes main()'s own catches (e.g. a
+  // throw between the entry and the guarded body). Recorder never throws; the
+  // outer catch keeps the never-non-zero-exit invariant regardless.
+  main().catch((e) => { try { recordHookError('ups:main', e, RUNTIME_DIR); } catch { /* never */ } });
 }

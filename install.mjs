@@ -1561,6 +1561,27 @@ async function doctor() {
     ok(`Native DB binding: loadable on Node ${process.version}`);
   }
 
+  // Disk footprint (audit 2026-08-14 M-9): a "lite" data dir had grown to 653MB
+  // against a 59MB DB — 360MB of it orphaned per-tag .bak snapshots — with no
+  // check anywhere. Cheap probes only (DB file + .bak aggregate, no tree walk).
+  // The budget itself is enforced by lib/db-backup on every new snapshot; this
+  // check surfaces stores that predate the budget or exceed it between snapshots.
+  try {
+    const { listSnapshots, backupBudgetBytes } = await import('./lib/db-backup.mjs');
+    const dbFile = join(MEM_DATA_DIR, 'claude-mem-lite.db');
+    const dbBytes = existsSync(dbFile) ? statSync(dbFile).size : 0;
+    const snaps = listSnapshots(dbFile);
+    const backupBytes = snaps.reduce((s, x) => s + x.size, 0);
+    const mb = (n) => (n / (1024 * 1024)).toFixed(1);
+    // Warn threshold = the REAL eviction budget (pre-release review 2026-08-16) —
+    // warning below it promised an eviction enforceBackupBudget would never do.
+    if (backupBytes > backupBudgetBytes()) {
+      dwarn(`Disk footprint: ${snaps.length} backup snapshot(s) hold ${mb(backupBytes)}MB, over the ${mb(backupBudgetBytes())}MB budget (CLAUDE_MEM_BACKUP_BUDGET_MB) — the next maintain/save snapshot evicts oldest snapshots past the 7d undo grace`);
+    } else {
+      ok(`Disk footprint: DB ${mb(dbBytes)}MB, ${snaps.length} backup snapshot(s) ${mb(backupBytes)}MB (budget ${mb(backupBudgetBytes())}MB)`);
+    }
+  } catch { /* footprint check is informational — never block doctor */ }
+
   // Plugin/hook lifecycle state
   const settings = readSettings();
   const hasHooks = hasMemHooksConfigured(settings);

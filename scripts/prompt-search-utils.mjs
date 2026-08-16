@@ -154,13 +154,17 @@ export const DEDUP_STALE_MS = 300_000; // 5 minutes
  * Check if injection should be skipped based on deduplication state.
  * @param {number[]} newIds - candidate observation IDs
  * @param {string} injectedFile - path to the dedup state file
+ * @param {string} [sessionId] - CC session id; a payload written by a DIFFERENT
+ *   session never suppresses (M-6, audit 2026-08-14: the file is keyed by project,
+ *   so session A's injections + count cap silently carried into session B)
  * @returns {boolean} true if injection should be skipped
  */
-export function shouldSkipByDedup(newIds, injectedFile) {
+export function shouldSkipByDedup(newIds, injectedFile, sessionId) {
   if (!newIds || newIds.length === 0) return true;
   try {
     const raw = readFileSync(injectedFile, 'utf8');
-    const { ids: prevIds, ts, count = 0 } = JSON.parse(raw);
+    const { ids: prevIds, ts, count = 0, session } = JSON.parse(raw);
+    if (session && sessionId && session !== sessionId) return false;
     if (count >= MAX_SESSION_INJECTIONS) return true;
     if (!ts || Date.now() - ts > DEDUP_STALE_MS) return false;
     if (!Array.isArray(prevIds) || prevIds.length === 0) return false;

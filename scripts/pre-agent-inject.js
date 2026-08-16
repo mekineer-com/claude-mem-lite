@@ -15,6 +15,23 @@
 const ENABLED = process.env.CLAUDE_MEM_SUBAGENT_INJECT === 'on'
   || process.env.CLAUDE_MEM_SUBAGENT_INJECT === '1';
 
+// Telemetry via DYNAMIC import so the default-off fast path stays import-free
+// (the file's stated contract). Only ever reached on the enabled path's failure
+// branches — this script had zero recordHookError coverage, so a dead DB or
+// schema drift silently disabled subagent injection with no trace (audit
+// 2026-08-14 M-5). Swallows everything: telemetry must never break a dispatch.
+async function recordFailure(scope, err, ctx) {
+  try {
+    const [{ recordHookError }, { resolveDataDir }, { join }] = await Promise.all([
+      import('../lib/hook-telemetry.mjs'),
+      import('../lib/resolve-data-dir.mjs'),
+      import('path'),
+    ]);
+    const dataDir = resolveDataDir(process.env.CLAUDE_MEM_DIR);
+    recordHookError(scope, err, process.env.CLAUDE_MEM_RUNTIME_DIR || join(dataDir, 'runtime'), ctx);
+  } catch { /* never */ }
+}
+
 function readStdin() {
   return new Promise((resolve) => {
     let data = '';
@@ -51,7 +68,7 @@ async function main() {
   const { buildSubagentInjection } = await import('../hook-memory.mjs');
 
   let db;
-  try { db = ensureDb(); } catch { return; }
+  try { db = ensureDb(); } catch (e) { await recordFailure('agent-inject:db-open', e); return; }
   try {
     const updatedInput = buildSubagentInjection(db, hook.tool_input, inferProject());
     if (updatedInput) {
@@ -59,7 +76,7 @@ async function main() {
         hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput },
       }));
     }
-  } catch { /* never break a dispatch */ } finally {
+  } catch (e) { await recordFailure('agent-inject:query', e); /* never break a dispatch */ } finally {
     try { db.close(); } catch { /* */ }
   }
 }
@@ -69,5 +86,6 @@ async function main() {
 // which FLUSHES stdout. The emitted updatedInput echoes the whole prompt back, so the
 // payload can exceed the ~64KB pipe buffer; a forced process.exit() would drop that
 // pending async write and truncate the JSON (the gotcha every sibling hook avoids).
-// Swallow any rejection so the exit code can never go non-zero.
-main().catch(() => {});
+// Swallow any rejection so the exit code can never go non-zero — but record it
+// first (recordFailure itself swallows everything, including its own failures).
+main().catch((e) => recordFailure('agent-inject:main', e));
