@@ -12,9 +12,10 @@ import {
   debugLog, debugCatch, neutralizeContextDelimiters,
   DECAY_HALF_LIFE_BY_TYPE, DEFAULT_DECAY_HALF_LIFE_MS, notLowSignalTitleClause,
 } from './utils.mjs';
-import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, isQuietHooks } from './hook-shared.mjs';
+import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, isQuietHooks, KEY_CONTEXT_LIMIT } from './hook-shared.mjs';
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 /**
  * Infer the project directory from environment variables or cwd.
@@ -83,12 +84,7 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const obsPool = db.prepare(`
     SELECT id, type, title, narrative, importance, created_at_epoch, files_modified, lesson_learned
     FROM observations
-    WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-      -- superseded invisibility: auto-dedup (hook.mjs) sets superseded_at but leaves
-      -- compressed_into=0, so the compressed filter alone lets the hidden near-duplicate
-      -- resurface in the most-visible surface (injected every SessionStart). Sibling
-      -- keyObs already filters this; obsPool + fallbackObs must match.
-      AND superseded_at IS NULL
+    WHERE project = ? AND ${liveObsFilterSql('')}
       AND ${notLowSignalTitleClause('')}
       AND (
         (created_at_epoch > ? AND importance >= 1)
@@ -293,9 +289,15 @@ export function cleanupClaudeMdLegacyBlock() {
  * @param {string|null} [currentCcSessionId=null] Claude Code session id — when provided,
  *   the "Working State (from /clear)" block is filtered to handoffs owned by this
  *   session, preventing parallel-session bleed (see docs/bug.txt).
+ * @param {object|null} [collector=null] Optional out-param: when given, its
+ *   `keyContextIds` property is set to the obs ids ACTUALLY rendered into the
+ *   File Lessons / Key Context sections ([] under quiet/adopted or when the
+ *   sections are empty). handleUserPrompt persists this as its exclude-set
+ *   (D#123: the exclude-set must mirror real injections, not the keyObs query).
  * @returns {string} Joined markdown lines (without <claude-mem-context> wrappers)
  */
-export function buildSessionContextLines(db, project, now = new Date(), currentCcSessionId = null) {
+export function buildSessionContextLines(db, project, now = new Date(), currentCcSessionId = null, collector = null) {
+  if (collector) collector.keyContextIds = [];
   // 1. Token-budgeted observation selection
   const selected = selectWithTokenBudget(db, project, 2000);
   const observations = selected.observations;
@@ -308,8 +310,7 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
     fallbackObs = db.prepare(`
       SELECT id, type, title, project, created_at
       FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE ${liveObsFilterSql('')}
         AND ${notLowSignalTitleClause('')}
         AND (
           (created_at_epoch > ? AND importance >= 1)
@@ -335,10 +336,9 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
   //    and Key Context (informational). Pushed into summaryLines.
   const keyObs = db.prepare(`
     SELECT o.id, o.type, o.title, o.lesson_learned, o.files_modified FROM observations o
-    WHERE o.project = ? AND COALESCE(o.compressed_into, 0) = 0
-      AND o.superseded_at IS NULL
+    WHERE o.project = ? AND ${liveObsFilterSql('o')}
       AND COALESCE(o.importance, 1) >= 2
-    ORDER BY o.created_at_epoch DESC LIMIT 10
+    ORDER BY o.created_at_epoch DESC LIMIT ${KEY_CONTEXT_LIMIT}
   `).all(project);
 
   if (keyObs.length > 0) {
@@ -357,30 +357,35 @@ export function buildSessionContextLines(db, project, now = new Date(), currentC
           const files = JSON.parse(o.files_modified);
           const fname = basename(Array.isArray(files) && files.length > 0 ? files[0] : '');
           if (fname) {
-            fileLessons.push(`- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})`);
+            fileLessons.push({ id: o.id, line: `- ${fname}: ${truncate(o.lesson_learned, 100)} (#${o.id})` });
             continue;
           }
         } catch { /* fall through to keyContext */ }
       }
       const lesson = hasLesson ? ` — ${truncate(o.lesson_learned, 60)}` : '';
-      keyContext.push(`- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}`);
+      keyContext.push({ id: o.id, line: `- [${o.type || 'discovery'}] ${truncate(clean, 80)} (#${o.id})${lesson}` });
     }
 
     // Phase A (QUIET_HOOKS) + Phase D (adopted sentinel): drop descriptive
     // File Lessons / Key Context sections when the user has opted into low-noise
     // hooks OR adopted invited-memory (MEMORY.md sentinel carries the triggers
     // at higher system-prompt authority). The Recent table still fires so #IDs
-    // remain reachable via mem_get.
+    // remain reachable via mem_get. The collector sees only rows that survive
+    // BOTH the quiet gate and the per-section slice — rendered rows, nothing else.
     const quiet = effectiveQuiet();
     if (fileLessons.length > 0 && !quiet) {
+      const shown = fileLessons.slice(0, 5);
       summaryLines.push('### File Lessons');
-      summaryLines.push(...fileLessons.slice(0, 5));
+      summaryLines.push(...shown.map((e) => e.line));
       summaryLines.push('');
+      if (collector) collector.keyContextIds.push(...shown.map((e) => e.id));
     }
     if (keyContext.length > 0 && !quiet) {
+      const shown = keyContext.slice(0, 5);
       summaryLines.push('### Key Context');
-      summaryLines.push(...keyContext.slice(0, 5));
+      summaryLines.push(...shown.map((e) => e.line));
       summaryLines.push('');
+      if (collector) collector.keyContextIds.push(...shown.map((e) => e.id));
     }
   } else if (!latestSummary && !effectiveQuiet()) {
     // Fallback: no summary AND no key observations — show recent activity.

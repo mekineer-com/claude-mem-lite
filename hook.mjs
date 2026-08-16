@@ -68,7 +68,7 @@ import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
 import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
-import { injectedIdsFileName } from './lib/injected-ids.mjs';
+import { injectedIdsFileName, keyContextIdsFileName } from './lib/injected-ids.mjs';
 import { liveObsFilterSql, recencyDecaySql } from './lib/inject-search-core.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -869,7 +869,8 @@ function gcStalePreRecallCooldowns() {
       // D#120: the injected-ids marker is also per-session now — same growth
       // shape as the cooldown files, same 24h GC (dedup window is 5 min).
       const isCooldown = name.startsWith('pre-recall-cooldown-') && name.endsWith('.json');
-      const isInjectedMarker = name.startsWith('.claude-mem-injected-');
+      const isInjectedMarker = name.startsWith('.claude-mem-injected-')
+        || name.startsWith('.claude-mem-keyctx-'); // D#123 Key Context marker — same per-session growth, same 24h GC
       if (!isCooldown && !isInjectedMarker) continue;
       try {
         const p = join(RUNTIME_DIR, name);
@@ -1471,12 +1472,27 @@ async function handleSessionStart() {
     // token-budgeted observation pool directly from the DB.
     // Pass CC session id so the Working State block is scoped to this session,
     // preventing parallel sessions from seeing each other's /clear handoff.
-    const fullContext = buildSessionContextLines(db, project, now, ccSessionId);
+    const contextCollector = {};
+    const fullContext = buildSessionContextLines(db, project, now, ccSessionId, contextCollector);
 
     // Stdout is the sole context-delivery channel. The SessionStart hook output
     // is injected as a <system-reminder> at session start, giving Claude the
     // full summary + handoff state + observations table fresh from the DB.
     process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
+
+    // D#123 (review C-1): persist the Key Context ids ACTUALLY rendered above so
+    // handleUserPrompt can exclude exactly those from <memory-context> — and
+    // nothing else. Under quiet/adopted the sections don't render, the id list is
+    // empty, and prompt-time injection is NOT suppressed (the old query-mirroring
+    // exclude-set blanked the same-project leg on adopted projects). Written
+    // unconditionally (even when empty) so a resumed session can't act on a
+    // previous session's stale marker semantics; 24h GC below.
+    try {
+      writeFileSync(
+        join(RUNTIME_DIR, keyContextIdsFileName(project, ccSessionId)),
+        JSON.stringify({ ids: contextCollector.keyContextIds || [], ts: Date.now(), session: ccSessionId || null }),
+      );
+    } catch (e) { debugCatch(e, 'session-start-keyctx-marker'); }
 
     // One-time migration: remove any stale <claude-mem-context> block left in
     // CLAUDE.md by pre-v2.30 installs. Idempotent no-op afterwards.
@@ -1651,13 +1667,21 @@ async function handleUserPrompt() {
     // (mirrors CC built-in memoryTypes.ts:215). Skip both Key Context lookup
     // and the <memory-context> emission for this turn.
     if (!detectMemOverride(promptText)) try {
-      const keyObs = db.prepare(`
-        SELECT id FROM observations
-        WHERE project = ? AND COALESCE(compressed_into, 0) = 0
-          AND COALESCE(importance, 1) >= 2
-        ORDER BY created_at_epoch DESC LIMIT 5
-      `).all(project);
-      const keyContextIds = keyObs.map(o => o.id);
+      // D#123 (review C-1): the exclude-set is the Key Context ids ACTUALLY
+      // rendered at SessionStart — read from the marker handleSessionStart wrote,
+      // not re-derived from a query. The old query-mirroring set excluded rows
+      // that were never shown (quiet/adopted projects render no Key Context at
+      // all), blanking the same-project <memory-context> leg outright. Missing
+      // or other-session marker → empty set: unknown injections must fail open
+      // (inject, maybe duplicate) rather than fail closed (suppress).
+      const keyContextIds = [];
+      try {
+        const raw = readFileSync(join(RUNTIME_DIR, keyContextIdsFileName(project, ccSessionId)), 'utf8');
+        const { ids, session } = JSON.parse(raw);
+        if (Array.isArray(ids) && !(session && ccSessionId && session !== ccSessionId)) {
+          keyContextIds.push(...ids);
+        }
+      } catch { /* no marker — nothing was injected, exclude nothing */ }
       const pathAInjectedIds = [];
 
       // Read IDs already injected by user-prompt-search.js to avoid duplicate injection
@@ -1686,8 +1710,9 @@ async function handleUserPrompt() {
       const taskImperativeOn = process.env.CLAUDE_MEM_TASK_IMPERATIVE === 'on'
         || process.env.CLAUDE_MEM_TASK_IMPERATIVE === '1';
       // Exclude only ids path-A (user-prompt-search.js) already injected — NOT the
-      // key-context top-5, which overlaps the high-value lesson pool and would suppress
-      // the pick. The chosen id is excluded from the <memory-context> block below instead.
+      // SessionStart Key Context set, which overlaps the high-value lesson pool and
+      // would suppress the pick. The chosen id is excluded from the <memory-context>
+      // block below instead.
       const imperativePick = taskImperativeOn
         ? selectImperativeLesson(db, promptText, project, pathAInjectedIds)
         : null;

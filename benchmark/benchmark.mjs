@@ -11,6 +11,7 @@ import { computePerSourceWindow } from '../lib/search-core.mjs';
 import { deepSearch } from '../deep-search.mjs';
 import { computeVector, rebuildVocabulary, _resetVocabCache, VOCAB_DIM, MIN_COSINE_SIMILARITY, RRF_K } from '../tfidf.mjs';
 import { OBS_BM25, TYPE_QUALITY_CASE, noisePenaltyClause, citeFactorClause } from '../scoring-sql.mjs';
+import { recencyDecaySql, liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { createTestDb } from '../tests/test-helpers.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -109,7 +110,7 @@ export function seedVectors(db, { dim } = {}) {
 
   const obs = db.prepare(`
     SELECT id, title, narrative, concepts FROM observations
-    WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
+    WHERE ${liveObsFilterSql('')}
   `).all();
   const ins = db.prepare(
     'INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)'
@@ -215,7 +216,11 @@ export function searchProductionHybrid(db, query, { limit = 10, project = null, 
 // each multiplier's parameters are appended in MULT_PARAMS order.
 
 const MULT_EXPR = {
-  decay:      '(1.0 + EXP(-0.693 * (? - o.created_at_epoch) / 1209600000.0))',
+  // decay composes the real clamped shape (D#123): same MAX(created, last_accessed)
+  // timestamp and per-type half-life as search-engine FULL_SCORE — the previous
+  // hand-copy was unclamped, created-only, constant-half-life while the mode doc
+  // above claims FULL_SCORE fidelity.
+  decay:      recencyDecaySql({ tsExpr: 'MAX(o.created_at_epoch, COALESCE(o.last_accessed_at, o.created_at_epoch))' }),
   // type imports the real TYPE_QUALITY_CASE (no hardcoded copy — #8770); lesson
   // mirrors search-engine.mjs FULL_SCORE's inline boost (no exported constant —
   // keep in sync). Both added so `hybrid` mirrors the full production chain.
@@ -223,7 +228,7 @@ const MULT_EXPR = {
   project:    '(CASE WHEN ? IS NOT NULL AND o.project = ? THEN 2.0 ELSE 1.0 END)',
   importance: '(0.5 + 0.5 * COALESCE(o.importance, 1))',
   access:     '(1.0 + 0.1 * LN(1 + COALESCE(o.access_count, 0)))',
-  lesson:     '(1.0 + 0.3 * (o.lesson_learned IS NOT NULL))',
+  lesson:     "(1.0 + 0.3 * (o.lesson_learned IS NOT NULL AND o.lesson_learned NOT IN ('', 'none')))",
   // noise/cite import the real clauses (no hardcoded copies) — D#121: FULL_SCORE
   // gained both in v3.63 M-3; without them here the matrix scored a stale chain.
   noise:      noisePenaltyClause('o'),

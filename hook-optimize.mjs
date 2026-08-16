@@ -20,6 +20,7 @@ import { getVocabulary, computeVector, cosineSimilarity, vecTextForRow } from '.
 import { MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { DB_DIR } from './schema.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 
@@ -104,8 +105,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
     const stmt = db.prepare(`
       SELECT id, title, narrative, type, subtitle, concepts, facts, text, search_aliases, importance, project
       FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE ${liveObsFilterSql('')}
         AND (search_aliases IS NULL OR search_aliases = '')
         AND LENGTH(COALESCE(narrative, '')) > 100
         AND ${notLowSignalTitleClause('')}
@@ -119,8 +119,7 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
     const stmt = db.prepare(`
       SELECT id, title, narrative, type, subtitle, concepts, facts, search_aliases, importance, project
       FROM observations
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND superseded_at IS NULL
+      WHERE ${liveObsFilterSql('')}
         AND optimized_at IS NULL
         AND type IN ('bugfix','refactor','feature','decision')
         AND (lesson_learned IS NULL OR lesson_learned = '')
@@ -459,8 +458,7 @@ export function findMergeCandidates(db, maxClusters = 5, { project } = {}) {
   const stmt = db.prepare(`
     SELECT id, title, narrative, project, type, access_count, importance, created_at_epoch, minhash_sig, lesson_learned, concepts, facts
     FROM observations
-    WHERE COALESCE(compressed_into, 0) = 0
-      AND superseded_at IS NULL
+    WHERE ${liveObsFilterSql('')}
       AND optimized_at IS NULL
       AND title IS NOT NULL AND title != ''
       AND created_at_epoch > ?

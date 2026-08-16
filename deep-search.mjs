@@ -36,6 +36,7 @@ import { sanitizeFtsQuery } from './utils.mjs';
 import { RRF_K } from './tfidf.mjs';
 import { rrfAccumulate } from './lib/rrf.mjs';
 import { llmRerankOrder, defaultRerankLLM } from './rerank.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 // original + up to 3 rewrites (keyword / concept-expansion / HyDE).
 export const MAX_VARIANTS = 4;
@@ -68,7 +69,7 @@ export const AUTO_DEEP_MIN_CORPUS = 10;
  */
 export function hasEscalatableCorpus(db, project, min = AUTO_DEEP_MIN_CORPUS) {
   try {
-    const where = ['superseded_at IS NULL', 'COALESCE(compressed_into, 0) = 0'];
+    const where = [liveObsFilterSql('')];
     const params = [];
     if (project) { where.push('project = ?'); params.push(project); }
     const row = db.prepare(`SELECT COUNT(*) AS c FROM observations WHERE ${where.join(' AND ')}`).get(...params);

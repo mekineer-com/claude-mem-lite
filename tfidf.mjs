@@ -7,6 +7,7 @@ import { cjkBigrams } from './utils.mjs';
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { createHash } from 'crypto';
 import { rrfAccumulate } from './lib/rrf.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 export const VOCAB_DIM = 512;
 // Fraction of the vocab dimension reserved for the highest-IDF (rarest) terms when the
@@ -240,7 +241,7 @@ export function vecTextForRow(row) {
 export function buildVocabulary(db, { dim = VOCAB_DIM } = {}) {
   const rows = db.prepare(`
     SELECT title, narrative, concepts, lesson_learned, search_aliases FROM observations
-    WHERE COALESCE(compressed_into, 0) = 0 AND superseded_at IS NULL
+    WHERE ${liveObsFilterSql('')}
   `).all();
 
   const N = rows.length;
@@ -444,8 +445,7 @@ export function vectorSearch(db, queryVec, { project, type, vocabVersion, limit 
   const now = Date.now();
 
   const wheres = [
-    'COALESCE(o.compressed_into, 0) = 0',
-    'o.superseded_at IS NULL',
+    liveObsFilterSql('o'),
     'ov.vocab_version = ?',
   ];
   const params = [vocabVersion];

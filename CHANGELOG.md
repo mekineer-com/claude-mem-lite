@@ -2,6 +2,24 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.65.0 — the consolidation's second cut: every read surface composes the shared SQL core, and the prompt-time exclude-set stops suppressing what was never shown
+
+**Upgrading from 3.64.0 — what changes for you.** Two behaviors you may notice. Each has an escape hatch; neither requires action.
+
+| Change | If it bothers you |
+|---|---|
+| Prompt-time `<memory-context>` injection no longer excludes rows by a DB query. The old exclude-set silently removed the 5 newest importance≥2 rows on every prompt — even on adopted/quiet projects where the SessionStart Key Context those rows were "deduped against" is never rendered at all (on a dense project this blanked the same-project injection leg outright: 3 → 0 lines in the review's reproduction). Exclusion now mirrors reality: SessionStart/PreCompact record the ids they ACTUALLY rendered into a per-session `.claude-mem-keyctx-*` runtime marker (empty under quiet), and the prompt hook excludes exactly those — no marker, or another session's marker → nothing excluded. Net effect: adopted/quiet projects see MORE relevant memory at prompt time; non-quiet projects get exact dedup (up to 10 rendered rows) instead of approximate recency-based dedup (5 rows). | Pin the prior version (rollback recipe in README → *Trust model per install path*). The marker rides the existing 24h session-start GC. |
+| `benchmark.mjs --matrix` ablation numbers are not comparable across this version: the `hybrid` arm's decay multiplier now composes the real FULL_SCORE shape (clamped, `MAX(created, last_accessed)`, per-type half-life) instead of an unclamped created-only 14-day copy, and the `lesson` arm now matches FULL_SCORE's empty/`'none'` guard. Fixture matrix `hybrid` R@10 0.9015 → 0.8998 — the old copy was measuring a chain production doesn't run. The default (non-matrix) benchmark and the denoise A/B suites run the real engine and are unaffected (Δ=0.000 bit-identical); `ci-gate` passes on the new numbers. | Dev-tooling only; re-baseline any private snapshots against v3.65.0. |
+
+Structural (D#123 — the second cut of the audit's P2-11):
+
+- **refactor(core):** the remaining ~26 hand-inlined live-row filter pairs across 13 read-surface files (hook-context / hook-handoff / hook-optimize / mem-cli / search-scoring / tfidf / deep-search / recall-core / recent-core / timeline-core / stats-core / search-core / maintain-core) + benchmark's `seedVectors` now compose `liveObsFilterSql()`; the sessions/events decay arms in `lib/search-core.mjs` compose `recencyDecaySql()`. The `EXP(-0.693` decay shape now has exactly one home repo-wide (source-scan pinned). The ledger test grew from 5 to 19 enforced files, strips `//` comments before scanning (a comment naming both literals near a legitimate single could otherwise false-positive later), and deliberate compressed-only singles are documented as non-members (maintain UPDATE guards, stats noise-gauge counts, export tombstone toggles, session-own history).
+- **fix(export):** CLI `export --include-compressed` branch restructured to compose the core — byte-identical WHERE in both flag states (verified against the pre-image by SQL capture).
+
+Review: two fresh-context passes (adversarial SQL-equivalence / test-quality + blast-radius) attacked the diff before tagging. The SQL reviewer verified all 32 converted statements byte-equivalent (fake-prepare capture against a `git archive` pre-image + real-DB CLI end-to-end diff) — and refuted the first cut's exclude-set "alignment" outright (C-1 above), which was redesigned to the marker mechanism pre-tag. The test reviewer mutation-tested the new pins (5-tombstone case couldn't catch a lone filter revert; over-exclusion direction had zero coverage) — the rewritten suite kills all three mutation classes (query-revert / marker-ignored / session-gate-dropped), verified by running each mutant. 4349/4349 tests, eslint/shellcheck clean, knip at the 32-export baseline, denoise A/B bit-identical, benchmark ci-gate green.
+
+Known measurement gap (deferred): rows rendered in SessionStart Key Context still have no citation extractor and no `injection_count` bump — shown-but-uncounted for the decay/telemetry loop (was 5 rows' worth before, now up to 10). Tracked as deferred work; the direction (wire Key Context as a fifth extractor face) is noted there.
+
 ## v3.64.0 — the drift class gets a home: one shared SQL core for the injection surfaces, five CLI/MCP twins consolidated, and the two-window dedup bug
 
 **Upgrading from 3.63.0 — what changes for you.** Five behaviors you may notice. Each has an escape hatch; none requires action.

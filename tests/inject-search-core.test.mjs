@@ -72,13 +72,35 @@ describe('shared atoms — semantics', () => {
 // guards (H-1 dedup joins use a./b. aliases; UPDATE guards use the bare column
 // without the compressed pair) do not match this shape and stay untouched.
 
-describe('consumer ledger — no inlined live-filter pairs in the five converted files', () => {
+describe('consumer ledger — no inlined live-filter pairs in the converted files', () => {
   const FILES = [
+    // P2-11 first cut — the injection-side surfaces:
     'scripts/user-prompt-search.js',
     'scripts/pre-tool-recall.js',
     'hook-memory.mjs',
     'hook.mjs',
     'search-engine.mjs',
+    // D#123 second cut — the remaining read surfaces. Deliberate NON-members of
+    // this ledger keep their compressed-only singles (verified legitimately
+    // different, deferral 2026-08-16): maintain-core UPDATE/compression guards,
+    // stats-core noise-gauge counts (its "live" = non-compressed by definition,
+    // F7), hook-optimize enrich-candidate singles, hook-handoff session-own
+    // history (comment at its `completed` query), hook-context velocity count,
+    // schema index predicate, server.mjs export tombstone toggle.
+    'hook-context.mjs',
+    'hook-handoff.mjs',
+    'hook-optimize.mjs',
+    'mem-cli.mjs',
+    'search-scoring.mjs',
+    'tfidf.mjs',
+    'deep-search.mjs',
+    'lib/recall-core.mjs',
+    'lib/recent-core.mjs',
+    'lib/timeline-core.mjs',
+    'lib/stats-core.mjs',
+    'lib/search-core.mjs',
+    'lib/maintain-core.mjs',
+    'benchmark/benchmark.mjs',
   ];
   // Retrieval-shape pair: COALESCE(<alias.|bare>compressed_into, 0) = 0 within a
   // few lines of <alias.|bare>superseded_at IS NULL — EITHER order (review
@@ -90,9 +112,17 @@ describe('consumer ledger — no inlined live-filter pairs in the five converted
     /(?:\w+\.)?superseded_at IS NULL[\s\S]{0,200}?COALESCE\((?:\w+\.)?compressed_into,\s*0\)\s*=\s*0/g,
   ];
 
+  // Strip `//` line comments before scanning (keep line count: blank the text,
+  // not the newline). Review 2026-08-16: a comment naming both literals near a
+  // legitimate compressed-only single (e.g. hook-handoff's exemption note) would
+  // otherwise false-positive the pair regex if an edit drifted them within the
+  // 200-char window. SQL `--` comments inside templates are NOT stripped — they
+  // sit inside the query text the regex is meant to police.
+  const stripLineComments = (src) => src.replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+
   for (const f of FILES) {
     it(`${f} contains no hand-rolled live-filter pair`, () => {
-      const src = readFileSync(join(REPO, f), 'utf8');
+      const src = stripLineComments(readFileSync(join(REPO, f), 'utf8'));
       const hits = PAIR_RES.flatMap((re) => [...src.matchAll(re)]).map((m) => {
         const line = src.slice(0, m.index).split('\n').length;
         return `${f}:${line}`;
@@ -105,6 +135,17 @@ describe('consumer ledger — no inlined live-filter pairs in the five converted
     for (const f of FILES) {
       const src = readFileSync(join(REPO, f), 'utf8');
       expect(src.includes('inject-search-core.mjs'), `${f} does not import the core`).toBe(true);
+    }
+  });
+
+  // FAILS IF: any consumer re-inlines the decay shape instead of composing
+  // recencyDecaySql (benchmark's `hybrid` mode claims FULL_SCORE fidelity —
+  // D#123 found it carrying an unclamped created-only constant-half-life copy).
+  // The clamp fix (M-1) must have exactly one home.
+  it('no hand-rolled EXP decay outside the core', () => {
+    for (const f of FILES) {
+      const src = readFileSync(join(REPO, f), 'utf8');
+      expect(src.includes('EXP(-0.693'), `${f} re-inlines the decay shape — compose recencyDecaySql`).toBe(false);
     }
   });
 });

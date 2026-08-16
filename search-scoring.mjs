@@ -9,6 +9,7 @@ import { debugCatch, COMPRESSED_AUTO, COMPRESSED_PENDING_PURGE, OBS_BM25 } from 
 import { BASE_STOP_WORDS } from './stop-words.mjs';
 import { porterStem } from './tfidf.mjs';
 import { CLI_INVOKE } from './cli-path.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
 // ─── MCP Server Instructions Builder ───────────────────────────────────────
 // Phase A (v2.31.3+): when quiet=true, drops WHEN-TO-USE proactive-trigger and
@@ -225,8 +226,7 @@ export function expandQueryByConcepts(db, ftsQuery, project) {
     rows = db.prepare(`
       SELECT o.concepts FROM observations_fts
       JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ? AND COALESCE(o.compressed_into, 0) = 0
-        AND o.superseded_at IS NULL
+      WHERE observations_fts MATCH ? AND ${liveObsFilterSql('o')}
         AND (? IS NULL OR o.project = ?)
       ORDER BY ${OBS_BM25}
       LIMIT 20

@@ -445,10 +445,12 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     const LESSON = 'Invalidate the widget cache on write, never on read';
     const targetId = await seedObs(cwd, 'Fixed the widget cache invalidation race in lib/widget-cache.mjs',
       ['--type', 'bugfix', '--importance', '3', '--lesson', LESSON]);
-    // handleUserPrompt excludes the 5 most recent importance>=2 rows (its "key context" set)
-    // from the <memory-context> block. Five later, unrelated importance-2 rows fill that set
-    // so the target stays eligible — without them the case would assert an injection the
-    // handler suppresses by design.
+    // handleUserPrompt excludes ONLY ids actually rendered somewhere (the path-A
+    // UPS marker and the SessionStart keyctx marker — D#123: exclusion mirrors
+    // real injections, never a DB query). This sandbox has neither marker for
+    // this project+session, so the target is always eligible; the fillers just
+    // give the corpus enough rows that the adaptive BM25 threshold (>=5 obs)
+    // applies, matching real installs.
     for (const filler of [
       'Chose postgres over sqlite for the billing ledger store',
       'Renamed the deployment runbook chapter headings',

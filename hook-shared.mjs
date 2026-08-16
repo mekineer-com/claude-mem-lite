@@ -32,6 +32,12 @@ export const STALE_LOCK_MS = 30000;                       // 30s
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
 export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
+// Candidate rows the SessionStart Key Context surface considers (hook-context.mjs
+// keyObs; each of the two sections then renders at most 5). The user-prompt
+// exclude-set does NOT mirror this query — it reads the ids actually rendered
+// from the keyctx marker (D#123 review C-1: query-mirroring suppressed
+// <memory-context> injection on quiet/adopted projects where nothing renders).
+export const KEY_CONTEXT_LIMIT = 10;
 
 // Phase A (v2.31.3+): MEM_QUIET_HOOKS=1 drops descriptive hook/MCP-instruction
 // bodies (File Lessons / Key Context headers, MCP WHEN-TO-USE & decision rules,

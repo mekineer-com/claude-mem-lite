@@ -32,6 +32,7 @@ import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { cmdAdopt, cmdUnadopt } from './adopt-cli.mjs';
 import { parseIntFlag, isNumericToken } from './lib/cli-flags.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { auditMemdir, memdirPath } from './memdir.mjs';
 import { aggregateProjectCiteRecall } from './lib/citation-tracker.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
@@ -1604,11 +1605,14 @@ function cmdExport(db, args) {
   if (rejectBareStringFlags(flags, ['project', 'type', 'from', 'to'])) return;
   const wheres = [];
   const params = [];
-  // --include-compressed: include compressed observations (aligned with MCP mem_export)
-  if (!(flags['include-compressed'] === true || flags['include-compressed'] === 'true')) {
-    wheres.push('COALESCE(compressed_into, 0) = 0');
+  // --include-compressed: include compressed observations (aligned with MCP mem_export).
+  // Superseded rows are excluded either way; the flag only toggles the compressed half
+  // of the live-row pair (backup/export of tombstones is opt-in, retractions are not).
+  if (flags['include-compressed'] === true || flags['include-compressed'] === 'true') {
+    wheres.push('superseded_at IS NULL');
+  } else {
+    wheres.push(liveObsFilterSql(''));
   }
-  wheres.push('superseded_at IS NULL');
 
   const project = flags.project ? resolveProject(db, flags.project) : null;
   if (project) { wheres.push('project = ?'); params.push(project); }
@@ -2468,8 +2472,7 @@ function cmdCitationStats(db, args) {
            SUM(CASE WHEN uncited_streak >= 2 THEN 1 ELSE 0 END) AS at_risk
       FROM observations
      WHERE created_at_epoch >= ?
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   GROUP BY project
   ORDER BY resolved DESC
   `).all(cutoff);
@@ -2478,8 +2481,7 @@ function cmdCitationStats(db, args) {
     SELECT id, project, type, title, importance, uncited_streak, cited_count
       FROM observations
      WHERE uncited_streak >= 2
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   ORDER BY uncited_streak DESC, importance ASC
      LIMIT 20
   `).all();
@@ -2488,8 +2490,7 @@ function cmdCitationStats(db, args) {
     SELECT id, project, type, title, importance, cited_count
       FROM observations
      WHERE importance >= 3 AND cited_count >= 1
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   ORDER BY cited_count DESC
      LIMIT 10
   `).all();
@@ -2499,8 +2500,7 @@ function cmdCitationStats(db, args) {
       FROM observations
      WHERE demoted_at IS NOT NULL
        AND demoted_at >= ?
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   ORDER BY demoted_at DESC
      LIMIT 10
   `).all(cutoff);
@@ -2515,8 +2515,7 @@ function cmdCitationStats(db, args) {
   const pollutedRows = db.prepare(`
     SELECT COUNT(*) AS n FROM observations
      WHERE cited_count > decay_seen_count
-       AND COALESCE(compressed_into, 0) = 0
-       AND superseded_at IS NULL
+       AND ${liveObsFilterSql('')}
   `).get();
   const dataPollutionNote = pollutedRows.n > 0
     ? `${pollutedRows.n} obs have cited_count > decay_seen_count (pre-v34 backfill — invariant holds for new data).`
