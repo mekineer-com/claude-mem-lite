@@ -1,7 +1,7 @@
 // claude-mem-lite: Shared infrastructure for hook.mjs and hook-llm.mjs
 // Constants, session management, DB access, LLM calls, process utilities
 
-import { execFileSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, readdirSync, statSync, unlinkSync, chmodSync } from 'fs';
@@ -10,7 +10,7 @@ import { ensureDbWithWalRecovery, DB_DIR } from './schema.mjs';
 // Pure-`node:`/local module (it imports only binding-probe + native-binding-hint, and
 // neither imports this file) — no cycle.
 import { recordHookError } from './lib/hook-telemetry.mjs';
-import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
+import { execClaudeCliSync, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
 // fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
 // neither imports hook-shared.
@@ -318,16 +318,10 @@ export async function callLLM(prompt, timeoutMs = BG_LLM_TIMEOUT_MS) {
 
   const { cli: modelName } = resolveModelShared();
   try {
-    // Same headless-tax flags as haiku-client.mjs#callModelCLI (rationale
-    // there): no transcript persistence, no claudemd hook fan-out.
-    const result = execFileSync(getClaudePathShared(), ['-p', '--model', modelName, '--no-session-persistence'], {
-      input: _flattenForCLI(prompt),
-      timeout: timeoutMs,
-      encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/tmp', // Prevent ghost sessions in user's /resume list
-    });
+    // Shared runner with haiku-client.mjs#callModelCLI (rationale there): no
+    // transcript persistence, no claudemd hook fan-out, and the one-shot
+    // retry-without-flag that keeps this leg alive on an older Claude Code CLI.
+    const result = execClaudeCliSync(modelName, { input: _flattenForCLI(prompt), timeout: timeoutMs });
     return result.trim();
   } catch (e) {
     const out = _extractResponseFromError(e);

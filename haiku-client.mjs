@@ -428,26 +428,122 @@ async function callModelAPI(prompt, model, { timeout, maxTokens, temperature = D
   }
 }
 
+// ─── Headless CLI flag compatibility ─────────────────────────────────────────
+//
+// --no-session-persistence + DISABLE_CLAUDEMD_HOOKS (2026-08-16): these headless
+// calls were paying the full interactive-session tax — 1,004 transcripts piled up
+// in ~/.claude/projects/-tmp/, and every spawn ran the claudemd plugin's whole
+// hook fan-out (its SessionStart banner alone logged 682 rows in 3 days, drowning
+// that project's telemetry). The persistence flag is OAuth-safe (probed);
+// `--bare`/CLAUDE_CODE_SIMPLE are NOT (they hard-require ANTHROPIC_API_KEY —
+// "Not logged in" on OAuth machines). The user's global CLAUDE.md injection has
+// no OAuth-safe opt-out; accepted (haiku + prompt caching keeps it cheap).
+//
+// The flag is an unguarded dependency on a recent Claude Code CLI: package.json
+// declares only node>=20, no Claude Code floor. On an older binary the spawn dies
+// in argument parsing, the catch swallows it, and every CLI-leg LLM call returns
+// null — no retry, no telemetry. That leg is what the keyed providers degrade to,
+// so such a user loses enrichment, summarization and optimize all at once. So:
+// detect the arg-parse rejection, retry once without the flag, and cache the
+// negative only AFTER the retry actually succeeded. Caching on the failure
+// instead would let one transient non-zero exit that happens to mention the flag
+// push a healthy CLI back onto the session tax for the rest of the process.
+// Hooks are short-lived, so an old binary pays one extra fail-fast spawn per
+// process; the long-lived MCP server pays it once per run.
+const HEADLESS_FLAG = '--no-session-persistence';
+let _headlessFlagOk = true;
+
+/** @internal test hook — module-level compat state must not leak across cases. */
+export function _resetHeadlessFlag() { _headlessFlagOk = true; }
+
+function claudeArgs(modelName) {
+  return _headlessFlagOk
+    ? ['-p', '--model', modelName, HEADLESS_FLAG]
+    : ['-p', '--model', modelName];
+}
+
+// A retry is only ever worth it when the diagnostic NAMES the token it rejected —
+// every argv parser does, and requiring it is what keeps this from firing on
+// Claude Code's own config diagnostics. The installed CLI carries strings like
+// `Skill X has invalid effort 'y'. Valid options: …` and `Input validation error:
+// Invalid arguments for tool`, which an unanchored unknown-word/option-word regex
+// matches outright. Those are emitted for a malformed agent/skill file — a
+// *persistent* condition — so an unanchored match would fire on the next transient
+// 529, permanently revert v3.66.0's session-tax fix on a perfectly healthy CLI,
+// and log a WARN blaming a flag that was never the problem (pre-tag review, HIGH).
+// Deliberately NOT keyed on exit code alone either: a non-zero exit is also the
+// normal shape of an overload/auth failure.
+const FLAG_TOKEN = /no-session-persistence/;
+const PARSE_REJECTION = /(unknown|unrecognized|unsupported|invalid|unexpected)[^\n]{0,40}(option|argument|flag|switch)/i;
+
+// Below this many ms left, a retry can only spawn a process and immediately kill
+// it — worse than returning the original failure.
+const RETRY_MIN_BUDGET_MS = 500;
+
+export function _isUnknownFlagError(diagnostic) {
+  if (!diagnostic) return false;
+  return FLAG_TOKEN.test(diagnostic) && (PARSE_REJECTION.test(diagnostic) || /usage:/i.test(diagnostic));
+}
+
+// stdout as well as stderr: a parser that prints its rejection (or usage banner)
+// on stdout is otherwise invisible here, and FLAG_TOKEN keeps the widened input
+// from loosening the match.
+function cliDiagnostic(e) {
+  const err = e?.stderr?.toString?.() || e?.output?.[2]?.toString?.() || '';
+  const out = e?.stdout?.toString?.() || e?.output?.[1]?.toString?.() || '';
+  return `${err}\n${out}`;
+}
+
+/**
+ * Shared blocking `claude -p` runner for every sync CLI leg (callModelCLI,
+ * callHaikuCLI, hook-shared#callLLM). Throws exactly what execFileSync throws so
+ * each caller keeps its own partial-output salvage; the only added behaviour is
+ * the one-shot flag-compat retry described above.
+ * @param {string} modelName CLI model name ('haiku'|'sonnet')
+ * @param {{input:string, timeout:number}} opts
+ * @returns {string} raw stdout
+ */
+export function execClaudeCliSync(modelName, { input, timeout }) {
+  const opts = {
+    input,
+    timeout,
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: '/tmp', // Prevent ghost sessions in the user's /resume list
+  };
+  const args = claudeArgs(modelName);
+  const started = Date.now();
+  try {
+    return execFileSync(getClaudePath(), args, opts);
+  } catch (e) {
+    // A timeout is NOT a parse rejection. execFileSync kills the child and throws
+    // with its partial buffers attached (callModelCLI's salvage depends on exactly
+    // that), so without this guard a slow call whose output merely looked
+    // parse-shaped would be retried on the FULL original budget — doubling a
+    // latency-bound ceiling. lesson-bridge runs this leg at 2500ms on PreToolUse,
+    // where the CLI is measured at 8–13s and therefore times out routinely.
+    if (e?.killed || e?.signal) throw e;
+    // `args`, not the live flag: what matters is whether THIS attempt carried it.
+    // Symmetry with the async leg, where the distinction is load-bearing (a
+    // sibling can flip the flag across an await). Here execFileSync blocks the
+    // event loop for the whole child, so no other JS can interleave and the two
+    // readings are behaviourally identical — the substitution is deliberately
+    // mutation-silent, kept so the two legs cannot drift apart in meaning.
+    if (!args.includes(HEADLESS_FLAG) || !_isUnknownFlagError(cliDiagnostic(e))) throw e;
+    const remaining = timeout - (Date.now() - started);
+    if (remaining < RETRY_MIN_BUDGET_MS) throw e;
+    const out = execFileSync(getClaudePath(), ['-p', '--model', modelName], { ...opts, timeout: remaining });
+    _headlessFlagOk = false;
+    debugLog('WARN', 'cli-compat', `claude CLI rejected ${HEADLESS_FLAG}; dropped for this process (the headless session tax returns — upgrade Claude Code to avoid it)`);
+    return out;
+  }
+}
+
 function callModelCLI(prompt, model, { timeout }) {
   const modelName = MODEL_MAP[model] ? model : 'haiku';
   try {
-    // --no-session-persistence + DISABLE_CLAUDEMD_HOOKS (2026-08-16): these
-    // headless calls were paying the full interactive-session tax — 1,004
-    // transcripts piled up in ~/.claude/projects/-tmp/, and every spawn ran
-    // the claudemd plugin's whole hook fan-out (its SessionStart banner alone
-    // logged 682 rows in 3 days, drowning that project's telemetry). The
-    // persistence flag is OAuth-safe (probed); `--bare`/CLAUDE_CODE_SIMPLE are
-    // NOT (they hard-require ANTHROPIC_API_KEY — "Not logged in" on OAuth
-    // machines). The user's global CLAUDE.md injection has no OAuth-safe
-    // opt-out; accepted (haiku + prompt caching keeps it cheap).
-    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName, '--no-session-persistence'], {
-      input: flattenForCLI(prompt),
-      timeout,
-      encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/tmp',
-    });
+    const result = execClaudeCliSync(modelName, { input: flattenForCLI(prompt), timeout });
     const text = result.trim();
     return text ? { text } : null;
   } catch (e) {
@@ -479,23 +575,31 @@ function callModelCLI(prompt, model, { timeout }) {
  * @param {{timeout:number}} opts  SIGKILL after `timeout` ms; no retry.
  * @returns {Promise<{text:string}|null>}
  */
-export function callModelCLIAsync(prompt, model, { timeout }) {
-  return new Promise((resolve) => {
-    const modelName = MODEL_MAP[model] ? model : 'haiku';
+export async function callModelCLIAsync(prompt, model, { timeout }) {
+  const modelName = MODEL_MAP[model] ? model : 'haiku';
+  const payload = flattenForCLI(prompt);
+  const started = Date.now();
+
+  // One spawn. Resolves {result, stderr, stdout, code}, never rejects. `code` is
+  // a number ONLY when the child exited on its own; a timeout/SIGKILL or a spawn
+  // error reports null, which is what keeps either from being mistaken for an
+  // argument-parse rejection and costing a second full-budget spawn.
+  const attempt = (args, budget) => new Promise((resolve) => {
     let child;
     try {
-      // Same headless-tax flags as callModelCLI (rationale there).
-      child = spawn(getClaudePath(), ['-p', '--model', modelName, '--no-session-persistence'], {
+      // Same headless-tax flags + flag-compat retry as callModelCLI (rationale there).
+      child = spawn(getClaudePath(), args, {
         env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
         cwd: '/tmp',
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (e) {
       debugCatch(e, `${model}-cli-async`);
-      resolve(null);
+      resolve({ result: null, stderr: '', stdout: '', code: null });
       return;
     }
     let stdout = '';
+    let stderr = '';
     let settled = false;
     const done = (val) => {
       if (settled) return;
@@ -510,26 +614,59 @@ export function callModelCLIAsync(prompt, model, { timeout }) {
       // brace check would discard a complete-but-```json-fenced payload (#8605);
       // parseJsonFromLLM strips fences before validating, and the caller re-parses
       // the returned text the same way.
-      if (t && parseJsonFromLLM(t) !== null) { done({ text: t }); return; }
-      done(null);
-    }, timeout);
+      if (t && parseJsonFromLLM(t) !== null) { done({ result: { text: t }, stderr, stdout, code: null }); return; }
+      done({ result: null, stderr, stdout, code: null });
+    }, budget);
     child.stdout?.setEncoding('utf8'); // decode multi-byte UTF-8 (CJK) across chunk boundaries
     child.stdout?.on('data', (d) => { stdout += d; });
-    child.stderr?.on('data', () => {}); // drain stderr so a chatty child can't block on a full pipe
-    child.on('error', (e) => { debugCatch(e, `${model}-cli-async`); done(null); });
-    child.on('close', () => {
+    // Keep draining stderr so a chatty child can't block on a full pipe, but keep
+    // a bounded head of it — the flag-compat probe needs the parser's complaint.
+    // Slice AFTER appending: checking the length first lets one arbitrarily large
+    // chunk through whole, which is the shape a single big stderr write takes.
+    child.stderr?.setEncoding?.('utf8');
+    child.stderr?.on('data', (d) => { stderr = (stderr + d).slice(0, 4096); });
+    child.on('error', (e) => { debugCatch(e, `${model}-cli-async`); done({ result: null, stderr: '', stdout: '', code: null }); });
+    child.on('close', (code) => {
       const t = stdout.trim();
-      done(t ? { text: t } : null);
+      done({ result: t ? { text: t } : null, stderr, stdout, code });
     });
     // EPIPE guard: the child may exit before we finish writing stdin.
     child.stdin?.on('error', () => {});
     try {
-      child.stdin?.write(flattenForCLI(prompt));
+      child.stdin?.write(payload);
       child.stdin?.end();
     } catch (e) {
       debugCatch(e, `${model}-cli-async:stdin`);
     }
   });
+
+  const firstArgs = claudeArgs(modelName);
+  const first = await attempt(firstArgs, timeout);
+  // Judged on `firstArgs`, not the live flag: a concurrent sibling may have
+  // flipped it between our spawn and our resume, and reading the global there
+  // would silently deny THIS call the retry it earned (MCP server, concurrent
+  // deep-search escalations). Gating on the exit code before `first.result` also
+  // covers a CLI that prints its usage banner to stdout and exits non-zero —
+  // otherwise that banner is returned as the model's answer and nothing retries.
+  const rejected = firstArgs.includes(HEADLESS_FLAG)
+    && typeof first.code === 'number' && first.code !== 0
+    && _isUnknownFlagError(`${first.stderr}\n${first.stdout.slice(0, 4096)}`);
+  if (!rejected) return first.result;
+  // The rejection is instantaneous (the child dies in argv parsing), so the retry
+  // normally gets nearly the whole budget; spend only what is left of it.
+  const remaining = timeout - (Date.now() - started);
+  if (remaining < RETRY_MIN_BUDGET_MS) return first.result;
+  const second = await attempt(['-p', '--model', modelName], remaining);
+  // Cache on the retry's EXIT, not its payload. Empty output is a designed
+  // outcome here (emit-nothing prompts, an `N/A` that trims away), so keying on
+  // text left the long-lived MCP server re-probing — two spawns per call, for the
+  // life of the process — on exactly the old CLI this exists to rescue. The sync
+  // twin caches on any non-throwing run; this now means the same thing.
+  if (second.code === 0) {
+    _headlessFlagOk = false;
+    debugLog('WARN', `${model}-cli-async`, `claude CLI rejected ${HEADLESS_FLAG}; dropped for this process (the headless session tax returns — upgrade Claude Code to avoid it)`);
+  }
+  return second.result;
 }
 
 // ─── API Mode ────────────────────────────────────────────────────────────────
@@ -635,15 +772,8 @@ async function callOpenRouterAPI(prompt, tier, { timeout, maxTokens, temperature
 function callHaikuCLI(prompt, { timeout }) {
   const { cli: modelName } = resolveModel();
   try {
-    // Same headless-tax flags as callModelCLI (rationale there).
-    const result = execFileSync(getClaudePath(), ['-p', '--model', modelName, '--no-session-persistence'], {
-      input: flattenForCLI(prompt),
-      timeout,
-      encoding: 'utf8',
-      env: { ...process.env, CLAUDE_MEM_HOOK_RUNNING: '1', DISABLE_CLAUDEMD_HOOKS: '1' },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: '/tmp', // Prevent ghost sessions in user's /resume list
-    });
+    // Same headless-tax flags + flag-compat retry as callModelCLI (rationale there).
+    const result = execClaudeCliSync(modelName, { input: flattenForCLI(prompt), timeout });
     const text = result.trim();
     return text ? { text } : null;
   } catch (e) {
