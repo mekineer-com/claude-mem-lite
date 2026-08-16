@@ -11,6 +11,7 @@ import { porterStem } from './tfidf.mjs';
 import { CLI_INVOKE } from './cli-path.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── MCP Server Instructions Builder ───────────────────────────────────────
 // Phase A (v2.31.3+): when quiet=true, drops WHEN-TO-USE proactive-trigger and
 // Decision-rules sections; keeps the irreducible CLI/MCP tool list. Intended
@@ -302,7 +303,7 @@ export function runIdleCleanup(db) {
 
   db.transaction(() => {
     for (const { types, days } of staleThresholds) {
-      const cutoff = Date.now() - days * 86400000;
+      const cutoff = Date.now() - days * DAY_MS;
 
       const marked = db.prepare(`
         UPDATE observations SET compressed_into = ${COMPRESSED_PENDING_PURGE}

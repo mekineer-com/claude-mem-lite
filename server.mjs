@@ -52,6 +52,7 @@ import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredToken
 import { saveObservation } from './lib/save-observation.mjs';
 import { applyObsUpdate } from './lib/observation-write.mjs';
 import { EXPORT_COLUMNS_SQL } from './lib/export-columns.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recallByFile } from './lib/recall-core.mjs';
 import { fetchRecent } from './lib/recent-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
@@ -1032,7 +1033,7 @@ server.registerTool(
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const preview = args.preview !== false;
     const ageDays = args.age_days ?? 30;
-    const cutoff = Date.now() - ageDays * 86400000;
+    const cutoff = Date.now() - ageDays * DAY_MS;
     const candidates = selectCompressionCandidates(db, { cutoff, project: args.project || null });
 
     if (candidates.length === 0) {
@@ -1181,7 +1182,7 @@ server.registerTool(
         // only rows a PRIOR run marked (backed up); rows decay marks below wait one cycle.
         if (ops.includes('purge_stale')) {
           const retainDays = args.retain_days ?? 30;
-          const retainCutoff = Date.now() - retainDays * 86400000;
+          const retainCutoff = Date.now() - retainDays * DAY_MS;
           if (!purgeConfirmed) {
             // Dry-run preview (parity with CLI `maintain` without --confirm): the other
             // requested non-destructive ops still run below.
@@ -1687,8 +1688,12 @@ export async function handleExportForTest(db, args) {
 async function runExport(db, args) {
   const wheres = [];
   const params = [];
-  if (!args.include_compressed) wheres.push('COALESCE(compressed_into, 0) = 0');
-  wheres.push('superseded_at IS NULL');
+  // Composed, not hand-written: the CLI twin (mem-cli.mjs cmdExport) already
+  // routes through liveObsFilterSql, and a hand-rolled copy here is how the
+  // live-row predicate drifted apart on other surfaces (P2-11/D#123). With
+  // include_compressed the compressed half is dropped but retractions still
+  // are not — tombstone export is opt-in, supersession is never exported.
+  wheres.push(args.include_compressed ? 'superseded_at IS NULL' : liveObsFilterSql(''));
   if (args.project) { wheres.push('project = ?'); params.push(_resolveProjectShared(db, args.project)); }
   if (args.type) { wheres.push('type = ?'); params.push(args.type); }
   // T3-P1-A: surface invalid dates instead of silently dropping the filter — mirrors
@@ -1801,6 +1806,7 @@ server.registerTool(
 // Handler extracted to server/fts-check.mjs (v2.41 split).
 import { handleMemFtsCheck } from './server/fts-check.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 server.registerTool(
   'mem_fts_check',
   {

@@ -18,6 +18,7 @@ import { recommendSkill } from '../registry-recommend.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { atomicWriteFileSync } from '../lib/atomic-write.mjs';
 
+import { DAY_MS } from '../lib/time-constants.mjs';
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 // Telemetry sink (lib/hook-telemetry.mjs contract): env override for tests, else
@@ -37,7 +38,7 @@ const injectedIdsFileFor = (sessionId) =>
 // gated by explicit "before/previously/记得" prompts where breadth is the
 // point). Env override for projects that want broader recall or to A/B.
 const MAX_RESULTS = Number(process.env.CLAUDE_MEM_UPS_MAX_RESULTS || 3);
-const LOOKBACK_MS = 60 * 86400000; // 60 days
+const LOOKBACK_MS = 60 * DAY_MS; // 60 days
 
 // v2.56.x: Past-similar-questions fallback row cap. Cut from 3 → 1 after
 // 30d transcript scan (#8062 follow-up, 2026-05-09) showed UPS prompt-fallback

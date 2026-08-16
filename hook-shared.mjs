@@ -10,7 +10,7 @@ import { ensureDbWithWalRecovery, DB_DIR } from './schema.mjs';
 // Pure-`node:`/local module (it imports only binding-probe + native-binding-hint, and
 // neither imports this file) — no cycle.
 import { recordHookError } from './lib/hook-telemetry.mjs';
-import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku } from './haiku-client.mjs';
+import { getClaudePath as getClaudePathShared, resolveModel as resolveModelShared, flattenForCLI as _flattenForCLI, detectMode as detectLLMMode, callHaiku, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 // Phase D: invited-memory sentinel detection. memdir.mjs/claudemd.mjs only pull in
 // fs/path/os/crypto; adopt-content.mjs is pure strings. No circular deps —
 // neither imports hook-shared.
@@ -18,6 +18,7 @@ import { memdirPath as _memdirPath, isAdopted as _isAdoptedMemdir } from './memd
 import { isAdopted as _isAdoptedClaudeMd } from './claudemd.mjs';
 import { PLUGIN_SLUG as _PLUGIN_SLUG } from './adopt-content.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 export const RUNTIME_DIR = join(DB_DIR, 'runtime');
@@ -30,7 +31,7 @@ export const SESSION_EXPIRY_MS = 12 * 60 * 60 * 1000;    // 12h
 export const STALE_SESSION_MS = 24 * 60 * 60 * 1000;     // 24h
 export const STALE_LOCK_MS = 30000;                       // 30s
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
-export const RELATED_OBS_WINDOW_MS = 7 * 86400000;       // 7 days
+export const RELATED_OBS_WINDOW_MS = 7 * DAY_MS;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
 // Candidate rows the SessionStart Key Context surface considers (hook-context.mjs
 // keyObs; each of the two sections then renders at most 5). The user-prompt
@@ -123,6 +124,89 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
   return count;
 }
 
+// ─── Per-project marker GC (P2-15) ───────────────────────────────────────────
+// RUNTIME_DIR had three sweeps and a hole. Per-SESSION files age out at 24h
+// (hook.mjs) and orphaned episode/read trackers at 1h/24h (above), but the
+// per-PROJECT markers — one file per project, written once, never revisited —
+// had no reclamation path at all. A live install on 2026-08-16 held 253 files,
+// 152 of them past 30 days, including entire families for test sandboxes
+// deleted months earlier (session-tmp--sdscc-e2e-*, cite-recall-scratchpad--
+// fixture-*) and a .skill-reco-cooldown-* family that nothing had ever swept.
+//
+// Deliberately a NAMED list rather than a wildcard: these markers share a shape
+// but not a meaning. The GC-able ones are caches — delete them and the next
+// session re-derives the state (or, for a cooldown, merely allows a suggestion
+// sooner). The preserved ones are records of a side effect already performed;
+// removing them re-arms it (.auto-adopt-* re-attempts a write into the user's
+// project CLAUDE.md, the migration sentinels re-run their one-time work), which
+// is a bad trade for the 13-45 bytes each occupies.
+export const STALE_PROJECT_MARKER_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Regenerated on demand; safe to lose at any time.
+export const GC_PROJECT_MARKER_PREFIXES = Object.freeze([
+  'session-',                 // project → memory-session-id pointer
+  'cite-recall-',             // last session's cite-recall snapshot (nudge input)
+  '.skill-cooldown-',         // suggestion throttle timestamp
+  '.skill-reco-cooldown-',    // recommendation throttle timestamp
+  // These two have NO writer and NO reader left in the tree (verified by grep,
+  // 2026-08-16) — they are version-keyed one-time markers from retired code
+  // paths (live dir holds `.mcp-dedup-v2.10`, `.residue-warned-v2.55`). Nothing
+  // recreates them, so sweeping them is a one-shot cleanup, not a policy.
+  '.mcp-dedup-',
+  '.residue-warned-',
+]);
+
+// Records of a completed side effect — never age out. `ep-`/`ep-flush-`/
+// `pending-`/`reads-` are absent from BOTH lists on purpose: the first holds
+// unflushed observations (data, not cache) and the rest already belong to
+// sweepOrphanEpisodeFiles on tighter cutoffs.
+export const GC_PRESERVED_MARKER_PREFIXES = Object.freeze([
+  '.auto-adopt-',
+  '.deferred-block-migrated-',
+  '.legacy-claude-md-cleaned-',
+]);
+
+/**
+ * Sweep per-project runtime markers older than `ageMs`. fs-only, best-effort,
+ * never throws. Returns the number of files removed.
+ *
+ * The two prefix lists are injectable ONLY so the precedence rule below can be
+ * exercised: with the shipped lists they are disjoint, which makes the
+ * preserved check redundant today and load-bearing the moment a future family
+ * nests inside a GC-able one. Production callers pass neither.
+ *
+ * @param {string} runtimeDir
+ * @param {{ageMs?: number, now?: number, gcPrefixes?: string[], preservedPrefixes?: string[]}} [opts]
+ * @returns {number}
+ */
+export function sweepStaleProjectMarkers(runtimeDir, {
+  ageMs = STALE_PROJECT_MARKER_AGE_MS,
+  now = Date.now(),
+  gcPrefixes = GC_PROJECT_MARKER_PREFIXES,
+  preservedPrefixes = GC_PRESERVED_MARKER_PREFIXES,
+  env = process.env,
+} = {}) {
+  // Kill switch (naming mirrors SKIP_COMPRESS / SKIP_OPTIMIZE / SKIP_SAVE_ENRICH):
+  // this is the only sweep that deletes files a user might want to inspect, so a
+  // released default that reclaims state needs a documented way back out.
+  if (env.CLAUDE_MEM_SKIP_MARKER_GC === '1') return 0;
+  let entries;
+  try { entries = readdirSync(runtimeDir); } catch { return 0; }
+  const cutoff = now - ageMs;
+  let count = 0;
+  for (const f of entries) {
+    // Preserved wins on any overlap, so a future prefix added to both lists
+    // fails safe (kept) instead of deleting a side-effect record.
+    if (preservedPrefixes.some((p) => f.startsWith(p))) continue;
+    if (!gcPrefixes.some((p) => f.startsWith(p))) continue;
+    const full = join(runtimeDir, f);
+    try {
+      if (statSync(full).mtimeMs < cutoff) { unlinkSync(full); count++; }
+    } catch { /* concurrent unlink / permission / directory — ignore */ }
+  }
+  return count;
+}
+
 // Ensure runtime directory exists AND is owner-only (0700), matching the DB dir
 // (schema.mjs). Runtime aux files carry captured file paths + scrubbed activity; on a
 // shared host a 0755 dir would let another local user read them. hardenRuntimeFiles()
@@ -195,7 +279,7 @@ export function openDb() {
 // response string (callers run parseJsonFromLLM themselves) or null.
 // maxTokens is sized for session-summary / episode JSON (larger than the
 // registry/optimize callers' budgets).
-export async function callLLM(prompt, timeoutMs = 15000) {
+export async function callLLM(prompt, timeoutMs = BG_LLM_TIMEOUT_MS) {
   if (detectLLMMode() !== 'cli') {
     const result = await callHaiku(prompt, { timeout: timeoutMs, maxTokens: 2000 });
     return result?.text ?? null;

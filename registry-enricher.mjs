@@ -2,7 +2,7 @@
 // Sends resource content to Haiku for semantic metadata generation
 // Graceful degradation: failure preserves existing data
 
-import { callHaikuJSON } from './haiku-client.mjs';
+import { callHaikuJSON, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { truncate, debugCatch } from './utils.mjs';
 
 /**
@@ -84,7 +84,7 @@ export async function enrichResource(db, name, type, content) {
 
   try {
     const prompt = buildEnrichPrompt(name, content, existing);
-    const result = await callHaikuJSON(prompt, { timeout: 15000, maxTokens: 500 });
+    const result = await callHaikuJSON(prompt, { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 500 });
 
     if (!result || !result.capability_summary) {
       db.prepare("UPDATE resources SET enrichment_status = 'failed' WHERE name = ? AND type = ?").run(name, type);

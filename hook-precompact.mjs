@@ -5,17 +5,15 @@
 // Differs from SessionStart-on-compact (which fires AFTER compaction):
 // PreCompact ensures memory survives the compaction step itself.
 
-import { writeFileSync } from 'fs';
-import { join } from 'path';
 import { buildSessionContextLines } from './hook-context.mjs';
 import { inferProject, debugCatch, debugLog } from './utils.mjs';
 import { RUNTIME_DIR } from './hook-shared.mjs';
-import { keyContextIdsFileName } from './lib/injected-ids.mjs';
+import { recordKeyContextInjection } from './lib/keyctx-marker.mjs';
 
 /**
- * Build + emit the memory context block on stdout. Pure read; no DB writes
- * (one runtime marker file: the Key Context ids the re-emitted block renders,
- * refreshing handleUserPrompt's exclude-set — see D#123 in hook.mjs).
+ * Build + emit the memory context block on stdout. Writes the Key Context ids
+ * the re-emitted block renders (refreshing handleUserPrompt's exclude-set — see
+ * D#123 in hook.mjs) and bumps injection_count on those rows (D#124).
  *
  * @param {object} ctx
  * @param {import('better-sqlite3').Database} ctx.db
@@ -29,12 +27,14 @@ export function handlePreCompact({ db, project, sessionId }) {
     const body = buildSessionContextLines(db, project, new Date(), sessionId || null, collector);
     if (!body || String(body).trim() === '') return;
     process.stdout.write(`<claude-mem-context>\n${body}\n</claude-mem-context>\n`);
-    try {
-      writeFileSync(
-        join(RUNTIME_DIR, keyContextIdsFileName(project, sessionId || null)),
-        JSON.stringify({ ids: collector.keyContextIds || [], ts: Date.now(), session: sessionId || null }),
-      );
-    } catch (e) { debugCatch(e, 'pre-compact-keyctx-marker'); }
+    // Same recorder as handleSessionStart: marker + injection_count bump (D#124).
+    // A re-render into a compacted context is a fresh injection of those rows.
+    recordKeyContextInjection(db, {
+      runtimeDir: RUNTIME_DIR,
+      project,
+      sessionId: sessionId || null,
+      ids: collector.keyContextIds || [],
+    });
   } catch (e) {
     debugCatch(e, 'handlePreCompact');
   }

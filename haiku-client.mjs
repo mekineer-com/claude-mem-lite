@@ -101,6 +101,28 @@ const MODEL_MAP = {
 const DEFAULT_LLM_TEMPERATURE = 0;
 
 /**
+ * Timeout budget for BACKGROUND LLM work (detached enrich/optimize/summary
+ * workers, registry indexing) — the calls with no latency budget at all.
+ *
+ * Every dispatcher below degrades to `claude -p` when the keyed provider fails,
+ * and the CLI leg pays a full Claude Code boot before inference: measured
+ * 8.1s / 9.2s / 11.7s / 13.4s on an idle machine for a 400-token JSON reply
+ * (2026-08-16), against API-leg latencies under 2s. Callers that sized their
+ * timeout for the API leg (15–20s) were therefore killing the fallback
+ * mid-flight — save-enrich's 15s budget left 1.6s of headroom over the worst
+ * sample, which is how 6/57 (10.5%) of instrumented runs landed on
+ * reason:'llm-null' and why manual saves stopped getting search_aliases.
+ *
+ * Deliberately NOT applied as a floor inside callModelCLI / callHaikuCLI /
+ * callModelCLIAsync: those are also reached from latency-bound callers — the
+ * lesson bridge's 2.5s fail-open budget on the PreToolUse hook, and deep-search
+ * rerank on the MCP request path — where failing fast beats blocking a user for
+ * 45s. The allowance is caller-side policy, not a clamp.
+ * Pinned both ways by `tests/llm-timeout-budget.test.mjs`.
+ */
+export const BG_LLM_TIMEOUT_MS = 45000;
+
+/**
  * Resolve the LLM model to use for background calls.
  * Reads CLAUDE_MEM_MODEL env var, defaults to 'haiku'.
  * @returns {{ cli: string, api: string }} CLI name and API model ID

@@ -8,6 +8,7 @@ import { join } from 'path';
 import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 import { searchResources, cjkIntentTokens } from './registry-retriever.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 const VALID_MODES = new Set(['shadow', 'live', 'off']);
 
 /** Recommendation mode from env; default 'shadow', unknown → 'shadow'. */
@@ -137,7 +138,7 @@ export function gcOldShadowShards(retainDays = 90) {
   try {
     const dir = shadowDir();
     if (!existsSync(dir)) return 0;
-    const cutoff = new Date(Date.now() - retainDays * 86_400_000).toISOString().slice(0, 10);
+    const cutoff = new Date(Date.now() - retainDays * DAY_MS).toISOString().slice(0, 10);
     let removed = 0;
     for (const name of readdirSync(dir)) {
       const m = /^(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(name);
@@ -155,7 +156,7 @@ export function logShadowAdoption(project, rec) { appendShadow({ ts: new Date().
 /** Yield parsed shadow rows from the last `days` daily shards. */
 export function* readShadowLog(days = 7) {
   for (let i = 0; i < days; i++) {
-    const d = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+    const d = new Date(Date.now() - i * DAY_MS).toISOString().slice(0, 10);
     let raw;
     try { raw = readFileSync(join(shadowDir(), `${d}.jsonl`), 'utf8'); } catch { continue; }
     for (const line of raw.split('\n')) { if (!line) continue; try { yield JSON.parse(line); } catch { /* skip malformed */ } }

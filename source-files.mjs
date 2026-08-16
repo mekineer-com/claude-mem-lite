@@ -123,6 +123,12 @@ export const SOURCE_FILES = [
   // scripts/user-prompt-search.js + scripts/pre-tool-recall.js. Under lib/ for
   // the same scripts-dir-rename reason as mem-override.mjs above.
   'lib/injected-ids.mjs',
+  // P2-13 (narrowed): millisecond time units, single-sourced from the four
+  // modules that each declared their own DAY_MS. Leaf module, zero imports.
+  'lib/time-constants.mjs',
+  // D#124: Key Context marker write + injection_count bump, shared by
+  // handleSessionStart and handlePreCompact. Statically imported by hook.mjs.
+  'lib/keyctx-marker.mjs',
   // P2-11: injection-side shared SQL core (live-row filter / clamped decay /
   // injection relevance chain). Statically imported by hook.mjs, hook-memory.mjs,
   // search-engine.mjs AND the standalone hook scripts — missing it from the

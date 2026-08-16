@@ -10,6 +10,7 @@ import {
   getCurrentBranch, notLowSignalTitleClause,
 } from './utils.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
+import { BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, vecTextForRow } from './tfidf.mjs';
 import { insertObservationRow, insertObservationFiles, insertObservationVector, normalizeScope } from './lib/observation-write.mjs';
@@ -23,6 +24,7 @@ import { isNoiseObservation, capNoiseImportance, isLowYieldChangeObs } from './l
 import { episodeHasSignificantContent } from './hook-episode.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
 const EVENT_TYPE_SET = new Set(EVENT_TYPES);
@@ -84,7 +86,7 @@ export function recordRetryAttempt(db, recovered, bucket = dateBucketUtc()) {
  * YYYY-MM-DD lexicographic order).
  */
 export function readRetryStats(db, days = 30) {
-  const cutoff = new Date(Date.now() - days * 86400000);
+  const cutoff = new Date(Date.now() - days * DAY_MS);
   return db.prepare(
     `SELECT date_bucket, attempts, recovered FROM lesson_retry_stats
      WHERE date_bucket >= ? ORDER BY date_bucket DESC`
@@ -205,8 +207,8 @@ export function saveObservation(obs, projectOverride, sessionIdOverride, externa
     // 3-day Jaccard catches near-duplicates without blocking legitimately new observations
     const LOW_SIGNAL = LOW_SIGNAL_TITLE;
     if (obs.title && LOW_SIGNAL.test(obs.title)) {
-      const sevenDaysAgo = now.getTime() - 7 * 86400000;
-      const threeDaysAgo = now.getTime() - 3 * 86400000;
+      const sevenDaysAgo = now.getTime() - 7 * DAY_MS;
+      const threeDaysAgo = now.getTime() - 3 * DAY_MS;
       // Phase 1: exact title match within 7 days
       const exactDup = db.prepare(`
         SELECT 1 FROM observations
@@ -856,7 +858,7 @@ ${actionList}`;
         const retrySlot = await acquireLLMSlot();
         try {
           const retryPrompt = buildLessonRetryPrompt(episode, parsed);
-          const retryRaw = retrySlot ? await callLLM(retryPrompt, 10000) : null;
+          const retryRaw = retrySlot ? await callLLM(retryPrompt, BG_LLM_TIMEOUT_MS) : null;
           if (retryRaw) {
             const retry = parseJsonFromLLM(retryRaw);
             const retryLesson = typeof retry?.lesson === 'string' ? retry.lesson.trim() : '';
@@ -1135,7 +1137,7 @@ ${obsList}`;
 
     let raw, llmParsed;
     try {
-      raw = await callLLM(prompt, 20000);
+      raw = await callLLM(prompt, BG_LLM_TIMEOUT_MS);
       llmParsed = parseJsonFromLLM(raw);
     } finally {
       releaseLLMSlot();

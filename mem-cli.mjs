@@ -1197,7 +1197,7 @@ async function cmdStats(db, args) {
   // recorded in the last 24h. Surfaces silent breakage (DB corruption,
   // CC upstream field rename) that would otherwise stay invisible — the
   // failure mode that left code-graph's matcher bug undetected for 10 sessions.
-  const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - 86400000);
+  const hookErrors24h = countRecentHookErrors(join(DB_DIR, 'runtime'), now - DAY_MS);
 
   // M-9 (audit 2026-08-14): disk footprint — a "lite" store had accumulated 360MB of
   // pre-maintain snapshots against a 59MB DB with nothing reporting it. Cheap probes
@@ -1636,7 +1636,7 @@ function cmdExport(db, args) {
   if (flags.to) {
     exportToEpoch = new Date(flags.to).getTime();
     if (isNaN(exportToEpoch)) { fail(`[mem] Invalid --to date: "${flags.to}". Use YYYY-MM-DD or ISO 8601.`); return; }
-    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) exportToEpoch += 86400000 - 1;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(flags.to)) exportToEpoch += DAY_MS - 1;
     wheres.push('created_at_epoch <= ?'); params.push(exportToEpoch);
   }
   if (exportFromEpoch !== null && exportToEpoch !== null && exportFromEpoch > exportToEpoch) {
@@ -1883,7 +1883,7 @@ function cmdCompress(db, args) {
     }
     ageDays = parsed;
   }
-  const cutoff = Date.now() - ageDays * 86400000;
+  const cutoff = Date.now() - ageDays * DAY_MS;
   const project = flags.project ? resolveProject(db, flags.project) : null;
 
   const candidates = selectCompressionCandidates(db, { cutoff, project });
@@ -2021,7 +2021,7 @@ function cmdMaintain(db, args) {
     }
     retainDays = parsed;
   }
-  const retainCutoff = Date.now() - retainDays * 86400000;
+  const retainCutoff = Date.now() - retainDays * DAY_MS;
   // purge_stale is the only DELETE here — require --confirm so a mis-typed run can't wipe rows.
   const confirmed = flags.confirm === true || flags.confirm === 'true';
 
@@ -2592,7 +2592,7 @@ function cmdCitationStats(db, args) {
   out(`Recently demoted (last ${days}d, importance ↓):`);
   if (demoted.length === 0) out('  (none)');
   for (const r of demoted) {
-    const ago = Math.round((Date.now() - r.demoted_at) / 86400000);
+    const ago = Math.round((Date.now() - r.demoted_at) / DAY_MS);
     out(`  #${r.id} [${r.type}] ${(r.title || '').slice(0, 60)}   imp=${r.importance}   ${ago}d ago`);
   }
 }
@@ -3140,6 +3140,7 @@ import { cmdDoctor } from './cli/doctor.mjs';
 // cmdActivity (T7 v2.31) extracted to cli/activity.mjs (v2.41 split).
 import { cmdActivity } from './cli/activity.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Main Entry Point ────────────────────────────────────────────────────────
 
 export async function run(argv) {

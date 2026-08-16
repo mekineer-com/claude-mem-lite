@@ -4,6 +4,7 @@
 
 import { DECAY_HALF_LIFE_BY_TYPE } from './utils.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const TWO_HOURS_MS = 2 * 3600000;
@@ -125,7 +126,7 @@ export function relativeTime(epoch, now) {
   const diff = Math.max(0, now - epoch);
   if (diff < 60000) return `${Math.floor(diff / 1000)}s ago`;
   if (diff < 3600000) return `${Math.floor(diff / 60000)}min ago`;
-  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
-  if (diff < 30 * 86400000) return `${Math.floor(diff / 86400000)}d ago`;
-  return `${Math.floor(diff / (30 * 86400000))}mo ago`;
+  if (diff < DAY_MS) return `${Math.floor(diff / 3600000)}h ago`;
+  if (diff < 30 * DAY_MS) return `${Math.floor(diff / DAY_MS)}d ago`;
+  return `${Math.floor(diff / (30 * DAY_MS))}mo ago`;
 }

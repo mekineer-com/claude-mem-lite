@@ -32,6 +32,9 @@ vi.mock('../haiku-client.mjs', () => ({
   flattenForCLI: vi.fn((p) => (typeof p === 'string' ? p : `${p.system}\n${p.user}`)),
   detectMode: detectModeMock,
   callHaiku: callHaikuMock,
+  // callLLM's default timeout argument — a full mock must carry it or every
+  // routing case throws before reaching the branch under test.
+  BG_LLM_TIMEOUT_MS: 45000,
 }));
 
 vi.mock('../memdir.mjs', () => ({

@@ -94,7 +94,15 @@ describe('haiku-client.mjs', () => {
       expect(spawn).toHaveBeenCalledWith(
         expect.any(String),
         ['-p', '--model', 'sonnet', '--no-session-persistence'],
-        expect.objectContaining({ cwd: '/tmp' }),
+        // Both halves of the headless-tax fix (d97d3d8) are pinned: the flag in
+        // argv AND the hook opt-out in env. Args alone were asserted, so this
+        // site could silently lose DISABLE_CLAUDEMD_HOOKS and stay green —
+        // verified by mutation 2026-08-16, and this is the highest-volume async
+        // headless caller (deep-search rewrite).
+        expect.objectContaining({
+          cwd: '/tmp',
+          env: expect.objectContaining({ DISABLE_CLAUDEMD_HOOKS: '1' }),
+        }),
       );
       expect(child.stdin.write).toHaveBeenCalledWith('the prompt');
       expect(child.stdin.end).toHaveBeenCalled();
@@ -488,7 +496,13 @@ describe('haiku-client.mjs', () => {
       expect(execFileSync).toHaveBeenCalledWith(
         expect.any(String),
         ['-p', '--model', 'sonnet', '--no-session-persistence'],
-        expect.objectContaining({ input: 'test prompt' })
+        // env half pinned alongside the argv half — see the callModelCLIAsync
+        // note above. callModelCLI is the sync headless path every background
+        // worker takes (save-enrich, optimize, registry-enrich).
+        expect.objectContaining({
+          input: 'test prompt',
+          env: expect.objectContaining({ DISABLE_CLAUDEMD_HOOKS: '1' }),
+        })
       );
     });
 

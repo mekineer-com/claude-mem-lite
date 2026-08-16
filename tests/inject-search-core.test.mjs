@@ -86,7 +86,13 @@ describe('consumer ledger — no inlined live-filter pairs in the converted file
     // stats-core noise-gauge counts (its "live" = non-compressed by definition,
     // F7), hook-optimize enrich-candidate singles, hook-handoff session-own
     // history (comment at its `completed` query), hook-context velocity count,
-    // schema index predicate, server.mjs export tombstone toggle.
+    // schema index predicate.
+    //
+    // server.mjs joined on 2026-08-16: mem_export's runExport was the last read
+    // surface still hand-writing the pair while its CLI twin already composed
+    // the core. Its include_compressed branch keeps a superseded-only single,
+    // which this shape does not match.
+    'server.mjs',
     'hook-context.mjs',
     'hook-handoff.mjs',
     'hook-optimize.mjs',

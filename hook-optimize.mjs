@@ -13,7 +13,7 @@ import {
   computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity, clampImportance, cjkBigrams,
   notLowSignalTitleClause, scrubSecrets,
 } from './utils.mjs';
-import { callModelJSON } from './haiku-client.mjs';
+import { callModelJSON, BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, cosineSimilarity, vecTextForRow } from './tfidf.mjs';
@@ -22,6 +22,7 @@ import { DB_DIR } from './schema.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 const RUNTIME_DIR = join(DB_DIR, 'runtime');
 
 // ─── Budget ─────────────────────────────────────────────────────────────────
@@ -174,7 +175,7 @@ Narrative: ${truncate(cand.narrative || '(no narrative)', 500)}
 
 JSON: {"search_aliases":["alt phrasing","synonym","spelled-out jargon","CJK term if the domain word has one"]}
 Give 3-6 aliases: words a user might search for the SAME concept but that are NOT already in the title (synonyms, the spelled-out form of an acronym, the jargon term for a described symptom, a CJK translation of a key domain term).`;
-        const parsed = await callModelJSON(aliasPrompt, 'haiku', { timeout: 15000, maxTokens: 300 });
+        const parsed = await callModelJSON(aliasPrompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 300 });
         const aliasArr = parsed && Array.isArray(parsed.search_aliases)
           ? parsed.search_aliases.filter((a) => typeof a === 'string' && a.trim().length > 0)
           : [];
@@ -203,7 +204,7 @@ importance: 0=no value, 1=routine, 2=notable non-obvious insight, 3=critical. De
 lesson_learned: State what was learned. If routine, write "none".
 search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
 
-      const parsed = await callModelJSON(prompt, 'haiku', { timeout: 15000, maxTokens: 500 });
+      const parsed = await callModelJSON(prompt, 'haiku', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 500 });
       if (!parsed || !parsed.title) { skipped++; continue; }
 
       // Auto-hide on importance:0 targets fully-degraded NARROW rows (this branch predates
@@ -288,7 +289,7 @@ search_aliases: 2-6 alternative search terms (include CJK if applicable).`;
 // ─── Task 2: Normalize ─────────────────────────────────────────────────────
 
 const NORMALIZE_GATE_FILE = join(RUNTIME_DIR, 'last-normalize.json');
-const NORMALIZE_INTERVAL_MS = 7 * 86400000; // 7 days
+const NORMALIZE_INTERVAL_MS = 7 * DAY_MS; // 7 days
 
 // Pure gate decision (no IO) — exported for testing. Fail-OPEN on a
 // malformed-but-valid-JSON gate: a missing/non-numeric `epoch` makes
@@ -355,7 +356,7 @@ Rules:
 - Include CJK ↔ English equivalents if present
 - Skip terms that have no synonyms in the list`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed?.groups || !Array.isArray(parsed.groups)) return [];
     return parsed.groups.filter(g => g.canonical && Array.isArray(g.aliases) && g.aliases.length > 0);
   } catch (e) {
@@ -447,7 +448,7 @@ export async function executeNormalize(db, force = false, { project } = {}) {
 
 // ─── Task 3: Cluster-merge ─────────────────────────────────────────────────
 
-const MERGE_TIME_WINDOW_MS = 30 * 86400000;
+const MERGE_TIME_WINDOW_MS = 30 * DAY_MS;
 // Merge-review band [MERGE_JACCARD_LOW, AUTO_MERGE_THRESHOLD): titles in this
 // Jaccard range are LLM-reviewed for merge; at/above AUTO_MERGE_THRESHOLD they'd
 // already auto-merge elsewhere, below MERGE_JACCARD_LOW they're too dissimilar.
@@ -523,7 +524,7 @@ Return ONLY valid JSON:
 - If they should NOT be merged: {"should_merge":false}
 - If they SHOULD be merged: {"should_merge":true,"merged_title":"≤120 char comprehensive title","merged_narrative":"comprehensive ≤800 char summary preserving all key details","merged_concepts":["kw1","kw2"],"merged_facts":["specific fact 1"],"merged_lesson":"synthesized non-obvious lesson or null","importance":2}`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed || !parsed.should_merge) return { merged: false };
 
     // Keeper = highest importance, then highest access_count. Previously access_count
@@ -641,11 +642,11 @@ export async function executeClusterMerge(db, maxClusters = 5, { project } = {})
 
 // ─── Task 4: Smart-compress ────────────────────────────────────────────────
 
-const COMPRESS_TIME_SPLIT_MS = 14 * 86400000;
+const COMPRESS_TIME_SPLIT_MS = 14 * DAY_MS;
 const COMPRESS_COSINE_THRESHOLD = 0.3;
 
 export function findSmartCompressCandidates(db, ageDays = 30, { project } = {}) {
-  const cutoff = Date.now() - ageDays * 86400000;
+  const cutoff = Date.now() - ageDays * DAY_MS;
   const projectClause = project ? 'AND project = ?' : '';
   const stmt = db.prepare(`
     SELECT id, title, narrative, lesson_learned, project, type, created_at_epoch
@@ -757,7 +758,7 @@ ${obsDescriptions}
 
 JSON: {"title":"descriptive summary ≤120 chars","narrative":"comprehensive summary ≤800 chars preserving key decisions and lessons","concepts":["kw1","kw2"],"facts":["all specific facts preserved"],"lesson_learned":"most important synthesized lesson or 'none'","search_aliases":["alt search 1","alt search 2"]}`;
 
-    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: 20000, maxTokens: 1000 });
+    const parsed = await callModelJSON(prompt, 'sonnet', { timeout: BG_LLM_TIMEOUT_MS, maxTokens: 1000 });
     if (!parsed || !parsed.title) return { compressed: false };
 
     // Scrub BEFORE truncate (see re-enrich note): boundary cut on scrubbed text.

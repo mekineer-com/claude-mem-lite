@@ -3,6 +3,7 @@
 
 import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // ─── Why these multipliers exist (read before "simplifying" them) ────────────
 //
 // The recency-decay, type-quality, project-boost, importance, cite, and noise
@@ -33,14 +34,14 @@ import { buildNotLowSignalSql } from './lib/low-signal-patterns.mjs';
 
 /** Recency half-life per observation type (in milliseconds) */
 export const DECAY_HALF_LIFE_BY_TYPE = {
-  decision:  90 * 86400000,  // 90 days — architectural decisions persist
-  discovery: 60 * 86400000,  // 60 days — learned patterns last
-  feature:   30 * 86400000,  // 30 days — feature work is mid-range
-  bugfix:    14 * 86400000,  // 14 days — bugs are usually one-off
-  refactor:  14 * 86400000,  // 14 days — code cleanup
-  change:     7 * 86400000,  //  7 days — routine changes decay fast
+  decision:  90 * DAY_MS,  // 90 days — architectural decisions persist
+  discovery: 60 * DAY_MS,  // 60 days — learned patterns last
+  feature:   30 * DAY_MS,  // 30 days — feature work is mid-range
+  bugfix:    14 * DAY_MS,  // 14 days — bugs are usually one-off
+  refactor:  14 * DAY_MS,  // 14 days — code cleanup
+  change:     7 * DAY_MS,  //  7 days — routine changes decay fast
 };
-export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * 86400000;
+export const DEFAULT_DECAY_HALF_LIFE_MS = 14 * DAY_MS;
 
 // ─── BM25 Weight Constants ──────────────────────────────────────────────────
 // Single source of truth for FTS5 BM25 weight expressions.

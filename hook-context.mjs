@@ -17,6 +17,7 @@ import { extractUnfinishedSummary } from './hook-handoff.mjs';
 import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 /**
  * Infer the project directory from environment variables or cwd.
  * @returns {string} Absolute path to the project directory
@@ -43,7 +44,7 @@ function mdCell(s) {
 }
 
 export function computeAdaptiveWindows(db, project) {
-  const sevenDaysAgo = Date.now() - 7 * 86400000;
+  const sevenDaysAgo = Date.now() - 7 * DAY_MS;
   const row = db.prepare(`
     SELECT COUNT(*) as c FROM observations
     WHERE project = ? AND created_at_epoch > ? AND COALESCE(compressed_into, 0) = 0
@@ -52,13 +53,13 @@ export function computeAdaptiveWindows(db, project) {
 
   if (velocity > 10) {
     // High velocity: tighter windows, focus on very recent
-    return { tier1: 12 * 3600000, tier2: 3 * 86400000, tier3: 14 * 86400000, sessWindow: 3 * 86400000 };
+    return { tier1: 12 * 3600000, tier2: 3 * DAY_MS, tier3: 14 * DAY_MS, sessWindow: 3 * DAY_MS };
   } else if (velocity >= 3) {
     // Medium velocity: default windows
-    return { tier1: 24 * 3600000, tier2: 7 * 86400000, tier3: 30 * 86400000, sessWindow: 7 * 86400000 };
+    return { tier1: 24 * 3600000, tier2: 7 * DAY_MS, tier3: 30 * DAY_MS, sessWindow: 7 * DAY_MS };
   } else {
     // Low velocity: wider windows, older data still relevant
-    return { tier1: 48 * 3600000, tier2: 14 * 86400000, tier3: 60 * 86400000, sessWindow: 14 * 86400000 };
+    return { tier1: 48 * 3600000, tier2: 14 * DAY_MS, tier3: 60 * DAY_MS, sessWindow: 14 * DAY_MS };
   }
 }
 

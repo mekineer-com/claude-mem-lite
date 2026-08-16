@@ -42,7 +42,7 @@ import {
   SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS,
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT,
   sessionFile, getSessionId, createSessionId, openDb,
-  spawnBackground, sweepOrphanEpisodeFiles,
+  spawnBackground, sweepOrphanEpisodeFiles, sweepStaleProjectMarkers,
 } from './hook-shared.mjs';
 import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation, saveEpisodeImmediate } from './hook-llm.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
@@ -69,6 +69,7 @@ import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs
 import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { injectedIdsFileName, keyContextIdsFileName } from './lib/injected-ids.mjs';
+import { recordKeyContextInjection } from './lib/keyctx-marker.mjs';
 import { liveObsFilterSql, recencyDecaySql } from './lib/inject-search-core.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -90,6 +91,7 @@ async function loadCacheGuard() {
 import { SKIP_TOOLS, SKIP_PREFIXES } from './skip-tools.mjs';
 import { getVocabulary } from './tfidf.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 // Prevent recursive hooks from background claude -p calls
 // Background workers (llm-episode, llm-summary) are exempt — they're ours
 const event = process.argv[2];
@@ -738,7 +740,12 @@ async function handleStop() {
             // filter as citedMain (the numerator, below) — an obs injected only
             // inside a subagent (sidechain) would otherwise enter the denominator
             // but never the numerator and streak-demote despite being used there.
-            const injected = extractAllInjected(transcriptPath, { mainOnly: true });
+            // runtimeDir + project enable the 5th (Key Context) face — see
+            // extractInjectedFromKeyContext: it is marker-derived, because the
+            // SessionStart block leaves no hook attachment to parse.
+            const injected = extractAllInjected(transcriptPath, {
+              mainOnly: true, runtimeDir: RUNTIME_DIR, project, sessionId: ccSessionId,
+            });
             // P5 ①: cite-back signals — observations whose warned file the agent
             // edited this session. Union into injected so they're resolved (they
             // were injected via pre-tool-recall) and, below, into cited so the
@@ -890,7 +897,7 @@ function gcStalePreRecallCooldowns() {
 function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now }) {
   // ── DB mutations in a transaction (crash-safe consistency) ──
   const staleSessionCutoff = Date.now() - STALE_SESSION_MS;
-  const autoCompressAge = Date.now() - 30 * 86400000; // 30 days (accelerated from 90)
+  const autoCompressAge = Date.now() - 30 * DAY_MS; // 30 days (accelerated from 90)
 
   db.transaction(() => {
     // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
@@ -945,7 +952,7 @@ function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now
     // imp=1 on these already; this just shrinks the GC latency so the
     // projected 32.5% corpus reduction materializes within a week on live
     // DBs instead of bleeding into the 30-day tier.
-    const noiseCompressAge = Date.now() - 7 * 86400000;
+    const noiseCompressAge = Date.now() - 7 * DAY_MS;
     const noiseCompressed = db.prepare(`
       UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
       WHERE COALESCE(compressed_into, 0) = 0
@@ -975,7 +982,7 @@ function runSessionStartAutoMaintain(db) {
   } catch {}
   if (shouldMaintain) {
     try {
-      const STALE_AGE = Date.now() - 30 * 86400000;
+      const STALE_AGE = Date.now() - 30 * DAY_MS;
       const OP_CAP = 500;
       // Shared maintenance context (whole-DB, cap 500) — used by every maintain-core
       // op below AND the MED-2 snapshot guard. injection_count>0 protection lives in
@@ -995,7 +1002,7 @@ function runSessionStartAutoMaintain(db) {
       // children (compressed_into dangling at a deleted id). purgeStale recovers them
       // first and caps at opCap. Schema has no marked_at_epoch, so retention anchors on
       // created_at_epoch: 30d marking gate + 7d grace = 37d.
-      const purged = purgeStale(db, mctx, Date.now() - 37 * 86400000);
+      const purged = purgeStale(db, mctx, Date.now() - 37 * DAY_MS);
       if (purged > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged} stale observations`);
 
       const cleaned = cleanupBroken(db, mctx);
@@ -1109,7 +1116,7 @@ function runSessionStartAutoMaintain(db) {
           DELETE FROM session_handoffs
           WHERE (type = 'clear' AND created_at_epoch < ?)
              OR (type != 'clear' AND created_at_epoch < ?)
-        `).run(Date.now() - HANDOFF_EXPIRY_CLEAR - 86400000, Date.now() - HANDOFF_EXPIRY_EXIT - 86400000);
+        `).run(Date.now() - HANDOFF_EXPIRY_CLEAR - DAY_MS, Date.now() - HANDOFF_EXPIRY_EXIT - DAY_MS);
         if (gc.changes > 0) debugLog('DEBUG', 'auto-maintain', `gc'd ${gc.changes} expired session_handoffs`);
       } catch (e) { debugCatch(e, 'auto-maintain-handoff-gc'); }
 
@@ -1349,6 +1356,10 @@ async function handleSessionStart() {
   // GC stale per-session cooldown files. Cheap (<5ms typical) and idempotent;
   // moved here from pre-tool-recall.js's hot path.
   gcStalePreRecallCooldowns();
+  // P2-15: the per-PROJECT half of the same problem — markers written once per
+  // project and never revisited (session-/cite-recall-/skill cooldowns). Same
+  // SessionStart cadence, 30d gate, named family list (hook-shared.mjs).
+  try { sweepStaleProjectMarkers(RUNTIME_DIR); } catch { /* best-effort */ }
   // Bound the shadow-recommendation log (daily JSONL shards, no GC at write time).
   try { gcOldShadowShards(); } catch { /* best-effort, never blocks SessionStart */ }
   // Same for the opt-in metrics sink (RUNTIME_DIR's parent is DB_DIR). Runs even when
@@ -1487,12 +1498,15 @@ async function handleSessionStart() {
     // exclude-set blanked the same-project leg on adopted projects). Written
     // unconditionally (even when empty) so a resumed session can't act on a
     // previous session's stale marker semantics; 24h GC below.
-    try {
-      writeFileSync(
-        join(RUNTIME_DIR, keyContextIdsFileName(project, ccSessionId)),
-        JSON.stringify({ ids: contextCollector.keyContextIds || [], ts: Date.now(), session: ccSessionId || null }),
-      );
-    } catch (e) { debugCatch(e, 'session-start-keyctx-marker'); }
+    // D#124: the same call also bumps injection_count on the rendered rows —
+    // Key Context was a shown-but-uncounted surface, so its rows could never
+    // reach applyCitationDecay's denominator. One recorder, both writers.
+    recordKeyContextInjection(db, {
+      runtimeDir: RUNTIME_DIR,
+      project,
+      sessionId: ccSessionId,
+      ids: contextCollector.keyContextIds || [],
+    });
 
     // One-time migration: remove any stale <claude-mem-context> block left in
     // CLAUDE.md by pre-v2.30 installs. Idempotent no-op afterwards.
@@ -1797,7 +1811,7 @@ function handleAutoCompress() {
   if (!db) return;
 
   try {
-    const compressCutoff = Date.now() - 60 * 86400000; // 60 days
+    const compressCutoff = Date.now() - 60 * DAY_MS; // 60 days
     const compressCandidates = selectCompressionCandidates(db, { cutoff: compressCutoff, includeAutoMarked: true });
     if (compressCandidates.length < 3) return;
 

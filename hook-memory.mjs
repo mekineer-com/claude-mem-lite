@@ -9,8 +9,9 @@ import { DB_DIR } from './schema.mjs';
 import { extractIdents } from './lib/lesson-idents.mjs';
 import { formatSubagentContext } from './lib/task-imperative.mjs';
 
+import { DAY_MS } from './lib/time-constants.mjs';
 const MAX_MEMORY_INJECTIONS = 3;
-const MEMORY_LOOKBACK_MS = 60 * 86400000; // 60 days
+const MEMORY_LOOKBACK_MS = 60 * DAY_MS; // 60 days
 // Aligned with TYPE_QUALITY_CASE in scoring-sql.mjs (R2 rebalance).
 // Weights calibrated to empirical avg access_count:
 //   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
@@ -98,7 +99,7 @@ function candidateCoverage(row, queryTerms) {
   return hits / queryTerms.length;
 }
 
-const FILE_RECALL_LOOKBACK_MS = 60 * 86400000; // 60 days
+const FILE_RECALL_LOOKBACK_MS = 60 * DAY_MS; // 60 days
 const MAX_FILE_RECALL = 2;
 
 // P1: stale-obs verify-before-use threshold. An injected obs older than this
@@ -107,7 +108,7 @@ const MAX_FILE_RECALL = 2;
 // renamed since capture. Pure-decision/architecture obs (no file_paths)
 // don't get the hint: their drift is text-only and Claude already verifies
 // at consumption time per the project mem-usage contract.
-const STALE_OBS_THRESHOLD_MS = 30 * 86400000;
+const STALE_OBS_THRESHOLD_MS = 30 * DAY_MS;
 
 /**
  * Format a single line for the <memory-context> block emitted by
