@@ -2,6 +2,28 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.64.0 — the drift class gets a home: one shared SQL core for the injection surfaces, five CLI/MCP twins consolidated, and the two-window dedup bug
+
+**Upgrading from 3.63.0 — what changes for you.** Five behaviors you may notice. Each has an escape hatch; none requires action.
+
+| Change | If it bothers you |
+|---|---|
+| Two Claude Code windows on the same project no longer clobber each other's injection-dedup state: the marker file is now **per session** (`.claude-mem-injected-<project>-<session>`), so each window keeps its own dedup window and its own `MAX_SESSION_INJECTIONS` cap. Before, alternating windows reset each other's count (the cap was unreachable) and re-injected the same rows. Stale markers are swept at session start (24h). | Nothing to do — single-window behavior is unchanged. |
+| Session-summary detail (`get S#N`, both CLI and MCP) now renders the **full** field set — `remaining_items`, `notes`, `files_read/edited` were searchable via FTS but never shown (a retrieval dead end); the CLI also gains the `Memory session id` / `Prompt number` lines the MCP face already had, and field order follows the shared list (`Completed` renders fifth, was second on the CLI). | Pin the prior version (rollback recipe in README → *Trust model per install path*). |
+| `registry list` is aligned across faces: the CLI gains the NULL-safe adoption ordering the MCP face had (`adopt:0` instead of `adopt:null`, no NULL rows sorting apart) and the 80-char summary cap (was 50); both faces keep newline-flattened, surrogate-safe truncation. | Same rollback recipe. |
+| `restore` no longer drops purge-**queued** rows (`compressed_into = -2`): they have no summary keeper, so rejecting them silently lost their only copy — they now restore live and re-enter normal decay. Keeper-absorbed and auto-retired tombstones stay rejected, and the rejection message now says which kind it meant. | Nothing to do — previously-rejected backups can simply be restored again. |
+| Concept/PRF **expansion** results now respect the noise penalty (an entrenched-noise row demoted 0.2× on every direct surface could re-enter through expansion at full magnitude). The cite factor deliberately stays out of expansion scoring — it can amplify 3×, exactly what the expansion path must not do to loose matches. Denoise A/B: NEUTRAL, Δ=0.000 bit-identical. | `CLAUDE_MEM_UPS_TOP_MIN=0`-style per-surface knobs are unchanged; pin the prior version if ordering matters to you. |
+
+Structural (the audit's P2-11/P2-12 — turning three audits' worth of "the fix reached surface A but not its twin" from memory into code):
+
+- **refactor(core):** `lib/inject-search-core.mjs` — single shared home for the live-row filter pair (the superseded invariant's 7-time reopening vector), the `MAX(0,…)`-clamped recency decay (M-1's missing clamp), and the injection relevance chain incl. cite/noise (M-3's missing factors). Five consumers compose it (UPS, pre-tool-recall, hook-memory, error-recall, search-engine); a source-scan ledger test fails the suite if any of them hand-rolls the pair again — any alias, either order.
+- **refactor(twins):** get/update/delete/browse/registry consolidated into lib/ cores (`get-core`, `browse-core`, `previewDeleteRows`, `applyObsUpdate`, `collectRegistryStats`/`listResourcesRanked`/`formatRegistryListLine`) per the fts-check thin-adapter template — the hand-copied blocks behind the audited 16-vs-24-column incident shape. Faces keep their validation front-ends and rendering conventions.
+- **fix(banding):** the cross-source lone-hit `-1.05` invariant vs cite-widened scores is adjudicated and pinned by three real-SQL probes (cite widening is exactly 3.0×-capped, a decisively strongest lone event survives max cite state, noise shrink can only improve the lone hit's band); benchmark `--matrix`/ablation now model the full FULL_SCORE chain incl. `no_noise`/`no_cite` arms.
+- **fix(bridge):** `pre-skill-bridge` defangs the `Read()` path outside the wrapper; PRF's row gate reads the pre-expansion primary count.
+- **docs(security):** `SECURITY.md` — private vulnerability reporting channel + scope notes (release signing, defang surfaces, secret scrubbing, data-dir confinement).
+
+Review: three fresh-context passes (adversarial / testing / maintainability) attacked the behavior-preservation claim before tagging — SQL parameter order, twin data parity, and every D#120 marker face verified clean; the one caught regression (a hand-rolled slice replacing `truncate()` dropped newline flattening and surrogate safety on the registry list) and three mutation-verified test holes were fixed pre-tag. 4330/4330 tests, eslint/shellcheck clean, knip at the 32-export baseline, denoise A/B bit-identical.
+
 ## v3.63.0 — the 2026-08-14 audit's P0+P1 batch: a write-side tombstone bug, two unclamped clocks, and the guards that never reached the explicit surfaces
 
 **Upgrading from 3.62.0 — what changes for you.** Four behaviors you may notice. Each has an escape hatch; none requires action.
