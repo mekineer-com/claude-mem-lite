@@ -62,15 +62,57 @@ describe('corpusFloorScale', () => {
     // Independent of the closed form — re-derive the 15.5 (ramp table in
     // tests/ups-cold-start-injection.test.mjs) if the tokenizer or scoring changes.
     expect(30 * s10).toBeLessThan(15.5);
+    // …and the same property at the small-N end, which is where the ramp SHAPE differs.
+    // Measured on the production write path (ramp table in
+    // tests/ups-cold-start-injection.test.mjs): a topical hit on a 3-row corpus reaches
+    // |bm25| ≈ 5.1. The superseded ln(N+1)/ln(N_REF+1) ramp put the floor at 6.53 there
+    // and silenced it; without this line the end-to-end suite is the only thing that
+    // notices, and only at n=3 and n=4.
+    const s3 = corpusFloorScale(open(3));
+    expect(30 * s3).toBeLessThan(5.1);
   });
 
   it('returns 0 on an empty corpus — no floor, and nothing for it to gate', () => {
-    // ln(1)=0, so both floors collapse to 0. Unreachable in effect: the two gates in
-    // main() are guarded by `ftsRows.length > 0`, and an empty observations table
-    // produces no FTS rows. Asserted so a future change to that guard is caught here.
+    // FTS5's max attainable IDF is 0 below two rows, so both floors collapse to 0.
+    // Unreachable in effect: the two gates in main() are guarded by `ftsRows.length > 0`,
+    // and an empty observations table produces no FTS rows. Asserted so a future change to
+    // that guard is caught here. (This comment used to cite `ln(1)=0`, from the ramp that
+    // v3.69.0 replaced.)
     const s = corpusFloorScale(open(0));
     expect(s).toBe(0);
     expect(Number.isFinite(s)).toBe(true);
+  });
+
+  it('treats a degenerate reference corpus as fully calibrated', async () => {
+    // CLAUDE_MEM_UPS_FLOOR_REF_CORPUS=2 or 3 makes the REFERENCE's own max IDF 0 or near
+    // it, so the ratio would divide by zero (or explode). The `!(refIdf > 0)` guard returns
+    // 1 instead — same posture as the `FLOOR_REF_CORPUS <= 1` short-circuit. Deleting that
+    // guard left the whole file green before this case existed. Re-imports with a
+    // cache-busting query string because the reference is read once at module load.
+    const saved = process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS;
+    try {
+      // Literal specifiers: Vite cannot analyse a template-literal dynamic import.
+      //
+      // The corpus size matters, twice over. The bounded `atRef` probe returns 1 as soon
+      // as the corpus REACHES the reference, so the guard is only reachable BELOW it —
+      // hence a 1-row corpus against REF=2. And the failure mode needs 0/0: with a large
+      // corpus the ratio would be `maxIdf(c) / 0` = Infinity, and `Math.min(1, Infinity)`
+      // is still 1, so the bug hides. At 0/0 it is NaN, which flows into
+      // `TOP_REL_FLOOR * NaN` and makes every floor comparison false — both floors
+      // silently off. That is the case worth pinning.
+      process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS = '2';
+      const refTwo = await import('../scripts/user-prompt-search.js?ref=2');
+      const degenerate = refTwo.corpusFloorScale(open(1));
+      expect(Number.isNaN(degenerate), 'scale went NaN — floors silently disabled').toBe(false);
+      expect(degenerate, 'ref=2 with a 1-row corpus (0/0)').toBe(1);
+
+      process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS = '3';
+      const refThree = await import('../scripts/user-prompt-search.js?ref=3');
+      expect(refThree.corpusFloorScale(open(10)), 'ref=3 (maxIdf near 0)').toBe(1);
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS;
+      else process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS = saved;
+    }
   });
 
   it('fails safe to 1.0 (today\'s behavior) when the corpus probe throws', () => {

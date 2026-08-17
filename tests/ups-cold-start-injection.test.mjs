@@ -137,10 +137,18 @@ describe('cold-start UPS injection — the floors must not silence a first-week 
   });
 
   it('keeps an established-size corpus on its calibrated floors', async () => {
-    // At/above the calibration corpus the scale is exactly 1.0 — the safety cap.
-    // A weak single-stem OR hit stays suppressed there.
+    // At/above the calibration corpus the scale is exactly 1.0 — the safety cap. A weak
+    // OR hit must stay suppressed there.
+    //
+    // The query matters more than it looks. An earlier version used a phrase whose top row
+    // scored composite relevance EXACTLY 0; the per-row BM25_MIN_SCORE (1e-5) guard then
+    // dropped it before the set-level floors were consulted, so the case was silent for a
+    // reason that had nothing to do with the floors and stayed green even when the safety
+    // cap was destroyed (`if (atRef) return 1` → `return 0`). This phrase produces a top
+    // row at |rel| ≈ 3.1 — past the per-row guard, far below the calibrated floor of 50 —
+    // so suppression here is attributable to the cap and nothing else.
     const { dir } = seedCorpus(600);
-    const out = await runHook(dir, '顺带调整了一些配置这件事当时是怎么决定的', 'warm-1');
+    const out = await runHook(dir, '配置默认值这块当时怎么处理的', 'warm-1');
     expect(out).toBe('');
   });
 });

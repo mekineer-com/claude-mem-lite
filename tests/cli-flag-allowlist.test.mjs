@@ -39,15 +39,30 @@ describe('KNOWN_CLI_FLAGS', () => {
       .join('\n')
       .split(listLiteral[0]).join('');
 
+    // Flag names that reach a reader as STRING LITERALS inside a list, rather than as a
+    // property access: `rejectBareStringFlags(flags, ['name', 'resource-type', …])` and
+    // `for (const f of ['repo-url', …]) { … flags[f] … }`. Parsed from those two shapes
+    // specifically, NOT accepted as a bare literal anywhere in the sources — an earlier
+    // version did the latter, so any string that happened to match a flag name vouched for
+    // it. Probed: bogus entries `observations`, `error` and `count` all slipped through,
+    // because those words occur in ordinary code. Only names declared at a real flag-list
+    // call site count now.
+    const declaredInLists = new Set();
+    for (const re of [/rejectBareStringFlags\([^,]+,\s*\[([^\]]*)\]/g, /for \(const \w+ of \[([^\]]*)\]\)/g]) {
+      for (const m of haystack.matchAll(re)) {
+        for (const lit of m[1].matchAll(/['"]([^'"]+)['"]/g)) declaredInLists.add(lit[1]);
+      }
+    }
+
     const unread = [];
     for (const flag of KNOWN_CLI_FLAGS) {
       const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
       const forms = [
         `flags['${flag}']`, `flags["${flag}"]`, `flags.${flag}`,
         `flags['${camel}']`, `flags["${camel}"]`, `flags.${camel}`,
-        `'${flag}'`, `"${flag}"`,   // string arrays: rejectBareStringFlags([...]) / field loops
         `--${flag}`,               // raw-argv readers (doctor --prompts-limit) + help text
       ];
+      if (declaredInLists.has(flag)) continue;
       if (!forms.some((f) => haystack.includes(f))) unread.push(flag);
     }
 
@@ -65,5 +80,30 @@ describe('KNOWN_CLI_FLAGS', () => {
   it('still stays quiet on flags that ARE read', async () => {
     const { suggestUnknownFlags } = await import('../cli/common.mjs');
     expect(suggestUnknownFlags({ project: 'p', limit: 5, json: true, type: 'bugfix' })).toEqual([]);
+  });
+
+  it('the derived guard rejects ordinary-vocabulary names, not just odd ones', () => {
+    // The false-negative class the bare-literal form used to allow. These three words all
+    // occur in the CLI sources as ordinary strings; none is a flag. Re-runs the same
+    // derivation the first case uses, against a synthetic allowlist.
+    const common = readFileSync(join(ROOT, 'cli', 'common.mjs'), 'utf8');
+    const listLiteral = common.match(/KNOWN_CLI_FLAGS = new Set\(\[[\s\S]*?\]\);/);
+    const haystack = cliSources().map((f) => readFileSync(f, 'utf8')).join('\n')
+      .split(listLiteral[0]).join('');
+    const declaredInLists = new Set();
+    for (const re of [/rejectBareStringFlags\([^,]+,\s*\[([^\]]*)\]/g, /for \(const \w+ of \[([^\]]*)\]\)/g]) {
+      for (const m of haystack.matchAll(re)) {
+        for (const lit of m[1].matchAll(/['"]([^'"]+)['"]/g)) declaredInLists.add(lit[1]);
+      }
+    }
+    const isVouchedFor = (flag) => declaredInLists.has(flag)
+      || [`flags['${flag}']`, `flags["${flag}"]`, `flags.${flag}`, `--${flag}`].some((f) => haystack.includes(f));
+    for (const bogus of ['observations', 'error', 'count', 'message', 'level']) {
+      expect(isVouchedFor(bogus), `bogus flag "${bogus}" vouched for itself`).toBe(false);
+    }
+    // …while the real string-list flags still pass.
+    for (const real of ['domain-tags', 'tech-stack', 'keywords']) {
+      expect(isVouchedFor(real), `real flag "${real}" no longer recognised`).toBe(true);
+    }
   });
 });

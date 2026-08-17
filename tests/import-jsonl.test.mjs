@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { join, dirname } from 'path';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'child_process';
+import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { writeFileSync, truncateSync, rmSync, mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
@@ -189,5 +190,68 @@ describe('importJsonl — oversized-file guard', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ─── CLI-level summary ───────────────────────────────────────────────────────
+// The lib-level counters are asserted above, but the SUMMARY LINE the user reads is
+// assembled in mem-cli.mjs and had no test at any level: its wording change and the
+// dropped `|| totalOrphans > 0` hint gate rode on the lib-level `observations` now
+// including orphans. That coupling is exactly what should be pinned rather than assumed.
+
+describe('import-jsonl — the CLI summary reports what was written', () => {
+  const CLI = resolve(__dirname, '../cli.mjs');
+  let dir, env;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'import-cli-'));
+    env = {
+      ...process.env, CLAUDE_MEM_DIR: dir, CLAUDE_MEM_SKIP_UPDATE: '1',
+      MEM_QUIET_HOOKS: '1', MEM_NO_AUTO_ADOPT: '1',
+      CLAUDE_PROJECT_DIR: '/x/importcli', PWD: '/x/importcli',
+    };
+  });
+  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* gone */ } });
+
+  it('counts an unpaired tool_use as an observation and labels it as a subset', () => {
+    // A truncated transcript is the COMMON shape for a cold-start backfill: the newest
+    // session is usually still open. Before this release the summary said
+    // "+0 observations, 1 orphan tool_use" while writing a row, which reads as a no-op.
+    const file = join(dir, 'truncated.jsonl');
+    writeFileSync(file, [
+      '{"type":"user","sessionId":"cli-trunc","cwd":"/p","message":{"role":"user","content":"read the cart service"},"timestamp":"2026-04-01T11:00:00Z"}',
+      '{"type":"assistant","sessionId":"cli-trunc","message":{"role":"assistant","content":[{"type":"tool_use","id":"orphan","name":"Read","input":{"file_path":"/p/cart.mjs"}}]},"timestamp":"2026-04-01T11:00:01Z"}',
+    ].join('\n') + '\n');
+
+    const out = execFileSync(process.execPath, [CLI, 'import-jsonl', file], { env, encoding: 'utf8' });
+    expect(out).toMatch(/\+1 observations \(1 from unpaired tool_use\)/);
+    expect(out).not.toMatch(/\+0 observations/);
+    // The "something landed, go look" hint must fire — an orphan-only import is not a no-op.
+    expect(out).toMatch(/Try: claude-mem-lite recent/);
+    expect(out).not.toMatch(/Nothing new/);
+  });
+
+  it('an orphan-only transcript (no prompts) still counts as something imported', () => {
+    // Pins the hint gate itself. The case above carries a user prompt, so `totalPrompts > 0`
+    // alone would keep the hint firing and the gate's dependence on `totalObs` would be
+    // invisible. Here the only thing written is the orphan observation: if the gate stops
+    // counting it, an import that DID write a row reports "Nothing new" and the user never
+    // looks.
+    const file = join(dir, 'orphan-only.jsonl');
+    writeFileSync(file,
+      '{"type":"assistant","sessionId":"cli-orphan","message":{"role":"assistant","content":[{"type":"tool_use","id":"o1","name":"Read","input":{"file_path":"/p/only.mjs"}}]},"timestamp":"2026-04-01T14:00:01Z"}\n');
+    const out = execFileSync(process.execPath, [CLI, 'import-jsonl', file], { env, encoding: 'utf8' });
+    expect(out).toMatch(/0 prompts, 1 observations \(1 from unpaired tool_use\)/);
+    expect(out).toMatch(/Try: claude-mem-lite recent/);
+    expect(out).not.toMatch(/Nothing new/);
+  });
+
+  it('says nothing landed when the file is a valid transcript already imported', () => {
+    const file = join(dir, 'twice.jsonl');
+    writeFileSync(file, '{"type":"user","sessionId":"cli-dup","cwd":"/p","message":{"role":"user","content":"a prompt worth importing once"},"timestamp":"2026-04-01T12:00:00Z"}\n');
+    execFileSync(process.execPath, [CLI, 'import-jsonl', file], { env, encoding: 'utf8' });
+    const second = execFileSync(process.execPath, [CLI, 'import-jsonl', file], { env, encoding: 'utf8' });
+    expect(second).toMatch(/Nothing new/);
+    expect(second).not.toMatch(/Try: claude-mem-lite recent/);
   });
 });

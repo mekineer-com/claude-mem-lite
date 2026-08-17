@@ -43,7 +43,7 @@ const homes = [];
 const ENTRIES = ['cli.mjs', 'mem-cli.mjs', 'server.mjs', 'hook.mjs', 'install.mjs'];
 
 /** Build a fake INSTALL_DIR under a fake HOME in the given shape, then run `doctor --json`. */
-function doctorOn({ symlinkEntries = false, copyEntries = false, extraSymlinks = [], extraCopies = [] }) {
+function doctorOn({ symlinkEntries = false, copyEntries = false, extraSymlinks = [], extraCopies = [], omitEntries = [] }) {
   // Fresh HOME per call so two shapes can be compared in one test.
   const home = mkdtempSync(join(tmpdir(), 'doctor-shape-'));
   homes.push(home);
@@ -54,6 +54,7 @@ function doctorOn({ symlinkEntries = false, copyEntries = false, extraSymlinks =
   // Entry points present in the shape under test; every lib/* module deliberately absent —
   // that is the fact whose SEVERITY differs between the shapes.
   for (const rel of ENTRIES) {
+    if (omitEntries.includes(rel)) continue;
     if (symlinkEntries) symlinkSync(REPO_FILE, join(installDir, rel));
     else if (copyEntries) writeFileSync(join(installDir, rel), '// copy\n');
   }
@@ -122,6 +123,22 @@ describe('doctor — missing-file severity by install shape', () => {
     // …and it must SAY why it is benign, so the reader does not run the remedy anyway.
     expect(driftLines(withMissing).map((c) => c.message).join(' '))
       .toMatch(/realpath|resolve|repo|harmless|benign/i);
+  });
+
+  it('a MISSING entry point is an issue even in a pure-symlink install', () => {
+    // Makes the entry-point classification observable in the DEMOTE direction. The other
+    // cases create every entry point, so removing one from lib/doctor-drift.mjs's
+    // ENTRY_POINTS set changed nothing they assert — only additions were caught. Here
+    // hook.mjs is absent: an entry point is fatal in every install shape (the hook command
+    // names that path directly), so the benign "reachable via realpath" branch must not
+    // claim it.
+    const withAll = doctorOn({ symlinkEntries: true });
+    const missingEntry = doctorOn({ symlinkEntries: true, omitEntries: ['hook.mjs'] });
+    expect(driftLines(missingEntry).length, 'no managed-files line at all').toBeGreaterThan(0);
+    expect(missingEntry.issues,
+      `an absent entry point added no issue (${missingEntry.issues} vs ${withAll.issues})`)
+      .toBeGreaterThan(withAll.issues);
+    expect(driftLines(missingEntry).map((c) => c.message).join(' ')).toMatch(/ENTRY POINT/);
   });
 
   it('a HYBRID install (a copied managed file among symlinks) still counts as an issue', () => {
