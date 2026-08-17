@@ -12,6 +12,20 @@ const _cache = new Map();
 /**
  * Infer a sanitized project name from CLAUDE_PROJECT_DIR, PWD, or cwd.
  * Format: "parent--basename" with non-alphanumeric chars replaced by hyphens.
+ *
+ * Deliberately does NOT anchor on the git work-tree root. That was tried and reverted
+ * before it shipped: it fixes `cd src/auth && claude-mem-lite recent` (session rooted at
+ * the repo root, CLI run deeper) but BREAKS the mirror case, which is more common —
+ * CLAUDE_PROJECT_DIR is the directory Claude Code was started in, not the repo root, so
+ * `cd packages/api && claude` makes hooks write `packages--api` while a plain terminal in
+ * the same directory would walk to the work-tree root and read `mono--monorepo`.
+ * Reproduced pre-tag: hooks saved to `packages--api`, `recent` answered
+ * `No recent observations (h1--mono)`. Splitting a monorepo user's namespace silently is
+ * worse than the subdirectory case, and unlike it, cwd-derivation at least keeps the hook
+ * and CLI faces agreeing whenever the session root and cwd match. A correct fix has to
+ * consult the DB for which candidate actually holds rows; this module is DB-free and on
+ * the hook hot path, so it is not the place. Tracked as deferred work.
+ *
  * @returns {string} Sanitized project identifier safe for use in filenames
  */
 export function inferProject() {

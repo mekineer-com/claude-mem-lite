@@ -7,8 +7,18 @@
 // 30.7 @ 300. The floors were calibrated at 584 obs, so on a new install they
 // reject every hit — a realistic first-day corpus scored 0/8 injections.
 //
-// corpusFloorScale() restores scale-invariance: ln(N+1)/ln(N_REF+1), capped at 1.
-// The cap is the safety property — established installs must be untouched.
+// corpusFloorScale() restores scale-invariance by dividing the corpus's max
+// attainable IDF — FTS5's `log((N - df + 0.5) / (df + 0.5))` at df=1 — by the
+// reference corpus's, capped at 1. The cap is the safety property: established
+// installs must be untouched.
+//
+// The 2026-08-17 e2e round replaced the first cut's ln(N+1)/ln(N_REF+1) ramp, which decayed far too
+// slowly at small N and left a first-week corpus silent below ~5 rows. The
+// end-to-end consequence is pinned in tests/ups-cold-start-injection.test.mjs;
+// this suite covers the scale's structural properties only. Deliberately NOT
+// asserted here: the closed form at any single N. Mirroring the formula in the test
+// makes the test agree with whatever the code says, which is how the wrong ramp
+// stayed green.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import Database from 'better-sqlite3';
@@ -44,11 +54,14 @@ describe('corpusFloorScale', () => {
     expect(s10).toBeLessThan(s100);
     expect(s100).toBeLessThan(s500);
     expect(s500).toBeLessThan(1);
-    // ln(11)/ln(585) ≈ 0.376 — the scaled OR floor lands ~11, inside the
-    // proportionally-scaled signal/noise gap rather than above all of it.
-    expect(s10).toBeCloseTo(Math.log(11) / Math.log(585), 5);
+    // The scaled OR floor must land strictly inside (0, 30) — relaxed, not removed.
     expect(30 * s10).toBeGreaterThan(0);
     expect(30 * s10).toBeLessThan(30);
+    // Measured on the production write path: a topical hit on a 10-row corpus reaches
+    // |bm25| ≈ 15.5. The scaled floor has to sit below that or the corpus is silent.
+    // Independent of the closed form — re-derive the 15.5 (ramp table in
+    // tests/ups-cold-start-injection.test.mjs) if the tokenizer or scoring changes.
+    expect(30 * s10).toBeLessThan(15.5);
   });
 
   it('returns 0 on an empty corpus — no floor, and nothing for it to gate', () => {

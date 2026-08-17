@@ -9,7 +9,7 @@ import { resolveProject } from './project-utils.mjs';
 import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
 import { reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
-import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS } from './lib/get-core.mjs';
+import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
 import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, upsertResource, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
@@ -532,6 +532,9 @@ function renderObsRows(db, ids, requestedFields) {
   const parts = [];
   for (const r of rows) {
     const lines = [`#${r.id} [${r.type}] ${fmtDateShort(r.created_at)}`];
+    // Retraction first (shared with mem_get via get-core) — see supersededNotice.
+    const retracted = supersededNotice(r);
+    if (retracted) lines.push(retracted);
     for (const f of fields) {
       if (f === 'id' || f === 'type' || f === 'created_at') continue;
       const val = r[f];
@@ -1853,7 +1856,21 @@ function cmdRestore(db, argv) {
   const totalMalformed = malformed + parseFailures;
   const totalLines = rows.length + parseFailures;
   const tombstoneNote = tombstoned > 0 ? `, ${tombstoned} compressed member(s) rejected (keeper-absorbed or auto-retired tombstones)` : '';
-  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} restored, ${skipped} duplicate(s) skipped${tombstoneNote}, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
+  // Past tense only when rows were actually written. `Restore (dry-run): 6 restored` reads
+  // as done to anyone skimming past the parenthetical, and this command's whole job is to
+  // let a user check a backup BEFORE trusting it.
+  out(`[mem] Restore${dryRun ? ' (dry-run)' : ''}: ${restored} ${dryRun ? 'would be restored (at most)' : 'restored'}`
+    + `, ${skipped} duplicate(s) ${dryRun ? 'would be skipped' : 'skipped'}${tombstoneNote}`
+    + `, ${totalMalformed} malformed/failed from ${totalLines} row(s).`);
+  if (dryRun) {
+    // The preview applies the durable exact-dup guard (project+title+created_at) but NOT
+    // saveObservation's Jaccard near-duplicate collapse, which only exists once rows are
+    // being written. Measured: a backup holding two same-titled weekly summaries previewed
+    // 10 and restored 9. Simulating Jaccard here would mean a second copy of the dedup rule
+    // — the drift class this codebase keeps paying for — so the number is labelled an upper
+    // bound instead. Run without --dry-run for the exact count.
+    out('[mem] Note: the preview does not simulate near-duplicate collapse, so the real run may restore fewer.');
+  }
   // Name the lossiness where the user meets it. Export omits related_ids and drops
   // superseded rows, and restore re-inserts under fresh AUTOINCREMENT ids — so no
   // cross-link can survive the round-trip. That is a deliberate format tradeoff (stored
@@ -2823,6 +2840,8 @@ Commands:
     recent [N]          Most recent events [--type T] [--project P]
     show <id>           Show full event row by id
     delete <id1,id2,…>  Delete events by ID (preview by default; use --confirm to execute)
+    promote             Promote insight-bearing events (body + importance>=2) to searchable
+                        observations (preview by default; use --execute to apply)
 
     Valid types: bugfix, lesson, bug, discovery, refactor, feature, observation, decision
     --files (plural, comma-split) preferred; --file (singular) kept for back-compat.
@@ -2964,14 +2983,18 @@ async function cmdImportJsonl(db, argv) {
     totalSkip += r.skipped;
     totalOrphans += r.orphans || 0;
     totalRecognized += r.recognized || 0;
-    out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations, ${r.orphans || 0} orphan tool_use, ${r.skipped} skipped`);
+    out(`[mem] ${f}: +${r.prompts} prompts, +${r.observations} observations`
+      + `${r.orphans ? ` (${r.orphans} from unpaired tool_use)` : ''}, ${r.skipped} skipped`);
   }
   const errorTail = errorCount > 0 ? `, ${errorCount} file(s) errored` : '';
-  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations, ${totalOrphans} orphan tool_use, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
-  if (totalPrompts > 0 || totalObs > 0 || totalOrphans > 0) {
-    // Orphan tool_use events persist as (truncated) observations, so they count as
-    // "something was imported" — otherwise an orphan-only first import would wrongly
-    // fall through to the "already imported" no-op branch below.
+  out(`[mem] Total: ${totalPrompts} prompts, ${totalObs} observations`
+    + `${totalOrphans ? ` (${totalOrphans} from unpaired tool_use)` : ''}`
+    + `, ${totalSkip} skipped from ${files.length} file(s)${errorTail}.`);
+  if (totalPrompts > 0 || totalObs > 0) {
+    // Orphan tool_use events persist as (truncated) observations and are counted INSIDE
+    // totalObs (lib/import-jsonl.mjs), so they already count as "something was imported"
+    // — an orphan-only first import must not fall through to the "already imported"
+    // no-op branch below.
     out(`[mem] Try: claude-mem-lite recent 5 --project ${project}`);
   } else if (totalRecognized > 0) {
     // Lines WERE Claude Code transcript events but produced no new rows — the file

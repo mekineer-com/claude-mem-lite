@@ -204,6 +204,13 @@ export const memSaveSchema = {
   content: z.string().min(1).max(50000).describe('Memory content to save'),
   title: z.string().optional().describe('Short title'),
   type: OBS_TYPE_ENUM.optional().describe('Observation type (default: discovery)'),
+  // Alias, same treatment memRecentSchema gives `type`. mem_search/mem_recall/mem_recent
+  // all name this field `obs_type`, mem_save named it only `type`, and the schema is
+  // non-strict — so `mem_save(obs_type: "bugfix")` (the shape a caller reaches for right
+  // after a search) dropped the unknown key and saved a `discovery` row with no error.
+  // A silently-wrong type changes type_quality ranking AND makes the row invisible to
+  // every `--type bugfix` filter, so it must not be a silent coercion.
+  obs_type: OBS_TYPE_ENUM.optional().describe('Alias for `type` (parity with mem_search/mem_recent)'),
   project: z.string().optional().describe('Project name (default: inferred from CWD)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('Importance level: 1=routine, 2=notable, 3=critical (default: 2 for explicit saves)'),
   files: coerceStringArray.optional().describe('File paths associated with this observation. Stored in the `files_modified` column and rendered as `files` — passing a path here does not assert the file was edited; a file you only read belongs here too'),
@@ -261,6 +268,11 @@ export const memUpdateSchema = {
   // '' would blank narrative/lesson/concepts irrecoverably (mem_update takes no snapshot).
   narrative: z.string().refine(s => s.trim() !== '', 'narrative cannot be empty').optional().describe('New narrative/content'),
   type: OBS_TYPE_ENUM.optional().describe('New observation type'),
+  // Same alias as memSaveSchema, for the same reason and found by the same review: without
+  // it `mem_update({id, importance: 3, obs_type: 'bugfix'})` reported
+  // "Updated observation #N: importance" and dropped the type silently. (obs_type alone
+  // errored loudly with "No fields to update", so only the mixed call was dangerous.)
+  obs_type: OBS_TYPE_ENUM.optional().describe('Alias for `type` (parity with mem_search/mem_recent)'),
   importance: coerceInt.pipe(z.number().int().min(1).max(3)).optional().describe('New importance (1-3)'),
   // 500-char cap mirrors memSaveSchema + cmdUpdate — update was the one path
   // that let overlong lessons leak into the DB via MCP.

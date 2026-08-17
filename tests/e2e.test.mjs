@@ -177,11 +177,14 @@ describe('Suite 1: Full Session Lifecycle', () => {
     expect(sessions.c).toBe(0);
   });
 
-  it('session-start creates session row and outputs context', () => {
+  it('session-start creates session row (and skips the context wrapper when empty)', () => {
     const { stdout, exitCode } = runHook('session-start', { env: { HOME: tmpHome } });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain('<claude-mem-context>');
-    expect(stdout).toContain('</claude-mem-context>');
+    // This fixture's DB holds no observations/summaries, so there is no context body.
+    // The hook now omits the wrapper rather than injecting an empty
+    // `<claude-mem-context></claude-mem-context>` pair — see
+    // tests/session-start-empty-context.test.mjs for the populated counterpart.
+    expect(stdout).not.toContain('<claude-mem-context>');
 
     // Session file created
     const sf = getSessionFile(tmpHome);
@@ -1134,7 +1137,10 @@ describe('Suite 8a: Additional E2E', () => {
       env: { HOME: freshHome, CLAUDE_PROJECT_DIR: freshProjDir },
     });
     expect(exitCode).toBe(0);
-    expect(stdout).toContain('<claude-mem-context>');
+    // A first-run install has nothing to inject, and the hook now writes no
+    // empty `<claude-mem-context>` wrapper. The DB-creation assertion below is what this
+    // case is actually about.
+    expect(stdout).not.toContain('<claude-mem-context>');
 
     // DB should have been created
     const dbPath = join(freshHome, '.claude-mem-lite', 'claude-mem-lite.db');

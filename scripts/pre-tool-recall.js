@@ -19,6 +19,13 @@ import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/rerea
 import { recordMetric } from '../lib/metrics.mjs';
 import { presentIdents } from '../lib/lesson-idents.mjs';
 import { neutralizeContextDelimiters } from '../format-utils.mjs';
+// Recall queries the SAVE-path project, so this MUST produce the same string as the
+// save path. It used to be a hand-kept copy of the same 6 lines; that copy had already
+// drifted once (missing the process.env.PWD fallback, so a symlinked project dir
+// recalled nothing) and would have drifted again when the 2026-08-17 e2e round taught inferProject to
+// anchor on the git work-tree root. project-utils.mjs is a leaf module over path/fs/os
+// only — cheaper than several imports this script already carries.
+import { inferProject } from '../project-utils.mjs';
 
 import { DAY_MS } from '../lib/time-constants.mjs';
 // CLAUDE_MEM_DIR matches schema.mjs / main CLI — one env var sandboxes the
@@ -126,21 +133,6 @@ async function bridgeTopLesson(rows, changeText) {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-// SYNC: must produce the SAME string as utils.mjs::inferProject (the path obs are SAVED
-// under) and the bash post-tool-use.sh fast-path — recall queries the SAVE-path project.
-// This previously used process.cwd() WITHOUT the process.env.PWD fallback the other two
-// have, so under a symlinked project dir (PWD = logical/symlinked path, cwd = resolved)
-// with CLAUDE_PROJECT_DIR unset it computed a DIFFERENT project than the save path and
-// silently recalled nothing. Resolution order + sanitize + 100-char cap now match utils.
-function inferProject() {
-  const dir = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-  const base = basename(dir);
-  const parent = basename(join(dir, '..'));
-  const raw = (parent && parent !== '.' && parent !== '/')
-    ? `${parent}--${base}` : base;
-  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 100);
-}
 
 function readCooldown(cooldownPath) {
   try { return JSON.parse(readFileSync(cooldownPath, 'utf8')); } catch { return {}; }

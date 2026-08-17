@@ -150,6 +150,23 @@ describe('importJsonl — fixture', () => {
       expect(r.orphans).toBe(1);
       const obs = db.prepare("SELECT text FROM observations WHERE memory_session_id = 'import-trunc-1'").get();
       expect(obs.text).toContain('transcript truncated');
+      // The reported observation count must equal the rows actually written. `orphans` is
+      // a SUBSET of `observations`, not a sibling: before this fix the import reported
+      // "+0 observations, 1 orphan tool_use" while writing one observation row, so a user
+      // backfilling a still-open (therefore truncated) transcript read it as a no-op.
+      const written = db.prepare('SELECT count(*) AS c FROM observations').get().c;
+      expect(r.observations).toBe(written);
+      expect(r.observations).toBeGreaterThanOrEqual(r.orphans);
+      // The body belongs in `narrative`, not only in `text`. `text` is a DERIVED search
+      // blob that applyObsUpdate recomputes from narrative — an imported row that leaves
+      // narrative empty loses its payload the first time anything calls `update` on it
+      // (see tests/update-preserves-body.test.mjs). Pre-tag review found that reverting
+      // this to `narrative: ''` left the ENTIRE suite green, so the ingest half of that
+      // fix had no guard at all; the rebuild repair silently masked it.
+      const stored = db.prepare(
+        "SELECT narrative, text FROM observations WHERE memory_session_id = 'import-trunc-1'").get();
+      expect(stored.narrative).toContain('transcript truncated');
+      expect(stored.narrative).toBe(stored.text);
     } finally {
       fs.unlinkSync(tmpPath);
     }

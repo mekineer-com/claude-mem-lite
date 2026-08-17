@@ -1721,24 +1721,63 @@ async function doctor() {
   try {
     const { checkDevDrift } = await import('./lib/doctor-drift.mjs');
     const r = checkDevDrift(INSTALL_DIR, SOURCE_FILES);
-    if (r.drift || (r.devMode && r.missingCount > 0)) {
+    const devRemedy = `re-run: node ${join(PROJECT_DIR, 'install.mjs')} install --dev`;
+    const nameList = (files, count) => {
+      const suffix = count > files.length ? ` +${count - files.length} more` : '';
+      return `${files.join(', ')}${suffix}`;
+    };
+    if (r.devMode) {
       const parts = [];
       if (r.plainCount > 0) {
-        const names = r.plainFiles.slice(0, 5).join(', ');
-        const suffix = r.plainCount > 5 ? ` +${r.plainCount - 5} more` : '';
-        parts.push(`${r.plainCount} non-symlink: ${names}${suffix}`);
+        parts.push(`${r.plainCount} non-symlink: ${nameList(r.plainFiles.slice(0, 5), r.plainCount)}`);
       }
-      if (r.missingCount > 0) {
-        const names = r.missingFiles.join(', ');
-        const suffix = r.missingCount > r.missingFiles.length ? ` +${r.missingCount - r.missingFiles.length} more` : '';
-        parts.push(`${r.missingCount} missing: ${names}${suffix}`);
+      if (r.missingEntryCount > 0) {
+        parts.push(`${r.missingEntryCount} missing ENTRY POINT: ${nameList(r.missingEntryFiles, r.missingEntryCount)}`);
       }
-      warn(`Dev drift: ${parts.join('; ')} (re-run: node ${join(PROJECT_DIR, 'install.mjs')} install --dev)`);
+      if (parts.length > 0) {
+        // Hard: a non-symlink means repo edits stop propagating, and a missing entry point
+        // means the hook/CLI command that names that path cannot start at all. A hybrid
+        // install also loses the realpath argument below — a COPIED entry point resolves
+        // its imports against the install dir, so absent modules can throw there.
+        if (r.missingModuleCount > 0) {
+          parts.push(`${r.missingModuleCount} missing module: ${nameList(r.missingModuleFiles, r.missingModuleCount)}`);
+        }
+        warn(`Dev drift: ${parts.join('; ')} (${devRemedy})`);
+        issues++;
+      } else if (r.missingModuleCount > 0) {
+        // Informational, NOT an issue: in a pure-symlink install every entry point resolves
+        // to the repo, and Node resolves each module's imports against that REALPATH — so an
+        // import-only file absent from the install dir is unreachable, not broken. Reporting
+        // it as drift prescribed `install --dev` for a demonstrably healthy install (the
+        // maintainer's own machine ran every one of those modules fine while doctor called
+        // them missing).
+        dwarn(`Dev drift: ${r.symlinkCount} symlinks, 0 plain, all entry points present — `
+          + `${r.missingModuleCount} import-only file(s) not linked into the install dir `
+          + `(${nameList(r.missingModuleFiles, r.missingModuleCount)}). Harmless: Node resolves `
+          + `imports against each entry point's realpath, i.e. the repo. ${devRemedy} to link them.`);
+      } else {
+        ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain, 0 missing)`);
+      }
+    } else if (r.missingCount > 0) {
+      // COPY install (npm / plugin / `install` without --dev). Here the realpath argument
+      // does NOT apply: entry points are real files, so `../lib/x.mjs` resolves against the
+      // install dir and a missing module is an ERR_MODULE_NOT_FOUND on every hook fire.
+      // This case used to print NOTHING — checkDevDrift returns devMode=false and both the
+      // warning and the all-clear were gated on devMode, so the shape where missing files
+      // are FATAL was the silent one (#8268's rule failing in the other direction).
+      const parts = [];
+      if (r.missingEntryCount > 0) {
+        parts.push(`${r.missingEntryCount} entry point: ${nameList(r.missingEntryFiles, r.missingEntryCount)}`);
+      }
+      if (r.missingModuleCount > 0) {
+        parts.push(`${r.missingModuleCount} module: ${nameList(r.missingModuleFiles, r.missingModuleCount)}`);
+      }
+      warn(`Managed files: ${r.missingCount} missing (${parts.join('; ')}) — a copy install resolves `
+        + `imports against the install dir, so these throw at hook time. Fix: claude-mem-lite update `
+        + `(or: node ${join(INSTALL_DIR, 'install.mjs')} repair)`);
       issues++;
-    } else if (r.devMode) {
-      ok(`Dev drift: clean (${r.symlinkCount} symlinks, 0 plain, 0 missing)`);
     }
-    // Prod (all plain) install: no message — dev-drift is a dev-only concern.
+    // Complete copy install: no message — drift is a dev-install concern.
   } catch (e) {
     dwarn('Dev drift: check failed — ' + e.message);
   }

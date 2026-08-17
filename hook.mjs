@@ -1530,7 +1530,14 @@ async function handleSessionStart() {
     // Stdout is the sole context-delivery channel. The SessionStart hook output
     // is injected as a <system-reminder> at session start, giving Claude the
     // full summary + handoff state + observations table fresh from the DB.
-    process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
+    // Skip the wrapper entirely when there is no body. On a brand-new install every
+    // section is empty, and the hook still emitted `<claude-mem-context>\n\n</...>` —
+    // a framing block that asserts a memory surface and then shows nothing, which is
+    // both wasted context and an active misread ("memory exists and is empty" is a
+    // reason NOT to call mem_*). Non-empty output is byte-identical.
+    if (fullContext.trim()) {
+      process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
+    }
 
     // D#123 (review C-1): persist the Key Context ids ACTUALLY rendered above so
     // handleUserPrompt can exclude exactly those from <memory-context> — and

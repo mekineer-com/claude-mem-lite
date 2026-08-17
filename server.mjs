@@ -23,7 +23,7 @@ import {
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
-import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS } from './lib/get-core.mjs';
+import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
 import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
@@ -628,6 +628,9 @@ server.registerTool(
       for (const row of rows) {
         foundBySource.obs.add(row.id);
         const lines = [`── #${row.id} ──`];
+        // Retraction first (shared with the CLI `get` via get-core) — see supersededNotice.
+        const retracted = supersededNotice(row);
+        if (retracted) lines.push(retracted);
         for (const f of renderFields) {
           const val = row[f];
           if (val === null || val === undefined || val === '') continue;
@@ -826,6 +829,9 @@ server.registerTool(
     inputSchema: memSaveSchema,
   },
   safeHandler(async (args) => {
+    // `obs_type` → `type`: the sibling read tools all name it obs_type (see the schema
+    // comment). Without this, an unknown key was dropped and the row saved as `discovery`.
+    args = applyArgAliases(args, { obs_type: 'type' });
     if (args.project) args = { ...args, project: resolveProject(args.project) };
     const project = args.project || inferProject();
 
@@ -1661,6 +1667,8 @@ server.registerTool(
     inputSchema: memUpdateSchema,
   },
   safeHandler(async (args) => {
+    // `obs_type` → `type`, same alias mem_save takes — see the schema comment.
+    args = applyArgAliases(args, { obs_type: 'type' });
     const obs = db.prepare('SELECT id, title FROM observations WHERE id = ?').get(args.id);
     if (!obs) return { content: [{ type: 'text', text: `Observation #${args.id} not found` }], isError: true };
 

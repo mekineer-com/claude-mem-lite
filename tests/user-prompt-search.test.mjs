@@ -877,7 +877,13 @@ describe('user-prompt-search subprocess integration', () => {
     db.pragma('wal_checkpoint(FULL)');
     const { stdout } = await runScript(
       { prompt: 'how do I fix the authentication middleware token expiry validation' },
-      { CLAUDE_MEM_UPS_TOP_MIN: '1e9' },
+      // Pin the corpus ramp off (corpusFloorScale returns 1 when the reference is <= 1).
+      // This fixture holds ONE observation, and the ramp now scales the floors
+      // by the corpus's max attainable IDF — which is 0 on a 1-row index, so both floors
+      // collapse to 0 and no gate can fire. That relaxation is the cold-start fix
+      // (tests/ups-cold-start-injection.test.mjs); this test is about the gate mechanism,
+      // so it asks for the calibrated scale explicitly instead of relying on corpus size.
+      { CLAUDE_MEM_UPS_TOP_MIN: '1e9', CLAUDE_MEM_UPS_FLOOR_REF_CORPUS: '1' },
     );
     expect(stdout).toBe('');
   });
@@ -974,7 +980,9 @@ describe('user-prompt-search subprocess integration', () => {
     db.pragma('wal_checkpoint(FULL)');
     const { stdout } = await runScript(
       { prompt: 'how do I fix the OAuth token refresh double-redirect' },
-      { CLAUDE_MEM_UPS_TOP_MIN: '0.0000001' },
+      // CLAUDE_MEM_UPS_FLOOR_REF_CORPUS=1 pins the corpus ramp off — see the top-|rel|
+      // gate test above for why a 1-row fixture otherwise has both floors at 0.
+      { CLAUDE_MEM_UPS_TOP_MIN: '0.0000001', CLAUDE_MEM_UPS_FLOOR_REF_CORPUS: '1' },
     );
     expect(stdout).toBe('');
   });
