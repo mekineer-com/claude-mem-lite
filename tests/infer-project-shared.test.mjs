@@ -13,8 +13,9 @@
 // doc comment). The revert is why this file tests the invariant rather than the walk.
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'fs';
-import { resolve } from 'path';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { resolve, join } from 'path';
+import { tmpdir } from 'os';
 import { inferProject } from '../project-utils.mjs';
 
 const RECALL_SRC = resolve(import.meta.dirname, '../scripts/pre-tool-recall.js');
@@ -44,15 +45,25 @@ describe('pre-tool-recall project derivation', () => {
   it('does not walk up to a git work-tree root (reverted pre-tag — see the doc comment)', () => {
     // Guards the revert: re-introducing the walk would make a session rooted below the
     // repo root read a different project than its own hooks write.
+    //
+    // Uses a purpose-built repo under tmp rather than this checkout. An earlier version
+    // asserted 'mem--lib' against ../lib and went red on CI, where the checkout is named
+    // claude-mem-lite — the expectation was a property of the directory name, not of the
+    // behaviour. Here both the repo name and the subdirectory are fixed by the fixture.
     const saved = { p: process.env.CLAUDE_PROJECT_DIR, w: process.env.PWD };
+    const root = mkdtempSync(join(tmpdir(), 'infer-shared-'));
     try {
+      mkdirSync(join(root, 'myrepo', 'sub'), { recursive: true });
+      mkdirSync(join(root, 'myrepo', '.git'), { recursive: true });
+      writeFileSync(join(root, 'myrepo', '.git', 'HEAD'), 'ref: refs/heads/main\n');
       delete process.env.CLAUDE_PROJECT_DIR;
-      // This repo IS a git work tree, so a walk would resolve to its root.
-      process.env.PWD = resolve(import.meta.dirname, '../lib');
-      expect(inferProject()).toBe('mem--lib');
+      process.env.PWD = join(root, 'myrepo', 'sub');
+      // A walk would resolve to the work-tree root and yield '<tmpname>--myrepo'.
+      expect(inferProject()).toBe('myrepo--sub');
     } finally {
       if (saved.p === undefined) delete process.env.CLAUDE_PROJECT_DIR; else process.env.CLAUDE_PROJECT_DIR = saved.p;
       if (saved.w === undefined) delete process.env.PWD; else process.env.PWD = saved.w;
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* gone */ }
     }
   });
 });
