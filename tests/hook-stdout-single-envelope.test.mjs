@@ -68,9 +68,77 @@ describe('lib/hook-stdout — the emitter', () => {
 
   it('drops a mismatched event rather than emit an envelope the host rejects', () => {
     queueHookContext('PostToolUse', 'first');
-    queueHookContext('SessionStart', 'second');
+    // warn injected: the real one writes to stderr, and a suite that prints
+    // "This is a wiring bug" on every run teaches people to ignore it.
+    queueHookContext('SessionStart', 'second', { warn: () => {} });
     expect(peekHookStdout().hookEventName).toBe('PostToolUse');
     expect(peekHookStdout().parts).toEqual(['first']);
+  });
+
+  // Pre-tag review NOTE 3: the drop above was silent. Unreachable today — all three
+  // call sites are event-consistent — but flushEpisode's hookEventName DEFAULTS to
+  // 'PostToolUse', so a future caller that omits the argument would both mis-tag its
+  // receipt and have it swallowed with no trace. "Work silently disappears" is this
+  // repo's most-repeated defect class; a drop has to leave a mark.
+  it('says so on stderr when it drops a mismatched contribution', () => {
+    const warned = [];
+    queueHookContext('PostToolUse', 'first');
+    queueHookContext('SessionStart', 'second', { warn: (m) => warned.push(m) });
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatch(/SessionStart/);
+    expect(warned[0]).toMatch(/PostToolUse/);
+  });
+
+  it('does not warn on the normal same-event path', () => {
+    const warned = [];
+    queueHookContext('PostToolUse', 'a', { warn: (m) => warned.push(m) });
+    queueHookContext('PostToolUse', 'b', { warn: (m) => warned.push(m) });
+    expect(warned).toEqual([]);
+  });
+});
+
+// The update banner is a notice for the HUMAN, not context for the model. v3.70.0
+// folded it into additionalContext with suppressOutput:true, which made it
+// model-only — content preserved, audience lost. Claude Code 2.1.234's command-hook
+// path renders a top-level `systemMessage` as its own `hook_system_message`
+// conversation message, independently of additionalContext:
+//
+//   if (G.systemMessage) { … yield { message: yc({ type: "hook_system_message", … }) } }
+//
+// and its embedded docs say "systemMessage — Display a message to the user (all
+// hooks)". Both fields may ride the same envelope, so one document can carry context
+// for the model and a notice for the user.
+describe('lib/hook-stdout — the human channel', () => {
+  beforeEach(() => resetHookStdout());
+
+  it('carries a system message alongside additionalContext in ONE envelope', async () => {
+    const { queueHookSystemMessage } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    queueHookContext('SessionStart', 'dashboard for the model');
+    queueHookSystemMessage('📦 claude-mem-lite: v9.9.9 available');
+    expect(flushHookStdout({ write: (s) => written.push(s) })).toBe(true);
+    expect(written).toHaveLength(1);
+    const parsed = JSON.parse(written[0]);
+    expect(parsed.systemMessage).toContain('v9.9.9 available');
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('dashboard for the model');
+  });
+
+  it('emits a systemMessage-only envelope when there is no model context', async () => {
+    const { queueHookSystemMessage } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    queueHookSystemMessage('just a notice');
+    expect(flushHookStdout({ write: (s) => written.push(s) })).toBe(true);
+    const parsed = JSON.parse(written[0]);
+    expect(parsed.systemMessage).toBe('just a notice');
+    // No hookSpecificOutput at all: Stop's schema rejects that block, and an
+    // event-less envelope must not invent one.
+    expect(parsed.hookSpecificOutput).toBeUndefined();
+  });
+
+  it('still writes nothing when neither channel has anything', async () => {
+    const written = [];
+    expect(flushHookStdout({ write: (s) => written.push(s) })).toBe(false);
+    expect(written).toEqual([]);
   });
 });
 

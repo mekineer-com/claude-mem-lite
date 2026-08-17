@@ -2,6 +2,44 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.71.0 — the update notice is for you, not for the assistant
+
+**Upgrade note.** No action needed. The "a new version is available" line returns to
+being shown to *you*; v3.70.0 had quietly turned it into something only the assistant
+could read. To revert, pin `npm i claude-mem-lite@3.70.2`.
+
+v3.70.0 merged SessionStart's three stdout writers into one envelope, which was
+necessary — Claude Code parses hook stdout as a single JSON document, so three writes
+meant none of them parsed. But it folded the update banner into
+`hookSpecificOutput.additionalContext` under `suppressOutput: true`. Content preserved,
+audience lost: `📦 claude-mem-lite: v3.71.0 available` was being delivered to the model
+as context instead of to the user as a notice. That release listed it as a known
+consequence and deferred the fix rather than guess at a channel; this is the fix.
+
+Claude Code renders a command hook's top-level `systemMessage` as its own
+`hook_system_message` conversation message, independently of `additionalContext` —
+from the 2.1.234 bundle:
+
+```js
+if (G.systemMessage) { … yield { message: yc({ type: "hook_system_message", … }) } }
+```
+
+and its embedded docs say `systemMessage` — "Display a message to the user (all
+hooks)". Both fields may ride the same envelope, so one document now carries context
+for the model and a notice for the user. Verified by reading the implementation, not by
+observing a live session — the same limit the v3.70.0 note stated.
+
+### Also in this release
+
+| Change | Detail |
+|---|---|
+| **A dropped hook contribution now says so.** `queueHookContext` discards a contribution whose `hookEventName` disagrees with what the process already queued, because one envelope carries exactly one event name and the host rejects a mismatch outright. That discard was silent. | Unreachable today — all three call sites are event-consistent — but `flushEpisode`'s `hookEventName` **defaults** to `'PostToolUse'`, so a caller that forgets the argument would both mis-tag its receipt and have it vanish. Work disappearing without a trace is this codebase's most-repeated defect class; it now writes a line naming both events to stderr, which the host never parses as the envelope. |
+| **The sandbox install harness is in the repo.** `tests/sandbox/` — 103 checks across both documented install paths (`/plugin install`, and `npm i -g` + `claude-mem-lite install`), each covering install → use → auto-update → self-heal → uninstall. | It found five defects in v3.70.0 that 4500 unit tests could not, because each lived in the difference between install *shapes* rather than inside a function. Deliberately **not** in `vitest run`: it drives real `npm pack` / `npm i -g` and a real MCP server over stdio, so it needs network and minutes. `tests/sandbox/README.md` records the conventions that make it honest — inherit the ambient env, never nest the sandbox under `$HOME`, give each fake root its own dependency tree, and pair every "it goes red" check with a control proving the thing is genuinely broken. |
+
+273 test files / 4633 tests green, eslint clean, shellcheck clean, knip 31 unused
+exports (the harness adds no manifest churn: `tests/` is outside knip's project globs,
+outside `package.json` `files`, and not collected by vitest). Sandbox 103/103.
+
 ## v3.70.2 — the ABI-mismatch check printed the path and dropped the diagnosis
 
 Node's message for a stale native binding is five lines, and the filename is line 0:

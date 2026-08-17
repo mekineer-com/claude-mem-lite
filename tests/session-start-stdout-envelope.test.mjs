@@ -154,9 +154,15 @@ describe('SessionStart stdout envelope', () => {
     const parsed = expectSingleEnvelope(stdout);
     // Pin the BANNER leg by content. Asserting only single-envelope-ness left the
     // banner unguarded anywhere in the repo, and the banner is the one contributor
-    // this release physically relocated — from a raw write at the end of
-    // handleSessionStart to a queued part ~90 lines earlier (SHOULD-FIX-2).
-    expect(parsed.hookSpecificOutput.additionalContext).toContain('99.0.0');
+    // v3.70.0 physically relocated — from a raw write at the end of
+    // handleSessionStart to a queued part ~90 lines earlier.
+    //
+    // It rides `systemMessage`, not `additionalContext`: an available-update notice
+    // is for the USER, and v3.70.0's merge had made it model-only (content kept,
+    // audience lost). Claude Code renders a command hook's top-level systemMessage as
+    // its own `hook_system_message`, independently of additionalContext.
+    expect(parsed.systemMessage, `banner missing from the human channel:\n${stdout}`).toContain('99.0.0');
+    expect(parsed.hookSpecificOutput.additionalContext).not.toContain('99.0.0');
   });
 
   it('stays silent when there is nothing to say (no empty envelope)', () => {

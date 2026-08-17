@@ -48,7 +48,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
-import { queueHookContext, flushHookStdout } from './lib/hook-stdout.mjs';
+import { queueHookContext, queueHookSystemMessage, flushHookStdout } from './lib/hook-stdout.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
@@ -1549,7 +1549,12 @@ async function handleSessionStart() {
     let updateCheckDue = false;
     try {
       const banner = getCachedUpdateBanner();
-      if (banner) stdoutParts.push(String(banner).trim());
+      // The human channel, not additionalContext: "vX available" is a notice for the
+      // USER. Folding it into additionalContext under suppressOutput:true kept its
+      // content and lost its audience. Claude Code renders a command hook's top-level
+      // systemMessage as its own hook_system_message, independent of the context
+      // block — see lib/hook-stdout.mjs for the bundle evidence.
+      if (banner) queueHookSystemMessage(String(banner));
       updateCheckDue = isUpdateCheckDue();
     } catch (e) { debugCatch(e, 'session-start-update'); }
 
