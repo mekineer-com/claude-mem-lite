@@ -25,7 +25,7 @@
 // defaults, NOT assertions about the scale formula: a test mirroring the formula
 // cannot tell a right formula from a wrong one.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -34,6 +34,15 @@ import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { saveObservation } from '../lib/save-observation.mjs';
 import { extractTechIdentifiers } from '../scripts/user-prompt-search.js';
+
+// Every case here spawns scripts/user-prompt-search.js and seeds a corpus through it,
+// so these are subprocess integration tests living under a 20s global timeout chosen
+// for unit tests. They fit comfortably on a dev box and began timing out on the 2-core
+// CI runner once the suite grew (v3.70.0 Release run 32070192835) — a scheduling
+// deadline, not a behaviour change: nothing here got slower, there is just more
+// competing for two cores. Raising the budget keeps every assertion intact; capping it
+// at 20s would only convert contention into a red release.
+vi.setConfig({ testTimeout: 60_000 });
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
 const PROJECT = 'x--coldstart';

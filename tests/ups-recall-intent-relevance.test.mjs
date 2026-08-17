@@ -20,7 +20,7 @@
 // ("之前我们在做什么"), so that behavior is pinned below too — the fix is ordering, not
 // removal.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { spawn } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -29,6 +29,12 @@ import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { saveObservation } from '../lib/save-observation.mjs';
 import { detectIntent } from '../scripts/prompt-search-utils.mjs';
+
+// Same reason as tests/ups-cold-start-injection.test.mjs: these spawn
+// scripts/user-prompt-search.js against a seeded corpus, and the 20s global timeout is
+// a unit-test budget. Both files began timing out on the 2-core CI runner as the suite
+// grew (v3.70.0 Release run 32070192835) — contention, not a regression.
+vi.setConfig({ testTimeout: 60_000 });
 
 const SCRIPT_PATH = resolve(import.meta.dirname, '../scripts/user-prompt-search.js');
 const PROJECT = 'x--recallintent';
