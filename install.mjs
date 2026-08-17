@@ -1731,15 +1731,11 @@ async function doctor() {
   // when their version segment ≠ current package.json version; dev-install
   // paths (no version segment) are never flagged.
   try {
-    const procs = execFileSync('pgrep', ['-af', 'chroma|claude-mem-lite.*(scripts/launch|server)\\.mjs|claude-mem.*worker'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim();
+    const procs = execFileSync('pgrep', ['-af', 'chroma|claude-mem-lite.*(scripts/launch|server)\\.mjs|\\.claude-mem/.*worker'], { encoding: 'utf8', timeout: 5000, stdio: 'pipe' }).trim();
     const lines = procs.split('\n').filter(l => l && !l.includes('pgrep'));
     let currentVersion = '';
     try { currentVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version; } catch { /* fall through with empty version */ }
-    const stale = lines.filter(l => {
-      if (/chroma|claude-mem.*worker/.test(l)) return true;
-      const m = l.match(/claude-mem-lite\/(\d+\.\d+\.\d+)\/(scripts\/launch|server)\.mjs/);
-      return m && currentVersion && m[1] !== currentVersion;
-    });
+    const stale = lines.filter(l => isStaleMemProcess(l, currentVersion));
     if (stale.length > 0) {
       warn(`Old processes running${currentVersion ? ` (current: v${currentVersion})` : ''}:\n    ` + stale.join('\n    '));
       issues++;
@@ -2382,6 +2378,55 @@ function regenerateLockfile() {
 // resolves matters, i.e. the one next to this file. Rebuilding the wrong tree
 // reports success while every hook keeps failing. Fall back to INSTALL_DIR when
 // this file sits in a source-only layout with no deps of its own.
+/**
+ * Is this `pgrep -af` line a stale claude-mem process worth flagging?
+ *
+ * Extracted and tightened after CI reported `1 issue(s) found` on a healthy
+ * plugin-only install (v3.70.0 Release run 32068227636). The legacy clause was
+ * `/claude-mem.*worker/`, which matches ANY command line where `claude-mem`
+ * precedes `worker` — including vitest's own
+ * `…/claude-mem-lite/node_modules/vitest/dist/workers/forks.js` whenever the repo
+ * is checked out into a directory called `claude-mem-lite`, as GitHub Actions does.
+ * doctor then counted an issue and exited 1 while every other check was green: the
+ * exact class of false-red this release exists to remove, invisible locally only
+ * because the dev checkout is not named after the package.
+ *
+ * The legacy worker lived under the pre-v2.20 DATA dir `~/.claude-mem/`, so anchor
+ * on that dot-prefixed path segment. It cannot appear in a repo checkout path.
+ *
+ * @param {string} line One `pgrep -af` output line.
+ * @param {string} currentVersion Running package version, '' when unreadable.
+ * @returns {boolean}
+ */
+export function isStaleMemProcess(line, currentVersion) {
+  if (!line) return false;
+  const cmd = (line.match(/^\s*\d+\s+(.*)$/)?.[1] ?? line).trim();
+  if (!cmd) return false;
+  const tokens = cmd.split(/\s+/);
+  const exe = tokens[0] || '';
+
+  // A shell or wrapper that merely MENTIONS these names in its arguments is not one
+  // of our processes. Searching the whole line as free text bit twice within one
+  // release: first vitest workers under a checkout named `claude-mem-lite`, then the
+  // `git commit -F -` publishing THIS fix, whose message text contains the word
+  // "chroma". Anything that takes a program as an argument can quote us.
+  if (/(^|\/)(ba|z|k|da|c|t)?sh$/.test(exe) || /(^|\/)(env|xargs|timeout|nohup|sudo|git|grep|rg|less|vi|vim|nano|code)$/.test(exe)) {
+    return false;
+  }
+
+  // Legacy chroma server: the EXECUTABLE, not a substring of some argument.
+  if (/(^|\/)chroma$/.test(exe)) return true;
+  // Legacy worker: a script path under the pre-v2.20 DATA dir. Dot-prefixed, so a
+  // repo checkout called `claude-mem-lite` cannot produce it.
+  if (tokens.some((t) => /\.claude-mem\/[^/]*worker[^/]*$/.test(t))) return true;
+
+  // A plugin-cache launcher/server whose version segment is not the running one.
+  // Anchored at end-of-token so it is a script being executed, not prose.
+  const script = tokens.find((t) => /claude-mem-lite\/\d+\.\d+\.\d+\/(scripts\/launch|server)\.mjs$/.test(t));
+  if (!script || !currentVersion) return false;
+  return script.match(/claude-mem-lite\/(\d+\.\d+\.\d+)\//)[1] !== currentVersion;
+}
+
 function bindingHostDir() {
   return existsSync(join(PROJECT_DIR, 'node_modules', 'better-sqlite3')) ? PROJECT_DIR : INSTALL_DIR;
 }

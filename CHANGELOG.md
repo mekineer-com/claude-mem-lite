@@ -52,12 +52,22 @@ Two independent reviewers read the release diff — one for correctness, one for
 | **`rebuild-binding` iterating every code home made an existing unit test mutate `~/.claude`.** `tests/native-binding-selfheal.test.mjs` ran with the real `HOME`, so a freshly-installed plugin cache version (deps present, binding uncompiled) would have it run a real `npm rebuild … --dangerously-allow-all-scripts` inside `~/.claude`. | That test now gets an isolated `HOME`, which is what its own name promised. |
 | Smaller: the SIGTERM salvage path exited without flushing a queued receipt; `semverDesc` collapsed to "equal" on a prerelease dir because `Number('0-rc1')` is `NaN`; a comment recorded a root cause the reviewer could not reproduce (raw-SQL inserts *do* populate FTS via `AFTER INSERT` triggers) and now says so. | |
 
+### And one more false-red, found by CI on the first tag attempt
+
+The first `v3.70.0` tag failed `validate`: the new subprocess tests are the first thing in this repo to assert `doctor`'s exit code, and on the runner it was 1 with `1 issue(s) found` while every individual check was green but one — `⚠ Old processes running`, listing **vitest's own worker processes**.
+
+The stale-process check's legacy clause was `/claude-mem.*worker/`, intended for the pre-v2.20 chroma worker. It matches any command line where `claude-mem` precedes `worker` anywhere, and GitHub Actions checks the repo out to `/home/runner/work/claude-mem-lite/claude-mem-lite/`, so `…/node_modules/vitest/dist/workers/forks.js` matched. Invisible on the dev machine purely because that checkout is not named after the package.
+
+The judgment is now `isStaleMemProcess(line, currentVersion)` — cwd-independent and unit-tested against the exact CI command line — and the legacy clause anchors on the old dot-prefixed data dir (`~/.claude-mem/…worker`), which a repo checkout path cannot contain. Fixing it also removed the last thing that made `doctor` exit non-zero on a healthy install, which is the whole point of the release.
+
+Three unrelated `ups-*` tests also timed out at 20 s on the 2-core runner; the new subprocess file was starving the other workers, so its 13 spawns are consolidated to 7 and the one npm-invoking case carries its own 120 s budget.
+
 ### Notes
 
 - **The update-available banner is now delivered to the assistant rather than printed raw.** It used to reach the transcript only because the whole stdout was being rendered as text — the same bug this release fixes. It now rides `additionalContext` with `suppressOutput: true`. The documented `systemMessage` field looks like the right channel for a human-facing notice, but the command-hook render path for it could not be confirmed in the bundle, so moving the banner there is deferred rather than shipped on a guess.
 - The plugin **update** window is fine and was measured, not assumed: a new cache version dir arrives without `node_modules`, and the next SessionStart's `setup.sh` provisioned and compiled it in 1013 ms with memory searchable across the version swap (15/15 checks). That measurement used a warm npm cache; cold-cache and offline behaviour is untested.
 - The harness that found all of this is a sandbox driver (fake `$HOME`, fake `claude` binary, real `npm pack` / `npm i -g`, real stdio MCP JSON-RPC). It is not in the repo; the regressions it caught are pinned by `tests/install-shape.test.mjs`, `tests/doctor-install-shape-e2e.test.mjs`, `tests/session-start-stdout-envelope.test.mjs` and `tests/hook-stdout-single-envelope.test.mjs`.
-- 271 test files / 4603 tests green, eslint clean, knip 31 unused exports (unchanged from baseline).
+- 272 test files / 4614 tests green, eslint clean, shellcheck clean, knip 31 unused exports (unchanged from baseline).
 
 ## v3.69.1 — a GitHub 503 ate v3.69.0's Release; identical code, re-cut so auto-update can verify it
 

@@ -108,31 +108,22 @@ afterEach(() => {
   try { rmSync(home, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
+// Each `it` here spawns install.mjs, and on a 2-core CI runner a pile of those
+// starves the other vitest workers into 20s timeouts. So related assertions share
+// ONE spawn per shape rather than re-running doctor for each claim.
 describe('doctor: a healthy plugin-only install is not an error', () => {
-  it('exits 0 with no ✗ when code is served from the plugin cache', () => {
+  it('exits 0, flags nothing, and prescribes nothing that does not exist', () => {
     makePluginVersion('3.69.1');
     mkdirSync(join(home, '.claude-mem-lite', 'runtime'), { recursive: true });
     enablePlugin();
     const r = run('doctor');
     expect(failLines(r.stdout), `doctor flagged a healthy plugin-only install:\n${r.stdout}`).toEqual([]);
     expect(r.code, `doctor exited ${r.code}\n${r.stdout}`).toBe(0);
-  });
-
-  it('does not demand ~/.claude-mem-lite/server.mjs from an install shape that never creates it', () => {
-    makePluginVersion('3.69.1');
-    mkdirSync(join(home, '.claude-mem-lite', 'runtime'), { recursive: true });
-    enablePlugin();
-    const r = run('doctor');
+    // The managed layout is not this install shape's to satisfy.
     expect(r.stdout).not.toMatch(/✗ server\.mjs: missing/);
     expect(r.stdout).not.toMatch(/✗ hook\.mjs: missing/);
     expect(r.stdout).not.toMatch(/Managed files: \d+ missing/);
-  });
-
-  it('never prescribes `claude-mem-lite update` (that is the observation editor)', () => {
-    makePluginVersion('3.69.1');
-    mkdirSync(join(home, '.claude-mem-lite', 'runtime'), { recursive: true });
-    enablePlugin();
-    const r = run('doctor');
+    // `update` is the observation editor; the self-updater is `self-update`.
     expect(r.stdout).not.toMatch(/claude-mem-lite update(?!\s*<)/);
   });
 
@@ -148,19 +139,16 @@ describe('doctor: a healthy plugin-only install is not an error', () => {
 });
 
 describe('doctor: a stale binding is found in whichever install owns it', () => {
-  it('exits 1 and NAMES the managed tree when only that tree is broken', () => {
+  it('exits 1, NAMES the managed tree, and points the repair at THAT tree', () => {
     // The CLI's own tree (the repo, where install.mjs runs from) is healthy, so a
     // single-root probe answers "verified" — the v3.60 false-green.
-    makeManagedInstall({ deps: 'broken' });
+    const managed = makeManagedInstall({ deps: 'broken' });
     const r = run('doctor');
     expect(r.code, `doctor exited ${r.code} on a broken managed tree\n${r.stdout}`).toBe(1);
     expect(r.stdout).toMatch(/better-sqlite3 unusable in .*managed install/);
     expect(r.stdout).toMatch(/Native DB binding: unusable in .*managed install/);
-  });
-
-  it('names the per-root repair path, not the healthy tree', () => {
-    const managed = makeManagedInstall({ deps: 'broken' });
-    const r = run('doctor');
+    // Sending the user to rebuild the healthy tree is how the pre-fix repair
+    // "succeeded" while the broken install stayed broken.
     expect(r.stdout).toContain(`cd ${managed}`);
     expect(r.stdout).not.toMatch(new RegExp(`cd ${REPO}\\b`));
   });
@@ -209,29 +197,24 @@ describe('status: the plugin manifest doing its job is not two failures', () => 
 });
 
 describe('rebuild-binding: repairs every broken tree, and says so honestly', () => {
-  it('exits NON-zero when a non-host tree cannot be repaired', () => {
+  // One spawn: this command shells out to npm, so it is the most expensive case in
+  // the file. Generous timeout for a cold 2-core runner.
+  it('exits NON-zero, names the broken root, and keeps the breakage marker', () => {
     // Pre-fix this rebuilt bindingHostDir() — the healthy tree — and printed
     // `✓ ... verified`, so the documented repair reported success while the broken
     // install stayed broken.
-    makeManagedInstall({ deps: 'broken' });
-    const r = run('rebuild-binding');
-    expect(r.code, `rebuild-binding exited ${r.code}\n${r.stdout}${r.stderr}`).toBe(1);
-    expect(r.stdout + r.stderr).toMatch(/still unusable in .*managed install/);
-  });
-
-  it('mentions each target root it acted on, so success cannot be about the wrong one', () => {
-    const managed = makeManagedInstall({ deps: 'broken' });
-    const r = run('rebuild-binding');
-    expect(r.stdout + r.stderr).toContain(managed);
-  });
-
-  it('leaves the breakage marker set while any live tree is still broken', () => {
     const managed = makeManagedInstall({ deps: 'broken' });
     const runtimeDir = join(managed, 'runtime');
     mkdirSync(runtimeDir, { recursive: true });
     const marker = join(runtimeDir, 'native-binding-broken.json');
     writeFileSync(marker, JSON.stringify({ ts: Date.now(), reason: 'seeded', event: 'test' }));
-    run('rebuild-binding');
+
+    const r = run('rebuild-binding');
+    expect(r.code, `rebuild-binding exited ${r.code}\n${r.stdout}${r.stderr}`).toBe(1);
+    expect(r.stdout + r.stderr).toMatch(/still unusable in .*managed install/);
+    expect(r.stdout + r.stderr).toContain(managed);
+    // Clearing the marker while a live tree is broken is what made the launcher
+    // re-spawn npm every 6h forever (2026-08-13).
     expect(existsSync(marker), 'marker cleared while a tree was still broken').toBe(true);
-  });
+  }, 120_000);
 });
