@@ -2,6 +2,14 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.69.1 — a GitHub 503 ate v3.69.0's Release; identical code, re-cut so auto-update can verify it
+
+No code change from v3.69.0. Its `Release` run published to npm and signed the manifest, then `softprops/action-gh-release` hit `503 No server is currently available` three times and aborted — a GitHub API outage, nothing in this repo. That left npm holding 3.69.0 with no GitHub Release behind it.
+
+That combination cannot be patched in place. `hook-update.mjs` ships an embedded Ed25519 public key, so it is in signed-release mode: a Release without `release-manifest.json` + `.sig` returns `missing-signature` and **refuses to install**. Creating the Release by hand would therefore have been worse than leaving it absent — `releases/latest` would advertise a version every client declines. Only CI holds the signing key, and re-running its `publish` job is impossible because `npm publish` is not idempotent and 3.69.0 is already on the registry.
+
+So v3.69.1 re-cuts the same tree under a version npm has not seen, which lets CI regenerate and attach the signed manifest. Everything in the v3.69.0 entry below applies unchanged. npm's orphaned 3.69.0 is harmless: auto-update resolves through `releases/latest`, and a direct `npm i claude-mem-lite@3.69.0` gets identical code.
+
 ## v3.69.0 — three rounds of first-day-user simulation, and the worst finding was that asking "what did we do before?" removed the answer
 
 An end-to-end round played the product as a new user would: cold install, first saves, prompt-time recall, edit-time recall, a `/clear`, a backup, a maintenance pass. Thirteen defects, each reproduced before it was fixed and each fix mutation-verified (break it, confirm red, revert). Two behaviours users feel change here, so this is a minor bump, not a patch.
