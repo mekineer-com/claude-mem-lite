@@ -485,12 +485,17 @@ describe('Suite 2: Episode Buffer Management', () => {
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
   });
 
-  it('SessionStart flush receipt + dashboard stay newline-delimited (no }{ collision)', () => {
-    // Regression: when a leftover significant episode flushes at SessionStart (common
-    // after /clear or /compact), flushEpisode wrote its hookSpecificOutput receipt with
-    // NO trailing newline, then the startup dashboard wrote a second one — landing as
-    // `}{` on one line. Claude Code's line-based JSON parser then dropped both, losing
-    // the episode-flush / cite-back context exactly at the session boundary.
+  it('SessionStart flush receipt + dashboard arrive as ONE envelope', () => {
+    // History, in two corrections. First: flushEpisode wrote its receipt with no
+    // trailing newline and the dashboard wrote a second object right after, landing as
+    // `}{`. The fix added the newline, on the belief that Claude Code parsed stdout
+    // line by line. v3.70.0 disproved that belief — 2.1.234's parser JSON.parses the
+    // WHOLE trimmed stdout and falls back to plain text on throw, so TWO envelopes on
+    // two lines were never both delivered either; for SessionStart the raw JSON went
+    // to the model as literal text. This assertion used to check only the `}{` shape
+    // and per-line parseability, which the two-envelope state satisfies — it passed
+    // against the pre-v3.70 code (pre-tag review, test-effectiveness SHOULD-FIX-1).
+    // Now it pins the real contract: exactly one document, carrying both surfaces.
     runHook('session-start', { env: { HOME: tmpHome } });
     // Build a leftover episode (below the 10-entry auto-flush threshold).
     for (let i = 0; i < 2; i++) {
@@ -503,13 +508,18 @@ describe('Suite 2: Episode Buffer Management', () => {
     }
     // SessionStart (clear) flushes the leftover episode AND prints the dashboard.
     const { stdout } = runHook('session-start', { stdin: JSON.stringify({ source: 'clear' }), env: { HOME: tmpHome } });
+    expect(stdout.trim(), 'the leftover episode + dashboard produced no output at all').not.toBe('');
     expect(stdout).not.toContain('}{');
-    // Every emitted JSON line must parse independently.
-    for (const line of stdout.split('\n')) {
-      const t = line.trim();
-      if (!t.startsWith('{')) continue;
-      expect(() => JSON.parse(t)).not.toThrow();
-    }
+    // The whole stdout — not each line — must be one JSON document.
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed.suppressOutput).toBe(true);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('SessionStart');
+    // Both surfaces ride it: the flushed episode receipt and the dashboard.
+    expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] episode flushed: \d+ entries/);
+    // And nothing rides outside it.
+    expect(stdout.trim().split('\n').filter((l) => l.trim() && !l.startsWith('{')).length === 0
+      || parsed.hookSpecificOutput.additionalContext.length > 0).toBe(true);
+    expect(stdout.split('\n').filter((l) => l.trim().startsWith('{'))).toHaveLength(1);
   });
 
   it('skipped tools (Read, Glob) do not create entries', () => {

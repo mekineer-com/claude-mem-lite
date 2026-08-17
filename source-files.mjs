@@ -93,6 +93,15 @@ export const SOURCE_FILES = [
   // self-heal after Node ABI changes). Missing from manifest → auto-update
   // ships a stale install that FATALs on first DB open after Node upgrade.
   'lib/binding-probe.mjs',
+  // Which code homes this machine runs (plugin cache / ~/.claude-mem-lite /
+  // npm-global) — imported by install.mjs for doctor, status and rebuild-binding.
+  // Missing from the manifest → an updated install ships a doctor that throws
+  // ERR_MODULE_NOT_FOUND on the command users run when something is already wrong.
+  'lib/install-shape.mjs',
+  // Single-envelope stdout for hook processes — imported by hook.mjs. Claude Code
+  // parses hook stdout as ONE JSON document; missing from the manifest → an updated
+  // install throws ERR_MODULE_NOT_FOUND on every hook fire.
+  'lib/hook-stdout.mjs',
   // audit P0/P1: inter-process install lock + atomic config writes — imported by
   // install.mjs (settings.json + install lock) and hook-update.mjs (.claude.json
   // + auto-update lock). Must ship or a partial install/update skips them.

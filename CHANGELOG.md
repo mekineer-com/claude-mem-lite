@@ -2,6 +2,63 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.70.0 — a sandbox install of the recommended method failed its own health check, and the hook envelope was never being parsed
+
+A sandbox played a real user through both documented install paths end to end — `/plugin install`, `npm i -g` + `claude-mem-lite install`, then use, auto-update, self-heal and uninstall for each (103 checks). Five defects, each reproduced before it was fixed and each fix mutation-verified. Two of them change what users see by default, so this is a minor bump.
+
+**Upgrade note.** No action needed. `doctor` and `status` will report differently — in most cases they stop reporting problems that were never there. To revert, pin the prior build: `npm i claude-mem-lite@3.69.1`. There is no env flag for either change: both are corrections to a health check and a wire format, not tunable policy.
+
+### Claude Code parses hook stdout as ONE JSON document — this repo assumed otherwise
+
+The parser, read out of the Claude Code 2.1.233 bundle, is four lines:
+
+```js
+function Hxi(e){ let t=e.trim();
+  if(!t.startsWith("{")) return {plainText:e};   // whole stdout = prose
+  try{ let r=XZf(t); ... }                        // JSON.parse(WHOLE stdout) + schema
+  catch(r){ return {plainText:e} } }              // throw ⇒ whole stdout = prose
+```
+
+There is no line splitting in it. `hook.mjs` had assumed the opposite in two comments ("Claude Code's line-based JSON parser", "two separate JSON lines each parse independently") and shipped surfaces that wrote more than one thing to stdout, which makes `JSON.parse` throw and drops everything to the plain-text branch.
+
+| Surface | What was actually happening |
+|---|---|
+| **SessionStart** | Three writers on one stdout: the dashboard envelope, the raw `<claude-mem-context>` block, and the update banner. The envelope was never parsed, so `suppressOutput: true` was ignored and the literal string `{"suppressOutput":true,"hookSpecificOutput":{…}}` — escaped newlines and all — was injected into every session as text. Visible in any transcript as `SessionStart:startup hook success: {…}`, where the same product's PreToolUse and PostToolUse hooks (one envelope, nothing else) render as `hook additional context:` with the content extracted. |
+| **PostToolUse** | A hard-error Bash call reaches `triggerErrorRecall` and then flushes a full episode buffer in one `handlePostToolUse`, writing two envelopes. Plain text is not rendered at all for PostToolUse, so **both receipts were dropped in silence** — the error-recall hint and the episode receipt, exactly when a command had just failed. |
+
+Both now queue through `lib/hook-stdout.mjs` and the dispatcher writes one envelope at exit. `tests/feature-sweep-hooks.test.mjs::expectHookStdout` encoded the same wrong model, so it graded two-envelope output as compliant; it now caps stdout at one JSON document and rejects prose beside it.
+
+### `doctor` answered about one install when the machine can run three
+
+A machine can hold three code homes at once — the plugin cache, `~/.claude-mem-lite`, and the npm-global package — each with its own `node_modules` and its own native binding that can go stale alone. `bindingHostDir()` probed whichever directory `install.mjs` itself sits in. That is the right question for `install.mjs`'s own imports and the wrong one for a health check, and it failed in both directions.
+
+| What changed | Detail |
+|---|---|
+| **A healthy plugin-only install no longer reports three problems.** `server.mjs`, `hook.mjs` and the `SOURCE_FILES` manifest only exist in the `install.mjs`-managed layout; `/plugin install` provisions the data dir and serves code from the plugin cache. Checks are now graded against the shape actually in use. | The README's recommended method, freshly installed and fully working, printed `✗ server.mjs: missing`, `✗ hook.mjs: missing`, `⚠ Managed files: 121 missing`, `3 issue(s) found` and exited 1 — and the remedy it named, `node ~/.claude-mem-lite/install.mjs repair`, is a path that install shape never creates. `status` likewise printed `✗ MCP server: not registered` and `✗ Hooks: not configured` for the plugin manifest doing its job. |
+| **A stale binding is now found in whichever install owns it.** `doctor` enumerates every wired runtime root and probes each, naming the broken one and giving that root's own repair command; `rebuild-binding` repairs every broken tree instead of only its own. | With `~/.claude-mem-lite`'s binding stale — the tree the settings.json hooks and the registered MCP server actually load — the server FATAL'd on startup (`wrong ELF class`) and every hook degraded to a silent exit 0, while `doctor` printed `✓ better-sqlite3: verified` and exited 0, and `rebuild-binding` rebuilt the *other*, healthy tree and reported success. That is the v3.60 field failure (memory dead for four days) with the entire diagnose→repair chain green. |
+| **`doctor` stopped prescribing a command that does something else.** The missing-managed-files remedy said `claude-mem-lite update`; that is the observation editor (`update <id>`), and running it prints a usage error. The self-updater is `self-update`. | |
+| **`claude-mem-lite install` no longer leaves the package it ran from uncompiled.** npm ≥ 12 blocks lifecycle scripts, so `npm i -g claude-mem-lite` always lands an uncompiled `better-sqlite3` in the global package; `install` rebuilt only `~/.claude-mem-lite`. | The documented two-command setup finished with every line green, and the very next `claude-mem-lite doctor` reported `2 issue(s) found` and exited 1. It self-healed on the following CLI call, so the state was transient — but the first thing a new user is told to run said the install had failed. Non-fatal: this tree is not what hooks or the MCP server load. |
+
+### What the pre-tag review changed, before the tag
+
+Two independent reviewers read the release diff — one for correctness, one for test effectiveness. Both earned their keep, and two of their findings were regressions introduced by this very refactor.
+
+| Finding | What shipped instead |
+|---|---|
+| **The new code turned a real failure from red to green.** `detectInstallShape` dropped any root with no `node_modules/better-sqlite3` — including a managed code home whose deps were deleted or whose `npm install` died after the file copy. Its hooks and MCP server still load from it and throw `ERR_MODULE_NOT_FOUND` on every fire, and that error is not in `NATIVE_BINDING_PATTERNS`, so nothing recorded it either. Pre-v3.70 probed `bindingHostDir()` → `INSTALL_DIR`, failed, exited 1. | A root this module has certified as a code home is now reported with `depsMissing`, graded broken, and given an `npm install` repair (not a `npm rebuild` of nothing). |
+| **Probing every cache version made the fix red where it used to be right.** Claude Code never prunes old version dirs and each keeps its own real `node_modules`; this machine holds three. After a Node major upgrade the never-started versions stay stale forever → `doctor` permanently red about trees nothing loads, and `rebuild-binding` — which clears the breakage marker only when *every* target succeeds — could never clear it, which is the documented "launcher re-spawns npm every 6h forever" state. | Only the **active** version is a runtime root: the one `CLAUDE_PLUGIN_ROOT` names, else the newest. Stale versions are still listed, never probed. |
+| **A 161-line change to the diagnose→repair chain had zero regression coverage.** Reverting `install.mjs` to its pre-fix state left the entire suite green — `tests/install-shape.test.mjs` covered the extracted helper, but the bug was always `install.mjs` asking the wrong helper. This is precisely how v3.60 shipped green and stayed broken for four days. | `tests/doctor-install-shape-e2e.test.mjs` drives `doctor` / `status` / `rebuild-binding` as subprocesses against real install shapes. The same revert now fails 11 of its 13 cases. |
+| **Three guards could not fail.** `tests/e2e.test.mjs`'s SessionStart co-fire case still asserted the disproven line-based contract and passed against the pre-fix code; the dashboard and update-banner legs of the new envelope test were satisfied by the context block alone. | All three now assert content, and each was mutation-verified against the exact deletion that used to slip through. |
+| **`rebuild-binding` iterating every code home made an existing unit test mutate `~/.claude`.** `tests/native-binding-selfheal.test.mjs` ran with the real `HOME`, so a freshly-installed plugin cache version (deps present, binding uncompiled) would have it run a real `npm rebuild … --dangerously-allow-all-scripts` inside `~/.claude`. | That test now gets an isolated `HOME`, which is what its own name promised. |
+| Smaller: the SIGTERM salvage path exited without flushing a queued receipt; `semverDesc` collapsed to "equal" on a prerelease dir because `Number('0-rc1')` is `NaN`; a comment recorded a root cause the reviewer could not reproduce (raw-SQL inserts *do* populate FTS via `AFTER INSERT` triggers) and now says so. | |
+
+### Notes
+
+- **The update-available banner is now delivered to the assistant rather than printed raw.** It used to reach the transcript only because the whole stdout was being rendered as text — the same bug this release fixes. It now rides `additionalContext` with `suppressOutput: true`. The documented `systemMessage` field looks like the right channel for a human-facing notice, but the command-hook render path for it could not be confirmed in the bundle, so moving the banner there is deferred rather than shipped on a guess.
+- The plugin **update** window is fine and was measured, not assumed: a new cache version dir arrives without `node_modules`, and the next SessionStart's `setup.sh` provisioned and compiled it in 1013 ms with memory searchable across the version swap (15/15 checks). That measurement used a warm npm cache; cold-cache and offline behaviour is untested.
+- The harness that found all of this is a sandbox driver (fake `$HOME`, fake `claude` binary, real `npm pack` / `npm i -g`, real stdio MCP JSON-RPC). It is not in the repo; the regressions it caught are pinned by `tests/install-shape.test.mjs`, `tests/doctor-install-shape-e2e.test.mjs`, `tests/session-start-stdout-envelope.test.mjs` and `tests/hook-stdout-single-envelope.test.mjs`.
+- 271 test files / 4603 tests green, eslint clean, knip 31 unused exports (unchanged from baseline).
+
 ## v3.69.1 — a GitHub 503 ate v3.69.0's Release; identical code, re-cut so auto-update can verify it
 
 No code change from v3.69.0. Its `Release` run published to npm and signed the manifest, then `softprops/action-gh-release` hit `503 No server is currently available` three times and aborted — a GitHub API outage, nothing in this repo. That left npm holding 3.69.0 with no GitHub Release behind it.

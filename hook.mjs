@@ -48,6 +48,7 @@ import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObse
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
+import { queueHookContext, flushHookStdout } from './lib/hook-stdout.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
@@ -168,6 +169,11 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
           }
         }
       } catch {}
+      // The salvage path exits without falling through to the dispatcher tail, so
+      // it owns its own flush: a receipt queued before the signal arrived was
+      // delivered by the pre-v3.70 inline write and would otherwise be dropped here
+      // (pre-tag review NOTE N1).
+      try { flushHookStdout(); } catch { /* never change the exit code for a receipt */ }
       process.exit(0);
     });
   });
@@ -265,20 +271,13 @@ function flushEpisodeWithDb(db, episode, hookEventName) {
       // bugfix-shape nudge above and may co-fire.
       const citeBack = loadCiteBackForEpisode(episode, RUNTIME_DIR);
       if (citeBack) lines.push(citeBack);
-      // Trailing newline is REQUIRED: when this receipt flushes at SessionStart
-      // (leftover episode after /clear or /compact), the startup dashboard writes a
-      // second hookSpecificOutput object right after. Without the '\n' the two land
-      // back-to-back as `}{` on one line and Claude Code's line-based JSON parser
-      // drops both — losing the episode-flush / cite-back context exactly at the
-      // session boundary. Every other hookSpecificOutput write appends '\n'; this
-      // was the lone exception.
-      process.stdout.write(JSON.stringify({
-        suppressOutput: true,
-        hookSpecificOutput: {
-          hookEventName,
-          additionalContext: lines.join('\n'),
-        },
-      }) + '\n');
+      // Queued, not written: when this receipt flushes at SessionStart (leftover
+      // episode after /clear or /compact) the startup dashboard also has something
+      // to say, and two envelopes on one stdout is not a JSON document — Claude
+      // Code's parser takes the whole thing as plain text (lib/hook-stdout.mjs).
+      // The older comment here claimed a line-based parser made two objects safe
+      // as long as each got its own line; the 2.1.233 bundle has no such parser.
+      queueHookContext(hookEventName, lines.join('\n'));
     } catch { /* never block on receipt */ }
   }
 
@@ -513,16 +512,14 @@ function triggerErrorRecall(db, toolInput, response) {
       // the G8 gate change (isError→isHardError) could not be volume-verified
       // from metrics. Counter only; no latency (query is bundled in the hook).
       recordMetric(join(RUNTIME_DIR, '..'), { event: 'error_recall', returned: rows.length });
-      // MED-3 (full audit 2026-07-16): emit via the JSON envelope (trailing '\n'),
-      // NOT raw stdout. A raw multi-line write corrupts a co-emitted episode-flush
-      // receipt (both write to PostToolUse stdout in the same call → `<text>{json}`)
-      // and is silently dropped on CC variants that ignore plain-text PostToolUse
-      // stdout. This is the same suppressOutput+additionalContext channel
-      // flushEpisode uses; two separate JSON lines each parse independently.
-      process.stdout.write(JSON.stringify({
-        suppressOutput: true,
-        hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: out },
-      }) + '\n');
+      // MED-3 (full audit 2026-07-16): go through the envelope, NOT raw stdout —
+      // a raw multi-line write corrupts a co-emitted episode-flush receipt.
+      // The follow-up correction (2026-08-17): "two separate JSON lines each parse
+      // independently" was false. A hard-error Bash call reaches BOTH this and
+      // flushEpisode in one handlePostToolUse, and two documents make the parser
+      // fall back to plain text — which the renderer drops entirely for
+      // PostToolUse. Both receipts vanished. Queue; one envelope is written at exit.
+      queueHookContext('PostToolUse', out);
     }
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
 }
@@ -1343,10 +1340,16 @@ function buildFallbackFastSummary(db, { project, now, prevSessionId }) {
   }
 }
 
-async function emitStartupDashboard(db, project) {
-  // T10c: Startup dashboard — aggregate git/tasks/plans/handoff/events into a
-  // structured JSON hookSpecificOutput block. Emitted BEFORE the plain-text
-  // <claude-mem-context> so both surfaces coexist. Empty string → skip.
+async function buildStartupDashboardText(db, project) {
+  // T10c: Startup dashboard — aggregate git/tasks/plans/handoff/events into text.
+  //
+  // Returns the text rather than writing it: SessionStart has three would-be
+  // stdout contributors (this, the <claude-mem-context> block, the update
+  // banner) and handleSessionStart merges them into ONE envelope. Writing here
+  // put a JSON document and raw prose on the same stdout, which stopped the
+  // host from parsing the envelope at all — the whole `{"suppressOutput":true,
+  // …}` object was delivered to the model as literal escaped text. See
+  // tests/session-start-stdout-envelope.test.mjs.
   try {
     const { buildDashboard } = await import('./lib/startup-dashboard.mjs');
     let dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
@@ -1381,16 +1384,8 @@ async function emitStartupDashboard(db, project) {
         dashboardText = dashboardText ? `${nudge}\n${dashboardText}` : nudge;
       }
     } catch (e) { debugCatch(e, 'session-start-deps-flag'); }
-    if (dashboardText) {
-      process.stdout.write(JSON.stringify({
-        suppressOutput: true,
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext: dashboardText,
-        },
-      }) + '\n');
-    }
-  } catch (e) { debugCatch(e, 'session-start-dashboard'); }
+    return dashboardText || '';
+  } catch (e) { debugCatch(e, 'session-start-dashboard'); return ''; }
 }
 
 async function handleSessionStart() {
@@ -1517,7 +1512,7 @@ async function handleSessionStart() {
 
     buildFallbackFastSummary(db, { project, now, prevSessionId });
 
-    await emitStartupDashboard(db, project);
+    const dashboardText = await buildStartupDashboardText(db, project);
 
     // Build the full context body via shared helper (also used by `mem-cli context`).
     // Queries session_summaries, key observations, clear handoff, and the
@@ -1527,16 +1522,43 @@ async function handleSessionStart() {
     const contextCollector = {};
     const fullContext = buildSessionContextLines(db, project, now, ccSessionId, contextCollector);
 
-    // Stdout is the sole context-delivery channel. The SessionStart hook output
-    // is injected as a <system-reminder> at session start, giving Claude the
-    // full summary + handoff state + observations table fresh from the DB.
+    // Stdout is the sole context-delivery channel, and it carries exactly ONE
+    // JSON envelope. Everything SessionStart wants to say is collected here and
+    // written once below: a JSON document followed by raw prose is not a JSON
+    // document, and the host then declines to parse the envelope — delivering
+    // `{"suppressOutput":true,…}` to the model as literal escaped text instead
+    // of honouring it.
+    //
     // Skip the wrapper entirely when there is no body. On a brand-new install every
     // section is empty, and the hook still emitted `<claude-mem-context>\n\n</...>` —
     // a framing block that asserts a memory surface and then shows nothing, which is
     // both wasted context and an active misread ("memory exists and is empty" is a
-    // reason NOT to call mem_*). Non-empty output is byte-identical.
+    // reason NOT to call mem_*).
+    const stdoutParts = [];
+    if (dashboardText) stdoutParts.push(dashboardText);
     if (fullContext.trim()) {
-      process.stdout.write(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>\n`);
+      stdoutParts.push(`<claude-mem-context>\n${fullContext}\n</claude-mem-context>`);
+    }
+
+    // Auto-update banner (audit P3d): NON-BLOCKING — read from cached state
+    // (zero network) and, if the 24h check is due, refresh in a detached
+    // background worker so SessionStart never blocks on a GitHub fetch (was an
+    // inline `await checkForUpdate()` that could stall the session 3-6s).
+    // Collected here rather than written at the end of the handler so it joins
+    // the single envelope; the spawn stays a side effect and is fired below.
+    let updateCheckDue = false;
+    try {
+      const banner = getCachedUpdateBanner();
+      if (banner) stdoutParts.push(String(banner).trim());
+      updateCheckDue = isUpdateCheckDue();
+    } catch (e) { debugCatch(e, 'session-start-update'); }
+
+    // Queued into the same single envelope a leftover episode receipt may also
+    // be contributing to (flushEpisode runs earlier in this very process after
+    // /clear or /compact). Written once, at the dispatcher's exit.
+    if (stdoutParts.length) queueHookContext('SessionStart', stdoutParts.join('\n\n'));
+    if (updateCheckDue) {
+      try { spawnBackground('update-check'); } catch (e) { debugCatch(e, 'session-start-update-spawn'); }
     }
 
     // D#123 (review C-1): persist the Key Context ids ACTUALLY rendered above so
@@ -1579,16 +1601,6 @@ async function handleSessionStart() {
 
     // Pre-load TF-IDF vocabulary cache for this session (from DB, ~1ms)
     try { getVocabulary(db); } catch (e) { debugCatch(e, 'session-start-vocab'); }
-
-    // Auto-update check (audit P3d): NON-BLOCKING. Emit the banner from cached
-    // state (zero network) and, if the 24h check is due, refresh in a detached
-    // background worker so SessionStart never blocks on a GitHub fetch (was an
-    // inline `await checkForUpdate()` that could stall the session 3-6s).
-    try {
-      const banner = getCachedUpdateBanner();
-      if (banner) process.stdout.write(banner);
-      if (isUpdateCheckDue()) spawnBackground('update-check');
-    } catch (e) { debugCatch(e, 'session-start-update'); }
 
   } finally {
     db.close();
@@ -1994,5 +2006,10 @@ try {
   // (audit 2026-08-14 M-5; same blindness one layer up from the v3.60 outage).
   recordHookError(`hook:${event}`, err, RUNTIME_DIR);
 }
+
+// Single stdout write for the whole process (lib/hook-stdout.mjs). Runs after the
+// catch too: a handler that queued a receipt and then threw should still deliver
+// what it had, and Claude Code only ever reads one JSON document from here.
+try { flushHookStdout(); } catch { /* a receipt must never change the exit code */ }
 
 process.exit(0);

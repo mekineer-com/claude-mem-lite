@@ -40,7 +40,8 @@ const NPM_INSTALL_CMD = 'npm install --omit=dev --no-audit --no-fund';
 import { RESOURCE_METADATA } from './install-metadata.mjs';
 import { scanPluginCacheHookPollution } from './plugin-cache-guard.mjs';
 import { SOURCE_FILES, HOOK_SCRIPT_FILES } from './source-files.mjs';
-import { probeBetterSqlite3Binding, probeBindingInFreshProcess, ensureBetterSqlite3Working, NATIVE_BINDING_REBUILD_CMD } from './lib/binding-probe.mjs';
+import { probeBetterSqlite3Binding, ensureBetterSqlite3Working, NATIVE_BINDING_REBUILD_CMD } from './lib/binding-probe.mjs';
+import { detectInstallShape, probeRuntimeRoots } from './lib/install-shape.mjs';
 import { clearNativeBindingBreakage, readNativeBindingBreakage } from './lib/native-binding-hint.mjs';
 import { sweepStaleTestFixtures } from './lib/tmp-fixture-sweep.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
@@ -500,6 +501,23 @@ if (IS_DEV) {
     fail(`better-sqlite3 binding unusable after rebuild: ${verify.error}`);
     log('Try manually: cd ' + INSTALL_DIR + ' && npm rebuild better-sqlite3 --dangerously-allow-all-scripts');
     process.exit(1);
+  }
+
+  // The package this installer is RUNNING from owns a second tree, and after
+  // `npm i -g claude-mem-lite` npm >= 12 has left its better-sqlite3 install
+  // scripts blocked — so the binding is present-but-uncompiled and nothing
+  // above touches it. The shell CLI heals it on first DB use, but only after
+  // the user has already seen `doctor` report `2 issue(s) found` on a
+  // correct install. Close the window here instead. Never fatal: this tree is
+  // not what hooks or the MCP server load.
+  if (PROJECT_DIR !== INSTALL_DIR && existsSync(join(PROJECT_DIR, 'node_modules', 'better-sqlite3'))) {
+    const selfVerify = await ensureBetterSqlite3Working(PROJECT_DIR);
+    if (selfVerify.ok) {
+      if (selfVerify.action === 'rebuilt') ok(`better-sqlite3: rebuilt for the running package too (${PROJECT_DIR})`);
+    } else {
+      warn(`better-sqlite3 unusable in the package this installer runs from (${PROJECT_DIR}): ${selfVerify.error}`);
+      log(`  The install itself is fine; the \`claude-mem-lite\` shell command will self-heal on first use, or run: cd ${PROJECT_DIR} && ${NATIVE_BINDING_REBUILD_CMD}`);
+    }
   }
 }
 }
@@ -1352,6 +1370,14 @@ async function status() {
   const checks = [];
   const push = (level, key, message, extra = {}) => checks.push({ level, key, message, ...extra });
 
+  // A plugin install registers its MCP server and its hooks through the plugin
+  // manifest, never through `claude mcp add` / settings.json. Without knowing
+  // that, status printed `✗ MCP server: not registered` and `✗ Hooks: not
+  // configured` at a correctly-installed plugin user — two red marks describing
+  // the intended state.
+  const shape = detectInstallShape({ home: homedir(), projectDir: PROJECT_DIR, installDir: INSTALL_DIR });
+  const pluginProvides = !!shape.activePluginVersion;
+
   // MCP
   try {
     const list = execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8' });
@@ -1364,7 +1390,13 @@ async function status() {
     // circuited first). `claude mcp list` formats as `<name>: <command>`, so
     // the two colon-form checks below cover every shape.
     const registered = list.includes('mem-lite:') || list.includes('mem:');
-    push(registered ? 'ok' : 'fail', 'mcp', registered ? 'MCP server: registered' : 'MCP server: not registered', { registered });
+    if (registered) {
+      push('ok', 'mcp', 'MCP server: registered', { registered });
+    } else if (pluginProvides) {
+      push('ok', 'mcp', `MCP server: provided by the plugin manifest (v${shape.activePluginVersion.version} .mcp.json) — no user-scope registration expected`, { registered: false, via: 'plugin' });
+    } else {
+      push('fail', 'mcp', 'MCP server: not registered', { registered });
+    }
   } catch {
     push('warn', 'mcp', 'Could not check MCP status', { registered: null });
   }
@@ -1385,6 +1417,8 @@ async function status() {
     push('ok', 'hooks', 'Hooks: configured', { configured: true });
   } else if (pluginDisabled) {
     push('ok', 'hooks', 'Hooks: not configured', { configured: false });
+  } else if (pluginProvides) {
+    push('ok', 'hooks', `Hooks: provided by the plugin manifest (v${shape.activePluginVersion.version} hooks/hooks.json) — settings.json correctly holds none`, { configured: false, via: 'plugin' });
   } else {
     push('fail', 'hooks', 'Hooks: not configured', { configured: false });
   }
@@ -1487,18 +1521,36 @@ async function doctor() {
     issues++;
   }
 
+  // Which code homes does this machine actually run? A machine can hold three
+  // at once (plugin cache / ~/.claude-mem-lite / npm-global) and each owns its
+  // own native binding. Answering about only the dir install.mjs sits in got it
+  // wrong both ways in the field: `✗ server.mjs: missing` on a healthy
+  // plugin-only install, and `✓ better-sqlite3: verified` while the registered
+  // MCP server FATAL'd because a DIFFERENT tree was stale. See lib/install-shape.mjs.
+  const shape = detectInstallShape({ home: homedir(), projectDir: PROJECT_DIR, installDir: INSTALL_DIR });
+
   // Dependencies. Out of process: an in-process open of a STALE .node caches a
   // dead module handle for the rest of doctor and can SIGSEGV on teardown —
   // truncating the report of the very run the user started because things are
   // broken. This is also what makes the native-binding check further down
-  // (which reads the same tree) honest rather than answering from a poisoned
+  // (which reuses these results) honest rather than answering from a poisoned
   // process.
-  const depProbe = probeBindingInFreshProcess(bindingHostDir());
-  if (depProbe.ok) {
-    ok('better-sqlite3: verified (import + open OK)');
-  } else {
-    fail(`better-sqlite3: import/init failed (${String(depProbe.error).split('\n')[0]})`);
+  const rootProbes = probeRuntimeRoots(shape.runtimeRoots);
+  const brokenRoots = rootProbes.filter((r) => !r.ok);
+  if (rootProbes.length === 0) {
+    fail('better-sqlite3: no install on this machine owns a native binding — nothing here can open the DB');
     issues++;
+  } else if (brokenRoots.length === 0) {
+    ok(`better-sqlite3: verified in ${rootProbes.length} install${rootProbes.length === 1 ? '' : 's'} (${rootProbes.map((r) => r.label).join('; ')})`);
+  } else {
+    // Name the ROOT, not just the fault: the repair is per-tree, and pointing a
+    // user at the wrong `cd` is how `rebuild-binding` used to report success
+    // while the broken install stayed broken.
+    for (const b of brokenRoots) {
+      fail(`better-sqlite3 unusable in ${b.label}: ${b.error}`);
+      log(`    repair: ${b.repair}`);
+      issues++;
+    }
   }
 
   try {
@@ -1509,20 +1561,27 @@ async function doctor() {
     issues++;
   }
 
-  // Server file
-  if (existsSync(SERVER_PATH)) {
+  // Entry points. These live in ~/.claude-mem-lite ONLY in the install.mjs-managed
+  // layout; `/plugin install` provisions the data dir but serves code from the
+  // plugin cache, so demanding them there reported two ✗ and exit 1 on a healthy
+  // install of the README's recommended method. Grade against the shape that is
+  // actually in use.
+  if (shape.managed) {
     ok(`server.mjs: ${SERVER_PATH}`);
+    ok(`hook.mjs: ${HOOK_PATH}`);
+  } else if (shape.activePluginVersion) {
+    const v = shape.activePluginVersion;
+    ok(`Entry points: served from plugin cache v${v.version} (plugin-only install — the ~/.claude-mem-lite code layout is not used)`);
+    for (const entry of ['server.mjs', 'hook.mjs', 'cli.mjs']) {
+      if (!existsSync(join(v.root, entry))) {
+        fail(`Plugin cache v${v.version}: ${entry} missing — reinstall with \`/plugin install claude-mem-lite@sdsrss\``);
+        issues++;
+      }
+    }
   } else {
     fail('server.mjs: missing');
-    issues++;
-  }
-
-  // Hook file
-  if (existsSync(HOOK_PATH)) {
-    ok(`hook.mjs: ${HOOK_PATH}`);
-  } else {
     fail('hook.mjs: missing');
-    issues++;
+    issues += 2;
   }
 
   // Hook self-heal runtime: the launcher (scripts/hook-launcher.mjs) degrades a
@@ -1548,11 +1607,10 @@ async function doctor() {
   // right now". A Node upgrade breaks every DB-touching path at once, so this is
   // the single highest-value line in doctor when it fires.
   const breakage = readNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
-  // Reuses the dependency probe above — same tree, same question, and doctor
-  // should not pay for two child spawns to ask it twice.
-  const bindingProbe = depProbe;
-  if (!bindingProbe.ok) {
-    fail(`Native DB binding: unusable (${String(bindingProbe.error).split('\n')[0]}) — run \`node ${join(PROJECT_DIR, 'cli.mjs')} rebuild-binding\``);
+  // Reuses the per-root probes above — same trees, same question, and doctor
+  // should not pay for another round of child spawns to ask it twice.
+  if (brokenRoots.length > 0) {
+    fail(`Native DB binding: unusable in ${brokenRoots.map((b) => b.label).join(', ')} — run \`node ${join(PROJECT_DIR, 'cli.mjs')} rebuild-binding\` (repairs every broken install, not just this one)`);
     issues++;
   } else if (breakage) {
     const ageH = Math.round((Date.now() - (breakage.ts || 0)) / 3600000);
@@ -1593,6 +1651,11 @@ async function doctor() {
     ok('Plugin lifecycle: disabled cleanly (no active mem hooks)');
   } else if (hasHooks) {
     ok('Plugin lifecycle: hooks active');
+  } else if (shape.activePluginVersion) {
+    // Plugin-only: hooks come from the cache's hooks/hooks.json, and an EMPTY
+    // settings.json hooks block is the correct state — warning about it told a
+    // correctly-installed user their hooks were missing.
+    ok(`Plugin lifecycle: hooks served by the plugin manifest (v${shape.activePluginVersion.version}); settings.json correctly holds none`);
   } else {
     dwarn('Plugin lifecycle: hooks not configured');
   }
@@ -1718,15 +1781,23 @@ async function doctor() {
   // class. Per #8043: "is this file present ≠ is this install consistent" —
   // missing is tracked separately by checkDevDrift but the caller MUST surface
   // it to honour #8268's "gate the all-green string on every counter" rule.
+  // Gated on the managed layout existing at all. SOURCE_FILES describes what
+  // `install` deploys into ~/.claude-mem-lite; on a plugin-only install nothing
+  // was ever deployed there, so every entry reads as "missing" and this reported
+  // `⚠ Managed files: 121 missing` + an issue on a correct install — prescribing
+  // a repair against a path that does not exist.
   try {
+    const skipDrift = !shape.managed && !!shape.activePluginVersion;
     const { checkDevDrift } = await import('./lib/doctor-drift.mjs');
-    const r = checkDevDrift(INSTALL_DIR, SOURCE_FILES);
+    const r = skipDrift ? null : checkDevDrift(INSTALL_DIR, SOURCE_FILES);
     const devRemedy = `re-run: node ${join(PROJECT_DIR, 'install.mjs')} install --dev`;
     const nameList = (files, count) => {
       const suffix = count > files.length ? ` +${count - files.length} more` : '';
       return `${files.join(', ')}${suffix}`;
     };
-    if (r.devMode) {
+    if (skipDrift) {
+      ok('Managed files: n/a (plugin-only install — code is served from the plugin cache, so ~/.claude-mem-lite holds data only)');
+    } else if (r.devMode) {
       const parts = [];
       if (r.plainCount > 0) {
         parts.push(`${r.plainCount} non-symlink: ${nameList(r.plainFiles.slice(0, 5), r.plainCount)}`);
@@ -1772,8 +1843,11 @@ async function doctor() {
       if (r.missingModuleCount > 0) {
         parts.push(`${r.missingModuleCount} module: ${nameList(r.missingModuleFiles, r.missingModuleCount)}`);
       }
+      // `claude-mem-lite update` is the observation editor (`update <id>`); the
+      // self-updater is `self-update`. Naming the wrong one sent the user to a
+      // usage error at the exact moment their install was incomplete.
       warn(`Managed files: ${r.missingCount} missing (${parts.join('; ')}) — a copy install resolves `
-        + `imports against the install dir, so these throw at hook time. Fix: claude-mem-lite update `
+        + `imports against the install dir, so these throw at hook time. Fix: claude-mem-lite self-update `
         + `(or: node ${join(INSTALL_DIR, 'install.mjs')} repair)`);
       issues++;
     }
@@ -2322,7 +2396,6 @@ function bindingHostDir() {
 // two concurrent rebuilds can clobber the .node mid-compile. A live peer → report
 // and exit 0 (it is doing this very work), never race it.
 async function rebuildBinding() {
-  const host = bindingHostDir();
   const release = acquireLock(join(MEM_DATA_DIR, 'runtime', 'install.lock'));
   if (!release) {
     // NOT exit 0: skipping is not healing. Callers key their state on the exit
@@ -2333,15 +2406,33 @@ async function rebuildBinding() {
     return;
   }
   try {
-    const verify = await ensureBetterSqlite3Working(host);
-    if (verify.ok) {
-      ok(`better-sqlite3 binding ${verify.action} for Node ${process.version} (${host})`);
-      // The fault is gone → drop the marker so session-start stops retrying.
-      clearNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
-    } else {
-      fail(`better-sqlite3 binding still unusable: ${verify.error}`);
-      log(`Try manually: cd ${host} && ${NATIVE_BINDING_REBUILD_CMD}`);
+    // Every code home on this machine, not just the one this file sits in.
+    // Pre-fix this rebuilt bindingHostDir() alone and reported `✓ ... verified`
+    // — so a user whose ~/.claude-mem-lite tree was stale (hooks silently dead,
+    // MCP server FATAL'ing) ran the documented repair, watched it succeed, and
+    // still had no memory. Falling back to INSTALL_DIR keeps a source-only
+    // layout with no deps of its own repairable.
+    const shape = detectInstallShape({ home: homedir(), projectDir: PROJECT_DIR, installDir: INSTALL_DIR });
+    const targets = shape.runtimeRoots.length > 0
+      ? shape.runtimeRoots
+      : [{ label: 'install dir', root: bindingHostDir() }];
+
+    let failed = 0;
+    for (const { label, root } of targets) {
+      const verify = await ensureBetterSqlite3Working(root);
+      if (verify.ok) {
+        ok(`better-sqlite3 binding ${verify.action} for Node ${process.version} — ${label} (${root})`);
+      } else {
+        fail(`better-sqlite3 binding still unusable in ${label}: ${verify.error}`);
+        log(`Try manually: cd ${root} && ${NATIVE_BINDING_REBUILD_CMD}`);
+        failed++;
+      }
+    }
+    if (failed > 0) {
       process.exitCode = 1;
+    } else {
+      // Every tree is loadable → drop the marker so session-start stops retrying.
+      clearNativeBindingBreakage(join(MEM_DATA_DIR, 'runtime'));
     }
   } finally {
     release();

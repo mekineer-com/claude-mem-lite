@@ -21,8 +21,13 @@
 //
 // PER-SURFACE STDOUT CONTRACT (asserted by expectHookStdout, per Claude Code's hook I/O
 // rules and the shapes tests/e2e.test.mjs + the source comments pin):
-//   hook.mjs session-start      JSON envelope line(s) (hookEventName SessionStart) AND the
-//                               plain <claude-mem-context> block — both are context channels.
+//   hook.mjs session-start      EXACTLY ONE JSON envelope (hookEventName SessionStart),
+//                               carrying the dashboard, the <claude-mem-context> block and
+//                               the update banner in additionalContext. Pre-v3.70 these were
+//                               three separate writes; the trailing raw prose made stdout
+//                               un-parseable as a JSON document and the host delivered the
+//                               whole envelope to the model as literal escaped text with
+//                               suppressOutput ignored (tests/session-start-stdout-envelope).
 //   hook.mjs post-tool-use      JSON envelope line(s) ONLY (hookEventName PostToolUse).
 //                               Plain text here is the shipped `<text>{json}` corruption bug
 //                               (MED-3, audit 2026-07-16) — one stray line makes Claude Code's
@@ -232,14 +237,31 @@ function expectHookStdout(out, { event = null, plainAllowed = false, label }) {
   const jsonLines = [], plainLines = [];
   for (const line of out.split('\n')) {
     if (line === '') continue;
-    // An envelope that does not START its line is invisible to Claude Code's line-based
-    // parser — and takes the rest of the line with it. This is the exact shape of the
-    // PostToolUse error-recall bug fixed in v3.48 (raw text + JSON in one write).
+    // An envelope that does not START its line is invisible — and takes the rest of the
+    // line with it. This is the exact shape of the PostToolUse error-recall bug fixed in
+    // v3.48 (raw text + JSON in one write).
     expect(
       /^[^{].*[{,]\s*"(?:suppressOutput|hookSpecificOutput)"/.test(line),
       `${label}: JSON envelope is not at the start of its line — the host drops it:\n${line}`,
     ).toBe(false);
     (line.startsWith('{') ? jsonLines : plainLines).push(line);
+  }
+
+  // At most ONE envelope, and nothing else beside it. Claude Code parses hook stdout
+  // as a single JSON document (2.1.233 `Hxi`: `if(!t.startsWith("{")) return {plainText:e}`
+  // then JSON.parse of the WHOLE trimmed string, catch → plainText). This helper used to
+  // encode a line-based parser that does not exist, so two envelopes on two lines read as
+  // compliant while the host was actually discarding both. See lib/hook-stdout.mjs.
+  expect(
+    jsonLines.length,
+    `${label}: ${jsonLines.length} JSON envelopes on one stdout — the host JSON.parses the whole `
+    + `thing, so this degrades to plain text and every envelope is lost:\n${out}`,
+  ).toBeLessThanOrEqual(1);
+  if (jsonLines.length === 1) {
+    expect(
+      plainLines,
+      `${label}: prose alongside a JSON envelope makes stdout unparseable as one document`,
+    ).toEqual([]);
   }
 
   if (event === null) {
@@ -410,7 +432,7 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     expect(r.code, `session-start exited ${r.code}\n${r.stderr}`).toBe(0);
 
     const envelopes = expectHookStdout(r.stdout, {
-      event: 'SessionStart', plainAllowed: true, label: 'hook.mjs session-start',
+      event: 'SessionStart', plainAllowed: false, label: 'hook.mjs session-start',
     });
     // The startup dashboard rides the JSON channel and must name the one event seeded above
     // (a dashboard computed over the wrong project — or over the live DB — says "0 entries"
@@ -418,11 +440,19 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
     expect(envelopes).toHaveLength(1);
     expect(envelopes[0].hookSpecificOutput.additionalContext).toContain('mem events: 1 entries');
     expect(envelopes[0].suppressOutput).toBe(true);
-    // …and the context block rides the plain channel, carrying the seeded memory.
-    expect(r.stdout).toContain('<claude-mem-context>');
-    expect(r.stdout).toContain('</claude-mem-context>');
-    expect(r.stdout).toContain('Session start sweep event');
-    expect(r.stdout).toContain('Fixed the widget cache invalidation race');
+    // …and the context block rides the SAME envelope, carrying the seeded memory.
+    // Asserted against additionalContext, not against raw stdout: `stdout` contains
+    // the block either way (JSON.stringify does not escape angle brackets), so a
+    // stdout-level toContain cannot tell the merged shape from the pre-v3.70 shape
+    // where a second raw write made the envelope unparseable for the host.
+    const ctx = envelopes[0].hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('<claude-mem-context>');
+    expect(ctx).toContain('</claude-mem-context>');
+    expect(ctx).toContain('Session start sweep event');
+    expect(ctx).toContain('Fixed the widget cache invalidation race');
+    // Nothing may ride outside the envelope on this surface.
+    expect(r.stdout.trim().split('\n').filter((l) => l.trim() && !l.startsWith('{')))
+      .toEqual([]);
 
     // Side effects landed in the SANDBOX, under the project derived from the sandbox cwd.
     expect(withDb((db) => db.prepare('SELECT status FROM sdk_sessions WHERE project = ?').get(project)))
@@ -434,7 +464,7 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
 
     await expectMalformedResilience(
       'hook.mjs session-start',
-      { event: 'SessionStart', plainAllowed: true },
+      { event: 'SessionStart', plainAllowed: false },
       (stdin, malCwd) => hookEvent('session-start', { cwd: malCwd, stdin }),
     );
   });
