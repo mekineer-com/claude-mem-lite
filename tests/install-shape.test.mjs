@@ -176,7 +176,7 @@ describe('detectInstallShape — every tree a runtime surface resolves', () => {
     makePluginVersion(home, '3.69.1', { deps: 'none' });
     const shape = detectInstallShape({ home, projectDir: join(home, 'nowhere'), installDir: join(home, '.claude-mem-lite') });
     expect(shape.runtimeRoots).toHaveLength(1);
-    expect(shape.runtimeRoots[0].depsMissing).toBe(true);
+    expect(shape.runtimeRoots[0].ownDeps).toBe(false);
   });
 
   // Pre-tag review (correctness lens, SHOULD-FIX 1): dropping a root because it has
@@ -196,7 +196,45 @@ describe('detectInstallShape — every tree a runtime surface resolves', () => {
     expect(shape.managed).toBe(true);
     const entry = shape.runtimeRoots.find((r) => r.root === managed);
     expect(entry, 'the managed code home must appear as a root').toBeTruthy();
-    expect(entry.depsMissing).toBe(true);
+    expect(entry.ownDeps).toBe(false);
+  });
+
+  // v3.70.0 fixed a false-GREEN here by pre-judging any certified root without its own
+  // node_modules as broken. That over-corrected into a false-RED: Node resolves a
+  // specifier up the directory tree, so a code home under an ancestor that HAS a
+  // working better-sqlite3 loads fine. Measured on the shipped build: ground-truth
+  // probe {ok:true} while the verdict said "absent — every hook throws
+  // ERR_MODULE_NOT_FOUND". Whether the tree is owned is not the question; whether the
+  // root can LOAD is, and only a probe answers that.
+  it('does NOT pre-judge a certified home that resolves better-sqlite3 from an ancestor', async () => {
+    const { probeRuntimeRoots } = await import('../lib/install-shape.mjs');
+    // Ancestor owns a working tree…
+    withRealDeps(home);
+    // …and the code home nested inside it owns none.
+    const managed = join(home, '.claude-mem-lite');
+    mkdirSync(managed, { recursive: true });
+    writeFileSync(join(managed, 'package.json'), JSON.stringify({ name: 'claude-mem-lite', version: '9.9.9' }));
+    for (const f of ['server.mjs', 'hook.mjs']) writeFileSync(join(managed, f), '// x\n');
+
+    const shape = detectInstallShape({ home, projectDir: join(home, 'nowhere'), installDir: managed });
+    const entry = shape.runtimeRoots.find((r) => r.root === managed);
+    expect(entry, 'still a probe target').toBeTruthy();
+    expect(entry.ownDeps).toBe(false);
+    const [r] = probeRuntimeRoots([entry]);
+    expect(r.ok, `probe said broken but the root loads fine: ${r.error}`).toBe(true);
+  });
+
+  it('still reports broken when NOTHING resolves, and says absent rather than stale', async () => {
+    const { probeRuntimeRoots } = await import('../lib/install-shape.mjs');
+    const managed = join(home, '.claude-mem-lite');
+    mkdirSync(managed, { recursive: true });
+    writeFileSync(join(managed, 'package.json'), JSON.stringify({ name: 'claude-mem-lite', version: '9.9.9' }));
+    for (const f of ['server.mjs', 'hook.mjs']) writeFileSync(join(managed, f), '// x\n');
+    const shape = detectInstallShape({ home, projectDir: join(home, 'nowhere'), installDir: managed });
+    const [r] = probeRuntimeRoots(shape.runtimeRoots);
+    expect(r.ok).toBe(false);
+    // An absent tree needs an install; `npm rebuild` of nothing exits 0 and heals nothing.
+    expect(r.repair).toMatch(/npm install/);
   });
 
   it('probeRuntimeRoots reports a deps-missing code home as broken, not ok', async () => {
@@ -207,8 +245,6 @@ describe('detectInstallShape — every tree a runtime surface resolves', () => {
     const shape = detectInstallShape({ home, projectDir: join(home, 'nowhere'), installDir: managed });
     const [r] = probeRuntimeRoots(shape.runtimeRoots);
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/node_modules/i);
-    // The repair for an absent tree is an install, not a rebuild of nothing.
     expect(r.repair).toMatch(/npm install/);
   });
 

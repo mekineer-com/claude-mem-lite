@@ -153,15 +153,24 @@ describe('doctor: a stale binding is found in whichever install owns it', () => 
     expect(r.stdout).not.toMatch(new RegExp(`cd ${REPO}\\b`));
   });
 
-  it('exits 1 when a CERTIFIED code home has no node_modules at all', () => {
-    // ERR_MODULE_NOT_FOUND on every hook fire, and it is not in
-    // NATIVE_BINDING_PATTERNS, so nothing else records it.
+  it('exits 1 when a CERTIFIED code home cannot load better-sqlite3 at all', () => {
+    // The failure mode is ERR_MODULE_NOT_FOUND on every hook fire, which is not in
+    // NATIVE_BINDING_PATTERNS, so nothing else records it either.
+    //
+    // Asserted on the VERDICT and the repair, not on the probe's error text: whether
+    // the resolver reaches an ancestor node_modules depends on where the OS put the
+    // temp dir (locally it lands under $HOME and finds one; on CI it lands under /tmp
+    // and does not). Pinning the message would make this test pass or fail on the
+    // machine's directory layout, which is the exact blind spot that shipped a
+    // free-text pgrep match in this same release.
     const root = join(home, '.claude-mem-lite');
     mkdirSync(join(root, 'runtime'), { recursive: true });
     for (const f of ['server.mjs', 'hook.mjs']) writeFileSync(join(root, f), '// x\n');
     const r = run('doctor');
-    expect(r.code, `doctor exited ${r.code} on a managed install with no deps\n${r.stdout}`).toBe(1);
-    expect(r.stdout).toMatch(/node_modules\/better-sqlite3 is absent/);
+    expect(r.code, `doctor exited ${r.code} on a managed install that cannot load\n${r.stdout}`).toBe(1);
+    expect(r.stdout).toMatch(/better-sqlite3 unusable in .*managed install/);
+    // An absent tree needs an install; rebuilding nothing exits 0 and heals nothing.
+    expect(r.stdout).toMatch(/npm install --omit=dev/);
   });
 
   it('ignores a stale NON-ACTIVE cache version instead of going red forever', () => {

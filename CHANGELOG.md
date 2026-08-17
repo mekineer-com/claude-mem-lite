@@ -2,6 +2,26 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.70.1 — v3.70.0's fix for a false green over-corrected into a false red
+
+One line of v3.70.0. Fixing the false-green case (a certified code home dropped from the probe set instead of reported) was done by pre-judging any such root **broken** without probing it. That is wrong in the other direction: Node resolves a specifier up the directory tree, so a code home nested under a parent that owns a working `better-sqlite3` loads perfectly well. On the shipped build the ground-truth probe returned `{ok: true}` while `doctor` printed
+
+```
+✗ better-sqlite3 unusable in managed install (~/.claude-mem-lite):
+    node_modules/better-sqlite3 is absent — every hook and the MCP server that
+    load this install throw ERR_MODULE_NOT_FOUND
+```
+
+— exit 1, about an install whose hooks were fine. Same class of defect v3.70.0 exists to remove, one step further out, and introduced by that release.
+
+Whether a root *owns* its dependency tree was never the question; whether it can **load** is, and only the probe answers that, because only the probe walks Node's real resolution chain. So every certified root is now probed. The repair still differs by case: a root that owns no tree gets `npm install --omit=dev` (a `npm rebuild` of a package that is not installed exits 0 and heals nothing), a present-but-unloadable tree gets the rebuild.
+
+The failure message also stopped asserting what it could not know. It claimed "none resolvable from a parent directory" while printing, in the same line, a probe error naming the parent tree it had just loaded from. It now reports the probe's own error plus the one fact that is certain: this install owns no tree, so there is nothing here to rebuild.
+
+Trigger was narrow — it needed a managed code home with no `node_modules` of its own *and* a usable `better-sqlite3` in an ancestor directory — but on this maintainer's machine `~/node_modules/better-sqlite3` exists, which is how a reviewer's aside about ancestor resolution turned into a reproduction.
+
+272 test files / 4616 tests green, eslint clean, shellcheck clean, knip 31 unused exports, sandbox 103/103. Both directions are mutation-verified: restoring the pre-judgment reddens the ancestor case, and dropping certified roots again reddens six.
+
 ## v3.70.0 — a sandbox install of the recommended method failed its own health check, and the hook envelope was never being parsed
 
 A sandbox played a real user through both documented install paths end to end — `/plugin install`, `npm i -g` + `claude-mem-lite install`, then use, auto-update, self-heal and uninstall for each (103 checks). Five defects, each reproduced before it was fixed and each fix mutation-verified. Two of them change what users see by default, so this is a minor bump.
