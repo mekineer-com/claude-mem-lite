@@ -2,6 +2,35 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.70.2 — the ABI-mismatch check printed the path and dropped the diagnosis
+
+Node's message for a stale native binding is five lines, and the filename is line 0:
+
+```
+[0] The module '/…/better_sqlite3.node'
+[1] was compiled against a different Node.js version using
+[2] NODE_MODULE_VERSION 127. This version of Node.js requires      ← the diagnosis
+[3] NODE_MODULE_VERSION 137. Please try re-compiling or re-installing
+[4] the module (for instance, using `npm rebuild` or `npm install`).
+```
+
+Four surfaces rendered that with `.split('\n')[0]`, so for the one fault family this whole subsystem exists to detect, each of them showed a bare path and dropped the ABI numbers. `lib/binding-probe.mjs` even asserted in a comment that this string is "the highest-value line `doctor` prints" — for a stale binding it carried no diagnosis at all.
+
+Not a regression: the same truncation is in v3.70.0 and in every build before it. It became conspicuous in the case v3.70.1 had just corrected, where the rendered line put a path from an *ancestor* tree immediately next to "this install owns no node_modules" — two halves naming different trees, which reads as a contradiction even though neither half is false.
+
+Flattening replaces truncating, at a single home (`flattenBindingError`), so the path and the numbers both survive on one line that is still safe for a JSON envelope, a JSONL record and a hook receipt. Fixed on all four surfaces, not just the one that was reported:
+
+| Surface | Was |
+|---|---|
+| `doctor`'s per-root binding failure | a bare path |
+| the **persisted** breakage marker | a bare path — and `doctor` reads it back hours later as `a fire failed ~Nh ago (<reason>)` |
+| `setup.sh`'s probe diagnostic (`binding-probe-cli`) | a bare path |
+| the same file's lock-contention message | a bare path |
+
+`bareProbe` keeps its own inlined copy on purpose: it is the fallback for a tree where `lib/` failed to import, so the shared helper is unreachable there — importing it would have turned the fallback into a `TypeError`.
+
+Verified against this machine's genuinely ABI-127 `~/node_modules/better-sqlite3` rather than a fixture: `doctor` now prints `NODE_MODULE_VERSION 127 … requires NODE_MODULE_VERSION 137` alongside the path and the correct `npm install --omit=dev` repair. 273 test files / 4626 tests green, eslint clean, shellcheck clean, knip 31, sandbox 103/103. All three flattening sites are mutation-verified against the exact `.split('\n')[0]` they replaced.
+
 ## v3.70.1 — v3.70.0's fix for a false green over-corrected into a false red
 
 One line of v3.70.0. Fixing the false-green case (a certified code home dropped from the probe set instead of reported) was done by pre-judging any such root **broken** without probing it. That is wrong in the other direction: Node resolves a specifier up the directory tree, so a code home nested under a parent that owns a working `better-sqlite3` loads perfectly well. On the shipped build the ground-truth probe returned `{ok: true}` while `doctor` printed

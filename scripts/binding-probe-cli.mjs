@@ -42,8 +42,16 @@ function bareProbe(root) {
   const r = spawnSync(process.execPath, ['-e', script], { stdio: 'pipe', timeout: 8000 });
   if (!r.error && r.status === 0) return true;
   // Say WHY. The inline predecessor printed the cause here; dropping it left the
-  // user with setup.sh's generic "binding unusable" and nothing to act on.
-  const why = String(r.stdout || '').trim().split('\n')[0]
+  // user with setup.sh's generic "binding unusable" and nothing to act on. Flattened
+  // rather than first-lined: Node's ABI message puts the filename on line 0 and the
+  // NODE_MODULE_VERSION pair on lines 2-3, so `.split('\n')[0]` said WHERE but never
+  // WHY — for the exact fault this probe exists to find.
+  //
+  // Flattening is inlined, NOT lib/binding-probe.mjs::flattenBindingError, because
+  // this function is the fallback for a tree where lib/ failed to import — `helpers`
+  // is still null on every path that reaches here. Duplicated deliberately; keep the
+  // two in step.
+  const why = String(r.stdout || '').replace(/\s+/g, ' ').trim().slice(0, 240)
     || (r.error && r.error.message)
     || `probe exited ${r.status ?? `on signal ${r.signal}`}`;
   process.stderr.write(`[claude-mem-lite] binding probe: ${why}\n`);
@@ -82,9 +90,9 @@ try {
 }
 const release = helpers.acquireLock(lockPath);
 if (!release) {
-  const firstLine = String(first.error).split('\n')[0];
   process.stderr.write(
-    `[claude-mem-lite] binding probe: ${firstLine} (another install/repair in flight — deferring heal)\n`,
+    `[claude-mem-lite] binding probe: ${helpers.flattenBindingError(first.error)} `
+    + '(another install/repair in flight — deferring heal)\n',
   );
   process.exit(1);
 }
