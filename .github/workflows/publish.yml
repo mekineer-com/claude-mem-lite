@@ -114,7 +114,21 @@ jobs:
         # variable NPM_PROVENANCE=true once the token is granular/automation-scoped
         # (the id-token: write permission above is harmless when provenance is OFF).
         run: |
-          if [ "${NPM_PROVENANCE}" = "true" ]; then
+          # Idempotency guard. `npm publish` errors on an existing version, so a job that
+          # published successfully and then failed LATER (signing, or the GitHub release
+          # step) could never be re-run: the retry died here instead of reaching the step
+          # that actually failed. v3.69.0 and v3.69.1 both hit exactly that — npm publish
+          # succeeded, then action-gh-release got 503 three times, and neither tag could
+          # be recovered because the only path back ran through this step. One transient
+          # GitHub outage permanently stranded a version. Skipping an already-published
+          # version makes the whole job re-runnable; `validate` has already proved the tag
+          # matches package.json, so "already there" means our own artifact, not someone
+          # else's.
+          PKG_NAME="$(node -p 'require("./package.json").name')"
+          PKG_VER="$(node -p 'require("./package.json").version')"
+          if npm view "${PKG_NAME}@${PKG_VER}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${PKG_VER} is already on the registry — skipping publish and continuing to the release steps."
+          elif [ "${NPM_PROVENANCE}" = "true" ]; then
             # Provenance needs an OIDC-capable (automation/granular) token. A classic
             # token can't attest and fails the provenance publish (lesson #8583). Rather
             # than block the release, fall back to a plain publish with a loud warning —
