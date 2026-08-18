@@ -48,20 +48,34 @@ const HELPER_SCRIPT = 'prompt-search-utils.mjs';
 /**
  * Build a fake INSTALL_DIR under a fake HOME, then run `doctor --json`.
  *
- * @param {{scriptsDir?: 'copy'|'symlink'|'absent', omitScripts?: string[]}} opts
+ * @param {{scriptsDir?: 'copy'|'symlink'|'dangling'|'absent', omitScripts?: string[],
+ *          pluginOnly?: boolean}} opts
  */
-function doctorOn({ scriptsDir = 'copy', omitScripts = [] } = {}) {
+function doctorOn({ scriptsDir = 'copy', omitScripts = [], pluginOnly = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'doctor-hookscripts-'));
   homes.push(home);
   const installDir = join(home, '.claude-mem-lite');
   mkdirSync(join(installDir, 'lib'), { recursive: true });
   mkdirSync(join(installDir, 'runtime'), { recursive: true });
-  for (const rel of ENTRIES) writeFileSync(join(installDir, rel), '// copy\n');
+  if (pluginOnly) {
+    // detectInstallShape: managed = server.mjs AND hook.mjs present in the install dir, so
+    // omitting them leaves the data-only dir every shape creates. The plugin cache supplies
+    // activePluginVersion — gated on scripts/launch.mjs, not mere directory presence.
+    const cache = join(home, '.claude', 'plugins', 'cache', 'sdsrss', 'claude-mem-lite', '3.72.0', 'scripts');
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'launch.mjs'), '// launcher\n');
+  } else {
+    for (const rel of ENTRIES) writeFileSync(join(installDir, rel), '// copy\n');
+  }
 
   const scripts = join(installDir, 'scripts');
   if (scriptsDir === 'symlink') {
     // What `install --dev` does: ONE symlink for the whole directory.
     symlinkSync(REPO_SCRIPTS, scripts);
+  } else if (scriptsDir === 'dangling') {
+    // A dev symlink whose target was moved or deleted. existsSync follows the link, so this
+    // reads as absent — which is right: the hook commands resolve through it to nothing.
+    symlinkSync(join(home, 'gone-away'), scripts);
   } else if (scriptsDir === 'copy') {
     mkdirSync(scripts, { recursive: true });
     for (const name of HOOK_SCRIPT_FILES) {
@@ -99,9 +113,9 @@ function hookLines(report) {
 }
 const msg = (report) => hookLines(report).map((c) => c.message).join(' ');
 
-// Five doctor subprocesses total, computed once — a 2-core runner cannot afford one spawn
+// Eight doctor subprocesses total, computed once — a 2-core runner cannot afford one spawn
 // per assertion (lesson: the execFileSync suites that timed out at default budget).
-let complete, noDir, noEntry, noHelper, devLinked;
+let complete, noDir, noEntry, noHelper, devLinked, noBoth, dangling, pluginOnly;
 
 describe('doctor — HOOK_SCRIPT_FILES manifest coverage', () => {
   beforeAll(() => {
@@ -110,7 +124,10 @@ describe('doctor — HOOK_SCRIPT_FILES manifest coverage', () => {
     noEntry = doctorOn({ scriptsDir: 'copy', omitScripts: [ENTRY_SCRIPT] });
     noHelper = doctorOn({ scriptsDir: 'copy', omitScripts: [HELPER_SCRIPT] });
     devLinked = doctorOn({ scriptsDir: 'symlink' });
-  }, 240_000);
+    noBoth = doctorOn({ scriptsDir: 'copy', omitScripts: [ENTRY_SCRIPT, HELPER_SCRIPT] });
+    dangling = doctorOn({ scriptsDir: 'dangling' });
+    pluginOnly = doctorOn({ scriptsDir: 'absent', pluginOnly: true });
+  }, 420_000);
 
   afterAll(() => {
     for (const h of homes.splice(0)) { try { rmSync(h, { recursive: true, force: true }); } catch { /* gone */ } }
@@ -176,6 +193,41 @@ describe('doctor — HOOK_SCRIPT_FILES manifest coverage', () => {
       .toEqual(invoked.sort());
     // And the set must never name a file the manifest does not ship.
     for (const name of HOOK_SCRIPT_ENTRY_POINTS) expect(HOOK_SCRIPT_FILES).toContain(name);
+  });
+
+  it('pairs each missing file with ITS OWN consequence, so the classes cannot be swapped', () => {
+    // The v3.68.1 face-swap class. Every other case here omits ONE file, and both branches
+    // name their files and both raise an issue — so SWAPPING the two filters in
+    // checkHookScriptDrift (entry ⇄ helper) left the whole suite green while doctor told the
+    // reader the wrong consequence. Omitting one of EACH makes the pairing observable.
+    const m = msg(noBoth);
+    expect(noBoth.issues).toBeGreaterThan(complete.issues);
+    expect(m, `entry script not reported as a dead command:\n${m}`)
+      .toMatch(new RegExp(`hook entry \\(${ENTRY_SCRIPT.replace('.', '\\.')}\\)`));
+    expect(m, `imported helper not reported as a resolution failure:\n${m}`)
+      .toMatch(new RegExp(`imported helper \\(${HELPER_SCRIPT.replace('.', '\\.')}\\)`));
+  });
+
+  it('names the install shape it inspected, so a wrong shape reading is visible', () => {
+    // `dirSymlink` steers three strings and nothing asserted any of them: forcing it to
+    // false left the suite green while doctor described a dev install as a copy install and
+    // a dangling link as a plain absent directory.
+    expect(msg(devLinked)).toMatch(/symlinked to the repo/);
+    expect(msg(complete)).toMatch(/copy install/);
+    expect(msg(dangling), `a dangling scripts/ symlink was reported as merely absent:\n${msg(dangling)}`)
+      .toMatch(/dangling symlink/);
+    expect(dangling.issues, 'a dangling scripts/ symlink raised no issue').toBeGreaterThan(complete.issues);
+  });
+
+  it('skips the check on a plugin-only install instead of prescribing a repair', () => {
+    // A plugin-only install never deploys into ~/.claude-mem-lite and runs its hooks from
+    // ${CLAUDE_PLUGIN_ROOT}, so grading it against that layout reports a broken install to a
+    // correct one — the same false alarm the managed-files check already had to gate.
+    // Nothing covered this branch: forcing skipScripts=false kept every test green.
+    expect(hookLines(pluginOnly).length, 'no hook-script line on a plugin-only install').toBeGreaterThan(0);
+    expect(hookLines(pluginOnly).every((c) => c.level === 'ok'),
+      `plugin-only install was graded against the managed layout:\n${msg(pluginOnly)}`).toBe(true);
+    expect(msg(pluginOnly)).toMatch(/n\/a|plugin-only/);
   });
 
   it('a dev install (whole scripts/ dir symlinked) is clean, not 8 non-symlink drifts', () => {

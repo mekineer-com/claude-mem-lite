@@ -23,7 +23,7 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import Database from 'better-sqlite3';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, mkdirSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve, basename } from 'path';
 import { initSchema } from '../schema.mjs';
@@ -169,6 +169,36 @@ describe('resolveCliProject', () => {
     mkdirSync(deep, { recursive: true });
     db.prepare("INSERT INTO deferred_work (project, title, priority, status, created_at_epoch) VALUES (?, 'x', 2, 'open', ?)")
       .run(projectNameFromDir(root), Date.now());
+    expect(resolveCliProject(db, { dir: deep })).toBe(projectNameFromDir(root));
+  });
+
+  it('memoizes per directory, not once per process', () => {
+    // One CLI process is one command, but the suite resets between tests and each test used
+    // a single dir — so a memo that ignored its key and returned the first cached value for
+    // everything stayed green. A subagent or a long-lived harness resolving two directories
+    // in one process would silently get the first one's answer for both.
+    const a = mktmp('cliproj-memoA-');
+    const b = mktmp('cliproj-memoB-');
+    mkdirSync(join(a, '.git'));
+    mkdirSync(join(b, '.git'));
+    seedObs(projectNameFromDir(a));
+    seedObs(projectNameFromDir(b));
+    expect(resolveCliProject(db, { dir: a })).toBe(projectNameFromDir(a));
+    expect(resolveCliProject(db, { dir: b }),
+      'the second directory got the first one\'s cached answer').toBe(projectNameFromDir(b));
+    expect(projectNameFromDir(a)).not.toBe(projectNameFromDir(b));
+  });
+
+  it('resolves a linked worktree, whose .git is a FILE and not a directory', () => {
+    // `git worktree add` and submodules write a `.git` FILE holding `gitdir: …`. Requiring a
+    // DIRECTORY would silently walk past such a root to the enclosing tree — or to nothing —
+    // and the fallback would stop working for every worktree user. Nothing pinned the choice.
+    const root = mktmp('cliproj-worktree-');
+    writeFileSync(join(root, '.git'), 'gitdir: /elsewhere/.git/worktrees/wt\n');
+    const deep = join(root, 'src');
+    mkdirSync(deep, { recursive: true });
+    seedObs(projectNameFromDir(root));
+    expect(findGitRoot(deep), 'a .git FILE was not accepted as a work-tree root').toBe(root);
     expect(resolveCliProject(db, { dir: deep })).toBe(projectNameFromDir(root));
   });
 

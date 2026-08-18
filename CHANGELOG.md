@@ -2,6 +2,54 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.72.1 — the guards the mutation harness said were not there
+
+**Upgrade note.** No action needed. Almost all of this is test-only. The one behaviour
+change: `stats` run from a SUBDIRECTORY now tiers rows against the same project `recent`
+resolves, instead of against the empty cwd-derived name. To revert, pin
+`npm i claude-mem-lite@3.72.0`.
+
+### five spots the new suites did not actually guard
+
+v3.72.0's pre-tag review ran a 51-mutation harness but never delivered a report. The harness
+was still on disk afterwards, so it was re-run against the shipped code: 42 mutations
+applied, 28 killed, **5 survived**. None was a behaviour defect — the shipped code is
+correct — but five things it does were pinned by nothing:
+
+- **Swapping the entry-script and imported-helper filters** in `checkHookScriptDrift` left
+  the whole suite green. Both branches name their files and both raise an issue, so doctor
+  would have told the reader the wrong consequence and no test noticed. This is the same
+  face-swap blindness v3.68.1 fixed on the citation funnel: when every case omits ONE file,
+  a classification swap is invisible. One entry AND one helper are now omitted together, so
+  the pairing is observable.
+- **Forcing `dirSymlink` to false** left it green: nothing asserted the shape wording, so
+  doctor could describe a dev install as a copy install, or a dangling `scripts/` symlink as
+  a plain absent directory. Both are asserted now, with a dangling-link fixture.
+- **The plugin-only skip branch had no fixture at all** — forcing `skipScripts=false` was
+  invisible, and that is the branch that stops doctor prescribing a repair to a correct
+  install. It now builds a real plugin-only shape: a data-only install dir plus a plugin
+  cache version dir carrying `scripts/launch.mjs`.
+- **Making the memo return its first cached value regardless of key** was invisible, because
+  each test resolved one directory after a reset. Two directories are now resolved in one
+  process.
+- **Requiring `.git` to be a DIRECTORY** was invisible. A linked worktree and a submodule
+  both put a `.git` FILE at their root, so the fallback would have quietly stopped working
+  for every worktree user. Pinned with a `gitdir:` fixture.
+
+All five mutations now fail their own new test.
+
+### stats and recent disagreed about "current project"
+
+`computeStatsFeed` filters by `project` but tiers by `inferProject()`, and v3.72.0 gave CLI
+read commands a DB-aware project without threading it through here. Tier classification is
+relative to the project you are standing in, so from a subdirectory the distribution
+collapsed — measured on a fixture, `{active:3, working:1}` became `{active:4}`. The feed now
+takes an optional `currentProject` that steers the tier context only; an explicit
+`--project` still wins over it, and the default stays `inferProject()` because the MCP twin
+has no CLI-layer resolver.
+
+---
+
 ## v3.72.0 — three checks that were looking at the wrong thing
 
 **Upgrade note.** No action needed, but one default changes: a `claude-mem-lite` READ

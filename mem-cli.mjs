@@ -1213,7 +1213,10 @@ async function cmdStats(db, args) {
     obsTotal, sessTotal, promptTotal, obsRecent, sessRecent,
     types, projects, daily, tokenEst, avgImp, lowVal, lowSignalTitle,
     noiseRatio, lowSignalRatio, compressedCount, supersededOnlyCount, tierMap,
-  } = computeStatsFeed(db, { project, days, now });
+    // currentProject steers the TIER context only (the report itself stays global unless
+    // --project was given). Without it, `stats` from a subdirectory tiered every row against
+    // the empty cwd-derived name while `recent` had already resolved to the work-tree root.
+  } = computeStatsFeed(db, { project, currentProject: cliProject(db), days, now });
 
   // Hook self-observation: count PreToolUse / Skill-bridge script failures
   // recorded in the last 24h. Surfaces silent breakage (DB corruption,
