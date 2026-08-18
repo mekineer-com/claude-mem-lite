@@ -2,6 +2,80 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.72.0 — three checks that were looking at the wrong thing
+
+**Upgrade note.** No action needed, but one default changes: a `claude-mem-lite` READ
+command (`search` / `recent` / `context` / `browse` / `defer list` / `defer drop` /
+`activity` / `doctor --benchmark`) run from a SUBDIRECTORY of a repo now falls back to the
+enclosing work-tree root's project when the subdirectory's own name holds no rows at all.
+Previously it silently read an empty project. Commands that CREATE rows — `save`,
+`defer add`, `restore`, `import-jsonl`, `activity save` — are unchanged and still name the
+directory you stand in, so a new subproject's first rows are never absorbed into the
+enclosing repo. Pass `--project` to target either explicitly. To revert, pin
+`npm i claude-mem-lite@3.71.0`.
+
+### doctor was grading the wrong manifest
+
+`checkDevDrift` classifies whatever the caller hands it, and `install.mjs` hands it
+`SOURCE_FILES` — which holds zero `scripts/` entries. Hook scripts install from the
+separate `HOOK_SCRIPT_FILES` manifest into `~/.claude-mem-lite/scripts/`, and every
+settings.json hook command names one of those absolute paths. So the failure
+`source-files.mjs` documents — a tarball published without `scripts/` — left every hook
+dead while doctor printed an all-clear. That is the fatal-in-every-shape case the v3.69.0
+severity split was written to grade, and it was the unmonitored one.
+
+The new `checkHookScriptDrift` does NOT reuse the SOURCE_FILES severity. #10686's rule is
+to grade by which path RESOLVES the file, and the two manifests answer differently: a dev
+install symlinks the whole `scripts/` DIRECTORY, so per-file `lstat` sees plain files and
+"plain among symlinks = drift" does not exist there at all — porting it would flag every
+healthy dev install with eight phantom drifts. A file missing there is missing from the
+repo. In a copy install an entry script is named by a command line and
+`user-prompt-search.js` resolves `./prompt-search-utils.mjs` against the install dir. Both
+classes are fatal in both shapes, so the entry/helper split drives the message and never a
+demotion. The entry-point set is re-derived in test from the `command` strings in
+`hooks/hooks.json` rather than kept by hand.
+
+### the CLI and the session's hooks could name different projects
+
+`inferProject()` names the directory the process stands in. Inside a hook that is always
+the session root, because Claude Code sets `CLAUDE_PROJECT_DIR`; in a bare terminal it does
+not, so `cd src/auth && claude-mem-lite recent` asked for `src--auth` and answered "No
+recent observations" about a project full of them.
+
+Anchoring on the git work-tree root was tried and reverted before v3.69.0 shipped, because
+it breaks the mirror case: Claude Code started in `mono/packages/api` sets
+`CLAUDE_PROJECT_DIR` to the PACKAGE dir, so hooks write `packages--api` while a git anchor
+sends the CLI to `mono--monorepo`. No path-derived rule separates the two — the difference
+is which name the hooks actually chose, and only the DB knows that. `lib/cli-project.mjs`
+computes both candidates and prefers whichever already holds rows, cwd winning ties; the
+probe reads `observations` and `deferred_work` so `defer add` at the root and
+`defer list` from a subdirectory cannot disagree one table over. A failing probe degrades
+to the old answer rather than taking the command down.
+
+`project-utils.mjs` stays DB-free and byte-identical on the hook hot path; the naming rule
+was extracted so the CLI candidate uses it instead of a copy, and the cwd candidate still
+routes through `inferProject()` so "what does this process call its project" keeps one
+definition.
+
+### the Key Context marker outlived its own garbage collector
+
+The marker is session-scoped — `injected-ids.mjs` documents "session-lifetime validity (no
+time window)" — but it is swept at 24h mtime on the policy borrowed from the cooldown and
+injected-ids markers, whose semantics genuinely are time-windowed. A session running past a
+day had its own exclude-set deleted underneath it and began re-injecting rows the Key
+Context block was still showing. Keying the sweep on session liveness does not fix it:
+`hook.mjs` marks any session older than `STALE_SESSION_MS` abandoned by
+`started_at_epoch`, so the long session reads as dead there too. Still being read is the
+signal that separates them, so the reader now refreshes the stamp (gated at one hour, since
+it runs on every prompt) and the age sweep means "a day with no prompt in this session".
+
+`handlePreCompact` also skipped the recorder entirely when the re-rendered body was empty,
+while `handleSessionStart` writes the marker even when empty. The early return left the
+previous render's ids standing as an exclude-set for content compaction was about to
+remove — suppression of rows no longer shown, which is D#123 review C-1 on the twin leg.
+
+---
+
 ## v3.71.0 — the update notice is for you, not for the assistant
 
 **Upgrade note.** No action needed. The "a new version is available" line returns to

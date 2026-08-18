@@ -6,6 +6,14 @@ import { homedir } from 'os';
 import { ensureDbWithWalRecovery, DB_PATH, DB_DIR, REGISTRY_DB_PATH } from './schema.mjs';
 import { truncate, typeIcon, inferProject, scrubSecrets, COMPRESSED_PENDING_PURGE } from './utils.mjs';
 import { resolveProject } from './project-utils.mjs';
+// READ commands resolve the project DB-aware: a subdirectory whose own name holds no rows
+// falls back to the enclosing work-tree root, so `cd src/auth && … recent` reads what the
+// session's hooks wrote. WRITE commands (save / defer add / restore / import-jsonl) keep
+// plain inferProject() — pre-tag review reproduced the reason: for a read, "cwd holds
+// nothing" means there is nothing to lose, but for a write it is the normal precondition of
+// a project about to be born, and absorbing it into the enclosing repo strands the row once
+// the session's hooks start writing the subdirectory's own name. Hook-side is untouched.
+import { resolveCliProject as cliProject } from './lib/cli-project.mjs';
 import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
 import { reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
@@ -174,7 +182,7 @@ async function cmdSearch(db, args, { llm } = {}) {
   const emitDeferredTrailer = () => {
     if (!wantDeferredTrailer) return;
     try {
-      const rows = searchDeferredWork(db, query, project || inferProject());
+      const rows = searchDeferredWork(db, query, project || cliProject(db));
       for (const line of formatDeferredSearchTrailer(rows, 'claude-mem-lite get D#<id>')) out(line);
     } catch { /* trailer is best-effort; never break search */ }
   };
@@ -236,7 +244,7 @@ async function cmdSearch(db, args, { llm } = {}) {
 
   const res = await coreRunSearchPipeline(
     {
-      db, currentProject: project ? null : inferProject(), env: process.env,
+      db, currentProject: project ? null : cliProject(db), env: process.env,
       searchObservationsHybrid, deepSearch, shouldEscalateToDeep, autoDeepLlmReady,
       reRankWithContext, llm,
     },
@@ -249,11 +257,11 @@ async function cmdSearch(db, args, { llm } = {}) {
       obsTypeFallback: false,            // #8217 removed list-by-type fallback from the CLI
       crossSourceEpochSortNoFts: false,  // CLI never reaches cross-source with empty ftsQuery (fails earlier)
       rerankPolicy: 'cli',               // re-rank/supersede on any obs; re-sort gated on cross-source
-      rerankProject: project || inferProject(),
+      rerankProject: project || cliProject(db),
       recentListingNoFts: false,
       tolerateMissingFts: true,          // pre-FTS legacy DBs: swallow session/prompt FTS errors
       tierPosition: 'early',             // tier filter inside the obs block (before sessions/prompts)
-      tierProject: project || inferProject(),
+      tierProject: project || cliProject(db),
     }
   );
   const isDeep = res.isDeep;
@@ -404,7 +412,7 @@ function cmdRecent(db, args) {
   const limit = isValid
     ? rawLimit
     : parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: RECENT_MAX });
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const jsonOutput = flags.json === true || flags.json === 'true';
 
   // `recent --type bugfix` previously parsed as a silent no-op — users naturally
@@ -1061,7 +1069,7 @@ function cmdDeferAdd(db, args) {
 
 function cmdDeferList(db, args) {
   const { flags } = parseArgs(args);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 10, max: 100 });
   const list = listOpenWithOrdinal(db, project, limit);
   if (list.length === 0) {
@@ -1100,7 +1108,7 @@ function cmdDeferDrop(db, args) {
   // without N shell invocations.
   const rawTokens = idStr.split(',').map(s => s.trim()).filter(Boolean);
   const tokens = rawTokens.map(t => /^\d+$/.test(t) ? parseInt(t, 10) : t);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
 
   let realIds;
   try {
@@ -1329,7 +1337,7 @@ function cmdContext(db, args) {
   // Generate context live from DB — same builder the SessionStart hook uses.
   // Pre-v2.30 this command parsed a snapshot out of CLAUDE.md, but the hook no
   // longer writes there; DB is now the single source of truth.
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const block = buildSessionContextLines(db, project).trim();
 
   if (!block) {
@@ -1369,7 +1377,7 @@ function cmdContext(db, args) {
 
 function cmdBrowse(db, args) {
   const { flags } = parseArgs(args);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  const project = flags.project ? resolveProject(db, flags.project) : cliProject(db);
   const tierFilter = flags.tier || null;
   if (tierFilter && !['working', 'active', 'archive'].includes(tierFilter)) {
     fail(`[mem] Invalid tier: "${tierFilter}". Use: working, active, or archive`);
@@ -2783,7 +2791,7 @@ Commands:
                         (aliases: backfill search_aliases on substantive rows that
                          lack them — incl. lesson-bearing manual saves — adds ONLY
                          aliases, never rewrites title/narrative/lesson)
-    --project P         Limit to a single project (.|current = inferProject())
+    --project P         Limit to a single project (.|current = the current project)
     --verbose / -v      Preview also dumps cluster contents + re-enrich samples
 
   doctor                Environment diagnostics and benchmarks
@@ -3130,12 +3138,12 @@ async function cmdOptimize(db, args) {
   }
   // --project <name> filters all 4 tasks to one project. Opt-in; absence
   // preserves prior cross-project default. `.` or `current` auto-resolve via
-  // inferProject() so users don't need to remember the exact name.
+  // the CLI project resolver so users don't need to remember the exact name.
   const projectIdx = args.indexOf('--project');
   let project;
   if (projectIdx >= 0 && args[projectIdx + 1]) {
     const raw = args[projectIdx + 1];
-    project = (raw === '.' || raw === 'current') ? inferProject() : raw;
+    project = (raw === '.' || raw === 'current') ? cliProject(db) : raw;
   }
 
   if (!run && !runAll) {

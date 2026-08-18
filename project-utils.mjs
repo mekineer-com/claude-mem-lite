@@ -29,7 +29,22 @@ const _cache = new Map();
  * @returns {string} Sanitized project identifier safe for use in filenames
  */
 export function inferProject() {
-  const p = process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
+  return projectNameFromDir(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
+}
+
+/**
+ * The naming rule alone, applied to an arbitrary directory: "parent--basename", sanitized.
+ *
+ * Split out of inferProject() so lib/cli-project.mjs can build its second candidate (the git
+ * work-tree root) with THIS rule rather than a copy of it — two copies of the rule would let
+ * the CLI face and the hook face drift apart on the next sanitization change, which is the
+ * exact class of bug this module's candidate-selection exists to close. Still DB-free and
+ * allocation-cheap, so the hook hot path is unaffected.
+ *
+ * @param {string} p Absolute directory path
+ * @returns {string} Sanitized project identifier safe for use in filenames
+ */
+export function projectNameFromDir(p) {
   const base = basename(p);
   const parent = basename(dirname(p));
   const raw = parent && parent !== '.' && parent !== '/' ? `${parent}--${base}` : base;

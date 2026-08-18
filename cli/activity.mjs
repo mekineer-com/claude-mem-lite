@@ -10,6 +10,7 @@
 
 import { inferProject } from '../utils.mjs';
 import { resolveProject } from '../project-utils.mjs';
+import { resolveCliProject as cliProject } from '../lib/cli-project.mjs';
 import { parseArgs, out, fail, rejectBareStringFlags } from './common.mjs';
 import { parseIntFlag, isNumericToken } from '../lib/cli-flags.mjs';
 
@@ -28,7 +29,13 @@ export async function cmdActivity(db, args) {
   const { positional, flags } = parseArgs(args.slice(1));
   const { saveEvent, searchEvents, recentEvents, getEvent, EVENT_TYPES, promoteInsightEvents } = await import('../lib/activity.mjs');
   const VALID_EVENT_TYPES = new Set(EVENT_TYPES);
-  const project = flags.project ? resolveProject(db, flags.project) : inferProject();
+  // `save` CREATES a row, so it keeps plain inferProject(): the DB-aware fallback is a read
+  // affordance, and applying it to a write absorbs a not-yet-born subproject's first event
+  // into the enclosing repo (pre-tag review, reproduced). Every other subcommand reads or
+  // operates on rows that already exist, where falling back is what finds them.
+  const project = flags.project
+    ? resolveProject(db, flags.project)
+    : (sub === 'save' ? inferProject() : cliProject(db));
 
   if (sub === 'save') {
     // Reject value-less string flags before they reach saveEvent as a boolean `true`

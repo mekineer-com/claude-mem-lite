@@ -21,19 +21,25 @@ import { recordKeyContextInjection } from './lib/keyctx-marker.mjs';
  * @param {string} [ctx.sessionId]
  * @returns {void}
  */
-export function handlePreCompact({ db, project, sessionId }) {
+export function handlePreCompact({ db, project, sessionId, runtimeDir = RUNTIME_DIR }) {
   try {
     const collector = {};
     const body = buildSessionContextLines(db, project, new Date(), sessionId || null, collector);
-    if (!body || String(body).trim() === '') return;
-    process.stdout.write(`<claude-mem-context>\n${body}\n</claude-mem-context>\n`);
-    // Same recorder as handleSessionStart: marker + injection_count bump (D#124).
-    // A re-render into a compacted context is a fresh injection of those rows.
+    const rendered = body && String(body).trim() !== '';
+    if (rendered) {
+      process.stdout.write(`<claude-mem-context>\n${body}\n</claude-mem-context>\n`);
+    }
+    // Recorded even when NOTHING was re-rendered, matching handleSessionStart — the two
+    // callers must describe the same set (keyctx-marker.mjs header), and the marker is an
+    // exclude-set for what is actually in context. The old empty-body early return left the
+    // PREVIOUS render's ids standing while compaction removed the block they described, so
+    // <memory-context> went on suppressing rows that were no longer shown: D#123 review C-1
+    // exactly, on the twin leg. An empty render means an empty exclude-set, not a stale one.
     recordKeyContextInjection(db, {
-      runtimeDir: RUNTIME_DIR,
+      runtimeDir,
       project,
       sessionId: sessionId || null,
-      ids: collector.keyContextIds || [],
+      ids: rendered ? (collector.keyContextIds || []) : [],
     });
   } catch (e) {
     debugCatch(e, 'handlePreCompact');

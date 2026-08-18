@@ -1852,6 +1852,44 @@ async function doctor() {
     dwarn('Dev drift: check failed — ' + e.message);
   }
 
+  // Hook scripts: the check above grades SOURCE_FILES, which holds zero `scripts/` entries.
+  // Hook scripts ship from the separate HOOK_SCRIPT_FILES manifest into
+  // ~/.claude-mem-lite/scripts/, and every settings.json hook command names one of those
+  // absolute paths — so "the tarball shipped without scripts/" (source-files.mjs:243) killed
+  // every hook while doctor printed an all-clear. Both classes are issues here; see
+  // checkHookScriptDrift for why the managed-files demote branch must not be copied over.
+  try {
+    // Same gate as the managed-files check: a plugin-only install never deploys into
+    // ~/.claude-mem-lite, and its hooks run from ${CLAUDE_PLUGIN_ROOT}/scripts/ instead.
+    const skipScripts = !shape.managed && !!shape.activePluginVersion;
+    const { checkHookScriptDrift, HOOK_SCRIPT_ENTRY_POINTS } = await import('./lib/doctor-drift.mjs');
+    const h = skipScripts ? null : checkHookScriptDrift(INSTALL_DIR, HOOK_SCRIPT_FILES);
+    const scriptRemedy = `claude-mem-lite self-update (or: node ${join(INSTALL_DIR, 'install.mjs')} repair)`;
+    if (skipScripts) {
+      ok('Hook scripts: n/a (plugin-only install — hooks run from the plugin cache)');
+    } else if (!h.present) {
+      warn(`Hook scripts: ${join(INSTALL_DIR, 'scripts')} `
+        + `${h.dirSymlink ? 'is a dangling symlink' : 'is absent'} — all ${HOOK_SCRIPT_ENTRY_POINTS.size} hook `
+        + `commands name absolute paths under it, so no hook can fire. Fix: ${scriptRemedy}`);
+      issues++;
+    } else if (h.missingCount > 0) {
+      const parts = [];
+      if (h.missingEntryFiles.length > 0) {
+        parts.push(`${h.missingEntryFiles.length} hook entry (${h.missingEntryFiles.join(', ')}) — the command cannot start`);
+      }
+      if (h.missingModuleFiles.length > 0) {
+        parts.push(`${h.missingModuleFiles.length} imported helper (${h.missingModuleFiles.join(', ')}) — ERR_MODULE_NOT_FOUND at hook time`);
+      }
+      warn(`Hook scripts: ${h.missingCount} missing — ${parts.join('; ')}. Fix: ${scriptRemedy}`);
+      issues++;
+    } else {
+      ok(`Hook scripts: ${HOOK_SCRIPT_FILES.length} present `
+        + `(${h.dirSymlink ? 'dev — scripts/ symlinked to the repo' : 'copy install'})`);
+    }
+  } catch (e) {
+    dwarn('Hook scripts: check failed — ' + e.message);
+  }
+
   // Stale temp files
   try {
     // hook-update + the episode workers write runtime/ + staging under DB_DIR

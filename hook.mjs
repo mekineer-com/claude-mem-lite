@@ -73,7 +73,7 @@ import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs
 import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { injectedIdsFileName, keyContextIdsFileName } from './lib/injected-ids.mjs';
-import { recordKeyContextInjection } from './lib/keyctx-marker.mjs';
+import { recordKeyContextInjection, touchKeyContextMarker } from './lib/keyctx-marker.mjs';
 import { liveObsFilterSql, recencyDecaySql } from './lib/inject-search-core.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
@@ -1760,6 +1760,11 @@ async function handleUserPrompt() {
         if (Array.isArray(ids) && !(session && ccSessionId && session !== ccSessionId)) {
           keyContextIds.push(...ids);
         }
+        // The marker's validity is session-lifetime but gcStalePreRecallCooldowns sweeps it
+        // by AGE. Stamping it on read makes that sweep mean "24h with no prompt in this
+        // session" instead of "24h since the render" — otherwise a session running past a
+        // day loses its own exclude-set and re-injects what Key Context is still showing.
+        touchKeyContextMarker({ runtimeDir: RUNTIME_DIR, project, sessionId: ccSessionId });
       } catch { /* no marker — nothing was injected, exclude nothing */ }
       const pathAInjectedIds = [];
 
