@@ -72,8 +72,14 @@ describe('llmProviderStatus', () => {
     vi.stubEnv('ANTHROPIC_API_KEY', '');
     vi.stubEnv('HTTPS_PROXY', 'http://127.0.0.1:10808');
     const probe = vi.fn(async () => ({ reachable: true }));
-    const s = await llmProviderStatus({ _probe: probe });
-    expect(probe.mock.calls[0][1].proxy).toBe('http://127.0.0.1:10808');
+    const proxyProbe = vi.fn(async () => ({ reachable: true }));
+    const s = await llmProviderStatus({ _probe: probe, _proxyProbe: proxyProbe });
+    // Proxied path must exercise the CONNECT probe against the proxy AND name
+    // the provider host — a direct TCP probe here is the false-green shape the
+    // pre-tag review found.
+    expect(probe).not.toHaveBeenCalled();
+    expect(proxyProbe.mock.calls[0][0]).toBe('http://127.0.0.1:10808');
+    expect(proxyProbe.mock.calls[0][1]).toBe('openrouter.ai');
     expect(s.message).toMatch(/proxy/i);
   });
 

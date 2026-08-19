@@ -68,6 +68,27 @@ Three test suites that mock `fetch` needed their proxy env neutralized. Two of t
 subprocess harnesses whose preflight probes still passed — they verify the stub is
 installed, not which branch runs.
 
+### three things the pre-tag review caught, all in the new code
+
+The reviewer went idle without filing a report, but left three probes on disk. Every one
+of them reproduced:
+
+- **The proxy password was printed.** `HTTP(S)_PROXY` legitimately carries `user:pass@`,
+  and the new doctor line echoed the URL verbatim — onto the terminal and into
+  `doctor --json`, which is the text people paste into bug reports. The URL is redacted to
+  scheme, host and port now, which is all the line needed to be diagnosable.
+- **The reachability check had a false green of its own.** It was a plain TCP connect to
+  the proxy port, so anything listening there read as healthy: a SOCKS-only listener, a
+  proxy that forbids CONNECT, or whatever took the port after the proxy died. A check
+  written to end silent provider failure would have certified a dead provider. It now
+  opens a real CONNECT to the provider host and requires a 200.
+- **`timeout` bounded each phase instead of the whole call.** A proxy that accepted the
+  CONNECT and then went silent rejected at 2008ms on a 1000ms budget. Recomputing the
+  per-phase timers from a deadline did not fix it — a TLS socket wrapping an
+  already-connected socket never finishes its handshake, so `ClientRequest.setTimeout`
+  arms against events that never arrive. The bound is now an explicit timer rather than a
+  claim about when Node arms its own.
+
 ## v3.72.1 — the guards the mutation harness said were not there
 
 **Upgrade note.** No action needed. Almost all of this is test-only. The one behaviour
