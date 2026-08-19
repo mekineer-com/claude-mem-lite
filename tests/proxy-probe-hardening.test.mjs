@@ -150,16 +150,42 @@ describe('NOTE 7 — the redirect chain shares ONE budget', () => {
 });
 
 describe('NOTE 11 — the scopes backlog is counted, not materialised', () => {
-  it('countReenrichCandidates agrees with the finder', async () => {
+  // The fixture has to make EVERY clause discriminating, or the test is a
+  // tautology. My first version was one: all rows had scope NULL and the only
+  // negative row's narrative was 5 chars, so deleting `AND scope IS NULL` and
+  // relaxing `LENGTH(narrative) > 100` to `> 10` both left the count at 4 and
+  // the test green. Each excluded row below fails EXACTLY ONE clause, and each
+  // sits just the wrong side of its boundary.
+  it('countReenrichCandidates agrees with the finder, clause by clause', async () => {
     const { countReenrichCandidates, findReenrichCandidates } = await import('../hook-optimize.mjs');
     const { createTestDb, insertSession, insertObs } = await import('./test-helpers.mjs');
     const db = createTestDb();
     insertSession(db, { id: 'sess-1', project: 'test' });
     const long = 'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained at all.';
-    for (let i = 0; i < 4; i++) insertObs(db, { title: `Row ${i}`, narrative: long, type: 'bugfix' });
-    insertObs(db, { title: 'Too thin', narrative: 'short', type: 'bugfix' });
-    expect(countReenrichCandidates(db, 'scopes')).toBe(4);
-    expect(countReenrichCandidates(db, 'scopes')).toBe(findReenrichCandidates(db, 5000, { scope: 'scopes' }).length);
+    expect(long.length).toBeGreaterThan(100);
+    // 40 chars: passes a mutated `> 10`, fails the real `> 100`.
+    const mid = 'Short narrative, over ten characters yet.';
+    expect(mid.length).toBeGreaterThan(10);
+    expect(mid.length).toBeLessThan(100);
+
+    for (let i = 0; i < 3; i++) insertObs(db, { title: `Included row ${i}`, narrative: long, type: 'bugfix' });
+
+    // Excluded — narrative gate. Long enough to survive a relaxed bound.
+    insertObs(db, { title: 'Too thin a narrative', narrative: mid, type: 'bugfix' });
+    // Excluded — already classified. Without this row, `AND scope IS NULL` is unobservable.
+    insertObs(db, { title: 'Already classified', narrative: long, type: 'bugfix' });
+    db.prepare("UPDATE observations SET scope = 'project' WHERE title = 'Already classified'").run();
+    // Excluded — retracted. Without it, the live-row filter is unobservable.
+    insertObs(db, { title: 'Superseded row', narrative: long, type: 'bugfix' });
+    db.prepare('UPDATE observations SET superseded_at = ? WHERE title = ?').run(Date.now(), 'Superseded row');
+    // Excluded — compression tombstone.
+    insertObs(db, { title: 'Compressed row', narrative: long, type: 'bugfix' });
+    db.prepare('UPDATE observations SET compressed_into = 999 WHERE title = ?').run('Compressed row');
+
+    expect(countReenrichCandidates(db, 'scopes')).toBe(3);
+    // The point of the function: same answer as the finder, without loading rows.
+    expect(countReenrichCandidates(db, 'scopes'))
+      .toBe(findReenrichCandidates(db, 5000, { scope: 'scopes' }).length);
     db.close();
   });
 });
