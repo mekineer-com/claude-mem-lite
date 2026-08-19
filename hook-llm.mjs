@@ -13,7 +13,7 @@ import { acquireLLMSlot, releaseLLMSlot } from './hook-semaphore.mjs';
 import { BG_LLM_TIMEOUT_MS } from './haiku-client.mjs';
 import { scrubRecord } from './lib/scrub-record.mjs';
 import { getVocabulary, computeVector, vecTextForRow } from './tfidf.mjs';
-import { insertObservationRow, insertObservationFiles, insertObservationVector, normalizeScope } from './lib/observation-write.mjs';
+import { insertObservationRow, insertObservationFiles, insertObservationVector, normalizeScope, SCOPE_PROMPT_LEGEND } from './lib/observation-write.mjs';
 import { DEDUP_JACCARD_THRESHOLD, AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import {
   RUNTIME_DIR, DEDUP_WINDOW_MS, RELATED_OBS_WINDOW_MS,
@@ -740,7 +740,7 @@ type: pick by strongest signal. decision = explicit tradeoff / "chose X over Y b
 Facts: each MUST be (1) atomic—one claim, (2) self-contained—no pronouns, include file/function name, (3) specific—"refreshToken() in auth.ts:45 uses 1h TTL" not "handles tokens"
 importance: Be strict — default to 1. 0=pure browsing with zero learning value. 1=routine file edits, standard changes, normal workflow (MOST episodes). 2=notable ONLY if it reveals something non-obvious: error fix with discovered root cause, architectural decision with explicit tradeoff, config change with unexpected side effects. 3=critical: breaking change affecting users, security vulnerability fix, data migration. Ask yourself: "would a future session benefit from knowing this?" — if not, it's importance=1.
 lesson_learned: The non-obvious insight a future session would benefit from. Examples: "FTS5 porter stemmer doesn't tokenize CJK — need bigram workaround", "vitest --reporter=verbose hangs on large test suites, use default reporter". Look hard before giving up — most coding episodes contain at least one micro-lesson (an undocumented flag, a surprising default, a debugging shortcut, an unexpected interaction). If literally no insight worth teaching (e.g. version bump, whitespace fix, file rename), output JSON null. Do NOT invent a lesson, do NOT write the strings "none"/"n/a"/"todo"/"tbd"/"-" — those will be discarded as noise.
-scope: where does the lesson APPLY (not where it was learned)? file = specific to the touched file(s)' own code. module = a directory/subsystem of this project. project = a project-wide convention, architecture, or workflow. environment = a tooling/OS/CI/network/registry/service quirk (proxy, npm, git, GitHub, shell, runner, editor) that would hold in ANY project — even though some project files were touched when it surfaced. When lesson_learned is null, still classify the episode's dominant subject.
+scope: ${SCOPE_PROMPT_LEGEND}
 search_aliases: 2-6 alternative search terms someone might use to find this memory later (include CJK if project uses Chinese)`;
 
   let prompt;

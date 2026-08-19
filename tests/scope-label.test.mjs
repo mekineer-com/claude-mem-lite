@@ -16,7 +16,7 @@ import { spawn } from 'child_process';
 import Database from 'better-sqlite3';
 import { createTestDb, insertSession } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
-import { insertObservationRow, normalizeScope } from '../lib/observation-write.mjs';
+import { insertObservationRow, normalizeScope, SCOPE_PROMPT_LEGEND } from '../lib/observation-write.mjs';
 import { saveObservation } from '../hook-llm.mjs';
 
 describe('scope schema (v43 batch)', () => {
@@ -116,7 +116,22 @@ describe('episode prompts instruct Haiku to emit scope', () => {
   });
 
   it('shared schema tail defines scope semantics including the environment class', () => {
-    expect(src).toMatch(/scope: .*environment/);
+    // The legend became a shared constant in D#135 P3 — three write faces classify
+    // scope now (episode summarizer, save-enrich, re-enrich) and hand-copied
+    // definitions would drift. Assert what actually ships: hook-llm interpolates
+    // the constant, and the constant carries the semantics.
+    expect(src).toMatch(/scope: \$\{SCOPE_PROMPT_LEGEND\}/);
+    expect(SCOPE_PROMPT_LEGEND).toMatch(/where does the lesson APPLY/);
+    expect(SCOPE_PROMPT_LEGEND).toMatch(/environment = a tooling\/OS\/CI/);
+  });
+
+  it('every scope-classifying prompt renders the SAME legend (no hand-copies)', () => {
+    for (const file of ['../lib/save-enrich.mjs', '../hook-optimize.mjs']) {
+      const text = readFileSync(resolve(import.meta.dirname, file), 'utf8');
+      expect(text).toMatch(/scope: \$\{SCOPE_PROMPT_LEGEND\}/);
+      // A face that inlined its own wording instead of importing the constant.
+      expect(text).not.toMatch(/where does the lesson APPLY/);
+    }
   });
 });
 

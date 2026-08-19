@@ -619,11 +619,13 @@ describe('T2 CLI fixes', () => {
   it('optimize --scope rejects unknown scope values', async () => {
     const output = await captureStdout(() => run(['optimize', '--scope', 'bogus']));
     expect(output).toMatch(/Invalid --scope/);
-    expect(output).toMatch(/narrow, wide/);
+    // Every accepted value must be named in the error — a scope missing from this
+    // list is a scope users can't discover from the failure they actually hit.
+    expect(output).toMatch(/narrow, wide, aliases, scopes/);
   });
 
-  it('optimize --scope accepts narrow and wide', async () => {
-    for (const scope of ['narrow', 'wide']) {
+  it('optimize --scope accepts narrow, wide, aliases and scopes', async () => {
+    for (const scope of ['narrow', 'wide', 'aliases', 'scopes']) {
       const output = await captureStdout(() => run(['optimize', '--scope', scope]));
       expect(output).toMatch(/Optimization Preview/);
     }

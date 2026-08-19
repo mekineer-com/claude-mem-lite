@@ -2790,10 +2790,13 @@ Commands:
     --run-all           Execute bypassing gates
     --task T            Comma-separated: re-enrich,normalize,cluster-merge,smart-compress
     --max N             Max items per task (1-100, default 15)
-    --scope S           re-enrich scope: narrow (default) | wide | aliases
+    --scope S           re-enrich scope: narrow (default) | wide | aliases | scopes
                         (aliases: backfill search_aliases on substantive rows that
                          lack them — incl. lesson-bearing manual saves — adds ONLY
                          aliases, never rewrites title/narrative/lesson)
+                        (scopes: backfill the applicability label observations.scope
+                         on rows that lack it — writes ONLY that column, never stamps
+                         optimized_at; feeds CLAUDE_MEM_SCOPE_FILTER)
     --project P         Limit to a single project (.|current = the current project)
     --verbose / -v      Preview also dumps cluster contents + re-enrich samples
 
@@ -3133,8 +3136,8 @@ async function cmdOptimize(db, args) {
   let reenrichScope = 'narrow';
   if (scopeIdx >= 0 && args[scopeIdx + 1] !== undefined) {
     const raw = args[scopeIdx + 1];
-    if (raw !== 'narrow' && raw !== 'wide' && raw !== 'aliases') {
-      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide, aliases`);
+    if (raw !== 'narrow' && raw !== 'wide' && raw !== 'aliases' && raw !== 'scopes') {
+      fail(`[mem] Invalid --scope "${raw}". Use: narrow, wide, aliases, scopes`);
       return;
     }
     reenrichScope = raw;
@@ -3153,7 +3156,7 @@ async function cmdOptimize(db, args) {
     const preview = optimizePreview(db, { project, detail: verbose });
     out('[mem] 🔍 LLM Optimization Preview:');
     if (project) out(`  Project filter: ${project}`);
-    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}${preview.reenrichAliases ? `  (aliases scope: ${preview.reenrichAliases})` : ''}`);
+    out(`  Re-enrich candidates: ${preview.reenrich}${preview.reenrichWide !== undefined && preview.reenrichWide !== null ? `  (wide scope: ${preview.reenrichWide})` : ''}${preview.reenrichAliases ? `  (aliases scope: ${preview.reenrichAliases})` : ''}${preview.reenrichScopes ? `  (scopes scope: ${preview.reenrichScopes})` : ''}`);
     out(`  Normalize: ${preview.normalizeGateOpen ? `${preview.normalize} unique concepts` : 'gate closed (7-day interval)'}`);
     // "candidates" matches the MCP wording (server.mjs mem_optimize preview) AND the
     // Re-enrich line just above, which already read that way on both surfaces. The two
