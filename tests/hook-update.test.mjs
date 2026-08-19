@@ -59,8 +59,18 @@ function makeReleaseDir(version = '1.1.0') {
   return dir;
 }
 
+// hook-update picks its transport from the proxy env: a proxy → CONNECT tunnel,
+// none → native fetch. Every test here stubs globalThis.fetch, so on a developer
+// machine that HAS HTTPS_PROXY set (the exact machine the tunnel was written
+// for) the stub would be bypassed and these tests would hit the real network.
+// Neutralize the four vars httpConnectProxyFor reads — same guard as
+// tests/haiku-client.test.mjs. Restored in afterEach.
+const PROXY_ENV_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy'];
+const originalProxyEnv = Object.fromEntries(PROXY_ENV_VARS.map((v) => [v, process.env[v]]));
+
 async function loadModule(env = {}) {
   vi.resetModules();
+  for (const v of PROXY_ENV_VARS) delete process.env[v];
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
   // `process.env.X = undefined` coerces to the STRING "undefined", which the
@@ -77,6 +87,9 @@ async function loadModule(env = {}) {
 afterEach(() => {
   mockedExecSync.mockReset();
   globalThis.fetch = originalFetch;
+  for (const [k, v] of Object.entries(originalProxyEnv)) {
+    if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
   delete process.env.CLAUDE_PLUGIN_ROOT;
   delete process.env.CLAUDE_MEM_SKIP_UPDATE;
   delete process.env.CLAUDE_MEM_DIR;

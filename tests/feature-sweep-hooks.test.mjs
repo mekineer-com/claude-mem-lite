@@ -858,7 +858,15 @@ describe('hook feature sweep: hook.mjs background workers', () => {
       '};',
       '',
     ].join('\n'));
-    const OFFLINE = { SWEEP_FETCH_LOG: fetchLog, NODE_OPTIONS: `--require "${offlineFetch}"` };
+    // The blanked proxy vars are part of the network boundary, not hygiene: when a
+    // proxy is configured hook-update takes the CONNECT tunnel, which does NOT go
+    // through globalThis.fetch — so on a proxy-bound developer machine this stub
+    // would be silently bypassed and the arms below would hit api.github.com.
+    const OFFLINE = {
+      SWEEP_FETCH_LOG: fetchLog,
+      NODE_OPTIONS: `--require "${offlineFetch}"`,
+      HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '',
+    };
 
     // This event is spawned in production as `spawnBackground('update-check')`, i.e. with
     // CLAUDE_MEM_HOOK_RUNNING=1. That used to kill it: `update-check` was missing from

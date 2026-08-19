@@ -13,6 +13,11 @@ import { debugCatch, debugLog } from './utils.mjs';
 // extracted tarball's own source-files.mjs inside installExtractedRelease.
 // See loadReleaseManifest below.
 import { SOURCE_FILES as LOCAL_SOURCE_FILES, HOOK_SCRIPT_FILES as LOCAL_HOOK_SCRIPT_FILES } from './source-files.mjs';
+// Native fetch ignores HTTP(S)_PROXY. Without this the whole update path — the
+// version check AND the release download — dies instantly behind a proxy, and
+// because checkForUpdate is silent on network failure the plugin then reports
+// itself permanently up to date. Same tunnel the OpenRouter call site uses.
+import { httpConnectProxyFor, getViaConnectProxy } from './lib/proxy-fetch.mjs';
 import { acquireLock } from './lib/proc-lock.mjs';
 import { atomicWriteFileSync } from './lib/atomic-write.mjs';
 import { verifyReleaseFiles, verifyManifestSignature } from './lib/release-digest.mjs';
@@ -234,7 +239,14 @@ async function fetchWithTimeout(url, headers) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal, headers });
+    // Proxy configured → CONNECT tunnel; otherwise native fetch, byte-for-byte
+    // the previous behaviour. Both shapes expose { status, ok, json() }, and the
+    // tunnel REJECTS on transport failure exactly as a failed fetch does, so the
+    // catch below still returns null and the caller still stays silent.
+    const proxy = httpConnectProxyFor(url);
+    const res = proxy
+      ? await getViaConnectProxy(proxy, url, { headers, timeout: FETCH_TIMEOUT_MS })
+      : await fetch(url, { signal: controller.signal, headers });
     if (res.status === 403 || res.status === 429) {
       // 429 = GitHub secondary rate limit (403 = primary). Both must route to the 6h
       // rate-limit backoff, not the 24h transient-failure path — else a 429 defers the
@@ -452,16 +464,24 @@ export function verifyDownloadedRelease(extractedDir, manifestBytes, signatureB6
 
 // Fetch a GitHub Release asset as a Buffer. Host-locked to github.com (the asset
 // browser_download_url); GitHub's own 302 to its CDN is followed by fetch.
-async function fetchAssetBuffer(url) {
+export async function fetchAssetBuffer(url) {
+  // Host lock is checked BEFORE transport selection, so having a proxy
+  // configured can never route around this supply-chain guard.
   if (!/^https:\/\/github\.com\/[\w./%~-]+$/.test(url || '')) {
     throw new Error(`rejected asset url: ${url}`);
   }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+    // getViaConnectProxy follows redirects itself — native fetch does that for
+    // free, and this URL always 302s from github.com to the asset CDN, so a
+    // tunnel without redirect handling would hand back an empty 302 body.
+    const proxy = httpConnectProxyFor(url);
+    const res = proxy
+      ? await getViaConnectProxy(proxy, url, { timeout: FETCH_TIMEOUT_MS })
+      : await fetch(url, { signal: controller.signal, redirect: 'follow' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+    return proxy ? res.buffer() : Buffer.from(await res.arrayBuffer());
   } finally {
     clearTimeout(timeout);
   }

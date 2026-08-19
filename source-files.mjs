@@ -111,6 +111,8 @@ export const SOURCE_FILES = [
   // + auto-update lock). Must ship or a partial install/update skips them.
   'lib/proc-lock.mjs',
   'lib/atomic-write.mjs',
+  'lib/proxy-fetch.mjs',
+  'lib/llm-provider-probe.mjs',
   // P1 supply-chain: shared release-signing core (sha256 manifest + Ed25519
   // verify). Imported by hook-update.mjs (verify) + scripts/sign-release.mjs (CI
   // sign). Must ship or auto-update can't verify release signatures.

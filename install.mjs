@@ -1770,6 +1770,20 @@ async function doctor() {
     dwarn('Update state: failed to read');
   }
 
+  // LLM provider reachability. Doctor had no provider check at all, which is how
+  // a configured OPENROUTER_API_KEY could sit unusable for weeks behind an
+  // all-green report while every background call silently paid the CLI fallback.
+  // Transport only, and only when a key is set — no key means no probe and no
+  // network touched.
+  try {
+    const { llmProviderStatus } = await import('./lib/llm-provider-probe.mjs');
+    const st = await llmProviderStatus();
+    if (st.level === 'ok') ok(st.message);
+    else dwarn(st.message);
+  } catch {
+    dwarn('LLM provider: check failed');
+  }
+
   // Dev drift: in dev-mode installs, all SOURCE_FILES entries should be
   // symlinks. A plain file means an earlier install (or manual cp) copied it
   // (edits in the repo won't propagate). A missing entry (neither symlink nor

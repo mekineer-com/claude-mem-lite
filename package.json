@@ -83,6 +83,8 @@
     "lib/hook-stdout.mjs",
     "lib/proc-lock.mjs",
     "lib/atomic-write.mjs",
+    "lib/proxy-fetch.mjs",
+    "lib/llm-provider-probe.mjs",
     "lib/release-digest.mjs",
     "lib/mem-override.mjs",
     "lib/injected-ids.mjs",

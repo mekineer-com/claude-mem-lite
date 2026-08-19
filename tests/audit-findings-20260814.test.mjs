@@ -531,8 +531,17 @@ describe('F7 — a crafted mem_use name cannot forge a skill block in the miss m
 describe('F6 — update-check reaches its handler under the recursion guard', () => {
   let dataDir, runtimeDir, cwd, fetchLog, offlineFetch;
 
-  /** Env that makes every fetch in the child an in-process, recorded, thrown refusal. */
-  const offlineEnv = (log) => ({ AUDIT_FETCH_LOG: log, NODE_OPTIONS: `--require "${offlineFetch}"` });
+  /** Env that makes every fetch in the child an in-process, recorded, thrown refusal.
+   *  The blanked proxy vars are load-bearing, not hygiene: hook-update picks its
+   *  transport from them, and the CONNECT tunnel does NOT go through globalThis.fetch.
+   *  A child inheriting a real HTTPS_PROXY would sail past the stub and reach
+   *  api.github.com for real — the preflight would still pass, because it probes the
+   *  stub, not the branch under test. */
+  const offlineEnv = (log) => ({
+    AUDIT_FETCH_LOG: log,
+    NODE_OPTIONS: `--require "${offlineFetch}"`,
+    HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '',
+  });
   const fetched = (log) => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []);
 
   beforeAll(async () => {
@@ -694,6 +703,11 @@ describe('F6b — the restored update-check checks for a release but does not in
     AUDIT_CURL_LOG: curlLog,
     NODE_OPTIONS: `--require "${releaseFetch}"`,
     PATH: `${binDir}:${process.env.PATH}`,
+    // Load-bearing: hook-update switches to a CONNECT tunnel when a proxy is
+    // configured, and that tunnel bypasses globalThis.fetch — so an inherited
+    // HTTPS_PROXY would make this canned-release stub invisible and send the
+    // child at the real api.github.com.
+    HTTPS_PROXY: '', https_proxy: '', HTTP_PROXY: '', http_proxy: '',
     ...extra,
   });
 
