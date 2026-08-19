@@ -47,8 +47,9 @@ adaptive half-share would not occasionally borrow from lesson enrichment — it 
 that cadence permanently. It is also an enum-only call (60 max tokens against 500), so one
 full item slot mis-prices it by an order of magnitude.
 
-The five prompts that classify scope now render one shared legend instead of hand-copied
-wording. A column whose `environment` means something different per writer makes the read
+The six prompts that classify scope now share one legend instead of hand-copied wording —
+five render sites, because the episode summarizer's two templates append one common schema
+tail. A column whose `environment` means something different per writer makes the read
 lever incoherent.
 
 ### the network paths that were proxy-blind, and nothing could see it

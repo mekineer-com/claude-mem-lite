@@ -12,7 +12,21 @@
 // Both directions are asserted. A test that only proves "proxy is used when set"
 // would pass an implementation that ALWAYS tunnels, which would break every user
 // without a proxy.
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+
+// hook-update resolves STATE_DIR from DB_DIR at MODULE LOAD, and the 403/429 arm
+// below calls saveState(). Without this, that arm wrote {"rateLimited":true}
+// into the DEVELOPER'S REAL ~/.claude-mem-lite/runtime/update-state.json —
+// verified: the file did not exist before this suite and appeared, with that
+// content, after a run. Hoisted so the env is set before the import below.
+const MEM_DIR = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'mem-proxy-wiring-'));
+  process.env.CLAUDE_MEM_DIR = dir;
+  return dir;
+});
 
 vi.mock('../lib/proxy-fetch.mjs', () => ({
   httpConnectProxyFor: vi.fn(() => null),
@@ -22,8 +36,12 @@ vi.mock('../lib/proxy-fetch.mjs', () => ({
   requestViaConnectProxy: vi.fn(),
 }));
 
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { httpConnectProxyFor, getViaConnectProxy } from '../lib/proxy-fetch.mjs';
 import { fetchLatestRelease, fetchAssetBuffer } from '../hook-update.mjs';
+
+afterAll(() => { rmSync(MEM_DIR, { recursive: true, force: true }); });
 
 const PROXY = 'http://127.0.0.1:10808';
 const RELEASE_BODY = { tag_name: 'v9.9.9', tarball_url: 'https://api.github.com/t', html_url: 'https://gh/r', assets: [] };
@@ -63,9 +81,20 @@ describe('auto-update honours the proxy', () => {
   it('version check: a proxied 403 still routes to the rate-limit backoff', async () => {
     // Losing this mapping would turn a rate-limit into the 24h transient-failure
     // path — the exact regression the 403/429 branch exists to prevent.
+    //
+    // `toBeNull()` alone did NOT test that: the `if (!res.ok) return null`
+    // fallthrough satisfies it too, so gating the branch on `!proxy` survived the
+    // whole suite (pre-tag review finding 2). The state write is the observable
+    // difference between the two paths, so assert THAT.
     vi.mocked(httpConnectProxyFor).mockReturnValue(PROXY);
     vi.mocked(getViaConnectProxy).mockResolvedValue(proxyResponse(null, { status: 403 }));
+    const stateFile = join(MEM_DIR, 'runtime', 'update-state.json');
+    rmSync(stateFile, { force: true });
+
     expect(await fetchLatestRelease()).toBeNull();
+
+    expect(existsSync(stateFile), 'the proxied 403 must persist the rate-limit state').toBe(true);
+    expect(JSON.parse(readFileSync(stateFile, 'utf8')).rateLimited).toBe(true);
   });
 
   it('version check: a proxy failure degrades to null, never throws', async () => {

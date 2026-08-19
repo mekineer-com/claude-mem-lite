@@ -203,6 +203,35 @@ describe('re-enrich narrow/wide/aliases carry scope (face C)', () => {
     expect(row(db, id).scope).toBe('project');
   });
 
+  // The COALESCE on the aliases UPDATE was pinned by NOTHING: mutating it to a
+  // plain `scope = ?` passed all 282 files / 4732 tests (pre-tag review, round 3,
+  // reproduced here before this case was written). The sibling case below starts
+  // from scope NULL, where COALESCE and plain-set are indistinguishable — so the
+  // release's own headline invariant, "an omitted scope must never erase a
+  // classification an earlier face wrote", had no guard on this face.
+  it('an omitted scope must NOT blank a classification an earlier face wrote (aliases)', async () => {
+    const { executeReenrich, findReenrichCandidates } = await import('../hook-optimize.mjs');
+    insertObs(db, {
+      title: 'Fixed the proxy install hang', narrative: SUBSTANTIVE,
+      text: 'npm proxy install hang', type: 'bugfix', importance: 2,
+      lessonLearned: 'Pass a ProxyAgent dispatcher to built-in fetch',
+      searchAliases: null,
+    });
+    const id = db.prepare('SELECT id FROM observations LIMIT 1').get().id;
+    db.prepare('UPDATE observations SET scope = ? WHERE id = ?').run('project', id);
+    // The shape is reachable, not hypothetical: scope set + aliases missing is a
+    // live aliases candidate (mem_save writes no aliases, the summarizer writes scope).
+    expect(findReenrichCandidates(db, 10, { scope: 'aliases' }).length).toBe(1);
+
+    // Haiku answers with aliases and no scope key — the ordinary partial response.
+    callModelJSONAsync.mockResolvedValue({ search_aliases: ['proxy hang', 'registry timeout'] });
+    await executeReenrich(db, 10, { scope: 'aliases' });
+
+    const after = row(db, id);
+    expect(after.scope).toBe('project');
+    expect(after.search_aliases).toContain('registry timeout');
+  });
+
   it('the aliases pass backfills scope while still touching nothing else', async () => {
     const { executeReenrich } = await import('../hook-optimize.mjs');
     insertObs(db, {
