@@ -243,6 +243,9 @@ async function fetchWithTimeout(url, headers) {
     // the previous behaviour. Both shapes expose { status, ok, json() }, and the
     // tunnel REJECTS on transport failure exactly as a failed fetch does, so the
     // catch below still returns null and the caller still stays silent.
+    // The AbortController above governs only the fetch branch; the tunnel takes
+    // the same budget as an explicit argument and bounds the whole call with it
+    // (redirect chain included). (pre-tag review NOTE 7)
     const proxy = httpConnectProxyFor(url);
     const res = proxy
       ? await getViaConnectProxy(proxy, url, { headers, timeout: FETCH_TIMEOUT_MS })

@@ -179,6 +179,29 @@ export function findReenrichCandidates(db, limit = 10, { scope = 'narrow', proje
   return project ? stmt.all(project, limit) : stmt.all(limit);
 }
 
+/**
+ * Row count for a re-enrich pool, without materialising it. Only the 'scopes'
+ * pool is served: it is the one large enough for the difference to matter
+ * (2041 rows at introduction, against ~22 alias candidates), and keeping the
+ * predicate here rather than duplicating it would drift — so this shares the
+ * finder's WHERE by construction, via a SELECT COUNT over the same clauses.
+ * @returns {number}
+ */
+export function countReenrichCandidates(db, scope = 'scopes', project) {
+  if (scope !== 'scopes') return findReenrichCandidates(db, 5000, { scope, project }).length;
+  const projectClause = project ? 'AND project = ?' : '';
+  const stmt = db.prepare(`
+    SELECT COUNT(*) c
+    FROM observations
+    WHERE ${liveObsFilterSql('')}
+      AND scope IS NULL
+      AND LENGTH(COALESCE(narrative, '')) > 100
+      AND ${notLowSignalTitleClause('')}
+      ${projectClause}
+  `);
+  return (project ? stmt.get(project) : stmt.get()).c;
+}
+
 export async function executeReenrich(db, limit = 10, { scope = 'narrow', project } = {}) {
   const candidates = findReenrichCandidates(db, limit, { scope, project });
   if (candidates.length === 0) return { processed: 0, skipped: 0 };
@@ -939,7 +962,11 @@ export function optimizePreview(db, { project, detail = false } = {}) {
   // D#135 P3: the scope-backfill backlog. Reported so the one-shot drain
   // (`optimize --run --task re-enrich --scope scopes --max N`) can be sized —
   // the daily pass alone would take months on a multi-thousand-row pool.
-  const reenrichScopes = findReenrichCandidates(db, 5000, { scope: 'scopes', project }).length;
+  // COUNT, not `findReenrichCandidates(5000).length`: this pool started at 2041
+  // rows against the aliases pool's ~22, and the finder selects narrative +
+  // lesson_learned per row, so counting by materialising was the one place this
+  // round pulled megabytes to print an integer. (pre-tag review NOTE 11)
+  const reenrichScopes = countReenrichCandidates(db, 'scopes', project);
 
   const concepts = extractUniqueConcepts(db, 500, { project });
   const normalizeReady = shouldRunNormalize(project) && concepts.length >= 5;

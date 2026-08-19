@@ -127,3 +127,39 @@ describe('finding 3 — timeout bounds TOTAL time, not each phase', () => {
     expect(elapsed).toBeLessThan(1600);
   });
 });
+
+describe('NOTE 7 — the redirect chain shares ONE budget', () => {
+  it('later hops get the REMAINING budget, not a fresh full one', async () => {
+    const { requestViaConnectProxy } = await import('../lib/proxy-fetch.mjs');
+    const seen = [];
+    const once = async (proxy, url, opts) => {
+      seen.push(opts.timeout);
+      await new Promise((r) => setTimeout(r, 120));
+      return seen.length < 3
+        ? { ok: false, status: 302, headers: { location: `https://a.test/${seen.length}` } }
+        : { ok: true, status: 200, headers: {} };
+    };
+    await requestViaConnectProxy('http://127.0.0.1:1', 'https://a.test/x', { timeout: 1000 }, { _once: once });
+    expect(seen.length).toBe(3);
+    // Each hop burned ~120ms; a fresh full budget per hop would leave all three
+    // at 1000 — that is the shape that made a 3s caller a worst-case 18s.
+    expect(seen[0]).toBeLessThanOrEqual(1000);
+    expect(seen[1]).toBeLessThan(seen[0]);
+    expect(seen[2]).toBeLessThan(seen[1]);
+  });
+});
+
+describe('NOTE 11 — the scopes backlog is counted, not materialised', () => {
+  it('countReenrichCandidates agrees with the finder', async () => {
+    const { countReenrichCandidates, findReenrichCandidates } = await import('../hook-optimize.mjs');
+    const { createTestDb, insertSession, insertObs } = await import('./test-helpers.mjs');
+    const db = createTestDb();
+    insertSession(db, { id: 'sess-1', project: 'test' });
+    const long = 'The worker pool deadlocked when every connection was checked out and a callback tried to acquire another one, so the pool never drained at all.';
+    for (let i = 0; i < 4; i++) insertObs(db, { title: `Row ${i}`, narrative: long, type: 'bugfix' });
+    insertObs(db, { title: 'Too thin', narrative: 'short', type: 'bugfix' });
+    expect(countReenrichCandidates(db, 'scopes')).toBe(4);
+    expect(countReenrichCandidates(db, 'scopes')).toBe(findReenrichCandidates(db, 5000, { scope: 'scopes' }).length);
+    db.close();
+  });
+});

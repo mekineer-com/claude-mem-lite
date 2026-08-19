@@ -394,16 +394,26 @@ async function callModelAPI(prompt, model, { timeout, maxTokens, temperature = D
       body.system = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
     }
 
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    // Proxy-aware, same as the OpenRouter site below. Missing it here meant the
+    // ANTHROPIC_API_KEY paths were the one keyed provider still doing a bare
+    // fetch — a silent outage behind a proxy, and one the new doctor check would
+    // have certified as healthy because it probes the hop this code was ASSUMED
+    // to use. (pre-tag review SHOULD-FIX 3)
+    const apiUrl = 'https://api.anthropic.com/v1/messages';
+    const apiHeaders = {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    };
+    const apiProxy = httpConnectProxyFor(apiUrl);
+    const res = apiProxy
+      ? await postViaConnectProxy(apiProxy, apiUrl, { headers: apiHeaders, body: JSON.stringify(body), timeout })
+      : await fetch(apiUrl, {
+        method: 'POST',
+        headers: apiHeaders,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
 
     if (!res.ok) {
       debugLog('WARN', `${model}-api`, `HTTP ${res.status}`);
@@ -696,16 +706,26 @@ async function callHaikuAPI(prompt, { timeout, maxTokens, temperature = DEFAULT_
       body.system = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
     }
 
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+    // Proxy-aware, same as the OpenRouter site below. Missing it here meant the
+    // ANTHROPIC_API_KEY paths were the one keyed provider still doing a bare
+    // fetch — a silent outage behind a proxy, and one the new doctor check would
+    // have certified as healthy because it probes the hop this code was ASSUMED
+    // to use. (pre-tag review SHOULD-FIX 3)
+    const apiUrl = 'https://api.anthropic.com/v1/messages';
+    const apiHeaders = {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    };
+    const apiProxy = httpConnectProxyFor(apiUrl);
+    const res = apiProxy
+      ? await postViaConnectProxy(apiProxy, apiUrl, { headers: apiHeaders, body: JSON.stringify(body), timeout })
+      : await fetch(apiUrl, {
+        method: 'POST',
+        headers: apiHeaders,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
 
     if (!res.ok) {
       debugLog('WARN', 'haiku-api', `HTTP ${res.status}`);

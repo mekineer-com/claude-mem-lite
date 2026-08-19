@@ -6,8 +6,15 @@ All notable changes to claude-mem-lite are documented in this file.
 
 **Upgrade note.** No action needed, and no default changed. Two things start happening
 that were not happening before: manual saves and the daily re-enrich pass now classify
-`observations.scope`, and auto-update works behind an HTTP proxy. Both were designed to
-be no-ops where they already worked. To revert, pin `npm i claude-mem-lite@3.72.1`.
+`observations.scope`, and the keyed LLM providers plus the auto-update version check work
+behind an HTTP proxy. Both were designed to be no-ops where they already worked.
+
+One cost worth stating plainly: until your scope backlog drains, the daily maintenance
+pass makes up to twice as many Haiku calls — the classification pass is budgeted
+separately from the re-enrich slice rather than carved out of it, for reasons in the code
+at the call site. Each of the extra calls is enum-only (60 max tokens against 500). Drain
+it in one go with `optimize --run --task re-enrich --scope scopes --max 100` if you would
+rather not pay it daily. To revert, pin `npm i claude-mem-lite@3.72.1`.
 
 ### a read lever whose column only one of three writers filled
 
@@ -40,17 +47,25 @@ adaptive half-share would not occasionally borrow from lesson enrichment — it 
 that cadence permanently. It is also an enum-only call (60 max tokens against 500), so one
 full item slot mis-prices it by an order of magnitude.
 
-The four prompts that classify scope now render one shared legend instead of hand-copied
+The five prompts that classify scope now render one shared legend instead of hand-copied
 wording. A column whose `environment` means something different per writer makes the read
 lever incoherent.
 
-### auto-update was proxy-blind, and nothing could see it
+### the network paths that were proxy-blind, and nothing could see it
 
 Node's global `fetch` ignores `HTTP(S)_PROXY`. A CONNECT tunnel already existed for that
-reason — but as two private functions inside `haiku-client.mjs`, so `hook-update.mjs` kept
-calling bare `fetch` at both of its network sites. Behind a proxy the version check and the
-release download both fail instantly, and because `checkForUpdate` is silent on network
-failure by design, the plugin then reports itself permanently up to date.
+reason — but as two private functions inside `haiku-client.mjs`, reachable only from the
+OpenRouter call site. Everything else kept calling bare `fetch`:
+
+- `hook-update.mjs`'s **version check** and its **release manifest / signature asset**
+  download. Behind a proxy both fail instantly, and because `checkForUpdate` is silent on
+  network failure by design, the plugin then reports itself permanently up to date. (The
+  release *tarball* was never affected — it goes through `curl`, which honours the proxy
+  environment natively. An earlier draft of this entry claimed otherwise.)
+- Both **`ANTHROPIC_API_KEY`** paths. The OpenRouter site had been tunnelled since the
+  outage that prompted it; the Anthropic ones never were, so the better-supported provider
+  was the broken one. Found in pre-tag review, together with the fact that the new doctor
+  check would have reported it green — it probed the hop that code was assumed to use.
 
 The tunnel is now `lib/proxy-fetch.mjs`, with the redirect following the swap requires: the
 release asset always 302s from github.com to the CDN, which native fetch had been doing for

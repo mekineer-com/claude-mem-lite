@@ -6,8 +6,11 @@
 // spot is exactly why hook-update.mjs kept calling bare `fetch` for the whole
 // auto-update path — nothing failed, because nothing looked. Behind a proxy
 // (measured on the dev box 2026-08-19: direct egress HTTP 000, via proxy HTTP
-// 200) that means the version check AND the tarball download silently never
-// happen, and auto-update degrades to "permanently up to date".
+// 200) that means the version check AND the release manifest/signature asset
+// download silently never happen, and auto-update degrades to "permanently up
+// to date". (Not the tarball: that goes through `curl`, which honours the proxy
+// env natively. An earlier version of this comment claimed it did — pre-tag
+// review NOTE 6.)
 //
 // Per the node-fetch-proxy-blindness skill: every suite that mocks fetch on a
 // transport that switches on proxy env MUST neutralize those vars, or it tests
