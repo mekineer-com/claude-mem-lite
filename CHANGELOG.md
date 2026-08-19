@@ -2,6 +2,72 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.73.0 — the column nothing filled, and the update that never phoned home
+
+**Upgrade note.** No action needed, and no default changed. Two things start happening
+that were not happening before: manual saves and the daily re-enrich pass now classify
+`observations.scope`, and auto-update works behind an HTTP proxy. Both were designed to
+be no-ops where they already worked. To revert, pin `npm i claude-mem-lite@3.72.1`.
+
+### a read lever whose column only one of three writers filled
+
+v44 added `observations.scope` (`file` / `module` / `project` / `environment`) and the
+`CLAUDE_MEM_SCOPE_FILTER` lever that skips environment-scoped rows on file-triggered
+recall. Three code paths create observations. Exactly one of them — the episode
+summarizer — ever set the column.
+
+The live reading that made this concrete: of the rows written across two days, the
+summarizer's `change` rows were 48/50 classified and every `bugfix` / `decision` /
+`discovery` / `refactor` / `feature` row was **0/41**. Those are the lesson-bearing rows
+pre-tool recall actually injects, so the lever was inert on precisely the population it
+exists to filter.
+
+- **Save-time enrichment** (`lib/save-enrich.mjs`) now classifies scope on the Haiku call
+  it was already making — no extra round trip — filling only when the column is empty,
+  re-checked inside the existing `BEGIN IMMEDIATE` transaction.
+- **The re-enrich passes** (narrow / wide / aliases) carry scope on their existing calls,
+  written through `COALESCE` so an omitted or off-enum value can never blank a label.
+- **A dedicated backfill scope**, `optimize --scope scopes`. It is not redundant with the
+  three above: narrow and wide both require a MISSING lesson and aliases requires MISSING
+  aliases, but 1955 of the 2041 unclassified rows had **both**, so the existing passes
+  could reach about 3% of the backlog. This one writes a single column, never stamps
+  `optimized_at`, and is guarded by `AND scope IS NULL` against a save-enrich worker
+  landing mid-classification.
+
+The scopes pass is budgeted **separately** rather than carved out of the re-enrich slice
+the way `aliases` is. Its candidate pool is a near-superset of every other scope's, so an
+adaptive half-share would not occasionally borrow from lesson enrichment — it would halve
+that cadence permanently. It is also an enum-only call (60 max tokens against 500), so one
+full item slot mis-prices it by an order of magnitude.
+
+The four prompts that classify scope now render one shared legend instead of hand-copied
+wording. A column whose `environment` means something different per writer makes the read
+lever incoherent.
+
+### auto-update was proxy-blind, and nothing could see it
+
+Node's global `fetch` ignores `HTTP(S)_PROXY`. A CONNECT tunnel already existed for that
+reason — but as two private functions inside `haiku-client.mjs`, so `hook-update.mjs` kept
+calling bare `fetch` at both of its network sites. Behind a proxy the version check and the
+release download both fail instantly, and because `checkForUpdate` is silent on network
+failure by design, the plugin then reports itself permanently up to date.
+
+The tunnel is now `lib/proxy-fetch.mjs`, with the redirect following the swap requires: the
+release asset always 302s from github.com to the CDN, which native fetch had been doing for
+free. Redirects drop `Authorization` on a cross-host hop and never replay the body, and the
+github.com host lock now runs BEFORE transport selection — having a proxy configured must
+not route around a supply-chain guard.
+
+`doctor` also had no LLM-provider check at all. It reported 21 green checks on a machine
+where a configured API key had never once been usable and every background call was paying
+the CLI fallback — 13.5s against 1.4s. It now reports the provider and whether it is
+reachable over the hop the product actually uses. Transport only, no key sent: a rejected
+key answers HTTP 401 and says so, while unreachability is the silent class.
+
+Three test suites that mock `fetch` needed their proxy env neutralized. Two of them are
+subprocess harnesses whose preflight probes still passed — they verify the stub is
+installed, not which branch runs.
+
 ## v3.72.1 — the guards the mutation harness said were not there
 
 **Upgrade note.** No action needed. Almost all of this is test-only. The one behaviour
