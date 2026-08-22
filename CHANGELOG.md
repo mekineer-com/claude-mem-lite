@@ -50,6 +50,38 @@ earned its place immediately: the first cut of this change imported `planErrorRe
 from `utils.mjs` without re-exporting it there, which broke `hook.mjs` load entirely and
 turned 119 tests red.
 
+### doctor no longer exits 1 over a process it cannot do anything about
+
+`doctor`'s stale-process check rendered with `warn()` (⚠) and then incremented the
+issue counter — the only check in the pipeline doing both; the other eight `issues++`
+sites all follow `fail()`. `buildDoctorSummary`'s own JSDoc states the contract it was
+breaking: issues are ✗-level (action required), warnings are ⚠-level (informational).
+The visible result was a run where every line on screen was ✓ or ⚠ and the summary still
+said `1 issue(s) found.`, exit 1.
+
+An old process is exactly the finding a doctor run cannot act on: auto-update bumps
+`installed_plugins.json` but cannot kill an MCP process a live session already spawned,
+so a correct, healthy install reports it for as long as that session stays open. **If you
+script against `doctor`'s exit code, note that a stale process alone no longer makes it
+non-zero.** Everything `fail()`-level still does. This is the same site that failed the
+v3.70.0 release `validate` job on vitest's own worker processes; the narrowing done then
+removed the false positive but left the accounting, so a *true* positive still went red.
+
+Two tests were already asserting the fixed behaviour and failing against it — one of
+them named "ignores a stale NON-ACTIVE cache version instead of going red forever". They
+had been written off as host-sensitive. They were not: they were correct guards on a real
+defect, and they pass now without being modified.
+
+### a test that depended on what sits above $TMPDIR
+
+`binding-error-diagnosis` needs `npm install` to fail so it can assert npm's diagnosis
+reaches inherited stderr, and it arranged that by running in an empty temp dir. But npm
+searches PARENT directories for a package.json, and `$TMPDIR` is commonly nested under
+one — so npm found an unrelated manifest, installed its dependencies, and exited 0. The
+case now writes an unparseable package.json itself, failing locally and immediately on
+`EJSONPARSE`: same assertions, still no network, and 5131ms → 362ms because it is no
+longer really installing somebody else's dependency tree.
+
 ## v3.73.0 — the column nothing filled, and the update that never phoned home
 
 **Upgrade note.** No action needed, and no default changed. Two things start happening
