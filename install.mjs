@@ -1737,8 +1737,17 @@ async function doctor() {
     try { currentVersion = JSON.parse(readFileSync(join(PROJECT_DIR, 'package.json'), 'utf8')).version; } catch { /* fall through with empty version */ }
     const stale = lines.filter(l => isStaleMemProcess(l, currentVersion));
     if (stale.length > 0) {
+      // ⚠-level ONLY, deliberately not `issues++`. buildDoctorSummary's contract is
+      // "issues are ✗-level (action required); warnings are ⚠-level (informational)",
+      // and an old process is the one finding here the user cannot act on from a
+      // doctor run: auto-update bumps installed_plugins.json but cannot kill the MCP
+      // process an active session already spawned, so a correct, healthy install
+      // reports this for as long as that session lives. Counting it made `doctor`
+      // exit 1 while every line on screen was ✓ or ⚠ — it failed the v3.70.0 release
+      // `validate` job (where the "old processes" were vitest's own workers) and it
+      // reddens doctor-install-shape-e2e's "instead of going red forever" case on any
+      // dev box with a previous-version session still open.
       warn(`Old processes running${currentVersion ? ` (current: v${currentVersion})` : ''}:\n    ` + stale.join('\n    '));
-      issues++;
     } else {
       ok('No stale processes');
     }
