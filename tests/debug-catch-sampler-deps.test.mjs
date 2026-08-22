@@ -34,17 +34,24 @@ describe('debugCatch sampling path dependencies', () => {
   // survive when the DB layer cannot be loaded? Run as a subprocess because the block
   // has to be installed before utils.mjs is imported.
   const runWithBlocked = (blockedSuffix) => {
+    // module.register + a hooks module, NOT module.registerHooks: the latter landed in
+    // Node 22.15 and this package declares engines >=20, so it threw a SyntaxError on
+    // the CI matrix's node-20 leg while passing locally on 24. register() has been
+    // available since 20.6.
+    const hooks = join(dir, 'hooks.mjs');
+    writeFileSync(hooks, `
+      export async function resolve(specifier, context, next) {
+        if (specifier.endsWith(${JSON.stringify(blockedSuffix)})) {
+          throw new Error('BLOCKED ' + specifier);
+        }
+        return next(specifier, context);
+      }
+    `);
     const blocker = join(dir, 'blocker.mjs');
     writeFileSync(blocker, `
-      import { registerHooks } from 'node:module';
-      registerHooks({
-        resolve(specifier, context, next) {
-          if (specifier.endsWith(${JSON.stringify(blockedSuffix)})) {
-            throw new Error('BLOCKED ' + specifier);
-          }
-          return next(specifier, context);
-        },
-      });
+      import { register } from 'node:module';
+      import { pathToFileURL } from 'node:url';
+      register(pathToFileURL(${JSON.stringify(hooks)}).href);
     `);
     execFileSync(process.execPath, [
       '--import', blocker,
