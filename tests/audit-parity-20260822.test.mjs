@@ -240,3 +240,87 @@ describe('P1-3 — registry import/remove/reindex behave identically on CLI and 
     expect(mcpCount).toBe(cliCount);
   }, 60000);
 });
+
+// P2-6 — the get detail face fetched and rendered three sources with hand-copied SQL on
+// each side, and the prompt source had already drifted: MCP rendered prompt_number and
+// created_at, the CLI rendered neither. A prompt_number is how a user cross-references a
+// P# against a session transcript, so on the CLI it was searchable-but-invisible — the
+// exact shape SESSION_DETAIL_FIELDS was introduced to close, reopened one source over.
+
+describe('P2-6 — get renders the same prompt/event fields on both faces', () => {
+  let dataDir, cwd;
+
+  beforeAll(async () => {
+    dataDir = sandboxDir('get-data');
+    cwd = sandboxDir('get-proj');
+    // Seed through the real save surface so the row shape is production's, not a fixture's.
+    const r = await fire(process.execPath, [
+      CLI_PATH, 'save', 'Prompt/event parity probe body',
+      '--type', 'decision', '--title', 'Parity probe for the get detail face',
+    ], { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+    expect(r.code, `seed save failed:\n${r.stdout}\n${r.stderr}`).toBe(0);
+
+    // A user_prompts row with a prompt_number — the field the CLI face was dropping.
+    const db = new Database(join(dataDir, 'claude-mem-lite.db'));
+    try {
+      const now = Date.now();
+      const sess = db.prepare('SELECT content_session_id FROM sdk_sessions LIMIT 1').get();
+      db.prepare(`
+        INSERT INTO user_prompts (content_session_id, prompt_text, prompt_number, created_at, created_at_epoch)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(sess.content_session_id, 'How did we fix the parser null deref?',
+        7, new Date(now).toISOString(), now);
+    } finally { db.close(); }
+  }, 60000);
+
+  /** The P# id of the seeded prompt row. */
+  function promptId() {
+    const db = new Database(join(dataDir, 'claude-mem-lite.db'), { readonly: true });
+    try { return db.prepare('SELECT id FROM user_prompts ORDER BY id DESC LIMIT 1').get().id; }
+    finally { db.close(); }
+  }
+
+  // FAILS IF: the CLI prompt renderer stops iterating PROMPT_DETAIL_FIELDS — prompt_number
+  // disappears from the CLI detail view while remaining FTS-searchable.
+  it('the CLI prompt detail renders prompt_number', async () => {
+    const r = await fire(process.execPath, [CLI_PATH, 'get', `P#${promptId()}`],
+      { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+    expect(r.stdout).toMatch(/Prompt number: 7/);
+    expect(r.stdout).toMatch(/How did we fix the parser null deref\?/);
+  }, 60000);
+
+  // Both faces must expose the same field SET. Labels and ordering are each face's own
+  // convention; which columns reach the user is not.
+  it('both faces expose the same prompt fields', async () => {
+    const id = promptId();
+    const cli = await fire(process.execPath, [CLI_PATH, 'get', `P#${id}`],
+      { cwd, env: { CLAUDE_MEM_DIR: dataDir } });
+
+    const { client, transport } = await startMcp(dataDir, cwd);
+    let mcp;
+    try {
+      mcp = textOf(await client.callTool({ name: 'mem_get', arguments: { ids: [`P#${id}`] } }));
+    } finally {
+      await client.close().catch(() => {});
+      await transport.close().catch(() => {});
+    }
+
+    // prompt_number reaches both; the prompt text reaches both.
+    for (const probe of ['7', 'How did we fix the parser null deref?']) {
+      expect(cli.stdout, `CLI dropped ${probe}`).toContain(probe);
+      expect(mcp, `MCP dropped ${probe}`).toContain(probe);
+    }
+  }, 60000);
+
+  // Neither face may re-inline its own SELECT for these two sources.
+  it('neither face hand-rolls the prompt/event fetch', async () => {
+    const { readFileSync } = await import('fs');
+    for (const f of ['mem-cli.mjs', 'server.mjs']) {
+      const src = readFileSync(join(REPO, f), 'utf8');
+      expect(src, `${f} re-inlined a user_prompts detail SELECT`)
+        .not.toMatch(/SELECT \* FROM user_prompts WHERE id IN/);
+      expect(src, `${f} re-inlined an events detail SELECT`)
+        .not.toMatch(/SELECT \* FROM events WHERE id IN/);
+    }
+  });
+});

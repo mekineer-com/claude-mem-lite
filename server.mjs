@@ -23,7 +23,7 @@ import {
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
-import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
+import { fetchObsDetail, fetchPromptDetail, fetchEventDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, PROMPT_DETAIL_FIELDS, EVENT_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
 import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { effectiveQuiet, RUNTIME_DIR } from './hook-shared.mjs';
 import { computeStatsFeed } from './lib/stats-core.mjs';
@@ -667,34 +667,31 @@ server.registerTool(
     }
 
     if (bySrc.prompt.length > 0) {
-      const ph = bySrc.prompt.map(() => '?').join(',');
-      const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.prompt);
-      for (const row of rows) {
+      for (const row of fetchPromptDetail(db, bySrc.prompt)) {
         foundBySource.prompt.add(row.id);
         const lines = [`── P#${row.id} ──`];
-        if (row.prompt_text) lines.push(`prompt_text: ${row.prompt_text.length > 500 ? row.prompt_text.slice(0, 500) + '…' : row.prompt_text}`);
-        if (row.content_session_id) lines.push(`content_session_id: ${row.content_session_id}`);
-        if (row.prompt_number !== null && row.prompt_number !== undefined) lines.push(`prompt_number: ${row.prompt_number}`);
-        if (row.created_at) lines.push(`created_at: ${row.created_at}`);
+        for (const f of PROMPT_DETAIL_FIELDS) {
+          if (f === 'id') continue;   // already in the header
+          const val = row[f];
+          if (val === null || val === undefined || val === '') continue;
+          lines.push(`${f}: ${typeof val === 'string' && val.length > 500 ? val.slice(0, 500) + '…' : val}`);
+        }
         sections.push(lines.join('\n'));
       }
     }
 
     if (bySrc.event.length > 0) {
-      const ph = bySrc.event.map(() => '?').join(',');
-      const rows = db.prepare(`SELECT * FROM events WHERE id IN (${ph}) ORDER BY created_at_epoch ASC`).all(...bySrc.event);
-      // events carry the distilled lesson in `body` (persistHaikuSummary writes lesson_learned||narrative).
-      // No created_at ISO column (only *_epoch) — render the epoch as an ISO string for a scannable date.
-      for (const row of rows) {
+      // fetchEventDetail derives created_at from created_at_epoch (events have no ISO
+      // column), so EVENT_DETAIL_FIELDS names it like any other field on both faces.
+      for (const row of fetchEventDetail(db, bySrc.event)) {
         foundBySource.event.add(row.id);
         const lines = [`── E#${row.id} [${row.event_type}] ──`];
-        if (row.title) lines.push(`title: ${row.title}`);
-        if (row.body) lines.push(`body: ${row.body.length > 500 ? row.body.slice(0, 500) + '…' : row.body}`);
-        if (row.project) lines.push(`project: ${row.project}`);
-        if (row.importance !== null && row.importance !== undefined) lines.push(`importance: ${row.importance}`);
-        if (row.file_paths) lines.push(`file_paths: ${row.file_paths}`);
-        if (row.git_sha) lines.push(`git_sha: ${row.git_sha}`);
-        if (row.created_at_epoch) lines.push(`created_at: ${new Date(row.created_at_epoch).toISOString()}`);
+        for (const f of EVENT_DETAIL_FIELDS) {
+          if (f === 'id' || f === 'event_type') continue;   // already in the header
+          const val = row[f];
+          if (val === null || val === undefined || val === '') continue;
+          lines.push(`${f}: ${typeof val === 'string' && val.length > 500 ? val.slice(0, 500) + '…' : val}`);
+        }
         sections.push(lines.join('\n'));
       }
     }

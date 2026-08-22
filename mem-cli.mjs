@@ -17,7 +17,7 @@ import { resolveCliProject as cliProject } from './lib/cli-project.mjs';
 import { _resetVocabCache, vecTextForRow, vectorsEnabled } from './tfidf.mjs';
 import { reRankWithContext } from './search-scoring.mjs';
 import { searchObservationsHybrid } from './search-engine.mjs';
-import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
+import { fetchObsDetail, fetchPromptDetail, fetchEventDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, PROMPT_DETAIL_FIELDS, EVENT_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
 import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
 import { ensureRegistryDb, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
@@ -580,34 +580,50 @@ function renderSessionRows(db, ids) {
   return { text: parts.join('\n\n'), count: rows.length };
 }
 
+// The CLI's established labels for the prompt/event detail faces. Sharing the FIELD SET
+// with MCP (P2-6) must not rename what users already grep for, so the columns that had a
+// label keep it; anything added later falls back to title-case.
+const CLI_DETAIL_LABELS = {
+  prompt_text: 'Text',
+  content_session_id: 'Session',
+  file_paths: 'Files',
+  git_sha: 'Git',
+};
+
+/** Label a column for the CLI's `Label: value` render style. */
+const cliFieldLabel = (f) =>
+  CLI_DETAIL_LABELS[f] || f[0].toUpperCase() + f.slice(1).replace(/_/g, ' ');
+
 function renderPromptRows(db, ids) {
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT * FROM user_prompts WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  const rows = fetchPromptDetail(db, ids);
   if (rows.length === 0) return null;
   const parts = [];
   for (const r of rows) {
     const lines = [`P#${r.id} ${fmtDateShort(r.created_at)}`];
-    if (r.prompt_text) lines.push(`Text: ${r.prompt_text}`);
-    if (r.content_session_id) lines.push(`Session: ${r.content_session_id}`);
+    // id and created_at are already in the header (same convention as the session face).
+    for (const f of PROMPT_DETAIL_FIELDS) {
+      if (f === 'id' || f === 'created_at') continue;
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      lines.push(`${cliFieldLabel(f)}: ${val}`);
+    }
     parts.push(lines.join('\n'));
   }
   return { text: parts.join('\n\n'), count: rows.length };
 }
 
 function renderEventRows(db, ids) {
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`SELECT * FROM events WHERE id IN (${placeholders}) ORDER BY created_at_epoch ASC`).all(...ids);
+  const rows = fetchEventDetail(db, ids);   // derives created_at from created_at_epoch
   if (rows.length === 0) return null;
   const parts = [];
   for (const r of rows) {
-    // events store the distilled lesson in `body`; only *_epoch is available for the date.
-    const lines = [`E#${r.id} [${r.event_type}] ${r.created_at_epoch ? fmtDateShort(new Date(r.created_at_epoch).toISOString()) : ''}`];
-    if (r.title) lines.push(`Title: ${r.title}`);
-    if (r.body) lines.push(`Body: ${r.body}`);
-    if (r.project) lines.push(`Project: ${r.project}`);
-    if (r.importance !== null && r.importance !== undefined) lines.push(`Importance: ${r.importance}`);
-    if (r.file_paths) lines.push(`Files: ${r.file_paths}`);
-    if (r.git_sha) lines.push(`Git: ${r.git_sha}`);
+    const lines = [`E#${r.id} [${r.event_type}] ${r.created_at ? fmtDateShort(r.created_at) : ''}`];
+    for (const f of EVENT_DETAIL_FIELDS) {
+      if (f === 'id' || f === 'event_type' || f === 'created_at') continue;   // in the header
+      const val = r[f];
+      if (val === null || val === undefined || val === '') continue;
+      lines.push(`${cliFieldLabel(f)}: ${val}`);
+    }
     parts.push(lines.join('\n'));
   }
   return { text: parts.join('\n\n'), count: rows.length };
