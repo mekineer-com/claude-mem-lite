@@ -2,6 +2,54 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.74.0 — the error-recall surface was searching the command, not the error
+
+**Upgrade note.** No action needed, and no default changed. One behaviour does change and
+it is a reduction: when a command fails but its output carries no error-signal token,
+the PostToolUse error-recall block no longer appears. In practice that means npm's own
+failures (`npm ERR! code ENOENT`, `ELIFECYCLE`) and a truncated Python traceback stop
+injecting, because what they were injecting was a match on the COMMAND's words. Failures
+that do carry an error word — test failures, thrown exceptions, module-not-found — are
+untouched. To revert, pin `npm i claude-mem-lite@3.73.0`.
+
+### two pattern lists that were never the same list
+
+This surface fires on `detectBashSignificance`'s `isHardError`, then extracts keywords
+with a second, unrelated regex. `HARD_ERROR_RE` accepts `ERR!`, `enoent` and `traceback`.
+The extractor's line filter wants the whole word `error`. Nothing kept them in sync, and
+npm sits exactly in the gap: `npm ERR! code ENOENT / npm ERR! enoent ENOENT: no such file
+or directory` clears the trigger, then yields **zero** error lines — no `error`, no
+`fail`, no `not found` (npm says "no such file"). The keyword set fell back to command
+words alone, literally `['npm','run','build']`, and the FTS query went looking for
+observations about npm and building.
+
+Measured on the live library: `npm run build` failing on a missing module returned two
+release records ahead of the one row that explained it. A Python traceback's head lines
+degrade identically to `['python','train.py']`. Both are among the most common failures
+a session produces, which is consistent with this surface's citation rate of 4–6% against
+pre-tool recall's 38–42%.
+
+- **`planErrorRecall()`** in `bash-utils.mjs` is the new decision seam — pure, so the gate
+  is testable without spawning a hook, the same split `formatErrorRecallHints` already
+  uses. No error-signal token means there is nothing to recall ON, so the surface stays
+  silent instead of injecting a topic match.
+- **Term selection is unchanged.** Demoting command words to a fallback was implemented,
+  measured, and rejected: replaying five real failures, error-terms-only fixed the
+  missing-module case but regressed two others — dropping `database` lost the plugin-mode
+  data-dir row for a failed DB open, dropping `vitest` lost the test-failure row. Command
+  words carry domain anchoring, not just BM25 noise. The demote-to-fallback variant
+  measured byte-identical to error-terms-only, because the primary query always filled
+  its `LIMIT 3` and the fallback never ran.
+- **Widening the regex is deliberately not the fix.** Enumerating failure shapes always
+  misses one more; the gate is correct for every shape it misses.
+
+Four mutants were run against the new tests and all four were killed, including one that
+restores the old ungated behaviour — that one also reddens an end-to-end case driving the
+real PostToolUse entry point, which the pure-function tests cannot see. That wiring test
+earned its place immediately: the first cut of this change imported `planErrorRecall`
+from `utils.mjs` without re-exporting it there, which broke `hook.mjs` load entirely and
+turned 119 tests red.
+
 ## v3.73.0 — the column nothing filled, and the update that never phoned home
 
 **Upgrade note.** No action needed, and no default changed. Two things start happening
