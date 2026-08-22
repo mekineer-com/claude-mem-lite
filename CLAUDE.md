@@ -75,6 +75,30 @@ the parent process cannot observe) and `scripts/**` (same reason).
 | `scripts/post-tool-use.sh` | Bash fast pre-filter (~5ms, skips low-value tools) |
 | `scripts/user-prompt-search.js` | UserPromptSubmit hook — auto-search memory on user prompts |
 
+## Where new code goes (audit 2026-08-22 P2-7)
+
+The four big files — `mem-cli.mjs` 3366, `install.mjs` 2668, `server.mjs` 2078,
+`hook.mjs` 1929 — are **routers and faces, not a split left half-finished**. v2.41 moved
+four handlers into `cli/` and stopped; the direction that actually took hold since is a
+different one, and it has produced **72 modules under `lib/`**: every piece of logic two
+faces share (CLI and MCP, or two hook events) gets extracted into a `lib/*-core.mjs`, and
+the big file keeps only argument parsing, rendering, and wiring.
+
+That is the convention, stated so the state stops reading as abandoned work:
+
+- **Shared by two or more faces → `lib/`.** This is what kills the twin-drift defect class
+  this project keeps paying for (get-core, registry-core, maintain-core, fast-summary,
+  transcript-scan…). Register every new module in BOTH `source-files.mjs` and
+  `package.json#files` — a missed registration has shipped a broken tarball three times.
+- **Owned by exactly one face → it stays in that face's file.** Moving it buys a file and
+  an import, not a guarantee.
+- **No standalone split project.** `cli/` stays as it is: `cli/common.mjs` is a shared
+  render layer that `server.mjs` also imports, so the directory name is already wrong; a
+  further split would spread that confusion rather than resolve it.
+
+Line count is not the trigger — a shared code path is. The four files shrink as cores get
+extracted, or they don't, and either is fine.
+
 ## Key Patterns
 
 - CLI commands: `claude-mem-lite search|recent|recall|get|timeline|browse|context|save|update|delete|defer|compress|maintain|optimize|enrich|fts-check|restore|export|import|import-jsonl|stats|citation-stats|activity|registry|memdir-audit|adopt|unadopt` (canonical set = `CLI_COMMANDS` in `cli.mjs`; `claude-mem-lite help` for flags)
