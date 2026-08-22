@@ -50,7 +50,7 @@ import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
 import { queueHookContext, queueHookSystemMessage, flushHookStdout } from './lib/hook-stdout.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, stampDedupSuperseded, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
@@ -1099,8 +1099,7 @@ function runSessionStartAutoMaintain(db) {
       `).all();
       if (dupPairs.length > 0) {
         const removeIds = dupPairs.map(p => p.remove_id);
-        const ph = removeIds.map(() => '?').join(',');
-        db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup' WHERE id IN (${ph}) AND superseded_at IS NULL`).run(Date.now(), ...removeIds);
+        stampDedupSuperseded(db, removeIds, 'auto-dedup');
         debugLog('DEBUG', 'auto-maintain', `auto-deduped ${dupPairs.length} near-identical observations`);
       }
 
@@ -1132,9 +1131,7 @@ function runSessionStartAutoMaintain(db) {
           }));
           const fuzzyRemoveIds = selectFuzzyDedupeIds(rows, { maxMerges: FUZZY_MAX_MERGES });
           if (fuzzyRemoveIds.length > 0) {
-            const ph = fuzzyRemoveIds.map(() => '?').join(',');
-            db.prepare(`UPDATE observations SET superseded_at = ?, superseded_by = 'auto-dedup-fuzzy' WHERE id IN (${ph})`)
-              .run(Date.now(), ...fuzzyRemoveIds);
+            stampDedupSuperseded(db, fuzzyRemoveIds, 'auto-dedup-fuzzy');
             debugLog('DEBUG', 'auto-maintain', `fuzzy auto-deduped ${fuzzyRemoveIds.length} near-identical observations`);
           }
         }
