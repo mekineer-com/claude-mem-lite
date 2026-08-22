@@ -23,7 +23,7 @@ import { join } from 'path';
 import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statSync, existsSync } from 'fs';
 import { homedir } from 'os';
 import {
-  truncate, inferProject, detectBashSignificance,
+  inferProject, detectBashSignificance,
   planErrorRecall, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
   OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
@@ -44,8 +44,8 @@ import {
   sessionFile, getSessionId, createSessionId, openDb,
   spawnBackground, sweepOrphanEpisodeFiles, sweepStaleProjectMarkers,
 } from './hook-shared.mjs';
-import { handleLLMEpisode, handleLLMSummary, saveObservation, buildImmediateObservation, saveEpisodeImmediate } from './hook-llm.mjs';
-import { scrubRecord } from './lib/scrub-record.mjs';
+import { handleLLMEpisode, handleLLMSummary, saveEpisodeImmediate } from './hook-llm.mjs';
+import { readFastSummarySource, insertFastSummary, FAST_SUMMARY_LIMITS } from './lib/fast-summary.mjs';
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
 import { queueHookContext, queueHookSystemMessage, flushHookStdout } from './lib/hook-stdout.mjs';
@@ -297,15 +297,13 @@ function flushEpisodeGroup(ep, db) {
   const isSignificant = episodeHasSignificantContent(ep);
 
   // Immediate save: rule-based observation for instant visibility; the LLM
-  // background worker upgrades title/narrative/importance later.
+  // background worker upgrades title/narrative/importance later. `db` is
+  // flushEpisode's handle — passed in so the caller owns open/close and the whole
+  // flush is gated on one availability check (B1). saveEpisodeImmediate re-checks
+  // significance itself, so the guard here is about the flush-file decision below.
   if (isSignificant) {
-    try {
-      const obs = buildImmediateObservation(ep);
-      // `db` is flushEpisode's handle — passed in so the caller owns open/close and the
-      // whole flush is gated on one availability check (B1).
-      const id = saveObservation(obs, ep.project, ep.sessionId, db);
-      if (id) ep.savedId = id;
-    } catch (e) { debugCatch(e, 'flushEpisode-immediateSave'); }
+    const id = saveEpisodeImmediate(ep, db, 'flushEpisode-immediateSave');
+    if (id) ep.savedId = id;
   }
 
   const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
@@ -596,21 +594,18 @@ async function handleStop() {
           // one garbled observation. planEpisodeFlush returns [episode] by reference for the common
           // single-session case, so this is a no-op there. Immediate-save each group BEFORE its
           // flush-file write (same ordering as flushEpisodeGroup) so a worker crash can't lose it.
+          // One body for both paths (audit 2026-08-22 P2-9). This loop used to be a
+          // hand-copy of flushEpisodeGroup carrying three comments asserting parity with
+          // it, and it was not in parity: it ignored CLAUDE_MEM_SKIP_EPISODE_LLM, so a
+          // lock-contended Stop under test spawned a real background worker; and a failed
+          // flush-file write threw out of the whole loop into the outer catch, whose
+          // `finally` then deleted the claim file — abandoning the subs that had not been
+          // written yet. flushEpisodeGroup returns 'writefail' and the caller skips only
+          // that sub. Per-sub significance gating lives inside it too.
           for (const sub of planEpisodeFlush(episode)) {
             if (!sub.sessionId) sub.sessionId = sessionId;
             if (!sub.project) sub.project = project;
-            // Per-sub significance gate — parity with flushEpisodeGroup. The whole-episode check
-            // above can pass while an interleaved concurrent-session sub is pure noise (e.g. a lone
-            // Read); without this the fallback persists that noise sub AND spawns an LLM worker for it.
-            if (!episodeHasSignificantContent(sub)) continue;
-            try {
-              const obs = buildImmediateObservation(sub);
-              const id = saveObservation(obs, sub.project, sub.sessionId, claimDb);
-              if (id) sub.savedId = id;
-            } catch (e) { debugCatch(e, 'handleStop-fallback-immediateSave'); }
-            const flushFile = join(RUNTIME_DIR, `ep-flush-${Date.now()}-${randomUUID().slice(0, 8)}.json`);
-            writeFileSync(flushFile, JSON.stringify(sub), { mode: 0o600 }); // captured paths + scrubbed activity — owner-only (sec P3-2)
-            spawnBackground('llm-episode', flushFile);
+            flushEpisodeGroup(sub, claimDb);
           }
         }
       } finally {
@@ -651,21 +646,7 @@ async function handleStop() {
           'SELECT 1 FROM session_summaries WHERE memory_session_id = ? LIMIT 1'
         ).get(sessionId);
         if (!existingSummary) {
-          const firstPrompt = db.prepare(`
-            SELECT prompt_text FROM user_prompts
-            WHERE content_session_id = ?
-            ORDER BY prompt_number ASC LIMIT 1
-          `).get(sessionId);
-          const recentObs = db.prepare(`
-            SELECT title FROM observations
-            WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-            ORDER BY created_at_epoch DESC LIMIT 5
-          `).all(sessionId);
-          // Raw values flow into scrubRecord below; truncation at .run() site
-          // so secrets straddling the boundary still match scrubSecrets's
-          // length floors.
-          const fastRequestRaw = firstPrompt?.prompt_text || '';
-          const obsCompleted = recentObs.map(o => o.title).filter(Boolean).join('; ');
+          const { request: fastRequestRaw, completed: obsCompleted } = readFastSummarySource(db, sessionId);
 
           // Structural extraction from the assistant's tail message.
           // CLAUDE.md §10 mandates Done/Not done/Failed/Uncertain markers, so the
@@ -693,24 +674,11 @@ async function handleStop() {
           const finalNotes = structuredNotes || 'fast';
 
           if (fastRequestRaw || finalCompleted || finalRemaining) {
-            const now = new Date();
-            const safe = scrubRecord('session_summaries', {
-              request: fastRequestRaw,
-              completed: finalCompleted,
-              remaining_items: finalRemaining,
-              notes: finalNotes,
+            insertFastSummary(db, {
+              sessionId, project, now: new Date(),
+              values: { request: fastRequestRaw, completed: finalCompleted, remaining: finalRemaining, notes: finalNotes },
+              limits: FAST_SUMMARY_LIMITS.stop,
             });
-            db.prepare(`
-              INSERT INTO session_summaries
-              (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-              VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', ?, ?, ?)
-            `).run(
-              sessionId, project, truncate(safe.request, 200),
-              truncate(safe.completed, 600),
-              truncate(safe.remaining_items, 600),
-              truncate(safe.notes, 400),
-              now.toISOString(), now.getTime()
-            );
           }
         }
       } catch (e) { debugCatch(e, 'handleStop-fast-summary'); }
@@ -1191,23 +1159,7 @@ function saveHandoffAndFastSummary(db, { prevSessionId, prevProject, project, cc
     // Background llm-summary will produce a richer Haiku version later;
     // context injection query (ORDER BY created_at_epoch DESC) auto-prefers latest.
     try {
-      const firstPrompt = db.prepare(`
-        SELECT prompt_text FROM user_prompts
-        WHERE content_session_id = ?
-        ORDER BY prompt_number ASC LIMIT 1
-      `).get(prevSessionId);
-
-      const prevObs = db.prepare(`
-        SELECT title FROM observations
-        WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-        ORDER BY created_at_epoch DESC LIMIT 5
-      `).all(prevSessionId);
-
-      // Raw values flow into scrubRecord; truncation deferred to .run() so
-      // secrets straddling the truncation boundary still match scrubSecrets
-      // regex length floors.
-      const fastRequestRaw = firstPrompt?.prompt_text || '';
-      const fastCompletedRaw = prevObs.map(o => o.title).filter(Boolean).join('; ');
+      const { request: fastRequestRaw, completed: fastCompletedRaw } = readFastSummarySource(db, prevSessionId);
 
       // Infer remaining_items from handoff unfinished (already built above at line 476)
       let fastRemainingRaw = '';
@@ -1221,16 +1173,11 @@ function saveHandoffAndFastSummary(db, { prevSessionId, prevProject, project, cc
       }
 
       if (fastRequestRaw || fastCompletedRaw) {
-        const safe = scrubRecord('session_summaries', {
-          request: fastRequestRaw,
-          completed: fastCompletedRaw,
-          remaining_items: fastRemainingRaw,
+        insertFastSummary(db, {
+          sessionId: prevSessionId, project: prevProject || project, now,
+          values: { request: fastRequestRaw, completed: fastCompletedRaw, remaining: fastRemainingRaw },
+          limits: FAST_SUMMARY_LIMITS.sessionStart,
         });
-        db.prepare(`
-          INSERT INTO session_summaries
-          (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-          VALUES (?, ?, ?, '', '', ?, '', ?, '[]', '[]', 'fast', ?, ?)
-        `).run(prevSessionId, prevProject || project, truncate(safe.request, 200), truncate(safe.completed, 300), truncate(safe.remaining_items, 200), now.toISOString(), now.getTime());
       }
     } catch (e) { debugCatch(e, 'session-start-fast-summary'); }
   }
@@ -1281,30 +1228,15 @@ function buildFallbackFastSummary(db, { project, now, prevSessionId }) {
         `).get(recentSession.content_session_id);
 
         if (!hasSummary) {
-          const fp = db.prepare(`
-            SELECT prompt_text FROM user_prompts
-            WHERE content_session_id = ? ORDER BY prompt_number ASC LIMIT 1
-          `).get(recentSession.content_session_id);
-          const po = db.prepare(`
-            SELECT title FROM observations
-            WHERE memory_session_id = ? AND COALESCE(compressed_into, 0) = 0
-            ORDER BY created_at_epoch DESC LIMIT 5
-          `).all(recentSession.content_session_id);
-
-          // Raw values into scrubRecord; truncation at .run() preserves
-          // straddling-secret detection (per privacy review).
-          const frRaw = fp?.prompt_text || '';
-          const fcRaw = po.map(o => o.title).filter(Boolean).join('; ');
+          const { request: frRaw, completed: fcRaw } = readFastSummarySource(db, recentSession.content_session_id);
           if (frRaw || fcRaw) {
-            const safe = scrubRecord('session_summaries', {
-              request: frRaw,
-              completed: fcRaw,
+            // No remaining_items on this path: an /exit restart has no handoff and no
+            // episode snapshot to infer one from. It was a bare '' in the SQL before.
+            insertFastSummary(db, {
+              sessionId: recentSession.content_session_id, project, now,
+              values: { request: frRaw, completed: fcRaw },
+              limits: FAST_SUMMARY_LIMITS.exitRestart,
             });
-            db.prepare(`
-              INSERT INTO session_summaries
-              (memory_session_id, project, request, investigated, learned, completed, next_steps, remaining_items, files_read, files_edited, notes, created_at, created_at_epoch)
-              VALUES (?, ?, ?, '', '', ?, '', '', '[]', '[]', 'fast', ?, ?)
-            `).run(recentSession.content_session_id, project, truncate(safe.request, 200), truncate(safe.completed, 300), now.toISOString(), now.getTime());
           }
         }
       }

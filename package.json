@@ -111,6 +111,7 @@
     "lib/save-enrich.mjs",
     "lib/persist-reminder.mjs",
     "lib/maintain-core.mjs",
+    "lib/fast-summary.mjs",
     "lib/dedup-constants.mjs",
     "lib/deferred-work.mjs",
     "lib/upgrade-banner.mjs",

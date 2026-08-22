@@ -511,14 +511,19 @@ export function buildDegradedTitle(episode) {
 // processed), so without this the in-flight episode is silently lost on abnormal
 // termination — and spawning a detached child from a dying process is unreliable, so
 // the save must be synchronous (audit #6). Never throws; returns the obs id or null.
-export function saveEpisodeImmediate(episode, externalDb) {
+// `scope` names the CALLER in hook-error telemetry. Audit 2026-08-22 P2-9 folded
+// flushEpisodeGroup's hand-copied version of this block into this function; without the
+// parameter all three paths would report failures under one label, and "the immediate
+// save threw" means different things on the normal flush, the lock-contended Stop
+// fallback, and the shutdown salvage.
+export function saveEpisodeImmediate(episode, externalDb, scope = 'saveEpisodeImmediate') {
   try {
     if (!episode || !Array.isArray(episode.entries) || episode.entries.length === 0) return null;
     if (!episodeHasSignificantContent(episode)) return null;
     const obs = buildImmediateObservation(episode);
     return saveObservation(obs, episode.project, episode.sessionId, externalDb) || null;
   } catch (e) {
-    debugCatch(e, 'saveEpisodeImmediate');
+    debugCatch(e, scope);
     return null;
   }
 }
