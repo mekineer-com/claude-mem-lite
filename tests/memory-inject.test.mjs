@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { searchRelevantMemories, recallForFile, formatMemoryLine } from '../hook-memory.mjs';
-import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { searchRelevantMemories, formatMemoryLine } from '../hook-memory.mjs';
+import { createTestDb, insertSession, insertObs, matchFileEdges } from './test-helpers.mjs';
 import { cjkBigrams } from '../utils.mjs';
 
 // ─── P1: formatMemoryLine — stale-obs verify-before-use hint ───────────────
@@ -454,13 +454,13 @@ describe('file-aware recall', () => {
       importance: 2, filesModified: '["hook.mjs"]',
       epochOffset: -5 * 86400000
     });
-    const results = recallForFile(db, 'hook.mjs', 'test');
+    const results = matchFileEdges(db, 'hook.mjs', 'test');
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].title).toMatch(/hook\.mjs/);
   });
 
   it('returns empty for files with no history', () => {
-    const results = recallForFile(db, 'brand-new-file.mjs', 'test');
+    const results = matchFileEdges(db, 'brand-new-file.mjs', 'test');
     expect(results.length).toBe(0);
   });
 
@@ -471,7 +471,7 @@ describe('file-aware recall', () => {
       importance: 1, filesModified: '["hook.mjs"]',
       epochOffset: -2 * 86400000
     });
-    const results = recallForFile(db, 'hook.mjs', 'test');
+    const results = matchFileEdges(db, 'hook.mjs', 'test');
     for (const r of results) {
       expect(r.importance).toBeGreaterThanOrEqual(2);
     }
@@ -492,7 +492,7 @@ describe('file-aware recall', () => {
       epochOffset: -2 * 86400000
     });
     // Should only match the exact filename, not the wildcard-expanded one
-    const results = recallForFile(db, 'test_100%.mjs', 'test');
+    const results = matchFileEdges(db, 'test_100%.mjs', 'test');
     expect(results.length).toBe(1);
     expect(results[0].title).toContain('test_100%.mjs');
   });

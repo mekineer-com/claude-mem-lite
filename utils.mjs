@@ -47,20 +47,15 @@ export function isPathConfined(candidate, allowedBase) {
   return resolved === base || resolved.startsWith(base + sep);
 }
 
-/**
- * Basename that treats BOTH '/' and '\' as separators on every host OS.
- * `path.basename` follows the HOST's rules, so on POSIX it returns a Windows
- * path unchanged. Hook payloads carry the CLIENT's paths and
- * observation_files.filename stores either separator (lib/file-edge-match.mjs),
- * so DB search keys derived from them must be host-independent.
- * Not for filesystem access — '\' is a legal POSIX filename character.
- * @param {string} p Path in any separator style
- * @returns {string} Last segment, trailing separators ignored; '' if none
- */
-export function basenameAnySep(p) {
-  const s = String(p ?? '').replace(/[/\\]+$/, '');
-  return s.slice(Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\')) + 1);
-}
+// `basenameAnySep` lived here until 2026-08-22. Its sole production consumer was
+// `recallForFile` (hook-memory.mjs), which had no callers of its own and was
+// deleted the same round; keeping the export would have added a dead name to the
+// knip baseline. The behaviour it encoded is NOT gone — it moved into
+// lib/file-edge-match.mjs (module-private, so that ~30ms cold-start path stays
+// free of this module's child_process import), which is where the split actually
+// had to happen: `path.basename` follows the HOST's rules, so on POSIX it returns
+// a Windows path unchanged, while observation_files.filename stores either
+// separator. tests/win-path-basename.test.mjs asserts it through fileMatchParams.
 
 // ─── Token Estimation ─────────────────────────────────────────────────────
 

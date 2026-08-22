@@ -1,7 +1,7 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters, basenameAnySep } from './utils.mjs';
+import { relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters } from './utils.mjs';
 import { upsFtsQuery } from './lib/ups-query.mjs';
 import { citeFactorJs, TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
@@ -98,8 +98,6 @@ function candidateCoverage(row, queryTerms) {
   return hits / queryTerms.length;
 }
 
-const FILE_RECALL_LOOKBACK_MS = 60 * DAY_MS; // 60 days
-const MAX_FILE_RECALL = 2;
 
 // P1: stale-obs verify-before-use threshold. An injected obs older than this
 // AND carrying file paths is flagged so Claude is reminded to grep/Read the
@@ -358,8 +356,27 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     // v26 P0: bump injection_count (NOT access_count) for injected rows.
     // Before v26 this was bumping access_count, which conflated auto-injection
     // with real cites/recalls/opens — polluting the noise-ratio signal the
-    // penalty clause now depends on. access_count is reserved for explicit
-    // access (cmdRecall/cmdGet/cmdTimeline/pre-tool-recall/citation-tracker).
+    // penalty clause now depends on.
+    //
+    // The two counters are NOT a metering pair, and reading them as one is how
+    // 2026-08-22 produced a wrong diagnosis off this very comment. Enumerated
+    // from the write sites rather than from memory:
+    //   access_count    — lib/recall-core.mjs (mem_recall / CLI recall),
+    //                     lib/get-core.mjs (mem_get), lib/timeline-core.mjs
+    //                     (timeline anchor), lib/citation-tracker.mjs (CITED
+    //                     ids only). All explicit. This comment used to list
+    //                     "pre-tool-recall" here too; scripts/pre-tool-recall.js
+    //                     bumps NOTHING, and the only code that would have was
+    //                     the unreferenced `recallForFile` twin deleted below.
+    //   injection_count — this line and scripts/user-prompt-search.js only, and
+    //                     deliberately so: scoring-sql.mjs noisePenaltyClause
+    //                     reads it as a NOISE signal (x0.5 at >=4, x0.2 at >=8),
+    //                     so it is valid only on QUERY-CONDITIONED faces. v3.66.0
+    //                     added an unconditional Key Context bump "mirroring"
+    //                     this one and v3.66.1 reverted it — an always-rendered
+    //                     face measures elapsed sessions, not noise (D#124,
+    //                     lib/keyctx-marker.mjs:53). The complete per-face
+    //                     denominator is citation_surface_log, not this column.
     // Per-row try/catch for FTS trigger safety (project_non_obvious.md).
     const result = coverageFiltered.slice(0, MAX_MEMORY_INJECTIONS);
     const now = Date.now();
@@ -380,49 +397,18 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
   }
 }
 
-/**
- * Recall observations related to a specific file being edited.
- * Useful for surfacing past bugfixes / decisions when revisiting a file.
- * @param {import('better-sqlite3').Database} db Memory database
- * @param {string} filePath File path (absolute or relative)
- * @param {string} project Current project
- * @returns {object[]} Up to MAX_FILE_RECALL observations with {id, type, title, importance, lesson_learned}
- */
-export function recallForFile(db, filePath, project) {
-  if (!db || !filePath) return [];
-  try {
-    // Both separators: filePath comes from a hook payload written by the
-    // CLIENT's OS, so a Windows path can reach a POSIX host (and vice versa).
-    const basename = basenameAnySep(filePath);
-    const cutoff = Date.now() - FILE_RECALL_LOOKBACK_MS;
-    // Escape SQL LIKE wildcards in filename to prevent injection
-    const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const likePattern = `%${escaped}`;
-    const rows = db.prepare(`
-      SELECT DISTINCT o.id, o.type, o.title, o.importance, o.lesson_learned
-      FROM observations o
-      JOIN observation_files of2 ON of2.obs_id = o.id
-      WHERE o.project = ?
-        AND o.importance >= 2
-        AND ${liveObsFilterSql('o')}
-        AND o.created_at_epoch > ?
-        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
-      ORDER BY o.created_at_epoch DESC
-      LIMIT ?
-    `).all(project, cutoff, filePath, likePattern, MAX_FILE_RECALL);
-    const now = Date.now();
-    const updateStmt = db.prepare('UPDATE observations SET access_count = COALESCE(access_count, 0) + 1, last_accessed_at = ? WHERE id = ?');
-    // Per-row try/catch for FTS trigger safety — mirror the injection-bump loop
-    // (searchRelevantMemories) and project_non_obvious.md. Without it, one
-    // SQLITE_CORRUPT_VTAB on the access_count UPDATE trigger throws to the outer
-    // catch and discards the ENTIRE file-recall result set.
-    for (const r of rows) { try { updateStmt.run(now, r.id); } catch {} }
-    return rows;
-  } catch (e) {
-    debugCatch(e, 'recallForFile');
-    return [];
-  }
-}
+// `recallForFile` lived here until 2026-08-22: an in-process file-recall
+// implementation with ZERO production callers, superseded by the standalone
+// scripts/pre-tool-recall.js hook (which owns the cooldown, scope filter,
+// edge-decay filter and event leg this function never had). Five test files
+// asserted against it, which made it look alive and cost real money twice:
+//   - its bare `%<basename>` LIKE lacked the path-boundary arms that
+//     lib/file-edge-match.mjs added for the bash-utils.mjs/utils.mjs collision;
+//   - it was the ONLY code splitting basenames on either separator, so the six
+//     Windows-path tests aimed at it went green while the shipped predicate
+//     carried the gap (fixed in lib/file-edge-match.mjs, same round).
+// Those suites now run through `matchFileEdges` (tests/test-helpers.mjs), which
+// calls the shipped predicate. Do not reintroduce an in-process twin here.
 
 /**
  * Phase-2 task-imperative ranking (spec 2026-06-29 §4.1): score every candidate lesson

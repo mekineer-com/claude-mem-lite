@@ -2796,7 +2796,9 @@ Commands:
     --merge-ids K:R,... For dedup: keepId:removeId pairs (e.g. 10:11,20:21:22)
     --project P         Filter by project
     --retain-days N     For purge_stale: keep last N days (default 30)
-                        demote_pinned: importance→1 for inj>=8 & cited=0 (clears pinned noise).
+                        demote_pinned: floors importance for inj>=8 & cited=0 — to 1 with no
+                        lesson_learned, to 2 with one (clears pinned noise; a lesson-bearing
+                        row keeps eligibility on every importance>=2 injection face).
                         In the default set since v3.76.0; runs AFTER boost, which would
                         otherwise hand the row straight back. Opt out of the DEFAULT with
                         CLAUDE_MEM_SKIP_DEMOTE_PINNED=1 — an explicit --ops demote_pinned

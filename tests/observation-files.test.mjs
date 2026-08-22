@@ -1,7 +1,6 @@
 // Tests for observation_files junction table normalization
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
-import { recallForFile } from '../hook-memory.mjs';
+import { createTestDb, insertSession, insertObs, matchFileEdges } from './test-helpers.mjs';
 import { saveObservation } from '../hook-llm.mjs';
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
@@ -113,9 +112,9 @@ describe('saveObservation populates observation_files', () => {
   });
 });
 
-// ─── recallForFile uses observation_files JOIN ──────────────────────────────
+// ─── the shipped file-edge predicate uses observation_files JOIN ────────────
 
-describe('recallForFile uses observation_files', () => {
+describe('shipped file-edge match uses observation_files', () => {
   let db;
   beforeEach(() => {
     db = createTestDb();
@@ -131,7 +130,7 @@ describe('recallForFile uses observation_files', () => {
       epochOffset: -5 * 86400000,
     });
 
-    const results = recallForFile(db, 'hook.mjs', 'test');
+    const results = matchFileEdges(db, 'hook.mjs', 'test');
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].title).toMatch(/hook\.mjs/);
   });
@@ -145,7 +144,7 @@ describe('recallForFile uses observation_files', () => {
     });
 
     // Search by just the basename path
-    const results = recallForFile(db, '/some/other/path/file.mjs', 'test');
+    const results = matchFileEdges(db, '/some/other/path/file.mjs', 'test');
     expect(results.length).toBeGreaterThanOrEqual(1);
   });
 });

@@ -2,6 +2,82 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.76.2 — the correct implementation was in the copy that does not ship
+
+**Upgrade note.** Bugfixes and tests only. One shipped-path defect (Windows-shaped file
+paths recalled nothing), one dead in-process twin deleted, and two description strings that
+had been telling the model and the user something v3.76.1 stopped doing. No behaviour a
+v3.76.1 user opted into changes.
+
+### the defect: a Windows-shaped file path recalled nothing
+
+`fileMatchParams` (`lib/file-edge-match.mjs`) derived the basename with node:path
+`basename`, which follows the **host's** rules. On a POSIX host,
+`basename('C:\proj\src\x.mjs')` returns the whole string, so three of the four match arms
+degrade to garbage and the row is never found:
+
+```
+"C:\proj\src\hook-memory.mjs" -> ["C:\proj\src\hook-memory.mjs",   <- arm 1, full path
+                                    "C:\proj\src\hook-memory.mjs",   <- arm 2, "basename"
+                                    "%/C:\proj\src\hook-memory.mjs",  <- arm 3
+                                    "%\\C:\proj\src\hook-memory.mjs"] <- arm 4
+```
+
+That predicate is shared, byte-identically and on purpose, by `scripts/pre-tool-recall.js`
+(the injection trigger) and `lib/edge-attribution.mjs` (Stop-side hit/miss resolution), so
+one fix covers both and their parity is preserved by construction. The split now accepts
+either separator regardless of host OS.
+
+### why it survived: the tests asserted the twin that does not ship
+
+`hook-memory.mjs` also carried `recallForFile`, an in-process file-recall implementation
+with **zero production callers** — superseded by the standalone `pre-tool-recall.js` hook,
+which owns the cooldown, scope filter, edge-decay filter and event leg it never had. Five
+test files imported it, which made it look alive, and it cost real money twice:
+
+- it was the only code splitting basenames on either separator, so six Windows-path cases
+  went green against it while the shipped predicate carried the gap;
+- its bare `%<basename>` LIKE lacked the path-boundary arms that `file-edge-match` added
+  for the `bash-utils.mjs`-vs-`utils.mjs` collision.
+
+`recallForFile` is deleted, along with `utils.mjs`'s `basenameAnySep` (its only consumer).
+The suites now go through one shared `matchFileEdges` helper that calls the shipped
+predicate, so there is no second derivation left to drift. A path-boundary collision case
+was added, since the twin never had one.
+
+### two descriptions that stopped being true one patch version ago
+
+v3.76.0 wrote `demote_pinned=importance→1` into the MCP tool schema and the CLI help.
+v3.76.1 changed the behaviour to a dual floor (no lesson → 1, lesson-bearing → 2) and
+updated neither, so the **released** LLM-visible schema stated the wrong rule for a whole
+patch version. Nothing failed, because no test read those strings. Both are corrected, and
+both are now asserted against `PINNED_INJ_THRESHOLD` and against the floor semantics —
+reverting either string turns the suite red.
+
+### tests
+
+- `demotePinned` gains five in-process cases at the `maintain-core` layer, where the floor
+  is written. Every other case in that file reaches the op through a face, so a floor
+  regression could previously only be read off a terminal importance after `cleanup`,
+  `decay` and `boost` had also run — three ops of interference between the change and the
+  assertion. All five were mutation-verified: flat floor, dropped `'none'` arm, moved
+  threshold, dropped `cited_count` guard, dropped WHERE bound — 5/5 killed.
+- Three pure in-process assertions moved out of the subprocess-paying `beforeEach` they had
+  been sitting in (a real `cli.mjs stats` spawn plus a seed write, ~450ms, to test pure
+  functions).
+- 300 files / 4870 tests (from 4860).
+
+### a claim in the v3.76.0 notes, narrowed
+
+Those notes led with "148 rows demoted by citation decay, never cited, and back at
+importance>=3 — 148/148 boost-eligible". True, and in the headline slot it invites "this
+fix repairs 148 rows". It does not. `boostAccessed` triggers on `access_count`,
+`demotePinned` on `injection_count >= 8`, and the overlap is thin. Re-measured on the same
+database: 178 rows now match that shape and 152 are boost-eligible, but only **7** are
+reachable by `demotePinned` — 94 sit at `injection_count = 0` and 77 between 1 and 7. The
+op closes the loop for the heavily-injected tail; the larger access-driven population it
+does not touch is a separate and still-open question. The test file's header now says so.
+
 ## v3.76.1 — the second review landed 13 minutes after the tag, and it was right
 
 **Upgrade note.** Upgrade from v3.76.0. One user-visible defect, introduced by v3.76.0's own

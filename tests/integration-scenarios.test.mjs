@@ -12,8 +12,8 @@ import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { createTestDb, insertObs, insertSession, createRegistryTestDb } from './test-helpers.mjs';
-import { searchRelevantMemories, recallForFile } from '../hook-memory.mjs';
+import { createTestDb, insertObs, insertSession, createRegistryTestDb, matchFileEdges } from './test-helpers.mjs';
+import { searchRelevantMemories } from '../hook-memory.mjs';
 import { shouldSkip, detectIntent, shouldSkipByDedup, extractFiles } from '../scripts/prompt-search-utils.mjs';
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
@@ -424,7 +424,7 @@ describe('Scenario 3: File Edit Pre-Recall — PreToolUse', () => {
     expect(stdout).toBe('');
   });
 
-  it('recallForFile finds observations by filename match', () => {
+  it('the shipped file-edge predicate finds observations by filename match', () => {
     const db = createTestDb();
     const project = 'parent--testproj';
     insertSession(db, { id: 'sess-1', project });
@@ -435,7 +435,7 @@ describe('Scenario 3: File Edit Pre-Recall — PreToolUse', () => {
       lessonLearned: 'Weak regex silently skips underscored names',
       filesModified: '["utils.mjs"]',
     });
-    const results = recallForFile(db, '/mnt/data/projects/mem/utils.mjs', project);
+    const results = matchFileEdges(db, '/mnt/data/projects/mem/utils.mjs', project);
     expect(results.length).toBeGreaterThan(0);
     expect(results[0].lesson_learned).toContain('regex');
   });

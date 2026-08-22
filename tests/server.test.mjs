@@ -1574,7 +1574,7 @@ describe('mem_save observation_files population', () => {
     expect(obsFiles.length).toBe(0);
   });
 
-  it('observation_files are queryable for recallForFile pattern', () => {
+  it('observation_files are queryable for the file-edge recall pattern', () => {
     const now = Date.now();
     const files = ['src/server.mjs'];
     const saveTx = db.transaction(() => {

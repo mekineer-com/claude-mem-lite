@@ -12,6 +12,18 @@
 // decay, never cited, and back at importance>=3 — 148/148 of them boost-eligible. Plus
 // 17 rows sitting demote-eligible right then, carrying 265 recorded injections.
 //
+// READ THOSE TWO NUMBERS AS SEPARATE POPULATIONS, not as a before/after pair. The
+// original wording put the 148 in the headline slot, which invites "this fix repairs
+// 148 rows"; it does not. `boostAccessed` triggers on access_count, `demotePinned` on
+// injection_count>=8, and the overlap is thin. Re-measured 2026-08-22 on the same DB:
+// 178 rows now match the decayed/never-cited/back-at-3 shape, 152 of them boost-eligible
+// — but only **7** are reachable by demotePinned (94 sit at injection_count=0, 77 at
+// 1-7). So this op closes the loop for the heavily-injected tail, and the far larger
+// access-driven population it does NOT touch is a separate, still-open question.
+// Un-narrowable on current data, and deliberately so: injection_count is bumped only on
+// the two query-conditioned UserPromptSubmit faces because scoring-sql.mjs reads it as a
+// NOISE signal, and v3.66.1 already reverted an attempt to widen it (D#124).
+//
 // The two faces that DID wire the op ran it in OPPOSITE orders, and the order is
 // load-bearing: mem-cli demoted then boosted, handing the row straight back (1 -> 2);
 // server.mjs boosted then demoted (row lands at 1). So a fixture must be able to tell
@@ -28,11 +40,12 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import Database from 'better-sqlite3';
-import { DEFAULT_MAINTAIN_OPS, resolveDefaultMaintainOps } from '../lib/maintain-core.mjs';
+import { DEFAULT_MAINTAIN_OPS, resolveDefaultMaintainOps, demotePinned, PINNED_INJ_THRESHOLD } from '../lib/maintain-core.mjs';
+import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
 
 const REPO = resolve(import.meta.dirname, '..');
 const CLI = join(REPO, 'cli.mjs');
@@ -115,15 +128,15 @@ function runAutoMaintain(extraEnv = {}) {
   });
 }
 
-describe('demote_pinned is in the default maintenance set on all three faces', () => {
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'maintain-ops-'));
-    // Materialize the schema through the real path, then seed.
-    runCli(['stats']);
-    seedPinnedRow();
-  });
-  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* gone */ } });
+// ─── In-process: the op set, the opt-out parser, and the floor itself ───────
+//
+// These need neither a subprocess nor a temp DB dir. They used to sit inside the
+// three-face describe below, so each one paid that block's beforeEach — a real
+// `cli.mjs stats` spawn plus a seed write (~150ms apiece, ~450ms total) to assert
+// a pure function. Split out here; the face-level suite keeps every case that
+// genuinely needs a face.
 
+describe('demote_pinned: default op set and opt-out parsing (pure)', () => {
   it('the shared default set contains demote_pinned, ordered after boost', () => {
     expect(DEFAULT_MAINTAIN_OPS).toContain('demote_pinned');
     expect(DEFAULT_MAINTAIN_OPS.indexOf('demote_pinned'))
@@ -135,6 +148,119 @@ describe('demote_pinned is in the default maintenance set on all three faces', (
       .toEqual(['cleanup', 'decay', 'boost']);
     expect(resolveDefaultMaintainOps({})).toEqual([...DEFAULT_MAINTAIN_OPS]);
   });
+
+  it('the opt-out honours `true`/`yes` and refuses to read `0`/`false` as skip', () => {
+    // First cut compared `=== '1'`, so `=true` silently got the new behaviour — the same
+    // class of surprise the opt-out exists to prevent.
+    for (const on of ['1', 'true', 'yes', ' 1 ', 'ON']) {
+      expect(resolveDefaultMaintainOps({ CLAUDE_MEM_SKIP_DEMOTE_PINNED: on }))
+        .toEqual(['cleanup', 'decay', 'boost']);
+    }
+    for (const off of ['', '0', 'false', 'no', 'off']) {
+      expect(resolveDefaultMaintainOps({ CLAUDE_MEM_SKIP_DEMOTE_PINNED: off }))
+        .toEqual([...DEFAULT_MAINTAIN_OPS]);
+    }
+  });
+});
+
+// The user- and LLM-visible copy for this op. v3.76.0 wrote "importance→1" into the
+// MCP tool description and the CLI help; v3.76.1 changed the behaviour to a dual floor
+// and updated NEITHER, so the released schema told the model the wrong thing for one
+// whole patch version. Nothing failed, because no test read that string. These do.
+//
+// FAILS IF: the floor semantics change again without both texts following, or the
+// threshold constant moves away from the number the copy quotes.
+describe('demote_pinned copy matches the shipped behaviour', () => {
+  const SRC = {
+    'tool-schemas.mjs (MCP, LLM-visible)': readFileSync(join(REPO, 'tool-schemas.mjs'), 'utf8'),
+    'mem-cli.mjs (CLI help)': readFileSync(join(REPO, 'mem-cli.mjs'), 'utf8'),
+  };
+
+  // A window, not a line: the CLI help wraps this description across four physical
+  // lines, so a per-line filter reads only its first clause and would pass on copy
+  // that never mentions the second floor at all.
+  const copyAround = (src) => {
+    const at = src.indexOf('demote_pinned:');
+    const i = at === -1 ? src.indexOf('demote_pinned=') : at;
+    return i === -1 ? '' : src.slice(i, i + 420);
+  };
+
+  for (const [label, src] of Object.entries(SRC)) {
+    it(`${label} states both floors, not just 1`, () => {
+      const copy = copyAround(src);
+      expect(copy, 'no demote_pinned copy found').not.toBe('');
+      // The pre-v3.76.1 wording, which is now false for lesson-bearing rows.
+      expect(copy).not.toMatch(/importance\u21921\b/);
+      expect(copy).toMatch(/\bto 1\b/);
+      expect(copy).toMatch(/\bto 2\b/);
+      expect(copy).toMatch(/lesson/i);
+    });
+
+    it(`${label} quotes the real injection threshold (${PINNED_INJ_THRESHOLD})`, () => {
+      expect(copyAround(src)).toMatch(new RegExp(`>=\\s*${PINNED_INJ_THRESHOLD}\\b`));
+    });
+  }
+});
+
+// The dual floor asserted at the core, where it is written. Every other case in
+// this file reaches demotePinned through a face, so a floor regression could only
+// ever be read off a terminal importance after cleanup/decay/boost also ran —
+// three ops of interference between the change and the assertion.
+describe('demotePinned floor (maintain-core, in-process)', () => {
+  let db;
+  beforeEach(() => { db = createTestDb(); insertSession(db, { id: 'sess-1', project: 'p' }); });
+  afterEach(() => { db?.close(); });
+
+  const pinned = (extra) => insertObs(db, {
+    project: 'p', type: 'change', importance: 3, injectionCount: 8, citedCount: 0, ...extra,
+  }).lastInsertRowid;
+  const impOf = (id) => db.prepare('SELECT importance FROM observations WHERE id = ?').get(Number(id)).importance;
+  const run = () => demotePinned(db, { projectFilter: 'AND project = ?', baseParams: ['p'] });
+
+  it('floors a lesson-bearing row at 2 and a lessonless row at 1', () => {
+    const withLesson = pinned({ title: 'Pinned with a lesson', lessonLearned: 'the takeaway' });
+    const noLesson = pinned({ title: 'Pinned with no lesson' });
+    expect(run()).toBe(2);
+    expect(impOf(withLesson)).toBe(2);
+    expect(impOf(noLesson)).toBe(1);
+  });
+
+  it("treats the literal string 'none' as no lesson", () => {
+    // NO_LESSON_SQL spells out three empties; 'none' is the one a reader drops.
+    const id = pinned({ title: 'Pinned lesson none', lessonLearned: 'none' });
+    expect(run()).toBe(1);
+    expect(impOf(id)).toBe(1);
+  });
+
+  it('reports 0 changes when every candidate already sits at its floor', () => {
+    // SQLite counts a same-value UPDATE in `changes`, so the floor doubles as the
+    // WHERE bound — without that, this run reports phantom demotions forever.
+    pinned({ title: 'Already floored lesson', lessonLearned: 'takeaway', importance: 2 });
+    pinned({ title: 'Already floored lessonless', importance: 1 });
+    expect(run()).toBe(0);
+  });
+
+  it('leaves a cited row alone however heavily injected', () => {
+    const id = pinned({ title: 'Pinned but cited', injectionCount: 99, citedCount: 1 });
+    expect(run()).toBe(0);
+    expect(impOf(id)).toBe(3);
+  });
+
+  it('does not reach a row below the injection threshold', () => {
+    const id = pinned({ title: 'Injected seven times', injectionCount: 7 });
+    expect(run()).toBe(0);
+    expect(impOf(id)).toBe(3);
+  });
+});
+
+describe('demote_pinned is in the default maintenance set on all three faces', () => {
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'maintain-ops-'));
+    // Materialize the schema through the real path, then seed.
+    runCli(['stats']);
+    seedPinnedRow();
+  });
+  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* gone */ } });
 
   it('CLI `maintain execute` with no --ops lands the row at importance 1', () => {
     expect(importanceOfPinnedRow()).toBe(2);
@@ -256,19 +382,6 @@ describe('demote_pinned is in the default maintenance set on all three faces', (
     seedPinnedRow({ title: 'Second pinned row' });
     callMcp('mem_maintain', { action: 'execute' }, optOut);
     expect(importanceOf('Second pinned row')).toBe(3);
-  });
-
-  it('the opt-out honours `true`/`yes` and refuses to read `0`/`false` as skip', () => {
-    // First cut compared `=== '1'`, so `=true` silently got the new behaviour — the same
-    // class of surprise the opt-out exists to prevent.
-    for (const on of ['1', 'true', 'yes', ' 1 ', 'ON']) {
-      expect(resolveDefaultMaintainOps({ CLAUDE_MEM_SKIP_DEMOTE_PINNED: on }))
-        .toEqual(['cleanup', 'decay', 'boost']);
-    }
-    for (const off of ['', '0', 'false', 'no', 'off']) {
-      expect(resolveDefaultMaintainOps({ CLAUDE_MEM_SKIP_DEMOTE_PINNED: off }))
-        .toEqual([...DEFAULT_MAINTAIN_OPS]);
-    }
   });
 
   it('the opt-out does NOT gag an explicit --ops demote_pinned', () => {

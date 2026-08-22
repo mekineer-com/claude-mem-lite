@@ -4,6 +4,7 @@
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { RESOURCES_SCHEMA, FTS5_SCHEMA, TRIGGERS_SCHEMA, INVOCATIONS_SCHEMA, PREINSTALLED_SCHEMA } from '../registry.mjs';
+import { fileMatchClause, fileMatchParams } from '../lib/file-edge-match.mjs';
 
 /**
  * Create an in-memory test database with full production schema + FTS5.
@@ -81,4 +82,36 @@ export function insertObs(db, { sessionId = 'sess-1', project = 'test', type = '
   }
 
   return result;
+}
+
+/**
+ * Run the SHIPPED (obs,file) trigger-edge predicate — the one
+ * scripts/pre-tool-recall.js injects on and lib/edge-attribution.mjs resolves
+ * with, via their shared lib/file-edge-match.mjs.
+ *
+ * Exists because several suites used to assert this behaviour through
+ * `recallForFile` (hook-memory.mjs), an in-process twin that had NO production
+ * caller and was deleted 2026-08-22. The twin split basenames on either
+ * separator while the shipped pair used host-native `basename`, so a real
+ * Windows-payload gap sat unobserved behind six green tests. One helper here
+ * keeps every caller on the shipped predicate instead of re-deriving the SELECT
+ * per suite — the twin-drift class this repo has re-opened repeatedly.
+ *
+ * @param {import('better-sqlite3').Database} db
+ * @param {string} filePath  edited file, either separator, any OS
+ * @param {string} project
+ * @param {{minImportance?: number}} [opts] `minImportance` mirrors
+ *   pre-tool-recall.js's `o.importance >= 2` gate; pass 0 to disable.
+ * @returns {Array<{id:number,type:string,title:string,importance:number,lesson_learned:string|null}>}
+ */
+export function matchFileEdges(db, filePath, project, { minImportance = 2 } = {}) {
+  return db.prepare(`
+    SELECT DISTINCT o.id, o.type, o.title, o.importance, o.lesson_learned
+    FROM observations o
+    JOIN observation_files of2 ON of2.obs_id = o.id
+    WHERE o.project = ?
+      AND COALESCE(o.importance, 1) >= ?
+      AND ${fileMatchClause('of2')}
+    ORDER BY o.created_at_epoch DESC
+  `).all(project, minImportance, ...fileMatchParams(filePath));
 }
