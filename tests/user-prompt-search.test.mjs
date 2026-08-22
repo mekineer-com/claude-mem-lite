@@ -744,6 +744,22 @@ describe('user-prompt-search subprocess integration', () => {
     cleanupTestFiles();
   });
 
+  // Audit 2026-08-22 P2-13 fixture. This surface runs sanitizeFtsQuery on EVERY prompt
+  // (0.8ms normal, 6.2ms on a 64KB ASCII prompt, 31.8ms on a 64KB CJK one), so the query
+  // is capped at 2000 chars / 64 meaningful terms here while explicit `search` stays
+  // uncapped. Proving the hook PASSES the cap needs behaviour, not a unit test on the
+  // option.
+  const CAP_PROMPT = 'how do I fix the zqx_widget_cache invalidation race condition';
+  function seedCapFixture() {
+    insertObs(db, {
+      sessionId: 'mem-s1', project: 'test--project', type: 'bugfix',
+      title: 'Fixed the zqx_widget_cache invalidation race',
+      text: 'zqx_widget_cache invalidation race condition on concurrent writes',
+      importance: 3,
+    });
+    db.pragma('wal_checkpoint(FULL)');
+  }
+
   it('skips short messages and produces no output', async () => {
     const { stdout } = await runScript({ prompt: 'hi' });
     expect(stdout).toBe('');
@@ -860,6 +876,37 @@ describe('user-prompt-search subprocess integration', () => {
     expect(stdout).toContain('Resolved authentication middleware token expiry');
     expect(stdout).not.toContain('Modified authentication.mjs');
   });
+
+  // Audit 2026-08-22 P2-13: this surface runs sanitizeFtsQuery on EVERY prompt, with
+  // only a 64KB byte guard upstream — 0.8ms on a normal prompt, 6.2ms on a 64KB ASCII
+  // one, 31.8ms on a 64KB CJK one, all paid before the model sees the turn. The query
+  // is now capped at 2000 characters / 64 meaningful terms HERE, while an explicit
+  // `search` stays uncapped.
+  //
+  // Wiring, not seam: a unit test on sanitizeFtsQuery proves the option works and proves
+  // nothing about whether this hook passes it. The pair below is behavioural — same
+  // identifier, once inside the cap and once past it.
+  it('P2-13: the capped surface still injects on a normal prompt', async () => {
+    // The regression this guards: capping the query must not change the common path.
+    seedCapFixture();
+    const { stdout } = await runScript({ prompt: CAP_PROMPT });
+    expect(stdout).toContain('zqx_widget_cache');
+  });
+
+  // NOT asserted here, deliberately: "an identifier past the 2000-character cap stops
+  // matching". It is true, and on this surface it cannot be shown without also showing
+  // something else. Any filler long enough to push a term past 2000 characters adds
+  // dozens of terms to an AND-joined FTS query, and that alone kills the match —
+  // measured both ways: with unrelated-word filler the match dies at 1200 characters,
+  // well under the cap, and with pure stop-word filler the query degenerates to
+  // stop-words-only (sanitizeFtsQuery keeps them when filtering would empty the query)
+  // and matches the fixture for the wrong reason. A case written either way passes
+  // whether or not the cap exists. The cap itself is pinned in tests/fts-query-caps.test.mjs
+  // against the real query builder this hook calls.
+  //
+  // Worth recording as a finding rather than a limitation: it means the cap costs close
+  // to nothing in practice — a prompt long enough to be truncated was already producing
+  // a query too diluted to match.
 
   // v2.34.3: top-|rel| sanity gate. BM25_MIN_SCORE filters per-row; this floor
   // gates the entire FTS set. Noise prompts produce OR-fallback leakage where

@@ -245,12 +245,26 @@ export const FTS_STOP_WORDS = new Set([...BASE_STOP_WORDS, ...CONTRACTION_FRAGME
 /**
  * Sanitize and expand a user query into a valid FTS5 query string.
  * Strips special characters, expands synonyms, and joins with AND/space.
+ *
+ * Unbounded by default — an explicit `search` from a human should search what they
+ * typed. The two caps exist for the AUTOMATIC surface (audit 2026-08-22 P2-13):
+ * UserPromptSubmit runs this on every prompt the user sends, with only a 64KB byte
+ * guard upstream, and cost grows with prompt length: 0.8ms on a normal prompt, 6.2ms
+ * on a 64KB ASCII one, 31.8ms on a 64KB CJK one (extractCjkKeywords is O(len x dict)
+ * over an unsegmented run). That is paid before the model sees the turn.
+ *
  * @param {string} query Raw user search query
+ * @param {object} [opts]
+ * @param {number} [opts.maxChars] Truncate the raw query first (bounds CJK segmentation,
+ *   which sees one huge token where ASCII sees many small ones).
+ * @param {number} [opts.maxTokens] Keep at most this many meaningful terms, applied
+ *   after stopword filtering and before expansion.
  * @returns {string|null} FTS5-safe query or null if empty
  */
-export function sanitizeFtsQuery(query) {
+export function sanitizeFtsQuery(query, opts = {}) {
   if (!query) return null;
-  const cleaned = query
+  const { maxChars = 0, maxTokens = 0 } = opts;
+  const cleaned = (maxChars > 0 ? String(query).slice(0, maxChars) : query)
     // Strip ASCII control chars / NUL FIRST. A NUL survives tokenization (it's not
     // \s), gets phrase-quoted by expandToken, and then terminates SQLite's C string
     // mid-phrase → FTS5 "unterminated string" throw, breaking the documented
@@ -293,6 +307,10 @@ export function sanitizeFtsQuery(query) {
   // Filter stop words (but keep all if filtering would empty the query)
   const filtered = tokens.filter(t => !FTS_STOP_WORDS.has(t.toLowerCase()));
   if (filtered.length > 0) tokens = filtered;
+  // Cap AFTER stopword filtering and BEFORE expansion: the terms kept are meaningful
+  // ones, and everything downstream (CJK segmentation, synonym expansion, bigrams) is
+  // per-token work that the cap therefore bounds too.
+  if (maxTokens > 0 && tokens.length > maxTokens) tokens = tokens.slice(0, maxTokens);
   // Split unsegmented CJK tokens into known vocabulary words using CJK_COMPOUNDS dictionary.
   // Uses broader dictionary than synonym-only extraction for better recall.
   // e.g. "这个函数是做什么的" → ["函数"] (not noisy bigrams)

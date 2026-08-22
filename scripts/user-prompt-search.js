@@ -343,7 +343,21 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
 // ×3 runs) → VERDICT NET-POSITIVE. The only behavior delta is on-topic eagerness (naming
 // an identifier surfaces its obs) — the highest-precision injection trigger there is. The
 // prose stop-list (IDENTIFIER_STOPWORDS) keeps the extractor off ordinary English.
-export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
+export // Query caps for THIS surface only (audit 2026-08-22 P2-13). The 64KB byte guard on
+// stdin bounds what we read, not what we compute: sanitizeFtsQuery costs 0.8ms on a
+// normal prompt, 6.2ms on a 64KB ASCII one and 31.8ms on a 64KB CJK one, and this hook
+// runs on every prompt before the model sees the turn. 2000 characters is a long prompt
+// by any measure, and past ~64 meaningful AND-joined terms an FTS5 query matches nothing
+// anyway and survives only through the OR fallback. An explicit `search` stays uncapped
+// — a person who types a long query meant it.
+const UPS_QUERY_CAPS = { maxChars: 2000, maxTokens: 64 };
+
+/** The capped query builder both search paths on this surface go through. */
+export function upsFtsQuery(text) {
+  return sanitizeFtsQuery(text, UPS_QUERY_CAPS);
+}
+
+const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
 const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
 
 // All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive
@@ -381,7 +395,7 @@ export function rowMatchesIdentifier(row, idsLower) {
 // importance/type/decay inflation.
 export function searchByFts(db, queryText, project, limit, typeFilter,
                             { nowT = Date.now(), epochTo = null } = {}) {
-  const ftsQuery = sanitizeFtsQuery(queryText);
+  const ftsQuery = upsFtsQuery(queryText);
   if (!ftsQuery) return { rows: [], mode: null };
 
   const cutoff = nowT - LOOKBACK_MS;
@@ -483,7 +497,7 @@ function searchByFile(db, files, project, limit) {
 // sparser and more surface-form than observations; the gate would rarely
 // fire and mostly kill real hits).
 function searchByUserPrompts(db, queryText, project, limit) {
-  const ftsQuery = sanitizeFtsQuery(queryText);
+  const ftsQuery = upsFtsQuery(queryText);
   if (!ftsQuery) return [];
 
   const cutoff = Date.now() - LOOKBACK_MS;
