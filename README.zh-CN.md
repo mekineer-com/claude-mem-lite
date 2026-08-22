@@ -4,7 +4,7 @@
 
 `claude-mem-lite` 是 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**（Anthropic 官方 CLI 编程代理）的 **持久化记忆系统**（也称 **长期记忆 / 跨会话上下文 / Claude Code 记忆插件**）。它以 **[MCP](https://modelcontextprotocol.io/) 服务器** + Claude Code 钩子（hooks）的形式运行，在编码会话中自动捕获观察记录、决策、bug 修复，并通过 FTS5 全文检索 + TF-IDF 向量的混合检索召回历史上下文。
 
-与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.88 / Precision@10 = 0.96**。
+与 [`mem0`](https://github.com/mem0ai/mem0)、MCP 官方参考实现的 [`memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) 服务器等通用 LLM 记忆框架相比，claude-mem-lite 专为 Claude Code 的钩子生命周期定制：episode 批处理把 LLM 调用量相比原版 [claude-mem](https://github.com/thedotmack/claude-mem) 减少 7-10 倍（综合成本估算下降约 600 倍 —— 见下方成本模型，属架构估算而非实测基准）；FTS5 + TF-IDF 混合检索在 30 个查询的基准上达到 **Recall@10 = 0.90 / Precision@10 = 0.85**（复现命令见[搜索质量](#搜索质量)一节）。
 
 无需外部服务。单一 SQLite 数据库。开销极低。
 
@@ -572,17 +572,25 @@ claude-mem-lite/
 
 ## 搜索质量
 
-基于 200 条观察和 30 个查询（标准 + 困难负样本类别）的基准测试结果：
+基于 200 条观察和 30 个查询（标准 + 困难负样本类别）的基准测试结果，测量的是
+**production-hybrid** 检索路径（FTS5 BM25 + TF-IDF 向量 + RRF）——也就是 `mem_search` /
+`recall` 实际走的那条路径：
 
-| 指标 | 得分 |
+| 指标 | 得分（production-hybrid） |
 |------|------|
-| Recall@10 | 0.88 |
-| Precision@10 | 0.96 |
-| nDCG@10 | 0.95 |
-| MRR@10 | 0.95 |
-| P95 搜索延迟 | 0.15ms |
+| Recall@10 | 0.90 |
+| Precision@10 | 0.85 |
+| nDCG@10 | 0.97 |
+| MRR@10 | 0.96 |
+| P95 搜索延迟 | ~1.8ms |
 
-基准测试作为 CI 门控运行（`npm run benchmark:gate`），防止搜索质量回退。
+> **数据来源。** 复现命令：`node benchmark/benchmark.mjs --production-hybrid`（确定性输出——
+> 固定语料、固定查询集、无采样）。CI 参考快照是 `benchmark/baseline.json`，
+> `npm run benchmark:gate` 在偏离超过 5% 时让构建失败。本 README 中所有检索指标都以此为唯一来源。
+
+> **关于测量路径。** 本表早期版本报告的是 *lexical* 纯 FTS 路径（Precision@10 0.96、
+> P95 0.15ms）。混合向量臂用 precision@10 换取更高的 recall / nDCG / MRR——它会召回超出字面
+> 匹配的语义相关候选；门控现在测量混合路径，所以这些数字反映的是 `mem_search` 的真实行为。
 
 ## 开发
 
