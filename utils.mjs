@@ -16,7 +16,7 @@ export { scrubSecrets, SECRET_PATTERNS } from './secret-scrub.mjs';
 export { stripPrivate } from './lib/private-strip.mjs';
 export { truncate, typeIcon, fmtDate, fmtTime, isoWeekKey, formatErrorRecallHints, neutralizeContextDelimiters } from './format-utils.mjs';
 export { computeMinHash, estimateJaccardFromMinHash, jaccardSimilarity } from './hash-utils.mjs';
-export { detectBashSignificance, extractErrorKeywords, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
+export { detectBashSignificance, extractErrorKeywords, planErrorRecall, extractFilePaths, stripTestSuffix } from './bash-utils.mjs';
 
 // Internal imports for functions that remain in this module
 import { truncate } from './format-utils.mjs';

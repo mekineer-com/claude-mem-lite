@@ -24,7 +24,7 @@ import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statS
 import { homedir } from 'os';
 import {
   truncate, inferProject, detectBashSignificance,
-  extractErrorKeywords, extractFilePaths, isRelatedToEpisode,
+  planErrorRecall, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
   COMPRESSED_AUTO, OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
   MAX_HOOK_STDIN_BYTES,
@@ -473,13 +473,20 @@ function triggerErrorRecall(db, toolInput, response) {
   try {
     const project = inferProject();
 
-    // Extract error keywords
+    // Extract error keywords. planErrorRecall (D#136) returns null when the output
+    // carried NO error-signal token. isHardError above and that check do NOT use the
+    // same pattern list: HARD_ERROR_RE accepts `ERR!`/`enoent`/`traceback`, while the
+    // line filter wants the whole word `error`. npm's own failure text clears the
+    // former and yields zero lines to the latter, so `npm run build` failing on
+    // ENOENT used to query ['npm','run','build'] — the command's topic, not the
+    // failure. Silence is the honest answer there.
+    // The term list itself is unchanged when the gate passes (rationale at the seam).
     const cmd = toolInput.command || '';
-    const keywords = extractErrorKeywords(cmd, response);
-    if (!keywords || keywords.length === 0) return;
+    const plan = planErrorRecall(cmd, response);
+    if (!plan) return;
 
     // FTS5 OR query for broader recall
-    const ftsQuery = keywords.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+    const ftsQuery = plan.terms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
     if (!ftsQuery) return;
 
     const nowR = Date.now();

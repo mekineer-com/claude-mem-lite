@@ -117,6 +117,38 @@ const ERROR_STOP_WORDS = new Set([
   'node', 'require', 'stack', 'trace',
 ]);
 
+const ERROR_LINE_RE = /error|fail|exception|cannot|not found|undefined|null/i;
+const ERROR_RECALL_MAX_TERMS = 6;
+
+/**
+ * Split a failed command + its output into command-derived and error-derived terms.
+ * Shared by extractErrorKeywords (merged view, unchanged contract) and
+ * planErrorRecall (which needs the two classes kept apart). Dedup is deliberately
+ * ACROSS both classes, command-first, so the merged view is byte-identical to the
+ * pre-split single-Set implementation.
+ * @returns {{cmdWords: string[], errWords: string[]}}
+ */
+function collectErrorTerms(cmd, response) {
+  const seen = new Set();
+  const cmdWords = [];
+  const cmdParts = String(cmd || '').split(/[\s/\\|&;]+/).filter(w => w.length > 2 && !/^-/.test(w));
+  for (const w of cmdParts.slice(0, 3)) {
+    const lw = w.toLowerCase();
+    if (!ERROR_STOP_WORDS.has(lw) && !seen.has(lw)) { seen.add(lw); cmdWords.push(lw); }
+  }
+  const errWords = [];
+  const errLines = String(response || '').split('\n').filter(l => ERROR_LINE_RE.test(l)).slice(0, 3);
+  for (const line of errLines) {
+    const tokens = line.replace(/[^a-zA-Z0-9_.-]/g, ' ').split(/\s+/)
+      .filter(w => w.length > 3 && !/^\d+$/.test(w));
+    for (const t of tokens.slice(0, 5)) {
+      const lt = t.toLowerCase();
+      if (!ERROR_STOP_WORDS.has(lt) && !seen.has(lt)) { seen.add(lt); errWords.push(lt); }
+    }
+  }
+  return { cmdWords, errWords };
+}
+
 /**
  * Extract discriminative keywords from a failed command and its error output.
  * Filters out common stop words to produce useful FTS5 search terms.
@@ -125,25 +157,55 @@ const ERROR_STOP_WORDS = new Set([
  * @returns {string[]|null} Array of 1-6 keywords or null if none found
  */
 export function extractErrorKeywords(cmd, response) {
-  const words = new Set();
-  const cmdParts = cmd.split(/[\s/\\|&;]+/).filter(w => w.length > 2 && !/^-/.test(w));
-  for (const w of cmdParts.slice(0, 3)) {
-    const lw = w.toLowerCase();
-    if (!ERROR_STOP_WORDS.has(lw)) words.add(lw);
-  }
-  const errLines = response.split('\n').filter(l =>
-    /error|fail|exception|cannot|not found|undefined|null/i.test(l)
-  ).slice(0, 3);
-  for (const line of errLines) {
-    const tokens = line.replace(/[^a-zA-Z0-9_.-]/g, ' ').split(/\s+/)
-      .filter(w => w.length > 3 && !/^\d+$/.test(w));
-    for (const t of tokens.slice(0, 5)) {
-      const lt = t.toLowerCase();
-      if (!ERROR_STOP_WORDS.has(lt)) words.add(lt);
-    }
-  }
-  const result = [...words].slice(0, 6);
+  const { cmdWords, errWords } = collectErrorTerms(cmd, response);
+  const result = [...cmdWords, ...errWords].slice(0, ERROR_RECALL_MAX_TERMS);
   return result.length >= 1 ? result : null;
+}
+
+/**
+ * Decide whether the error-recall surface should fire, and with which terms (D#136).
+ *
+ * Two defects this closes, both measured against the live DB on 2026-08-22 (obs
+ * #10730 carries the readings):
+ *
+ * 1. NO ERROR SIGNAL ⇒ NO INJECTION. This surface fires on detectBashSignificance's
+ *    isHardError, and that gate's HARD_ERROR_RE is NOT in sync with ERROR_LINE_RE
+ *    here: HARD_ERROR_RE accepts `ERR!`, `enoent` and `traceback`, while ERROR_LINE_RE
+ *    only matches the whole word `error`. So npm's own failure output clears the
+ *    trigger and then yields ZERO error lines — `npm ERR! code ENOENT / npm ERR!
+ *    enoent ENOENT: no such file or directory` contains no `error`, no `fail`, and no
+ *    `not found` (it says "no such file"). The keyword set then degraded to pure
+ *    command words — literally ['npm','run','build'] — and the surface searched the
+ *    COMMAND'S TOPIC instead of the failure. Same for a Python traceback whose head
+ *    lines carry `Traceback (most recent call last):` and a bare `File "x.py"`.
+ *    Both are among the most common failures a session produces.
+ *    With no error term there is nothing to recall ON, so the honest answer is
+ *    silence rather than a topic match. Widening ERROR_LINE_RE is NOT the fix —
+ *    enumeration always misses one more shape, and this gate is correct for every
+ *    shape it misses. (Verified: a `grep` killed by seccomp does NOT reach here at
+ *    all — isHardError is false for it — so that shape is not evidence for this gate.)
+ *
+ * 2. COMMAND WORDS STAY IN THE QUERY — a demotion was TRIED AND REJECTED on data.
+ *    The obvious follow-up is to drop `npm` / `run` / `grep` from the query, since
+ *    they demonstrably let BM25 return release records for a missing-module failure.
+ *    Replaying five real failures against the live DB (2026-08-22) says the trade is
+ *    not one-way: error-terms-only did fix `npm run build` (it surfaced #8721
+ *    ERR_MODULE_NOT_FOUND and #8185 SOURCE_FILES, the rows that actually explain it),
+ *    but it REGRESSED two others — dropping `database` lost #8673 (plugin-mode
+ *    data-dir skew) for a failed DB open, and dropping `vitest` lost #8725 (test
+ *    fails locally) for a test failure. Command words are carrying domain anchoring,
+ *    not just noise. A demote-to-fallback variant measured byte-identical to
+ *    error-terms-only (12 rows either way): the primary query always filled its
+ *    LIMIT 3, so the fallback never ran. Net: gate only, selection unchanged.
+ *
+ * @param {string} cmd The command that was executed
+ * @param {string} response The error output text
+ * @returns {{terms: string[]}|null} null ⇒ do not inject
+ */
+export function planErrorRecall(cmd, response) {
+  const { cmdWords, errWords } = collectErrorTerms(cmd, response);
+  if (errWords.length === 0) return null;
+  return { terms: [...cmdWords, ...errWords].slice(0, ERROR_RECALL_MAX_TERMS) };
 }
 
 // ─── File Paths ──────────────────────────────────────────────────────────────
