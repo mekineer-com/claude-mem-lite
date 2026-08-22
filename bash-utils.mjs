@@ -137,7 +137,21 @@ function collectErrorTerms(cmd, response) {
     if (!ERROR_STOP_WORDS.has(lw) && !seen.has(lw)) { seen.add(lw); cmdWords.push(lw); }
   }
   const errWords = [];
-  const errLines = String(response || '').split('\n').filter(l => ERROR_LINE_RE.test(l)).slice(0, 3);
+  // The line filter is the TRIGGER's pattern list OR'd with the prose one. Anything
+  // that made detectBashSignificance call this a hard error is, by construction, also
+  // something we will extract terms from — which closes the "trigger fired, extractor
+  // found nothing, so we queried the command's own words" class without enumerating
+  // failure shapes. ERROR_LINE_RE alone missed `npm ERR! code ENOENT` (no `error`, no
+  // `fail`, no `not found` — npm says "no such file") and `panic: assignment to entry
+  // in nil map`, while letting `panic: runtime error: …` through purely because that
+  // message happens to contain the substring `error`.
+  // Note HARD_ERROR_RE's `\n\s+at\s+\S` alternative cannot match a single line (it
+  // needs the preceding newline); that is fine — it is a stack-frame anchor, and the
+  // frames it guards are accompanied by a line the other alternatives do catch.
+  const errLines = String(response || '')
+    .split('\n')
+    .filter((l) => ERROR_LINE_RE.test(l) || HARD_ERROR_RE.test(l))
+    .slice(0, 3);
   for (const line of errLines) {
     const tokens = line.replace(/[^a-zA-Z0-9_.-]/g, ' ').split(/\s+/)
       .filter(w => w.length > 3 && !/^\d+$/.test(w));
@@ -168,22 +182,25 @@ export function extractErrorKeywords(cmd, response) {
  * Two defects this closes, both measured against the live DB on 2026-08-22 (obs
  * #10730 carries the readings):
  *
- * 1. NO ERROR SIGNAL ⇒ NO INJECTION. This surface fires on detectBashSignificance's
- *    isHardError, and that gate's HARD_ERROR_RE is NOT in sync with ERROR_LINE_RE
- *    here: HARD_ERROR_RE accepts `ERR!`, `enoent` and `traceback`, while ERROR_LINE_RE
- *    only matches the whole word `error`. So npm's own failure output clears the
- *    trigger and then yields ZERO error lines — `npm ERR! code ENOENT / npm ERR!
- *    enoent ENOENT: no such file or directory` contains no `error`, no `fail`, and no
- *    `not found` (it says "no such file"). The keyword set then degraded to pure
- *    command words — literally ['npm','run','build'] — and the surface searched the
- *    COMMAND'S TOPIC instead of the failure. Same for a Python traceback whose head
- *    lines carry `Traceback (most recent call last):` and a bare `File "x.py"`.
- *    Both are among the most common failures a session produces.
- *    With no error term there is nothing to recall ON, so the honest answer is
- *    silence rather than a topic match. Widening ERROR_LINE_RE is NOT the fix —
- *    enumeration always misses one more shape, and this gate is correct for every
- *    shape it misses. (Verified: a `grep` killed by seccomp does NOT reach here at
- *    all — isHardError is false for it — so that shape is not evidence for this gate.)
+ * 1. THE SELECTION FILTER IS A SUPERSET OF THE TRIGGER. This surface fires on
+ *    detectBashSignificance's isHardError (HARD_ERROR_RE), but term extraction used to
+ *    keep only lines matching ERROR_LINE_RE — a DIFFERENT list. The two diverge:
+ *    HARD_ERROR_RE accepts `ERR!`, `enoent`, `panic`, `traceback`; ERROR_LINE_RE takes
+ *    `error|fail|exception|cannot|not found|undefined|null` as SUBSTRINGS (no word
+ *    boundaries — `AssertionError` matches on `error`). npm's own output sits in the
+ *    gap: `npm ERR! code ENOENT / npm ERR! enoent ENOENT: no such file or directory`
+ *    has no `error`, no `fail`, no `not found` (npm says "no such file"), so it cleared
+ *    the trigger and then yielded ZERO lines to extract from. The keyword set degraded
+ *    to pure command words — literally ['npm','run','build'] — and the surface searched
+ *    the COMMAND'S TOPIC instead of the failure.
+ *    The sharpest symptom was Go: `panic: assignment to entry in nil map` was silenced
+ *    while `panic: runtime error: index out of range` was not, purely because the
+ *    second message happens to contain the substring `error`. Recall depending on the
+ *    wording of a panic is the same divergence, relocated.
+ *    OR-ing HARD_ERROR_RE into the line filter closes the class BY CONSTRUCTION rather
+ *    than by enumerating shapes: whatever convinced the trigger this was a hard error
+ *    is, by definition, also something we will read terms from. (Widening ERROR_LINE_RE
+ *    ad hoc WOULD be enumeration; making it a superset of the trigger is not.)
  *
  * 2. COMMAND WORDS STAY IN THE QUERY — a demotion was TRIED AND REJECTED on data.
  *    The obvious follow-up is to drop `npm` / `run` / `grep` from the query, since
@@ -196,7 +213,21 @@ export function extractErrorKeywords(cmd, response) {
  *    fails locally) for a test failure. Command words are carrying domain anchoring,
  *    not just noise. A demote-to-fallback variant measured byte-identical to
  *    error-terms-only (12 rows either way): the primary query always filled its
- *    LIMIT 3, so the fallback never ran. Net: gate only, selection unchanged.
+ *    LIMIT 3, so the fallback never ran.
+ *
+ * 3. THE RESIDUAL GATE. With (1) in place this fires rarely, but it is not dead: a
+ *    failure can still yield no usable term — empty output, or a line whose tokens are
+ *    all stop words (`Error: it failed`). There is then nothing to recall ON, and
+ *    silence beats querying the command's topic.
+ *    Read the predicate precisely: `errWords` excludes anything ALREADY taken as a
+ *    command word, because collectErrorTerms dedups across both classes with the
+ *    command filled first. So this is "no error term that is not also in the command",
+ *    not "no error term". `docker compose up -d` and `docker stack deploy` on the SAME
+ *    output decide differently for exactly that reason — the first has `compose` in the
+ *    command, the second does not. That asymmetry is inherited from the pre-split
+ *    single-Set implementation and is preserved deliberately; it is documented here
+ *    rather than silently "fixed" because changing it would change extractErrorKeywords
+ *    for every caller, which is a separate decision from this one.
  *
  * @param {string} cmd The command that was executed
  * @param {string} response The error output text

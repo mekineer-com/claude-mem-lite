@@ -473,14 +473,14 @@ function triggerErrorRecall(db, toolInput, response) {
   try {
     const project = inferProject();
 
-    // Extract error keywords. planErrorRecall (D#136) returns null when the output
-    // carried NO error-signal token. isHardError above and that check do NOT use the
-    // same pattern list: HARD_ERROR_RE accepts `ERR!`/`enoent`/`traceback`, while the
-    // line filter wants the whole word `error`. npm's own failure text clears the
-    // former and yields zero lines to the latter, so `npm run build` failing on
-    // ENOENT used to query ['npm','run','build'] — the command's topic, not the
-    // failure. Silence is the honest answer there.
-    // The term list itself is unchanged when the gate passes (rationale at the seam).
+    // Extract error keywords (D#136). The extractor's line filter is HARD_ERROR_RE —
+    // the very predicate isHardError above used — OR'd with the prose one, so anything
+    // that reaches this line is also something we can read terms from. Before that,
+    // the two lists diverged and npm's own output fell in the gap: `npm ERR! code
+    // ENOENT` has no `error`/`fail`/`not found`, so extraction yielded nothing and the
+    // query degraded to ['npm','run','build'] — the command's topic, not the failure.
+    // planErrorRecall still returns null when nothing usable survives (empty output, or
+    // only stop words), and then we stay silent rather than query the command's topic.
     const cmd = toolInput.command || '';
     const plan = planErrorRecall(cmd, response);
     if (!plan) return;

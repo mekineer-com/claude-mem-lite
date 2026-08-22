@@ -43,31 +43,102 @@ const NPM_ENOENT_OUT = [
 const PY_TRACEBACK_HEAD = 'Traceback (most recent call last):\n  File "train.py", line 42, in <module>\n    main()';
 const NPM_BUILD_OUT = "Error: Cannot find module './lib/observation-write.mjs'\n    at Module._resolveFilename";
 
-describe('planErrorRecall — gate (no error signal ⇒ no injection)', () => {
-  // THE case: isHardError says "recall now", the line filter finds nothing to recall
-  // ON. Without the gate this injected a query for ['npm','run','build'].
-  it('suppresses npm ENOENT — which DOES trip isHardError, so the gate is load-bearing', () => {
-    expect(detectBashSignificance({ command: 'npm run build' }, NPM_ENOENT_OUT).isHardError,
-      'npm ENOENT must still reach this surface, else the gate would be dead code').toBe(true);
-    expect(extractErrorKeywords('npm run build', NPM_ENOENT_OUT),
-      'the old path queried the command topic').toEqual(['npm', 'run', 'build']);
-    expect(planErrorRecall('npm run build', NPM_ENOENT_OUT)).toBeNull();
+// The line filter is the TRIGGER's own pattern list OR'd with the prose one, so
+// "isHardError fired but the extractor found nothing" is closed by construction rather
+// than by enumerating failure shapes. Every case below is a shape that reaches this
+// surface (isHardError true) and whose discriminative tokens live in a line the prose
+// filter alone does not match.
+describe('planErrorRecall — the selection filter is a superset of the trigger', () => {
+  const reaches = (cmd, out) => {
+    expect(detectBashSignificance({ command: cmd }, out).isHardError,
+      'precondition: this shape must reach the surface, else the case proves nothing').toBe(true);
+  };
+
+  it('npm ENOENT queries the ERROR, not the command topic', () => {
+    reaches('npm run build', NPM_ENOENT_OUT);
+    // The defect was that every discriminative token got dropped and the query became
+    // the command's own words (['npm','run','build']), so the surface searched for
+    // observations about npm rather than about the failure.
+    const terms = planErrorRecall('npm run build', NPM_ENOENT_OUT).terms;
+    expect(terms).toContain('enoent');
+    expect(terms).toContain('syscall');
+    // Both entry points share one extractor — they must not drift into two dialects,
+    // which is the class of defect this whole change is about.
+    expect(terms).toEqual(extractErrorKeywords('npm run build', NPM_ENOENT_OUT));
   });
 
-  it('suppresses a Python traceback head for the same reason', () => {
-    expect(detectBashSignificance({ command: 'python train.py' }, PY_TRACEBACK_HEAD).isHardError).toBe(true);
-    expect(planErrorRecall('python train.py', PY_TRACEBACK_HEAD)).toBeNull();
+  it('a Go panic keeps recall — and does not depend on the word "error" appearing in it', () => {
+    // Both are panics; only the second happens to contain the substring "error"
+    // (in "runtime error"). Before this filter, the first was silenced and the second
+    // was not — the same trigger/selection divergence, relocated to panic wording.
+    const NIL_MAP = 'panic: assignment to entry in nil map\n\ngoroutine 1 [running]:\nmain.main()\n\t/app/main.go:12 +0x1d\nexit status 2';
+    const RUNTIME = 'panic: runtime error: index out of range [3] with length 2\n\ngoroutine 1 [running]:';
+    reaches('go run main.go', NIL_MAP);
+    reaches('go test ./...', RUNTIME);
+    const a = planErrorRecall('go run main.go', NIL_MAP);
+    const b = planErrorRecall('go test ./...', RUNTIME);
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(a.terms).toContain('panic');
+    expect(a.terms).toContain('assignment');
+    expect(b.terms).toContain('panic');
   });
 
+  it('a truncated Python traceback keeps recall via the traceback anchor', () => {
+    reaches('python train.py', PY_TRACEBACK_HEAD);
+    expect(planErrorRecall('python train.py', PY_TRACEBACK_HEAD).terms).toContain('traceback');
+  });
+});
+
+describe('planErrorRecall — gate (nothing to recall ON ⇒ no injection)', () => {
   it('returns null when the output is empty or whitespace', () => {
     expect(planErrorRecall('npm run build', '')).toBeNull();
     expect(planErrorRecall('npm run build', '   \n  \n')).toBeNull();
   });
 
   it('does NOT fall back to command words when the error line yields only stop words', () => {
-    // 'Error:' / 'failed' / 'cannot' are all in ERROR_STOP_WORDS, and the remaining
-    // tokens are <=3 chars — so there is no discriminative error term to search on.
+    // 'Error:' / 'failed' are in ERROR_STOP_WORDS and the rest are <=3 chars — the line
+    // matches, but nothing discriminative survives, so there is still nothing to query.
     expect(planErrorRecall('npm run build', 'Error: it failed')).toBeNull();
+  });
+});
+
+// Each case below pins a constant or an ordering that a mutation was shown to flip while
+// the suite stayed green. They are here because a reviewer mutated them and nothing died.
+describe('planErrorRecall — term-selection internals that mutation showed were unpinned', () => {
+  it('honours every alternative of the line filter, not just "error"', () => {
+    // Narrowing the filter to /error|fail|exception/i flips this from inject to silent,
+    // and `command not found` is itself a trigger alternative — one of the shapes most
+    // certain to arrive here.
+    const out = 'deploy.sh: line 4: kubectl: command not found';
+    expect(detectBashSignificance({ command: 'bash deploy.sh' }, out).isHardError).toBe(true);
+    expect(planErrorRecall('bash deploy.sh', out).terms).toContain('kubectl');
+    // `undefined` / `cannot` as the sole anchor must work too.
+    expect(planErrorRecall('node x.mjs', 'result is undefined for scopeLabel').terms).toContain('scopelabel');
+  });
+
+  it('scans more than the first matching line for discriminative tokens', () => {
+    // Line 1 carries only stop words; everything useful is on line 2. Narrowing the
+    // per-response line budget to 1 flips this to silent.
+    const out = 'Error: build failed\nTypeError: scopeLabel is undefined in observation-write.mjs';
+    expect(detectBashSignificance({ command: 'npm run build' }, out).isHardError).toBe(true);
+    expect(planErrorRecall('npm run build', out).terms).toContain('observation-write.mjs');
+  });
+
+  it('pins the merged ORDER, not just membership — the cap truncates by order', () => {
+    // Golden list. Membership-only assertions let the two arrays swap places while the
+    // suite stays green, and with >6 candidates that silently changes WHICH terms the
+    // 6-cap keeps — i.e. it changes the query without changing any test.
+    const out = 'FAIL tests/scope-label.test.mjs\nAssertionError: expected observation-write.mjs to be defined';
+    expect(planErrorRecall('npx vitest run tests/scope-label.test.mjs', out).terms)
+      .toEqual(['npx', 'vitest', 'run', 'fail', 'tests', 'scope-label.test.mjs']);
+  });
+
+  it('dedups ACROSS command and error classes so a repeat cannot burn a cap slot', () => {
+    // 'build' appears in both the command and the error line; it must occupy one slot.
+    const terms = planErrorRecall('npm run build', 'Error: build failed while bundling build.config.mjs').terms;
+    expect(terms.filter((t) => t === 'build')).toHaveLength(1);
+    expect(terms).toEqual(['npm', 'run', 'build', 'while', 'bundling']);
   });
 });
 
@@ -127,6 +198,7 @@ describe('extractErrorKeywords — existing contract unchanged (regression)', ()
 // These two cases drive the real PostToolUse entry point.
 describe('error-recall wiring: hook.mjs honours the gate', () => {
   let ROOT, HOME_DIR, BASE_ENV, dataDir, cwd;
+  let baitCommandTopicId, baitErrorTopicId;
 
   beforeAll(async () => {
     ROOT = mkdtempSync(join(tmpdir(), 'mem-errgate-'));
@@ -154,13 +226,21 @@ describe('error-recall wiring: hook.mjs honours the gate', () => {
     delete BASE_ENV.CLAUDE_PROJECT_DIR;
     delete BASE_ENV.PWD;
 
-    // BAIT. Without a row the command words WOULD have matched, "nothing injected"
-    // proves nothing — the suppression case would pass on an empty store.
-    const bait = await fire(process.execPath, [CLI_PATH, 'save',
+    // Two rows that COMPETE: one matches the command's words, one matches the failure.
+    // The whole point of the change is which of them a failed `npm run build` recalls,
+    // so a test that seeds only one of them cannot tell the fix from the defect.
+    const decoy = await fire(process.execPath, [CLI_PATH, 'save',
       'Recovering an npm run build that fails during the bundle step',
       '--type', 'bugfix', '--importance', '3',
       '--lesson', 'npm run build recovery: clear the cache before rebuilding'], { cwd });
-    expect(bait.code, bait.stderr).toBe(0);
+    expect(decoy.code, decoy.stderr).toBe(0);
+    baitCommandTopicId = Number(decoy.stdout.match(/#(\d+)/)[1]);
+    const real = await fire(process.execPath, [CLI_PATH, 'save',
+      'A missing package.json makes the launcher die with ENOENT on syscall open',
+      '--type', 'bugfix', '--importance', '3',
+      '--lesson', 'ENOENT from syscall open means the manifest is absent, not that a dependency is missing'], { cwd });
+    expect(real.code, real.stderr).toBe(0);
+    baitErrorTopicId = Number(real.stdout.match(/#(\d+)/)[1]);
     const vitestRow = await fire(process.execPath, [CLI_PATH, 'save',
       'A vitest suite that fails only on the shared sqlite temp file',
       '--type', 'bugfix', '--importance', '3',
@@ -203,9 +283,24 @@ describe('error-recall wiring: hook.mjs honours the gate', () => {
     return { block, stdout: r.stdout };
   }
 
-  it('injects nothing for npm ENOENT even though a command-word match is sitting in the store', async () => {
+  it('recalls the ERROR-topic row for npm ENOENT, not the command-topic row', async () => {
     const { block, stdout } = await firePostTool('npm run build', NPM_ENOENT_OUT);
-    expect(block, `error-recall fired on a command-topic match:\n${stdout}`).toBeUndefined();
+    // Positive proof-of-life first: "nothing was injected" must not be able to satisfy
+    // this case, which is exactly how the previous version of this test could pass for
+    // the wrong reason.
+    expect(block, `error-recall did not fire at all:\n${stdout}`).toBeTruthy();
+    // The load-bearing assertion. That row's text carries no `npm`, `run` or `build`,
+    // so the old command-word-only query could not reach it at all — its presence here
+    // is only possible because `enoent`/`syscall` now enter the query.
+    expect(block, 'the ENOENT/syscall row is the one that explains this failure')
+      .toContain(`#${baitErrorTopicId}`);
+    // The command-topic row is still recalled, and that is CORRECT, not a leak: command
+    // words are kept on purpose (they carry domain anchoring — measured, see the commit
+    // body), so the OR-query legitimately still matches it. Asserting its presence also
+    // keeps the case honest — it proves the seeded store is reachable at all, so the
+    // assertion above cannot pass on an empty or misrouted DB.
+    expect(block, 'the command-topic row remains reachable — command words are retained')
+      .toContain(`#${baitCommandTopicId}`);
   }, 40000);
 
   it('still injects for a failure that DOES carry error signal (the gate is not a mute button)', async () => {

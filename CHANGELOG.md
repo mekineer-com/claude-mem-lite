@@ -4,51 +4,65 @@ All notable changes to claude-mem-lite are documented in this file.
 
 ## v3.74.0 — the error-recall surface was searching the command, not the error
 
-**Upgrade note.** No action needed, and no default changed. One behaviour does change and
-it is a reduction: when a command fails but its output carries no error-signal token,
-the PostToolUse error-recall block no longer appears. In practice that means npm's own
-failures (`npm ERR! code ENOENT`, `ELIFECYCLE`) and a truncated Python traceback stop
-injecting, because what they were injecting was a match on the COMMAND's words. Failures
-that do carry an error word — test failures, thrown exceptions, module-not-found — are
-untouched. To revert, pin `npm i claude-mem-lite@3.73.0`.
+**Upgrade note.** No action needed, and no default changed. What changes is WHICH terms
+the PostToolUse error-recall block searches on: a failure whose output carries npm's,
+Go's or Python's own error vocabulary now queries that vocabulary instead of falling back
+to the words in your command. Concretely, `npm run build` dying on ENOENT used to search
+for memories about *npm and building*; it now searches on `enoent` and `syscall`. Where a
+failure yields no usable term at all — empty output, or a line that is nothing but stop
+words — the block does not appear; that case previously injected a command-topic match.
+To revert, pin `npm i claude-mem-lite@3.73.0`.
 
 ### two pattern lists that were never the same list
 
-This surface fires on `detectBashSignificance`'s `isHardError`, then extracts keywords
-with a second, unrelated regex. `HARD_ERROR_RE` accepts `ERR!`, `enoent` and `traceback`.
-The extractor's line filter wants the whole word `error`. Nothing kept them in sync, and
-npm sits exactly in the gap: `npm ERR! code ENOENT / npm ERR! enoent ENOENT: no such file
-or directory` clears the trigger, then yields **zero** error lines — no `error`, no
-`fail`, no `not found` (npm says "no such file"). The keyword set fell back to command
-words alone, literally `['npm','run','build']`, and the FTS query went looking for
-observations about npm and building.
+This surface fires on `detectBashSignificance`'s `isHardError`, then extracted keywords
+using a second, unrelated regex. `HARD_ERROR_RE` accepts `ERR!`, `enoent`, `panic`,
+`traceback`. The extractor's line filter took `error|fail|exception|cannot|not found|
+undefined|null` as substrings. Nothing kept the two in sync, and npm sits exactly in the
+gap: `npm ERR! code ENOENT / npm ERR! enoent ENOENT: no such file or directory` clears
+the trigger, then yields **zero** lines to extract from — no `error`, no `fail`, no `not
+found` (npm says "no such file"). The keyword set fell back to command words alone,
+literally `['npm','run','build']`, and the FTS query went looking for observations about
+npm and building.
+
+The sharpest symptom was Go. `panic: assignment to entry in nil map` produced nothing and
+was answered with a query for `['run','main.go']`, while `panic: runtime error: index out
+of range` worked fine — purely because the second message happens to contain the
+substring `error`. Whether you got recall depended on the wording of your panic.
 
 Measured on the live library: `npm run build` failing on a missing module returned two
-release records ahead of the one row that explained it. A Python traceback's head lines
-degrade identically to `['python','train.py']`. Both are among the most common failures
-a session produces, which is consistent with this surface's citation rate of 4–6% against
-pre-tool recall's 38–42%.
+release records ahead of the one row that explained it, and a seeded row describing an
+ENOENT-on-`syscall open` failure could not be reached by the old query at all, because
+its text contains no `npm`, `run` or `build`.
 
-- **`planErrorRecall()`** in `bash-utils.mjs` is the new decision seam — pure, so the gate
-  is testable without spawning a hook, the same split `formatErrorRecallHints` already
-  uses. No error-signal token means there is nothing to recall ON, so the surface stays
-  silent instead of injecting a topic match.
-- **Term selection is unchanged.** Demoting command words to a fallback was implemented,
+- **The line filter is now `ERROR_LINE_RE || HARD_ERROR_RE`** — the selection filter is a
+  superset of the trigger. Whatever convinced `isHardError` this was a failure is, by
+  definition, also something terms get read from, which closes the class by construction
+  rather than by listing failure shapes. Widening the prose regex ad hoc WOULD have been
+  enumeration; making it a superset of the trigger is not.
+- **`planErrorRecall()`** in `bash-utils.mjs` is the decision seam — pure, so it is
+  testable without spawning a hook, the same split `formatErrorRecallHints` already uses.
+  It still returns null when nothing usable survives, and the surface then stays silent
+  rather than querying the command's topic.
+- **Command words stay in the query.** Demoting them to a fallback was implemented,
   measured, and rejected: replaying five real failures, error-terms-only fixed the
   missing-module case but regressed two others — dropping `database` lost the plugin-mode
   data-dir row for a failed DB open, dropping `vitest` lost the test-failure row. Command
   words carry domain anchoring, not just BM25 noise. The demote-to-fallback variant
   measured byte-identical to error-terms-only, because the primary query always filled
   its `LIMIT 3` and the fallback never ran.
-- **Widening the regex is deliberately not the fix.** Enumerating failure shapes always
-  misses one more; the gate is correct for every shape it misses.
 
-Four mutants were run against the new tests and all four were killed, including one that
-restores the old ungated behaviour — that one also reddens an end-to-end case driving the
-real PostToolUse entry point, which the pure-function tests cannot see. That wiring test
-earned its place immediately: the first cut of this change imported `planErrorRecall`
-from `utils.mjs` without re-exporting it there, which broke `hook.mjs` load entirely and
-turned 119 tests red.
+Five mutants were killed by the new tests, including one restoring the old prose-only
+filter and one restoring the old ungated behaviour; both also redden an end-to-end case
+driving the real PostToolUse entry point, which the pure-function tests cannot see. That
+wiring test earned its place immediately: the first cut of this change imported
+`planErrorRecall` from `utils.mjs` without re-exporting it there, which broke `hook.mjs`
+load entirely and turned 119 tests red.
+
+**On this face's citation rate.** The measured 4–6% for `error_recall` (against pre-tool
+recall's 38–42%) was computed before this change. The population it measures is now
+different — the same failures inject different terms, and a few inject nothing — so a
+rate change across this version boundary is not on its own evidence of a quality change.
 
 ### doctor no longer exits 1 over a process it cannot do anything about
 
