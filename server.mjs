@@ -46,7 +46,8 @@ function descriptionOf(name) {
 import { optimizePreview, optimizeRun } from './hook-optimize.mjs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import { ensureRegistryDb, upsertResource, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
+import { ensureRegistryDb, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
+import { IMPORT_STRING_FIELDS, importResource, removeResource, reindexResources } from './lib/registry-core.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { probeOtherSources as probeIdSources, bucketIdTokens, splitDeferredTokens } from './lib/id-routing.mjs';
 import { saveObservation } from './lib/save-observation.mjs';
@@ -1454,19 +1455,14 @@ server.registerTool(
       if (!args.name || !args.resource_type) {
         return { content: [{ type: 'text', text: 'import requires name and resource_type' }], isError: true };
       }
-      const IMPORT_STRING_FIELDS = ['repo_url', 'local_path', 'invocation_name', 'intent_tags',
-        'domain_tags', 'trigger_patterns', 'capability_summary', 'keywords', 'tech_stack', 'use_cases'];
-      // Preserve provenance on a metadata-only re-import (parity with cmdRegistry): default
-      // source to 'user' only for a NEW resource — a partial re-upsert of an existing
-      // github/preinstalled row without `source` must not flip it to 'user'.
-      let source = args.source;
-      if (!source) {
-        const existing = rdb.prepare('SELECT source FROM resources WHERE type = ? AND name = ?').get(args.resource_type, args.name);
-        source = existing ? existing.source : 'user';
-      }
-      const fields = { name: args.name, type: args.resource_type, status: 'active', source };
+      // Provenance preservation + the 'installed' tier grant live in lib/registry-core.mjs,
+      // shared with the `registry import` CLI twin (audit 2026-08-22 P1-3). Before that
+      // extraction this side wrote its own SQL and silently skipped the tier grant.
+      const fields = {};
       for (const f of IMPORT_STRING_FIELDS) fields[f] = args[f] || '';
-      const id = upsertResource(rdb, fields);
+      const { id } = importResource(rdb, {
+        name: args.name, type: args.resource_type, source: args.source, fields,
+      });
       return { content: [{ type: 'text', text: `Imported: ${args.resource_type}:${args.name} (id=${id})` }] };
     }
 
@@ -1474,14 +1470,13 @@ server.registerTool(
       if (!args.name || !args.resource_type) {
         return { content: [{ type: 'text', text: 'remove requires name and resource_type' }], isError: true };
       }
-      const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(args.resource_type, args.name);
-      return { content: [{ type: 'text', text: result.changes > 0 ? `Removed: ${args.resource_type}:${args.name}` : 'Not found.' }] };
+      const { removed } = removeResource(rdb, { name: args.name, type: args.resource_type });
+      return { content: [{ type: 'text', text: removed ? `Removed: ${args.resource_type}:${args.name}` : 'Not found.' }] };
     }
 
     if (action === 'reindex') {
-      rdb.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
-      const count = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      return { content: [{ type: 'text', text: `FTS5 reindexed. ${count.c} active resources.` }] };
+      const { activeCount } = reindexResources(rdb);
+      return { content: [{ type: 'text', text: `FTS5 reindexed. ${activeCount} active resources.` }] };
     }
 
     if (action === 'import_url') {

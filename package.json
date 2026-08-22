@@ -96,6 +96,7 @@
     "lib/save-observation.mjs",
     "lib/observation-write.mjs",
     "lib/recall-core.mjs",
+    "lib/registry-core.mjs",
     "lib/timeline-core.mjs",
     "lib/search-core.mjs",
     "lib/recent-core.mjs",

@@ -164,6 +164,10 @@ export const SOURCE_FILES = [
   // auto-update. Same single-source-of-truth pattern (see #8217).
   'lib/observation-write.mjs',
   'lib/recall-core.mjs',
+  // Shared registry write core (import/remove/reindex + the 'installed' tier grant).
+  // Statically imported by mem-cli.mjs AND server.mjs — missing it from the manifest
+  // would break `registry import|remove|reindex` and mem_registry on auto-update.
+  'lib/registry-core.mjs',
   // Shared timeline core (anchor resolution + before/after window) and shared
   // cross-source search core (sessions/prompts FTS, CJK fallback, normalization,
   // pagination math). Statically imported by mem-cli.mjs AND server.mjs — same

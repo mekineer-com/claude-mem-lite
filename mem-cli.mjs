@@ -20,7 +20,8 @@ import { searchObservationsHybrid } from './search-engine.mjs';
 import { fetchObsDetail, OBS_FIELDS, SESSION_DETAIL_FIELDS, supersededNotice } from './lib/get-core.mjs';
 import { collectBrowseTiers, getActiveMemorySessionId, BROWSE_TIERS, BROWSE_TIER_LABELS } from './lib/browse-core.mjs';
 import { deepSearch, resolveDeepMode, shouldEscalateToDeep, autoDeepLlmReady } from './deep-search.mjs';
-import { ensureRegistryDb, upsertResource, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
+import { ensureRegistryDb, collectRegistryStats, listResourcesRanked, formatRegistryListLine } from './registry.mjs';
+import { IMPORT_STRING_FIELDS, importResource, removeResource, reindexResources } from './lib/registry-core.mjs';
 import { searchResources } from './registry-retriever.mjs';
 import { computeFunnel, formatFunnel, computeSweep, formatSweep, DEFAULT_SWEEP_FLOORS, DEFAULT_SWEEP_MARGINS } from './registry-recommend.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
@@ -2339,24 +2340,12 @@ function cmdRegistry(_memDb, args) {
         fail(`[mem] Invalid --source "${flags.source}". Valid: preinstalled, user, github`);
         return;
       }
-      // Preserve provenance on a metadata-only re-import: default source to 'user' only for
-      // a genuinely NEW resource. Re-importing an existing github/preinstalled row without
-      // --source must not flip it to 'user' (which also mis-grants the user-source rank boost).
-      let source = flags.source;
-      if (!source) {
-        const existing = rdb.prepare('SELECT source FROM resources WHERE type = ? AND name = ?').get(resourceType, name);
-        source = existing ? existing.source : 'user';
-      }
-      const fields = { name, type: resourceType, status: 'active', source };
-      for (const f of ['repo-url', 'local-path', 'invocation-name', 'intent-tags', 'domain-tags', 'trigger-patterns', 'capability-summary', 'keywords', 'tech-stack', 'use-cases']) {
-        const camel = f.replace(/-([a-z])/g, (_, c) => '_' + c);
-        fields[camel] = flags[f] || '';
-      }
-      const id = upsertResource(rdb, fields);
-      // User-imported resources get 'installed' quality tier (user explicitly chose to add them)
-      if (id && !flags.source) {
-        rdb.prepare("UPDATE resources SET quality_tier = 'installed' WHERE id = ?").run(id);
-      }
+      // Provenance preservation + the 'installed' tier grant live in lib/registry-core.mjs,
+      // shared with the mem_registry MCP twin (audit 2026-08-22 P1-3). CLI flags are
+      // kebab-case; the core's field list is the canonical snake_case source.
+      const fields = {};
+      for (const f of IMPORT_STRING_FIELDS) fields[f] = flags[f.replace(/_/g, '-')] || '';
+      const { id } = importResource(rdb, { name, type: resourceType, source: flags.source, fields });
       out(`[mem] Imported: ${resourceType}:${name} (id=${id})`);
       if (!flags['capability-summary'] && !flags['use-cases']) {
         out('[mem] Tip: Add --capability-summary or --use-cases so the resource appears in searches.');
@@ -2371,17 +2360,16 @@ function cmdRegistry(_memDb, args) {
       const name = flags.name;
       const resourceType = flags['resource-type'];
       if (!name || !resourceType) { fail('[mem] Usage: claude-mem-lite registry remove --name N --resource-type skill|agent'); return; }
-      const result = rdb.prepare('DELETE FROM resources WHERE type = ? AND name = ?').run(resourceType, name);
-      out(result.changes > 0
+      const { removed } = removeResource(rdb, { name, type: resourceType });
+      out(removed
         ? `[mem] Removed: ${resourceType}:${name}`
         : `[mem] Not found: ${resourceType}:${name}`);
       return;
     }
 
     if (action === 'reindex') {
-      rdb.exec("INSERT INTO resources_fts(resources_fts) VALUES('rebuild')");
-      const count = rdb.prepare('SELECT COUNT(*) as c FROM resources WHERE status = ?').get('active');
-      out(`[mem] FTS5 reindexed. ${count.c} active resources.`);
+      const { activeCount } = reindexResources(rdb);
+      out(`[mem] FTS5 reindexed. ${activeCount} active resources.`);
       return;
     }
   } finally {
