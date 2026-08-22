@@ -70,11 +70,12 @@ import { computeCitationFunnelTrend, computeSurfaceFunnel } from './lib/citation
 // the citation-stats face table lines up; the enum itself lives in
 // lib/citation-tracker.mjs (CITATION_SURFACES).
 const SURFACE_LABELS = {
-  pretool:      'PreToolUse recall  ',
-  ups:          'UserPromptSubmit   ',
-  error_recall: 'error-recall       ',
-  fyi:          'FYI (prompt-search)',
-  keyctx:       'Key Context        ',
+  pretool:        'PreToolUse recall  ',
+  ups:            'UserPromptSubmit   ',
+  error_recall:   'error-recall       ',
+  fyi:            'FYI (prompt-search)',
+  task_imperative: 'task-imperative   ',
+  keyctx:         'Key Context        ',
 };
 import { aggregateMetrics, readMetrics } from './lib/metrics.mjs';
 import {

@@ -327,7 +327,11 @@ describe('recordCitationSurfaces', () => {
   });
 
   it('exposes the surface enum so callers cannot invent labels', () => {
-    expect(CITATION_SURFACES).toEqual(['pretool', 'ups', 'error_recall', 'fyi', 'keyctx']);
+    // Order matters here only as a change-detector: recordCitationSurfaces drops labels
+    // absent from this list, so an addition should be a deliberate edit in both places.
+    // task_imperative joined in v3.76 (metered; see citation-surface-imperative.test.mjs
+    // for why it is NOT in the decay denominator).
+    expect(CITATION_SURFACES).toEqual(['pretool', 'ups', 'error_recall', 'fyi', 'task_imperative', 'keyctx']);
   });
 });
 

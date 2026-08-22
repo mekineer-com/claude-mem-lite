@@ -33,7 +33,7 @@ import {
   readEpisodeRaw, episodeFile,
   acquireLock, releaseLock, readEpisode, writeEpisode,
   createEpisode, addFileToEpisode, planEpisodeFlush,
-  writePendingEntry, mergePendingEntries, episodeHasSignificantContent,
+  writePendingEntry, mergePendingEntries, episodeHasSignificantContent, explainSignificance,
 } from './hook-episode.mjs';
 import { cleanupClaudeMdLegacyBlock, buildSessionContextLines } from './hook-context.mjs';
 import { entry as preCompactEntry } from './hook-precompact.mjs';
@@ -294,7 +294,21 @@ function flushEpisodeWithDb(db, episode, hookEventName) {
 // suppresses the detached enrichment spawn (test determinism; sibling of
 // CLAUDE_MEM_SKIP_COMPRESS / _OPTIMIZE) — the synchronous immediate obs still lands.
 function flushEpisodeGroup(ep, db) {
-  const isSignificant = episodeHasSignificantContent(ep);
+  const verdict = explainSignificance(ep);
+  const isSignificant = verdict.significant;
+  // Audit P2-14 instrument: moving Grep into the bash prefilter would save 85ms per Grep
+  // (91.2ms handoff vs 6.1ms for the already-skipped Read), but nothing records how many
+  // episodes are kept ONLY because of their Greps — and demoting what the product
+  // remembers on a deduction is how work disappears silently. This is that counter.
+  // Off unless CLAUDE_MEM_METRICS=1, like every other row in this sink.
+  recordMetric(join(RUNTIME_DIR, '..'), {
+    event: 'episode_significance',
+    rule: verdict.rule,
+    significant: isSignificant,
+    readCount: verdict.readCount,
+    grepCount: verdict.grepCount,
+    grepDecisive: verdict.grepDecisive,
+  });
 
   // Immediate save: rule-based observation for instant visibility; the LLM
   // background worker upgrades title/narrative/importance later. `db` is

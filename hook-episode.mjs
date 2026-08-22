@@ -246,6 +246,54 @@ export function mergePendingEntries(episode) {
   }
 }
 
+/** Rule 4's threshold — 8+ Read/Grep entries read as investigation. */
+const RESEARCH_ENTRY_THRESHOLD = 8;
+
+/**
+ * The significance decision WITH its reasoning, for instrumentation.
+ * `episodeHasSignificantContent` is the boolean face of this same body, so the meter
+ * and the decision cannot drift (audit 2026-08-22 P2-14).
+ *
+ * `grepDecisive` answers the one question the "move Grep into the bash skip list"
+ * decision is blocked on: would this episode still have been kept without its Grep
+ * entries? It is true ONLY when rule 4 decided AND the non-Grep entries alone fall
+ * short — an edit-driven episode that happens to contain Greps is not evidence that
+ * Grep carries research episodes.
+ *
+ * @param {object} episode
+ * @returns {{significant: boolean, rule: 1|2|3|4|null, readCount: number,
+ *   grepCount: number, grepDecisive: boolean}}
+ */
+export function explainSignificance(episode) {
+  const entries = episode?.entries || [];
+  const grepCount = entries.filter(e => e.tool === 'Grep').length;
+  const readCount = entries.filter(e => e.tool === 'Read' || e.tool === 'Grep').length;
+  const base = { readCount, grepCount, grepDecisive: false };
+
+  // 1. File edits → always significant (code changes matter)
+  if (entries.some(e => EDIT_TOOLS.has(e.tool))) return { ...base, significant: true, rule: 1 };
+
+  // 2. Test/build errors → significant (actionable failures)
+  // Plain bash errors without edits are noise (e.g. typos, exploration errors)
+  if (entries.some(e => e.tool === 'Bash' && e.isError && (e.bashSig?.isTest || e.bashSig?.isBuild))) {
+    return { ...base, significant: true, rule: 2 };
+  }
+
+  // 3. Important files touched (config, schema, security, migration)
+  // Checks episode.files (all touched files, including reads) — catches important-file investigation
+  const allFiles = episode?.files || [];
+  if (allFiles.some(f =>
+    /\.(env|yml|yaml|toml|lock|sql|prisma|proto)$/.test(f) ||
+    /(config|schema|migration|auth|security)/i.test(f)
+  )) return { ...base, significant: true, rule: 3 };
+
+  // 4. Research pattern: reading many files indicates investigation
+  if (readCount >= RESEARCH_ENTRY_THRESHOLD) {
+    return { ...base, significant: true, rule: 4, grepDecisive: readCount - grepCount < RESEARCH_ENTRY_THRESHOLD };
+  }
+  return { ...base, significant: false, rule: null };
+}
+
 /**
  * Check if an episode has significant content worth processing with LLM.
  * Significant = contains file edits, Bash errors, or a review/research pattern
@@ -254,29 +302,5 @@ export function mergePendingEntries(episode) {
  * @returns {boolean} true if the episode has significant content
  */
 export function episodeHasSignificantContent(episode) {
-  // 1. File edits → always significant (code changes matter)
-  const hasEdits = episode.entries.some(e => EDIT_TOOLS.has(e.tool));
-  if (hasEdits) return true;
-
-  // 2. Test/build errors → significant (actionable failures)
-  // Plain bash errors without edits are noise (e.g. typos, exploration errors)
-  const hasTestOrBuildError = episode.entries.some(e =>
-    e.tool === 'Bash' && e.isError && (e.bashSig?.isTest || e.bashSig?.isBuild)
-  );
-  if (hasTestOrBuildError) return true;
-
-  // 3. Important files touched (config, schema, security, migration)
-  // Checks episode.files (all touched files, including reads) — catches important-file investigation
-  const allFiles = episode.files || [];
-  const hasImportantFile = allFiles.some(f =>
-    /\.(env|yml|yaml|toml|lock|sql|prisma|proto)$/.test(f) ||
-    /(config|schema|migration|auth|security)/i.test(f)
-  );
-  if (hasImportantFile) return true;
-
-  // 4. Research pattern: reading many files indicates investigation
-  const readCount = episode.entries.filter(e =>
-    e.tool === 'Read' || e.tool === 'Grep'
-  ).length;
-  return readCount >= 8;
+  return explainSignificance(episode).significant;
 }

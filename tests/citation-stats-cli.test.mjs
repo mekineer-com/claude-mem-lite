@@ -243,6 +243,16 @@ describe('citation-stats CLI', () => {
     expect(output).toMatch(/not a partition/i);
   });
 
+  // The label table and the enum are two lists again the moment a face is added to one
+  // of them. The render falls back to the raw key, so a missed label is silent — it just
+  // prints `task_imperative` in a column of prose names. This pins the readable label.
+  it('renders a readable label for every metered face, task_imperative included', async () => {
+    seedSurface('task_imperative', 12, 3);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/task-imperative.*inj\s+12\s+cited\s+3\s+25\.0%/);
+    expect(output).not.toMatch(/task_imperative/);   // the raw key must not reach the user
+  });
+
   it('labels keyctx as promotion-only (it can never demote)', async () => {
     seedSurface('keyctx', 10, 1);
     const output = await captureStdout(() => run(['citation-stats']));
