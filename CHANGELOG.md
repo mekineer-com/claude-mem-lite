@@ -2,6 +2,75 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.76.1 — the second review landed 13 minutes after the tag, and it was right
+
+**Upgrade note.** Upgrade from v3.76.0. One user-visible defect, introduced by v3.76.0's own
+pre-tag fix and shipped 90 minutes later, plus three test holes that let two real mutants
+pass 4857 tests. No behaviour a v3.76.0 user opted into changes.
+
+### the defect: `maintain scan` promised work that `maintain execute` would never do
+
+v3.76.0 gave `demotePinned` two floors (no lesson → 1, lesson → 2). The **forecast** in
+`maintenanceStats` was not moved with it: it still counted `importance > 1`. So a
+lesson-bearing row already sitting at its floor of 2 was reported as pinned **forever**,
+while every execute reported `Demoted 0`. Reproduced end to end before fixing:
+
+```
+--- scan BEFORE ---  Pinned-but-uncited (…): 1 — cleared by the default maintain set…
+--- execute ---      [mem] Demoted 0 pinned-but-uncited observations…
+--- scan AFTER ---   Pinned-but-uncited (…): 1        ← unchanged, and unchangeable
+```
+
+Worse than a wrong number, because v3.76.0 also rewrote that line to *promise* the rows
+would be cleared. The predicate now has one home (`PINNED_PREDICATE_SQL`) that the op and
+its forecast both consume, so they cannot disagree again, and a test pairs the two counts
+across a real scan → execute → scan cycle rather than asserting either alone — asserting
+either alone is exactly what let this ship. This is the same scan-forecast-vs-execute drift
+class the `decayAndMarkIdle` comment a few lines above it exists to prevent.
+
+The scan label also stops saying `imp>1`, which was never true of a lesson row.
+
+### three test holes, two of them hiding live mutants
+
+- **The opt-out was pinned on one face out of three — and not the one that matters.**
+  `CLAUDE_MEM_SKIP_DEMOTE_PINNED` was asserted only through the CLI. Deleting the check
+  from `hook.mjs` — the **only** face that runs unattended, and therefore the one a user
+  setting the variable actually needs — passed all 4857 tests, as did deleting it from the
+  MCP face. The case was even named "on every face" while running one. Both faces are now
+  asserted end to end, and both mutants die.
+- **`tests/lint-gate-coverage.test.mjs` asserted a necessary condition and called it
+  binding.** `isPathIgnored()` answers "is this file skipped", not "does any rule apply".
+  Review built a config that un-ignores `scripts/` while scoping the strict rules to
+  `**/*.mjs`, under which the case stayed green and the five production hook scripts had
+  silently lost `eqeqeq` / `no-var` / `prefer-const` / `no-unreachable` — the v3.75.1 stray
+  `export` sails through that config. A second case now resolves the config per file with
+  `calculateConfigForFile()` and asserts the rules are in force.
+- **The shellcheck half matched a commented-out line.** `l.includes('run: shellcheck')` is
+  satisfied by `# run: shellcheck …`, so replacing the step with `run: echo skipping` and
+  commenting the original kept it green. Anchored to a line that actually runs.
+
+**Also:** `CLAUDE.md` said 4853 tests where the real count was 4857 — the pre-tag review
+added four cases after the Quick Reference was synced. Now 4860 and re-synced.
+
+### about the review itself
+
+Both v3.76.0 reviews were dispatched before the tag. The correctness lens delivered in
+time and reshaped the release. The test-quality lens delivered **13 minutes after** it —
+the fifth time in this project a review has arrived post-tag — and found the defect above.
+The cost was one patch release rather than one rollback, which is the argument for waiting;
+the honest reading is that the v3.76.0 notes claimed a test-quality lens was missing, and
+it was merely late.
+
+One of its findings did **not** reproduce and is recorded as refuted: it reported the suite
+red at `ca7be0d` in this checkout (`session-start-stdout-envelope`, attributed to the
+working copy's adopted state). That file passes 5/5 here at HEAD, and the pre-commit hook
+ran the full suite green at commit time — so the commit message's "300 files / 4857 tests"
+was accurate as written.
+
+Suite **300 files / 4860 tests**, eslint clean, shellcheck clean over four scripts, knip
+back at 31 unused exports (the new predicate constant is module-private — nothing outside
+consumes it, and exporting by habit is how that baseline drifts).
+
 ## v3.76.0 — the automatic maintenance path promoted and never demoted
 
 **Upgrade note — a default changes, and it will move rows in your database.**

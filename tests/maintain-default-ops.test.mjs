@@ -1,6 +1,7 @@
 // v3.76.0: the automatic maintenance path promoted and never demoted.
 //
-// `demotePinned` (injection_count>=8 AND cited_count=0 -> importance=1) is the only op
+// `demotePinned` (injection_count>=8 AND cited_count=0 -> importance floored: no lesson
+// to 1, lesson-bearing to 2) is the only op
 // that can reach a heavily-injected-but-uncited row — the regular decay op deliberately
 // protects injection_count>0, on the theory that a row Claude was shown 8 times is
 // contextually proven. But demote_pinned was in NO face's default op set, and hook.mjs
@@ -42,6 +43,9 @@ let dir;
 
 const baseEnv = (extra = {}) => ({
   ...process.env,
+  // Scrubbed, not inherited: a dev or CI shell that exports the opt-out would turn most
+  // of this file red for a reason that has nothing to do with the code under test.
+  CLAUDE_MEM_SKIP_DEMOTE_PINNED: undefined,
   CLAUDE_MEM_DIR: dir,
   CLAUDE_MEM_SKIP_UPDATE: '1',
   CLAUDE_MEM_SKIP_COMPRESS: '1',
@@ -218,6 +222,40 @@ describe('demote_pinned is in the default maintenance set on all three faces', (
     check.close();
     expect(row.importance).toBe(1);          // demoted — no lesson, so floor 1
     expect(row.compressed_into).toBeNull();  // but NOT hidden
+  });
+
+  // v3.76.1: the scan forecast and the op drifted the moment demotePinned gained a second
+  // floor — the forecast still said `importance > 1`, so a lesson row already at 2 was
+  // counted as pinned forever while every execute reported "Demoted 0". Pair the two
+  // numbers so they cannot disagree again; asserting either alone is what let this ship.
+  it('the scan forecast equals what execute actually moves', () => {
+    seedPinnedRow({ title: 'Lesson at floor', lesson: 'already floored', importance: 2, accessCount: 0 });
+    const pinnedInScan = (out) => Number(/above floor\): (\d+)/.exec(out)[1]);
+    const demotedInExecute = (out) => Number(/Demoted (\d+) pinned-but-uncited/.exec(out)[1]);
+
+    const before = pinnedInScan(runCli(['maintain', 'scan']));
+    const moved = demotedInExecute(runCli(['maintain', 'execute']));
+    const after = pinnedInScan(runCli(['maintain', 'scan']));
+
+    // Only the beforeEach no-lesson row is above its floor; the lesson row is AT its floor
+    // of 2 and must not be forecast. Pre-fix: before=2, moved=1, after=1 forever.
+    expect(before).toBe(1);
+    expect(moved).toBe(1);
+    expect(after).toBe(0);
+  });
+
+  it('honours the opt-out on the hook and MCP faces too, not just the CLI', () => {
+    // The previous cut asserted the opt-out through runCli only, while calling itself
+    // "on every face". Deleting the hook's opt-out check — the ONE face that runs
+    // unattended, and therefore the one a user setting this var actually needs — passed
+    // all 4857 tests.
+    const optOut = { CLAUDE_MEM_SKIP_DEMOTE_PINNED: '1' };
+    runAutoMaintain(optOut);
+    expect(importanceOfPinnedRow()).toBe(3);
+
+    seedPinnedRow({ title: 'Second pinned row' });
+    callMcp('mem_maintain', { action: 'execute' }, optOut);
+    expect(importanceOf('Second pinned row')).toBe(3);
   });
 
   it('the opt-out honours `true`/`yes` and refuses to read `0`/`false` as skip', () => {

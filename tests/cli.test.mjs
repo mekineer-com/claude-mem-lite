@@ -1768,7 +1768,7 @@ describe('CLI maintain command', () => {
       title: 'Pinned noise', text: 'x', importance: 3, injectionCount: 10, citedCount: 0,
     });
     const output = await captureStdout(() => run(['maintain', 'scan']));
-    expect(output).toContain('Pinned-but-uncited (inj>=8, cited=0, imp>1): 1');
+    expect(output).toContain('Pinned-but-uncited (inj>=8, cited=0, above floor): 1');
   });
 
   it('execute runs dedup with --merge-ids', async () => {

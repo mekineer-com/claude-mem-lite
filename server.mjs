@@ -19,7 +19,7 @@ import {
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   hardDeleteCandidateCount,
-  OP_CAP, STALE_AGE_MS, resolveDefaultMaintainOps,
+  OP_CAP, STALE_AGE_MS, resolveDefaultMaintainOps, DEFAULT_MAINTAIN_OPS,
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
@@ -1152,7 +1152,7 @@ server.registerTool(
       // T2-P1-A: reject explicit empty array (vs. omitted → defaults above). Empty-array
       // callers are almost always mistakes; silently running only FTS5 optimize hides the error.
       if (args.operations && args.operations.length === 0) {
-        return { content: [{ type: 'text', text: 'operations array is empty. Pass a non-empty list (e.g. ["cleanup","decay","boost"]) or omit operations to use the default set.' }], isError: true };
+        return { content: [{ type: 'text', text: `operations array is empty. Pass a non-empty list (e.g. ${JSON.stringify(DEFAULT_MAINTAIN_OPS)}) or omit operations to use the default set.` }], isError: true };
       }
       const results = [];
       const staleAge = Date.now() - STALE_AGE_MS;

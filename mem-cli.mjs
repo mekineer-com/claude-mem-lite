@@ -2012,7 +2012,7 @@ function cmdMaintain(db, args) {
     out(`  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`);
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
-    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — cleared by the default maintain set since v3.76.0 (opt out: CLAUDE_MEM_SKIP_DEMOTE_PINNED=1)`);
+    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, above floor): ${stats.pinned} — floored by the default maintain set since v3.76.0, no lesson → 1, lesson → 2 (opt out: CLAUDE_MEM_SKIP_DEMOTE_PINNED=1)`);
     out(formatPendingPurgeLine(stats.pendingPurge));
     if (duplicates.length > 0) {
       const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);

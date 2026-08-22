@@ -4,9 +4,9 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.76.0
+- **Version**: 3.76.1
 - **Package manager**: npm
-- **Test**: `npx vitest run` (300 test files / 4853 tests, vitest) · **Sandbox install harness** (not in `vitest run`; real `npm i -g` + real MCP stdio, minutes + network): `node tests/sandbox/phaseA-plugin.mjs` / `phaseB-npm.mjs` / `phaseC-update.mjs` — see `tests/sandbox/README.md`
+- **Test**: `npx vitest run` (300 test files / 4860 tests, vitest) · **Sandbox install harness** (not in `vitest run`; real `npm i -g` + real MCP stdio, minutes + network): `node tests/sandbox/phaseA-plugin.mjs` / `phaseB-npm.mjs` / `phaseC-update.mjs` — see `tests/sandbox/README.md`
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **Denoising A/B** (evaluate any precision/recall lever BEFORE shipping): `node benchmark/denoise-ab.mjs --save before.json` (control) → apply the change → `node benchmark/denoise-ab.mjs --compare before.json` (verdict). Runs the precision hard-negative, vocab-mismatch paraphrase, AND cjk_mixed suites so a lever's precision gain and recall cost are weighed on one screen — the split that let an OR-BM25 floor ship-then-revert (2026-06-29). Behavioral probes ride the same screen (multiscript guard + cross-source direction + deferred reachability + events end-to-end pipeline); any probe failure overrides the verdict to PROBE-FAIL and exits 1 — "A/B NEUTRAL ≠ safe" on faces the metric suites can't see. Verdict: REJECT / TRADEOFF / NET-POSITIVE / NEUTRAL / PROBE-FAIL.
