@@ -330,8 +330,10 @@ describe('recordCitationSurfaces', () => {
     // Order matters here only as a change-detector: recordCitationSurfaces drops labels
     // absent from this list, so an addition should be a deliberate edit in both places.
     // task_imperative joined in v3.76 (metered; see citation-surface-imperative.test.mjs
-    // for why it is NOT in the decay denominator).
-    expect(CITATION_SURFACES).toEqual(['pretool', 'ups', 'error_recall', 'fyi', 'task_imperative', 'keyctx']);
+    // for why it is NOT in the decay denominator). subagent joined in v3.77
+    // (D#152; see citation-surface-subagent.test.mjs — it is a non-attachment
+    // face, so it is fed by its own recordCitationSurfaces call at Stop).
+    expect(CITATION_SURFACES).toEqual(['pretool', 'ups', 'error_recall', 'fyi', 'task_imperative', 'keyctx', 'subagent']);
   });
 });
 

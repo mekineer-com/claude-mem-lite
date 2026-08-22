@@ -86,7 +86,12 @@ describe('pre-tool-recall', () => {
     });
   });
 
-  describe('DB query pattern', () => {
+  // These two cases run a HAND-COPY of the injection SELECT, not the shipped
+  // one — they document the intended shape and cannot detect drift in
+  // scripts/pre-tool-recall.js. That is how D#162 stayed open: the copy asserted
+  // superseded/compressed exclusion while the real query's filter was untested.
+  // Guards that bind the shipped script live in the D#162 block at the bottom.
+  describe('DB query pattern (illustrative copy — see D#162 block for the real guard)', () => {
     it('uses observation_files junction table with correct filters', () => {
       const db = createTestDb();
       insertSession(db, { id: 'sess-1' });
@@ -1765,6 +1770,123 @@ describe('pre-tool-recall', () => {
       expect(bodyIdx).toBeGreaterThanOrEqual(0);
       expect(titleIdx).toBeGreaterThanOrEqual(0);
       expect(bodyIdx).toBeLessThan(titleIdx);
+    });
+  });
+
+  // ─── D#162: live-row + lookback filters on the SHIPPED query ───────────────
+  // The `DB query pattern` block above hand-copies this SELECT, so it kept
+  // passing while nothing tested the real one: deleting
+  // `AND ${liveObsFilterSql('o')}` from scripts/pre-tool-recall.js left all
+  // 4881 tests green. That let a retracted (superseded) or compacted
+  // (compressed_into) lesson reach the highest-cite-rate injection face in the
+  // repo — and superseded-leak is this project's most-reopened defect class.
+  //
+  // Assertion shape matters (feedback_necessary_not_sufficient_assertions):
+  // each case seeds a live row on the SAME file as the excluded row, so the
+  // test cannot pass by the query returning nothing. The excluded row is
+  // always the NEWER one, so with the filter gone it sorts first and renders
+  // within the Edit path's 2-row obs limit.
+  describe('live-row + lookback filters, shipped query (D#162)', () => {
+    let tmpRoot;
+    let projectDir;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-live-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'livetest');
+      mkdirSync(projectDir, { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-live', project: 'parent--livetest', memoryId: 'mem-live' });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    function seedObs(file, lesson, extra = {}) {
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertObs(db, {
+        sessionId: 'mem-live', project: 'parent--livetest',
+        type: 'bugfix', importance: 2,
+        title: 'seeded lesson', lessonLearned: lesson,
+        filesModified: JSON.stringify([file]),
+        ...extra,
+      });
+      db.close();
+    }
+
+    function editFile(name, session) {
+      return runScript({
+        tool_name: 'Edit',
+        session_id: session,
+        tool_input: { file_path: join(projectDir, name) },
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+    }
+
+    it('excludes a superseded observation while still injecting the live one', async () => {
+      seedObs('sup.mjs', 'live lesson that must survive', { epochOffset: -60_000 });
+      seedObs('sup.mjs', 'retracted lesson must not inject', {
+        supersededAt: new Date().toISOString(),
+        supersededBy: 999,
+      });
+      const { stdout } = await editFile('sup.mjs', 'sess-live-sup');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('live lesson that must survive');
+      expect(ctx).not.toContain('retracted lesson must not inject');
+    });
+
+    it('excludes a compressed observation while still injecting the live one', async () => {
+      seedObs('comp.mjs', 'live lesson beside a tombstone', { epochOffset: -60_000 });
+      seedObs('comp.mjs', 'compressed tombstone must not inject', { compressedInto: 999 });
+      const { stdout } = await editFile('comp.mjs', 'sess-live-comp');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('live lesson beside a tombstone');
+      expect(ctx).not.toContain('compressed tombstone must not inject');
+    });
+
+    // compressed_into = -2 is the pending-purge marker, not a keeper id — a
+    // `> 0` test would let it through, which is why liveObsFilterSql uses
+    // `COALESCE(...) = 0`.
+    it('excludes a pending-purge (compressed_into = -2) observation', async () => {
+      seedObs('purge.mjs', 'live lesson beside a purge marker', { epochOffset: -60_000 });
+      seedObs('purge.mjs', 'pending-purge row must not inject', { compressedInto: -2 });
+      const { stdout } = await editFile('purge.mjs', 'sess-live-purge');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('live lesson beside a purge marker');
+      expect(ctx).not.toContain('pending-purge row must not inject');
+    });
+
+    // Pre-tag review of this very round: the clause ONE LINE ABOVE the one this
+    // block was opened to guard had the same problem. `AND o.importance >= 2`
+    // could be relaxed to `>= 0` with 237 related tests green — the noise gate
+    // on the repo's highest-VOLUME injection face, deletable without a red
+    // test. The only case that looked like it covered this
+    // (`tests/memory-inject.test.mjs` "only returns importance>=2") binds
+    // fileEdgeMatchOnly's own hand-copied gate, not the shipped query — the
+    // exact D#163 shape, found one altitude down.
+    it('excludes a below-threshold-importance observation while injecting the live one', async () => {
+      seedObs('imp.mjs', 'importance-2 lesson must survive', { epochOffset: -60_000 });
+      seedObs('imp.mjs', 'importance-1 lesson must not inject', { importance: 1 });
+      const { stdout } = await editFile('imp.mjs', 'sess-live-imp');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('importance-2 lesson must survive');
+      expect(ctx).not.toContain('importance-1 lesson must not inject');
+    });
+
+    // Same untested-clause argument as the live filter: the 60-day
+    // `created_at_epoch > cutoff` lookback had no probe either.
+    it('excludes an observation older than the 60-day lookback', async () => {
+      seedObs('old.mjs', 'recent lesson inside the window', { epochOffset: -60_000 });
+      seedObs('old.mjs', 'stale lesson outside the window', { epochOffset: -90 * 86400000 });
+      const { stdout } = await editFile('old.mjs', 'sess-live-old');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain('recent lesson inside the window');
+      expect(ctx).not.toContain('stale lesson outside the window');
     });
   });
 });

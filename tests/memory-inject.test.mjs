@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { searchRelevantMemories, formatMemoryLine } from '../hook-memory.mjs';
-import { createTestDb, insertSession, insertObs, matchFileEdges } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, fileEdgeMatchOnly } from './test-helpers.mjs';
 import { cjkBigrams } from '../utils.mjs';
 
 // ─── P1: formatMemoryLine — stale-obs verify-before-use hint ───────────────
@@ -454,7 +454,7 @@ describe('file-aware recall', () => {
       importance: 2, filesModified: '["hook.mjs"]',
       epochOffset: -5 * 86400000
     });
-    const results = matchFileEdges(db, 'hook.mjs', 'test');
+    const results = fileEdgeMatchOnly(db, 'hook.mjs', 'test');
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].title).toMatch(/hook\.mjs/);
   });
@@ -470,18 +470,23 @@ describe('file-aware recall', () => {
       importance: 2, filesModified: '["some-other-file.mjs"]',
       epochOffset: -2 * 86400000
     });
-    const results = matchFileEdges(db, 'brand-new-file.mjs', 'test');
+    const results = fileEdgeMatchOnly(db, 'brand-new-file.mjs', 'test');
     expect(results.length).toBe(0);
   });
 
-  it('only returns importance>=2 observations', () => {
+  // Binds fileEdgeMatchOnly's OWN minImportance gate and nothing else — the
+  // helper re-derives that gate rather than sharing it, so relaxing the shipped
+  // `o.importance >= 2` in scripts/pre-tool-recall.js leaves this green
+  // (mutation-verified, v3.77.0 pre-tag review). The shipped gate is guarded in
+  // tests/pre-tool-recall.test.mjs's D#162 block. The title now says which.
+  it("applies the helper's own minImportance gate (NOT the shipped query's)", () => {
     insertObs(db, {
       type: 'change', title: 'Minor edit to hook.mjs',
       text: 'hook.mjs minor change',
       importance: 1, filesModified: '["hook.mjs"]',
       epochOffset: -2 * 86400000
     });
-    const results = matchFileEdges(db, 'hook.mjs', 'test');
+    const results = fileEdgeMatchOnly(db, 'hook.mjs', 'test');
     for (const r of results) {
       expect(r.importance).toBeGreaterThanOrEqual(2);
     }
@@ -502,7 +507,7 @@ describe('file-aware recall', () => {
       epochOffset: -2 * 86400000
     });
     // Should only match the exact filename, not the wildcard-expanded one
-    const results = matchFileEdges(db, 'test_100%.mjs', 'test');
+    const results = fileEdgeMatchOnly(db, 'test_100%.mjs', 'test');
     expect(results.length).toBe(1);
     expect(results[0].title).toContain('test_100%.mjs');
   });

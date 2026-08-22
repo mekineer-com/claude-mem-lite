@@ -2,6 +2,127 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.77.0 — the face nobody could see, and the guard nobody could break
+
+**Upgrade note.** One new metering face (`subagent`) writes rows to
+`citation_surface_log` and adds a line to `claude-mem-lite citation-stats`. It does
+**not** feed the citation-decay denominator, so no lesson's importance moves because of
+it. Everything else here is tests and naming.
+
+### D#162 — the live-row filter on the highest-cite-rate face had no guard
+
+`scripts/pre-tool-recall.js` injects into the PreToolUse recall face, the
+**highest-volume** injection face in the repo and the best-performing one at real volume
+(35.0%, 414 injections over the last 7 days; `task_imperative` reads 42.9% and `ups` 28.1%,
+on 7 and 32 injections respectively). Its query excludes retracted (`superseded_at`) and
+compacted (`compressed_into`) observations via `liveObsFilterSql`. Deleting that clause left
+the entire suite green — 4881 tests, zero failures.
+
+The suite *looked* covered: two cases in `tests/pre-tool-recall.test.mjs` assert exactly
+that exclusion, against a **hand-copy** of the SELECT written in the test file. The copy
+cannot drift-detect the original. The deleted `recallForFile` twin (v3.76.2) carried the
+filter too, but no test ever seeded a superseded row through it either.
+
+Four cases now drive the real script as a subprocess. Each seeds a live row and an
+excluded row **on the same file**, with the excluded row NEWER so it sorts first and would
+render inside the Edit path's 2-row limit — so the case cannot pass by the query returning
+nothing (the failure mode recorded in `feedback_necessary_not_sufficient_assertions`).
+Verified by mutation: removing `liveObsFilterSql` kills three, disabling the 60-day
+`created_at_epoch` lookback kills the fourth, and neither kills the other's cases.
+
+### D#152 — the `subagent` injection face is now metered
+
+`scripts/pre-agent-inject.js` appends a memory block to a dispatched subagent's task
+prompt via PreToolUse `updatedInput`. Claude Code writes that turn to
+`<session>/subagents/agent-<name>-<hash>.jsonl` — **not** the parent transcript — so every
+attachment-based extractor read zero and the face had no row in `citation_surface_log` at
+all. Its contribution to every denominator was zero by construction, not by measurement.
+
+Two search shapes silently find nothing here, which is why this sat blocked: the files are
+not at the transcript directory's top level, and grepping the parent transcript for
+`isSidechain` returns 0 records — the flag lives inside the subagent files.
+
+The extractor (`extractInjectedFromSubagentPrompt`) had existed since v3.47 with zero
+production callers. What was missing was the file discovery, now `findSubagentTranscripts`
+(derived from the parent path, no directory scan) and `collectSubagentSurface`.
+
+Two things are load-bearing in the wiring:
+
+- **It is a separate `recordCitationSurfaces` call.** That function scores every face in
+  one call against one `cited` set, and a lesson handed to a subagent is cited in the
+  *subagent's* text. Scoring it against `citedMain` reports 0% by construction; unioning
+  its cites into `citedMain` credits the main-thread faces for citations the main thread
+  never made.
+- **It runs last.** `lib/transcript-scan.mjs` memoizes one file, so reading sidechain
+  files evicts the parent transcript. Placed earlier, the block costs **one** extra parse of
+  the parent — the memo re-caches on the first re-read, so it is one, not one per later
+  scanner — and breaks the one-parse-per-Stop property the surrounding code documents.
+  Verified by instrumenting the parse: 1 parent parse at the shipped position, 2 when
+  relocated earlier. ~25ms on the largest real transcript here (5.4MB).
+
+`subagent` joins `keyctx` in the new `NON_ATTACHMENT_SURFACES` list: faces that leave no
+attachment, so the derived `DECAY_DENOMINATOR_SURFACES` can never include them and their
+absence would otherwise be silent. Metered first — D#152's own instruction. A retro-read
+over this project's real transcripts (28 sessions, 21 with subagents, 74 sidechain files)
+finds 28 injections and 7 of them cited.
+
+**Read the unit before reading that rate.** Both sets are unioned across all of a session's
+sidechain files, so it measures "fraction of injected ids that appear anywhere in any
+sidechain of the session", not per-dispatch adoption: an id handed to agent A and cited by
+agent B counts as a hit. One of the 7 above is exactly that shape. The number is therefore
+biased **high** against per-dispatch adoption, which is the caveat that matters when D#164
+decides whether this face joins the decay denominator. Per-dispatch attribution would need
+per-file accounting, deliberately not built yet.
+
+The `citation-stats` face table now annotates every non-decay face rather than only
+`keyctx`; an annotated `keyctx` beside a bare `task_imperative` read as "that one does feed
+decay", which is false.
+
+### D#163 — a helper named for more than it covers
+
+`matchFileEdges` (`tests/test-helpers.mjs`) is now `fileEdgeMatchOnly`. Its docstring
+claimed it ran "the SHIPPED predicate — the one `scripts/pre-tool-recall.js` injects on";
+it runs the shipped **match arm** plus a hand-copied importance gate, and nothing else from
+that query. Four suites read as though the missing clauses were guarded there. They were
+not guarded anywhere until D#162 above — which is how the two items are the same finding at
+two altitudes.
+
+### one of this round's own tests was non-binding, and the mutation pass caught it
+
+The text-floor case for the new face asserted "no row recorded" while referencing a
+hard-coded `#1` that was never seeded. `recordCitationSurfaces` drops ids that resolve to
+no live row, so the case passed on an empty DB regardless of the gate — replacing the gate
+with `if (true)` left it green. It seeds a real observation now, and the mutation kills it.
+
+### what the pre-tag review changed
+
+Two independent lenses ran before the tag; **both delivered**, and both found real things.
+Neither found a BLOCKER, and all three load-bearing wiring claims above were independently
+mutation-verified — including the one that turned out to be structurally enforced rather
+than merely intended: at the shipped position `citedMain` is out of scope, so the block
+*cannot* score against it.
+
+Four numbers in the first draft of this entry were wrong and are corrected above: the
+pretool cite-rate (40.0% was carried over from an older memory entry, not measured — it is
+35.0%), "best cite-rate in the repo" (false as written; `task_imperative` reads higher at
+n=7), the re-parse cost (42ms was a *cold* single read; warm is ~25ms, which is what
+`lib/transcript-scan.mjs`'s own header already said — the draft contradicted a comment five
+files away), and the re-parse *mechanism* (one extra parse, not one per later scanner).
+
+Four guards that were missing or non-binding are now closed, three of them the round's own
+thesis one clause further out:
+
+- `scripts/pre-tool-recall.js`'s `AND o.importance >= 2` — the line **directly above** the
+  one D#162 was opened to guard — could be relaxed to `>= 0` with 237 related tests green.
+  The only case that looked like it covered this binds `fileEdgeMatchOnly`'s hand-copied
+  gate, not the shipped query; it is retitled to say so, and a real case now guards the
+  shipped clause.
+- the new CLI note and label had no assertion at all, while their *sibling* (`keyctx`) did.
+- `CLAUDE_MEM_NO_CITATION_TRACK` correctly gates the new face, but nothing bound it. The
+  other two gates on that block each had a case; this one now does too.
+- the `.jsonl` guard in `findSubagentTranscripts` was covered by a negative assertion with
+  no decoy — it passed because `readdirSync` threw and returned the same `[]`.
+
 ## v3.76.2 — the correct implementation was in the copy that does not ship
 
 **Upgrade note.** Bugfixes and tests only. One shipped-path defect (Windows-shaped file

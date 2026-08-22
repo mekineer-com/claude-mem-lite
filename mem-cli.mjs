@@ -64,7 +64,7 @@ import { resolveAnchorToken, formatAnchorError, resolveQueryAnchor, fetchRecentT
 import { buildSearchFtsQuery, parseDateBounds, parseDuration, coreRunSearchPipeline } from './lib/search-core.mjs';
 import { AUTO_MERGE_THRESHOLD } from './lib/dedup-constants.mjs';
 import { countRecentHookErrors } from './lib/hook-telemetry.mjs';
-import { computeCitationFunnelTrend, computeSurfaceFunnel } from './lib/citation-tracker.mjs';
+import { computeCitationFunnelTrend, computeSurfaceFunnel, DECAY_DENOMINATOR_SURFACES } from './lib/citation-tracker.mjs';
 
 // Human labels for citation_surface_log.surface. Padded to a common width so
 // the citation-stats face table lines up; the enum itself lives in
@@ -74,8 +74,9 @@ const SURFACE_LABELS = {
   ups:            'UserPromptSubmit   ',
   error_recall:   'error-recall       ',
   fyi:            'FYI (prompt-search)',
-  task_imperative: 'task-imperative   ',
+  task_imperative: 'task-imperative    ',
   keyctx:         'Key Context        ',
+  subagent:       'subagent (dispatch)',
 };
 import { aggregateMetrics, readMetrics } from './lib/metrics.mjs';
 import {
@@ -2649,7 +2650,15 @@ function cmdCitationStats(db, args) {
   } else {
     for (const s of surfaceFunnel.surfaces) {
       const pct = (s.rate * 100).toFixed(1) + '%';
-      const note = s.surface === 'keyctx' ? '  (promotion-only: never demotes)' : '';
+      // Which faces actually move importance is NOT readable from the rates —
+      // and an annotated keyctx beside a bare task_imperative reads as "that
+      // one does feed decay", which is false. Derived from the exported sets so
+      // the note cannot drift from the behaviour it describes.
+      const note = s.surface === 'keyctx'
+        ? '  (promotion-only: never demotes)'
+        : (DECAY_DENOMINATOR_SURFACES.includes(s.surface)
+          ? ''
+          : '  (metered only: outside the decay denominator)');
       out(`  ${SURFACE_LABELS[s.surface] || s.surface}  inj ${String(s.injected).padStart(4)}  cited ${String(s.cited).padStart(4)}  ${pct.padStart(6)}  over ${s.sessions} session(s)${note}`);
     }
   }

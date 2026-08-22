@@ -407,8 +407,10 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
 //   - it was the ONLY code splitting basenames on either separator, so the six
 //     Windows-path tests aimed at it went green while the shipped predicate
 //     carried the gap (fixed in lib/file-edge-match.mjs, same round).
-// Those suites now run through `matchFileEdges` (tests/test-helpers.mjs), which
-// calls the shipped predicate. Do not reintroduce an in-process twin here.
+// Those suites now run through `fileEdgeMatchOnly` (tests/test-helpers.mjs),
+// which calls the shipped MATCH clause — and only that clause; the rest of the
+// injection query is guarded by the subprocess cases in
+// tests/pre-tool-recall.test.mjs. Do not reintroduce an in-process twin here.
 
 /**
  * Phase-2 task-imperative ranking (spec 2026-06-29 §4.1): score every candidate lesson

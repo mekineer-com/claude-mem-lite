@@ -62,6 +62,7 @@ import {
   applyCitationDecay,
   recordCitationFunnel,
   recordCitationSurfaces,
+  collectSubagentSurface,
   hasMainThreadAssistantText,
 } from './lib/citation-tracker.mjs';
 import { resolveEdgeAttribution, readPreRecallFileEdges } from './lib/edge-attribution.mjs';
@@ -860,6 +861,41 @@ async function handleStop() {
             const payload = { ...stats, ...bugfixStats, lowStreak, decisionSignal, project, savedAt: Date.now() };
             writeFileSync(dest, JSON.stringify(payload), { mode: 0o600 });
           } catch (e) { debugCatch(e, 'handleStop-cite-recall-persist'); }
+
+          // D#152: the `subagent` face. Recorded in its OWN
+          // recordCitationSurfaces call because it carries a different `cited`
+          // set — a lesson handed to a dispatched subagent is cited in that
+          // subagent's own transcript. Folding it into the main call would score
+          // subagent injections against citedMain and report 0% by
+          // construction; folding its cites INTO citedMain would credit the
+          // main-thread faces for citations the main thread never made. The
+          // upsert key is (project, session, surface), so two calls with
+          // disjoint face sets do not collide. Metering only — `subagent` is in
+          // NON_ATTACHMENT_SURFACES and never reaches applyCitationDecay.
+          //
+          // Placed LAST on purpose: lib/transcript-scan.mjs memoizes ONE file,
+          // so reading the sidechain files evicts the parent transcript. Run
+          // earlier, this block costs ONE extra parse of the parent — the memo
+          // re-caches on the first re-read, so it is one, not one per later
+          // scanner — and breaks the "one parse per Stop" property the block
+          // above documents. Measured by instrumenting the parse: 1 parent parse
+          // at this position, 2 when relocated earlier. ~25ms on the largest
+          // real transcript here (5.4MB), matching lib/transcript-scan.mjs's
+          // own header figure.
+          // The text floor is re-checked rather than inherited — same reason as
+          // every other face: a tool-only Stop must not bank a verdict, and it
+          // must not enter the funnel's session denominator either.
+          try {
+            if (hasMainThreadAssistantText(transcriptPath)) {
+              const sub = collectSubagentSurface(transcriptPath);
+              if (sub.injected.size > 0) {
+                recordCitationSurfaces(db, project, ccSessionId || sessionId,
+                  { subagent: sub.injected }, sub.cited);
+                debugLog('DEBUG', 'handleStop',
+                  `subagent-face: files=${sub.files} injected=${sub.injected.size} cited=${sub.cited.size}`);
+              }
+            }
+          } catch (e) { debugCatch(e, 'handleStop-subagent-face'); }
         }
       } catch (e) { debugCatch(e, 'handleStop-citation-track'); }
     } finally {

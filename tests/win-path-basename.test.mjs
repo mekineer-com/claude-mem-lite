@@ -15,7 +15,7 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { createTestDb, insertSession, insertObs, matchFileEdges } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, fileEdgeMatchOnly } from './test-helpers.mjs';
 import { fileMatchParams } from '../lib/file-edge-match.mjs';
 
 // ─── Separator semantics, asserted on the SHIPPED derivation ────────────────
@@ -95,7 +95,7 @@ describe('the shipped file-match predicate handles Windows-style paths', () => {
 
   // Shared helper -> the shipped predicate (lib/file-edge-match.mjs), the same
   // one scripts/pre-tool-recall.js injects on.
-  const match = (filePath) => matchFileEdges(db, filePath, 'test');
+  const match = (filePath) => fileEdgeMatchOnly(db, filePath, 'test');
 
   it('matches history stored under a bare basename when given a backslash path', () => {
     insertObs(db, {

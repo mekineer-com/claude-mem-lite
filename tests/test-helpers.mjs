@@ -85,26 +85,38 @@ export function insertObs(db, { sessionId = 'sess-1', project = 'test', type = '
 }
 
 /**
- * Run the SHIPPED (obs,file) trigger-edge predicate — the one
- * scripts/pre-tool-recall.js injects on and lib/edge-attribution.mjs resolves
- * with, via their shared lib/file-edge-match.mjs.
+ * Run the shipped (obs,file) EDGE-MATCH ARM ONLY — `fileMatchClause` /
+ * `fileMatchParams` from lib/file-edge-match.mjs, the pair that
+ * scripts/pre-tool-recall.js and lib/edge-attribution.mjs both build on —
+ * plus a hand-copied `importance >= 2` gate.
  *
- * Exists because several suites used to assert this behaviour through
+ * It is NOT the shipped injection query, and no caller should read it as one.
+ * Everything else in scripts/pre-tool-recall.js is absent here: the
+ * `liveObsFilterSql` superseded/compressed filter, the 60-day
+ * `created_at_epoch` lookback, the `miss_streak` edge decay, the `scope`
+ * filter, the lesson/type fallback, the lesson-first ORDER BY, the Read-1 /
+ * Edit-2 LIMIT, the events leg, and the session cooldown. Those clauses are
+ * guarded — by the subprocess cases in tests/pre-tool-recall.test.mjs, which
+ * drive the real script — not by anything in this helper. The `importance`
+ * column it selects is likewise helper-only: the shipped injection query never
+ * returns it (D#163).
+ *
+ * Exists because several suites used to assert edge matching through
  * `recallForFile` (hook-memory.mjs), an in-process twin that had NO production
  * caller and was deleted 2026-08-22. The twin split basenames on either
  * separator while the shipped pair used host-native `basename`, so a real
  * Windows-payload gap sat unobserved behind six green tests. One helper here
- * keeps every caller on the shipped predicate instead of re-deriving the SELECT
- * per suite — the twin-drift class this repo has re-opened repeatedly.
+ * keeps every caller on the shipped MATCH clause instead of re-deriving it per
+ * suite — the twin-drift class this repo has re-opened repeatedly.
  *
  * @param {import('better-sqlite3').Database} db
  * @param {string} filePath  edited file, either separator, any OS
  * @param {string} project
- * @param {{minImportance?: number}} [opts] `minImportance` mirrors
- *   pre-tool-recall.js's `o.importance >= 2` gate; pass 0 to disable.
+ * @param {{minImportance?: number}} [opts] `minImportance` re-derives (does not
+ *   share) pre-tool-recall.js's `o.importance >= 2` gate; pass 0 to disable.
  * @returns {Array<{id:number,type:string,title:string,importance:number,lesson_learned:string|null}>}
  */
-export function matchFileEdges(db, filePath, project, { minImportance = 2 } = {}) {
+export function fileEdgeMatchOnly(db, filePath, project, { minImportance = 2 } = {}) {
   return db.prepare(`
     SELECT DISTINCT o.id, o.type, o.title, o.importance, o.lesson_learned
     FROM observations o

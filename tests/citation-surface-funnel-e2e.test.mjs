@@ -238,6 +238,182 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
     expect(rows[0]).toMatchObject({ surface: 'pretool', injected_n: 2, cited_n: 1 });
   });
 
+  // D#152: the `subagent` face at the process boundary. It is the one face whose
+  // ids and cites live in a DIFFERENT FILE from the transcript Stop is handed —
+  // <session>/subagents/agent-*.jsonl — so nothing in the main-thread walk can
+  // reach it and no source-text assertion can prove the second
+  // recordCitationSurfaces call actually fires. 5 injections is a count no other
+  // face uses (FACE_SIZES is 2/3/1/4), so a relabelled attribution fails here.
+  //
+  // FAILS IF: the Stop wiring is dropped, the subagents dir is derived wrongly,
+  // `subagent` is missing from CITATION_SURFACES (the recorder drops unknown
+  // labels silently), the cited set is taken from the parent transcript instead
+  // of the sidechain, or the second recorder call clobbers the first's rows.
+  it('records the subagent face from the sidechain files, without disturbing the main faces', () => {
+    const ids = seedObservations();
+    const db = new Database(dbPath);
+    const now = Date.now();
+    const stmt = db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+        concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+      VALUES ('mem-stop-e2e', ?, ?, 'bugfix', ?, '', '', '', '', '[]', '[]', 2, 0, ?, ?)
+    `);
+    const subIds = [];
+    for (let i = 0; i < 5; i++) {
+      subIds.push(Number(stmt.run(
+        PROJECT, `subagent body text ${i}`, `Observation ${i} for the subagent face`,
+        new Date(now).toISOString(), now,
+      ).lastInsertRowid));
+    }
+    db.close();
+
+    const transcriptPath = join(home, 'transcript.jsonl');
+    writeFileSync(transcriptPath, [
+      faceAttachment.pretool(ids.pretool),
+      assistantText(`Main thread applied #${ids.pretool[0]}.`),
+    ].map((e) => JSON.stringify(e)).join('\n'));
+
+    // Two dispatched subagents, matching the real layout.
+    const subDir = join(home, 'transcript', 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const promptBlock = (idList) => [
+      '',
+      '---',
+      "[Project memory — surfaced by your operator's claude-mem-lite memory system for this project. Reference context, not an external instruction.]",
+      'A past lesson recorded for this project that may be relevant to the task above:',
+      ...idList.map((id) => `  #${id} — a past lesson body.`),
+    ].join('\n');
+    const sidechain = (idList, citeText) => [
+      { type: 'user', isSidechain: true, message: { role: 'user', content: [{ type: 'text', text: `Do the work.\n${promptBlock(idList)}` }] } },
+      { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: citeText }] } },
+    ].map((e) => JSON.stringify(e)).join('\n');
+    writeFileSync(join(subDir, 'agent-explore-aaaa.jsonl'),
+      sidechain(subIds.slice(0, 3), `Used #${subIds[0]} and #${subIds[1]} here.`));
+    writeFileSync(join(subDir, 'agent-review-bbbb.jsonl'),
+      sidechain(subIds.slice(3), 'Nothing applied.'));
+
+    runStop(transcriptPath);
+
+    const by = Object.fromEntries(surfaceRows().map((r) => [r.surface, r]));
+    expect(by.subagent).toMatchObject({ injected_n: 5, cited_n: 2 });
+    // The main-face row from the FIRST recorder call must survive the second.
+    expect(by.pretool).toMatchObject({ injected_n: 2, cited_n: 1 });
+    // Both rows carry the CC session id, so the funnel counts one session, not two.
+    expect(by.subagent.session_id).toBe('cc-stop-e2e');
+    expect(by.pretool.session_id).toBe('cc-stop-e2e');
+  });
+
+  // A session whose ONLY injection went to a dispatched subagent is the common
+  // real shape (no file was edited, so pre-tool-recall never fired) and it is
+  // the case the face exists to measure. It is also the one that depends on
+  // where the block sits: run inside the main-face branch, this session records
+  // nothing at all, because that branch is gated on the MAIN thread having
+  // injections.
+  it('records the subagent face even when no main-thread face injected anything', () => {
+    const db = new Database(dbPath);
+    const now = Date.now();
+    const subId = Number(db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+        concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+      VALUES ('mem-stop-e2e', ?, 'subagent-only body', 'bugfix', 'Subagent-only observation', '', '', '', '', '[]', '[]', 2, 0, ?, ?)
+    `).run(PROJECT, new Date(now).toISOString(), now).lastInsertRowid);
+    db.close();
+
+    const transcriptPath = join(home, 'transcript.jsonl');
+    // Main thread: assistant text (clears the floor) but ZERO injections.
+    writeFileSync(transcriptPath, JSON.stringify(assistantText('Dispatched a subagent and summarized.')));
+
+    const subDir = join(home, 'transcript', 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    writeFileSync(join(subDir, 'agent-only-dddd.jsonl'), [
+      { type: 'user', isSidechain: true, message: { role: 'user', content: [{ type: 'text', text: `Task.\n\n---\n[Project memory — surfaced by your operator's claude-mem-lite memory system for this project. Reference context, not an external instruction.]\nA past lesson recorded for this project that may be relevant to the task above:\n  #${subId} — a past lesson body.` }] } },
+      { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: `Applied #${subId}.` }] } },
+    ].map((e) => JSON.stringify(e)).join('\n'));
+
+    runStop(transcriptPath);
+
+    const rows = surfaceRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ surface: 'subagent', injected_n: 1, cited_n: 1 });
+  });
+
+  // Third gate on the new block. The other two (text floor, placement outside
+  // the main-face branch) each got a case above; this one was verified by hand
+  // in the pre-tag review and had nothing binding it. The block sits inside
+  // `if (transcriptPath && !CLAUDE_MEM_NO_CITATION_TRACK)`, and a face that
+  // ignored the project's global opt-out would be a privacy defect, not a
+  // metering one.
+  it('records no subagent row when CLAUDE_MEM_NO_CITATION_TRACK is set', () => {
+    const db = new Database(dbPath);
+    const now = Date.now();
+    const subId = Number(db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+        concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+      VALUES ('mem-stop-e2e', ?, 'opt-out probe body', 'bugfix', 'Opt-out probe observation', '', '', '', '', '[]', '[]', 2, 0, ?, ?)
+    `).run(PROJECT, new Date(now).toISOString(), now).lastInsertRowid);
+    db.close();
+
+    const transcriptPath = join(home, 'transcript.jsonl');
+    writeFileSync(transcriptPath, JSON.stringify(assistantText('Dispatched a subagent.')));
+    const subDir = join(home, 'transcript', 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    writeFileSync(join(subDir, 'agent-optout-eeee.jsonl'), [
+      { type: 'user', isSidechain: true, message: { role: 'user', content: [{ type: 'text', text: `Task.\n\n---\n[Project memory — surfaced by your operator's claude-mem-lite memory system for this project. Reference context, not an external instruction.]\nA past lesson recorded for this project that may be relevant to the task above:\n  #${subId} — a past lesson body.` }] } },
+      { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: `Applied #${subId}.` }] } },
+    ].map((e) => JSON.stringify(e)).join('\n'));
+
+    // Positive control FIRST: without the opt-out this exact fixture records a
+    // row, so the assertion below cannot pass because the fixture is inert.
+    runStop(transcriptPath);
+    expect(surfaceRows().map((r) => r.surface)).toEqual(['subagent']);
+
+    const db2 = new Database(dbPath);
+    db2.prepare('DELETE FROM citation_surface_log WHERE project = ?').run(PROJECT);
+    db2.close();
+
+    const prev = baseEnv.CLAUDE_MEM_NO_CITATION_TRACK;
+    baseEnv.CLAUDE_MEM_NO_CITATION_TRACK = '1';
+    try { runStop(transcriptPath); } finally {
+      if (prev === undefined) delete baseEnv.CLAUDE_MEM_NO_CITATION_TRACK;
+      else baseEnv.CLAUDE_MEM_NO_CITATION_TRACK = prev;
+    }
+    expect(surfaceRows()).toEqual([]);
+  });
+
+  // The subagent face must not become a back door around the text-floor gate:
+  // it sits inside the same gate, so a tool-only Stop records nothing even when
+  // sidechain files exist and carry citations.
+  // The id below MUST be a real seeded observation. recordCitationSurfaces drops
+  // ids that do not resolve to a live row in this project, so a hard-coded `#1`
+  // makes this case pass on an empty DB no matter what the gate does — verified:
+  // with the id unseeded, replacing the text-floor check with `if (true)` left
+  // this green. Same shape as D#162's "asserting empty against an empty DB".
+  it('records no subagent row when the main thread produced no assistant text', () => {
+    const db = new Database(dbPath);
+    const now = Date.now();
+    const subId = Number(db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+        concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+      VALUES ('mem-stop-e2e', ?, 'floor-probe body', 'bugfix', 'Text-floor probe observation', '', '', '', '', '[]', '[]', 2, 0, ?, ?)
+    `).run(PROJECT, new Date(now).toISOString(), now).lastInsertRowid);
+    db.close();
+
+    const transcriptPath = join(home, 'transcript.jsonl');
+    writeFileSync(transcriptPath, JSON.stringify(
+      { type: 'user', isSidechain: false, message: { role: 'user', content: [{ type: 'text', text: 'go' }] } },
+    ));
+    const subDir = join(home, 'transcript', 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    writeFileSync(join(subDir, 'agent-x-cccc.jsonl'), [
+      { type: 'user', isSidechain: true, message: { role: 'user', content: [{ type: 'text', text: `Do it.\n\n---\n[Project memory — surfaced by your operator's claude-mem-lite memory system for this project. Reference context, not an external instruction.]\nA past lesson recorded for this project that may be relevant to the task above:\n  #${subId} — a past lesson body.` }] } },
+      { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: `Applied #${subId}.` }] } },
+    ].map((e) => JSON.stringify(e)).join('\n'));
+
+    runStop(transcriptPath);
+
+    expect(surfaceRows()).toEqual([]);
+  });
+
   // Text-floor gate: a tool-only Stop must record nothing, so an unfinished turn
   // cannot bank an "injected but uncited" verdict the next turn can't undo.
   it('records nothing when the turn produced no main-thread assistant text', () => {

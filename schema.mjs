@@ -280,7 +280,7 @@ const CORE_SCHEMA = `
   -- v45: per-INJECTION-FACE twin of citation_log. One row per
   -- (project, session, surface); the surface column is one of the
   -- CITATION_SURFACES enum in lib/citation-tracker.mjs
-  -- (pretool | ups | error_recall | fyi | task_imperative | keyctx). The column is plain
+  -- (pretool | ups | error_recall | fyi | task_imperative | keyctx | subagent). The column is plain
   -- TEXT with no CHECK: the JS enum is the gate (recordCitationSurfaces drops unknown
   -- labels), which is why adding a face needs no migration.
   --

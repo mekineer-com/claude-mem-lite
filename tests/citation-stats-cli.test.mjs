@@ -259,6 +259,23 @@ describe('citation-stats CLI', () => {
     expect(output).toMatch(/Key Context.*promotion-only/s);
   });
 
+  // The sibling of the case above, and the reason the note is derived from
+  // DECAY_DENOMINATOR_SURFACES rather than special-cased: an annotated keyctx
+  // beside a BARE task_imperative reads as "that one does feed decay", which is
+  // false. Until v3.77.0 that argument lived only in a code comment — collapsing
+  // the note to '' left every CLI suite green. Both non-decay faces are pinned
+  // here, and a decay face is pinned as NOT carrying the note, so the assertion
+  // fails if the derivation inverts as well as if it disappears.
+  it('labels every non-decay face as metered-only, and no decay face', async () => {
+    seedSurface('subagent', 5, 2);
+    seedSurface('task_imperative', 12, 3);
+    seedSurface('pretool', 20, 8);
+    const output = await captureStdout(() => run(['citation-stats']));
+    expect(output).toMatch(/subagent \(dispatch\).*metered only: outside the decay denominator/);
+    expect(output).toMatch(/task-imperative.*metered only: outside the decay denominator/);
+    expect(output).not.toMatch(/PreToolUse recall.*metered only/);
+  });
+
   it('--json includes the surface_funnel breakdown', async () => {
     seedSurface('ups', 8, 3);
     const output = await captureStdoutOnly(() => run(['citation-stats', '--json']));
