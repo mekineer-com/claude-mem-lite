@@ -2,6 +2,132 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.75.0 — the audit batch: five hand-copied twins collapsed, four hot paths bounded, and a README that no longer disagrees with itself
+
+**Upgrade note.** Three defaults move, all of them toward what the other face already did.
+`mem_registry import` now grants `quality_tier='installed'` like its CLI twin always has,
+so a resource imported over MCP ranks and gates the same way as one imported from the
+shell — if you relied on MCP imports staying at `community`, re-import is the revert.
+`CLAUDE_MEM_RECOMMEND_MODE=live` no longer pretends: Phase 2 was never built, so the value
+now resolves to `shadow`, warns once per process on stderr, and `doctor` reports it as an
+inert flag rather than letting the log claim `mode='live'`. And `get` on the CLI now prints
+`prompt_number` and `created_at` for prompt rows, which the MCP face has printed all along;
+existing labels (`Text:`, `Files:`) are unchanged, so the visible delta is additive.
+Nothing here needs a migration; pin v3.74.1 to keep the old behaviour.
+
+### what the npm page was telling users
+
+The headline retrieval metrics disagreed with themselves in **four** places (the audit
+named three; `README.zh-CN.md` still carried the entire retired lexical row). Rather than
+copy `baseline.json`, they were re-measured — three runs of `benchmark.mjs
+--production-hybrid` agree in every digit: R@10 **0.8998** / P@10 **0.8497** / nDCG
+**0.9712** / MRR **0.9611** / p95 **~1.79ms**. All four sites now read those numbers and
+name the command that reproduces them. Published precision is the measured 0.8497, not
+`baseline.json`'s 0.8597: ci-gate passes within its 5% tolerance, and re-capturing the
+baseline would lower the CI floor rather than fix a document.
+
+The env-flag surface had rotted to **9 documented out of 70** the shipped code reads — the
+whole `SKIP_*` family, the `UPS_*` tuning set and the citation loop were undiscoverable.
+README now covers 70/70, grouped by what each flag controls, with experimental arms and
+test-only names called out. `tests/readme-env-flags.test.mjs` keeps it from rotting again:
+it reads `package.json#files`, so a flag only `benchmark/` touches is not treated as a user
+knob, and it fails in both directions — undocumented flag, and documented name no shipped
+file references.
+
+### five twins, collapsed onto one body each
+
+Each of these was two hand-copies of one rule, and in three cases the copies had already
+drifted. The pattern this project pays for most is a guard wired into one face and missing
+on the other, so the fix is one home per rule, not one more patched instance.
+
+- **registry import/remove/reindex** — the last CLI/MCP pair where both sides wrote their
+  own SQL. Drift was real and reproduced before it was fixed: a parity pin driving a
+  spawned `cli.mjs` and a real `server.mjs` over stdio failed on exactly one column,
+  `quality_tier: cli="installed" mcp="community"`. Now `lib/registry-core.mjs`. The pin
+  compares every non-identity column, so a column added later is compared by default.
+- **auto-dedup `superseded_by` stamping** — the exact channel grew `AND superseded_at IS
+  NULL` in v3.63; the fuzzy channel never got it. This is the **seventh** time this one
+  invariant has drifted between hand-copies, so both channels now stamp through
+  `stampDedupSuperseded` in `lib/maintain-core.mjs`, and a fifth case asserts `hook.mjs`
+  still routes through the helper — re-inlining an UPDATE fails.
+- **type-quality weights** — a SQL `CASE` plus two JS objects, kept equal by comments. The
+  values did agree; the next re-weighting is what three copies are waiting for, and two of
+  them sit on injection paths where a wrong weight is silent. `TYPE_QUALITY_CASE` is now
+  generated from the one table, and the test evaluates generated and pre-generator SQL side
+  by side in SQLite across all six types plus unknown/empty/NULL. Ranking is metric-coupled,
+  so the benchmark was re-run: identical in every digit to the run before the change.
+- **`get`'s prompt and event sources** — the third and fourth sources to join `get-core`.
+  The prompt source had drifted the way the session source did before it.
+- **`hook.mjs`'s two triplicated blocks** — the 13-column fast-summary INSERT (three
+  retypings) and the episode-flush fallback, which carried three comments claiming parity
+  with `flushEpisodeGroup` while diverging from it twice: it ignored
+  `CLAUDE_MEM_SKIP_EPISODE_LLM`, and a failed flush-file write threw out of the loop into a
+  `finally` that deleted the claim file, abandoning the subs not yet written. Fast-summary
+  truncation limits are deliberately **not** unified — the Stop path stores roughly twice
+  what the SessionStart paths do, every one of those strings is re-injected later, and
+  changing how much text the product injects is a decision, not a refactor's to make. A
+  test pins the difference so unifying stays something someone chooses.
+
+### four hot paths, measured before and after
+
+- **Stop transcript parsing.** `handleStop` asked the same `.jsonl` eight different
+  questions, each doing its own read + split + per-line parse. On a real 5.7MB transcript:
+  **165.8ms → 30.0ms**, peak RSS **118MB → 80MB**. `lib/transcript-scan.mjs` memoizes one
+  parse behind a path+size+mtime key — a memo, not a rewrite; every scanner keeps its
+  per-entry logic byte for byte. mtime is in the key because an in-place rewrite landing on
+  the same byte count would otherwise be served stale (dropping it stayed green until a test
+  covered that case). Above a 24MB cap nothing is retained — parsed entries cost ~3.45× the
+  file in heap — so a very large transcript behaves exactly as before rather than risking an
+  OOM-killed hook.
+- **UserPromptSubmit query building.** The only upstream guard capped what is *read*, not
+  what is *computed*: 0.8ms for a normal prompt, 6.2ms for a 64KB ASCII one, **31.8ms for a
+  64KB CJK one** (`extractCjkKeywords` is O(len × dict) over an unsegmented run) — all of it
+  before the model sees the turn. With caps (2000 chars, 64 terms) on that surface only:
+  **0.2ms / 1.4ms**. An explicit `claude-mem-lite search` stays uncapped and searches exactly
+  what was typed. `denoise-ab` VERDICT NEUTRAL, every delta 0.000, all probes green — and
+  that neutrality is structural (no fixture comes near 2000 characters), so the load-bearing
+  evidence is that a normal query is byte-identical capped and uncapped.
+- **Agent dispatch.** `CLAUDE_MEM_SUBAGENT_INJECT` is default-off yet started a Node
+  interpreter on every dispatch. Both registries now point at `scripts/pre-agent-inject.sh`,
+  which execs the launcher only when the flag is on: **22.6ms → 2.4ms**.
+- **SessionStart.** Two full-table conditional UPDATEs marking auto-compressible rows ran on
+  every boot, outside the 24h gate that already guarded decay, purge and backup a few lines
+  away. Nothing about starting a session makes a 30-day-old row newly compressible; the
+  marking moved onto the maintain worker, project scope forwarded through argv so it does not
+  quietly widen to the whole DB.
+
+### coverage, containment, and a sandbox that runs on its own
+
+- **Coverage scope.** The gate measured 22 hand-picked root modules; `lib/`'s ~70 shipped
+  modules — every shared core extracted since v3.4x — were outside `include` entirely. Now
+  **92 files: statements 82.94% / branches 77.17% / functions 87.27% / lines 86.55%**. The
+  re-scoping *raised* the number, so the audit's premise that including `lib/**` would force
+  a threshold downgrade was wrong: 75/75/65 is unchanged and now guards 4× the files.
+- **Test containment.** Clearing `CLAUDE_MEM_DIR` stops a relocated dev DB from being read,
+  but not a test that never sets it — that one takes the default, i.e. the live database, as
+  v3.73.0 did when it wrote a `rateLimited` marker there. `resolveDataDir` now redirects the
+  live dir to a per-run sandbox whenever `CLAUDE_MEM_TEST_GUARD` is armed. It redirects
+  rather than throws: throwing took 181 of 289 test files down at collection, because
+  `schema.mjs` resolves at import time and "imported the module" is not the failure.
+- **Sandbox CI.** `tests/sandbox` (103 checks over both install paths) ran only when someone
+  remembered. Now weekly + `workflow_dispatch`, one job per phase (the README records phase A
+  chaining into B crashing B), opening or commenting on a single issue on failure. Not
+  nightly: the phases drive real `npm install`s over the network.
+
+### where new code goes
+
+The audit called the god-module split "half finished". Re-reading it, that is not what
+happened: v2.41's `cli/` split did stop, but a different direction took hold and has produced
+**72 modules under `lib/`**. So the fix is a stated convention rather than a split project —
+shared by two or more faces goes to `lib/` (registered in **both** `source-files.mjs` and
+`package.json#files`; a missed registration has shipped a broken tarball three times), owned
+by one face stays put, and line count is not the trigger.
+
+Suite **293 files / 4816 tests** green, eslint clean, knip unchanged at 0 unused files / 31
+unused exports with a byte-identical name set — the five new exports each have a real
+consumer. Every new guard in this batch was mutation-checked against the assertion it
+protects, with each mutated file verified byte-identical after restore.
+
 ## v3.74.1 — v3.74.0 silenced Go panics; the filter is now a superset of the trigger
 
 **Upgrade note.** Upgrade from v3.74.0. That release closed a real defect but with an

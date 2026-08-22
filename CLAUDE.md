@@ -4,7 +4,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 ## Quick Reference
 
-- **Version**: 3.74.1
+- **Version**: 3.75.0
 - **Package manager**: npm
 - **Test**: `npx vitest run` (293 test files / 4816 tests, vitest) · **Sandbox install harness** (not in `vitest run`; real `npm i -g` + real MCP stdio, minutes + network): `node tests/sandbox/phaseA-plugin.mjs` / `phaseB-npm.mjs` / `phaseC-update.mjs` — see `tests/sandbox/README.md`
 - **Lint**: `npx eslint .`
