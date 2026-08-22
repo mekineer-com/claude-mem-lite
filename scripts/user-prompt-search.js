@@ -6,6 +6,7 @@
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
 import { relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, notLowSignalTitleClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
 import { liveObsFilterSql, injectionRelevanceSql } from '../lib/inject-search-core.mjs';
+import { fileMatchClause, fileMatchParams, basenameAnySep } from '../lib/file-edge-match.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
 import { upsFtsQuery } from '../lib/ups-query.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
@@ -448,10 +449,13 @@ function searchByFile(db, files, project, limit) {
   const results = [];
 
   for (const file of files.slice(0, 3)) {
-    const basename = file.split('/').pop();
+    // Shared predicate (pre-tag review of v3.76.2, SF-1/S2). This leg used
+    // `file.split('/').pop()` — weaker than node:path `basename`, since it misses '\'
+    // even ON a Windows host — plus a bare `%<basename>` suffix LIKE with no path
+    // boundary, so a prompt mentioning `utils.mjs` recalled `bash-utils.mjs` lessons.
+    // fileMatchClause's four arms and fileMatchParams' escaping are the single home.
+    const basename = basenameAnySep(file);
     if (!basename || basename.length < 2) continue;
-    const escaped = basename.replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const likePattern = `%${escaped}`;
 
     // R1: exclude LOW_SIGNAL degraded titles from file-level recall.
     const rows = db.prepare(`
@@ -462,11 +466,11 @@ function searchByFile(db, files, project, limit) {
         AND o.importance >= 1
         AND ${liveObsFilterSql('o')}
         AND o.created_at_epoch > ?
-        AND (of2.filename = ? OR of2.filename LIKE ? ESCAPE '\\')
+        AND ${fileMatchClause('of2')}
         AND ${notLowSignalTitleClause('o')}
       ORDER BY o.created_at_epoch DESC
       LIMIT ?
-    `).all(project, cutoff, file, likePattern, limit);
+    `).all(project, cutoff, ...fileMatchParams(file), limit);
 
     results.push(...rows);
   }

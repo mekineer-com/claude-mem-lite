@@ -11,9 +11,10 @@
 // process.platform, so they are meaningful on the Linux CI host.
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { basename, win32, posix } from 'path';
-import { mkdtempSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { createTestDb, insertSession, insertObs, matchFileEdges } from './test-helpers.mjs';
 import { fileMatchParams } from '../lib/file-edge-match.mjs';
 
@@ -200,4 +201,64 @@ describe('install prune log derives basenames with node:path', () => {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+});
+
+// ─── Sweep guard: no shipped file may hand-roll the file-recall key ─────────
+//
+// v3.76.2 fixed lib/file-edge-match.mjs, and a pre-tag review found the SAME two
+// defects still live on three other shipped faces (SF-1): the events leg of
+// scripts/pre-tool-recall.js (120 lines below the fix, same file), the
+// UserPromptSubmit file-reference leg in scripts/user-prompt-search.js, and
+// lib/recall-core.mjs — which is BOTH mem_recall (MCP) and the CLI `recall`.
+// All four are fixed now. This suite exists so the fifth one cannot be added
+// silently: "fix applied to N-1 of N faces" is the defect class this repo has
+// paid for repeatedly, and the per-face tests never catch it because each face
+// only tests itself.
+//
+// FAILS IF: a file joins observation_files with a hand-written match instead of
+// fileMatchClause, or derives a lookup key with host-native basename / split('/').
+
+describe('every shipped observation_files consumer uses the shared predicate', () => {
+  const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+  // Files that JOIN observation_files to answer "what do we know about this file?".
+  // Write paths (save-observation, observation-write) insert rows and are not
+  // lookups, so they are out of scope.
+  const READ_FACES = [
+    'lib/recall-core.mjs',
+    'lib/edge-attribution.mjs',
+    'scripts/pre-tool-recall.js',
+    'scripts/user-prompt-search.js',
+  ];
+
+  // Comments must not count. The first cut of this suite went red on its own
+  // explanatory comment quoting the banned `split('/').pop()` shape — the same
+  // "a comment matched the substring scan" trap v3.76.1 recorded. Strip block
+  // comments and whole-line `//` comments; a trailing comment carrying the shape
+  // is rare enough that a false positive there is the safe direction.
+  const code = (src) => src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+
+  for (const rel of READ_FACES) {
+    const src = code(readFileSync(join(ROOT, rel), 'utf8'));
+
+    it(`${rel} matches through fileMatchClause, not a hand-written arm`, () => {
+      expect(src, 'must import the shared predicate').toMatch(/fileMatchClause/);
+      // The two-arm shape every one of these faces used to carry. It matches on a
+      // bare '%<basename>' suffix, which cannot tell utils.mjs from bash-utils.mjs.
+      expect(src, 'hand-rolled two-arm match found')
+        .not.toMatch(/filename\s*=\s*\?\s*OR\s*of2?\.?filename\s+LIKE/i);
+    });
+
+    it(`${rel} derives its lookup key with basenameAnySep, not a host-native split`, () => {
+      // Display text may still use node:path basename; a LOOKUP KEY may not.
+      // Narrow the search to assignment sites so a `basename(filePath)` inside an
+      // injected message string does not trip this.
+      const hostNative = [...src.matchAll(/const\s+(\w*[Nn]ame\w*)\s*=\s*basename\(/g)].map(m => m[0]);
+      const naiveSplit = [...src.matchAll(/\.split\(['"]\/['"]\)\s*\.pop\(\)/g)].map(m => m[0]);
+      expect(hostNative, `host-native basename assigned to a key: ${hostNative.join(', ')}`).toEqual([]);
+      expect(naiveSplit, `split('/').pop() used as a key: ${naiveSplit.join(', ')}`).toEqual([]);
+    });
+  }
 });

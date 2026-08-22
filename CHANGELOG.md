@@ -33,7 +33,8 @@ either separator regardless of host OS.
 `hook-memory.mjs` also carried `recallForFile`, an in-process file-recall implementation
 with **zero production callers** — superseded by the standalone `pre-tool-recall.js` hook,
 which owns the cooldown, scope filter, edge-decay filter and event leg it never had. Five
-test files imported it, which made it look alive, and it cost real money twice:
+test files referenced it and four imported it, which made it look alive, and it cost real
+money twice:
 
 - it was the only code splitting basenames on either separator, so six Windows-path cases
   went green against it while the shipped predicate carried the gap;
@@ -54,6 +55,72 @@ patch version. Nothing failed, because no test read those strings. Both are corr
 both are now asserted against `PINNED_INJ_THRESHOLD` and against the floor semantics —
 reverting either string turns the suite red.
 
+### the pre-tag review, and what it found
+
+Two independent reviewers read this diff **before** the tag — the first time in six releases
+that both landed in time to change what shipped. Neither found a blocker; both found real
+work, and all of it is in this release rather than the next one.
+
+**The same defect was still shipping on three other faces.** The fix above landed in
+`lib/file-edge-match.mjs`. Host-native `basename` was still deriving the lookup key in:
+
+- `scripts/pre-tool-recall.js` — the **events** leg, ~120 lines below the fix, in the same
+  function. So a Windows-shaped payload would have recalled lessons but still no events.
+- `scripts/user-prompt-search.js` — the UserPromptSubmit file-reference leg, using
+  `file.split('/').pop()`, which is weaker still: it misses `\` even *on* a Windows host.
+- `lib/recall-core.mjs` — which is `mem_recall` (MCP) **and** the CLI `recall` command.
+
+The latter two also carried the second defect, the bare `%<basename>` suffix LIKE with no
+path boundary. Demonstrated on the real function before fixing:
+
+```
+recallByFile(db, "utils.mjs")  ->  [ 'Fix in bash-utils.mjs' ]     <- false positive
+recallByFile(db, "C:\proj\src\hook-memory.mjs")
+                               ->  filename = "C:\proj\src\hook-memory.mjs", 0 rows
+```
+
+All three now go through the shared predicate. Shipping a release *named* "the correct
+implementation was in the copy that does not ship" while leaving three more copies of the
+wrong one would have been the joke writing itself.
+
+A **sweep guard** now enforces the class rather than the instances: every shipped file that
+joins `observation_files` to answer "what do we know about this file?" must match through
+`fileMatchClause` and derive its key with `basenameAnySep`. Reverting any one of the three
+fixes turns it red (3/3 mutation-verified). Per-face tests never catch this, because each
+face only tests itself. The guard strips comments before scanning — its own first run went
+red on the explanatory comment quoting the banned shape.
+
+**A test added by this very release passed on copy stating the exact opposite rule.** The
+`demote_pinned copy matches the shipped behaviour` suite asserted `/to 1/`, `/to 2/` and
+`/lesson/i` as three independent existence checks. Rewriting both descriptions to
+"to 1 when it HAS a lesson_learned, to 2 when it has none" left all 22 tests green. Three
+necessary conditions were reading as one sufficient condition — in the suite written to
+prevent exactly this failure recurring, and inverting a clause while editing is the most
+likely way the copy actually goes wrong. Each floor is now bound to its condition in one
+regex per arm, and both inversion mutants die.
+
+**`demotePinned` had no cross-project fixture.** Neutering `projectFilter` while preserving
+SQL arity kept **279 tests** green across all three maintain suites, because every fixture
+lived in project `'p'`. For an op that writes `importance` across the whole table, "it only
+touched my project" is the property that most needs one. Added; the mutant now dies.
+
+Also from the review: a vacuous emptiness assertion (`returns empty for files with no
+history` asserted against an *empty* database, so `OR 1=1` bolted onto the match clause left
+it green while killing six siblings) now seeds a decoy first; the `CLAUDE.md` knip paragraph
+had attributed the parent commit's 46-name count to this commit, which measures 45; a stale
+`importance→1` comment three lines above the corrected CLI help; and a test name in
+`maintain-core.test.mjs` that stated the whole rule while covering one arm.
+
+Independently re-derived by the reviewers and worth recording: 14/14 and 15/15 mutations
+killed with **empty NOT-BINDING columns** on the pre-review diff, the "5/5" floor-suite claim
+reproduced from scratch, zero match regressions across 9 probes × 15 stored filename shapes,
+0 of 6406 `observation_files` rows containing a backslash, and the ~450ms subprocess saving
+measured at 3 × 138ms rather than estimated.
+
+One environment note for anyone re-running the suite: **do not export `CLAUDE_MEM_DIR`.** The
+suite self-sandboxes, and an ambient value makes `tests/resolve-data-dir.test.mjs` fail for a
+reason that has nothing to do with the code.
+
 ### tests
 
 - `demotePinned` gains five in-process cases at the `maintain-core` layer, where the floor
@@ -65,7 +132,7 @@ reverting either string turns the suite red.
 - Three pure in-process assertions moved out of the subprocess-paying `beforeEach` they had
   been sitting in (a real `cli.mjs stats` spawn plus a seed write, ~450ms, to test pure
   functions).
-- 300 files / 4870 tests (from 4860).
+- 300 files / 4881 tests (from 4860).
 
 ### a claim in the v3.76.0 notes, narrowed
 

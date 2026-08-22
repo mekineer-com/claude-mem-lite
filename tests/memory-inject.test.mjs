@@ -460,6 +460,16 @@ describe('file-aware recall', () => {
   });
 
   it('returns empty for files with no history', () => {
+    // Seed a decoy first. Asserting emptiness against an EMPTY db holds for any
+    // predicate at all, including a broken one: a pre-tag review bolted `OR 1=1`
+    // onto the match clause and this case stayed green while six siblings died.
+    // The same negative shape done right is in tests/win-path-basename.test.mjs.
+    insertObs(db, {
+      type: 'bugfix', title: 'Fix in some-other-file.mjs',
+      text: 'some-other-file.mjs fix',
+      importance: 2, filesModified: '["some-other-file.mjs"]',
+      epochOffset: -2 * 86400000
+    });
     const results = matchFileEdges(db, 'brand-new-file.mjs', 'test');
     expect(results.length).toBe(0);
   });

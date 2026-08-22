@@ -13,7 +13,7 @@ import { liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
-import { fileMatchClause, fileMatchParams } from '../lib/file-edge-match.mjs';
+import { fileMatchClause, fileMatchParams, basenameAnySep } from '../lib/file-edge-match.mjs';
 import { fileIntelFor } from '../lib/file-intel.mjs';
 import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/reread-guard.mjs';
 import { recordMetric } from '../lib/metrics.mjs';
@@ -355,7 +355,14 @@ try {
 
   try {
     const project = inferProject();
-    const fname = basename(filePath);
+    // Same any-separator split the observations leg gets through fileMatchParams
+    // (pre-tag review of v3.76.2, SF-1/S1). This derivation feeds the EVENTS leg
+    // ~120 lines below, which matches a JSON array inside events.file_paths rather
+    // than the observation_files junction, so it cannot use fileMatchClause — but it
+    // needs the same key, and host-native `basename` gave it the whole path for a
+    // Windows-shaped payload. Fixing the observations leg alone would have left this
+    // hook recalling lessons but no events.
+    const fname = basenameAnySep(filePath);
     // Escape LIKE wildcards (still needed below for the events file_paths arms)
     const escaped = fname.replace(/%/g, '\\%').replace(/_/g, '\\_');
     // P0 (D#78): path-boundary match — editing utils.mjs must NOT pull lessons

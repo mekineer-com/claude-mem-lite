@@ -191,9 +191,16 @@ describe('demote_pinned copy matches the shipped behaviour', () => {
       expect(copy, 'no demote_pinned copy found').not.toBe('');
       // The pre-v3.76.1 wording, which is now false for lesson-bearing rows.
       expect(copy).not.toMatch(/importance\u21921\b/);
-      expect(copy).toMatch(/\bto 1\b/);
-      expect(copy).toMatch(/\bto 2\b/);
-      expect(copy).toMatch(/lesson/i);
+      // Bind each FLOOR to its CONDITION, in one regex per arm. The first cut
+      // asserted /to 1/, /to 2/ and /lesson/i independently, and a pre-tag review
+      // proved that copy stating the exact OPPOSITE mapping ("to 1 when it HAS a
+      // lesson_learned, to 2 when it has none") satisfied all three and kept the
+      // suite green on both files. Three necessary conditions read as one
+      // sufficient condition — and inverting the clause while editing is the most
+      // likely way this copy actually goes wrong, which is the recurrence this
+      // suite was written to prevent.
+      expect(copy, 'the no-lesson arm must name floor 1').toMatch(/to 1 with no[\s|]+lesson_learned/);
+      expect(copy, 'the lesson-bearing arm must name floor 2').toMatch(/to 2 with one\b/);
     });
 
     it(`${label} quotes the real injection threshold (${PINNED_INJ_THRESHOLD})`, () => {
@@ -244,6 +251,27 @@ describe('demotePinned floor (maintain-core, in-process)', () => {
     const id = pinned({ title: 'Pinned but cited', injectionCount: 99, citedCount: 1 });
     expect(run()).toBe(0);
     expect(impOf(id)).toBe(3);
+  });
+
+  // Pre-tag review of v3.76.2 (S-2): neutering `projectFilter` while preserving SQL
+  // arity kept 279 tests green across all three maintain suites, because every fixture
+  // in this file lives in project 'p' — there was no second project for a leak to
+  // reach. For an op that writes `importance` across the whole observations table,
+  // "it only touched my project" is precisely the property that needs a fixture.
+  //
+  // FAILS IF: demotePinned stops honouring projectFilter (e.g. the interpolation is
+  // dropped, or widened to `OR 1=1`).
+  it('scopes to the requested project and leaves other projects untouched', () => {
+    insertSession(db, { id: 'sess-2', project: 'other' });
+    const mine = pinned({ title: 'Pinned in the target project' });
+    const theirs = insertObs(db, {
+      sessionId: 'sess-2', project: 'other', type: 'change', importance: 3,
+      title: 'Pinned in a different project', injectionCount: 40, citedCount: 0,
+    }).lastInsertRowid;
+
+    expect(run()).toBe(1);
+    expect(impOf(mine)).toBe(1);
+    expect(impOf(theirs), 'a row in another project must not be demoted').toBe(3);
   });
 
   it('does not reach a row below the injection threshold', () => {

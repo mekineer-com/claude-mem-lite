@@ -2154,7 +2154,8 @@ function cmdMaintain(db, args) {
     if (ops.includes('demote_pinned')) {
       // Repair the citation-decay blind spot: decay protects injection_count>0, so a
       // heavily-injected-but-uncited memory stays pinned at max importance forever.
-      // demotePinned (maintain-core) drops it to 1 in one pass. Floor 1, not purge.
+      // demotePinned (maintain-core) floors it in one pass: no lesson_learned -> 1,
+      // lesson-bearing -> 2 (v3.76.1 dual floor). Floor, not purge.
       const demoted = demotePinned(db, mctx);
       results.push(`Demoted ${demoted} pinned-but-uncited observations (inj>=${PINNED_INJ_THRESHOLD}, cited=0; no lesson → importance 1, lesson → 2)${capHint(demoted)}`);
     }

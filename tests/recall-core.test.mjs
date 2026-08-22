@@ -14,6 +14,34 @@ describe('recall-core', () => {
   });
   afterEach(() => db.close());
 
+  // Pre-tag review of v3.76.2 (SF-1/S3): recall-core derived its key with node:path
+  // `basename` and matched with a bare `%<basename>` suffix LIKE — the two defects
+  // v3.76.2 fixed in lib/file-edge-match.mjs, still live on THIS face. recallByFile is
+  // mem_recall (MCP) and the CLI `recall` command, so both were affected.
+  //
+  // FAILS IF: this face stops using the shared fileMatchClause/fileMatchParams and
+  // hand-rolls the derivation again.
+  it('matches a Windows-shaped path against a bare-basename junction entry', () => {
+    insertObs(db, {
+      sessionId: 'sess-rc', type: 'bugfix', importance: 2,
+      title: 'hook-memory null deref', lessonLearned: 'guard the deref',
+      filesModified: '["hook-memory.mjs"]',
+    });
+    const { filename, rows } = recallByFile(db, 'C:\\proj\\src\\hook-memory.mjs');
+    expect(filename).toBe('hook-memory.mjs');
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    expect(rows[0].title).toMatch(/hook-memory/);
+  });
+
+  it('does not collide across the path boundary (utils.mjs must not match bash-utils.mjs)', () => {
+    insertObs(db, {
+      sessionId: 'sess-rc', type: 'bugfix', importance: 2,
+      title: 'bash-utils regex fix', lessonLearned: 'anchor the suffix',
+      filesModified: '["src/bash-utils.mjs"]',
+    });
+    expect(recallByFile(db, 'utils.mjs').rows).toEqual([]);
+  });
+
   it('matches by basename against full-path junction entries', () => {
     insertObs(db, {
       sessionId: 'sess-rc', type: 'bugfix', importance: 2,

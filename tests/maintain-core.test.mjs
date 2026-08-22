@@ -343,7 +343,10 @@ describe('execute ops', () => {
     expect(get(db, cold, 'importance')).toBe(1);
   });
 
-  test('demotePinned drops heavy-injection zero-citation rows to importance 1', () => {
+  // Lessonless fixture, so this covers the floor-1 arm only — the name says so since a
+  // pre-tag review flagged the old one ('...to importance 1') as stating the whole rule.
+  // The lesson-bearing arm that floors at 2 lives in tests/maintain-default-ops.test.mjs.
+  test('demotePinned floors heavy-injection zero-citation LESSONLESS rows to importance 1', () => {
     const db = freshDb();
     const pinned = add(db, { title: 'pinned noise', importance: 3, injectionCount: 8, citedCount: 0 });
     const cited = add(db, { title: 'earns it', importance: 3, injectionCount: 8, citedCount: 2 });
