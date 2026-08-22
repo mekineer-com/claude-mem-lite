@@ -179,8 +179,15 @@ describe('launch.mjs npm-install failure: npm speaks for itself on inherited std
   afterEach(() => { try { rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ } });
 
   it("delivers npm's own diagnosis plus an actionable repair", () => {
-    // No package.json and no node_modules → the guard opens and npm fails fast,
-    // no network needed.
+    // The guard opens on missing node_modules/better-sqlite3 alone (launch.mjs:13), so
+    // npm runs. Making npm FAIL has to be done here, not left to the empty directory:
+    // npm walks PARENT directories looking for a package.json, and $TMPDIR is commonly
+    // nested under one (here ~/.claude/tmp, below /home/sds/package.json), in which case
+    // npm cheerfully installs THAT manifest's dependencies and exits 0 — the test then
+    // fails on a machine where nothing is wrong. An unparseable manifest fails locally
+    // and immediately (`npm error code EJSONPARSE`), keeping the original "no network
+    // needed" property while removing the dependency on what sits above $TMPDIR.
+    writeFileSync(join(root, 'package.json'), '{ this is not json');
     const r = spawnSync(process.execPath, [join(root, 'scripts', 'launch.mjs')], {
       encoding: 'utf8', timeout: 180_000,
       env: { ...process.env, CLAUDE_PLUGIN_ROOT: root, CLAUDE_MEM_DIR: root },
