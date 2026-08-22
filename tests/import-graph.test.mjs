@@ -97,9 +97,11 @@ function findCycles(graph) {
 // standard remedy for a cycle, not a defect — the module is not on the importer's
 // load path. Listed explicitly so a NEW lazy cycle still fails this suite.
 const KNOWN_LAZY_CYCLES = [
-  // utils.debugCatch() lazy-loads schema.mjs for DB_DIR only under
-  // CLAUDE_MEM_CATCH_SAMPLE; schema.mjs statically imports utils.mjs.
-  'utils.mjs -> schema.mjs -> utils.mjs',
+  // Was: 'utils.mjs -> schema.mjs -> utils.mjs' — debugCatch()'s sampler lazy-loaded
+  // schema.mjs for DB_DIR while schema.mjs statically imports utils.mjs. The sampler now
+  // takes lib/resolve-data-dir.mjs (node:os + node:path only), so the cycle is gone
+  // rather than tolerated. Keep this list EMPTY if you can: an entry here means a real
+  // cycle that only an await-import keeps off the load path.
 ];
 
 const fmt = (cycles) => cycles.map(c => c.map(f => relative(ROOT, f)).join(' -> ')).sort();

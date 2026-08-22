@@ -243,7 +243,15 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
     if (rows.length === 0) {
       const orQuery = relaxFtsQueryToOr(ftsQuery);
       if (orQuery && (queryIsCjkDominant || queryTokenCount <= orFallbackMaxTokens)) {
-        try { rows = selectStmt.all(orQuery, project, cutoff); usedOrFallback = true; } catch {}
+        // debugCatch, not a bare swallow: this is the injection chain's LAST query, and
+        // an FTS5 fault here (corrupt index, malformed relaxed query) degrades to an
+        // EMPTY injection that reads exactly like "nothing matched" — invisible to
+        // stats and doctor alike. Still non-fatal; the prompt must go through.
+        // (The two bare catches further down, around the per-row access bumps, are
+        // deliberately left bare: they are write-path and per-row, so logging them would
+        // flood the debug stream on the same corruption this one reports once.)
+        try { rows = selectStmt.all(orQuery, project, cutoff); usedOrFallback = true; }
+        catch (e) { debugCatch(e, 'injectMemory:orFallback'); }
       }
     }
 
@@ -274,7 +282,10 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
       if (crossRows.length === 0) {
         const orQuery = relaxFtsQueryToOr(ftsQuery);
         if (orQuery && (queryIsCjkDominant || queryTokenCount <= orFallbackMaxTokens)) {
-          try { crossRows = crossStmt.all(orQuery, project, cutoff); crossUsedOr = true; } catch {}
+          // Same reasoning as the same-project OR fallback above: a fault here silently
+          // drops the cross-project half of the injection.
+          try { crossRows = crossStmt.all(orQuery, project, cutoff); crossUsedOr = true; }
+          catch (e) { debugCatch(e, 'injectMemory:crossOrFallback'); }
         }
       }
     } catch (e) { debugCatch(e, 'crossProjectSearch'); }

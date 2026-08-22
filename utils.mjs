@@ -21,6 +21,9 @@ export { detectBashSignificance, extractErrorKeywords, planErrorRecall, extractF
 // Internal imports for functions that remain in this module
 import { truncate } from './format-utils.mjs';
 import { stripTestSuffix } from './bash-utils.mjs';
+// Static, and deliberately the dependency-free resolver (node:os + node:path only) —
+// debugCatch's sampler must not pull in the DB layer. See its comment below.
+import { resolveDataDir } from './lib/resolve-data-dir.mjs';
 
 // ─── Sentinel Values ────────────────────────────────────────────────────────
 
@@ -266,14 +269,19 @@ export function debugCatch(e, context) {
   // Sampled-to-disk surface for post-mortem. Lazy-loaded so fs-less paths
   // don't pay the module cost; wrapped in try so sampler faults never crash
   // the caller (debugCatch is the error-handler-of-last-resort path).
+  //
+  // The data dir comes from lib/resolve-data-dir.mjs (imports: node:os, node:path) and
+  // NOT from schema.mjs's DB_DIR. This is the last-resort error path, so it must not
+  // inherit the DB layer's import graph: with schema.mjs unresolvable, the sampler wrote
+  // NOTHING — the trail meant to explain a broken install disappeared with it (verified
+  // by blocking the specifier; tests/debug-catch-sampler-deps.test.mjs). Resolving at
+  // call time also honours a data dir redirected after module load, which DB_DIR (a
+  // load-time constant) does not.
   if (process.env.CLAUDE_MEM_CATCH_SAMPLE) {
     (async () => {
       try {
-        const [{ maybeSampleError }, { DB_DIR }] = await Promise.all([
-          import('./lib/err-sampler.mjs'),
-          import('./schema.mjs'),
-        ]);
-        maybeSampleError(e, context, DB_DIR);
+        const { maybeSampleError } = await import('./lib/err-sampler.mjs');
+        maybeSampleError(e, context, resolveDataDir(process.env.CLAUDE_MEM_DIR));
       } catch { /* sampler dynamic-import fault must not propagate */ }
     })();
   }
