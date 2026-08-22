@@ -753,6 +753,31 @@ describe('haiku-client.mjs', () => {
   // ─── callHaiku ────────────────────────────────────────────────────────────
 
   describe('callHaiku', () => {
+    // callHaiku's api leg used to have its own copy of the Anthropic call —
+    // byte-identical to callModelAPI apart from where the model id came from and a
+    // hardcoded 'haiku-api' log label. Two copies meant every proxy patch had to be
+    // applied twice, on the code path where getting the proxy wrong costs 13.5s vs
+    // 1.4s. Collapsing them is observable in exactly one place: under
+    // CLAUDE_MEM_MODEL=sonnet the failure log said `haiku-api` while calling Sonnet.
+    it('labels an API failure with the model actually called, not a hardcoded haiku', async () => {
+      vi.stubEnv('ANTHROPIC_API_KEY', 'sk-test-key');
+      vi.stubEnv('CLAUDE_MEM_MODEL', 'sonnet');
+      _resetMode();
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 }));
+      // debugLog is module-mocked at the top of this file, so assert on the mock's
+      // arguments — spying on console.error would observe a channel it never reaches.
+      const { debugLog } = await import('../utils.mjs');
+      vi.mocked(debugLog).mockClear();
+      // CLI fallback after the API failure — irrelevant here, just must not throw.
+      vi.mocked(execFileSync).mockReturnValue('fallback');
+
+      await callHaiku('test prompt');
+
+      const contexts = vi.mocked(debugLog).mock.calls.map((c) => c[1]);
+      expect(contexts).toContain('sonnet-api');
+      expect(contexts).not.toContain('haiku-api');
+    });
+
     it('returns null on empty prompt', async () => {
       const result = await callHaiku('');
       expect(result).toBeNull();

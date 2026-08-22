@@ -190,8 +190,14 @@ export async function callHaiku(prompt, { timeout = 10000, maxTokens = 500, temp
   // out-of-credit key must not silently drop background summaries.
   let primary = null;
   try {
+    // callModelAPI, not a second copy of it: the two were byte-identical apart from
+    // where the model id came from (MODEL_MAP[model] vs resolveModel().api — the same
+    // value, since resolveModel().cli is a MODEL_MAP key) and a hardcoded 'haiku-api'
+    // log label that lied under CLAUDE_MEM_MODEL=sonnet. Two copies of an HTTP client
+    // means every proxy fix has to land twice, on the path where missing the proxy is
+    // the difference between 1.4s and 13.5s.
     primary = mode === 'api'
-      ? await callHaikuAPI(prompt, { timeout, maxTokens, temperature })
+      ? await callModelAPI(prompt, resolveModel().cli, { timeout, maxTokens, temperature })
       : await callOpenRouterAPI(prompt, resolveModel().cli, { timeout, maxTokens, temperature });
   } catch (e) {
     debugCatch(e, `callHaiku:${mode}`);
@@ -681,63 +687,6 @@ export async function callModelCLIAsync(prompt, model, { timeout }) {
     debugLog('WARN', `${model}-cli-async`, `claude CLI rejected ${HEADLESS_FLAG}; dropped for this process (the headless session tax returns — upgrade Claude Code to avoid it)`);
   }
   return second.result;
-}
-
-// ─── API Mode ────────────────────────────────────────────────────────────────
-
-async function callHaikuAPI(prompt, { timeout, maxTokens, temperature = DEFAULT_LLM_TEMPERATURE }) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
-
-  const { api: modelId } = resolveModel();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const { system, user } = splitPrompt(prompt);
-    const body = {
-      model: modelId,
-      max_tokens: maxTokens,
-      temperature,
-      messages: [{ role: 'user', content: user }],
-    };
-    // See callModelAPI: cache_control on the constant system slot.
-    if (system) {
-      body.system = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
-    }
-
-    // Proxy-aware, same as the OpenRouter site below. Missing it here meant the
-    // ANTHROPIC_API_KEY paths were the one keyed provider still doing a bare
-    // fetch — a silent outage behind a proxy, and one the new doctor check would
-    // have certified as healthy because it probes the hop this code was ASSUMED
-    // to use. (pre-tag review SHOULD-FIX 3)
-    const apiUrl = 'https://api.anthropic.com/v1/messages';
-    const apiHeaders = {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    };
-    const apiProxy = httpConnectProxyFor(apiUrl);
-    const res = apiProxy
-      ? await postViaConnectProxy(apiProxy, apiUrl, { headers: apiHeaders, body: JSON.stringify(body), timeout })
-      : await fetch(apiUrl, {
-        method: 'POST',
-        headers: apiHeaders,
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
-
-    if (!res.ok) {
-      debugLog('WARN', 'haiku-api', `HTTP ${res.status}`);
-      return null;
-    }
-
-    const data = await res.json();
-    const text = data.content?.[0]?.text;
-    return text ? { text } : null;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 // ─── OpenRouter Mode ─────────────────────────────────────────────────────────
