@@ -192,6 +192,7 @@ export const SOURCE_FILES = [
   // and hook.mjs (handleAutoMaintain) — missing it would break maintain on auto-update.
   'lib/maintain-core.mjs',
   'lib/fast-summary.mjs',
+  'lib/transcript-scan.mjs',
   // Pre-maintenance VACUUM INTO snapshot (MED-2). Statically imported by mem-cli.mjs,
   // server.mjs, and hook.mjs before their destructive purge/cleanup — missing it
   // would crash maintain on auto-update with an unresolved import.
