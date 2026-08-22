@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
-  getRecommendMode, RECO_BM25_FLOOR, RECO_MARGIN,
+  getRecommendMode, getRequestedRecommendMode, RECOMMEND_MODE_UNIMPLEMENTED,
+  RECO_BM25_FLOOR, RECO_MARGIN,
   fetchInstalledSkillCandidates, intentMatch, applyGate,
   getRecoCooldown, setRecoCooldown,
   logShadowReco, logShadowAdoption, computeFunnel,
@@ -31,9 +32,34 @@ describe('getRecommendMode', () => {
   const prev = process.env.CLAUDE_MEM_RECOMMEND_MODE;
   afterEach(() => { if (prev === undefined) delete process.env.CLAUDE_MEM_RECOMMEND_MODE; else process.env.CLAUDE_MEM_RECOMMEND_MODE = prev; });
   it('defaults to shadow when unset', () => { delete process.env.CLAUDE_MEM_RECOMMEND_MODE; expect(getRecommendMode()).toBe('shadow'); });
-  it('honors live/off and normalizes case/space', () => {
-    process.env.CLAUDE_MEM_RECOMMEND_MODE = '  LIVE '; expect(getRecommendMode()).toBe('live');
-    process.env.CLAUDE_MEM_RECOMMEND_MODE = 'off'; expect(getRecommendMode()).toBe('off');
+  it('honors off and normalizes case/space', () => {
+    process.env.CLAUDE_MEM_RECOMMEND_MODE = '  OFF '; expect(getRecommendMode()).toBe('off');
+    process.env.CLAUDE_MEM_RECOMMEND_MODE = 'shadow'; expect(getRecommendMode()).toBe('shadow');
+  });
+  // Audit 2026-08-22 P2-5. Phase 2 was never built, so `live` used to be returned
+  // verbatim: the run behaved as shadow and every logged row said mode='live'.
+  // The effective mode must now BE what happens, while the requested value stays
+  // readable for the doctor check that tells the user their flag does nothing.
+  it('resolves the unimplemented live mode to shadow, and says so exactly once', async () => {
+    process.env.CLAUDE_MEM_RECOMMEND_MODE = '  LIVE ';
+    expect(getRequestedRecommendMode()).toBe('live');
+    expect(RECOMMEND_MODE_UNIMPLEMENTED.has('live')).toBe(true);
+    // Fresh module instance: the once-per-process latch is module state, and the
+    // statically imported copy may already have been tripped by an earlier case in
+    // this file. Asserting `<= 1` against a shared copy would pass with the warning
+    // deleted outright — the exact-1 below is only meaningful on a fresh latch.
+    const fresh = await import('../registry-recommend.mjs?live-warn-latch');
+    const seen = [];
+    const orig = process.stderr.write;
+    process.stderr.write = (chunk) => { seen.push(String(chunk)); return true; };
+    try {
+      expect(fresh.getRecommendMode()).toBe('shadow');
+      fresh.getRecommendMode(); fresh.getRecommendMode();
+    } finally { process.stderr.write = orig; }
+    // Once per process, not once per prompt: this runs inside a hook that fires on
+    // every user turn.
+    expect(seen.length).toBe(1);
+    expect(seen[0]).toMatch(/not implemented/);
   });
   it('falls back to shadow on unknown value', () => { process.env.CLAUDE_MEM_RECOMMEND_MODE = 'banana'; expect(getRecommendMode()).toBe('shadow'); });
   it('exposes negative floor + positive margin', () => { expect(RECO_BM25_FLOOR).toBeLessThan(0); expect(RECO_MARGIN).toBeGreaterThan(0); });

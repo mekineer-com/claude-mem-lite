@@ -682,6 +682,9 @@ settings.hooks = settings.hooks || {};
 
 const SCRIPTS_PATH = join(INSTALL_DIR, 'scripts');
 const PREFILTER_PATH = join(SCRIPTS_PATH, 'post-tool-use.sh');
+// Second bash prefilter, same idea one event over: skip the Node start for a
+// default-off feature (audit 2026-08-22 P2-5, see the script's header).
+const AGENT_PREFILTER_PATH = join(SCRIPTS_PATH, 'pre-agent-inject.sh');
 // v2.84: every Node hook invocation routes through hook-launcher.mjs so an
 // ERR_MODULE_NOT_FOUND from a partial-install drift auto-heals via
 // install.mjs repair instead of permanently bricking the hook chain.
@@ -792,12 +795,16 @@ const memPreSkillBridge = {
 // P0 subagent dispatch-time injection (default off — CLAUDE_MEM_SUBAGENT_INJECT).
 // Fires on the Agent/Task dispatch so a subagent (otherwise memory-blind — #8848)
 // can receive one relevant lesson via updatedInput. Parity with hooks/hooks.json.
+// Behind the bash prefilter since 2026-08-22 (audit P2-5): the flag is off by
+// default, and a disabled feature was starting a Node interpreter on every single
+// Agent dispatch (22.6ms → 2.4ms; see scripts/pre-agent-inject.sh). The prefilter
+// execs the same launcher when the flag is on.
 const memPreAgentInject = {
   matcher: 'Agent|Task',
   hooks: [
     {
       type: 'command',
-      command: nodeHook('scripts/pre-agent-inject.js'),
+      command: `bash "${AGENT_PREFILTER_PATH}"`,
       timeout: 5
     }
   ]
@@ -1957,6 +1964,26 @@ async function doctor() {
     }
   }
 
+  // Env flags that are ACCEPTED but do nothing. A flag a user set and believes is
+  // in effect is a silent lie the rest of doctor cannot see: every other check here
+  // asks whether the install is healthy, and this install is perfectly healthy while
+  // behaving as though the flag were unset (audit 2026-08-22 P2-5).
+  // Dynamically imported, and the mode table is read from the module that owns it:
+  // a static import would drag the registry retriever's dependency chain into a tool
+  // whose whole job is to run when the tree is broken, and a local copy of the list
+  // is the drift shape this repo keeps paying for.
+  try {
+    const { getRequestedRecommendMode, RECOMMEND_MODE_UNIMPLEMENTED } = await import('./registry-recommend.mjs');
+    const requested = getRequestedRecommendMode();
+    if (RECOMMEND_MODE_UNIMPLEMENTED.has(requested)) {
+      dwarn(`CLAUDE_MEM_RECOMMEND_MODE=${requested}: accepted but NOT implemented — `
+        + 'live skill-recommendation injection is Phase 2 and does not exist. The engine '
+        + 'is running in shadow (logs only, injects nothing). Set shadow or off.');
+    }
+  } catch (e) {
+    dwarn('Env flags: check failed — ' + e.message);
+  }
+
   // Plugin cache versions
   const pluginCacheBase = join(homedir(), '.claude', 'plugins', 'cache', MARKETPLACE_KEY, 'claude-mem-lite');
   if (existsSync(pluginCacheBase)) {
@@ -2005,7 +2032,13 @@ export function isMemHook(cfg) {
     const cmd = h.command || '';
     return cmd.includes('claude-mem-lite') ||
       cmd.includes('hook-launcher.mjs') ||
-      cmd.includes('scripts/post-tool-use.sh');
+      cmd.includes('scripts/post-tool-use.sh') ||
+      // Same reason post-tool-use.sh is named here: a bash prefilter routes through
+      // NO launcher, and the product-name clause only fires when the install dir
+      // happens to contain it — which CLAUDE_MEM_DIR can relocate. Without this line
+      // an Agent|Task hook in a relocated install survives uninstall and duplicates
+      // on reinstall (audit 2026-08-22 P2-5 added the second prefilter).
+      cmd.includes('scripts/pre-agent-inject.sh');
   });
 }
 

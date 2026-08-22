@@ -868,7 +868,7 @@ and names can change between releases.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLAUDE_MEM_RECOMMEND_MODE` | Skill-recommendation engine: `shadow` (log would-be recommendations, inject nothing), `off`, or `live`. **`live` is accepted but not yet implemented — it currently behaves as `shadow`.** | `shadow` |
+| `CLAUDE_MEM_RECOMMEND_MODE` | Skill-recommendation engine: `shadow` (log would-be recommendations, inject nothing) or `off`. **`live` is parsed but not implemented** — live injection is Phase 2. Setting it runs shadow and prints one warning to stderr per process; `claude-mem-lite doctor` also reports it as an inert flag. | `shadow` |
 | `CLAUDE_MEM_TASK_IMPERATIVE` | `on`/`1` injects the single most relevant lesson at prompt position under an imperative template. | _(off)_ |
 | `CLAUDE_MEM_SUBAGENT_INJECT` | Dispatch-time memory injection for subagents. | _(off)_ |
 | `CLAUDE_MEM_SALIENCE` | Selects a comprehension-bridge arm (`bridge`, `bind`); unset = current default behavior. | _(unset)_ |
@@ -882,6 +882,14 @@ Set by the tool or by the test harness. Setting these by hand is not supported:
 `CLAUDE_MEM_NO_DELAY`, `CLAUDE_MEM_CATCH_SAMPLE`, `CLAUDE_MEM_QUIET_TRACE`,
 `CLAUDE_MEM_DB_PATH`, `CLAUDE_MEM_RUNTIME_DIR`, `MEM_DISABLE_SPAWN_LOG`.
 `CLAUDE_PLUGIN_ROOT` is set by Claude Code itself.
+
+Three more are set by `vitest.config.mjs` / `tests/global-setup.mjs` and exist only to
+keep a test run off the live database: `CLAUDE_MEM_TEST_GUARD` (`1` arms the guard, `off`
+opts a test out), `CLAUDE_MEM_TEST_REALDIR` (the live data dir, captured before the suite
+relocates anything) and `CLAUDE_MEM_TEST_SANDBOX` (this run's throwaway dir). With the
+guard armed, any resolution that lands on the live data dir is redirected to the sandbox
+instead — including from a subprocess that inherited the ambient environment. Unset in
+normal use, and inert when unset.
 
 ## FAQ
 

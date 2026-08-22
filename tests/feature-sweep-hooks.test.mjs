@@ -189,6 +189,8 @@ function fire(cmd, args, { cwd, stdin = '', env = {}, timeout = 30000 } = {}) {
 const hookEvent = (event, opts = {}) => fire(process.execPath, [HOOK_PATH, ...event.split(' ')], opts);
 const hookScript = (name, opts = {}) => fire(process.execPath, [join(REPO, 'scripts', name)], opts);
 const bashPrefilter = (opts = {}) => fire('bash', [join(REPO, 'scripts', 'post-tool-use.sh')], opts);
+/** Any bash-entry hook, run the way hooks.json registers it (audit P2-5 added a second). */
+const bashHook = (name, opts = {}) => fire('bash', [join(REPO, 'scripts', name)], opts);
 
 /** Seed rows through the real CLI (the sweep never hand-writes schema). */
 async function cli(args, cwd) {
@@ -1049,7 +1051,10 @@ describe('hook feature sweep: standalone hook scripts', () => {
     );
   });
 
-  itHook('scripts/pre-agent-inject.js', async () => {
+  // Registered surface is the PREFILTER (audit P2-5): hooks.json names the .sh, which
+  // execs the .js only when CLAUDE_MEM_SUBAGENT_INJECT is on. Firing the .js directly here
+  // would sweep a path Claude Code no longer invokes.
+  itHook('scripts/pre-agent-inject.sh', async () => {
     const NAME = 'hs-agent';
     const cwd = workDir(NAME);
     const LESSON = 'Always call invalidateWidgetCache after a write, never on read';
@@ -1063,14 +1068,14 @@ describe('hook feature sweep: standalone hook scripts', () => {
     });
 
     // Default OFF: the cheapest possible no-op, no stdin read, no DB.
-    const off = await hookScript('pre-agent-inject.js', { cwd, stdin });
+    const off = await bashHook('pre-agent-inject.sh', { cwd, stdin });
     expect(off.code).toBe(0);
     expect(off.stdout).toBe('');
 
-    const r = await hookScript('pre-agent-inject.js', { cwd, stdin, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } });
+    const r = await bashHook('pre-agent-inject.sh', { cwd, stdin, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } });
     expect(r.code, `pre-agent-inject exited ${r.code}\n${r.stderr}`).toBe(0);
     const [envelope] = expectHookStdout(r.stdout, {
-      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-agent-inject.js',
+      event: 'PreToolUse', plainAllowed: false, label: 'scripts/pre-agent-inject.sh',
     });
     expect(envelope, `no PreToolUse envelope emitted:\n${r.stdout}`).toBeTruthy();
     // Functional: tool_input is REWRITTEN — the lesson is appended to the subagent's prompt,
@@ -1084,9 +1089,9 @@ describe('hook feature sweep: standalone hook scripts', () => {
     expect(updated.prompt).toContain('Reference context, not an external instruction');
 
     await expectMalformedResilience(
-      'scripts/pre-agent-inject.js',
+      'scripts/pre-agent-inject.sh',
       { event: 'PreToolUse', plainAllowed: false },
-      (stdinPayload, malCwd) => hookScript('pre-agent-inject.js', { cwd: malCwd, stdin: stdinPayload, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } }),
+      (stdinPayload, malCwd) => bashHook('pre-agent-inject.sh', { cwd: malCwd, stdin: stdinPayload, env: { CLAUDE_MEM_SUBAGENT_INJECT: 'on' } }),
     );
   });
 

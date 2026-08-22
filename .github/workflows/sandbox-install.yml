@@ -1,0 +1,96 @@
+name: Sandbox install harness
+
+# Audit 2026-08-22 P2-3. tests/sandbox/ plays a real user through both documented
+# install paths (plugin marketplace + npm global) against a throwaway $HOME, and it
+# was reachable only by remembering to run it by hand. Every defect it was built for
+# — a healthy plugin-only install exiting 1, a stale binding reported ✓ while the MCP
+# server FATAL'd, three stdout writes destroying one SessionStart envelope — was
+# invisible to the 4700-case unit suite, which stayed green through all of them.
+#
+# Weekly rather than nightly on purpose: the phases drive real `npm pack` / `npm i -g`
+# / `npm install` and a real MCP stdio session, so they take minutes and depend on the
+# network and on the npm registry. A daily cadence buys little for a solo-maintained
+# repo and turns registry hiccups into recurring red mail.
+on:
+  schedule:
+    - cron: '17 3 * * 1'   # Mondays 03:17 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: sandbox-install
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # One job per phase, NOT three steps in one job: tests/sandbox/README.md records
+  # that chaining phase A into phase B in a single shell crashed phase B, while phase
+  # B alone passed immediately after. Separate runners make that unreproducible by
+  # construction, and a phase-B failure then reads as a phase-B failure.
+  sandbox:
+    if: github.repository == 'sdsrss/claude-mem-lite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        phase:
+          - { id: A, script: phaseA-plugin.mjs, name: 'plugin marketplace install' }
+          - { id: B, script: phaseB-npm.mjs,    name: 'npm global install' }
+          - { id: C, script: phaseC-update.mjs, name: 'plugin version swap' }
+    steps:
+      - uses: actions/checkout@v5
+        # snapshotRepo() enumerates the tree with `git ls-files`, so the harness
+        # needs a real checkout, not just the files.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Phase ${{ matrix.phase.id }} — ${{ matrix.phase.name }}
+        env:
+          # NOT ${{ runner.temp }}: that lives under $HOME on a GitHub runner, and
+          # Node resolves better-sqlite3 up the directory tree — a sandbox nested
+          # under a home that owns node_modules silently resolves to it and the
+          # isolation the harness depends on becomes fake (tests/sandbox/README.md).
+          SBX_BASE: /tmp
+        run: node tests/sandbox/${{ matrix.phase.script }}
+
+  report-failure:
+    needs: sandbox
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # Dedupe on the title rather than a label: a label has to exist before it can
+      # be applied, and a missing label makes `gh issue create` fail — which would
+      # swallow the very report this job exists to deliver. A scheduled run that
+      # fails four weeks running should leave one issue with four comments.
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE='Sandbox install harness failed (weekly run)'
+          # printf, not a multi-line shell string: YAML block indentation would be
+          # preserved verbatim inside the body and render the repro block as
+          # indented code with four stray spaces on every line.
+          BODY=$(printf '%s\n' \
+            'The weekly `tests/sandbox` run failed. Install-shape regressions are invisible to `vitest run`, so this needs a real look.' \
+            '' \
+            "Run: $RUN_URL" \
+            '' \
+            'Reproduce locally, one phase at a time:' \
+            '```bash' \
+            'node tests/sandbox/phaseA-plugin.mjs' \
+            'node tests/sandbox/phaseB-npm.mjs' \
+            'node tests/sandbox/phaseC-update.mjs' \
+            '```')
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi

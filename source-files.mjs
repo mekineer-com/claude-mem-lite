@@ -270,6 +270,12 @@ export const HOOK_SCRIPT_FILES = [
   'pre-tool-recall.js',
   'post-tool-recall.js',
   'pre-skill-bridge.js',
+  // The Agent|Task hook command in BOTH registration sites is now the .sh prefilter,
+  // which execs the .js only when CLAUDE_MEM_SUBAGENT_INJECT is on (audit P2-5). Both
+  // must be materialized: shipping the prefilter without its target turns every
+  // opt-in dispatch into a silent no-op, and shipping the target without the
+  // prefilter leaves the registered hook command pointing at a file that is not there.
+  'pre-agent-inject.sh',
   'pre-agent-inject.js',
   // v2.84: self-heal wrapper that detects ERR_MODULE_NOT_FOUND under the
   // install dir and runs install.mjs repair before retrying the entry.

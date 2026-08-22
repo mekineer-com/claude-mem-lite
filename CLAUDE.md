@@ -33,6 +33,20 @@ reverted feature, not back-compat. Plus 1 duplicate-name export pair
 (FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS, intentional alias). Treat baseline
 as the floor; flag NEW unused exports as PR review signal.
 
+Coverage baseline (2026-08-22, audit P2-2 re-scoping, `npx vitest run --coverage`):
+**92 files measured** = all 70 `lib/**/*.mjs` + the 22 hand-picked root modules —
+statements **82.94%** (6813/8214) · branches **77.17%** (5094/6601) · functions
+**87.27%** (837/959) · lines **86.55%** (5699/6584). The prior line — 77.47% stmts /
+71.72% branch — described only those 22 root modules; `lib/`'s ~70 shipped modules,
+i.e. every shared core extracted since v3.4x, carried no coverage signal at all.
+**The re-scoping did not lower the number, it raised it**: the extracted cores are
+better covered than the root modules they were pulled out of, so the audit's premise
+(that including `lib/` would force a threshold downgrade) was wrong and the
+75/75/65 gate in `vitest.config.mjs` is unchanged — it now simply guards 4× the files.
+Still **outside** the gate and honest about it: `install.mjs` / `server.mjs` /
+`hook.mjs` / `registry*.mjs` (exercised through subprocess E2E, which v8 coverage of
+the parent process cannot observe) and `scripts/**` (same reason).
+
 ## Architecture
 
 | Module | Role |
@@ -53,7 +67,7 @@ as the floor; flag NEW unused exports as PR review signal.
 | `registry.mjs` | Resource registry DB schema + CRUD |
 | `registry-retriever.mjs` | FTS5 search + BM25 composite scoring + domain filtering |
 | `registry-indexer.mjs` | Resource indexing pipeline |
-| `registry-recommend.mjs` | Intent-based skill recommendation (shadow-first): 4-gate precision filter over installed skills, append-only shadow log, `Skill`-adoption probe. Funnel reports session-keyed matched precision + per-skill **lift** (P(adopt\|gate PASS) ÷ organic base rate); `computeSweep`/`replayGate` re-run the gate offline at swept (floor,margin) from each reco's logged replay vector (ROC calibration). Mode via `CLAUDE_MEM_RECOMMEND_MODE` (shadow\|live\|off, default shadow) |
+| `registry-recommend.mjs` | Intent-based skill recommendation (shadow-first): 4-gate precision filter over installed skills, append-only shadow log, `Skill`-adoption probe. Funnel reports session-keyed matched precision + per-skill **lift** (P(adopt\|gate PASS) ÷ organic base rate); `computeSweep`/`replayGate` re-run the gate offline at swept (floor,margin) from each reco's logged replay vector (ROC calibration). Mode via `CLAUDE_MEM_RECOMMEND_MODE` (shadow\|off, default shadow; `live` parses but resolves to shadow + warns — Phase 2 unbuilt) |
 | `tfidf.mjs` | TF-IDF vector engine — tokenization, vocabulary, vectors, cosine similarity, RRF merge |
 | `tier.mjs` | Temporal tier system — activity-based time window classification |
 | `schema.mjs` | DB schema definitions and migrations (incl. vocab_state, observation_vectors) |
@@ -69,7 +83,7 @@ as the floor; flag NEW unused exports as PR review signal.
 - FTS5 search: sanitizeFtsQuery (synonym expansion) → BM25 scoring → OR fallback → concept co-occurrence
 - Context delivery: SessionStart hook stdout emits the `<claude-mem-context>` block fresh from DB; CLAUDE.md is no longer auto-updated (pre-v2.30 left a stale snapshot here)
 - Skill commands (`/search`, `/recall`, `/recent`, `/timeline`) use `!` preprocessing for CLI injection
-- Skill recommendation (shadow-first): `CLAUDE_MEM_RECOMMEND_MODE=shadow|live|off` (default `shadow`). Phase 1 logs would-be recommendations to `RUNTIME_DIR/recommendations/*.jsonl` (zero injection); reco rows carry a CC `session` id + a replay vector (relevance/rel2/intentTop/cooldownTop), adopt rows carry the same `session` so PostToolUse adoptions pair to the reco in-session. Inspect with `claude-mem-lite registry recommend-stats [--days N] [--sweep]`: funnel = session-keyed matched precision + per-skill lift; `--sweep` = offline ROC over (floor,margin). Calibration caveat: shadow adoption is a biased-LOW proxy for live `P(adopt|inject)`, so the flip metric is **lift > 1** (gate beats organic base rate) + per-session PASS density, NOT a raw-precision threshold (single-dev volume never reaches significance). Live injection (UserPromptSubmit, sibling to the T4 explicit-name pointer) is Phase 2. Adoption = `Skill` tool only (`mem_use` is pre-filtered in PostToolUse).
+- Skill recommendation (shadow-first): `CLAUDE_MEM_RECOMMEND_MODE=shadow|off` (default `shadow`; `live` still parses but resolves to shadow with a one-time stderr warning + a `doctor` line — Phase 2 was never built, and an accepted value that silently means something else is worse than an unsupported one). Phase 1 logs would-be recommendations to `RUNTIME_DIR/recommendations/*.jsonl` (zero injection); reco rows carry a CC `session` id + a replay vector (relevance/rel2/intentTop/cooldownTop), adopt rows carry the same `session` so PostToolUse adoptions pair to the reco in-session. Inspect with `claude-mem-lite registry recommend-stats [--days N] [--sweep]`: funnel = session-keyed matched precision + per-skill lift; `--sweep` = offline ROC over (floor,margin). Calibration caveat: shadow adoption is a biased-LOW proxy for live `P(adopt|inject)`, so the flip metric is **lift > 1** (gate beats organic base rate) + per-session PASS density, NOT a raw-precision threshold (single-dev volume never reaches significance). Live injection (UserPromptSubmit, sibling to the T4 explicit-name pointer) is Phase 2. Adoption = `Skill` tool only (`mem_use` is pre-filtered in PostToolUse).
 
 <!-- claude-mem-lite:begin v1 -->
 ## claude-mem-lite — persistent memory
