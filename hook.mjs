@@ -50,7 +50,7 @@ import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
 import { queueHookContext, queueHookSystemMessage, flushHookStdout } from './lib/hook-stdout.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, markAutoCompressible, selectFuzzyDedupeIds, stampDedupSuperseded, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, resolveDefaultMaintainOps, markAutoCompressible, selectFuzzyDedupeIds, stampDedupSuperseded, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
@@ -1121,6 +1121,36 @@ function runSessionStartAutoMaintain(db, project) {
           }
         }
       }
+
+      // v3.76.0: the automatic path used to promote and never demote. boostAccessed ran
+      // above; demotePinned was not even imported here, and it sat outside the default op
+      // set of the CLI and MCP faces too — so the only op that can reach a
+      // heavily-injected-but-uncited row (regular decay deliberately protects
+      // injection_count>0) ran solely when a human typed `--ops demote_pinned`. Measured
+      // on the maintainer's live DB before the fix: 148 rows demoted by citation decay,
+      // never cited, and back at importance>=3, 148/148 of them boost-eligible.
+      //
+      // Placed AFTER boost, for the obvious reason: boostAccessed lifts any
+      // access_count>3 row with importance<3, so demoting first hands the row straight
+      // back at 2 (mem-cli had exactly that order and silently undid its own demotion
+      // inside a single run).
+      //
+      // Placed AFTER fuzzy dedup, for a less obvious one, found by pre-tag review: the
+      // dedup block above re-SELECTs `importance` and selectFuzzyDedupeIds keeps the
+      // higher-importance member of a near-duplicate pair. Demoting first inverted that
+      // rule using a value rewritten 40 lines earlier in the same pass — the pinned row
+      // lost and was tombstoned, keeping the copy WITHOUT the injection history. Dedup
+      // now decides on pre-demotion importance. Nothing between boost and here reads
+      // importance, so the move is free.
+      //
+      // Whole-DB mctx (projectFilter ''), so unlike markAutoCompressibleIfDue this needs
+      // NO per-project gate: one run under the global 24h gate covers every project at
+      // once. Do not "fix" it into a per-project gate — that is the v3.75.0 regression in
+      // reverse.
+      const demotedPinned = resolveDefaultMaintainOps().includes('demote_pinned')
+        ? demotePinned(db, mctx)
+        : 0;
+      if (demotedPinned > 0) debugLog('DEBUG', 'auto-maintain', `demoted ${demotedPinned} pinned-but-uncited observations (no lesson → 1, lesson → 2)`);
 
       // Orphan sweep: remove `ep-flush-*` / `pending-*` runtime files older
       // than 1h. handleLLMEpisode normally unlinks its own tmpFile on every

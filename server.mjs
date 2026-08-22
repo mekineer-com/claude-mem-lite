@@ -19,7 +19,7 @@ import {
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   hardDeleteCandidateCount,
-  OP_CAP, STALE_AGE_MS,
+  OP_CAP, STALE_AGE_MS, resolveDefaultMaintainOps,
 } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
@@ -1148,7 +1148,7 @@ server.registerTool(
     if (action === 'execute') {
       const ops = args.operations && args.operations.length > 0
         ? args.operations
-        : ['cleanup', 'decay', 'boost'];
+        : resolveDefaultMaintainOps();
       // T2-P1-A: reject explicit empty array (vs. omitted → defaults above). Empty-array
       // callers are almost always mistakes; silently running only FTS5 optimize hides the error.
       if (args.operations && args.operations.length === 0) {
@@ -1239,7 +1239,7 @@ server.registerTool(
 
         if (ops.includes('demote_pinned')) {
           const demoted = demotePinned(db, mctx);
-          results.push(`Demoted ${demoted} pinned-but-uncited observations to importance 1 (inj>=8, cited=0)` + (demoted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
+          results.push(`Demoted ${demoted} pinned-but-uncited observations (inj>=8, cited=0; no lesson → importance 1, lesson → 2)` + (demoted >= OP_CAP ? ' (cap reached, re-run for more)' : ''));
         }
 
         if (ops.includes('dedup') && args.merge_ids) {

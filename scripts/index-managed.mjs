@@ -219,7 +219,13 @@ function extractFeatures(frontmatter, body) {
 
   // ── 5. Capability summary — structured extraction ─────────────────────
   const sections = (body.match(/^#{1,3}\s+(.+)$/gm) || [])
-    .map(s => s.replace(/^#{1,3}\s+/, '').replace(/[#*`🚀📋⚡🔍]/g, '').trim())
+    // `u` flag required: without it this class holds the SURROGATE UNITS of the
+    // three astral emoji, so the shared lead \uD83D strips out of EVERY other
+    // U+1F3xx–1F5xx emoji and leaves a lone trailing surrogate behind —
+    // "## 📊 Metrics" became "\uDCCA Metrics", which then went into `resources`
+    // and `resources_fts` as unpaired UTF-16. With `u` the class matches whole
+    // code points: only the four listed emoji are stripped, the rest survive intact.
+    .map(s => s.replace(/^#{1,3}\s+/, '').replace(/[#*`🚀📋⚡🔍]/gu, '').trim())
     .filter(s => s.length > 2 && !/^(overview|purpose|table of contents|---)/i.test(s))
     .slice(0, 8);
 

@@ -34,7 +34,7 @@ const EMPTY_REPOS = new Set([
   'yusufkaraaslan-Skill_Seekers',
 ]);
 
-let stats = { agents: 0, skills: 0, skipped: 0 };
+const stats = { agents: 0, skills: 0, skipped: 0 };
 
 function ensureDir(dir) {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

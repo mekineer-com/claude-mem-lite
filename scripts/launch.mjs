@@ -42,8 +42,15 @@ if (!existsSync(join(ROOT, 'node_modules', 'better-sqlite3'))) {
     //
     // `e.status` not `e.code`: execSync failures carry the exit status on `status`,
     // so the old `|| e.code` rung was dead.
+    // `?? null` not `!= null`: the loose form is the idiom, but this file is
+    // linted under `eqeqeq: always`, and rewriting it as `!== undefined` would
+    // be a BEHAVIOUR change — execSync reports a signal kill with `status: null`,
+    // which `!== undefined` accepts and would render as "npm exited null".
+    // Coalescing first keeps the original both-nullish semantics exactly, `0`
+    // included.
+    const status = e?.status ?? null;
     const detail = e?.message?.split('\n')[0]
-      || (e?.status != null ? `npm exited ${e.status}` : '')
+      || (status !== null ? `npm exited ${status}` : '')
       || (e?.signal ? `npm killed by ${e.signal}` : '')
       || 'unknown error';
     process.stderr.write(`[claude-mem-lite] npm install failed in ${ROOT} — ${detail}\n`);

@@ -2,6 +2,173 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.76.0 — the automatic maintenance path promoted and never demoted
+
+**Upgrade note — a default changes, and it will move rows in your database.**
+`demote_pinned` joins the default maintenance op set. Observations auto-injected **8+
+times and never cited** get their importance floored: **rows with no lesson to 1, rows
+carrying a lesson to 2**. Nothing is deleted, and nothing is hidden. The automatic pass
+caps at **500 rows per 24h run**, the CLI/MCP faces at 1000 per run, so a large backlog
+drains over days rather than in one sweep.
+
+The two floors matter because `importance >= 2` is a hard `WHERE` on the injection faces
+that actually earn citations — PreToolUse recall, SessionStart Key Context, cross-project —
+while `injection_count`, the signal that triggers this op, is incremented only on the two
+UserPromptSubmit faces, the weakest by measured cite-rate. A single floor of 1 would
+convict a row on its weakest surface and evict it from its strongest. **On the maintainer's
+own database, 16 of the 17 rows this op moves carry lessons** (13 of them at importance 3),
+so "clears pinned noise" would have been the wrong description of what it actually does.
+Lesson rows lose the top tier and its ranking weight, and stay eligible everywhere.
+
+**Recovery, stated precisely.** A citation lifts importance by **+1 per cited session**,
+through the Stop-time decay resolution — not "straight back". The row has to be injected
+in that session for the citation to resolve, which a lesson row at 2 still is on every
+face. `boostAccessed` also lifts +1 per 24h maintain run, but only for rows with
+`access_count > 3`; a row below that has no automatic path back and recovers by citation
+alone.
+
+**No action required.** To keep the old behaviour, set `CLAUDE_MEM_SKIP_DEMOTE_PINNED=1`
+(any non-empty value except `0`/`false`/`no`/`off`). It removes the op from the DEFAULT
+set only, so an explicit `maintain execute --ops demote_pinned` or
+`mem_maintain operations:["demote_pinned"]` still runs. Pinning v3.75.1 also works.
+
+### the defect: the op that clears pinned noise was wired to every face except the ones that run
+
+`demotePinned` exists, is tested, and its docstring names the exact blind spot it repairs:
+the regular `decay` op deliberately protects `injection_count > 0` — a row Claude was shown
+eight times is treated as contextually proven — so a heavily-injected, never-cited row is
+the one thing decay can never reach. That is what `demote_pinned` is for.
+
+It ran on no path by default. It was absent from the CLI default op set
+(`cleanup,decay,boost`), absent from the MCP default set (the same three), and `hook.mjs`
+did not import it at all — so on the only path that runs unattended, it did not exist. Its
+opponent `boostAccessed` (`access_count > 3` → `importance + 1`) was in all three. The
+automatic path promoted and never demoted.
+
+Measured on the maintainer's live database before the fix: **148 rows** sat demoted by
+citation decay, never cited, and back at `importance >= 3` — and **148 of those 148** were
+`boostAccessed`-eligible, so the mechanism is exact rather than inferred. A further **17
+rows** were sitting demote-eligible at that moment, carrying 265 recorded injections
+between them.
+
+A second drift rode along: the two faces that *did* wire the op ran it in **opposite
+orders**, and the order is load-bearing. `mem-cli` demoted then boosted — which hands the
+row straight back, 1 → 2, the demotion silently undone inside a single maintain run.
+`server.mjs` boosted then demoted, landing at 1. The default set and its order now live in
+one place (`DEFAULT_MAINTAIN_OPS` in `lib/maintain-core.mjs`) and all three faces consume
+it; `demote_pinned` is ordered after `boost` everywhere.
+
+The auto-maintain call sits inside the global 24h gate on purpose. Unlike
+`markAutoCompressible` — whose per-project argument is what made the v3.75.0 regression
+possible — this op runs on the whole-DB `mctx` (`projectFilter: ''`), so one run covers
+every project at once. The comment says so, because "fix it into a per-project gate" is the
+plausible wrong move here.
+
+Pinned by `tests/maintain-default-ops.test.mjs`, which drives all three faces for real: the
+CLI through `cli.mjs maintain execute`, MCP through a `tools/call` over stdio, and the hook
+through `hook.mjs auto-maintain` in a subprocess. The fixture row seeds at **importance 2**,
+not 3, and that is the whole design: at 3 `boostAccessed` cannot fire (it requires
+`importance < 3`), the ordering mutation stays green, and the case would only prove "demote
+ran at all". At 2 the three outcomes separate — correct order ends at 1, reversed order at
+2, opt-out at 3. Eight mutations verified, each landing on its predicted value: dropping
+`demote_pinned` from the default set reddens all three faces; swapping the CLI's block order
+reddens with `expected 2 to be 1`; deleting the hook's call reddens with `expected 3 to be
+1`; making the opt-out a no-op reddens with `expected 1 to be 3`; collapsing the two floors
+to a literal 1 reddens the lesson case; reverting only the `WHERE` bound while keeping the
+`CASE` in `SET` reddens the phantom-demotion case; restoring `=== '1'` reddens the env-value
+case; and dropping `injection_count = 0` from the noise pass reddens the auto-hide case.
+
+### what pre-tag review changed
+
+Two independent fresh-context reviews were dispatched against this candidate **before** the
+tag — the first release in a while where that happened in the right order rather than 40 to
+90 minutes after it. **One of the two delivered nothing** (an idle signal, no report, no
+scratch artifact — the fourth time this delivery channel has failed here), so the
+test-quality lens is missing from this release and its questions are unanswered: what these
+tests do NOT kill, and whether the diff eroded any pre-existing guard. The correctness pass
+did deliver, and it confirmed the four verifiable claims (execution order on all three faces, the whole-DB
+`mctx` argument for keeping the global gate, the 500/1000 caps, and that no cited row or
+sub-1 importance is reachable) and **refuted the framing of the change itself**. Four
+things landed because of it:
+
+- **The lesson floor above.** It was a flat `importance = 1` until review measured the
+  affected population and found it was 16/17 lessons. `demotePinned` was the only
+  automatic pass in `lib/maintain-core.mjs` without the "never auto-GC a lesson" clause its
+  six siblings all carry.
+- **`markAutoCompressible`'s noise pass gained `injection_count = 0`,** matching the aged
+  pass that has had it since v2.56.0. Review reproduced the full chain: demote a row to 1
+  on one run, and the next run marks it `COMPRESSED_AUTO` — hidden from every read path,
+  therefore never injected, therefore never cited, therefore with no way back. The
+  population was zero and stayed zero only because of an undocumented interlock between two
+  hand-listed title sets in two files. Now it is a clause, and a test.
+- **The demote call moved below the fuzzy-dedup block in `hook.mjs`.** Dedup keeps the
+  higher-importance member of a near-duplicate pair, and it re-`SELECT`s importance — so
+  demoting first inverted dedup's own rule using a value rewritten 40 lines earlier in the
+  same pass, tombstoning the pinned row and keeping the copy without the injection history.
+- **`CLAUDE_MEM_SKIP_DEMOTE_PINNED` stopped comparing `=== '1'`,** which silently ignored
+  `=true` / `=yes`. That is the exact failure mode the comment three lines above it cites
+  `CLAUDE_MEM_RECOMMEND_MODE=live` for, committed underneath its own warning.
+
+Two claims in the first draft of these notes were false and are corrected above: that a
+citation "promotes the row straight back", and that the change "clears pinned noise".
+
+### also fixed: eslint never looked at scripts/
+
+`eslint.config.mjs` listed `scripts/**` in `ignores`, so **17 files / 4470 lines** were
+outside the gate — five of them (`post-tool-use`, `pre-agent-inject`, `pre-tool-recall`,
+`pre-skill-bridge`, `user-prompt-search`) fire on every hook event in production. This is
+where the v3.75.1 stray-`export` bug lived. Un-ignoring the directory reported five errors,
+three of them real:
+
+- **A lone-surrogate corruption reaching SQLite.** `scripts/index-managed.mjs:222` stripped
+  header emoji with `/[#*`🚀📋⚡🔍]/g` — no `u` flag, so the class held the *surrogate
+  units* of the three astral emoji and the shared lead `\uD83D` was stripped out of every
+  other U+1F3xx–1F5xx emoji. `"## 📊 Metrics"` became `"\uDCCA Metrics"`, an unpaired
+  UTF-16 code unit, which then flowed through `extractFeatures` into `resources` and
+  `resources_fts`. With `u` the class matches whole code points: the four listed emoji are
+  stripped, the rest survive intact.
+- **An `eqeqeq` report that must not be taken at face value.** `scripts/launch.mjs:46` used
+  `e?.status != null` — the deliberate both-nullish idiom. Rewriting it as `!== undefined`,
+  which is what the rule suggests, would be a behaviour change: `execSync` reports a
+  signal kill with `status: null`, and the result would read `npm exited null`. Coalescing
+  first (`e?.status ?? null`) keeps the original semantics exactly, `0` included.
+- `scripts/extract-repos.mjs:37` — `let` that is never reassigned.
+
+`tests/lint-gate-coverage.test.mjs` pins the gate open through eslint's own
+`isPathIgnored()` rather than a substring match on the config, so a config-format change
+cannot make it pass vacuously. Its second half guards the sibling gate with the identical
+failure mode: `ci.yml` enumerates the shellcheck targets by hand, and
+`scripts/pre-agent-inject.sh` already spent a release outside that list. Both assertions
+were mutation-verified.
+
+### corrections to the v3.75.1 notes below
+
+- **knip does not skip `scripts/`.** The v3.75.1 note says "eslint and knip both skip
+  `scripts/`". Only the eslint half is true. `knip.json` lists `scripts/**/*.{mjs,js}` in
+  both `project` and `entry` — it scans the directory, and the stray `export` escaped
+  because **an entry point's exports are exempt from the unused-export report by
+  definition**, not because the file was unseen. The evidence is in the report itself: zero
+  of the 31 unused exports carry a `scripts/` path. The distinction matters because the two
+  causes have different fixes, and the sentence as written points at the wrong one.
+
+Suite **300 files / 4857 tests** (from 298 / 4844), eslint clean with `scripts/` now inside
+the gate, shellcheck clean over four scripts, knip unchanged at 0 unused files / 31 unused
+exports — both new exports have real consumers, so the round adds no dead surface. Denoise
+A/B at baseline (precision P@10 0.811, vocab-mismatch R@10 0.341, cjk_mixed P@10 0.940) with
+all four behavioural probe groups green — though that suite is structurally blind to this
+release's main change: its fixtures seed `importance` directly and never run maintenance, so
+"unchanged" here means no collateral damage to retrieval, not that the lever was evaluated.
+
+**What was deliberately NOT built.** The investigation started from a different hypothesis —
+that heavily-injected, never-cited rows need a hard gate that stops injecting them — and the
+data refuted it. A candidate gate of `decay_seen >= 20 AND cited_count = 0` matches 631 rows,
+while 331 of the 510 rows that have *ever* been cited also carry a lifetime `decay_seen >= 20`.
+Whether those rows had already been cited when they crossed the threshold is unknowable:
+`citation_log` stores per-session aggregates (`injected_n` / `cited_n`), never a
+per-observation citation timestamp. That unknown is exactly what such a gate's safety rests
+on, so no gate ships. Deciding it needs a new column recording `decay_seen_count` at first
+citation, and several weeks of data.
+
 ## v3.75.1 — what independent review found in v3.75.0, including a regression and three false claims
 
 **Upgrade note.** Upgrade from v3.75.0. Three independent reviews of that release landed

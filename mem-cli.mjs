@@ -30,7 +30,7 @@ import {
   recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans,
   purgeStale, purgeStalePreview, findDuplicates, maintenanceStats, rebuildVectors, vacuum,
   hardDeleteCandidateCount,
-  OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD,
+  OP_CAP, STALE_AGE_MS, PINNED_INJ_THRESHOLD, resolveDefaultMaintainOps,
 } from './lib/maintain-core.mjs';
 import { snapshotDb, listSnapshots, backupBudgetBytes } from './lib/db-backup.mjs';
 import { deleteObservations, previewDeleteRows } from './lib/delete-core.mjs';
@@ -2012,7 +2012,7 @@ function cmdMaintain(db, args) {
     out(`  Stale (>30d, imp=1, no access, never injected): ${stats.stale}`);
     out(`  Broken (no title/narrative): ${stats.broken}`);
     out(`  Boostable (accessed>3, imp<3): ${stats.boostable}`);
-    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — run: maintain execute --ops demote_pinned`);
+    out(`  Pinned-but-uncited (inj>=${PINNED_INJ_THRESHOLD}, cited=0, imp>1): ${stats.pinned} — cleared by the default maintain set since v3.76.0 (opt out: CLAUDE_MEM_SKIP_DEMOTE_PINNED=1)`);
     out(formatPendingPurgeLine(stats.pendingPurge));
     if (duplicates.length > 0) {
       const autoMergeable = duplicates.filter(d => parseFloat(d.similarity) >= AUTO_MERGE_THRESHOLD);
@@ -2047,9 +2047,11 @@ function cmdMaintain(db, args) {
   const VALID_OPS = ['cleanup', 'decay', 'boost', 'demote_pinned', 'dedup', 'purge_stale', 'rebuild_vectors', 'vacuum'];
   // Distinguish flag-absent (use default op set) from flag-present-but-empty
   // (`--ops ""`, e.g. an unset shell var). The latter previously coerced via `||`
-  // to the destructive default cleanup,decay,boost and EXECUTED it; route it to the
-  // VALID_OPS check below instead so it's rejected like `--ops " "` / `--ops "decay,"`.
-  const opsStr = flags.ops === undefined ? 'cleanup,decay,boost' : String(flags.ops);
+  // to the destructive default set and EXECUTED it; route it to the VALID_OPS check
+  // below instead so it's rejected like `--ops " "` / `--ops "decay,"`. (That default
+  // was the literal `cleanup,decay,boost` when this was written; it now comes from
+  // DEFAULT_MAINTAIN_OPS, which is why the list is no longer spelled out here.)
+  const opsStr = flags.ops === undefined ? resolveDefaultMaintainOps().join(',') : String(flags.ops);
   const ops = opsStr.split(',').map(s => s.trim());
   const invalidOps = ops.filter(op => !VALID_OPS.includes(op));
   if (invalidOps.length > 0) {
@@ -2138,17 +2140,23 @@ function cmdMaintain(db, args) {
       results.push(`Decayed ${decayed} stale observations, marked ${idleMarked} idle as pending-purge${decayCap}`);
     }
 
+    if (ops.includes('boost')) {
+      const boosted = boostAccessed(db, mctx);
+      results.push(`Boosted ${boosted} frequently-accessed observations${capHint(boosted)}`);
+    }
+
+    // AFTER boost, matching server.mjs and hook.mjs. This block used to sit BEFORE
+    // it, and the order was load-bearing in the wrong direction: boostAccessed lifts
+    // any access_count>3 row with importance<3, so demoting a pinned row to 1 and
+    // then boosting handed it straight back at 2 — the demotion silently undone
+    // inside a single maintain run. DEFAULT_MAINTAIN_OPS pins the order; this block
+    // has to physically follow the boost block for that order to be real.
     if (ops.includes('demote_pinned')) {
       // Repair the citation-decay blind spot: decay protects injection_count>0, so a
       // heavily-injected-but-uncited memory stays pinned at max importance forever.
       // demotePinned (maintain-core) drops it to 1 in one pass. Floor 1, not purge.
       const demoted = demotePinned(db, mctx);
-      results.push(`Demoted ${demoted} pinned-but-uncited observations to importance 1 (inj>=${PINNED_INJ_THRESHOLD}, cited=0)${capHint(demoted)}`);
-    }
-
-    if (ops.includes('boost')) {
-      const boosted = boostAccessed(db, mctx);
-      results.push(`Boosted ${boosted} frequently-accessed observations${capHint(boosted)}`);
+      results.push(`Demoted ${demoted} pinned-but-uncited observations (inj>=${PINNED_INJ_THRESHOLD}, cited=0; no lesson → importance 1, lesson → 2)${capHint(demoted)}`);
     }
 
     if (ops.includes('dedup') && flags['merge-ids']) {
@@ -2784,10 +2792,15 @@ Commands:
 
   maintain <scan|execute>  Memory maintenance
     --ops O             Comma-separated: cleanup,decay,boost,demote_pinned,dedup,purge_stale,rebuild_vectors,vacuum
+                        Default when omitted: cleanup,decay,boost,demote_pinned (in that order)
     --merge-ids K:R,... For dedup: keepId:removeId pairs (e.g. 10:11,20:21:22)
     --project P         Filter by project
     --retain-days N     For purge_stale: keep last N days (default 30)
-                        demote_pinned: importance→1 for inj>=8 & cited=0 (clears pinned noise)
+                        demote_pinned: importance→1 for inj>=8 & cited=0 (clears pinned noise).
+                        In the default set since v3.76.0; runs AFTER boost, which would
+                        otherwise hand the row straight back. Opt out of the DEFAULT with
+                        CLAUDE_MEM_SKIP_DEMOTE_PINNED=1 — an explicit --ops demote_pinned
+                        still runs.
                         vacuum: reclaim freelist dead space (whole-DB, ignores --project)
 
   optimize              LLM-powered memory optimization (preview by default)
