@@ -763,9 +763,11 @@ function initHomeDb(home) {
   return { db, dbPath };
 }
 
+// `event` may be a string or [event, ...argv] — `auto-maintain` takes the project scope
+// as argv[3] since the compress-marking passes moved off SessionStart (P2-11).
 function runHookCmd(event, { home, stdin = '', cwd = home }) {
   try {
-    const stdout = execFileSync(process.execPath, [HOOK_PATH, event], {
+    const stdout = execFileSync(process.execPath, [HOOK_PATH, ...(Array.isArray(event) ? event : [event])], {
       input: stdin,
       timeout: 10000,
       encoding: 'utf8',
@@ -1552,6 +1554,10 @@ describe('v2.56.0 #4: injection_count protects from auto-maintain decay/mark-idl
     db.close();
 
     runHookCmd('session-start', { home: tmpHome, cwd: projDir, stdin: JSON.stringify({ session_id: 'cc-inj-uuid' }) });
+    // P2-11: the compress-marking passes moved off the SessionStart transaction onto the
+    // 24h auto-maintain cadence, so the marking that used to happen inside the call above
+    // is now driven explicitly — the same shape MED-4 already established here.
+    runHookCmd(['auto-maintain', 'audit--t4'], { home: tmpHome, cwd: projDir });
 
     const db2 = new Database(dbPath, { readonly: true });
     try {

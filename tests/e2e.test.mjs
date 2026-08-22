@@ -1345,8 +1345,12 @@ describe('Suite 8a: Additional E2E', () => {
 
     db.close();
 
-    // Session-start triggers auto-compression
+    // P2-11: auto-compress marking moved off the SessionStart transaction onto the 24h
+    // auto-maintain cadence, so it is driven explicitly here (SKIP_MAINTAIN is set in this
+    // harness, so the background spawn never races the read below). The project scope is
+    // argv[3] — the same scope the SessionStart transaction always applied.
     runHook('session-start', { env: { HOME: tmpHome } });
+    runHook('auto-maintain', { env: { HOME: tmpHome }, args: ['parent--testproj'] });
 
     const db2 = openTestDb(tmpHome);
     const obs = db2.prepare('SELECT id, importance, compressed_into FROM observations ORDER BY id').all();

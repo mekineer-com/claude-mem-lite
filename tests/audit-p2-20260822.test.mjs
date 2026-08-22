@@ -209,3 +209,121 @@ describe('P2-10 — the type-quality table has one source', () => {
     }
   });
 });
+
+// P2-11: SessionStart ran two full-table conditional UPDATEs on every boot to mark
+// auto-compressible rows, outside the 24h auto-maintain gate that already guarded decay,
+// purge and backup. Nothing about starting a session makes a 30-day-old row newly
+// compressible — the work is maintenance, and every boot paid for it. It now runs on the
+// maintain cadence. The predicates and the project scope are unchanged: the cadence moved,
+// not what gets marked.
+
+describe('P2-11 — auto-compress marking runs on the maintain cadence, not every boot', () => {
+  let dir, db;
+  const PROJECT = 'p2--markproj';
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mem-p2-mark-'));
+    db = new Database(join(dir, 'mark.db'));
+    initSchema(db);
+    const now = Date.now();
+    db.prepare(`
+      INSERT INTO sdk_sessions (content_session_id, memory_session_id, project, started_at, started_at_epoch, status)
+      VALUES ('mk-sess', 'mk-mem', ?, ?, ?, 'active')
+    `).run(PROJECT, new Date(now).toISOString(), now);
+  });
+
+  afterEach(() => {
+    try { db.close(); } catch { /* already closed */ }
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  function seedObs({ title, ageDays, importance = 1, lesson = null, facts = '[]',
+    injectionCount = 0, project = PROJECT }) {
+    const epoch = Date.now() - ageDays * 86400000;
+    return Number(db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+        concepts, facts, files_read, files_modified, importance, compressed_into, access_count,
+        injection_count, lesson_learned, created_at, created_at_epoch)
+      VALUES ('mk-mem', ?, ?, 'change', ?, '', '', '', ?, '[]', '[]', ?, NULL, 0, ?, ?, ?, ?)
+    `).run(project, `${title} body`, title, facts, importance, injectionCount, lesson,
+      new Date(epoch).toISOString(), epoch).lastInsertRowid);
+  }
+
+  const compressedInto = (id) =>
+    db.prepare('SELECT compressed_into FROM observations WHERE id = ?').get(id).compressed_into;
+
+  it('marks the aged low-importance rows the 30d pass always marked', async () => {
+    const { markAutoCompressible } = await import('../lib/maintain-core.mjs');
+    const old = seedObs({ title: 'Worked on the parser', ageDays: 45 });
+    const recent = seedObs({ title: 'Worked on the lexer', ageDays: 3 });
+
+    const res = markAutoCompressible(db, PROJECT);
+
+    expect(res.aged).toBe(1);
+    expect(compressedInto(old)).toBe(-1);           // COMPRESSED_AUTO
+    expect(compressedInto(recent)).toBeNull();
+  });
+
+  // The protections the 30d predicate carries are the reason the pass is safe to run at
+  // all; a move that silently dropped one would be invisible until rows went missing.
+  //
+  // The titles here deliberately avoid the LOW_SIGNAL shapes ('Modified '/'Worked on '/
+  // 'Reviewed '/'Error…'). The accelerated 7d pass does NOT carry the injection_count
+  // guard — that asymmetry is pre-existing, and a 'Worked on …' title would be swept by
+  // the noise pass before the 30d protections were ever exercised.
+  it('the 30d pass still protects lessons, injected rows, and high importance', async () => {
+    const { markAutoCompressible } = await import('../lib/maintain-core.mjs');
+    const withLesson = seedObs({ title: 'Investigated auth', ageDays: 45, lesson: 'real takeaway' });
+    const injected = seedObs({ title: 'Investigated cache', ageDays: 45, injectionCount: 3 });
+    const important = seedObs({ title: 'Investigated schema', ageDays: 45, importance: 3 });
+    const otherProject = seedObs({ title: 'Investigated other', ageDays: 45, project: 'p2--elsewhere' });
+
+    markAutoCompressible(db, PROJECT);
+
+    expect(compressedInto(withLesson), 'a lesson-bearing row was auto-hidden').toBeNull();
+    expect(compressedInto(injected), 'an injected row was auto-hidden').toBeNull();
+    expect(compressedInto(important), 'an importance>1 row was auto-hidden').toBeNull();
+    expect(compressedInto(otherProject), 'marking escaped its project scope').toBeNull();
+  });
+
+  // The accelerated 7d pass has different protections (no injection_count guard, requires
+  // empty facts and a LOW_SIGNAL title shape) — it is a separate predicate, tested apart.
+  it('marks LOW_SIGNAL noise on the accelerated 7d window', async () => {
+    const { markAutoCompressible } = await import('../lib/maintain-core.mjs');
+    const noise = seedObs({ title: 'Modified a.mjs, b.mjs', ageDays: 10 });
+    const withFacts = seedObs({ title: 'Modified c.mjs', ageDays: 10, facts: '["a fact"]' });
+    const notNoiseShape = seedObs({ title: 'Investigated the flush race', ageDays: 10 });
+
+    const res = markAutoCompressible(db, PROJECT);
+
+    expect(res.noise).toBe(1);
+    expect(compressedInto(noise)).toBe(-1);
+    expect(compressedInto(withFacts), 'a fact-bearing row was swept as noise').toBeNull();
+    expect(compressedInto(notNoiseShape), 'a non-LOW_SIGNAL title was swept as noise').toBeNull();
+  });
+
+  it('is a no-op without a project scope', async () => {
+    const { markAutoCompressible } = await import('../lib/maintain-core.mjs');
+    seedObs({ title: 'Worked on the parser', ageDays: 45 });
+    expect(markAutoCompressible(db, undefined)).toEqual({ aged: 0, noise: 0 });
+  });
+
+  // The point of the move: SessionStart's transaction must no longer carry these UPDATEs,
+  // and the maintain worker must. Predicates alone can't show that — only the call sites.
+  it('the marking call sites moved from SessionStart to auto-maintain', async () => {
+    const { readFileSync } = await import('fs');
+    const { fileURLToPath } = await import('url');
+    const { dirname } = await import('path');
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'hook.mjs'), 'utf8');
+
+    const dbMutations = src.slice(
+      src.indexOf('function runSessionStartDbMutations'),
+      src.indexOf('function runSessionStartAutoMaintain'));
+    expect(dbMutations, 'SessionStart still runs a compress-marking UPDATE every boot')
+      .not.toMatch(/UPDATE observations SET compressed_into/);
+
+    const autoMaintain = src.slice(src.indexOf('function runSessionStartAutoMaintain'));
+    expect(autoMaintain, 'auto-maintain does not run the marking')
+      .toMatch(/markAutoCompressible\(db, project\)/);
+  });
+});

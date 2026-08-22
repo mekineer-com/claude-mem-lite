@@ -26,7 +26,7 @@ import {
   truncate, inferProject, detectBashSignificance,
   planErrorRecall, extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
-  COMPRESSED_AUTO, OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
+  OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
   MAX_HOOK_STDIN_BYTES,
 } from './utils.mjs';
 import {
@@ -50,7 +50,7 @@ import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
 import { queueHookContext, queueHookSystemMessage, flushHookStdout } from './lib/hook-stdout.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
-import { cleanupBroken, decayAndMarkIdle, boostAccessed, selectFuzzyDedupeIds, stampDedupSuperseded, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
+import { cleanupBroken, decayAndMarkIdle, boostAccessed, markAutoCompressible, selectFuzzyDedupeIds, stampDedupSuperseded, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
@@ -942,7 +942,6 @@ function gcStalePreRecallCooldowns() {
 function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now }) {
   // ── DB mutations in a transaction (crash-safe consistency) ──
   const staleSessionCutoff = Date.now() - STALE_SESSION_MS;
-  const autoCompressAge = Date.now() - 30 * DAY_MS; // 30 days (accelerated from 90)
 
   db.transaction(() => {
     // Ensure session exists in DB (INSERT OR IGNORE avoids race condition)
@@ -965,59 +964,14 @@ function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now
       WHERE status = 'active' AND started_at_epoch < ?
     `).run(staleSessionCutoff);
 
-    // Auto-compress: mark old low-importance observations as compressed (30+ days, importance<=1)
-    // Lightweight: only marks rows, doesn't create summaries (full compression via mem_compress)
-    // v2.56.0 #4: protect injection_count > 0 obs (proven contextually relevant
-    // via hook-memory injection, even if user never explicitly fetched). Same
-    // protection applied symmetrically in auto-maintain decay/mark-idle below.
-    // `<= 1` (was `= 1`): citation-decay floors importance at 0 (added v2.73.2, after this
-    // predicate was written) and the LLM low-signal filter saves at imp=0 — those rows are
-    // STRICTLY lower value than imp=1 yet escaped GC, accumulating to ~40% of a mature DB
-    // (immortal: hidden from injection by the imp>=1 floor, but visible as explicit-search noise).
-    const compressed = db.prepare(`
-      UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND COALESCE(importance, 1) <= 1
-        AND COALESCE(injection_count, 0) = 0
-        -- v3.23: never auto-hide a row that carries a real lesson. compression folds
-        -- sources into a title-only summary (lesson lost), and COMPRESSED_AUTO hides the
-        -- row from search entirely. A low-importance obs whose lesson_learned is the
-        -- distilled value must stay findable (audit: 62 lessons buried this way). The 7d
-        -- noise block below already excludes lessons; this 30d block had drifted.
-        AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
-        AND created_at_epoch < ?
-        AND project = ?
-    `).run(autoCompressAge, project);
-    if (compressed.changes > 0) {
-      debugLog('DEBUG', 'session-start', `auto-compressed ${compressed.changes} old observations`);
-    }
-
-    // v2.47 P0-3: accelerated compress for LOW_SIGNAL + no-signal noise.
-    // 7-day window instead of 30. The write-side capNoiseImportance forces
-    // imp=1 on these already; this just shrinks the GC latency so the
-    // projected 32.5% corpus reduction materializes within a week on live
-    // DBs instead of bleeding into the 30-day tier.
-    const noiseCompressAge = Date.now() - 7 * DAY_MS;
-    const noiseCompressed = db.prepare(`
-      UPDATE observations SET compressed_into = ${COMPRESSED_AUTO}
-      WHERE COALESCE(compressed_into, 0) = 0
-        AND COALESCE(importance, 1) <= 1
-        AND (lesson_learned IS NULL OR lesson_learned = '' OR lesson_learned = 'none')
-        AND (facts IS NULL OR facts = '' OR facts = '[]')
-        AND (
-          title LIKE 'Modified %' OR title LIKE 'Worked on %'
-          OR title LIKE 'Reviewed %' OR title LIKE 'Error%'
-        )
-        AND created_at_epoch < ?
-        AND project = ?
-    `).run(noiseCompressAge, project);
-    if (noiseCompressed.changes > 0) {
-      debugLog('DEBUG', 'session-start', `auto-compressed ${noiseCompressed.changes} LOW_SIGNAL noise (7d window)`);
-    }
+    // The two auto-compress marking passes that used to run here moved to the 24h
+    // auto-maintain worker (audit 2026-08-22, P2-11): they are maintenance, and every
+    // boot paid two full-table conditional UPDATEs for them. markAutoCompressible in
+    // lib/maintain-core.mjs holds the (unchanged) predicates.
   })();
 }
 
-function runSessionStartAutoMaintain(db) {
+function runSessionStartAutoMaintain(db, project) {
   // Auto-maintain: cleanup + decay + boost + purge, gated to once per 24h
   const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
   let shouldMaintain = true;
@@ -1047,6 +1001,20 @@ function runSessionStartAutoMaintain(db) {
       // children (compressed_into dangling at a deleted id). purgeStale recovers them
       // first and caps at opCap. Schema has no marked_at_epoch, so retention anchors on
       // created_at_epoch: 30d marking gate + 7d grace = 37d.
+      // Mark auto-compressible rows BEFORE the purge/decay ops below, preserving the
+      // order the SessionStart transaction had relative to them (marking ran first, at
+      // boot). Project-scoped exactly as before — P2-11 moved the cadence, not the scope.
+      if (project) {
+        const marked = markAutoCompressible(db, project);
+        if (marked.aged > 0) debugLog('DEBUG', 'auto-maintain', `auto-compressed ${marked.aged} old observations`);
+        if (marked.noise > 0) debugLog('DEBUG', 'auto-maintain', `auto-compressed ${marked.noise} LOW_SIGNAL noise (7d window)`);
+      } else {
+        // Every production spawn passes it (spawnBackground('auto-maintain', project)); a
+        // hand-run `hook.mjs auto-maintain` does not. Say so rather than skipping in
+        // silence — work vanishing without a word is this codebase's recurring shape.
+        debugLog('DEBUG', 'auto-maintain', 'no project argument — skipping auto-compress marking');
+      }
+
       const purged = purgeStale(db, mctx, Date.now() - 37 * DAY_MS);
       if (purged > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged} stale observations`);
 
@@ -1175,22 +1143,22 @@ function runSessionStartAutoMaintain(db) {
 // due, the heavy pass (VACUUM-INTO snapshot + purge/cleanup/decay/dedup) is handed to
 // a detached `auto-maintain` worker via spawnBackground so it never blocks interactive
 // session start. The worker re-checks the same gate (idempotent) before doing the work.
-function scheduleSessionStartAutoMaintain() {
+function scheduleSessionStartAutoMaintain(project) {
   const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
   try {
     const last = JSON.parse(readFileSync(maintainFile, 'utf8'));
     if (Date.now() - last.epoch < 24 * 3600000) return; // not due — no spawn
   } catch { /* no gate file → due */ }
-  if (!process.env.CLAUDE_MEM_SKIP_MAINTAIN) spawnBackground('auto-maintain');
+  if (!process.env.CLAUDE_MEM_SKIP_MAINTAIN) spawnBackground('auto-maintain', project);
 }
 
 // Detached `auto-maintain` worker entry: opens its own DB and runs the maintenance
 // pass off the interactive boot path. runSessionStartAutoMaintain still owns the 24h
 // gate + the compress/optimize spawns at its tail.
-function handleAutoMaintain() {
+function handleAutoMaintain(project) {
   const db = openDb();
   if (!db) return;
-  try { runSessionStartAutoMaintain(db); }
+  try { runSessionStartAutoMaintain(db, project); }
   finally { try { db.close(); } catch { /* ignore */ } }
 }
 
@@ -1506,7 +1474,7 @@ async function handleSessionStart() {
 
     runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now });
 
-    scheduleSessionStartAutoMaintain();
+    scheduleSessionStartAutoMaintain(project);
 
     // ── Non-transactional operations (side effects, background work) ──
 
@@ -1989,7 +1957,7 @@ try {
     case 'llm-summary':      await handleLLMSummary(); break;
     case 'auto-compress':    handleAutoCompress(); break;
     case 'enrich-save':      await handleEnrichSave(process.argv[3]); break;
-    case 'auto-maintain':    handleAutoMaintain(); break;
+    case 'auto-maintain':    handleAutoMaintain(process.argv[3]); break;
     case 'llm-optimize':   await handleLLMOptimize(); break;
     // Detached update refresh spawned by handleSessionStart (audit P3d) — does the
     // GitHub fetch off the SessionStart critical path, writing update-state.json so
