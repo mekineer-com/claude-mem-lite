@@ -16,6 +16,9 @@ import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, 
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
+// Single source for the type-quality weights (audit 2026-08-22 P2-10) — this table used
+// to be hand-copied here and in hook-memory.mjs, kept equal only by comment convention.
+import { TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 
 import { DAY_MS } from './lib/time-constants.mjs';
 /**
@@ -108,18 +111,12 @@ export function selectWithTokenBudget(db, project, budget = 2000) {
   const selectedSess = [];
   let totalTokens = 0;
 
-  // Type quality multipliers — aligned with scoring-sql.mjs TYPE_QUALITY_CASE (R2).
-  // Weights calibrated from empirical avg access_count per type:
-  //   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
-  // Pre-R2 had bugfix=0.35 (inverted vs reality — bugfixes are 2.4× more used than changes).
-  const TYPE_QUALITY = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature: 1.0, refactor: 0.6, change: 0.5 };
-
   // Score each candidate: value = recency * type_quality * importance, cost = tokens
   // Recency uses exponential half-life (consistent with server.mjs BM25 scoring)
   const scoredObs = obsPool.map(o => {
     const halfLifeMs = DECAY_HALF_LIFE_BY_TYPE[o.type] || DEFAULT_DECAY_HALF_LIFE_MS;
     const recency = 1.0 + Math.exp(-0.693 * (now_ms - o.created_at_epoch) / halfLifeMs);
-    const typeQuality = TYPE_QUALITY[o.type] || 1.0;
+    const typeQuality = TYPE_QUALITY[o.type] || TYPE_QUALITY_DEFAULT;
     const impBoost = 0.5 + 0.5 * (o.importance || 1);
     const lessonBoost = o.lesson_learned ? 1.3 : 1.0;
     const value = recency * typeQuality * impBoost * lessonBoost;

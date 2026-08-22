@@ -2,7 +2,7 @@
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
 import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters, basenameAnySep } from './utils.mjs';
-import { citeFactorJs } from './scoring-sql.mjs';
+import { citeFactorJs, TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recordMetric } from './lib/metrics.mjs';
 import { DB_DIR } from './schema.mjs';
@@ -12,11 +12,9 @@ import { formatSubagentContext } from './lib/task-imperative.mjs';
 import { DAY_MS } from './lib/time-constants.mjs';
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * DAY_MS; // 60 days
-// Aligned with TYPE_QUALITY_CASE in scoring-sql.mjs (R2 rebalance).
-// Weights calibrated to empirical avg access_count:
-//   decision 6.05, discovery 3.32, bugfix 2.24, feature 2.04, change 0.93, refactor 0.54.
+// Type weights come from scoring-sql.mjs — this was a hand-copy kept equal by an
+// "aligned with (R2)" comment (audit 2026-08-22, P2-10).
 // lesson_learned boost (1.5×) stacks for entries with a real takeaway.
-const MEMORY_TYPE_BOOST = { decision: 1.5, discovery: 1.3, bugfix: 1.1, feature: 1.0, refactor: 0.6, change: 0.5 };
 // Adaptive BM25 thresholds — scale with corpus size to filter noise.
 // Larger corpora produce more weak matches from common words.
 const BM25_THRESHOLD = { TINY: 0, SMALL: 1.5, MEDIUM: 2.5, LARGE: 3.5 };
@@ -302,7 +300,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         return {
           ...r,
           score: Math.abs(r.relevance)
-            * (MEMORY_TYPE_BOOST[r.type] || 1.0)
+            * (TYPE_QUALITY[r.type] || TYPE_QUALITY_DEFAULT)
             * (r.lesson_learned ? 1.5 : 1.0)
             * (r.importance >= 2 ? 1.0 : 0.6)
             * crossProjectPenalty

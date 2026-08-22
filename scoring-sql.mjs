@@ -80,15 +80,29 @@ export const TYPE_DECAY_CASE = `(
  * The old (pre-R2) table had bugfix=0.75 < change=0.8, inverted vs reality.
  * Applied as: BM25 × time_decay × TYPE_QUALITY × project_boost × importance
  */
+export const TYPE_QUALITY = {
+  decision: 1.5,
+  discovery: 1.3,
+  bugfix: 1.1,
+  feature: 1.0,
+  refactor: 0.6,
+  change: 0.5,
+};
+
+/** Multiplier for a type not in the table (legacy rows, manual saves). */
+export const TYPE_QUALITY_DEFAULT = 1.0;
+
+/**
+ * The SQL form, generated from TYPE_QUALITY rather than written beside it.
+ * The table used to exist three times — here, hook-context.mjs, hook-memory.mjs — with
+ * "aligned with scoring-sql.mjs (R2)" comments as the only thing keeping them equal
+ * (audit 2026-08-22, P2-10). Values happened to agree; the next re-weighting is what the
+ * copies were waiting for. Both JS consumers now import TYPE_QUALITY from here.
+ */
 export const TYPE_QUALITY_CASE = `(
   CASE o.type
-    WHEN 'decision'  THEN 1.5
-    WHEN 'discovery' THEN 1.3
-    WHEN 'bugfix'    THEN 1.1
-    WHEN 'feature'   THEN 1.0
-    WHEN 'refactor'  THEN 0.6
-    WHEN 'change'    THEN 0.5
-    ELSE 1.0
+${Object.entries(TYPE_QUALITY).map(([t, w]) => `    WHEN '${t}' THEN ${w.toFixed(1)}`).join('\n')}
+    ELSE ${TYPE_QUALITY_DEFAULT.toFixed(1)}
   END
 )`;
 
