@@ -2,16 +2,53 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.74.1 — v3.74.0 silenced Go panics; the filter is now a superset of the trigger
+
+**Upgrade note.** Upgrade from v3.74.0. That release closed a real defect but with an
+over-broad instrument, and independent pre-tag review caught it after the tag went out:
+a failure that trips the error-recall trigger but whose output does not match the
+extractor's prose regex was answered with silence, and that class is larger than it
+looked. `panic: assignment to entry in nil map` got no recall while `panic: runtime
+error: index out of range` did — purely because the second message contains the substring
+`error`. Whether you got recall depended on the wording of your panic. Verified
+end-to-end against a real store: a row the pre-v3.74.0 query did retrieve was not
+retrieved under v3.74.0.
+
+The fix keeps v3.74.0's goal and drops its instrument. The extractor's line filter is now
+`ERROR_LINE_RE || HARD_ERROR_RE` — the selection filter is a superset of the trigger, so
+whatever convinced `isHardError` this was a failure is by definition also something terms
+are read from. The class is closed by construction instead of by listing failure shapes.
+v3.74.0's own headline case improves too: `npm run build` dying on ENOENT now queries
+`['npm','run','build','code','enoent','syscall']` rather than being silenced, i.e. it
+searches the failure instead of either the command's topic (pre-3.74.0) or nothing
+(3.74.0). The residual gate still fires when extraction genuinely yields nothing — empty
+output, or a line that is only stop words.
+
+Two comment claims from v3.74.0 were also falsified by review and corrected. `ERROR_LINE_RE`
+has no word boundary: it matches substrings, and it matches six alternatives, not just
+`error` — the old comment asserted the opposite twice over. And `errWords.length === 0`
+reads as "no error term that is not ALSO a command word", because term collection dedups
+across both classes command-first; `docker compose up -d` and `docker stack deploy` decide
+differently on byte-identical output. That asymmetry predates this work and is now
+documented rather than silently changed.
+
+Tests +5, each pinning a behaviour a reviewer mutated without anything dying: the line
+filter's non-`error` alternatives (`command not found` flips the gate), the 3-line scan
+budget (line 1 holding only stop words flips it), the merged term ORDER (golden list —
+order is what the 6-term cap truncates), and cross-class dedup. The end-to-end case now
+seeds two COMPETING rows — one matching the command's words, one matching the failure —
+and asserts the failure-topic row is recalled; the v3.74.0 version asserted absence and
+so could have passed on an empty store. Suite 4750/4750; `denoise-ab` unchanged to four
+decimals with all behavioral probes green.
+
+**On this face's citation rate.** The measured 4–6% for `error_recall` (against pre-tool
+recall's 38–42%) predates both releases. The population it measures has changed twice
+now, so a rate movement across these boundaries is not on its own evidence of quality.
+
 ## v3.74.0 — the error-recall surface was searching the command, not the error
 
-**Upgrade note.** No action needed, and no default changed. What changes is WHICH terms
-the PostToolUse error-recall block searches on: a failure whose output carries npm's,
-Go's or Python's own error vocabulary now queries that vocabulary instead of falling back
-to the words in your command. Concretely, `npm run build` dying on ENOENT used to search
-for memories about *npm and building*; it now searches on `enoent` and `syscall`. Where a
-failure yields no usable term at all — empty output, or a line that is nothing but stop
-words — the block does not appear; that case previously injected a command-topic match.
-To revert, pin `npm i claude-mem-lite@3.73.0`.
+**Upgrade note.** Superseded by v3.74.1 — upgrade past this version. It introduced a
+regression that silences Go panics whose message lacks the substring `error`; see above.
 
 ### two pattern lists that were never the same list
 
@@ -25,44 +62,29 @@ found` (npm says "no such file"). The keyword set fell back to command words alo
 literally `['npm','run','build']`, and the FTS query went looking for observations about
 npm and building.
 
-The sharpest symptom was Go. `panic: assignment to entry in nil map` produced nothing and
-was answered with a query for `['run','main.go']`, while `panic: runtime error: index out
-of range` worked fine — purely because the second message happens to contain the
-substring `error`. Whether you got recall depended on the wording of your panic.
-
 Measured on the live library: `npm run build` failing on a missing module returned two
-release records ahead of the one row that explained it, and a seeded row describing an
-ENOENT-on-`syscall open` failure could not be reached by the old query at all, because
-its text contains no `npm`, `run` or `build`.
+release records ahead of the one row that explained it. A Python traceback's head lines
+degrade identically to `['python','train.py']`.
 
-- **The line filter is now `ERROR_LINE_RE || HARD_ERROR_RE`** — the selection filter is a
-  superset of the trigger. Whatever convinced `isHardError` this was a failure is, by
-  definition, also something terms get read from, which closes the class by construction
-  rather than by listing failure shapes. Widening the prose regex ad hoc WOULD have been
-  enumeration; making it a superset of the trigger is not.
 - **`planErrorRecall()`** in `bash-utils.mjs` is the decision seam — pure, so it is
   testable without spawning a hook, the same split `formatErrorRecallHints` already uses.
-  It still returns null when nothing usable survives, and the surface then stays silent
-  rather than querying the command's topic.
+  This release answered "no extractable error term" with silence rather than a
+  command-topic match. **That instrument was too broad** — see v3.74.1, which keeps the
+  goal and replaces the mechanism.
 - **Command words stay in the query.** Demoting them to a fallback was implemented,
   measured, and rejected: replaying five real failures, error-terms-only fixed the
   missing-module case but regressed two others — dropping `database` lost the plugin-mode
   data-dir row for a failed DB open, dropping `vitest` lost the test-failure row. Command
   words carry domain anchoring, not just BM25 noise. The demote-to-fallback variant
   measured byte-identical to error-terms-only, because the primary query always filled
-  its `LIMIT 3` and the fallback never ran.
+  its `LIMIT 3` and the fallback never ran. This finding still holds in v3.74.1.
 
-Five mutants were killed by the new tests, including one restoring the old prose-only
-filter and one restoring the old ungated behaviour; both also redden an end-to-end case
-driving the real PostToolUse entry point, which the pure-function tests cannot see. That
-wiring test earned its place immediately: the first cut of this change imported
-`planErrorRecall` from `utils.mjs` without re-exporting it there, which broke `hook.mjs`
-load entirely and turned 119 tests red.
-
-**On this face's citation rate.** The measured 4–6% for `error_recall` (against pre-tool
-recall's 38–42%) was computed before this change. The population it measures is now
-different — the same failures inject different terms, and a few inject nothing — so a
-rate change across this version boundary is not on its own evidence of a quality change.
+Four mutants were killed by the tests shipped here, including one restoring the ungated
+behaviour, which also reddens an end-to-end case driving the real PostToolUse entry point
+— something the pure-function tests cannot see. That wiring test earned its place
+immediately: the first cut of this change imported `planErrorRecall` from `utils.mjs`
+without re-exporting it there, which broke `hook.mjs` load entirely and turned 119 tests
+red. What those tests did NOT pin is what review later found — see v3.74.1.
 
 ### doctor no longer exits 1 over a process it cannot do anything about
 
