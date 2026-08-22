@@ -2,16 +2,96 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.75.1 — what independent review found in v3.75.0, including a regression and three false claims
+
+**Upgrade note.** Upgrade from v3.75.0. Three independent reviews of that release landed
+*after* the tag went out; between them they found one behaviour regression, one half-wired
+fix, and three statements in the v3.75.0 notes below that are not true as written. Those
+statements are corrected in place rather than rewritten, so the record of what was claimed
+survives.
+
+### the regression: auto-compress marking reached only one project per 24h
+
+v3.75.0 moved `markAutoCompressible` off SessionStart onto the auto-maintain worker and
+said *"this moves **when** the marking runs, not **what** it marks."* **That sentence was
+wrong.** The scope did survive each invocation — but the worker sits behind
+`last-auto-maintain.json`, a *single* gate file in the one global runtime directory. There
+is no per-project key. Whichever project's SessionStart won the 24h gate was the only
+project whose rows got marked; with N projects in daily rotation, N−1 never got the
+**7-day accelerated noise pass** at all.
+
+Reproduced before fixing, on two projects through the real worker argv: project A ended
+with 3 rows at `COMPRESSED_AUTO`, project B with **zero**. Being precise about the blast
+radius, because the first framing of this overstated it — B's rows are not orphaned
+forever; the whole-DB decay still reaches them at 30 days. What was lost is the 7-to-30-day
+window and the compressible disposition inside it.
+
+The marking now runs on its **own per-project gate**, before the global one, so every
+project gets it daily while the expensive pass (VACUUM snapshot, purge, decay, dedup)
+stays global and still runs once a day in total. Both existing tests stayed green through
+the regression because each drives exactly one project; the new suite drives two, and a
+source guard now fails if the marking call drifts back inside the global gate.
+
+### the half-wired fix: the query cap covered one of the event's two hooks
+
+UserPromptSubmit fires **two** commands — `scripts/user-prompt-search.js` (the FYI block)
+and `hook.mjs user-prompt` (the `<memory-context>` block). v3.75.0 capped the first and
+titled the item "UserPromptSubmit query building". The second still called
+`sanitizeFtsQuery` on the raw prompt every turn, and it is the worse half: its stdin
+ceiling is 256KB against path A's 64KB, with no truncation in between. Measured at that
+ceiling: **186ms → 2ms**. A normal prompt stays byte-identical either way.
+
+The caps now live in `lib/ups-query.mjs` and both faces import them, so this cannot be
+present on one hook and missing on the other again — the same one-home-per-rule treatment
+the five twins got in v3.75.0.
+
+### also fixed
+
+- **A stray `export` keyword.** In `scripts/user-prompt-search.js` it landed before a
+  comment block instead of its declaration, so it silently attached to the constant seven
+  lines below: `IDENTIFIER_BYPASS` stopped being exported and `UPS_QUERY_CAPS` started.
+  Inert (nothing imports either), and invisible to every gate in the repo — **eslint and
+  knip both skip `scripts/`**, which is why the v3.75.0 "byte-identical export name set"
+  claim was true and yet could not see this file.
+- **A ninth uncollapsed transcript scan.** `countDeliberatePersistence` did its own
+  read + per-line parse two lines away from two scanners that had just been migrated,
+  charging a full re-parse against the pass whose entire purpose was to stop doing that.
+  It now shares the memo like its eight siblings.
+- **`picomatch` was an undeclared dependency** of `tests/coverage-scope.test.mjs`,
+  resolving only through npm's flat hoist of a vitest transitive. Now a devDependency.
+  (knip had been reporting it under `Unlisted dependencies`; the v3.75.0 note read only
+  the `Unused exports` line.)
+- **`scripts/pre-agent-inject.sh` was outside the shellcheck gate** and not executable
+  (`100644`, unlike its `100755` sibling). Both fixed; it is clean under shellcheck.
+
+### corrections to the v3.75.0 notes below
+
+- **The MCP-import revert instruction does not work.** `quality_tier` is only ever written
+  upward — no shipped path lowers it — so re-importing re-grants `installed` rather than
+  restoring `community`. The actual revert is `registry remove` followed by
+  `registry import --source <preinstalled|user|github>`, or pinning v3.74.1.
+- **CLI `get` gained `prompt_number`, not `created_at`.** `created_at` has been printed in
+  the `P#NN <date>` header since before v3.75.0; the field loop skips it deliberately.
+- **The auto-compress item claimed an invariant it did not hold** — see the regression
+  above.
+
+Suite **298 files / 4844 tests**, eslint clean, shellcheck clean over four scripts, knip
+0 unused files / 31 unused exports / **0 unlisted dependencies**.
+
 ## v3.75.0 — the audit batch: five hand-copied twins collapsed, four hot paths bounded, and a README that no longer disagrees with itself
 
 **Upgrade note.** Three defaults move, all of them toward what the other face already did.
 `mem_registry import` now grants `quality_tier='installed'` like its CLI twin always has,
 so a resource imported over MCP ranks and gates the same way as one imported from the
-shell — if you relied on MCP imports staying at `community`, re-import is the revert.
+shell — if you relied on MCP imports staying at `community`, ~~re-import is the revert~~
+**[corrected in v3.75.1: re-importing re-grants `installed`; `quality_tier` is never
+written downward. Use `registry remove` then `registry import --source <…>`]**.
 `CLAUDE_MEM_RECOMMEND_MODE=live` no longer pretends: Phase 2 was never built, so the value
 now resolves to `shadow`, warns once per process on stderr, and `doctor` reports it as an
 inert flag rather than letting the log claim `mode='live'`. And `get` on the CLI now prints
-`prompt_number` and `created_at` for prompt rows, which the MCP face has printed all along;
+`prompt_number` ~~and `created_at`~~ **[corrected in v3.75.1: only `prompt_number` is new;
+`created_at` was already in the `P#NN <date>` header]** for prompt rows, which the MCP face
+has printed all along;
 existing labels (`Text:`, `Files:`) are unchanged, so the visible delta is additive.
 Nothing here needs a migration; pin v3.74.1 to keep the old behaviour.
 
@@ -94,7 +174,9 @@ on the other, so the fix is one home per rule, not one more patched instance.
   every boot, outside the 24h gate that already guarded decay, purge and backup a few lines
   away. Nothing about starting a session makes a 30-day-old row newly compressible; the
   marking moved onto the maintain worker, project scope forwarded through argv so it does not
-  quietly widen to the whole DB.
+  quietly widen to the whole DB. **[corrected in v3.75.1: the scope survived, but the global
+  24h gate collapsed the marking to ONE project per day. Fixed with a per-project gate — see
+  the v3.75.1 entry above.]**
 
 ### coverage, containment, and a sandbox that runs on its own
 

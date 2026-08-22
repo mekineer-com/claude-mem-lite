@@ -1,7 +1,8 @@
 // claude-mem-lite — Semantic Memory Injection
 // Search past observations for relevant memories to inject as context at user-prompt time.
 
-import { sanitizeFtsQuery, relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters, basenameAnySep } from './utils.mjs';
+import { relaxFtsQueryToOr, debugCatch, truncate, OBS_BM25, notLowSignalTitleClause, noisePenaltyClause, tokenizeHandoff, HANDOFF_STOP_WORDS, extractCjkKeywords, neutralizeContextDelimiters, basenameAnySep } from './utils.mjs';
+import { upsFtsQuery } from './lib/ups-query.mjs';
 import { citeFactorJs, TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 import { recordMetric } from './lib/metrics.mjs';
@@ -192,7 +193,12 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
   };
 
   try {
-    const ftsQuery = sanitizeFtsQuery(userPrompt);
+    // upsFtsQuery, not bare sanitizeFtsQuery: this is the SECOND hook UserPromptSubmit
+    // fires, and v3.75.0 capped only the first. This one is the worse half — its stdin
+    // ceiling is MAX_HOOK_STDIN_BYTES (256KB) against path A's 64KB, and nothing
+    // truncates between stdin and here. The caps are shared, not copied, so the two
+    // faces of one event cannot drift apart again.
+    const ftsQuery = upsFtsQuery(userPrompt);
     if (!ftsQuery) return [];
 
     const cutoff = Date.now() - MEMORY_LOOKBACK_MS;

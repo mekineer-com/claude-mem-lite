@@ -324,6 +324,16 @@ describe('P2-11 — auto-compress marking runs on the maintain cadence, not ever
 
     const autoMaintain = src.slice(src.indexOf('function runSessionStartAutoMaintain'));
     expect(autoMaintain, 'auto-maintain does not run the marking')
-      .toMatch(/markAutoCompressible\(db, project\)/);
+      .toMatch(/markAutoCompressibleIfDue\(db, project\)/);
+
+    // v3.75.1: the marking must sit BEFORE the global `shouldMaintain` block, on its own
+    // per-project gate. Inside it — where v3.75.0 put it — one global 24h stamp meant
+    // only the first project of the day ever got marked.
+    const markAt = autoMaintain.indexOf('markAutoCompressibleIfDue(db, project)');
+    const gateAt = autoMaintain.indexOf('let shouldMaintain');
+    expect(markAt, 'marking call not found in auto-maintain').toBeGreaterThan(-1);
+    expect(gateAt, 'global gate not found in auto-maintain').toBeGreaterThan(-1);
+    expect(markAt, 'the marking is back inside the GLOBAL 24h gate — that is the v3.75.0 regression')
+      .toBeLessThan(gateAt);
   });
 });

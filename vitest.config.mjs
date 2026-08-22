@@ -25,8 +25,12 @@ export default defineConfig({
     // relocated dev DB from being READ, but a test that never sets the var resolves the
     // default — the maintainer's real ~/.claude-mem-lite — and writes to it. That
     // happened during the v3.73.0 release. With the guard on, lib/resolve-data-dir.mjs
-    // refuses any data dir outside os.tmpdir(), in this process AND in every subprocess
-    // that inherits the ambient env (the same channel by which the var goes missing).
+    // REDIRECTS the live data dir to a per-run sandbox — in this process AND in every
+    // subprocess that inherits the ambient env (the same channel by which the var goes
+    // missing). It blocks exactly one directory, the real one; it does NOT refuse
+    // everything outside os.tmpdir(), which was an earlier design that resolve-data-dir's
+    // own comment explains at length was wrong (fixtures hardcode /tmp, os.tmpdir()
+    // follows a relocated $TMPDIR, several suites keep scratch DBs in tests/.tmp-*).
     env: {
       CLAUDE_MEM_AUTO_DEEP_CLI: '0', ANTHROPIC_API_KEY: '', OPENROUTER_API_KEY: '',
       MEM_QUIET_HOOKS: '', CLAUDE_MEM_DIR: '', CLAUDE_MEM_TEST_GUARD: '1',

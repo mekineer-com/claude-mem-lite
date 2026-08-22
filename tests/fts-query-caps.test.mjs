@@ -10,7 +10,9 @@
 // works, and the automatic surface is the one passing it.
 import { describe, it, expect } from 'vitest';
 import { sanitizeFtsQuery } from '../nlp.mjs';
-import { upsFtsQuery } from '../scripts/user-prompt-search.js';
+// Moved to lib/ups-query.mjs so BOTH hooks of the UserPromptSubmit event share one
+// cap definition — v3.75.0 capped only the user-prompt-search.js face.
+import { upsFtsQuery } from '../lib/ups-query.mjs';
 
 const NORMAL = 'how do I fix the FTS5 tokenizer for CJK queries';
 const longAscii = (n) => 'refactor parser widget cache invalidation module '.repeat(n);

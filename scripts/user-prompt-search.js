@@ -4,9 +4,10 @@
 // Lightweight: only imports schema.mjs and utils.mjs, no MCP SDK
 
 import { ensureDb, DB_DIR, REGISTRY_DB_PATH } from '../schema.mjs';
-import { sanitizeFtsQuery, relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, notLowSignalTitleClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
+import { relaxFtsQueryToOr, truncate, typeIcon, inferProject, OBS_BM25, notLowSignalTitleClause, stripPrivate, neutralizeContextDelimiters, MAX_UPS_PROMPT_BYTES } from '../utils.mjs';
 import { liveObsFilterSql, injectionRelevanceSql } from '../lib/inject-search-core.mjs';
 import { cjkPrecisionOk } from '../nlp.mjs';
+import { upsFtsQuery } from '../lib/ups-query.mjs';
 import { writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { join, sep } from 'path';
 import { pathToFileURL } from 'url';
@@ -343,21 +344,11 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
 // ×3 runs) → VERDICT NET-POSITIVE. The only behavior delta is on-topic eagerness (naming
 // an identifier surfaces its obs) — the highest-precision injection trigger there is. The
 // prose stop-list (IDENTIFIER_STOPWORDS) keeps the extractor off ordinary English.
-export // Query caps for THIS surface only (audit 2026-08-22 P2-13). The 64KB byte guard on
-// stdin bounds what we read, not what we compute: sanitizeFtsQuery costs 0.8ms on a
-// normal prompt, 6.2ms on a 64KB ASCII one and 31.8ms on a 64KB CJK one, and this hook
-// runs on every prompt before the model sees the turn. 2000 characters is a long prompt
-// by any measure, and past ~64 meaningful AND-joined terms an FTS5 query matches nothing
-// anyway and survives only through the OR fallback. An explicit `search` stays uncapped
-// — a person who types a long query meant it.
-const UPS_QUERY_CAPS = { maxChars: 2000, maxTokens: 64 };
+// Query caps live in lib/ups-query.mjs — shared with `hook.mjs user-prompt`, the OTHER
+// hook this same event fires. v3.75.0 capped this face only; a second copy of the
+// constants here is what would let them drift apart again.
 
-/** The capped query builder both search paths on this surface go through. */
-export function upsFtsQuery(text) {
-  return sanitizeFtsQuery(text, UPS_QUERY_CAPS);
-}
-
-const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
+export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
 const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
 
 // All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive

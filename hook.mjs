@@ -823,10 +823,13 @@ async function handleStop() {
           } catch (e) { debugCatch(e, 'handleStop-citation-decay'); }
 
           // Persist cite-recall ratio for the next SessionStart to surface as
-          // feedback. We deliberately scan the transcript a second time here
-          // (cheap; the file is already in OS cache) rather than threading the
-          // count through `extractCitationsFromTranscript` so the bump path stays
-          // unchanged.
+          // feedback. This block re-scans the transcript rather than threading the
+          // count through `extractCitationsFromTranscript`, so the bump path stays
+          // unchanged — and since P2-8 every scanner in it shares ONE parse via
+          // lib/transcript-scan.mjs, so "scan again" costs an array iteration, not a
+          // re-read. (The old wording, "cheap; the file is already in OS cache", was
+          // arguing the pre-memo case: the OS cache saved the read, never the parse,
+          // which was ~all of the cost.)
           try {
             const stats = computeCiteRecall(transcriptPath);
             // B2 (v2.83.1): also persist the bugfix-shape nudge/save delta so
@@ -953,7 +956,48 @@ function runSessionStartDbMutations(db, { sessionId, project, prevSessionId, now
   })();
 }
 
+// Per-project 24h gate for the auto-compressible marking. Separate from the global
+// maintain gate on purpose: the marking is project-scoped work that every project needs
+// daily, while the pass it used to ride on (VACUUM snapshot + purge + decay + dedup) is
+// whole-DB work that should happen once a day in total.
+function markCompressibleGateFile(project) {
+  // Project names arrive already mangled by inferProject (`projects--mem`), but this is
+  // a filename, so do not trust that — one stray separator writes outside RUNTIME_DIR.
+  return join(RUNTIME_DIR, `last-mark-compressible-${String(project).replace(/[^A-Za-z0-9._-]/g, '-')}.json`);
+}
+
+function markAutoCompressibleIfDue(db, project) {
+  if (!project) {
+    // Every production spawn passes it (spawnBackground('auto-maintain', project)); a
+    // hand-run `hook.mjs auto-maintain` does not. Say so rather than skipping in
+    // silence — work vanishing without a word is this codebase's recurring shape.
+    debugLog('DEBUG', 'auto-maintain', 'no project argument — skipping auto-compress marking');
+    return;
+  }
+  const gate = markCompressibleGateFile(project);
+  try {
+    const last = JSON.parse(readFileSync(gate, 'utf8'));
+    if (Date.now() - last.epoch < 24 * 3600000) return;
+  } catch { /* no gate file → due */ }
+  try {
+    const marked = markAutoCompressible(db, project);
+    if (marked.aged > 0) debugLog('DEBUG', 'auto-maintain', `auto-compressed ${marked.aged} old observations`);
+    if (marked.noise > 0) debugLog('DEBUG', 'auto-maintain', `auto-compressed ${marked.noise} LOW_SIGNAL noise (7d window)`);
+    writeFileSync(gate, JSON.stringify({ epoch: Date.now() }));
+  } catch (e) { debugCatch(e, 'auto-maintain-mark-compressible'); }
+}
+
 function runSessionStartAutoMaintain(db, project) {
+  // The auto-compressible marking runs on its OWN per-project gate, before the global
+  // one below. v3.75.0 moved this work off SessionStart onto this worker (P2-11) and,
+  // by putting it inside the global `shouldMaintain` block, cut its coverage from
+  // "every project, every boot" to "one project per 24h" — RUNTIME_DIR is a single
+  // global directory, so whichever project wins the gate is the only one marked, and
+  // with N projects in rotation N-1 never get the 7-day noise pass. The move was right;
+  // the shared gate was not. Heavy work (VACUUM snapshot, purge, decay, dedup) stays on
+  // the global gate — that genuinely should run once a day, not once per project.
+  markAutoCompressibleIfDue(db, project);
+
   // Auto-maintain: cleanup + decay + boost + purge, gated to once per 24h
   const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
   let shouldMaintain = true;
@@ -983,19 +1027,10 @@ function runSessionStartAutoMaintain(db, project) {
       // children (compressed_into dangling at a deleted id). purgeStale recovers them
       // first and caps at opCap. Schema has no marked_at_epoch, so retention anchors on
       // created_at_epoch: 30d marking gate + 7d grace = 37d.
-      // Mark auto-compressible rows BEFORE the purge/decay ops below, preserving the
-      // order the SessionStart transaction had relative to them (marking ran first, at
-      // boot). Project-scoped exactly as before — P2-11 moved the cadence, not the scope.
-      if (project) {
-        const marked = markAutoCompressible(db, project);
-        if (marked.aged > 0) debugLog('DEBUG', 'auto-maintain', `auto-compressed ${marked.aged} old observations`);
-        if (marked.noise > 0) debugLog('DEBUG', 'auto-maintain', `auto-compressed ${marked.noise} LOW_SIGNAL noise (7d window)`);
-      } else {
-        // Every production spawn passes it (spawnBackground('auto-maintain', project)); a
-        // hand-run `hook.mjs auto-maintain` does not. Say so rather than skipping in
-        // silence — work vanishing without a word is this codebase's recurring shape.
-        debugLog('DEBUG', 'auto-maintain', 'no project argument — skipping auto-compress marking');
-      }
+      // The marking itself already ran at the top of this function, on its own
+      // per-project gate — it must not be conditioned on the global one (see
+      // markAutoCompressibleIfDue). It still happens BEFORE the purge/decay ops below,
+      // preserving the order the SessionStart transaction had relative to them.
 
       const purged = purgeStale(db, mctx, Date.now() - 37 * DAY_MS);
       if (purged > 0) debugLog('DEBUG', 'auto-maintain', `purged ${purged} stale observations`);
@@ -1126,11 +1161,19 @@ function runSessionStartAutoMaintain(db, project) {
 // a detached `auto-maintain` worker via spawnBackground so it never blocks interactive
 // session start. The worker re-checks the same gate (idempotent) before doing the work.
 function scheduleSessionStartAutoMaintain(project) {
-  const maintainFile = join(RUNTIME_DIR, 'last-auto-maintain.json');
-  try {
-    const last = JSON.parse(readFileSync(maintainFile, 'utf8'));
-    if (Date.now() - last.epoch < 24 * 3600000) return; // not due — no spawn
-  } catch { /* no gate file → due */ }
+  // TWO gates, either of which is enough to spawn. Checking only the global one is what
+  // made the marking single-project in v3.75.0: in a multi-project rotation the global
+  // stamp is already fresh by the time the second project boots, so its worker never
+  // ran and its rows were never marked.
+  const due = (file) => {
+    try {
+      const last = JSON.parse(readFileSync(file, 'utf8'));
+      return Date.now() - last.epoch >= 24 * 3600000;
+    } catch { return true; }   // no gate file → due
+  };
+  const maintainDue = due(join(RUNTIME_DIR, 'last-auto-maintain.json'));
+  const markingDue = Boolean(project) && due(markCompressibleGateFile(project));
+  if (!maintainDue && !markingDue) return;
   if (!process.env.CLAUDE_MEM_SKIP_MAINTAIN) spawnBackground('auto-maintain', project);
 }
 

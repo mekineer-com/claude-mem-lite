@@ -149,6 +149,9 @@ export const SOURCE_FILES = [
   // search-engine.mjs AND the standalone hook scripts — missing it from the
   // manifest kills every retrieval surface on auto-update.
   'lib/inject-search-core.mjs',
+  // Shared UserPromptSubmit query caps — imported by BOTH hooks that event fires
+  // (scripts/user-prompt-search.js and hook.mjs user-prompt via hook-memory.mjs).
+  'lib/ups-query.mjs',
   // P2-12 twin cores: get/browse shared data collection for the CLI/MCP pairs
   // (update lives in observation-write, delete-preview in delete-core, registry
   // stats/list in registry.mjs — all already listed).
