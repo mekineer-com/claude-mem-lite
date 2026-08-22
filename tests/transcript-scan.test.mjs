@@ -13,6 +13,11 @@ import { readTranscriptEntries, _resetTranscriptCache, TRANSCRIPT_CACHE_MAX_BYTE
 
 let dir, tx;
 
+// Whole seconds only. The two cache-HIT cases below need a size+mtime pair that survives
+// a rewrite unchanged, and utimes cannot portably round-trip an arbitrary sub-millisecond
+// mtime — see the comment in the first of them.
+const PINNED_MTIME_SEC = 1_700_000_000;
+
 const line = (text) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
 
 beforeEach(() => {
@@ -62,16 +67,20 @@ describe('readTranscriptEntries', () => {
 
   it('serves the same parse to repeated callers — that is the whole point', () => {
     writeFileSync(tx, `${line('cached')}\n`);
+    // Pin the mtime to a WHOLE SECOND before taking the baseline, rather than capturing
+    // whatever the write produced and restoring it after. The key holds mtimeMs, and a
+    // captured sub-millisecond value does not round-trip through utimes portably: CI
+    // returned 1787406755453.47 for a value written as 1787406755453.4705, so the key
+    // changed and this case failed on a filesystem difference rather than on the cache.
+    // A whole second is exactly representable everywhere.
+    utimesSync(tx, PINNED_MTIME_SEC, PINNED_MTIME_SEC);
     const first = readTranscriptEntries(tx);
     // Rewrite the CONTENT while pinning size and mtime, so nothing in the cache key
     // changes. Only a real cache can return the old parse here; a re-reader returns the
     // new text and this case fails.
     const st = statSync(tx);
     writeFileSync(tx, `${line('rewrit')}\n`);
-    // Numeric seconds, not the Date objects: passing Dates truncates sub-millisecond
-    // precision, so the restored mtimeMs differs from the original and the key changes
-    // anyway — the cache would look broken while working correctly.
-    utimesSync(tx, st.atimeMs / 1000, st.mtimeMs / 1000);
+    utimesSync(tx, PINNED_MTIME_SEC, PINNED_MTIME_SEC);
     expect(statSync(tx).size, 'the rewrite must keep the size identical').toBe(st.size);
     expect(statSync(tx).mtimeMs, 'the pinned mtime must survive the rewrite').toBe(st.mtimeMs);
     const second = readTranscriptEntries(tx);
@@ -89,11 +98,12 @@ describe('readTranscriptEntries', () => {
     writeFileSync(tx, one.repeat(repeats));
     expect(statSync(tx).size).toBeGreaterThan(TRANSCRIPT_CACHE_MAX_BYTES);
 
+    utimesSync(tx, PINNED_MTIME_SEC, PINNED_MTIME_SEC);
     const first = readTranscriptEntries(tx);
     const st = statSync(tx);
     // Same pinned-key rewrite as above: an oversized file must come back FRESH.
     writeFileSync(tx, `${line('x'.repeat(padding.length - 6) + 'CHANGED')}\n`.padEnd(st.size, ' '));
-    utimesSync(tx, st.atimeMs / 1000, st.mtimeMs / 1000);
+    utimesSync(tx, PINNED_MTIME_SEC, PINNED_MTIME_SEC);
     const second = readTranscriptEntries(tx);
     expect(second).not.toBe(first);
     expect(JSON.stringify(second).includes('CHANGED')).toBe(true);
