@@ -60,10 +60,21 @@ export default defineConfig({
       // to the repo root — it also matches `experiment/lib/*.mjs`, an unshipped scratch dir
       // that would otherwise drag the gate down with code nothing ships.
       exclude: ['install.mjs', 'server.mjs', 'hook.mjs', 'registry.mjs', 'registry-retriever.mjs', 'benchmark/**', 'scripts/**', 'experiment/**'],
+      // Re-baselined 2026-08-22 against the measured number, which the P2-2 re-scoping
+      // had left 12 points below: the gate said 75/75/65 while the suite actually ran
+      // 86.58 lines / 87.42 functions / 77.22 branches, i.e. coverage could fall by a
+      // ninth of the codebase without anything going red. Each threshold now sits ~3
+      // points under its measurement — tight enough that a real regression trips it,
+      // loose enough that ordinary refactoring does not. `statements` is pinned too;
+      // it was simply absent before.
+      //
+      // Raise these when the measurement rises. Lowering one is a decision that belongs
+      // in a commit message, not a quiet edit.
       thresholds: {
-        lines: 75,
-        functions: 75,
-        branches: 65,
+        statements: 80,
+        lines: 83,
+        functions: 84,
+        branches: 74,
       },
     },
   },

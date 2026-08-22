@@ -2807,6 +2807,9 @@ Commands:
 
   doctor                Environment diagnostics and benchmarks
     --benchmark         Run perf benchmark and emit JSON
+    --metrics           Summarize the recorded metrics window (CLAUDE_MEM_METRICS=1)
+    --session-audit     Audit session/episode state for orphans and drift
+    --json              Machine-readable output (plain doctor run)
 
   fts-check <check|rebuild>  FTS5 index check or rebuild
 
@@ -2842,6 +2845,7 @@ Commands:
     import              Import resource --name N --resource-type T [--repo-url U] [--local-path P] [--use-cases U]
     remove              Remove resource --name N --resource-type T
     reindex             Rebuild FTS5 index
+    recommend-stats     Shadow recommendation funnel [--days N] [--sweep] [--json]
 
   import-jsonl <file-or-dir>      Import Claude Code JSONL transcripts (cold-start backfill)
     --project P         Project name (default: inferred from cwd)

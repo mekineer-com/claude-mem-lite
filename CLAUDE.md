@@ -6,7 +6,7 @@ Lightweight persistent memory system for Claude Code. MCP server + hooks plugin.
 
 - **Version**: 3.75.0
 - **Package manager**: npm
-- **Test**: `npx vitest run` (293 test files / 4816 tests, vitest) · **Sandbox install harness** (not in `vitest run`; real `npm i -g` + real MCP stdio, minutes + network): `node tests/sandbox/phaseA-plugin.mjs` / `phaseB-npm.mjs` / `phaseC-update.mjs` — see `tests/sandbox/README.md`
+- **Test**: `npx vitest run` (296 test files / 4836 tests, vitest) · **Sandbox install harness** (not in `vitest run`; real `npm i -g` + real MCP stdio, minutes + network): `node tests/sandbox/phaseA-plugin.mjs` / `phaseB-npm.mjs` / `phaseC-update.mjs` — see `tests/sandbox/README.md`
 - **Lint**: `npx eslint .`
 - **Benchmark**: `node benchmark/benchmark.mjs` (local micro-bench) · `node benchmark/longmemeval.mjs <dataset>` (standard LongMemEval recall, lexical baseline — see `benchmark/datasets/README.md`)
 - **Denoising A/B** (evaluate any precision/recall lever BEFORE shipping): `node benchmark/denoise-ab.mjs --save before.json` (control) → apply the change → `node benchmark/denoise-ab.mjs --compare before.json` (verdict). Runs the precision hard-negative, vocab-mismatch paraphrase, AND cjk_mixed suites so a lever's precision gain and recall cost are weighed on one screen — the split that let an OR-BM25 floor ship-then-revert (2026-06-29). Behavioral probes ride the same screen (multiscript guard + cross-source direction + deferred reachability + events end-to-end pipeline); any probe failure overrides the verdict to PROBE-FAIL and exits 1 — "A/B NEUTRAL ≠ safe" on faces the metric suites can't see. Verdict: REJECT / TRADEOFF / NET-POSITIVE / NEUTRAL / PROBE-FAIL.
@@ -33,16 +33,20 @@ reverted feature, not back-compat. Plus 1 duplicate-name export pair
 (FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS, intentional alias). Treat baseline
 as the floor; flag NEW unused exports as PR review signal.
 
-Coverage baseline (2026-08-22, audit P2-2 re-scoping, `npx vitest run --coverage`):
-**92 files measured** = all 70 `lib/**/*.mjs` + the 22 hand-picked root modules —
-statements **82.94%** (6813/8214) · branches **77.17%** (5094/6601) · functions
-**87.27%** (837/959) · lines **86.55%** (5699/6584). The prior line — 77.47% stmts /
-71.72% branch — described only those 22 root modules; `lib/`'s ~70 shipped modules,
-i.e. every shared core extracted since v3.4x, carried no coverage signal at all.
+Coverage baseline (2026-08-22, re-measured after the metering + silent-failure batches,
+`npx vitest run --coverage`): statements **83.00%** (6804/8197) · branches **77.22%** ·
+functions **87.42%** · lines **86.58%**, over all `lib/**/*.mjs` plus the 22 hand-picked
+root modules. **The gate now tracks that number**: `vitest.config.mjs` was re-baselined
+from 75/75/65 to statements 80 / lines 83 / functions 84 / branches 74 — each ~3 points
+under its measurement. It had been left 12 points low after the P2-2 re-scoping, i.e.
+coverage could fall by a ninth of the codebase without anything going red; the gate is
+verified binding (raising statements to 90 fails the run, 80 passes). Earlier line
+(pre-re-baseline): 92 files, statements 82.94% / branches 77.17% / functions 87.27% /
+lines 86.55%; and before the re-scoping, 77.47% stmts / 71.72% branch described only the
+22 root modules, with `lib/`'s ~70 shipped modules carrying no coverage signal at all.
 **The re-scoping did not lower the number, it raised it**: the extracted cores are
 better covered than the root modules they were pulled out of, so the audit's premise
-(that including `lib/` would force a threshold downgrade) was wrong and the
-75/75/65 gate in `vitest.config.mjs` is unchanged — it now simply guards 4× the files.
+(that including `lib/` would force a threshold downgrade) was wrong.
 Still **outside** the gate and honest about it: `install.mjs` / `server.mjs` /
 `hook.mjs` / `registry*.mjs` (exercised through subprocess E2E, which v8 coverage of
 the parent process cannot observe) and `scripts/**` (same reason).

@@ -22,6 +22,8 @@ tasks/
 tmp/
 .context/
 .npmrc
+# loop-eng run state (autoloop/polish rounds) — local, regenerated per run
+.loop/
 
 # Benchmark datasets (large, ~300 MB each — fetched via benchmark/datasets/*.sh)
 # and raw per-question result dumps. Download scripts + READMEs stay committed.
