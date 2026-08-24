@@ -144,8 +144,17 @@ registration was mutation-tested and does red). Three things bound the change:
   the host's `is_interrupt` flag rather than by pattern-matching text.
 - **It does not feed the episode buffer.** That is scope, not oversight: episode entries
   flow into LLM summarisation and the bugfix save-nudge, whose behaviour under a sudden
-  influx of failures is unmeasured, and this change already takes the surface from 53 to
-  ~186 firing shapes.
+  influx of failures is unmeasured.
+
+**A correction to this section's own arithmetic, from the first hour of live use.** The
+replay reports firing *shapes* — 53 → 186 across 15 projects — and that is a COVERAGE
+measure. It was written here in a way that reads as a volume prediction, which it is not.
+Window-matched production counters over the first 56 minutes after install say the new
+event adds **+20% fires and +20% injected rows** (25 → 5 fires, 75 → 15 rows), not 3.5×.
+Distinct shapes replayed across every project is not the same question as firings in one
+session, and quoting one to answer the other is the exact error the rest of these notes
+are about. n=5, so treat +20% as a first reading rather than a settled rate — the
+`error_recall_failure` counter exists to refine it.
 
 Precision on the newly-visible population is not worse than on the old one — replayed
 across 15 projects, 22.4% of injected rows and 17.9% of top rows match no error term,
