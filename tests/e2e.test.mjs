@@ -1212,6 +1212,25 @@ describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-rec
     expect(stdout).not.toContain('Related memories found for this error');
   });
 
+  it('a Bash failure carrying no command injects nothing', () => {
+    // The guard the Bash-scoping case above leans on, pinned in its own right. Review
+    // flagged the two as entangled: the scoping case was rescued by THIS guard in a
+    // first draft, and once that was fixed nothing was left asserting this one.
+    //
+    // It is not merely defensive. Without it the payload still reaches selectErrorRecall
+    // with `cmd: undefined`, planErrorRecall extracts terms from the error text alone,
+    // and the surface injects — attributing a recall to a command it never saw.
+    seed();
+    for (const toolInput of [{}, { command: '' }, { command: 42 }, { file_path: '/app/x.mjs' }]) {
+      const { stdout } = runHook('post-tool-failure', {
+        stdin: failurePayload({ tool_input: toolInput }),
+        env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+      });
+      expect(stdout, `tool_input=${JSON.stringify(toolInput)}`)
+        .not.toContain('Related memories found for this error');
+    }
+  });
+
   it('honours the kill switch, and only "off" trips it', () => {
     seed();
     const off = runHook('post-tool-failure', {
