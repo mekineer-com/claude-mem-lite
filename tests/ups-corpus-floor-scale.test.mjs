@@ -87,8 +87,16 @@ describe('corpusFloorScale', () => {
     // CLAUDE_MEM_UPS_FLOOR_REF_CORPUS=2 or 3 makes the REFERENCE's own max IDF 0 or near
     // it, so the ratio would divide by zero (or explode). The `!(refIdf > 0)` guard returns
     // 1 instead — same posture as the `FLOOR_REF_CORPUS <= 1` short-circuit. Deleting that
-    // guard left the whole file green before this case existed. Re-imports with a
-    // cache-busting query string because the reference is read once at module load.
+    // guard left the whole file green before this case existed.
+    //
+    // The cache-busting re-import below is now VESTIGIAL, and is kept only because it
+    // is harmless: since v3.78.0 the implementation moved to lib/relevance-floor.mjs
+    // and reads the reference corpus at CALL time, so setting the env would take effect
+    // without any re-import. (It also would not work as advertised any more —
+    // `?ref=2` re-executes this face, but its import of the lib module resolves to the
+    // same cached instance, so `refTwo.corpusFloorScale` is the same function object.)
+    // What still binds this case is the guard itself: both deleting `!(refIdf > 0)` and
+    // re-freezing the reference at module load are killed by it.
     const saved = process.env.CLAUDE_MEM_UPS_FLOOR_REF_CORPUS;
     try {
       // Literal specifiers: Vite cannot analyse a template-literal dynamic import.

@@ -152,7 +152,7 @@ export const CODE_DIR = join(homedir(), '.claude-mem-lite');
 // (citation_surface_log.surface) in LATEST_MIGRATION_COLUMNS: a table that only
 // the forced pass can create is unreachable forever once the version row says
 // "done", which is not a hypothetical — see the note there.
-export const CURRENT_SCHEMA_VERSION = 45;
+export const CURRENT_SCHEMA_VERSION = 46;
 
 // Sentinel columns for the LATEST migration set(s). The fast-path uses these
 // to self-heal half-migrated DBs — schema_version bumped but column ALTERs
@@ -173,6 +173,7 @@ export const CURRENT_SCHEMA_VERSION = 45;
 // pragma_table_info on a missing table returns zero rows (it does not throw), so
 // naming any column of the new table is a table-presence check.
 const LATEST_MIGRATION_COLUMNS = [
+  { table: 'observations', column: 'decay_seen_at_first_cite' },   // v46
   { table: 'citation_surface_log', column: 'surface' },            // v45
   { table: 'observations', column: 'scope' },                      // v44
   { table: 'observation_files', column: 'last_cited_session_id' }, // v43
@@ -380,6 +381,20 @@ const MIGRATIONS = [
   // makes pre-tool-recall skip environment-scoped rows on file-triggered
   // injection; NULL always passes the filter.
   'ALTER TABLE observations ADD COLUMN scope TEXT DEFAULT NULL',
+  // v46 (D#159): decay_seen_count AS IT STOOD when this observation was cited for
+  // the FIRST time. The lifetime counters already on the row cannot answer the
+  // question the "stop injecting a long-uncited memory" gate needs: measured
+  // 2026-08-22, a candidate gate of `decay_seen >= 20 AND cited_count = 0` matched
+  // 631 rows, while 331 of the 510 rows that HAVE been cited also carry a lifetime
+  // decay_seen >= 20 — whether those crossed 20 before or after their first citation
+  // is unrecoverable from cumulative counters, so the gate's false-kill rate is not
+  // computable. This column makes it computable going forward.
+  //
+  // NULLABLE ON PURPOSE, and NULL is not 0: NULL means "never cited", 1 means "cited
+  // on its very first decay resolution". A DEFAULT 0 would merge those two states and
+  // destroy the distinction the column exists to record. Legacy rows stay NULL — they
+  // are not evidence of anything and must not be read as first-cite-at-0.
+  'ALTER TABLE observations ADD COLUMN decay_seen_at_first_cite INTEGER DEFAULT NULL',
 ];
 
 /**

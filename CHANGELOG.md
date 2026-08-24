@@ -2,6 +2,192 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.78.0 — a ruler built to justify a lever, and what it measured instead
+
+**Upgrade note.** No default behaviour changes. The error-recall face (memories injected
+after a failed Bash command) gains a relevance floor that is **off by default**, and
+schema moves to v46 with one nullable column (`observations.decay_seen_at_first_cite`)
+written by the citation-decay loop and read by nothing yet. The floor is opt-in via
+`CLAUDE_MEM_ERROR_RECALL_BM25_MIN=10.5`; why it is not the default is the substance of
+this release.
+
+### The measurement that started this
+
+Per-face citation funnel, whole of `citation_surface_log` as of 2026-08-24 — 135 rows
+(its PK is `(project, session_id, surface)`) across 42 distinct sessions, `resolved_at`
+spanning 2026-08-16..24. Header and body come from one query, because
+`recordCitationSurfaces` **overwrites** `injected_n`/`cited_n` and bumps `resolved_at`
+on every resolution: a snapshot taken at another moment cannot be reconstructed, and
+mixing two of them is how the first draft of this table ended up self-inconsistent.
+
+| face | rows | injected | cited | cite-rate |
+|---|---|---|---|---|
+| pretool | 40 | 432 | 151 | 35.0% |
+| error_recall | 37 | 345 | 20 | **5.8%** |
+| fyi | 33 | 141 | 18 | 12.8% |
+| ups | 17 | 33 | 9 | 27.3% |
+| task_imperative | 7 | 7 | 3 | 42.9% |
+| subagent | 1 | 1 | 1 | n=1 |
+
+`error_recall` is the **second-largest injector** and the worst-performing one. Reading
+the ratio rather than the level (per #10798: an A/B-shaped metric needs its control read
+at the same time) it sits at 0.17 of pretool here and held at 0.13–0.17 across the
+v3.74.0 gate change — so this is a property of the face, not of one week's sessions.
+
+**D#150 is answered**: the v3.74.0 gate fixed "the surface could not extract terms" and
+did not move the cite-rate. **D#151 stays open and stays correct** — verified again,
+`SqliteError: unable to open database file`, `eslint` errors and `go test FAIL` all have
+`isHardError=false` and never reach this face at all. The face is simultaneously too
+narrow and too imprecise; D#151's own reason for waiting (widening the trigger while
+changing precision mixes two variables) is why only precision was examined here.
+
+### A ruler for a face no existing harness can see
+
+`denoise-ab.mjs` is structurally blind to error-recall: its suites are query→document,
+and this face's input is a failed command plus its stderr. Any lever here reads
+NEUTRAL Δ=0 there no matter what it does. So `benchmark/error-recall-suite.mjs` — 9
+cases over a 620-row fixture, scoring the statement the hook actually runs (the
+selection was extracted to `lib/error-recall-core.mjs` precisely so the benchmark
+cannot measure a lookalike).
+
+Two rules it enforces on itself, both learned here:
+
+- **Every case must clear the real trigger gate.** `assertReachable` refuses to score a
+  shape whose `detectBashSignificance().isHardError` is false — #10731's lesson made
+  mechanical. It fired immediately: `Segmentation fault (core dumped)` was written into
+  the case list from memory and rejected on the spot. `core dumped` is in
+  `HARD_ERROR_RE`'s alternation, but the surrounding conditions still decline the shape,
+  exactly as the 24-shape battery in #10737 recorded.
+- **The corpus must have real IDF.** On a small all-one-topic fixture every row scores
+  exactly 0.00 (df = N kills the IDF term) and any floor removes everything; 600 filler
+  rows with disjoint vocabulary put the fixture past `FLOOR_REF_CORPUS`.
+
+Ground truth is structural, and the negative classes are kept apart per #8858: `filler`
+rows are TRUE off-topic false positives, `negative` rows are topical-but-unrequested —
+the shape #10730 measured, where a missing-module failure returned v3.66.0 release
+records because `npm`/`run`/`build` dominate BM25.
+
+### What the ruler said: build it, calibrate it, and leave it off
+
+The distribution suggested a floor. Over 7 well-served cases, `filler` p75 was 10.13 and
+`relevant` min was 10.93, so 10.5 sat in a clean gap — the same shape of choice that put
+the UPS face's OR floor at 30 in its own 22→41 gap. A per-row floor there was worth
++3.3pp precision (20 → 18 injected rows, both removed rows off-topic, hit-rate flat).
+
+Three measurements then took that apart.
+
+**The probe was measuring post-gate rows.** `probeScores()` inherited the shipped default
+instead of passing `floor: 0`, so the distribution used to choose the floor had already
+been filtered by it — `filler` reported n=4/min 10.69 instead of n=19/min 8.33. The
+calibration table was, for a while, not reproducible from the shipped tool. Found in
+review; the probe now passes `floor: 0` and self-checks that it can see below the
+calibrated value.
+
+**On a live database the per-row form was five times larger than the fixture suggested.**
+Across 8 projects × 10 real hard-error shapes on the maintainer's own DB: injected rows
+**221 → 112 (−49%)**, and **25 of 80 firing cases (31%) went to injecting nothing at
+all**. The loss is entirely in small projects (under ~500 observations: −47..−87%; above
+~800: −0..−3%). `corpusFloorScale` cannot correct this and is documented as deliberately
+project-blind — it normalises over the whole observations table, which is right for
+FTS5's IDF. But what collapses on a small project is not IDF, it is how good the best
+available memory is. That is v3.61.0's failure mode relocated from install scope to
+project scope.
+
+**The obvious repair looked free, and the fixture was lying again.** Making the gate
+set-level — read the top row, drop the whole set on failure, which is what UPS actually
+does and what "every other face has a floor" should have said — is the form now
+implemented. On the ruler it is a no-op at 10.5 (26 injected rows at every floor from 0
+to 20; it bites only at 25, costing hit-rate 85.7% → 42.9%). On the live DB, same
+threshold, 8 projects × 9 shapes, 69 firing cases:
+
+| | injected rows | vs off | cases silenced |
+|---|---|---|---|
+| floor off | 201 | — | — |
+| set-level 10.5 | 126 | **−37%** | **27 / 69 (39%)** |
+| per-row 10.5 | 97 | −52% | 26 / 69 (38%) |
+
+So it is not inert: it trims fewer rows in the cases it spares and silences just as
+many. The fixture cannot see this because its hard negatives are **constructed to score
+high** — every fixture case, including the two no-good-match ones, has a top row above
+10.5, while real small projects frequently have nothing above it. A second reviewer
+caught this, and it is the same defect as the per-row measurement one level up: a
+fixture number standing in for a live one.
+
+And the gap itself was an artifact. The fixture originally contained only cases the
+corpus could answer. Adding two **no-good-match** cases — real failures nothing in the
+corpus explains, which is the common case in production — moves `filler` p75 to 10.99,
+**above** `relevant` min of 10.93. There is no gap.
+
+So: the per-row form buys 2 rows on a fixture at a live cost nothing has shown to be
+noise (`citation_surface_log` stores counts, not ids, so the |bm25| of the 15 cited rows
+is unrecoverable), and the set-level form costs a third of the face for a benefit
+measured nowhere. Neither earns a default. The defect this face actually has is that
+command words dominate BM25 — semantic, and out of reach of any magnitude gate (filed as
+D#167). The floor ships built, calibrated, documented and **off**, which is the same
+call D#153 got when its data came back.
+
+One property worth stating because the comment used to overstate it: the gate reads the
+**rank-top** row's undecayed |bm25| — rank being `bm25 × recency-decay` — not the best
+|bm25| in the set. With a 14-day half-life a fresh weaker row can outrank an older
+stronger one and veto the whole set, which is why the set-level form silences marginally
+*more* cases than the per-row one. This matches what UPS does with `ftsRows[0]`, so the
+shape is consistent across faces; it is documented rather than "fixed" because changing
+it would make this face diverge from the one it was modelled on.
+
+The suite grew a second population as a result: cases are scored as **servable** (judged
+on hit-rate) or **unservable** (judged on whether the surface stayed quiet), because
+averaging them hides both effects.
+
+### Two defects I introduced, both caught by machinery rather than by reading
+
+**Placeholder order is decided by position in the SQL text, not by meaning.** Moving the
+decayed score from `ORDER BY` into a SELECT list renumbered every placeholder: `MATCH`
+received the project name and FTS5 answered `no such column: main`. Fixed by shape —
+the statement binds **named** parameters, and `recencyDecaySql` grew an optional
+`nowParam` (defaulting to the positional `?`, with a test asserting the six existing
+positional callers generate byte-identical SQL).
+
+**My own guard for the floor's ordering was vacuous.** It passed even when `LIMIT` was
+moved inside the subquery. Distinguishing the two orderings needs rows where rank order
+(decayed score) and gate order (undecayed |bm25|) disagree, and the shared fixture had
+none — the decay multiplier tops out at 2×, so a fresh row only outranks an old one
+while its |bm25| stays above half the old row's. That test is gone with the per-row
+form, but the lesson produced the tie-break pair now in the fixture: without it,
+collapsing the 14-day half-life to 1 millisecond — deleting recency ranking outright —
+left the entire suite green.
+
+### D#159 — making "stop injecting a memory nobody cites" a decidable question
+
+`observations.decay_seen_at_first_cite` (schema v46) records `decay_seen_count` as it
+stood when a memory was first cited. The lifetime counters cannot answer the question
+the gate needs. Measured 2026-08-22, a candidate gate of `decay_seen >= 20 AND
+cited_count = 0` matched 631 rows, while 331 of the 510 rows that *had* been cited also
+carried lifetime `decay_seen >= 20` — whether they crossed 20 before or after their
+first citation is unrecoverable from cumulative counters, so the gate's false-kill rate
+was not computable. (Both halves drift with use; re-read 2026-08-24 the same DB gives
+631 / 334 of 518. Every count in this paragraph is a snapshot, and the two must be read
+from the same one — the 518 quoted further down is the 08-24 figure.)
+
+The value includes the citing resolution, so it reads as "cited on the Nth time the loop
+saw it". NULL is deliberately not 0 — but note the boundary, because the analysis in
+4–6 weeks depends on it: **NULL means never cited *or* first cited before v46.** The
+stamp only fires when `cited_count` is 0 pre-update, so every row already cited when the
+migration ran (518 on the maintainer's DB) stays NULL permanently. The D#159 cohort is
+rows whose first citation happens after the upgrade, and the never-cited query needs
+`AND cited_count = 0` — a test pins that the naive form miscounts a legacy row.
+
+Instrumentation only. **No gate is added**, and there will not be enough data to design
+one for another 4–6 weeks.
+
+### Not in this release
+
+**SCOPE_FILTER redesign (D#153) was cut.** It is default-off, so reshaping it from a
+query-time exclusion into a render-time demotion changes nothing observable until
+someone flips the default — and the data already refused that flip (173 of 1112 recall
+groups would go empty; environment-scoped rows waste at 19.6% against project-scoped
+rows' 20.4%). Its deferred entry stands, including its own precondition: `denoise-ab`
+has no scope-annotated fixture, so any SCOPE change measures NEUTRAL Δ=0 there today.
+
 ## v3.77.0 — the face nobody could see, and the guard nobody could break
 
 **Upgrade note.** One new metering face (`subagent`) writes rows to

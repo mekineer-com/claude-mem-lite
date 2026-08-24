@@ -24,9 +24,9 @@ import { readFileSync, writeFileSync, unlinkSync, readdirSync, renameSync, statS
 import { homedir } from 'os';
 import {
   inferProject, detectBashSignificance,
-  planErrorRecall, extractFilePaths, isRelatedToEpisode,
+  extractFilePaths, isRelatedToEpisode,
   makeEntryDesc, scrubSecrets, stripPrivate, EDIT_TOOLS, debugCatch, debugLog,
-  OBS_BM25, notLowSignalTitleClause, formatErrorRecallHints,
+  formatErrorRecallHints,
   MAX_HOOK_STDIN_BYTES,
 } from './utils.mjs';
 import {
@@ -75,7 +75,8 @@ import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
 import { detectMemOverride } from './lib/mem-override.mjs';
 import { injectedIdsFileName, keyContextIdsFileName } from './lib/injected-ids.mjs';
 import { recordKeyContextInjection, touchKeyContextMarker } from './lib/keyctx-marker.mjs';
-import { liveObsFilterSql, recencyDecaySql } from './lib/inject-search-core.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
+import { selectErrorRecall } from './lib/error-recall-core.mjs';
 import { buildAndSaveHandoff, detectContinuationIntent, renderHandoffInjection, pickHandoffToInject, extractUnfinishedSummary } from './hook-handoff.mjs';
 import { checkForUpdate, getCachedUpdateBanner, isUpdateCheckDue } from './hook-update.mjs';
 import { handleLLMOptimize } from './hook-optimize.mjs';
@@ -494,37 +495,15 @@ function triggerErrorRecall(db, toolInput, response) {
     // query degraded to ['npm','run','build'] — the command's topic, not the failure.
     // planErrorRecall still returns null when nothing usable survives (empty output, or
     // only stop words), and then we stay silent rather than query the command's topic.
-    const cmd = toolInput.command || '';
-    const plan = planErrorRecall(cmd, response);
-    if (!plan) return;
-
-    // FTS5 OR query for broader recall
-    const ftsQuery = plan.terms.map(t => `"${t.replace(/"/g, '""')}"`).join(' OR ');
-    if (!ftsQuery) return;
-
-    const nowR = Date.now();
-    const rows = db.prepare(`
-      SELECT o.id, o.type, o.title, o.lesson_learned
-      FROM observations_fts
-      JOIN observations o ON observations_fts.rowid = o.id
-      WHERE observations_fts MATCH ? AND o.project = ?
-        -- Live-row invariant, same as every other model-facing retrieval path
-        -- (hook-context obsPool/fallbackObs/keyObs, hook-memory, search-engine,
-        -- recent/search/timeline/recall-core, pre-tool-recall, user-prompt-search).
-        -- This surface INLINES rows[0].lesson_learned into the model context, so an
-        -- unfiltered SELECT handed a retracted lesson to the agent verbatim while its
-        -- correction trailed as a bare pointer. compressed_into is filtered too, not
-        -- only for symmetry: the block's own footer is a mem_get(ids=...) pointer, and a
-        -- COMPRESSED_PENDING_PURGE row is queued for deletion by maintain purge_stale,
-        -- so that pointer would resolve to nothing.
-        AND ${liveObsFilterSql('o')}
-        AND ${notLowSignalTitleClause('o')}
-      -- Decay via the shared core (P2-11): the M-1 MAX(0,…) age clamp lives there.
-      -- Fixed 14d half-life (error recency matters more than obs type here).
-      ORDER BY ${OBS_BM25}
-        * ${recencyDecaySql({ tsExpr: 'o.created_at_epoch', halfLifeSql: '1209600000.0' })}
-      LIMIT 3
-    `).all(ftsQuery, project, nowR);
+    // Selection lives in lib/error-recall-core.mjs so the offline calibration suite
+    // scores THIS statement rather than a re-typed lookalike. null ⇒ do not inject.
+    const selected = selectErrorRecall(db, {
+      cmd: toolInput.command || '',
+      response,
+      project,
+    });
+    if (!selected) return;
+    const rows = selected.rows;
 
     const out = formatErrorRecallHints(rows);
     if (out) {

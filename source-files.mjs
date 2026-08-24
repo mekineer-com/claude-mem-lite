@@ -149,6 +149,14 @@ export const SOURCE_FILES = [
   // search-engine.mjs AND the standalone hook scripts — missing it from the
   // manifest kills every retrieval surface on auto-update.
   'lib/inject-search-core.mjs',
+  // Error-triggered recall selection. Statically imported by hook.mjs (PostToolUse
+  // injection) and by benchmark/error-recall-suite.mjs (offline calibration) — the
+  // hook is the one that breaks on a missing manifest entry.
+  'lib/error-recall-core.mjs',
+  // Corpus-size ramp for absolute relevance floors. Imported by BOTH floor-bearing
+  // injection faces: scripts/user-prompt-search.js (standalone hook) and
+  // lib/error-recall-core.mjs. Missing here = UserPromptSubmit dies on auto-update.
+  'lib/relevance-floor.mjs',
   // Shared UserPromptSubmit query caps — imported by BOTH hooks that event fires
   // (scripts/user-prompt-search.js and hook.mjs user-prompt via hook-memory.mjs).
   'lib/ups-query.mjs',

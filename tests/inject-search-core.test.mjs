@@ -34,6 +34,22 @@ describe('shared atoms — semantics', () => {
     expect(sql).toContain('EXP(-0.693');
   });
 
+  // FAILS IF: the v46 nowParam option changes what EXISTING callers generate. Six
+  // call sites bind this expression BY POSITION, so a different default would
+  // renumber their parameters silently — the exact failure that broke error-recall
+  // while it was being written (MATCH received a project name; FTS5 reported
+  // `no such column`). Named placeholders must reach only the caller that asks.
+  it('nowParam defaults to positional ? and changes nothing unless requested', () => {
+    const base = recencyDecaySql({ tsExpr: 'o.created_at_epoch' });
+    expect(base, 'default must stay byte-identical to the pre-option output')
+      .toBe(recencyDecaySql({ tsExpr: 'o.created_at_epoch', nowParam: '?' }));
+    const named = recencyDecaySql({ tsExpr: 'o.created_at_epoch', nowParam: '@now' });
+    expect(named).toContain('MAX(0, @now - o.created_at_epoch)');
+    expect(named, 'opting in must remove the positional placeholder, not add to it')
+      .not.toContain('MAX(0, ? -');
+    expect(named).toBe(base.replace('MAX(0, ? -', 'MAX(0, @now -'));
+  });
+
   // FAILS IF: cite or noise is dropped from the injection relevance chain — the
   // M-3 class (behavior signal wired on some surfaces, missing on others) reopens.
   it('injectionRelevanceSql composes decay + type-quality + importance + noise + cite', () => {
