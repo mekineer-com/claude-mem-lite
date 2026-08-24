@@ -11,13 +11,18 @@
 // data, and rewriting ~200 assertion sites would be churn with no reader.
 
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'fs';
+import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { DAY_MS } from '../lib/time-constants.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const SKIP_DIRS = new Set(['node_modules', 'tests', 'benchmark', '.git', '.tmp', 'coverage', 'docs', 'tasks', '.loop']);
+// `tmp` (D#168) is the repo's scratch directory — a §5 safe-path, gitignored, and where
+// this project habitually parks measurement harnesses. It is NOT runtime source, and
+// scanning it means an unrelated scratch file can turn the whole suite red with a
+// failure that points at a file nobody was working on. `.tmp` was already here; the
+// undotted sibling that people actually use was not.
+const SKIP_DIRS = new Set(['node_modules', 'tests', 'benchmark', '.git', 'tmp', '.tmp', 'coverage', 'docs', 'tasks', '.loop']);
 
 function runtimeSources(dir = ROOT, acc = []) {
   for (const name of readdirSync(dir)) {
@@ -65,5 +70,34 @@ describe('single-sourcing (runtime source only)', () => {
       if (n > 0) offenders.push(`${f} (${n})`);
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('a scratch file under tmp/ cannot turn this scan red (D#168)', () => {
+    // Asserting `SKIP_DIRS.has('tmp')` would pass while the walker ignored the set.
+    // This writes a file that WOULD be an offender if scanned, and proves it is not —
+    // a live reviewer hit exactly this, with two unrelated suites reporting failures
+    // against its own mutation harness parked in tmp/.
+    const dir = join(ROOT, 'tmp');
+    const probe = join(dir, 'd168-scan-probe.mjs');
+    // Remember whether tmp/ was ours to create, so a fresh clone is not left with an
+    // empty scratch dir by a test that only meant to write one file into it.
+    const dirWasAbsent = !existsSync(dir);
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(probe, 'export const DAY_MS = 86400000;\n');
+      // Precondition: the probe really is an offender by both of this file's rules, so
+      // a green result below means "excluded", not "harmless".
+      const src = readFileSync(probe, 'utf8');
+      expect(/^\s*(?:export\s+)?const DAY_MS\s*=/m.test(src)).toBe(true);
+      expect(/\b86_?400_?000\b/.test(src)).toBe(true);
+
+      const scanned = runtimeSources();
+      expect(scanned.filter((f) => f.startsWith('tmp/')),
+        'the walker descended into tmp/ — any scratch file there can now fail this suite').toEqual([]);
+    } finally {
+      try { rmSync(probe, { force: true }); } catch { /* best-effort */ }
+      // Only if this case created it, and only if nothing else landed there meanwhile.
+      if (dirWasAbsent) { try { rmSync(dir, { recursive: false }); } catch { /* not empty — leave it */ } }
+    }
   });
 });

@@ -121,6 +121,58 @@ const ERROR_LINE_RE = /error|fail|exception|cannot|not found|undefined|null/i;
 const ERROR_RECALL_MAX_TERMS = 6;
 
 /**
+ * The token that NAMES the failure: an exception class (`ModuleNotFoundError`,
+ * `JSONDecodeError`), an errno-style code (`ENOENT`, `EACCES`), a signal (`SIGSEGV`),
+ * or Rust's `panicked`.
+ *
+ * WHY THIS EXISTS (D#167). The line scan below takes the FIRST 3 matching lines and the
+ * first 5 tokens of each, and a real failure puts its banner first and its name last:
+ *
+ *     Traceback (most recent call last):        <- matches, contributes `traceback most recent`
+ *       File "<string>", line 3, in <module>
+ *     ModuleNotFoundError: No module named 'x'  <- the only line that says WHAT broke
+ *
+ * Measured over 52 real failing commands pulled from 1110 transcripts: 28 of them name
+ * their failure this way, and in 25 of those 28 (89.3%) THE NAME NEVER REACHED THE
+ * QUERY. The six-term budget went to the banner (`traceback,most,recent`) and to path
+ * fragments from the command (`mnt,data_ssd,dev`). Downstream, 39.2% of injected rows
+ * (764/1947 over 8 projects x 52 shapes on the live DB) matched no error term at all —
+ * they were admitted on command vocabulary alone — and for 42.3% of firing cases that
+ * was true of the TOP-1 row, whose lesson_learned is inlined into the model's context.
+ *
+ * This is deliberately a POSITIVE pattern for the signal, not a stop-list for the noise:
+ * a stop-list of boilerplate ("traceback", "most", "recent", "call", "last", …) grows
+ * once per runtime forever, which is the enumeration the D#136 docblock below warns
+ * against. Matching the shape of an exception name instead covers runtimes nobody has
+ * seen yet, and when nothing matches, extraction is byte-identical to before.
+ *
+ * Note `E[A-Z]{3,}` also matches the literal `ERROR`; it is dropped by ERROR_STOP_WORDS
+ * on the next line, and that interaction is load-bearing rather than incidental.
+ */
+const ERROR_NAMER_RE = /\b(?:[A-Z][A-Za-z]*(?:Error|Exception)|E[A-Z]{3,}|SIG[A-Z]{2,}|panicked)\b/g;
+
+/**
+ * How many names may jump the queue. Each one displaces a scanned term (the 6-term cap
+ * is unchanged), so this trades tail tokens for the identifier.
+ *
+ * ONE, and that is measured rather than argued. Swept on the live DB over the same 52
+ * shapes x 15 projects, reading the share of injected rows that match no error term and
+ * the share of cases whose top row does:
+ *
+ *   MAX=1   434 rows (22.4%)   154 cases (21.5%)
+ *   MAX=2   442 rows (22.8%)   157 cases (22.0%)
+ *   MAX=3   445 rows (22.9%)   157 cases (22.0%)
+ *
+ * The second name never pays: 96.4% of shapes already have their failure named by the
+ * first, so slots 2 and 3 buy a duplicate or a second-order name while still evicting a
+ * scanned term — and the evicted tail is often the most specific token in the list (see
+ * the golden case in tests/error-recall-gate.test.mjs, where a filename is lost). This
+ * shipped at 2 on the reasoning that a chained Python traceback has two real names; the
+ * sweep says that reasoning does not survive contact with the sample.
+ */
+const ERROR_NAMER_MAX = 1;
+
+/**
  * Split a failed command + its output into command-derived and error-derived terms.
  * Shared by extractErrorKeywords (merged view, unchanged contract) and
  * planErrorRecall (which needs the two classes kept apart). Dedup is deliberately
@@ -137,6 +189,19 @@ function collectErrorTerms(cmd, response) {
     if (!ERROR_STOP_WORDS.has(lw) && !seen.has(lw)) { seen.add(lw); cmdWords.push(lw); }
   }
   const errWords = [];
+  // The failure's NAME goes in first — see ERROR_NAMER_RE for the measurement that put
+  // it here. Prepending rather than re-ordering the LINE scan is deliberate: sorting
+  // namer-bearing lines to the front also promotes their verbose neighbours, which costs
+  // real terms (on npm's ENOENT output it evicts `syscall` in favour of `such`/`file`
+  // from the long "no such file or directory" line). Prepending only ever displaces the
+  // TAIL of what the scan would have produced.
+  for (const m of String(response || '').match(ERROR_NAMER_RE) || []) {
+    if (errWords.length >= ERROR_NAMER_MAX) break;
+    const lt = m.toLowerCase();
+    if (ERROR_STOP_WORDS.has(lt) || seen.has(lt)) continue;
+    seen.add(lt);
+    errWords.push(lt);
+  }
   // The line filter is the TRIGGER's pattern list OR'd with the prose one. Anything
   // that made detectBashSignificance call this a hard error is, by construction, also
   // something we will extract terms from — which closes the "trigger fired, extractor
@@ -164,6 +229,40 @@ function collectErrorTerms(cmd, response) {
 }
 
 /**
+ * THE CAP TRUNCATES BY POSITION, AND THAT WAS TESTED AGAINST THE ALTERNATIVE (D#169).
+ *
+ * The alternative looked obviously right. Tokens are scanned line by line, prose comes
+ * before identifiers within a line, so `AssertionError: expected observation-write.mjs
+ * to be defined` yields `assertionerror, expected, observation-write.mjs` — and whatever
+ * the cap removes comes off that end. On a real shape, `npx vitest run
+ * tests/scope-label.test.mjs` failing with an AssertionError kept `fail, tests` and
+ * dropped `scope-label.test.mjs`: a filename traded for a word in thousands of memories.
+ * Keeping identifier-shaped tokens (`[._-]`) first should fix that.
+ *
+ * Measured on the live DB, same 58 real shapes x 15 projects either way:
+ *
+ *                              cmd-only rows     cmd-only at TOP-1
+ *   positional cap (shipped)   493/2184  22.6%   171/801  21.3%
+ *   identifier-first cap        749/2093  35.8%   259/775  33.4%
+ *
+ * Thirteen points WORSE on both, and the mechanism is worth keeping written down:
+ * `[._-]` conflates "discriminative" with "unique to this invocation". The tokens it
+ * promotes are this run's own paths and filenames — `d167-measure.mjs`,
+ * `s-default.json` — whose IDF is so high they match NOTHING in the corpus, and the
+ * tokens it evicts to make room are `enoent`, `syscall`: low-IDF, but present in the
+ * memories that actually explain the failure. A row then survives on command vocabulary
+ * alone, which is the D#167 defect re-created from the other side.
+ *
+ * (A variant that promoted identifiers only among ERROR words, sparing command words,
+ * measured byte-identical: command words sit at low indices, so a positional tiebreak
+ * already keeps them and promotion never decides their fate.)
+ *
+ * The premise "the evicted tail is systematically the good part" is therefore FALSE.
+ * The tail is often hapax. Any future attempt here needs real document frequencies, not
+ * a shape heuristic — and planErrorRecall is pure, with no corpus to count against.
+ */
+
+/**
  * Extract discriminative keywords from a failed command and its error output.
  * Filters out common stop words to produce useful FTS5 search terms.
  * @param {string} cmd The command that was executed
@@ -172,6 +271,8 @@ function collectErrorTerms(cmd, response) {
  */
 export function extractErrorKeywords(cmd, response) {
   const { cmdWords, errWords } = collectErrorTerms(cmd, response);
+  // Same cap rule as planErrorRecall — the two must not drift into dialects, which is
+  // pinned by a test asserting they emit identical lists.
   const result = [...cmdWords, ...errWords].slice(0, ERROR_RECALL_MAX_TERMS);
   return result.length >= 1 ? result : null;
 }
@@ -231,12 +332,26 @@ export function extractErrorKeywords(cmd, response) {
  *
  * @param {string} cmd The command that was executed
  * @param {string} response The error output text
- * @returns {{terms: string[]}|null} null ⇒ do not inject
+ * @returns {{terms: string[], cmdWords: string[], errWords: string[]}|null}
+ *   null ⇒ do not inject. The two classes are returned ALONGSIDE the merged list, and
+ *   post-cap, so the retrieval surface can rank on "did this row match the failure or
+ *   only the command" without re-deriving the split from the command string — a
+ *   re-derivation is the "second program that merely looks like the first" trap this
+ *   file's consumer (lib/error-recall-core.mjs) is structured to avoid.
  */
 export function planErrorRecall(cmd, response) {
   const { cmdWords, errWords } = collectErrorTerms(cmd, response);
   if (errWords.length === 0) return null;
-  return { terms: [...cmdWords, ...errWords].slice(0, ERROR_RECALL_MAX_TERMS) };
+  const terms = [...cmdWords, ...errWords].slice(0, ERROR_RECALL_MAX_TERMS);
+  // Intersect with the CAPPED list: a term the cap dropped is not in the query, so
+  // reporting it as an error term would have the surface rank on a word it never
+  // matched on.
+  const kept = new Set(terms);
+  return {
+    terms,
+    cmdWords: cmdWords.filter((t) => kept.has(t)),
+    errWords: errWords.filter((t) => kept.has(t)),
+  };
 }
 
 // ─── File Paths ──────────────────────────────────────────────────────────────

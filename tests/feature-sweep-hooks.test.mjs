@@ -285,13 +285,18 @@ function expectHookStdout(out, { event = null, plainAllowed = false, label }) {
   return parsed;
 }
 
-// The four payload shapes a hook must survive. Claude Code should never send the last two,
+// The payload shapes a hook must survive. Claude Code should never send most of these,
 // but a truncated pipe, a protocol change or a third-party wrapper can — and a non-zero exit
 // or a crash here degrades the user's session with no error surface.
 const MALFORMED = [
   ['empty stdin', ''],
   ['invalid JSON', 'not json at all {{{'],
   ['valid JSON, required fields missing', '{}'],
+  // `'null'` is VALID JSON that parses to null, so it slips past the parse guard and
+  // reaches the destructure — which throws. Added after review found every handler here
+  // shares the hole and none of the four shapes above reaches it.
+  ['valid JSON that is null', 'null'],
+  ['valid JSON that is a scalar', '42'],
   ['unexpected types', JSON.stringify({
     session_id: [], tool_name: 42, tool_input: 'not-an-object', tool_response: { a: 1 },
     prompt: { b: 2 }, transcript_path: 17, source: false,
@@ -568,6 +573,67 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
       'hook.mjs post-tool-use',
       { event: 'PostToolUse', plainAllowed: false },
       (stdin, malCwd) => hookEvent('post-tool-use', { cwd: malCwd, stdin }),
+    );
+  });
+
+  itHook('hook.mjs post-tool-failure', async () => {
+    // D#170. The event PostToolUse never sees: Claude Code routes tool calls it judged
+    // FAILED here instead. The sibling case above proves the surface works on an exit-0
+    // command that printed error text; this one proves it works on the population that
+    // used to be invisible — and that it reads `error`, since the payload has no
+    // `tool_response` at all.
+    const NAME = 'hs-postfail';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const recallId = await seedObs(cwd, 'ENOENT on package.json means the build ran from the wrong cwd',
+      ['--type', 'bugfix', '--importance', '3', '--lesson', 'Run the build from the package root, not from scripts/']);
+
+    const fire = await hookEvent('post-tool-failure', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-postfail', tool_name: 'Bash',
+        tool_input: { command: 'node scripts/build.mjs' },
+        tool_use_id: 'toolu_sweep_d170',
+        error: "Error: ENOENT: no such file or directory, open '/app/package.json'\n    at Object.openSync (node:fs:596:3)",
+      }),
+    });
+    expect(fire.code, `post-tool-failure exited ${fire.code}\n${fire.stderr}`).toBe(0);
+    const [recall] = expectHookStdout(fire.stdout, {
+      event: 'PostToolUseFailure', plainAllowed: false, label: 'hook.mjs post-tool-failure',
+    });
+    expect(recall, `no error-recall envelope emitted:\n${fire.stdout}`).toBeTruthy();
+    expect(recall.hookSpecificOutput.additionalContext).toContain('Related memories found for this error');
+    expect(recall.hookSpecificOutput.additionalContext).toContain(`#${recallId}`);
+
+    // Scope, asserted against the real subprocess rather than the manifest matcher: a
+    // tool-chain refusal is not a program failure, and 68.9% of host-flagged Bash
+    // failures on the maintainer's machine were of that kind.
+    // The refusal text must carry terms that WOULD match the row seeded above, or this
+    // asserts nothing: the first version used `§8 SAFETY … rm -rf`, on which
+    // planErrorRecall returns null, so the surface was silent no matter what the gate
+    // did. Mutation confirmed it survived. Same ENOENT/package.json vocabulary as the
+    // firing case, one marker added.
+    const refused = await hookEvent('post-tool-failure', {
+      cwd,
+      stdin: JSON.stringify({
+        session_id: 'cc-hooksweep-postfail', tool_name: 'Bash',
+        tool_input: { command: 'node scripts/build.mjs' },
+        error: '[claudemd] §11 memory-hint: refused — the ENOENT probe on package.json was blocked before it ran.\nError: command not executed.',
+      }),
+    });
+    expect(refused.code).toBe(0);
+    expect(refused.stdout, 'a denied command must not recall').toBe('');
+
+    // This path deliberately does NOT feed the episode buffer (scope: episode entries
+    // flow into LLM summarisation and the save-nudge, unmeasured under an influx of
+    // failures). The buffer must therefore hold nothing from either fire above.
+    expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`)),
+      'post-tool-failure must not write an episode entry').toBe(false);
+
+    await expectMalformedResilience(
+      'hook.mjs post-tool-failure',
+      { event: 'PostToolUseFailure', plainAllowed: false },
+      (stdin, malCwd) => hookEvent('post-tool-failure', { cwd: malCwd, stdin }),
     );
   });
 

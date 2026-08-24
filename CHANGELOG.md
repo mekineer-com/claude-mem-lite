@@ -2,6 +2,259 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.79.0 — the query knew the command's name and not the failure's, and never saw it fail
+
+**Upgrade note.** Two default-on changes, both to the error-recall face (the memories
+injected after a failed Bash command), and **one new hook event registration**:
+`PostToolUseFailure`. Installing rewrites your `settings.json` hook block; third-party
+hooks are preserved (verified: 7 in, 7 out, none lost). What changes for you:
+
+- The face now fires on commands that **actually failed**. It never did before — Claude
+  Code delivers failed tool calls to a hook event this plugin had not registered, so the
+  only "failures" it ever saw were commands that exited `0` while printing error-ish
+  text. Off switch: `CLAUDE_MEM_ERROR_RECALL_ON_FAILURE=off`.
+- What it retrieves changes: the query now carries the failure's *name*, and memories
+  that merely share the failed command's vocabulary are ranked below memories that
+  mention the failure. Off switch for the ranking half:
+  `CLAUDE_MEM_ERROR_RECALL_RERANK=off`. The term half has no switch, because it has no
+  defensible off position (see below).
+
+Nothing else moves. Two of the three deferred items this release set out to close were
+**refuted by measurement instead** — that story is the rest of these notes.
+
+### The failure had a name and the query did not carry it
+
+D#167 was filed against the wrong culprit. Its premise — "command words dominate BM25" —
+came from five hand-picked replays. Measured properly it is half right, and the half it
+misses is bigger.
+
+The sample is 52 real failing commands with their real stderr, extracted from 1110
+transcripts and filtered through the surface's actual trigger (`detectBashSignificance`
+→ `isHardError`), then replayed against the live database across 15 projects. Two
+readings:
+
+- **28 of the 52 name their failure** — `ModuleNotFoundError`, `ENOENT`,
+  `JSONDecodeError`, `OperationalError`. In **25 of those 28 (89.3%) the name never
+  reached the query.** The six-term budget went to the Python banner
+  (`traceback, most, recent` — a constant string that says nothing about what broke) and
+  to path fragments split out of the command (`mnt, data_ssd, dev`).
+- **39.2% of injected rows (764/1947) matched no error term at all**, and for
+  **42.3% of firing cases that was true of the TOP-1 row** — the row whose
+  `lesson_learned` is inlined verbatim into the model's context.
+
+`ERROR_NAMER_RE` fixes the first: the token that names a failure is prepended to the term
+list. It is a positive pattern for the signal, deliberately not a stop-list for the noise
+— a list of boilerplate grows once per runtime forever, which is the enumeration the
+D#136 docblock warns against. When nothing matches, extraction is byte-identical to
+before. The name now reaches the query in **96.4%** of the shapes that have one.
+
+### The two defects are independent, and the first fix does not touch the second
+
+Naming the failure did **not** reduce command-vocabulary injection. It nudged it up,
+39.2% → 40.2%: better terms are more specific, so they match fewer rows, so the flat OR
+has *more* room to fill its three slots with whatever shares the command's words.
+
+So the ranking half ships too. The retrieval runs an error-first query — at least one
+term from the failure required, every term still scoring, because dropping command words
+outright was measured in D#136 and regressed two of five replays — and then **fills any
+remaining slots from the unchanged flat-OR result**:
+
+| | cmd-only rows | cmd-only at TOP-1 | rows injected |
+|---|---|---|---|
+| v3.78.0 | 764/1947 39.2% | 302/714 42.3% | 1947 |
+| + names only | 780/1941 40.2% | 301/715 42.1% | 1941 |
+| **+ error-first rerank** | **434/1941 22.4%** | **154/715 21.5%** | **1941** |
+
+On the face's own calibration suite the same change reads precision **23.1% → 34.6%**
+with hit-rate **85.7% → 100%** and the injected row count unchanged at 26. Fixture and
+live DB agree on direction here — worth stating, because in v3.78.0 they did not, and
+that disagreement is why the floor from that release is still off.
+
+### What was rejected, and why the shape matters
+
+The simpler form — make the error term **mandatory** and stop — was measured on the same
+sample: −22.4% rows and **154 of 715 cases (21.5%) injecting nothing at all**, with the
+loss concentrated in small projects. That is v3.78.0's magnitude floor wearing a
+different hat, and it is not what ships. The rerank **reorders and never removes**: a row
+that only matches the command falls to slot 2 or 3 instead of being deleted, and when a
+project has no error-matching row anywhere the output is byte-identical to the flat OR.
+The residual 21.5% is essentially that set — verified rather than assumed: of the cases
+the mandatory form silences, **0** had a base set containing an error-matching row.
+
+D#136 had already considered and rejected this shape, on the grounds that "the primary
+query always fills its LIMIT 3 so the fallback never runs". True of the five cases it
+replayed. False at 715, where the primary leaves hundreds of slots for the fallback.
+
+### Two errors of mine, both caught by measurement rather than by reading
+
+- **The first ruler was an always-true predicate, and it "refuted" the defect.** Row
+  membership was tested with `SELECT 1 FROM observations_fts WHERE rowid = ? AND
+  observations_fts MATCH ?`. On SQLite 3.53.1 that form **silently drops the rowid
+  constraint** and returns a row whenever the term matches *anywhere in the table*. It
+  reported 0.0% command-only rows — which is what an always-true membership test always
+  reports — and the number was only exposed as false because it contradicted a second
+  measurement in the same run. Proven by probing a rowid known to be outside the term's
+  match set and getting a hit back.
+- **`ERROR_NAMER_MAX` shipped at 2 on an argument, not a measurement.** The argument was
+  chained Python tracebacks. The sweep says 1 is better on both metrics (22.4%/21.5% vs
+  22.8%/22.0%) and 3 is worse: 96.4% of shapes have their failure named by the *first*
+  match, so later slots buy a duplicate while still evicting a scanned term — and the
+  evicted tail is often the most specific token there is.
+
+That last cost is real and is recorded rather than smoothed over: on a vitest-assertion
+shape, prepending `assertionerror` evicts `scope-label.test.mjs`, trading a high-IDF
+filename for a low-IDF class name. The golden case in `tests/error-recall-gate.test.mjs`
+now states the trade in place. The follow-up it argues for — evict the *least*
+discriminative term rather than the last one — is **D#169**, not implemented.
+
+### The surface had never once seen a failed command
+
+D#151 said "widen `HARD_ERROR_RE`, a lot of real failures do not trigger this surface".
+Measured, it was aimed one layer too low — the same way D#167's premise was. Over 1110
+transcripts and 12904 Bash results, every anchor D#151 named (`panicked`, segfault, tsc,
+gcc, make, go-test, cargo-test, docker, kubectl) gains **zero**; the one that gains
+anything, `git fatal:`, adds 6 cases and 9 false positives. And 89.1% of missed failures
+never reach that regex at all — `looksLikeError` upstream already said no.
+
+The reason is that **`PostToolUse` does not fire for a tool call the host marks as
+failed.** Claude Code routes those to a separate `PostToolUseFailure` event, which this
+plugin had never registered. So the only "failures" error-recall ever saw were commands
+that exited **0** while printing error-ish text — the classic shape being
+`cmd 2>&1 | tail`, where the pipe launders a failure into a success. A genuinely failing
+build recalled nothing, ever. Verified twice over: the 2.1.241 bundle lists the event
+with the failure text in an `error` field (there is no `tool_response`) and an
+`additionalContext` output channel; and two genuinely failing Bash calls, one carrying a
+full stack frame, left zero trace in the episode buffer and the `events` table while the
+successful calls either side were recorded.
+
+**The event is now registered** (`hooks/hooks.json` and `install.mjs` both — they are two
+separate hook sets, and `tests/audit-silent-20260814.test.mjs` diffs them; a one-sided
+registration was mutation-tested and does red). Three things bound the change:
+
+- **Bash only.** This surface queries on a command plus its output; no other tool has
+  that shape.
+- **A refusal gate** (`lib/tool-refusal.mjs`). Of 798 host-flagged Bash failures on the
+  maintainer's machine, **558 (68.9%) are the agent's own tool chain refusing** — sandbox
+  denials, policy hooks, declined permission prompts. Injecting three memories because a
+  permission prompt was declined is noise by construction. Every sentinel is anchored on
+  something no ordinary program prints (a bracketed tag, a section marker, a syscall
+  name), never a bare word: `docker`, `psql` and `npm` all print "permission denied" in
+  their own voice, and a gate that swallowed those would fail *silently*, because silence
+  is also what this path did before it existed. The user's own interrupt is excluded via
+  the host's `is_interrupt` flag rather than by pattern-matching text.
+- **It does not feed the episode buffer.** That is scope, not oversight: episode entries
+  flow into LLM summarisation and the bugfix save-nudge, whose behaviour under a sudden
+  influx of failures is unmeasured, and this change already takes the surface from 53 to
+  ~186 firing shapes.
+
+Precision on the newly-visible population is not worse than on the old one — replayed
+across 15 projects, 22.4% of injected rows and 17.9% of top rows match no error term,
+against 22.5%/21.4% for the population the surface already had. Its volume is metered
+separately (`error_recall_failure`) so the addition can be read on its own, while the
+citation funnel deliberately keeps one `error_recall` surface: these are the same
+injections to the model, and splitting the cite-rate denominator would leave both halves
+too small to read. Off switch: `CLAUDE_MEM_ERROR_RECALL_ON_FAILURE=off`.
+
+Nine mutations were run against the new guards; all nine killed — but only after the
+first round, where **the Bash-scoping case survived**. It was asserting a necessary
+condition instead of the one it named: the Edit payload it sent carried no `command`, so
+a downstream guard rejected it and deleting the tool_name check changed nothing. The
+payload now carries a `command`, which is the whole difference between a test that
+mentions a guard and one that binds it.
+
+### What two independent pre-tag reviews found, and what it cost
+
+Both lenses were dispatched before the tag and both delivered. No BLOCKER in the shipped
+behaviour; one BLOCKER in the *tests*, and one real production defect. Everything below
+was fixed before tagging, and every mutation the reviewers reported as SURVIVED was
+re-run against the fix and killed (12/12).
+
+**The production defect.** The refusal gate was anchored on `§8 SAFETY`, the one section
+marker that happened to appear first in the corpus. The family is wider — `§7
+Ship-baseline`, `§11 MEMORY.md`, `§10-V Specificity`. The `§7` shape alone was **13 of 135
+firing cases (9.6%)**, and it does not merely waste a slot: the refusal's own boilerplate
+becomes the query, so a `git push` blocked by a red-CI rule injected three memories about
+statusline adoption — this release's headline defect arriving through the door this
+release opened. Now anchored on the section *citation*; firing shapes 135 → 122, exactly
+the 13.
+
+**The test BLOCKER.** Both cases that named the refusal filter were vacuous. They sent
+`§8 SAFETY (immutable): denied …`, on which `planErrorRecall` returns null — so the
+surface injects nothing whatever the gate does, and disabling *only* the refusal branch
+passed every test in the release. Same class the author had already caught once this
+round, reproduced twice more. The cases now use refusal text that would match the seeded
+row, plus a negative control asserting the same text *without* the marker does inject —
+so "silent" can no longer be satisfied by matching nothing.
+
+**A defect the docblock's own claim hid.** The rerank's `(errWords) AND (allTerms)`
+repeats every error term, and FTS5's `bm25()` sums over phrase instances — so a primary
+row's `|bm25_raw|` is systematically larger than its flat-OR score (1.334 → 1.779 on a
+one-row index). The calibration table for the still-off relevance floor was derived
+pre-rerank: filler p75 moves 10.99 → 20.27, and the 10.5 constant no longer sits in any
+gap. Documented at the constant rather than silently left for whoever switches it on.
+
+Also fixed: the fallback could inject the top row **twice** (the id de-dup was unbound and
+its mutant produced ids 1,1,2); the rerank compared against the raw `limit` rather than
+the sanitized one, so `limit: 0` turned it into the filter this release rejects; two
+irreconcilable refusal ratios shipped in different files (**558 of 810, 68.9%** is the
+reproducible one, and the benchmark now buckets by the gate's own reason instead of
+lumping refusals with empties); `handlePostToolFailure` recorded nothing on its
+silent-exit paths, which is the only window a host payload-shape change would show in.
+
+And the guards the reviews showed were decorative are now binding: `ERROR_NAMER_MAX`
+(the value this release corrected on data could be set straight back), three of the four
+alternatives in `ERROR_NAMER_RE`, the stop-word interaction its own docblock calls
+load-bearing, the `tmp/**` exclusion that D#168 was actually about, and the sentinel
+anchoring meta-test — which was a whitelist keyed to the list it checked, and fell to a
+one-line loose pattern. Writing that guard behaviourally immediately caught a second
+thing: `**/.git/**` had been silently dropped from Vitest's defaults by our own
+`exclude`.
+
+### A third premise, also refuted — built, measured, reverted
+
+D#169 came out of this release's own evidence, which is the strongest kind of premise
+there is, and it was still wrong. The term cap truncates by position, and a real shape
+showed that costing a filename: `npx vitest run tests/scope-label.test.mjs` failing with
+an `AssertionError` keeps `fail, tests` and drops `scope-label.test.mjs`. Keeping
+identifier-shaped tokens (`[._-]`) first should fix it. Same 58 real shapes × 15 projects
+either way:
+
+| | cmd-only rows | cmd-only at TOP-1 |
+|---|---|---|
+| positional cap (kept) | 493/2184 **22.6%** | 171/801 **21.3%** |
+| identifier-first cap | 749/2093 35.8% | 259/775 33.4% |
+
+Thirteen points worse on both. `[._-]` conflates *discriminative* with *unique to this
+invocation*: it promotes the run's own paths and filenames, whose IDF is so high they
+match nothing, and evicts `enoent` and `syscall` — low-IDF, but present in the memories
+that explain the failure. The row then survives on command vocabulary alone, which is
+this release's headline defect rebuilt from the other side. (A variant sparing command
+words measured byte-identical; command words sit at low indices, so a positional
+tiebreak already keeps them.) Reverted, with the numbers and the mechanism recorded in
+the cap's docblock rather than in a commit message nobody will find.
+
+### Scratch files in `tmp/` could fail the whole suite
+
+D#168, reported by a reviewer whose own mutation harness — parked in `tmp/`, this repo's
+gitignored scratch dir and a §5 safe-path — produced two failures in suites unrelated to
+anything it was reviewing. Two repo-walking invariant scanners skipped `.tmp` but not
+`tmp`, and Vitest's default discovery collected `tmp/**/*.test.mjs` and ran it.
+
+Fixed in all three places, and pinned by a probe rather than by asserting the skip list
+contains the entry — that assertion passes even if the walker ignores the list. Each
+scanner now writes a file into `tmp/` that *would* be reported if scanned, asserts it
+really is an offender, then asserts it was not seen. Verified by reverting: the same
+planted files produce 5 failures and one collected test file; with the fix, none.
+Vitest's `exclude` **replaces** the defaults rather than extending them, so they are
+restated in full — omitting them would have collected thousands of vendored tests.
+
+Six mutations were run against the new guards (rerank disabled, rerank turned into a
+filter, command words dropped from the error-first expression, namer disabled, namer
+pattern partially reverted, reported query decoupled from the one that ran); all six
+killed. The fixture needed a new decoy row to see any of it: before that row existed,
+the reranked and flat orders coincided and the whole feature measured as a no-op — the
+same "fixture cannot see the lever" failure recorded in v3.78.0.
+
 ## v3.78.0 — a ruler built to justify a lever, and what it measured instead
 
 **Upgrade note.** No default behaviour changes. The error-recall face (memories injected

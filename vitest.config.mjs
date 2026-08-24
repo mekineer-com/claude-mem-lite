@@ -3,6 +3,26 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     testTimeout: 20000,
+    // D#168. Vitest's default discovery globs the whole repo, so a scratch file named
+    // `*.test.mjs` under `tmp/` — the project's own gitignored scratch dir and a §5
+    // safe-path — is collected and RUN as part of the suite. Restating the defaults is
+    // required: supplying `exclude` REPLACES them rather than appending. On vitest 4.1.6
+    // `configDefaults.exclude` is only `['**/node_modules/**', '**/.git/**']` (verified,
+    // not assumed — an earlier version of this comment quoted the vitest 2.x list); the
+    // extra entries below are a deliberate superset kept for the day that shrinks again.
+    // Pinned by tests/vitest-config-exclude.test.mjs.
+    // The two repo-walking invariant scanners (tests/time-constants.test.mjs,
+    // tests/obs-types-invariant.test.mjs) skip `tmp` for the same reason, each pinned by
+    // its own probe case.
+    exclude: [
+      // The installed vitest's two actual defaults, verbatim. The brace form below is a
+      // superset in behaviour but a DIFFERENT string, and the guard compares strings —
+      // which is how it caught `**/.git/**` being silently dropped here.
+      '**/node_modules/**', '**/.git/**',
+      '**/dist/**', '**/cypress/**', '**/.{idea,git,cache,output,temp}/**',
+      '**/{karma,rollup,webpack,vite,vitest,jest,ava,babel,nyc,cypress,tsup,build,eslint,prettier}.config.*',
+      'tmp/**', '.tmp/**',
+    ],
     // D#40: the CLI auto-escalation path is default-ON in production but must
     // never spawn a real `claude` subprocess during the suite. This forces
     // autoDeepLlmReady's CLI branch off in every worker; tests that exercise the

@@ -30,6 +30,16 @@ import {
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'p-main';
 
+/** Run `fn` with the D#167 rerank kill-switch set (and restored afterwards). */
+function withRerank(value, fn) {
+  const KEY = 'CLAUDE_MEM_ERROR_RECALL_RERANK';
+  const saved = process.env[KEY];
+  if (value === undefined) delete process.env[KEY]; else process.env[KEY] = value;
+  try { return fn(); } finally {
+    if (saved === undefined) delete process.env[KEY]; else process.env[KEY] = saved;
+  }
+}
+
 // npm's real ENOENT output — the shape D#136 was built around, reused here so the
 // query under test is the one a real failure produces, not a hand-written MATCH.
 const NPM_ENOENT_OUT = [
@@ -122,6 +132,21 @@ function seed() {
   });
 
   const decoys = {
+    // D#167: a row that shares ONLY the COMMAND's vocabulary (npm / run / build) and
+    // says nothing about the failure — no enoent, no code, no syscall. Recent enough
+    // that recency decay floats it to the top of the flat OR, which is precisely the
+    // shape measured on the live DB: 39.2% of injected rows and 42.3% of TOP-1 rows
+    // matched no error term at all.
+    //
+    // Its presence is what makes the rerank VISIBLE here. Without it every fixture row
+    // matched an error term, the reranked and flat orders coincided, and the suite
+    // reported the shipped default as a no-op — the same "fixture cannot see the lever"
+    // failure that let a floor be calibrated against a ruler it had already contaminated.
+    cmdOnly: insertObs(db, {
+      title: 'npm build pipeline retuned for the run step',
+      text: 'npm run build npm build run npm build pipeline cadence notes',
+      ageDays: 0.05,
+    }),
     // liveObsFilterSql: superseded row
     superseded: insertObs(db, {
       title: 'ENOENT superseded decoy', text: 'enoent module npm build',
@@ -271,7 +296,7 @@ describe('error-recall core — relevance floor (SET-LEVEL, default OFF)', () =>
     errorRecallFtsQuery(planErrorRecall('npm run build', NPM_ENOENT_OUT).terms), PROJECT, now,
   );
 
-  it('is OFF by default — the shipped default injects exactly what it did before', () => {
+  it('is OFF by default — nothing is suppressed, and with the rerank off the statement is the pre-floor one', () => {
     // 0 is a measured decision, not an oversight (see the core docblock: the per-row
     // form cost 49% of injections on the live DB for a fixture gain of +3.3pp, and the
     // set-level form is a no-op at any safe threshold). This case pins the decision, so
@@ -282,7 +307,12 @@ describe('error-recall core — relevance floor (SET-LEVEL, default OFF)', () =>
     const out = withEnv(undefined, () => select(db, { now }));
     expect(out.floor, 'default must reach the gate as 0').toBe(0);
     expect(out.suppressed).toBe(0);
-    expect(out.rows.map((r) => r.id)).toEqual(controlRows(db, now).map((r) => r.id));
+    // The control is the FLAT-OR statement, so the comparison has to hold the OTHER
+    // lever still. The shipped default also reranks (D#167), which reorders this
+    // fixture on purpose — comparing the reranked output to a flat-OR control would
+    // make this case fail for a reason that has nothing to do with the floor.
+    const flat = withRerank('off', () => withEnv(undefined, () => select(db, { now })));
+    expect(flat.rows.map((r) => r.id)).toEqual(controlRows(db, now).map((r) => r.id));
   });
 
   it('when enabled, drops the WHOLE set if the best row is below the floor', () => {
@@ -346,7 +376,9 @@ describe('error-recall core — relevance floor (SET-LEVEL, default OFF)', () =>
   it('floor 0 is an EXACT revert to the pre-floor statement, not an approximate one', () => {
     const { db } = seed();
     const now = Date.now();
-    const reverted = withEnv('0', () => select(db, { now }));
+    // Rerank held off for the same reason as the case above: this asserts what the FLOOR
+    // does, and the control it compares against is the pre-floor FLAT statement.
+    const reverted = withRerank('off', () => withEnv('0', () => select(db, { now })));
     expect(reverted.floor).toBe(0);
     expect(reverted.rows.map((r) => r.id)).toEqual(controlRows(db, now).map((r) => r.id));
   });
@@ -413,5 +445,165 @@ describe('error-recall core — wiring', () => {
     // The re-inlining regression this guard exists to catch: the FROM/JOIN pair of
     // this surface's statement reappearing inside hook.mjs.
     expect(src).not.toMatch(/FROM\s+observations_fts\s*\n\s*JOIN\s+observations\s+o\s+ON\s+observations_fts\.rowid/);
+  });
+});
+
+// D#167. The flat OR admits a row on ANY term, so a memory that shares only the
+// COMMAND's words competes for the three slots with one that names the failure. On the
+// live DB — 52 real failing commands from 1110 transcripts x 15 projects, ~715 firing
+// cases — 39.2% of injected rows and 42.3% of TOP-1 rows matched no error term at all;
+// with the rerank on, 22.4% and 21.5%.
+//
+// Every case below is written against `decoys.cmdOnly`, the fixture row that carries
+// npm/run/build and nothing from the failure. That row is the reason this block can see
+// anything: before it existed, the reranked and flat orders coincided on this fixture
+// and the whole feature measured as a no-op.
+describe('error-recall core — error-first rerank (D#167, default ON)', () => {
+  const select = (db, extra = {}) => selectErrorRecall(db, {
+    cmd: 'npm run build', response: NPM_ENOENT_OUT, project: PROJECT, floor: 0, ...extra,
+  });
+  const matchesAnErrorTerm = (db, id) => {
+    const plan = planErrorRecall('npm run build', NPM_ENOENT_OUT);
+    return plan.errWords.some((t) => db.prepare(
+      'SELECT 1 ok FROM observations WHERE id = ? AND (lower(title) LIKE ? OR lower(text) LIKE ?)',
+    ).get(id, `%${t}%`, `%${t}%`));
+  };
+
+  it('the fixture can SEE the rerank — flat OR puts a command-only row first', () => {
+    // Precondition, not decoration. If the flat order already led with an
+    // error-matching row, every assertion below would pass against a rerank that does
+    // nothing at all.
+    const { db, decoys } = seed();
+    const now = Date.now();
+    const flat = withRerank('off', () => select(db, { now }));
+    expect(flat.rows[0].id, 'flat OR must lead with the command-only decoy').toBe(decoys.cmdOnly);
+    expect(matchesAnErrorTerm(db, decoys.cmdOnly),
+      'the decoy must genuinely carry no error term, or it is not a decoy').toBeFalsy();
+  });
+
+  it('demotes the command-only row out of the lead', () => {
+    const { db, decoys } = seed();
+    const now = Date.now();
+    const out = select(db, { now });
+    expect(out.rows[0].id, 'command-only row must not lead once the rerank is on')
+      .not.toBe(decoys.cmdOnly);
+    expect(matchesAnErrorTerm(db, out.rows[0].id),
+      'the new lead must actually mention the failure').toBeTruthy();
+  });
+
+  it('tops up a SHORT primary without duplicating it', () => {
+    // The branch the case below cannot see. Measured during review: across the whole
+    // fixture, 21 of 23 selections have `primary.length === limit`, so the top-up never
+    // runs and a length assertion holds with or without it. This shape forces
+    // `0 < primary < limit`: exactly ONE row mentions the failure, the rest share only
+    // the command's words.
+    //
+    // The id-uniqueness assertion is the point. The error-first match set is a SUBSET of
+    // the flat one, so every primary row appears AGAIN in the fallback; dropping the
+    // dedup injects the top row twice and wastes a slot. Review's mutant produced
+    // ids 1,1,2 where the fix gives 1,2,3 — a length check cannot tell them apart.
+    const db = new Database(':memory:');
+    initSchema(db);
+    db.prepare(SESSION_INSERT_SQL).run(PROJECT, Date.now());
+    for (let i = 0; i < 30; i++) {
+      insertObs(db, { title: `quasar ledger ${i}`, text: `meridian basalt kestrel ${i}`, ageDays: 9 + i });
+    }
+    const only = insertObs(db, {
+      title: 'ENOENT on package.json means the cwd is wrong',
+      text: 'enoent syscall open package.json npm build path', ageDays: 6,
+    });
+    for (let i = 0; i < 3; i++) {
+      insertObs(db, {
+        title: `npm build pipeline note ${i}`,
+        text: 'npm run build npm build run pipeline cadence', ageDays: 0.1 + i,
+      });
+    }
+    const now = Date.now();
+    const out = select(db, { now });
+    const flat = withRerank('off', () => select(db, { now }));
+
+    const ids = out.rows.map((r) => r.id);
+    expect(ids.length, 'precondition: the cap must actually bite here').toBe(ERROR_RECALL_LIMIT);
+    expect(new Set(ids).size, `a row was injected twice: ${ids}`).toBe(ids.length);
+    expect(ids[0], 'the single error-matching row must lead').toBe(only);
+    expect(ids.length).toBe(flat.rows.length);
+    // And the top-up really did run — i.e. this case exercises the branch it names.
+    expect(ids.slice(1).length, 'fallback must have contributed rows').toBeGreaterThan(0);
+    expect(ids.slice(1)).not.toContain(only);
+  });
+
+  it('REORDERS, never removes — the row count is identical to the flat OR', () => {
+    // This is the whole difference from the mandatory-error-term form, which was
+    // measured on the live DB at −22.4% rows and 21.5% of cases injecting nothing,
+    // concentrated in small projects. A future edit that turns the primary query into a
+    // filter breaks this case rather than shipping that silently.
+    const { db } = seed();
+    const now = Date.now();
+    const flat = withRerank('off', () => select(db, { now }));
+    const out = select(db, { now });
+    expect(out.rows.length).toBe(flat.rows.length);
+    expect(out.rows.length).toBeGreaterThan(1);
+  });
+
+  it('falls back to the flat order when NOTHING in the project mentions the failure', () => {
+    // The residual case, and the reason the rerank cannot silence a project the way a
+    // floor can: with no error-matching row anywhere, the primary is empty and the
+    // fallback returns the flat result byte for byte.
+    const db = new Database(':memory:');
+    initSchema(db);
+    db.prepare(SESSION_INSERT_SQL).run(PROJECT, Date.now());
+    for (let i = 0; i < 3; i++) {
+      insertObs(db, { title: `npm build note ${i}`, text: `npm run build cadence ${i}`, ageDays: 1 + i });
+    }
+    const now = Date.now();
+    const on = select(db, { now });
+    const off = withRerank('off', () => select(db, { now }));
+    expect(on.rows.length, 'must not silence a project that has no error-matching row').toBeGreaterThan(0);
+    expect(on.rows.map((r) => r.id)).toEqual(off.rows.map((r) => r.id));
+  });
+
+  it('a pathological limit cannot turn the rerank into a filter', () => {
+    // The rerank's control flow and the SQL's `LIMIT` must agree about the cap. They read
+    // the same argument, and the SQL sanitizes it — so comparing against the RAW value
+    // made `limit: 0` short-circuit the fallback, i.e. the rerank became the filter this
+    // face rejected, while the SQL had already fallen back to 3. Found by fuzzing in
+    // review; unreachable from the hook (it passes no limit), which is exactly why it
+    // needs a test rather than a reader.
+    const { db } = seed();
+    const now = Date.now();
+    for (const bad of [0, -1, null, 0.5, NaN, Infinity]) {
+      const on = select(db, { now, limit: bad });
+      const off = withRerank('off', () => select(db, { now, limit: bad }));
+      expect(on.rows.length, `limit=${String(bad)}: rerank changed the row count`)
+        .toBe(off.rows.length);
+      expect(on.rows.length, `limit=${String(bad)}: must fall back to the default cap`)
+        .toBe(ERROR_RECALL_LIMIT);
+    }
+  });
+
+  it('the kill-switch is honoured and only "off" disables it', () => {
+    const { db, decoys } = seed();
+    const now = Date.now();
+    expect(withRerank('off', () => select(db, { now })).rows[0].id).toBe(decoys.cmdOnly);
+    expect(withRerank('OFF', () => select(db, { now })).rows[0].id, 'case-insensitive').toBe(decoys.cmdOnly);
+    // Anything else — including junk — leaves the measured default in place, rather
+    // than a typo silently reverting the surface.
+    for (const v of [undefined, '', 'on', 'yes', 'false', '0']) {
+      expect(withRerank(v, () => select(db, { now })).rows[0].id, `value=${String(v)}`)
+        .not.toBe(decoys.cmdOnly);
+    }
+  });
+
+  it('reports the expression that actually ranked the set', () => {
+    const { db } = seed();
+    const out = select(db);
+    expect(out.errorFirstQuery, 'the error-first expression must be reported when it ran').toBeTruthy();
+    // Command words stay in the expression so bm25 keeps summing them — dropping them
+    // was measured in D#136 and regressed two of five live replays.
+    expect(out.errorFirstQuery).toContain('"npm"');
+    expect(out.errorFirstQuery).toContain('"enoent"');
+    expect(out.errorFirstQuery).toMatch(/\)\s*AND\s*\(/);
+    expect(withRerank('off', () => select(db)).errorFirstQuery,
+      'and it must be null when the rerank did not run').toBeNull();
   });
 });

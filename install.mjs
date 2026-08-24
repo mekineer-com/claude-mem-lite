@@ -718,6 +718,19 @@ const memPostToolRecall = {
   }]
 };
 
+// D#170. A SEPARATE event from PostToolUse, not a variant of it: Claude Code does not
+// fire PostToolUse for a tool call it judged failed, so without this registration the
+// plugin never sees a single host-flagged failure. Matched on Bash alone — the surface
+// it feeds queries on a command plus its output, and no other tool has that shape.
+const memPostToolFailure = {
+  matcher: 'Bash',
+  hooks: [{
+    type: 'command',
+    command: nodeHook('hook.mjs', 'post-tool-failure'),
+    timeout: 5
+  }]
+};
+
 const memSessionStart = {
   matcher: 'startup|clear|compact',
   hooks: [{
@@ -819,6 +832,7 @@ const memPreAgentInject = {
 const hookConfigs = {
   PreToolUse: [memPreToolRecall, memPreSkillBridge, memPreAgentInject],
   PostToolUse: [memPostToolUse, memPostToolRecall],
+  PostToolUseFailure: [memPostToolFailure],
   PreCompact: [memPreCompact],
   SessionStart: [memSessionStart],
   Stop: [memStop],

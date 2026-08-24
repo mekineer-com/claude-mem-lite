@@ -153,6 +153,10 @@ export const SOURCE_FILES = [
   // injection) and by benchmark/error-recall-suite.mjs (offline calibration) — the
   // hook is the one that breaks on a missing manifest entry.
   'lib/error-recall-core.mjs',
+  // D#170: the PostToolUseFailure gate. hook.mjs imports it on the failure path and
+  // benchmark/error-recall-live-replay.mjs scores the SAME predicate, so a missing
+  // registration would ship a hook that cannot load its own filter.
+  'lib/tool-refusal.mjs',
   // Corpus-size ramp for absolute relevance floors. Imported by BOTH floor-bearing
   // injection faces: scripts/user-prompt-search.js (standalone hook) and
   // lib/error-recall-core.mjs. Missing here = UserPromptSubmit dies on auto-update.

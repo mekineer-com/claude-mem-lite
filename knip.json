@@ -11,6 +11,7 @@
     "benchmark/cjk-straddle-prevalence.mjs",
     "benchmark/ups-ab.mjs",
     "benchmark/error-recall-suite.mjs",
+    "benchmark/error-recall-live-replay.mjs",
     "scripts/*.mjs",
     "scripts/*.js",
     "tests/**/*.test.mjs"

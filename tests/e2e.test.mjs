@@ -1063,6 +1063,171 @@ describe('Suite 6: Error Recall', () => {
   });
 });
 
+// D#170. Claude Code does NOT fire PostToolUse for a tool call it judged failed — those
+// go to a separate `PostToolUseFailure` event. Registering only PostToolUse made this
+// plugin blind to every host-flagged failure, so the only "failures" error-recall saw
+// were commands that exited 0 while printing error-ish text.
+//
+// The payload is not PostToolUse's: the failure text lives in `error` (there is no
+// `tool_response`) and `is_interrupt` marks a cancellation. Reading the wrong field
+// would make this path silently do nothing, which looks exactly like the old behaviour
+// — so the field name is asserted directly rather than inferred from a passing case.
+describe('Suite 6b: PostToolUseFailure — host-flagged failures reach error-recall (D#170)', () => {
+  const FAILURE_TEXT = "Error: ENOENT: no such file or directory, open '/app/package.json'\n"
+    + '    at Object.openSync (node:fs:596:3)';
+
+  const failurePayload = (over = {}) => JSON.stringify({
+    hook_event_name: 'PostToolUseFailure',
+    tool_name: 'Bash',
+    tool_input: { command: 'node scripts/build.mjs' },
+    tool_use_id: 'toolu_d170',
+    error: FAILURE_TEXT,
+    ...over,
+  });
+
+  function seed() {
+    runHook('session-start', { env: { HOME: tmpHome } });
+    const sessionId = getSessionIdFromFile(tmpHome);
+    const db = openTestDb(tmpHome);
+    const now = new Date();
+    db.prepare(`
+      INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative, lesson_learned, concepts, facts, files_read, files_modified, importance, created_at, created_at_epoch)
+      VALUES (?, 'parent--testproj', 'ENOENT package.json missing openSync build', 'bugfix', 'ENOENT on package.json means the cwd is wrong', '', '', 'Run the build from the package root, not from scripts/.', '', '', '[]', '[]', 2, ?, ?)
+    `).run(sessionId, now.toISOString(), now.getTime());
+    db.close();
+  }
+
+  it('injects for a failure PostToolUse never sees, on its OWN event envelope', () => {
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload(),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+
+    expect(stdout).toContain('[claude-mem-lite] Related memories found for this error');
+    expect(stdout).toContain('Run the build from the package root');
+
+    // The envelope's event name is the field a copy-paste from the PostToolUse path
+    // gets wrong, and the host rejects a mismatch — so the injection would vanish while
+    // every other assertion here still passed.
+    const parsed = stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const hint = parsed.find((p) => p.hookSpecificOutput?.additionalContext?.includes('Related memories'));
+    expect(hint).toBeTruthy();
+    expect(hint.hookSpecificOutput.hookEventName).toBe('PostToolUseFailure');
+
+    // Its own counter: the volume this event adds has to be readable on its own rather
+    // than merged into the surface's existing total.
+    const rows = readMetricRows(tmpHome);
+    expect(rows.filter((r) => r.event === 'error_recall_failure').length).toBe(1);
+    expect(rows.filter((r) => r.event === 'error_recall').length).toBe(0);
+  });
+
+  it('reads the failure from `error`, NOT from `tool_response`', () => {
+    // The wiring bug this whole suite exists to catch. Same text, delivered under
+    // PostToolUse's field name: a handler that reached for `tool_response` would pass
+    // every other case in this file and do nothing in production.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: JSON.stringify({
+        hook_event_name: 'PostToolUseFailure',
+        tool_name: 'Bash',
+        tool_input: { command: 'node scripts/build.mjs' },
+        tool_use_id: 'toolu_d170',
+        tool_response: FAILURE_TEXT,
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
+
+  // A refusal whose text WOULD produce query terms and WOULD match the seeded row.
+  //
+  // The first version of this pair used `§8 SAFETY (immutable): denied …`, and both cases
+  // were vacuous: `planErrorRecall` returns null on it (no `error`/`fail`/`not found`
+  // wording, no namer), so the surface injects nothing whatever the gate does. Mutation
+  // proved it — disabling ONLY the refusal branch passed every test in the release. The
+  // text below carries `ENOENT` and `package.json`, which the seeded memory matches, so
+  // the ONLY thing keeping this quiet is the gate.
+  const REFUSAL_WITH_TERMS = '[claudemd] §11 memory-hint: refused — the ENOENT probe on '
+    + "package.json was blocked before it ran.\nError: command not executed.";
+
+  it('stays silent for a tool-chain refusal', () => {
+    // 68.9% of host-flagged Bash failures on the maintainer's machine. Injecting three
+    // memories because a policy hook denied a command is noise by construction.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({
+        error: REFUSAL_WITH_TERMS,
+        tool_input: { command: 'node scripts/build.mjs' },
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+    expect(readMetricRows(tmpHome).filter((r) => r.event === 'error_recall_failure').length).toBe(0);
+  });
+
+  it('...and the SAME text without the refusal marker DOES inject', () => {
+    // The negative control the case above needs. Without it, "stays silent" could still
+    // be satisfied by text that matches nothing — which is exactly how the first version
+    // of this pair passed while the gate was disconnected. Strip only the `[claudemd] §11`
+    // marker; every query term stays.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({
+        error: REFUSAL_WITH_TERMS.replace('[claudemd] §11 memory-hint: refused — the', 'The'),
+        tool_input: { command: 'node scripts/build.mjs' },
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout, 'the refusal case must be silent because of the MARKER, not because its text matches nothing')
+      .toContain('Related memories found for this error');
+  });
+
+  it('stays silent when the user interrupted the command', () => {
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({ is_interrupt: true }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
+
+  it('is scoped to Bash even if a hand-edited matcher widens the registration', () => {
+    // install.mjs writes a SECOND registration into the user's settings.json; the
+    // manifest matcher is not the only thing that decides what arrives here.
+    //
+    // The input DELIBERATELY carries a `command`. A first version of this case sent an
+    // Edit payload with only `file_path`, which the downstream "no command string"
+    // guard rejected — so deleting the tool_name check entirely left the case green and
+    // the guard it names untested. Mutation caught that; the payload below is the
+    // difference between asserting a necessary condition and asserting this one.
+    seed();
+    const { stdout } = runHook('post-tool-failure', {
+      stdin: failurePayload({
+        tool_name: 'Edit',
+        tool_input: { command: 'node scripts/build.mjs', file_path: '/app/x.mjs' },
+      }),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1' },
+    });
+    expect(stdout).not.toContain('Related memories found for this error');
+  });
+
+  it('honours the kill switch, and only "off" trips it', () => {
+    seed();
+    const off = runHook('post-tool-failure', {
+      stdin: failurePayload(),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1', CLAUDE_MEM_ERROR_RECALL_ON_FAILURE: 'off' },
+    });
+    expect(off.stdout).not.toContain('Related memories found for this error');
+    // A typo must not silently revert the feature.
+    const typo = runHook('post-tool-failure', {
+      stdin: failurePayload(),
+      env: { HOME: tmpHome, CLAUDE_MEM_METRICS: '1', CLAUDE_MEM_ERROR_RECALL_ON_FAILURE: '0' },
+    });
+    expect(typo.stdout).toContain('Related memories found for this error');
+  });
+});
+
 describe('Suite 7: Secret Scrubbing E2E', () => {
   it('post-tool-use with password=secret scrubs episode desc', () => {
     runHook('session-start', { env: { HOME: tmpHome } });

@@ -49,6 +49,7 @@ import { readFastSummarySource, insertFastSummary, FAST_SUMMARY_LIMITS } from '.
 import { formatHookError } from './lib/native-binding-hint.mjs';
 import { recordHookError } from './lib/hook-telemetry.mjs';
 import { queueHookContext, queueHookSystemMessage, flushHookStdout } from './lib/hook-stdout.mjs';
+import { shouldRecallOnFailure } from './lib/tool-refusal.mjs';
 import { selectCompressionCandidates, groupByProjectWeek, compressGroup } from './lib/compress-core.mjs';
 import { cleanupBroken, decayAndMarkIdle, boostAccessed, demotePinned, resolveDefaultMaintainOps, markAutoCompressible, selectFuzzyDedupeIds, stampDedupSuperseded, hardDeleteCandidateCount, purgeStale, recoverOrphanedChildren, recoverBuriedLessons, sweepDeferredWorkOrphans } from './lib/maintain-core.mjs';
 import { snapshotDb } from './lib/db-backup.mjs';
@@ -483,7 +484,18 @@ async function handlePostToolUse() {
 
 // ─── Error-Triggered Recall (Tier 2 G) ─────────────────────────────────────
 
-function triggerErrorRecall(db, toolInput, response) {
+/**
+ * @param {object} db Open handle.
+ * @param {object} toolInput The failed tool's input (needs `.command`).
+ * @param {string} response The failure text.
+ * @param {{eventName?: string, metricEvent?: string}} [opts] Which hook event this is
+ *   answering. The envelope carries exactly one hookEventName and the host rejects a
+ *   mismatch, so the PostToolUseFailure path MUST pass its own — defaulting silently
+ *   would emit a PostToolUse envelope from a PostToolUseFailure hook.
+ */
+function triggerErrorRecall(db, toolInput, response, opts = {}) {
+  const eventName = opts.eventName || 'PostToolUse';
+  const metricEvent = opts.metricEvent || 'error_recall';
   try {
     const project = inferProject();
 
@@ -510,7 +522,7 @@ function triggerErrorRecall(db, toolInput, response) {
       // G13: this surface feeds the citation denominator but had zero metering —
       // the G8 gate change (isError→isHardError) could not be volume-verified
       // from metrics. Counter only; no latency (query is bundled in the hook).
-      recordMetric(join(RUNTIME_DIR, '..'), { event: 'error_recall', returned: rows.length });
+      recordMetric(join(RUNTIME_DIR, '..'), { event: metricEvent, returned: rows.length });
       // MED-3 (full audit 2026-07-16): go through the envelope, NOT raw stdout —
       // a raw multi-line write corrupts a co-emitted episode-flush receipt.
       // The follow-up correction (2026-08-17): "two separate JSON lines each parse
@@ -518,9 +530,116 @@ function triggerErrorRecall(db, toolInput, response) {
       // flushEpisode in one handlePostToolUse, and two documents make the parser
       // fall back to plain text — which the renderer drops entirely for
       // PostToolUse. Both receipts vanished. Queue; one envelope is written at exit.
-      queueHookContext('PostToolUse', out);
+      queueHookContext(eventName, out);
     }
   } catch (e) { debugCatch(e, 'triggerErrorRecall'); }
+}
+
+/**
+ * PostToolUseFailure — the event that carries tool calls the HOST judged failed (D#170).
+ *
+ * WHY A SECOND ENTRY POINT AT ALL. `PostToolUse` does not fire for a failed tool call;
+ * Claude Code routes those here. Registering only `PostToolUse` therefore made this
+ * plugin blind to every host-flagged failure, and the only "failures" error-recall ever
+ * saw were commands that exited 0 while printing error-ish text — the classic shape
+ * being `cmd 2>&1 | tail`, where the pipe launders a failure into a success. Verified on
+ * the 2.1.241 bundle (the event and its schema) and by live probe (two genuinely failing
+ * Bash calls, one with a full stack frame, left zero trace in the episode buffer and the
+ * events table while the successful calls either side were recorded).
+ *
+ * THE PAYLOAD IS NOT PostToolUse'S. There is no `tool_response`; the failure text is in
+ * `error`, and `is_interrupt` marks a user cancellation. Reading `tool_response` here
+ * would find undefined and silently do nothing — which is exactly how this class of
+ * wiring bug stays invisible, so the field names are asserted in the tests.
+ *
+ * DELIBERATELY NARROWER THAN THE EVENT. Only `Bash` (this surface queries on a command
+ * plus its output; no other tool has that shape), only when the failure came from a
+ * PROGRAM rather than from the agent's own tool chain (lib/tool-refusal.mjs — 68.9% of
+ * host-flagged failures on the maintainer's machine were guardrails working), and NOT
+ * feeding the episode buffer. That last exclusion is scope, not oversight: episode
+ * entries flow into LLM summarisation and the bugfix save-nudge, whose behaviour under a
+ * sudden influx of failures has not been measured, and this change is already worth a
+ * 3.5x increase in this surface's firing volume.
+ *
+ * NO `isHardError` GATE HERE, AND THAT IS THE POINT — stated because review found it
+ * unwritten and it is a real semantic difference between the two entry points. On the
+ * PostToolUse path the host says nothing about success, so `isHardError` has to GUESS
+ * from vocabulary whether a command failed; here the host has already ruled, and
+ * re-deriving its verdict from the text would only discard cases. The measurable
+ * consequence: `Segmentation fault (core dumped)` and a Rust `panicked at` both score
+ * `isHardError === false` (the first has no error word, the second loses on `\bpanic\b`'s
+ * word boundary), so until this event they could not reach term extraction at all. They
+ * can now. That is the coverage this event was wired for, not an oversight — but it does
+ * mean ERROR_NAMER_RE's `SIG…`/`panicked` alternatives went live here first.
+ *
+ * Off switch: CLAUDE_MEM_ERROR_RECALL_ON_FAILURE=off.
+ */
+async function handlePostToolFailure() {
+  if (String(process.env.CLAUDE_MEM_ERROR_RECALL_ON_FAILURE || '').toLowerCase() === 'off') return;
+
+  let raw;
+  try { raw = await readStdin(); } catch { return; }
+  let hookData;
+  try { hookData = JSON.parse(raw.text); } catch { return; }
+
+  const { tool_name, tool_input, error, is_interrupt } = hookData || {};
+  // The manifest matcher already scopes this to Bash. Re-checking is not redundancy for
+  // its own sake: install.mjs writes a SECOND registration into the user's settings.json,
+  // and a hand-edited matcher there would otherwise hand this path an Edit or a Read.
+  //
+  // A payload whose SHAPE is wrong is recorded, not just dropped. Tests pin the field
+  // names against a payload we construct; they cannot see the host renaming `error` or
+  // changing `tool_name`'s type, and this whole path fails silently by design — the
+  // v3.60 binding outage ran four days on exactly that combination, and hook-errors/ was
+  // the only window that would have shown it. Volume is bounded by the recorder's
+  // 14-day retention and one short line per fire.
+  if (tool_name !== undefined && typeof tool_name !== 'string') {
+    recordHookError(
+      'post-tool-failure:tool_name-type',
+      new TypeError(`tool_name is ${Array.isArray(tool_name) ? 'array' : typeof tool_name}, expected string`),
+      RUNTIME_DIR,
+    );
+    return;
+  }
+  if (tool_name !== 'Bash') return;
+  if (error !== undefined && typeof error !== 'string') {
+    recordHookError(
+      'post-tool-failure:error-type',
+      new TypeError(`error is ${typeof error}, expected string — host payload shape may have changed`),
+      RUNTIME_DIR,
+    );
+    return;
+  }
+
+  const verdict = shouldRecallOnFailure({ error, is_interrupt });
+  if (!verdict.ok) return;
+
+  const toolInput = typeof tool_input === 'string' ? tryParseJson(tool_input) : (tool_input || {});
+  if (typeof toolInput?.command !== 'string' || !toolInput.command) return;
+
+  let db = null;
+  try {
+    db = openDb();
+    if (!db) return;
+    // Same selection, same rendering, same core as the PostToolUse path — only the event
+    // name on the envelope differs. A second copy of the query here is the twin-drift
+    // defect this project keeps paying for.
+    triggerErrorRecall(db, toolInput, error, {
+      eventName: 'PostToolUseFailure',
+      // A separate counter, so the volume this event adds is readable on its own rather
+      // than merged into the existing surface's total. The citation funnel deliberately
+      // keeps ONE `error_recall` surface: these are the same injections to the model, and
+      // splitting the cite-rate denominator would make both halves too small to read.
+      metricEvent: 'error_recall_failure',
+    });
+  } catch (e) {
+    debugCatch(e, 'handlePostToolFailure');
+  } finally {
+    // No flushHookStdout() here: the single flush after the event switch owns writing
+    // the envelope, and two flush points is how a process ends up emitting two JSON
+    // documents — the degradation that made BOTH receipts vanish in v3.68.
+    if (db) try { db.close(); } catch {}
+  }
 }
 
 // ─── Stop Handler ───────────────────────────────────────────────────────────
@@ -1983,6 +2102,8 @@ function normalizeToolResponse(toolResponse) {
 try {
   switch (event) {
     case 'post-tool-use':    await handlePostToolUse(); break;
+    // Host-flagged tool failures arrive on their own event; PostToolUse never sees them.
+    case 'post-tool-failure': await handlePostToolFailure(); break;
     case 'session-start':    await handleSessionStart(); break;
     case 'pre-compact':      await handlePreCompactDispatch(); break;
     case 'stop':             await handleStop(); break;

@@ -90,6 +90,63 @@ describe('planErrorRecall — the selection filter is a superset of the trigger'
   });
 });
 
+// The failure's NAME is prepended to the query (D#167). Review found that only the
+// "namer on vs off" distinction was pinned: three of the four alternatives in
+// ERROR_NAMER_RE could be deleted, and the count could be raised back to the value the
+// release explicitly measured against, with the whole suite staying green.
+describe('planErrorRecall — the failure NAMER', () => {
+  it('errno-style codes (ENOENT/EACCES) are names, and they lead', () => {
+    // Dropping the `E[A-Z]{3,}` alternative demotes `enoent` behind `code`; nothing
+    // caught that before. `syscall` must survive too — prepending must not evict it.
+    const terms = planErrorRecall('npm run build', NPM_ENOENT_OUT).terms;
+    expect(terms.indexOf('enoent')).toBeGreaterThanOrEqual(0);
+    expect(terms.indexOf('enoent')).toBeLessThan(terms.indexOf('code'));
+    expect(terms).toContain('syscall');
+  });
+
+  it('a signal name is a name — SIGSEGV survives the scan that would drop it', () => {
+    // `Segmentation fault (core dumped)` has no error-word tokens of its own worth
+    // keeping; without the SIG alternative the failure's identity is lost entirely.
+    const out = 'a.out: fatal signal SIGSEGV detected\nSegmentation fault (core dumped)';
+    expect(planErrorRecall('./a.out --run', out).terms).toContain('sigsegv');
+  });
+
+  it("Rust's `panicked` is a name — the word-boundary miss that started this", () => {
+    // `HARD_ERROR_RE`'s `\bpanic\b` famously does not match `panicked`; the namer must.
+    const out = "thread 'main' panicked at src/lib.rs:42:\nassertion failed: unwrap on a None value";
+    expect(planErrorRecall('cargo test', out).terms).toContain('panicked');
+  });
+
+  it('the uppercase literal ERROR is NOT a name — the stop-word interaction is load-bearing', () => {
+    // `E[A-Z]{3,}` matches the bare word `ERROR`; ERROR_STOP_WORDS is what drops it.
+    // Remove that check and `error` occupies a slot, evicting a real token — the
+    // docblock calls the interaction load-bearing, so it gets an assertion.
+    const terms = planErrorRecall('make build', 'ERROR: linker command failed, symbol not found').terms;
+    expect(terms).not.toContain('error');
+    expect(terms).toContain('linker');
+  });
+
+  it('only ONE name jumps the queue — the cap the sweep chose over the one it shipped with', () => {
+    // ERROR_NAMER_MAX went 2 → 1 on measured data (22.4%/21.5% vs 22.8%/22.0% live).
+    // A chained traceback carries two names, so it is the shape that distinguishes them:
+    // at 2, `modulenotfounderror` also jumps in and evicts a scanned term.
+    const chained = [
+      'Traceback (most recent call last):',
+      '  File "x.py", line 3, in <module>',
+      "ValueError: invalid literal for int() with base 10: 'x'",
+      '',
+      'During handling of the above exception, another exception occurred:',
+      '',
+      'Traceback (most recent call last):',
+      "ModuleNotFoundError: No module named 'clientlib'",
+    ].join('\n');
+    const terms = planErrorRecall('python3 x.py', chained).terms;
+    expect(terms).toContain('valueerror');
+    expect(terms, 'a second name must not jump the queue — it evicts a scanned term for a duplicate class name')
+      .not.toContain('modulenotfounderror');
+  });
+});
+
 describe('planErrorRecall — gate (nothing to recall ON ⇒ no injection)', () => {
   it('returns null when the output is empty or whitespace', () => {
     expect(planErrorRecall('npm run build', '')).toBeNull();
@@ -131,7 +188,20 @@ describe('planErrorRecall — term-selection internals that mutation showed were
     // 6-cap keeps — i.e. it changes the query without changing any test.
     const out = 'FAIL tests/scope-label.test.mjs\nAssertionError: expected observation-write.mjs to be defined';
     expect(planErrorRecall('npx vitest run tests/scope-label.test.mjs', out).terms)
-      .toEqual(['npx', 'vitest', 'run', 'fail', 'tests', 'scope-label.test.mjs']);
+      .toEqual(['npx', 'vitest', 'run', 'assertionerror', 'fail', 'tests']);
+    // THE PRICE OF THE NAMER, recorded rather than smoothed over. This list used to end
+    // `fail, tests, scope-label.test.mjs`; prepending the failure's name evicted the
+    // tail, and the tail was the most discriminative token in it — a filename has far
+    // higher IDF than the word `assertionerror`. On this shape the trade is a loss.
+    // It ships anyway because the shapes it wins are both more common and worse off:
+    // measured over 52 real failing commands, 25 of the 28 that name their failure were
+    // querying pure boilerplate (`traceback, most, recent`) before this.
+    // The follow-up it argues for — a cap that evicts the LEAST discriminative term
+    // instead of the last one (D#169) — was BUILT AND MEASURED, and it is worse: on the
+    // live DB, command-vocabulary-only injections went 22.6% -> 35.8% and top-1 21.3% ->
+    // 33.4%. See the cap's docblock in bash-utils.mjs for the mechanism. So this case
+    // records a real local loss inside a rule that wins globally; do not "fix" it with a
+    // shape heuristic, because that specific fix has already been tried.
   });
 
   it('dedups ACROSS command and error classes so a repeat cannot burn a cap slot', () => {

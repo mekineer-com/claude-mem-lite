@@ -9,7 +9,7 @@
 //     failure mode was 11 verbatim copies edited out of lockstep. Only lib/obs-types.mjs
 //     (the source of truth) and schema.mjs (the DDL literal) may contain it.
 import { describe, it, expect } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { OBS_TYPES, OBS_TYPE_SET } from '../lib/obs-types.mjs';
 import { OBS_TYPE_ENUM } from '../tool-schemas.mjs';
@@ -53,13 +53,21 @@ describe('obs-types single source of truth', () => {
     expect(ddlTypes.sort()).toEqual([...OBS_TYPES].sort());
   });
 
-  it('no runtime source file carries a NEW hardcoded copy of the list', () => {
-    // The literal signature of the historical hardcopies. Allowed only in the source
-    // of truth and the DDL literal. Tests/benchmark/docs are out of scope — they don't
-    // validate production writes.
-    const SIGNATURE = /'decision',\s*'bugfix',\s*'feature',\s*'refactor',\s*'discovery',\s*'change'/;
+  // The literal signature of the historical hardcopies. Allowed only in the source of
+  // truth and the DDL literal. Tests/benchmark/docs are out of scope — they don't
+  // validate production writes.
+  const SIGNATURE = /'decision',\s*'bugfix',\s*'feature',\s*'refactor',\s*'discovery',\s*'change'/;
+
+  // Hoisted so the tmp/-exclusion case below drives the SAME walker rather than a copy
+  // of it. A second copy would be free to disagree with this one, which is the exact
+  // defect class this whole file exists to lock down.
+  const scanOffenders = () => {
     const ALLOWED = new Set(['lib/obs-types.mjs', 'schema.mjs']);
-    const SKIP_DIRS = new Set(['node_modules', 'tests', 'benchmark', 'docs', 'coverage', 'tasks', '.git', '.claude', '.claude-plugin']);
+    // `tmp` (D#168): the repo's scratch dir, gitignored and a §5 safe-path. Not runtime
+    // source — scanning it lets an unrelated harness parked there fail this suite with a
+    // message pointing at a file nobody touched. Kept in sync with the sibling scanner in
+    // tests/time-constants.test.mjs; both are pinned by a probe case below.
+    const SKIP_DIRS = new Set(['node_modules', 'tests', 'benchmark', 'docs', 'coverage', 'tasks', 'tmp', '.tmp', '.git', '.claude', '.claude-plugin']);
     const offenders = [];
     const walk = (dir) => {
       for (const name of readdirSync(dir)) {
@@ -75,6 +83,33 @@ describe('obs-types single source of truth', () => {
       }
     };
     walk(ROOT);
+    return offenders;
+  };
+
+  it('no runtime source file carries a NEW hardcoded copy of the list', () => {
+    const offenders = scanOffenders();
     expect(offenders, `hardcoded obs-type list found in: ${offenders.join(', ')} — import lib/obs-types.mjs instead`).toEqual([]);
+  });
+
+  it('a scratch file under tmp/ cannot turn this scan red (D#168)', () => {
+    // Asserting SKIP_DIRS contains 'tmp' would pass even if the walker ignored the set.
+    // Write a file that WOULD be reported if scanned, and prove it is not.
+    const dir = join(ROOT, 'tmp');
+    const probe = join(dir, 'd168-obs-probe.mjs');
+    // Remember whether tmp/ was ours to create, so a fresh clone is not left with an
+    // empty scratch dir by a test that only meant to write one file into it.
+    const dirWasAbsent = !existsSync(dir);
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(probe, "export const T = ['decision', 'bugfix', 'feature', 'refactor', 'discovery', 'change'];\n");
+      // Precondition: this really is an offender, so a green result means "excluded".
+      expect(SIGNATURE.test(readFileSync(probe, 'utf8'))).toBe(true);
+      expect(scanOffenders().filter((f) => f.startsWith('tmp/')),
+        'the walker descended into tmp/ — any scratch file there can now fail this suite').toEqual([]);
+    } finally {
+      try { rmSync(probe, { force: true }); } catch { /* best-effort */ }
+      // Only if this case created it, and only if nothing else landed there meanwhile.
+      if (dirWasAbsent) { try { rmSync(dir, { recursive: false }); } catch { /* not empty — leave it */ } }
+    }
   });
 });
