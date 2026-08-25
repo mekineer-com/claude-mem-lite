@@ -413,6 +413,57 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
 // tests/pre-tool-recall.test.mjs. Do not reintroduce an in-process twin here.
 
 /**
+ * Upper bound on the imperative candidate pool. This is an OOM/latency BACKSTOP, not a
+ * ranking gate — read that literally before changing it (D#172, authorised 2026-08-25).
+ *
+ * The bound is applied in SQL, i.e. BEFORE the identifier-overlap filter below, so
+ * whatever it is set to is a hard REACHABILITY bound: a lesson outside the window cannot
+ * be picked however well it matches the prompt. At its original value of 50 that made
+ * this face reachable only from the 50 newest `importance >= 2` rows, and in five
+ * projects on this machine the importance=3 population ALONE exceeds 50 — so every
+ * importance=2 lesson in those projects was structurally unreachable, and a
+ * citation-decay demotion 3->2 EVICTED a row from the pool instead of down-ranking it.
+ * That eviction loop is the risk D#172 was filed on; raising the bound above any
+ * plausible per-project population is what closes it, because a 3->2 demotion then only
+ * changes the row's score multiplier, which is what the decay design intends.
+ *
+ * COUNT THE POPULATION WITH THE POOL'S OWN FILTER. Those figures are
+ * `liveObsFilterSql` + the `importance >= 2` + non-empty-lesson gates, i.e. what the query
+ * below can actually return — 327 / 121 / 56 / 53 / 51 for projects--mem, code-graph-mcp,
+ * ubuntu-sec, daagu, agentsmd. The first version of this note published the RAW
+ * importance=3 counts instead (365 / 131 / 62 / 69 / 51), which include superseded and
+ * compressed rows the pool can never see and overstated one project by a third; the
+ * pre-tag review caught it, and caught that those wrong numbers had replaced correct ones
+ * in lib/citation-tracker.mjs. Re-measure with `node benchmark/imperative-pool-replay.mjs
+ * --population`, never with a bare `SELECT ... WHERE importance = 3`.
+ *
+ * 3->2 IS NOW A DOWN-RANK; 2->1 IS STILL AN EVICTION. The pool gate is
+ * `COALESCE(importance, 1) >= 2`, so a row demoted to the IMPORTANCE_FLOOR of 1 leaves
+ * this face's reach until some other face cites it back up. Widening the bound is also
+ * what first makes importance=2 rows reachable here (56 of projects--mem's 383 eligible),
+ * so it creates the injections that can walk one down to 1. Measured exposure: of the
+ * picks the widening newly surfaces, one is importance=2 — `score = importance x overlap`
+ * keeps importance=3 rows ahead nearly always — so this is a known small edge, not a
+ * closed loop.
+ *
+ * MEASURED, and reproducible: `node benchmark/imperative-pool-replay.mjs`. Over 373 real
+ * user prompts replayed against their OWN project's live corpus (85 produced a candidate
+ * at all), the 50-row bound destroyed 7 picks outright (8.2%) and changed the top-1 in 3
+ * of 78 (3.8%). Small n, so the load-bearing argument is not that one: the wide pool is a
+ * SUPERSET of the narrow one, so its top-1 score is always >= the narrow one's and a
+ * stable sort keeps the incumbent on a tie — a different pick therefore always means a
+ * strictly higher score under this face's own objective. That harness attacks the claim on
+ * every prompt and exits non-zero on a counterexample; it currently finds none.
+ *
+ * COST, from the same harness against projects--mem (383 eligible rows under the shipped
+ * predicate): 0.44 ms/prompt at 50, 1.50 ms/prompt at 5000, on a UserPromptSubmit path
+ * budgeted in seconds. A synthetic 8000-row pool measured 8.3 ms/prompt, so the bound is
+ * doing real work at the top of its range and should not be raised casually. It is ~13x
+ * the largest eligible population on this machine.
+ */
+export const IMPERATIVE_POOL_BACKSTOP = 5000;
+
+/**
  * Phase-2 task-imperative ranking (spec 2026-06-29 §4.1): score every candidate lesson
  * relevant to THIS prompt (importance>=2 + non-empty lesson + identifier overlap with the
  * prompt), sorted best-first — deliberately independent of searchRelevantMemories' coverage/
@@ -428,6 +479,13 @@ export function rankImperativeCandidates(db, userPrompt, project, excludeIds = [
   if (promptIdents.size === 0) return []; // no symbol anchor → no imperative (precision-first)
   const exclude = new Set(excludeIds);
   let rows;
+  // The ORDER BY ends in `id DESC` to make it a TOTAL order. Without that tiebreaker two
+  // rows sharing (importance, created_at_epoch) may come back in either relative order,
+  // and SQLite is free to use a bounded top-N sorter at a small LIMIT and a full sort at a
+  // large one — so "the narrow pool is a prefix of the wide pool", which the v3.82.0
+  // widening argument rests on, was an empirical property of this corpus rather than a
+  // guaranteed one. There are zero such collisions live, so it changes no behaviour here;
+  // it makes the guarantee hold on corpora nobody has seen.
   try {
     rows = db.prepare(`
       SELECT id, title, lesson_learned, importance
@@ -439,8 +497,8 @@ export function rankImperativeCandidates(db, userPrompt, project, excludeIds = [
         AND TRIM(lesson_learned) != ''
         AND LOWER(TRIM(lesson_learned)) != 'none'
         AND (? IS NULL OR created_at_epoch <= ?)
-      ORDER BY importance DESC, created_at_epoch DESC
-      LIMIT 50
+      ORDER BY importance DESC, created_at_epoch DESC, id DESC
+      LIMIT ${IMPERATIVE_POOL_BACKSTOP}
     `).all(project, epochTo, epochTo);
   } catch { return []; }
   const out = [];

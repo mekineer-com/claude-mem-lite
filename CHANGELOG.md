@@ -2,6 +2,176 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.82.0 — a LIMIT that was never a ranking bound, and the ruler I said did not exist
+
+**Upgrade note — one default behaviour change, and it reaches you only if you opted in.**
+The candidate pool behind the task-imperative pick got much wider: `rankImperativeCandidates`
+took `LIMIT 50`, and now takes `LIMIT 5000`. That changes WHICH lesson two injection faces
+pick — `task_imperative` (the imperative one-liner after the `<memory-context>` block) and the
+dispatch-time subagent injection, which share the same selector.
+
+**Both faces are behind flags that are OFF by default** (`CLAUDE_MEM_TASK_IMPERATIVE`,
+`CLAUDE_MEM_SUBAGENT_INJECT` — verified against `hook.mjs:1927`, `scripts/pre-agent-inject.js`
+and the README env table, not from memory). If neither is set, nothing about your install
+changes. If one is: the pick can differ, and when it does it is a strictly better-scoring
+pick under this face's own objective — see the argument below. Reverting precisely means
+pinning `claude-mem-lite@3.81.0`; there is no per-face switch for the pool bound and this
+release does not add one.
+
+**The bound was never doing the job its position implied.** The pool selects
+`importance >= 2 ORDER BY importance DESC, created_at DESC, id DESC LIMIT n` **in SQL**, and
+the identifier-overlap relevance filter runs afterwards **in JS**. So `n` was never a ranking
+bound; it was a hard REACHABILITY bound. At `n = 50` the face could only ever pick from the
+50 newest high-importance rows, and in five projects on this machine the `importance = 3`
+population alone exceeds that (projects--mem 327, code-graph-mcp 121, ubuntu-sec 56, daagu 53,
+agentsmd 51) — so every `importance = 2` lesson in those projects was unreachable no matter
+how exactly it matched the prompt.
+
+**Count that population with the pool's own filter.** Those five figures are measured through
+`liveObsFilterSql` plus the pool's own gates, i.e. rows the query can actually return. The
+first draft of this entry published the RAW `importance = 3` counts (365 / 131 / 62 / 69 / 51),
+which include superseded and compressed rows and overstate one project by a third — and, worse,
+those wrong figures replaced correct ones already sitting in `lib/citation-tracker.mjs`. The
+pre-tag review caught both halves. `node benchmark/imperative-pool-replay.mjs --population` is
+now the way to ask.
+
+That is a bigger fact than the one D#172 was filed on. D#172 recorded a narrower symptom: a
+citation-decay demotion `3 -> 2` **evicted** a row from this pool rather than down-ranking it,
+a feedback loop the four FTS-selected denominator faces do not have. Both are the same cause,
+and raising the bound out of relevance range closes both. The constant is now named
+`IMPERATIVE_POOL_BACKSTOP` and documented at its definition as an OOM/latency backstop that is
+explicitly **not** a relevance gate, so the next reader does not have to re-derive why it is
+large.
+
+**Measured, and then argued — and this time the harness ships.**
+`benchmark/imperative-pool-replay.mjs` replays real user prompts against their OWN project's
+live corpus. Over the 373 prompts that resolve to a project with a corpus (1019 scanned), 85
+produced a candidate at all: the 50-row bound destroyed **7 of 85** picks outright and changed
+the top-1 in **3 of 78**. That n is small and the per-project split is
+smaller still, so the load-bearing argument is deliberately not that one: the wider pool is a
+**superset** of the narrower one, so its top-1 score is monotone non-decreasing, and
+`Array.prototype.sort` being stable keeps the incumbent on a tie — a different pick therefore
+always means a strictly higher `importance x overlap`. Widening cannot lower this face's own objective — and the harness stops treating that as an
+assertion. It tries to FALSIFY it on every prompt (narrow pick missing from the wide pool, wide
+top-1 scoring lower, pick changed without a strict gain) and exits non-zero on a counterexample;
+it currently finds **0** of each, and it cross-checks its own pool query against the shipped
+`rankImperativeCandidates` before reporting anything.
+
+Cost, from the same run against the **383** eligible rows in projects--mem:
+**0.45 -> 1.51 ms/prompt**, on a UserPromptSubmit path budgeted in seconds. A synthetic 8000-row
+pool measures 8.3 ms/prompt, so 5000 is doing real work at the top of its range and should not be
+raised casually; it is ~13x the largest eligible population here.
+
+**One tiebreaker was added to make that argument true rather than merely observed.** The pool's
+`ORDER BY importance DESC, created_at_epoch DESC` is not a total order, and SQLite may sort a
+small LIMIT with a bounded top-N sorter and a large one with a full sort — so "the narrow pool is
+a prefix of the wide pool" held on this corpus rather than by construction. Appending `id DESC`
+closes that. Zero rows are tied on both keys live, so it changes nothing here.
+
+**And one thing the closure does NOT cover.** A `3 -> 2` demotion is a down-rank again; a
+`2 -> 1` demotion is still an eviction, because the pool gate is `>= 2` and the importance floor
+is 1. Widening is also what first makes `importance = 2` rows reachable by this face, so it
+creates the injections that can walk one down there. Measured exposure: of the picks the widening
+newly surfaces, one is `importance = 2` — `score = importance x overlap` keeps `importance = 3`
+rows ahead nearly always. Small, known, and stated rather than rounded off to "the loop is
+closed".
+
+**`benchmark/denoise-ab.mjs` cannot see this face and reports NEUTRAL regardless** — its
+suites are query→document FTS, and this face is prompt→lesson identifier overlap. Same
+structural blindness the error-recall face has. It was run anyway and its behavioural probes
+are green (multiscript 8/8, cross-source 11/11, deferred 10/10, events 9/9); that is evidence
+about the retrieval path, not about this change.
+
+**New: `benchmark/citation-live-replay.mjs`** — every injection FACE's cite-rate re-derived
+from real transcripts through the **shipped** extractors (`extractInjectedBySurface`,
+`extractCitationsFromTranscript`, `collectSubagentSurface`). Baseline over 1115 transcripts /
+87 injection-bearing sessions / 9 projects: pretool 39.5% (562/1424) · subagent 24.5% (12/49) ·
+task_imperative 45.7% (16/35) · fyi 11.3% (32/284) · ups 8.1% (20/246) · error_recall 6.2%
+(44/709). Those are quoted from a FROZEN corpus so they are reproducible; a fresh walk reads a
+little higher on every face within the same day, which is corpus growth and precisely why a
+cross-time subtraction is banned above.
+
+Three properties it has because of specific past failures: the denominator is **(session, id)
+pairs** and the `subagent` numerator is **receiver-attributed** (an id handed to agent A and
+mentioned by agent B is not a hit — the caliber that inflated this face until v3.81.0);
+`--split` cuts ONE walk into a before/after pair so nothing between the arms is corpus growth,
+because a +38 delta measured as two runs at two times was +22 in a same-corpus pass; and
+`keyctx` is **declared unreachable** rather than silently omitted, with an assertion that
+fails the run if a face is added to `SURFACE_MATCHERS` that this replay can neither score nor
+declare. A frozen `--dump` carries a format stamp and `--corpus` refuses a shape it does not
+recognise instead of half-scoring it.
+
+**A correction to my own last report.** I said the tooling was missing exactly this slot, and that I
+had rewritten one-off scripts for the third time. `benchmark/cite-recall.mjs` has walked real
+transcripts all along. The real gap was narrower and more specific: it routes ids into buckets
+with its own hand-copied markers — a twin of `SURFACE_MATCHERS` — its buckets are hook EVENT
+names rather than `citation_surface_log.surface` labels, and its cited-side attribution is a
+per-session union. It keeps its `--vs-baseline` job; new per-face questions go to the new
+script. A tool can look like it does not cover a surface when what it actually does is
+re-implement the rules that define the surface.
+
+**Also:** `wilson95` had been hand-copied into two benchmarks; a third copy was not written.
+It now lives once in `benchmark/wilson.mjs` and both existing callers import it, and both were
+re-run to confirm unchanged output.
+
+**What the new tests do and do not bind.** The three cases added to
+`tests/adoption-imperative-rank.test.mjs` are killed by mutating the bound back to 50, 100 and
+200, and SURVIVE at 250 — by design: they bind "this bound is no longer a small relevance gate",
+not the literal 5000. Nothing binds it as FINITE; deleting the `LIMIT` outright would pass.
+Across both suites the round was mutation-tested at **27 points against the post-review code**:
+26 killed, and the one survivor is the intentional 250 above. `tests/citation-live-replay.test.mjs`
+carries 26 cases.
+
+**Both pre-tag review lenses landed before the tag, and between them they changed this
+release.** The test lens returned no blocker and four should-fix items, every one of them in
+code written this round; the correctness lens returned no blocker, four should-fix items, and
+twenty-four explicit clean findings including an independent 449-prompt replication of the
+headline effect (13.8% / 7.2% against the 8.2% / 3.8% published here — different sample, same
+direction, larger on theirs). What they caught, and what it changed:
+
+- **Four guards that could be deleted with the suite still green.** `--split` was never
+  exercised as a partition, because the fixture was stamped entirely on one side of the split
+  date and `expect(after).toHaveLength(0)` is satisfied by a literal `[]`; both self-checks
+  could be unwired from `main()` with all 17 cases passing; `assertFaceCoverage` did not enforce
+  that its two lists are disjoint while the case titled "names every real face in exactly one of
+  the two lists" asserted only that the face list was non-empty; and `wilson95` had no coverage
+  at all — a mutation making it always return `[0, 0]` survived. All four now fail their
+  mutations. The self-checks were also collapsed into a single wiring point so there is one
+  thing to bind rather than two.
+- **`assertRulerCanSayNo` summed across faces, so it could not see the defect it names.** Rows
+  of `[{pretool, 10, 10}, {error_recall, 10, 0}]` — one face always-true, one face blind,
+  simultaneously — reduce to 20/10 and the guard stayed silent. It is now per-face as well as
+  global, asymmetrically: 100% over 20+ pairs hard-fails, 0% is flagged rather than thrown
+  because a narrow `--project`/`--since` slice can legitimately be zero.
+- **The population figures were counted without the pool's own live filter** — see above. This
+  is the one that replaced right numbers with wrong ones.
+- **"438 eligible rows" and "~11x"** came from the same loose predicate: 383 and 13x.
+- **"A demotion is a down-rank again" was unqualified and false at `2 -> 1`** — corrected above.
+- **CLAUDE.md gave one gitignore justification for two files**, only one of which carries real
+  transcript text. The citation corpus holds no transcript text at all; it is excluded for
+  session UUIDs and absolute paths.
+- **No harness in the tree could reproduce any published number.** That is why
+  `benchmark/imperative-pool-replay.mjs` exists.
+- Smaller: the empty-scope error message always blamed `CLAUDE_MEM_TRANSCRIPT_ROOT`, which is
+  irrelevant under `--corpus`; `--split`'s session-START boundary and `--project`'s unanchored
+  substring match are now documented at the flags.
+
+Two of my own mutation results from the first pass were worthless and are recorded because the
+shapes recur: one fixture could not DISCRIMINATE the two subagent calibers (the receiving agent
+also cited the very lesson it was handed, so receiver-attribution and a session union produced
+the same number), and one "mutation" was a no-op — it appended an unused const instead of
+changing the constant, and reported SURVIVED while testing nothing. The re-run harness now
+aborts on an edit that does not change the file.
+
+**Still open.** The other half of D#172 — admitting `subagent` to the citation-decay
+denominator — is not in this release; it needs the receiver-attributed cites merged into
+`citedMain` asymmetrically. And v3.79.0's error-recall rerank still has no live-corpus verdict:
+at the release split the after-arm held 35 pairs with a CI of [0.5, 14.5]%, fully overlapping
+the before-arm. `benchmark/citation-live-replay.mjs` reports a `sidechain_files` count for
+`subagent` but deliberately computes no rate from it: the per-dispatch caliber its docblock
+quotes needs a (dispatch, id) pair count that `collectSubagentSurface` does not return, and
+dividing by files instead reads 8.6% against a documented 14.6%.
+
 ## v3.81.0 — the parked flag and the young meter, and a ruler that credited the wrong agent
 
 **Upgrade note — one default behaviour change, and it reaches you only if you opted in.**

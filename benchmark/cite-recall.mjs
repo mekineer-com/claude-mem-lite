@@ -37,6 +37,7 @@ import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 // One caliber for `#NN`, owned by the production extractor this benchmark re-derives.
 import { OBS_ID_DIGITS, citationIdRe } from '../lib/citation-tracker.mjs';
+import { wilson95 } from './wilson.mjs';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -112,17 +113,6 @@ function extractRowIds(textLines) {
 function* lines(file) {
   const buf = readFileSync(file, 'utf8');
   for (const line of buf.split('\n')) if (line) yield line;
-}
-
-// Wilson score 95% confidence interval for a binomial proportion.
-function wilson95(successes, trials) {
-  if (trials === 0) return [0, 0];
-  const p = successes / trials;
-  const z = 1.96;
-  const denom = 1 + (z * z) / trials;
-  const center = (p + (z * z) / (2 * trials)) / denom;
-  const margin = (z * Math.sqrt((p * (1 - p) + (z * z) / (4 * trials)) / trials)) / denom;
-  return [Math.max(0, center - margin), Math.min(1, center + margin)];
 }
 
 const candidateFiles = readdirSync(DIR)
