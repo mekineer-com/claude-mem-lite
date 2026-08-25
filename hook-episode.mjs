@@ -275,10 +275,56 @@ const RESEARCH_ENTRY_THRESHOLD = 8;
  * `Read || Grep`, and `Read` is filtered out at both layers (scripts/post-tool-use.sh
  * records it to `reads-<project>.txt` and exits; SKIP_TOOLS returns early in Node), so the
  * rule's only remaining input is a tool that is never called. Last observation the review
- * branch produced: 133 days ago, 111 lifetime. The data it wants is already on the episode
- * — `episode.filesRead`, populated at hook.mjs:228 before this function runs, the same way
- * rule 3 already reads `episode.files`. Re-pointing it there would resurrect a dormant
- * default behaviour on a released artifact, so it is deferred rather than done in passing.
+ * branch produced: 133 days ago, 111 lifetime.
+ *
+ * D#171 proposed the obvious repair — re-point rule 4 at `episode.filesRead`, populated at
+ * hook.mjs:228 before this function runs, the same way rule 3 already reads
+ * `episode.files`. MEASURED 2026-08-25: IT DOES NOT WORK TODAY, and the reason is dated,
+ * not structural. Both halves matter, and the pre-tag review corrected the first draft of
+ * each.
+ *
+ * Unlike the Grep case the denominator is real: `Read` fires 1861 times across the
+ * 1114-transcript history (9.1% of all tool calls; the transcripts hold records spanning
+ * 2026-08-13..08-25, so that is a live rate, not a lifetime counter). But `filesRead` is a
+ * per-FLUSH slice, not a per-episode total — flushEpisodeWithDb renames and consumes
+ * `reads-<project>.txt` on every flush. COMPARE THE TWO RATES ON THE SAME WINDOW: the
+ * `episode_significance` metric rows cover three ACTIVE days (08-22 / 08-24 / 08-25; 08-23
+ * has no file), 607 flushes; the transcripts touched in that window carry 596 Reads. That
+ * is 0.98 Reads per episode. The first draft said 0.8 by dividing a 12-day Read rate by a
+ * 3-day flush rate — two windows, one ratio, which is the same shape of error v3.80.0
+ * recorded as "reading a lifetime counter as an active rate".
+ *
+ * At ~1 Read per episode a threshold of 8 is out of reach, and the 90-day sample agrees:
+ * `files_read` is non-empty on 34 of 1872 rows (1.8%), p50 1 / p95 5 / max 8, exactly ONE
+ * row reaching 8 — and that column is a SUPERSET of `episode.filesRead` (hook-llm.mjs
+ * merges searched files in), so the true field is smaller. Two caveats on that sample, both
+ * from the review: it only covers SIGNIFICANT episodes (saveEpisodeImmediate is gated on
+ * `isSignificant`), which is ~8% of flushes and structurally excludes the population rule 4
+ * would change; and 90 days starts AFTER the break below.
+ *
+ * THE RULE WAS NOT ALWAYS UNREACHABLE — do not write "structurally". Non-empty `files_read`
+ * by month, with the count reaching the threshold of 8:
+ *
+ *     2026-02    35/  78  44.9%   >=8:  3   max 11
+ *     2026-03   603/1004  60.1%   >=8: 49   max 53
+ *     2026-04   314/ 621  50.6%   >=8: 28   max 33
+ *     2026-05     8/ 129   6.2%   >=8:  0
+ *     2026-06     5/ 754   0.7%   >=8:  0
+ *     2026-07     8/ 919   0.9%   >=8:  1
+ *     2026-08    20/ 193  10.4%   >=8:  0
+ *     lifetime reaching >=8: 81
+ *
+ * For three consecutive months this field fed the threshold at a real rate. It collapsed in
+ * 2026-05 and the cause is NOT identified. That regime break is the single most useful fact
+ * here, because it is direct evidence for the conclusion rather than against it: the
+ * reachable input is the episode BOUNDARY, not the threshold and not the field, and the
+ * boundary demonstrably moved once already.
+ *
+ * D#171 closed as won't-fix-as-specified: the repair it named does not work at the current
+ * cadence, and re-pointing the rule would move the dormancy to a field nobody suspects.
+ * Reopening means finding what changed in 2026-05 — a far larger change than the rule, with
+ * no evidence its output was worth it (111 lifetime observations, dormant 133 days, nobody
+ * noticed). The May break is tracked separately so it is not lost with the closure.
  *
  * @param {object} episode
  * @returns {{significant: boolean, rule: 1|2|3|4|null, readCount: number,

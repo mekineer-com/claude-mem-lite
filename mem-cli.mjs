@@ -2651,9 +2651,11 @@ function cmdCitationStats(db, args) {
     for (const s of surfaceFunnel.surfaces) {
       const pct = (s.rate * 100).toFixed(1) + '%';
       // Which faces actually move importance is NOT readable from the rates —
-      // and an annotated keyctx beside a bare task_imperative reads as "that
-      // one does feed decay", which is false. Derived from the exported sets so
-      // the note cannot drift from the behaviour it describes.
+      // and an annotated keyctx beside a bare `subagent` reads as "that one
+      // does feed decay", which is false. Derived from the exported sets so
+      // the note cannot drift from the behaviour it describes. (The example
+      // used to name task_imperative; it joined the denominator on 2026-08-25
+      // once its rate was read, leaving `subagent` as the bare non-decay face.)
       const note = s.surface === 'keyctx'
         ? '  (promotion-only: never demotes)'
         : (DECAY_DENOMINATOR_SURFACES.includes(s.surface)

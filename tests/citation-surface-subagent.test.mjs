@@ -164,6 +164,48 @@ describe('collectSubagentSurface — injected from the prompt, cited from the si
     expect(injected.size).toBe(0);
     expect(cited.size).toBe(0);
   });
+
+  // D#164. `subagent` is the ONLY face where the injection and the citation can
+  // land in different contexts: every other face injects into the main thread and
+  // looks for the cite in that same thread. Unioning `cited` across the whole
+  // subagents/ directory credits this face when agent B cites a lesson that agent
+  // A received — B got that id from somewhere else (the parent quoted it, or its
+  // own prompt did), so the credit is unearned. Measured on the live corpus before
+  // this guard existed: 13/48 under the union, 12/48 receiver-attributed.
+  //
+  // The decoy is the second agent's OWN lesson (#22, received AND cited by B).
+  // Without it, "cited must be empty" would also pass for a fix that simply
+  // stopped reading the sidechains at all.
+  it('credits a cite only to the agent that RECEIVED the lesson', () => {
+    writeJsonl(join(dir, 'agent-a-1.jsonl'), [
+      promptTurn([11, 'lesson handed to A']),
+      subagentCite('A did the work without referring to anything.'),
+    ]);
+    writeJsonl(join(dir, 'agent-b-2.jsonl'), [
+      promptTurn([22, 'lesson handed to B']),
+      subagentCite('Applying #22 here; also noting #11 which the parent mentioned.'),
+    ]);
+    const { injected, cited } = collectSubagentSurface(parent);
+    expect([...injected].sort((a, b) => a - b)).toEqual([11, 22]);
+    // B's own lesson is credited…
+    expect(cited.has(22)).toBe(true);
+    // …A's is not, even though the string `#11` appears in the same session.
+    expect(cited.has(11)).toBe(false);
+  });
+
+  // Consequence of the rule above, stated on its own so a future change that
+  // widens `cited` back to the union fails on the invariant and not only on the
+  // one hand-built case: the face can never report cited > injected.
+  it('never credits an id that no agent was handed', () => {
+    writeJsonl(join(dir, 'agent-a-1.jsonl'), [
+      promptTurn([11, 'lesson handed to A']),
+      subagentCite('Citing #11 and, separately, #77 which was never injected.'),
+    ]);
+    const { injected, cited } = collectSubagentSurface(parent);
+    expect(cited.has(11)).toBe(true);
+    expect(cited.has(77)).toBe(false);
+    expect([...cited].every((id) => injected.has(id))).toBe(true);
+  });
 });
 
 describe('subagent face in the surface enum and the decay denominator', () => {

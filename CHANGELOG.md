@@ -2,6 +2,226 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.81.0 — the parked flag and the young meter, and a ruler that credited the wrong agent
+
+**Upgrade note — one default behaviour change, and it reaches you only if you opted in.**
+The `task-imperative` injection face now feeds the citation-decay denominator: a lesson
+delivered as the imperative one-liner after the `<memory-context>` block can now lose
+importance if it goes uncited, where before it could not. It could already GAIN importance
+by being cited; only the downward half was missing.
+
+**If `CLAUDE_MEM_TASK_IMPERATIVE` is unset — the default — this changes nothing for you.**
+The face never injects, so it contributes no rows to the denominator and the blast radius is
+exactly zero. The affected population is people who turned an experimental flag on. If that
+is you: there is no per-face switch and this release does not add one;
+`MEM_DISABLE_CITATION_DECAY=1` turns the whole decay loop off (blunt — it also stops
+promotion on every face), and pinning `claude-mem-lite@3.80.0` reverts precisely.
+
+Measured blast radius on this machine, which does run the flag on — same-corpus one-pass A/B
+over 1114 transcripts: **+22 (session,id) rows = +0.90% of the denominator, across 17
+sessions**, 9 of the 22 cited (40.9%).
+
+A first draft of this note claimed "zero demotions, none had accumulated the three-session
+uncited streak a demotion requires". **The pre-tag review showed that was measured on the
+wrong unit and it has been restated.** `uncited_streak` is per-OBSERVATION and is driven by
+all five faces at once, so the question is not whether a row went uncited in three *marginal*
+sessions — it is whether a marginal uncited resolution lands on a row the other four faces
+already walked to 2. It does: 13 of the 22 marginal pairs are uncited, and of the 16 distinct
+observations behind them **five sit at `uncited_streak = 2` today**, four of which this flip
+newly resolves as uncited. One of those, `#8847`, is `importance=3` with `cited_count=56`.
+The CLI in this repo labels that state `Active decay queue (uncited_streak >= 2, next miss →
+demote)`, so the original claim contradicted the product's own framing of the same rows.
+
+What softens it, and is also measured: a 3→2 demotion is **not** permanent. It still clears
+the candidate pool's `>= 2` gate (it only loses the `LIMIT 50` race against the imp=3
+population), and a citation from *any* face restores importance on the next resolution.
+
+Nothing else in this release changes behaviour: the other two items are a metering correction
+and a docblock, neither of which moves what gets injected or demoted.
+
+### The rate was read, and the exclusion's own exit criterion failed (D#164, P2-5)
+
+`task_imperative` was metered in v3.76 and deliberately held out of the decay denominator on
+a written condition — *"if the imperative framing under-performs, the penalty lands on the
+LESSONS it carried rather than on the framing"* — with the instruction to read the rate
+first. The rate was read on 2026-08-25 and the condition is not met. Over the live corpus:
+
+| face | sessions | injected | cited | rate |
+|---|---|---|---|---|
+| pretool | 76 | 1362 | 521 | 38.3% |
+| **task_imperative** | 27 | **34** | **15** | **44.1%** |
+| fyi | 63 | 274 | 30 | 10.9% |
+| ups | 68 | 237 | 20 | 8.4% |
+| error_recall | 73 | 678 | 42 | 6.2% |
+
+Two things about that table are worth more than the flip itself.
+
+**`citation_surface_log` would not have supported this.** It held n=8 over 2.1 days, which
+reads as "not enough data, keep waiting" — the state P2-5 called out as systemic debt. But
+the FLAG had been parked for weeks while the METER had only run since v3.76, so the small
+number was a property of the instrument, not of the behaviour. Re-deriving the rate by
+walking live transcripts with the *shipped* extractors turned n=8 into n=34. When a face's
+row count looks too small to decide on, check whether the meter is younger than the thing it
+measures before concluding there is nothing to read.
+
+**The delta was nearly mis-attributed by subtraction.** Post-flip the denominator measured
+2462 against a pre-flip 2424 — +38, contradicting the predicted +23. The change was not the
+cause: the corpus grew while the round ran (1113 → 1114 transcripts; the four-face baseline
+itself moved 2424 → 2440). A same-corpus A/B computing both unions **in one walk** gave +22
+(+0.90%), matching the prediction. This is the knip-baseline rule from `CLAUDE.md`
+generalising past knip: never attribute a delta by subtracting two counts taken at different
+times.
+
+**What ships with a known residual risk** — see the upgrade note above for the corrected
+demotion figures. All 22 marginal rows are `importance=3`, because
+`rankImperativeCandidates` orders by `importance DESC` and takes 50, and in the five largest
+projects here the imp=3 population alone exceeds that limit (`projects--mem` 327,
+`projects--code-graph-mcp` 121). So a demotion 3→2 **evicts** a lesson from this face's
+candidate pool rather than merely down-ranking it — a feedback loop the four original
+denominator faces do not have, because they select on FTS relevance instead. Measured
+demotion volume is 0 over 12 days: the loop is slow, not absent, and its long-run
+accumulation is **not** measured. If imperative picks start thinning out, that is the first
+place to look, and the cap belongs in `rankImperativeCandidates` (raise the LIMIT above the
+imp=3 population, or exempt this face's picks from demotion) rather than back in the
+exclusion set.
+
+`DECAY_EXCLUDED_SURFACES` is now empty. That turns its companion guard — *"every face is in
+the denominator OR in the exclusion list"* — **true by construction**, since the denominator
+is literally the attachment list minus the exclusion set. A test that cannot fail is worse
+than no test, so it was replaced with one that pins the DECISION: the denominator must equal
+the full attachment face list, and re-excluding a face has to be a deliberate edit to that
+line. In the CLI suite `task_imperative` moved from the pinned positive to the pinned
+negative, which is the stronger half — a derivation that inverts fails on it, and so does one
+that hardcodes the old face list.
+
+### The subagent face credited citations to agents that never received them (D#164)
+
+`subagent` is the only injection face where the injection and the citation can land in
+different contexts: every other face injects into the main thread and looks for the cite in
+that same thread. `collectSubagentSurface` built two independent unions over the session's
+`subagents/*.jsonl` — every injected id into one set, every cited id into another — and then
+intersected them. So "agent A was handed it, agent B mentioned it" counted as adoption.
+
+Fixed by pairing per file: an id is credited only when the agent that *received* it cited it.
+On the live corpus that moves the face from 13/48 to **12/48**, and `cited` is now a subset of
+`injected` by construction (verified end-to-end: 30 sessions, 0 violations).
+
+Three calibers now exist for this face and they answer different questions, so the docblock
+names all three rather than picking one silently: union 27.1% (what shipped), receiver-attributed
+id-level **25.0%** (the house ruler — every other face also counts an obs once per session),
+per-dispatch 14.6% (48 ids fan out over 82 dispatches). 25.0% sits above `fyi` and
+`error_recall`, both already in the denominator, so "it performs badly" was never available
+as a reason to keep it out.
+
+It stays out anyway, and the reason is not the rate. Admitting it needs its receiver-attributed
+cites merged alongside `citedMain` asymmetrically (measured cost: 3 of 1064 main-face ids,
+0.28%, would flip demote→promote on a cite the main thread never made); its numerator only
+became trustworthy in this release; and letting one release separate the two faces means the
+eviction loop they share — they call the same `selectImperativeLesson` — is observed acting on
+one face before it acts on two. Tracked as D#172.
+
+### D#171 closed as won't-fix, on measurement rather than judgement (D#171)
+
+v3.80.0 recorded that `explainSignificance`'s rule 4 and `isReviewPattern` are both dormant
+because `readCount` counts `Read || Grep` and both are filtered out before they reach
+`episode.entries`. The obvious repair — re-point rule 4 at `episode.filesRead`, which
+hook.mjs populates before the rule runs — was deferred as an L3 default-behaviour change.
+It was measured before being scheduled, and it does not work.
+
+Unlike the `grepDecisive` case, the denominator here is real: `Read` fires **1861 times**
+across the 1114-transcript history (9.1% of all tool calls, and the transcripts hold records
+spanning 2026-08-13..08-25, so that is a live rate rather than a lifetime counter). But
+`filesRead` is a per-FLUSH slice, not a per-episode total — `flushEpisodeWithDb` renames and
+consumes `reads-<project>.txt` on every flush.
+
+**Compare the two rates on the same window.** The first draft of this section divided a
+12-day Read rate by a 3-day flush rate and got ~0.8 Reads per episode — two windows, one
+ratio, the same shape of error v3.80.0 recorded as *reading a lifetime counter as an active
+rate*. On the same three active days (08-22 / 08-24 / 08-25; 08-23 has no metric file):
+**596 Reads against 607 episode flushes = 0.98 Reads per episode.** The conclusion survives;
+the figure did not.
+
+At ~1 Read per episode a threshold of 8 is out of reach, and the 90-day sample agrees:
+`observations.files_read` is non-empty on 34 of 1872 rows (1.8%), p50 1 / p95 5 / max 8,
+exactly one row reaching 8 — and that column is a *superset* of `episode.filesRead`
+(`hook-llm.mjs` merges searched files in), so the real field is smaller still. Two caveats,
+both from the review: the sample covers only SIGNIFICANT episodes (`saveEpisodeImmediate` is
+gated on `isSignificant`), i.e. ~8% of flushes, and that is structurally the wrong population
+— rule 4 exists to *make* an episode significant. And 90 days starts after the break below.
+
+**The rule was not always unreachable, and "structurally" was the wrong word.** Non-empty
+`files_read` by month, with the count reaching 8:
+
+| month | non-empty / total | ≥8 | max |
+|---|---|---|---|
+| 2026-02 | 35 / 78 (44.9%) | 3 | 11 |
+| 2026-03 | 603 / 1004 (60.1%) | **49** | 53 |
+| 2026-04 | 314 / 621 (50.6%) | **28** | 33 |
+| 2026-05 | 8 / 129 (6.2%) | 0 | 3 |
+| 2026-06 | 5 / 754 (0.7%) | 0 | 3 |
+| 2026-07 | 8 / 919 (0.9%) | 1 | 8 |
+| 2026-08 | 20 / 193 (10.4%) | 0 | 5 |
+
+81 rows lifetime reach the threshold, 49 of them in March alone. For three consecutive months
+this field fed rule 4 at a real rate; it collapsed in **2026-05** and the cause is not
+identified. That break is the most useful fact in this section, and it argues *for* the
+conclusion rather than against it: the reachable input is the episode **boundary**, not the
+threshold and not the field — and the boundary demonstrably moved once already.
+
+So D#171 closes as won't-fix-as-specified: the repair it named does not work at the current
+cadence, and re-pointing the rule would move the dormancy to a field nobody suspects.
+Reopening means finding what changed in May 2026, which is a far larger change than the rule,
+with no evidence its output was worth it (111 lifetime observations, dormant 133 days, nobody
+noticed). Recorded in the `explainSignificance` docblock so the next reader does not
+re-derive the cheap repair, and the May break is tracked separately so it does not close with
+D#171.
+
+### Pre-tag review
+
+Two independent lenses, both delivered before the tag. Neither found a BLOCKER, and neither
+found a defect in the code — **every finding was in the numbers and the claims built on
+them**, which is where the brief predicted the problem would be and where it was worse than
+predicted in two places.
+
+*Correctness lens* reproduced the figures against the live DB and all 1114 transcripts.
+Three SHOULD-FIX, all now applied: the "zero demotions" claim was measured on the wrong unit
+(above); the docblock and the CHANGELOG disagreed with each other on the same measurement
+(23 / +0.95% / 39.1% versus 22 / +0.90%) — and the surviving `39.1%` was a rate over the
+stale denominator the CHANGELOG itself spends a paragraph disowning, corrected to 40.9%; and
+the D#171 ratio compared two different windows. It also confirmed the parts that held: no
+consumer of `DECAY_DENOMINATOR_SURFACES` assumed four members, there is no demote-by-
+construction path for the admitted face, `sub.cited` has no consumer wanting the old broader
+meaning, and the A/B method and arithmetic are both right.
+
+One of its premises did not survive checking, and the correction is recorded because it cuts
+the other way: it read the 1861 Reads as a lifetime counter spanning 2026-02, on the grounds
+that the observations table goes back that far. The transcripts do not — their records span
+2026-08-13..08-25, so the per-day Read rate was sound. The window error was in the
+comparison, not the numerator.
+
+*Test-effectiveness lens* ran 18 mutations, each backed up with `cp` and each restore
+verified. Both new subagent cases are binding, and it found a mutation the brief did not
+name: a **global** intersection (union both sets across files, intersect once at the end)
+preserves `cited ⊆ injected`, so the invariant case lets it through while re-introducing
+cross-agent credit in full — `credits a cite only to the agent that RECEIVED the lesson` is
+the sole guard against it. It confirmed the replaced imperative guard is strictly stronger
+than the three assertions it retired, killing one mutation class (a denominator hardcoded to
+the correct faces in the wrong order) that none of the old three caught. Its three SHOULD-FIX
+were prose the flip made false: an inverted comment in `mem-cli.mjs` whose twin in the test
+file this diff *had* updated, a stale cross-reference in the funnel suite, and the test count
+in `CLAUDE.md` left at 5182.
+
+Two of its NITs were applied — the CLI case now carries a positive assertion so its negative
+cannot pass by row-disappearance, and the load-bearing `toEqual` now says in a comment why it
+must not be weakened. Three were not, and are recorded rather than dropped: D#175 files the
+one unpinned premise under D#171's closure, with the reason it was not rushed in before a tag.
+
+The review also flushed out an unrelated one-token hole by tripping over it. `tasks/` is
+gitignored local workspace, and both sibling repo-walkers (`obs-types-invariant`,
+`time-constants`) skip it — but `import-graph`'s `SKIP_DIRS` did not, so a reviewer's `cp`
+backups under `tasks/bak-3810/` turned the suite red. Same shape as D#168, one directory over.
+`tasks` added to that set; the odd one out is now aligned with its two siblings.
+
 ## v3.80.0 — two counters that were never the same ruler, and a blocker that was not there
 
 **Upgrade note.** Nothing user-facing changes. One behaviour delta, on a surface that is

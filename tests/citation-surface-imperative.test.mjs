@@ -95,29 +95,41 @@ describe('task_imperative surface', () => {
     expect(extractInjectedBySurface(path, { mainOnly: true }).task_imperative.size).toBe(0);
   });
 
-  // Metering is the whole change; the decay denominator is deliberately NOT widened in
-  // the same step. Widening it would demote the LESSONS this face carried on the basis
-  // of a framing whose effectiveness is the open question (D#137) — and it would do so
-  // on upgrade, in every live install, before anyone had read a single rate.
-  it('is metered WITHOUT entering the decay denominator', () => {
+  // v3.76 metered this face and deliberately kept it OUT of the decay denominator until
+  // someone read its rate. The rate was read on 2026-08-25 over the live 1113-transcript
+  // corpus — 44.1% (15/34), against pretool 38.3%, fyi 10.9%, ups 8.4%, error_recall 6.2%
+  // — so the stated exclusion condition ("if the imperative framing under-performs") is
+  // not met, and the face was admitted. This case is the behavioural half of that flip:
+  // the id reached only by the imperative row must now appear in the union the decay loop
+  // consumes, not merely in its own funnel row.
+  it('enters the decay denominator alongside the block it rides with', () => {
     const path = writeTranscript([bothInOne(202, 909)]);
     expect([...extractInjectedBySurface(path).task_imperative]).toEqual([909]);
-    expect([...extractAllInjected(path)]).toEqual([202]);
+    // 202 comes from the <memory-context> block, 909 from the imperative row: one
+    // attachment, two faces, and after the flip BOTH reach applyCitationDecay.
+    expect([...extractAllInjected(path)].sort((a, b) => a - b)).toEqual([202, 909]);
   });
 
-  // The v45 union was built to widen automatically so a new face could not be forgotten.
-  // The exclusion set above is the escape hatch, so it needs its own guard: every matcher
-  // face must be either in the denominator or named in the exclusion list. A face that is
-  // in neither would have silently dropped out of decay — the original defect, re-opened
-  // through the escape hatch instead of through the union.
-  it('leaves no face undeclared — each is in the denominator or explicitly excluded', () => {
+  // The v45 union widens automatically so a new face cannot be forgotten;
+  // DECAY_EXCLUDED_SURFACES is the escape hatch out of it. With the hatch now empty, a
+  // guard phrased as "every face is in the denominator OR in the exclusion list" would be
+  // true by construction — DENOMINATOR is literally ATTACHMENT minus EXCLUDED — i.e. a
+  // test that cannot fail. So this pins the DECISION instead of the derivation: every
+  // attachment face feeds decay, and re-excluding one has to be an edit to this line.
+  // DO NOT WEAKEN OR DELETE the toEqual below. With the exclusion set empty, the
+  // denominator and the attachment list are element-identical, so NO behavioural test can
+  // tell them apart any more — this line is the only guard in the suite against a WRONG
+  // widening. Verified by mutation in the v3.81.0 pre-tag review: unioning `keyctx` into
+  // the denominator (the exact v3.66.0 incident, where "the block ate its own contents")
+  // turns this case red and nothing else in 163 tests. It pins ORDER as well as membership,
+  // and that is deliberate: a denominator hardcoded to the correct faces in a different
+  // order is caught by nothing else. A legitimate reorder of SURFACE_MATCHERS moves both
+  // sides together — `faces` derives from the same Object.keys — so the pin is not brittle.
+  it('feeds every attachment face into the decay denominator (the exclusion set is empty)', () => {
     const path = writeTranscript([bothInOne(202, 909)]);
     const faces = Object.keys(extractInjectedBySurface(path));
-    const declared = new Set([...DECAY_DENOMINATOR_SURFACES, 'task_imperative']);
-    expect(faces.filter((f) => !declared.has(f))).toEqual([]);
-    // …and the exclusion is not vacuous: the denominator is a strict subset.
-    expect(DECAY_DENOMINATOR_SURFACES).not.toContain('task_imperative');
-    expect(DECAY_DENOMINATOR_SURFACES.length).toBe(faces.length - 1);
+    expect(DECAY_DENOMINATOR_SURFACES).toEqual(faces);
+    expect(DECAY_DENOMINATOR_SURFACES).toContain('task_imperative');
   });
 
   it('records and reads back as its own row in the funnel', () => {

@@ -261,18 +261,26 @@ describe('citation-stats CLI', () => {
 
   // The sibling of the case above, and the reason the note is derived from
   // DECAY_DENOMINATOR_SURFACES rather than special-cased: an annotated keyctx
-  // beside a BARE task_imperative reads as "that one does feed decay", which is
+  // beside a BARE non-decay face reads as "that one does feed decay", which is
   // false. Until v3.77.0 that argument lived only in a code comment — collapsing
-  // the note to '' left every CLI suite green. Both non-decay faces are pinned
-  // here, and a decay face is pinned as NOT carrying the note, so the assertion
-  // fails if the derivation inverts as well as if it disappears.
+  // the note to '' left every CLI suite green.
+  //
+  // `task_imperative` moved sides here (it entered the denominator once its rate was
+  // read) and is now the pinned NEGATIVE, which is the stronger half of this case: a
+  // derivation that inverts fails on it, and so does one that hardcodes the old face
+  // list. `subagent` is still metered-only, so the positive is pinned too.
   it('labels every non-decay face as metered-only, and no decay face', async () => {
     seedSurface('subagent', 5, 2);
     seedSurface('task_imperative', 12, 3);
     seedSurface('pretool', 20, 8);
     const output = await captureStdout(() => run(['citation-stats']));
     expect(output).toMatch(/subagent \(dispatch\).*metered only: outside the decay denominator/);
-    expect(output).toMatch(/task-imperative.*metered only: outside the decay denominator/);
+    // Positive first: a bare `not.toMatch` on this face is satisfied just as well by the
+    // row not being rendered at all (v3.79.0's "my assertion was satisfied by another
+    // cause"). A sibling case does pin the row, but keeping the non-vacuity in the SAME
+    // case is what makes this one self-contained.
+    expect(output).toMatch(/task-imperative.*inj\s+12\s+cited\s+3/);
+    expect(output).not.toMatch(/task-imperative.*metered only/);
     expect(output).not.toMatch(/PreToolUse recall.*metered only/);
   });
 
