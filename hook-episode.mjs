@@ -260,6 +260,26 @@ const RESEARCH_ENTRY_THRESHOLD = 8;
  * short — an edit-driven episode that happens to contain Greps is not evidence that
  * Grep carries research episodes.
  *
+ * READ THE DENOMINATOR BEFORE READING `grepDecisive: 0`. It is a vacuous zero whenever
+ * no episode contains a Grep at all, and that is the state measured on 2026-08-25:
+ * across 555 instrumented episodes, `sum(readCount) = sum(grepCount) = 0`, and the `Grep`
+ * tool was invoked **0 times in the entire 1111-transcript history on this machine**.
+ * So "grepDecisive is 0, therefore Grep is safe to skip" is not an inference this counter
+ * supports here — it never had the chance to fire. (The decision it was built for is
+ * separately moot on that corpus: skipping a tool nobody calls saves 0ms.) Same shape as
+ * the FTS5 `rowid = ? AND fts MATCH ?` trap this repo already paid for — a predicate that
+ * cannot return true reports the defect as absent.
+ *
+ * The same measurement shows rules 4 and `buildImmediateObservation`'s `isReviewPattern`
+ * are BOTH dormant, for a reason that has nothing to do with Grep: `readCount` counts
+ * `Read || Grep`, and `Read` is filtered out at both layers (scripts/post-tool-use.sh
+ * records it to `reads-<project>.txt` and exits; SKIP_TOOLS returns early in Node), so the
+ * rule's only remaining input is a tool that is never called. Last observation the review
+ * branch produced: 133 days ago, 111 lifetime. The data it wants is already on the episode
+ * — `episode.filesRead`, populated at hook.mjs:228 before this function runs, the same way
+ * rule 3 already reads `episode.files`. Re-pointing it there would resurrect a dormant
+ * default behaviour on a released artifact, so it is deferred rather than done in passing.
+ *
  * @param {object} episode
  * @returns {{significant: boolean, rule: 1|2|3|4|null, readCount: number,
  *   grepCount: number, grepDecisive: boolean}}
