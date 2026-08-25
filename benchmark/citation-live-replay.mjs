@@ -74,6 +74,8 @@ import {
 } from '../lib/citation-tracker.mjs';
 import { readTranscriptEntries } from '../lib/transcript-scan.mjs';
 import { wilson95 } from './wilson.mjs';
+import Database from 'better-sqlite3';
+import { resolveDataDir } from '../lib/resolve-data-dir.mjs';
 
 const argv = process.argv.slice(2);
 const argOf = (flag) => {
@@ -397,6 +399,7 @@ function main() {
         after: shape(aggregate(inWindow.filter((r) => r.ts >= split))),
       }),
       ...(has('--by-project') ? { by_project: byProject(inWindow) } : {}),
+      ...(has('--by-scope') ? { by_scope: byScope(inWindow, scopeLookup()) } : {}),
     }, null, 2));
     return;
   }
@@ -425,6 +428,67 @@ function main() {
     console.log('\n─── per project ───');
     console.table(byProject(inWindow));
   }
+
+  if (has('--by-scope')) {
+    console.log('\n─── per observations.scope (D#153) ───');
+    console.log('`pretool` IS the file-triggered face CLAUDE_MEM_SCOPE_FILTER gates. `(gone)` = the row');
+    console.log('left the table since injection; kept so the buckets still sum to the face\'s pair count.');
+    console.table(byScope(inWindow, scopeLookup()));
+  }
+}
+
+/**
+ * D#153's ruler. Break a face's (session,id) pairs down by the row attribute the SCOPE
+ * lever keys on — `observations.scope` — and give each bucket its own cite-rate.
+ *
+ * WHY HERE AND NOT IN denoise-ab. The scope lever lives in scripts/pre-tool-recall.js,
+ * which denoise-ab does not execute at all (its own SCOPE docblock says so): editing a
+ * scope filter and re-running that harness reports NEUTRAL Δ=0 by construction. A
+ * scope-mixed FIXTURE suite there would have produced a number about a corpus somebody
+ * authored, which on this surface has twice reported the opposite of the live DB. The
+ * question D#153 actually asks — "are environment-scoped rows less relevant ON THE
+ * FILE-TRIGGERED FACE" — has a direct answer in real data: that face is `pretool`, and
+ * this walk already holds every id it injected and every id the model then cited.
+ *
+ * Two caliber notes that decide how to read the table:
+ *   • an id whose row is gone from the DB (compressed, deleted, merged) buckets as
+ *     `(gone)` rather than being dropped, because dropping it would shrink a denominator
+ *     silently and the scope buckets would no longer sum to the face's own pair count.
+ *   • `(null)` is legacy/manual rows that never went through enrich-time labelling. It is
+ *     a real bucket with real behaviour, not missing data to be excluded.
+ */
+export function byScope(records, scopeOf) {
+  const per = new Map();
+  for (const rec of records) {
+    for (const [face, v] of Object.entries(rec.faces)) {
+      const hit = new Set(v.hit);
+      for (const id of v.inj) {
+        const scope = scopeOf(id);
+        const k = `${face} ${scope}`;
+        const r = per.get(k) || { face, scope, pairs: 0, cited: 0 };
+        r.pairs++;
+        if (hit.has(id)) r.cited++;
+        per.set(k, r);
+      }
+    }
+  }
+  return [...per.values()].sort((a, b) => (a.face === b.face ? b.pairs - a.pairs : a.face.localeCompare(b.face)))
+    .map((r) => {
+      const [lo, hi] = wilson95(r.cited, r.pairs);
+      return { ...r, rate: pct(r.cited, r.pairs), ci95: `[${(lo * 100).toFixed(1)}, ${(hi * 100).toFixed(1)}]%` };
+    });
+}
+
+/** id → scope bucket, read once from the live DB. */
+function scopeLookup() {
+  const db = new Database(join(resolveDataDir(), 'claude-mem-lite.db'), { readonly: true });
+  const map = new Map();
+  try {
+    for (const r of db.prepare('SELECT id, scope FROM observations').all()) {
+      map.set(r.id, r.scope || '(null)');
+    }
+  } finally { db.close(); }
+  return (id) => map.get(Number(id)) ?? '(gone)';
 }
 
 function byProject(records) {

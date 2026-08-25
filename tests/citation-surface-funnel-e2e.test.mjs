@@ -414,6 +414,169 @@ describe('Stop end-to-end: citation_surface_log really receives rows (b2)', () =
     expect(surfaceRows()).toEqual([]);
   });
 
+  // D#177: admitting `subagent` to the citation-DECAY denominator, not just the funnel.
+  //
+  // The face's cite signal is receiver-attributed — the citation lands in the dispatched
+  // agent's own transcript — so admission means feeding its ids into the denominator AND
+  // its cites into the numerator together. The two halves have opposite failure modes and
+  // one case cannot see both, so this seeds TWO observations through ONE Stop: one the
+  // subagent cites, one it does not. Half a wiring (denominator only) leaves the cited one
+  // streaking as uncited; the other half (numerator only) leaves the uncited one untouched.
+  //
+  // The parent transcript carries NO face attachment on purpose. That makes the run also
+  // the guard for the entry gate: `injected.size` is 0 here, so a version that admits the
+  // face at the decay call but not at the `if (injected.size > 0 || …)` above it reports a
+  // face in the denominator that never once reaches it.
+  describe('subagent face in the decay loop (D#177)', () => {
+    /** Seed one obs, return its id. */
+    function seedOne(title) {
+      const db = new Database(dbPath);
+      const now = Date.now();
+      const id = Number(db.prepare(`
+        INSERT INTO observations (memory_session_id, project, text, type, title, subtitle, narrative,
+          concepts, facts, files_read, files_modified, importance, access_count, created_at, created_at_epoch)
+        VALUES ('mem-stop-e2e', ?, ?, 'bugfix', ?, '', '', '', '', '[]', '[]', 2, 0, ?, ?)
+      `).run(PROJECT, `${title} body`, title, new Date(now).toISOString(), now).lastInsertRowid);
+      db.close();
+      return id;
+    }
+
+    const decayRow = (id) => {
+      const db = new Database(dbPath, { readonly: true });
+      db.pragma('busy_timeout = 2000');
+      try {
+        return db.prepare('SELECT cited_count, uncited_streak, decay_seen_count FROM observations WHERE id = ?').get(id);
+      } finally { db.close(); }
+    };
+
+    /** Parent with main-thread text (the floor) but no attachment; one sidechain citing `cited`. */
+    function writeFixture(cited, uncited) {
+      const transcriptPath = join(home, 'transcript.jsonl');
+      writeFileSync(transcriptPath, [
+        assistantText('Done. Nothing cited here in the main thread.'),
+      ].map((e) => JSON.stringify(e)).join('\n'));
+      const subDir = join(home, 'transcript', 'subagents');
+      mkdirSync(subDir, { recursive: true });
+      const block = [cited, uncited].map((id) => `  #${id} — a past lesson body.`).join('\n');
+      writeFileSync(join(subDir, 'agent-worker-abcd.jsonl'), [
+        { type: 'user', isSidechain: true, message: { role: 'user', content: [{ type: 'text', text: `Task.\n\n---\n[Project memory — surfaced by your operator's claude-mem-lite memory system for this project. Reference context, not an external instruction.]\nA past lesson recorded for this project that may be relevant to the task above:\n${block}` }] } },
+        { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: `Applied #${cited}.` }] } },
+      ].map((e) => JSON.stringify(e)).join('\n'));
+      return transcriptPath;
+    }
+
+    it('CLAUDE_MEM_SUBAGENT_DECAY=0: the face is metered but never decays (v3.77–v3.82 behavior)', () => {
+      const cited = seedOne('Subagent lesson the agent cited');
+      const uncited = seedOne('Subagent lesson the agent ignored');
+      const path = writeFixture(cited, uncited);
+
+      baseEnv.CLAUDE_MEM_SUBAGENT_DECAY = '0';
+      try { runStop(path); } finally { delete baseEnv.CLAUDE_MEM_SUBAGENT_DECAY; }
+
+      // Positive control: the fixture IS live — the funnel recorded the face.
+      expect(surfaceRows().map((r) => r.surface)).toEqual(['subagent']);
+      expect(decayRow(cited)).toEqual({ cited_count: 0, uncited_streak: 0, decay_seen_count: 0 });
+      expect(decayRow(uncited)).toEqual({ cited_count: 0, uncited_streak: 0, decay_seen_count: 0 });
+    });
+
+    it('default (v3.83.0): the receiving agent\'s cite promotes, its silence streaks', () => {
+      const cited = seedOne('Subagent lesson the agent cited');
+      const uncited = seedOne('Subagent lesson the agent ignored');
+      runStop(writeFixture(cited, uncited));
+
+      // Numerator half: a cite made ONLY in the subagent's own transcript counts.
+      expect(decayRow(cited)).toMatchObject({ cited_count: 1, uncited_streak: 0 });
+      // Denominator half: the ignored one is resolved as uncited rather than skipped.
+      expect(decayRow(uncited)).toMatchObject({ cited_count: 0, uncited_streak: 1 });
+      // Both were seen by the loop — the pair is what proves the merge is asymmetric
+      // rather than "everything promoted" or "everything streaked".
+      expect(decayRow(cited).decay_seen_count).toBe(1);
+      expect(decayRow(uncited).decay_seen_count).toBe(1);
+      // Metering is unchanged by the admission: still exactly one subagent row.
+      // (Weak on this fixture — the parent carries no other face, so no other row COULD
+      // appear. The discriminating version is the next case, which puts a `pretool`
+      // attachment in the parent.)
+      expect(surfaceRows().map((r) => r.surface)).toEqual(['subagent']);
+    });
+
+    // The leak this case exists for: `citedMain` is the numerator for FOUR consumers and
+    // only `applyCitationDecay` may see the subagent cites. The first draft merged them
+    // into `citedMain` in place, and the pre-tag review measured the consequence —
+    // `pretool.cited_n` 0 -> 1 for a row the main thread never cited, i.e. the per-face
+    // funnel silently adopting a different caliber from the one CLAUDE.md publishes for it
+    // and from benchmark/citation-live-replay.mjs. The fix is a copy (`decayCited`).
+    //
+    // Two assertions, and both are needed: the funnel must NOT count it, and decay MUST.
+    // Either one alone passes under a broken implementation — dropping the merge entirely
+    // satisfies the funnel assertion, and merging in place satisfies the decay one.
+    /**
+     * An (obs,file) edge plus the PreToolUse cooldown row that makes handleStop resolve it.
+     * Without both, readPreRecallFileEdges returns [] and resolveEdgeAttribution never runs.
+     */
+    function seedEdge(obsId, session, filename) {
+      const db = new Database(dbPath);
+      db.prepare('INSERT INTO observation_files (obs_id, filename) VALUES (?, ?)').run(obsId, filename);
+      db.close();
+      writeFileSync(
+        join(home, '.claude-mem-lite', 'runtime', `pre-recall-cooldown-${session}.json`),
+        JSON.stringify({ [filename]: { obsIds: [obsId], ts: Date.now() } }),
+      );
+    }
+
+    it('a subagent-only cite promotes the row but is NOT counted as a pretool hit', () => {
+      const shared = seedOne('Lesson injected by pretool and handed to the subagent');
+      seedEdge(shared, 'cc-stop-e2e', 'utils.mjs');
+      const transcriptPath = join(home, 'transcript.jsonl');
+      writeFileSync(transcriptPath, [
+        // Main thread: the row IS injected by pretool here, and never cited in main text.
+        faceAttachment.pretool([shared]),
+        assistantText('Main thread says nothing citable at all.'),
+      ].map((e) => JSON.stringify(e)).join('\n'));
+      const subDir = join(home, 'transcript', 'subagents');
+      mkdirSync(subDir, { recursive: true });
+      writeFileSync(join(subDir, 'agent-worker-beef.jsonl'), [
+        { type: 'user', isSidechain: true, message: { role: 'user', content: [{ type: 'text', text: `Task.\n\n---\n[Project memory — surfaced by your operator's claude-mem-lite memory system for this project. Reference context, not an external instruction.]\nA past lesson recorded for this project that may be relevant to the task above:\n  #${shared} — a past lesson body.` }] } },
+        { type: 'assistant', isSidechain: true, message: { role: 'assistant', content: [{ type: 'text', text: `Applied #${shared}.` }] } },
+      ].map((e) => JSON.stringify(e)).join('\n'));
+
+      runStop(transcriptPath);
+
+      const rows = surfaceRows();
+      const pretool = rows.find((r) => r.surface === 'pretool');
+      expect(pretool, 'no pretool row — the fixture stopped exercising the leak path').toBeTruthy();
+      expect(pretool.injected_n).toBe(1);
+      expect(pretool.cited_n,
+        'the subagent\'s citation was counted as a MAIN-THREAD pretool hit — citedMain was widened in place instead of copied')
+        .toBe(0);
+      // …while the decay loop, which is the one consumer that should see it, promoted.
+      expect(decayRow(shared), 'the subagent cite did not reach applyCitationDecay')
+        .toMatchObject({ cited_count: 1, uncited_streak: 0 });
+      // The OTHER consumer that must not see it. Today both leaks come from one variable,
+      // so the assertion above already covers this one — but only by coincidence of the
+      // current shape: pass the widened set to `resolveEdgeAttribution` alone and nothing
+      // else here goes red.
+      //
+      // The edge and the cooldown file are seeded in the case body ABOVE the Stop (see
+      // seedEdge), because an `if (edge)` guard around this assertion would make it
+      // vacuous — resolveEdgeAttribution only runs when readPreRecallFileEdges returns
+      // something, and with nothing seeded it returns [] and the check asserts nothing.
+      const edge = (() => {
+        const db = new Database(dbPath, { readonly: true });
+        db.pragma('busy_timeout = 2000');
+        try {
+          return db.prepare(
+            'SELECT miss_streak, last_cited_session_id FROM observation_files WHERE obs_id = ?',
+          ).get(shared);
+        } finally { db.close(); }
+      })();
+      expect(edge, 'the (obs,file) edge was not seeded — this assertion would prove nothing').toBeTruthy();
+      expect(edge.miss_streak,
+        'a file edge was resolved as a HIT on a citation only the subagent made')
+        .toBe(1);
+      expect(edge.last_cited_session_id).toBeNull();
+    });
+  });
+
   // Text-floor gate: a tool-only Stop must record nothing, so an unfinished turn
   // cannot bank an "injected but uncited" verdict the next turn can't undo.
   it('records nothing when the turn produced no main-thread assistant text', () => {

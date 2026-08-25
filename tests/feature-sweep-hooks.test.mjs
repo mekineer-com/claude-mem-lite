@@ -808,6 +808,161 @@ describe('hook flush: the reads-file is consumed, not accumulated (D#175)', () =
   }, 60000);
 });
 
+// ─── an INSIGNIFICANT flush must not eat the accumulated Reads (D#178) ──────────────
+// The D#175 case above pins that a flush CONSUMES the reads file. This one pins the other
+// half of that statement, which was the defect: the consumption used to happen before
+// anything knew whether the flush would persist an observation, so a flush with entries
+// but no significance swallowed every Read since the last flush and dropped them. Measured
+// over 1121 real transcripts (benchmark/episode-flush-replay.mjs): 42.8% of all collected
+// reads died that way.
+//
+// TWO ARMS, and both are load-bearing:
+//   default (v3.83.0: ON) — the fix. Reverting the reorder in flushEpisodeWithDb makes BOTH
+//     of its assertions fail (the file is gone after the insignificant flush, and the later
+//     row's files_read is empty). Verified by mutation, not by reading.
+//   CLAUDE_MEM_READS_CARRY=0 — the off switch, pinned against the OLD behavior. Without
+//     this arm the switch is documentation: an off switch that silently stopped switching
+//     anything would keep the default arm green and nobody would know.
+//
+// The insignificant flush is a plain `echo` Bash entry: no edit (rule 1), not a test/build
+// error (rule 2), no important-looking file in the command (rule 3 reads episode.files via
+// extractFilePaths, so the command must contain no path), and one entry is far under the
+// research threshold (rule 4).
+describe('hook flush: an insignificant flush does not destroy accumulated Reads (D#178)', () => {
+  /** Seed Read paths through the REAL bash prefilter — the only writer of the reads file. */
+  async function seedReads(cwd, session, paths) {
+    for (const p of paths) {
+      const r = await bashPrefilter({
+        cwd,
+        stdin: JSON.stringify({ session_id: session, tool_name: 'Read', tool_input: { file_path: p } }),
+      });
+      expect(r.code, `post-tool-use.sh exited ${r.code}\n${r.stderr}`).toBe(0);
+    }
+  }
+
+  /** Buffer one entry, then Stop. `significant` picks which rule the entry trips. */
+  async function bufferThenFlush(cwd, session, { significant, env = {}, schemaFile }) {
+    const stdin = significant
+      ? JSON.stringify({
+        session_id: session, tool_name: 'Write',
+        tool_input: { file_path: schemaFile, content: 'CREATE TABLE widgets (id INTEGER);\n' },
+        tool_response: `File created successfully at: ${schemaFile}`,
+      })
+      : JSON.stringify({
+        session_id: session, tool_name: 'Bash',
+        tool_input: { command: 'echo hello from the harness' },
+        tool_response: 'hello from the harness\n',
+      });
+    const post = await hookEvent('post-tool-use', { cwd, stdin, env });
+    expect(post.code, `post-tool-use exited ${post.code}\n${post.stderr}`).toBe(0);
+    const stop = await hookEvent('stop', {
+      cwd, env,
+      stdin: JSON.stringify({ session_id: session, transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+    });
+    expect(stop.code, `stop exited ${stop.code}\n${stop.stderr}`).toBe(0);
+  }
+
+  const rowFor = (project, schemaFile) => withDb((db) => db.prepare(
+    'SELECT title, files_read, files_modified FROM observations WHERE project = ? AND files_modified LIKE ? ORDER BY id DESC LIMIT 1',
+  ).get(project, `%${schemaFile.split('/').pop()}%`));
+
+  it('CLAUDE_MEM_READS_CARRY=0: the insignificant flush consumes and discards them (pre-D#178)', async () => {
+    const NAME = 'hs-readseat-off';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+    const env = { CLAUDE_MEM_READS_CARRY: '0' };
+
+    await seedReads(cwd, 'cc-off-1', [readA, readB]);
+    expect(existsSync(readsFile), 'the bash prefilter wrote no reads file — every later assertion would be vacuous').toBe(true);
+
+    await bufferThenFlush(cwd, 'cc-off-1', { significant: false, env });
+    expect(existsSync(readsFile), 'the off switch did not switch anything off: the insignificant flush left the reads file').toBe(false);
+
+    const schema = join(cwd, 'alpha-schema.sql');
+    await bufferThenFlush(cwd, 'cc-off-2', { significant: true, schemaFile: schema, env });
+    const row = rowFor(project, schema);
+    expect(row, 'no observation flushed for the significant episode').toBeTruthy();
+    expect(JSON.parse(row.files_read), 'the off switch did not restore the old behavior: the reads survived the insignificant flush').toEqual([]);
+  }, 60000);
+
+  // The reorder put `planEpisodeFlush` ABOVE the collection, and its multi-session branch
+  // builds fresh sub-objects that copied whatever `filesRead` the buffer held at that
+  // moment — always `[]`. One line writes the collected paths back into every sub. Without
+  // this case that line is invisible: deleting it leaves the whole suite (309 files / 5231
+  // tests) green while every concurrent same-project session silently loses its reads, and
+  // it fails in BOTH flag arms, because the reorder is not gated on the flag. Found by the
+  // pre-tag review, which mutated the line and watched nothing go red.
+  it('two concurrent sessions in one project: BOTH observations carry the reads', async () => {
+    const NAME = 'hs-readseat-multi';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+
+    await seedReads(cwd, 'cc-multi-1', [readA, readB]);
+    expect(existsSync(readsFile), 'the bash prefilter wrote no reads file — the case would assert nothing').toBe(true);
+
+    // Two DIFFERENT session ids buffered into the one per-project episode file, so
+    // planEpisodeFlush takes its multi-session branch on the flush below.
+    const schemaA = join(cwd, 'alpha-schema.sql');
+    const schemaB = join(cwd, 'beta-schema.sql');
+    for (const [session, file] of [['cc-multi-1', schemaA], ['cc-multi-2', schemaB]]) {
+      const post = await hookEvent('post-tool-use', {
+        cwd,
+        stdin: JSON.stringify({
+          session_id: session, tool_name: 'Write',
+          tool_input: { file_path: file, content: 'CREATE TABLE widgets (id INTEGER);\n' },
+          tool_response: `File created successfully at: ${file}`,
+        }),
+      });
+      expect(post.code, `post-tool-use exited ${post.code}\n${post.stderr}`).toBe(0);
+    }
+    const stop = await hookEvent('stop', {
+      cwd, stdin: JSON.stringify({ session_id: 'cc-multi-1', transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+    });
+    expect(stop.code, `stop exited ${stop.code}\n${stop.stderr}`).toBe(0);
+
+    // Both sub-episodes saved, and BOTH carry the reads — the multi-session branch
+    // inherits the collected set by value, so a missing write-back empties both.
+    for (const schema of [schemaA, schemaB]) {
+      const row = rowFor(project, schema);
+      expect(row, `no observation flushed for ${schema}`).toBeTruthy();
+      expect(JSON.parse(row.files_read),
+        `${schema.split('/').pop()}'s sub-episode lost the collected reads — planEpisodeFlush now runs before the collect, so every sub needs the write-back`)
+        .toEqual([readA, readB]);
+    }
+  }, 60000);
+
+  it('default (v3.83.0): the reads survive and land on the next significant flush', async () => {
+    const NAME = 'hs-readseat-on';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+    const env = {};
+
+    await seedReads(cwd, 'cc-on-1', [readA, readB]);
+    expect(existsSync(readsFile)).toBe(true);
+
+    await bufferThenFlush(cwd, 'cc-on-1', { significant: false, env });
+    expect(existsSync(readsFile), 'the insignificant flush still consumed the reads file').toBe(true);
+    expect(readFileSync(readsFile, 'utf8').split('\n').filter(Boolean)).toEqual([readA, readB]);
+
+    const schema = join(cwd, 'alpha-schema.sql');
+    await bufferThenFlush(cwd, 'cc-on-2', { significant: true, schemaFile: schema, env });
+    const row = rowFor(project, schema);
+    expect(row, 'no observation flushed for the significant episode').toBeTruthy();
+    expect(JSON.parse(row.files_read), 'the carried reads did not reach the saved observation').toEqual([readA, readB]);
+    // …and the significant flush DID consume: the carry is a deferral, not a leak.
+    expect(existsSync(readsFile), 'the significant flush left the reads file in place — it would accumulate forever').toBe(false);
+  }, 60000);
+});
+
 // ─── hook.mjs: the background workers (spawnBackground / detached) ──────────────────
 // These run under CLAUDE_MEM_HOOK_RUNNING=1 — the recursion guard exits every other event
 // immediately, so without it each case would assert "exit 0, no output" against a process

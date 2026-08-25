@@ -14,6 +14,7 @@
     "benchmark/error-recall-live-replay.mjs",
     "benchmark/citation-live-replay.mjs",
     "benchmark/imperative-pool-replay.mjs",
+    "benchmark/episode-flush-replay.mjs",
     "scripts/*.mjs",
     "scripts/*.js",
     "tests/**/*.test.mjs"

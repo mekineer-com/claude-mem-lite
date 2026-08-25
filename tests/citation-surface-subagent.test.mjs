@@ -213,11 +213,18 @@ describe('subagent face in the surface enum and the decay denominator', () => {
     expect(CITATION_SURFACES).toContain('subagent');
   });
 
-  // Metered, not scored — D#152 says read the rate first. The exclusion is
-  // asserted directly rather than inferred from the derivation, so a later
-  // refactor that folds `subagent` into ATTACHMENT_SURFACES fails here instead
-  // of quietly starting to demote lessons on an unmeasured face.
-  it('stays OUT of the decay denominator', () => {
+  // READ THE NAME CAREFULLY — this pins the DERIVATION, not the behaviour, and since
+  // v3.83.0 those differ. `subagent` leaves no hook attachment, so it can never enter
+  // `DECAY_DENOMINATOR_SURFACES` (derived from ATTACHMENT_SURFACES); D#177 admitted it to
+  // the decay loop at the CALL SITE in hook.mjs instead, because its numerator has to
+  // travel with it. So this assertion still holds and still catches a refactor that folds
+  // the face into the attachment table — but it is NOT the guard for "does this face
+  // demote lessons". That guard is tests/citation-surface-funnel-e2e.test.mjs's D#177
+  // block, which drives a real Stop.
+  //
+  // The old name was 'stays OUT of the decay denominator', which went on passing while
+  // the opposite shipped — the class of green test this repo keeps having to rename.
+  it('stays out of the DECAY_DENOMINATOR_SURFACES derivation (admitted at the call site since v3.83.0 — see D#177)', () => {
     expect(DECAY_DENOMINATOR_SURFACES).not.toContain('subagent');
   });
 

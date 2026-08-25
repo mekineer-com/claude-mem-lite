@@ -2,6 +2,168 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.83.0 — the flush that ate the reads, and the class I was about to demote for citing best
+
+**Upgrade note — two default behaviour changes, both with an off switch, both measured on
+real data before they were flipped.**
+
+1. **An episode flush that saves nothing no longer discards the file paths it swept up.**
+   `reads-<project>.txt` used to be renamed, read and unlinked on EVERY flush, while an
+   observation is only written when the episode is significant. So an insignificant flush
+   destroyed every Read since the last one, and the next saved observation carried
+   `files_read: []`. Measured over 1122 real transcripts: **42.2% of the Read paths a flush
+   consumed died that way** (687 of 1627), and 72.7% of significant flushes carried no reads
+   at all. What changes for you: more of those paths reach a flush that saves — ×1.68 —
+   and a read can now attach to a flush later than the one that swept it up. How much of
+   that survives the DB's own dedup is NOT established; see below. Revert with
+   `CLAUDE_MEM_READS_CARRY=0`.
+2. **The `subagent` injection face now feeds citation-decay.** A lesson injected into a
+   dispatched agent's prompt enters the decay denominator, and the citation that agent
+   makes **in its own transcript** counts as the numerator. Until now the face was metered
+   but could neither promote nor demote. What changes for you: importance on lessons that
+   reach subagents starts moving — including one measured row that a miss would evict, see
+   the cost paragraph. Revert with `CLAUDE_MEM_SUBAGENT_DECAY=0`.
+
+Pinning `claude-mem-lite@3.82.0` reverts both without flags.
+
+**The reads defect is an ORDERING, and that is also the fix.** `explainSignificance` reads
+only `entries` and `files` — never `filesRead` — so the verdict was always available before
+the file was touched; the code simply asked in the wrong order. `flushEpisodeWithDb` now
+decides first and collects second. Two things had to move with it: `planEpisodeFlush` runs
+before the collection now, and its multi-session branch builds fresh objects that had
+copied the OLD `filesRead`, so the collected paths are written back to every sub-episode;
+and not collecting means the file grows across an insignificant streak, so
+`READS_CARRY_MAX_LINES = 20000` trims it — an unbounded-growth backstop, not a relevance
+bound. The trim counts LINES: the bash prefilter appends one line per Read with no dedup,
+so the growth mode is repeated lines, and the first draft compared the DISTINCT set (median
+1, p95 6, max 21 carried paths on this corpus) against the cap — a valve that could not
+fire on the thing it was installed for.
+
+**The filed premise was wrong by more than a factor of two.** D#178 was written saying
+92–96% of flushes are insignificant. The live `episode_significance` meter says **40.7%**
+(n=938 across three active days). The new ruler, `benchmark/episode-flush-replay.mjs`,
+computes 37.1% independently and the two are cross-checked against each other on every run:
+the replay models the same quantity the meter measures directly, and a gap over 15
+percentage points exits 1 (measured 3.6pp). That check is the reason the corrected number
+is trustworthy rather than a second guess — it also names its own known under-count
+(`<session>/subagents/*.jsonl` sits one level below the walk, so tool calls inside a
+dispatched agent are missing from the input) and says plainly that on a machine which never
+set `CLAUDE_MEM_METRICS=1` it has no teeth at all. The replay has no fixture: it drives the
+SHIPPED batcher (`isRelatedToEpisode`, `EPISODE_BUFFER_SIZE`, `EPISODE_TIME_GAP_MS`,
+`planEpisodeFlush`, `explainSignificance`, `buildImmediateObservation`, both write-side
+noise gates) over every real tool call in `~/.claude/projects/**.jsonl`.
+
+**What this release does NOT claim.** The flush-level number (42.2% of consumed reads) is
+solid. The observation-level benefit is not: past the two write-side noise gates, 10 → 17
+of 47 landed rows would carry a read, and that is an upper bound because the DB's own dedup
+tiers are not modelled. The live DB currently shows 0 of 73 non-empty `files_read` over five
+active days — dominated by manual saves — and this release does not establish that the fix
+moves that number much. It fixes a mechanism that was provably destroying data; the
+downstream size is still uncertain and is left uncertain here rather than rounded up.
+
+**Admitting `subagent` to decay is four wiring points, not one.** A face is "in the
+denominator" only if all of them agree: the entry gate (`injected.size > 0 || …` had to
+learn about `sub.injected`, or a session whose ONLY injection was a dispatched prompt never
+reaches the loop at all), the denominator set, the numerator set, and the position where the
+copies are built. **Both sets are copies, and the pre-tag review is why.** The first draft
+merged the subagent cites into `citedMain` in place; `citedMain` has four consumers, and the
+review measured two leaks that caused — `recordCitationSurfaces` scored a `pretool` row the
+main thread never cited as a pretool HIT (`pretool.cited_n` 0 → 1), and
+`resolveEdgeAttribution`, whose sidechain gate reads `!mainInjected.has(id) && !cited.has(id)`,
+flipped a file edge from MISS to HIT (`miss_streak` 1 → 0). The first would have made
+`citation_surface_log` and `benchmark/citation-live-replay.mjs` permanently different rulers,
+which is the v3.81.0 cross-agent defect mirrored. Both are now pinned by a case that asserts
+the funnel does NOT count the cite while decay DOES — either half alone passes under a broken
+implementation. `collectSubagentSurface` also moved from the tail of the citation block to
+its head, with no additional parent-transcript parse: `lib/transcript-scan.mjs` memoizes ONE
+file, and the constraint was never "run last", it was "do not run BETWEEN two parent scans".
+
+**Measured cost of the admission**, from one walk of 1122 transcripts: the face cites at
+25.5% (14/55), above `fyi` 11.1% and `error_recall` 6.6% which were already in the
+denominator. 33 marginal (session, id) pairs join, 21.2% of them cited; behind the uncited
+ones sit 21 distinct observations, five of which are at `uncited_streak = 2` and take a
+demotion on their next miss.
+
+**Four of those five are 3→2 down-ranks. The fifth is an EVICTION, and the first draft of
+this entry said there were none.** The part that generalises is that the marginal population
+is not all `importance = 3`. When this was measured (2026-08-25 18:00Z) #10716 sat at
+`importance = 2` with `uncited_streak = 2` — one miss from `IMPORTANCE_FLOOR = 1`, which is
+below the `COALESCE(importance, 1) >= 2` gate of `rankImperativeCandidates`, the pool of the
+very face being admitted. That is the 2→1 eviction v3.82.0's own note says
+`IMPERATIVE_POOL_BACKSTOP` does not cover; raising the pool bound fixed 3→2, not this. The
+four down-ranks are #8597, #8847 (`cited_count` 56), #8948 and #10246.
+
+**A re-check today will not find that row in that state, and the reason is a property of the
+shipped system worth more than the finding it undermines.** #10716 is now `importance = 3`,
+`uncited_streak = 0`, `demoted_at` cleared, `last_cited_session_id` set to the session this
+release was written in. Nothing applied it. It was promoted because **21 occurrences of
+`#10716` appear in that session's own assistant text** — this entry, and the two reviews of
+it, discussing the row. `extractCitationsFromTranscript` scans assistant text for `#NN` and
+`applyCitationDecay` promotes on a hit, so **writing ABOUT a memory is indistinguishable
+from applying it**. The same thing happened to #10857, which is why the marginal-cited share
+reads 21.2% here and 18.2% in a pass taken 37 minutes earlier. Filed as D#179; it is not
+fixable inside a release that is already changing decay behaviour, and it means the two
+DB-state figures in this paragraph are the only ones in this entry that cannot be
+re-derived. Every other figure can, and was.
+
+Cross-crediting — a main-face id the main thread never cited but a subagent did — is 3
+pairs; the denominator that gives 0.25% is **distinct (session, id) across the five decay
+faces inside subagent-bearing sessions** (1181), and 0.11% is the same caliber corpus-wide
+(2738). Naming the caliber matters here more than the ratio: the per-face sums for the same
+populations are 1245 and 2894, and quoting one against the other is the error this paragraph
+used to end by warning about.
+
+**D#153 is closed by refutation, and nothing shipped for it.** `CLAUDE_MEM_SCOPE_FILTER`
+rests on the claim that environment-scoped lessons are the low-relevance class on
+file-triggered recall. `benchmark/citation-live-replay.mjs --by-scope` re-buckets each face's
+(session, id) pairs by `observations.scope`, and on `pretool` — the exact face that filter
+gates — `environment` cites at **47.5% (67/141)**, the highest bucket, against `project`
+44.3% (293/661), `file` 40.0% (2/5), `(gone)` 37.1% (185/498), `module` 36.5% (31/85) and
+`(null)` 34.9% (45/129); face overall 41.0% (623/1519), and those six buckets sum to exactly
+that 1519. The confidence intervals for environment and project overlap, so "environment
+leads" is NOT established — what is refuted is that it is the class to suppress. The planned
+redesign (multiplicative demotion instead of a WHERE-clause exclusion) would have fixed the
+failure mode that was measured — 173 recall groups going empty — while still down-ranking
+the best-citing bucket on that face, so it was not built. The flag stays as an off switch
+with the reason not to flip it written at its definition.
+
+Caliber note so the number is re-derivable: 498 of that face's 1519 pairs are ids whose row
+has since left the table, reported as `(gone)` rather than dropped — a scope table whose
+buckets do not sum to the face's pair count is comparing rates over a population that is not
+the face. Those gone ids are an old cohort (max id 8880 against a live corpus reaching
+10850), and in the id bands they come from the surviving population is ~81% `(null)`-scope
+and ~2.5% `environment`, so the missing bucket cannot plausibly be environment-heavy.
+`environment` and `project` pairs sit in the same id bands, so the head-to-head the
+refutation rests on is not era-confounded; the `(null)` bucket and the face-overall
+comparator are, being dominated by legacy rows.
+
+**One corroboration was withdrawn.** The first draft said #10720 was a second independent
+measurement putting environment's waste rate on par with project's. It is not: #10720 is a
+scope LABEL distribution (364 labelled DB rows — project 184 / environment 114 / module 50 /
+file 16), and what it establishes is the filter's blast radius, that environment is 31.3% of
+labels rather than the near-no-op it looked like at 8 rows. There is no hand-labelled
+waste-rate-by-scope measurement in the store; the refutation rests on the by-scope replay
+alone, which is sufficient on its own.
+
+**The prerequisite D#153 carried was itself the wrong shape.** It said to add a scope-mixed
+suite to `benchmark/denoise-ab.mjs` first. denoise-ab does not execute
+`scripts/pre-tool-recall.js` at all — its own SCOPE docblock says so — so any suite added
+there reports NEUTRAL Δ=0 by construction, which is the "A/B NEUTRAL ≠ safe" trap this repo
+has now hit on three separate faces. The ruler had to be real injections bucketed by the
+attribute the lever keys on.
+
+Every figure above was measured on 2026-08-25 against a 1122-transcript corpus and a live DB
+that both grow daily; they are a frozen snapshot, not a moving number. Corpus-derived figures
+drift upward with a fresh walk. **DB-state figures (`importance`, `uncited_streak`,
+`demoted_at`) drift in BOTH directions and are perturbed by the act of writing about them —
+see D#179 above.** Tests 5216 → 5233 (+17, 309 files). knip
+unchanged at 46 unused exports / 0 unused files, with the round's new benchmark entry point
+registered in `knip.json` rather than left reported. Two independent pre-tag reviews ran and
+between them found one blocker (the eviction above), the `citedMain` leak, a delivery
+multiple inflated 2.9% by summing occurrences where production takes a union, a trim valve
+that could not fire, and a load-bearing line no test could see — deleting the write-back loop
+left all 5231 tests green. Each of those now has a case, and each case was mutation-verified.
+
 ## v3.82.0 — a LIMIT that was never a ranking bound, and the ruler I said did not exist
 
 **Upgrade note — one default behaviour change, and it reaches you only if you opted in.**

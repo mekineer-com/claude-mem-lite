@@ -216,27 +216,124 @@ function flushEpisode(episode, hookEventName = 'PostToolUse') {
   }
 }
 
-function flushEpisodeWithDb(db, episode, hookEventName) {
-  // Collect Read file paths tracked by post-tool-use.sh
-  // Use rename to atomically collect — prevents losing concurrent appends
-  const readsFile = join(RUNTIME_DIR, `reads-${episode.project || inferProject()}.txt`);
-  const readsCollect = readsFile + `.collect-${Date.now()}`;
-  try {
-    renameSync(readsFile, readsCollect);
-    const raw = readFileSync(readsCollect, 'utf8');
-    const paths = [...new Set(raw.split('\n').filter(Boolean))];
-    episode.filesRead = paths;
-    try { unlinkSync(readsCollect); } catch {}
-  } catch {
-    episode.filesRead = episode.filesRead || [];
-  }
+// D#178 safety valve. With CLAUDE_MEM_READS_CARRY on, an insignificant flush leaves
+// `reads-<project>.txt` in place, so a long insignificant streak keeps appending to it.
+//
+// THE CAP COUNTS LINES, NOT DISTINCT PATHS, and that is the whole point. The writer
+// (`scripts/post-tool-use.sh`) appends one line per Read with no dedup, so the file grows
+// by REPEATED lines — a session re-reading the same five files forever. The first draft
+// compared the DISTINCT set against the cap, which is the quantity that stays tiny
+// (measured on the live corpus: median 1, p95 6, max 21 carried paths), so the valve could
+// not fire on the growth mode it exists to bound. That is this repo's recurring
+// "predicate that cannot return true reports the defect as absent" shape, and the pre-tag
+// review caught it here.
+//
+// Still a backstop and not a relevance bound — the same distinction
+// IMPERATIVE_POOL_BACKSTOP documents for its pool.
+const READS_CARRY_MAX_LINES = 20000;
 
+/**
+ * Bound the reads file when an insignificant flush leaves it in place. Rewrites it only
+ * when it is over READS_CARRY_MAX_LINES raw lines, keeping the newest distinct paths.
+ *
+ * @param {string} readsFile
+ * @returns {number} distinct paths now held; 0 when there is no reads file (the COMMON
+ *   case — no Read since the last collect); -1 only when the file exists but could not be
+ *   read or the trim threw. The three-way split is the point: `episode_reads` is the ruler
+ *   for this flag, and folding "nothing to hold" together with "could not look" would put
+ *   the normal case and the broken case on the same value. A first draft returned -1 for
+ *   both, which made -1 the overwhelmingly common reading and hid the failure inside it.
+ */
+function trimReadsFile(readsFile) {
+  let raw;
+  try {
+    raw = readFileSync(readsFile, 'utf8');
+  } catch (e) {
+    return e?.code === 'ENOENT' ? 0 : -1;
+  }
+  try {
+    const lines = raw.split('\n').filter(Boolean);
+    const paths = [...new Set(lines)];
+    if (lines.length <= READS_CARRY_MAX_LINES) return paths.length;
+    const keep = paths.slice(-READS_CARRY_MAX_LINES);
+    const tmp = readsFile + `.trim-${process.pid}`;
+    writeFileSync(tmp, keep.join('\n') + '\n', { mode: 0o600 });
+    renameSync(tmp, readsFile);
+    return keep.length;
+  } catch {
+    return -1;
+  }
+}
+
+function flushEpisodeWithDb(db, episode, hookEventName) {
   // Split by CC session so concurrent same-project sessions flush as separate
   // observations. planEpisodeFlush returns [episode] BY REFERENCE for the common
   // single-session (or all-legacy) case → flushEpisodeGroup(episode) is identical
   // to pre-grouping. Two+ interleaved sessions each get their own sub-episode.
   const subs = planEpisodeFlush(episode);
+
+  // D#178. The reads file used to be consumed right here, unconditionally, BEFORE
+  // anything knew whether this flush would persist an observation — and an
+  // insignificant flush then dropped every path it had just swept up, leaving the
+  // next observation that DID save with files_read = []. Measured over 1122 real
+  // transcripts (benchmark/episode-flush-replay.mjs): 42.2% of the reads a flush
+  // consumed died that way, and 72.7% of significant flushes carried none at all.
+  //
+  // The fix is an ORDERING, not a buffer: explainSignificance reads only `entries`
+  // and `files`, never `filesRead`, so the verdict is available before the file is
+  // touched. An insignificant flush now leaves the file alone and the next
+  // significant one collects the union. Ages measured on the same corpus: the reads
+  // that survive attach a median 1.7 minutes and p90 10.1 minutes later than they do
+  // today, which is the whole cost — a read carried across two insignificant flushes
+  // lands on the edit it preceded rather than on nothing.
+  //
+  // ON by default since v3.83.0. `CLAUDE_MEM_READS_CARRY=0` restores the pre-D#178
+  // behavior byte for byte — kept as an off switch because this changes what a released
+  // artifact stores, and a defect here is invisible from the outside (the symptom is an
+  // absent field, which reads exactly like "there was nothing to record").
+  const carryReads = !['0', 'off', 'false', 'no'].includes(
+    String(process.env.CLAUDE_MEM_READS_CARRY ?? '').toLowerCase());
+  const willPersist = !carryReads || subs.some((s) => episodeHasSignificantContent(s));
+
+  // Collect Read file paths tracked by post-tool-use.sh
+  // Use rename to atomically collect — prevents losing concurrent appends
+  const readsFile = join(RUNTIME_DIR, `reads-${episode.project || inferProject()}.txt`);
+  const readsCollect = readsFile + `.collect-${Date.now()}`;
+  let readsHeld = 0;
+  if (willPersist) {
+    try {
+      renameSync(readsFile, readsCollect);
+      const raw = readFileSync(readsCollect, 'utf8');
+      const paths = [...new Set(raw.split('\n').filter(Boolean))];
+      episode.filesRead = paths;
+      try { unlinkSync(readsCollect); } catch {}
+    } catch {
+      episode.filesRead = episode.filesRead || [];
+    }
+  } else {
+    episode.filesRead = [];
+    // Not collecting means the file keeps growing across an insignificant streak, and a
+    // project that never flushes significantly would grow it without bound. Trim it.
+    //
+    // The trim's race window is WIDER than the collect path's, and saying otherwise (the
+    // first draft did) is the kind of comfortable claim that stops anyone checking: the
+    // collect path is a single atomic `renameSync`, while this is read → dedup → write tmp
+    // → rename, and a `>>` append from the bash prefilter landing inside that span is lost
+    // to the final rename. Accepted rather than fixed: the trim only runs above
+    // READS_CARRY_MAX_LINES, which no observed session approaches, so the exposure is a
+    // path or two in a session that has already read 20000 times.
+    readsHeld = trimReadsFile(readsFile);
+  }
+  // planEpisodeFlush now runs BEFORE the collection, so the multi-session branch — the
+  // one that builds fresh objects rather than returning [episode] by reference — copied
+  // whatever filesRead the buffer happened to carry, not what was just collected. The
+  // single-group path is identity and unaffected; this line is what keeps the two paths
+  // saying the same thing, and without it concurrent same-project sessions would lose
+  // their reads while a solo session kept them.
+  for (const sub of subs) if (sub !== episode) sub.filesRead = episode.filesRead;
+
   let anySignificant = false;
+  let writefail = false;
   for (const sub of subs) {
     const r = flushEpisodeGroup(sub, db);
     if (r === 'writefail') {
@@ -245,11 +342,38 @@ function flushEpisodeWithDb(db, episode, hookEventName) {
       // keep the rest. The asymmetry is safe: each group's immediate obs is persisted
       // BEFORE its flush-file write, so re-flushing the whole buffer would re-emit
       // already-saved groups as duplicate observations.
-      if (subs.length === 1) return;
+      if (subs.length === 1) { writefail = true; break; }
       continue;
     }
     if (r === 'significant') anySignificant = true;
   }
+
+  // D#178 instrument, and the ruler for the flag above. With CLAUDE_MEM_READS_CARRY
+  // off, a row with `significant: false` and `readsConsumed > 0` is that many Read
+  // paths collected and dropped on the floor. With it on, those rows become
+  // `readsConsumed: 0, readsHeld: N` — the same event, now recording a deferral
+  // instead of a loss, so one query over this sink covers both arms.
+  // Emitted HERE and not in flushEpisodeGroup on purpose: planEpisodeFlush copies
+  // the SAME filesRead array into every sub, so a per-group counter double-counts
+  // the multi-session case, and the destroyed/kept decision is `anySignificant`,
+  // which only exists at this level. `writefail` is its own arm because on the SIGNIFICANT
+  // path it keeps the episode buffer for a retry the reads file can no longer serve — it
+  // was already unlinked, so the retry re-collects nothing. A writefail flush is NOT
+  // necessarily one whose significance said collect: `flushEpisodeGroup` writes its flush
+  // file outside the significance branch, so an insignificant flush can fail there too —
+  // and with the flag on that case is strictly better than before, because the reads file
+  // was never touched and the retry still finds it.
+  // Off unless CLAUDE_MEM_METRICS=1, like every other row in this sink.
+  recordMetric(join(RUNTIME_DIR, '..'), {
+    event: 'episode_reads',
+    readsConsumed: (episode.filesRead || []).length,
+    readsHeld,
+    carry: carryReads,
+    significant: anySignificant,
+    subs: subs.length,
+    writefail,
+  });
+  if (writefail) return;
 
   // Aggregate receipt over the whole episode, gated exactly as before
   // (isSignificant → anySignificant). v2.33.4: Stop rejects hookSpecificOutput.
@@ -807,6 +931,19 @@ async function handleStop() {
       // applyCitationDecay checks separately.
       try {
         if (transcriptPath && !process.env.CLAUDE_MEM_NO_CITATION_TRACK) {
+          // D#152/D#177: the `subagent` face, collected ONCE, up front, and used twice —
+          // by the decay block below (only under CLAUDE_MEM_SUBAGENT_DECAY) and by its own
+          // metering call at the tail. It used to be collected at the tail only, with a
+          // comment saying the position was load-bearing because lib/transcript-scan.mjs
+          // memoizes ONE file and reading the sidechains evicts the parent. That constraint
+          // is real but it is not "last" — it is "not BETWEEN two parent scans". Running it
+          // FIRST parses the sidechains before anything has memoized the parent, so the
+          // parent is then parsed once and stays memoized for every scanner after it:
+          // still one parent parse per Stop, the property the tail comment was protecting.
+          let sub = { injected: new Set(), cited: new Set(), files: 0 };
+          try { sub = collectSubagentSurface(transcriptPath); }
+          catch (e) { debugCatch(e, 'handleStop-subagent-collect'); }
+
           const ids = extractCitationsFromTranscript(transcriptPath);
           if (ids.size > 0) {
             const n = bumpCitationAccess(db, ids, project);
@@ -854,7 +991,15 @@ async function handleStop() {
             const keyCtxIds = extractInjectedFromKeyContext({
               runtimeDir: RUNTIME_DIR, project, sessionId: ccSessionId,
             });
-            if (injected.size > 0 || keyCtxIds.size > 0) {
+            // D#177: `sub.injected` counts toward the entry gate when the face is admitted.
+            // Without this a session whose ONLY injection was a dispatched agent's prompt
+            // would return here with injected.size === 0 and the face would be "in the
+            // denominator" in name only — the failure mode where a face is wired at one
+            // level and gated out at another, which is how UPS went unmetered for a whole
+            // minor version.
+            const subDecayOn = !['0', 'off', 'false', 'no'].includes(
+              String(process.env.CLAUDE_MEM_SUBAGENT_DECAY ?? '').toLowerCase());
+            if (injected.size > 0 || keyCtxIds.size > 0 || (subDecayOn && sub.injected.size > 0)) {
               // Text-floor gate: skip decay on tool-only Stops. Without this,
               // a turn that ends on tool_use locks every injected obs as
               // uncited (last_decided_session_id set), so a later turn that
@@ -867,17 +1012,71 @@ async function handleStop() {
               } else {
                 const citedMain = extractCitationsFromTranscript(transcriptPath, { mainOnly: true });
                 for (const id of citeBackIds) citedMain.add(id);
+                // D#177: admit the `subagent` face to the decay loop. It cannot ride the
+                // normal path because its injection lands in a dispatched agent's PROMPT
+                // and its citation lands in that agent's OWN transcript — so its ids enter
+                // the denominator AND its receiver-attributed cites enter the numerator,
+                // asymmetrically, together. Feeding only the first half would mark every
+                // subagent-only injection uncited by construction (that is why the face was
+                // metered-but-excluded since v3.77); feeding only the second half would
+                // credit the main-thread faces for citations the main thread never made.
+                //
+                // `sub.cited` is already the per-FILE intersection with `sub.injected`
+                // (collectSubagentSurface), so this cannot credit an id the subagent surface
+                // did not itself inject. Measured on the live corpus (1122 transcripts, 34
+                // subagent-bearing sessions): 33 marginal (session,id) pairs enter the
+                // denominator, 21.2% of them cited; 21 distinct observations behind the
+                // uncited ones, FIVE at uncited_streak = 2. Four are 3->2 down-ranks (#8597,
+                // #8847 with cited_count 56, #8948, #10246). At 2026-08-25 18:00Z #10716 was
+                // at importance 2 — one miss from a 2->1 eviction out of
+                // rankImperativeCandidates' own `importance >= 2` pool, the case
+                // IMPERATIVE_POOL_BACKSTOP does not cover, and the reason "down-ranks, not
+                // evictions" is wrong as a blanket claim. That row has since been promoted by
+                // the very session that documented it (D#179: this loop cannot tell writing
+                // `#NN` from applying it), so re-check the CLASS, not the row.
+                // Cross-crediting is 3 pairs of 1181 DISTINCT (session,id) across the five
+                // decay faces inside subagent-bearing sessions (0.25%), or 3 of 2738 the same
+                // way corpus-wide (0.11%) — ids the main thread never cited but a subagent did.
+                //
+                // ON by default since v3.83.0; `CLAUDE_MEM_SUBAGENT_DECAY=0` restores the
+                // metered-but-never-decaying state the face sat in from v3.77 to v3.82.
+                //
+                // The denominator is a COPY, not a mutation of `injected`: the edge
+                // attribution below takes `mainInjectedIds: injected` to keep sidechain-only
+                // injections from accruing file-edge misses (review D#78), and folding the
+                // subagent ids into that set would undo exactly that guard.
                 // The promotion-only half: a Key Context row the agent actually
                 // cited joins the decay set (and takes the promote branch); one
                 // it ignored is never entered, so it cannot streak or demote.
                 for (const id of keyCtxIds) if (citedMain.has(id)) injected.add(id);
+                // BOTH halves of the merge are COPIES, built AFTER the keyctx promotion above
+                // so they carry it too. When the flag is off each IS the original object, so
+                // every consumer below is byte identical to the pre-D#177 path.
+                //
+                // The copies are the whole safety property. `injected` and `citedMain` have
+                // four consumers between them and only `applyCitationDecay` should see the
+                // subagent ids; the first draft of this change mutated `citedMain` in place
+                // and the pre-tag review measured both leaks it caused:
+                //   • recordCitationSurfaces (below) scored a `pretool` row the main thread
+                //     never cited as a pretool HIT — `pretool.cited_n` 0 -> 1 on a
+                //     two-observation probe. That is the caliber CLAUDE.md publishes for the
+                //     funnel ("cited as #NN in the session's own MAIN-THREAD text"), so it
+                //     would have made citation_surface_log and citation-live-replay.mjs
+                //     permanently different rulers — the v3.81.0 cross-agent defect, mirrored.
+                //   • resolveEdgeAttribution gates sidechain edges on
+                //     `!mainInjected.has(id) && !cited.has(id)`, so a file edge flipped MISS
+                //     -> HIT (`miss_streak` 1 -> 0). The comment there defends the DENOMINATOR
+                //     half of that gate and says nothing about the numerator, which is exactly
+                //     how the leak got past a reading of it.
+                const decayInjected = subDecayOn ? new Set([...injected, ...sub.injected]) : injected;
+                const decayCited = subDecayOn ? new Set([...citedMain, ...sub.cited]) : citedMain;
                 // D#60: the idempotency key must be the CC session UUID, NOT the
                 // project-scoped memory sessionId — concurrent same-project CC
                 // sessions share the latter, so the second session's decay pass
                 // read "already decided" and silently undercounted decay_seen /
                 // streaks / adoption denominators. Fallback keeps legacy
                 // stdin-less invocations on the old key.
-                const r = applyCitationDecay(db, project, injected, citedMain, ccSessionId || sessionId);
+                const r = applyCitationDecay(db, project, decayInjected, decayCited, ccSessionId || sessionId);
                 debugLog('DEBUG', 'handleStop', `citation-decay: touched=${r.touched} promoted=${r.promoted} demoted=${r.demoted}`);
                 // R1: persist this session's invocation→cite funnel row. touched =
                 // obs resolved this run (denominator), promoted = obs cited this run
@@ -968,11 +1167,19 @@ async function handleStop() {
           // construction; folding its cites INTO citedMain would credit the
           // main-thread faces for citations the main thread never made. The
           // upsert key is (project, session, surface), so two calls with
-          // disjoint face sets do not collide. Metering only — `subagent` is in
-          // NON_ATTACHMENT_SURFACES and never reaches applyCitationDecay.
+          // disjoint face sets do not collide.
           //
-          // Placed LAST on purpose: lib/transcript-scan.mjs memoizes ONE file,
-          // so reading the sidechain files evicts the parent transcript. Run
+          // SINCE v3.83.0 (D#177) this is no longer metering-only: the face DOES reach
+          // applyCitationDecay, through the `decayInjected` / `decayCited` copies above.
+          // The sentence above about folding cites into `citedMain` still holds and is the
+          // reason those are copies — this call, `resolveEdgeAttribution` and the keyctx
+          // promotion all keep the un-widened set. `CLAUDE_MEM_SUBAGENT_DECAY=0` returns
+          // the face to metering-only.
+          //
+          // The "placed LAST" note below is now historical: `collectSubagentSurface` runs
+          // at the HEAD of this block (the decay loop needs its result), and `sub` here is
+          // that same object rather than a second call. The parse-count property the note
+          // defends is unchanged — see the comment at the collection site.
           // earlier, this block costs ONE extra parse of the parent — the memo
           // re-caches on the first re-read, so it is one, not one per later
           // scanner — and breaks the "one parse per Stop" property the block
@@ -985,7 +1192,9 @@ async function handleStop() {
           // must not enter the funnel's session denominator either.
           try {
             if (hasMainThreadAssistantText(transcriptPath)) {
-              const sub = collectSubagentSurface(transcriptPath);
+              // `sub` is the one collected at the top of this block — a second
+              // collectSubagentSurface call here would re-parse every sidechain file and,
+              // worse, could disagree with the set the decay loop above just scored.
               if (sub.injected.size > 0) {
                 recordCitationSurfaces(db, project, ccSessionId || sessionId,
                   { subagent: sub.injected }, sub.cited);

@@ -105,6 +105,45 @@ const EDGE_DECAY_K = Math.max(1, Number.isNaN(EDGE_DECAY_K_RAW) ? 3 : EDGE_DECAY
 // environment-scoped observations (tooling/CI/network gotchas that apply in
 // ANY project) stop firing on FILE-triggered recall; they stay reachable via
 // search / UPS / error-recall. NULL scope (legacy / manual rows) always passes.
+//
+// DO NOT TURN THIS ON, AND DO NOT REBUILD IT AS A DOWN-WEIGHT (D#153, closed
+// 2026-08-25). Its premise is that environment-scoped rows are the low-relevance
+// class on THIS face. Measured on the live corpus with the shipped extractors —
+// `node benchmark/citation-live-replay.mjs --by-scope`, 1122 transcripts — the
+// `pretool` face (this one) cites:
+//   environment 47.5% (67/141)  CI [39.5, 55.7]
+//   project     44.3% (293/661) CI [40.6, 48.1]
+//   file        40.0% (2/5)  ·  (gone) 37.1% (185/498)  ·  module 36.5% (31/85)
+//   (null)      34.9% (45/129)          ·  face overall 41.0% (623/1519)
+// environment is the best-citing scope bucket on the face the filter gates. The
+// CIs for environment and project OVERLAP, so "environment leads" is NOT
+// established; what is refuted is "environment is the class to suppress".
+// Its interval sits above module and null, which is the comparison that matters
+// for a lever whose whole premise is that this bucket is the weak one.
+//
+// The earlier redesign sketch (multiplicative demotion at the TYPE_QUALITY layer
+// instead of a WHERE-clause exclusion) fixes the failure mode that was measured
+// in 2026-08 — 173 recall groups going empty — but it would still down-rank this
+// bucket, so it was NOT built. Kept as an off switch rather than deleted: the
+// column and the label are used elsewhere, and a flag nobody flips costs nothing
+// as long as the reason not to flip it is written down, which is this paragraph.
+//
+// NOT corroborated by #10720, though an earlier draft of this note said so. That
+// observation is a scope LABEL distribution (364 labelled DB rows: project 184 /
+// environment 114 / module 50 / file 16), which establishes the filter's blast
+// radius — environment is 31.3% of labels, not the near-no-op it looked like at 8
+// rows — and says nothing about relevance. The refutation rests on the by-scope
+// replay alone.
+//
+// Caliber caveat, so the numbers are re-derivable rather than quotable: the six
+// buckets sum to exactly 1519, the face's own pair count, because 498 ids whose
+// observation has since left the table are reported as `(gone)` rather than
+// dropped. Those are an OLD cohort (max id 8880 against a corpus reaching 10850)
+// from id bands where the surviving population is ~81% `(null)` and ~2.5%
+// environment, so the missing bucket cannot plausibly be environment-heavy;
+// environment and project pairs sit in the same bands, so the head-to-head is not
+// era-confounded. The `(null)` bucket and the face-overall figure ARE, being
+// dominated by legacy rows.
 const SCOPE_FILTER_ON = ['1', 'on', 'true', 'yes'].includes(
   String(process.env.CLAUDE_MEM_SCOPE_FILTER || '').toLowerCase());
 const FILE_INTEL_MIN_TOKENS = Math.max(1,

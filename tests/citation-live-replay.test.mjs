@@ -17,6 +17,7 @@ import {
   aggregate,
   assertFaceCoverage,
   assertRulerCanSayNo,
+  byScope,
 } from '../benchmark/citation-live-replay.mjs';
 import { wilson95 } from '../benchmark/wilson.mjs';
 import { CITATION_SURFACES } from '../lib/citation-tracker.mjs';
@@ -170,6 +171,43 @@ describe('aggregate', () => {
     const [row] = aggregate(recs);
     expect(row.pairs).toBe(3);
     expect(row.silentPairs).toBe(2);
+  });
+});
+
+// D#153's ruler. The failure this case is built to catch is a bucketing that quietly drops
+// pairs: a scope breakdown whose buckets do not sum to the face's own pair count is
+// comparing rates over populations that are not the face, and the FIRST thing that goes
+// missing in practice is the id whose row has since left the table. So the fixture
+// deliberately contains one such id, and the assertions pin BOTH the per-bucket rates and
+// the sum. A `scopeOf` that returned only known scopes (dropping the unknown) would keep
+// every rate below identical and fail only on the sum — which is why the sum is asserted.
+describe('byScope (D#153 — is `environment` the low-relevance class on the file face?)', () => {
+  const scopeOf = (id) => ({ 1: 'environment', 2: 'environment', 3: 'project' }[id] ?? '(gone)');
+  const recs = [
+    // env: 1 cited / 2 injected. project: 1/1. gone: 0/1.
+    { project: 'p', session: 's1', ts: 1, anyCite: true, faces: { pretool: { inj: [1, 2, 3, 99], hit: [1, 3] } } },
+  ];
+
+  it('rates each scope over its OWN pairs, and the buckets sum to the face total', () => {
+    const rows = byScope(recs, scopeOf);
+    const get = (scope) => rows.find((r) => r.face === 'pretool' && r.scope === scope);
+    expect(get('environment')).toMatchObject({ pairs: 2, cited: 1, rate: '50.0%' });
+    expect(get('project')).toMatchObject({ pairs: 1, cited: 1, rate: '100.0%' });
+    // The row whose observation is gone from the DB is bucketed, never dropped.
+    expect(get('(gone)')).toMatchObject({ pairs: 1, cited: 0 });
+    expect(rows.reduce((a, r) => a + r.pairs, 0),
+      'the scope buckets do not sum to the face pair count — some pairs were silently dropped')
+      .toBe(aggregate(recs)[0].pairs);
+  });
+
+  it('keeps faces separate — a scope rate must not pool two faces', () => {
+    const two = [{
+      project: 'p', session: 's1', ts: 1, anyCite: true,
+      faces: { pretool: { inj: [1], hit: [1] }, ups: { inj: [2], hit: [] } },
+    }];
+    const rows = byScope(two, scopeOf);
+    expect(rows.find((r) => r.face === 'pretool' && r.scope === 'environment')).toMatchObject({ pairs: 1, cited: 1 });
+    expect(rows.find((r) => r.face === 'ups' && r.scope === 'environment')).toMatchObject({ pairs: 1, cited: 0 });
   });
 });
 

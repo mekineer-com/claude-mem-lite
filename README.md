@@ -827,7 +827,8 @@ benchmark and A/B harness are calibrated against — changing them invalidates t
 | `CLAUDE_MEM_AUTO_DEEP` | `0` disables automatic deep-search escalation (one Haiku call rewriting a weak query into keyword/concept/HyDE variants). Explicit `deep: true` still works. | _(auto)_ |
 | `CLAUDE_MEM_AUTO_DEEP_CLI` | `0` disables the same auto-escalation on the CLI path only. | _(auto)_ |
 | `CLAUDE_MEM_VECTORS` | `1` re-enables the persisted TF-IDF vector arm (off by default; also needs a vector rebuild via `maintain`). | _(off)_ |
-| `CLAUDE_MEM_SCOPE_FILTER` | `1` stops environment-scoped observations from firing on file-triggered recall. They stay reachable via search. | _(off)_ |
+| `CLAUDE_MEM_SCOPE_FILTER` | `1` stops environment-scoped observations from firing on file-triggered recall. They stay reachable via search. **Leave it off**: on the face it gates, `environment` is not the low-relevance class its premise assumes — it cites at least as well as `project` (47.5% vs 44.3%, intervals overlapping), and an earlier measurement left 173 recall groups empty with it on. | _(off)_ |
+| `CLAUDE_MEM_READS_CARRY` | An episode flush collects `reads-<project>.txt` only when it will actually save an observation, so a flush that records nothing no longer discards the Read paths it swept up (42.2% of the paths a flush consumed, measured over 1122 transcripts). `0` restores the pre-v3.83.0 behaviour. | _(on)_ |
 
 ### Citation tracking and feedback
 
@@ -840,6 +841,7 @@ benchmark and A/B harness are calibrated against — changing them invalidates t
 | `CLAUDE_MEM_CITE_NUDGE_THRESHOLD` | Cite-rate below which the nudge fires. | `0.6` |
 | `CLAUDE_MEM_CITE_NUDGE_MIN_INJECTED` | Minimum injection volume before the ratio gate is judged at all. | `5` |
 | `CLAUDE_MEM_CITE_NUDGE_SILENCE_AFTER` | Consecutive low-cite sessions before the nudge goes quiet; `0` = never silence. | `3` |
+| `CLAUDE_MEM_SUBAGENT_DECAY` | The `subagent` injection face feeds the decay loop: memories handed to a dispatched agent enter the denominator, and the citation that agent makes in its own transcript counts as the numerator. `0` returns the face to metered-but-never-decaying (v3.77–v3.82). | _(on)_ |
 | `CLAUDE_MEM_METRICS` | `1` records feature-injection counters surfaced by `claude-mem-lite stats`. | _(off)_ |
 
 ### Background work

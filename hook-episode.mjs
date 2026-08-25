@@ -328,16 +328,30 @@ const RESEARCH_ENTRY_THRESHOLD = 8;
  * 05-24, hooks/hooks.json byte-identical from 04-22 to 05-10, and EPISODE_BUFFER_SIZE /
  * EPISODE_TIME_GAP_MS / isRelatedToEpisode untouched since 2026-02-11.
  *
- * WHAT ACTUALLY SETS THE RATE (probed, not read): a flush consumes reads-<project>.txt
- * unconditionally (hook.mjs:222-232) but only PERSISTS it when the episode is significant
+ * WHAT ACTUALLY SET THE RATE (probed, not read): a flush consumed reads-<project>.txt
+ * unconditionally but only PERSISTED it when the episode was significant
  * (flushEpisodeGroup saves on `isSignificant`, and unlinks the flush file otherwise). So a
- * buffered-but-insignificant flush — a successful `npm test` on its own, say — swallows every
- * Read accumulated since the previous flush and writes none of them anywhere. Measured in a
+ * buffered-but-insignificant flush — a successful `npm test` on its own, say — swallowed every
+ * Read accumulated since the previous flush and wrote none of them anywhere. Measured in a
  * sandbox: seed 2 Reads, fire one such flush, and 0 observations are saved, the reads-file is
- * gone, and the NEXT (edit-bearing, significant) observation carries `files_read=[]`. With
- * ~4-8% of flushes significant, a 1-10% landing rate needs no code change to explain — which
- * is why there is none to find. Tracked as D#178; the fix is a released-artifact behaviour
- * change, so it is not made here.
+ * gone, and the NEXT (edit-bearing, significant) observation carries `files_read=[]`.
+ *
+ * PAST TENSE SINCE v3.83.0: D#178 is FIXED. `flushEpisodeWithDb` now decides significance
+ * before it touches the file, and an insignificant flush leaves it in place for the next
+ * saving one (`CLAUDE_MEM_READS_CARRY=0` restores the old order). Two numbers in the
+ * paragraph above were also wrong and are corrected here rather than left to be re-quoted:
+ * the significant share is ~59%, not "~4-8%" — the `episode_significance` meter reads 40.7%
+ * INsignificant over n=938 across three active days — and the 92-96% figure D#178 was filed
+ * on came from the same slip. What the loss actually was, replayed over 1122 real
+ * transcripts through this file's own batcher (`benchmark/episode-flush-replay.mjs`):
+ * 42.2% of the Read paths a flush consumed destroyed, 72.7% of significant flushes
+ * carrying none. Same measurement pass as CHANGELOG v3.83.0, CLAUDE.md and README — quoting
+ * a second pass here would be the stitched-across-runs error one file at a time.
+ *
+ * The D#171 conclusion below is UNAFFECTED and that is worth stating explicitly, because
+ * the fix moves the quantity its arithmetic used. Post-fix the carried distinct set runs
+ * median 1, p95 6, max 21 per delivering flush — still nowhere near rule 4's threshold of
+ * 8 on a per-EPISODE basis, and rule 4 does not read this field anyway.
  *
  * Note the first version of that probe used `echo hello` as its "insignificant" entry.
  * detectBashSignificance drops it, so the episode had zero entries, flushEpisode
@@ -354,13 +368,21 @@ const RESEARCH_ENTRY_THRESHOLD = 8;
  * EXACTLY ONE claim above is pinned by a test, and deliberately so (D#175). Every number
  * here is a corpus measured at a timestamp — a test over those would be a snapshot that
  * rots and gets edited into greenness. The per-FLUSH claim is different in kind: it is a
- * property of code (hook.mjs:222-232 renames the reads-file aside, then unlinks the copy),
- * and if someone later makes reads accumulate across flushes, every "out of reach at ~1
- * Read per episode" sentence above silently becomes false. That is the one this closure
- * rests on, so `tests/feature-sweep-hooks.test.mjs` → "the reads-file is consumed, not
- * accumulated (D#175)" drives two real flushes through the subprocess and asserts the
- * second one starts empty. Rename-becomes-copy and the dropped unlink are separate
- * mutations caught by separate assertions there — one does not cover the other.
+ * property of code (the reads-file is renamed aside, then the copy is unlinked), and if
+ * someone later makes reads accumulate across flushes, every "out of reach at ~1 Read per
+ * episode" sentence above silently becomes false. That is the one this closure rests on,
+ * so `tests/feature-sweep-hooks.test.mjs` → "the reads-file is consumed, not accumulated
+ * (D#175)" drives two real flushes through the subprocess and asserts the second one starts
+ * empty. Rename-becomes-copy and the dropped unlink are separate mutations caught by
+ * separate assertions there — one does not cover the other.
+ *
+ * THAT ALARM DID NOT FIRE FOR D#178, and the reason is worth keeping. Both of its flushes
+ * are SIGNIFICANT (each buffers a `.sql` Write), so both take the collect branch under the
+ * new order too — the v3.83.0 change walked straight underneath a guard installed one
+ * commit earlier to catch exactly "reads accumulate across flushes". Its sibling cases in
+ * the same file now cover the insignificant arm, in both flag positions and in the
+ * multi-session shape; a per-flush guard whose fixture only ever exercises one arm of the
+ * branch it guards is covering the arm nobody was going to change.
  *
  * @param {object} episode
  * @returns {{significant: boolean, rule: 1|2|3|4|null, readCount: number,
