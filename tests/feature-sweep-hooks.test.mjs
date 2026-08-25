@@ -76,7 +76,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn } from 'child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
@@ -704,6 +704,108 @@ describe('hook feature sweep: hook.mjs foreground events', () => {
       (stdin, malCwd) => hookEvent('pre-compact', { cwd: malCwd, stdin }),
     );
   });
+});
+
+// ─── episode.filesRead is a per-FLUSH slice, not a per-episode total (D#175) ────────
+// The one link in D#171's won't-fix chain that is a property of CODE rather than of a
+// corpus at a timestamp: flushEpisodeWithDb RENAMES reads-<project>.txt aside and then
+// UNLINKS the collected copy on every flush (hook.mjs:222-232), so `episode.filesRead`
+// only ever carries the Reads since the LAST flush. Every other figure in that docblock
+// (1861 Reads / 0.98 per episode / 1.8% of rows non-empty) is a measurement and correctly
+// ships as prose — a test over those would be a snapshot that rots. This one is different:
+// make the collect a copy instead of a rename and the whole "a threshold of 8 is out of
+// reach at ~1 Read per episode" rationale becomes false while nothing goes red.
+//
+// Not hypothetical hygiene. D#174 records that this exact axis already moved silently
+// once: files_read fed the threshold on 44-60% of rows for three straight months and
+// collapsed to 6.2% in 2026-05, cause never identified. This is the alarm that was
+// missing then.
+//
+// SHAPE — the discriminating pair is flush 1 vs flush 2, and flush 1 is not decoration.
+// Asserting only "flush 2 read nothing" passes just as well when the seeding never worked
+// at all, which is v3.79.0's "my assertion was satisfied by another cause" repeated; so
+// flush 1 must first prove both seeded paths reached the row.
+//
+// TWO INDEPENDENT MUTATIONS, because one assertion does not cover both statements:
+//   copy instead of rename  → flush 2 inherits the same paths  → the files_read equality fails.
+//   drop the unlinkSync     → flush 2 is STILL empty (the residue is named .collect-<ts>,
+//                             which no flush looks for) → only the residue sweep fails.
+
+describe('hook flush: the reads-file is consumed, not accumulated (D#175)', () => {
+  it('a flush consumes reads-<project>.txt and the next flush starts empty', async () => {
+    const NAME = 'hs-readslice';
+    const cwd = workDir(NAME);
+    const project = projectOf(NAME);
+    const readsFile = join(RUNTIME_DIR, `reads-${project}.txt`);
+    const readsResidue = () => readdirSync(RUNTIME_DIR).filter((f) => f.startsWith(`reads-${project}`));
+
+    // The Read paths must differ from the file each episode WRITES: buildImmediateObservation
+    // subtracts modified files back out of filesRead (hook-llm.mjs:602), so reusing one name
+    // would empty the row for a reason that has nothing to do with the rename.
+    const readA = join(cwd, 'alpha-config.mjs');
+    const readB = join(cwd, 'beta-config.mjs');
+
+    // (1) Seed through the REAL bash prefilter — the only writer of this file, and the
+    // reason a Read never reaches Node at all (scripts/post-tool-use.sh:49-93).
+    for (const p of [readA, readB]) {
+      const r = await bashPrefilter({
+        cwd,
+        stdin: JSON.stringify({ session_id: 'cc-readslice-1', tool_name: 'Read', tool_input: { file_path: p } }),
+      });
+      expect(r.code, `post-tool-use.sh exited ${r.code}\n${r.stderr}`).toBe(0);
+    }
+    // Both halves of the seed asserted before anything downstream runs: a silently absent
+    // reads file would make every later assertion in this case vacuous.
+    expect(existsSync(readsFile), 'the bash prefilter wrote no reads file — the rest of this case would assert nothing').toBe(true);
+    expect(readFileSync(readsFile, 'utf8').split('\n').filter(Boolean)).toEqual([readA, readB]);
+
+    /** Buffer one significant Write, then Stop — the real flush path. */
+    async function writeThenFlush(session, schemaFile) {
+      // `…schema.sql` clears the write-side noise gate at rule importance 2, exactly as the
+      // `hook.mjs stop` case above relies on; a dropped row would leave nothing to read.
+      const post = await hookEvent('post-tool-use', {
+        cwd,
+        stdin: JSON.stringify({
+          session_id: session, tool_name: 'Write',
+          tool_input: { file_path: schemaFile, content: 'CREATE TABLE widgets (id INTEGER);\n' },
+          tool_response: `File created successfully at: ${schemaFile}`,
+        }),
+      });
+      expect(post.code, `post-tool-use exited ${post.code}\n${post.stderr}`).toBe(0);
+      expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(true);
+
+      const stop = await hookEvent('stop', {
+        cwd, stdin: JSON.stringify({ session_id: session, transcript_path: join(ROOT, 'no-such-transcript.jsonl') }),
+      });
+      expect(stop.code, `stop exited ${stop.code}\n${stop.stderr}`).toBe(0);
+      expect(existsSync(join(RUNTIME_DIR, `ep-${project}.json`))).toBe(false);
+
+      const row = withDb((db) => db.prepare(
+        'SELECT title, files_read, files_modified FROM observations WHERE project = ? AND files_modified LIKE ? ORDER BY id DESC LIMIT 1',
+      ).get(project, `%${schemaFile.split('/').pop()}%`));
+      expect(row, `no observation flushed for ${schemaFile}`).toBeTruthy();
+      return row;
+    }
+
+    // (2) First flush: it carries the seeded Reads …
+    const first = await writeThenFlush('cc-readslice-1', join(cwd, 'alpha-schema.sql'));
+    expect(JSON.parse(first.files_read)).toEqual([readA, readB]);
+
+    // … and consumed the file rather than reading it in place.
+    expect(existsSync(readsFile), 'the flush left reads-<project>.txt in place — filesRead would accumulate across flushes').toBe(false);
+    // The rename target too: a collect copy left behind is an unswept per-flush file that
+    // grows forever and leaks captured paths, and the emptiness assertion below cannot see it.
+    expect(readsResidue(), 'the flush left reads-file residue in RUNTIME_DIR').toEqual([]);
+
+    // (3) Second flush with no intervening Read — the assertion that actually pins the
+    // per-flush semantics. A row IS produced (files_modified proves it), and its read set
+    // is empty rather than inheriting round 1's.
+    const second = await writeThenFlush('cc-readslice-2', join(cwd, 'beta-schema.sql'));
+    expect(second.files_modified).toContain('beta-schema.sql');
+    expect(JSON.parse(second.files_read),
+      'the second flush inherited the first flush\'s Reads — filesRead is no longer a per-flush slice, and D#171\'s closure rationale is void').toEqual([]);
+    expect(readsResidue()).toEqual([]);
+  }, 60000);
 });
 
 // ─── hook.mjs: the background workers (spawnBackground / detached) ──────────────────

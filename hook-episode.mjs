@@ -314,17 +314,53 @@ const RESEARCH_ENTRY_THRESHOLD = 8;
  *     2026-08    20/ 193  10.4%   >=8:  0
  *     lifetime reaching >=8: 81
  *
- * For three consecutive months this field fed the threshold at a real rate. It collapsed in
- * 2026-05 and the cause is NOT identified. That regime break is the single most useful fact
- * here, because it is direct evidence for the conclusion rather than against it: the
- * reachable input is the episode BOUNDARY, not the threshold and not the field, and the
- * boundary demonstrably moved once already.
+ * For three consecutive months this field fed the threshold at a real rate. The break is
+ * sharp: 2026-05-08 reads 11%, 05-09 onward reads 0.
+ *
+ * "THE REACHABLE INPUT IS THE EPISODE BOUNDARY" WAS WRONG — D#174 investigated it and the
+ * boundary never moved. One query falsifies the whole family of boundary explanations:
+ * measure the SIBLING column the same producer writes. `files_modified` is non-empty on
+ * 85-98% of rows every month from 2026-02 through 2026-08, averaging 2.0-2.6 paths, and it
+ * does not so much as dip across the break — while `files_read` goes 60% -> 1%. Episodes
+ * still carry ~2 edits each; they just stopped carrying reads. A smaller boundary would have
+ * taken both columns down together. Consistent with that, nothing in this repo changed at the
+ * break: zero commits on 05-08/05-09, scripts/post-tool-use.sh byte-identical from 03-29 to
+ * 05-24, hooks/hooks.json byte-identical from 04-22 to 05-10, and EPISODE_BUFFER_SIZE /
+ * EPISODE_TIME_GAP_MS / isRelatedToEpisode untouched since 2026-02-11.
+ *
+ * WHAT ACTUALLY SETS THE RATE (probed, not read): a flush consumes reads-<project>.txt
+ * unconditionally (hook.mjs:222-232) but only PERSISTS it when the episode is significant
+ * (flushEpisodeGroup saves on `isSignificant`, and unlinks the flush file otherwise). So a
+ * buffered-but-insignificant flush — a successful `npm test` on its own, say — swallows every
+ * Read accumulated since the previous flush and writes none of them anywhere. Measured in a
+ * sandbox: seed 2 Reads, fire one such flush, and 0 observations are saved, the reads-file is
+ * gone, and the NEXT (edit-bearing, significant) observation carries `files_read=[]`. With
+ * ~4-8% of flushes significant, a 1-10% landing rate needs no code change to explain — which
+ * is why there is none to find. Tracked as D#178; the fix is a released-artifact behaviour
+ * change, so it is not made here.
+ *
+ * Note the first version of that probe used `echo hello` as its "insignificant" entry.
+ * detectBashSignificance drops it, so the episode had zero entries, flushEpisode
+ * early-returned at `entries.length === 0`, the reads were never touched — and the probe
+ * confidently reported the opposite conclusion. An insignificant entry must be asserted into
+ * the buffer before it proves anything.
  *
  * D#171 closed as won't-fix-as-specified: the repair it named does not work at the current
  * cadence, and re-pointing the rule would move the dormancy to a field nobody suspects.
- * Reopening means finding what changed in 2026-05 — a far larger change than the rule, with
- * no evidence its output was worth it (111 lifetime observations, dormant 133 days, nobody
- * noticed). The May break is tracked separately so it is not lost with the closure.
+ * That closure stands, and D#174 no longer offers a reason to reopen it — the rule's own
+ * input (`readCount`, which counts Read/Grep ENTRIES, and Read never reaches Node) is a
+ * different quantity from `filesRead` and is untouched by any of the above.
+ *
+ * EXACTLY ONE claim above is pinned by a test, and deliberately so (D#175). Every number
+ * here is a corpus measured at a timestamp — a test over those would be a snapshot that
+ * rots and gets edited into greenness. The per-FLUSH claim is different in kind: it is a
+ * property of code (hook.mjs:222-232 renames the reads-file aside, then unlinks the copy),
+ * and if someone later makes reads accumulate across flushes, every "out of reach at ~1
+ * Read per episode" sentence above silently becomes false. That is the one this closure
+ * rests on, so `tests/feature-sweep-hooks.test.mjs` → "the reads-file is consumed, not
+ * accumulated (D#175)" drives two real flushes through the subprocess and asserts the
+ * second one starts empty. Rename-becomes-copy and the dropped unlink are separate
+ * mutations caught by separate assertions there — one does not cover the other.
  *
  * @param {object} episode
  * @returns {{significant: boolean, rule: 1|2|3|4|null, readCount: number,
