@@ -19,6 +19,25 @@ import { shouldWarnReread, buildRereadWarning, readFileMeta } from '../lib/rerea
 import { recordMetric } from '../lib/metrics.mjs';
 import { presentIdents } from '../lib/lesson-idents.mjs';
 import { neutralizeContextDelimiters } from '../format-utils.mjs';
+// D#154: the one stdout writer. This script has THREE emit sites (Read→Edit ack,
+// repeated-read guard, lesson block) and they stay one document because each branch
+// process.exit()s before reaching the next.
+//
+// Be precise about what routing them through the queue does and does not buy, because an
+// earlier version of this comment claimed "a second write is now impossible by
+// construction" and that is FALSE (pre-tag review, v3.80.0): each site flushes
+// IMMEDIATELY after queueing, and the flush resets the queue — so queue→flush→queue→flush
+// emits two documents exactly like two raw writes would. Merging is a property of
+// DEFERRING the flush (what hook.mjs does with a single flush at the end of its dispatch),
+// not of using the queue.
+//
+// What it does buy: one construction site instead of three, so the "only the writer
+// assembles an envelope" invariant is checkable (tests/hook-script-stdout-contract.test.mjs),
+// and the merge is AVAILABLE to anyone who later defers the flush. The mutual exclusion
+// itself is still control flow — the process.exit(0) below.
+//
+// Import-free module, no runtime deps — nothing added to this script's load cost.
+import { queueHookContext, flushHookStdout } from '../lib/hook-stdout.mjs';
 // Recall queries the SAVE-path project, so this MUST produce the same string as the
 // save path. It used to be a hand-kept copy of the same 6 lines; that copy had already
 // drifted once (missing the process.env.PWD fallback, so a symlinked project dir
@@ -305,16 +324,11 @@ try {
       const wasReadMode = typeof entry === 'object' && entry.mode === 'read';
       if (!isRead && wasReadMode && seenIds.length > 0 && !SALIENCE_LEGACY) {
         const idList = seenIds.map(id => `#${id}`).join(', ');
-        process.stdout.write(JSON.stringify({
-          suppressOutput: true,
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            additionalContext: [
-              '[mem] PreToolUse recall — system-injected context, continue your planned action:',
-              `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACTIVE_DIRECTIVE}`,
-            ].join('\n'),
-          },
-        }));
+        queueHookContext('PreToolUse', [
+          '[mem] PreToolUse recall — system-injected context, continue your planned action:',
+          `[mem] ⚠ Lessons ${idList} were shown when you Read ${basename(filePath)} — ${ACTIVE_DIRECTIVE}`,
+        ].join('\n'));
+        flushHookStdout();
         cooldown[filePath] = { ...entry, mode: 'edit' };
         writeCooldown(cooldownPath, cooldown, isSessionScoped);
       } else if (isRead && !REREAD_GUARD_OFF && typeof entry === 'object' && entry.reread) {
@@ -322,16 +336,11 @@ try {
         // nudge to reuse what's already in context. Read-only; never throws.
         const meta = readFileMeta(filePath);
         if (shouldWarnReread(entry.reread, meta ? meta.mtimeMs : null, isFullRead, REREAD_MIN_TOKENS)) {
-          process.stdout.write(JSON.stringify({
-            suppressOutput: true,
-            hookSpecificOutput: {
-              hookEventName: 'PreToolUse',
-              additionalContext: [
-                '[mem] PreToolUse recall — system-injected context, continue your planned action:',
-                buildRereadWarning(basename(filePath), entry.reread.tokens),
-              ].join('\n'),
-            },
-          }));
+          queueHookContext('PreToolUse', [
+            '[mem] PreToolUse recall — system-injected context, continue your planned action:',
+            buildRereadWarning(basename(filePath), entry.reread.tokens),
+          ].join('\n'));
+          flushHookStdout();
           recordMetric(DATA_DIR, { event: 'reread_warn' }); // tier-1 firing counter (②)
         }
       }
@@ -605,13 +614,8 @@ try {
     }
 
     if (lines.length > 0) {
-      process.stdout.write(JSON.stringify({
-        suppressOutput: true,
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          additionalContext: lines.join('\n'),
-        },
-      }));
+      queueHookContext('PreToolUse', lines.join('\n'));
+      flushHookStdout();
     }
     // Cooldown applies on ALL branches (including silent-Read) so subsequent
     // calls on the same file in the same session don't re-query — preserving

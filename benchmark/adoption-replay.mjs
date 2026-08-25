@@ -1,6 +1,11 @@
 import { readFileSync } from 'fs';
+// One OWNER for the `#NN` caliber (was a hand-copied `{2,7}`). Deliberately the
+// unanchored-INJECTED caliber, not `citationIdRe()`: `ids()` below builds `injectedIds`
+// from a whole prompt with nothing anchoring it, so a prose `#1` is a false positive by
+// construction. See the docblock at the owner — the real fix is to match injected ROWS.
+import { unanchoredInjectedIdRe } from '../lib/citation-tracker.mjs';
 
-const ID_RE = /#(\d{2,7})\b/g;
+const ID_RE = unanchoredInjectedIdRe();
 // v1 scope: path-A only ([mem] FYI via searchByFts, gated to UserPromptSubmit below). Path-B (<memory-context> / searchRelevantMemories) is intentionally excluded — no ranker-replay seam yet; do not "fix" a path-B miss by adding a memory-context marker here.
 const UPS_FTS_MARKER = /\[mem\]/;
 const IMP_MARKER = /Memory — a past lesson applies to THIS task\. You must:/;

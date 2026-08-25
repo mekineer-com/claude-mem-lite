@@ -27,6 +27,8 @@ import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
+// One caliber for `#NN`, owned by the production extractor (was a hand-copied `{2,6}`).
+import { citationIdRe } from '../lib/citation-tracker.mjs';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -41,7 +43,7 @@ const DAY = 86400000;
 const GAP_MS = 1 * DAY;                 // skip same-work-unit follow-up fixes
 const WINDOWS = [7 * DAY, 14 * DAY, 30 * DAY];
 
-const ID_RE = /#(\d{2,6})\b/g;
+const ID_RE = citationIdRe();
 const INJECT_MARKER = /\[mem\]/;
 // pre-tool-recall.js injects "[mem] Lessons for <file>:" — the file the lesson
 // pool was keyed to. This ties an injection to a concrete file deterministically.

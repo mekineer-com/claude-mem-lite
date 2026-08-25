@@ -10,11 +10,16 @@
 // The plan's original seed() snippet omits this and fails the NOT NULL
 // constraint.
 //
-// NOTE 2: adoption-replay.mjs's ID_RE is /#(\d{2,7})\b/g (2-7 digits) — a
-// single-digit id like `(#1)` (as in the plan's illustrative fixture) extracts
-// ZERO ids, so extractInjectionEvents silently drops the event (surface is
-// set internally but injected.length === 0 fails the push guard). Every
-// fixture below uses a realistic multi-digit observation id.
+// NOTE 2: adoption-replay.mjs's ID_RE is 2-7 digits — a single-digit id like `(#1)` (as
+// in the plan's illustrative fixture) extracts ZERO ids, so extractInjectionEvents
+// silently drops the event (surface is set internally but injected.length === 0 fails the
+// push guard). Every fixture below uses a realistic multi-digit observation id.
+// The caliber is no longer a literal in that file: as of v3.80.0 it comes from
+// `unanchoredInjectedIdRe()` in lib/citation-tracker.mjs, and it is 2-7 rather than the
+// numerator's 1-7 ON PURPOSE — `ids()` there feeds an INJECTED set from unanchored prose,
+// where a `#1` is a false positive by construction. Read that docblock before widening it;
+// this round already widened it once and a pre-tag review caught two prose ids entering
+// the denominator on a real transcript.
 import { describe, it, expect, afterEach } from 'vitest';
 import { writeFileSync, readFileSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';

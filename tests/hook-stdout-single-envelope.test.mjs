@@ -97,6 +97,107 @@ describe('lib/hook-stdout — the emitter', () => {
   });
 });
 
+// updatedInput is a REPLACEMENT of the tool's input, and PreToolUse is the only event
+// whose schema carries one. From the 2.1.241 bundle, that schema is:
+//
+//   ye({ hookEventName: Ht("PreToolUse"), permissionDecision: …optional(),
+//        permissionDecisionReason: …optional(), updatedInput: …optional(),
+//        additionalContext: …optional() })
+//
+// — a mutation and a context line may ride ONE envelope. That is why the channel lives
+// here rather than in its own writer: scripts/pre-agent-inject.js hand-wrote its own
+// envelope, so the day it also wants to say something it would have emitted two
+// documents and lost both (D#154).
+describe('lib/hook-stdout — the updatedInput channel', () => {
+  beforeEach(() => resetHookStdout());
+
+  it('carries a tool-input replacement alongside context in ONE envelope', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    queueHookUpdatedInput('PreToolUse', { prompt: 'task text\n\nlesson #42' });
+    queueHookContext('PreToolUse', '[mem] heads up');
+    expect(flushHookStdout({ write: (s) => written.push(s) })).toBe(true);
+    expect(written).toHaveLength(1);
+    const parsed = JSON.parse(written[0]);
+    expect(parsed.hookSpecificOutput.hookEventName).toBe('PreToolUse');
+    expect(parsed.hookSpecificOutput.updatedInput.prompt).toContain('lesson #42');
+    expect(parsed.hookSpecificOutput.additionalContext).toBe('[mem] heads up');
+  });
+
+  it('emits an updatedInput-only envelope with no additionalContext key', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    queueHookUpdatedInput('PreToolUse', { prompt: 'only a mutation' });
+    expect(flushHookStdout({ write: (s) => written.push(s) })).toBe(true);
+    const parsed = JSON.parse(written[0]);
+    expect(parsed.hookSpecificOutput.updatedInput.prompt).toBe('only a mutation');
+    // Not merely falsy: an empty additionalContext is a different document than none.
+    expect('additionalContext' in parsed.hookSpecificOutput).toBe(false);
+  });
+
+  it('keeps the FIRST replacement and says so, rather than silently clobbering it', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const warned = [];
+    queueHookUpdatedInput('PreToolUse', { prompt: 'first' }, { warn: (m) => warned.push(m) });
+    queueHookUpdatedInput('PreToolUse', { prompt: 'second' }, { warn: (m) => warned.push(m) });
+    expect(peekHookStdout().updatedInput).toEqual({ prompt: 'first' });
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatch(/second mutation is lost/);
+  });
+
+  it('refuses a replacement whose event contradicts what is already queued', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const warned = [];
+    queueHookContext('PostToolUse', 'a receipt');
+    queueHookUpdatedInput('PreToolUse', { prompt: 'x' }, { warn: (m) => warned.push(m) });
+    expect(peekHookStdout().updatedInput).toBeNull();
+    expect(peekHookStdout().hookEventName).toBe('PostToolUse');
+    expect(warned[0]).toMatch(/PreToolUse updatedInput/);
+  });
+
+  it('ignores non-object replacements instead of emitting a malformed envelope', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    for (const bad of [null, undefined, '', 'a string', 42, ['an', 'array']]) {
+      queueHookUpdatedInput('PreToolUse', bad);
+    }
+    expect(peekHookStdout().updatedInput).toBeNull();
+    expect(flushHookStdout({ write: (s) => written.push(s) })).toBe(false);
+    expect(written).toEqual([]);
+  });
+
+  // The first version of this flushed twice with NOTHING queued in between and asserted
+  // one write. It was not binding: deleting `queuedInput = null` from the flush left the
+  // whole suite 19/19 green, because the same reset clears `queuedEvent` and
+  // `hasInput = Boolean(queuedEvent) && queuedInput !== null` short-circuits on that — so
+  // the probe could never reach the state it named. Both v3.80.0 pre-tag reviewers found
+  // it independently. Re-queueing a CONTEXT line between the flushes is what forces the
+  // assertion through `queuedInput`; verified to fail under that mutation and pass here.
+  it('clears the replacement on flush, so a later envelope cannot re-apply a stale mutation', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    queueHookUpdatedInput('PreToolUse', { prompt: 'once' });
+    flushHookStdout({ write: (s) => written.push(s) });
+    queueHookContext('PreToolUse', 'a later, unrelated line');
+    flushHookStdout({ write: (s) => written.push(s) });
+    expect(written).toHaveLength(2);
+    expect(JSON.parse(written[0]).hookSpecificOutput.updatedInput.prompt).toBe('once');
+    // The stale whole-tool-input replacement must NOT ride the second envelope — that is
+    // a silent re-mutation of the tool call, the shape this module exists to prevent.
+    expect('updatedInput' in JSON.parse(written[1]).hookSpecificOutput).toBe(false);
+    expect(JSON.parse(written[1]).hookSpecificOutput.additionalContext).toBe('a later, unrelated line');
+  });
+
+  it('writes nothing on a second flush when nothing was re-queued', async () => {
+    const { queueHookUpdatedInput } = await import('../lib/hook-stdout.mjs');
+    const written = [];
+    queueHookUpdatedInput('PreToolUse', { prompt: 'once' });
+    flushHookStdout({ write: (s) => written.push(s) });
+    flushHookStdout({ write: (s) => written.push(s) });
+    expect(written).toHaveLength(1);
+  });
+});
+
 // The update banner is a notice for the HUMAN, not context for the model. v3.70.0
 // folded it into additionalContext with suppressOutput:true, which made it
 // model-only — content preserved, audience lost. Claude Code 2.1.234's command-hook

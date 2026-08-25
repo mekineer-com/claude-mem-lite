@@ -2,6 +2,218 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.80.0 — two counters that were never the same ruler, and a blocker that was not there
+
+**Upgrade note.** Nothing user-facing changes. One behaviour delta, on a surface that is
+off by default: the subagent-injection hook (`CLAUDE_MEM_SUBAGENT_INJECT=on`) now emits
+`suppressOutput: true`, so its payload stops appearing in transcript mode. The payload is
+the dispatched prompt echoed back — a machine mutation, not a message. Verified
+display-only against the 2.1.241 host bundle: the field is documented "Hide stdout from
+transcript (default: false)" and is read at exactly one place, the transcript-render
+branch; the `updatedInput` mutation is taken from the parsed envelope regardless.
+
+This release is internal hardening. Its interest is in what it did **not** build.
+
+### One writer for the hook envelope (D#154)
+
+Claude Code parses a command hook's stdout as ONE JSON document — no line splitting. Two
+envelopes, or an envelope after prose, degrade to plain text: `SessionStart` and
+`UserPromptSubmit` then inject the raw JSON as literal text, and every other event drops
+it in silence. `lib/hook-stdout.mjs` was built for this in v3.70.0 and only `hook.mjs`
+adopted it. The four standalone hook scripts still hand-wrote their own envelopes —
+`pre-tool-recall.js` at three separate emit sites, which stay one document today only
+because each branch happens to `process.exit()` before reaching the next.
+
+All four now queue through the writer. `pre-tool-recall.js`, `pre-skill-bridge.js` and
+`post-tool-recall.js` take a static import; `pre-agent-inject.js` takes a dynamic one on
+its enabled path, leaving its import-free default-off fast path untouched.
+
+**The deferred item's stated blocker was wrong on both halves.** It recorded that two of
+the four scripts keep an import-free default-off fast path and therefore cannot use a
+shared module, so the round would first have to decide "shared module or inlinable
+codegen". In fact `pre-tool-recall.js` carries fifteen static imports of repo modules
+(twelve from `lib/`) and has no fast path at all — it is default-ON — and
+`pre-agent-inject.js`, the one that really does have one,
+already resolves the conflict three lines above its write site with `await import()` for
+`schema.mjs` / `utils.mjs` / `hook-memory.mjs`. There was no design decision to make.
+
+New channel: `queueHookUpdatedInput`. The 2.1.241 `PreToolUse` schema carries
+`updatedInput` and `additionalContext` in the same `hookSpecificOutput`, so a mutation
+hook that later also wants to say something must merge rather than write twice. First
+writer wins; a second is dropped loudly, because merging two whole tool inputs is not
+defined and silently discarding the first is this repo's most-repeated defect shape.
+
+### The guard that was worth adding was not the obvious one
+
+The obvious guard is behavioural: spawn each hook script, assert its stdout is one
+document. That was built first — and then **mutation-checked against the existing suite
+rather than assumed to be new**. `tests/feature-sweep-hooks.test.mjs::expectHookStdout`
+already covers all six registered entry points: appending a second envelope in
+`pre-tool-recall.js` (tried in two different branches) and queueing one behind
+`hook.mjs`'s prose user-prompt writer each turned that suite red on its own. The
+behavioural leg was deleted as a slower copy with no additional kill-power.
+
+What nothing caught is the invariant D#154 is actually about — *route through the
+writer*, not merely *emit one document*. Reverting `post-tool-recall.js` to its
+hand-written single envelope left **39 of 39** pre-existing tests green. So the guard
+that shipped is structural: no manifest-registered entry point may CONSTRUCT an envelope;
+only `lib/hook-stdout.mjs` assembles one. Plus a coverage cross-check that every entry in
+`hooks/hooks.json` appears in the behavioural sweep — both lists were hand-maintained, so
+a newly registered hook was previously born unguarded. The registered set is derived from
+the manifest, following the `.sh` prefilter hop that `pre-agent-inject.js` is reachable
+only through.
+
+### One caliber for `#NN`, and an honest zero
+
+Four id calibers were live at once. `benchmark/cite-recall.mjs` scanned citations with
+`{2,6}` while its **own** injected denominator used `{1,7}`; `efficacy-observational.mjs`
+had a third, `adoption-replay.mjs` a fourth, production a fifth. A denominator wider than
+its numerator counts ids as injected-never-cited that the numerator structurally cannot
+see, biasing measured cite-rate down — and nothing errors when it happens.
+
+`lib/citation-tracker.mjs` now owns `OBS_ID_DIGITS` / `citationIdRe()`; the five
+production regexes and the three benchmarks derive from it. The sweep guard added
+alongside found a **sixth** copy that hand enumeration had missed —
+`lib/cite-back-hint.mjs`, whose ids are unioned into the same cited set
+`applyCitationDecay` reads, which is the one place the caliber most had to match.
+
+**One owner does not mean one shape, and the first version of this got that wrong.** The
+bare caliber is a NUMERATOR caliber: on the cited side a spurious `#1` costs nothing,
+because it only counts once it intersects an injected set that was anchored — every
+injected-side extractor in `citation-tracker.mjs` matches a row shape. Two of the three
+benchmarks apply the caliber to *injected* text, where nothing anchors it.
+
+Pointing `adoption-replay.mjs` at `citationIdRe()` therefore did **not** measure as a
+no-op. On a real transcript it pulled `#1` and `#2` — quoted from a subagent prompt
+discussing fixture rows, "with `#1` superseded by `#2` …" — straight into `injectedIds`,
+the denominator whose inflation this section's own rationale says to avoid. That file now
+takes a second, deliberately narrower export, `unanchoredInjectedIdRe()`, whose docblock
+says why it is narrower and that the real fix is to anchor the extraction rather than
+tune digits.
+
+**Measured impact on the other two: exactly zero.** A same-tree A/B — swap only `ID_RE`,
+run `cite-recall.mjs --json` twice over the same window — produced byte-identical output
+apart from the `Date.now()` window timestamps, and `efficacy-observational.mjs` likewise.
+Over the live corpus (3692 rows, ids 1..10834 at time of measurement) the only ids outside
+`{2,6}` are four 1-digit rows, all with `injection_count = 0`, so they never entered a
+denominator; there are no 7-digit ids. The mechanism is real, its live magnitude on the
+numerator side is nil. This corrects an earlier claim in this project's own notes that the
+drift "systematically underestimates cite-rate" — stated without measuring.
+
+The sweep guard's first version walked only `benchmark/` and `lib/`, which is how it
+reported a closed class while a **seventh** copy sat in `scripts/p0-forward-probe.mjs` —
+`{3,6}`, narrower than every other copy at both ends, scanning transcripts for injected
+and cited ids exactly like the benchmarks do. A guard whose directory list is what hides
+the violation is not a guard. It now walks the repo root and `scripts/` as well, covers
+`.js` alongside `.mjs`, and pins three specific files so narrowing it back goes red.
+
+### The decay defect that was not one
+
+The round was going to fix a measured cohort: 85 rows with `injection_count >= 5` and
+`cited_count = 0`, carrying 877 injections — 18.3% of every injection the database has
+recorded — of which 17 rows had `uncited_streak = 0`, `demoted_at IS NULL` and
+`decay_seen_count = 0`, i.e. the decay mechanism had never resolved them despite 5 to 61
+injections each. Nothing in the codebase noticed.
+
+Four checks, each meant to confirm it, and the fourth killed it:
+
+- **Not an era effect.** The resolved cohort spans 0–124 days since last injection, the
+  unresolved one 28–123 — the same range, fully overlapping.
+- **Not a per-project gap.** Decay resolves rows in the same projects those rows live in
+  (`projects--bz`: 5 resolved, 3 unresolved).
+- **The two counters do not measure the same population.** `injection_count` is bumped by
+  exactly two UPS write paths; `decay_seen_count` comes from Stop-time transcript
+  extraction across every decay-denominator face. **1253 of 1949 decay-resolved rows have
+  `injection_count = 0` — 64.3%.** So `injection_count >= 5 AND uncited_streak = 0` is not
+  a decay-coverage predicate at all. It is two rulers of different caliber, subtracted —
+  the same defect shape as the benchmark regexes fixed one section above.
+- **There is no live waste to recover.** 877 is a lifetime sum. Scoped by
+  `last_injected_at`, the whole 85-row cohort had **1** row injected in the last 7 days
+  and 12 in the last 30; the 17-row "blind" set had **none in the last 7 days** and one in
+  the last 30 — its most recent injection was 28 days ago. These rows stopped consuming
+  the context budget long ago.
+
+All live-DB figures in this section are a point-in-time reading taken on 2026-08-24; the
+database grows during a session, so re-measuring gives ±1 row (a pre-tag review re-ran
+them the next day and got 1252 where this says 1253, because `MAX(id)` had moved).
+
+So nothing was built. The note this project already carried said "many noisy rows" ≠
+"noise is diluting retrieval — first look at their `injection_count`". The correct
+generalisation is **recency**, not magnitude, and this round made the original mistake
+one level up by treating a lifetime counter as a live rate.
+
+### Knip counting: fix the method, not the discrepancy (D#161)
+
+The same commit measures ~15 fewer unused exports from a detached `git worktree` than
+from the primary working tree, with the same binary. Reproduced, never explained, and one
+round was already misled into reading `+14 added` where the true delta was `-1 / +0`.
+Closed by pinning the method instead: `CLAUDE.md`'s baseline now fixes the command and
+the tree context as part of the number, mandates same-tree NAME-SET A/B for attributing a
+round's delta, and marks every count in that paragraph stale-by-default. The
+worktree/working-tree gap is documented as reproduced-but-unexplained and explicitly not
+worth chasing.
+
+This round, measured under that contract: 46 unused exports, 0 unused files, same-tree
+A/B name set **+0 / −0**.
+
+### What the pre-tag review changed
+
+Two independent read-only reviewers (correctness lens, test-effectiveness lens; 28 and 7
+source mutations respectively) ran before the tag. Both of the author's central claims
+were put up for refutation and **both survived**: the behavioural half of the stdout guard
+really is redundant against `feature-sweep-hooks.test.mjs` (mutating all six registered
+entry points to emit two envelopes turns that suite red on each), and reverting
+`post-tool-recall.js` really does leave 5107 of 5108 pre-existing tests green.
+
+Four things they found that the author had wrong, all fixed above and each re-verified by
+killing the reviewer's own mutant:
+
+1. **The headline guard had an unguarded door.** `ENVELOPE_LITERAL` matched
+   `hookSpecificOutput:` in object-literal position only — while the repo's canonical way
+   to assemble an envelope is *assignment*, `envelope.hookSpecificOutput = {...}`, which
+   the neighbouring assertion pins by name. A hand-written envelope in assignment form
+   passed both the structural sweep and the shape sweep. Widened to `[:=]`; the writer is
+   exempt by path, never by syntax.
+2. **The caliber unification was not the no-op the notes claimed** — see the section
+   above.
+3. **A new assertion was satisfied by the wrong cause.** "is cleared by the flush" flushed
+   twice with nothing queued in between, so it could never reach `queuedInput`: deleting
+   the reset left the file 19/19 green while the mutant silently re-applied a stale
+   whole-tool-input replacement on a later envelope. Both reviewers found this
+   independently. It now re-queues a context line between the flushes.
+4. **A comment asserted something false.** `pre-tool-recall.js` claimed routing through
+   the queue makes a second write "impossible by construction". It does not — each site
+   flushes immediately, so queue→flush→queue→flush emits two documents; the three sites
+   are still mutually exclusive by `process.exit()`. Corrected in the source and in the
+   test header. This project's own recorded lesson is that an unverified assertion written
+   as a comment gets obeyed by every caller that believes it, so it is worth naming rather
+   than quietly editing.
+
+Delivery note, because it is now a pattern: one reviewer returned an empty idle
+notification and nothing else — the fifth such failure here. Its 19KB report was on disk
+because the dispatch mandated writing the file **and** returning the text. The mandate is
+the only reason the review exists.
+
+### Also
+
+- 307 test files / 5182 tests (from 305 / 4984). `tests/sandbox/phaseA-plugin.mjs` 43/43
+  against a real plugin-cache install, which is what the D#154 deferral asked for.
+- A correction this round made against itself, worth the line because it nearly cost a
+  round of duplicate work: while looking for remaining work, the 2026-08-22 audit report
+  was read as listing five fixed items as still open, and two of them (a weekly CI job
+  for the real-install sandbox, and a triplicated `fast-summary` whose truncation
+  constants had drifted) were about to be re-done. Both were already fixed —
+  `.github/workflows/sandbox-install.yml` exists, and `lib/fast-summary.mjs` owns a
+  single `FAST_SUMMARY_LIMITS` table consumed at all three sites. The report is not
+  stale; its `✅` marker sits inconsistently in the table's ID cell while the actual
+  resolution lives in a blockquote directly beneath the row, and only the rows had been
+  scanned. Checked properly, exactly three of its eighteen items carry no resolution
+  block: **P1-4** (UserPromptSubmit still spawns two node processes per prompt, with a
+  marker-file protocol that exists only because of that split), **P2-5** (parked
+  experiment flags — `TASK_IMPERATIVE` and `PRETOOL_NUDGE` still have no verdict after
+  8-9 weeks), **P2-14** (`Grep` absent from the bash pre-filter, paying a full Node
+  handoff per call). Verified against the code, not the document.
+
 ## v3.79.0 — the query knew the command's name and not the failure's, and never saw it fail
 
 **Upgrade note.** Two default-on changes, both to the error-recall face (the memories

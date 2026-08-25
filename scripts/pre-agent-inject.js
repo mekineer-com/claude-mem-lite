@@ -66,15 +66,28 @@ async function main() {
   const { ensureDb } = await import('../schema.mjs');
   const { inferProject } = await import('../utils.mjs');
   const { buildSubagentInjection } = await import('../hook-memory.mjs');
+  // D#154: single envelope writer. Deferred to this line, not hoisted to a static
+  // import, because the file's stated contract is that the default-off path costs one
+  // env check and nothing else — the deferral filed this as "shared module vs
+  // import-free fast path, pick one", but the script already resolves that conflict
+  // three lines up: dynamic import on the enabled path only. The fast path above is
+  // untouched.
+  const { queueHookUpdatedInput, flushHookStdout } = await import('../lib/hook-stdout.mjs');
 
   let db;
   try { db = ensureDb(); } catch (e) { await recordFailure('agent-inject:db-open', e); return; }
   try {
     const updatedInput = buildSubagentInjection(db, hook.tool_input, inferProject());
     if (updatedInput) {
-      process.stdout.write(JSON.stringify({
-        hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput },
-      }));
+      // Behaviour delta vs the hand-written envelope this replaced: it now carries
+      // top-level `suppressOutput: true`. Verified display-only in the 2.1.241 bundle —
+      // the field is documented "Hide stdout from transcript (default: false)" and is
+      // read at exactly one place, the transcript-render branch
+      // (`if (a6(he) && !he.suppressOutput && …)`); the updatedInput mutation is taken
+      // from the parsed hookSpecificOutput regardless. Hiding it is also the right
+      // audience call: this payload is the whole prompt echoed back, not a message.
+      queueHookUpdatedInput('PreToolUse', updatedInput);
+      flushHookStdout();
     }
   } catch (e) { await recordFailure('agent-inject:query', e); /* never break a dispatch */ } finally {
     try { db.close(); } catch { /* */ }
