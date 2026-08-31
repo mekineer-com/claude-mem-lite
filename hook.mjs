@@ -63,6 +63,8 @@ import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
   extractInjectedBySurface,
+  extractAllInjected,
+  extractUserTypedIds,
   unionSurfaces,
   extractInjectedFromKeyContext,
   bumpCitationAccess,
@@ -954,8 +956,20 @@ async function handleStop() {
 
           const ids = extractCitationsFromTranscript(transcriptPath);
           if (ids.size > 0) {
-            const n = bumpCitationAccess(db, ids, project);
-            debugLog('DEBUG', 'handleStop', `citations: ${ids.size} ids scanned, ${n} obs bumped`);
+            // Gate the access-count channel on relevance (audit FLOW-2 / D#179). The cited
+            // set is every `#NN` in this session's assistant text and cannot tell a
+            // citation from a mention; in this repository a CHANGELOG or audit-writing
+            // session names dozens of ids in prose, and access_count > 3 promotes a row a
+            // tier via boostAccessed. Credit only rows this session was actually given
+            // (injected, any face, sidechains included — a subagent's injection is still
+            // this session showing the row) or that the user named themselves.
+            const relevant = new Set([
+              ...extractAllInjected(transcriptPath),
+              ...extractUserTypedIds(transcriptPath),
+            ]);
+            const n = bumpCitationAccess(db, ids, project, relevant);
+            debugLog('DEBUG', 'handleStop',
+              `citations: ${ids.size} ids scanned, ${relevant.size} relevant, ${n} obs bumped`);
           }
 
           // v32 citation-decay: tighter feedback loop on top of P4. Re-scan

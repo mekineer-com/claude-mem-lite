@@ -18,6 +18,7 @@ import {
   assertFaceCoverage,
   assertRulerCanSayNo,
   byScope,
+  pollutionSensitivity,
 } from '../benchmark/citation-live-replay.mjs';
 import { wilson95 } from '../benchmark/wilson.mjs';
 import { CITATION_SURFACES } from '../lib/citation-tracker.mjs';
@@ -415,5 +416,58 @@ describe('end-to-end over a known corpus', () => {
     expect(() => execFileSync(process.execPath, [SCRIPT, '--json', '--corpus', stale], {
       env: { ...process.env, CLAUDE_MEM_TRANSCRIPT_ROOT: root }, encoding: 'utf8', stdio: 'pipe',
     })).toThrow(/citation-live-replay\/0/);
+  });
+});
+
+// ── FLOW-2(b) / D#179: make the mention-inflation in these readings legible ──
+//
+// A face's `hit` list can only contain ids that face injected, so nothing already in a
+// record could see a session that names fifty ids none of which were ever injected. The
+// annotation needs the session's WHOLE cited count, which is why records carry
+// `citedTotal` and the corpus format went to /2.
+describe('pollutionSensitivity', () => {
+  const rec = (session, citedTotal, faces) => ({
+    project: 'p', session, ts: 1, anyCite: true, citedTotal, faces,
+  });
+
+  it('recomputes each face with document-shaped sessions excluded', () => {
+    const records = [
+      // Ordinary session: the face's two picks, one cited.
+      rec('s1', 3, { pretool: { inj: [1, 2], hit: [1] } }),
+      // Document-shaped: 40 ids named in prose, and its picks read as fully cited.
+      rec('s2', 40, { pretool: { inj: [3, 4], hit: [3, 4] } }),
+    ];
+    const rows = aggregate(records);
+    const out = pollutionSensitivity(records, rows);
+    expect(out.docSessions).toBe(1);
+    const pretool = out.rows.find((r) => r.face === 'pretool');
+    expect(pretool.rate).toBe('75.0%');            // 3/4 with the document session in
+    expect(pretool.pairsFromDocSessions).toBe(2);
+    expect(pretool.rateExclDocSessions).toBe('50.0%'); // 1/2 without it
+    expect(pretool.delta).toBe('-25.0pp');
+  });
+
+  it('reports nothing to discount when no session is document-shaped', () => {
+    const records = [rec('s1', 3, { pretool: { inj: [1, 2], hit: [1] } })];
+    const out = pollutionSensitivity(records, aggregate(records));
+    expect(out.docSessions).toBe(0);
+    expect(out.rows).toEqual([]);
+  });
+
+  it('treats a missing citedTotal as not-document-shaped rather than as zero pollution', () => {
+    // A /1 record has no citedTotal. The format gate refuses those corpora outright, but
+    // the reducer must not silently treat the absence as "measured, and clean".
+    const records = [{ project: 'p', session: 's1', ts: 1, anyCite: true, faces: { pretool: { inj: [1], hit: [1] } } }];
+    expect(pollutionSensitivity(records, aggregate(records)).docSessions).toBe(0);
+  });
+
+  it('the threshold can say NO — a face made entirely of document sessions reads n/a', () => {
+    // Anti-vacuity for `rateExclDocSessions`: if every pair for a face comes from
+    // document-shaped sessions there is no clean sub-population, and the cell must say so
+    // rather than quietly reporting 0%.
+    const records = [rec('s1', 50, { fyi: { inj: [1, 2], hit: [1] } })];
+    const out = pollutionSensitivity(records, aggregate(records));
+    expect(out.docSessions).toBe(1);
+    expect(out.rows.find((r) => r.face === 'fyi').rateExclDocSessions).toBe('n/a');
   });
 });

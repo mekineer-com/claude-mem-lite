@@ -88,7 +88,10 @@ const has = (flag) => argv.includes(flag);
 
 // Stamped into every `--dump` and required by `--corpus`. Bump it whenever a record's
 // shape changes, so a corpus frozen months ago is REFUSED rather than half-read.
-const CORPUS_FORMAT = 'citation-live-replay/1';
+// Bumped to /2 by the FLOW-2 annotation: records now carry `citedTotal`. The
+// format check below refuses a /1 dump rather than reading a missing field as zero,
+// which would report every frozen session as pollution-free.
+const CORPUS_FORMAT = 'citation-live-replay/2';
 
 // DERIVED from the production table, not a second list of face names: calling the
 // extractor with no transcript returns one empty Set per attachment face, so a face
@@ -178,7 +181,14 @@ function scanSession(project, path) {
     faces.subagent = { inj: [...sub.injected], hit: [...sub.cited], dispatches: sub.files };
   }
   if (!Object.keys(faces).length) return null;
-  return { project, session: basename(path, '.jsonl'), ts, anyCite: cited.size > 0, faces };
+  // citedTotal is the session's WHOLE cited set, not just the part that matches an
+  // injection. It is what makes the pollution below visible: a face's `hit` count can
+  // only contain ids that face injected, so nothing already in this record could see a
+  // session that names fifty ids none of which were ever injected.
+  return {
+    project, session: basename(path, '.jsonl'), ts,
+    anyCite: cited.size > 0, citedTotal: cited.size, faces,
+  };
 }
 
 function walk() {
@@ -309,6 +319,47 @@ export function runSelfChecks(rows, opts = {}) {
 
 const pct = (a, b) => (b ? `${((a / b) * 100).toFixed(1)}%` : 'n/a');
 
+/**
+ * Sessions citing more ids than any injection surface could plausibly have supplied.
+ *
+ * These are document-shaped sessions — writing a CHANGELOG, a release note, or an audit
+ * report in a repository whose subject matter IS the memory store, naming dozens of ids
+ * in prose. The `#NN` extractor cannot tell that from a citation (D#179), so those
+ * sessions inflate every cite-rate on this screen in one direction: up.
+ *
+ * Reported, not filtered. Which of those mentions is a real use is not decidable from the
+ * text, so dropping the sessions would trade a known upward bias for an unknown one; a
+ * reader who can see how much of the corpus is document-shaped can discount accordingly.
+ * The same reasoning is why the ACCESS-count channel got a relevance gate instead of a
+ * context regex (lib/citation-tracker.mjs bumpCitationAccess).
+ */
+const DOC_SESSION_CITED_IDS = 20;
+
+export function pollutionSensitivity(records, rows) {
+  const doc = records.filter((r) => (r.citedTotal ?? 0) > DOC_SESSION_CITED_IDS);
+  if (!doc.length) return { docSessions: 0, docSessionIds: new Set(), rows: [] };
+  const docIds = new Set(doc.map((r) => r.session));
+  const clean = aggregate(records.filter((r) => !docIds.has(r.session)));
+  const byFace = new Map(clean.map((r) => [r.face, r]));
+  return {
+    docSessions: doc.length,
+    totalSessions: records.length,
+    docSessionIds: docIds,
+    rows: rows.map((r) => {
+      const c = byFace.get(r.face);
+      const full = r.pairs ? r.hits / r.pairs : 0;
+      const excl = c && c.pairs ? c.hits / c.pairs : null;
+      return {
+        face: r.face,
+        rate: pct(r.hits, r.pairs),
+        pairsFromDocSessions: r.pairs - (c?.pairs ?? 0),
+        rateExclDocSessions: excl === null ? 'n/a' : `${(excl * 100).toFixed(1)}%`,
+        delta: excl === null ? 'n/a' : `${((excl - full) * 100).toFixed(1)}pp`,
+      };
+    }),
+  };
+}
+
 function report(label, rows) {
   console.log(`\n─── ${label} ───`);
   console.table(rows.map((r) => ({
@@ -363,6 +414,7 @@ function main() {
   const inWindow = records.filter((r) => (since === null || r.ts >= since) && (until === null || r.ts < until));
 
   const all = aggregate(inWindow);
+  const pollution = pollutionSensitivity(inWindow, all);
   const rulerFlags = runSelfChecks(all, {
     windowed: (since !== null || until !== null) && records.length > inWindow.length,
     frozen: frozen !== null,
@@ -398,6 +450,12 @@ function main() {
         before: shape(aggregate(inWindow.filter((r) => r.ts < split))),
         after: shape(aggregate(inWindow.filter((r) => r.ts >= split))),
       }),
+      pollution_sensitivity: {
+        doc_session_threshold: DOC_SESSION_CITED_IDS,
+        doc_sessions: pollution.docSessions,
+        total_sessions: inWindow.length,
+        by_face: pollution.rows,
+      },
       ...(has('--by-project') ? { by_project: byProject(inWindow) } : {}),
       ...(has('--by-scope') ? { by_scope: byScope(inWindow, scopeLookup()) } : {}),
     }, null, 2));
@@ -416,6 +474,22 @@ function main() {
   }
 
   report('all sessions in window', all);
+
+  // D#179 sensitivity. Printed unconditionally rather than behind a flag: a reader who
+  // has to know to ask for the caveat will read the headline rate without it.
+  console.log(`\n─── pollution sensitivity (D#179) ───`);
+  if (pollution.docSessions === 0) {
+    console.log(`no session in window cites more than ${DOC_SESSION_CITED_IDS} ids — no document-shaped`);
+    console.log('sessions to discount. The rates above carry no measurable mention-inflation.');
+  } else {
+    console.log(`${pollution.docSessions} of ${inWindow.length} sessions cite more than `
+      + `${DOC_SESSION_CITED_IDS} ids — the document-shaped ones (CHANGELOG / release notes /`);
+    console.log('audit reports naming ids in prose). The `#NN` extractor cannot tell those from real');
+    console.log('citations, so every rate above is biased UP. Below: the same faces with those sessions');
+    console.log('excluded. Reported, not filtered — which mentions were real uses is not decidable from');
+    console.log('the text, so dropping them would trade a known bias for an unknown one.');
+    console.table(pollution.rows);
+  }
 
   if (split !== null) {
     console.log(`\nsplit at ${new Date(split).toISOString()} — BOTH arms come from the one walk above,`);
