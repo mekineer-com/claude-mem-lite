@@ -168,3 +168,104 @@ describe('hook-telemetry — retention', () => {
     expect(remaining.length).toBe(1);
   });
 });
+
+// ── SEC-2 (2026-08-29 audit): this sink wrote msg/stack/ctx verbatim ──
+//
+// lib/err-sampler.mjs is the twin sink (same JSONL daily-shard layout, same 0600 mode,
+// same 14-day retention) and has scrubbed since it was written, with a comment naming
+// the reason: a connection string / Authorization header / 401 body rides along in an
+// error message. This one did not scrub, so the same class of data had two calibers
+// depending on which directory it landed in.
+describe('hook-telemetry — secret scrubbing (parity with lib/err-sampler.mjs)', () => {
+  let tmp;
+  beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'hook-telemetry-scrub-')); });
+  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  function readOnlyLine() {
+    const dir = join(tmp, 'hook-errors');
+    const files = readdirSync(dir).filter(f => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f));
+    expect(files.length).toBe(1);
+    const lines = readFileSync(join(dir, files[0]), 'utf8').trim().split('\n');
+    expect(lines.length).toBe(1);
+    return JSON.parse(lines[0]);
+  }
+
+  it('redacts a secret in the error message', () => {
+    recordHookError('pre-recall:json', new Error('token=abcdef123456'), tmp);
+    const parsed = readOnlyLine();
+    expect(parsed.msg).toBe('token=***');
+    expect(parsed.msg).not.toContain('abcdef123456');
+  });
+
+  it('redacts a secret carried in the ctx object', () => {
+    recordHookError('pre-recall:query', new Error('boom'), tmp, {
+      filePath: '/tmp/x', header: 'Authorization: Bearer sk-ant-api03-XYZ123456789abcdef',
+    });
+    const parsed = readOnlyLine();
+    expect(parsed.ctx).not.toContain('sk-ant-api03-XYZ123456789abcdef');
+    expect(parsed.ctx).toContain('***');
+    expect(parsed.ctx).toContain('/tmp/x'); // non-secret context still readable
+  });
+
+  it('redacts a secret carried in the stack, not just the message', () => {
+    const err = new Error('parse failed');
+    err.stack = 'Error: parse failed\n    at readStdin (token=abcdef123456)\n    at main';
+    recordHookError('pre-recall:json', err, tmp);
+    const parsed = readOnlyLine();
+    expect(parsed.stack).not.toContain('abcdef123456');
+    expect(parsed.stack).toContain('token=***');
+  });
+
+  it('scrubs BEFORE truncating, so a secret cannot survive as a boundary fragment', () => {
+    // The ordering has to be pinned by a case where the two orders actually differ, and
+    // most patterns still fire on a truncated prefix (`Authorization: Bearer sk-a` → ***),
+    // which would make this assertion pass either way. A GitHub PAT does not: scrubSecrets
+    // redacts `ghp_` + 36 chars but leaves `ghp_ABCDEFGHIJ` alone.
+    //
+    // ctx is sliced to 240. `{"pad":"` (8) + pad(209) + `","tok":"` (9) puts the token at
+    // 226, so a truncate-first order keeps exactly 14 unredactable characters of it.
+    const pad = 'p'.repeat(209);
+    const pat = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    expect(JSON.stringify({ pad, tok: pat }).indexOf(pat)).toBe(226); // the premise itself
+    recordHookError('pre-recall:query', new Error('e'), tmp, { pad, tok: pat });
+    const parsed = readOnlyLine();
+    expect(parsed.ctx.length).toBeLessThanOrEqual(240);
+    expect(parsed.ctx).not.toContain('ghp_');
+    expect(parsed.ctx).toContain('***');
+  });
+
+  it('leaves an ordinary in-code scope label untouched', () => {
+    recordHookError('pre-recall:db-open', new Error('SQLITE_CORRUPT'), tmp);
+    expect(readOnlyLine().scope).toBe('pre-recall:db-open');
+  });
+
+  it('agrees field-for-field with the err-sampler sink on the same input', async () => {
+    // The drift guard: if either sink loses its scrub, the two stop agreeing.
+    const { maybeSampleError } = await import('../lib/err-sampler.mjs');
+    const secret = 'Authorization: Bearer sk-ant-api03-XYZ123456789abcdef';
+    const err = new Error(secret);
+    err.stack = `Error: ${secret}\n    at f (x.js:1:1)`;
+
+    recordHookError('pre-recall:json', err, tmp);
+    const mine = readOnlyLine();
+
+    const prev = process.env.CLAUDE_MEM_CATCH_SAMPLE;
+    process.env.CLAUDE_MEM_CATCH_SAMPLE = '1';
+    try {
+      maybeSampleError(err, 'pre-recall:json', tmp);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_MEM_CATCH_SAMPLE;
+      else process.env.CLAUDE_MEM_CATCH_SAMPLE = prev;
+    }
+    const errDir = join(tmp, 'errors');
+    const sampled = JSON.parse(
+      readFileSync(join(errDir, readdirSync(errDir)[0]), 'utf8').trim().split('\n')[0],
+    );
+
+    expect(sampled.msg).toBe(mine.msg);
+    expect(sampled.stack).toBe(mine.stack);
+    for (const line of [mine.msg, mine.stack, sampled.msg, sampled.stack]) {
+      expect(line).not.toContain('sk-ant-api03-XYZ123456789abcdef');
+    }
+  });
+});
