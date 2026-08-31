@@ -16,19 +16,14 @@ import { STALE_SESSION_MS, FALLBACK_OBS_WINDOW_MS, RUNTIME_DIR, effectiveQuiet, 
 import { extractUnfinishedSummary } from './hook-handoff.mjs';
 import { recentInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
 import { liveObsFilterSql } from './lib/inject-search-core.mjs';
+// The canonical one (v3.84.0): this file carried a byte-identical private copy, which is
+// the same one-home rule this release enforced for the cooldown path and the dashboard.
+import { inferProjectDir } from './project-utils.mjs';
 // Single source for the type-quality weights (audit 2026-08-22 P2-10) — this table used
 // to be hand-copied here and in hook-memory.mjs, kept equal only by comment convention.
 import { TYPE_QUALITY, TYPE_QUALITY_DEFAULT } from './scoring-sql.mjs';
 
 import { DAY_MS } from './lib/time-constants.mjs';
-/**
- * Infer the project directory from environment variables or cwd.
- * @returns {string} Absolute path to the project directory
- */
-function inferProjectDir() {
-  return process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
-}
-
 /**
  * Compute adaptive recall time windows based on project activity velocity.
  * High activity -> shorter windows (recent data more relevant).

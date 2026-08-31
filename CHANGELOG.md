@@ -17,9 +17,14 @@ anything had ever put that memory in front of the model. Downstream that is a pr
 `access_count > 3` raises importance a tier. In a repository whose subject matter IS the
 memory store, a session writing release notes or an audit report names dozens of ids in
 prose and promoted every one of them. Now a citation counts when the memory was injected
-this session, or when **you** typed its `#NN` yourself. Measured on real transcripts: **267
-of 859 credited (id, session) pairs — 31.1% — were mentions nothing had put in front of the
-model**, and ten sessions citing more than twenty ids contributed 44.2% of them. Revert with
+this session — through any of the seven faces, including the SessionStart Key Context block
+and lessons handed to a dispatched agent — or when **you** typed its `#NN` yourself.
+
+Measured on the live transcript corpus (77 session transcripts, 72 carrying an injection):
+**269 of 863 (id, session) pairs the Stop scan cited were mentions nothing had put in front
+of the model — 31.2%**. Of the 254 pairs the old code would actually have *credited* (the id
+still existing as a row in that project), **69 — 27.2%**. Both are given because the second
+is the population the change acts on, and it is the smaller number. Revert with
 `CLAUDE_MEM_CITATION_RELEVANCE_GATE=off`; pinning `claude-mem-lite@3.83.0` also reverts it.
 
 This was filed as D#179 against the citation-decay loop, which at least had an injected
@@ -39,8 +44,9 @@ than by a fallback chain, so identity and filesystem root cannot drift apart aga
 
 **And a second one, found by running the suite rather than by reading the code.** A full run
 reddened an unrelated case on a 5-second MCP-startup timeout. A cold `node server.mjs`
-initialize round trip measures 635ms here, so that cap had a 7.9× margin — and it still lost,
-on 24 cores with 311 test files in flight, to CPU starvation of the spawn. Thirteen suites
+initialize round trip measures 240-640ms on this machine, so that cap had an order of
+magnitude of headroom — and it still lost, on 24 cores with 311 test files in flight, to CPU
+starvation of the spawn. Thirteen suites
 had independently copy-pasted the same literal. They now share one budget under vitest's own
 `testTimeout`, which is what actually owns hang protection; the inner timer exists only to
 name which round trip stalled.
@@ -69,14 +75,20 @@ the in-place UPDATE reported success while writing a whole enrichment onto a tom
 the delete hard-removed rows a keeper may have absorbed.
 
 **Performance.** `lib/ups-query.mjs` calls itself the one query-cap definition for the
-UserPromptSubmit event. That event has three legs, not two, and the third was uncapped:
-**356ms on a 250KB CJK prompt against 5.5ms capped**, synchronously, before the model sees
-the turn. `denoise-ab` reported NEUTRAL with Δ=0.000 on all twelve metrics, and that verdict
+UserPromptSubmit event. That event has three legs, not two, and the third was uncapped. On a
+250KB CJK prompt — path B's stdin cap is 256KB — building the query cost **two orders of
+magnitude more uncapped than capped** (measured between 114ms and 356ms depending on whether
+the text is prose or random glyphs, against 4-10ms capped), synchronously, before the model
+sees the turn. `denoise-ab` reported NEUTRAL with Δ=0.000 on all twelve metrics, and that verdict
 was worth nothing here — its longest fixture query is 72 characters against a 2000-character
-cap, so the suites cannot reach the lever. The evidence is 11,255 live prompts instead:
-10.65% of them do build a different query under the cap, and running both through the
-shipped retriever returns the same rows for all of them, on a face whose overall firing rate
-is high enough for the ruler to see rows at all.
+cap, so the suites cannot reach the lever. The evidence is the live prompt corpus instead:
+around a third of prompts do build a different query under the cap, and running both through
+the shipped retriever returns the same rows for every one of them. Said precisely, because
+"the same rows" flatters it: on the prompts where the cap changes the query, **neither arm
+returns any row at all**. A 2900-term AND-joined FTS5 query matches nothing, and so does the
+50-term one it is capped to. That is a sound safety argument for the cap and it is the true
+one; the face fires on roughly 1% of prompts overall and never once on a prompt the cap
+changed.
 
 **Fixed guards, one home each.** The test-directory containment guard was wired into the
 Node exit of the PostToolUse channel; the channel has two, and the bash Read fast path
@@ -98,7 +110,20 @@ managed block into your project's own `CLAUDE.md` — a file that normally goes 
 plus a `.claude/` detail file, and it re-syncs on every SessionStart, not the first. The
 audit named two sites; sweeping for copies of the claim found eight.
 
-Suite: 309 files / 5233 tests with one red on a clean tree → **315 files / 5307 tests green**.
+**Two independent pre-tag reviewers changed this release before it was tagged**, which is the
+whole reason that step exists. Both found, separately, that the first cut of the relevance gate
+built its population from the five injection faces that leave a hook attachment and silently
+dropped the other two — inverting a contract written verbatim in the omitted extractor's own
+docblock, and doing it invisibly on this machine, because the Key Context marker is empty on an
+*adopted* project. The loss would have landed on non-adopted ones: the default for a new install,
+and the configuration where that block is the most prominent surface there is. One reviewer also
+found two tests in `hook-context.mjs`'s suite that were red from any checkout other than the
+maintainer's — the release's own headline defect class, reproduced here in a clean clone and
+fixed. The rest of their findings corrected four numbers in these notes, including one that named
+a population 3.4× larger than the sentence claimed and one non-vacuity clause that the data
+refutes; those corrections are already folded in above.
+
+Suite: 309 files / 5233 tests with one red on a clean tree → **315 files / 5318 tests green**.
 eslint 0, shellcheck 0, knip 46 unused exports / 0 unused files, unchanged. Every batch was
 mutation-verified — the fix reverted, the new tests confirmed red, and only the ones that
 should be. One of those mutations survived and that was the finding: the branch it guarded

@@ -417,6 +417,23 @@ describe('end-to-end over a known corpus', () => {
       env: { ...process.env, CLAUDE_MEM_TRANSCRIPT_ROOT: root }, encoding: 'utf8', stdio: 'pipe',
     })).toThrow(/citation-live-replay\/0/);
   });
+
+  it('REFUSES a /1 corpus specifically — the version whose records lack citedTotal', () => {
+    // Binds the format BUMP, not just the format check (pre-tag review S-5). A /1 record
+    // has no `citedTotal`, and pollutionSensitivity reads `(r.citedTotal ?? 0)` — so if the
+    // constant were reverted to /1 the file would be accepted and every frozen session
+    // would read as pollution-free. That is the silently-wrong published number this whole
+    // guard exists to prevent, and nothing failed when the bump was reverted.
+    const v1 = join(root, 'v1.json');
+    writeFileSync(v1, JSON.stringify({
+      format: 'citation-live-replay/1',
+      files: 1,
+      records: [{ project: 'p', session: 's1', ts: 1, anyCite: true, faces: { pretool: { inj: [1], hit: [1] } } }],
+    }));
+    expect(() => execFileSync(process.execPath, [SCRIPT, '--json', '--corpus', v1], {
+      env: { ...process.env, CLAUDE_MEM_TRANSCRIPT_ROOT: root }, encoding: 'utf8', stdio: 'pipe',
+    })).toThrow(/citation-live-replay\/1/);
+  });
 });
 
 // ── FLOW-2(b) / D#179: make the mention-inflation in these readings legible ──

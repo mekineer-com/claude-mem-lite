@@ -543,7 +543,12 @@ describe('buildSessionContextLines: Recent table cell safety', () => {
   it('escapes a literal pipe in a title so the markdown table stays 4 columns', () => {
     insertObs(db, { sessionId: 'sess-r', project: 'test', type: 'decision', title: 'Use grep | sort | uniq pipeline', importance: 3 });
     const out = buildSessionContextLines(db, 'test');
-    const row = out.split('\n').find(l => l.includes('grep'));
+    // Select the TABLE ROW, not any line mentioning the word. On a project that is not
+    // adopted the context block also renders a `### Key Context` bullet containing the same
+    // title, and `.find()` returned that instead — so this passed or failed on whether the
+    // HOST directory happened to be adopted (green in the maintainer's tree, red from any
+    // clone). That is the very defect class this release's MAIN-1 fix is about.
+    const row = out.split('\n').find(l => l.startsWith('|') && l.includes('grep'));
     expect(row).toBeTruthy();
     // Every cell-separating pipe is unescaped; title pipes are escaped \| — so a
     // correct row has exactly the 5 structural pipes of a 4-column row.
@@ -555,7 +560,8 @@ describe('buildSessionContextLines: Recent table cell safety', () => {
   it('collapses CR/LF/tab in a title to spaces so one obs stays one row', () => {
     insertObs(db, { sessionId: 'sess-r', project: 'test', type: 'bugfix', title: 'multi\nline\ttitle', importance: 2 });
     const out = buildSessionContextLines(db, 'test');
-    const row = out.split('\n').find(l => l.includes('multi'));
+    // Table row, not any matching line — see the note in the pipe-escaping case above.
+    const row = out.split('\n').find(l => l.startsWith('|') && l.includes('multi'));
     expect(row).toContain('multi line title');
   });
 });

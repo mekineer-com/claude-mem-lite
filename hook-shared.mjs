@@ -30,6 +30,16 @@ export const EPISODE_TIME_GAP_MS = 5 * 60 * 1000;       // 5 min
 export const SESSION_EXPIRY_MS = 12 * 60 * 60 * 1000;    // 12h
 export const STALE_SESSION_MS = 24 * 60 * 60 * 1000;     // 24h
 export const STALE_LOCK_MS = 30000;                       // 30s
+
+// The background-maintenance mutex, defined HERE next to the sweeper policy it has to
+// escape. cleanStaleLockFiles() below unlinks any `*.lock` older than STALE_LOCK_MS
+// WITHOUT checking whether the holder is alive — right for the episode lock's millisecond
+// critical section, fatal for a maintenance pass that runs for seconds to minutes. The
+// name therefore ends in `.proclock`, and `tests/auto-maintain-proc-lock.test.mjs` asserts
+// that against THIS constant rather than a re-typed copy: the first version of that test
+// built its own path from a literal, so renaming the lock left it green with the hazard
+// back. proc-lock's own staleness policy (age OR provably-dead pid) is the correct one.
+export const AUTO_MAINTAIN_LOCK = 'auto-maintain.proclock';
 export const DEDUP_WINDOW_MS = 5 * 60 * 1000;            // 5 min (title dedup)
 export const RELATED_OBS_WINDOW_MS = 7 * DAY_MS;       // 7 days
 export const FALLBACK_OBS_WINDOW_MS = RELATED_OBS_WINDOW_MS; // same window
@@ -119,8 +129,13 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
     // Neither of the old clauses could reach them: `reads-<p>.txt.collect-<ts>` does not
     // end in `.txt`, and `ep-<p>.json.tmp-<pid>` does not start with `ep-flush-`.
     //
-    // Anchored to the END of the name so a project legitimately containing `.tmp-`
-    // (`reads-x.tmp-y.txt`) is not mistaken for residue and swept on the shorter clock.
+    // Anchored to the END of the name, and the reason is not the one first written here.
+    // The original note claimed it protected `reads-x.tmp-y.txt` from the short clock; it
+    // does not — that name ends in `.txt`, so `isReads` picks the 24h cutoff either way,
+    // and dropping the anchor killed no test (caught by a pre-tag reviewer). What the
+    // anchor actually protects is the LIVE episode buffer of a project whose sanitized
+    // name contains the token: `ep-x.tmp-y.json` matches an unanchored pattern, and would
+    // then be swept as residue one hour into a session that is still using it.
     const isCrashResidue = /\.(claim|collect|trim|tmp)-[^.]*$/.test(f);
     const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-');
     const isReads = f.startsWith('reads-') && f.endsWith('.txt');

@@ -4,16 +4,20 @@
 // messages), deduped, and bumped against observations scoped by project.
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { writeFileSync, mkdtempSync, mkdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   extractCitationsFromTranscript,
   extractUserTypedIds,
+  buildCitationRelevanceSet,
+  assertRelevanceCoversAllFaces,
+  CITATION_SURFACES,
   bumpCitationAccess,
   computeCiteRecall,
 } from '../lib/citation-tracker.mjs';
 import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { keyContextIdsFileName } from '../lib/injected-ids.mjs';
 
 describe('extractCitationsFromTranscript', () => {
   let tmp;
@@ -380,5 +384,84 @@ describe('computeCiteRecall', () => {
     const stats = computeCiteRecall(path);
     expect(stats.injected).toBe(1);
     expect(stats.recalled).toBe(1);
+  });
+});
+
+// ── The relevance population: all SEVEN faces, not extractAllInjected's five ──
+//
+// Caught by BOTH pre-tag reviewers independently. The first cut of the gate built the set
+// from extractAllInjected alone, which covers only the faces with a hook attachment to
+// walk. The two it omits are omitted for reasons that do not apply to the promotion
+// channel — and extractInjectedFromKeyContext's own docblock names this caller: "Callers
+// must therefore intersect with the cited set (see handleStop) so a CITED Key Context row
+// is credited while an uncited one is left alone."
+//
+// The miss was invisible on the machine it was written on: every keyctx marker is empty on
+// an ADOPTED project. It would have landed on non-adopted ones — the default for a new
+// install, and the configuration where that block is the most prominent surface there is.
+describe('buildCitationRelevanceSet', () => {
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'mem-relset-')); });
+  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ } });
+
+  const transcript = (entries) => {
+    const f = join(dir, 't.jsonl');
+    writeFileSync(f, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    return f;
+  };
+
+  it('includes a keyctx id — the case the first cut dropped', () => {
+    const runtimeDir = join(dir, 'runtime');
+    mkdirSync(runtimeDir, { recursive: true });
+    // The marker filename is session-scoped too — write the name the extractor reads.
+    writeFileSync(join(runtimeDir, keyContextIdsFileName('proj', 'sess-a')),
+      JSON.stringify({ ids: [777], session: 'sess-a' }));
+    const set = buildCitationRelevanceSet({
+      transcriptPath: transcript([]), runtimeDir, project: 'proj', sessionId: 'sess-a',
+    });
+    expect(set.has(777)).toBe(true);
+  });
+
+  it('includes a subagent id the caller hands in', () => {
+    const set = buildCitationRelevanceSet({
+      transcriptPath: transcript([]), subagentInjected: new Set([888]),
+    });
+    expect(set.has(888)).toBe(true);
+  });
+
+  it('includes an id the user typed, and excludes one only the assistant wrote', () => {
+    const set = buildCitationRelevanceSet({
+      transcriptPath: transcript([
+        { type: 'user', message: { content: 'look at #111' } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'and #222' }] } },
+      ]),
+    });
+    expect(set.has(111)).toBe(true);
+    expect(set.has(222)).toBe(false);
+  });
+
+  it('does not credit a keyctx marker written by a DIFFERENT session', () => {
+    // The marker is session-gated; another window's render is not this session's evidence.
+    const runtimeDir = join(dir, 'runtime');
+    mkdirSync(runtimeDir, { recursive: true });
+    // Same filename this session would read, but stamped by another window: exercises the
+    // session field guard rather than just missing the file.
+    writeFileSync(join(runtimeDir, keyContextIdsFileName('proj', 'sess-a')),
+      JSON.stringify({ ids: [777], session: 'other-window' }));
+    const set = buildCitationRelevanceSet({
+      transcriptPath: transcript([]), runtimeDir, project: 'proj', sessionId: 'sess-a',
+    });
+    expect(set.has(777)).toBe(false);
+  });
+
+  it('every face in CITATION_SURFACES has a source', () => {
+    expect(assertRelevanceCoversAllFaces()).toBe(true);
+    // The guard can say NO: drop either non-attachment face and it must throw by name.
+    expect(() => assertRelevanceCoversAllFaces(
+      CITATION_SURFACES.filter((f) => f !== 'keyctx'),
+    )).toThrow(/keyctx/);
+    expect(() => assertRelevanceCoversAllFaces(
+      CITATION_SURFACES.filter((f) => f !== 'subagent'),
+    )).toThrow(/subagent/);
   });
 });

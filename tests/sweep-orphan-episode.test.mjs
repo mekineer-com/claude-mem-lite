@@ -119,14 +119,23 @@ describe('sweepOrphanEpisodeFiles', () => {
       expect(readdirSync(dir)).toEqual(['reads-projects--mem.txt.collect-1699999999']);
     });
 
-    it('does not mistake a project name containing .tmp- for residue', () => {
-      // `reads-x.tmp-y.txt` is a live tracker for a project whose sanitized name happens to
-      // contain the token. It must keep the 24h reads clock, so at 2h it survives; the
-      // residue pattern is anchored to the end of the name for exactly this.
+    it('does not sweep the LIVE episode buffer of a project whose name contains .tmp-', () => {
+      // What the end-anchor actually protects. `ep-x.tmp-y.json` is the episode file of a
+      // project whose sanitized name contains the token — an UNANCHORED pattern matches it
+      // and sweeps it as residue one hour into a session still writing to it.
+      //
+      // The first version of this case used `reads-x.tmp-y.txt` and proved nothing: that
+      // name ends in `.txt`, so `isReads` selects the 24h cutoff whether or not the anchor
+      // is there. Dropping the anchor killed no test, and a pre-tag reviewer caught it.
+      writeWithMtime('ep-x.tmp-y.json', 2 * 3600 * 1000);
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
+      expect(readdirSync(dir)).toEqual(['ep-x.tmp-y.json']);
+    });
+
+    it('a reads tracker for such a project keeps the 24h clock', () => {
       writeWithMtime('reads-x.tmp-y.txt', 2 * 3600 * 1000);
       expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
-      expect(readdirSync(dir)).toEqual(['reads-x.tmp-y.txt']);
-      // …and it is still swept once it really is abandoned.
+      // …and is still swept once it really is abandoned.
       expect(sweepOrphanEpisodeFiles(dir, { readsAgeMs: 3600 * 1000 })).toBe(1);
     });
   });

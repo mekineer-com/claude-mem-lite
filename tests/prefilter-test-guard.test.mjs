@@ -102,6 +102,20 @@ describe('post-tool-use.sh — CLAUDE_MEM_TEST_GUARD containment', () => {
     expect(readsFilesIn(sandbox)).toHaveLength(0);
   });
 
+  it('contains a trailing-slash spelling of the real dir (Node resolve()s, bash did not)', () => {
+    // The Node exit compares resolve(dir) !== resolve(real); the bash mirror compared raw
+    // strings, so `CLAUDE_MEM_DIR="$HOME/.claude-mem-lite/"` walked through the guard and
+    // appended into the live runtime dir — the exact leak the mirror exists to close.
+    runPrefilter({
+      CLAUDE_MEM_DIR: `${realDir}/`,
+      CLAUDE_MEM_TEST_GUARD: '1',
+      CLAUDE_MEM_TEST_REALDIR: realDir,
+      CLAUDE_MEM_TEST_SANDBOX: sandbox,
+    });
+    expect(readsFilesIn(realDir)).toHaveLength(0);
+    expect(readsFilesIn(sandbox)).toHaveLength(1);
+  });
+
   it('falls back to a temp directory when the guard is armed with no sandbox', () => {
     runPrefilter({ CLAUDE_MEM_TEST_GUARD: '1', CLAUDE_MEM_TEST_REALDIR: realDir });
     expect(readsFilesIn(realDir)).toHaveLength(0);

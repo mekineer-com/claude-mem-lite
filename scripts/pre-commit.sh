@@ -67,9 +67,16 @@ fi
 # genuinely sensitive: `*-shapes-*.json` carries real failing commands and their real
 # stderr, pulled from live transcripts. (The citation corpus holds no transcript text —
 # its longest string is a project path — but it does carry session UUIDs and absolute
-# paths, so it is out too.) Match on the STAGED path, so a copy saved anywhere is caught.
-STAGED_CORPUS=$(git diff --cached --name-only --diff-filter=AM \
-  | grep -E '(^|/)benchmark/results/|-shapes-[0-9-]*\.json$|-corpus-[0-9-]*\.json$' || true)
+# paths, so it is out too.)
+#
+# Scope, stated honestly because the first version of this comment overclaimed: this
+# matches the gitignored directory OR the dated dump NAMING CONVENTION. It is a convention
+# reminder, not a content gate — `--dump f.json` writes a file this cannot see. Widened
+# below to not require the date and to accept `_` separators, which covers the shapes the
+# benchmarks actually emit; a real gate would have to scan staged blobs for session-UUID
+# and absolute-path shapes, which is a bigger change than a release should carry.
+STAGED_CORPUS=$(git diff --cached --name-only --diff-filter=ACMR \
+  | grep -E '(^|/)benchmark/results/|[-_]shapes[-_0-9]*\.json$|[-_]corpus[-_0-9]*\.json$' || true)
 if [ -n "$STAGED_CORPUS" ]; then
   if [ "${DISABLE_CORPUS_GUARD:-0}" = "1" ]; then
     echo "[pre-commit] ⚠ frozen corpus staged (DISABLE_CORPUS_GUARD=1, allowing):"

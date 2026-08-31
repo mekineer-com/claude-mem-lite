@@ -22,6 +22,13 @@ import { join } from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
+// Imported, not re-typed: the previous version derived its own path from a literal, so
+// renaming the constant in hook.mjs left this case green with the sweeper hazard fully
+// reintroduced (pre-tag review S-4). Same "import it, don't copy it" rule the rest of this
+// round applied to the cooldown path and the UPS caps. (hook.mjs is an entry point that
+// exits on import, so the constant lives in hook-shared.mjs beside STALE_LOCK_MS — the
+// sweeper policy it has to escape.)
+import { AUTO_MAINTAIN_LOCK } from '../hook-shared.mjs';
 
 const REPO = fileURLToPath(new URL('..', import.meta.url));
 const HOOK = join(REPO, 'hook.mjs');
@@ -97,7 +104,7 @@ beforeEach(() => {
   runtimeDir = join(dataDir, 'runtime');
   mkdirSync(runtimeDir, { recursive: true });
   dbPath = join(dataDir, 'claude-mem-lite.db');
-  lockPath = join(runtimeDir, 'auto-maintain.proclock');
+  lockPath = join(runtimeDir, AUTO_MAINTAIN_LOCK);
   gateFile = join(runtimeDir, 'last-auto-maintain.json');
 });
 
@@ -224,5 +231,8 @@ describe('auto-maintain — cross-process mutex', () => {
 
     expect(existsSync(decoy), 'sweeper did not run — the survival below proves nothing').toBe(false);
     expect(existsSync(lockPath)).toBe(true);
+    // Bind the NAME as well as the behaviour: without this, renaming the constant renames
+    // the fixture with it and the case stays green while the hazard is back.
+    expect(AUTO_MAINTAIN_LOCK).not.toMatch(/\.lock$/);
   });
 });

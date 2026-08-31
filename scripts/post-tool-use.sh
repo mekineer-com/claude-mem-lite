@@ -91,6 +91,14 @@ if [[ "$tool" == "Read" ]]; then
     # and an absolute sandbox to redirect into. Pure builtins; no spawn on this ~5ms path.
     if [[ "${CLAUDE_MEM_TEST_GUARD:-}" == "1" ]]; then
       _real_dir="${CLAUDE_MEM_TEST_REALDIR:-$HOME/.claude-mem-lite}"
+      # Node compares resolve(dir) !== resolve(real); a raw string compare here let
+      # `CLAUDE_MEM_DIR="$HOME/.claude-mem-lite/"` (trailing slash) walk straight through
+      # the guard and append into the live runtime dir — the exact leak this exists to
+      # close. Trailing-slash strip only, with the same builtin loop used for `_dir` above:
+      # a realpath spawn would blow the ~5ms budget, and a trailing slash is the spelling
+      # difference that actually occurs.
+      while [[ "$_data_dir" == */ && ${#_data_dir} -gt 1 ]]; do _data_dir="${_data_dir%/}"; done
+      while [[ "$_real_dir" == */ && ${#_real_dir} -gt 1 ]]; do _real_dir="${_real_dir%/}"; done
       if [[ "$_data_dir" == "$_real_dir" ]]; then
         if [[ "${CLAUDE_MEM_TEST_SANDBOX:-}" == /* ]]; then
           _data_dir="$CLAUDE_MEM_TEST_SANDBOX"

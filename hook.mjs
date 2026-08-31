@@ -46,7 +46,7 @@ import { cleanupClaudeMdLegacyBlock, buildSessionContextLines } from './hook-con
 import { entry as preCompactEntry } from './hook-precompact.mjs';
 import {
   RUNTIME_DIR, EPISODE_BUFFER_SIZE, EPISODE_TIME_GAP_MS,
-  SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS,
+  SESSION_EXPIRY_MS, STALE_SESSION_MS, STALE_LOCK_MS, AUTO_MAINTAIN_LOCK,
   HANDOFF_EXPIRY_CLEAR, HANDOFF_EXPIRY_EXIT,
   sessionFile, getSessionId, createSessionId, openDb,
   spawnBackground, sweepOrphanEpisodeFiles, sweepStaleProjectMarkers,
@@ -63,8 +63,7 @@ import { snapshotDb } from './lib/db-backup.mjs';
 import {
   extractCitationsFromTranscript,
   extractInjectedBySurface,
-  extractAllInjected,
-  extractUserTypedIds,
+  buildCitationRelevanceSet,
   unionSurfaces,
   extractInjectedFromKeyContext,
   bumpCitationAccess,
@@ -960,13 +959,12 @@ async function handleStop() {
             // set is every `#NN` in this session's assistant text and cannot tell a
             // citation from a mention; in this repository a CHANGELOG or audit-writing
             // session names dozens of ids in prose, and access_count > 3 promotes a row a
-            // tier via boostAccessed. Credit only rows this session was actually given
-            // (injected, any face, sidechains included — a subagent's injection is still
-            // this session showing the row) or that the user named themselves.
-            const relevant = new Set([
-              ...extractAllInjected(transcriptPath),
-              ...extractUserTypedIds(transcriptPath),
-            ]);
+            // tier via boostAccessed. The population to credit — all seven faces, and why
+            // extractAllInjected alone is the wrong five — lives in the builder.
+            const relevant = buildCitationRelevanceSet({
+              transcriptPath, runtimeDir: RUNTIME_DIR, project,
+              sessionId: ccSessionId, subagentInjected: sub.injected,
+            });
             const n = bumpCitationAccess(db, ids, project, relevant);
             debugLog('DEBUG', 'handleStop',
               `citations: ${ids.size} ids scanned, ${relevant.size} relevant, ${n} obs bumped`);
@@ -1580,7 +1578,6 @@ function scheduleSessionStartAutoMaintain(project) {
 // mid-pass and hand the exclusion straight back to the race it exists to close.
 // proc-lock brings its own staleness policy (age OR provably-dead pid), which is the
 // correct one here.
-const AUTO_MAINTAIN_LOCK = 'auto-maintain.proclock';
 // Generous upper bound on one pass; a crashed holder is normally reclaimed sooner via the
 // dead-pid check, so this only matters for a holder killed on another host.
 const AUTO_MAINTAIN_LOCK_STALE_MS = 10 * 60 * 1000;
