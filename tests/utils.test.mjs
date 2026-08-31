@@ -1161,6 +1161,50 @@ describe('makeEntryDesc', () => {
     expect(() => makeEntryDesc('Bash', {}, '')).not.toThrow();
     expect(() => makeEntryDesc('Write', {}, '')).not.toThrow();
   });
+
+  // ── SEC-3 (2026-08-29 audit): scrub before truncating, inside the truncating fn ──
+  //
+  // hook.mjs wraps this whole result in scrubSecrets(), one step too late: by then every
+  // field is already cut to 40-60 chars, so a secret straddling the cut has lost the tail
+  // its value-length-gated pattern needs and the surviving head goes into the episode
+  // verbatim. The prompt path fixed this ordering; this path kept the old one.
+  describe('scrub/truncate ordering', () => {
+    // The offsets are load-bearing. Padded so the AWS value begins 3 characters before the
+    // 60-char response cut: any shorter and the whole secret is dropped by truncation
+    // anyway, any longer and it survives intact for the outer scrub to catch — either way
+    // the two orderings agree and the fixture proves nothing.
+    const KEY = 'AWS_SECRET_ACCESS_KEY=';
+    const VALUE = 'AKIAIOSFODNN7EXAMPLE';
+    const respStraddle = 'y'.repeat(34) + KEY + VALUE + ' done';
+
+    it('redacts a secret straddling the Bash response cut', () => {
+      const desc = makeEntryDesc('Bash', { command: 'ls' }, respStraddle, { isError: false });
+      expect(desc).toContain(`${KEY}***`);
+      expect(desc, 'a value head must not survive the cut').not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+    });
+
+    it('DISCRIMINATOR: the old ordering leaks a head on this exact input', () => {
+      // Anti-vacuity. Without this, the assertion above passes on any fixture where the
+      // secret happens to be dropped by truncation rather than redacted by the scrub.
+      const truncateFirst = scrubSecrets(truncate(respStraddle, 60));
+      expect(truncateFirst).toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+      expect(truncateFirst).toContain('AKI');
+    });
+
+    it('redacts a secret straddling the Edit old_string cut', () => {
+      const straddle = 'y'.repeat(14) + KEY + VALUE;
+      const desc = makeEntryDesc('Edit', { file_path: '/p/a.mjs', old_string: straddle, new_string: '' }, '');
+      expect(desc).not.toMatch(/ACCESS_KEY=[A-Za-z0-9]/);
+    });
+
+    it('leaves ordinary text byte-identical', () => {
+      // The scrub must be invisible on the case that is every other tool call.
+      expect(makeEntryDesc('Bash', { command: 'npm test' }, 'ok: 12 passed', { isError: false }))
+        .toBe('npm test → ok: 12 passed');
+      expect(makeEntryDesc('WebFetch', { url: 'https://example.com' }, ''))
+        .toBe('Fetch: https://example.com');
+    });
+  });
 });
 
 // ─── scrubSecrets ────────────────────────────────────────────────────────────

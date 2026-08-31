@@ -5,6 +5,9 @@
 import { basename, dirname, resolve, sep } from 'path';
 import { execSync } from 'child_process';
 import { buildLowSignalRegex } from './lib/low-signal-patterns.mjs';
+// Local binding for internal use: the `export … from './secret-scrub.mjs'` re-export below
+// is a pass-through and creates no binding in this module's scope.
+import { scrubSecrets as _scrubSecrets } from './secret-scrub.mjs';
 
 // ─── Re-exports from extracted modules ──────────────────────────────────────
 // Backward compatibility: all consumers import from utils.mjs
@@ -200,34 +203,51 @@ export function isRelatedToEpisode(episode, newFiles) {
  * @param {boolean} [opts.isError] If provided, overrides inline error regex detection
  * @returns {string} Concise description of the action
  */
+// SEC-3 (2026-08-29 audit): scrub BEFORE truncating, inside the function that truncates.
+//
+// The caller wraps this whole result in scrubSecrets(), which is one step too late: every
+// field below is already cut to 40-60 characters by then, so a secret straddling the cut
+// has lost the tail its value-length-gated pattern needs and the head survives verbatim.
+// The prompt path fixed this ordering (hook.mjs) and this path kept the old one.
+//
+// The scrub input is windowed rather than whole: `resp` is an uncapped tool response (a
+// Bash stdout can be megabytes) and this runs on every PostToolUse. 4096 is two orders of
+// magnitude above the longest cut here, so a secret that begins before the cut is still
+// seen whole by the patterns, at bounded cost.
+const DESC_SCRUB_WINDOW = 4096;
+function scrubTruncate(str, max) {
+  if (typeof str !== 'string' || str === '') return truncate(str, max);
+  return truncate(_scrubSecrets(str.slice(0, DESC_SCRUB_WINDOW)), max);
+}
+
 export function makeEntryDesc(toolName, input, resp, opts) {
   switch (toolName) {
     case 'Edit':
-      return `${basename(input.file_path || '')}: "${truncate(input.old_string || '', 40)}" → "${truncate(input.new_string || '', 40)}"`;
+      return `${basename(input.file_path || '')}: "${scrubTruncate(input.old_string || '', 40)}" → "${scrubTruncate(input.new_string || '', 40)}"`;
     case 'Write':
       return `Created ${basename(input.file_path || '')} (${(input.content || '').length} chars)`;
     case 'NotebookEdit':
-      return `Notebook cell: ${truncate(input.new_source || '', 60)}`;
+      return `Notebook cell: ${scrubTruncate(input.new_source || '', 60)}`;
     case 'Bash': {
-      const cmd = truncate(input.command || '', 50);
+      const cmd = scrubTruncate(input.command || '', 50);
       // Use caller-provided bashSig.isError (word-boundary aware) when available;
       // fall back to inline regex only for standalone callers (tests, etc.)
       const isErr = opts?.isError ?? (/\berror\b|\bfail(ed|ure)?\b|\bexception\b|\bpanic\b/i.test(resp) && resp.length > 30);
-      const snippet = truncate(resp, 60);
+      const snippet = scrubTruncate(resp, 60);
       return isErr ? `${cmd} → ERROR: ${snippet}` : `${cmd} → ${snippet}`;
     }
     case 'Grep':
-      return `Search "${truncate(input.pattern || '', 20)}" → ${truncate(resp, 60)}`;
+      return `Search "${scrubTruncate(input.pattern || '', 20)}" → ${scrubTruncate(resp, 60)}`;
     case 'LSP':
       return `${input.operation || ''} ${basename(input.filePath || '')}`;
     case 'Task': case 'Agent':
-      return truncate(input.description || '', 60);
+      return scrubTruncate(input.description || '', 60);
     case 'WebSearch':
-      return `Web: ${truncate(input.query || '', 50)}`;
+      return `Web: ${scrubTruncate(input.query || '', 50)}`;
     case 'WebFetch':
-      return `Fetch: ${truncate(input.url || '', 50)}`;
+      return `Fetch: ${scrubTruncate(input.url || '', 50)}`;
     default:
-      return `${toolName}: ${truncate(resp, 50)}`;
+      return `${toolName}: ${scrubTruncate(resp, 50)}`;
   }
 }
 
