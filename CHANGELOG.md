@@ -2,6 +2,108 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.84.0 — the audit's own P1, and a second promotion path the ledger never knew about
+
+Thirteen batches against the 2026-08-29 engineering audit (`docs/reviews/PROJECT_AUDIT.md`).
+Every P0/P1/P2 is closed; eight P3 items with it. Of the twelve findings re-tested before
+any code moved, twelve held and none was rejected — but four were **larger than filed**,
+and one new P1 came out of running the suite rather than out of the report.
+
+**Upgrade note — one default behaviour change, with an off switch.**
+
+**Discussing a memory no longer promotes it.** At Stop, an `access_count` used to be
+credited for every `#NN` appearing in the session's assistant text, with no check that
+anything had ever put that memory in front of the model. Downstream that is a promotion:
+`access_count > 3` raises importance a tier. In a repository whose subject matter IS the
+memory store, a session writing release notes or an audit report names dozens of ids in
+prose and promoted every one of them. Now a citation counts when the memory was injected
+this session, or when **you** typed its `#NN` yourself. Measured on real transcripts: **267
+of 859 credited (id, session) pairs — 31.1% — were mentions nothing had put in front of the
+model**, and ten sessions citing more than twenty ids contributed 44.2% of them. Revert with
+`CLAUDE_MEM_CITATION_RELEVANCE_GATE=off`; pinning `claude-mem-lite@3.83.0` also reverts it.
+
+This was filed as D#179 against the citation-decay loop, which at least had an injected
+gate. The audit found the *second* path — this one, with no gate at all — so "discussing a
+memory" was promoting it twice over while the ledger recorded only the gated half. D#179
+itself stays open and now says so: an injected id that is merely mentioned rather than
+applied still promotes through decay.
+
+**The report's own P1 was a test whose green depended on the host.** The startup dashboard
+took its `project` from the environment but its filesystem root from `process.cwd()`. Those
+diverge whenever a hook is not spawned at the project root, and the dashboard then renders
+one directory's git state and task list under another directory's project name. Production
+never showed it — Claude Code spawns hooks at the project root — but the test face did: on
+a clean tree HEAD was one test red, and the CI green of 2026-08-25 was a parallel worker
+happening to leave a scratch file in the repository first. Fixed by same-sourcing rather
+than by a fallback chain, so identity and filesystem root cannot drift apart again.
+
+**And a second one, found by running the suite rather than by reading the code.** A full run
+reddened an unrelated case on a 5-second MCP-startup timeout. A cold `node server.mjs`
+initialize round trip measures 635ms here, so that cap had a 7.9× margin — and it still lost,
+on 24 cores with 311 test files in flight, to CPU starvation of the spawn. Thirteen suites
+had independently copy-pasted the same literal. They now share one budget under vitest's own
+`testTimeout`, which is what actually owns hang protection; the inner timer exists only to
+name which round trip stalled.
+
+**Security and reliability.** `stripPrivate` — the first step of every `scrubSecrets` call,
+on the synchronous prompt path — was quadratic on opener-dense input: 891ms at the 256KB
+stdin cap, against 0.6ms for a megabyte of plain text, and `import-jsonl` feeds it user
+files with no cap at all. Rewritten as a linear tag scan: **891ms → 1.8ms**, with a
+differential oracle against the original regex over 13 adversarial arrangements and 500
+seeded random tag soups, so "same output" is asserted rather than assumed. The unsampled
+hook-error log now scrubs its fields like its twin sampler already did — Node quotes
+offending input back inside JSON.parse errors, and one hook hands it raw stdin. Episode
+descriptions scrub *before* truncating, so a secret straddling the cut can no longer leave
+its head behind. The cite-back hints' filenames are defanged, closing the last cell in the
+ten-surface injection matrix that reached the model raw.
+
+**Concurrency, and a memory row that could vanish early.** Two Claude Code windows booting
+either side of the 24-hour maintenance boundary both saw "due" and both spawned a worker.
+That broke an invariant `decayAndMarkIdle` documents in its own docblock: it marks before it
+decays precisely so an importance-2 row cannot be decayed and hidden as pending-purge in one
+pass. Across two processes the ordering is gone — one worker decays, the other hides the
+row, 37 days from a hard delete. The family now takes a cross-process lock, deliberately not
+named `*.lock` because the 30-second sweeper strips those without checking whether the holder
+is alive. Separately, both episode upgrade paths now check the pre-saved row is still live:
+the in-place UPDATE reported success while writing a whole enrichment onto a tombstone, and
+the delete hard-removed rows a keeper may have absorbed.
+
+**Performance.** `lib/ups-query.mjs` calls itself the one query-cap definition for the
+UserPromptSubmit event. That event has three legs, not two, and the third was uncapped:
+**356ms on a 250KB CJK prompt against 5.5ms capped**, synchronously, before the model sees
+the turn. `denoise-ab` reported NEUTRAL with Δ=0.000 on all twelve metrics, and that verdict
+was worth nothing here — its longest fixture query is 72 characters against a 2000-character
+cap, so the suites cannot reach the lever. The evidence is 11,255 live prompts instead:
+10.65% of them do build a different query under the cap, and running both through the
+shipped retriever returns the same rows for all of them, on a face whose overall firing rate
+is high enough for the ruler to see rows at all.
+
+**Fixed guards, one home each.** The test-directory containment guard was wired into the
+Node exit of the PostToolUse channel; the channel has two, and the bash Read fast path
+appended straight into the developer's live runtime directory. The pre-recall cooldown path
+had three copies of its naming rule — a writer and two readers, two of them carrying comments
+saying the copies must agree — and only one pair was pinned by a test. The crash-residue
+sweep reached one of four temp-name families. Frozen benchmark corpora, one of which holds
+real commands and their real stderr, were protected by a single `.gitignore` line while the
+flags that write them take an arbitrary path.
+
+**Instrumentation you can now discount.** `citation-live-replay` prints a pollution
+sensitivity table by default, not behind a flag: excluding document-shaped sessions moves
+`pretool` 37.5% → 31.6% and `task_imperative` 36.8% → 30.8%. Reported, not filtered — which
+mentions were real uses is not decidable from the text, so dropping those sessions would
+trade a known bias for an unknown one.
+
+**Docs.** Both READMEs described an auto-adopt that stopped existing in v3.13: it writes a
+managed block into your project's own `CLAUDE.md` — a file that normally goes into git —
+plus a `.claude/` detail file, and it re-syncs on every SessionStart, not the first. The
+audit named two sites; sweeping for copies of the claim found eight.
+
+Suite: 309 files / 5233 tests with one red on a clean tree → **315 files / 5307 tests green**.
+eslint 0, shellcheck 0, knip 46 unused exports / 0 unused files, unchanged. Every batch was
+mutation-verified — the fix reverted, the new tests confirmed red, and only the ones that
+should be. One of those mutations survived and that was the finding: the branch it guarded
+was unreachable, so it was deleted rather than papered over with a test that could not fail.
+
 ## v3.83.0 — the flush that ate the reads, and the class I was about to demote for citing best
 
 **Upgrade note — two default behaviour changes, both with an off switch, both measured on

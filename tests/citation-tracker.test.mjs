@@ -216,6 +216,41 @@ describe('bumpCitationAccess', () => {
     expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id).access_count).toBe(0);
   });
 
+  it('CLAUDE_MEM_CITATION_RELEVANCE_GATE=off restores the pre-v3.84.0 behaviour', () => {
+    // The documented revert path. It restores ALL of the old behaviour including the
+    // missing-argument hole — a half-reverted gate would be a third behaviour nobody has
+    // measured.
+    const discussed = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
+    const env = { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'off' };
+    expect(bumpCitationAccess(db, [discussed], 'projects--test', new Set(), env)).toBe(1);
+    expect(bumpCitationAccess(db, [discussed], 'projects--test', undefined, env)).toBe(1);
+    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(discussed).access_count).toBe(2);
+  });
+
+  it('an unset or unrelated flag value leaves the gate ON', () => {
+    // Off-by-default reverts are how a guard quietly stops guarding. Only the documented
+    // token disarms it.
+    const discussed = newObs({ title: 'X', type: 'bugfix', project: 'projects--test' });
+    for (const env of [{}, { CLAUDE_MEM_CITATION_RELEVANCE_GATE: '' },
+      { CLAUDE_MEM_CITATION_RELEVANCE_GATE: '0' }, { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'false' }]) {
+      expect(bumpCitationAccess(db, [discussed], 'projects--test', new Set(), env)).toBe(0);
+    }
+    expect(db.prepare('SELECT access_count FROM observations WHERE id = ?').get(discussed).access_count).toBe(0);
+  });
+
+  it('the flag does NOT restore crediting a tombstone (FLOW-6 is not part of the revert)', () => {
+    // FLOW-6 was a separate defect with no upside to restore, so it stays fixed on both
+    // sides of the flag.
+    const keeper = newObs({ title: 'K', type: 'bugfix', project: 'projects--test' });
+    const dead = newObs({ title: 'D', type: 'bugfix', project: 'projects--test' });
+    db.prepare('UPDATE observations SET superseded_at = ?, superseded_by = ? WHERE id = ?')
+      .run(Date.now(), keeper, dead);
+    bumpCitationAccess(db, [dead], 'projects--test', undefined, { CLAUDE_MEM_CITATION_RELEVANCE_GATE: 'off' });
+    const acc = (id) => db.prepare('SELECT access_count FROM observations WHERE id = ?').get(id).access_count;
+    expect(acc(keeper)).toBe(1);
+    expect(acc(dead)).toBe(0);
+  });
+
   it('redirects a superseded citation to its keeper (FLOW-6)', () => {
     // Parity with applyCitationDecay / recordCitationSurfaces. This was the last
     // access-side surface still crediting the tombstone instead of the row that
