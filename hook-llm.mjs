@@ -25,6 +25,7 @@ import { episodeHasSignificantContent } from './hook-episode.mjs';
 import { OBS_TYPE_SET } from './lib/obs-types.mjs';
 
 import { DAY_MS } from './lib/time-constants.mjs';
+import { liveObsFilterSql } from './lib/inject-search-core.mjs';
 // T9: memdir-incompatible types live in the `events` table, not `observations`.
 // Set lookup is O(1) — authoritative source is lib/activity.mjs::EVENT_TYPES.
 const EVENT_TYPE_SET = new Set(EVENT_TYPES);
@@ -351,7 +352,18 @@ export function persistHaikuSummary(db, summary, ctx) {
 
     if (ctx.preSavedObsId) {
       const id = db.transaction(() => {
-        db.prepare(`DELETE FROM observations WHERE id = ?`).run(ctx.preSavedObsId);
+        // Same live-row guard as the in-place upgrade (FLOW-7). If auto-dedup superseded
+        // or compressed the pre-saved row while this worker was in flight, that row is no
+        // longer ours to hard-delete — a keeper may have absorbed it, and children can
+        // point at it through compressed_into. Leave it to the maintenance path, which
+        // recovers children before deleting; the event still gets written either way.
+        const removed = db.prepare(
+          `DELETE FROM observations WHERE id = ? AND ${liveObsFilterSql('')}`,
+        ).run(ctx.preSavedObsId).changes;
+        if (removed === 0) {
+          debugLog('DEBUG', 'llm-episode',
+            `upgrade-delete: pre-saved obs #${ctx.preSavedObsId} no longer live — left in place`);
+        }
         return insertEvent();
       })();
       return { table: 'events', id };
@@ -1014,12 +1026,18 @@ ${actionList}`;
           lesson_learned: obs.lessonLearned || null,
           search_aliases: obs.searchAliases || null,
         });
-        db.prepare(`
+        // The live-row guard (FLOW-7, 2026-08-29 audit). This worker is 2-5s behind the
+        // foreground pre-save, and auto-dedup can supersede or compress that row inside
+        // the window. An unguarded `WHERE id = ?` then writes the whole enrichment onto a
+        // tombstone: `changes` is 1, nothing looks wrong, and the row it landed on is
+        // excluded from every read face by liveObsFilterSql. Same clause as those read
+        // faces, so "what the update may touch" and "what a query may return" cannot drift.
+        const upgraded = db.prepare(`
           UPDATE observations SET type=?, title=?, subtitle=?,
             narrative=COALESCE(NULLIF(?, ''), narrative), concepts=?, facts=?,
             text=?, importance=?, files_read=?, minhash_sig=?, lesson_learned=?, search_aliases=?,
             scope=COALESCE(?, scope)
-          WHERE id = ?
+          WHERE id = ? AND ${liveObsFilterSql('')}
         `).run(
           obs.type, safe.title, safe.subtitle,
           safe.narrative,
@@ -1031,23 +1049,38 @@ ${actionList}`;
           safe.search_aliases,
           normalizeScope(obs.scope),
           episode.savedId
-        );
-        savedId = episode.savedId;
-        savedTable = 'observations';
-        debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+        ).changes;
 
-        // Update TF-IDF vector with enriched content
-        try {
-          const vocab = getVocabulary(db);
-          if (vocab) {
-            const vecText = vecTextForRow({ title: obs.title, narrative: obs.narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
-            const vec = computeVector(vecText, vocab);
-            if (vec) {
-              db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
-                .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+        if (upgraded === 0) {
+          // The pre-saved row is gone or tombstoned. Dropping the enrichment here is the
+          // silent-loss shape this repository keeps paying for, so save it as a fresh row
+          // and let the normal dedup path decide whether it merges into the keeper.
+          debugLog('DEBUG', 'llm-episode',
+            `pre-saved obs #${episode.savedId} no longer live — saving enrichment as a fresh row`);
+          const result = persistHaikuSummary(db, obsToSummary(obs), {
+            project: episode.project,
+            session_id: episode.sessionId,
+          });
+          savedId = result.id;
+          savedTable = result.table;
+        } else {
+          savedId = episode.savedId;
+          savedTable = 'observations';
+          debugLog('DEBUG', 'llm-episode', `upgraded pre-saved obs #${savedId}`);
+
+          // Update TF-IDF vector with enriched content
+          try {
+            const vocab = getVocabulary(db);
+            if (vocab) {
+              const vecText = vecTextForRow({ title: obs.title, narrative: obs.narrative, concepts: conceptsText, lesson_learned: safe.lesson_learned, search_aliases: safe.search_aliases });
+              const vec = computeVector(vecText, vocab);
+              if (vec) {
+                db.prepare('INSERT OR REPLACE INTO observation_vectors (observation_id, vector, vocab_version, created_at_epoch) VALUES (?, ?, ?, ?)')
+                  .run(savedId, Buffer.from(vec.buffer), vocab.version, Date.now());
+              }
             }
-          }
-        } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
+          } catch (e) { debugCatch(e, 'handleLLMEpisode-vector'); }
+        }
       }
     } else {
       // Clean insert (no pre-save) — dispatcher routes by type.

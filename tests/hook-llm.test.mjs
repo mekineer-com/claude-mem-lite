@@ -566,6 +566,108 @@ describe('handleLLMEpisode', () => {
     expect(stillExists).toBeUndefined();
   });
 
+  // ── FLOW-7 (2026-08-29 audit): the pre-saved row can stop being live mid-flight ──
+  //
+  // This worker runs 2-5s behind the foreground pre-save, and auto-dedup can supersede or
+  // compress that row inside the window. Both upgrade paths addressed it by `id` alone:
+  // the UPDATE reported changes=1 while writing the entire enrichment onto a tombstone
+  // that liveObsFilterSql excludes from every read face, and the DELETE hard-removed a row
+  // a keeper may have absorbed and children may point at through compressed_into.
+  describe('FLOW-7: upgrade paths guard on the row still being live', () => {
+    const CHANGE_ENRICHMENT = JSON.stringify({
+      type: 'change',
+      title: 'Enriched title from Haiku',
+      narrative: 'Extracted env parsing into a single loader function',
+      concepts: ['config'],
+      facts: [],
+      importance: 1,
+      lesson_learned: 'BM25 rank is ascending in FTS5 — sorting DESC silently inverts relevance.',
+    });
+
+    /** Foreground rule-fallback insert, as the pre-save leaves it. */
+    function preSave(title = 'Modified config.mjs') {
+      insertSession(db, { id: 'ep-sess', project: 'test-proj' });
+      return db.prepare(`
+        INSERT INTO observations (memory_session_id, project, type, title, importance, created_at, created_at_epoch, narrative, concepts, facts, files_read, files_modified, text)
+        VALUES (?, ?, 'change', ?, 1, ?, ?, '', '', '', '[]', '[]', '')
+      `).run('ep-sess', 'test-proj', title, new Date().toISOString(), Date.now()).lastInsertRowid;
+    }
+
+    function runEpisode(preSavedId) {
+      writeFileSync(tmpFile, JSON.stringify({
+        sessionId: 'ep-sess', project: 'test-proj', savedId: preSavedId,
+        files: ['config.mjs'], filesRead: [],
+        entries: [{ tool: 'Edit', desc: 'Refactor config', isError: false }],
+      }));
+      return handleLLMEpisode();
+    }
+
+    const titleOf = (id) => db.prepare('SELECT title FROM observations WHERE id = ?').get(id)?.title;
+
+    it('CONTROL: a live pre-saved row is still upgraded in place', async () => {
+      callLLM.mockReturnValueOnce(CHANGE_ENRICHMENT);
+      const id = preSave();
+      await runEpisode(id);
+      // Without this, the guarded cases below could not tell "protected the tombstone"
+      // apart from "the upgrade path stopped working".
+      expect(titleOf(id)).toBe('Enriched title from Haiku');
+      expect(db.prepare('SELECT COUNT(*) c FROM observations WHERE project = ?').get('test-proj').c).toBe(1);
+    });
+
+    it('does not write the enrichment onto a superseded row, and does not drop it either', async () => {
+      callLLM.mockReturnValueOnce(CHANGE_ENRICHMENT);
+      const id = preSave();
+      db.prepare('UPDATE observations SET superseded_at = ? WHERE id = ?').run(Date.now(), id);
+
+      await runEpisode(id);
+
+      expect(titleOf(id)).toBe('Modified config.mjs'); // tombstone untouched
+      // The enrichment is not silently discarded — it lands on a fresh live row.
+      const live = db.prepare(
+        'SELECT id, title FROM observations WHERE project = ? AND superseded_at IS NULL',
+      ).all('test-proj');
+      expect(live.length).toBe(1);
+      expect(live[0].id).not.toBe(id);
+      expect(live[0].title).toBe('Enriched title from Haiku');
+    });
+
+    it('applies the same guard to a compressed pre-saved row', async () => {
+      callLLM.mockReturnValueOnce(CHANGE_ENRICHMENT);
+      const id = preSave();
+      db.prepare('UPDATE observations SET compressed_into = -2 WHERE id = ?').run(id);
+
+      await runEpisode(id);
+
+      expect(titleOf(id)).toBe('Modified config.mjs');
+      const live = db.prepare(
+        'SELECT id FROM observations WHERE project = ? AND COALESCE(compressed_into, 0) = 0',
+      ).all('test-proj');
+      expect(live.length).toBe(1);
+      expect(live[0].id).not.toBe(id);
+    });
+
+    it('upgrade-delete leaves a superseded pre-saved row in place and still writes the event', async () => {
+      callLLM.mockReturnValueOnce(JSON.stringify({
+        type: 'feature',
+        title: 'Add user authentication',
+        narrative: 'Implemented JWT-based auth flow',
+        concepts: ['auth'],
+        facts: [],
+        importance: 2,
+        lesson_learned: 'JWT auth flow chose RS256 over HS256 for key rotation support',
+      }));
+      const id = preSave();
+      db.prepare('UPDATE observations SET superseded_at = ? WHERE id = ?').run(Date.now(), id);
+
+      await runEpisode(id);
+
+      // Hard-deleting it would orphan anything the keeper's compression points at; the
+      // maintenance path removes it properly (recoverChildrenOf first).
+      expect(db.prepare('SELECT id FROM observations WHERE id = ?').get(id)).toBeTruthy();
+      expect(db.prepare('SELECT COUNT(*) c FROM events WHERE project = ?').get('test-proj').c).toBe(1);
+    });
+  });
+
   it('v2.56.0 #1: KEEPS type=change with substantive lesson', async () => {
     callLLM.mockReturnValueOnce(JSON.stringify({
       type: 'change',
