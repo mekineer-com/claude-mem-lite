@@ -65,6 +65,7 @@
     "lib/edge-attribution.mjs",
     "lib/file-edge-match.mjs",
     "lib/cite-back-hint.mjs",
+    "lib/cooldown-path.mjs",
     "lib/tmp-fixture-sweep.mjs",
     "lib/summary-extractor.mjs",
     "lib/id-routing.mjs",

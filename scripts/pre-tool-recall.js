@@ -12,6 +12,7 @@ import { injectedIdsFileName } from '../lib/injected-ids.mjs';
 import { liveObsFilterSql } from '../lib/inject-search-core.mjs';
 import { buildNotLowSignalSql } from '../lib/low-signal-patterns.mjs';
 import { recordHookError } from '../lib/hook-telemetry.mjs';
+import { cooldownPathFor as sharedCooldownPathFor } from '../lib/cooldown-path.mjs';
 import { citeFactorClause } from '../scoring-sql.mjs';
 import { fileMatchClause, fileMatchParams, basenameAnySep } from '../lib/file-edge-match.mjs';
 import { fileIntelFor } from '../lib/file-intel.mjs';
@@ -53,12 +54,13 @@ import { DAY_MS } from '../lib/time-constants.mjs';
 const DATA_DIR = resolveDataDir(process.env.CLAUDE_MEM_DIR);
 const DB_PATH = process.env.CLAUDE_MEM_DB_PATH || join(DATA_DIR, 'claude-mem-lite.db');
 const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtime');
-// A3 (v2.83): cross-hook dedup window — must mirror DEDUP_STALE_MS in
-// scripts/prompt-search-utils.mjs. UPS writes
-// `runtime/.claude-mem-injected-<project>` after each inject; we read it to
-// drop IDs the agent already saw in this 5-min window. Standalone fast-path
-// (#8447) so we inline the constant rather than importing the helper.
-const CROSS_HOOK_DEDUP_MS = 5 * 60 * 1000;
+// A3 (v2.83): cross-hook dedup window. UPS writes
+// `runtime/.claude-mem-injected-<project>` after each inject; we read it to drop IDs the
+// agent already saw in this window. Imported, not inlined (ARCH-3): the copy's stated
+// reason — keep this standalone fast path import-free (#8447) — was retired by v3.80.0,
+// which already imports lib modules here, and the inlined value silently encoded the
+// same premise twice.
+import { DEDUP_STALE_MS as CROSS_HOOK_DEDUP_MS } from './prompt-search-utils.mjs';
 // v2.33.1: cooldown path is session-scoped so same-file-twice within one
 // session never re-injects (was: global file, 5-min window). Cross-session:
 // fresh file, fresh nudges — this is intended. No session_id → fall back to
@@ -160,10 +162,14 @@ const REREAD_MIN_TOKENS = Math.max(1,
 // Edit cost 15-30 disk stats per call. SessionStart fires once at session boot,
 // which is enough to keep RUNTIME_DIR from growing unbounded.
 
+// Path rule lives in lib/cooldown-path.mjs — this script WRITES the file that
+// lib/cite-back-hint.mjs and lib/edge-attribution.mjs read, and a writer/reader
+// disagreement does not error, it silently reads a file nobody wrote (ARCH-2). The
+// no-session legacy fallback stays here: it is this script's own back-compat, not part
+// of the shared naming rule.
 function cooldownPathFor(sessionId) {
   if (!sessionId) return LEGACY_COOLDOWN_PATH;
-  const safe = String(sessionId).replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 64);
-  return join(RUNTIME_DIR, `pre-recall-cooldown-${safe}.json`);
+  return sharedCooldownPathFor(RUNTIME_DIR, sessionId);
 }
 
 // Comprehension-bridge (CLAUDE_MEM_SALIENCE=bridge): rewrite the top bound lesson
