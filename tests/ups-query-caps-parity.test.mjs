@@ -18,6 +18,8 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { sanitizeFtsQuery } from '../utils.mjs';
 import { UPS_QUERY_CAPS, upsFtsQuery } from '../lib/ups-query.mjs';
+import { searchInjectableEvents } from '../lib/events-injection.mjs';
+import { createTestDb } from './test-helpers.mjs';
 
 const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
@@ -27,7 +29,13 @@ describe('UserPromptSubmit query caps — both hooks of the event', () => {
     // assertion below while re-opening the exact drift this fix closes.
     const pathA = read('../scripts/user-prompt-search.js');
     const pathB = read('../hook-memory.mjs');
-    for (const [name, src] of [['user-prompt-search.js', pathA], ['hook-memory.mjs', pathB]]) {
+    // Third leg (audit ALGO-1): `hook.mjs user-prompt` runs the events block alongside
+    // the memory block. It was wired in v3.48, before this module existed, and kept
+    // handing raw prompt text to searchInjectableEvents — so the event that "both faces"
+    // above were meant to cover in fact had three query builders, and the uncapped one
+    // survived the round that named the defect.
+    const pathC = read('../hook.mjs');
+    for (const [name, src] of [['user-prompt-search.js', pathA], ['hook-memory.mjs', pathB], ['hook.mjs', pathC]]) {
       expect(src, `${name} must import the shared cap`).toMatch(/from '\.\.?\/lib\/ups-query\.mjs'/);
       expect(src, `${name} must not re-declare the caps`).not.toMatch(/maxChars:\s*2000/);
     }
@@ -56,5 +64,48 @@ describe('UserPromptSubmit query caps — both hooks of the event', () => {
     // The caps must be invisible in the case that matters most — every ordinary turn.
     const normal = 'why does the dedup guard skip superseded rows';
     expect(upsFtsQuery(normal)).toBe(sanitizeFtsQuery(normal));
+  });
+
+  // ── ALGO-1: the events leg was the event's third, uncapped query builder ──
+
+  it('the events leg cannot be handed raw prompt text at all', () => {
+    // Capping at the call site would leave the uncapped door open for the next caller,
+    // which is how this leg came to exist. searchInjectableEvents now takes a BUILT
+    // query only: a `prompt` option would be silently ignored, so the signature is what
+    // is asserted, not the caller's good behaviour.
+    const src = read('../lib/events-injection.mjs');
+    expect(src).toMatch(/export function searchInjectableEvents\(db, \{\s*ftsQuery,/);
+    expect(src, 'events-injection must not build a query of its own')
+      .not.toMatch(/sanitizeFtsQuery\(/);
+    expect(read('../hook.mjs'), 'the events call must pass a built, capped query')
+      .toMatch(/searchInjectableEvents\(db, \{\s*ftsQuery: upsFtsQuery\(promptText\)/);
+  });
+
+  it('the events leg returns nothing for a query it was never given', () => {
+    // Anti-vacuity for the signature assertion: prove the removed option is genuinely
+    // inert rather than trusting that it is gone. Passing the old shape must not
+    // resurrect the uncapped path — it must simply retrieve nothing.
+    const db = createTestDb();
+    db.prepare(
+      "INSERT INTO events (project, event_type, title, body, importance, created_at_epoch)"
+      + " VALUES ('p', 'bugfix', 'redis connection pool exhausted', 'raise the cap', 2, ?)",
+    ).run(Date.now());
+    expect(searchInjectableEvents(db, { ftsQuery: 'redis', project: 'p' }).length).toBe(1);
+    expect(searchInjectableEvents(db, { prompt: 'redis', project: 'p' }).length).toBe(0);
+    db.close();
+  });
+
+  it('builds the events query in bounded time on a 250KB CJK prompt', () => {
+    // Path B's stdin cap is 256KB and nothing truncates between stdin and the query
+    // builder, so this is a real input. Measured before the fix: 356ms, synchronously,
+    // before the model sees the turn. Distinct CJK terms, not a repeated phrase —
+    // repetition dedups to a handful of tokens and the cap never fires (#9081).
+    let text = '';
+    for (let i = 0; text.length < 250_000; i++) text += `第${i}号缺陷在检索层的注入面上复现 `;
+    const started = process.hrtime.bigint();
+    const q = upsFtsQuery(text);
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    expect(String(q).length).toBeLessThanOrEqual(UPS_QUERY_CAPS.maxChars);
+    expect(ms, `upsFtsQuery took ${ms.toFixed(1)}ms on ${text.length} bytes`).toBeLessThan(60);
   });
 });

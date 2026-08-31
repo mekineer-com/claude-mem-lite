@@ -77,6 +77,7 @@ import { resolveEdgeAttribution, readPreRecallFileEdges } from './lib/edge-attri
 import { extractTailAssistantText, extractStructuredSummary } from './lib/summary-extractor.mjs';
 import { searchRelevantMemories, formatMemoryLine, selectImperativeLesson } from './hook-memory.mjs';
 import { searchInjectableEvents, renderInjectableEvent } from './lib/events-injection.mjs';
+import { upsFtsQuery } from './lib/ups-query.mjs';
 import { formatTaskImperative } from './lib/task-imperative.mjs';
 import { recordSkillAdoption, gcOldShadowShards } from './registry-recommend.mjs';
 import { gcOldMetricShards, recordMetric } from './lib/metrics.mjs';
@@ -2208,7 +2209,14 @@ async function handleUserPrompt() {
       // ranking and citation extractors (bare-`#` anchored) never read an event id as
       // an obs id. Nested try so an events failure can't suppress the imperative pick.
       try {
-        const events = searchInjectableEvents(db, { prompt: promptText, project });
+        // upsFtsQuery, not the raw prompt (audit ALGO-1). lib/ups-query.mjs declares
+        // itself "the ONE query-cap definition for the UserPromptSubmit event", and both
+        // OTHER legs of this same event go through it — but this leg, wired in v3.48
+        // before that module existed, handed searchInjectableEvents the whole prompt and
+        // let it call the uncapped sanitizeFtsQuery. Measured here: a 250KB CJK prompt
+        // (path B's stdin cap is 256KB) costs 356ms uncapped against 5.5ms capped, all of
+        // it synchronous, before the model sees the turn.
+        const events = searchInjectableEvents(db, { ftsQuery: upsFtsQuery(promptText), project });
         if (events.length > 0) {
           const elines = ['<memory-context relevance="events">'];
           for (const e of events) elines.push(`- ${renderInjectableEvent(e)}`);
