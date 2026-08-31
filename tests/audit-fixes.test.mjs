@@ -16,7 +16,7 @@ import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
-import { insertSession, insertObs } from './test-helpers.mjs';
+import { insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { memTimelineSchema, memMaintainSchema, memOptimizeSchema } from '../tool-schemas.mjs';
 import { COMPRESSED_PENDING_PURGE } from '../utils.mjs';
 
@@ -58,7 +58,7 @@ function rpc(proc, id, method, params) {
     setTimeout(() => {
       proc.stdout.off('data', onData);
       reject(new Error(`timeout waiting for id=${id} method=${method}`));
-    }, 5000);
+    }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

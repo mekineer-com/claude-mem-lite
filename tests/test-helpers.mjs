@@ -127,3 +127,39 @@ export function fileEdgeMatchOnly(db, filePath, project, { minImportance = 2 } =
     ORDER BY o.created_at_epoch DESC
   `).all(project, minImportance, ...fileMatchParams(filePath));
 }
+
+/**
+ * Wall-clock cap for a test waiting on a spawned subprocess (MAIN-2, surfaced during the
+ * 2026-08-29 audit follow-up).
+ *
+ * Fourteen suites had independently copy-pasted a bare `5000`. That cap is not an
+ * assertion about the product — hang protection is already owned by vitest's
+ * `testTimeout: 20000` in vitest.config.mjs, and the inner timer exists only to fail with
+ * a message that names WHICH round trip stalled instead of a generic test timeout. So the
+ * cap's only job is to be loose enough never to fire on a machine that is merely busy.
+ *
+ * 5000 was not. Measured on this host: an MCP `initialize` round trip against a cold
+ * `node server.mjs` (native binding load + schema init included) takes 635ms idle — a
+ * 7.9x margin — and the cap still lost once in five full-suite runs, on 24 cores with 311
+ * test files in flight. The failure was the spawn being starved of CPU, not a slow server,
+ * which is the same "green depends on host load" defect class as the audit's MAIN-1 and
+ * pollutes the same `tests green` release gate.
+ *
+ * 15s sits under the 20s testTimeout, so the specific inner error is still what a reader
+ * sees, while a genuinely hung subprocess fails just as reliably — 10s later. Override
+ * with MEM_TEST_SUBPROCESS_TIMEOUT_MS on a slower host.
+ */
+export const DEFAULT_SUBPROCESS_TIMEOUT_MS = 15000;
+
+/**
+ * Resolution rule, exported separately so it can be asserted without re-importing this
+ * module under a stubbed env (vite refuses a cache-busting query on a static specifier).
+ * Anything not a positive finite number falls back — `''`, `'abc'`, `'0'` and `'-1'` all
+ * coerce in ways that would otherwise produce a 0ms or NaN timer.
+ */
+export function resolveSubprocessTimeout(raw) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SUBPROCESS_TIMEOUT_MS;
+}
+
+export const SUBPROCESS_TIMEOUT_MS = resolveSubprocessTimeout(process.env.MEM_TEST_SUBPROCESS_TIMEOUT_MS);

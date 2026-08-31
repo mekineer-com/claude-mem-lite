@@ -14,7 +14,7 @@ import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { spawn } from 'child_process';
 import Database from 'better-sqlite3';
-import { createTestDb, insertSession } from './test-helpers.mjs';
+import { createTestDb, insertSession, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
 import { insertObservationRow, normalizeScope, SCOPE_PROMPT_LEGEND } from '../lib/observation-write.mjs';
 import { saveObservation } from '../hook-llm.mjs';
@@ -172,7 +172,7 @@ describe('pre-tool-recall CLAUDE_MEM_SCOPE_FILTER (opt-in)', () => {
       child.on('error', reject);
       child.stdin.write(JSON.stringify(input));
       child.stdin.end();
-      setTimeout(() => { child.kill(); reject(new Error('timeout')); }, 5000);
+      setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
     });
   }
 

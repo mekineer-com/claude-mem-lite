@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import { resolve, join } from 'path';
 import { writeFileSync, mkdirSync, rmSync, readFileSync, mkdtempSync } from 'fs';
-import { createTestDb, insertSession, insertObs } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { initSchema } from '../schema.mjs';
 import Database from 'better-sqlite3';
 import { tmpdir } from 'os';
@@ -34,7 +34,7 @@ function runScriptRaw(inputStr, env = {}) {
     child.on('error', reject);
     child.stdin.write(inputStr);
     child.stdin.end();
-    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, 5000);
+    setTimeout(() => { child.kill(); reject(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

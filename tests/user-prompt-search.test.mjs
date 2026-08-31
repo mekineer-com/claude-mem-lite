@@ -10,7 +10,7 @@ import { sanitizeFtsQuery, relaxFtsQueryToOr } from '../utils.mjs';
 import Database from 'better-sqlite3';
 import { initSchema } from '../schema.mjs';
 import { ensureRegistryDb } from '../registry.mjs';
-import { createTestDb, insertSession, insertObs, insertPrompt } from './test-helpers.mjs';
+import { createTestDb, insertSession, insertObs, insertPrompt, SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 import { typeIcon, truncate } from '../utils.mjs';
 import {
   shouldSkip,
@@ -704,7 +704,7 @@ function runScript(hookData, extraEnv = {}) {
 
     // Safety timeout — script should never hang, but if it does, kill it
     // to avoid stalling the test suite.
-    const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+    const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, SUBPROCESS_TIMEOUT_MS);
 
     proc.on('exit', () => {
       clearTimeout(killTimer);
@@ -809,7 +809,7 @@ describe('user-prompt-search subprocess integration', () => {
       let stderr = '';
       proc.stdout.on('data', (d) => { stdout += d.toString(); });
       proc.stderr.on('data', (d) => { stderr += d.toString(); });
-      const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+      const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, SUBPROCESS_TIMEOUT_MS);
       proc.on('exit', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr }); });
       proc.on('error', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr }); });
       proc.stdin.write('not valid json');
@@ -832,7 +832,7 @@ describe('user-prompt-search subprocess integration', () => {
         let stderr = '';
         proc.stdout.on('data', (d) => { stdout += d.toString(); });
         proc.stderr.on('data', (d) => { stderr += d.toString(); });
-        const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+        const killTimer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, SUBPROCESS_TIMEOUT_MS);
         proc.on('exit', (c) => { clearTimeout(killTimer); resolvePromise({ stdout, stderr, code: c }); });
         proc.on('error', () => { clearTimeout(killTimer); resolvePromise({ stdout, stderr, code: -1 }); });
         proc.stdin.write(payload);

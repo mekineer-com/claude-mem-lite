@@ -9,6 +9,7 @@ import { spawn } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
+import { SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 
 const SERVER_PATH = resolve(new URL('..', import.meta.url).pathname, 'server.mjs');
 
@@ -53,7 +54,7 @@ function rpc(proc, id, method, params) {
     setTimeout(() => {
       proc.stdout.off('data', onData);
       reject(new Error(`timeout waiting for id=${id} method=${method}`));
-    }, 5000);
+    }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 

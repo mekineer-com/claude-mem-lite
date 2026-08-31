@@ -4,6 +4,7 @@ import { spawn } from 'child_process';
 import { resolve, join } from 'path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
+import { SUBPROCESS_TIMEOUT_MS } from './test-helpers.mjs';
 
 const SCRIPT = resolve(import.meta.dirname, '../scripts/post-tool-recall.js');
 function run(input, env = {}) {
@@ -12,7 +13,7 @@ function run(input, env = {}) {
     let out = ''; c.stdout.on('data', (d) => { out += d; });
     c.on('close', () => res(out)); c.on('error', rej);
     c.stdin.write(JSON.stringify(input)); c.stdin.end();
-    setTimeout(() => { c.kill(); rej(new Error('timeout')); }, 5000);
+    setTimeout(() => { c.kill(); rej(new Error('timeout')); }, SUBPROCESS_TIMEOUT_MS);
   });
 }
 
