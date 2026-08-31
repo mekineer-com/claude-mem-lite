@@ -163,7 +163,9 @@ Plugin mode manages its own hooks/runtime. On session start it only **checks and
 
 > **The plugin install is complete on its own** — hooks, MCP tools, and the bundled slash commands (`/mem`, `/lesson`, `/bug`, `/adopt`) all run from the plugin with no second step. The slash commands invoke the bundled CLI by an absolute path resolved from the plugin directory (`${CLAUDE_PLUGIN_ROOT}/cli.mjs <cmd>`), so they work without anything on your `PATH`. A global `claude-mem-lite` **shell** command (for running queries yourself in a terminal) is **optional** — `npm i -g claude-mem-lite` — and is a *separate* npm install: the plugin's auto-update does **not** refresh it, so re-run `npm i -g claude-mem-lite@latest` if you want that shell command kept in sync. You do **not** need it for the plugin to be fully functional.
 
-> **Auto-adopt fires on the first SessionStart per project (v2.82.1+).** The plugin automatically writes the **invited-memory sentinel** (a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`) into the project's memdir — **no manual `/adopt` needed**, regardless of install path (npm, npx, `/plugin`, manual). Per-project opt-out: `claude-mem-lite adopt --disable` (`--enable` to re-arm). Global opt-out: `export MEM_NO_AUTO_ADOPT=1`. Manual `/adopt` remains available for re-applying after edits and for the `--all` batch path.
+> **Auto-adopt writes into your project, on every SessionStart (v3.13+).** The plugin adds a slug-scoped **managed block** to your project's own **`<cwd>/CLAUDE.md`** — a file that is normally committed to git — plus a `<cwd>/.claude/plugin_claude_mem_lite.md` detail file. The block is a system-authority pointer that boosts Claude's proactive use of `mem_recall` / `mem_save`. Everything outside the block is preserved verbatim, and it coexists with other plugins' blocks in the same file ([details](#invited-memory-v232)). This happens on **every** SessionStart, not just the first: the sync is idempotent and re-applies the block if it is edited away, and refreshes it when the shipped template changes. It applies regardless of install path (npm, npx, `/plugin`, manual), so **no manual `/adopt` is needed**.
+>
+> Opt out per project with `claude-mem-lite adopt --disable` (`--enable` to re-arm), globally with `export MEM_NO_AUTO_ADOPT=1`, or freeze an already-adopted block against template refreshes with `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`. `claude-mem-lite unadopt` removes the block and the detail file. Manual `/adopt` remains available for re-applying after edits and for the `--all` batch path.
 
 ### Method 2: npx (one-liner)
 
@@ -355,8 +357,11 @@ Slash commands `/adopt` and `/unadopt` wrap the same CLI.
   ever rewritten, and duplicate / CRLF-orphaned copies are collapsed to one.
   Unlike the legacy `MEMORY.md` scheme there is no line-budget gate — `CLAUDE.md`
   has no truncation cap.
-- **Auto-adopt fires on the first SessionStart per project for any install
-  path (v2.82.1+).** Per-project opt-out: `claude-mem-lite adopt --disable`
+- **Auto-adopt runs on EVERY SessionStart, for any install path (v2.82.1+;
+  target moved from the memdir to `<cwd>/CLAUDE.md` in v3.13).** The sync is
+  idempotent — it re-applies the managed block if it was edited away and
+  refreshes it when the shipped template changes (freeze with
+  `CLAUDE_MEM_NO_TEMPLATE_REFRESH=1`). Per-project opt-out: `claude-mem-lite adopt --disable`
   (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker
   deletion / plugin reinstalls). Global opt-out: `MEM_NO_AUTO_ADOPT=1`.
   Pre-v2.82.1 the `CLAUDE_PLUGIN_ROOT` gate left auto-adopt unreachable for
@@ -783,8 +788,8 @@ claude-mem-lite.
 | `OPENROUTER_MODEL` | Overrides the OpenRouter model slug for **all** background calls (e.g. `openai/gpt-4o-mini`, `qwen/qwen-2.5-72b-instruct`). When unset, the `CLAUDE_MEM_MODEL` tier maps to `anthropic/claude-haiku-4.5` (haiku) or `anthropic/claude-sonnet-4.5` (sonnet). | _(tier default)_ |
 | `CLAUDE_MEM_DEBUG` | Enable debug logging (`1` to enable). | _(disabled)_ |
 | `MEM_QUIET_HOOKS` | Low-noise hooks. `1` drops the `File Lessons` / `Key Context` sections from SessionStart injection, the lesson suffix from `[mem] Related memories`, and the `WHEN TO USE` / `Decision rules` blocks from MCP server instructions. IDs and the `Recent` table still surface so `mem_get(ids=[…])` remains reachable. Intended for users running the invited-memory adopt path or who otherwise want minimal auto-injection. **Since v2.82.0 this env no longer gates auto-adopt — use `MEM_NO_AUTO_ADOPT=1` for that.** | _(disabled)_ |
-| `MEM_NO_AUTO_ADOPT` | Global opt-out for auto-adopt (v2.82.0+). `1` prevents the first-SessionStart auto-write of the invited-memory sentinel across **all** projects. For per-project opt-out use `claude-mem-lite adopt --disable` instead (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion). | _(disabled)_ |
-| `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. Since v2.82.1 auto-adopt fires on first SessionStart for any install path, so this hint typically surfaces only when you've explicitly opted out (`MEM_NO_AUTO_ADOPT=1` or `claude-mem-lite adopt --disable`). | _(disabled)_ |
+| `MEM_NO_AUTO_ADOPT` | Global opt-out for auto-adopt (v2.82.0+). `1` prevents the per-SessionStart auto-write of the `CLAUDE.md` managed block across **all** projects. For per-project opt-out use `claude-mem-lite adopt --disable` instead (writes a durable `<memdir>/.mem-no-auto-adopt` sentinel that survives marker deletion). | _(disabled)_ |
+| `MEM_NO_ADOPT_HINT` | Silences the one-line "Invited-memory 未启用：`claude-mem-lite adopt`…" hint that SessionStart appends when the current project hasn't been adopted. Since v2.82.1 auto-adopt runs on every SessionStart for any install path, so this hint typically surfaces only when you've explicitly opted out (`MEM_NO_AUTO_ADOPT=1` or `claude-mem-lite adopt --disable`). | _(disabled)_ |
 
 ### What gets injected into your context
 
