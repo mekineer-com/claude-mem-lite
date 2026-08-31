@@ -33,6 +33,9 @@ import {
 // backward-compat surface that knip already lists as unused; new shared symbols go to
 // their canonical module.
 import { inferProjectDir } from './project-utils.mjs';
+// Aliased: `acquireLock` from hook-episode.mjs below is the episode buffer's own
+// (argument-less) lock — a different mutex with a different staleness policy.
+import { acquireLock as acquireProcLock } from './lib/proc-lock.mjs';
 import {
   readEpisodeRaw, episodeFile,
   acquireLock, releaseLock, readEpisode, writeEpisode,
@@ -1554,14 +1557,53 @@ function scheduleSessionStartAutoMaintain(project) {
   if (!process.env.CLAUDE_MEM_SKIP_MAINTAIN) spawnBackground('auto-maintain', project);
 }
 
+// The maintenance mutex deliberately does NOT end in `.lock`: cleanStaleLockFiles()
+// below unlinks every `*.lock` in RUNTIME_DIR whose age exceeds STALE_LOCK_MS (30s)
+// WITHOUT consulting the holder's pid — a policy written for the episode lock, whose
+// critical section is milliseconds. A maintenance pass is seconds to minutes (VACUUM INTO
+// snapshot, purge, decay, dedup over the whole DB), so that sweeper would strip this lock
+// mid-pass and hand the exclusion straight back to the race it exists to close.
+// proc-lock brings its own staleness policy (age OR provably-dead pid), which is the
+// correct one here.
+const AUTO_MAINTAIN_LOCK = 'auto-maintain.proclock';
+// Generous upper bound on one pass; a crashed holder is normally reclaimed sooner via the
+// dead-pid check, so this only matters for a holder killed on another host.
+const AUTO_MAINTAIN_LOCK_STALE_MS = 10 * 60 * 1000;
+
 // Detached `auto-maintain` worker entry: opens its own DB and runs the maintenance
 // pass off the interactive boot path. runSessionStartAutoMaintain still owns the 24h
 // gate + the compress/optimize spawns at its tail.
+//
+// Cross-process mutual exclusion (2026-08-29 audit FLOW-1). The pass is shaped
+// read-gate → long work → write-gate, so two Claude Code windows booting either side of
+// the 24h boundary both see "due" and both spawn a worker. That breaks a documented
+// in-process invariant: decayAndMarkIdle marks BEFORE it decays precisely so an imp-2 row
+// cannot be decayed 2→1 and marked COMPRESSED_PENDING_PURGE in the same pass (MED-1, see
+// its docblock — each importance tier is supposed to buy a grace cycle). Across two
+// processes the ordering is gone: worker A decays 2→1, worker B's mark-idle then sees a
+// qualifying imp-1 row and hides it, 37 days from a hard delete. The same overlap
+// double-runs the cascade below it (duplicate weekly summaries from compressGroup, whose
+// UPDATE has no compressed_into guard; doubled llm-optimize spend).
+//
+// Lock at the worker entry rather than around the individual ops: the cascade spawns sit
+// inside the pass, so one gate covers the whole family. Not acquiring is a plain no-op —
+// a peer is already doing exactly this work.
 function handleAutoMaintain(project) {
-  const db = openDb();
-  if (!db) return;
-  try { runSessionStartAutoMaintain(db, project); }
-  finally { try { db.close(); } catch { /* ignore */ } }
+  const release = acquireProcLock(join(RUNTIME_DIR, AUTO_MAINTAIN_LOCK), {
+    staleMs: AUTO_MAINTAIN_LOCK_STALE_MS,
+  });
+  if (!release) {
+    debugLog('DEBUG', 'auto-maintain', 'skipped — a live peer holds the maintenance lock');
+    return;
+  }
+  try {
+    const db = openDb();
+    if (!db) return;
+    try { runSessionStartAutoMaintain(db, project); }
+    finally { try { db.close(); } catch { /* ignore */ } }
+  } finally {
+    release();
+  }
 }
 
 function saveHandoffAndFastSummary(db, { prevSessionId, prevProject, project, ccSessionId, episodeSnapshot, now }) {
