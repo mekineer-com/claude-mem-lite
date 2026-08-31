@@ -29,6 +29,10 @@ import {
   formatErrorRecallHints,
   MAX_HOOK_STDIN_BYTES,
 } from './utils.mjs';
+// Direct import (not via the utils.mjs barrel): the barrel's re-exports are a v2.21
+// backward-compat surface that knip already lists as unused; new shared symbols go to
+// their canonical module.
+import { inferProjectDir } from './project-utils.mjs';
 import {
   readEpisodeRaw, episodeFile,
   acquireLock, releaseLock, readEpisode, writeEpisode,
@@ -1686,7 +1690,11 @@ async function buildStartupDashboardText(db, project) {
   // tests/session-start-stdout-envelope.test.mjs.
   try {
     const { buildDashboard } = await import('./lib/startup-dashboard.mjs');
-    let dashboardText = buildDashboard({ db, project, projectPath: process.cwd() });
+    // projectPath MUST come from the same place `project` does (inferProjectDir), not from
+    // process.cwd(): otherwise the dashboard renders directory A's git state and task list
+    // under directory B's project name whenever the hook process was not spawned at the
+    // project root. See inferProjectDir()'s docblock for the case this closed.
+    let dashboardText = buildDashboard({ db, project, projectPath: inferProjectDir() });
     const citeNudge = buildCiteRecallNudge(project);
     if (citeNudge) {
       dashboardText = dashboardText ? `${citeNudge}\n${dashboardText}` : citeNudge;

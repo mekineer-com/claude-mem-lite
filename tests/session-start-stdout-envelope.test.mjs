@@ -29,11 +29,15 @@ import { initSchema } from '../schema.mjs';
 const HOOK_PATH = resolve(import.meta.dirname, '../hook.mjs');
 let tmpHome, projDir, dbPath, runtimeDir, env;
 
-function runSessionStart(sessionId, extraEnv = {}) {
+// `cwd` defaults to the fixture project. Leaving it unset made the subprocess inherit
+// vitest's cwd — the REAL repository — so every dashboard reader that took process.cwd()
+// read the host tree instead of the fixture, and the dashboard assertion below passed
+// only while the host tree happened to be dirty (2026-08-29 audit MAIN-1).
+function runSessionStart(sessionId, extraEnv = {}, cwd = projDir) {
   try {
     return execFileSync(process.execPath, [HOOK_PATH, 'session-start'], {
       input: JSON.stringify({ session_id: sessionId, source: 'startup', cwd: projDir }),
-      timeout: 20000, encoding: 'utf8',
+      timeout: 20000, encoding: 'utf8', cwd,
       env: { ...env, HOME: tmpHome, CLAUDE_PROJECT_DIR: projDir, ...extraEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -73,6 +77,16 @@ function seedObservation(text, title) {
                               facts, files_read, files_modified, importance, created_at, created_at_epoch)
     VALUES ('seed-mem', 'work--fresh', ?, 'bugfix', ?, '', '', '', '', '[]', '[]', 3, ?, ?)
   `).run(text, title, new Date(now).toISOString(), now);
+  db.close();
+}
+
+/** Give the dashboard a leg of its own that no other stdout contributor can produce. */
+function seedEvent(title) {
+  const db = new Database(dbPath);
+  db.prepare(`
+    INSERT INTO events (project, event_type, title, body, importance, created_at_epoch)
+    VALUES ('work--fresh', 'lesson', ?, '', 1, ?)
+  `).run(title, Date.now());
   db.close();
 }
 
@@ -128,6 +142,10 @@ describe('SessionStart stdout envelope', () => {
 
   it('carries the startup dashboard in the same envelope, not a second write', () => {
     seedObservation('Backoff reset on every redirect hop', 'Backoff reset on every redirect hop');
+    // Seed the events leg explicitly. Before MAIN-1 this test rendered a dashboard only
+    // by reading the HOST repository's git state; with the subprocess correctly rooted in
+    // the fixture there is nothing to report unless the fixture supplies it.
+    seedEvent('replay budget exhausted mid-shard');
     const stdout = runSessionStart('cc-env-2');
     const parsed = expectSingleEnvelope(stdout);
     // One document ⇒ exactly one line that parses as JSON.
@@ -141,6 +159,38 @@ describe('SessionStart stdout envelope', () => {
     // block alone satisfied a length check (pre-tag review, SHOULD-FIX-3).
     // `mem events` is the dashboard's own line, absent from the context block.
     expect(parsed.hookSpecificOutput.additionalContext).toMatch(/\[mem\] Startup dashboard|mem events:/);
+  });
+
+  it('roots the dashboard at the project dir, not at the process cwd', () => {
+    // The dashboard's `project` comes from inferProject() (env-derived) while its
+    // filesystem root used to come from process.cwd(). Those diverge whenever the hook
+    // process was not spawned at the project root, and the dashboard then reports one
+    // directory's git/tasks under another directory's project name.
+    //
+    // Discriminator: readProjectTasks() only accepts a task list whose meta.json
+    // `projectPath` equals the root it was handed. Pointing it at projDir while running
+    // the subprocess from the repository root makes the two candidates tell different
+    // stories — reverting hook.mjs to `projectPath: process.cwd()` drops this task.
+    const listDir = join(tmpHome, '.claude', 'tasks', 'list-a');
+    mkdirSync(listDir, { recursive: true });
+    writeFileSync(join(listDir, 'meta.json'), JSON.stringify({ projectPath: projDir }));
+    writeFileSync(join(listDir, 't1.json'), JSON.stringify({
+      id: 't1', subject: 'rekey the shard router', status: 'in_progress',
+    }));
+
+    const repoRoot = resolve(import.meta.dirname, '..');
+    const parsed = expectSingleEnvelope(runSessionStart('cc-env-cwd', {}, repoRoot));
+    expect(parsed.hookSpecificOutput.additionalContext).toContain('rekey the shard router');
+    // Negative half: a task list belonging to the process cwd must NOT leak in.
+    const otherDir = join(tmpHome, '.claude', 'tasks', 'list-b');
+    mkdirSync(otherDir, { recursive: true });
+    writeFileSync(join(otherDir, 'meta.json'), JSON.stringify({ projectPath: repoRoot }));
+    writeFileSync(join(otherDir, 't2.json'), JSON.stringify({
+      id: 't2', subject: 'host-tree decoy task', status: 'in_progress',
+    }));
+    const second = expectSingleEnvelope(runSessionStart('cc-env-cwd2', {}, repoRoot));
+    expect(second.hookSpecificOutput.additionalContext).toContain('rekey the shard router');
+    expect(second.hookSpecificOutput.additionalContext).not.toContain('host-tree decoy task');
   });
 
   it('folds the update banner in too, instead of appending raw text after the envelope', () => {

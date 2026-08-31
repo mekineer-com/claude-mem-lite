@@ -29,7 +29,26 @@ const _cache = new Map();
  * @returns {string} Sanitized project identifier safe for use in filenames
  */
 export function inferProject() {
-  return projectNameFromDir(process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd());
+  return projectNameFromDir(inferProjectDir());
+}
+
+/**
+ * The DIRECTORY `inferProject()` derives its name from — the session's project root.
+ *
+ * Callers that read the filesystem on behalf of the current project (git state, tasks,
+ * adoption sentinel) must use THIS, not `process.cwd()`. The two diverge whenever the
+ * process was not spawned with cwd == project root, and the result is a surface that
+ * labels directory A's git/tasks with directory B's project name. That was live in the
+ * startup dashboard: `buildDashboard({ project: inferProject(), projectPath: process.cwd() })`
+ * — the identity came from the env, the filesystem root from the process. In production the
+ * two happen to coincide, so only the test face showed it (a hook subprocess spawned with the
+ * repo root as cwd read the REAL repo's git state, and the assertion pinning the dashboard
+ * leg passed or failed on whether the host tree was dirty).
+ *
+ * @returns {string} Absolute project root directory.
+ */
+export function inferProjectDir() {
+  return process.env.CLAUDE_PROJECT_DIR || process.env.PWD || process.cwd();
 }
 
 /**
