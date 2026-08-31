@@ -77,7 +77,29 @@ if [[ "$tool" == "Read" ]]; then
     # hook.mjs flushEpisode reads reads-<project>.txt from CLAUDE_MEM_DIR/runtime; if this
     # bash fast-path wrote to $HOME unconditionally, a relocated install would drop all
     # Read context from episodes AND grow an uncollected reads file in $HOME forever.
-    runtime_dir="${CLAUDE_MEM_DIR:-$HOME/.claude-mem-lite}/runtime"
+    _data_dir="${CLAUDE_MEM_DIR:-$HOME/.claude-mem-lite}"
+    # Test containment, mirroring containInTests() in lib/resolve-data-dir.mjs (audit
+    # ENG-1). That guard sits at the NODE exit of this channel, and this channel has two:
+    # the Read fast path above never reaches Node, so a test that spawned the prefilter
+    # without setting CLAUDE_MEM_DIR appended straight into the developer's live runtime
+    # dir. That is not hypothetical — it is what v3.83.0 had to clean up, and the fix
+    # there was a single-file canary keyed on one fingerprint, so any other test using
+    # any other project name still walked through.
+    #
+    # Same three conditions as the Node side, same order: guard armed, target IS the real
+    # directory (not merely "outside tmp" — suites legitimately point HOME at fixtures),
+    # and an absolute sandbox to redirect into. Pure builtins; no spawn on this ~5ms path.
+    if [[ "${CLAUDE_MEM_TEST_GUARD:-}" == "1" ]]; then
+      _real_dir="${CLAUDE_MEM_TEST_REALDIR:-$HOME/.claude-mem-lite}"
+      if [[ "$_data_dir" == "$_real_dir" ]]; then
+        if [[ "${CLAUDE_MEM_TEST_SANDBOX:-}" == /* ]]; then
+          _data_dir="$CLAUDE_MEM_TEST_SANDBOX"
+        else
+          _data_dir="${TMPDIR:-/tmp}"; _data_dir="${_data_dir%/}/claude-mem-test-fallback"
+        fi
+      fi
+    fi
+    runtime_dir="${_data_dir}/runtime"
     # Owner-only (0700 dir / 0600 file): reads-<project>.txt lists captured file
     # paths, so on a shared host the default umask leaked them to every local user.
     # umask is a shell builtin — no extra process on this ~5ms per-tool-call path
