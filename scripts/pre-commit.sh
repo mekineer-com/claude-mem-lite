@@ -60,6 +60,31 @@ if git diff --cached --name-only | grep -qx 'package-lock.json'; then
   fi
 fi
 
+# ── Frozen-corpus guard ─────────────────────────────────────────────────────
+# The LIVE replay benchmarks dump frozen corpora so a later A/B can be run over the same
+# denominator. `benchmark/results/` is gitignored, but that is one door and these files
+# take an arbitrary path from --dump / --shapes / --corpus. One of the two families is
+# genuinely sensitive: `*-shapes-*.json` carries real failing commands and their real
+# stderr, pulled from live transcripts. (The citation corpus holds no transcript text —
+# its longest string is a project path — but it does carry session UUIDs and absolute
+# paths, so it is out too.) Match on the STAGED path, so a copy saved anywhere is caught.
+STAGED_CORPUS=$(git diff --cached --name-only --diff-filter=AM \
+  | grep -E '(^|/)benchmark/results/|-shapes-[0-9-]*\.json$|-corpus-[0-9-]*\.json$' || true)
+if [ -n "$STAGED_CORPUS" ]; then
+  if [ "${DISABLE_CORPUS_GUARD:-0}" = "1" ]; then
+    echo "[pre-commit] ⚠ frozen corpus staged (DISABLE_CORPUS_GUARD=1, allowing):"
+    while IFS= read -r f; do echo "[pre-commit]      $f"; done <<< "$STAGED_CORPUS"
+  else
+    echo "[pre-commit] ❌ Frozen benchmark corpus staged for commit:"
+    while IFS= read -r f; do echo "[pre-commit]      $f"; done <<< "$STAGED_CORPUS"
+    echo "[pre-commit]    These hold real command text / stderr / session ids from live"
+    echo "[pre-commit]    transcripts and are never committed. Keep them out of the tree"
+    echo "[pre-commit]    (benchmark/results/ is gitignored) and pass them by path."
+    echo "[pre-commit]    Override (you have checked the contents): DISABLE_CORPUS_GUARD=1 git commit ..."
+    exit 1
+  fi
+fi
+
 # ── Lint ─────────────────────────────────────────────────────────────────────
 echo "[pre-commit] Running eslint..."
 npx eslint . || {

@@ -108,13 +108,30 @@ export function sweepOrphanEpisodeFiles(runtimeDir, { ageMs = ORPHAN_EPISODE_AGE
   const readsCutoff = now - readsAgeMs;
   let count = 0;
   for (const f of entries) {
-    // `.claim-` = handleStop's lock-contended fallback claim file (ep-<project>.json.claim-<pid>-<ts>),
-    // which leaks if the process dies between rename and unlink; sweep it on the same 1h cutoff.
-    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-') || f.includes('.claim-');
+    // Crash residue: this runtime dir writes four families of temp name, each the middle
+    // of a rename-or-unlink pair that leaks if the process dies between the two steps.
+    // The predicate covered only `.claim-`, whose comment states the reason it exists —
+    // and the other three are that same window (audit FLOW-3):
+    //   .claim-   handleStop's lock-contended fallback   (hook.mjs)
+    //   .collect- the reads-file rename a flush performs (hook.mjs)
+    //   .trim-    the reads-file truncation              (hook.mjs)
+    //   .tmp-     every atomic write                     (hook-episode.mjs, atomicWrite)
+    // Neither of the old clauses could reach them: `reads-<p>.txt.collect-<ts>` does not
+    // end in `.txt`, and `ep-<p>.json.tmp-<pid>` does not start with `ep-flush-`.
+    //
+    // Anchored to the END of the name so a project legitimately containing `.tmp-`
+    // (`reads-x.tmp-y.txt`) is not mistaken for residue and swept on the shorter clock.
+    const isCrashResidue = /\.(claim|collect|trim|tmp)-[^.]*$/.test(f);
+    const isEpisode = f.startsWith('ep-flush-') || f.startsWith('pending-');
     const isReads = f.startsWith('reads-') && f.endsWith('.txt');
-    if (!isEpisode && !isReads) continue;
+    if (!isCrashResidue && !isEpisode && !isReads) continue;
     const full = join(runtimeDir, f);
     try {
+      // Residue takes the short cutoff and a live tracker takes the 24h one, with no
+      // tie-break needed: residue always APPENDS its suffix, so it never ends in `.txt`
+      // and `isReads` is already false for it. (A `&& !isCrashResidue` tie-break was
+      // written here first and no mutation could kill it — it was guarding a state the
+      // two predicates cannot both be in.)
       if (statSync(full).mtimeMs < (isReads ? readsCutoff : cutoff)) {
         unlinkSync(full);
         count++;

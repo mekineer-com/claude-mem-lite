@@ -91,6 +91,46 @@ describe('sweepOrphanEpisodeFiles', () => {
     expect(remaining).toEqual(['cite-recall-foo.json', 'session-bar']);
   });
 
+  // ── FLOW-3 (2026-08-29 audit): three of the four crash-residue families were unreachable ──
+  //
+  // This runtime dir writes four temp-name families, each the middle of a rename-or-unlink
+  // pair that leaks if the process dies between the steps. The predicate covered only
+  // `.claim-`, whose own comment states exactly that reason. Neither of the other clauses
+  // could reach the rest: `reads-<p>.txt.collect-<ts>` does not end in `.txt`, and
+  // `ep-<p>.json.tmp-<pid>` does not start with `ep-flush-`.
+  describe('crash residue from the rename/unlink window', () => {
+    it('sweeps all four families on the SHORT clock, not just .claim-', () => {
+      // 2h old: past the 1h residue cutoff, well inside the 24h reads cutoff — so this
+      // also pins that residue is clocked as residue, not as a reads tracker.
+      const age = 2 * 3600 * 1000;
+      writeWithMtime('ep-projects--mem.json.claim-123-999', age);
+      writeWithMtime('reads-projects--mem.txt.collect-1699999999', age);
+      writeWithMtime('reads-projects--mem.txt.trim-4242', age);
+      writeWithMtime('ep-projects--mem.json.tmp-4242', age);
+
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(4);
+      expect(readdirSync(dir)).toEqual([]);
+    });
+
+    it('leaves residue younger than the 1h cutoff alone', () => {
+      // An in-flight rename must never be raced — the reason every clause here is age-gated.
+      writeWithMtime('reads-projects--mem.txt.collect-1699999999', 10 * 60 * 1000);
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
+      expect(readdirSync(dir)).toEqual(['reads-projects--mem.txt.collect-1699999999']);
+    });
+
+    it('does not mistake a project name containing .tmp- for residue', () => {
+      // `reads-x.tmp-y.txt` is a live tracker for a project whose sanitized name happens to
+      // contain the token. It must keep the 24h reads clock, so at 2h it survives; the
+      // residue pattern is anchored to the end of the name for exactly this.
+      writeWithMtime('reads-x.tmp-y.txt', 2 * 3600 * 1000);
+      expect(sweepOrphanEpisodeFiles(dir)).toBe(0);
+      expect(readdirSync(dir)).toEqual(['reads-x.tmp-y.txt']);
+      // …and it is still swept once it really is abandoned.
+      expect(sweepOrphanEpisodeFiles(dir, { readsAgeMs: 3600 * 1000 })).toBe(1);
+    });
+  });
+
   it('honors a custom `now` so callers can pin time for deterministic assertions', () => {
     const t0 = 1_000_000_000_000;
     const stale = writeWithMtime('ep-flush-stale.json', 0);
