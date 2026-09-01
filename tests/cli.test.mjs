@@ -689,6 +689,7 @@ describe('CLI search pagination stability (hybrid FTS+vector RRF)', () => {
   };
 
   it('paging limit=5 across offsets is disjoint and reconstructs the single query', async () => {
+    const defaultPage = await idsOf();
     const vecCount = testDb.prepare('SELECT COUNT(*) AS c FROM observation_vectors').get().c;
     expect(vecCount).toBeGreaterThan(0); // guard: vector arm is actually live
     const p0 = await idsOf('--limit', '5', '--offset', '0');
@@ -696,6 +697,7 @@ describe('CLI search pagination stability (hybrid FTS+vector RRF)', () => {
     const p2 = await idsOf('--limit', '5', '--offset', '10');
     const combined = await idsOf('--limit', '15', '--offset', '0');
     const paged = [...p0, ...p1, ...p2];
+    expect(defaultPage).toEqual(p0);
     expect(new Set(paged).size).toBe(paged.length);   // no id on two pages
     expect(paged).toEqual(combined);                  // identical order ⇒ stable
   });

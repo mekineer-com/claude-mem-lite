@@ -82,7 +82,7 @@ async function cmdSearch(db, args, { llm } = {}) {
     return;
   }
 
-  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 20, max: 1000 });
+  const limit = parseIntFlag(flags.limit, { name: '--limit', defaultValue: 5, max: 1000 });
   const type = flags.type || null;
   const validObsTypes = OBS_TYPE_SET;
   if (type && !validObsTypes.has(type)) {
@@ -2686,14 +2686,14 @@ Commands:
     --query Q           Query as a flag (alias for the positional; use one, not both)
     --source S          Table: observations|sessions|prompts (default: all)
     --type T            Filter obs type (bugfix|decision|discovery|feature|refactor|change)
-    --limit N           Max results (default 20)
+    --limit N           Max results (default 5)
     --project P         Filter by project
     --from DATE         Start date (YYYY-MM-DD or ISO 8601)
     --to DATE           End date (YYYY-MM-DD or ISO 8601)
     --since DUR         Relative lower bound: 7d|24h|90m|2w|30s (ignored if --from set)
     --importance N      Minimum importance (1=routine, 2=notable, 3=critical)
     --branch B          Filter by git branch
-    --offset N          Skip first N results (pagination)
+    --offset N          Skip first N results (5 = next 5, then 10, etc.)
     --tier T            Filter by tier (working|active|archive, observations only)
     --sort S            Sort: relevance (default), time, importance
     --or                Use OR instead of AND between search terms

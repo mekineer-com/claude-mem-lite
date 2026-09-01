@@ -117,10 +117,10 @@ describe('search-core', () => {
       expect(w0.perSourceOffset).toBe(0);
     });
 
-    // MIN_FUSION_POOL floor: limits ≤ 20 (the common range: mem_search=20,
+    // MIN_FUSION_POOL floor: limits ≤ 20 (the common range: mem_search=5,
     // mem_recall/recent=10) all fuse the SAME 60-candidate pool, so top-N is
-    // limit-stable (top-5 ⊂ top-10 ⊂ top-20) and the default limit=20 offset=0
-    // pool is byte-identical to before (60) — no recall regression on the
+    // limit-stable (top-5 ⊂ top-10 ⊂ top-20) while retaining the old default-20
+    // candidate pool (60) — no recall regression on the
     // benchmarked path (longmemeval recall@k is pool-insensitive across 20–100).
     it('floors small limits to the default-20 pool so top-N is limit-stable', () => {
       expect(computePerSourceWindow(5, 0).perSourceLimit).toBe(60);

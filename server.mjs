@@ -330,7 +330,7 @@ async function runSearchPipeline(db, args, { llm, rerankLlm, clientIdentity = 'u
   // canonical names below, so every downstream filter sees them.
   args = applyArgAliases(args, { source: 'type', from: 'date_from', to: 'date_to', since: 'date_since' });
 
-  const limit = args.limit ?? 20;
+  const limit = args.limit ?? 5;
   const offset = args.offset ?? 0;
   // args.or: force OR from the start (CLI `search --or` parity). The default path
   // still does AND with the engine's OR-fallback when AND returns 0.

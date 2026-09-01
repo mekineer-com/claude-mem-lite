@@ -142,6 +142,32 @@ describe('search telemetry v45', () => {
     db.close();
   });
 
+  it('defaults MCP search to five results and pages with offset five', async () => {
+    const db = openDb();
+    seedObservation(db, { title: 'Paging token entry 0' });
+    const insert = db.prepare(`
+      INSERT INTO observations
+        (memory_session_id, project, text, type, title, created_at, created_at_epoch, importance)
+      VALUES ('memory-1', 'telemetry-test', ?, 'decision', ?, ?, ?, 3)
+    `);
+    for (let i = 1; i < 7; i++) {
+      const title = `Paging token entry ${i}`;
+      const now = Date.now();
+      insert.run(title, title, new Date(now).toISOString(), now);
+    }
+    const createdAt = Date.now() - 86400000;
+    db.prepare('UPDATE observations SET created_at = ?, created_at_epoch = ?')
+      .run(new Date(createdAt).toISOString(), createdAt);
+    const first = await handleSearchForTest(db, { query: 'paging token', project: 'telemetry-test', deep: false });
+    const second = await handleSearchForTest(db, { query: 'paging token', project: 'telemetry-test', offset: 5, deep: false });
+    expect(first.results).toHaveLength(5);
+    expect(second.results).toHaveLength(2);
+    const pages = [...first.results, ...second.results];
+    expect(new Set(pages.map(row => row.id)).size,
+      JSON.stringify({ first: first.results.map(row => [row.id, row.score]), second: second.results.map(row => [row.id, row.score]) })).toBe(7);
+    db.close();
+  });
+
   it('keeps rank precision surface-local and gates it by surface coverage', () => {
     const db = openDb();
     for (let i = 1; i <= 30; i++) {
