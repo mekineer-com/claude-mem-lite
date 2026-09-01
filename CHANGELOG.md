@@ -2,6 +2,54 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.84.1 — the update banner nagged forever on the one install shape we never had
+
+First outside contribution ([#17](https://github.com/sdsrss/claude-mem-lite/pull/17), Peter Bakker):
+a **pure-plugin** install — no `claude-mem-lite install`, only the marketplace plugin — showed
+`📦 claude-mem-lite: v3.84.0 available (current: v0.0.0) — plugin mode only checks for updates;
+reinstall/update the plugin to apply it` at every SessionStart on a fully current plugin cache.
+The hint was the insult on top: there was nothing to reinstall.
+
+`getCurrentVersion()` read `~/.claude-mem-lite/package.json`, and on that install shape the
+file does not exist: the data dir holds the DB and runtime state, never source. This repo
+states that invariant in two places already — `syncDataDirFromCache`'s `no-existing-code-install`
+guard and doctor's "plugin-only install never deploys into ~/.claude-mem-lite" branch — but the
+version read predated both. The `'0.0.0'` catch-all then made `compareVersions` report an update
+forever, and the banner is rendered from that persisted state.
+
+Fixed by falling back to `CLAUDE_PLUGIN_ROOT/package.json` — the running plugin cache. Two
+narrowings on top of the contributed patch:
+
+- **The code dir is asked first, the cache second.** `getCurrentVersion()` is also how
+  `repair()`'s signed-release rollback guard (`isRepairDowngrade`) learns which tree is about
+  to be overwritten, and `hook-launcher.mjs`'s `attemptHeal` spawns `repair` with no env
+  override — so `CLAUDE_PLUGIN_ROOT` is set in that child too. On a hybrid install (managed
+  code dir *plus* plugin cache) the two trees legitimately carry different versions; that drift
+  is why `syncDataDirFromCache` exists. Cache-first would have judged one tree by the other's.
+- **A `package.json` with no `version` field falls through** instead of returning `undefined`.
+  Not because comparing would throw: `compareVersions` parses `String(undefined)` to `[NaN]` and
+  reads every component as `pa[i] || 0`, so `undefined` degrades to exactly `0.0.0` — the bug
+  this release closes, wearing a different hat and rendering `(current: vundefined)`.
+
+The tradeoff the first form got right and this one does not: on a **hybrid** install whose code
+dir lags the cache, reading the code dir first shows one banner that cache-first would have
+suppressed. It is bounded — `trySyncDataDirFromCache()` runs at every SessionStart and pulls the
+code dir up to the cache — and a correct rollback guard is worth more than a transient banner,
+but it is a real cost and not a free win.
+
+Three tests added beside the contributed one, each verified to fail against the code without
+its guard: code-dir-wins-when-both-exist (the contributed case leaves only one readable
+`package.json`, so it passes under either order and cannot pin it), the version-less
+`package.json` fall-through, and the reported symptom end-to-end — a current pure-plugin
+install must report no update and emit no banner. 68 passed in `tests/hook-update.test.mjs`.
+
+Known, not fixed here: `tests/cli-path-invocation.test.mjs`'s injection-budget test measures
+four strings that each embed the absolute `CLI_PATH`, so what it gates on is partly the length
+of the checkout path. The first to trip is the detail doc — 26 occurrences, 6293/8000 — which
+goes red once `CLI_PATH` reaches 104 chars; the instructions (7 occurrences, 2866/3500) hold to
+129. On this machine `CLI_PATH` is 38, which is why the contributor saw a failure there and a
+re-run here could not reproduce it. Filed as a deferred item.
+
 ## v3.84.0 — the audit's own P1, and a second promotion path the ledger never knew about
 
 Thirteen batches against the 2026-08-29 engineering audit (`docs/reviews/PROJECT_AUDIT.md`).

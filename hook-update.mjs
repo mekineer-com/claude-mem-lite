@@ -276,22 +276,44 @@ export function compareVersions(a, b) {
   return 0;
 }
 
+// The version of the code this install runs. INSTALL_DIR is asked FIRST and the
+// plugin cache is a FALLBACK, not a precedence — the order is load-bearing in
+// both directions:
+//
+//   • Plugin cache reachable at all (PR #17): a pure-plugin ~/.claude-mem-lite/
+//     holds only the DB + runtime state and never any source — the same invariant
+//     syncDataDirFromCache states from the other side in its
+//     `no-existing-code-install` guard — so the INSTALL_DIR read cannot succeed
+//     there and the '0.0.0' last resort made checkForUpdate compute
+//     hasUpdate=true forever, nagging `(current: v0.0.0)` at every SessionStart
+//     on a fully current cache.
+//   • INSTALL_DIR still first: this is also the "which tree is about to be
+//     overwritten" answer for repair()'s signed-release rollback guard
+//     (install.mjs → isRepairDowngrade), and repair is spawned by
+//     scripts/hook-launcher.mjs's attemptHeal WITHOUT an env override, so
+//     CLAUDE_PLUGIN_ROOT is set in that child too. On a hybrid install the two
+//     trees legitimately differ — that drift is the entire reason
+//     syncDataDirFromCache exists — and answering with the cache's version would
+//     judge one tree by the other's.
+//
+// A package.json with no `version` field falls through rather than returning
+// undefined. compareVersions does NOT blow up on it — `String(undefined)` parses
+// to [NaN] and every read is `pa[i] || 0`, so undefined degrades to exactly
+// 0.0.0: the same permanent hasUpdate=true this function exists to prevent, plus
+// a banner rendered as `(current: vundefined)` from the persisted state.
 export function getCurrentVersion() {
-  // In plugin mode INSTALL_DIR (~/.claude-mem-lite/) holds only the DB + runtime
-  // state — no package.json — so read the running plugin-cache version from
-  // CLAUDE_PLUGIN_ROOT first, else the update check sees '0.0.0' and nags every
-  // SessionStart. Fall back to the INSTALL_DIR read for non-plugin installs.
+  try {
+    const pkg = JSON.parse(readFileSync(join(INSTALL_DIR, 'package.json'), 'utf8'));
+    if (pkg.version) return pkg.version;
+  } catch { /* no code install here → try the running plugin cache */ }
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
   if (pluginRoot) {
     try {
       const pkg = JSON.parse(readFileSync(join(pluginRoot, 'package.json'), 'utf8'));
-      return pkg.version;
-    } catch { /* fall through to INSTALL_DIR */ }
+      if (pkg.version) return pkg.version;
+    } catch { /* fall through to the last resort */ }
   }
-  try {
-    const pkg = JSON.parse(readFileSync(join(INSTALL_DIR, 'package.json'), 'utf8'));
-    return pkg.version;
-  } catch { return '0.0.0'; }
+  return '0.0.0';
 }
 
 // SWITCHABLE_PATHS = everything in SOURCE_FILES plus the recursive dirs that
