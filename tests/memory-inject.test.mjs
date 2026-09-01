@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { searchRelevantMemories, formatMemoryLine } from '../hook-memory.mjs';
 import { createTestDb, insertSession, insertObs, fileEdgeMatchOnly } from './test-helpers.mjs';
-import { cjkBigrams } from '../utils.mjs';
+import { cjkBigrams, OBS_BM25 } from '../utils.mjs';
 
 // ─── P1: formatMemoryLine — stale-obs verify-before-use hint ───────────────
 // A surfaced obs older than 30 days that references file paths has elevated
@@ -783,6 +783,171 @@ describe('cross-project rows: stale-hint field parity (parallel-path miss)', () 
       expect(typeof cross.created_at_epoch).toBe('number');
       expect(cross.files_modified).toContain('auth.mjs');
       expect(formatMemoryLine(cross)).toContain('[verify-before-use]');
+    } finally { db.close(); }
+  });
+});
+
+// ─── D#172 class (audit 2026-08-29 ALGO-3): the candidate pool is taken by RAW bm25
+// but the injected row is chosen by the JS composite, so the SQL LIMIT bounds
+// REACHABILITY, not just output width. See the RERANK_POOL_* docblock in
+// hook-memory.mjs for the 281× multiplier spread that makes this reachable-in-practice.
+describe('rerank pool is a reachability bound, not a ranking gate (ALGO-3)', () => {
+  // Ranks the target at raw-bm25 #13 while every JS multiplier favours it:
+  //   fillers  = change(0.5) × no-lesson(1.0) × imp1(0.6) × noise(0.2) × cite(0.4) = 0.024
+  //   target   = decision(1.5) × lesson(1.5) × imp3(1.0) × noise(1.0) × cite(3.0) = 6.75
+  // The 60 off-topic rows are not padding for its own sake: with a single-topic corpus
+  // FTS5's IDF degenerates and bm25() returns 0.000 for EVERY row, which makes any
+  // ranking fixture here vacuous (the same trap the error-recall suite pins as its
+  // invariant #2). Measured with them present: fillers −14.845, target −4.235.
+  function seed(db) {
+    insertSession(db, { id: 'algo3-s', project: 'algo3' });
+    const TOPICS = [
+      'oauth token refresh redirect', 'sqlite wal checkpoint pragma', 'docker layer cache prune',
+      'react hydration mismatch ssr', 'grpc deadline propagation retry', 'yaml anchor merge parser',
+      'kafka consumer rebalance lag', 'tls handshake alpn negotiation', 'regex backtracking catastrophic',
+      'cron timezone dst skew',
+    ];
+    for (let i = 0; i < 60; i++) {
+      insertObs(db, {
+        sessionId: 'algo3-s', project: 'algo3', type: 'change',
+        title: `${TOPICS[i % 10]} note ${i}`, text: `${TOPICS[i % 10]} details ${i}`, importance: 1,
+      });
+    }
+    const fillerIds = [];
+    for (let i = 0; i < 12; i++) {
+      const id = Number(insertObs(db, {
+        sessionId: 'algo3-s', project: 'algo3', type: 'change',
+        title: `widget cache invalidation race condition ${i}`,
+        text: 'widget cache invalidation race condition', importance: 1,
+      }).lastInsertRowid);
+      db.prepare(
+        'UPDATE observations SET injection_count = 9, access_count = 0, cited_count = 0, uncited_streak = 3 WHERE id = ?'
+      ).run(id);
+      fillerIds.push(id);
+    }
+    // Long body → lower bm25 magnitude than the short fillers, while the title and
+    // lesson still carry every query term so the v27 term-coverage filter passes.
+    const PAD = 'unrelated filler prose about deployment pipelines and log rotation. '.repeat(120);
+    const targetId = Number(insertObs(db, {
+      sessionId: 'algo3-s', project: 'algo3', type: 'decision',
+      title: 'widget cache invalidation race condition — serialize writers',
+      text: PAD, narrative: PAD,
+      lessonLearned: 'widget cache invalidation race condition: serialize through a single writer',
+      importance: 3,
+    }).lastInsertRowid);
+    db.prepare('UPDATE observations SET cited_count = 10, uncited_streak = 0 WHERE id = ?').run(targetId);
+    return { targetId, fillerIds };
+  }
+
+  const QUERY = 'widget cache invalidation race condition';
+
+  it('injects a row ranked below the old LIMIT-10 window when the composite favours it', () => {
+    // VERIFIED RED: with RERANK_POOL_SAME_PROJECT back at its shipped-until-now 10,
+    // searchRelevantMemories returns [] for this prompt — not "the target ranked
+    // lower", but the whole face silent (measured 2026-09-01, same fixture).
+    const db = createTestDb();
+    try {
+      const { targetId } = seed(db);
+      const results = searchRelevantMemories(db, QUERY, 'algo3', []);
+      expect(results.map(r => r.id)).toContain(targetId);
+    } finally { db.close(); }
+  });
+
+  it('pins the target OUTSIDE the old window, so the case above cannot pass for free', () => {
+    // Without this, a fixture drift that pulls the target up to raw-bm25 rank ≤10
+    // would leave the test above green while proving nothing about reachability —
+    // the "necessary condition standing in for the sufficient one" shape.
+    const db = createTestDb();
+    try {
+      const { targetId } = seed(db);
+      const ranked = db.prepare(`
+        SELECT o.id FROM observations_fts
+        JOIN observations o ON o.id = observations_fts.rowid
+        WHERE observations_fts MATCH ?
+        ORDER BY ${OBS_BM25}
+      `).all('widget AND cache AND invalidation AND race AND condition').map(r => r.id);
+      expect(ranked.indexOf(targetId)).toBeGreaterThan(9);
+      expect(ranked.indexOf(targetId)).toBeLessThan(30);
+    } finally { db.close(); }
+  });
+
+  it('applies the same widening to the CROSS-PROJECT arm', () => {
+    // The pre-tag review found the three cases here do NOT cover
+    // RERANK_POOL_CROSS_PROJECT: the fixture above is single-project, so reverting that
+    // constant to 5 stayed green across the whole suite. The cross arm is the copy the
+    // audit did not name and it has the identical defect. Same construction, one arm
+    // over: 6 penalised `discovery` fillers (the cross arm filters
+    // `type IN ('decision','discovery') AND importance >= 2`, so fillers must satisfy it
+    // too) put the boosted target at cross-arm raw-bm25 rank 7 — outside the old LIMIT 5.
+    // The 60 IDF rows go in the MAIN project on purpose: FTS5's IDF is global across the
+    // table, while `obsCount` (and therefore the adaptive threshold) counts only the
+    // queried project.
+    // VERIFIED RED: with RERANK_POOL_CROSS_PROJECT back at 5 this returns [].
+    const db = createTestDb();
+    try {
+      insertSession(db, { id: 'algo3x-m', project: 'algo3x' });
+      insertSession(db, { id: 'algo3x-o', project: 'algo3x-other' });
+      const TOPICS = [
+        'oauth token refresh redirect', 'sqlite wal checkpoint pragma', 'docker layer cache prune',
+        'react hydration mismatch ssr', 'grpc deadline propagation retry', 'yaml anchor merge parser',
+        'kafka consumer rebalance lag', 'tls handshake alpn negotiation', 'regex backtracking catastrophic',
+        'cron timezone dst skew',
+      ];
+      for (let i = 0; i < 60; i++) {
+        insertObs(db, {
+          sessionId: 'algo3x-m', project: 'algo3x', type: 'change',
+          title: `${TOPICS[i % 10]} note ${i}`, text: `${TOPICS[i % 10]} details ${i}`, importance: 1,
+        });
+      }
+      const fillerIds = [];
+      for (let i = 0; i < 6; i++) {
+        const id = Number(insertObs(db, {
+          sessionId: 'algo3x-o', project: 'algo3x-other', type: 'discovery',
+          title: `widget cache invalidation race condition ${i}`,
+          text: 'widget cache invalidation race condition', importance: 2,
+        }).lastInsertRowid);
+        db.prepare(
+          'UPDATE observations SET injection_count = 9, access_count = 0, cited_count = 0, uncited_streak = 3 WHERE id = ?'
+        ).run(id);
+        fillerIds.push(id);
+      }
+      const PAD = 'unrelated filler prose about deployment pipelines and log rotation. '.repeat(120);
+      const targetId = Number(insertObs(db, {
+        sessionId: 'algo3x-o', project: 'algo3x-other', type: 'decision',
+        title: 'widget cache invalidation race condition — serialize writers',
+        text: PAD, narrative: PAD,
+        lessonLearned: 'widget cache invalidation race condition: serialize through a single writer',
+        importance: 3,
+      }).lastInsertRowid);
+      db.prepare('UPDATE observations SET cited_count = 10, uncited_streak = 0 WHERE id = ?').run(targetId);
+
+      // Pin the target outside the OLD window, so the assertion below cannot pass for free.
+      const ranked = db.prepare(`
+        SELECT o.id FROM observations_fts
+        JOIN observations o ON o.id = observations_fts.rowid
+        WHERE observations_fts MATCH ?
+          AND o.project != 'algo3x'
+          AND o.type IN ('decision', 'discovery')
+          AND o.importance >= 2
+        ORDER BY ${OBS_BM25}
+      `).all('widget AND cache AND invalidation AND race AND condition').map(r => r.id);
+      expect(ranked.indexOf(targetId)).toBeGreaterThan(4);
+      expect(ranked.indexOf(targetId)).toBeLessThan(15);
+
+      const returned = searchRelevantMemories(db, QUERY, 'algo3x', []).map(r => r.id);
+      expect(returned).toContain(targetId);
+      for (const id of fillerIds) expect(returned).not.toContain(id);
+    } finally { db.close(); }
+  });
+
+  it('does not inject the penalised fillers that outrank it on raw bm25', () => {
+    // The widening must not become "inject more"; the fillers are stronger textual
+    // matches and must still lose on the composite.
+    const db = createTestDb();
+    try {
+      const { fillerIds } = seed(db);
+      const returned = searchRelevantMemories(db, QUERY, 'algo3', []).map(r => r.id);
+      for (const id of fillerIds) expect(returned).not.toContain(id);
     } finally { db.close(); }
   });
 });

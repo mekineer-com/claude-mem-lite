@@ -1497,6 +1497,170 @@ describe('pre-tool-recall', () => {
     });
   });
 
+  // ─── D#172 class (audit 2026-08-29 ALGO-4): the cross-hook dedup ran DOWNSTREAM
+  // of the SQL LIMIT, so a deduped row left its slot EMPTY instead of yielding it to
+  // the next candidate — "dedup" implemented as "shrink". Own fixture rather than the
+  // A3 block above, because it needs more rows than the cap and the A3 assertions are
+  // written against a single-row corpus.
+  describe('cross-hook dedup is a re-rank, not a truncation (ALGO-4)', () => {
+    let tmpRoot;
+    let projectDir;
+    let ids;
+    let eventIds;
+
+    beforeEach(() => {
+      tmpRoot = mkdtempSync(join(tmpdir(), `pre-recall-algo4-${process.pid}-`));
+      projectDir = join(tmpRoot, 'parent', 'algo4');
+      mkdirSync(projectDir, { recursive: true });
+      mkdirSync(join(tmpRoot, 'runtime'), { recursive: true });
+
+      const db = new Database(join(tmpRoot, 'claude-mem-lite.db'));
+      db.pragma('foreign_keys = OFF');
+      initSchema(db);
+      insertSession(db, { id: 'sess-a4', project: 'parent--algo4', memoryId: 'mem-a4' });
+      const target = join(projectDir, 'shared.mjs');
+      // Four lesson rows on one file. The query sorts lesson-first, then cite_factor
+      // DESC — so cited_count pins a deterministic rank order without relying on
+      // insertion timing (created_at is only the tertiary key and can tie at ms
+      // resolution). Ranks: A(3) > B(2) > C(1) > D(0).
+      ids = [3, 2, 1, 0].map((cited, i) => {
+        const info = insertObs(db, {
+          sessionId: 'mem-a4', project: 'parent--algo4',
+          type: 'bugfix', importance: 2,
+          title: `algo4 lesson rank ${i}`,
+          lessonLearned: `Lesson body number ${i} for the about-to-edit agent`,
+          filesModified: `["${target}"]`,
+        });
+        const id = Number(info?.lastInsertRowid ?? info);
+        db.prepare('UPDATE observations SET cited_count = ? WHERE id = ?').run(cited, id);
+        return id;
+      });
+      // Four EVENTS rows on a DIFFERENT file, so the events arm can be exercised in
+      // isolation (the observations query returns nothing for this path and the merge
+      // is events-only). All carry a body, so the events ORDER BY reduces to
+      // `created_at_epoch DESC` — rank is pinned by the timestamps, not by insert order.
+      const evtFile = join(projectDir, 'events-only.mjs');
+      const now = Date.now();
+      eventIds = [0, 1, 2, 3].map((k) => {
+        const info = db.prepare(`
+          INSERT INTO events (project, event_type, title, body, file_paths, importance, created_at_epoch)
+          VALUES (?, 'lesson', ?, ?, ?, 2, ?)
+        `).run(
+          'parent--algo4',
+          `algo4 event rank ${k}`,
+          `Event body number ${k} for the about-to-edit agent`,
+          JSON.stringify([evtFile]),
+          now - k * 60_000,
+        );
+        return Number(info.lastInsertRowid);
+      });
+      db.close();
+    });
+
+    afterEach(() => {
+      try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+    });
+
+    it('still fills the slot when UPS already injected every row the old LIMIT could reach', async () => {
+      // Edit path: obsLimit was a flat 2, so seeding the top TWO ranks emptied the
+      // whole obs source. With the dedup slack the SELECT reaches rank 3, and the
+      // face keeps emitting.
+      // VERIFIED RED: reverting `obsLimit` to `(isRead ? 1 : 2)` makes this assertion
+      // fail — stdout carries no `#<id>` for any of the four rows (measured
+      // 2026-09-01, same fixture).
+      const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-1');
+      writeFileSync(file, JSON.stringify({
+        ids: [ids[0], ids[1]].map(String), ts: Date.now(), count: 2, session: 'sess-a4-1',
+      }));
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a4-1',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      // Assert the emptiness FIRST and by name: the pre-fix behaviour is that the
+      // face emits nothing at all, and letting JSON.parse throw on '' reports that as
+      // "Unexpected end of JSON input" — a parse error where the defect is a silenced
+      // injection surface.
+      expect(stdout, 'obs source was truncated to nothing by the dedup').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      // The two deduped ids must stay out — the slack must not defeat the dedup.
+      expect(ctx).not.toContain(`#${ids[0]}`);
+      expect(ctx).not.toContain(`#${ids[1]}`);
+      // ...and the next-ranked row must take the freed slot.
+      expect(ctx).toContain(`#${ids[2]}`);
+    });
+
+    it('emits the top rank unchanged when nothing was deduped (slack is not a widening)', async () => {
+      // Negative control: with no UPS state the seen-set is empty, dedupSlack is 0,
+      // and the LIMITs are exactly what they were before ALGO-4. Without this case a
+      // slack that ALWAYS over-fetched would pass the test above while quietly
+      // inflating the PreToolUse injection budget.
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a4-2',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).toContain(`#${ids[0]}`);
+      // mergeCap for Edit is 3, and only 2 obs rows were ever fetched pre-ALGO-4;
+      // rank 4 must not appear however wide the pool got.
+      expect(ctx).not.toContain(`#${ids[3]}`);
+    });
+
+    it('fills the slot on the READ path, where one dedup hit used to silence the face', async () => {
+      // The pre-tag review's S-3: the release text leads with the Read case (`obsLimit`
+      // 1, `mergeCap` 1, so ONE dedup hit empties the whole face) while both cases above
+      // drive Edit. Testing the arm the headline is about, not the neighbouring one.
+      // VERIFIED RED: reverting `obsLimit` to `(isRead ? 1 : 2)` empties stdout.
+      const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-4');
+      writeFileSync(file, JSON.stringify({
+        ids: [ids[0]].map(String), ts: Date.now(), count: 1, session: 'sess-a4-4',
+      }));
+
+      const { stdout } = await runScript({
+        tool_name: 'Read',
+        tool_input: { file_path: join(projectDir, 'shared.mjs') },
+        session_id: 'sess-a4-4',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      expect(stdout, 'Read path silenced: obsLimit 1 minus one dedup hit left zero rows').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).not.toContain(`#${ids[0]}`);
+      expect(ctx).toContain(`#${ids[1]}`);
+      // mergeCap is 1 on Read — the slack must not turn a one-row face into a two-row one.
+      expect(ctx).not.toContain(`#${ids[2]}`);
+    });
+
+    it('applies the same slack to the EVENTS arm', async () => {
+      // The pre-tag review found the case above does NOT cover `eventsLimit`: the
+      // fixture seeded only observations, so reverting the events slack stayed green
+      // across the whole suite. The events arm has the identical defect — its LIMIT is
+      // also upstream of the same JS dedup — and on a Read (`eventsLimit` 1) one dedup
+      // hit silences it outright. Driven through a file that has NO observation rows,
+      // so the merge is events-only and the assertion cannot be satisfied by the obs arm.
+      // VERIFIED RED: reverting `eventsLimit` to `(isRead ? 1 : 2)` empties stdout.
+      const file = join(tmpRoot, 'runtime', '.claude-mem-injected-parent--algo4-sess-a4-3');
+      writeFileSync(file, JSON.stringify({
+        ids: [eventIds[0], eventIds[1]].map(String), ts: Date.now(), count: 2, session: 'sess-a4-3',
+      }));
+
+      const { stdout } = await runScript({
+        tool_name: 'Edit',
+        tool_input: { file_path: join(projectDir, 'events-only.mjs') },
+        session_id: 'sess-a4-3',
+      }, { CLAUDE_MEM_DIR: tmpRoot, CLAUDE_PROJECT_DIR: projectDir });
+
+      expect(stdout, 'events source was truncated to nothing by the dedup').not.toBe('');
+      const ctx = JSON.parse(stdout).hookSpecificOutput.additionalContext;
+      expect(ctx).not.toContain(`#${eventIds[0]}`);
+      expect(ctx).not.toContain(`#${eventIds[1]}`);
+      expect(ctx).toContain(`#${eventIds[2]}`);
+    });
+  });
+
   // ─── P2 (D#78): edge-level decay enforcement ───────────────────────────────
   // A (lesson,file) edge whose miss_streak reached K consecutive uncited
   // injections stops firing — the lesson body stays alive for every other

@@ -50,6 +50,12 @@ const LOOKBACK_MS = 60 * DAY_MS; // 60 days
 // quality gate — only BM25 ordering — so additional rows inflate noise without
 // improving signal. Env-overridable for projects that want broader prompt recall.
 const PROMPT_FALLBACK_LIMIT = Number(process.env.CLAUDE_MEM_UPS_PROMPT_FALLBACK_LIMIT || 1);
+// Over-fetch factor for that cap. searchByUserPrompts filters rows in JS (cjkPrecisionOk)
+// AFTER the SQL LIMIT, so the LIMIT bounds reachability, not just output width — see the
+// comment at the query. These size the pool only; the function still returns at most
+// PROMPT_FALLBACK_LIMIT rows, so widening them cannot inflate the injection budget.
+const PROMPT_FALLBACK_POOL_FACTOR = 5;
+const PROMPT_FALLBACK_POOL_MAX = 25;
 
 // T3 (v2.31): per-row BM25 magnitude floor. OBS_BM25 (in scoring-sql.mjs)
 // returns the raw bm25() value — negative, smaller = better. Multiplied by
@@ -263,6 +269,13 @@ export function hasExplicitSignal(text, { errSig, files, intent } = {}) {
 // constants here is what would let them drift apart again.
 
 export const IDENTIFIER_BYPASS = process.env.CLAUDE_MEM_UPS_IDENTIFIER_BYPASS !== '0';
+// How far past the main LIMIT the bypass may look, and how many rows it may pull from
+// there (ALGO-2). These size the CANDIDATE POOL only — the injected set is still capped
+// by MAX_RESULTS downstream, so neither widens the injection budget. Kept small on
+// purpose: rows this deep matched the prompt weakly overall, and the identifier hit is
+// the only reason they are admitted at all.
+const IDENTIFIER_BYPASS_POOL_EXTRA = 7;
+const IDENTIFIER_BYPASS_DEEP_MAX = 2;
 const TECH_IDENTIFIER_RE_G = new RegExp(TECH_IDENTIFIER_RE.source, 'g');
 
 // All tech-identifier tokens in `text`, lowercased + de-duped (for case-insensitive
@@ -426,12 +439,20 @@ function searchByUserPrompts(db, queryText, project, limit) {
     LIMIT ?
   `;
 
-  let rows = db.prepare(sql).all(ftsQuery, project, cutoff, limit);
+  // Over-fetch, because the cjkPrecisionOk filter below runs in JS (audit 2026-08-29
+  // ALGO-5, the D#172 shape). At the shipped PROMPT_FALLBACK_LIMIT of 1 the SQL LIMIT
+  // was a REACHABILITY bound sitting upstream of a relevance filter: dropping one row
+  // dropped the whole face, so a CJK prompt whose best BM25 match happened to be a
+  // false bigram hit injected NOTHING even when rank 2 was a real match. Fetch a pool,
+  // filter, then take `limit` — same ORDER BY, so the old result is a prefix of this
+  // one and a row can only be added, never displaced by something worse.
+  const poolLimit = Math.min(limit * PROMPT_FALLBACK_POOL_FACTOR, PROMPT_FALLBACK_POOL_MAX);
+  let rows = db.prepare(sql).all(ftsQuery, project, cutoff, poolLimit);
 
   if (rows.length === 0) {
     const orQuery = relaxFtsQueryToOr(ftsQuery);
     if (orQuery) {
-      try { rows = db.prepare(sql).all(orQuery, project, cutoff, limit); } catch {}
+      try { rows = db.prepare(sql).all(orQuery, project, cutoff, poolLimit); } catch {}
     }
   }
 
@@ -439,7 +460,7 @@ function searchByUserPrompts(db, queryText, project, limit) {
   // FTS degrades CJK bigram queries to single-char AND, letting any prose
   // sharing common chars leak through. Drop rows that miss < 20% of query
   // bigrams/keywords as contiguous substrings. Non-CJK queries bypass.
-  return rows.filter(r => cjkPrecisionOk(queryText, r.prompt_text));
+  return rows.filter(r => cjkPrecisionOk(queryText, r.prompt_text)).slice(0, limit);
 }
 
 function searchRecent(db, project, limit) {
@@ -752,12 +773,24 @@ async function main() {
     } else {
       // FTS search: use the prompt as query, optionally type-filtered
       const files = filesForGate;
-      let ftsResult = searchByFts(db, promptText, project, intent?.limit || MAX_RESULTS, intent?.type || null);
+      const mainLimit = intent?.limit || MAX_RESULTS;
+      // Over-fetch ONLY to feed the identifier bypass below (audit 2026-08-29 ALGO-2,
+      // the D#172 shape). The bypass used to select from `ftsRows`, i.e. from the same
+      // LIMIT-`mainLimit` window it exists to rescue rows into — so it could only ever
+      // recover a row the composite sort had ALREADY ranked top-3, and the df=1
+      // identifier row its own docblock argues for (rare token, so BM25-strong on the
+      // term but easily out-ranked by rows matching more of the prompt) was unreachable.
+      // `ftsRows` stays the exact old head slice, so the main path is byte-identical;
+      // only the bypass sees deeper. Pool sizing is bypass-only: with the bypass off
+      // this is the old query verbatim.
+      const poolLimit = IDENTIFIER_BYPASS ? mainLimit + IDENTIFIER_BYPASS_POOL_EXTRA : mainLimit;
+      let ftsResult = searchByFts(db, promptText, project, poolLimit, intent?.type || null);
       // Fallback: if typed search returned nothing, retry without type filter
       if (ftsResult.rows.length === 0 && intent?.type) {
-        ftsResult = searchByFts(db, promptText, project, intent.limit || MAX_RESULTS, null);
+        ftsResult = searchByFts(db, promptText, project, poolLimit, null);
       }
-      let ftsRows = ftsResult.rows;
+      const ftsPool = ftsResult.rows;
+      let ftsRows = ftsPool.slice(0, mainLimit);
       const ftsMode = ftsResult.mode;
       const fileRows = files.length > 0 ? searchByFile(db, files, project, 2) : [];
 
@@ -775,9 +808,26 @@ async function main() {
       // Capture rows that exact-match a prompt identifier BEFORE the set-floors below;
       // they carry independent precision signal (sigRows/fileRows rationale) and are
       // restored after the floors so a low top-score can't drop a named-identifier hit.
-      const bypassRows = (IDENTIFIER_BYPASS && promptIdentifiers.length > 0)
-        ? ftsRows.filter(r => rowMatchesIdentifier(r, promptIdentifiers))
-        : [];
+      // STRICTLY ADDITIVE to the pre-ALGO-2 behaviour: `head` is what this expression
+      // used to return (the post-floor rows of the old LIMIT window that match an
+      // identifier), and `deep` adds at most IDENTIFIER_BYPASS_DEEP_MAX rows from
+      // beyond that window. The audit prescribed a standalone LIMIT-2 SELECT; a capped
+      // tail of the SAME query is the same reach with one fewer FTS scan, and it cannot
+      // regress the head — a flat cap of 2 over the merged set could have, by evicting
+      // a third head row that ships today.
+      const bypassFloorOk = (r) => typeof r.relevance === 'number' && Math.abs(r.relevance) >= bm25Floor;
+      let bypassRows = [];
+      if (IDENTIFIER_BYPASS && promptIdentifiers.length > 0) {
+        const head = ftsPool.slice(0, mainLimit)
+          .filter(bypassFloorOk)
+          .filter(r => rowMatchesIdentifier(r, promptIdentifiers));
+        const headIds = new Set(head.map(r => r.id));
+        const deep = ftsPool.slice(mainLimit)
+          .filter(bypassFloorOk)
+          .filter(r => !headIds.has(r.id) && rowMatchesIdentifier(r, promptIdentifiers))
+          .slice(0, IDENTIFIER_BYPASS_DEEP_MAX);
+        bypassRows = [...head, ...deep];
+      }
 
       // v2.43.x: OR-mode raw-BM25 floor. In OR-fallback mode the composite
       // TOP_REL_FLOOR below is inflated by importance × type_quality × decay

@@ -13,6 +13,49 @@ import { formatSubagentContext } from './lib/task-imperative.mjs';
 import { DAY_MS } from './lib/time-constants.mjs';
 const MAX_MEMORY_INJECTIONS = 3;
 const MEMORY_LOOKBACK_MS = 60 * DAY_MS; // 60 days
+
+/**
+ * Candidate-pool bounds for the `fyi` injection face (searchRelevantMemories).
+ *
+ * READ THESE AS REACHABILITY BOUNDS, NOT AS RANKING GATES — the same distinction
+ * D#172 cost us on IMPERATIVE_POOL_BACKSTOP, found again here by the 2026-08-29 audit
+ * (ALGO-3). The two SELECTs below `ORDER BY` RAW bm25, but the row that actually gets
+ * injected is chosen by the JS composite in `scored` (type quality × lesson bonus ×
+ * importance × cross-project × OR × noise × cite). So whatever these numbers are, a row
+ * outside the window cannot be picked however high its composite score would have been.
+ *
+ * The window has to be wide because the composite spread is enormous. Multiplying the
+ * extremes of the JS factors (same-project, AND mode): best = 1.5 decision × 1.5 lesson
+ * × 1.0 importance × 1.0 noise × 3.0 cite = 6.75; worst = 0.5 change × 1.0 no-lesson
+ * × 0.6 importance × 0.2 noise × 0.4 cite = 0.024. That is a **281× spread**, so a row
+ * ranked below the window on raw bm25 can outscore the window's contents by a wide
+ * margin. (The audit estimated ">10×"; the factor tables say 281×.)
+ *
+ * HONEST LIMIT OF THIS FIX: because the spread is 281× and bm25 magnitude decays slowly
+ * across a top-N window, NO finite pool size proves sufficiency. 30/15 is a 3× widening
+ * chosen where cost stays flat (the SELECT carries `narrative`, so the pool is the
+ * expensive term, not the sort) — it makes the bound loose, it does not remove it.
+ *
+ * The bound is REMOVABLE, and deliberately was not removed: ordering both SELECTs by the
+ * composite instead of raw bm25 is expressible in SQL today (every factor already has a
+ * clause — TYPE_QUALITY_CASE / noisePenaltyClause / citeFactorClause — and the two
+ * remaining factors, cross-project and OR, are per-QUERY constants that cannot affect
+ * within-query order). That would make LIMIT a true ranking bound. It is not done here
+ * because `lib/inject-search-core.mjs:23-25` records this surface's "BM25-sort + JS
+ * scoring" composition as a deliberate per-surface asymmetry (#8786), and this face is
+ * one `benchmark/denoise-ab.mjs` is structurally blind to (its suites drive the
+ * search-engine, not this function) — re-ranking an unmeasurable face is how this
+ * project has repeatedly shipped regressions. Widening is monotone and provable;
+ * re-ranking needs a ruler that does not exist yet.
+ *
+ * WHY WIDENING IS SAFE: the old window is a strict PREFIX of the new one (same ORDER BY,
+ * larger LIMIT), so the new candidate set is a superset. `scored` sorts by composite and
+ * the threshold filter is monotone in that score, so every row returned is at least as
+ * good as the row it displaced. The only non-monotone stage is the term-coverage filter,
+ * which is exactly why the pool needs slack rather than just `MAX_MEMORY_INJECTIONS`.
+ */
+const RERANK_POOL_SAME_PROJECT = 30;
+const RERANK_POOL_CROSS_PROJECT = 15;
 // Type weights come from scoring-sql.mjs — this was a hand-copy kept equal by an
 // "aligned with (R2)" comment (audit 2026-08-22, P2-10).
 // lesson_learned boost (1.5×) stacks for entries with a real takeaway.
@@ -225,7 +268,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
         AND ${liveObsFilterSql('o')}
         AND ${notLowSignalTitleClause('o')}
       ORDER BY ${OBS_BM25}
-      LIMIT 10
+      LIMIT ${RERANK_POOL_SAME_PROJECT}
     `);
     let rows = selectStmt.all(ftsQuery, project, cutoff);
     let usedOrFallback = false;
@@ -280,7 +323,7 @@ export function searchRelevantMemories(db, userPrompt, project, excludeIds = [])
           AND ${liveObsFilterSql('o')}
           AND ${notLowSignalTitleClause('o')}
         ORDER BY ${OBS_BM25}
-        LIMIT 5
+        LIMIT ${RERANK_POOL_CROSS_PROJECT}
       `);
       crossRows = crossStmt.all(ftsQuery, project, cutoff);
       if (crossRows.length === 0) {

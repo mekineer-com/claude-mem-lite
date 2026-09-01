@@ -2,6 +2,209 @@
 
 All notable changes to claude-mem-lite are documented in this file.
 
+## v3.85.0 — the bound we closed in v3.82.0 was alive on four more surfaces
+
+D#172 established that **a SQL `LIMIT` upstream of a JS-side relevance filter is a
+reachability bound, not a ranking bound** — whatever the SQL orders by, a row outside the
+window cannot be picked however well it scores on the criterion that actually decides.
+The 2026-08-29 audit found the same shape in four more places (ALGO-2~5) and filed them as
+P3. All four are closed here. The pattern is this project's first recurring disease —
+*the copy you fixed was not the only copy* — and this is its fifth counted round.
+
+**ALGO-3 · `hook-memory.mjs`, the `fyi` injection face.** The candidate pool was taken with
+`ORDER BY <raw bm25> LIMIT 10` (and `LIMIT 5` cross-project — a second copy the audit did
+not name), but the injected row is chosen by a JS composite. Multiplying out the factor
+tables, that composite spans **281×** (best 1.5 decision × 1.5 lesson × 1.0 importance ×
+1.0 noise × 3.0 cite = 6.75; worst 0.5 × 1.0 × 0.6 × 0.2 × 0.4 = 0.024) — the audit
+estimated ">10×". Pools raised to 30 / 15.
+
+Priced on the live corpus, not on the fixture, and reproducible:
+**`node benchmark/rerank-pool-replay.mjs`**. The default replays the **whole
+`user_prompts` table** — every prompt, no sampling predicate — through both the shipped
+module and a twin carrying the old 10/5 pools. On this machine (n = **11279**):
+
+| | over all 11279 | over the 4901 that retrieve anything |
+|---|---|---|
+| different injected set | **15.9%** | 36.5% |
+| different top-1 | **6.6%** | 15.2% |
+
+2476 rows newly reachable against 1230 displaced, and 219 prompts that previously injected
+nothing now inject something (6597 → 6378 empty). The gain exceeds the displacement because
+freed-but-empty slots get filled, not because the cap moved; the injected set is still
+`MAX_MEMORY_INJECTIONS = 3`.
+
+**Why the whole corpus and not a sample.** The first draft of this entry quoted 11.9% / 4.0%
+off a newest-1200 sample filtered to `LENGTH(prompt_text) BETWEEN 20 AND 2000`. The pre-tag
+review could not reproduce it and re-measured under nine sampling configurations, every one
+of them higher. Running the same harness on the reviewer's sample settles it: the harness
+agrees to within one row (14.8% / 7.1% / 284 / 126 vs their 14.7% / 7.0% / 282 / 126), and
+**the sample predicate was the entire disagreement** — 1200-row samples of this one table
+span 11.9%–20.2% depending on which predicate you pick. A headline that moves by 70% with
+the sampling choice is not a measurement of the change; the whole-corpus run has no such
+free parameter, which is why it is the number quoted and why `--sample N` prints a warning.
+
+**The replay cannot pollute the corpus, and proves it rather than promising it.**
+`searchRelevantMemories` bumps `injection_count` on every row it returns — the exact column
+`noisePenaltyClause` reads — so replaying it against a writable handle would both corrupt
+that signal permanently and let arm A's writes change arm B's scores. The DB is opened
+`readonly`, and the harness executes the bump against its own handle at startup and
+**refuses to run if it succeeds**. Confirmed independently by the review: `sum(injection_count)`
+unchanged at 5048 across the whole exercise, with only 14 rows carrying a same-day
+`last_injected_at`, in human-scale clusters.
+
+**How loose the cross-project arm still is, measured rather than asserted**
+(`--cross-arm`, whole corpus, n = 11104). Driving the *shipped* cross-project predicate
+including its OR fallback — the branch it takes on 6730 of its 8487 firings — the leg fires
+on **76.4%** of prompts, and of those firings **83.9% match more than 5 rows**. So the old
+`LIMIT 5` was truncating in the large majority of cases, not occasionally. But **71.5% still
+match more than 15**, and 56.9% match more than 50; largest single match 242. On match count
+alone, 5 → 15 does not close this arm.
+
+That sounds worse than it is, and the difference was checked rather than argued. Relaxing the
+cross pool further — `--baseline-same 30 --baseline-cross 50`, whole corpus — changes the
+injected set on **4.0%** of prompts and the top-1 on **1.7%**, and fills 52 more previously
+empty injections. So the OR penalty (0.4×), the cross penalty (0.7×) and the adaptive
+threshold do drop nearly every row the LIMIT cuts, and match-count truncation overstates the
+harm by roughly an order of magnitude — but not to zero. **15 is a judgement call, not a
+finding**: 50 buys a measured 4.0% / 1.7% for ~3.3× the cross-arm `narrative` reads per
+prompt, and that trade was declined for a face `denoise-ab` cannot see, not proven worthless.
+The command above is in the repo precisely so the next person can disagree with numbers.
+
+The first version of that measurement reported the cross leg as firing on **5 of 1200**
+prompts and never truncating. It modelled only the AND pass, and the leg takes the OR
+fallback on the large majority of real prompts — it measured a branch production rarely
+uses. That is why the OR fallback is modelled inside the shipped `--cross-arm` mode rather
+than left to whoever re-derives the number next.
+
+**Stated plainly, because widening is not closing:** with a 281× spread and bm25 decaying
+slowly across a window, **no finite pool size proves sufficiency**. 30/15 makes the bound
+loose. The bound is *removable* — every composite factor already has a SQL clause, and the
+two that do not (cross-project, OR) are per-query constants that cannot affect within-query
+order, so ordering by the composite would make `LIMIT` a true ranking bound. That was
+deliberately **not** done: `lib/inject-search-core.mjs:23-25` records this surface's
+"BM25-sort + JS scoring" split as an intentional per-surface asymmetry (#8786), and
+`benchmark/denoise-ab.mjs` is structurally blind to this face (its suites drive the
+search-engine, not this function). Widening is monotone and provable; re-ranking needs a
+ruler that does not exist yet.
+
+**ALGO-2 · `scripts/user-prompt-search.js`, the identifier bypass.** The bypass exists so a
+named-identifier hit survives the set floors — and it selected from `ftsRows`, the same
+LIMIT-3 window it was meant to rescue rows *into*. It could therefore only restore rows the
+sort had already ranked top-3; the low-document-frequency identifier row its own docblock
+argues for was unreachable. Now the query over-fetches (bypass-only; with the bypass off it
+is the old query verbatim) and the bypass may pull at most 2 rows from beyond the window.
+Implemented as **strictly additive** rather than as the audit's flat "LIMIT 2": a cap of 2
+over the merged set could have evicted a third head row that ships today.
+
+**ALGO-4 · `scripts/pre-tool-recall.js`, cross-hook dedup.** The dedup that drops rows UPS
+already injected ran *downstream* of the SQL `LIMIT`, so a deduped row left its slot **empty
+instead of yielding it to the next candidate** — "dedup" implemented as "shrink". On a Read
+(`obsLimit` 1) one dedup hit silenced the entire face. The seen-set is now read before the
+queries and its size raises each `LIMIT` (capped at 5), so the dedup re-ranks.
+
+**ALGO-5 · prompt-fallback.** `searchByUserPrompts` filters through `cjkPrecisionOk` after
+the SQL `LIMIT`, and `PROMPT_FALLBACK_LIMIT` ships at 1 — dropping one row dropped the whole
+face. Fetches a pool, filters, then takes `limit`.
+
+Building that fixture turned up something worth writing down: **`user_prompts_fts` is
+declared with no `tokenize=` clause, and FTS5's default tokenizer indexes a contiguous CJK
+run as ONE token** — `'分页接口'` is a single term, not 分/页/接/口 (verified against
+`fts5vocab` on SQLite 3.53.1). `observations_fts` is CJK-searchable only because its write
+path folds space-separated CJK bigrams into the **`text`** column — `buildFtsTextField`
+(hook-llm.mjs) joins `cjkBigrams(title + narrative)` into the `text` blob, and `derivedText`
+(lib/observation-write.mjs) and lib/save-enrich.mjs do the same on their paths. This table
+holds raw `prompt_text` and has no such segmentation. So a CJK query reaches this corpus only through
+the OR fallback, on prompts that happen to carry the bigram as an isolated run — which is
+the branch the new test exercises, and the reason ALGO-5's blast radius is narrow.
+
+**Evidence.** Every one of the four is pinned by a fixture **verified to go RED against the
+pre-fix code**, checked by reverting each fix in turn: ALGO-2 (bypass reading `ftsRows`) →
+empty stdout; ALGO-3 (pool back to 10) → the face returns nothing at all; ALGO-4 (`obsLimit`
+back to a flat 2) → no id emitted; ALGO-5 (`LIMIT` back to `limit`) → empty stdout. Two of
+the fixtures needed a correction that is itself the lesson: **an all-one-topic corpus makes
+FTS5's IDF degenerate and `bm25()` returns 0.000 for every row**, so the first drafts were
+ranking on rowid tie-breaks and asserting on insertion order. The ALGO-2 draft also failed
+for the wrong reason first — "why" in the prompt triggers `detectIntent`'s type filter, a
+*different* reachability bound that dropped the target row in SQL before the pool question
+was reached. Each case ships with a negative control on the same corpus (the set floors must
+still bind; the fillers must still lose; the dedup must still dedup).
+
+`benchmark/denoise-ab.mjs`: Δ **exactly 0.000** on all 12 metrics, all behavioural probes
+pass. Read that as the signature of *a lever this ruler cannot see* — all four faces are
+outside the suites' query→document path — i.e. evidence of no collateral regression on the
+search engine, and **not** validation of the four changes. Full suite 315 files / **5335**
+tests (+13), `eslint .` 0, knip 46 unused exports / 0 unused files (name set unchanged).
+
+**What the pre-tag review changed.** Two independent reviewers; both found real defects, and
+the first draft of this entry shipped none of the following.
+
+- **The CJK write-path sentence above named the wrong columns.** It said the bigrams go into
+  `search_aliases`/`concepts`; they go into **`text`**. Confirmed three ways before accepting
+  it: `buildFtsTextField` folds `bigramText` into the `text` blob, `derivedText` and
+  save-enrich do the same on their paths, and on a live CJK row the bigram run is in `text`
+  (626 chars) while `search_aliases` is NULL and `concepts` empty. The failure is #10918's own
+  lesson — *when a "because X" is executable, run it before writing it* — applied to half a
+  claim: the tokenizer half was verified with `fts5vocab`, the write-path half was written
+  from memory, and the wrong half was then copied into three files. The row that proves it is
+  that very memory.
+- **Three of the four fixes had no binding test.** Mutating `RERANK_POOL_CROSS_PROJECT`,
+  `eventsLimit`'s slack, and the trailing `.slice(0, limit)` each left the **entire** suite
+  green. The `.slice` is the one that mattered, and the reason is sharper than "untested":
+  `cjkPrecisionOk` returns `true` unconditionally for any query without two adjacent CJK
+  characters, so on every English or code prompt the filter is the identity function and that
+  `.slice` is the *only* thing holding this face at `PROMPT_FALLBACK_LIMIT = 1`. Deleting it
+  injects `min(1 × 5, 25)` = **5 rows instead of 1 on every non-CJK prompt-fallback firing** —
+  a 5× budget blowout on the main path, not an edge case. (The first draft of this entry said
+  "up to 25 rows"; 25 is the cap of the pool formula, reachable only under the env override.)
+  All three now have fixtures verified
+  RED against their mutation. The lesson is narrower than "add tests":
+  each of the three unbound changes was the *second arm* of a fix whose first arm was tested —
+  cross-project beside same-project, events beside observations, the cap beside the pool.
+- **The five live-corpus numbers came from a scratch script that was never committed, and
+  the reviewer could not reproduce one of them.** The harness turned out to be right — run
+  on the reviewer's own sample it returns 14.8% / 7.1% / 284 / 126 / 736→705 against their
+  14.7% / 7.0% / 282 / 126 / 736→706 — and the entire gap was the sample predicate: the draft
+  filtered `LENGTH(prompt_text) BETWEEN 20 AND 2000`, the reviewer did not, and 1200-row
+  samples of this one table span **11.9%–20.2%** depending on which predicate you pick. Two
+  fixes, because "my harness was fine" does not answer the objection: the headline is now the
+  **whole corpus** (no sampling decision exists to argue about), and the ruler ships as
+  `benchmark/rerank-pool-replay.mjs`, the way `imperative-pool-replay.mjs` shipped for D#172.
+  A number nobody else can re-derive is not evidence.
+
+**Two findings are recorded rather than fixed**, both outside this round's authorised scope.
+
+- **D#188** — `scripts/pre-tool-recall.js`'s cross-hook dedup tests
+  `crossHookSeen.has(String(r.id))` against rows that mix `src: 'obs'` and `src: 'evt'`, and
+  events share the numeric id space with observations, so an event is dropped because an
+  *observation* with the same id was injected. The comment three lines above states that
+  id-space collision as the reason the `src` tag exists; the predicate below ignores the tag.
+- **D#189 — a FIFTH instance of this release's own defect class, and it is not fixed here.**
+  `selectWithTokenBudget` (hook-context.mjs:72-178), the SessionStart Key Context face, takes
+  `obsPool` with `ORDER BY created_at_epoch DESC LIMIT 50` and `sessPool` with the same
+  ordering `LIMIT 10`, then chooses what to inject by `valueDensity`. It is a purer form of
+  the defect than ALGO-3: there the SQL key (raw bm25) is at least a factor of the composite,
+  whereas here `recency` is squashed into `(1, 2]` by `1 + exp(…)` while
+  `typeQuality × impBoost × lessonBoost / √cost` spans far more — the column the SQL sorts by
+  barely participates in the ranking that decides. Measured on the live DB with the shipped
+  `computeAdaptiveWindows` and the pools' own predicates: `obsPool` is truncated in **3 of 8**
+  projects (109 / 73 / 61 eligible against a LIMIT of 50) and `sessPool` in **5 of 8**
+  (75 / 73 / 47 / 41 / 25 against a LIMIT of 10). It is left open deliberately: SessionStart
+  injects on every start, so changing it is a user-visible default-behaviour change on a
+  released artifact, and it surfaced *after* this release's review round — folding it in would
+  ship one unreviewed change on the back of four reviewed ones. Saying "we closed the class"
+  while a quantified fifth instance stays open would be the same overclaim this project keeps
+  paying for, so: four surfaces closed, one known and open, numbers above.
+
+**CI (`.github/workflows/publish.yml`, both authorised explicitly).**
+
+- **SEC-4** — top-level `permissions` tightened from `contents: write` to `read`. It covered
+  only `validate`, which checks out and runs npm; the `publish` job declares its own
+  `contents: write` + `id-token: write`, so release upload and provenance are untouched.
+- **ENG-2** — `validate` now runs `node benchmark/ci-gate.mjs`. `ci.yml` has a standalone
+  benchmark job, but it gates the *branch*: a tag pushed right after the branch push starts
+  a Release run that does not wait for it. Observed 2026-09-01 — CI started 13:55:59,
+  Release 13:56:09 — so a retrieval regression could ride out with the release.
+
 ## v3.84.1 — the update banner nagged forever on the one install shape we never had
 
 First outside contribution ([#17](https://github.com/sdsrss/claude-mem-lite/pull/17), Peter Bakker):

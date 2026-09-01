@@ -61,6 +61,13 @@ const RUNTIME_DIR = process.env.CLAUDE_MEM_RUNTIME_DIR || join(DATA_DIR, 'runtim
 // which already imports lib modules here, and the inlined value silently encoded the
 // same premise twice.
 import { DEDUP_STALE_MS as CROSS_HOOK_DEDUP_MS } from './prompt-search-utils.mjs';
+// Upper bound on the over-fetch the cross-hook dedup buys itself (ALGO-4). The dedup
+// runs in JS after the SELECTs, so each LIMIT is raised by the seen-set size to keep the
+// dedup a re-ranking rather than a truncation. This cap exists because the seen-set is
+// read from a file on disk: it is bounded by UPS's own per-prompt budget in practice
+// (MAX_RESULTS 3), but an unbounded value read off disk must never size a query. 5 is
+// well above that budget and still leaves the worst case at 2+5=7 rows per SELECT.
+const CROSS_HOOK_DEDUP_SLACK_MAX = 5;
 // v2.33.1: cooldown path is session-scoped so same-file-twice within one
 // session never re-injects (was: global file, 5-min window). Cross-session:
 // fresh file, fresh nudges — this is intended. No session_id → fall back to
@@ -451,7 +458,18 @@ try {
           (o.lesson_learned IS NOT NULL AND o.lesson_learned != '')
           OR (o.type IN ('bugfix', 'decision') AND ${notLowSignalSql})
         )`;
-    const obsLimit = isRead ? 1 : 2;
+    // Cross-hook dedup slack (audit 2026-08-29 ALGO-4, the D#172 shape again). The
+    // dedup below drops rows UPS already injected this prompt, and it used to run
+    // DOWNSTREAM of these LIMITs — so a deduped row left its slot EMPTY instead of
+    // yielding it to the next candidate, i.e. "dedup" was implemented as "shrink".
+    // On a Read (obsLimit 1 / eventsLimit 1) one dedup hit silenced the whole face.
+    // Read the seen-set FIRST and over-fetch by its size so the dedup removes rows
+    // from a pool that still has enough left to fill the cap. Capped at
+    // CROSS_HOOK_DEDUP_SLACK_MAX: the seen-set is bounded by UPS's own per-prompt
+    // budget in practice, but it is read off disk and must not size a query.
+    const crossHookSeen = readCrossHookInjected(project, sessionId);
+    const dedupSlack = Math.min(crossHookSeen.size, CROSS_HOOK_DEDUP_SLACK_MAX);
+    const obsLimit = (isRead ? 1 : 2) + dedupSlack;
     // A1.5 (v2.83.2): cite_factor as a tertiary sort key. When multiple file-
     // matching lessons exist, the one with proven cite history outranks the
     // merely-most-recent one. Single-match files unchanged (obsLimit=1 Read /
@@ -521,7 +539,7 @@ try {
       ? "AND body IS NOT NULL AND body != ''"
       : `AND ((body IS NOT NULL AND body != '')
           OR (event_type IN ('bugfix', 'decision', 'lesson') AND ${buildNotLowSignalSql('')}))`;
-    const eventsLimit = isRead ? 1 : 2;
+    const eventsLimit = (isRead ? 1 : 2) + dedupSlack;
     let eventRows = [];
     try {
       eventRows = db.prepare(`
@@ -548,7 +566,7 @@ try {
     // P1 (D#78): tag each row's source table — events share the numeric id
     // space with observations, and the Stop-side edge attribution must never
     // feed an event id into observation_files updates.
-    const crossHookSeen = readCrossHookInjected(project, sessionId);
+    // (crossHookSeen is read above, before the two SELECTs — it sizes their LIMITs.)
     const sourcedRows = [
       ...rows.map(r => ({ ...r, src: 'obs' })),
       ...eventRows.map(r => ({ ...r, src: 'evt' })),

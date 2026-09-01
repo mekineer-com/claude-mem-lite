@@ -5,7 +5,13 @@ on:
     tags: ['v*']
 
 permissions:
-  contents: write
+  # Least privilege for the DEFAULT job token (audit 2026-08-29 SEC-4). `validate`
+  # is the only job this covers, and all it does is check out and run npm — with a
+  # write-scoped token in a runner that has just executed several thousand dev
+  # dependencies' install scripts. The `publish` job declares its own
+  # `contents: write` + `id-token: write` block, so tightening here does not touch
+  # the release upload or the provenance attestation.
+  contents: read
 
 jobs:
   validate:
@@ -84,6 +90,22 @@ jobs:
         # Runs AFTER npm shrinkwrap so the smoked tarball is the locked shape
         # that publish ships.
         run: node scripts/smoke-tarball.mjs
+
+      - name: Benchmark gate
+        # ENG-2 (audit 2026-08-29). ci.yml carries a standalone `benchmark` job, but it
+        # gates the BRANCH, not the tag: pushing a tag right after the branch push starts
+        # a Release run that does not wait for it, so a retrieval-quality regression can
+        # ride out with the release while the branch run is still going.
+        #
+        # This is systematic, not a one-off — every recent release shows the same overlap
+        # (`gh run list`, UTC): v3.84.1 CI 13:55:59Z / Release 13:56:09Z (10s), v3.84.0
+        # 18:29:59Z / 18:31:03Z (64s), v3.83.0 19:42:28Z / 19:42:44Z (16s), v3.82.0
+        # 17:21:48Z / 17:22:02Z (14s). None of those gaps is long enough for the branch
+        # benchmark job to finish.
+        #
+        # Runs last: it is the slowest check here and the cheap ones should fail first.
+        # `benchmark/baseline.json` is committed, so this works on a fresh checkout.
+        run: node benchmark/ci-gate.mjs
 
   publish:
     needs: validate
